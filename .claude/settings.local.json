@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:lib.rs)",
+      "Bash(cargo init *)",
+      "Bash(cargo add *)",
+      "Bash(cargo tree *)",
+      "Bash(grep -v '^\\\\s*$')",
+      "Bash(cargo check *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(python3 /home/ruby/.claude/jobs/7297f6c1/tmp/fake_telnetd.py)",
+      "Bash(tmux new-session *)",
+      "Bash(tmux send-keys *)",
+      "Bash(tmux capture-pane *)",
+      "Bash(tmux ls *)",
+      "Bash(tmux kill-session *)",
+      "Bash(pkill -f fake_telnetd)",
+      "Bash(python3 /home/ruby/.claude/jobs/7297f6c1/tmp/fake_bbs.py)",
+      "Bash(pkill -f fake_bbs)",
+      "Bash(awk '{print $1}')",
+      "Bash(xargs -r kill)",
+      "Bash(python3 *)",
+      "Bash(git -C /home/ruby/Code/TRust status --short)",
+      "Bash(git -C /home/ruby/Code/TRust log --oneline)"
+    ]
+  }
+}
