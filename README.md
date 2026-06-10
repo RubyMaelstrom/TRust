@@ -1,11 +1,12 @@
 # TRust — Telnet in Rust
 
 A telnet client aiming for 1:1 functionality with GNU telnet — plus a
-gopher browser — wrapped in a cyberpunk-themed terminal UI.
+gopher and gemini browser — wrapped in a cyberpunk-themed terminal UI.
 
 ```
 cargo run -- <host> [port]         # telnet, connect on startup
 cargo run -- gopher://host[/sel]   # open the gopher browser
+cargo run -- gemini://host[/path]  # open the gemini browser
 cargo run                          # start at the command prompt
 ```
 
@@ -33,7 +34,7 @@ either input mode; **Esc** returns to the session. Commands:
 
 | Command | Effect |
 |---|---|
-| `open <host> [port]` | connect (default port 23; `gopher://`/port 70 open the browser, `telnets://`/port 992 use TLS, `telnet://` forces plain telnet) |
+| `open <host> [port]` | connect (default port 23; `gopher://`/port 70 and `gemini://`/port 1965 open the browser, `telnets://`/port 992 is telnet-TLS, `telnet://` forces plain telnet) |
 | `close` | drop the connection |
 | `mode character\|line\|auto` | force input mode or follow ECHO |
 | `send brk\|ip\|ao\|ayt\|ec\|el\|ga\|nop\|escape` | transmit an IAC command (or a literal Ctrl-]) |
@@ -52,16 +53,19 @@ Ctrl-] as `Ctrl-5`, so both encodings are matched in `app.rs`.
 `open telnets://host [port]` (default 992) or any port-992 connection
 wraps the telnet session in TLS via rustls. Certificate validation is
 **trust-on-first-use**, matching small-net practice (self-signed certs
-everywhere): the first certificate a host presents is accepted and its
-SHA-256 fingerprint pinned; a different certificate later is refused.
-Pins are in-memory only for now — a persistent known-hosts store lands
-with Gemini, which will reuse this connector. A green `TLS` badge shows
-in the status bar while a TLS session is live.
+everywhere): the first certificate a host:port presents is accepted and
+its SHA-256 fingerprint pinned in `~/.config/trust/known_hosts`
+(override the location with `TRUST_KNOWN_HOSTS`); a different
+certificate later is refused, with the error telling you which line to
+remove to re-trust the server. Gemini requests use the same connector.
+A green `TLS` badge shows in the status bar while a telnet-TLS session
+is live.
 
-## Gopher browser
+## Browser (gopher + gemini)
 
-`open gopher://host[:port][/Xselector]` (or any port-70 connection)
-replaces the terminal panel with a gopherus-style browser:
+`open gopher://host[:port][/Xselector]` or `open gemini://host[/path]`
+(or any port-70/1965 connection) replaces the terminal panel with a
+gopherus-style browser shared by both protocols:
 
 - **Up/Down** navigate gopherus-style. When the adjacent line is also a
   link, the highlight steps onto it, with the page scrolling along so the
@@ -83,10 +87,28 @@ replaces the terminal panel with a gopherus-style browser:
   resize (the raw bytes are kept per document, so encoding switches
   re-render too). Only the first row of a wrapped menu item is
   selectable; continuations belong to the same item visually.
-- Fetches are one-shot TCP with a 15 s timeout and a 2 MB cap, run in
-  the background so the UI never blocks. Binary/image item types are
-  reported as unsupported (yet); `h` items show their `URL:` target for
-  use in a web browser.
+- Fetches are one-shot with a 15 s timeout and a 2 MB cap, run in the
+  background so the UI never blocks. Binary/image gopher item types are
+  reported as unsupported (yet); `h` items and foreign-scheme gemtext
+  links (http, mailto, ...) display their target instead of following.
+
+Gemini specifics:
+
+- Requests go over the TOFU TLS connector (`tls.rs`); servers that skip
+  the TLS close_notify on shutdown are tolerated, as is common practice.
+- Gemtext renders with styled headings (3 levels), `•` lists, `▌`
+  quotes, and preformatted blocks (never wrapped, never linkified);
+  paragraphs and link labels word-wrap like everything else.
+- Relative link and redirect targets resolve per RFC 3986 (dot-segment
+  removal included); 3x redirects are followed in the fetch task, capped
+  at 5. Cross-scheme gemtext links into gopherspace are followable.
+- **`.gmi` files served over gopher render as gemtext** — a nod to the
+  common habit of uploading gemtext to gopher holes. Relative `=>`
+  targets resolve to gopher selectors on the same host (trailing `/`
+  means a menu); absolute gemini/gopher/web URLs work as usual.
+- 1x input statuses open the amber `search>` prompt and send the query
+  percent-encoded; 4x/5x land in the status bar; 6x (client certs) is
+  reported as unsupported for now.
 
 ## Architecture
 
@@ -97,10 +119,12 @@ src/
   telnet.rs   Connection task: socket I/O + libmudtelnet protocol state
               (generic over plain TCP and TLS transports)
   tls.rs      rustls connector with trust-on-first-use fingerprint pinning
+  doc.rs      protocol-agnostic document model (Link, Kind, DocLine, Doc)
   gopher.rs   Gopher (RFC 1436): one-shot fetches, menu/text parsing
+  gemini.rs   Gemini: TLS fetches, redirects, gemtext parsing, URL resolve
   cp437.rs    CP437→Unicode translation for BBS ANSI art
   ui.rs       Ratatui rendering: cyberpunk chrome, tui-term session widget,
-              gopher document panel
+              browser document panel
 ```
 
 Design notes:
@@ -149,11 +173,13 @@ Design notes:
 
 - [x] Gopher browser (RFC 1436) with gopherus-style navigation
 - [x] TLS foundation: rustls with TOFU fingerprint pinning; `telnets://`
-- [ ] **Gemini — next up.** The TLS connector, document view,
-      word-wrap, and fetch-task pattern are all in place; see CLAUDE.md
-      for the agreed implementation plan (gemtext parsing, status
-      codes, link-type generalization, persistent TOFU known-hosts).
+- [x] Gemini: gemtext rendering, redirects, 1x input, shared browser
+      view (protocol-agnostic `doc.rs` document model)
+- [x] Persistent TOFU known-hosts at `~/.config/trust/known_hosts`,
+      pins keyed by host:port
+- [ ] Gemini client certificates (status 6x)
 - [ ] Finger (79), WHOIS (43), DICT (2628) — trivial one-shot
       personalities
-- [ ] HTTP(S) GET + html2text rendering (after Gemini)
+- [ ] HTTP(S) GET + html2text rendering — the document model and
+      External-link plumbing are ready for it
 - SSH is an explicit non-goal.

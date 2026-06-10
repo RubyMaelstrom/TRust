@@ -11,6 +11,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::doc::{Doc, DocLine, Kind, Link, push_wrapped};
+use crate::gemini;
+
 /// Cap on a single response; gopherspace text rarely exceeds kilobytes.
 const MAX_RESPONSE: usize = 2 * 1024 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -63,27 +66,47 @@ impl fmt::Display for GopherUrl {
     }
 }
 
-/// One display line of a fetched document.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DocLine {
-    /// Gopher item type for menus (`'i'` info, `'1'` menu, ...);
-    /// `' '` for plain text documents.
-    pub kind: char,
-    pub text: String,
-    pub link: Option<GopherUrl>,
+/// Map a gopher item type to a styling class and link policy.
+fn kind_of(item_type: char) -> Kind {
+    match item_type {
+        'i' => Kind::Info,
+        '3' => Kind::Error,
+        '1' => Kind::Dir,
+        '0' => Kind::Document,
+        '7' => Kind::Search,
+        _ => Kind::OtherLink,
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GopherDoc {
-    pub url: GopherUrl,
-    pub lines: Vec<DocLine>,
-    /// The bytes as fetched, kept so the document can be re-wrapped when
-    /// the terminal resizes or re-decoded when the encoding changes.
-    pub raw: Vec<u8>,
-    /// Width `lines` was wrapped to.
-    pub wrapped_to: usize,
-    /// Whether `lines` was decoded as CP437.
-    pub cp437: bool,
+/// Resolve a `=>` target found in a gopher-hosted .gmi file. Absolute
+/// URLs of any scheme work as usual; relative references become gopher
+/// selectors on the same host (menus when the path ends in `/`, text
+/// items otherwise — .gmi targets render as gemtext again on arrival).
+fn resolve_gmi(base: &GopherUrl, target: &str) -> Link {
+    if let Some(link) = gemini::absolute_link(target) {
+        return link;
+    }
+    if let Some(rest) = target.strip_prefix("//") {
+        // Network-path reference: same scheme (gopher), new authority.
+        return match GopherUrl::parse(&format!("gopher://{rest}")) {
+            Some(url) => Link::Gopher(url),
+            None => Link::External(target.to_string()),
+        };
+    }
+    let selector = if let Some(abs) = target.strip_prefix('/') {
+        gemini::normalize(&format!("/{abs}"))
+    } else {
+        let sel = &base.selector;
+        let dir = sel.rfind('/').map(|i| &sel[..=i]).unwrap_or("/");
+        gemini::normalize(&format!("{dir}{target}"))
+    };
+    let item_type = if selector.ends_with('/') { '1' } else { '0' };
+    Link::Gopher(GopherUrl {
+        host: base.host.clone(),
+        port: base.port,
+        item_type,
+        selector,
+    })
 }
 
 /// Fetch one item: send the selector, read to EOF.
@@ -116,42 +139,30 @@ pub async fn fetch(url: &GopherUrl) -> Result<Vec<u8>, String> {
 
 /// Parse a fetched item into a document, menu or text depending on type,
 /// word-wrapping long lines to `width` columns.
-pub fn parse(url: &GopherUrl, raw: Vec<u8>, cp437: bool, width: usize) -> GopherDoc {
+pub fn parse(url: &GopherUrl, raw: Vec<u8>, cp437: bool, width: usize) -> Doc {
     let width = width.max(10);
     let lines = match url.item_type {
         '1' | '7' => parse_menu(&raw, cp437, width),
+        // Gemtext hosted in gopherspace: a common modern habit is to
+        // serve .gmi files over gopher; render them properly, with
+        // relative links resolving to gopher selectors on this host.
+        _ if url
+            .selector
+            .split(['?', '\t'])
+            .next()
+            .is_some_and(|s| s.to_ascii_lowercase().ends_with(".gmi")) =>
+        {
+            gemini::parse_gemtext(&raw, width, &|target| resolve_gmi(url, target))
+        }
         _ => parse_text(&raw, cp437, width),
     };
-    GopherDoc {
-        url: url.clone(),
+    Doc {
+        url: Link::Gopher(url.clone()),
         lines,
         raw,
         wrapped_to: width,
         cp437,
-    }
-}
-
-/// Push a display line, word-wrapping it to `width`. Continuation rows
-/// keep the kind (for styling) but never the link, so only an item's
-/// first row is selectable.
-fn push_wrapped(
-    out: &mut Vec<DocLine>,
-    kind: char,
-    text: String,
-    link: Option<GopherUrl>,
-    width: usize,
-) {
-    if text.chars().count() <= width {
-        out.push(DocLine { kind, text, link });
-        return;
-    }
-    let mut link = link;
-    for piece in textwrap::wrap(&text, width) {
-        out.push(DocLine {
-            kind,
-            text: piece.into_owned(),
-            link: link.take(),
-        });
+        meta: None,
     }
 }
 
@@ -176,7 +187,7 @@ fn parse_menu(raw: &[u8], cp437: bool, width: usize) -> Vec<DocLine> {
         }
         if line.is_empty() {
             lines.push(DocLine {
-                kind: 'i',
+                kind: Kind::Info,
                 text: String::new(),
                 link: None,
             });
@@ -185,25 +196,33 @@ fn parse_menu(raw: &[u8], cp437: bool, width: usize) -> Vec<DocLine> {
         let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
         if fields.len() < 2 {
             // Not a well-formed item; some servers emit bare text.
-            push_wrapped(&mut lines, 'i', decode(line, cp437), None, width);
+            push_wrapped(&mut lines, Kind::Info, decode(line, cp437), None, width);
             continue;
         }
-        let kind = fields[0][0] as char;
+        let item_type = fields[0][0] as char;
         let text = decode(&fields[0][1..], cp437);
         let host = fields
             .get(2)
             .map(|h| decode(h, cp437).trim().to_string())
             .unwrap_or_default();
-        let link = (kind != 'i' && kind != '3' && !host.is_empty()).then(|| GopherUrl {
-            host,
-            port: fields
-                .get(3)
-                .and_then(|p| decode(p, cp437).trim().parse().ok())
-                .unwrap_or(70),
-            item_type: kind,
-            selector: decode(fields[1], cp437),
-        });
-        push_wrapped(&mut lines, kind, text, link, width);
+        let selector = decode(fields[1], cp437);
+        let link = if item_type == 'h' && selector.starts_with("URL:") {
+            // `h` items conventionally carry a web URL in the selector.
+            Some(Link::External(selector["URL:".len()..].to_string()))
+        } else if item_type != 'i' && item_type != '3' && !host.is_empty() {
+            Some(Link::Gopher(GopherUrl {
+                host,
+                port: fields
+                    .get(3)
+                    .and_then(|p| decode(p, cp437).trim().parse().ok())
+                    .unwrap_or(70),
+                item_type,
+                selector,
+            }))
+        } else {
+            None
+        };
+        push_wrapped(&mut lines, kind_of(item_type), text, link, width);
     }
     lines
 }
@@ -220,7 +239,7 @@ fn parse_text(raw: &[u8], cp437: bool, width: usize) -> Vec<DocLine> {
             .strip_prefix(b".")
             .filter(|r| r.starts_with(b"."))
             .unwrap_or(line);
-        push_wrapped(&mut lines, ' ', decode(line, cp437), None, width);
+        push_wrapped(&mut lines, Kind::Text, decode(line, cp437), None, width);
     }
     // Drop a trailing blank produced by the final CRLF.
     if lines.last().is_some_and(|l| l.text.is_empty()) {
@@ -232,6 +251,15 @@ fn parse_text(raw: &[u8], cp437: bool, width: usize) -> Vec<DocLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::doc::{Kind, Link};
+
+    /// Unwrap a gopher link in tests.
+    fn gopher_link(line: &crate::doc::DocLine) -> &GopherUrl {
+        match line.link.as_ref().unwrap() {
+            Link::Gopher(url) => url,
+            other => panic!("expected gopher link, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parses_urls() {
@@ -261,14 +289,18 @@ mod tests {
         let doc = parse(&url, raw.to_vec(), false, 80);
 
         assert_eq!(doc.lines.len(), 6);
-        assert_eq!(doc.lines[0].kind, 'i');
+        assert_eq!(doc.lines[0].kind, Kind::Info);
         assert!(doc.lines[0].link.is_none());
-        let dir = doc.lines[1].link.as_ref().unwrap();
+        let dir = gopher_link(&doc.lines[1]);
         assert_eq!((dir.item_type, dir.selector.as_str()), ('1', "/tunnels"));
-        let txt = doc.lines[2].link.as_ref().unwrap();
+        assert_eq!(doc.lines[1].kind, Kind::Dir);
+        let txt = gopher_link(&doc.lines[2]);
         assert_eq!((txt.host.as_str(), txt.port), ("mirror.example", 7070));
-        assert_eq!(doc.lines[3].link.as_ref().unwrap().item_type, '7');
+        assert_eq!(doc.lines[2].kind, Kind::Document);
+        assert_eq!(gopher_link(&doc.lines[3]).item_type, '7');
+        assert_eq!(doc.lines[3].kind, Kind::Search);
         assert!(doc.lines[4].link.is_none(), "errors are not links");
+        assert_eq!(doc.lines[4].kind, Kind::Error);
         assert_eq!(doc.lines[5].text, "stray text without tabs");
     }
 
@@ -290,7 +322,44 @@ mod tests {
         assert!(doc.lines[0].link.is_some());
         assert!(doc.lines[1..].iter().all(|l| l.link.is_none()));
         // Continuations keep the kind so they style like their item.
-        assert!(doc.lines[1..].iter().all(|l| l.kind == '1'));
+        assert!(doc.lines[1..].iter().all(|l| l.kind == Kind::Dir));
+    }
+
+    #[test]
+    fn renders_gmi_files_as_gemtext_with_gopher_links() {
+        let url = GopherUrl::parse("gopher://e.org/0/phlog/post.gmi").unwrap();
+        let body = b"# Hello from gopherspace\n\
+                     => other.gmi Next post\n\
+                     => ../top.gmi Up top\n\
+                     => sub/ A menu\n\
+                     => gemini://capsule.example/x Crossover\n\
+                     => https://example.com/ Web\n";
+        let doc = parse(&url, body.to_vec(), false, 80);
+
+        assert_eq!(doc.lines[0].kind, Kind::Heading(1));
+        assert_eq!(doc.lines[1].kind, Kind::GemLink);
+        // Relative links resolve to gopher selectors on the same host.
+        let next = gopher_link(&doc.lines[1]);
+        assert_eq!(
+            (next.item_type, next.selector.as_str()),
+            ('0', "/phlog/other.gmi")
+        );
+        let up = gopher_link(&doc.lines[2]);
+        assert_eq!((up.item_type, up.selector.as_str()), ('0', "/top.gmi"));
+        let menu = gopher_link(&doc.lines[3]);
+        assert_eq!(
+            (menu.item_type, menu.selector.as_str()),
+            ('1', "/phlog/sub/")
+        );
+        // Absolute URLs keep their scheme.
+        assert!(matches!(doc.lines[4].link, Some(Link::Gemini(_))));
+        assert!(matches!(doc.lines[5].link, Some(Link::External(_))));
+
+        // Plain .txt files still render as plain gopher text.
+        let url = GopherUrl::parse("gopher://e.org/0/notes.txt").unwrap();
+        let doc = parse(&url, b"# not a heading\n".to_vec(), false, 80);
+        assert_eq!(doc.lines[0].kind, Kind::Text);
+        assert_eq!(doc.lines[0].text, "# not a heading");
     }
 
     #[test]

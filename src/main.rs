@@ -1,5 +1,7 @@
 mod app;
 mod cp437;
+mod doc;
+mod gemini;
 mod gopher;
 mod telnet;
 mod tls;

@@ -128,7 +128,7 @@ async fn run(
                 return;
             }
         };
-        let stream = match tls::connector().connect(name, stream).await {
+        let stream = match tls::connector(&host, port).connect(name, stream).await {
             Ok(stream) => stream,
             Err(err) => {
                 let _ = events
@@ -287,9 +287,15 @@ mod tests {
         use tokio_rustls::rustls::ServerConfig;
         use tokio_rustls::rustls::pki_types::PrivateKeyDer;
 
-        // Make sure a crypto provider is installed before building any
-        // rustls config in this test.
-        let _ = crate::tls::connector();
+        // Pin store goes to a temp file; provider must exist before any
+        // rustls config is built in this test.
+        unsafe {
+            std::env::set_var(
+                "TRUST_KNOWN_HOSTS",
+                std::env::temp_dir().join(format!("trust-test-kh-{}", std::process::id())),
+            );
+        }
+        crate::tls::ensure_provider();
 
         let make_acceptor = || {
             let signed = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -332,10 +338,10 @@ mod tests {
         drop(handle);
         let _ = events.recv().await; // drain the close
 
-        // Phase 2: the same host presenting a *different* certificate is
-        // refused by the fingerprint pin.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        // Phase 2: the same host:port (pins are keyed by both) presenting
+        // a *different* certificate is refused by the fingerprint pin.
+        // The phase-1 listener is gone, so the port is free to rebind.
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let acceptor = make_acceptor(); // brand-new cert
         let server = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
