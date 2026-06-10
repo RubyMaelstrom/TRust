@@ -7,7 +7,7 @@ this file is workflow, gotchas, and the up-next plan.
 ## Quality bar
 
 - `cargo fmt`, `cargo clippy` (zero warnings), `cargo test` — all clean
-  before calling anything done. Currently 28 tests.
+  before calling anything done. Currently 36 tests.
 - Every feature gets BOTH a unit/integration test and a live smoke test
   in tmux against a throwaway local server. Unit tests prove the logic;
   the tmux run proves the UX (and has caught real bugs the tests missed).
@@ -49,10 +49,13 @@ this file is workflow, gotchas, and the up-next plan.
 - All TLS goes through `tls::connector()` (single ClientConfig, TOFU
   verifier, installs the process-wide crypto provider). Don't build a
   second ClientConfig.
-- RAM-only ethos: entry histories, scrollback, gopher history, TOFU
-  pins — nothing persists to disk yet. First persistent state should be
-  the TOFU known-hosts file (see Gemini plan) and is a deliberate,
-  user-approved decision, not a default.
+- RAM-only ethos for session state: entry histories, scrollback,
+  browser history. The ONE deliberate exception (user-approved
+  2026-06): TOFU pins persist to ~/.config/trust/known_hosts
+  (TRUST_KNOWN_HOSTS overrides; TLS tests point it at a temp file and
+  must keep doing so). Pins are keyed host:port — the verifier can't
+  see the port, so tls::connector(host, port) bakes the key in per
+  connection. Don't add other persistent state without asking her.
 - Crossterm quirk: legacy terminals deliver Ctrl-] as `Ctrl-5` (0x1D
   maps to `Char('5')+CONTROL`); both encodings are matched in app.rs.
 - Documents (gopher, future gemini) wrap at *parse* time into real
@@ -72,35 +75,42 @@ Right/Enter follows, Left pops history (position restored), Esc returns
 to the terminal view. The 7 `gopherus_*`/rewrap tests in app.rs encode
 this — they are the spec; don't "simplify" them.
 
-## Next up: Gemini (agreed plan)
+## Gemini (done 2026-06) — notes
 
-Everything it needs already exists; estimated shape:
+Implemented per plan: `gemini.rs` (URL parse/resolve, header parse,
+fetch with capped redirects, gemtext → DocLine), generalized document
+model in `doc.rs` (Link enum: Gopher/Gemini/External; Kind enum for
+styling), BrowserView (renamed from GopherView) shared by both
+protocols. 1x input reuses Mode::Search with percent-encoded queries.
 
-1. `gemini.rs` modeled on `gopher.rs`: URL parse (default port 1965,
-   default path `/`), one-shot fetch over `tls::connector()` (SNI
-   required), request is `gemini://host/path\r\n`, response is
-   `<status><space><meta>\r\n` + body.
-2. Status codes: 2x render body; 3x follow redirect (cap ~5, re-fetch);
-   1x prompt for input via the existing Mode::Search flow (append
-   `?query` URL-encoded); 4x/5x show error in status; 6x (client cert)
-   out of scope initially — report politely.
-3. Gemtext → DocLine: `=>` link lines (link + label), `#`/`##`/`###`
-   headings (style by level), `* ` lists, `> ` quotes, ``` toggles
-   preformatted (NO wrapping inside pre blocks; everything else wraps
-   via the existing push_wrapped pattern — first row carries the link).
-4. Generalize the browser: GopherView/GopherDoc/DocLine currently
-   carry `GopherUrl` links. Introduce a link enum or trait (gopher item
-   vs gemini URL) so one BrowserView serves both; the nav/wrap/history
-   code should not fork.
-5. Persistent TOFU known-hosts file (first on-disk state — confirm
-   location/format with the user; suggest ~/.local/share/trust/).
-6. Dispatch: `gemini://` scheme + port 1965; CLI arg already flows
-   through `dispatch_open`.
+Hard-won detail: many gemini servers close without TLS close_notify;
+`fetch_once` treats UnexpectedEof during body read as EOF. Keep that.
 
-Further out (user-endorsed direction): finger (79), whois (43), DICT
-(2628); HTTP(S)+html2text later; SSH is an explicit non-goal.
+Testing note: TOFU pins are global per server name within the process,
+so TLS tests must not share a hostname across different certs — the
+telnet TLS test owns "localhost", the gemini test owns "127.0.0.1"
+(one cert for all its phases). A live capsule for tmux demos:
+fake_gemini.py + openssl-generated cert in $CLAUDE_JOB_DIR/tmp.
+
+## Next up (in rough priority order)
+
+1. Finger (79), WHOIS (43), DICT (2628): trivial one-shot personalities
+   rendering into Doc as Kind::Text.
+2. HTTP(S) GET + html2text → DocLine; the Link::External plumbing is
+   the natural entry point (make External followable when it's http).
+   Minimal-GET trick: `Connection: close` + `Accept-Encoding: identity`
+   dodges keep-alive/chunked/gzip; handle 301/302 manually.
+3. Gemini client certificates (status 6x) if a capsule she uses needs it.
+
+Done since: .gmi files over gopher render as gemtext
+(gemini::parse_gemtext takes a resolver closure; gopher::resolve_gmi
+maps relative targets to selectors on the same host).
+
+SSH remains an explicit non-goal.
 
 ## User preferences observed
+
+- She's "sister", not "brother".
 
 - Wants planning discussion *before* implementation on big features;
   small fixes can just be done and verified.

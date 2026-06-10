@@ -8,7 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, Encoding, GopherView, Mode};
+use crate::app::{App, BrowserView, Encoding, Mode};
+use crate::doc::{Kind, Link};
 
 pub mod theme {
     use ratatui::style::Color;
@@ -30,7 +31,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    let (title, border_color) = match &app.gopher {
+    let (title, border_color) = match &app.browser {
         Some(g) => (format!("░▒▓ TRUST :: {} ▓▒░", g.doc.url), theme::NEON_CYAN),
         None => (
             match &app.host {
@@ -58,9 +59,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let inner = block.inner(session_area);
     app.last_inner = (inner.width, inner.height);
 
-    match &app.gopher {
+    match &app.browser {
         Some(g) => {
-            let doc = Paragraph::new(gopher_lines(g, inner.height as usize)).block(block);
+            let doc = Paragraph::new(browser_lines(g, inner.height as usize)).block(block);
             frame.render_widget(doc, session_area);
         }
         None => {
@@ -73,22 +74,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(status_bar(app), status_area);
 }
 
-/// The visible slice of a gopher document, gopherus-style: the cursor
-/// line is highlighted when it carries a link.
-fn gopher_lines(g: &GopherView, height: usize) -> Vec<Line<'_>> {
+/// The visible slice of a document, gopherus-style: the cursor line is
+/// highlighted when it carries a link.
+fn browser_lines(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
     let end = (g.scroll + height).min(g.doc.lines.len());
     g.doc.lines[g.scroll..end]
         .iter()
         .enumerate()
         .map(|(i, line)| {
             let mut style = match (line.link.is_some(), line.kind) {
-                (true, '1') => Style::new()
+                (true, Kind::Dir | Kind::GemLink) => Style::new()
                     .fg(theme::NEON_CYAN)
                     .add_modifier(Modifier::BOLD),
-                (true, '0') => Style::new().fg(theme::NEON_GREEN),
-                (true, '7') => Style::new().fg(theme::AMBER),
+                (true, Kind::Document) => Style::new().fg(theme::NEON_GREEN),
+                (true, Kind::Search) => Style::new().fg(theme::AMBER),
                 (true, _) => Style::new().fg(theme::NEON_PINK),
-                (false, '3') => Style::new().fg(theme::NEON_PINK),
+                (_, Kind::Error) => Style::new().fg(theme::NEON_PINK),
+                (_, Kind::Heading(1)) => Style::new()
+                    .fg(theme::NEON_PINK)
+                    .add_modifier(Modifier::BOLD),
+                (_, Kind::Heading(2)) => Style::new()
+                    .fg(theme::NEON_CYAN)
+                    .add_modifier(Modifier::BOLD),
+                (_, Kind::Heading(_)) => Style::new().fg(theme::NEON_CYAN),
+                (_, Kind::Quote) => Style::new().fg(theme::DIM),
+                (_, Kind::Pre) => Style::new().fg(theme::NEON_GREEN),
                 _ => Style::new().fg(theme::TEXT),
             };
             if g.selected == Some(g.scroll + i) && line.link.is_some() {
@@ -97,6 +107,15 @@ fn gopher_lines(g: &GopherView, height: usize) -> Vec<Line<'_>> {
             Line::styled(line.text.as_str(), style)
         })
         .collect()
+}
+
+/// Status-bar / strip badge for the active browser protocol.
+fn protocol_badge(g: &BrowserView) -> &'static str {
+    match &g.doc.url {
+        Link::Gopher(_) => " GOPHER ",
+        Link::Gemini(_) => " GEMINI ",
+        Link::External(_) => " NET ",
+    }
 }
 
 fn input_box(app: &App) -> Paragraph<'_> {
@@ -178,8 +197,11 @@ fn input_box(app: &App) -> Paragraph<'_> {
 
 /// Badge and hint for the dimmed strip when keys bypass the input field.
 fn strip_content(app: &App) -> Option<(&'static str, &'static str)> {
-    if app.gopher.is_some() {
-        Some((" GOPHER ", " ↑↓ scroll · → follow · ← back · Esc terminal"))
+    if let Some(g) = &app.browser {
+        Some((
+            protocol_badge(g),
+            " ↑↓ scroll · → follow · ← back · Esc terminal",
+        ))
     } else if app.char_mode() {
         Some((" CHAR ", " keys go directly to remote · server echoes"))
     } else {
@@ -188,14 +210,14 @@ fn strip_content(app: &App) -> Option<(&'static str, &'static str)> {
 }
 
 fn status_bar(app: &App) -> Paragraph<'_> {
-    let (label, color) = if app.gopher.is_some() {
-        (" GOPHER ", theme::NEON_CYAN)
+    let (label, color) = if let Some(g) = &app.browser {
+        (protocol_badge(g), theme::NEON_CYAN)
     } else if app.connected {
         (" LINK:ONLINE ", theme::NEON_GREEN)
     } else {
         (" LINK:DOWN ", theme::NEON_PINK)
     };
-    let hint = match (app.mode, app.gopher.is_some(), app.char_mode()) {
+    let hint = match (app.mode, app.browser.is_some(), app.char_mode()) {
         (Mode::Session, true, _) => "· ↑↓ → ← navigate · Ctrl-] commands",
         (Mode::Session, false, true) => "· CHAR mode · Ctrl-] commands",
         (Mode::Session, false, false) => "· Enter send · Ctrl-] commands",
@@ -225,7 +247,7 @@ fn status_bar(app: &App) -> Paragraph<'_> {
         ));
     }
     let scrollback = app.vt.screen().scrollback();
-    if app.gopher.is_none() && scrollback > 0 {
+    if app.browser.is_none() && scrollback > 0 {
         spans.push(Span::styled(
             format!(" SCROLL ↑{scrollback} "),
             Style::new()
@@ -237,7 +259,7 @@ fn status_bar(app: &App) -> Paragraph<'_> {
     // While browsing, show the selected link instead of the connection
     // status, the way gopherus does.
     let middle = match app
-        .gopher
+        .browser
         .as_ref()
         .and_then(|g| g.selected.and_then(|i| g.doc.lines.get(i)))
         .and_then(|l| l.link.as_ref())

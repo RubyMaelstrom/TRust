@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 use tui_term::vt100;
 
 use crate::cp437;
-use crate::gopher::{self, GopherDoc, GopherUrl};
+use crate::doc::{Doc, Link};
+use crate::gemini::{self, GeminiUrl};
+use crate::gopher::{self, GopherUrl};
 use crate::telnet;
 use crate::ui;
 
@@ -191,22 +193,29 @@ impl ProbeDetector {
     }
 }
 
-/// The gopherus-style browser state: a scrolling viewport with a link
-/// cursor constrained to it, and an in-RAM back history.
-pub struct GopherView {
-    pub doc: GopherDoc,
+/// The gopherus-style browser state (shared by gopher and gemini): a
+/// scrolling viewport with a link cursor constrained to it, and an
+/// in-RAM back history.
+pub struct BrowserView {
+    pub doc: Doc,
     /// The selected link's line index. Always a visible link when one is
     /// on screen; None while no link is in the viewport.
     pub selected: Option<usize>,
     /// First visible line.
     pub scroll: usize,
-    history: Vec<(GopherDoc, Option<usize>, usize)>,
+    history: Vec<(Doc, Option<usize>, usize)>,
 }
 
-/// Result of a background gopher fetch.
+/// What a background fetch produced, by protocol.
+enum Payload {
+    Gopher(Vec<u8>),
+    Gemini(gemini::Response),
+}
+
+/// Result of a background fetch.
 struct FetchMsg {
-    url: GopherUrl,
-    result: Result<Vec<u8>, String>,
+    target: Link,
+    result: Result<Payload, String>,
 }
 
 pub struct App {
@@ -246,12 +255,12 @@ pub struct App {
     command_history: History,
     /// Watches inbound data for terminal queries we must answer.
     probes: ProbeDetector,
-    /// When Some, the gopher browser replaces the terminal panel.
-    pub gopher: Option<GopherView>,
-    /// In-flight gopher fetch, if any.
+    /// When Some, the browser (gopher/gemini) replaces the terminal panel.
+    pub browser: Option<BrowserView>,
+    /// In-flight fetch, if any.
     fetch_rx: Option<mpsc::Receiver<FetchMsg>>,
-    /// The type-7 item awaiting a query from Mode::Search.
-    search_target: Option<GopherUrl>,
+    /// The gopher type-7 item or gemini 1x URL awaiting a query.
+    search_target: Option<Link>,
     conn: Option<telnet::Handle>,
     events: Option<mpsc::Receiver<telnet::Event>>,
     quit: bool,
@@ -285,7 +294,7 @@ impl App {
             session_history: History::default(),
             command_history: History::default(),
             probes: ProbeDetector::default(),
-            gopher: None,
+            browser: None,
             fetch_rx: None,
             search_target: None,
             conn: None,
@@ -307,7 +316,7 @@ impl App {
         while !self.quit {
             terminal.draw(|frame| ui::draw(frame, &mut self))?;
             self.sync_vt_size().await;
-            self.sync_gopher_wrap();
+            self.sync_browser_wrap();
 
             tokio::select! {
                 event = input.next() => match event {
@@ -349,11 +358,11 @@ impl App {
             TermEvent::Key(key) => key,
             TermEvent::Mouse(mouse) => {
                 // 3 lines per wheel click, matching terminal convention.
-                match (mouse.kind, self.gopher.is_some()) {
+                match (mouse.kind, self.browser.is_some()) {
                     (MouseEventKind::ScrollUp, false) => self.scroll_by(3),
                     (MouseEventKind::ScrollDown, false) => self.scroll_by(-3),
-                    (MouseEventKind::ScrollUp, true) => self.gopher_scroll(-3, true),
-                    (MouseEventKind::ScrollDown, true) => self.gopher_scroll(3, true),
+                    (MouseEventKind::ScrollUp, true) => self.browser_scroll(-3, true),
+                    (MouseEventKind::ScrollDown, true) => self.browser_scroll(3, true),
                     _ => {}
                 }
                 return;
@@ -378,8 +387,8 @@ impl App {
         }
 
         // The gopher browser captures session-mode keys while open.
-        if self.mode == Mode::Session && self.gopher.is_some() {
-            self.gopher_nav(key);
+        if self.mode == Mode::Session && self.browser.is_some() {
+            self.browser_nav(key);
             return;
         }
 
@@ -660,11 +669,14 @@ impl App {
         self.vt.process(report.as_bytes());
     }
 
-    /// Route an open target to the right protocol: gopher:// URLs and
-    /// port 70 get the browser, everything else is telnet.
+    /// Route an open target to the right protocol: gopher:// and
+    /// gemini:// URLs (or ports 70/1965) get the browser, everything
+    /// else is telnet (TLS for telnets:// / port 992).
     fn dispatch_open(&mut self, target: &str, port: u16) {
         if let Some(url) = GopherUrl::parse(target) {
-            self.start_fetch(url);
+            self.start_fetch(Link::Gopher(url));
+        } else if let Some(url) = GeminiUrl::parse(target) {
+            self.start_fetch(Link::Gemini(url));
         } else if let Some(host) = target.strip_prefix("telnet://") {
             self.open(host.trim_end_matches('/').to_string(), port, false);
         } else if let Some(host) = target.strip_prefix("telnets://") {
@@ -672,48 +684,99 @@ impl App {
             let port = if port == 23 { 992 } else { port };
             self.open(host, port, true);
         } else if port == 70 {
-            self.start_fetch(GopherUrl {
+            self.start_fetch(Link::Gopher(GopherUrl {
                 host: target.to_string(),
                 port,
                 item_type: '1',
                 selector: String::new(),
-            });
+            }));
+        } else if port == 1965 {
+            self.start_fetch(Link::Gemini(GeminiUrl {
+                host: target.to_string(),
+                port,
+                path: String::from("/"),
+            }));
         } else {
             // telnets convention: port 992 is telnet over TLS.
             self.open(target.to_string(), port, port == 992);
         }
     }
 
-    /// Fetch a gopher item in the background; the result arrives in the
+    /// Fetch a document in the background; the result arrives in the
     /// select loop as a FetchMsg.
-    fn start_fetch(&mut self, url: GopherUrl) {
+    fn start_fetch(&mut self, target: Link) {
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
-        self.status = format!("Fetching {url} ...");
+        self.status = format!("Fetching {target} ...");
         tokio::spawn(async move {
-            let result = gopher::fetch(&url).await;
-            let _ = tx.send(FetchMsg { url, result }).await;
+            let result = match &target {
+                Link::Gopher(url) => gopher::fetch(url).await.map(Payload::Gopher),
+                Link::Gemini(url) => gemini::fetch(url).await.map(Payload::Gemini),
+                Link::External(url) => Err(format!("cannot fetch foreign scheme: {url}")),
+            };
+            let _ = tx.send(FetchMsg { target, result }).await;
         });
     }
 
     fn on_fetch(&mut self, msg: FetchMsg) {
         self.fetch_rx = None;
-        match msg.result {
-            Ok(raw) => {
+        let width = (self.last_inner.0 as usize).max(10);
+        match (msg.result, msg.target) {
+            (Ok(Payload::Gopher(raw)), Link::Gopher(url)) => {
                 let cp437 = self.encoding == Encoding::Cp437;
-                let width = (self.last_inner.0 as usize).max(10);
-                let doc = gopher::parse(&msg.url, raw, cp437, width);
-                self.status = format!("{} — {} lines", msg.url, doc.lines.len());
+                let doc = gopher::parse(&url, raw, cp437, width);
+                self.status = format!("{url} — {} lines", doc.lines.len());
                 self.navigate_to(doc);
             }
-            Err(err) => self.status = format!("gopher: {} — {err}", msg.url),
+            (Ok(Payload::Gemini(response)), _) => self.on_gemini_response(response, width),
+            (Err(err), target) => self.status = format!("{target} — {err}"),
+            _ => {}
+        }
+    }
+
+    /// Act on a gemini response by status class. 3x redirects were
+    /// already followed inside the fetch task.
+    fn on_gemini_response(&mut self, response: gemini::Response, width: usize) {
+        match response.status {
+            20..=29 => {
+                let doc = gemini::parse(&response.url, &response.meta, &response.body, width);
+                let media = if response.meta.is_empty() {
+                    "text/gemini"
+                } else {
+                    response.meta.as_str()
+                };
+                self.status = format!("{} — {media}", response.url);
+                self.navigate_to(doc);
+            }
+            // 1x: the server wants input; reuse the search prompt.
+            // (11 is "sensitive input" — we don't mask the field yet.)
+            10..=19 => {
+                self.status = if response.meta.is_empty() {
+                    String::from("Input requested.")
+                } else {
+                    response.meta.clone()
+                };
+                self.search_target = Some(Link::Gemini(response.url));
+                self.mode = Mode::Search;
+                self.input.clear();
+                self.cursor = 0;
+            }
+            60..=69 => {
+                self.status = format!(
+                    "{}: requires a client certificate (status {}) — not supported yet",
+                    response.url, response.status
+                );
+            }
+            status => {
+                self.status = format!("{}: {} {}", response.url, status, response.meta);
+            }
         }
     }
 
     /// Show a fetched document, pushing the current one onto the back
     /// history (RAM-only, dropped when the view closes).
-    fn navigate_to(&mut self, doc: GopherDoc) {
-        match &mut self.gopher {
+    fn navigate_to(&mut self, doc: Doc) {
+        match &mut self.browser {
             Some(g) => {
                 let old = std::mem::replace(&mut g.doc, doc);
                 g.history.push((old, g.selected, g.scroll));
@@ -721,7 +784,7 @@ impl App {
                 g.scroll = 0;
             }
             None => {
-                self.gopher = Some(GopherView {
+                self.browser = Some(BrowserView {
                     doc,
                     selected: None,
                     scroll: 0,
@@ -731,27 +794,27 @@ impl App {
         }
         // A fresh page selects its first visible link, gopherus-style.
         let height = self.last_inner.1.max(1) as usize;
-        if let Some(g) = &mut self.gopher {
-            g.selected = Self::gopher_visible_links(g, height).first().copied();
+        if let Some(g) = &mut self.browser {
+            g.selected = Self::browser_visible_links(g, height).first().copied();
         }
     }
 
     /// gopherus keys: Up/Down scroll the page (the highlight rides the
     /// visible links), Right follows, Left goes back, Esc closes.
-    fn gopher_nav(&mut self, key: KeyEvent) {
+    fn browser_nav(&mut self, key: KeyEvent) {
         let page = i64::from(self.last_inner.1.max(2)) - 1;
         match key.code {
-            KeyCode::Up => self.gopher_arrow(-1),
-            KeyCode::Down => self.gopher_arrow(1),
-            KeyCode::PageUp => self.gopher_scroll(-page, false),
-            KeyCode::PageDown => self.gopher_scroll(page, false),
-            KeyCode::Home => self.gopher_scroll(i64::MIN / 2, false),
-            KeyCode::End => self.gopher_scroll(i64::MAX / 2, false),
-            KeyCode::Right | KeyCode::Enter => self.gopher_follow(),
-            KeyCode::Left => self.gopher_back(),
+            KeyCode::Up => self.browser_arrow(-1),
+            KeyCode::Down => self.browser_arrow(1),
+            KeyCode::PageUp => self.browser_scroll(-page, false),
+            KeyCode::PageDown => self.browser_scroll(page, false),
+            KeyCode::Home => self.browser_scroll(i64::MIN / 2, false),
+            KeyCode::End => self.browser_scroll(i64::MAX / 2, false),
+            KeyCode::Right | KeyCode::Enter => self.browser_follow(),
+            KeyCode::Left => self.browser_back(),
             KeyCode::Esc => {
-                self.gopher = None;
-                self.status = String::from("Gopher view closed.");
+                self.browser = None;
+                self.status = String::from("Browser closed.");
             }
             _ => {}
         }
@@ -761,13 +824,13 @@ impl App {
     /// link, the highlight steps onto it (the page scrolls along once the
     /// selection has reached the center of the screen, so it tends to stay
     /// there except near the document's ends). Otherwise the page scrolls
-    /// under the sticky selection, and `gopher_retarget` decides when a
+    /// under the sticky selection, and `browser_retarget` decides when a
     /// new link takes the highlight. With the page pinned at either end,
     /// the highlight walks between the visible links instead.
-    fn gopher_arrow(&mut self, dir: i64) {
+    fn browser_arrow(&mut self, dir: i64) {
         let height = self.last_inner.1.max(1) as i64;
         let center_row = (height - 1) / 2;
-        let Some(g) = &mut self.gopher else { return };
+        let Some(g) = &mut self.browser else { return };
         let len = g.doc.lines.len() as i64;
         let max_scroll = (len - height).max(0);
 
@@ -793,18 +856,18 @@ impl App {
         };
         if can_scroll {
             g.scroll = (g.scroll as i64 + dir) as usize;
-            self.gopher_retarget(dir);
+            self.browser_retarget(dir);
         } else {
-            self.gopher_walk(dir);
+            self.browser_walk(dir);
         }
     }
 
     /// Scroll the viewport by `delta` lines (wheel, page keys, jumps) and
     /// re-aim the highlight. When the viewport can't move and
     /// `walk_at_edge` is set, step the highlight instead.
-    fn gopher_scroll(&mut self, delta: i64, walk_at_edge: bool) {
+    fn browser_scroll(&mut self, delta: i64, walk_at_edge: bool) {
         let height = self.last_inner.1.max(1) as i64;
-        let Some(g) = &mut self.gopher else { return };
+        let Some(g) = &mut self.browser else { return };
         let len = g.doc.lines.len() as i64;
         let max_scroll = (len - height).max(0);
         let target = (g.scroll as i64).saturating_add(delta).clamp(0, max_scroll);
@@ -812,9 +875,9 @@ impl App {
         g.scroll = target as usize;
         let dir = if delta >= 0 { 1 } else { -1 };
         if moved {
-            self.gopher_retarget(dir);
+            self.browser_retarget(dir);
         } else if walk_at_edge && delta != 0 {
-            self.gopher_walk(dir);
+            self.browser_walk(dir);
         }
     }
 
@@ -822,11 +885,11 @@ impl App {
     /// or the encoding changed since it was parsed — including documents
     /// restored from history at an older width. The selection is carried
     /// over by its position in the document's link order.
-    fn sync_gopher_wrap(&mut self) {
+    fn sync_browser_wrap(&mut self) {
         let width = (self.last_inner.0 as usize).max(10);
         let cp437 = self.encoding == Encoding::Cp437;
         let height = self.last_inner.1.max(1) as usize;
-        let Some(g) = &mut self.gopher else { return };
+        let Some(g) = &mut self.browser else { return };
         if g.doc.raw.is_empty() || (g.doc.wrapped_to == width && g.doc.cp437 == cp437) {
             return;
         }
@@ -836,9 +899,15 @@ impl App {
                 .filter(|l| l.link.is_some())
                 .count()
         });
-        let url = g.doc.url.clone();
         let raw = std::mem::take(&mut g.doc.raw);
-        g.doc = gopher::parse(&url, raw, cp437, width);
+        g.doc = match g.doc.url.clone() {
+            Link::Gopher(url) => gopher::parse(&url, raw, cp437, width),
+            Link::Gemini(url) => {
+                let meta = g.doc.meta.clone().unwrap_or_default();
+                gemini::parse(&url, &meta, &raw, width)
+            }
+            Link::External(_) => return,
+        };
         g.selected = link_ordinal.and_then(|n| {
             g.doc
                 .lines
@@ -857,7 +926,7 @@ impl App {
     }
 
     /// Indices of the links currently in the viewport.
-    fn gopher_visible_links(g: &GopherView, height: usize) -> Vec<usize> {
+    fn browser_visible_links(g: &BrowserView, height: usize) -> Vec<usize> {
         let visible = g.scroll..(g.scroll + height).min(g.doc.lines.len());
         g.doc.lines[visible.clone()]
             .iter()
@@ -875,10 +944,10 @@ impl App {
     /// and then sticks near the center. A selection that scrolled off
     /// screen is replaced by the nearest visible link it left behind;
     /// none visible means none highlighted.
-    fn gopher_retarget(&mut self, dir: i64) {
+    fn browser_retarget(&mut self, dir: i64) {
         let height = self.last_inner.1.max(1) as usize;
-        let Some(g) = &mut self.gopher else { return };
-        let links = Self::gopher_visible_links(g, height);
+        let Some(g) = &mut self.browser else { return };
+        let links = Self::browser_visible_links(g, height);
         if links.is_empty() {
             g.selected = None;
             return;
@@ -913,10 +982,10 @@ impl App {
 
     /// Step the highlight between the visible links (used when the page
     /// is pinned at the top or bottom of the document).
-    fn gopher_walk(&mut self, dir: i64) {
+    fn browser_walk(&mut self, dir: i64) {
         let height = self.last_inner.1.max(1) as usize;
-        let Some(g) = &mut self.gopher else { return };
-        let links = Self::gopher_visible_links(g, height);
+        let Some(g) = &mut self.browser else { return };
+        let links = Self::browser_visible_links(g, height);
         g.selected = match (g.selected, links.as_slice()) {
             (_, []) => None,
             (None, links) => Some(if dir > 0 {
@@ -937,8 +1006,8 @@ impl App {
         };
     }
 
-    fn gopher_follow(&mut self) {
-        let Some(g) = &self.gopher else { return };
+    fn browser_follow(&mut self) {
+        let Some(g) = &self.browser else { return };
         let Some(link) = g
             .selected
             .and_then(|i| g.doc.lines.get(i))
@@ -946,25 +1015,26 @@ impl App {
         else {
             return;
         };
-        match link.item_type {
-            '0' | '1' => self.start_fetch(link),
-            '7' => {
-                self.search_target = Some(link);
-                self.mode = Mode::Search;
-                self.input.clear();
-                self.cursor = 0;
+        match link {
+            Link::Gopher(url) => match url.item_type {
+                '0' | '1' => self.start_fetch(Link::Gopher(url)),
+                '7' => {
+                    self.search_target = Some(Link::Gopher(url));
+                    self.mode = Mode::Search;
+                    self.input.clear();
+                    self.cursor = 0;
+                }
+                other => self.status = format!("item type '{other}' not supported yet"),
+            },
+            Link::Gemini(url) => self.start_fetch(Link::Gemini(url)),
+            Link::External(target) => {
+                self.status = format!("external link (use a browser): {target}");
             }
-            'h' => {
-                // HTML items carry "URL:<target>" selectors by convention.
-                let target = link.selector.strip_prefix("URL:").unwrap_or(&link.selector);
-                self.status = format!("web link (use a browser): {target}");
-            }
-            other => self.status = format!("item type '{other}' not supported yet"),
         }
     }
 
-    fn gopher_back(&mut self) {
-        let Some(g) = &mut self.gopher else { return };
+    fn browser_back(&mut self) {
+        let Some(g) = &mut self.browser else { return };
         match g.history.pop() {
             Some((doc, selected, scroll)) => {
                 g.doc = doc;
@@ -975,15 +1045,26 @@ impl App {
         }
     }
 
-    /// Run a gopher type-7 search with the entered query (RFC 1436:
-    /// selector and query separated by a tab).
+    /// Run a query the page asked for: gopher type-7 search (RFC 1436:
+    /// selector TAB query) or a gemini 1x input (percent-encoded ?query).
     fn run_search(&mut self, query: &str) {
-        if let Some(base) = self.search_target.take() {
-            let url = GopherUrl {
-                selector: format!("{}\t{}", base.selector, query),
-                ..base
-            };
-            self.start_fetch(url);
+        match self.search_target.take() {
+            Some(Link::Gopher(base)) => {
+                let url = GopherUrl {
+                    selector: format!("{}\t{}", base.selector, query),
+                    ..base
+                };
+                self.start_fetch(Link::Gopher(url));
+            }
+            Some(Link::Gemini(base)) => {
+                let path = base.path.split('?').next().unwrap_or("/").to_string();
+                let url = GeminiUrl {
+                    path: format!("{path}?{}", gemini::encode_query(query)),
+                    ..base
+                };
+                self.start_fetch(Link::Gemini(url));
+            }
+            _ => {}
         }
     }
 
@@ -1315,34 +1396,38 @@ mod tests {
         assert!(contents.contains("Encoding: UTF-8"));
     }
 
-    /// Build a gopher doc from a pattern: 'x' = link line, '.' = text.
-    fn gopher_doc(pattern: &str) -> crate::gopher::GopherDoc {
+    /// Build a browser doc from a pattern: 'x' = link line, '.' = text.
+    fn gopher_doc(pattern: &str) -> crate::doc::Doc {
+        use crate::doc::{Doc, DocLine, Kind, Link};
         let url = crate::gopher::GopherUrl::parse("gopher://test.host").unwrap();
         let lines = pattern
             .chars()
             .enumerate()
-            .map(|(i, c)| crate::gopher::DocLine {
-                kind: if c == 'x' { '1' } else { 'i' },
+            .map(|(i, c)| DocLine {
+                kind: if c == 'x' { Kind::Dir } else { Kind::Info },
                 text: format!("line {i}"),
-                link: (c == 'x').then(|| crate::gopher::GopherUrl {
-                    host: String::from("test.host"),
-                    port: 70,
-                    item_type: '1',
-                    selector: format!("/{i}"),
+                link: (c == 'x').then(|| {
+                    Link::Gopher(crate::gopher::GopherUrl {
+                        host: String::from("test.host"),
+                        port: 70,
+                        item_type: '1',
+                        selector: format!("/{i}"),
+                    })
                 }),
             })
             .collect();
-        crate::gopher::GopherDoc {
-            url,
+        Doc {
+            url: Link::Gopher(url),
             lines,
             raw: Vec::new(), // synthetic docs are never re-wrapped
             wrapped_to: 80,
             cp437: false,
+            meta: None,
         }
     }
 
     fn selected(app: &super::App) -> Option<usize> {
-        app.gopher.as_ref().unwrap().selected
+        app.browser.as_ref().unwrap().selected
     }
 
     #[test]
@@ -1355,13 +1440,13 @@ mod tests {
         // First visible link is selected on load.
         assert_eq!(selected(&app), Some(1));
         // Scroll down: the link is still on screen, highlight stays put.
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(selected(&app), Some(1));
         // It scrolls off the top: highlight jumps to the next visible link.
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(selected(&app), Some(5));
         // Scrolling back up: 5 leaves through the bottom, 1 returns.
-        app.gopher_arrow(-1);
+        app.browser_arrow(-1);
         assert_eq!(selected(&app), Some(1));
     }
 
@@ -1373,12 +1458,12 @@ mod tests {
 
         assert_eq!(selected(&app), Some(0));
         // Scroll into the link-free middle: nothing highlighted.
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(selected(&app), None);
-        app.gopher_scroll(3, true); // mouse wheel
+        app.browser_scroll(3, true); // mouse wheel
         assert_eq!(selected(&app), None);
         // The next link enters the viewport and takes the highlight.
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(selected(&app), Some(7));
     }
 
@@ -1390,16 +1475,16 @@ mod tests {
 
         assert_eq!(selected(&app), Some(1));
         // The page is pinned, so Up/Down step between visible links.
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(selected(&app), Some(3));
-        app.gopher_arrow(1); // line 4 is adjacent to 3: direct transition
+        app.browser_arrow(1); // line 4 is adjacent to 3: direct transition
         assert_eq!(selected(&app), Some(4));
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(selected(&app), Some(4), "stays on the last link");
-        app.gopher_arrow(-1); // adjacent transition back
+        app.browser_arrow(-1); // adjacent transition back
         assert_eq!(selected(&app), Some(3));
-        app.gopher_arrow(-1);
-        app.gopher_arrow(-1);
+        app.browser_arrow(-1);
+        app.browser_arrow(-1);
         assert_eq!(selected(&app), Some(1), "stays on the first link");
     }
 
@@ -1416,16 +1501,16 @@ mod tests {
         app.navigate_to(crate::gopher::parse(&url, raw, false, 80));
 
         // Select the second link.
-        app.gopher_arrow(1);
-        let g = app.gopher.as_ref().unwrap();
+        app.browser_arrow(1);
+        let g = app.browser.as_ref().unwrap();
         let lines_at_80 = g.doc.lines.len();
         assert_eq!(g.doc.lines[g.selected.unwrap()].text, "Link two");
 
         // Halving the width re-wraps the prose; the links move to new
         // line indices but the selection stays on "Link two".
         app.last_inner = (40, 10);
-        app.sync_gopher_wrap();
-        let g = app.gopher.as_ref().unwrap();
+        app.sync_browser_wrap();
+        let g = app.browser.as_ref().unwrap();
         assert!(g.doc.lines.len() > lines_at_80, "narrower wrap adds rows");
         assert!(g.doc.lines.iter().all(|l| l.text.chars().count() <= 40));
         assert_eq!(g.doc.lines[g.selected.unwrap()].text, "Link two");
@@ -1440,16 +1525,16 @@ mod tests {
         app.navigate_to(gopher_doc(".x.x..x......."));
 
         assert_eq!(selected(&app), Some(1));
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(selected(&app), Some(3), "nearest link, not the center one");
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(selected(&app), Some(6));
         // No further links below: sticks near the center while scrolling.
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(selected(&app), Some(6));
         // Mirror going up: 3 is farther from the center than 6, so the
         // handoff back upward waits (sticky) rather than snapping.
-        app.gopher_arrow(-1);
+        app.browser_arrow(-1);
         assert_eq!(selected(&app), Some(6));
     }
 
@@ -1460,22 +1545,22 @@ mod tests {
         app.navigate_to(gopher_doc("..xxx..."));
 
         let g = |app: &super::App| {
-            let g = app.gopher.as_ref().unwrap();
+            let g = app.browser.as_ref().unwrap();
             (g.selected, g.scroll)
         };
         // First link sits exactly on the center row.
         assert_eq!(g(&app), (Some(2), 0));
         // Adjacent links below: the highlight steps down and the page
         // scrolls along, holding the selection on the center row.
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(g(&app), (Some(3), 1));
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(g(&app), (Some(4), 2));
         // Next line is text: the selection sticks and the page scrolls.
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(g(&app), (Some(4), 3));
         // Page now pinned at the bottom, no link below: nothing changes.
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(g(&app), (Some(4), 3));
     }
 
@@ -1488,11 +1573,11 @@ mod tests {
         assert_eq!(selected(&app), Some(1));
         // One scroll: link 5 is now closer to the center than the stuck
         // link 1, so the highlight hands off downward.
-        app.gopher_arrow(1);
+        app.browser_arrow(1);
         assert_eq!(selected(&app), Some(5));
         // Scrolling back up: link 1 is merely *as* close to the center,
         // not closer, so the selection stays put (sticky).
-        app.gopher_arrow(-1);
+        app.browser_arrow(-1);
         assert_eq!(selected(&app), Some(5));
     }
 
