@@ -3,6 +3,7 @@ mod cp437;
 mod doc;
 mod gemini;
 mod gopher;
+mod http;
 mod telnet;
 mod tls;
 mod ui;

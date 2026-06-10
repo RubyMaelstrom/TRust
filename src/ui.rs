@@ -114,6 +114,7 @@ fn protocol_badge(g: &BrowserView) -> &'static str {
     match &g.doc.url {
         Link::Gopher(_) => " GOPHER ",
         Link::Gemini(_) => " GEMINI ",
+        Link::Http(_) => " WWW ",
         Link::External(_) => " NET ",
     }
 }

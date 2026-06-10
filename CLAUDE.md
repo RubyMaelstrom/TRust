@@ -7,7 +7,7 @@ this file is workflow, gotchas, and the up-next plan.
 ## Quality bar
 
 - `cargo fmt`, `cargo clippy` (zero warnings), `cargo test` — all clean
-  before calling anything done. Currently 36 tests.
+  before calling anything done. Currently 41 tests.
 - Every feature gets BOTH a unit/integration test and a live smoke test
   in tmux against a throwaway local server. Unit tests prove the logic;
   the tmux run proves the UX (and has caught real bugs the tests missed).
@@ -92,21 +92,79 @@ telnet TLS test owns "localhost", the gemini test owns "127.0.0.1"
 (one cert for all its phases). A live capsule for tmux demos:
 fake_gemini.py + openssl-generated cert in $CLAUDE_JOB_DIR/tmp.
 
-## Next up (in rough priority order)
+## HTTP — Phase A: DONE (2026-06-10). Decisions remain binding:
 
-1. Finger (79), WHOIS (43), DICT (2628): trivial one-shot personalities
-   rendering into Doc as Kind::Text.
-2. HTTP(S) GET + html2text → DocLine; the Link::External plumbing is
-   the natural entry point (make External followable when it's http).
-   Minimal-GET trick: `Connection: close` + `Accept-Encoding: identity`
-   dodges keep-alive/chunked/gzip; handle 301/302 manually.
-3. Gemini client certificates (status 6x) if a capsule she uses needs it.
+- **Hand-rolled HTTP/1.1 in `http.rs`** (no reqwest/hyper). GET *and
+  POST* — she has a specific application needing POST. Before
+  finalizing the POST UX, ask what it needs (content-type? auth
+  headers?); meanwhile build the plumbing: `fetch(method, url, body,
+  content_type)` plus a `post <url> <body>` command defaulting to
+  application/x-www-form-urlencoded.
+- **User-Agent: `TRust/0.1`** exactly — "leave them scratching their
+  heads".
+- **`set webcolors` (html2text css feature): SIDELINED.** Don't build
+  it unless she re-raises it.
+- **Images: placeholder-only for now** (`[img: alt]` line carrying the
+  image URL). A dedicated planning discussion happens before any image
+  viewer work — she wants to review SOTA ratatui image options
+  (ratatui-image, sixel/kitty protocols, half-blocks) at that point.
+- **No JS, ever** — design position like no-SSH, written in README.
+
+Implementation notes (as built):
+
+1. New crates: `url` (HTTP URL parse/join only — gemini/gopher keep
+   their hand-rolled resolution), `webpki-roots`, `html2text`. NOT
+   flate2/encoding_rs unless the wild forces it (start UTF-8 + manual
+   Latin-1).
+2. `tls.rs`: second connector `webpki_connector()` with standard cert
+   validation against webpki-roots. TOFU is WRONG for the web (90-day
+   Let's Encrypt rotation = constant false alarms); keep TOFU strictly
+   for gemini/telnets.
+3. Request: `GET|POST <path> HTTP/1.1`, `Host`, `Connection: close`,
+   `Accept-Encoding: identity`, `User-Agent: TRust/0.1`. Response:
+   status line + headers, **chunked transfer decoder** (servers chunk
+   regardless of Connection: close), body cap 5 MB for http (small-net
+   stays 2 MB). Redirects ≤10: 301/302/303 become GET, 307/308 keep
+   method+body; `Location` may be relative (Url::join). http→https
+   upgrades fine.
+4. `Link::Http(url::Url)` variant (Url is Clone+Eq+Display).
+   `gemini::absolute_link` and gopher `h`/`URL:` items return it for
+   http(s); External stays for mailto and the rest. Follow → fetch
+   task → `Payload::Http(http::Response)`.
+5. Render: text/html → html2text *rich* mode → DocLine (headings →
+   Kind::Heading, links resolved via base Url::join → Link, pre/code →
+   Kind::Pre, images → `[img: alt]` + Link to image URL); other text/*
+   → plain lines; else "unsupported media type". Store Content-Type in
+   Doc.meta for the resize re-parse (same pattern as gemini).
+   CHECK html2text's current API in ~/.cargo/registry source after
+   adding — the rich/TaggedLine API has changed across versions.
+6. Dispatch: `http://`/`https://` schemes (ports 80/443 imply nothing —
+   schemes only, since bare-port heuristics would misfire on dev
+   servers). Status codes land in the status bar; 4xx/5xx still render
+   their body if HTML (error pages are content).
+
+Phase A landed: http.rs (Request/Response, exchange generic over
+TCP/TLS, parse_response + dechunk are pure & unit-tested), Link::Http
+(url::Url), html_to_lines maps RichAnnotation→DocLine (single-link
+lines selectable directly; multi-link lines emit `→ label` rows;
+heading/quote detection via RichDecorator's #/> prefixes; consecutive
+wrapped link rows dedup so only the first is selectable). `post <url>
+[body]` command (form-urlencoded). Latin-1 done. Verified live against
+https://example.com (WebPKI) and a local POST echo.
+
+Phase B (later): gzip if the wild forces it, GET-forms — forms make
+search engines work (FrogFind, lite.duckduckgo are the target
+audience). ASK her POST app's needs (content-type/auth) before
+polishing POST UX. Phase C: image viewer panel (planning talk first —
+SOTA ratatui image options). Gemini client certs if she hits a capsule
+needing them. Also still on the list: finger (79), WHOIS (43), DICT
+(2628) one-shots.
 
 Done since: .gmi files over gopher render as gemtext
 (gemini::parse_gemtext takes a resolver closure; gopher::resolve_gmi
 maps relative targets to selectors on the same host).
 
-SSH remains an explicit non-goal.
+SSH remains an explicit non-goal. JS is now also an explicit non-goal.
 
 ## User preferences observed
 

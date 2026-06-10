@@ -207,8 +207,14 @@ fn parse_menu(raw: &[u8], cp437: bool, width: usize) -> Vec<DocLine> {
             .unwrap_or_default();
         let selector = decode(fields[1], cp437);
         let link = if item_type == 'h' && selector.starts_with("URL:") {
-            // `h` items conventionally carry a web URL in the selector.
-            Some(Link::External(selector["URL:".len()..].to_string()))
+            // `h` items conventionally carry a web URL in the selector;
+            // those are followable in our own browser now.
+            let target = &selector["URL:".len()..];
+            Some(
+                crate::http::parse_url(target)
+                    .map(Link::Http)
+                    .unwrap_or_else(|| Link::External(target.to_string())),
+            )
         } else if item_type != 'i' && item_type != '3' && !host.is_empty() {
             Some(Link::Gopher(GopherUrl {
                 host,
@@ -353,7 +359,7 @@ mod tests {
         );
         // Absolute URLs keep their scheme.
         assert!(matches!(doc.lines[4].link, Some(Link::Gemini(_))));
-        assert!(matches!(doc.lines[5].link, Some(Link::External(_))));
+        assert!(matches!(doc.lines[5].link, Some(Link::Http(_))));
 
         // Plain .txt files still render as plain gopher text.
         let url = GopherUrl::parse("gopher://e.org/0/notes.txt").unwrap();

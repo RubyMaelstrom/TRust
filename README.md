@@ -1,12 +1,14 @@
 # TRust — Telnet in Rust
 
 A telnet client aiming for 1:1 functionality with GNU telnet — plus a
-gopher and gemini browser — wrapped in a cyberpunk-themed terminal UI.
+gopher, gemini, and text-web browser — wrapped in a cyberpunk-themed
+terminal UI.
 
 ```
 cargo run -- <host> [port]         # telnet, connect on startup
 cargo run -- gopher://host[/sel]   # open the gopher browser
 cargo run -- gemini://host[/path]  # open the gemini browser
+cargo run -- https://host/[path]   # open the text-web browser
 cargo run                          # start at the command prompt
 ```
 
@@ -34,7 +36,8 @@ either input mode; **Esc** returns to the session. Commands:
 
 | Command | Effect |
 |---|---|
-| `open <host> [port]` | connect (default port 23; `gopher://`/port 70 and `gemini://`/port 1965 open the browser, `telnets://`/port 992 is telnet-TLS, `telnet://` forces plain telnet) |
+| `open <host> [port]` | connect (default port 23; `gopher://`/port 70, `gemini://`/port 1965, and `http(s)://` open the browser; `telnets://`/port 992 is telnet-TLS; `telnet://` forces plain telnet) |
+| `post <url> [body]` | HTTP POST (form-urlencoded) rendering the response |
 | `close` | drop the connection |
 | `mode character\|line\|auto` | force input mode or follow ECHO |
 | `send brk\|ip\|ao\|ayt\|ec\|el\|ga\|nop\|escape` | transmit an IAC command (or a literal Ctrl-]) |
@@ -61,11 +64,12 @@ remove to re-trust the server. Gemini requests use the same connector.
 A green `TLS` badge shows in the status bar while a telnet-TLS session
 is live.
 
-## Browser (gopher + gemini)
+## Browser (gopher + gemini + text web)
 
-`open gopher://host[:port][/Xselector]` or `open gemini://host[/path]`
-(or any port-70/1965 connection) replaces the terminal panel with a
-gopherus-style browser shared by both protocols:
+`open gopher://host[:port][/Xselector]`, `open gemini://host[/path]`,
+or `open http(s)://host/path` (bare ports 70/1965 work too) replaces
+the terminal panel with a gopherus-style browser shared by all three
+protocols:
 
 - **Up/Down** navigate gopherus-style. When the adjacent line is also a
   link, the highlight steps onto it, with the page scrolling along so the
@@ -110,6 +114,24 @@ Gemini specifics:
   percent-encoded; 4x/5x land in the status bar; 6x (client certs) is
   reported as unsupported for now.
 
+Web specifics:
+
+- Hand-rolled HTTP/1.1 (`User-Agent: TRust/0.1`): one request per
+  connection, no compression, chunked transfer decoded, ≤10 redirects
+  (301/302/303 become GET; 307/308 keep method and body), UTF-8 and
+  Latin-1 charsets, 5 MB cap. HTTPS validates against the bundled
+  Mozilla roots (WebPKI) — TOFU stays small-net-only.
+- HTML renders via html2text (html5ever underneath): styled headings,
+  quotes, preformatted blocks, lists, tables-as-text. A line with one
+  link is selectable directly; lines with several links emit one
+  indented `→ label` row per target. Images appear as `[img: alt]`
+  placeholder rows carrying the image URL (viewer TBD). Error pages
+  (4xx/5xx) still render — they're content; the code shows in the
+  status bar.
+- `post <url> [body]` sends a form-urlencoded POST and renders the
+  response. Links between the webs interconnect: gemtext and gopher
+  pages can link to http(s) and vice versa.
+
 ## Architecture
 
 ```
@@ -122,6 +144,7 @@ src/
   doc.rs      protocol-agnostic document model (Link, Kind, DocLine, Doc)
   gopher.rs   Gopher (RFC 1436): one-shot fetches, menu/text parsing
   gemini.rs   Gemini: TLS fetches, redirects, gemtext parsing, URL resolve
+  http.rs     Text web: HTTP/1.1 GET/POST, chunked, redirects, html2text
   cp437.rs    CP437→Unicode translation for BBS ANSI art
   ui.rs       Ratatui rendering: cyberpunk chrome, tui-term session widget,
               browser document panel
@@ -178,8 +201,12 @@ Design notes:
 - [x] Persistent TOFU known-hosts at `~/.config/trust/known_hosts`,
       pins keyed by host:port
 - [ ] Gemini client certificates (status 6x)
+- [x] HTTP(S) Phase A: hand-rolled HTTP/1.1 (GET + POST), WebPKI
+      validation, html2text rendering, images as placeholder links
+- [ ] HTTP Phase B/C: GET-forms (search engines!), image viewer
+      (planning discussion first — SOTA ratatui options)
 - [ ] Finger (79), WHOIS (43), DICT (2628) — trivial one-shot
       personalities
-- [ ] HTTP(S) GET + html2text rendering — the document model and
-      External-link plumbing are ready for it
-- SSH is an explicit non-goal.
+- SSH is an explicit non-goal. **JavaScript is an explicit non-goal**:
+  TRust is a reader for the text-web and small-web; a JS engine without
+  a DOM and layout engine renders nothing real, so we don't pretend.
