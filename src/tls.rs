@@ -210,6 +210,25 @@ pub fn ensure_provider() -> Arc<CryptoProvider> {
     }
 }
 
+/// A TLS connector with standard WebPKI validation against the bundled
+/// Mozilla roots — for the public web, where certificates rotate
+/// constantly and TOFU pinning would only cry wolf. The small net
+/// (gemini, telnets) keeps the TOFU `connector` below.
+pub fn webpki_connector() -> TlsConnector {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    let config = CONFIG.get_or_init(|| {
+        ensure_provider();
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    });
+    TlsConnector::from(config.clone())
+}
+
 /// A TLS connector whose TOFU pin is keyed to this `host:port`.
 pub fn connector(host: &str, port: u16) -> TlsConnector {
     let provider = ensure_provider();

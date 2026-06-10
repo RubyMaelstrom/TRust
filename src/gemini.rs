@@ -82,6 +82,9 @@ pub fn absolute_link(target: &str) -> Option<Link> {
     if let Some(url) = crate::gopher::GopherUrl::parse(target) {
         return Some(Link::Gopher(url));
     }
+    if let Some(url) = crate::http::parse_url(target) {
+        return Some(Link::Http(url));
+    }
     let colon = target.find(':')?;
     let scheme = &target[..colon];
     let valid_scheme = !scheme.is_empty()
@@ -511,6 +514,10 @@ mod tests {
         assert_eq!(gem("gemini://abs.host:1966/y"), "gemini://abs.host:1966/y");
         assert!(matches!(
             resolve(&base, "https://example.com/"),
+            Link::Http(_)
+        ));
+        assert!(matches!(
+            resolve(&base, "mailto:sister@night.city"),
             Link::External(_)
         ));
         assert!(matches!(

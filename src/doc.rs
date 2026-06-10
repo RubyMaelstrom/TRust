@@ -15,7 +15,8 @@ use crate::gopher::GopherUrl;
 pub enum Link {
     Gopher(GopherUrl),
     Gemini(GeminiUrl),
-    /// A scheme we don't speak (http, mailto, ...) — shown, not followed.
+    Http(url::Url),
+    /// A scheme we don't speak (mailto, irc, ...) — shown, not followed.
     External(String),
 }
 
@@ -24,6 +25,7 @@ impl fmt::Display for Link {
         match self {
             Link::Gopher(url) => url.fmt(f),
             Link::Gemini(url) => url.fmt(f),
+            Link::Http(url) => url.fmt(f),
             Link::External(url) => f.write_str(url),
         }
     }

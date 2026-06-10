@@ -15,6 +15,7 @@ use crate::cp437;
 use crate::doc::{Doc, Link};
 use crate::gemini::{self, GeminiUrl};
 use crate::gopher::{self, GopherUrl};
+use crate::http;
 use crate::telnet;
 use crate::ui;
 
@@ -210,6 +211,7 @@ pub struct BrowserView {
 enum Payload {
     Gopher(Vec<u8>),
     Gemini(gemini::Response),
+    Http(http::Response),
 }
 
 /// Result of a background fetch.
@@ -565,6 +567,16 @@ impl App {
                 }
                 None => self.status = String::from("usage: open <host> [port]"),
             },
+            Some("post") => match parts.next().map(str::to_string) {
+                Some(target) => match http::parse_url(&target) {
+                    Some(url) => {
+                        let body = parts.collect::<Vec<_>>().join(" ");
+                        self.start_post(url, body);
+                    }
+                    None => self.status = String::from("post needs an http(s):// URL"),
+                },
+                None => self.status = String::from("usage: post <url> [body]"),
+            },
             Some("mode" | "m") => match parts.next() {
                 Some("character" | "char") => {
                     self.mode_override = Some(InputMode::Character);
@@ -677,6 +689,8 @@ impl App {
             self.start_fetch(Link::Gopher(url));
         } else if let Some(url) = GeminiUrl::parse(target) {
             self.start_fetch(Link::Gemini(url));
+        } else if let Some(url) = http::parse_url(target) {
+            self.start_fetch(Link::Http(url));
         } else if let Some(host) = target.strip_prefix("telnet://") {
             self.open(host.trim_end_matches('/').to_string(), port, false);
         } else if let Some(host) = target.strip_prefix("telnets://") {
@@ -712,9 +726,37 @@ impl App {
             let result = match &target {
                 Link::Gopher(url) => gopher::fetch(url).await.map(Payload::Gopher),
                 Link::Gemini(url) => gemini::fetch(url).await.map(Payload::Gemini),
+                Link::Http(url) => http::fetch(&http::Request::get(url.clone()))
+                    .await
+                    .map(Payload::Http),
                 Link::External(url) => Err(format!("cannot fetch foreign scheme: {url}")),
             };
             let _ = tx.send(FetchMsg { target, result }).await;
+        });
+    }
+
+    /// POST a form-encoded body to a web URL (her use case; the UX can
+    /// grow content-type options once the target application is known).
+    fn start_post(&mut self, url: url::Url, body: String) {
+        let (tx, rx) = mpsc::channel(1);
+        self.fetch_rx = Some(rx);
+        self.status = format!("POSTing to {url} ...");
+        tokio::spawn(async move {
+            let request = http::Request {
+                method: String::from("POST"),
+                url: url.clone(),
+                body: Some((
+                    String::from("application/x-www-form-urlencoded"),
+                    body.into_bytes(),
+                )),
+            };
+            let result = http::fetch(&request).await.map(Payload::Http);
+            let _ = tx
+                .send(FetchMsg {
+                    target: Link::Http(url),
+                    result,
+                })
+                .await;
         });
     }
 
@@ -729,6 +771,7 @@ impl App {
                 self.navigate_to(doc);
             }
             (Ok(Payload::Gemini(response)), _) => self.on_gemini_response(response, width),
+            (Ok(Payload::Http(response)), _) => self.on_http_response(response, width),
             (Err(err), target) => self.status = format!("{target} — {err}"),
             _ => {}
         }
@@ -771,6 +814,30 @@ impl App {
                 self.status = format!("{}: {} {}", response.url, status, response.meta);
             }
         }
+    }
+
+    /// Render an http response. Non-2xx pages still render when the
+    /// server sent a usable body (error pages are content); the status
+    /// code always lands in the status bar.
+    fn on_http_response(&mut self, response: http::Response, width: usize) {
+        if response.body.is_empty() {
+            self.status = format!("{}: HTTP {}", response.url, response.status);
+            return;
+        }
+        let doc = http::parse(&response.url, &response.content_type, &response.body, width);
+        let media = response
+            .content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        self.status = if response.status == 200 {
+            format!("{} — {media}", response.url)
+        } else {
+            format!("{} — HTTP {} ({media})", response.url, response.status)
+        };
+        self.navigate_to(doc);
     }
 
     /// Show a fetched document, pushing the current one onto the back
@@ -906,6 +973,10 @@ impl App {
                 let meta = g.doc.meta.clone().unwrap_or_default();
                 gemini::parse(&url, &meta, &raw, width)
             }
+            Link::Http(url) => {
+                let meta = g.doc.meta.clone().unwrap_or_default();
+                http::parse(&url, &meta, &raw, width)
+            }
             Link::External(_) => return,
         };
         g.selected = link_ordinal.and_then(|n| {
@@ -1027,8 +1098,9 @@ impl App {
                 other => self.status = format!("item type '{other}' not supported yet"),
             },
             Link::Gemini(url) => self.start_fetch(Link::Gemini(url)),
+            Link::Http(url) => self.start_fetch(Link::Http(url)),
             Link::External(target) => {
-                self.status = format!("external link (use a browser): {target}");
+                self.status = format!("external link: {target}");
             }
         }
     }
