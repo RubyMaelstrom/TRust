@@ -31,9 +31,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    let (title, border_color) = match &app.browser {
-        Some(g) => (format!("░▒▓ TRUST :: {} ▓▒░", g.doc.url), theme::NEON_CYAN),
-        None => (
+    let (title, border_color) = match (&app.viewer, &app.browser) {
+        (Some(v), _) => (format!("░▒▓ TRUST :: {} ▓▒░", v.url), theme::NEON_PINK),
+        (None, Some(g)) => (format!("░▒▓ TRUST :: {} ▓▒░", g.doc.url), theme::NEON_CYAN),
+        (None, None) => (
             match &app.host {
                 Some(host) => format!("░▒▓ TRUST :: {host}:{port} ▓▒░", port = app.port),
                 None => String::from("░▒▓ TRUST :: TELNET/NVT ▓▒░"),
@@ -59,19 +60,60 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let inner = block.inner(session_area);
     app.last_inner = (inner.width, inner.height);
 
-    match &app.browser {
-        Some(g) => {
+    match (&app.viewer, &app.browser) {
+        (Some(v), _) => {
+            frame.render_widget(block, session_area);
+            // Center the scaled image in the panel; the protocol was
+            // encoded to fit it, but clamp anyway (a resize may not
+            // have re-encoded yet).
+            let size = v.protocol.size();
+            let image_area = ratatui::layout::Rect::new(
+                inner.x + inner.width.saturating_sub(size.width) / 2,
+                inner.y + inner.height.saturating_sub(size.height) / 2,
+                size.width.min(inner.width),
+                size.height.min(inner.height),
+            );
+            frame.render_widget(ratatui_image::Image::new(&v.protocol), image_area);
+        }
+        (None, Some(g)) => {
             let doc = Paragraph::new(browser_lines(g, inner.height as usize)).block(block);
             frame.render_widget(doc, session_area);
         }
-        None => {
+        (None, None) => {
             let term = PseudoTerminal::new(app.vt.screen()).block(block);
             frame.render_widget(term, session_area);
         }
     }
 
-    frame.render_widget(input_box(app), input_area);
+    frame.render_widget(
+        input_box(app, input_area.width.saturating_sub(2)),
+        input_area,
+    );
     frame.render_widget(status_bar(app), status_area);
+
+    // Fetch in flight: a tiny beating heart at the right end of the
+    // entry bar, animated by the run loop's ticker. Lub, dub, rest —
+    // filled bold, hollow, filled again, then dim through the diastole.
+    if app.loading() && app.mode == Mode::Session && input_area.width > 8 {
+        let (glyph, style) = match app.spinner % 6 {
+            0 => (
+                "♥",
+                Style::new()
+                    .fg(theme::NEON_PINK)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            1 => ("♡", Style::new().fg(theme::NEON_PINK)),
+            2 => ("♥", Style::new().fg(theme::NEON_PINK)),
+            _ => ("♡", Style::new().fg(theme::DIM)),
+        };
+        let area = ratatui::layout::Rect::new(
+            input_area.right().saturating_sub(3),
+            input_area.y + 1,
+            1,
+            1,
+        );
+        frame.render_widget(Paragraph::new(Span::styled(glyph, style)), area);
+    }
 }
 
 /// The visible slice of a document, gopherus-style: the cursor line is
@@ -148,7 +190,17 @@ fn form_status(g: &BrowserView, form: usize, field: usize) -> String {
     }
 }
 
-fn input_box(app: &App) -> Paragraph<'_> {
+/// First visible char of the input window: keeps the cursor in view
+/// (riding the right edge once the text outgrows the field) while
+/// showing as much text as fits.
+fn window_start(cursor: usize, len: usize, avail: usize) -> usize {
+    // The +1s make room for the cursor's virtual cell past the end.
+    (cursor + 1)
+        .saturating_sub(avail)
+        .min((len + 1).saturating_sub(avail))
+}
+
+fn input_box(app: &App, width: u16) -> Paragraph<'_> {
     // Browsing and character mode capture keystrokes, so the field
     // renders as a dimmed strip rather than shifting the layout around.
     if app.mode == Mode::Session
@@ -180,28 +232,36 @@ fn input_box(app: &App) -> Paragraph<'_> {
         Mode::Search => ("search> ", theme::AMBER),
     };
 
-    // Split the text around the cursor so the char under it renders inverted.
-    let byte_cursor = app
-        .input
-        .char_indices()
-        .nth(app.cursor)
-        .map_or(app.input.len(), |(i, _)| i);
-    let before = &app.input[..byte_cursor];
-    let mut rest = app.input[byte_cursor..].chars();
-    let at = rest.next().map_or(' ', |c| c);
-    let after: String = rest.collect();
-
-    let line = Line::from(vec![
-        Span::styled(prompt, Style::new().fg(accent).add_modifier(Modifier::BOLD)),
-        Span::styled(before, Style::new().fg(theme::NEON_CYAN)),
-        Span::styled(
-            at.to_string(),
-            Style::new()
-                .fg(theme::NEON_CYAN)
-                .add_modifier(Modifier::REVERSED),
-        ),
-        Span::styled(after, Style::new().fg(theme::NEON_CYAN)),
-    ]);
+    // Window the text horizontally so the cursor (and the prompt) stay
+    // visible however long the line grows; render per-char so the
+    // cursor block and any Shift-selection can style their cells.
+    let chars: Vec<char> = app.input.chars().collect();
+    let avail = (width as usize)
+        .saturating_sub(prompt.chars().count())
+        .max(1);
+    let start = window_start(app.cursor, chars.len(), avail);
+    let selection = app.selection();
+    let mut spans = vec![Span::styled(
+        prompt,
+        Style::new().fg(accent).add_modifier(Modifier::BOLD),
+    )];
+    for i in start..(start + avail).min(chars.len() + 1) {
+        // One virtual cell past the end hosts the cursor block.
+        let ch = if i == start && start > 0 {
+            '…' // more text off to the left
+        } else {
+            chars.get(i).copied().unwrap_or(' ')
+        };
+        let mut style = Style::new().fg(theme::NEON_CYAN);
+        if selection.is_some_and(|(lo, hi)| i >= lo && i < hi) {
+            style = style.bg(theme::DIM);
+        }
+        if i == app.cursor {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    let line = Line::from(spans);
 
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -230,7 +290,9 @@ fn input_box(app: &App) -> Paragraph<'_> {
 
 /// Badge and hint for the dimmed strip when keys bypass the input field.
 fn strip_content(app: &App) -> Option<(&'static str, &'static str)> {
-    if let Some(g) = &app.browser {
+    if app.viewer.is_some() {
+        Some((" IMG ", " ← / Esc close"))
+    } else if let Some(g) = &app.browser {
         Some((
             protocol_badge(g),
             " ↑↓ scroll · → follow · ← back · Esc terminal",
@@ -243,7 +305,9 @@ fn strip_content(app: &App) -> Option<(&'static str, &'static str)> {
 }
 
 fn status_bar(app: &App) -> Paragraph<'_> {
-    let (label, color) = if let Some(g) = &app.browser {
+    let (label, color) = if app.viewer.is_some() {
+        (" IMG ", theme::NEON_PINK)
+    } else if let Some(g) = &app.browser {
         (protocol_badge(g), theme::NEON_CYAN)
     } else if app.connected {
         (" LINK:ONLINE ", theme::NEON_GREEN)
@@ -251,6 +315,7 @@ fn status_bar(app: &App) -> Paragraph<'_> {
         (" LINK:DOWN ", theme::NEON_PINK)
     };
     let hint = match (app.mode, app.browser.is_some(), app.char_mode()) {
+        (Mode::Session, ..) if app.viewer.is_some() => "· ← Esc close · Ctrl-] commands",
         (Mode::Session, true, _) => "· ↑↓ → ← navigate · Ctrl-] commands",
         (Mode::Session, false, true) => "· CHAR mode · Ctrl-] commands",
         (Mode::Session, false, false) => "· Enter send · Ctrl-] commands",
@@ -300,15 +365,38 @@ fn status_bar(app: &App) -> Paragraph<'_> {
         .as_ref()
         .and_then(|g| g.selected.and_then(|i| g.doc.lines.get(i)))
         .and_then(|l| l.link.as_ref())
-        .filter(|_| !app.notice);
-    let middle = match selection {
-        Some(Link::Form { form, field }) => {
+        .filter(|_| !app.notice && app.viewer.is_none());
+    let middle = match (&app.viewer, selection) {
+        // While viewing an image: its dimensions and type (unless a
+        // notice — e.g. a failed re-encode — needs the bar).
+        (Some(v), _) if !app.notice => format!(" {} — {} ", v.url, v.info),
+        (_, Some(Link::Form { form, field })) => {
             form_status(app.browser.as_ref().unwrap(), *form, *field)
         }
-        Some(link) => format!(" → {link} "),
-        None => format!(" {} ", app.status),
+        (_, Some(link)) => format!(" → {link} "),
+        _ => format!(" {} ", app.status),
     };
     spans.push(Span::styled(middle, Style::new().fg(theme::NEON_CYAN)));
     spans.push(Span::styled(hint, Style::new().fg(theme::DIM)));
     Paragraph::new(Line::from(spans)).style(Style::new().bg(theme::BG))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_start;
+
+    #[test]
+    fn input_window_keeps_cursor_and_tail_visible() {
+        // Short text: no scrolling.
+        assert_eq!(window_start(3, 5, 20), 0);
+        // Cursor at the end of long text: the tail (and cursor cell)
+        // fills the field, latest chars visible.
+        assert_eq!(window_start(30, 30, 10), 21);
+        // Cursor moved into the middle: it rides the window edge.
+        assert_eq!(window_start(15, 30, 10), 6);
+        // Back at the start: window follows all the way home.
+        assert_eq!(window_start(0, 30, 10), 0);
+        // Degenerate width never panics or hides the cursor.
+        assert_eq!(window_start(4, 4, 1), 4);
+    }
 }

@@ -7,7 +7,7 @@ this file is workflow, gotchas, and the up-next plan.
 ## Quality bar
 
 - `cargo fmt`, `cargo clippy` (zero warnings), `cargo test` — all clean
-  before calling anything done. Currently 49 tests.
+  before calling anything done. Currently 58 tests.
 - Every feature gets BOTH a unit/integration test and a live smoke test
   in tmux against a throwaway local server. Unit tests prove the logic;
   the tmux run proves the UX (and has caught real bugs the tests missed).
@@ -31,6 +31,9 @@ this file is workflow, gotchas, and the up-next plan.
 - Wheel/mouse events can be synthesized through tmux:
   `tmux send-keys -l $'\x1b[<64;10;10M'` (SGR wheel-up; 65 = down).
 - Ctrl-] in tmux: `tmux send-keys C-]` works (arrives as 0x1D).
+  Multi-word text needs `send-keys -l '...'` — without `-l` it
+  arrives mangled or not at all. Shift-modified keys: `S-Left`,
+  `S-End`, etc.
 
 ## Architecture invariants (don't break these)
 
@@ -62,6 +65,9 @@ this file is workflow, gotchas, and the up-next plan.
   lines — never use ratatui render-time wrapping, it breaks the
   scroll/selection index math. Raw bytes are kept per doc for re-wrap
   on resize and re-decode on encoding change.
+- The run loop redraws only on events. Animations (the loading heart)
+  are driven by an interval in the select gated on `App::loading()` —
+  it must stay gated, or the app burns CPU redrawing while idle.
 
 ## The gopherus navigation model (user-specified, tested)
 
@@ -92,123 +98,77 @@ telnet TLS test owns "localhost", the gemini test owns "127.0.0.1"
 (one cert for all its phases). A live capsule for tmux demos:
 fake_gemini.py + openssl-generated cert in $CLAUDE_JOB_DIR/tmp.
 
-## HTTP — Phase A: DONE (2026-06-10). Decisions remain binding:
+## HTTP (Phases A+B+C all DONE) — binding decisions
 
-- **Hand-rolled HTTP/1.1 in `http.rs`** (no reqwest/hyper). GET *and
-  POST* — she has a specific application needing POST. Before
-  finalizing the POST UX, ask what it needs (content-type? auth
-  headers?); meanwhile build the plumbing: `fetch(method, url, body,
-  content_type)` plus a `post <url> <body>` command defaulting to
-  application/x-www-form-urlencoded.
-- **User-Agent: `TRust/0.1`** exactly — "leave them scratching their
-  heads".
-- **`set webcolors` (html2text css feature): SIDELINED.** Don't build
-  it unless she re-raises it.
-- **Images: placeholder-only for now** (`[img: alt]` line carrying the
-  image URL). A dedicated planning discussion happens before any image
-  viewer work — she wants to review SOTA ratatui image options
-  (ratatui-image, sixel/kitty protocols, half-blocks) at that point.
-- **No JS, ever** — design position like no-SSH, written in README.
+- Hand-rolled HTTP/1.1 in `http.rs` (no reqwest/hyper, no gzip unless
+  the wild forces it). **User-Agent: `TRust/0.1` exactly.**
+- WebPKI (`tls::webpki_connector`) for the web; TOFU strictly for
+  gemini/telnets (cert rotation would make web TOFU cry wolf).
+- **No JS, ever** (README design position). `set webcolors` sidelined
+  unless she re-raises it. File uploads / multipart deliberately
+  unsupported. Inline images not ruled out forever, but the doc model
+  keeps its line-based invariant. Animated GIF (someday webm) is the
+  "impress me" stretch goal — webm needs a video decoder, don't
+  promise it.
+- Her POST application is https://rubymaelstrom.com/chat (HTML-only
+  LLM chat) — the canonical live form test. DDG lite is the search
+  demo (FrogFind's backend is unreliable).
 
-Implementation notes (as built):
+Traps that cost real debugging time (don't rediscover these):
 
-1. New crates: `url` (HTTP URL parse/join only — gemini/gopher keep
-   their hand-rolled resolution), `webpki-roots`, `html2text`. NOT
-   flate2/encoding_rs unless the wild forces it (start UTF-8 + manual
-   Latin-1).
-2. `tls.rs`: second connector `webpki_connector()` with standard cert
-   validation against webpki-roots. TOFU is WRONG for the web (90-day
-   Let's Encrypt rotation = constant false alarms); keep TOFU strictly
-   for gemini/telnets.
-3. Request: `GET|POST <path> HTTP/1.1`, `Host`, `Connection: close`,
-   `Accept-Encoding: identity`, `User-Agent: TRust/0.1`. Response:
-   status line + headers, **chunked transfer decoder** (servers chunk
-   regardless of Connection: close), body cap 5 MB for http (small-net
-   stays 2 MB). Redirects ≤10: 301/302/303 become GET, 307/308 keep
-   method+body; `Location` may be relative (Url::join). http→https
-   upgrades fine.
-4. `Link::Http(url::Url)` variant (Url is Clone+Eq+Display).
-   `gemini::absolute_link` and gopher `h`/`URL:` items return it for
-   http(s); External stays for mailto and the rest. Follow → fetch
-   task → `Payload::Http(http::Response)`.
-5. Render: text/html → html2text *rich* mode → DocLine (headings →
-   Kind::Heading, links resolved via base Url::join → Link, pre/code →
-   Kind::Pre, images → `[img: alt]` + Link to image URL); other text/*
-   → plain lines; else "unsupported media type". Store Content-Type in
-   Doc.meta for the resize re-parse (same pattern as gemini).
-   CHECK html2text's current API in ~/.cargo/registry source after
-   adding — the rich/TaggedLine API has changed across versions.
-6. Dispatch: `http://`/`https://` schemes (ports 80/443 imply nothing —
-   schemes only, since bare-port heuristics would misfire on dev
-   servers). Status codes land in the status bar; 4xx/5xx still render
-   their body if HTML (error pages are content).
-
-Phase A landed: http.rs (Request/Response, exchange generic over
-TCP/TLS, parse_response + dechunk are pure & unit-tested), Link::Http
-(url::Url), html_to_lines maps RichAnnotation→DocLine (single-link
-lines selectable directly; multi-link lines emit `→ label` rows;
-heading/quote detection via RichDecorator's #/> prefixes; consecutive
-wrapped link rows dedup so only the first is selectable). `post <url>
-[body]` command (form-urlencoded). Latin-1 done. Verified live against
-https://example.com (WebPKI) and a local POST echo.
-
-## HTTP Phase B: HTML forms — DONE (2026-06-11)
-
-Her POST application turned out to be https://rubymaelstrom.com/chat —
-an HTML-only LLM chat (hidden session field + text input + Send
-button). Forms (GET and POST) are implemented and verified live
-against it (Talkie replied through TRust) and against
-lite.duckduckgo.com (POST search → results). That closes the standing
-"ask her POST app's needs" question.
-
-How it works (and the traps, hard-won):
-
-- `doc.rs`: `Form`/`Field`/`FieldKind` + `Link::Form{form,field}` +
-  `Kind::Input`/`Kind::Button`. `Doc.forms` is LIVE state — field
-  values/checked are mutated in place; any re-parse must seed from it
-  (`http::parse_seeded`). `Form::encode(pressed)` serializes the
-  successful fields (only the pressed submit; unchecked boxes stay
-  home; nameless fields skipped; value-less checked boxes send "on").
-- `http.rs::extract_forms` walks the DOM *between* html2text's
-  `parse_html` and `dom_to_render_tree` (the split public API is why no
-  extra crate is needed). Each rendering control is replaced by
-  `<div><img src="x-trust-form:F.I" alt="[widget row]"></div>` — img
-  because its label renders from the alt *attribute*: html2text
-  re-exports rcdom's `Element` variant but NOT `Text`, so text nodes
-  cannot be fabricated or matched from outside. Element text (button
-  labels, options, textarea defaults) is read via `node.serialize` +
-  tag-strip (`node_as_dom_string` is a debug dump — don't).
+- **html2text re-exports rcdom's `Element` variant but NOT `Text`** —
+  text nodes can't be fabricated or matched from outside. Form widgets
+  are therefore marker `<img>` nodes (label rendered from the alt
+  *attribute*): `<div><img src="x-trust-form:F.I" alt="[row]"></div>`,
+  spliced in between `parse_html` and `dom_to_render_tree`. Element
+  text is read via `node.serialize` + tag-strip (`node_as_dom_string`
+  is a debug dump — don't).
 - **rcdom's `Node::drop` force-clears every descendant's `children`,
-  live Rc holders or not.** A node spliced out of a snippet DOM must be
-  *detached from its parent* before that DOM drops, or it arrives
-  empty. This was the silent killer; `marker_node` does the detach.
-- Interaction: Enter on a field → the amber prompt (titled INPUT,
-  `input>`, prefilled) via `search_target = Link::Form`; checkboxes
-  toggle, radios pick within their name group, selects cycle; submit →
-  GET builds `action?query`, POST reuses `start_post`. After any value
-  change `refresh_forms()` sets `wrapped_to = 0` and calls
-  `sync_browser_wrap()` inline (the run loop draws *before* syncing, so
-  waiting for the next frame would show stale rows).
-- `app.notice`: fetch errors/empty responses set it so the status bar
-  shows the message instead of the selected-link hint (cleared on next
-  browser key). Without it a dead search engine looks like "nothing
-  happened".
-- Not supported (deliberately): file uploads, multipart encoding,
-  `<button type=button>`/reset (dropped — they're JS hooks).
-- FrogFind's search backend was broken on 2026-06-11 (200 + empty body
-  for us, 503 for browser UAs) — not a TRust bug; DDG lite is the
-  working search demo.
+  live Rc holders or not.** A node spliced out of a snippet DOM must
+  be detached from its parent before that DOM drops (`marker_node`
+  does this) or it arrives empty.
+- `Doc.forms` is LIVE state — re-parses must seed from it
+  (`http::parse_seeded`); `refresh_forms()` must call
+  `sync_browser_wrap()` inline because the run loop draws before
+  syncing.
+- `app.notice`: fetch failures show in the status bar over the
+  selected-link hint until the next key — without it a dead server
+  looks like "nothing happened".
+- CHECK a crate's current API in ~/.cargo/registry source after
+  adding/upgrading — html2text and ratatui-image both shift APIs.
 
-Still later: gzip if the wild forces it. Phase C: image viewer panel
-(planning talk first — SOTA ratatui image options). Gemini client
-certs if she hits a capsule needing them. Also still on the list:
-finger (79), WHOIS (43), DICT (2628) one-shots.
+Image viewer (`src/img.rs` + `App.viewer`):
+
+- `ratatui-image` default-features OFF (avoids the `chafa-dyn` C
+  dependency) + `image` with png/jpeg/gif/webp only. All pure Rust.
+- `Picker::from_query_stdio()` runs in main.rs after ratatui::init but
+  BEFORE the crossterm EventStream exists — the stream would eat the
+  query replies. Fallback/tests: `Picker::halfblocks()`; main installs
+  the queried picker via `set_picker` (records `auto_protocol` for
+  `set image auto`).
+- `decode` sniffs magic bytes (servers lie about content types) and
+  caps dimensions 12k×12k (`image::Limits` decompression-bomb guard).
+  `encode` → fixed `Protocol` for the *stateless* `Image` widget (not
+  StatefulImage/ThreadProtocol — our channels already offload); work
+  runs on `spawn_blocking` → `img_rx`. **Fit does not upscale** —
+  small images render 1:1, deliberately.
+- Viewer sits OVER the browser (state untouched beneath);
+  Esc/Left/Backspace/q close; `navigate_to` closes it. `ImageView.raw`
+  (Arc<[u8]>, RAM-only) re-encodes on resize/protocol switch;
+  `encoded_for` + the img_rx in-flight check prevent re-encode storms.
+- Routing: http `image/*` (+ octet-stream that sniffs as image),
+  gopher I/g/p items, gemini `image/*` meta.
+- **tmux can't show sixel.** Smoke tests force halfblocks and assert
+  on `38;2;R;G;Bm` cells in `capture-pane -e`; sixel verified by her
+  in foot (confirmed 2026-06-11).
 
 Done since: .gmi files over gopher render as gemtext
 (gemini::parse_gemtext takes a resolver closure; gopher::resolve_gmi
 maps relative targets to selectors on the same host).
 
-SSH remains an explicit non-goal. JS is now also an explicit non-goal.
+Still on the list: finger (79), WHOIS (43), DICT (2628) one-shots;
+gemini client certs if she hits a capsule needing them. SSH and JS
+remain explicit non-goals.
 
 ## User preferences observed
 

@@ -11,11 +11,15 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc;
 use tui_term::vt100;
 
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::protocol::Protocol;
+
 use crate::cp437;
 use crate::doc::{Doc, Link};
 use crate::gemini::{self, GeminiUrl};
 use crate::gopher::{self, GopherUrl};
 use crate::http;
+use crate::img;
 use crate::telnet;
 use crate::ui;
 
@@ -221,6 +225,31 @@ struct FetchMsg {
     result: Result<Payload, String>,
 }
 
+/// A fetched image shown full-panel over the browser. The raw bytes
+/// stay in RAM (like everything else) so panel resizes and protocol
+/// switches can re-encode without refetching; the Arc keeps those
+/// re-encode round-trips from copying megabytes.
+pub struct ImageView {
+    /// Where the image came from (title bar).
+    pub url: Link,
+    raw: std::sync::Arc<[u8]>,
+    /// "W×H mime", for the status bar.
+    pub info: String,
+    /// Encoded for the panel size in `encoded_for`.
+    pub protocol: Protocol,
+    /// Panel size the protocol was encoded for; a mismatch with the
+    /// current size triggers a background re-encode.
+    encoded_for: (u16, u16),
+}
+
+/// Result of a background image decode + encode.
+struct ImgMsg {
+    url: Link,
+    raw: std::sync::Arc<[u8]>,
+    size: (u16, u16),
+    result: Result<(Protocol, String), String>,
+}
+
 pub struct App {
     pub mode: Mode,
     /// Terminal emulation of the remote byte stream, rendered by tui-term.
@@ -240,6 +269,12 @@ pub struct App {
     pub input: String,
     /// Cursor position in `input`, counted in chars.
     pub cursor: usize,
+    /// Selection anchor (char index) while Shift+movement extends a
+    /// selection in the input field; None when nothing is selected.
+    pub select_anchor: Option<usize>,
+    /// Animation frame for the fetch-in-flight pulse, advanced by the
+    /// run loop's ticker while a fetch is pending.
+    pub spinner: usize,
     pub host: Option<String>,
     pub port: u16,
     pub connected: bool,
@@ -260,8 +295,16 @@ pub struct App {
     probes: ProbeDetector,
     /// When Some, the browser (gopher/gemini) replaces the terminal panel.
     pub browser: Option<BrowserView>,
+    /// When Some, the image viewer sits over the browser (or terminal).
+    pub viewer: Option<ImageView>,
+    /// Terminal graphics: font size + protocol, queried at startup.
+    pub picker: Picker,
+    /// What the startup query found, restored by `set image auto`.
+    auto_protocol: ProtocolType,
     /// In-flight fetch, if any.
     fetch_rx: Option<mpsc::Receiver<FetchMsg>>,
+    /// In-flight image decode/encode, if any.
+    img_rx: Option<mpsc::Receiver<ImgMsg>>,
     /// The gopher type-7 item, gemini 1x URL, or form field awaiting
     /// input (pub so the UI can label the prompt accordingly).
     pub(crate) search_target: Option<Link>,
@@ -291,6 +334,8 @@ impl App {
             local_opts: HashSet::new(),
             input: String::new(),
             cursor: 0,
+            select_anchor: None,
+            spinner: 0,
             host,
             port,
             connected: false,
@@ -302,7 +347,13 @@ impl App {
             command_history: History::default(),
             probes: ProbeDetector::default(),
             browser: None,
+            viewer: None,
+            // Tests and pre-query startup get the universal fallback;
+            // main installs the queried picker via set_picker.
+            picker: Picker::halfblocks(),
+            auto_protocol: ProtocolType::Halfblocks,
             fetch_rx: None,
+            img_rx: None,
             search_target: None,
             notice: false,
             conn: None,
@@ -311,8 +362,24 @@ impl App {
         }
     }
 
+    /// Install the terminal-queried graphics picker (once, at startup).
+    pub fn set_picker(&mut self, picker: Picker) {
+        self.auto_protocol = picker.protocol_type();
+        self.picker = picker;
+    }
+
+    /// A fetch or image encode is in flight (drives the loading pulse).
+    pub fn loading(&self) -> bool {
+        self.fetch_rx.is_some() || self.img_rx.is_some()
+    }
+
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
         let mut input = EventStream::new();
+        // The run loop only redraws on events; this ticker animates the
+        // loading pulse while a fetch is pending (and is disabled, via
+        // the select guard, the rest of the time).
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Draw once before connecting so the first NAWS negotiation reports
         // the widget's real size instead of the 80x24 default.
         terminal.draw(|frame| ui::draw(frame, &mut self))?;
@@ -325,6 +392,7 @@ impl App {
             terminal.draw(|frame| ui::draw(frame, &mut self))?;
             self.sync_vt_size().await;
             self.sync_browser_wrap();
+            self.sync_viewer_size();
 
             tokio::select! {
                 event = input.next() => match event {
@@ -339,6 +407,13 @@ impl App {
                 msg = recv_opt(&mut self.fetch_rx) => match msg {
                     Some(msg) => self.on_fetch(msg),
                     None => self.fetch_rx = None,
+                },
+                msg = recv_opt(&mut self.img_rx) => match msg {
+                    Some(msg) => self.on_img(msg),
+                    None => self.img_rx = None,
+                },
+                _ = tick.tick(), if self.loading() => {
+                    self.spinner = self.spinner.wrapping_add(1);
                 },
             }
         }
@@ -365,6 +440,9 @@ impl App {
         let key = match event {
             TermEvent::Key(key) => key,
             TermEvent::Mouse(mouse) => {
+                if self.viewer.is_some() {
+                    return; // nothing to scroll in the image viewer
+                }
                 // 3 lines per wheel click, matching terminal convention.
                 match (mouse.kind, self.browser.is_some()) {
                     (MouseEventKind::ScrollUp, false) => self.scroll_by(3),
@@ -394,6 +472,20 @@ impl App {
             return;
         }
 
+        // The image viewer sits over the browser: any of the "back"
+        // keys close it, returning to the page (or terminal) beneath.
+        if self.mode == Mode::Session && self.viewer.is_some() {
+            self.notice = false;
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Left | KeyCode::Backspace | KeyCode::Char('q')
+            ) {
+                self.viewer = None;
+                self.status = String::from("Image closed.");
+            }
+            return;
+        }
+
         // The gopher browser captures session-mode keys while open.
         if self.mode == Mode::Session && self.browser.is_some() {
             self.browser_nav(key);
@@ -409,14 +501,17 @@ impl App {
             return;
         }
 
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc if matches!(self.mode, Mode::Command | Mode::Search) => {
                 self.mode = Mode::Session;
                 self.search_target = None;
+                self.select_anchor = None;
             }
             KeyCode::Enter => {
                 let line = std::mem::take(&mut self.input);
                 self.cursor = 0;
+                self.select_anchor = None;
                 self.active_history().push(&line);
                 match self.mode {
                     Mode::Session => self.send_line(&line).await,
@@ -441,9 +536,14 @@ impl App {
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Typing over a selection replaces it.
+                self.delete_selection();
                 self.input.insert(self.byte_cursor(), c);
                 self.cursor += 1;
                 self.active_history().detach();
+            }
+            KeyCode::Backspace | KeyCode::Delete if self.selection().is_some() => {
+                self.delete_selection();
             }
             KeyCode::Backspace if self.cursor > 0 => {
                 self.cursor -= 1;
@@ -459,20 +559,22 @@ impl App {
                 if let Some(text) = self.active_history().up(&current) {
                     self.cursor = text.chars().count();
                     self.input = text;
+                    self.select_anchor = None;
                 }
             }
             KeyCode::Down => {
                 if let Some(text) = self.active_history().down() {
                     self.cursor = text.chars().count();
                     self.input = text;
+                    self.select_anchor = None;
                 }
             }
-            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Left => self.move_cursor(self.cursor.saturating_sub(1), shift),
             KeyCode::Right => {
-                self.cursor = (self.cursor + 1).min(self.input.chars().count());
+                self.move_cursor((self.cursor + 1).min(self.input.chars().count()), shift)
             }
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.chars().count(),
+            KeyCode::Home => self.move_cursor(0, shift),
+            KeyCode::End => self.move_cursor(self.input.chars().count(), shift),
             _ => {}
         }
     }
@@ -519,10 +621,50 @@ impl App {
 
     /// Byte offset of the char cursor into `input`.
     fn byte_cursor(&self) -> usize {
+        self.byte_at(self.cursor)
+    }
+
+    /// Byte offset of a char index into `input`.
+    fn byte_at(&self, char_idx: usize) -> usize {
         self.input
             .char_indices()
-            .nth(self.cursor)
+            .nth(char_idx)
             .map_or(self.input.len(), |(i, _)| i)
+    }
+
+    /// The selected char range (lo..hi), if a non-empty selection exists.
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.select_anchor?;
+        if anchor == self.cursor {
+            return None;
+        }
+        Some((anchor.min(self.cursor), anchor.max(self.cursor)))
+    }
+
+    /// Remove the selected text, parking the cursor where it started.
+    /// Returns whether anything was deleted.
+    fn delete_selection(&mut self) -> bool {
+        let Some((lo, hi)) = self.selection() else {
+            self.select_anchor = None;
+            return false;
+        };
+        let range = self.byte_at(lo)..self.byte_at(hi);
+        self.input.replace_range(range, "");
+        self.cursor = lo;
+        self.select_anchor = None;
+        self.active_history().detach();
+        true
+    }
+
+    /// Move the cursor for an arrow/Home/End press: Shift extends the
+    /// selection from the current position, plain movement clears it.
+    fn move_cursor(&mut self, to: usize, shift: bool) {
+        if shift {
+            self.select_anchor.get_or_insert(self.cursor);
+        } else {
+            self.select_anchor = None;
+        }
+        self.cursor = to;
     }
 
     /// Send one entered line to the remote host.
@@ -626,7 +768,11 @@ impl App {
                     self.encoding = Encoding::Utf8;
                     self.status = String::from("Encoding set to UTF-8.");
                 }
-                _ => self.status = String::from("usage: set encoding cp437|utf8"),
+                (Some("image"), Some(proto)) => self.set_image_protocol(proto),
+                _ => {
+                    self.status =
+                        String::from("usage: set encoding cp437|utf8 · set image <protocol>|auto")
+                }
             },
             Some("toggle" | "t") => match parts.next() {
                 Some("crlf") => {
@@ -646,6 +792,32 @@ impl App {
                     "unknown command: {other} (open/close/mode/send/set/toggle/status/quit)"
                 )
             }
+        }
+    }
+
+    /// `set image <protocol>`: force the graphics protocol, or `auto`
+    /// to restore what the startup query found. An open viewer
+    /// re-encodes under the new protocol.
+    fn set_image_protocol(&mut self, proto: &str) {
+        let chosen = match proto {
+            "sixel" => ProtocolType::Sixel,
+            "halfblocks" | "blocks" => ProtocolType::Halfblocks,
+            "kitty" => ProtocolType::Kitty,
+            "iterm2" => ProtocolType::Iterm2,
+            "auto" => self.auto_protocol,
+            _ => {
+                self.status = String::from("usage: set image sixel|halfblocks|kitty|iterm2|auto");
+                return;
+            }
+        };
+        self.picker.set_protocol_type(chosen);
+        self.status = format!(
+            "Image protocol: {}{}.",
+            format!("{chosen:?}").to_lowercase(),
+            if proto == "auto" { " (queried)" } else { "" }
+        );
+        if let Some(v) = &mut self.viewer {
+            v.encoded_for = (0, 0); // force the next sync to re-encode
         }
     }
 
@@ -767,12 +939,76 @@ impl App {
         });
     }
 
+    /// Decode and scale-to-fit encode an image off the UI thread; the
+    /// viewer opens (or refreshes) when the ImgMsg comes back.
+    fn open_image(&mut self, url: Link, raw: impl Into<std::sync::Arc<[u8]>>) {
+        let raw = raw.into();
+        let (tx, rx) = mpsc::channel(1);
+        self.img_rx = Some(rx);
+        self.status = format!("Rendering {url} ...");
+        let picker = self.picker.clone();
+        let size = self.last_inner;
+        tokio::task::spawn_blocking(move || {
+            let result = img::decode(&raw).and_then(|(image, mime)| {
+                let info = format!("{}×{} {mime}", image.width(), image.height());
+                let panel = ratatui::layout::Size::new(size.0, size.1);
+                img::encode(&picker, image, panel).map(|protocol| (protocol, info))
+            });
+            let _ = tx.blocking_send(ImgMsg {
+                url,
+                raw,
+                size,
+                result,
+            });
+        });
+    }
+
+    fn on_img(&mut self, msg: ImgMsg) {
+        self.img_rx = None;
+        match msg.result {
+            Ok((protocol, info)) => {
+                self.status = format!("{} — {info}", msg.url);
+                self.viewer = Some(ImageView {
+                    url: msg.url,
+                    raw: msg.raw,
+                    info,
+                    protocol,
+                    encoded_for: msg.size,
+                });
+            }
+            Err(err) => {
+                self.status = format!("{} — {err}", msg.url);
+                self.notice = true;
+            }
+        }
+    }
+
+    /// Re-encode the viewed image when the panel size (or the protocol,
+    /// which zeroes `encoded_for`) changed. One encode in flight at a
+    /// time; the old rendering stays up until the new one lands.
+    fn sync_viewer_size(&mut self) {
+        if self.img_rx.is_some() {
+            return;
+        }
+        let Some(v) = &self.viewer else { return };
+        if v.encoded_for == self.last_inner {
+            return;
+        }
+        self.open_image(v.url.clone(), v.raw.clone());
+    }
+
     fn on_fetch(&mut self, msg: FetchMsg) {
         self.fetch_rx = None;
         self.notice = false;
         let width = (self.last_inner.0 as usize).max(10);
         match (msg.result, msg.target) {
             (Ok(Payload::Gopher(raw)), Link::Gopher(url)) => {
+                // Image item types go to the viewer, not the document
+                // parser ('I' any image, 'g' GIF, 'p' PNG).
+                if matches!(url.item_type, 'I' | 'g' | 'p') {
+                    self.open_image(Link::Gopher(url), raw);
+                    return;
+                }
                 let cp437 = self.encoding == Encoding::Cp437;
                 let doc = gopher::parse(&url, raw, cp437, width);
                 self.status = format!("{url} — {} lines", doc.lines.len());
@@ -793,6 +1029,10 @@ impl App {
     fn on_gemini_response(&mut self, response: gemini::Response, width: usize) {
         match response.status {
             20..=29 => {
+                if response.meta.starts_with("image/") {
+                    self.open_image(Link::Gemini(response.url), response.body);
+                    return;
+                }
                 let doc = gemini::parse(&response.url, &response.meta, &response.body, width);
                 let media = if response.meta.is_empty() {
                     "text/gemini"
@@ -814,6 +1054,7 @@ impl App {
                 self.mode = Mode::Search;
                 self.input.clear();
                 self.cursor = 0;
+                self.select_anchor = None;
             }
             60..=69 => {
                 self.status = format!(
@@ -841,7 +1082,6 @@ impl App {
             self.notice = true;
             return;
         }
-        let doc = http::parse(&response.url, &response.content_type, &response.body, width);
         let media = response
             .content_type
             .split(';')
@@ -849,6 +1089,15 @@ impl App {
             .unwrap_or("")
             .trim()
             .to_string();
+        // Images open the viewer. The sniff fallback covers servers
+        // that serve pixels as octet-stream (or with no type at all).
+        if media.starts_with("image/")
+            || (media == "application/octet-stream" && img::sniff(&response.body).is_some())
+        {
+            self.open_image(Link::Http(response.url), response.body);
+            return;
+        }
+        let doc = http::parse(&response.url, &response.content_type, &response.body, width);
         self.status = if response.status == 200 {
             format!("{} — {media}", response.url)
         } else {
@@ -860,6 +1109,8 @@ impl App {
     /// Show a fetched document, pushing the current one onto the back
     /// history (RAM-only, dropped when the view closes).
     fn navigate_to(&mut self, doc: Doc) {
+        // A new page replaces any image that was being viewed.
+        self.viewer = None;
         match &mut self.browser {
             Some(g) => {
                 let old = std::mem::replace(&mut g.doc, doc);
@@ -1108,12 +1359,13 @@ impl App {
         };
         match link {
             Link::Gopher(url) => match url.item_type {
-                '0' | '1' => self.start_fetch(Link::Gopher(url)),
+                '0' | '1' | 'I' | 'g' | 'p' => self.start_fetch(Link::Gopher(url)),
                 '7' => {
                     self.search_target = Some(Link::Gopher(url));
                     self.mode = Mode::Search;
                     self.input.clear();
                     self.cursor = 0;
+                    self.select_anchor = None;
                 }
                 other => self.status = format!("item type '{other}' not supported yet"),
             },
@@ -1143,6 +1395,7 @@ impl App {
             FieldKind::Text | FieldKind::Password | FieldKind::Textarea => {
                 self.input = value;
                 self.cursor = self.input.chars().count();
+                self.select_anchor = None;
                 self.search_target = Some(Link::Form { form, field });
                 self.mode = Mode::Search;
                 self.status = format!("Editing {name} — Enter sets, Esc cancels.");
@@ -1253,6 +1506,10 @@ impl App {
     }
 
     fn open(&mut self, host: String, port: u16, use_tls: bool) {
+        // A fresh telnet session takes the screen; a browser or image
+        // viewer left open would hide the connection behind it.
+        self.browser = None;
+        self.viewer = None;
         self.reset_screen();
         let (handle, events) = telnet::connect(host.clone(), port, self.last_inner, use_tls);
         self.conn = Some(handle);
@@ -1837,6 +2094,169 @@ mod tests {
         app.browser_follow();
         assert_eq!(app.input, "hello there");
         assert_eq!(app.cursor, "hello there".chars().count());
+    }
+
+    /// Deliver a decoded+encoded image to the app, the way the
+    /// blocking task does (halfblocks picker: deterministic, no tty).
+    fn deliver_image(app: &mut super::App, url: Link, raw: Vec<u8>) {
+        let (image, mime) = crate::img::decode(&raw).expect("test image decodes");
+        let info = format!("{}×{} {mime}", image.width(), image.height());
+        let size = ratatui::layout::Size::new(app.last_inner.0, app.last_inner.1);
+        let protocol = crate::img::encode(&app.picker, image, size).unwrap();
+        app.on_img(super::ImgMsg {
+            url,
+            raw: raw.into(),
+            size: app.last_inner,
+            result: Ok((protocol, info)),
+        });
+    }
+
+    #[tokio::test]
+    async fn image_viewer_opens_over_the_browser_and_closes_back() {
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+
+        let mut app = chat_app();
+        app.mode = super::Mode::Session; // keys go to the panels, not the prompt
+        let url = Link::Http(url::Url::parse("https://example.com/cat.png").unwrap());
+        deliver_image(&mut app, url.clone(), crate::img::red_png());
+
+        let v = app.viewer.as_ref().expect("viewer open");
+        assert_eq!(v.url, url);
+        assert!(v.info.contains("4×4") && v.info.contains("image/png"));
+        assert_eq!(v.encoded_for, app.last_inner);
+
+        // Browser keys are captured by the viewer: Down must not move
+        // the page selection underneath.
+        let before = app.browser.as_ref().unwrap().selected;
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Down)))
+            .await;
+        assert_eq!(app.browser.as_ref().unwrap().selected, before);
+        assert!(app.viewer.is_some());
+
+        // Esc closes the viewer; the page beneath is intact.
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Esc)))
+            .await;
+        assert!(app.viewer.is_none());
+        let g = app.browser.as_ref().expect("browser survived");
+        assert!(g.doc.lines.iter().any(|l| l.text.contains("Talkie")));
+    }
+
+    #[test]
+    fn failed_image_decode_reports_and_keeps_the_page() {
+        let mut app = chat_app();
+        app.on_img(super::ImgMsg {
+            url: Link::Http(url::Url::parse("https://example.com/cat.png").unwrap()),
+            raw: Vec::new().into(),
+            size: app.last_inner,
+            result: Err(String::from("unrecognized image format")),
+        });
+        assert!(app.viewer.is_none());
+        assert!(app.notice, "failure must not hide behind the link hint");
+        assert!(app.status.contains("unrecognized image format"));
+    }
+
+    #[tokio::test]
+    async fn gopher_image_items_are_followable() {
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (80, 10);
+        let mut doc = gopher_doc("x");
+        doc.lines[0].link = Some(Link::Gopher(crate::gopher::GopherUrl {
+            host: String::from("test.host"),
+            port: 70,
+            item_type: 'p',
+            selector: String::from("/cat.png"),
+        }));
+        app.navigate_to(doc);
+        app.browser_follow();
+        assert!(
+            app.status.starts_with("Fetching"),
+            "type p starts a fetch instead of 'not supported': {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn set_image_forces_protocol_and_reencodes_the_viewer() {
+        use ratatui_image::picker::ProtocolType;
+
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (40, 12);
+        let url = Link::Http(url::Url::parse("https://example.com/cat.png").unwrap());
+        deliver_image(&mut app, url, crate::img::red_png());
+
+        app.execute_command("set image sixel").await;
+        assert_eq!(app.picker.protocol_type(), ProtocolType::Sixel);
+        assert_eq!(
+            app.viewer.as_ref().unwrap().encoded_for,
+            (0, 0),
+            "open viewer is marked for re-encode"
+        );
+        app.execute_command("set image auto").await;
+        assert_eq!(
+            app.picker.protocol_type(),
+            ProtocolType::Halfblocks,
+            "auto restores the startup query result"
+        );
+        app.execute_command("set image vhs").await;
+        assert!(app.status.starts_with("usage:"));
+    }
+
+    #[tokio::test]
+    async fn shift_movement_selects_and_edits_replace() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let mut app = super::App::new(None, 23); // starts at the trust> prompt
+        app.input = String::from("open bbs.example 23");
+        app.cursor = app.input.chars().count();
+        let key = |code, mods| Event::Key(KeyEvent::new(code, mods));
+
+        // Shift+Left three times selects " 23"; Backspace removes it.
+        for _ in 0..3 {
+            app.on_terminal_event(key(KeyCode::Left, KeyModifiers::SHIFT))
+                .await;
+        }
+        assert_eq!(app.selection(), Some((16, 19)));
+        app.on_terminal_event(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.input, "open bbs.example");
+        assert_eq!(app.cursor, 16);
+        assert_eq!(app.selection(), None);
+
+        // Shift+Home selects everything; typing replaces the lot.
+        app.on_terminal_event(key(KeyCode::Home, KeyModifiers::SHIFT))
+            .await;
+        assert_eq!(app.selection(), Some((0, 16)));
+        app.on_terminal_event(key(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.input, "q");
+        assert_eq!(app.cursor, 1);
+
+        // A plain arrow clears any selection instead of extending it.
+        app.on_terminal_event(key(KeyCode::Left, KeyModifiers::SHIFT))
+            .await;
+        assert!(app.selection().is_some());
+        app.on_terminal_event(key(KeyCode::Right, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.selection(), None);
+        assert_eq!(app.input, "q", "plain movement must not edit");
+    }
+
+    #[tokio::test]
+    async fn opening_telnet_closes_the_browser() {
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (80, 10);
+        app.navigate_to(gopher_doc(".x."));
+        deliver_image(
+            &mut app,
+            Link::Http(url::Url::parse("https://example.com/cat.png").unwrap()),
+            crate::img::red_png(),
+        );
+        assert!(app.browser.is_some() && app.viewer.is_some());
+
+        // `open <host>` for telnet must take the screen, not connect
+        // invisibly behind the browser.
+        app.execute_command("open 127.0.0.1 1").await;
+        assert!(app.browser.is_none(), "browser closed");
+        assert!(app.viewer.is_none(), "viewer closed");
     }
 
     #[test]

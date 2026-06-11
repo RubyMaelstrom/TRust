@@ -231,6 +231,22 @@ pub struct Doc {
     pub forms: Vec<Form>,
 }
 
+/// Wrap a plain-text body (gemini `text/*`, web `text/plain`) into
+/// document lines.
+pub fn wrap_plain(text: &str, width: usize) -> Vec<DocLine> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        push_wrapped(
+            &mut out,
+            Kind::Text,
+            line.trim_end().to_string(),
+            None,
+            width,
+        );
+    }
+    out
+}
+
 /// Push a display line, word-wrapping it to `width`. Continuation rows
 /// keep the kind (for styling) but never the link, so only an item's
 /// first row is selectable.

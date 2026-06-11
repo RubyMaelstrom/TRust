@@ -195,12 +195,13 @@ fn parse_menu(raw: &[u8], cp437: bool, width: usize) -> Vec<DocLine> {
             continue;
         }
         let fields: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
-        if fields.len() < 2 {
-            // Not a well-formed item; some servers emit bare text.
+        // A well-formed item needs a type byte and a selector field;
+        // some servers emit bare text (or lines starting with a tab).
+        let (Some(&type_byte), true) = (fields[0].first(), fields.len() >= 2) else {
             push_wrapped(&mut lines, Kind::Info, decode(line, cp437), None, width);
             continue;
-        }
-        let item_type = fields[0][0] as char;
+        };
+        let item_type = type_byte as char;
         let text = decode(&fields[0][1..], cp437);
         let host = fields
             .get(2)
@@ -292,10 +293,11 @@ mod tests {
                     7Search the void\t/search\texample.org\t70\r\n\
                     3Something broke\t\terror.host\t1\r\n\
                     stray text without tabs\r\n\
+                    \tno type byte at all\t\t\r\n\
                     .\r\nignored after terminator";
         let doc = parse(&url, raw.to_vec(), false, 80);
 
-        assert_eq!(doc.lines.len(), 6);
+        assert_eq!(doc.lines.len(), 7);
         assert_eq!(doc.lines[0].kind, Kind::Info);
         assert!(doc.lines[0].link.is_none());
         let dir = gopher_link(&doc.lines[1]);
@@ -309,6 +311,8 @@ mod tests {
         assert!(doc.lines[4].link.is_none(), "errors are not links");
         assert_eq!(doc.lines[4].kind, Kind::Error);
         assert_eq!(doc.lines[5].text, "stray text without tabs");
+        // A tab-leading line (empty type field) must not panic.
+        assert_eq!(doc.lines[6].kind, Kind::Info);
     }
 
     #[test]

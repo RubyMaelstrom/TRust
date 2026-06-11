@@ -47,7 +47,22 @@
       "Bash(ps -eo pid,cmd)",
       "Bash(awk '/^[ ]*[0-9]+ python3 .*fake_search/ {print $1}')",
       "Bash(ps -p 1904885 -o pid,cmd=)",
-      "Bash(kill 1904885)"
+      "Bash(kill 1904885)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(grep -A3 'name = \"image\"$' /home/ruby/Code/TRust/Cargo.lock)",
+      "Bash(echo SRV=__TRACKED_VAR__)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code} %{content_type}\\\\n\" http://127.0.0.1:8096/ http://127.0.0.1:8096/quad.png)",
+      "Bash(ps -eo pid,args)",
+      "Bash(awk '/python3 fake_imgweb/ && !/awk/ {print $1}')",
+      "Bash(kill 2056788)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code} %{content_type} %{size_download}\\\\n\" http://127.0.0.1:8096/big.png)",
+      "Bash(sed -n '1p;20p;40p;60p')",
+      "Bash(tmux resize-window *)",
+      "Bash(grep -om1 '48;2;0;255;255m\\\\|38;2;0;255;255m')",
+      "Bash(grep -om1 '[34]8;2;0;255;255m')",
+      "Bash(awk '{print $5, $9}')",
+      "Bash(tmux kill-server *)"
     ]
   }
 }

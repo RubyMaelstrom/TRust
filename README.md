@@ -17,10 +17,13 @@ mode:
 
 - **Line mode** (server does not echo): text is typed into the entry
   field at the bottom (local echo, cursor editing); **Enter** sends the
-  line. **Up/Down** recall previously entered lines (in-memory only,
-  cleared on exit; an unfinished line is stashed and restored when you
-  arrow back past the newest entry). Control chords (Ctrl-C, Ctrl-D, ...)
-  bypass the field.
+  line. Long lines scroll horizontally, keeping the cursor and prompt
+  in view (`…` marks text off to the left). **Shift+arrows/Home/End**
+  select text — Backspace/Delete removes the selection, typing
+  replaces it. **Up/Down** recall previously entered lines (in-memory
+  only, cleared on exit; an unfinished line is stashed and restored
+  when you arrow back past the newest entry). Control chords (Ctrl-C,
+  Ctrl-D, ...) bypass the field.
 - **Character mode** (server sends `WILL ECHO` — BBSes, login prompts,
   full-screen apps): every keystroke goes straight to the wire and the
   server echoes. The entry field dims to a `CHAR` strip so the layout
@@ -42,6 +45,7 @@ either input mode; **Esc** returns to the session. Commands:
 | `mode character\|line\|auto` | force input mode or follow ECHO |
 | `send brk\|ip\|ao\|ayt\|ec\|el\|ga\|nop\|escape` | transmit an IAC command (or a literal Ctrl-]) |
 | `set encoding cp437\|utf8` | CP437 translation for BBS ANSI art (dim badge when active) |
+| `set image sixel\|halfblocks\|kitty\|iterm2\|auto` | force the image-viewer graphics protocol (`auto` = what the startup query found) |
 | `toggle crlf` | Enter sends CR LF instead of the default CR NUL |
 | `status` | print connection/options report into the feed |
 | `quit` | exit |
@@ -92,9 +96,19 @@ protocols:
   re-render too). Only the first row of a wrapped menu item is
   selectable; continuations belong to the same item visually.
 - Fetches are one-shot with a 15 s timeout and a 2 MB cap, run in the
-  background so the UI never blocks. Binary/image gopher item types are
-  reported as unsupported (yet); `h` items and foreign-scheme gemtext
-  links (http, mailto, ...) display their target instead of following.
+  background so the UI never blocks — a little heart beats at the
+  right end of the entry bar while one is in flight. Binary gopher
+  item types are reported as unsupported (yet); `h` items and
+  foreign-scheme gemtext links (http, mailto, ...) display their
+  target instead of following.
+- **Images open in a full-panel viewer** (gopher `I`/`g`/`p` items,
+  gemini `image/*` responses, web `[img: alt]` rows), scaled to fit
+  and centered; **Left or Esc** returns to the page where you were.
+  Rendering uses the best graphics protocol your terminal answers for
+  at startup — sixel, kitty, iTerm2 — with unicode half-blocks as the
+  universal fallback (`set image ...` overrides). PNG, JPEG, GIF
+  (first frame), and WebP; small images render 1:1 rather than
+  upscaling; resizing the terminal re-fits the image.
 
 Gemini specifics:
 
@@ -125,22 +139,21 @@ Web specifics:
   quotes, preformatted blocks, lists, tables-as-text. A line with one
   link is selectable directly; lines with several links emit one
   indented `→ label` row per target. Images appear as `[img: alt]`
-  placeholder rows carrying the image URL (viewer TBD). Error pages
+  rows — following one opens the image viewer. Error pages
   (4xx/5xx) still render — they're content; the code shows in the
   status bar.
 - `post <url> [body]` sends a form-urlencoded POST and renders the
   response. Links between the webs interconnect: gemtext and gopher
   pages can link to http(s) and vice versa.
 - **HTML forms work.** Controls render as selectable widget rows in
-  document order: text/password/textarea fields as amber `[name: value]`
-  rows (Enter opens the `input>` prompt, pre-filled for re-edits),
-  checkboxes `[x]`/radios `(*)` toggle on Enter, selects `[name: opt ▾]`
-  cycle their options, and submit buttons `[ label ]` fire the form —
-  GET serializes into the action's query string, POST goes
-  form-urlencoded. Hidden fields ride along silently; forms without a
-  submit control get a synthetic `[ Submit ]`. Typed values survive
-  resize re-wraps. File uploads and multipart encoding are not
-  supported. This is how search engines (and HTML chat apps) work.
+  document order: text fields as amber `[name: value]` rows (Enter
+  opens the `input>` prompt, pre-filled on re-edit), checkboxes `[x]`
+  and radios `(*)` toggle on Enter, selects `[name: opt ▾]` cycle, and
+  submit buttons `[ label ]` fire the form — GET into the query
+  string, POST form-urlencoded. Hidden fields ride along; forms
+  without a submit control get a synthetic `[ Submit ]`; typed values
+  survive resizes. File uploads/multipart are not supported. This is
+  how search engines (and HTML chat apps) work.
 
 ## Architecture
 
@@ -216,8 +229,10 @@ Design notes:
 - [x] HTTP Phase B: HTML forms — text/hidden/password/textarea,
       checkbox/radio/select, GET and POST submission (search engines
       and form-driven apps work)
-- [ ] HTTP Phase C: image viewer (planning discussion first — SOTA
-      ratatui options)
+- [x] HTTP Phase C: image viewer — full-panel, scale-to-fit, sixel /
+      kitty / iTerm2 / half-blocks via startup detection; serves the
+      web, gopher, and gemini alike (inline images may come someday;
+      animated GIF / video are aspirational)
 - [ ] Finger (79), WHOIS (43), DICT (2628) — trivial one-shot
       personalities
 - SSH is an explicit non-goal. **JavaScript is an explicit non-goal**:
