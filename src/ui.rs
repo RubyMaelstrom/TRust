@@ -87,7 +87,10 @@ fn browser_lines(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
                     .fg(theme::NEON_CYAN)
                     .add_modifier(Modifier::BOLD),
                 (true, Kind::Document) => Style::new().fg(theme::NEON_GREEN),
-                (true, Kind::Search) => Style::new().fg(theme::AMBER),
+                (true, Kind::Search | Kind::Input) => Style::new().fg(theme::AMBER),
+                (true, Kind::Button) => Style::new()
+                    .fg(theme::NEON_GREEN)
+                    .add_modifier(Modifier::BOLD),
                 (true, _) => Style::new().fg(theme::NEON_PINK),
                 (_, Kind::Error) => Style::new().fg(theme::NEON_PINK),
                 (_, Kind::Heading(1)) => Style::new()
@@ -115,7 +118,33 @@ fn protocol_badge(g: &BrowserView) -> &'static str {
         Link::Gopher(_) => " GOPHER ",
         Link::Gemini(_) => " GEMINI ",
         Link::Http(_) => " WWW ",
+        // Form controls never appear as a document's own URL.
+        Link::Form { .. } => " WWW ",
         Link::External(_) => " NET ",
+    }
+}
+
+/// Status-bar text for a selected form control.
+fn form_status(g: &BrowserView, form: usize, field: usize) -> String {
+    use crate::doc::{FieldKind, FormMethod};
+    let Some(f) = g.doc.forms.get(form) else {
+        return String::from(" form ");
+    };
+    let Some(field) = f.fields.get(field) else {
+        return String::from(" form ");
+    };
+    match &field.kind {
+        FieldKind::Submit => {
+            let method = match f.method {
+                FormMethod::Get => "GET",
+                FormMethod::Post => "POST",
+            };
+            format!(" {method} {} — Enter submits ", f.action)
+        }
+        FieldKind::Checkbox => format!(" {} — Enter toggles ", field.name),
+        FieldKind::Radio => format!(" {} — Enter selects ", field.name),
+        FieldKind::Select(_) => format!(" {} — Enter cycles options ", field.name),
+        _ => format!(" {} — Enter edits ", field.name),
     }
 }
 
@@ -142,9 +171,12 @@ fn input_box(app: &App) -> Paragraph<'_> {
         return Paragraph::new(line).block(block);
     }
 
+    // The search prompt doubles as the form-field editor.
+    let editing_field = matches!(app.search_target, Some(Link::Form { .. }));
     let (prompt, accent) = match app.mode {
         Mode::Session => ("❯ ", theme::NEON_GREEN),
         Mode::Command => ("trust> ", theme::AMBER),
+        Mode::Search if editing_field => ("input> ", theme::AMBER),
         Mode::Search => ("search> ", theme::AMBER),
     };
 
@@ -185,7 +217,7 @@ fn input_box(app: &App) -> Paragraph<'_> {
                 .add_modifier(Modifier::BOLD),
         )),
         Mode::Search => block.title(Line::styled(
-            " SEARCH ",
+            if editing_field { " INPUT " } else { " SEARCH " },
             Style::new()
                 .fg(theme::BG)
                 .bg(theme::AMBER)
@@ -223,6 +255,9 @@ fn status_bar(app: &App) -> Paragraph<'_> {
         (Mode::Session, false, true) => "· CHAR mode · Ctrl-] commands",
         (Mode::Session, false, false) => "· Enter send · Ctrl-] commands",
         (Mode::Command, ..) => "· Enter run · Esc back · open/close/mode/send/set/status/quit",
+        (Mode::Search, ..) if matches!(app.search_target, Some(Link::Form { .. })) => {
+            "· Enter set · Esc cancel"
+        }
         (Mode::Search, ..) => "· Enter search · Esc cancel",
     };
     let mut spans = vec![Span::styled(
@@ -258,13 +293,18 @@ fn status_bar(app: &App) -> Paragraph<'_> {
         ));
     }
     // While browsing, show the selected link instead of the connection
-    // status, the way gopherus does.
-    let middle = match app
+    // status, the way gopherus does — unless a fetch just went wrong,
+    // which must not hide behind the selection hint.
+    let selection = app
         .browser
         .as_ref()
         .and_then(|g| g.selected.and_then(|i| g.doc.lines.get(i)))
         .and_then(|l| l.link.as_ref())
-    {
+        .filter(|_| !app.notice);
+    let middle = match selection {
+        Some(Link::Form { form, field }) => {
+            form_status(app.browser.as_ref().unwrap(), *form, *field)
+        }
         Some(link) => format!(" → {link} "),
         None => format!(" {} ", app.status),
     };

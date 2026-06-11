@@ -7,7 +7,7 @@ this file is workflow, gotchas, and the up-next plan.
 ## Quality bar
 
 - `cargo fmt`, `cargo clippy` (zero warnings), `cargo test` — all clean
-  before calling anything done. Currently 41 tests.
+  before calling anything done. Currently 49 tests.
 - Every feature gets BOTH a unit/integration test and a live smoke test
   in tmux against a throwaway local server. Unit tests prove the logic;
   the tmux run proves the UX (and has caught real bugs the tests missed).
@@ -152,13 +152,57 @@ wrapped link rows dedup so only the first is selectable). `post <url>
 [body]` command (form-urlencoded). Latin-1 done. Verified live against
 https://example.com (WebPKI) and a local POST echo.
 
-Phase B (later): gzip if the wild forces it, GET-forms — forms make
-search engines work (FrogFind, lite.duckduckgo are the target
-audience). ASK her POST app's needs (content-type/auth) before
-polishing POST UX. Phase C: image viewer panel (planning talk first —
-SOTA ratatui image options). Gemini client certs if she hits a capsule
-needing them. Also still on the list: finger (79), WHOIS (43), DICT
-(2628) one-shots.
+## HTTP Phase B: HTML forms — DONE (2026-06-11)
+
+Her POST application turned out to be https://rubymaelstrom.com/chat —
+an HTML-only LLM chat (hidden session field + text input + Send
+button). Forms (GET and POST) are implemented and verified live
+against it (Talkie replied through TRust) and against
+lite.duckduckgo.com (POST search → results). That closes the standing
+"ask her POST app's needs" question.
+
+How it works (and the traps, hard-won):
+
+- `doc.rs`: `Form`/`Field`/`FieldKind` + `Link::Form{form,field}` +
+  `Kind::Input`/`Kind::Button`. `Doc.forms` is LIVE state — field
+  values/checked are mutated in place; any re-parse must seed from it
+  (`http::parse_seeded`). `Form::encode(pressed)` serializes the
+  successful fields (only the pressed submit; unchecked boxes stay
+  home; nameless fields skipped; value-less checked boxes send "on").
+- `http.rs::extract_forms` walks the DOM *between* html2text's
+  `parse_html` and `dom_to_render_tree` (the split public API is why no
+  extra crate is needed). Each rendering control is replaced by
+  `<div><img src="x-trust-form:F.I" alt="[widget row]"></div>` — img
+  because its label renders from the alt *attribute*: html2text
+  re-exports rcdom's `Element` variant but NOT `Text`, so text nodes
+  cannot be fabricated or matched from outside. Element text (button
+  labels, options, textarea defaults) is read via `node.serialize` +
+  tag-strip (`node_as_dom_string` is a debug dump — don't).
+- **rcdom's `Node::drop` force-clears every descendant's `children`,
+  live Rc holders or not.** A node spliced out of a snippet DOM must be
+  *detached from its parent* before that DOM drops, or it arrives
+  empty. This was the silent killer; `marker_node` does the detach.
+- Interaction: Enter on a field → the amber prompt (titled INPUT,
+  `input>`, prefilled) via `search_target = Link::Form`; checkboxes
+  toggle, radios pick within their name group, selects cycle; submit →
+  GET builds `action?query`, POST reuses `start_post`. After any value
+  change `refresh_forms()` sets `wrapped_to = 0` and calls
+  `sync_browser_wrap()` inline (the run loop draws *before* syncing, so
+  waiting for the next frame would show stale rows).
+- `app.notice`: fetch errors/empty responses set it so the status bar
+  shows the message instead of the selected-link hint (cleared on next
+  browser key). Without it a dead search engine looks like "nothing
+  happened".
+- Not supported (deliberately): file uploads, multipart encoding,
+  `<button type=button>`/reset (dropped — they're JS hooks).
+- FrogFind's search backend was broken on 2026-06-11 (200 + empty body
+  for us, 503 for browser UAs) — not a TRust bug; DDG lite is the
+  working search demo.
+
+Still later: gzip if the wild forces it. Phase C: image viewer panel
+(planning talk first — SOTA ratatui image options). Gemini client
+certs if she hits a capsule needing them. Also still on the list:
+finger (79), WHOIS (43), DICT (2628) one-shots.
 
 Done since: .gmi files over gopher render as gemtext
 (gemini::parse_gemtext takes a resolver closure; gopher::resolve_gmi
