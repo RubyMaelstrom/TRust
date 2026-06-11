@@ -20,7 +20,9 @@ use crate::gemini::{self, GeminiUrl};
 use crate::gopher::{self, GopherUrl};
 use crate::http;
 use crate::img;
+use crate::oneshot;
 use crate::telnet;
+use crate::tls;
 use crate::ui;
 
 /// What the input field feeds, mirroring GNU telnet's two states: lines go
@@ -217,6 +219,7 @@ enum Payload {
     Gopher(Vec<u8>),
     Gemini(gemini::Response),
     Http(http::Response),
+    OneShot(Vec<u8>),
 }
 
 /// Result of a background fetch.
@@ -308,6 +311,9 @@ pub struct App {
     /// The gopher type-7 item, gemini 1x URL, or form field awaiting
     /// input (pub so the UI can label the prompt accordingly).
     pub(crate) search_target: Option<Link>,
+    /// A capsule that answered status 60: the prompt is asking for a
+    /// name to mint a client identity under.
+    pub(crate) cert_for: Option<GeminiUrl>,
     /// A fetch just failed (or came back empty): the status bar shows
     /// the message even while a link is selected, until the next key.
     pub(crate) notice: bool,
@@ -355,6 +361,7 @@ impl App {
             fetch_rx: None,
             img_rx: None,
             search_target: None,
+            cert_for: None,
             notice: false,
             conn: None,
             events: None,
@@ -469,6 +476,7 @@ impl App {
                 Mode::Session | Mode::Search => Mode::Command,
                 Mode::Command => Mode::Session,
             };
+            self.cert_for = None;
             return;
         }
 
@@ -506,6 +514,14 @@ impl App {
             KeyCode::Esc if matches!(self.mode, Mode::Command | Mode::Search) => {
                 self.mode = Mode::Session;
                 self.search_target = None;
+                self.cert_for = None;
+                self.select_anchor = None;
+            }
+            // Esc in a line-mode session opens command mode, like
+            // Ctrl-]. (Char-mode sessions never reach here — their Esc
+            // goes to the remote, where full-screen apps need it.)
+            KeyCode::Esc => {
+                self.mode = Mode::Command;
                 self.select_anchor = None;
             }
             KeyCode::Enter => {
@@ -702,10 +718,10 @@ impl App {
             Some("open" | "o") => match parts.next() {
                 Some(host) => {
                     let port = match parts.next() {
-                        Some(p) => match p.parse() {
-                            Ok(p) => p,
-                            Err(_) => {
-                                self.status = format!("bad port number: {p}");
+                        Some(p) => match parse_port(p) {
+                            Some(p) => p,
+                            None => {
+                                self.status = format!("bad port or service name: {p}");
                                 return;
                             }
                         },
@@ -785,11 +801,62 @@ impl App {
                 _ => self.status = String::from("usage: toggle crlf"),
             },
             Some("status" | "st") => self.show_status(),
+            Some("finger" | "f") => match parts.next() {
+                Some(target) => {
+                    let (user, host) = match target.rsplit_once('@') {
+                        Some((user, host)) => (user, host),
+                        None => ("", target),
+                    };
+                    if host.is_empty() {
+                        self.status = String::from("usage: finger [user]@<host>");
+                        return;
+                    }
+                    let (host, port) = split_host_port(host);
+                    self.start_fetch(Link::OneShot(oneshot::OneShotUrl {
+                        scheme: oneshot::Scheme::Finger,
+                        host: host.to_string(),
+                        port: port.unwrap_or(79),
+                        query: user.to_string(),
+                    }));
+                }
+                None => self.status = String::from("usage: finger [user]@<host>"),
+            },
+            Some("whois") => match parts.next() {
+                Some(query) => {
+                    let (host, port) =
+                        split_host_port(parts.next().unwrap_or(oneshot::WHOIS_DEFAULT));
+                    self.start_fetch(Link::OneShot(oneshot::OneShotUrl {
+                        scheme: oneshot::Scheme::Whois,
+                        host: host.to_string(),
+                        port: port.unwrap_or(43),
+                        query: query.to_string(),
+                    }));
+                }
+                None => self.status = String::from("usage: whois <domain> [server]"),
+            },
+            Some("dict" | "define") => match parts.next() {
+                Some(word) => {
+                    let (host, port) =
+                        split_host_port(parts.next().unwrap_or(oneshot::DICT_DEFAULT));
+                    self.start_fetch(Link::OneShot(oneshot::OneShotUrl {
+                        scheme: oneshot::Scheme::Dict,
+                        host: host.to_string(),
+                        port: port.unwrap_or(2628),
+                        query: word.to_string(),
+                    }));
+                }
+                None => self.status = String::from("usage: dict <word> [server]"),
+            },
+            // A bare URL opens directly, as if `open` had been typed.
+            Some(target) if target.contains("://") => {
+                let port = parts.next().and_then(parse_port).unwrap_or(23);
+                self.dispatch_open(target, port);
+            }
             // TODO for GNU telnet parity: full set/unset, display,
             // logout, z (suspend), ! (shell escape).
             Some(other) => {
                 self.status = format!(
-                    "unknown command: {other} (open/close/mode/send/set/toggle/status/quit)"
+                    "unknown command: {other} (open/close/mode/send/set/toggle/finger/whois/dict/status/quit — or just type a URL)"
                 )
             }
         }
@@ -869,12 +936,15 @@ impl App {
             self.start_fetch(Link::Gemini(url));
         } else if let Some(url) = http::parse_url(target) {
             self.start_fetch(Link::Http(url));
-        } else if let Some(host) = target.strip_prefix("telnet://") {
-            self.open(host.trim_end_matches('/').to_string(), port, false);
-        } else if let Some(host) = target.strip_prefix("telnets://") {
-            let host = host.trim_end_matches('/').to_string();
-            let port = if port == 23 { 992 } else { port };
-            self.open(host, port, true);
+        } else if let Some(url) = oneshot::OneShotUrl::parse(target) {
+            self.start_fetch(Link::OneShot(url));
+        } else if let Some(rest) = target.strip_prefix("telnet://") {
+            let (host, url_port) = split_host_port(rest.trim_end_matches('/'));
+            self.open(host.to_string(), url_port.unwrap_or(port), false);
+        } else if let Some(rest) = target.strip_prefix("telnets://") {
+            let (host, url_port) = split_host_port(rest.trim_end_matches('/'));
+            let port = url_port.unwrap_or(if port == 23 { 992 } else { port });
+            self.open(host.to_string(), port, true);
         } else if port == 70 {
             self.start_fetch(Link::Gopher(GopherUrl {
                 host: target.to_string(),
@@ -888,9 +958,20 @@ impl App {
                 port,
                 path: String::from("/"),
             }));
+        } else if port == 79 {
+            // Finger with an empty query: who is logged in.
+            self.start_fetch(Link::OneShot(oneshot::OneShotUrl {
+                scheme: oneshot::Scheme::Finger,
+                host: target.to_string(),
+                port,
+                query: String::new(),
+            }));
         } else {
+            // A bare host:port works without the separate port argument;
             // telnets convention: port 992 is telnet over TLS.
-            self.open(target.to_string(), port, port == 992);
+            let (host, url_port) = split_host_port(target);
+            let port = url_port.unwrap_or(port);
+            self.open(host.to_string(), port, port == 992);
         }
     }
 
@@ -907,6 +988,7 @@ impl App {
                 Link::Http(url) => http::fetch(&http::Request::get(url.clone()))
                     .await
                     .map(Payload::Http),
+                Link::OneShot(url) => oneshot::fetch(url).await.map(Payload::OneShot),
                 Link::External(url) => Err(format!("cannot fetch foreign scheme: {url}")),
                 Link::Form { .. } => Err(String::from("form controls are not fetchable")),
             };
@@ -1014,6 +1096,11 @@ impl App {
                 self.status = format!("{url} — {} lines", doc.lines.len());
                 self.navigate_to(doc);
             }
+            (Ok(Payload::OneShot(raw)), Link::OneShot(url)) => {
+                let doc = oneshot::parse(&url, raw, width);
+                self.status = format!("{url} — {} lines", doc.lines.len());
+                self.navigate_to(doc);
+            }
             (Ok(Payload::Gemini(response)), _) => self.on_gemini_response(response, width),
             (Ok(Payload::Http(response)), _) => self.on_http_response(response, width),
             (Err(err), target) => {
@@ -1039,7 +1126,8 @@ impl App {
                 } else {
                     response.meta.as_str()
                 };
-                self.status = format!("{} — {media}", response.url);
+                let id = if response.identity { " · ID" } else { "" };
+                self.status = format!("{} — {media}{id}", response.url);
                 self.navigate_to(doc);
             }
             // 1x: the server wants input; reuse the search prompt.
@@ -1056,12 +1144,32 @@ impl App {
                 self.cursor = 0;
                 self.select_anchor = None;
             }
+            // 60 with nothing on file: offer to mint an identity right
+            // there. Everything else in the 6x class (61/62, or a 60
+            // even though we presented one) shows the server's words,
+            // plus which file spoke for us.
             60..=69 => {
-                self.status = format!(
-                    "{}: requires a client certificate (status {}) — not supported yet",
-                    response.url, response.status
-                );
-                self.notice = true;
+                if response.status == 60 && !response.identity {
+                    self.input = std::env::var("USER").unwrap_or_default();
+                    self.cursor = self.input.chars().count();
+                    self.select_anchor = None;
+                    self.cert_for = Some(response.url.clone());
+                    self.mode = Mode::Search;
+                    self.status = format!(
+                        "{} requests an identity — Enter mints a certificate with that name.",
+                        response.url
+                    );
+                } else {
+                    let sent = tls::identity_path(&response.url.host)
+                        .filter(|_| response.identity)
+                        .map(|p| format!(" (sent {})", p.display()))
+                        .unwrap_or_default();
+                    self.status = format!(
+                        "{}: {} {}{sent}",
+                        response.url, response.status, response.meta
+                    );
+                    self.notice = true;
+                }
             }
             status => {
                 self.status = format!("{}: {} {}", response.url, status, response.meta);
@@ -1248,6 +1356,7 @@ impl App {
                 let forms = std::mem::take(&mut g.doc.forms);
                 http::parse_seeded(&url, &meta, &raw, width, Some(&forms))
             }
+            Link::OneShot(url) => oneshot::parse(&url, raw, width),
             Link::Form { .. } | Link::External(_) => return,
         };
         g.selected = link_ordinal.and_then(|n| {
@@ -1371,6 +1480,7 @@ impl App {
             },
             Link::Gemini(url) => self.start_fetch(Link::Gemini(url)),
             Link::Http(url) => self.start_fetch(Link::Http(url)),
+            Link::OneShot(url) => self.start_fetch(Link::OneShot(url)),
             Link::Form { form, field } => self.form_interact(form, field),
             Link::External(target) => {
                 self.status = format!("external link: {target}");
@@ -1467,6 +1577,23 @@ impl App {
     /// Run a query the page asked for: gopher type-7 search (RFC 1436:
     /// selector TAB query) or a gemini 1x input (percent-encoded ?query).
     fn run_search(&mut self, query: &str) {
+        // A pending status-60 prompt: mint the identity, then retry
+        // the page that asked for it.
+        if let Some(url) = self.cert_for.take() {
+            let name = query.trim();
+            let name = if name.is_empty() { "anonymous" } else { name };
+            match tls::create_identity(&url.host, name) {
+                Ok(path) => {
+                    self.status = format!("Identity '{name}' saved to {}.", path.display());
+                    self.start_fetch(Link::Gemini(url));
+                }
+                Err(err) => {
+                    self.status = err;
+                    self.notice = true;
+                }
+            }
+            return;
+        }
         match self.search_target.take() {
             Some(Link::Gopher(base)) => {
                 let url = GopherUrl {
@@ -1607,6 +1734,50 @@ impl App {
         self.bells_seen = bells;
         ring
     }
+}
+
+/// Resolve a port argument: a number, or a well-known service name —
+/// GNU telnet's getservbyname, in miniature.
+pub(crate) fn parse_port(s: &str) -> Option<u16> {
+    if let Ok(port) = s.parse() {
+        return Some(port);
+    }
+    Some(match s {
+        "echo" => 7,
+        "daytime" => 13,
+        "chargen" => 19,
+        "ftp" => 21,
+        "telnet" => 23,
+        "smtp" | "mail" => 25,
+        "whois" | "nicname" => 43,
+        "domain" => 53,
+        "gopher" => 70,
+        "finger" => 79,
+        "http" | "www" => 80,
+        "pop3" => 110,
+        "nntp" => 119,
+        "imap" => 143,
+        "https" => 443,
+        "telnets" => 992,
+        "gemini" => 1965,
+        "dict" => 2628,
+        "irc" => 6667,
+        _ => return None,
+    })
+}
+
+/// Split a trailing `:port` off a host string, the way users write
+/// telnet targets (`isharmud.com:23`). Hosts with more than one colon
+/// (raw IPv6 literals) are left whole.
+fn split_host_port(s: &str) -> (&str, Option<u16>) {
+    if let Some((host, port)) = s.rsplit_once(':')
+        && !host.is_empty()
+        && !host.contains(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return (host, Some(port));
+    }
+    (s, None)
 }
 
 /// Pass a BEL through to the real terminal.
@@ -2257,6 +2428,153 @@ mod tests {
         app.execute_command("open 127.0.0.1 1").await;
         assert!(app.browser.is_none(), "browser closed");
         assert!(app.viewer.is_none(), "viewer closed");
+    }
+
+    #[test]
+    fn splits_trailing_ports_but_not_ipv6() {
+        use super::split_host_port;
+        assert_eq!(
+            split_host_port("isharmud.com:23"),
+            ("isharmud.com", Some(23))
+        );
+        assert_eq!(split_host_port("bbs.example"), ("bbs.example", None));
+        // Not a port: left attached to the host.
+        assert_eq!(split_host_port("host:name"), ("host:name", None));
+        // Raw IPv6 literals keep all their colons.
+        assert_eq!(split_host_port("::1"), ("::1", None));
+        assert_eq!(split_host_port("fe80::1:23"), ("fe80::1:23", None));
+    }
+
+    #[tokio::test]
+    async fn esc_opens_command_mode_in_line_mode() {
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+        let mut app = super::App::new(Some(String::from("h")), 23);
+        assert_eq!(app.mode, super::Mode::Session);
+
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Esc)))
+            .await;
+        assert_eq!(app.mode, super::Mode::Command);
+        // And Esc backs out again.
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Esc)))
+            .await;
+        assert_eq!(app.mode, super::Mode::Session);
+    }
+
+    #[tokio::test]
+    async fn bare_urls_open_and_telnet_urls_split_ports() {
+        let mut app = super::App::new(None, 23);
+
+        // A bare URL at the trust> prompt behaves like `open <url>`.
+        app.execute_command("gemini://gem.sdf.org").await;
+        assert!(
+            app.status.starts_with("Fetching gemini://gem.sdf.org"),
+            "got: {}",
+            app.status
+        );
+
+        // telnet:// URLs treat a trailing :port as the port.
+        app.execute_command("telnet://isharmud.com:2323").await;
+        assert_eq!(app.host.as_deref(), Some("isharmud.com"));
+        assert_eq!(app.port, 2323);
+
+        // telnets:// without a port keeps its 992 convention.
+        app.execute_command("open telnets://secure.example").await;
+        assert_eq!(app.port, 992);
+        assert!(app.tls || !app.connected, "TLS path taken");
+
+        // Bare host:port works through plain `open` too.
+        app.execute_command("open bbs.example:1701").await;
+        assert_eq!(app.host.as_deref(), Some("bbs.example"));
+        assert_eq!(app.port, 1701);
+    }
+
+    #[tokio::test]
+    async fn oneshot_commands_build_the_right_queries() {
+        let mut app = super::App::new(None, 23);
+
+        app.execute_command("finger ruby@sdf.org").await;
+        assert!(
+            app.status.starts_with("Fetching finger://sdf.org/ruby"),
+            "got: {}",
+            app.status
+        );
+        app.execute_command("whois example.com").await;
+        assert!(
+            app.status
+                .starts_with("Fetching whois://whois.iana.org/example.com"),
+            "got: {}",
+            app.status
+        );
+        app.execute_command("dict rain").await;
+        assert!(
+            app.status.starts_with("Fetching dict://dict.org/rain"),
+            "got: {}",
+            app.status
+        );
+        // URLs work through open and bare dispatch too.
+        app.execute_command("dict://dict.org/d:neon").await;
+        assert!(
+            app.status.starts_with("Fetching dict://dict.org/neon"),
+            "got: {}",
+            app.status
+        );
+        app.execute_command("finger").await;
+        assert!(app.status.starts_with("usage: finger"));
+    }
+
+    #[test]
+    fn ports_resolve_by_number_or_service_name() {
+        use super::parse_port;
+        assert_eq!(parse_port("2323"), Some(2323));
+        assert_eq!(parse_port("telnet"), Some(23));
+        assert_eq!(parse_port("smtp"), Some(25));
+        assert_eq!(parse_port("gemini"), Some(1965));
+        assert_eq!(parse_port("warpgate"), None);
+    }
+
+    #[tokio::test]
+    async fn status_60_prompts_for_and_mints_an_identity() {
+        unsafe {
+            std::env::set_var(
+                "TRUST_IDENTITIES",
+                std::env::temp_dir().join(format!("trust-test-ids-{}", std::process::id())),
+            );
+        }
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (80, 10);
+        let url = crate::gemini::GeminiUrl::parse("gemini://astro.test/app").unwrap();
+        app.on_gemini_response(
+            crate::gemini::Response {
+                url: url.clone(),
+                status: 60,
+                meta: String::from("Certificate required"),
+                body: Vec::new(),
+                identity: false,
+            },
+            80,
+        );
+
+        // The amber prompt opens, prefilled with the system username.
+        assert_eq!(app.mode, super::Mode::Search);
+        assert_eq!(app.cert_for, Some(url));
+        assert_eq!(app.input, std::env::var("USER").unwrap_or_default());
+
+        // Naming it mints the file and retries the capsule.
+        app.run_search("neon-ruby");
+        let path = crate::tls::identity_path("astro.test").unwrap();
+        let pem = std::fs::read_to_string(&path).expect("identity written");
+        assert!(pem.contains("BEGIN CERTIFICATE"));
+        assert!(app.cert_for.is_none());
+        assert!(
+            app.status.starts_with("Fetching gemini://astro.test"),
+            "retries the page: {}",
+            app.status
+        );
+
+        // A second 60 for the same host (cert now exists but the
+        // server rejected it, say) must NOT offer to overwrite.
+        app.run_search("x"); // no pending prompt: routes nowhere
+        assert!(!app.status.contains("saved"), "{}", app.status);
     }
 
     #[test]

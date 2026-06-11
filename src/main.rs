@@ -5,6 +5,7 @@ mod gemini;
 mod gopher;
 mod http;
 mod img;
+mod oneshot;
 mod telnet;
 mod tls;
 mod ui;
@@ -16,12 +17,12 @@ async fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let host = args.next();
     let port = match args.next() {
-        // TODO: GNU telnet also accepts service names (e.g. "telnet", "smtp")
-        // via getservbyname; numeric ports only for now.
-        Some(p) => match p.parse::<u16>() {
-            Ok(p) => p,
-            Err(_) => {
-                eprintln!("trust: bad port number: {p}");
+        // Numeric, or a well-known service name ("telnet", "smtp", ...)
+        // like GNU telnet's getservbyname.
+        Some(p) => match app::parse_port(&p) {
+            Some(p) => p,
+            None => {
+                eprintln!("trust: bad port or service name: {p}");
                 return ExitCode::FAILURE;
             }
         },

@@ -160,6 +160,11 @@ fn protocol_badge(g: &BrowserView) -> &'static str {
         Link::Gopher(_) => " GOPHER ",
         Link::Gemini(_) => " GEMINI ",
         Link::Http(_) => " WWW ",
+        Link::OneShot(url) => match url.scheme {
+            crate::oneshot::Scheme::Finger => " FINGER ",
+            crate::oneshot::Scheme::Whois => " WHOIS ",
+            crate::oneshot::Scheme::Dict => " DICT ",
+        },
         // Form controls never appear as a document's own URL.
         Link::Form { .. } => " WWW ",
         Link::External(_) => " NET ",
@@ -223,11 +228,14 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
         return Paragraph::new(line).block(block);
     }
 
-    // The search prompt doubles as the form-field editor.
+    // The search prompt doubles as the form-field editor and the
+    // identity-name prompt for capsules that ask for a certificate.
     let editing_field = matches!(app.search_target, Some(Link::Form { .. }));
+    let minting_identity = app.cert_for.is_some();
     let (prompt, accent) = match app.mode {
         Mode::Session => ("❯ ", theme::NEON_GREEN),
         Mode::Command => ("trust> ", theme::AMBER),
+        Mode::Search if minting_identity => ("name> ", theme::AMBER),
         Mode::Search if editing_field => ("input> ", theme::AMBER),
         Mode::Search => ("search> ", theme::AMBER),
     };
@@ -277,7 +285,13 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
                 .add_modifier(Modifier::BOLD),
         )),
         Mode::Search => block.title(Line::styled(
-            if editing_field { " INPUT " } else { " SEARCH " },
+            if minting_identity {
+                " IDENTITY "
+            } else if editing_field {
+                " INPUT "
+            } else {
+                " SEARCH "
+            },
             Style::new()
                 .fg(theme::BG)
                 .bg(theme::AMBER)
@@ -318,8 +332,9 @@ fn status_bar(app: &App) -> Paragraph<'_> {
         (Mode::Session, ..) if app.viewer.is_some() => "· ← Esc close · Ctrl-] commands",
         (Mode::Session, true, _) => "· ↑↓ → ← navigate · Ctrl-] commands",
         (Mode::Session, false, true) => "· CHAR mode · Ctrl-] commands",
-        (Mode::Session, false, false) => "· Enter send · Ctrl-] commands",
+        (Mode::Session, false, false) => "· Enter send · Esc/Ctrl-] commands",
         (Mode::Command, ..) => "· Enter run · Esc back · open/close/mode/send/set/status/quit",
+        (Mode::Search, ..) if app.cert_for.is_some() => "· Enter mints the identity · Esc cancel",
         (Mode::Search, ..) if matches!(app.search_target, Some(Link::Form { .. })) => {
             "· Enter set · Esc cancel"
         }

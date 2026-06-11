@@ -245,6 +245,119 @@ pub fn connector(host: &str, port: u16) -> TlsConnector {
     TlsConnector::from(Arc::new(config))
 }
 
+/// Where client identities live: one `<host>.pem` per capsule, holding
+/// the certificate and its private key (`TRUST_IDENTITIES` overrides
+/// the directory; tests point it at temp space).
+fn identities_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("TRUST_IDENTITIES") {
+        return Some(PathBuf::from(dir));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config/trust/identities"))
+}
+
+/// The file that holds (or would hold) a host's client identity.
+pub fn identity_path(host: &str) -> Option<PathBuf> {
+    identities_dir().map(|dir| dir.join(format!("{host}.pem")))
+}
+
+type Identity = (
+    Vec<CertificateDer<'static>>,
+    tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+);
+
+/// Load a host's client identity. No file is fine (`Ok(None)`); a file
+/// that exists but can't be used is an error the user must hear about.
+/// Certificate and key blocks may appear in any order (openssl output,
+/// concatenated .crt + .key — whatever she has lying around).
+fn load_identity(host: &str) -> Result<Option<Identity>, String> {
+    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, pem::PemObject};
+    let Some(path) = identity_path(host) else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+    let show = path.display();
+    let certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(&path)
+        .and_then(Iterator::collect)
+        .map_err(|e| format!("{show}: {e}"))?;
+    if certs.is_empty() {
+        return Err(format!("{show}: no CERTIFICATE block"));
+    }
+    let key = PrivateKeyDer::from_pem_file(&path)
+        .map_err(|e| format!("{show}: no usable private key ({e})"))?;
+    Ok(Some((certs, key)))
+}
+
+/// TLS for gemini: the TOFU verifier plus the host's client identity
+/// when one is on file. The bool reports whether one was presented.
+pub fn gemini_connector(host: &str, port: u16) -> Result<(TlsConnector, bool), String> {
+    let provider = ensure_provider();
+    let schemes = provider
+        .signature_verification_algorithms
+        .supported_schemes();
+    let builder = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Tofu {
+            key: format!("{host}:{port}"),
+            schemes,
+        }));
+    let (config, identity) = match load_identity(host)? {
+        Some((certs, key)) => (
+            builder
+                .with_client_auth_cert(certs, key)
+                .map_err(|e| format!("client certificate: {e}"))?,
+            true,
+        ),
+        None => (builder.with_no_client_auth(), false),
+    };
+    Ok((TlsConnector::from(Arc::new(config)), identity))
+}
+
+/// Mint a self-signed client identity (CN = `name`) for a host and
+/// save it where `identity_path` will find it. Refuses to overwrite —
+/// capsules pin the certificate, so replacing one means losing the
+/// account it represents.
+pub fn create_identity(host: &str, name: &str) -> Result<PathBuf, String> {
+    let path = identity_path(host).ok_or("no home directory")?;
+    if path.exists() {
+        return Err(format!(
+            "{} already exists — remove it to mint a new identity",
+            path.display()
+        ));
+    }
+    let mut params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).map_err(|e| e.to_string())?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, name);
+    // Capsules pin the cert; an expiry would only ever lock her out.
+    params.not_before = rcgen::date_time_ymd(2025, 1, 1);
+    params.not_after = rcgen::date_time_ymd(2125, 1, 1);
+    let key = rcgen::KeyPair::generate().map_err(|e| e.to_string())?;
+    let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
+
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600); // the file holds a private key
+    }
+    use std::io::Write;
+    let mut file = options
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    file.write_all(format!("{}{}", cert.pem(), key.serialize_pem()).as_bytes())
+        .map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 /// Resolve a host string into the SNI name rustls requires.
 pub fn server_name(host: &str) -> Result<ServerName<'static>, String> {
     ServerName::try_from(host.to_string()).map_err(|_| format!("invalid host name: {host}"))
@@ -253,6 +366,47 @@ pub fn server_name(host: &str) -> Result<ServerName<'static>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_identities_mint_and_load_in_any_order() {
+        // All identity tests share one temp dir (the env var is
+        // process-global); each uses its own hostname.
+        let dir = std::env::temp_dir().join(format!("trust-test-ids-{}", std::process::id()));
+        unsafe {
+            std::env::set_var("TRUST_IDENTITIES", &dir);
+        }
+
+        // Nothing on file: anonymous connection.
+        let (_, presented) = gemini_connector("capsule.test", 1965).unwrap();
+        assert!(!presented);
+
+        // Mint one — private, both blocks present — and it gets used.
+        let path = create_identity("capsule.test", "ruby").unwrap();
+        let pem = std::fs::read_to_string(&path).unwrap();
+        assert!(pem.contains("BEGIN CERTIFICATE") && pem.contains("PRIVATE KEY"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "key file is owner-only");
+        }
+        let (_, presented) = gemini_connector("capsule.test", 1965).unwrap();
+        assert!(presented);
+
+        // Never overwrite: the capsule pinned this certificate.
+        assert!(create_identity("capsule.test", "someone-else").is_err());
+
+        // Her openssl-made files may put the key first; order is free.
+        let key_start = pem.find("-----BEGIN PRIVATE KEY-----").unwrap();
+        let reversed = format!("{}{}", &pem[key_start..], &pem[..key_start]);
+        std::fs::write(dir.join("reversed.test.pem"), reversed).unwrap();
+        let (_, presented) = gemini_connector("reversed.test", 1965).unwrap();
+        assert!(presented, "key-before-cert PEM loads fine");
+
+        // A broken file is an error, never a silent anonymous visit.
+        std::fs::write(dir.join("broken.test.pem"), "not pem at all").unwrap();
+        assert!(gemini_connector("broken.test", 1965).is_err());
+    }
 
     #[test]
     fn known_hosts_roundtrip() {
