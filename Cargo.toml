@@ -18,6 +18,7 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 libmudtelnet = "2.0.2"
 ratatui = "0.30.1"
 ratatui-image = { version = "11.0.4", default-features = false, features = ["crossterm"] }
+rcgen = "0.14.8"
 sha2 = "0.11.0"
 textwrap = "0.16.2"
 tokio = { version = "1.52.3", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time"] }
@@ -25,9 +26,6 @@ tokio-rustls = "0.26.4"
 tui-term = "0.3.4"
 url = "2.5.8"
 webpki-roots = "1.0.7"
-
-[dev-dependencies]
-rcgen = "0.14.8"
 
 # Optimized binary: whole-program LTO and a single codegen unit trade
 # compile time for speed and size; symbols stripped (panic messages

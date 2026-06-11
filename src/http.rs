@@ -332,6 +332,9 @@ fn resolve(base: &Url, target: &str) -> Link {
             "gopher" => crate::gopher::GopherUrl::parse(joined.as_str())
                 .map(Link::Gopher)
                 .unwrap_or_else(|| Link::External(joined.to_string())),
+            "finger" | "whois" | "dict" => crate::oneshot::OneShotUrl::parse(joined.as_str())
+                .map(Link::OneShot)
+                .unwrap_or_else(|| Link::External(joined.to_string())),
             _ => Link::External(joined.to_string()),
         },
         Err(_) => Link::External(target.to_string()),

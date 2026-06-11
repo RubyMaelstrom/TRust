@@ -1,240 +1,137 @@
 # TRust — Telnet in Rust
 
-A telnet client aiming for 1:1 functionality with GNU telnet — plus a
-gopher, gemini, and text-web browser — wrapped in a cyberpunk-themed
-terminal UI.
+A GNU-telnet-compatible client that grew a browser. Telnet (plain or
+TLS) for your BBSes and MUDs, plus gopher, gemini, and the text-only
+web — forms, search engines, even images — all in one cyberpunk
+terminal UI. No JavaScript, no SSH, no apologies.
 
 ```
-cargo run -- <host> [port]         # telnet, connect on startup
-cargo run -- gopher://host[/sel]   # open the gopher browser
-cargo run -- gemini://host[/path]  # open the gemini browser
-cargo run -- https://host/[path]   # open the text-web browser
-cargo run                          # start at the command prompt
+trust <host> [port]          # telnet (port may be a name: smtp, nntp, ...)
+trust gemini://gem.sdf.org   # or gopher://, http(s)://, finger://, ...
+trust                        # start at the command prompt
 ```
 
-Input mode follows the ECHO negotiation, the way GNU telnet picks its
-mode:
+## Driving it
 
-- **Line mode** (server does not echo): text is typed into the entry
-  field at the bottom (local echo, cursor editing); **Enter** sends the
-  line. Long lines scroll horizontally, keeping the cursor and prompt
-  in view (`…` marks text off to the left). **Shift+arrows/Home/End**
-  select text — Backspace/Delete removes the selection, typing
-  replaces it. **Up/Down** recall previously entered lines (in-memory
-  only, cleared on exit; an unfinished line is stashed and restored
-  when you arrow back past the newest entry). Control chords (Ctrl-C,
-  Ctrl-D, ...) bypass the field.
-- **Character mode** (server sends `WILL ECHO` — BBSes, login prompts,
-  full-screen apps): every keystroke goes straight to the wire and the
-  server echoes. The entry field dims to a `CHAR` strip so the layout
-  stays put when servers toggle ECHO around password prompts.
+The bottom of the screen is the entry field. In **line mode** you type
+locally and Enter sends the line — with cursor editing, Shift+arrow
+selection, Up/Down history recall, and horizontal scrolling when a
+line outgrows the field. When a server negotiates ECHO (BBS login
+prompts, full-screen apps), TRust switches to **character mode** and
+every keystroke goes straight to the wire, just like GNU telnet.
 
-The **mouse wheel** scrolls the session feed through 10k lines of
-in-memory scrollback (an amber `SCROLL` badge shows the offset; sending
-anything snaps back to live). The mouse is captured for this, so use
-Shift+drag for terminal-native text selection.
-
-**Ctrl-]** toggles command mode (GNU telnet's `telnet>` prompt) from
-either input mode; **Esc** returns to the session. Commands:
+**Ctrl-]** opens the `trust>` command prompt from anywhere; in line
+mode plain **Esc** works too. You can skip `open` entirely — typing
+`gemini://gem.sdf.org` at the prompt just goes there.
 
 | Command | Effect |
 |---|---|
-| `open <host> [port]` | connect (default port 23; `gopher://`/port 70, `gemini://`/port 1965, and `http(s)://` open the browser; `telnets://`/port 992 is telnet-TLS; `telnet://` forces plain telnet) |
-| `post <url> [body]` | HTTP POST (form-urlencoded) rendering the response |
-| `close` | drop the connection |
+| `open <host> [port]` | connect — URLs pick their protocol, `host:port` works, ports can be service names; `telnets://` (or port 992) is telnet over TLS |
+| `post <url> [body]` | HTTP POST, form-urlencoded |
+| `finger [user]@<host>` | who's there / their .plan (RFC 1288) |
+| `whois <domain> [server]` | domain lookup via IANA, referral followed (RFC 3912) |
+| `dict <word> [server]` | definitions from dict.org (RFC 2229) |
+| `close` / `quit` | drop the connection / exit |
 | `mode character\|line\|auto` | force input mode or follow ECHO |
-| `send brk\|ip\|ao\|ayt\|ec\|el\|ga\|nop\|escape` | transmit an IAC command (or a literal Ctrl-]) |
-| `set encoding cp437\|utf8` | CP437 translation for BBS ANSI art (dim badge when active) |
-| `set image sixel\|halfblocks\|kitty\|iterm2\|auto` | force the image-viewer graphics protocol (`auto` = what the startup query found) |
-| `toggle crlf` | Enter sends CR LF instead of the default CR NUL |
-| `status` | print connection/options report into the feed |
-| `quit` | exit |
+| `send brk\|ip\|ao\|ayt\|ec\|el\|ga\|nop\|escape` | transmit IAC commands (or a literal Ctrl-]) |
+| `set encoding cp437\|utf8` | CP437 for BBS ANSI art |
+| `set image sixel\|halfblocks\|kitty\|iterm2\|auto` | force the image protocol |
+| `toggle crlf` | Enter sends CR LF instead of CR NUL |
+| `status` | connection/options report |
 
-BEL from the remote rings the real terminal's bell.
+The mouse wheel scrolls 10k lines of scrollback (Shift+drag for
+terminal-native text selection, since the mouse is captured). BEL
+rings your real bell. BBS "ANSI detection" works — TRust answers
+cursor-position and device-attribute probes itself, because the remote
+talks to an embedded vt100 emulator, not your actual terminal.
 
-Note: crossterm reports the raw `0x1D` byte that terminals send for
-Ctrl-] as `Ctrl-5`, so both encodings are matched in `app.rs`.
+## The browser
 
-## TLS
+Any gopher, gemini, or http(s) URL opens a shared browser panel with
+gopherus-style navigation: **Up/Down** move through the page with the
+link highlight riding the center of the screen, **Right/Enter**
+follows, **Left** goes back (position restored), **Esc** returns to
+the terminal. Pages re-wrap live when you resize. Fetches run in the
+background with timeouts and size caps — a little heart beats at the
+right end of the entry bar while one is in flight.
 
-`open telnets://host [port]` (default 992) or any port-992 connection
-wraps the telnet session in TLS via rustls. Certificate validation is
-**trust-on-first-use**, matching small-net practice (self-signed certs
-everywhere): the first certificate a host:port presents is accepted and
-its SHA-256 fingerprint pinned in `~/.config/trust/known_hosts`
-(override the location with `TRUST_KNOWN_HOSTS`); a different
-certificate later is refused, with the error telling you which line to
-remove to re-trust the server. Gemini requests use the same connector.
-A green `TLS` badge shows in the status bar while a telnet-TLS session
-is live.
+Things it handles along the way:
 
-## Browser (gopher + gemini + text web)
+- **Search**: gopher type-7 items and gemini input prompts open an
+  amber `search>` field. On the web, search engines work because...
+- **HTML forms work.** Text fields, checkboxes, radios, selects, and
+  buttons render as selectable widget rows — Enter edits, toggles,
+  cycles, or submits (GET and POST). Hidden fields ride along, typed
+  values survive resizes. No file uploads, no multipart.
+- **Images** open in a full-panel viewer, scaled to fit: sixel, kitty,
+  or iTerm2 graphics when your terminal speaks them, unicode
+  half-blocks anywhere else. Works for web images, gopher `I`/`g`/`p`
+  items, and gemini `image/*`. PNG/JPEG/GIF/WebP. Left/Esc puts you
+  back on the page exactly where you were.
+- **One-shot lookups** (`finger`, `whois`, `dict`) render in the same
+  panel, and their URL schemes are followable links everywhere —
+  gophermaps, gemtext, HTML.
+- **`.gmi` files served over gopher render as gemtext**, relative
+  links and all — a nod to a common small-net habit.
+- Cross-scheme links interconnect: gemtext can point at gopherspace,
+  gophermaps at the web, and back.
 
-`open gopher://host[:port][/Xselector]`, `open gemini://host[/path]`,
-or `open http(s)://host/path` (bare ports 70/1965 work too) replaces
-the terminal panel with a gopherus-style browser shared by all three
-protocols:
+## Trust (the name is not an accident)
 
-- **Up/Down** navigate gopherus-style. When the adjacent line is also a
-  link, the highlight steps onto it, with the page scrolling along so the
-  selection tends to ride the center of the screen (except near the
-  document's ends, where the page pins and the highlight walks between
-  the visible links). Across link-free stretches the page scrolls under
-  the sticky selection; the highlight hands off to the next link once it
-  comes closer to the center, and disappears while no link is on screen.
-  The status bar shows the selected link's URL.
-- **Right** (or Enter) follows the selected link; **Left** goes back
-  through the in-RAM history, restoring your position. **Esc** returns
-  to the terminal view.
-- Type-7 search items open an amber `search>` prompt; the query is sent
-  tab-separated per RFC 1436.
-- Menus and text files render with type-colored links (menus cyan, text
-  green, search amber); errors show in pink, info lines in plain text.
-  `set encoding cp437` applies to gopherspace too.
-- Long lines word-wrap to the panel width and re-flow live on terminal
-  resize (the raw bytes are kept per document, so encoding switches
-  re-render too). Only the first row of a wrapped menu item is
-  selectable; continuations belong to the same item visually.
-- Fetches are one-shot with a 15 s timeout and a 2 MB cap, run in the
-  background so the UI never blocks — a little heart beats at the
-  right end of the entry bar while one is in flight. Binary gopher
-  item types are reported as unsupported (yet); `h` items and
-  foreign-scheme gemtext links (http, mailto, ...) display their
-  target instead of following.
-- **Images open in a full-panel viewer** (gopher `I`/`g`/`p` items,
-  gemini `image/*` responses, web `[img: alt]` rows), scaled to fit
-  and centered; **Left or Esc** returns to the page where you were.
-  Rendering uses the best graphics protocol your terminal answers for
-  at startup — sixel, kitty, iTerm2 — with unicode half-blocks as the
-  universal fallback (`set image ...` overrides). PNG, JPEG, GIF
-  (first frame), and WebP; small images render 1:1 rather than
-  upscaling; resizing the terminal re-fits the image.
+Small-net TLS is **trust-on-first-use**: the first certificate a
+host:port shows is pinned (SHA-256) in `~/.config/trust/known_hosts`,
+and a different one later is refused with instructions for re-trusting
+deliberately. That covers `telnets://` and gemini. The web instead
+validates against the bundled Mozilla roots — TOFU would cry wolf
+every cert rotation.
 
-Gemini specifics:
-
-- Requests go over the TOFU TLS connector (`tls.rs`); servers that skip
-  the TLS close_notify on shutdown are tolerated, as is common practice.
-- Gemtext renders with styled headings (3 levels), `•` lists, `▌`
-  quotes, and preformatted blocks (never wrapped, never linkified);
-  paragraphs and link labels word-wrap like everything else.
-- Relative link and redirect targets resolve per RFC 3986 (dot-segment
-  removal included); 3x redirects are followed in the fetch task, capped
-  at 5. Cross-scheme gemtext links into gopherspace are followable.
-- **`.gmi` files served over gopher render as gemtext** — a nod to the
-  common habit of uploading gemtext to gopher holes. Relative `=>`
-  targets resolve to gopher selectors on the same host (trailing `/`
-  means a menu); absolute gemini/gopher/web URLs work as usual.
-- 1x input statuses open the amber `search>` prompt and send the query
-  percent-encoded; 4x/5x land in the status bar; 6x (client certs) is
-  reported as unsupported for now.
-
-Web specifics:
-
-- Hand-rolled HTTP/1.1 (`User-Agent: TRust/0.1`): one request per
-  connection, no compression, chunked transfer decoded, ≤10 redirects
-  (301/302/303 become GET; 307/308 keep method and body), UTF-8 and
-  Latin-1 charsets, 5 MB cap. HTTPS validates against the bundled
-  Mozilla roots (WebPKI) — TOFU stays small-net-only.
-- HTML renders via html2text (html5ever underneath): styled headings,
-  quotes, preformatted blocks, lists, tables-as-text. A line with one
-  link is selectable directly; lines with several links emit one
-  indented `→ label` row per target. Images appear as `[img: alt]`
-  rows — following one opens the image viewer. Error pages
-  (4xx/5xx) still render — they're content; the code shows in the
-  status bar.
-- `post <url> [body]` sends a form-urlencoded POST and renders the
-  response. Links between the webs interconnect: gemtext and gopher
-  pages can link to http(s) and vice versa.
-- **HTML forms work.** Controls render as selectable widget rows in
-  document order: text fields as amber `[name: value]` rows (Enter
-  opens the `input>` prompt, pre-filled on re-edit), checkboxes `[x]`
-  and radios `(*)` toggle on Enter, selects `[name: opt ▾]` cycle, and
-  submit buttons `[ label ]` fire the form — GET into the query
-  string, POST form-urlencoded. Hidden fields ride along; forms
-  without a submit control get a synthetic `[ Submit ]`; typed values
-  survive resizes. File uploads/multipart are not supported. This is
-  how search engines (and HTML chat apps) work.
+**Gemini identities** (client certificates): drop a PEM with your cert
+and key at `~/.config/trust/identities/<host>.pem` — block order
+doesn't matter, `cat my.crt my.key` is fine — and it's presented to
+that host, and only that host. The status bar shows `· ID` when one
+was sent. If a capsule asks for a certificate you don't have (status
+60), TRust offers to mint one on the spot: a `name>` prompt prefilled
+with your username, one Enter, and you're in (the name becomes the CN,
+which capsules like astrobotany use as your username). Existing
+identity files are never overwritten — capsules pin them, and losing
+one means losing the account.
 
 ## Architecture
 
 ```
 src/
-  main.rs     CLI args, terminal setup/teardown
-  app.rs      App state + event loop (crossterm EventStream ⨯ telnet events)
-  telnet.rs   Connection task: socket I/O + libmudtelnet protocol state
-              (generic over plain TCP and TLS transports)
-  tls.rs      rustls connector with trust-on-first-use fingerprint pinning
+  main.rs     CLI args, terminal setup, graphics-protocol query
+  app.rs      App state + event loop (crossterm events ⨯ network channels)
+  telnet.rs   Connection task: socket I/O + telnet protocol state
+  tls.rs      rustls: TOFU pinning, WebPKI, client identities
   doc.rs      protocol-agnostic document model (Link, Kind, DocLine, Doc)
-  gopher.rs   Gopher (RFC 1436): one-shot fetches, menu/text parsing
-  gemini.rs   Gemini: TLS fetches, redirects, gemtext parsing, URL resolve
-  http.rs     Text web: HTTP/1.1 GET/POST, chunked, redirects, html2text
-  cp437.rs    CP437→Unicode translation for BBS ANSI art
-  ui.rs       Ratatui rendering: cyberpunk chrome, tui-term session widget,
-              browser document panel
+  gopher.rs   Gopher (RFC 1436)
+  gemini.rs   Gemini: fetches, redirects, gemtext
+  http.rs     HTTP/1.1 GET/POST, chunked transfer, html2text, forms
+  oneshot.rs  finger, WHOIS (with referrals), DICT
+  img.rs      image decode + terminal-graphics encode
+  cp437.rs    CP437→Unicode for BBS art
+  ui.rs       ratatui rendering: chrome, session widget, browser panel
 ```
 
-Design notes:
+The shape of it: the app never touches protocol bytes (connection
+tasks own them, talking over channels), remote output renders through
+an embedded vt100 emulator so full-screen apps survive inside the
+styled frame, and every document — gophermap, gemtext, HTML, a WHOIS
+reply — parses into the same line-based model the browser renders.
 
-- **The app never sees protocol bytes.** The connection task
-  (`telnet.rs`) owns the `libmudtelnet::Parser`; IAC sequences, option
-  negotiation, and NAWS subnegotiation happen there. The app exchanges
-  plain `Send`/`Resize`/`Close` commands and `Connected`/`Data`/`Closed`
-  events over mpsc channels.
-- **Remote output is emulated, not echoed.** Because ratatui owns the
-  screen, the remote byte stream is fed into a `vt100` parser and rendered
-  with tui-term's `PseudoTerminal` widget. This keeps full-screen remote
-  applications working inside the styled frame.
-- **NAWS reports the widget's inner size**, not the real terminal size,
-  since that is the area the remote application actually gets to draw in.
-- `vt100` is used via tui-term's re-export (`tui_term::vt100`) so the two
-  can never drift apart.
+## Status
 
-## GNU telnet parity roadmap
+Done: the telnet core with option negotiation, NAWS, TERMINAL-TYPE,
+BINARY, probe replies, CP437; TOFU TLS and `telnets://`; the full
+browser stack across gopher, gemini (including client identities), and
+the text web (HTML forms, images); finger/whois/dict; service-name
+ports.
 
-- [x] Connect/close/quit, Ctrl-] command mode
-- [x] Option negotiation framework (ECHO, SGA accepted; rest refused)
-- [x] NAWS (RFC 1073) with renegotiation on resize
-- [x] TERMINAL-TYPE (RFC 1091) — offers ANSI, XTERM, VT100 in order
-- [x] Terminal probe replies (BBS "ANSI detection"): `ESC[6n` cursor
-      position report, `ESC[5n` status report, `ESC[c` device attributes —
-      answered by us because the remote talks to our embedded emulator,
-      not the real terminal
-- [x] BINARY (RFC 856) accepted when the server asks
-- [x] `send brk/ip/ao/ayt/ec/el/ga/nop/escape` (IAC commands, BREAK for
-      console servers, literal Ctrl-])
-- [x] `status` command, `toggle crlf` (Enter sends CR NUL by default per
-      RFC 854, CR LF when toggled)
-- [x] BEL passthrough to the host terminal
-- [x] CP437 encoding for BBS ANSI art (`set encoding cp437` — not a GNU
-      feature, but required because we emulate rather than pass through)
-- [ ] TSPEED (RFC 1079), LFLOW (RFC 1372)
-- [ ] LINEMODE (RFC 1184) and the localchars machinery
-- [ ] NEW-ENVIRON (RFC 1572), STATUS-the-option (RFC 859)
-- [ ] Remaining command-mode parity: full `set`/`unset`, `display`,
-      `logout`, `z`, `!`, `.telnetrc`, service-name ports
-- [x] Character-at-a-time vs line mode, driven by ECHO negotiation,
-      with a manual `mode` override
+Still to come: TSPEED/LFLOW, LINEMODE, NEW-ENVIRON, and the long tail
+of GNU command-mode parity (`set`/`unset`, `display`, `logout`, `z`,
+`!`, `.telnetrc`). Maybe someday: inline images, animated GIFs.
 
-## Small-net roadmap
-
-- [x] Gopher browser (RFC 1436) with gopherus-style navigation
-- [x] TLS foundation: rustls with TOFU fingerprint pinning; `telnets://`
-- [x] Gemini: gemtext rendering, redirects, 1x input, shared browser
-      view (protocol-agnostic `doc.rs` document model)
-- [x] Persistent TOFU known-hosts at `~/.config/trust/known_hosts`,
-      pins keyed by host:port
-- [ ] Gemini client certificates (status 6x)
-- [x] HTTP(S) Phase A: hand-rolled HTTP/1.1 (GET + POST), WebPKI
-      validation, html2text rendering, images as placeholder links
-- [x] HTTP Phase B: HTML forms — text/hidden/password/textarea,
-      checkbox/radio/select, GET and POST submission (search engines
-      and form-driven apps work)
-- [x] HTTP Phase C: image viewer — full-panel, scale-to-fit, sixel /
-      kitty / iTerm2 / half-blocks via startup detection; serves the
-      web, gopher, and gemini alike (inline images may come someday;
-      animated GIF / video are aspirational)
-- [ ] Finger (79), WHOIS (43), DICT (2628) — trivial one-shot
-      personalities
-- SSH is an explicit non-goal. **JavaScript is an explicit non-goal**:
-  TRust is a reader for the text-web and small-web; a JS engine without
-  a DOM and layout engine renders nothing real, so we don't pretend.
+Never: SSH (use ssh). JavaScript — TRust is a reader for the text-web
+and small-web; a JS engine without a DOM and layout engine renders
+nothing real, so we don't pretend.

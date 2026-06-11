@@ -16,6 +16,8 @@ pub enum Link {
     Gopher(GopherUrl),
     Gemini(GeminiUrl),
     Http(url::Url),
+    /// finger://, whois://, or dict:// one-shot queries.
+    OneShot(crate::oneshot::OneShotUrl),
     /// An HTML form control: indices into the document's `forms`.
     Form {
         form: usize,
@@ -31,6 +33,7 @@ impl fmt::Display for Link {
             Link::Gopher(url) => url.fmt(f),
             Link::Gemini(url) => url.fmt(f),
             Link::Http(url) => url.fmt(f),
+            Link::OneShot(url) => url.fmt(f),
             Link::Form { .. } => f.write_str("form control"),
             Link::External(url) => f.write_str(url),
         }

@@ -85,6 +85,9 @@ pub fn absolute_link(target: &str) -> Option<Link> {
     if let Some(url) = crate::http::parse_url(target) {
         return Some(Link::Http(url));
     }
+    if let Some(url) = crate::oneshot::OneShotUrl::parse(target) {
+        return Some(Link::OneShot(url));
+    }
     let colon = target.find(':')?;
     let scheme = &target[..colon];
     let valid_scheme = !scheme.is_empty()
@@ -173,6 +176,8 @@ pub struct Response {
     pub status: u8,
     pub meta: String,
     pub body: Vec<u8>,
+    /// Whether a client identity was presented for this request.
+    pub identity: bool,
 }
 
 /// Fetch a URL, following up to `MAX_REDIRECTS` 3x redirects.
@@ -202,7 +207,9 @@ async fn fetch_once(url: &GeminiUrl) -> Result<Response, String> {
         .map_err(|e| e.to_string())?;
     let _ = stream.set_nodelay(true);
     let name = tls::server_name(&url.host)?;
-    let mut stream = tls::connector(&url.host, url.port)
+    // The host's client identity rides along when one is on file.
+    let (connector, identity) = tls::gemini_connector(&url.host, url.port)?;
+    let mut stream = connector
         .connect(name, stream)
         .await
         .map_err(|e| format!("TLS: {e}"))?;
@@ -258,6 +265,7 @@ async fn fetch_once(url: &GeminiUrl) -> Result<Response, String> {
         status,
         meta,
         body,
+        identity,
     })
 }
 
@@ -453,6 +461,146 @@ mod tests {
             (10, "What is your handle?")
         );
         assert!(response.body.is_empty());
+
+        server.abort();
+    }
+
+    /// A capsule that wants a client certificate: bare visits get 60,
+    /// certified ones get content — the astrobotany flow.
+    #[tokio::test]
+    async fn status_60_then_identity_roundtrip() {
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio_rustls::TlsAcceptor;
+        use tokio_rustls::rustls::client::danger::HandshakeSignatureValid;
+        use tokio_rustls::rustls::crypto::CryptoProvider;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
+        use tokio_rustls::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+        use tokio_rustls::rustls::{
+            DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig,
+            SignatureScheme,
+        };
+
+        unsafe {
+            std::env::set_var(
+                "TRUST_KNOWN_HOSTS",
+                std::env::temp_dir().join(format!("trust-test-kh-{}", std::process::id())),
+            );
+            std::env::set_var(
+                "TRUST_IDENTITIES",
+                std::env::temp_dir().join(format!("trust-test-ids-{}", std::process::id())),
+            );
+        }
+        tls::ensure_provider();
+
+        /// Accepts any client certificate (the capsule convention:
+        /// identity is the cert itself, pinned on first use).
+        #[derive(Debug)]
+        struct AnyClient;
+        impl ClientCertVerifier for AnyClient {
+            fn root_hint_subjects(&self) -> &[DistinguishedName] {
+                &[]
+            }
+            fn client_auth_mandatory(&self) -> bool {
+                false
+            }
+            fn verify_client_cert(
+                &self,
+                _: &CertificateDer<'_>,
+                _: &[CertificateDer<'_>],
+                _: UnixTime,
+            ) -> Result<ClientCertVerified, TlsError> {
+                Ok(ClientCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                m: &[u8],
+                c: &CertificateDer<'_>,
+                d: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, TlsError> {
+                tokio_rustls::rustls::crypto::verify_tls12_signature(
+                    m,
+                    c,
+                    d,
+                    &CryptoProvider::get_default()
+                        .unwrap()
+                        .signature_verification_algorithms,
+                )
+            }
+            fn verify_tls13_signature(
+                &self,
+                m: &[u8],
+                c: &CertificateDer<'_>,
+                d: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, TlsError> {
+                tokio_rustls::rustls::crypto::verify_tls13_signature(
+                    m,
+                    c,
+                    d,
+                    &CryptoProvider::get_default()
+                        .unwrap()
+                        .signature_verification_algorithms,
+                )
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                CryptoProvider::get_default()
+                    .unwrap()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        let signed = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let key = PrivateKeyDer::try_from(signed.signing_key.serialize_der()).unwrap();
+        let config = ServerConfig::builder()
+            .with_client_cert_verifier(Arc::new(AnyClient))
+            .with_single_cert(vec![signed.cert.der().clone()], key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut stream) = acceptor.accept(sock).await else {
+                    continue;
+                };
+                let mut req = Vec::new();
+                let mut byte = [0u8; 1];
+                while !req.ends_with(b"\r\n") {
+                    match stream.read(&mut byte).await {
+                        Ok(1..) => req.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let reply: &[u8] = match stream.get_ref().1.peer_certificates() {
+                    Some(_) => b"20 text/gemini\r\nWelcome back, certified user.\n",
+                    None => b"60 Certificate required\r\n",
+                };
+                let _ = stream.write_all(reply).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let url = GeminiUrl {
+            host: String::from("127.0.0.1"),
+            port,
+            path: String::from("/garden"),
+        };
+        // Anonymous visit: turned away with a 60.
+        let response = fetch(&url).await.unwrap();
+        assert_eq!((response.status, response.identity), (60, false));
+        assert_eq!(response.meta, "Certificate required");
+
+        // Mint the identity (what the status-60 prompt does), retry:
+        // recognized, and the response records that a cert was sent.
+        tls::create_identity("127.0.0.1", "talkie").unwrap();
+        let response = fetch(&url).await.unwrap();
+        assert_eq!((response.status, response.identity), (20, true));
+        assert_eq!(response.body, b"Welcome back, certified user.\n");
 
         server.abort();
     }
