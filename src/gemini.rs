@@ -270,14 +270,7 @@ pub fn parse(url: &GeminiUrl, meta: &str, body: &[u8], width: usize) -> Doc {
     let lines = if media.is_empty() || media == "text/gemini" {
         parse_gemtext(body, width, &|target| resolve(url, target))
     } else if media.starts_with("text/") {
-        String::from_utf8_lossy(body)
-            .lines()
-            .flat_map(|l| {
-                let mut out = Vec::new();
-                push_wrapped(&mut out, Kind::Text, l.trim_end().to_string(), None, width);
-                out
-            })
-            .collect()
+        crate::doc::wrap_plain(&String::from_utf8_lossy(body), width)
     } else {
         vec![DocLine {
             kind: Kind::Error,
@@ -322,7 +315,9 @@ pub fn parse_gemtext(
                 text: line.to_string(),
                 link: None,
             });
-        } else if let Some(rest) = line.strip_prefix("=>") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("=>") {
             let rest = rest.trim_start();
             let (target, label) = match rest.split_once(char::is_whitespace) {
                 Some((t, l)) => (t, l.trim()),
@@ -338,49 +333,22 @@ pub fn parse_gemtext(
                 label.to_string()
             };
             push_wrapped(&mut lines, Kind::GemLink, text, Some(link), width);
-        } else if let Some(rest) = line.strip_prefix("###") {
-            push_wrapped(
-                &mut lines,
-                Kind::Heading(3),
-                rest.trim().to_string(),
-                None,
-                width,
-            );
-        } else if let Some(rest) = line.strip_prefix("##") {
-            push_wrapped(
-                &mut lines,
-                Kind::Heading(2),
-                rest.trim().to_string(),
-                None,
-                width,
-            );
-        } else if let Some(rest) = line.strip_prefix('#') {
-            push_wrapped(
-                &mut lines,
-                Kind::Heading(1),
-                rest.trim().to_string(),
-                None,
-                width,
-            );
-        } else if let Some(rest) = line.strip_prefix("* ") {
-            push_wrapped(
-                &mut lines,
-                Kind::List,
-                format!("• {}", rest.trim()),
-                None,
-                width,
-            );
-        } else if let Some(rest) = line.strip_prefix('>') {
-            push_wrapped(
-                &mut lines,
-                Kind::Quote,
-                format!("▌ {}", rest.trim()),
-                None,
-                width,
-            );
-        } else {
-            push_wrapped(&mut lines, Kind::Text, line.to_string(), None, width);
+            continue;
         }
+        let (kind, text) = if let Some(rest) = line.strip_prefix("###") {
+            (Kind::Heading(3), rest.trim().to_string())
+        } else if let Some(rest) = line.strip_prefix("##") {
+            (Kind::Heading(2), rest.trim().to_string())
+        } else if let Some(rest) = line.strip_prefix('#') {
+            (Kind::Heading(1), rest.trim().to_string())
+        } else if let Some(rest) = line.strip_prefix("* ") {
+            (Kind::List, format!("• {}", rest.trim()))
+        } else if let Some(rest) = line.strip_prefix('>') {
+            (Kind::Quote, format!("▌ {}", rest.trim()))
+        } else {
+            (Kind::Text, line.to_string())
+        };
+        push_wrapped(&mut lines, kind, text, None, width);
     }
     lines
 }

@@ -4,6 +4,7 @@ mod doc;
 mod gemini;
 mod gopher;
 mod http;
+mod img;
 mod telnet;
 mod tls;
 mod ui;
@@ -28,10 +29,17 @@ async fn main() -> ExitCode {
     };
 
     let terminal = ratatui::init();
+    // Query the terminal for its graphics protocol and font size. This
+    // talks on stdin/stdout, so it must happen before the event stream
+    // exists (which would eat the reply) — hence here, not in App.
+    let picker = ratatui_image::picker::Picker::from_query_stdio()
+        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
     // Capture the mouse so wheel events scroll our scrollback instead of
     // being translated into arrow keys by the terminal emulator.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-    let result = app::App::new(host, port).run(terminal).await;
+    let mut app = app::App::new(host, port);
+    app.set_picker(picker);
+    let result = app.run(terminal).await;
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
 

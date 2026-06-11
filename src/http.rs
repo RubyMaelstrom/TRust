@@ -302,20 +302,7 @@ pub fn parse_seeded(
         forms = found;
         lines
     } else if media.starts_with("text/") {
-        let text = decode_body(content_type, body);
-        text.lines()
-            .flat_map(|l| {
-                let mut out = Vec::new();
-                crate::doc::push_wrapped(
-                    &mut out,
-                    Kind::Text,
-                    l.trim_end().to_string(),
-                    None,
-                    width,
-                );
-                out
-            })
-            .collect()
+        crate::doc::wrap_plain(&decode_body(content_type, body), width)
     } else {
         vec![DocLine {
             kind: Kind::Error,
