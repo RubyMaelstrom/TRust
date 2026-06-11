@@ -131,6 +131,16 @@ Web specifics:
 - `post <url> [body]` sends a form-urlencoded POST and renders the
   response. Links between the webs interconnect: gemtext and gopher
   pages can link to http(s) and vice versa.
+- **HTML forms work.** Controls render as selectable widget rows in
+  document order: text/password/textarea fields as amber `[name: value]`
+  rows (Enter opens the `input>` prompt, pre-filled for re-edits),
+  checkboxes `[x]`/radios `(*)` toggle on Enter, selects `[name: opt ▾]`
+  cycle their options, and submit buttons `[ label ]` fire the form —
+  GET serializes into the action's query string, POST goes
+  form-urlencoded. Hidden fields ride along silently; forms without a
+  submit control get a synthetic `[ Submit ]`. Typed values survive
+  resize re-wraps. File uploads and multipart encoding are not
+  supported. This is how search engines (and HTML chat apps) work.
 
 ## Architecture
 
@@ -203,8 +213,11 @@ Design notes:
 - [ ] Gemini client certificates (status 6x)
 - [x] HTTP(S) Phase A: hand-rolled HTTP/1.1 (GET + POST), WebPKI
       validation, html2text rendering, images as placeholder links
-- [ ] HTTP Phase B/C: GET-forms (search engines!), image viewer
-      (planning discussion first — SOTA ratatui options)
+- [x] HTTP Phase B: HTML forms — text/hidden/password/textarea,
+      checkbox/radio/select, GET and POST submission (search engines
+      and form-driven apps work)
+- [ ] HTTP Phase C: image viewer (planning discussion first — SOTA
+      ratatui options)
 - [ ] Finger (79), WHOIS (43), DICT (2628) — trivial one-shot
       personalities
 - SSH is an explicit non-goal. **JavaScript is an explicit non-goal**:

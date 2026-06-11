@@ -21,11 +21,12 @@ use crate::ui;
 
 /// What the input field feeds, mirroring GNU telnet's two states: lines go
 /// to the remote host, or to the `telnet>` command prompt reached with Ctrl-].
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Session,
     Command,
-    /// Query entry for a gopher type-7 search item.
+    /// Query entry for a gopher type-7 search, a gemini 1x input, or an
+    /// HTML form field (the target lives in `search_target`).
     Search,
 }
 
@@ -261,8 +262,12 @@ pub struct App {
     pub browser: Option<BrowserView>,
     /// In-flight fetch, if any.
     fetch_rx: Option<mpsc::Receiver<FetchMsg>>,
-    /// The gopher type-7 item or gemini 1x URL awaiting a query.
-    search_target: Option<Link>,
+    /// The gopher type-7 item, gemini 1x URL, or form field awaiting
+    /// input (pub so the UI can label the prompt accordingly).
+    pub(crate) search_target: Option<Link>,
+    /// A fetch just failed (or came back empty): the status bar shows
+    /// the message even while a link is selected, until the next key.
+    pub(crate) notice: bool,
     conn: Option<telnet::Handle>,
     events: Option<mpsc::Receiver<telnet::Event>>,
     quit: bool,
@@ -299,6 +304,7 @@ impl App {
             browser: None,
             fetch_rx: None,
             search_target: None,
+            notice: false,
             conn: None,
             events: None,
             quit: false,
@@ -730,6 +736,7 @@ impl App {
                     .await
                     .map(Payload::Http),
                 Link::External(url) => Err(format!("cannot fetch foreign scheme: {url}")),
+                Link::Form { .. } => Err(String::from("form controls are not fetchable")),
             };
             let _ = tx.send(FetchMsg { target, result }).await;
         });
@@ -762,6 +769,7 @@ impl App {
 
     fn on_fetch(&mut self, msg: FetchMsg) {
         self.fetch_rx = None;
+        self.notice = false;
         let width = (self.last_inner.0 as usize).max(10);
         match (msg.result, msg.target) {
             (Ok(Payload::Gopher(raw)), Link::Gopher(url)) => {
@@ -772,7 +780,10 @@ impl App {
             }
             (Ok(Payload::Gemini(response)), _) => self.on_gemini_response(response, width),
             (Ok(Payload::Http(response)), _) => self.on_http_response(response, width),
-            (Err(err), target) => self.status = format!("{target} — {err}"),
+            (Err(err), target) => {
+                self.status = format!("{target} — {err}");
+                self.notice = true;
+            }
             _ => {}
         }
     }
@@ -809,9 +820,11 @@ impl App {
                     "{}: requires a client certificate (status {}) — not supported yet",
                     response.url, response.status
                 );
+                self.notice = true;
             }
             status => {
                 self.status = format!("{}: {} {}", response.url, status, response.meta);
+                self.notice = true;
             }
         }
     }
@@ -821,7 +834,11 @@ impl App {
     /// code always lands in the status bar.
     fn on_http_response(&mut self, response: http::Response, width: usize) {
         if response.body.is_empty() {
-            self.status = format!("{}: HTTP {}", response.url, response.status);
+            self.status = format!(
+                "{}: HTTP {} (empty response)",
+                response.url, response.status
+            );
+            self.notice = true;
             return;
         }
         let doc = http::parse(&response.url, &response.content_type, &response.body, width);
@@ -869,6 +886,7 @@ impl App {
     /// gopherus keys: Up/Down scroll the page (the highlight rides the
     /// visible links), Right follows, Left goes back, Esc closes.
     fn browser_nav(&mut self, key: KeyEvent) {
+        self.notice = false;
         let page = i64::from(self.last_inner.1.max(2)) - 1;
         match key.code {
             KeyCode::Up => self.browser_arrow(-1),
@@ -975,9 +993,11 @@ impl App {
             }
             Link::Http(url) => {
                 let meta = g.doc.meta.clone().unwrap_or_default();
-                http::parse(&url, &meta, &raw, width)
+                // Seed so typed-in form values survive the re-parse.
+                let forms = std::mem::take(&mut g.doc.forms);
+                http::parse_seeded(&url, &meta, &raw, width, Some(&forms))
             }
-            Link::External(_) => return,
+            Link::Form { .. } | Link::External(_) => return,
         };
         g.selected = link_ordinal.and_then(|n| {
             g.doc
@@ -1099,10 +1119,84 @@ impl App {
             },
             Link::Gemini(url) => self.start_fetch(Link::Gemini(url)),
             Link::Http(url) => self.start_fetch(Link::Http(url)),
+            Link::Form { form, field } => self.form_interact(form, field),
             Link::External(target) => {
                 self.status = format!("external link: {target}");
             }
         }
+    }
+
+    /// Enter on a form control: edit, toggle, cycle, or submit per kind.
+    fn form_interact(&mut self, form: usize, field: usize) {
+        use crate::doc::FieldKind;
+        let Some(g) = &mut self.browser else { return };
+        let Some((kind, name, value)) = g
+            .doc
+            .forms
+            .get(form)
+            .and_then(|f| f.fields.get(field))
+            .map(|f| (f.kind.clone(), f.name.clone(), f.value.clone()))
+        else {
+            return;
+        };
+        match kind {
+            FieldKind::Text | FieldKind::Password | FieldKind::Textarea => {
+                self.input = value;
+                self.cursor = self.input.chars().count();
+                self.search_target = Some(Link::Form { form, field });
+                self.mode = Mode::Search;
+                self.status = format!("Editing {name} — Enter sets, Esc cancels.");
+            }
+            FieldKind::Checkbox => {
+                let f = &mut g.doc.forms[form].fields[field];
+                f.checked = !f.checked;
+                self.refresh_forms();
+            }
+            FieldKind::Radio => {
+                for (i, f) in g.doc.forms[form].fields.iter_mut().enumerate() {
+                    if f.kind == FieldKind::Radio && f.name == name {
+                        f.checked = i == field;
+                    }
+                }
+                self.refresh_forms();
+            }
+            FieldKind::Select(options) => {
+                let f = &mut g.doc.forms[form].fields[field];
+                let current = options.iter().position(|(_, v)| *v == f.value).unwrap_or(0);
+                f.value = options[(current + 1) % options.len()].1.clone();
+                self.refresh_forms();
+            }
+            FieldKind::Submit => self.submit_form(form, field),
+            FieldKind::Hidden => {}
+        }
+    }
+
+    /// Fire a form: GET serializes into the action's query string,
+    /// POST goes form-urlencoded through the existing post plumbing.
+    fn submit_form(&mut self, form: usize, pressed: usize) {
+        use crate::doc::FormMethod;
+        let Some(form) = self.browser.as_ref().and_then(|g| g.doc.forms.get(form)) else {
+            return;
+        };
+        let query = form.encode(pressed);
+        let action = form.action.clone();
+        match form.method {
+            FormMethod::Get => {
+                let mut url = action;
+                url.set_query((!query.is_empty()).then_some(query.as_str()));
+                self.start_fetch(Link::Http(url));
+            }
+            FormMethod::Post => self.start_post(action, query),
+        }
+    }
+
+    /// Re-render the page after a form value changed: force the wrap
+    /// sync's re-parse, which seeds the fresh parse from live form state.
+    fn refresh_forms(&mut self) {
+        if let Some(g) = &mut self.browser {
+            g.doc.wrapped_to = 0;
+        }
+        self.sync_browser_wrap();
     }
 
     fn browser_back(&mut self) {
@@ -1135,6 +1229,24 @@ impl App {
                     ..base
                 };
                 self.start_fetch(Link::Gemini(url));
+            }
+            // A form field edit: store the value and re-render the page.
+            Some(Link::Form { form, field }) => {
+                if let Some(g) = &mut self.browser
+                    && let Some(f) = g
+                        .doc
+                        .forms
+                        .get_mut(form)
+                        .and_then(|f| f.fields.get_mut(field))
+                {
+                    f.value = query.to_string();
+                    self.status = if f.name.is_empty() {
+                        String::from("Field set.")
+                    } else {
+                        format!("{} set.", f.name)
+                    };
+                }
+                self.refresh_forms();
             }
             _ => {}
         }
@@ -1334,6 +1446,7 @@ fn encode_key(key: KeyEvent, crlf: bool) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{HISTORY_CAP, History};
+    use crate::doc::Link;
 
     #[test]
     fn recalls_entries_and_restores_draft() {
@@ -1495,6 +1608,7 @@ mod tests {
             wrapped_to: 80,
             cp437: false,
             meta: None,
+            forms: Vec::new(),
         }
     }
 
@@ -1661,5 +1775,102 @@ mod tests {
         }
         assert_eq!(h.entries.len(), HISTORY_CAP);
         assert_eq!(h.entries[0], "line 10");
+    }
+
+    /// A page shaped like rubymaelstrom.com/chat, in the browser.
+    fn chat_app() -> super::App {
+        let html = r#"
+            <p>Talkie says hello.</p>
+            <form method="POST" action="/chat">
+              <input type="hidden" name="session" value="cafe123">
+              <input type="text" name="msg" placeholder="Type a message...">
+              <button type="submit">Send</button>
+            </form>"#;
+        let base = url::Url::parse("https://example.com/chat").unwrap();
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (60, 10);
+        app.navigate_to(crate::http::parse(&base, "text/html", html.as_bytes(), 60));
+        app
+    }
+
+    #[test]
+    fn form_field_edits_through_the_input_prompt() {
+        let mut app = chat_app();
+        let g = app.browser.as_ref().unwrap();
+        let field_row = g
+            .doc
+            .lines
+            .iter()
+            .position(|l| l.link == Some(Link::Form { form: 0, field: 1 }))
+            .expect("the msg widget row");
+        app.browser.as_mut().unwrap().selected = Some(field_row);
+
+        // Enter on the field opens the input prompt (empty: no value yet).
+        app.browser_follow();
+        assert_eq!(app.mode, super::Mode::Search);
+        assert_eq!(
+            app.search_target,
+            Some(Link::Form { form: 0, field: 1 }),
+            "prompt is aimed at the field"
+        );
+        assert_eq!(app.input, "");
+
+        // Submitting the prompt stores the value and re-renders the row.
+        app.mode = super::Mode::Search; // as the Enter handler leaves it
+        app.run_search("hello there");
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.doc.forms[0].fields[1].value, "hello there");
+        assert!(
+            g.doc
+                .lines
+                .iter()
+                .any(|l| l.text.contains("[msg: hello there]")),
+            "widget row shows the value"
+        );
+
+        // Re-editing prefills the prompt with the current value.
+        app.browser.as_mut().unwrap().selected = g
+            .doc
+            .lines
+            .iter()
+            .position(|l| l.link == Some(Link::Form { form: 0, field: 1 }));
+        app.browser_follow();
+        assert_eq!(app.input, "hello there");
+        assert_eq!(app.cursor, "hello there".chars().count());
+    }
+
+    #[test]
+    fn form_selects_cycle_and_checkboxes_toggle() {
+        let html = r#"
+            <form action="/s">
+              <select name="region">
+                <option value="all" selected>Everywhere</option>
+                <option value="us">United States</option>
+              </select>
+              <input type="checkbox" name="safe">
+              <input type="submit" value="Go">
+            </form>"#;
+        let base = url::Url::parse("http://search.example/").unwrap();
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (60, 10);
+        app.navigate_to(crate::http::parse(&base, "text/html", html.as_bytes(), 60));
+
+        app.form_interact(0, 0); // cycle the select
+        let forms = &app.browser.as_ref().unwrap().doc.forms;
+        assert_eq!(forms[0].fields[0].value, "us");
+        let g = app.browser.as_ref().unwrap();
+        assert!(
+            g.doc
+                .lines
+                .iter()
+                .any(|l| l.text == "[region: United States ▾]")
+        );
+
+        app.form_interact(0, 1); // toggle the box
+        let g = app.browser.as_ref().unwrap();
+        assert!(g.doc.forms[0].fields[1].checked);
+        assert!(g.doc.lines.iter().any(|l| l.text == "[x] safe"));
+        // The cycled select survived the toggle's re-render (seeding).
+        assert_eq!(g.doc.forms[0].fields[0].value, "us");
     }
 }

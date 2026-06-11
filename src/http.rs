@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use url::Url;
 
-use crate::doc::{Doc, DocLine, Kind, Link};
+use crate::doc::{Doc, DocLine, Field, FieldKind, Form, FormMethod, Kind, Link};
 use crate::tls;
 
 const MAX_BODY: usize = 5 * 1024 * 1024;
@@ -277,6 +277,18 @@ fn decode_body(content_type: &str, body: &[u8]) -> String {
 
 /// Render a response body into a document.
 pub fn parse(url: &Url, content_type: &str, body: &[u8], width: usize) -> Doc {
+    parse_seeded(url, content_type, body, width, None)
+}
+
+/// Like `parse`, seeding form field values from a previous parse of the
+/// same page (resize re-wraps and edits must not lose what was typed).
+pub fn parse_seeded(
+    url: &Url,
+    content_type: &str,
+    body: &[u8],
+    width: usize,
+    seed: Option<&[Form]>,
+) -> Doc {
     let width = width.max(10);
     let media = content_type
         .split(';')
@@ -284,8 +296,11 @@ pub fn parse(url: &Url, content_type: &str, body: &[u8], width: usize) -> Doc {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
+    let mut forms = Vec::new();
     let lines = if media.is_empty() || media == "text/html" || media == "application/xhtml+xml" {
-        html_to_lines(url, &decode_body(content_type, body), width)
+        let (lines, found) = html_to_lines(url, &decode_body(content_type, body), width, seed);
+        forms = found;
+        lines
     } else if media.starts_with("text/") {
         let text = decode_body(content_type, body);
         text.lines()
@@ -315,6 +330,7 @@ pub fn parse(url: &Url, content_type: &str, body: &[u8], width: usize) -> Doc {
         wrapped_to: width,
         cp437: false,
         meta: Some(content_type.to_string()),
+        forms,
     }
 }
 
@@ -335,22 +351,56 @@ fn resolve(base: &Url, target: &str) -> Link {
     }
 }
 
+/// What an annotated span turned out to be.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Found {
+    Anchor,
+    Image,
+    /// Form control rows (from marker images): input widget or submit.
+    Input,
+    Button,
+}
+
+/// The src prefix of the marker `<img>` nodes form controls become; the
+/// suffix is `form.field` indices into the extracted forms.
+const FORM_MARKER: &str = "x-trust-form:";
+
 /// Convert HTML to document lines via html2text's rich mode. Lines come
 /// back pre-wrapped to `width`. A line with exactly one link target
 /// carries it directly; lines with several emit one indented `→ label`
 /// row per link below the text, keeping our one-link-per-line model.
-fn html_to_lines(base: &Url, html: &str, width: usize) -> Vec<DocLine> {
+/// Form controls were rewritten into block marker images by
+/// `extract_forms`, so each arrives as its own row.
+fn html_to_lines(
+    base: &Url,
+    html: &str,
+    width: usize,
+    seed: Option<&[Form]>,
+) -> (Vec<DocLine>, Vec<Form>) {
     use html2text::render::RichAnnotation;
 
-    let rendered = match html2text::config::rich().lines_from_read(html.as_bytes(), width) {
-        Ok(lines) => lines,
-        Err(err) => {
-            return vec![DocLine {
+    let error_doc = |err: String| {
+        (
+            vec![DocLine {
                 kind: Kind::Error,
-                text: format!("could not render HTML: {err}"),
+                text: err,
                 link: None,
-            }];
-        }
+            }],
+            Vec::new(),
+        )
+    };
+    let config = html2text::config::rich();
+    let dom = match config.parse_html(html.as_bytes()) {
+        Ok(dom) => dom,
+        Err(err) => return error_doc(format!("could not parse HTML: {err}")),
+    };
+    let forms = extract_forms(&dom, base, seed);
+    let rendered = match config
+        .dom_to_render_tree(&dom)
+        .and_then(|tree| config.render_to_lines(tree, width))
+    {
+        Ok(lines) => lines,
+        Err(err) => return error_doc(format!("could not render HTML: {err}")),
     };
 
     let mut lines: Vec<DocLine> = Vec::new();
@@ -358,8 +408,8 @@ fn html_to_lines(base: &Url, html: &str, width: usize) -> Vec<DocLine> {
     for tagged in rendered {
         let mut text = String::new();
         let mut pre = false;
-        // (target, label, is_image) per annotated span, deduplicated.
-        let mut found: Vec<(Link, String, bool)> = Vec::new();
+        // (target, label, what) per annotated span, deduplicated.
+        let mut found: Vec<(Link, String, Found)> = Vec::new();
         for piece in tagged.tagged_strings() {
             text.push_str(&piece.s);
             for annotation in &piece.tag {
@@ -368,10 +418,16 @@ fn html_to_lines(base: &Url, html: &str, width: usize) -> Vec<DocLine> {
                         let link = resolve(base, href);
                         match found.iter_mut().find(|(l, _, _)| *l == link) {
                             Some((_, label, _)) => label.push_str(&piece.s),
-                            None => found.push((link, piece.s.clone(), false)),
+                            None => found.push((link, piece.s.clone(), Found::Anchor)),
                         }
                     }
                     RichAnnotation::Image(src) => {
+                        if let Some((link, what)) = form_marker(src, &forms) {
+                            if !found.iter().any(|(l, _, _)| *l == link) {
+                                found.push((link, piece.s.trim().to_string(), what));
+                            }
+                            continue;
+                        }
                         let link = resolve(base, src);
                         if !found.iter().any(|(l, _, _)| *l == link) {
                             let alt = if piece.s.trim().is_empty() {
@@ -379,7 +435,7 @@ fn html_to_lines(base: &Url, html: &str, width: usize) -> Vec<DocLine> {
                             } else {
                                 piece.s.trim().to_string()
                             };
-                            found.push((link, format!("[img: {alt}]"), true));
+                            found.push((link, format!("[img: {alt}]"), Found::Image));
                         }
                     }
                     RichAnnotation::Preformat(_) => pre = true,
@@ -410,17 +466,17 @@ fn html_to_lines(base: &Url, html: &str, width: usize) -> Vec<DocLine> {
                 previous_carried = None;
             }
             1 => {
-                let (link, label, is_image) = found.into_iter().next().unwrap();
+                let (link, label, what) = found.into_iter().next().unwrap();
                 // A wrapped link paragraph repeats its target on every
                 // row; only the first row of a run is selectable.
                 let carried = (previous_carried.as_ref() != Some(&link)).then(|| link.clone());
                 previous_carried = Some(link);
-                let (kind, text) = if is_image {
-                    (Kind::OtherLink, label)
-                } else if kind == Kind::Text {
-                    (Kind::GemLink, display)
-                } else {
-                    (kind, display)
+                let (kind, text) = match what {
+                    Found::Image => (Kind::OtherLink, label),
+                    Found::Input => (Kind::Input, display),
+                    Found::Button => (Kind::Button, display),
+                    Found::Anchor if kind == Kind::Text => (Kind::GemLink, display),
+                    Found::Anchor => (kind, display),
                 };
                 lines.push(DocLine {
                     kind,
@@ -434,12 +490,13 @@ fn html_to_lines(base: &Url, html: &str, width: usize) -> Vec<DocLine> {
                     text: display,
                     link: None,
                 });
-                for (link, label, is_image) in found {
+                for (link, label, what) in found {
                     lines.push(DocLine {
-                        kind: if is_image {
-                            Kind::OtherLink
-                        } else {
-                            Kind::GemLink
+                        kind: match what {
+                            Found::Image => Kind::OtherLink,
+                            Found::Input => Kind::Input,
+                            Found::Button => Kind::Button,
+                            Found::Anchor => Kind::GemLink,
                         },
                         text: format!("  → {}", label.trim()),
                         link: Some(link),
@@ -451,7 +508,300 @@ fn html_to_lines(base: &Url, html: &str, width: usize) -> Vec<DocLine> {
     }
     // Trim runs of blank lines html2text leaves between blocks.
     lines.dedup_by(|a, b| a.text.is_empty() && b.text.is_empty() && a.link.is_none());
-    lines
+    (lines, forms)
+}
+
+/// Decode a marker image src into a form-control link.
+fn form_marker(src: &str, forms: &[Form]) -> Option<(Link, Found)> {
+    let (form, field) = src.strip_prefix(FORM_MARKER)?.split_once('.')?;
+    let (form, field): (usize, usize) = (form.parse().ok()?, field.parse().ok()?);
+    let what = match forms.get(form)?.fields.get(field)?.kind {
+        FieldKind::Submit => Found::Button,
+        _ => Found::Input,
+    };
+    Some((Link::Form { form, field }, what))
+}
+
+/// Walk the parsed DOM, collect every `<form>` into the model, and
+/// replace each rendering control with a block marker
+/// (`<div><img src="x-trust-form:F.I" alt="[widget row]"></div>`), so
+/// the widget lands at the control's document position as its own row.
+///
+/// html2text re-exports the rcdom `Element` variant but not `Text`, so
+/// a marker `<img>` — whose label renders from its alt *attribute* — is
+/// the one node we can fabricate, by parsing a snippet and splicing the
+/// result into the page.
+fn extract_forms(dom: &html2text::RcDom, base: &Url, seed: Option<&[Form]>) -> Vec<Form> {
+    let mut forms = Vec::new();
+    // (parent, child index) per rendering control; usize::MAX appends
+    // (used for the synthetic submit of button-less forms).
+    let mut slots: Vec<(html2text::Handle, usize, usize, usize)> = Vec::new();
+    walk_forms(&dom.document, None, base, &mut forms, &mut slots);
+
+    // Seed values typed into a previous parse of this page, as long as
+    // the form shape still matches (same page, different width).
+    if let Some(seed) = seed {
+        for (new, old) in forms.iter_mut().zip(seed) {
+            if new.fields.len() == old.fields.len()
+                && new
+                    .fields
+                    .iter()
+                    .zip(&old.fields)
+                    .all(|(a, b)| a.name == b.name)
+            {
+                for (a, b) in new.fields.iter_mut().zip(&old.fields) {
+                    a.value = b.value.clone();
+                    a.checked = b.checked;
+                }
+            }
+        }
+    }
+
+    // Labels bake the (possibly seeded) values in, so inject last.
+    for (parent, index, form, field) in slots {
+        let label = forms[form].fields[field].row_label();
+        let Some(marker) = marker_node(form, field, &label) else {
+            continue;
+        };
+        let mut children = parent.children.borrow_mut();
+        if index == usize::MAX {
+            children.push(marker);
+        } else {
+            children[index] = marker;
+        }
+    }
+    forms
+}
+
+fn walk_forms(
+    node: &html2text::Handle,
+    current: Option<usize>,
+    base: &Url,
+    forms: &mut Vec<Form>,
+    slots: &mut Vec<(html2text::Handle, usize, usize, usize)>,
+) {
+    let children: Vec<html2text::Handle> = node.children.borrow().clone();
+    for (index, child) in children.iter().enumerate() {
+        match child.element_name().as_deref() {
+            Some("form") => {
+                let method = match attr(child, "method").as_deref() {
+                    Some(m) if m.eq_ignore_ascii_case("post") => FormMethod::Post,
+                    _ => FormMethod::Get,
+                };
+                let action = base
+                    .join(attr(child, "action").as_deref().unwrap_or(""))
+                    .unwrap_or_else(|_| base.clone());
+                forms.push(Form {
+                    method,
+                    action,
+                    fields: Vec::new(),
+                });
+                let form = forms.len() - 1;
+                walk_forms(child, Some(form), base, forms, slots);
+                // A form with no submit control still needs a trigger.
+                if !forms[form].fields.is_empty()
+                    && !forms[form]
+                        .fields
+                        .iter()
+                        .any(|f| f.kind == FieldKind::Submit)
+                {
+                    forms[form].fields.push(Field {
+                        name: String::new(),
+                        value: String::new(),
+                        checked: false,
+                        label: String::from("Submit"),
+                        kind: FieldKind::Submit,
+                    });
+                    slots.push((
+                        child.clone(),
+                        usize::MAX,
+                        form,
+                        forms[form].fields.len() - 1,
+                    ));
+                }
+            }
+            Some(tag @ ("input" | "button" | "select" | "textarea")) => {
+                let Some(form) = current else { continue };
+                let Some(field) = field_from(child, tag) else {
+                    continue;
+                };
+                let renders = field.kind != FieldKind::Hidden;
+                forms[form].fields.push(field);
+                if renders {
+                    slots.push((node.clone(), index, form, forms[form].fields.len() - 1));
+                }
+            }
+            _ => walk_forms(child, current, base, forms, slots),
+        }
+    }
+}
+
+/// Build a Field from a control element, or None for controls we drop
+/// (file uploads, script-only buttons, empty selects).
+fn field_from(node: &html2text::Handle, tag: &str) -> Option<Field> {
+    let name = attr(node, "name").unwrap_or_default();
+    let value = attr(node, "value").unwrap_or_default();
+    let checked = attr(node, "checked").is_some();
+    let mut label = String::new();
+    let kind = match tag {
+        "input" => {
+            let ty = attr(node, "type").unwrap_or_default().to_ascii_lowercase();
+            match ty.as_str() {
+                "hidden" => FieldKind::Hidden,
+                "password" => FieldKind::Password,
+                "checkbox" => FieldKind::Checkbox,
+                "radio" => FieldKind::Radio,
+                "submit" | "image" => {
+                    label = if value.is_empty() {
+                        String::from("Submit")
+                    } else {
+                        value.clone()
+                    };
+                    FieldKind::Submit
+                }
+                "button" | "reset" | "file" => return None,
+                // text, search, email, url, ... and the HTML rule that
+                // unknown types behave as text.
+                _ => {
+                    label = attr(node, "placeholder").unwrap_or_default();
+                    FieldKind::Text
+                }
+            }
+        }
+        "button" => {
+            let ty = attr(node, "type").unwrap_or_default().to_ascii_lowercase();
+            if !(ty.is_empty() || ty == "submit") {
+                return None;
+            }
+            let text = text_content(node);
+            label = if !text.is_empty() {
+                text
+            } else if !value.is_empty() {
+                value.clone()
+            } else {
+                String::from("Submit")
+            };
+            FieldKind::Submit
+        }
+        "textarea" => {
+            return Some(Field {
+                name,
+                value: text_content(node),
+                checked: false,
+                label,
+                kind: FieldKind::Textarea,
+            });
+        }
+        "select" => {
+            let mut options: Vec<(String, String)> = Vec::new();
+            let mut selected = None;
+            for option in node.children.borrow().iter() {
+                if option.element_name().as_deref() != Some("option") {
+                    continue;
+                }
+                let text = text_content(option);
+                let value = attr(option, "value").unwrap_or_else(|| text.clone());
+                if attr(option, "selected").is_some() {
+                    selected = Some(options.len());
+                }
+                options.push((text, value));
+            }
+            if options.is_empty() {
+                return None;
+            }
+            let value = options[selected.unwrap_or(0)].1.clone();
+            return Some(Field {
+                name,
+                value,
+                checked: false,
+                label,
+                kind: FieldKind::Select(options),
+            });
+        }
+        _ => return None,
+    };
+    Some(Field {
+        name,
+        value,
+        checked,
+        label,
+        kind,
+    })
+}
+
+/// An attribute value off an element node.
+fn attr(node: &html2text::Handle, want: &str) -> Option<String> {
+    if let html2text::Element { ref attrs, .. } = node.data {
+        for attribute in attrs.borrow().iter() {
+            if &attribute.name.local == want {
+                return Some(attribute.value.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The text inside an element (button labels, option labels, textarea
+/// defaults). rcdom's Text variant isn't matchable from outside, so go
+/// through html5ever serialization and strip the markup back off.
+fn text_content(node: &html2text::Handle) -> String {
+    let mut html = Vec::new();
+    if node.serialize(&mut html).is_err() {
+        return String::new();
+    }
+    let html = String::from_utf8_lossy(&html);
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let out = out
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Fabricate the block marker for one control by parsing a snippet.
+fn marker_node(form: usize, field: usize, label: &str) -> Option<html2text::Handle> {
+    let escaped = label
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;");
+    let snippet = format!("<div><img src=\"{FORM_MARKER}{form}.{field}\" alt=\"{escaped}\"></div>");
+    let dom = html2text::config::rich()
+        .parse_html(snippet.as_bytes())
+        .ok()?;
+    let div = find_element(&dom.document, "div")?;
+    // Detach before the snippet DOM drops: rcdom's Node::drop clears
+    // every descendant's children, live Rc holders or not.
+    if let Some(parent) = div.get_parent() {
+        parent
+            .children
+            .borrow_mut()
+            .retain(|child| !std::rc::Rc::ptr_eq(child, &div));
+    }
+    div.parent.set(None);
+    Some(div)
+}
+
+fn find_element(node: &html2text::Handle, name: &str) -> Option<html2text::Handle> {
+    if node.element_name().as_deref() == Some(name) {
+        return Some(node.clone());
+    }
+    for child in node.children.borrow().iter() {
+        if let Some(found) = find_element(child, name) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// `# Title` → (Heading(1), "Title"), etc.; html2text emits these
@@ -626,5 +976,113 @@ mod tests {
                 Url::parse("https://example.com/cat.png").unwrap()
             ))
         );
+    }
+
+    /// The shape of rubymaelstrom.com/chat: a POST form with a hidden
+    /// session, a text input, and a submit button.
+    const CHAT_PAGE: &str = r#"
+        <html><body>
+        <p>Talkie says hello.</p>
+        <form method="POST" action="/chat">
+          <input type="hidden" name="session" value="cafe123">
+          <input type="text" name="msg" placeholder="Type a message...">
+          <button type="submit">Send</button>
+        </form>
+        </body></html>"#;
+
+    #[test]
+    fn parses_forms_into_widgets() {
+        let base = Url::parse("https://example.com/chat").unwrap();
+        let doc = parse(&base, "text/html", CHAT_PAGE.as_bytes(), 60);
+
+        assert_eq!(doc.forms.len(), 1);
+        let form = &doc.forms[0];
+        assert_eq!(form.method, FormMethod::Post);
+        assert_eq!(form.action.as_str(), "https://example.com/chat");
+        let names: Vec<&str> = form.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["session", "msg", ""]);
+        assert_eq!(form.fields[0].kind, FieldKind::Hidden);
+        assert_eq!(form.fields[1].kind, FieldKind::Text);
+        assert_eq!(form.fields[2].kind, FieldKind::Submit);
+        assert_eq!(form.fields[2].label, "Send");
+
+        let find = |needle: &str| {
+            doc.lines
+                .iter()
+                .find(|l| l.text.contains(needle))
+                .unwrap_or_else(|| panic!("no line containing {needle:?}"))
+        };
+        // The hidden field never renders; the others are widget rows in
+        // document order with the right kinds and control links.
+        assert!(!doc.lines.iter().any(|l| l.text.contains("cafe123")));
+        let input = find("[msg: Type a message...]");
+        assert_eq!(input.kind, Kind::Input);
+        assert_eq!(input.link, Some(Link::Form { form: 0, field: 1 }));
+        let button = find("[ Send ]");
+        assert_eq!(button.kind, Kind::Button);
+        assert_eq!(button.link, Some(Link::Form { form: 0, field: 2 }));
+    }
+
+    #[test]
+    fn seeds_form_values_across_reparse() {
+        let base = Url::parse("https://example.com/chat").unwrap();
+        let mut doc = parse(&base, "text/html", CHAT_PAGE.as_bytes(), 60);
+        doc.forms[0].fields[1].value = String::from("hello there");
+
+        // A resize-style re-parse at another width keeps the value.
+        let rewrapped = parse_seeded(
+            &base,
+            "text/html",
+            CHAT_PAGE.as_bytes(),
+            40,
+            Some(&doc.forms),
+        );
+        assert_eq!(rewrapped.forms[0].fields[1].value, "hello there");
+        assert!(
+            rewrapped
+                .lines
+                .iter()
+                .any(|l| l.text.contains("[msg: hello there]")),
+            "widget row shows the typed value"
+        );
+    }
+
+    #[test]
+    fn renders_get_forms_with_selects_and_boxes() {
+        let base = Url::parse("http://search.example/").unwrap();
+        let html = r#"
+            <form action="lite/search">
+              <input type="text" name="q">
+              <select name="region">
+                <option value="all" selected>Everywhere</option>
+                <option value="us">United States</option>
+              </select>
+              <input type="checkbox" name="safe" checked>
+              <input type="submit" value="Search">
+            </form>"#;
+        let doc = parse(&base, "text/html", html.as_bytes(), 60);
+        let form = &doc.forms[0];
+        assert_eq!(form.method, FormMethod::Get);
+        assert_eq!(form.action.as_str(), "http://search.example/lite/search");
+        assert_eq!(
+            form.fields[1].kind,
+            FieldKind::Select(vec![
+                (String::from("Everywhere"), String::from("all")),
+                (String::from("United States"), String::from("us")),
+            ])
+        );
+        assert_eq!(form.fields[1].value, "all");
+        assert!(doc.lines.iter().any(|l| l.text == "[region: Everywhere ▾]"));
+        assert!(doc.lines.iter().any(|l| l.text == "[x] safe"));
+        assert!(doc.lines.iter().any(|l| l.text == "[ Search ]"));
+    }
+
+    #[test]
+    fn forms_without_submit_get_a_synthetic_one() {
+        let base = Url::parse("http://example.com/").unwrap();
+        let html = r#"<form action="/go"><input type="text" name="q"></form>"#;
+        let doc = parse(&base, "text/html", html.as_bytes(), 60);
+        assert_eq!(doc.forms[0].fields.last().unwrap().kind, FieldKind::Submit);
+        assert!(doc.lines.iter().any(|l| l.text == "[ Submit ]"));
     }
 }

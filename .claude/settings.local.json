@@ -26,7 +26,28 @@
       "Bash(xargs -r kill)",
       "Bash(python3 *)",
       "Bash(git -C /home/ruby/Code/TRust status --short)",
-      "Bash(git -C /home/ruby/Code/TRust log --oneline)"
+      "Bash(git -C /home/ruby/Code/TRust log --oneline)",
+      "Bash(sed -n 3040,3092p /home/ruby/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/html2text-0.17.1/src/lib.rs)",
+      "Bash(sed -n 150,170p /home/ruby/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/html2text-0.17.1/src/lib.rs)",
+      "Bash(sed -n 112,165p /home/ruby/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/html2text-0.17.1/src/markup5ever_rcdom.rs)",
+      "Bash(sed -n 63,110p /home/ruby/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/html2text-0.17.1/src/markup5ever_rcdom.rs)",
+      "Bash(sed -n '510,530p' src/gemini.rs)",
+      "Bash(sed -n '1465,1505p' src/app.rs)",
+      "Bash(sed -n '20,35p' src/app.rs)",
+      "Bash(sed -n '155,170p' src/gopher.rs)",
+      "Bash(sed -n '284,298p' src/gemini.rs)",
+      "Bash(echo \"server pid $!\")",
+      "Bash(curl -s --max-time 15 -A 'TRust/0.1' http://frogfind.com/)",
+      "Bash(curl -s --max-time 15 -A 'TRust/0.1' 'http://frogfind.com/?q=commodore+64')",
+      "Bash(curl -sv --max-time 15 -A 'TRust/0.1' http://frogfind.com/ -o /home/ruby/.claude/jobs/7297f6c1/tmp/frog.html)",
+      "Bash(time curl *)",
+      "Bash(curl -s --max-time 30 -A 'Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\)' 'http://frogfind.com/?q=commodore+64' -w 'UA-moz: status %{http_code}, %{size_download} bytes\\\\n' -o /dev/null)",
+      "Bash(curl -s --max-time 30 'https://lite.duckduckgo.com/lite/?q=commodore+64' -A 'TRust/0.1' -w 'ddg-lite GET: status %{http_code}, %{size_download} bytes\\\\n' -o /dev/null)",
+      "Bash(kill 1902498)",
+      "Bash(ps -eo pid,cmd)",
+      "Bash(awk '/^[ ]*[0-9]+ python3 .*fake_search/ {print $1}')",
+      "Bash(ps -p 1904885 -o pid,cmd=)",
+      "Bash(kill 1904885)"
     ]
   }
 }
