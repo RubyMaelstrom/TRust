@@ -1,6 +1,8 @@
 //! Application state and the main event loop.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use url::Url;
 
 use crossterm::event::{
     Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
@@ -206,12 +208,24 @@ impl ProbeDetector {
 /// in-RAM back history.
 pub struct BrowserView {
     pub doc: Doc,
-    /// The selected link's line index. Always a visible link when one is
-    /// on screen; None while no link is in the viewport.
+    /// The selected link's line index (gopher/gemini line model). Always
+    /// a visible link when one is on screen; None while no link is in the
+    /// viewport.
     pub selected: Option<usize>,
-    /// First visible line.
+    /// The selected item, as `(row, item)`, on an HTTP laid-out doc. The
+    /// HTTP path uses this instead of `selected`; the two are never both
+    /// active (a doc is either laid out or not).
+    pub sel_item: Option<(usize, usize)>,
+    /// First visible line/row.
     pub scroll: usize,
-    history: Vec<(Doc, Option<usize>, usize)>,
+    history: Vec<(Doc, ViewPos, usize)>,
+}
+
+/// A saved selection across history pops — whichever model the doc used.
+#[derive(Clone, Copy, Default)]
+struct ViewPos {
+    selected: Option<usize>,
+    sel_item: Option<(usize, usize)>,
 }
 
 /// What a background fetch produced, by protocol.
@@ -253,12 +267,55 @@ struct ImgMsg {
     result: Result<(Protocol, String), String>,
 }
 
+/// A page image decoded once and kept in RAM: the raw bytes (for the
+/// stateless encode), its pixel size, and the cell box chosen decode-first
+/// from the terminal's font aspect. Layout reads `cell`; the renderer
+/// encodes `raw` to a `Protocol` for that box.
+#[derive(Clone)]
+struct DecodedImage {
+    raw: std::sync::Arc<[u8]>,
+    cell: (u16, u16),
+}
+
+/// One page image finished the parallel fetch+decode pipeline.
+struct ImgLoadMsg {
+    url: String,
+    decoded: Option<DecodedImage>,
+}
+
+/// One inline-image box finished encoding to a terminal protocol.
+struct EncMsg {
+    key: (String, u16, u16),
+    protocol: Option<Protocol>,
+}
+
+/// Cap a decoded image's natural cell box (never upscales; preserves
+/// aspect). Layout clamps width further to the content width.
+const IMG_MAX_CELLS: (f32, f32) = (80.0, 24.0);
+
 pub struct App {
     pub mode: Mode,
     /// Terminal emulation of the remote byte stream, rendered by tui-term.
     pub vt: Vt,
     /// Inbound byte interpretation (`set encoding cp437` for BBS art).
     pub encoding: Encoding,
+    /// Run page JavaScript (budgeted) on the web. ON by default (her
+    /// call, 2026-06-12 — the engine only spins up for pages that
+    /// actually carry scripts); `set js off` opts out.
+    js_enabled: bool,
+    /// Session-lifetime web storage for page JS (RAM-only, origin-keyed).
+    web_storage: crate::js::WebStorage,
+    /// The living page behind the current browser doc, if its JS left
+    /// anything to interact with. ONE live engine, ever.
+    live_page: Option<crate::js::PageHandle>,
+    page_rx: Option<mpsc::Receiver<crate::js::PageEvt>>,
+    /// A click dispatch is in flight (drives the loading heart).
+    page_busy: bool,
+    /// Cumulative page-JS errors, for the status badge.
+    page_js_errors: usize,
+    /// The next fetched document replaces the current one instead of
+    /// pushing history (`reload`).
+    replace_nav: bool,
     /// GNU telnet's `crlf` toggle: Enter sends CR LF when true, CR NUL
     /// when false (char mode only; line mode always sends CR LF).
     crlf: bool,
@@ -308,6 +365,22 @@ pub struct App {
     fetch_rx: Option<mpsc::Receiver<FetchMsg>>,
     /// In-flight image decode/encode, if any.
     img_rx: Option<mpsc::Receiver<ImgMsg>>,
+    /// Decoded page images (inline `<img>`), keyed by absolute URL.
+    /// RAM-only, session-lifetime; survives re-layout/resize so a resize
+    /// never refetches. Built by the parallel pipeline.
+    image_cache: HashMap<String, DecodedImage>,
+    /// In-flight parallel page-image fetch+decode batch.
+    imgs_rx: Option<mpsc::Receiver<ImgLoadMsg>>,
+    /// Encoded inline-image protocols, keyed by `(url, cell_w, cell_h)`.
+    /// Scroll doesn't change the box, so it never re-encodes on scroll.
+    pub(crate) image_protocols: HashMap<(String, u16, u16), Protocol>,
+    /// Boxes currently being encoded (one async encode per key in flight).
+    /// Non-empty drives the loading pulse (the channel is persistent so it
+    /// can't gate the pulse itself).
+    image_encoding: HashSet<(String, u16, u16)>,
+    /// Persistent channel for finished inline-image encodes.
+    enc_tx: mpsc::Sender<EncMsg>,
+    enc_rx: mpsc::Receiver<EncMsg>,
     /// The gopher type-7 item, gemini 1x URL, or form field awaiting
     /// input (pub so the UI can label the prompt accordingly).
     pub(crate) search_target: Option<Link>,
@@ -329,11 +402,19 @@ impl App {
             Some(_) => Mode::Session,
             None => Mode::Command,
         };
+        let (enc_tx, enc_rx) = mpsc::channel(64);
         Self {
             mode,
             // In memory only, like the entry histories.
             vt: new_vt(24, 80),
             encoding: Encoding::Utf8,
+            js_enabled: true,
+            web_storage: Default::default(),
+            live_page: None,
+            page_rx: None,
+            page_busy: false,
+            page_js_errors: 0,
+            replace_nav: false,
             crlf: false,
             bells_seen: 0,
             remote_opts: HashSet::new(),
@@ -360,6 +441,12 @@ impl App {
             auto_protocol: ProtocolType::Halfblocks,
             fetch_rx: None,
             img_rx: None,
+            image_cache: HashMap::new(),
+            imgs_rx: None,
+            image_protocols: HashMap::new(),
+            image_encoding: HashSet::new(),
+            enc_tx,
+            enc_rx,
             search_target: None,
             cert_for: None,
             notice: false,
@@ -377,7 +464,11 @@ impl App {
 
     /// A fetch or image encode is in flight (drives the loading pulse).
     pub fn loading(&self) -> bool {
-        self.fetch_rx.is_some() || self.img_rx.is_some()
+        self.fetch_rx.is_some()
+            || self.img_rx.is_some()
+            || self.imgs_rx.is_some()
+            || !self.image_encoding.is_empty()
+            || self.page_busy
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
@@ -400,6 +491,7 @@ impl App {
             self.sync_vt_size().await;
             self.sync_browser_wrap();
             self.sync_viewer_size();
+            self.sync_image_encodes();
 
             tokio::select! {
                 event = input.next() => match event {
@@ -418,6 +510,18 @@ impl App {
                 msg = recv_opt(&mut self.img_rx) => match msg {
                     Some(msg) => self.on_img(msg),
                     None => self.img_rx = None,
+                },
+                msg = recv_opt(&mut self.imgs_rx) => match msg {
+                    Some(msg) => self.on_img_load(msg),
+                    None => self.imgs_rx = None,
+                },
+                Some(msg) = self.enc_rx.recv() => self.on_enc(msg),
+                evt = recv_opt(&mut self.page_rx) => match evt {
+                    Some(evt) => self.on_page_evt(evt),
+                    None => {
+                        // The actor is gone; the last render stands.
+                        self.drop_live_page();
+                    }
                 },
                 _ = tick.tick(), if self.loading() => {
                     self.spinner = self.spinner.wrapping_add(1);
@@ -494,9 +598,16 @@ impl App {
             return;
         }
 
-        // The gopher browser captures session-mode keys while open.
+        // The browser captures session-mode keys while open. HTTP laid-out
+        // docs use the 2D item model (Enter follows, Backspace backs, arrows
+        // move the selection laterally and vertically); gopher/gemini keep
+        // the gopherus line model.
         if self.mode == Mode::Session && self.browser.is_some() {
-            self.browser_nav(key);
+            if self.browser.as_ref().is_some_and(|g| g.doc.laid_out()) {
+                self.http_nav(key);
+            } else {
+                self.browser_nav(key);
+            }
             return;
         }
 
@@ -709,6 +820,7 @@ impl App {
         match parts.next() {
             None => {}
             Some("quit" | "q" | "exit") => self.quit = true,
+            Some("reload") => self.reload(),
             Some("close" | "c") => match self.conn.take() {
                 Some(conn) => {
                     let _ = conn.commands.send(telnet::Command::Close).await;
@@ -785,9 +897,20 @@ impl App {
                     self.status = String::from("Encoding set to UTF-8.");
                 }
                 (Some("image"), Some(proto)) => self.set_image_protocol(proto),
+                (Some("js"), Some("on")) => {
+                    self.js_enabled = true;
+                    self.status = String::from(
+                        "JavaScript on: pages run scripts, fetch/XHR allowed (budgeted, capped).",
+                    );
+                }
+                (Some("js"), Some("off")) => {
+                    self.js_enabled = false;
+                    self.status = String::from("JavaScript off (on is the default).");
+                }
                 _ => {
-                    self.status =
-                        String::from("usage: set encoding cp437|utf8 · set image <protocol>|auto")
+                    self.status = String::from(
+                        "usage: set encoding cp437|utf8 · set image <protocol>|auto · set js on|off",
+                    )
                 }
             },
             Some("toggle" | "t") => match parts.next() {
@@ -912,6 +1035,7 @@ impl App {
              Input mode: {mode}\r\n\
              Enter sends: {eol}\r\n\
              Encoding: {enc}\r\n\
+             JavaScript: {js}\r\n\
              Remote options (WILL): {remote}\r\n\
              Local options (DO): {local}\r\n\
              \x1b[36m--------------------\x1b[0m\r\n",
@@ -920,6 +1044,7 @@ impl App {
                 Encoding::Utf8 => "UTF-8",
                 Encoding::Cp437 => "CP437",
             },
+            js = if self.js_enabled { "on" } else { "off" },
             remote = option_names(&self.remote_opts),
             local = option_names(&self.local_opts),
         );
@@ -975,22 +1100,50 @@ impl App {
         }
     }
 
+    /// `reload`: re-fetch what is on screen (image viewer first, else
+    /// the browser document), replacing it in place — history untouched,
+    /// scroll kept. The way to re-render after `set js on`.
+    fn reload(&mut self) {
+        let target = match (&self.viewer, &self.browser) {
+            (Some(v), _) => v.url.clone(),
+            (None, Some(g)) => g.doc.url.clone(),
+            (None, None) => {
+                self.status = String::from("Nothing to reload.");
+                return;
+            }
+        };
+        self.replace_nav = true;
+        self.start_fetch(target);
+    }
+
     /// Fetch a document in the background; the result arrives in the
     /// select loop as a FetchMsg.
     fn start_fetch(&mut self, target: Link) {
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("Fetching {target} ...");
+        let js = self
+            .js_enabled
+            .then(|| (self.last_inner, self.web_storage.clone()));
         tokio::spawn(async move {
             let result = match &target {
                 Link::Gopher(url) => gopher::fetch(url).await.map(Payload::Gopher),
                 Link::Gemini(url) => gemini::fetch(url).await.map(Payload::Gemini),
-                Link::Http(url) => http::fetch(&http::Request::get(url.clone()))
-                    .await
-                    .map(Payload::Http),
+                Link::Http(url) => match http::fetch(&http::Request::get(url.clone())).await {
+                    Ok(response) => Ok(Payload::Http(match js {
+                        Some((viewport, storage)) => {
+                            http::execute_js(response, viewport, storage).await
+                        }
+                        None => response,
+                    })),
+                    Err(err) => Err(err),
+                },
                 Link::OneShot(url) => oneshot::fetch(url).await.map(Payload::OneShot),
                 Link::External(url) => Err(format!("cannot fetch foreign scheme: {url}")),
                 Link::Form { .. } => Err(String::from("form controls are not fetchable")),
+                Link::JsClick { .. } => {
+                    Err(String::from("page-script links need their living page"))
+                }
             };
             let _ = tx.send(FetchMsg { target, result }).await;
         });
@@ -1002,6 +1155,9 @@ impl App {
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("POSTing to {url} ...");
+        let js = self
+            .js_enabled
+            .then(|| (self.last_inner, self.web_storage.clone()));
         tokio::spawn(async move {
             let request = http::Request {
                 method: String::from("POST"),
@@ -1011,7 +1167,15 @@ impl App {
                     body.into_bytes(),
                 )),
             };
-            let result = http::fetch(&request).await.map(Payload::Http);
+            let result = match http::fetch(&request).await {
+                Ok(response) => Ok(Payload::Http(match js {
+                    Some((viewport, storage)) => {
+                        http::execute_js(response, viewport, storage).await
+                    }
+                    None => response,
+                })),
+                Err(err) => Err(err),
+            };
             let _ = tx
                 .send(FetchMsg {
                     target: Link::Http(url),
@@ -1024,6 +1188,8 @@ impl App {
     /// Decode and scale-to-fit encode an image off the UI thread; the
     /// viewer opens (or refreshes) when the ImgMsg comes back.
     fn open_image(&mut self, url: Link, raw: impl Into<std::sync::Arc<[u8]>>) {
+        // The viewer always replaces; a pending reload flag is spent.
+        self.replace_nav = false;
         let raw = raw.into();
         let (tx, rx) = mpsc::channel(1);
         self.img_rx = Some(rx);
@@ -1079,9 +1245,150 @@ impl App {
         self.open_image(v.url.clone(), v.raw.clone());
     }
 
+    /// The URL→cell-box map the layout pass reads, built from the decode
+    /// cache (only decoded images get a real box; the rest stay alt text).
+    fn image_sizes(&self) -> crate::layout::ImageSizes {
+        self.image_cache
+            .iter()
+            .map(|(u, d)| (u.clone(), d.cell))
+            .collect()
+    }
+
+    /// Start the parallel fetch+decode of every page image not already in
+    /// the cache. Fetches overlap (pooled, `buffer_unordered`) and each
+    /// decode runs on a blocking task — no serial wall, results stream
+    /// back over `imgs_rx` and re-layout as they land.
+    fn start_image_loads(&mut self, page: Url, urls: Vec<String>) {
+        let todo: Vec<String> = urls
+            .into_iter()
+            .filter(|u| !self.image_cache.contains_key(u))
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        let font = self.picker.font_size();
+        let (tx, rx) = mpsc::channel(todo.len().max(1));
+        self.imgs_rx = Some(rx);
+        tokio::spawn(async move {
+            futures::stream::iter(todo.into_iter().map(|url| {
+                let tx = tx.clone();
+                let page = page.clone();
+                async move {
+                    let decoded = load_one_image(&page, &url, font).await;
+                    let _ = tx.send(ImgLoadMsg { url, decoded }).await;
+                }
+            }))
+            .buffer_unordered(IMG_FETCH_CONCURRENCY)
+            .for_each(|_| async {})
+            .await;
+        });
+    }
+
+    /// One image finished decoding: cache it and re-flow the page so its
+    /// box (and the rows beneath it) appear in place of the alt text.
+    fn on_img_load(&mut self, msg: ImgLoadMsg) {
+        let Some(decoded) = msg.decoded else {
+            return; // fetch/decode failed: the alt text stands
+        };
+        self.image_cache.insert(msg.url, decoded);
+        self.relayout_browser();
+    }
+
+    /// Re-lay-out the current HTTP doc with the decoded-image sizes,
+    /// preserving the selected item and scroll (same as a resize re-flow).
+    fn relayout_browser(&mut self) {
+        let width = (self.last_inner.0 as usize).max(10);
+        let height = self.last_inner.1.max(1) as usize;
+        let images = self.image_sizes();
+        let Some(g) = &mut self.browser else { return };
+        let Link::Http(url) = g.doc.url.clone() else {
+            return;
+        };
+        if g.doc.raw.is_empty() {
+            return;
+        }
+        let item_target = g
+            .sel_item
+            .and_then(|(r, i)| g.doc.rows.get(r).and_then(|row| row.items.get(i)).cloned());
+        let meta = g.doc.meta.clone().unwrap_or_default();
+        let forms = std::mem::take(&mut g.doc.forms);
+        let raw = std::mem::take(&mut g.doc.raw);
+        g.doc = http::parse_seeded(&url, &meta, &raw, width, Some(&forms), &images);
+        g.sel_item = item_target.and_then(|t| Self::find_item_like(&g.doc.rows, &t));
+        let max_scroll = g.doc.rows.len().saturating_sub(height);
+        g.scroll = g.scroll.min(max_scroll);
+    }
+
+    fn on_enc(&mut self, msg: EncMsg) {
+        self.image_encoding.remove(&msg.key);
+        if let Some(protocol) = msg.protocol {
+            self.image_protocols.insert(msg.key, protocol);
+        }
+    }
+
+    /// Encode every inline image that is fully visible in the current
+    /// viewport but not yet encoded for its box. Runs each encode on a
+    /// blocking task (parallel), keyed by `(url, w, h)` so scroll — which
+    /// never changes the box — never re-encodes. Called each loop tick
+    /// before the draw, like `sync_browser_wrap`.
+    fn sync_image_encodes(&mut self) {
+        let (vw, vh) = (self.last_inner.0, self.last_inner.1);
+        let Some(g) = &self.browser else { return };
+        if !g.doc.laid_out() {
+            return;
+        }
+        let end = (g.scroll + vh as usize).min(g.doc.rows.len());
+        let mut wanted: Vec<(String, u16, u16)> = Vec::new();
+        for (r, row) in g.doc.rows[g.scroll..end].iter().enumerate() {
+            let top = r as u16; // viewport-relative row of this line
+            for item in &row.items {
+                let Some(url) = &item.image else { continue };
+                // Only fully-visible boxes render (stateless Image refuses
+                // to clip sixel); skip the rest until scrolled into view.
+                if item.col + item.width > vw || top + item.height > vh {
+                    continue;
+                }
+                let key = (url.clone(), item.width, item.height);
+                if !self.image_protocols.contains_key(&key)
+                    && !self.image_encoding.contains(&key)
+                    && !wanted.contains(&key)
+                {
+                    wanted.push(key);
+                }
+            }
+        }
+        for key in wanted {
+            self.request_image_encode(key);
+        }
+    }
+
+    /// Spawn one blocking encode of a decoded image to a terminal protocol
+    /// for the given cell box; the result lands over `enc_rx`.
+    fn request_image_encode(&mut self, key: (String, u16, u16)) {
+        let Some(decoded) = self.image_cache.get(&key.0) else {
+            return;
+        };
+        let raw = decoded.raw.clone();
+        let picker = self.picker.clone();
+        let tx = self.enc_tx.clone();
+        let (_, w, h) = key.clone();
+        self.image_encoding.insert(key.clone());
+        tokio::task::spawn_blocking(move || {
+            let protocol = crate::img::decode(&raw).ok().and_then(|(image, _)| {
+                crate::img::encode(&picker, image, ratatui::layout::Size::new(w, h)).ok()
+            });
+            let _ = tx.blocking_send(EncMsg { key, protocol });
+        });
+    }
+
     fn on_fetch(&mut self, msg: FetchMsg) {
         self.fetch_rx = None;
         self.notice = false;
+        let failed = msg.result.is_err();
+        if failed {
+            // A failed reload must not make the NEXT navigation replace.
+            self.replace_nav = false;
+        }
         let width = (self.last_inner.0 as usize).max(10);
         match (msg.result, msg.target) {
             (Ok(Payload::Gopher(raw)), Link::Gopher(url)) => {
@@ -1181,7 +1488,8 @@ impl App {
     /// Render an http response. Non-2xx pages still render when the
     /// server sent a usable body (error pages are content); the status
     /// code always lands in the status bar.
-    fn on_http_response(&mut self, response: http::Response, width: usize) {
+    fn on_http_response(&mut self, mut response: http::Response, width: usize) {
+        let live = response.live.take();
         if response.body.is_empty() {
             self.status = format!(
                 "{}: HTTP {} (empty response)",
@@ -1205,40 +1513,218 @@ impl App {
             self.open_image(Link::Http(response.url), response.body);
             return;
         }
-        let doc = http::parse(&response.url, &response.content_type, &response.body, width);
+        let doc = http::parse(
+            &response.url,
+            &response.content_type,
+            &response.body,
+            width,
+            &self.image_sizes(),
+        );
+        let image_urls = doc.image_urls.clone();
+        let page = response.url.clone();
+        // JS visibility: a clean run gets a quiet badge; script errors
+        // get a count (the page still rendered — no notice).
+        let js_note = match &response.js {
+            Some(o) if !o.errors.is_empty() => format!(" · JS:{}!", o.errors.len()),
+            Some(o) if o.modules_skipped > 0 => String::from(" · JS (modules skipped)"),
+            Some(_) => String::from(" · JS"),
+            None => String::new(),
+        };
         self.status = if response.status == 200 {
-            format!("{} — {media}", response.url)
+            format!("{} — {media}{js_note}", response.url)
         } else {
-            format!("{} — HTTP {} ({media})", response.url, response.status)
+            format!(
+                "{} — HTTP {} ({media}){js_note}",
+                response.url, response.status
+            )
         };
         self.navigate_to(doc);
+        // navigate_to dropped the previous living page; install this one.
+        if let Some(live) = live {
+            self.live_page = Some(live.handle);
+            self.page_rx = Some(live.events);
+            self.page_js_errors = response.js.as_ref().map_or(0, |o| o.errors.len());
+        }
+        // Kick off the parallel image pipeline; decoded images re-flow in.
+        self.start_image_loads(page, image_urls);
+    }
+
+    fn drop_live_page(&mut self) {
+        self.live_page = None;
+        self.page_rx = None;
+        self.page_busy = false;
+    }
+
+    /// Enter on a `Link::JsClick`: send the click to the living page.
+    fn dispatch_click(&mut self, node: usize) {
+        let Some(handle) = &self.live_page else {
+            self.status = String::from("This page's scripts are no longer running (reload?).");
+            self.notice = true;
+            return;
+        };
+        match handle.cmds.try_send(crate::js::PageCmd::Click(node)) {
+            Ok(()) => {
+                self.page_busy = true;
+                self.status = String::from("· click dispatched to page script");
+            }
+            Err(_) => {
+                self.status = String::from("Page script is busy; try again.");
+                self.notice = true;
+            }
+        }
+    }
+
+    /// A living page spoke. Updates are COALESCED: when several renders
+    /// queued up, only the newest is parsed (parsing is the cost, not
+    /// drawing) — the redraw-economy requirement.
+    fn on_page_evt(&mut self, evt: crate::js::PageEvt) {
+        use crate::js::PageEvt;
+        self.page_busy = false;
+        let mut latest_update: Option<(String, crate::js::Outcome)> = None;
+        let mut trouble: Vec<String> = Vec::new();
+        let mut navigate: Option<String> = None;
+        let mut pending = Some(evt);
+        loop {
+            match pending {
+                Some(PageEvt::Updated { html, outcome } | PageEvt::Static { html, outcome }) => {
+                    latest_update = Some((html, outcome));
+                }
+                Some(PageEvt::Trouble(errors)) => trouble.extend(errors),
+                Some(PageEvt::Navigate(url)) => navigate = Some(url),
+                None => break,
+            }
+            pending = self.page_rx.as_mut().and_then(|rx| rx.try_recv().ok());
+        }
+
+        if let Some((html, outcome)) = latest_update {
+            self.page_js_errors += outcome.errors.len();
+            self.replace_live_doc(html.into_bytes());
+            self.status = if self.page_js_errors > 0 {
+                format!("page updated · JS:{}!", self.page_js_errors)
+            } else {
+                String::from("page updated · JS")
+            };
+        }
+        if !trouble.is_empty() {
+            self.page_js_errors += trouble.len();
+            self.status = format!("page JS: {} (JS:{}!)", trouble[0], self.page_js_errors);
+            self.notice = true;
+        }
+        if let Some(url) = navigate {
+            // An un-prevented click on a live anchor: a real navigation.
+            self.dispatch_open(&url, 80);
+        }
+    }
+
+    /// Swap the living page's fresh render into the browser doc:
+    /// history untouched, scroll kept, selection re-found by TARGET
+    /// (line indices shift under a mutating page; the gopherus
+    /// navigation model must not jumble).
+    fn replace_live_doc(&mut self, raw: Vec<u8>) {
+        let width = (self.last_inner.0 as usize).max(10);
+        let height = self.last_inner.1.max(1) as usize;
+        let images = self.image_sizes();
+        let Some(g) = &mut self.browser else { return };
+        let Link::Http(url) = g.doc.url.clone() else {
+            return;
+        };
+        // Remember the selected item by its arena node (and link) so the
+        // selection survives the DOM mutating under it.
+        let selected_target = g
+            .sel_item
+            .and_then(|(r, i)| g.doc.rows.get(r).and_then(|row| row.items.get(i)).cloned());
+        let forms = std::mem::take(&mut g.doc.forms);
+        let doc = http::parse_seeded(
+            &url,
+            "text/html; charset=utf-8",
+            &raw,
+            width,
+            Some(&forms),
+            &images,
+        );
+        g.doc = doc;
+        g.sel_item = selected_target
+            .and_then(|target| Self::find_item_like(&g.doc.rows, &target))
+            // Lost it? Fall back to the first interactive item in view.
+            .or_else(|| Self::http_first_visible_item(g, height));
+        let max_scroll = g.doc.rows.len().saturating_sub(height);
+        g.scroll = match g.sel_item {
+            // Keep the selection visible if its row moved off-screen.
+            Some((r, _)) if r < g.scroll || r >= g.scroll + height => {
+                r.saturating_sub(height / 2).min(max_scroll)
+            }
+            _ => g.scroll.min(max_scroll),
+        };
+    }
+
+    /// Find the `(row, item)` matching `target` in fresh rows: same arena
+    /// node wins (a control that moved), else same link target.
+    fn find_item_like(
+        rows: &[crate::layout::Row],
+        target: &crate::layout::Item,
+    ) -> Option<(usize, usize)> {
+        for (r, row) in rows.iter().enumerate() {
+            for (i, it) in row.items.iter().enumerate() {
+                if !it.is_interactive() {
+                    continue;
+                }
+                let same = (target.node != crate::layout::NO_NODE && it.node == target.node)
+                    || (it.link.is_some() && it.link == target.link);
+                if same {
+                    return Some((r, i));
+                }
+            }
+        }
+        None
     }
 
     /// Show a fetched document, pushing the current one onto the back
     /// history (RAM-only, dropped when the view closes).
     fn navigate_to(&mut self, doc: Doc) {
-        // A new page replaces any image that was being viewed.
+        // A new page replaces any image that was being viewed, and ends
+        // whatever living page came before it (freeze: its last render
+        // is already the doc going into history).
         self.viewer = None;
+        self.drop_live_page();
+        let replace = std::mem::take(&mut self.replace_nav);
         match &mut self.browser {
+            Some(g) if replace => {
+                // Reload: swap the document in place, keep history and
+                // ride the scroll (clamped to the fresh content).
+                g.doc = doc;
+                g.selected = None;
+                g.sel_item = None;
+                g.scroll = g.scroll.min(g.doc.extent().saturating_sub(1));
+            }
             Some(g) => {
                 let old = std::mem::replace(&mut g.doc, doc);
-                g.history.push((old, g.selected, g.scroll));
+                let pos = ViewPos {
+                    selected: g.selected,
+                    sel_item: g.sel_item,
+                };
+                g.history.push((old, pos, g.scroll));
                 g.selected = None;
+                g.sel_item = None;
                 g.scroll = 0;
             }
             None => {
                 self.browser = Some(BrowserView {
                     doc,
                     selected: None,
+                    sel_item: None,
                     scroll: 0,
                     history: Vec::new(),
                 });
             }
         }
-        // A fresh page selects its first visible link, gopherus-style.
+        // A fresh page selects its first interactive target.
         let height = self.last_inner.1.max(1) as usize;
         if let Some(g) = &mut self.browser {
-            g.selected = Self::browser_visible_links(g, height).first().copied();
+            if g.doc.laid_out() {
+                g.sel_item = Self::http_first_visible_item(g, height);
+            } else {
+                g.selected = Self::browser_visible_links(g, height).first().copied();
+            }
         }
     }
 
@@ -1256,11 +1742,199 @@ impl App {
             KeyCode::End => self.browser_scroll(i64::MAX / 2, false),
             KeyCode::Right | KeyCode::Enter => self.browser_follow(),
             KeyCode::Left => self.browser_back(),
+            KeyCode::Char('v' | 'V') => self.open_in_mpv(),
             KeyCode::Esc => {
                 self.browser = None;
+                self.drop_live_page();
                 self.status = String::from("Browser closed.");
             }
             _ => {}
+        }
+    }
+
+    /// HTTP 2D navigation: Enter follows, Backspace goes back, Up/Down
+    /// move the selection to the nearest interactive item in an adjacent
+    /// row, Left/Right step between items (spilling to adjacent rows),
+    /// Esc closes. The arrows are free here because nav lives on
+    /// Enter/Backspace — the HTTP-only layout model.
+    fn http_nav(&mut self, key: KeyEvent) {
+        self.notice = false;
+        let page = i64::from(self.last_inner.1.max(2)) - 1;
+        match key.code {
+            KeyCode::Up => self.http_move(-1, false),
+            KeyCode::Down => self.http_move(1, false),
+            KeyCode::Left => self.http_move(-1, true),
+            KeyCode::Right => self.http_move(1, true),
+            KeyCode::PageUp => self.http_scroll(-page),
+            KeyCode::PageDown => self.http_scroll(page),
+            KeyCode::Home => self.http_scroll(i64::MIN / 2),
+            KeyCode::End => self.http_scroll(i64::MAX / 2),
+            KeyCode::Enter => self.browser_follow(),
+            KeyCode::Backspace => self.browser_back(),
+            KeyCode::Char('v' | 'V') => self.open_in_mpv(),
+            KeyCode::Esc => {
+                self.browser = None;
+                self.drop_live_page();
+                self.status = String::from("Browser closed.");
+            }
+            _ => {}
+        }
+    }
+
+    /// Interactive item indices on a row (followable links; form controls
+    /// fold in later).
+    fn row_interactives(row: &crate::layout::Row) -> Vec<usize> {
+        Self::row_interactives_excluding(row, crate::layout::NO_NODE)
+    }
+
+    /// Interactive item indices on a row, excluding pieces of `skip` (a
+    /// link that wrapped onto this row) so navigation steps link-to-link
+    /// rather than through one link's own wrapped fragments.
+    fn row_interactives_excluding(row: &crate::layout::Row, skip: usize) -> Vec<usize> {
+        row.items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| {
+                it.link.is_some() && (skip == crate::layout::NO_NODE || it.node != skip)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The first interactive item in the viewport, `(row, item)`.
+    fn http_first_visible_item(g: &BrowserView, height: usize) -> Option<(usize, usize)> {
+        let end = (g.scroll + height).min(g.doc.rows.len());
+        (g.scroll..end).find_map(|r| {
+            Self::row_interactives(&g.doc.rows[r])
+                .first()
+                .map(|&i| (r, i))
+        })
+    }
+
+    /// Move the item selection. `horizontal` steps within/between rows in
+    /// document order; otherwise it jumps to the column-nearest item in an
+    /// adjacent row. The page scrolls to keep the new selection visible.
+    fn http_move(&mut self, dir: i64, horizontal: bool) {
+        let height = self.last_inner.1.max(1) as usize;
+        let Some(g) = &mut self.browser else { return };
+        let rows = &g.doc.rows;
+        if rows.is_empty() {
+            return;
+        }
+        // No selection yet: take the first/last interactive item on screen.
+        let Some((cr, ci)) = g.sel_item else {
+            g.sel_item = Self::http_first_visible_item(g, height);
+            self.http_keep_visible();
+            return;
+        };
+
+        let target = if horizontal {
+            Self::http_step_horizontal(rows, cr, ci, dir)
+        } else {
+            Self::http_step_vertical(rows, cr, ci, dir)
+        };
+        if let Some(next) = target {
+            g.sel_item = Some(next);
+        }
+        self.http_keep_visible();
+    }
+
+    /// Next interactive item in document order from `(cr, ci)`, scanning
+    /// items on the current row first, then spilling into later/earlier
+    /// rows.
+    fn http_step_horizontal(
+        rows: &[crate::layout::Row],
+        cr: usize,
+        ci: usize,
+        dir: i64,
+    ) -> Option<(usize, usize)> {
+        let cur_node = rows[cr]
+            .items
+            .get(ci)
+            .map_or(crate::layout::NO_NODE, |it| it.node);
+        let here = Self::row_interactives_excluding(&rows[cr], cur_node);
+        if dir > 0 {
+            if let Some(&i) = here.iter().find(|&&i| i > ci) {
+                return Some((cr, i));
+            }
+            ((cr + 1)..rows.len()).find_map(|r| {
+                Self::row_interactives_excluding(&rows[r], cur_node)
+                    .first()
+                    .map(|&i| (r, i))
+            })
+        } else {
+            if let Some(&i) = here.iter().rev().find(|&&i| i < ci) {
+                return Some((cr, i));
+            }
+            (0..cr).rev().find_map(|r| {
+                Self::row_interactives_excluding(&rows[r], cur_node)
+                    .last()
+                    .map(|&i| (r, i))
+            })
+        }
+    }
+
+    /// The interactive item in the next row (in `dir`) whose column is
+    /// nearest the current item's column.
+    fn http_step_vertical(
+        rows: &[crate::layout::Row],
+        cr: usize,
+        ci: usize,
+        dir: i64,
+    ) -> Option<(usize, usize)> {
+        let cur_col = rows[cr].items.get(ci).map_or(0, |it| it.col);
+        let cur_node = rows[cr]
+            .items
+            .get(ci)
+            .map_or(crate::layout::NO_NODE, |it| it.node);
+        let candidates: Box<dyn Iterator<Item = usize>> = if dir > 0 {
+            Box::new((cr + 1)..rows.len())
+        } else {
+            Box::new((0..cr).rev())
+        };
+        for r in candidates {
+            let inter = Self::row_interactives_excluding(&rows[r], cur_node);
+            if let Some(&best) = inter
+                .iter()
+                .min_by_key(|&&i| (i32::from(rows[r].items[i].col) - i32::from(cur_col)).abs())
+            {
+                return Some((r, best));
+            }
+        }
+        None
+    }
+
+    /// Scroll the HTTP viewport by `delta` rows, dropping any selection
+    /// that scrolls out of view onto the nearest visible interactive item.
+    fn http_scroll(&mut self, delta: i64) {
+        let height = self.last_inner.1.max(1) as usize;
+        let Some(g) = &mut self.browser else { return };
+        let max_scroll = g.doc.rows.len().saturating_sub(height);
+        let target = (g.scroll as i64)
+            .saturating_add(delta)
+            .clamp(0, max_scroll as i64);
+        g.scroll = target as usize;
+        // Re-aim the selection into the viewport if it scrolled away.
+        if let Some((r, _)) = g.sel_item
+            && (r < g.scroll || r >= g.scroll + height)
+        {
+            g.sel_item = Self::http_first_visible_item(g, height);
+        } else if g.sel_item.is_none() {
+            g.sel_item = Self::http_first_visible_item(g, height);
+        }
+    }
+
+    /// Scroll just enough that the selected item's row is on screen,
+    /// keeping it roughly centered when it would otherwise be clipped.
+    fn http_keep_visible(&mut self) {
+        let height = self.last_inner.1.max(1) as usize;
+        let Some(g) = &mut self.browser else { return };
+        let Some((r, _)) = g.sel_item else { return };
+        let max_scroll = g.doc.rows.len().saturating_sub(height);
+        if r < g.scroll {
+            g.scroll = r.min(max_scroll);
+        } else if r >= g.scroll + height {
+            g.scroll = r.saturating_sub(height / 2).min(max_scroll);
         }
     }
 
@@ -1312,6 +1986,15 @@ impl App {
     fn browser_scroll(&mut self, delta: i64, walk_at_edge: bool) {
         let height = self.last_inner.1.max(1) as i64;
         let Some(g) = &mut self.browser else { return };
+        // HTTP laid-out docs index by `rows` (their `lines` is empty), and
+        // use the 2D item selection, not the gopherus line highlight. The
+        // wheel is the one pure viewport scroll: move `scroll` line-by-line,
+        // clamp, and leave the selection where it is.
+        if g.doc.laid_out() {
+            let max_scroll = (g.doc.rows.len() as i64 - height).max(0);
+            g.scroll = (g.scroll as i64).saturating_add(delta).clamp(0, max_scroll) as usize;
+            return;
+        }
         let len = g.doc.lines.len() as i64;
         let max_scroll = (len - height).max(0);
         let target = (g.scroll as i64).saturating_add(delta).clamp(0, max_scroll);
@@ -1333,6 +2016,7 @@ impl App {
         let width = (self.last_inner.0 as usize).max(10);
         let cp437 = self.encoding == Encoding::Cp437;
         let height = self.last_inner.1.max(1) as usize;
+        let images = self.image_sizes();
         let Some(g) = &mut self.browser else { return };
         if g.doc.raw.is_empty() || (g.doc.wrapped_to == width && g.doc.cp437 == cp437) {
             return;
@@ -1343,6 +2027,10 @@ impl App {
                 .filter(|l| l.link.is_some())
                 .count()
         });
+        // For laid-out docs, carry the selection over by its item identity.
+        let item_target = g
+            .sel_item
+            .and_then(|(r, i)| g.doc.rows.get(r).and_then(|row| row.items.get(i)).cloned());
         let raw = std::mem::take(&mut g.doc.raw);
         g.doc = match g.doc.url.clone() {
             Link::Gopher(url) => gopher::parse(&url, raw, cp437, width),
@@ -1354,11 +2042,22 @@ impl App {
                 let meta = g.doc.meta.clone().unwrap_or_default();
                 // Seed so typed-in form values survive the re-parse.
                 let forms = std::mem::take(&mut g.doc.forms);
-                http::parse_seeded(&url, &meta, &raw, width, Some(&forms))
+                http::parse_seeded(&url, &meta, &raw, width, Some(&forms), &images)
             }
             Link::OneShot(url) => oneshot::parse(&url, raw, width),
-            Link::Form { .. } | Link::External(_) => return,
+            Link::Form { .. } | Link::JsClick { .. } | Link::External(_) => return,
         };
+        if g.doc.laid_out() {
+            // Re-flow at the new width re-laid the rows; re-anchor the
+            // selected item by identity.
+            g.sel_item = item_target.and_then(|t| Self::find_item_like(&g.doc.rows, &t));
+            let max_scroll = g.doc.rows.len().saturating_sub(height);
+            g.scroll = match g.sel_item {
+                Some((r, _)) => r.saturating_sub(height / 2).min(max_scroll),
+                None => g.scroll.min(max_scroll),
+            };
+            return;
+        }
         g.selected = link_ordinal.and_then(|n| {
             g.doc
                 .lines
@@ -1458,12 +2157,17 @@ impl App {
     }
 
     fn browser_follow(&mut self) {
-        let Some(g) = &self.browser else { return };
-        let Some(link) = g
-            .selected
-            .and_then(|i| g.doc.lines.get(i))
-            .and_then(|l| l.link.clone())
-        else {
+        // Auto-route recognized video links (YouTube and its various
+        // formats) straight to mpv, in EVERY view — people post these on
+        // gopher and gemini too, and following one should play it, not try
+        // to render YouTube. Manual `v` covers any other web link.
+        if let Some(url) = self.selected_web_url()
+            && is_youtube_video_url(&url)
+        {
+            self.launch_mpv(url);
+            return;
+        }
+        let Some(link) = self.selected_link() else {
             return;
         };
         match link {
@@ -1482,10 +2186,87 @@ impl App {
             Link::Http(url) => self.start_fetch(Link::Http(url)),
             Link::OneShot(url) => self.start_fetch(Link::OneShot(url)),
             Link::Form { form, field } => self.form_interact(form, field),
+            Link::JsClick { node, .. } => self.dispatch_click(node),
             Link::External(target) => {
                 self.status = format!("external link: {target}");
             }
         }
+    }
+
+    /// `v`: hand the selected link's URL to mpv, which plays direct video
+    /// files and — via yt-dlp — YouTube, Vimeo, and hundreds of others.
+    /// TRust shows the page; mpv plays the stream. (TRust's first
+    /// external-process delegation; nothing persists.) No-op with a notice
+    /// when nothing web-shaped is selected or mpv isn't on PATH.
+    fn open_in_mpv(&mut self) {
+        let Some(url) = self.selected_web_url() else {
+            self.status = String::from("Select a web link first (v opens it in mpv).");
+            self.notice = true;
+            return;
+        };
+        self.launch_mpv(url);
+    }
+
+    /// Spawn mpv on a URL, detached. Shared by the `v` key and the
+    /// automatic YouTube routing.
+    fn launch_mpv(&mut self, url: String) {
+        // notice so the confirmation/error shows over the selected-link
+        // hint until the next keypress.
+        self.notice = true;
+        match std::process::Command::new("mpv")
+            .arg(&url)
+            // Detach from our tty so mpv can't fight ratatui for the screen;
+            // it opens its own window. We don't wait on it.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => self.status = format!("▶ mpv {url}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.status = String::from("mpv not found on PATH (can't play video).");
+            }
+            Err(e) => self.status = format!("mpv failed to launch: {e}"),
+        }
+    }
+
+    /// The active selection's link, whichever model the doc uses (HTTP
+    /// item selection or the gopher/gemini line selection).
+    pub(crate) fn selected_link(&self) -> Option<Link> {
+        let g = self.browser.as_ref()?;
+        if g.doc.laid_out() {
+            let (r, i) = g.sel_item?;
+            g.doc.rows.get(r)?.items.get(i)?.link.clone()
+        } else {
+            g.selected
+                .and_then(|i| g.doc.lines.get(i))
+                .and_then(|l| l.link.clone())
+        }
+    }
+
+    /// The selected link as an http(s) URL string, for handing to an
+    /// external program. Relative JS-page hrefs resolve against the page;
+    /// foreign schemes (mailto:, …) and non-link selections return None.
+    fn selected_web_url(&self) -> Option<String> {
+        let g = self.browser.as_ref()?;
+        let link = self.selected_link()?;
+        let raw: String = match &link {
+            Link::Http(url) => url.to_string(),
+            Link::JsClick { href, .. } if !href.is_empty() => href.clone(),
+            Link::External(s) => s.clone(),
+            _ => return None,
+        };
+        if let Ok(u) = url::Url::parse(&raw) {
+            return matches!(u.scheme(), "http" | "https").then(|| u.to_string());
+        }
+        // Relative href on a living JS page: resolve against the page URL.
+        if let Link::Http(base) = &g.doc.url
+            && let Ok(u) = base.join(&raw)
+            && matches!(u.scheme(), "http" | "https")
+        {
+            return Some(u.to_string());
+        }
+        None
     }
 
     /// Enter on a form control: edit, toggle, cycle, or submit per kind.
@@ -1565,10 +2346,13 @@ impl App {
     fn browser_back(&mut self) {
         let Some(g) = &mut self.browser else { return };
         match g.history.pop() {
-            Some((doc, selected, scroll)) => {
+            Some((doc, pos, scroll)) => {
                 g.doc = doc;
-                g.selected = selected;
+                g.selected = pos.selected;
+                g.sel_item = pos.sel_item;
                 g.scroll = scroll;
+                // Back leaves a living page: it froze the moment we left.
+                self.drop_live_page();
             }
             None => self.status = String::from("History empty (Esc returns to terminal)."),
         }
@@ -1637,6 +2421,7 @@ impl App {
         // viewer left open would hide the connection behind it.
         self.browser = None;
         self.viewer = None;
+        self.drop_live_page();
         self.reset_screen();
         let (handle, events) = telnet::connect(host.clone(), port, self.last_inner, use_tls);
         self.conn = Some(handle);
@@ -1788,6 +2573,36 @@ fn ring_terminal_bell() {
     let _ = out.flush();
 }
 
+/// Recognize a YouTube video URL across its formats, for auto-routing to
+/// mpv (yt-dlp resolves all of these). Covers `youtu.be/<id>`,
+/// `youtube.com/watch`, and the `/shorts/ /embed/ /live/ /v/` paths, on
+/// the bare, `www.`, `m.`, `music.`, and `-nocookie` hosts.
+fn is_youtube_video_url(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(u.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = u.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    let path = u.path();
+    match host {
+        "youtu.be" => path.len() > 1,
+        "youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtube-nocookie.com" => {
+            path == "/watch"
+                || path.starts_with("/shorts/")
+                || path.starts_with("/embed/")
+                || path.starts_with("/live/")
+                || path.starts_with("/v/")
+        }
+        _ => false,
+    }
+}
+
 const SEND_USAGE: &str = "usage: send brk|ip|ao|ayt|ec|el|ga|nop|escape";
 
 /// Map GNU telnet `send` argument names to IAC command codes (RFC 854).
@@ -1818,6 +2633,10 @@ fn option_names(opts: &HashSet<u8>) -> String {
             op_option::SGA => String::from("SGA"),
             op_option::TTYPE => String::from("TTYPE"),
             op_option::NAWS => String::from("NAWS"),
+            op_option::STATUS => String::from("STATUS"),
+            op_option::TSPEED => String::from("TSPEED"),
+            op_option::LFLOW => String::from("LFLOW"),
+            op_option::NEWENVIRON => String::from("NEW-ENVIRON"),
             other => other.to_string(),
         })
         .collect();
@@ -1832,6 +2651,49 @@ async fn recv_opt<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// How many page images fetch+decode at once.
+const IMG_FETCH_CONCURRENCY: usize = 8;
+
+/// Fetch one page image (pooled GET, SSRF-guarded against private
+/// addresses) and decode it on a blocking task, returning its raw bytes
+/// and decode-first cell box. `None` on any failure (the alt text stands).
+async fn load_one_image(
+    page: &Url,
+    url: &str,
+    font: ratatui_image::FontSize,
+) -> Option<DecodedImage> {
+    let parsed = http::parse_url(url)?;
+    if !http::subresource_allowed(page, &parsed) {
+        return None;
+    }
+    let resp = http::fetch(&http::Request::get(parsed)).await.ok()?;
+    if resp.status != 200 || resp.body.is_empty() {
+        return None;
+    }
+    let raw: std::sync::Arc<[u8]> = resp.body.into();
+    let for_decode = raw.clone();
+    let cell = tokio::task::spawn_blocking(move || {
+        crate::img::decode(&for_decode)
+            .ok()
+            .map(|(image, _mime)| natural_cell_box(&image, font))
+    })
+    .await
+    .ok()??;
+    Some(DecodedImage { raw, cell })
+}
+
+/// The cell box an image occupies: its natural size at the terminal font,
+/// scaled down (never up) to fit `IMG_MAX_CELLS` while preserving aspect.
+/// Layout clamps the width further to the content width (rescaling height).
+fn natural_cell_box(image: &image::DynamicImage, font: ratatui_image::FontSize) -> (u16, u16) {
+    let nat = ratatui_image::Resize::natural_size(image, font);
+    let (cw, ch) = (nat.width.max(1) as f32, nat.height.max(1) as f32);
+    let scale = (IMG_MAX_CELLS.0 / cw).min(IMG_MAX_CELLS.1 / ch).min(1.0);
+    let w = (cw * scale).round().max(1.0) as u16;
+    let h = (ch * scale).round().max(1.0) as u16;
+    (w, h)
 }
 
 /// Translate a key event into the bytes a character-mode telnet client sends.
@@ -2037,11 +2899,38 @@ mod tests {
             cp437: false,
             meta: None,
             forms: Vec::new(),
+            rows: Vec::new(),
+            image_urls: Vec::new(),
         }
     }
 
     fn selected(app: &super::App) -> Option<usize> {
         app.browser.as_ref().unwrap().selected
+    }
+
+    #[tokio::test]
+    async fn reload_replaces_in_place_without_history_growth() {
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(gopher_doc("ix"));
+        app.navigate_to(gopher_doc("xxi"));
+        let depth = app.browser.as_ref().unwrap().history.len();
+        assert_eq!(depth, 1);
+
+        // A reload-flagged navigation swaps the doc, history untouched.
+        app.replace_nav = true;
+        app.navigate_to(gopher_doc("iii"));
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.history.len(), 1);
+        assert_eq!(g.doc.lines.len(), 3);
+
+        // The flag is one-shot: the next navigation pushes again.
+        app.navigate_to(gopher_doc("x"));
+        assert_eq!(app.browser.as_ref().unwrap().history.len(), 2);
+
+        // Nothing on screen: reload is a polite no-op.
+        app.browser = None;
+        app.reload();
+        assert_eq!(app.status, "Nothing to reload.");
     }
 
     #[test]
@@ -2131,6 +3020,106 @@ mod tests {
     }
 
     #[test]
+    fn v_routing_extracts_only_web_urls() {
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (80, 24);
+        let url = url::Url::parse("https://example.com/watch").unwrap();
+        let html = b"<body><a href=\"https://youtu.be/dQw4w9WgXcQ\">vid</a>\
+                     <a href=\"mailto:x@y.z\">mail</a></body>";
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html,
+            80,
+            &Default::default(),
+        ));
+
+        // A web link → its absolute URL, ready for mpv.
+        select_item(&mut app, |it| {
+            matches!(&it.link, Some(crate::doc::Link::Http(_)))
+        });
+        assert_eq!(
+            app.selected_web_url().as_deref(),
+            Some("https://youtu.be/dQw4w9WgXcQ")
+        );
+
+        // A foreign scheme (mailto:) is not something mpv should get.
+        select_item(&mut app, |it| {
+            matches!(&it.link, Some(crate::doc::Link::External(_)))
+        });
+        assert_eq!(app.selected_web_url(), None);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_an_http_laid_out_doc() {
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let body: String = (0..40).map(|i| format!("<p>row {i}</p>")).collect();
+        let html = format!("<body>{body}</body>");
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html.as_bytes(),
+            80,
+            &Default::default(),
+        ));
+        assert!(app.browser.as_ref().unwrap().doc.laid_out());
+        assert_eq!(app.browser.as_ref().unwrap().scroll, 0);
+        // Wheel down moves the viewport (the bug: lines.len()==0 pinned it).
+        app.browser_scroll(3, true);
+        assert_eq!(
+            app.browser.as_ref().unwrap().scroll,
+            3,
+            "wheel scrolled down"
+        );
+        app.browser_scroll(3, true);
+        assert_eq!(app.browser.as_ref().unwrap().scroll, 6);
+        // Wheel up returns; clamps at the top.
+        app.browser_scroll(-9, true);
+        assert_eq!(
+            app.browser.as_ref().unwrap().scroll,
+            0,
+            "clamped at the top"
+        );
+    }
+
+    /// Point an HTTP laid-out doc's item selection at the first item that
+    /// matches `pred`.
+    fn select_item(app: &mut super::App, pred: impl Fn(&crate::layout::Item) -> bool) {
+        let g = app.browser.as_mut().expect("a browser");
+        for (r, row) in g.doc.rows.iter().enumerate() {
+            if let Some(i) = row.items.iter().position(&pred) {
+                g.sel_item = Some((r, i));
+                return;
+            }
+        }
+        panic!("no item matched the predicate");
+    }
+
+    #[test]
+    fn youtube_url_recognizer_covers_the_formats() {
+        use super::is_youtube_video_url as yt;
+        // Auto-route these:
+        assert!(yt("https://youtu.be/dQw4w9WgXcQ"));
+        assert!(yt("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        assert!(yt("https://youtube.com/watch?v=x&t=10s"));
+        assert!(yt("https://m.youtube.com/watch?v=x"));
+        assert!(yt("https://music.youtube.com/watch?v=x"));
+        assert!(yt("https://www.youtube.com/shorts/abc123"));
+        assert!(yt("https://www.youtube-nocookie.com/embed/abc"));
+        assert!(yt("http://youtube.com/live/abc"));
+        // Leave these to normal navigation:
+        assert!(!yt("https://www.youtube.com/")); // channel/home, not a video
+        assert!(!yt("https://www.youtube.com/feed/subscriptions"));
+        assert!(!yt("https://youtu.be/")); // no id
+        assert!(!yt("https://example.com/watch?v=x"));
+        assert!(!yt("https://notyoutube.com/watch"));
+        assert!(!yt("mailto:x@y.z"));
+        assert!(!yt("not a url"));
+    }
+
+    #[test]
     fn gopherus_steps_to_nearest_link_never_skipping() {
         let mut app = super::App::new(None, 23);
         app.last_inner = (80, 9); // center row 4
@@ -2217,21 +3206,23 @@ mod tests {
         let base = url::Url::parse("https://example.com/chat").unwrap();
         let mut app = super::App::new(None, 23);
         app.last_inner = (60, 10);
-        app.navigate_to(crate::http::parse(&base, "text/html", html.as_bytes(), 60));
+        app.navigate_to(crate::http::parse(
+            &base,
+            "text/html",
+            html.as_bytes(),
+            60,
+            &Default::default(),
+        ));
         app
     }
 
     #[test]
     fn form_field_edits_through_the_input_prompt() {
         let mut app = chat_app();
-        let g = app.browser.as_ref().unwrap();
-        let field_row = g
-            .doc
-            .lines
-            .iter()
-            .position(|l| l.link == Some(Link::Form { form: 0, field: 1 }))
-            .expect("the msg widget row");
-        app.browser.as_mut().unwrap().selected = Some(field_row);
+        // The msg field is a selectable Form item on the laid-out doc.
+        select_item(&mut app, |it| {
+            it.link == Some(Link::Form { form: 0, field: 1 })
+        });
 
         // Enter on the field opens the input prompt (empty: no value yet).
         app.browser_follow();
@@ -2250,21 +3241,50 @@ mod tests {
         assert_eq!(g.doc.forms[0].fields[1].value, "hello there");
         assert!(
             g.doc
-                .lines
+                .rows
                 .iter()
-                .any(|l| l.text.contains("[msg: hello there]")),
-            "widget row shows the value"
+                .flat_map(|r| &r.items)
+                .any(|it| it.text.contains("[msg: hello there]")),
+            "widget item shows the value"
         );
 
-        // Re-editing prefills the prompt with the current value.
-        app.browser.as_mut().unwrap().selected = g
-            .doc
-            .lines
-            .iter()
-            .position(|l| l.link == Some(Link::Form { form: 0, field: 1 }));
+        // Re-editing prefills the prompt with the current value (the
+        // selection re-anchored to the field across the re-render).
+        select_item(&mut app, |it| {
+            it.link == Some(Link::Form { form: 0, field: 1 })
+        });
         app.browser_follow();
         assert_eq!(app.input, "hello there");
         assert_eq!(app.cursor, "hello there".chars().count());
+    }
+
+    #[tokio::test]
+    async fn form_submits_via_the_button_item() {
+        let mut app = chat_app();
+        // Fill the message, then press the Send button item.
+        select_item(&mut app, |it| {
+            it.link == Some(Link::Form { form: 0, field: 1 })
+        });
+        app.browser_follow();
+        app.mode = super::Mode::Search;
+        app.run_search("hi talkie");
+        // The submit control is the button (field 2 in the chat form).
+        let submit = app.browser.as_ref().unwrap().doc.forms[0]
+            .fields
+            .iter()
+            .position(|f| f.kind == crate::doc::FieldKind::Submit)
+            .expect("a submit control");
+        select_item(&mut app, move |it| {
+            it.link
+                == Some(Link::Form {
+                    form: 0,
+                    field: submit,
+                })
+        });
+        app.browser_follow();
+        // A POST fetch to the form action is now in flight (hidden +
+        // typed fields encoded).
+        assert!(app.loading(), "submit kicked off a fetch");
     }
 
     /// Deliver a decoded+encoded image to the app, the way the
@@ -2309,7 +3329,13 @@ mod tests {
             .await;
         assert!(app.viewer.is_none());
         let g = app.browser.as_ref().expect("browser survived");
-        assert!(g.doc.lines.iter().any(|l| l.text.contains("Talkie")));
+        assert!(
+            g.doc
+                .rows
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.text.contains("Talkie"))
+        );
     }
 
     #[test]
@@ -2591,23 +3617,34 @@ mod tests {
         let base = url::Url::parse("http://search.example/").unwrap();
         let mut app = super::App::new(None, 23);
         app.last_inner = (60, 10);
-        app.navigate_to(crate::http::parse(&base, "text/html", html.as_bytes(), 60));
+        app.navigate_to(crate::http::parse(
+            &base,
+            "text/html",
+            html.as_bytes(),
+            60,
+            &Default::default(),
+        ));
+
+        let has_widget = |app: &super::App, needle: &str| {
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .rows
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.text.contains(needle))
+        };
 
         app.form_interact(0, 0); // cycle the select
         let forms = &app.browser.as_ref().unwrap().doc.forms;
         assert_eq!(forms[0].fields[0].value, "us");
-        let g = app.browser.as_ref().unwrap();
-        assert!(
-            g.doc
-                .lines
-                .iter()
-                .any(|l| l.text == "[region: United States ▾]")
-        );
+        assert!(has_widget(&app, "[region: United States ▾]"));
 
         app.form_interact(0, 1); // toggle the box
+        assert!(app.browser.as_ref().unwrap().doc.forms[0].fields[1].checked);
+        assert!(has_widget(&app, "[x] safe"));
         let g = app.browser.as_ref().unwrap();
-        assert!(g.doc.forms[0].fields[1].checked);
-        assert!(g.doc.lines.iter().any(|l| l.text == "[x] safe"));
         // The cycled select survived the toggle's re-render (seeding).
         assert_eq!(g.doc.forms[0].fields[0].value, "us");
     }

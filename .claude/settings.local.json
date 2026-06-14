@@ -62,7 +62,8 @@
       "Bash(grep -om1 '48;2;0;255;255m\\\\|38;2;0;255;255m')",
       "Bash(grep -om1 '[34]8;2;0;255;255m')",
       "Bash(awk '{print $5, $9}')",
-      "Bash(tmux kill-server *)"
+      "Bash(tmux kill-server *)",
+      "Bash(cargo --version)"
     ]
   }
 }

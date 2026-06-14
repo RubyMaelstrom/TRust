@@ -4,6 +4,7 @@
 //! protocol bytes (IAC sequences, negotiation, subnegotiation) are produced
 //! and consumed here; the app only ever sees decoded application data.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use bytes::Bytes;
@@ -82,8 +83,16 @@ fn compat_table() -> CompatibilityTable {
     // 8-bit clean paths (RFC 856); accepted if the server asks.
     table.support_local(op_option::BINARY);
     table.support_remote(op_option::BINARY);
-    // TODO for GNU telnet parity: TSPEED (RFC 1079), LFLOW (RFC 1372),
-    // LINEMODE (RFC 1184), NEW-ENVIRON (RFC 1572), STATUS (RFC 859).
+    // Answered in suboption_reply: TSPEED (RFC 1079), NEW-ENVIRON
+    // (RFC 1572, deliberately empty), STATUS (RFC 859).
+    table.support_local(op_option::TSPEED);
+    table.support_local(op_option::NEWENVIRON);
+    table.support_local(op_option::STATUS);
+    // LFLOW (RFC 1372): accepted so servers get their WILL; its ON/OFF
+    // subnegotiations expect no reply, and pausing output is meaningless
+    // here — the remote feeds a vt100 emulator, not a real tty.
+    table.support_local(op_option::LFLOW);
+    // TODO for GNU telnet parity: LINEMODE (RFC 1184).
     table
 }
 
@@ -100,6 +109,88 @@ fn ttype_reply(parser: &mut Parser, sends_seen: &mut usize) -> Option<TelnetEven
     let mut payload = vec![op_command::IS];
     payload.extend_from_slice(name);
     parser.subnegotiation(op_option::TTYPE, Bytes::from(payload))
+}
+
+/// Speed reported through TSPEED (RFC 1079), "transmit,receive". There is
+/// no serial line here; 38400 is what modern terminal emulators claim.
+const TERMINAL_SPEED: &[u8] = b"38400,38400";
+
+/// Answer a server subnegotiation that demands a reply. All four queries
+/// share the `SEND` opcode in their first payload byte: TTYPE and TSPEED
+/// get `IS <value>`, NEW-ENVIRON gets an empty `IS` (no local environment
+/// ever goes on the wire), STATUS gets the live option states. Anything
+/// else (e.g. LFLOW toggles) needs no answer.
+fn suboption_reply(
+    parser: &mut Parser,
+    opts: &OptionStates,
+    option: u8,
+    payload: &[u8],
+    ttype_sends: &mut usize,
+) -> Option<TelnetEvents> {
+    if payload.first() != Some(&op_command::SEND) {
+        return None;
+    }
+    match option {
+        op_option::TTYPE => ttype_reply(parser, ttype_sends),
+        op_option::TSPEED => {
+            let mut reply = vec![op_command::IS];
+            reply.extend_from_slice(TERMINAL_SPEED);
+            parser.subnegotiation(op_option::TSPEED, Bytes::from(reply))
+        }
+        op_option::NEWENVIRON => {
+            parser.subnegotiation(op_option::NEWENVIRON, Bytes::from(vec![op_command::IS]))
+        }
+        op_option::STATUS => {
+            parser.subnegotiation(op_option::STATUS, Bytes::from(status_reply(opts)))
+        }
+        _ => None,
+    }
+}
+
+/// Option states as actually negotiated on the wire, tracked from
+/// Negotiation events. libmudtelnet's own table marks an option
+/// "remotely enabled" whenever we merely accept a DO, so it cannot be
+/// trusted for STATUS reporting.
+#[derive(Default)]
+struct OptionStates {
+    local: HashSet<u8>,
+    remote: HashSet<u8>,
+}
+
+impl OptionStates {
+    fn update(&mut self, command: u8, option: u8) {
+        match command {
+            op_command::WILL => {
+                self.remote.insert(option);
+            }
+            op_command::WONT => {
+                self.remote.remove(&option);
+            }
+            op_command::DO => {
+                self.local.insert(option);
+            }
+            op_command::DONT => {
+                self.local.remove(&option);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The `IS` payload for a STATUS SEND (RFC 859): `WILL <opt>` for every
+/// option enabled on our side, `DO <opt>` for every option enabled on the
+/// remote, in ascending option order.
+fn status_reply(opts: &OptionStates) -> Vec<u8> {
+    let mut reply = vec![op_command::IS];
+    for option in 0..=u8::MAX {
+        if opts.local.contains(&option) {
+            reply.extend_from_slice(&[op_command::WILL, option]);
+        }
+        if opts.remote.contains(&option) {
+            reply.extend_from_slice(&[op_command::DO, option]);
+        }
+    }
+    reply
 }
 
 async fn run(
@@ -160,6 +251,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
     let mut parser = Parser::with_support(compat_table());
     let mut buf = vec![0u8; 8192];
     let mut ttype_sends = 0usize;
+    let mut opts = OptionStates::default();
 
     loop {
         tokio::select! {
@@ -184,6 +276,7 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                                 }
                             }
                             TelnetEvents::Negotiation(neg) => {
+                                opts.update(neg.command, neg.option);
                                 // The WILL NAWS answer is already queued as DataSend;
                                 // RFC 1073 requires us to follow it with our size.
                                 if (neg.command, neg.option) == (op_command::DO, op_option::NAWS)
@@ -203,18 +296,19 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                                 }
                             }
                             TelnetEvents::Subnegotiation(sub) => {
-                                // TTYPE SEND (RFC 1091) — answer IS <name>.
-                                if sub.option == op_option::TTYPE
-                                    && sub.buffer.first() == Some(&op_command::SEND)
-                                    && let Some(reply) = ttype_reply(&mut parser, &mut ttype_sends)
-                                    && write_or_close(&mut writer, &reply.to_bytes(), &events)
-                                        .await
-                                        .is_err()
+                                if let Some(reply) = suboption_reply(
+                                    &mut parser,
+                                    &opts,
+                                    sub.option,
+                                    &sub.buffer,
+                                    &mut ttype_sends,
+                                ) && write_or_close(&mut writer, &reply.to_bytes(), &events)
+                                    .await
+                                    .is_err()
                                 {
                                     return;
                                 }
-                                // TODO: STATUS and LINEMODE subnegotiations for
-                                // GNU telnet parity.
+                                // TODO: LINEMODE subnegotiation for GNU telnet parity.
                             }
                             TelnetEvents::IAC(_) => {}
                             TelnetEvents::DecompressImmediate(_) => {
@@ -491,6 +585,134 @@ mod tests {
             ),
             "got {event:?}"
         );
+
+        server.await.unwrap();
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn answers_tspeed_with_fixed_speed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 3];
+            sock.write_all(&[255, 253, 32]).await.unwrap(); // IAC DO TSPEED
+            sock.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, [255, 251, 32]); // IAC WILL TSPEED
+
+            // IAC SB TSPEED SEND IAC SE → IS "38400,38400"
+            sock.write_all(&[255, 250, 32, 1, 255, 240]).await.unwrap();
+            let mut reply = [0u8; 17];
+            sock.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, *b"\xff\xfa\x20\x0038400,38400\xff\xf0");
+        });
+
+        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
+
+        server.await.unwrap();
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn answers_new_environ_with_empty_is() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 3];
+            sock.write_all(&[255, 253, 39]).await.unwrap(); // IAC DO NEW-ENVIRON
+            sock.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, [255, 251, 39]); // IAC WILL NEW-ENVIRON
+
+            // IAC SB NEW-ENVIRON SEND IAC SE → IS with no variables:
+            // nothing from the local environment leaks to the server.
+            sock.write_all(&[255, 250, 39, 1, 255, 240]).await.unwrap();
+            let mut reply = [0u8; 6];
+            sock.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [255, 250, 39, 0, 255, 240]);
+        });
+
+        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
+
+        server.await.unwrap();
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn answers_status_with_live_option_states() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 3];
+            sock.write_all(&[255, 253, 5]).await.unwrap(); // IAC DO STATUS
+            sock.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, [255, 251, 5]); // IAC WILL STATUS
+            sock.write_all(&[255, 251, 1]).await.unwrap(); // IAC WILL ECHO
+            sock.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, [255, 253, 1]); // IAC DO ECHO
+
+            // IAC SB STATUS SEND IAC SE → IS DO ECHO, WILL STATUS
+            // (ascending option order: ECHO=1 then STATUS=5).
+            sock.write_all(&[255, 250, 5, 1, 255, 240]).await.unwrap();
+            let mut reply = [0u8; 10];
+            sock.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [255, 250, 5, 0, 253, 1, 251, 5, 255, 240]);
+        });
+
+        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
+
+        server.await.unwrap();
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn accepts_lflow_and_ignores_its_toggles() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 3];
+            sock.write_all(&[255, 253, 33]).await.unwrap(); // IAC DO LFLOW
+            sock.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, [255, 251, 33]); // IAC WILL LFLOW
+
+            // IAC SB LFLOW OFF IAC SE expects no reply (RFC 1372) and
+            // must not pause anything — data after it still flows.
+            sock.write_all(&[255, 250, 33, 0, 255, 240]).await.unwrap();
+            sock.write_all(b"still here").await.unwrap();
+        });
+
+        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
+        let event = events.recv().await.unwrap();
+        assert!(
+            matches!(
+                event,
+                Event::Negotiation {
+                    command: op_command::DO,
+                    option: op_option::LFLOW,
+                }
+            ),
+            "got {event:?}"
+        );
+        let event = events.recv().await.unwrap();
+        match event {
+            Event::Data(data) => assert_eq!(data, b"still here"),
+            other => panic!("expected data, got {other:?}"),
+        }
 
         server.await.unwrap();
         drop(handle);

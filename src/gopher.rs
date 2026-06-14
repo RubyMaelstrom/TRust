@@ -164,6 +164,8 @@ pub fn parse(url: &GopherUrl, raw: Vec<u8>, cp437: bool, width: usize) -> Doc {
         cp437,
         meta: None,
         forms: Vec::new(),
+        rows: Vec::new(),
+        image_urls: Vec::new(),
     }
 }
 

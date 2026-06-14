@@ -4,9 +4,8 @@ GNU-telnet-parity client + gopher/gemini/text-web browser + image
 viewer + finger/whois/dict, in a cyberpunk ratatui TUI. The README
 describes features and architecture (read it); this file is how to
 work, what not to break, and the traps that already cost debugging
-time. As of 2026-06-11 everything in the README's "Status" section is
-shipped and live-verified; 70 tests, clippy zero. She commits to git
-herself — don't commit unless asked, and don't nag about it.
+time. She commits to git herself — don't commit unless asked, and
+don't nag about it.
 
 ## Working with her
 
@@ -20,7 +19,8 @@ herself — don't commit unless asked, and don't nag about it.
   demos over claims.
 - Her POST/forms application is https://rubymaelstrom.com/chat (an
   HTML-only LLM chat) — the canonical live form test. DDG lite is the
-  search demo. Her terminal is foot (sixel, no kitty protocol).
+  search demo. Her test pages (jstest/expandtest at rubymaelstrom.com)
+  are regression fixtures. Her terminal is foot (sixel, no kitty).
 
 ## Quality bar
 
@@ -30,7 +30,9 @@ herself — don't commit unless asked, and don't nag about it.
   smoke test against a throwaway local server. The tmux run proves the
   UX and has caught real bugs the tests missed.
 - Release builds are `cargo build --release` (LTO profile in
-  Cargo.toml); plain `cargo build` does not refresh it.
+  Cargo.toml); plain `cargo build` does not refresh it. SHE TESTS THE
+  RELEASE BINARY — a feature isn't delivered until release is rebuilt
+  (a stale release made working JS look broken once).
 
 ## Live-testing workflow (and its gotchas)
 
@@ -55,6 +57,13 @@ herself — don't commit unless asked, and don't nag about it.
 - **tmux can't show sixel.** Image smoke tests: `set image
   halfblocks`, then assert on `38;2;R;G;Bm` cells in
   `capture-pane -e`. Sixel itself she verifies in foot.
+- **The startup line field runs commands only ONCE**: fresh sessions
+  show "Enter run" and execute the first line as a command, then flip
+  to "Enter send" — a second chained command silently goes nowhere.
+  For multi-command tmux scripts: first command via the line field,
+  the rest via Ctrl-] (verify `trust>` appeared before typing, verify
+  effects in the status line before proceeding). Burned us twice; a
+  demo "bug" turned out to be the demo driver clicking reset.
 
 ## Architecture invariants (don't break these)
 
@@ -81,7 +90,7 @@ herself — don't commit unless asked, and don't nag about it.
   overrides; cert+key any order; written 0600; NEVER overwritten —
   capsules pin them; presented by `gemini_connector` only, exact-host
   match, never on telnets). Don't add other persistent state without
-  asking her.
+  asking her. (JS storage is RAM-only, session-lifetime — see below.)
 - Esc is layered: prompt → cancel, viewer/browser → close, line-mode
   session → command mode. In char-mode sessions Esc MUST go to the
   remote — full-screen BBS apps depend on it. (Crossterm quirk: legacy
@@ -99,20 +108,38 @@ document order* (never skipping) when it's strictly closer to the
 center row; no links visible → no highlight; page pinned at either end
 → highlight walks between visible links. Right/Enter follows, Left
 pops history (position restored), Esc exits. The 7 `gopherus_*`/rewrap
-tests in app.rs ARE the spec — don't "simplify" them.
+tests in app.rs ARE the spec — don't "simplify" them. They outrank the
+living-page logic; keep them UNTOUCHED.
 
 ## Binding decisions
 
 - **User-Agent: `TRust/0.1` exactly.** Hand-rolled HTTP/1.1, no
   reqwest/hyper; no gzip unless the wild forces it.
-- **No JS, no SSH, ever** (README states both). `set webcolors`
-  sidelined unless she re-raises it. File uploads/multipart
+- `set webcolors` sidelined unless she re-raises it. File uploads/multipart
   deliberately unsupported. `parse_port` has deliberately no "ssh".
 - Inline images not ruled out forever, but the line-based doc model
   stays. Animated GIF (someday webm) is her "impress me" stretch goal
   — webm needs a video decoder, don't promise it.
 - Identity minting prompts for a name (CN matters — astrobotany uses
   it as the username), prefilled with $USER.
+- **`v` in the browser opens the selected link in mpv** (`open_in_mpv`
+  in app.rs): handed the link's http(s) URL — mpv plays direct video
+  and, via yt-dlp, YouTube/Vimeo/etc. Spawned detached (null stdio so
+  it can't fight ratatui; its own window); mpv-not-on-PATH degrades to a
+  notice. This is TRust's FIRST external-process delegation; still
+  RAM-only/zero-persist. `selected_web_url` extracts the URL (Http
+  direct; JsClick/External hrefs resolved against the page, http(s)
+  only — foreign schemes like mailto: return None).
+- **YouTube links AUTO-LAUNCH in mpv on follow (Enter), in EVERY view.**
+  `browser_follow` checks `is_youtube_video_url` first and routes to
+  `launch_mpv` instead of navigating — gopher/gemini included (their
+  `h`/`URL:` and `=>`-to-http links both become `Link::Http`). Always
+  on, no toggle yet (a `set` flag is an easy add if she wants to
+  disable). Recognizer matches youtu.be/<id>, youtube.com/watch,
+  /shorts/ /embed/ /live/ /v/, on www/m/music/-nocookie hosts. `v` is
+  the manual form for ANY web link. The real "render YouTube" target is
+  a privacy front-end (Invidious/Piped), not youtube.com — simpler
+  markup, links resolve to IDs mpv plays.
 
 ## Traps that cost real debugging time
 
@@ -153,11 +180,320 @@ tests in app.rs ARE the spec — don't "simplify" them.
   honored (that's also how the test picks its port). DICT pipelines
   DEFINE+QUIT so the fetch stays read-to-EOF.
 
+## The JS engine (the big one — default ON)
+
+Goal: best terminal browser, with real JS for the big web. JS is a
+*parse-time DOM transformation*: fetch → html5ever → arena DOM → Boa
+runs scripts under budget → serialize post-JS HTML into `Doc.raw` →
+existing html2text pipeline. Scripts run ONCE per fetch; resize/re-wrap
+never re-runs JS. Default-ON since 2026-06-13 (`set js off` disables
+per session); status shows `· JS` / `· JS:n!`. archive.org renders +
+SPA-routes in the TUI; jQuery 3.7 / D3 7.9 / Vue 3.5 (render-function)
+/ Lit 3 all run.
+
+### Module roles
+
+- **dom.rs** — the arena (`Vec<Node>` + `NodeId`; html5ever TreeSink
+  builds straight into it; serializer back to HTML drops
+  script/noscript/template/style). NOT rcdom in this path. Also owns
+  the selector engine, template-content cloning, and the
+  display/visibility mini-cascade (limits below).
+- **js.rs** — the syscall boundary and the **ONLY module allowed to
+  import `boa_engine`** (keep it that way — it's the swap blast-radius;
+  rquickjs is the named fallback). `page_context()` sets RuntimeLimits
+  (10M loop iterations). Two budgets: `COMPUTE_BUDGET` (2s) caps
+  cumulative *execution* time (gates launching more scripts —
+  measures compute, not wall, so a slow server can't starve a fast
+  page) and `WALL_BUDGET` (20s, NETWORK-INCLUSIVE) is the hard load
+  deadline enforced as a `tokio::time::timeout` on the async job loop;
+  on expiry the future drops at an await boundary and we render
+  whatever the DOM holds. `Outcome` tolerates per-script errors,
+  counting them for the badge + app.notice. The whole web
+  platform is PRELUDE — plain JS, engine-portable: Node/Element/Document
+  classes, events, virtual-time timers, classList/dataset/style,
+  URL/URLSearchParams, atob/btoa, ES modules, shadow DOM, `<template>`
+  content, customElements, CSSStyleSheet/adoptedStyleSheets,
+  TextEncoder/Decoder, the Intl shim, etc. `__dom_*` / `__http_fetch`
+  syscalls take and return integer ids.
+- **http.rs `execute_js`** — runs `transform` on a dedicated 64MB-stack
+  thread (`trust-js`). Fetches external scripts/sheets/module graph,
+  then serializes post-JS HTML into `Doc.raw`. **NEVER call transform
+  with net set from a runtime thread — `block_on` panics; the dedicated
+  thread is the only sanctioned path.**
+
+### Caps, storage, limits
+
+- `MAX_PAGE_FETCHES` 96 (PROVISIONAL, her call — archive.org's module
+  graph is ~32, full boot 62; 24 cut it off mid-graph),
+  `MAX_PAGE_PRELOADS` 96, `MAX_PAGE_SHEETS` 16, `PREFETCH_CONCURRENCY`
+  8. `subresource_allowed` / `script_source_allowed` block
+  private-address pivots. No CORS theater (no cookies/credentials
+  exist). **Page fetches run CONCURRENTLY** (see "Parallel fetch"
+  below): `fetch()` and async XHR fire `__http_fetch_async` jobs that
+  don't block the JS thread, so `Promise.all([...])` overlaps. Async
+  XHR still defers `__finish` via `setTimeout(0)` (callbacks are
+  macrotasks — promise reactions must run first). Sync XHR
+  (`open(...,false)`) keeps the blocking `__http_fetch` syscall.
+- Storage: RAM-only, session-lifetime, origin-bucketed local/session
+  (`WebStorage` Arc in App). Deviation from "no storage", accepted as
+  zero-I/O.
+- **Cookies: READ-ONLY RAM jar** (`COOKIE_JAR` in http.rs, process-global
+  like `POOL`). We CAPTURE `Set-Cookie` from responses (collected in
+  `read_response` before the dedup'ing header HashMap loses the
+  multi-valued ones; stored in `finish_response`) and expose them to page
+  JS via `document.cookie` (`__cookie_get`/`__cookie_set` → `cookies_for_js`
+  /`set_cookie_from_js`; `navigator.cookieEnabled` now true). We
+  DELIBERATELY DO NOT send cookies back on requests — read-only, no
+  cross-request tracking; sending-back is a future opt-in (her call, not a
+  defining decision). Subset of RFC 6265: name=value + Domain/Path/Secure/
+  HttpOnly/Max-Age(=0 deletes); Expires/SameSite ignored; HttpOnly hidden
+  from JS, Secure only over https, domain/path matched. This is what fixed
+  old.reddit (its `getLoIdData` reads the loid cookie unguarded).
+  Process-global ⇒ tests must use unique hostnames (like the TOFU pins).
+- **CSS visibility (step 1)**: `is_hidden` is a real mini-cascade for
+  EXACTLY display + visibility. Winner per element/property =
+  lexicographic max of (!important, inline, specificity, source order);
+  `hidden` attr wins outright. Sources in cascade order: tree sheets
+  (`<style>` + fetched `<link>`) in composed document order, then
+  adoptedStyleSheets — SCOPED by tree root (document vs shadow
+  fragment). Selector engine: `:not(compound)`, attr operators
+  (`~= |= ^= $= *=`), per-Complex specificity, paren/quote-aware comma
+  splitting; querySelector shares it. `:hover`/`:focus`/unknown
+  pseudos parse but NEVER match (fail-open); an unparseable member
+  kills its whole rule (also fail-open). LIMITS: visibility treated
+  like display (subtree hides; no visible-child-of-hidden-parent);
+  sibling combinators `+`/`~` unparsed; `:host` ignored; no @-rules; no
+  getComputedStyle integration (still inline-backed, unset reads give
+  ""); rides the JS pipeline (`set js on` + script-bearing pages only).
+- **Intl**: prelude shim (Boa's `intl_bundled` measured and rejected —
+  +11MB ICU, ~2x binary, and HALF-BUILT: `DateTimeFormat().format`
+  throws and `DisplayNames` isn't a constructor, both used by
+  archive.org). Shim covers NumberFormat, DateTimeFormat (ISO-ish
+  English), Collator, DisplayNames (returns the code), PluralRules,
+  RelativeTimeFormat, getCanonicalLocales. en-only;
+  `resolvedOptions`/`supportedLocalesOf` everywhere so detection
+  passes; Number/Date `toLocaleString` route through it.
+- Honest remainders: collection-page item list renders empty (its data
+  pipeline needs more platform depth); `crypto.subtle` missing.
+
+### JS traps (learned the hard way)
+
+1. **Boa's parser recurses on the native stack** — big bundles
+   (archive.org) overflow the 2MB tokio blocking thread (= process
+   abort, uncatchable). Hence the dedicated 64MB `trust-js` thread.
+2. **`with(this)` panics Boa's VM** ("must be declarative
+   environment") — Vue's in-browser template compiler emits it, so
+   render-function components work but template compilation doesn't.
+   `run_script` catch_unwinds: a panic costs one script,
+   `Outcome.panicked` halts page JS and keeps the partial DOM.
+3. **Class getters without setters throw in strict mode** — every
+   commonly-assigned Element property needs a setter (jQuery does
+   `input.type = "radio"`).
+4. jQuery requires `document.implementation.createHTMLDocument`
+   OUTSIDE try/catch.
+5. Raw strings holding JS need `r##` — selectors contain `"#`.
+6. **Boa 0.21 VM panics (define opcode, OOB binding slot) when a
+   closure capturing a block-scoped (`const`/`let`) class-constructor
+   local is invoked from a NATIVE callback** (Array#sort found it;
+   direct calls and `var` capture are fine). Prelude rule: constructor
+   locals captured by callback-bound closures use `var` (see
+   Intl.Collator).
+7. **Template cloning must propagate `template_contents`**
+   (`clone_subtree`/`transplant`) — webcomponents-loader.js probes
+   exactly this; failing it makes the loader declare us IE-grade.
+8. **One missing platform method = ONE opaque "not a callable"
+   rejection with no `.stack`** — bisect with the mirror harness +
+   console probes (below). Silent-killers since fixed:
+   `Element.toggleAttribute`, the ChildNode mixin
+   (`replaceWith`/`before`/`after`/`replaceChildren`), anchor URL
+   components (`a.pathname` via `__urlPart`), `<base href>` resolution
+   (`baseHref()`), `new MyElement()` constructing registered custom
+   elements, `attachInternals`, `Event.composedPath`,
+   TextEncoder/Decoder, both serializers dropping `<style>`.
+
+### Diagnostics
+
+- **Mirror harness** (`$CLAUDE_JOB_DIR/tmp/mirror.py` pattern): cache
+  bundles, STUB env to stub modules, python text-patch to wrap suspect
+  methods with `console.log` probes. console → `Outcome.console` —
+  that's the diagnostic channel (Boa gives rejections no `.stack`,
+  so this bisection IS the tool; budget an hour, not a re-architecture).
+- `net_diag` / `js_diag` ignored tests fetch + diagnose any URL/file;
+  `TRUST_NET_DIAG_OUT=<path>` dumps full post-JS HTML;
+  `TRUST_JS_DIAG=<file>`; `TRUST_NET_TRACE=1` prints per-request timing.
+- Canary bundles in `target/canary/` (see js.rs doc comment):
+  `cargo test --release canary -- --ignored --nocapture`; `lit_canary`
+  / net_diag / js_diag likewise.
+- Regression tests for the platform surface:
+  `webcomponents_loader_feature_probes_pass`,
+  `spa_router_platform_surface_works`,
+  `intl_shim_formats_honestly_and_passes_feature_detection`,
+  `keep_alive_reuses_connections`, the dom CSS tests.
+
+### Page-load speed (it's the wire, not Boa)
+
+Diagnosed with `TRUST_NET_TRACE=1`: archive.org's ~62 subresource
+fetches were strictly SERIAL on FRESH `Connection: close` sockets
+(~500ms DNS+TCP+TLS even for a 91-byte file); Boa compute is only
+~5-6s. The fix (both in http.rs) took archive.org ~44s → ~15s:
+
+- **Keep-alive connection pool** (`POOL`, RAM-only, keyed
+  scheme/host/port; `Conn` enum wraps plain or TLS behind one
+  AsyncRead/Write face). Idle TTL 30s, ≤8 idle/key, newest-first
+  reuse. **REUSE IS GET-ONLY** with up to 2 silent retries — a pooled
+  socket can be server-closed while idle, and the recovering re-dial
+  must never double-submit, so POST always dials fresh. `exchange`
+  returns a "safe to pool" bool; truncation/missing close_notify =
+  keep the bytes, don't reuse.
+- **Concurrent prefetch** in `execute_js`: external scripts +
+  stylesheets + the announced module graph (`<link rel=modulepreload>`
+  + module entry srcs) fetched `buffered(8)`, which KEEPS LIST ORDER
+  so execution/cascade order is preserved regardless of arrival.
+  Sum-of-latencies → max-of-latencies for the announced graph.
+### Parallel fetch (the JS-driven fetches now overlap too)
+
+The remaining slow tail was the JS-driven runtime fetches a router
+issues as it mounts: `__http_fetch` did `handle.block_on(http::fetch)`
+AT CALL TIME, so every `fetch()`/XHR blocked the single JS thread —
+`Promise.all([fetch,fetch])` couldn't overlap (no core pegged, just
+serial network waits). Fixed (all in js.rs):
+
+- **`fetch()`/async XHR → `__http_fetch_async`**: synchronous
+  precondition checks (`page_net_prepare`), then a pending `JsPromise`
+  + a `Job::AsyncJob` (`NativeAsyncJob`) that `await`s `http::fetch`
+  WITHOUT borrowing the context (borrow only after, to settle the
+  promise). They fire immediately and overlap. Sync XHR keeps the
+  blocking `__http_fetch`/`page_net_fetch`.
+- **Custom `PageJobExecutor`** (the ONLY change from the bundled
+  `SimpleJobExecutor`): it **parks** on `group.next().await`
+  (`FuturesUnordered`) instead of busy-polling (`poll_once`+`yield_now`).
+  The stock executor spins a core the whole time a request is
+  outstanding — unshippable. `run_jobs_into` drives it via
+  `handle.block_on(timeout(budget.remaining(), exec.run_jobs_async))`
+  so tokio reactors the concurrent sockets; no-net pages take the
+  plain `ctx.run_jobs()` path.
+- The module loader (`load_imported_module`, already `async fn`) now
+  `await`s its fetch instead of `block_on` (block_on nested inside the
+  job-loop's block_on = "runtime within a runtime" panic). Sibling
+  module fetches overlap too.
+- TRAPS (regression-tested): (1) the busy-poll executor — never go
+  back to `SimpleJobExecutor` for net pages. (2) Don't hold a `RefCell`
+  borrow across `.await` (clippy catches it; the preloaded-cache take
+  must be its own statement). (3) Async XHR delivers `__finish` via
+  `setTimeout(0)` — its callbacks are macrotasks, so promise reactions
+  (e.g. a fetch `.catch`) must run first; making XHR a microtask
+  reorders them (`without_a_net_grant_fetch_rejects_and_xhr_errors`
+  pins this). (4) Scripts still run sequentially with a job-drain
+  between each; overlap is WITHIN a script (Promise.all) and during
+  settle — not across classic `<script>` tags (matches the platform).
+- Proof: `page_fetches_run_concurrently` (12 fetches @120ms: 1.56s
+  serial → ~216ms). Live (release, tmux): 16 page fetches all hit a
+  local server within ~20ms of each other (NB: a test server's listen
+  backlog — Python `socketserver.request_queue_size` defaults to 5 —
+  will fake a ~7-concurrency ceiling; raise it or you'll chase a
+  phantom cap). jQuery/D3/Vue/Lit canaries unchanged.
+- STILL TRUE: ~5-6s of archive.org's time is irreducible Boa compute;
+  fetches a router issues strictly sequentially (await chains) still
+  can't be parallelized by anyone — only the pool helps those. But
+  any concurrency the page expresses now actually happens.
+
+## The living document (JS Phase 2b — in flight)
+
+Goal: a displayed page keeps its engine + DOM alive; user actions
+dispatch real DOM events; the page re-renders from the mutated arena.
+Design agreed in full 2026-06-12 — **deviations need a conversation,
+not a commit.**
+
+### The page actor (SHIPPED)
+
+A living page is a **dedicated resident thread owning the Context +
+arena** for the page's lifetime (the 64MB `trust-js` thread, promoted
+from one-shot). The app talks to it over channels exactly like a
+telnet connection task: `PageCmd` in (Click, SetValue, Submit,
+Shutdown), `PageEvt` out (Updated{html, outcome-delta}, Navigate(url),
+Died). The app NEVER touches engine internals — same invariant as "the
+app never sees protocol bytes". `blocking_recv` = zero idle CPU;
+auto-Static exit when a page has no clickables (articles never hold an
+engine). ONE live engine ever (the foreground page); navigating away
+**freezes** it (final serialized HTML → the Doc.raw history stores;
+back = static, reviving = `reload`); Esc kills it. Budgets are
+**per-dispatch** (~1s + wire-time extension); a Boa panic degrades the
+page to last-good static + the `· JS:n!` badge.
+
+### Invariants from step 1 (binding, her requirements)
+
+- **Dirty bit**: every mutating syscall sets it; idempotent
+  set_text/set_attr (same value) stay dirty-free (counters rewriting
+  the same value cost nothing). Serialize once per dispatch/timer
+  batch, never per mutation. No mutation → no Updated → no redraw.
+- **Coalesce Updated**: parse only the newest snapshot per event-loop
+  turn (parse is the cost, not the draw); drop intermediates unparsed.
+- **Selection/scroll stability**: selection is re-found by its *target*
+  (x-trust-js node id / href / form field id) in the re-extracted doc,
+  fallback nearest line; scroll kept and clamped.
+- **Click markers**: the serializer wraps clickables in
+  `<a href="x-trust-js:<id>:<orig-href>">` → `Link::JsClick{node, href}`
+  (Display shows the href so previews stay readable). Clickable =
+  `<button>`, input[type=button|submit], summary, [role=button],
+  [onclick], or any node in the prelude's listener registry. Delegation
+  containers are detected (a subtree-holding-interactives is a listener
+  host, not a button); html/body are never wrapped. `onclick` (and
+  friends) compile to listeners LAZILY at first dispatch, cached by
+  source text, `return false` = preventDefault. Live anchors
+  (self-or-ancestor listens, delegation included): un-prevented click
+  → `PageEvt::Navigate(resolved URL)`; `javascript:`/`#` never navigate.
+- **`el.style` is backed by the real style attribute** (writes are DOM
+  mutations — dirty-bit, serialized, idempotent-write-free); both
+  serializers honor the DOM's visibility primitives (`hidden` attr,
+  inline display:none / visibility:hidden via `Dom::is_hidden`).
+  getComputedStyle returns the inline-backed style.
+
+### Still to build
+
+- **Step 2 (NEXT) — forms**: editing a field (existing prompt UX) also
+  sets the live element's value and fires input/change; submit
+  dispatches a real `submit` event first — preventDefault means the
+  page's JS owns it (fetch-and-update), otherwise the HTTP submit
+  proceeds as today. **TRAP**: this inverts form-state ownership — on a
+  living page **the DOM is truth** and Doc.forms seeds FROM it on
+  re-extract (opposite of today's `parse_seeded` direction). Fiddliest
+  spot; isolate it. Demo: her chat form.
+- **Step 3 — script navigation** (location.href/assign →
+  PageEvt::Navigate), per-dispatch timer drain polish, resize-at-rest.
+  Demo: a hash-router SPA.
+- **Resize at rest** (requirement): re-wrap when the terminal reaches a
+  REST state, not on every Resize — debounce ~200ms after the last
+  Resize (all docs, not only JS pages). No idle wake-ups: arm a sleep
+  future only while a resize is pending (like the loading-heart
+  gating). Telnet NAWS renegotiation stays immediate; only document
+  re-wrap waits.
+- **Timers frozen at rest** (requirement): after the load settle,
+  timers advance ONLY during dispatches (each drains due timers under
+  its budget). Click→fetch→update works; idle clocks/polling
+  deliberately don't (no idle CPU — the redraw-only-on-events invariant
+  holds). Background ticking is a possible later opt-in — don't add it
+  unprompted.
+- Later: RAM cookie jar. Phase 3+: MutationObserver (stub class exists,
+  records nothing).
+
+## Telnet negotiation parity
+
+TSPEED/NEW-ENVIRON/STATUS/LFLOW shipped (`suboption_reply` in
+telnet.rs; live-verified against vert.synchro.net, which really asks
+for TSPEED and NEW-ENVIRON). Three decisions baked in: NEW-ENVIRON
+answers an empty IS — nothing from the local environment ever goes on
+the wire; TSPEED claims 38400,38400; STATUS replies come from the
+task's own `OptionStates`, NOT `parser.options` — libmudtelnet marks an
+option "remotely enabled" whenever we merely accept a DO, so its table
+lies.
+
 ## What's next
 
-- TSPEED (RFC 1079), LFLOW, LINEMODE, NEW-ENVIRON, STATUS-the-option —
-  negotiation parity. Test against *real* servers/BBSes, not only
-  fakes.
+- JS Phase 2b step 2: form integration (input/change/submit, JS-owned
+  submits). Demo: a fetch-backed form (her chat). Then step 3: script
+  navigation, timer drain polish, resize-at-rest.
+- LINEMODE (RFC 1184) — the last negotiation-parity gap. Test against
+  *real* servers/BBSes, not only fakes.
 - Remaining GNU command-mode parity: full `set`/`unset`, `display`,
   `logout`, `z`, `!`, `.telnetrc`.
 - Aspirational: inline images (planning talk first), animated GIF.

@@ -23,6 +23,13 @@ pub enum Link {
         form: usize,
         field: usize,
     },
+    /// A clickable element on a living JS page: the arena NodeId to
+    /// dispatch a click to, plus the original href (empty for buttons)
+    /// for the status hint and navigation fallback.
+    JsClick {
+        node: usize,
+        href: String,
+    },
     /// A scheme we don't speak (mailto, irc, ...) — shown, not followed.
     External(String),
 }
@@ -35,6 +42,8 @@ impl fmt::Display for Link {
             Link::Http(url) => url.fmt(f),
             Link::OneShot(url) => url.fmt(f),
             Link::Form { .. } => f.write_str("form control"),
+            Link::JsClick { href, .. } if !href.is_empty() => f.write_str(href),
+            Link::JsClick { .. } => f.write_str("page script"),
             Link::External(url) => f.write_str(url),
         }
     }
@@ -200,10 +209,6 @@ pub enum Kind {
     Quote,
     /// Gemtext preformatted block content (never wrapped).
     Pre,
-    /// HTML form input widget row.
-    Input,
-    /// HTML form submit button row.
-    Button,
 }
 
 /// One display line.
@@ -232,6 +237,33 @@ pub struct Doc {
     /// HTML forms on the page; `Link::Form` rows index into this. Field
     /// values are live state — re-parses must seed from it.
     pub forms: Vec<Form>,
+    /// HTTP-mode 2D layout: rows of positioned items. Empty for gopher/
+    /// gemini/oneshot (which use the line model and gopherus nav) and for
+    /// HTTP `text/*`; populated for HTML, where the browser renders and
+    /// navigates these instead of `lines`.
+    pub rows: Vec<crate::layout::Row>,
+    /// Absolute http(s) URLs of every `<img>` on the page (HTML only), in
+    /// document order. The app's decode pipeline fetches these; once
+    /// decoded, a re-layout turns the alt-text placeholders into pixels.
+    pub image_urls: Vec<String>,
+}
+
+impl Doc {
+    /// Whether this document uses the HTTP 2D layout (rows of items)
+    /// rather than the gopher/gemini line model.
+    pub fn laid_out(&self) -> bool {
+        !self.rows.is_empty()
+    }
+
+    /// The vertical extent for scrolling: layout rows when laid out, else
+    /// document lines.
+    pub fn extent(&self) -> usize {
+        if self.laid_out() {
+            self.rows.len()
+        } else {
+            self.lines.len()
+        }
+    }
 }
 
 /// Wrap a plain-text body (gemini `text/*`, web `text/plain`) into
