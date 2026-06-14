@@ -942,6 +942,12 @@ impl Dom {
         if is_click && is_anchor && self.attr(id, "href").is_none() {
             out.push_str(&format!(" href=\"x-trust-js:{id}:\""));
         }
+        // The app re-parses this serialized HTML into a fresh layout DOM,
+        // so form controls need an explicit pointer back to the resident
+        // page actor's original node ids.
+        if matches!(tag, "form" | "input" | "button" | "select" | "textarea") {
+            out.push_str(&format!(" data-trust-node=\"{id}\""));
+        }
         out.push('>');
         if !VOID_ELEMENTS.contains(&tag) {
             if let Some(root) = self.shadow_root(id) {
@@ -1534,6 +1540,14 @@ const TRACKED: &[&str] = &[
     "text-decoration",
     "text-decoration-line",
     "content",
+    "width",
+    "max-width",
+    "min-width",
+    "flex-wrap",
+    "flex-flow",
+    "flex-direction",
+    "float",
+    "clear",
 ];
 
 fn is_tracked(prop: &str) -> bool {
@@ -1558,6 +1572,14 @@ const BAKE_PROPS: &[&str] = &[
     "text-transform",
     "text-decoration",
     "text-decoration-line",
+    "width",
+    "max-width",
+    "min-width",
+    "flex-wrap",
+    "flex-flow",
+    "flex-direction",
+    "float",
+    "clear",
 ];
 
 /// Expand a `margin`/`padding` shorthand into its top/right/bottom/left
@@ -2219,7 +2241,7 @@ mod tests {
         // Buttons wrapped; icon-only ones get a readable label.
         assert!(
             html.contains(&format!(
-                "<a href=\"x-trust-js:{b}:\"><button id=\"b\">Push</button></a>"
+                "<a href=\"x-trust-js:{b}:\"><button id=\"b\" data-trust-node=\"{b}\">Push</button></a>"
             )),
             "{html}"
         );

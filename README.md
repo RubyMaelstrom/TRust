@@ -37,7 +37,7 @@ mode plain **Esc** works too. You can skip `open` entirely — typing
 | `send brk\|ip\|ao\|ayt\|ec\|el\|ga\|nop\|escape` | transmit IAC commands (or a literal Ctrl-]) |
 | `set encoding cp437\|utf8` | CP437 for BBS ANSI art |
 | `set image sixel\|halfblocks\|kitty\|iterm2\|auto` | force the image protocol |
-| `set js on\|off` | run web-page JavaScript against a real DOM (off by default) |
+| `set js on\|off` | run web-page JavaScript against a real DOM (on by default; `off` opts out) |
 | `toggle crlf` | Enter sends CR LF instead of CR NUL |
 | `status` | connection/options report |
 
@@ -73,23 +73,23 @@ Things it handles along the way:
 - **One-shot lookups** (`finger`, `whois`, `dict`) render in the same
   panel, and their URL schemes are followable links everywhere —
   gophermaps, gemtext, HTML.
-- **JavaScript, if you ask for it** (`set js on`): pages run through a
+- **JavaScript is on by default** (`set js off` opts out): pages run through a
   real JS engine (Boa, pure Rust) against a real DOM before rendering —
   scripts build the page, the text pipeline draws what they built.
   jQuery manipulates pages, D3 appends elements, Vue mounts components,
   and pages may `fetch()`/XHR through TRust's own HTTP stack (capped
-  per page, never into private address space, no cookies) and keep
-  RAM-only `localStorage` for the session. **Pages with things to
-  click stay alive**: buttons and script-handled links join the normal
-  link navigation — Enter dispatches a real click into the live DOM
-  (onclick attributes included) and the page re-renders with whatever
-  the handlers built, your place preserved. SPA-style links that call
-  preventDefault update in place; real ones navigate. Strictly
-  budgeted (per-dispatch wall clock, hard loop limits); idle pages
-  cost nothing (timers advance only when you interact) and pages with
-  nothing to click never hold an engine at all. Script errors show as
-  a `JS:n!` badge; the page still renders. ES modules (and so
-  Lit-style portals) are a later phase.
+  per page, never into private address space), run ES modules, see a
+  read-only RAM cookie jar, and keep RAM-only `localStorage` for the
+  session. **Pages with things to click or edit stay alive**: buttons,
+  script-handled links, and forms join the normal navigation — Enter
+  dispatches real click/input/change/submit events into the live DOM
+  and the page re-renders with whatever the handlers built, your place
+  preserved. SPA-style links or forms that call preventDefault update
+  in place; real navigations and unhandled form submits proceed through
+  TRust's normal fetch path. Strictly budgeted (per-dispatch wall clock,
+  hard loop limits); idle pages cost nothing (timers advance only when
+  you interact) and pages with nothing interactive never hold an engine
+  at all. Script errors show as a `JS:n!` badge; the page still renders.
 - **`.gmi` files served over gopher render as gemtext**, relative
   links and all — a nod to a common small-net habit.
 - Cross-scheme links interconnect: gemtext can point at gopherspace,

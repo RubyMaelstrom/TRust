@@ -63,7 +63,8 @@
       "Bash(grep -om1 '[34]8;2;0;255;255m')",
       "Bash(awk '{print $5, $9}')",
       "Bash(tmux kill-server *)",
-      "Bash(cargo --version)"
+      "Bash(cargo --version)",
+      "Bash(echo \"=== FMT EXIT: $? ===\")"
     ]
   }
 }
