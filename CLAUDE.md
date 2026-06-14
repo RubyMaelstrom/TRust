@@ -18,9 +18,11 @@ don't nag about it.
 - She values honest caveats (what's stubbed, what's deferred) and live
   demos over claims.
 - Her POST/forms application is https://rubymaelstrom.com/chat (an
-  HTML-only LLM chat) — the canonical live form test. DDG lite is the
-  search demo. Her test pages (jstest/expandtest at rubymaelstrom.com)
-  are regression fixtures. Her terminal is foot (sixel, no kitty).
+  HTML-only LLM chat) — the canonical live/non-JS form submission test.
+  DDG lite is the search demo. Formatting checks currently use
+  https://www.safebooru.org/index.php?page=post&s=list as a reference.
+  Her test pages (jstest/expandtest at rubymaelstrom.com) are regression
+  fixtures. Her terminal is foot (sixel, no kitty).
 
 ## Quality bar
 
@@ -199,8 +201,13 @@ SPA-routes in the TUI; jQuery 3.7 / D3 7.9 / Vue 3.5 (render-function)
   the selector engine, template-content cloning, and the
   display/visibility mini-cascade (limits below).
 - **js.rs** — the syscall boundary and the **ONLY module allowed to
-  import `boa_engine`** (keep it that way — it's the swap blast-radius;
-  rquickjs is the named fallback). `page_context()` sets RuntimeLimits
+  import `boa_engine`** (keep it that way — it localizes the Boa surface
+  to one file). **Boa IS the engine, not a placeholder.** It's the only
+  viable pure-Rust JS engine (rquickjs/v8/SpiderMonkey are C/C++ and
+  would betray the pure-Rust ethos), so the answer to a Boa showstopper
+  is **fork/patch Boa**, not swap it — which is exactly what the
+  cyclic-module `Debug` abort already pushed us toward. Don't architect
+  around a hypothetical engine swap. `page_context()` sets RuntimeLimits
   (10M loop iterations). Two budgets: `COMPUTE_BUDGET` (2s) caps
   cumulative *execution* time (gates launching more scripts —
   measures compute, not wall, so a slow server can't starve a fast
@@ -209,17 +216,39 @@ SPA-routes in the TUI; jQuery 3.7 / D3 7.9 / Vue 3.5 (render-function)
   on expiry the future drops at an await boundary and we render
   whatever the DOM holds. `Outcome` tolerates per-script errors,
   counting them for the badge + app.notice. The whole web
-  platform is PRELUDE — plain JS, engine-portable: Node/Element/Document
-  classes, events, virtual-time timers, classList/dataset/style,
-  URL/URLSearchParams, atob/btoa, ES modules, shadow DOM, `<template>`
-  content, customElements, CSSStyleSheet/adoptedStyleSheets,
-  TextEncoder/Decoder, the Intl shim, etc. `__dom_*` / `__http_fetch`
-  syscalls take and return integer ids.
+  platform is PRELUDE — plain JS over the integer syscalls:
+  Node/Element/Document classes, events, virtual-time timers,
+  classList/dataset/style, URL/URLSearchParams, atob/btoa, ES modules,
+  shadow DOM, `<template>` content, customElements,
+  CSSStyleSheet/adoptedStyleSheets, TextEncoder/Decoder, the Intl shim,
+  etc. `__dom_*` / `__http_fetch` syscalls take and return integer ids.
+  **Why PRELUDE is JS, not Rust** (the real reasons — NOT portability):
+  (1) GC — nodes are bare ints in JS-land, so we never wrap the arena as
+  Boa GC objects (no `Trace`/lifetime tangle); (2) conciseness — the
+  platform written in the language it's specced in is ~1.3K lines vs
+  several KB of Boa native-object glue; (3) single source of truth — the
+  DOM stays canonical in the Rust arena (what layout reads). **Cost
+  (measured, release, `cargo test --release prelude_cost -- --ignored`):
+  ~8ms/page (5.9ms parse+compile, 1.9ms run), 65KB.** Negligible — a real
+  SPA's own JS is ~5-6s (archive.org); a tiny page pays ~8ms once, only
+  if it has a `<script>` at all. NOT worth optimizing: the only lever
+  (compile-once cache) is blocked — Boa's `Script` binds to the realm it
+  parsed in, and every page needs its own realm.
 - **http.rs `execute_js`** — runs `transform` on a dedicated 64MB-stack
   thread (`trust-js`). Fetches external scripts/sheets/module graph,
   then serializes post-JS HTML into `Doc.raw`. **NEVER call transform
   with net set from a runtime thread — `block_on` panics; the dedicated
   thread is the only sanctioned path.**
+
+### Maintainability note (suggestion, not plan)
+
+`app.rs` and `js.rs` are large because they own real orchestration
+boundaries. They are still coherent, so don't split them just to make
+smaller files. But if future work keeps adding behavior there, consider
+compartmentalizing around stable seams: browser/form command handling,
+live-page actor protocol/dispatch helpers, and the JS prelude/platform
+surface are likely candidates. Treat this as refactoring pressure to
+watch, not a roadmap item.
 
 ### Caps, storage, limits
 
@@ -227,8 +256,8 @@ SPA-routes in the TUI; jQuery 3.7 / D3 7.9 / Vue 3.5 (render-function)
   graph is ~32, full boot 62; 24 cut it off mid-graph),
   `MAX_PAGE_PRELOADS` 96, `MAX_PAGE_SHEETS` 16, `PREFETCH_CONCURRENCY`
   8. `subresource_allowed` / `script_source_allowed` block
-  private-address pivots. No CORS theater (no cookies/credentials
-  exist). **Page fetches run CONCURRENTLY** (see "Parallel fetch"
+  private-address pivots. No CORS theater (no credentials exist; the cookie jar is
+  read-only and is not sent on requests). **Page fetches run CONCURRENTLY** (see "Parallel fetch"
   below): `fetch()` and async XHR fire `__http_fetch_async` jobs that
   don't block the JS thread, so `Promise.all([...])` overlaps. Async
   XHR still defers `__finish` via `setTimeout(0)` (callbacks are
@@ -409,12 +438,13 @@ not a commit.**
 A living page is a **dedicated resident thread owning the Context +
 arena** for the page's lifetime (the 64MB `trust-js` thread, promoted
 from one-shot). The app talks to it over channels exactly like a
-telnet connection task: `PageCmd` in (Click, SetValue, Submit,
-Shutdown), `PageEvt` out (Updated{html, outcome-delta}, Navigate(url),
-Died). The app NEVER touches engine internals — same invariant as "the
-app never sees protocol bytes". `blocking_recv` = zero idle CPU;
-auto-Static exit when a page has no clickables (articles never hold an
-engine). ONE live engine ever (the foreground page); navigating away
+telnet connection task: `PageCmd` in (Click, SetValue, Submit),
+`PageEvt` out (Updated{html, outcome-delta}, Static, Navigate(url),
+Trouble, Settled, SubmitDefault). The app NEVER touches engine
+internals — same invariant as "the app never sees protocol bytes".
+`blocking_recv` = zero idle CPU; auto-Static exit when a page has no
+clickables or forms (articles never hold an engine). ONE live engine
+ever (the foreground page); navigating away
 **freezes** it (final serialized HTML → the Doc.raw history stores;
 back = static, reviving = `reload`); Esc kills it. Budgets are
 **per-dispatch** (~1s + wire-time extension); a Boa panic degrades the
@@ -425,7 +455,8 @@ page to last-good static + the `· JS:n!` badge.
 - **Dirty bit**: every mutating syscall sets it; idempotent
   set_text/set_attr (same value) stay dirty-free (counters rewriting
   the same value cost nothing). Serialize once per dispatch/timer
-  batch, never per mutation. No mutation → no Updated → no redraw.
+  batch, never per mutation. No mutation → no Updated; the actor sends
+  `Settled` only to clear the app's busy state.
 - **Coalesce Updated**: parse only the newest snapshot per event-loop
   turn (parse is the cost, not the draw); drop intermediates unparsed.
 - **Selection/scroll stability**: selection is re-found by its *target*
@@ -448,16 +479,29 @@ page to last-good static + the `· JS:n!` badge.
   inline display:none / visibility:hidden via `Dom::is_hidden`).
   getComputedStyle returns the inline-backed style.
 
+### Shipped in this session (2026-06-14)
+
+- **Step 2 forms shipped**: editing a live form field now sends
+  `PageCmd::SetValue`, mutates the resident DOM, fires `input` and
+  `change`, and re-renders from the actor snapshot. Submit sends
+  `PageCmd::Submit` and dispatches a real `submit` event; if page JS
+  calls preventDefault, the page owns the update, otherwise
+  `PageEvt::SubmitDefault` tells the app to run the existing GET/POST
+  submit path. Live forms stay resident even without click listeners.
+- **TRAP pinned**: live serializer writes `data-trust-node` on
+  form/control elements because the app re-parses snapshots into a
+  fresh layout DOM; never use layout parse node ids as actor node ids.
+  On live updates, `replace_live_doc` parses with **no form seed** —
+  the actor DOM is truth. Static resize/edit reparses still seed from
+  `Doc.forms` as before.
+- **Regression coverage added**: actor tests for input/change,
+  prevented submit, and default submit fallback; app tests for prompt
+  edits through the page actor and prevented submits avoiding HTTP
+  fetch. `a_mutationless_click_emits_nothing` now expects `Settled`
+  rather than silence.
+
 ### Still to build
 
-- **Step 2 (NEXT) — forms**: editing a field (existing prompt UX) also
-  sets the live element's value and fires input/change; submit
-  dispatches a real `submit` event first — preventDefault means the
-  page's JS owns it (fetch-and-update), otherwise the HTTP submit
-  proceeds as today. **TRAP**: this inverts form-state ownership — on a
-  living page **the DOM is truth** and Doc.forms seeds FROM it on
-  re-extract (opposite of today's `parse_seeded` direction). Fiddliest
-  spot; isolate it. Demo: her chat form.
 - **Step 3 — script navigation** (location.href/assign →
   PageEvt::Navigate), per-dispatch timer drain polish, resize-at-rest.
   Demo: a hash-router SPA.
@@ -473,8 +517,8 @@ page to last-good static + the `· JS:n!` badge.
   deliberately don't (no idle CPU — the redraw-only-on-events invariant
   holds). Background ticking is a possible later opt-in — don't add it
   unprompted.
-- Later: RAM cookie jar. Phase 3+: MutationObserver (stub class exists,
-  records nothing).
+- Later: sending cookies back is a future opt-in decision; Phase 3+:
+  MutationObserver (stub class exists, records nothing).
 
 ## Telnet negotiation parity
 
@@ -489,9 +533,10 @@ lies.
 
 ## What's next
 
-- JS Phase 2b step 2: form integration (input/change/submit, JS-owned
-  submits). Demo: a fetch-backed form (her chat). Then step 3: script
-  navigation, timer drain polish, resize-at-rest.
+- JS Phase 2b step 3: script navigation (`location.href`/`assign` →
+  `PageEvt::Navigate`), per-dispatch timer drain polish, and
+  resize-at-rest. Demo: a hash-router SPA. Live form integration
+  shipped 2026-06-14; her chat form is now the smoke target.
 - LINEMODE (RFC 1184) — the last negotiation-parity gap. Test against
   *real* servers/BBSes, not only fakes.
 - Remaining GNU command-mode parity: full `set`/`unset`, `display`,

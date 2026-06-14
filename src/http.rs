@@ -1004,6 +1004,7 @@ fn walk_forms_arena(
                     method,
                     action,
                     fields: Vec::new(),
+                    live_node: live_node(dom, child),
                 });
                 let form = forms.len() - 1;
                 walk_forms_arena(dom, child, Some(form), base, forms, map);
@@ -1021,6 +1022,7 @@ fn walk_forms_arena(
                         checked: false,
                         label: String::from("Submit"),
                         kind: FieldKind::Submit,
+                        live_node: live_node(dom, child),
                     });
                     map.insert(child, (form, forms[form].fields.len() - 1));
                 }
@@ -1043,6 +1045,10 @@ fn walk_forms_arena(
 
 /// Build a `Field` from an arena control element (mirrors `field_from`
 /// but over our own DOM), or `None` for controls we drop.
+fn live_node(dom: &crate::dom::Dom, id: usize) -> Option<usize> {
+    dom.attr(id, "data-trust-node")?.parse().ok()
+}
+
 fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field> {
     let name = dom.attr(id, "name").unwrap_or("").to_string();
     let value = dom.attr(id, "value").unwrap_or("").to_string();
@@ -1093,6 +1099,7 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                 checked: false,
                 label,
                 kind: FieldKind::Textarea,
+                live_node: live_node(dom, id),
             });
         }
         "select" => {
@@ -1122,6 +1129,7 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                 checked: false,
                 label,
                 kind: FieldKind::Select(options),
+                live_node: live_node(dom, id),
             });
         }
         _ => return None,
@@ -1132,6 +1140,7 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
         checked,
         label,
         kind,
+        live_node: live_node(dom, id),
     })
 }
 
@@ -1638,9 +1647,7 @@ mod tests {
                             "import './a.js';\nimport './b.js';\n\
                              document.getElementById('t').textContent = 'shared=' + window.__shared;",
                         )
-                    } else if text.starts_with("GET /m/a.js ") {
-                        ("text/javascript", "import './shared.js';")
-                    } else if text.starts_with("GET /m/b.js ") {
+                    } else if text.starts_with("GET /m/a.js ") || text.starts_with("GET /m/b.js ") {
                         ("text/javascript", "import './shared.js';")
                     } else if text.starts_with("GET /m/shared.js ") {
                         (

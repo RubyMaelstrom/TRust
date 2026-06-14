@@ -86,6 +86,9 @@ pub struct Field {
     /// Placeholder text (editable fields) or button label (submits).
     pub label: String,
     pub kind: FieldKind,
+    /// Original DOM node id inside the living page actor, when this
+    /// field came from a live JS render.
+    pub live_node: Option<usize>,
 }
 
 impl Field {
@@ -145,6 +148,8 @@ pub struct Form {
     pub method: FormMethod,
     pub action: url::Url,
     pub fields: Vec<Field>,
+    /// Original `<form>` DOM node id inside the living page actor.
+    pub live_node: Option<usize>,
 }
 
 impl Form {
@@ -317,6 +322,7 @@ mod tests {
             checked: false,
             label: String::new(),
             kind,
+            live_node: None,
         }
     }
 
@@ -334,6 +340,7 @@ mod tests {
                 field("go", "Send", FieldKind::Submit),
                 field("alt", "Other", FieldKind::Submit),
             ],
+            live_node: None,
         };
         // Unchecked boxes stay home; only the pressed submit is sent;
         // spaces and ampersands urlencode.

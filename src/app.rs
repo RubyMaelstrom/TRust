@@ -309,8 +309,11 @@ pub struct App {
     /// anything to interact with. ONE live engine, ever.
     live_page: Option<crate::js::PageHandle>,
     page_rx: Option<mpsc::Receiver<crate::js::PageEvt>>,
-    /// A click dispatch is in flight (drives the loading heart).
+    /// A page-script dispatch is in flight (drives the loading heart).
     page_busy: bool,
+    /// Static form submit to perform if the live page does not prevent
+    /// the submitted form's default action.
+    pending_live_submit: Option<(usize, usize)>,
     /// Cumulative page-JS errors, for the status badge.
     page_js_errors: usize,
     /// The next fetched document replaces the current one instead of
@@ -413,6 +416,7 @@ impl App {
             live_page: None,
             page_rx: None,
             page_busy: false,
+            pending_live_submit: None,
             page_js_errors: 0,
             replace_nav: false,
             crlf: false,
@@ -1553,6 +1557,7 @@ impl App {
         self.live_page = None;
         self.page_rx = None;
         self.page_busy = false;
+        self.pending_live_submit = None;
     }
 
     /// Enter on a `Link::JsClick`: send the click to the living page.
@@ -1574,6 +1579,62 @@ impl App {
         }
     }
 
+    fn dispatch_live_form_set(
+        &mut self,
+        node: usize,
+        value: String,
+        checked: Option<bool>,
+        status: String,
+    ) -> bool {
+        let Some(handle) = &self.live_page else {
+            return false;
+        };
+        match handle.cmds.try_send(crate::js::PageCmd::SetValue {
+            node,
+            value,
+            checked,
+        }) {
+            Ok(()) => {
+                self.page_busy = true;
+                self.status = status;
+                true
+            }
+            Err(_) => {
+                self.status = String::from("Page script is busy; try again.");
+                self.notice = true;
+                true
+            }
+        }
+    }
+
+    fn dispatch_live_submit(
+        &mut self,
+        form_index: usize,
+        field_index: usize,
+        form_node: usize,
+        submitter_node: Option<usize>,
+    ) -> bool {
+        let Some(handle) = &self.live_page else {
+            return false;
+        };
+        match handle.cmds.try_send(crate::js::PageCmd::Submit {
+            form: form_node,
+            submitter: submitter_node,
+        }) {
+            Ok(()) => {
+                self.page_busy = true;
+                self.pending_live_submit = Some((form_index, field_index));
+                self.status = String::from("· submit dispatched to page script");
+                true
+            }
+            Err(_) => {
+                self.status = String::from("Page script is busy; try again.");
+                self.notice = true;
+                true
+            }
+        }
+    }
+
     /// A living page spoke. Updates are COALESCED: when several renders
     /// queued up, only the newest is parsed (parsing is the cost, not
     /// drawing) — the redraw-economy requirement.
@@ -1583,6 +1644,8 @@ impl App {
         let mut latest_update: Option<(String, crate::js::Outcome)> = None;
         let mut trouble: Vec<String> = Vec::new();
         let mut navigate: Option<String> = None;
+        let mut submit_default = false;
+        let pending_submit = self.pending_live_submit.take();
         let mut pending = Some(evt);
         loop {
             match pending {
@@ -1590,6 +1653,8 @@ impl App {
                     latest_update = Some((html, outcome));
                 }
                 Some(PageEvt::Trouble(errors)) => trouble.extend(errors),
+                Some(PageEvt::Settled) => {}
+                Some(PageEvt::SubmitDefault) => submit_default = true,
                 Some(PageEvt::Navigate(url)) => navigate = Some(url),
                 None => break,
             }
@@ -1609,6 +1674,9 @@ impl App {
             self.page_js_errors += trouble.len();
             self.status = format!("page JS: {} (JS:{}!)", trouble[0], self.page_js_errors);
             self.notice = true;
+        }
+        if submit_default && let Some((form, field)) = pending_submit {
+            self.submit_form_static(form, field);
         }
         if let Some(url) = navigate {
             // An un-prevented click on a live anchor: a real navigation.
@@ -1633,15 +1701,7 @@ impl App {
         let selected_target = g
             .sel_item
             .and_then(|(r, i)| g.doc.rows.get(r).and_then(|row| row.items.get(i)).cloned());
-        let forms = std::mem::take(&mut g.doc.forms);
-        let doc = http::parse_seeded(
-            &url,
-            "text/html; charset=utf-8",
-            &raw,
-            width,
-            Some(&forms),
-            &images,
-        );
+        let doc = http::parse_seeded(&url, "text/html; charset=utf-8", &raw, width, None, &images);
         g.doc = doc;
         g.sel_item = selected_target
             .and_then(|target| Self::find_item_like(&g.doc.rows, &target))
@@ -2272,13 +2332,20 @@ impl App {
     /// Enter on a form control: edit, toggle, cycle, or submit per kind.
     fn form_interact(&mut self, form: usize, field: usize) {
         use crate::doc::FieldKind;
-        let Some(g) = &mut self.browser else { return };
-        let Some((kind, name, value)) = g
-            .doc
-            .forms
-            .get(form)
+        let Some((kind, name, value, checked, live_node)) = self
+            .browser
+            .as_ref()
+            .and_then(|g| g.doc.forms.get(form))
             .and_then(|f| f.fields.get(field))
-            .map(|f| (f.kind.clone(), f.name.clone(), f.value.clone()))
+            .map(|f| {
+                (
+                    f.kind.clone(),
+                    f.name.clone(),
+                    f.value.clone(),
+                    f.checked,
+                    f.live_node,
+                )
+            })
         else {
             return;
         };
@@ -2292,22 +2359,58 @@ impl App {
                 self.status = format!("Editing {name} — Enter sets, Esc cancels.");
             }
             FieldKind::Checkbox => {
-                let f = &mut g.doc.forms[form].fields[field];
-                f.checked = !f.checked;
+                if let Some(node) = live_node
+                    && self.dispatch_live_form_set(
+                        node,
+                        String::new(),
+                        Some(!checked),
+                        format!("· {name} changed by page script"),
+                    )
+                {
+                    return;
+                }
+                if let Some(g) = &mut self.browser {
+                    let f = &mut g.doc.forms[form].fields[field];
+                    f.checked = !f.checked;
+                }
                 self.refresh_forms();
             }
             FieldKind::Radio => {
-                for (i, f) in g.doc.forms[form].fields.iter_mut().enumerate() {
-                    if f.kind == FieldKind::Radio && f.name == name {
-                        f.checked = i == field;
+                if let Some(node) = live_node
+                    && self.dispatch_live_form_set(
+                        node,
+                        value,
+                        Some(true),
+                        format!("· {name} changed by page script"),
+                    )
+                {
+                    return;
+                }
+                if let Some(g) = &mut self.browser {
+                    for (i, f) in g.doc.forms[form].fields.iter_mut().enumerate() {
+                        if f.kind == FieldKind::Radio && f.name == name {
+                            f.checked = i == field;
+                        }
                     }
                 }
                 self.refresh_forms();
             }
             FieldKind::Select(options) => {
-                let f = &mut g.doc.forms[form].fields[field];
-                let current = options.iter().position(|(_, v)| *v == f.value).unwrap_or(0);
-                f.value = options[(current + 1) % options.len()].1.clone();
+                let current = options.iter().position(|(_, v)| *v == value).unwrap_or(0);
+                let next = options[(current + 1) % options.len()].1.clone();
+                if let Some(node) = live_node
+                    && self.dispatch_live_form_set(
+                        node,
+                        next.clone(),
+                        None,
+                        format!("· {name} changed by page script"),
+                    )
+                {
+                    return;
+                }
+                if let Some(g) = &mut self.browser {
+                    g.doc.forms[form].fields[field].value = next;
+                }
                 self.refresh_forms();
             }
             FieldKind::Submit => self.submit_form(form, field),
@@ -2315,9 +2418,22 @@ impl App {
         }
     }
 
-    /// Fire a form: GET serializes into the action's query string,
-    /// POST goes form-urlencoded through the existing post plumbing.
+    /// Fire a form: a living page sees a real submit event first. If page
+    /// JS does not preventDefault(), the static HTTP submit proceeds.
     fn submit_form(&mut self, form: usize, pressed: usize) {
+        if let Some((form_node, submitter_node)) = self.browser.as_ref().and_then(|g| {
+            let form_doc = g.doc.forms.get(form)?;
+            Some((form_doc.live_node?, form_doc.fields.get(pressed)?.live_node))
+        }) && self.dispatch_live_submit(form, pressed, form_node, submitter_node)
+        {
+            return;
+        }
+        self.submit_form_static(form, pressed);
+    }
+
+    /// Fire a static form: GET serializes into the action's query string,
+    /// POST goes form-urlencoded through the existing post plumbing.
+    fn submit_form_static(&mut self, form: usize, pressed: usize) {
         use crate::doc::FormMethod;
         let Some(form) = self.browser.as_ref().and_then(|g| g.doc.forms.get(form)) else {
             return;
@@ -2394,8 +2510,27 @@ impl App {
                 };
                 self.start_fetch(Link::Gemini(url));
             }
-            // A form field edit: store the value and re-render the page.
+            // A form field edit: living pages receive input/change in
+            // the DOM; static pages store the value in Doc.forms.
             Some(Link::Form { form, field }) => {
+                let target = self.browser.as_ref().and_then(|g| {
+                    let f = g.doc.forms.get(form)?.fields.get(field)?;
+                    Some((f.name.clone(), f.live_node))
+                });
+                if let Some((name, Some(node))) = target
+                    && self.dispatch_live_form_set(
+                        node,
+                        query.to_string(),
+                        None,
+                        if name.is_empty() {
+                            String::from("· field changed by page script")
+                        } else {
+                            format!("· {name} changed by page script")
+                        },
+                    )
+                {
+                    return;
+                }
                 if let Some(g) = &mut self.browser
                     && let Some(f) = g
                         .doc
@@ -3256,6 +3391,117 @@ mod tests {
         app.browser_follow();
         assert_eq!(app.input, "hello there");
         assert_eq!(app.cursor, "hello there".chars().count());
+    }
+
+    async fn live_form_app(html: &str) -> super::App {
+        let base = url::Url::parse("https://example.com/chat").unwrap();
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (60, 10);
+        let response = crate::http::Response {
+            url: base,
+            status: 200,
+            content_type: String::from("text/html"),
+            body: html.as_bytes().to_vec(),
+            js: None,
+            live: None,
+        };
+        let response = crate::http::execute_js(response, app.last_inner, Default::default()).await;
+        app.on_http_response(response, 60);
+        app
+    }
+
+    async fn drain_page_event(app: &mut super::App) {
+        let evt = app
+            .page_rx
+            .as_mut()
+            .expect("live page receiver")
+            .recv()
+            .await
+            .expect("page event");
+        app.on_page_evt(evt);
+    }
+
+    #[tokio::test]
+    async fn live_form_field_edits_through_the_page_actor() {
+        let html = r#"
+            <form method="POST" action="/chat">
+              <input type="hidden" name="session" value="cafe123">
+              <input id="msg" type="text" name="msg" placeholder="Type a message...">
+              <button type="submit">Send</button>
+            </form>
+            <p id="out"></p>
+            <script>
+              const msg = document.getElementById('msg');
+              const out = document.getElementById('out');
+              const log = [];
+              msg.addEventListener('input', () => log.push('input:' + msg.value));
+              msg.addEventListener('change', () => { log.push('change:' + msg.value); out.textContent = log.join('|'); });
+            </script>"#;
+        let mut app = live_form_app(html).await;
+        assert!(app.live_page.is_some(), "scripted form stays live");
+        select_item(&mut app, |it| {
+            it.link == Some(Link::Form { form: 0, field: 1 })
+        });
+        app.browser_follow();
+        assert_eq!(app.mode, super::Mode::Search);
+        app.run_search("hello live");
+        assert!(app.page_busy, "edit dispatched to page actor");
+        drain_page_event(&mut app).await;
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.doc.forms[0].fields[1].value, "hello live");
+        assert!(
+            g.doc
+                .rows
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.text.contains("input:hello live|change:hello live")),
+            "input/change result rendered"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_form_prevented_submit_updates_without_http_fetch() {
+        let html = r#"
+            <form method="POST" action="/chat">
+              <input id="msg" type="text" name="msg" value="hi">
+              <button type="submit">Send</button>
+            </form>
+            <p id="out"></p>
+            <script>
+              const form = document.querySelector('form');
+              form.addEventListener('submit', (event) => {
+                event.preventDefault();
+                document.getElementById('out').textContent = 'handled:' + form.querySelector('input').value + ':' + event.submitter.textContent;
+              });
+            </script>"#;
+        let mut app = live_form_app(html).await;
+        let submit = app.browser.as_ref().unwrap().doc.forms[0]
+            .fields
+            .iter()
+            .position(|f| f.kind == crate::doc::FieldKind::Submit)
+            .expect("submit field");
+        select_item(&mut app, move |it| {
+            it.link
+                == Some(Link::Form {
+                    form: 0,
+                    field: submit,
+                })
+        });
+        app.browser_follow();
+        assert!(app.page_busy, "submit dispatched to page actor");
+        drain_page_event(&mut app).await;
+        assert!(app.fetch_rx.is_none(), "preventDefault blocked HTTP submit");
+        assert!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .rows
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.text.contains("handled:hi:Send")),
+            "submit handler result rendered"
+        );
     }
 
     #[tokio::test]

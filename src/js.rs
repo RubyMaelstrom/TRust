@@ -276,8 +276,11 @@ pub fn run_script(
 // The arena lives in Rust; JS sees nodes as bare integer ids. A thin set
 // of `__dom_*` globals is the entire Rust↔JS surface — flat, typed, no
 // GC entanglement — and the DOM API shape (prototypes, getters, events,
-// timers) is built *in JavaScript* by PRELUDE on top of them. Swapping
-// engines means re-gluing these syscalls; the prelude ports verbatim.
+// timers) is built *in JavaScript* by PRELUDE on top of them. The win is
+// keeping the arena out of Boa's GC (nodes never become GC objects) and
+// writing the platform concisely in the language it's specced in — NOT
+// engine portability (Boa is the engine; a showstopper means forking it,
+// see CLAUDE.md).
 
 /// The page's arena, shared with syscalls through the context's
 /// host-defined storage.
@@ -1281,6 +1284,7 @@ fn run_module(
     path: &str,
     budget: &Budget,
     outcome: &mut Outcome,
+    register: Option<(&Rc<WebModuleLoader>, &str)>,
 ) {
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         boa_engine::Module::parse(
@@ -1303,6 +1307,18 @@ fn run_module(
             return;
         }
     };
+    // Register the entry module in the loader cache under its own URL BEFORE
+    // evaluating it, so a later `import` of the entry's own URL (archive.org
+    // does this) reuses THIS instance instead of re-fetching + parsing a
+    // second Module record for the same specifier — which both wastes a
+    // fetch per chunk (cascading through its import subgraph) and risks the
+    // duplicate-record identity assert. One tracked Module, as intended.
+    if let Some((loader, key)) = register {
+        loader
+            .cache
+            .borrow_mut()
+            .insert(key.to_string(), module.clone());
+    }
     let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let promise = module.load_link_evaluate(ctx);
         // Drive load/link/evaluate — and any fetches the module's
@@ -1372,7 +1388,7 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
         cache: RefCell::new(std::collections::HashMap::new()),
         preloaded: preloaded.clone(),
     });
-    let (mut ctx, hooks) = page_context_with(Some(loader));
+    let (mut ctx, hooks) = page_context_with(Some(loader.clone()));
     let budget = Rc::new(Budget::new(WALL_BUDGET));
     {
         let mut host = ctx.realm().host_defined_mut();
@@ -1447,7 +1463,15 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
                         match pre {
                             Some(body) => {
                                 let path = resolved.as_deref().unwrap_or(src.as_str());
-                                run_module(&mut ctx, src, &body, path, &budget, &mut outcome);
+                                run_module(
+                                    &mut ctx,
+                                    src,
+                                    &body,
+                                    path,
+                                    &budget,
+                                    &mut outcome,
+                                    Some((&loader, path)),
+                                );
                             }
                             None => {
                                 match page_net_fetch(&mut ctx, src, String::from("GET"), None) {
@@ -1460,6 +1484,7 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
                                             &path,
                                             &budget,
                                             &mut outcome,
+                                            Some((&loader, &path)),
                                         );
                                     }
                                     None => outcome.modules_skipped += 1,
@@ -1476,6 +1501,7 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
                             page_url,
                             &budget,
                             &mut outcome,
+                            None,
                         );
                     }
                 }
@@ -1664,6 +1690,18 @@ pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
 pub enum PageCmd {
     /// Dispatch a click on this arena node.
     Click(usize),
+    /// Set a form control's value in the live DOM, then fire input/change.
+    SetValue {
+        node: usize,
+        value: String,
+        checked: Option<bool>,
+    },
+    /// Dispatch a submit event on a live form. If page JS does not
+    /// prevent it, the app proceeds with its existing HTTP submit path.
+    Submit {
+        form: usize,
+        submitter: Option<usize>,
+    },
 }
 
 /// Page → app.
@@ -1679,6 +1717,11 @@ pub enum PageEvt {
     Navigate(String),
     /// A dispatch produced errors but no content change.
     Trouble(Vec<String>),
+    /// A dispatch settled without a renderable mutation.
+    Settled,
+    /// The page did not prevent a form submit; the app should perform
+    /// the normal HTTP form submission it already prepared.
+    SubmitDefault,
 }
 
 #[derive(Debug)]
@@ -1755,32 +1798,150 @@ fn page_actor(
                     }
                     continue; // app decides; we stay alive until dropped
                 }
+                if !finish_dispatch(&mut page, &evts) {
+                    return;
+                }
+            }
+            PageCmd::SetValue {
+                node,
+                value,
+                checked,
+            } => {
+                dispatch_form_set_in(&mut page, node, &value, checked);
+                drain_js_side(&mut page.ctx, &mut page.outcome);
+                if !finish_dispatch(&mut page, &evts) {
+                    return;
+                }
+            }
+            PageCmd::Submit { form, submitter } => {
+                let prevented = dispatch_submit_in(&mut page, form, submitter);
+                drain_js_side(&mut page.ctx, &mut page.outcome);
                 if page.outcome.panicked {
-                    // Engine bug: degrade to static, last render stands.
                     let _ = evts
                         .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
                     return;
                 }
-                let dirty = page.dom.borrow_mut().take_dirty();
-                if dirty {
-                    let (out, _) = extract_live(&mut page);
-                    let outcome = std::mem::take(&mut page.outcome);
-                    if evts
-                        .blocking_send(PageEvt::Updated { html: out, outcome })
-                        .is_err()
-                    {
+                if !prevented {
+                    if evts.blocking_send(PageEvt::SubmitDefault).is_err() {
                         return;
                     }
-                } else if !page.outcome.errors.is_empty()
-                    && evts
-                        .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)))
-                        .is_err()
-                {
+                    continue;
+                }
+                if !finish_dispatch(&mut page, &evts) {
                     return;
                 }
             }
         }
     }
+}
+
+fn finish_dispatch(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
+    if page.outcome.panicked {
+        // Engine bug: degrade to static, last render stands.
+        let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+        return false;
+    }
+    let dirty = page.dom.borrow_mut().take_dirty();
+    if dirty {
+        let (out, _) = extract_live(page);
+        let outcome = std::mem::take(&mut page.outcome);
+        return evts
+            .blocking_send(PageEvt::Updated { html: out, outcome })
+            .is_ok();
+    }
+    if !page.outcome.errors.is_empty() {
+        return evts
+            .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)))
+            .is_ok();
+    }
+    evts.blocking_send(PageEvt::Settled).is_ok()
+}
+
+fn prepare_dispatch(page: &mut LoadedPage) {
+    page.budget.rearm(DISPATCH_BUDGET);
+    if let Some(net) = page.ctx.realm().host_defined().get::<PageNet>() {
+        net.fetched.set(0);
+    }
+    let _ = page.dom.borrow_mut().take_dirty();
+}
+
+fn js_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn dispatch_form_set_in(page: &mut LoadedPage, node: usize, value: &str, checked: Option<bool>) {
+    prepare_dispatch(page);
+    let checked = checked
+        .map(|v| if v { "true" } else { "false" })
+        .unwrap_or("null");
+    let call = format!("__trust.formSet({node}, {}, {checked})", js_string(value));
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        page.ctx.eval(Source::from_bytes(call.as_bytes()))
+    })) {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => page.outcome.errors.push(format!("form input: {err}")),
+        Err(_) => {
+            page.outcome.errors.push(String::from(
+                "form input: engine panic (Boa bug) — page JS halted",
+            ));
+            page.outcome.panicked = true;
+            return;
+        }
+    }
+    let mut dispatch_outcome = Outcome::default();
+    settle(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
+    page.outcome.errors.extend(dispatch_outcome.errors);
+}
+
+fn dispatch_submit_in(page: &mut LoadedPage, form: usize, submitter: Option<usize>) -> bool {
+    prepare_dispatch(page);
+    let submitter = submitter
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| String::from("null"));
+    let call = format!("__trust.formSubmit({form}, {submitter})");
+    let prevented = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        page.ctx.eval(Source::from_bytes(call.as_bytes()))
+    })) {
+        Ok(Ok(v)) => v.to_boolean(),
+        Ok(Err(err)) => {
+            page.outcome.errors.push(format!("form submit: {err}"));
+            false
+        }
+        Err(_) => {
+            page.outcome.errors.push(String::from(
+                "form submit: engine panic (Boa bug) — page JS halted",
+            ));
+            page.outcome.panicked = true;
+            return true;
+        }
+    };
+    let mut dispatch_outcome = Outcome::default();
+    settle(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
+    page.outcome.errors.extend(dispatch_outcome.errors);
+    prevented
 }
 
 /// Serialize for interaction: gather clickables (inherent tags + the
@@ -1857,7 +2018,13 @@ fn extract_live(page: &mut LoadedPage) -> (String, bool) {
     let mut clickable: HashSet<usize> = candidates.difference(&containers).copied().collect();
     clickable.extend(anchors);
 
-    let has_any = !clickable.is_empty();
+    let has_forms = everyone.iter().copied().any(|d| {
+        matches!(
+            dom.tag_name(d),
+            Some("form" | "input" | "button" | "select" | "textarea")
+        )
+    });
+    let has_any = !clickable.is_empty() || has_forms;
     let html = dom.serialize_live(crate::dom::DOCUMENT, &clickable);
     drop(dom);
     // Extraction itself is not a page mutation.
@@ -1869,11 +2036,7 @@ fn extract_live(page: &mut LoadedPage) -> (String, bool) {
 /// budget. Returns the resolved navigation URL when an un-prevented
 /// click landed on (or bubbled from inside) an anchor with an href.
 fn dispatch_click_in(page: &mut LoadedPage, node: usize) -> Option<String> {
-    page.budget.rearm(DISPATCH_BUDGET);
-    if let Some(net) = page.ctx.realm().host_defined().get::<PageNet>() {
-        net.fetched.set(0);
-    }
-    let _ = page.dom.borrow_mut().take_dirty();
+    prepare_dispatch(page);
 
     let call = format!("__trust.click({node})");
     let prevented = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2136,6 +2299,63 @@ const PRELUDE: &str = r##"
             }
         }
         return out;
+    };
+    function nearestForm(el) {
+        let p = el;
+        while (p) {
+            if (p.localName === "form") return p;
+            p = p.parentNode;
+        }
+        return null;
+    }
+    function fireFormEvents(el) {
+        dispatch(el, new Event("input", { bubbles: true }), false);
+        dispatch(el, new Event("change", { bubbles: true }), false);
+    }
+    trust.formSet = function (id, value, checked) {
+        const el = wrap(id);
+        if (!el) return false;
+        value = value === null || value === undefined ? "" : String(value);
+        const tag = el.localName;
+        const type = String(el.type || "").toLowerCase();
+        let changed = false;
+        if (tag === "input" && (type === "checkbox" || type === "radio")) {
+            const want = !!checked;
+            if (type === "radio" && want && el.name) {
+                const scope = nearestForm(el) || g.document;
+                for (const r of scope.querySelectorAll("input")) {
+                    if (r !== el && String(r.type || "").toLowerCase() === "radio" && r.name === el.name && r.checked) {
+                        r.checked = false;
+                        changed = true;
+                    }
+                }
+            }
+            if (el.checked !== want) { el.checked = want; changed = true; }
+        } else if (tag === "select") {
+            for (const o of el.querySelectorAll("option")) {
+                const ov = o.getAttribute("value") === null ? o.textContent : o.getAttribute("value");
+                const want = ov === value;
+                if (want !== o.hasAttribute("selected")) {
+                    if (want) o.setAttribute("selected", "");
+                    else o.removeAttribute("selected");
+                    changed = true;
+                }
+            }
+        } else if (tag === "textarea") {
+            if (el.textContent !== value) { el.textContent = value; changed = true; }
+        } else {
+            if (el.value !== value) { el.value = value; changed = true; }
+        }
+        if (changed) fireFormEvents(el);
+        return changed;
+    };
+    trust.formSubmit = function (formId, submitterId) {
+        const form = wrap(formId);
+        if (!form) return false;
+        const ev = new Event("submit", { bubbles: true, cancelable: true });
+        ev.submitter = submitterId === null || submitterId === undefined ? null : wrap(submitterId);
+        dispatch(form, ev, false);
+        return ev.defaultPrevented;
     };
 
     // --- the DOM classes over the syscall boundary ---
@@ -3214,6 +3434,87 @@ const PRELUDE: &str = r##"
 mod tests {
     use super::*;
 
+    /// Measure PRELUDE's per-page cost in isolation, and the parse/exec
+    /// split (to judge whether a compile cache would even help — note Boa's
+    /// `Script` binds to the realm it parsed in, so cross-page reuse isn't
+    /// available anyway). Run:
+    ///   cargo test --release prelude_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual measurement"]
+    fn prelude_cost() {
+        // A faithful page context: DOM arena + syscalls + config script,
+        // exactly as `load_page` builds it (minus net/module loader, which
+        // PRELUDE doesn't touch at load time).
+        fn build_ctx() -> Context {
+            let html = r#"<html><head></head><body><p>hi</p><script>1</script></body></html>"#;
+            let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
+            let mut ctx = page_context_with(None).0;
+            {
+                let mut host = ctx.realm().host_defined_mut();
+                host.insert(PageDom(dom.clone()));
+                host.insert(PageStore {
+                    map: Default::default(),
+                    origin: String::from("https://example.com"),
+                });
+            }
+            register_syscalls(&mut ctx).unwrap();
+            let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 640, height: 384 };"#;
+            ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+            ctx
+        }
+
+        const N: u32 = 50;
+
+        // (a) context build + syscalls + config, no PRELUDE.
+        let t = Instant::now();
+        for _ in 0..N {
+            let _c = build_ctx();
+        }
+        let ctx_build = t.elapsed() / N;
+
+        // (b) PRELUDE total (parse + compile + run) in a fresh context each.
+        let t = Instant::now();
+        for _ in 0..N {
+            let mut c = build_ctx();
+            c.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+        }
+        let prelude_total = (t.elapsed() / N).saturating_sub(ctx_build);
+
+        // (c) split parse+compile vs evaluate, fresh context each.
+        let (mut parse_acc, mut eval_acc) = (Duration::ZERO, Duration::ZERO);
+        for _ in 0..N {
+            let mut c = build_ctx();
+            let t = Instant::now();
+            let script =
+                boa_engine::Script::parse(Source::from_bytes(PRELUDE.as_bytes()), None, &mut c)
+                    .unwrap();
+            parse_acc += t.elapsed();
+            let t = Instant::now();
+            script.evaluate(&mut c).unwrap();
+            eval_acc += t.elapsed();
+        }
+
+        // (d) a trivial post-PRELUDE page call, for contrast.
+        let mut c = build_ctx();
+        c.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+        let t = Instant::now();
+        for _ in 0..N {
+            c.eval(Source::from_bytes(
+                b"document.querySelector('p').textContent",
+            ))
+            .unwrap();
+        }
+        let tiny_call = t.elapsed() / N;
+
+        eprintln!("--- PRELUDE cost (avg of {N}, release recommended) ---");
+        eprintln!("PRELUDE size:                      {} bytes", PRELUDE.len());
+        eprintln!("context build (+syscalls+config):  {ctx_build:?}");
+        eprintln!("PRELUDE total (parse+compile+run): {prelude_total:?}");
+        eprintln!("  - parse+compile:                 {:?}", parse_acc / N);
+        eprintln!("  - evaluate:                      {:?}", eval_acc / N);
+        eprintln!("tiny post-prelude page call:       {tiny_call:?}");
+    }
+
     #[test]
     fn scripts_run_and_globals_persist_within_a_page() {
         let mut ctx = page_context();
@@ -3571,6 +3872,103 @@ mod tests {
         assert!(out.contains("stays"), "{out}");
     }
 
+    fn live_node_after(html: &str, marker: &str) -> usize {
+        let start = html.find(marker).expect("marker in live html");
+        let rest = &html[start..];
+        let attr = "data-trust-node=\"";
+        let attr_start = rest.find(attr).expect("live node attr") + attr.len();
+        let rest = &rest[attr_start..];
+        let attr_end = rest.find('"').expect("attr end");
+        rest[..attr_end].parse().expect("node id")
+    }
+
+    #[test]
+    fn live_form_input_sets_dom_and_fires_input_change() {
+        let (handle, mut events) = live(
+            "<body><form><input name=msg><p id=out></p></form>\
+             <script>\
+             const msg = document.querySelector('input');\
+             const out = document.getElementById('out');\
+             const log = [];\
+             msg.addEventListener('input', function () { log.push('input:' + msg.value); });\
+             msg.addEventListener('change', function () { log.push('change:' + msg.value); out.textContent = log.join('|'); });\
+             </script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("live form should keep the actor resident");
+        };
+        let input = live_node_after(&html, "name=\"msg\"");
+        handle
+            .cmds
+            .blocking_send(PageCmd::SetValue {
+                node: input,
+                value: String::from("hello"),
+                checked: None,
+            })
+            .unwrap();
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("form edit should render an update");
+        };
+        assert!(html.contains("value=\"hello\""), "{html}");
+        assert!(
+            html.contains("input:hello|change:hello"),
+            "input/change fired in order: {html}"
+        );
+    }
+
+    #[test]
+    fn live_form_submit_prevent_default_updates_in_place() {
+        let (handle, mut events) = live(
+            "<body><form><input name=msg value=hi><button type=submit value=go>Send</button><p id=out></p></form>\
+             <script>\
+             const form = document.querySelector('form');\
+             form.addEventListener('submit', function (event) {\
+               event.preventDefault();\
+               document.getElementById('out').textContent = 'submit:' + form.querySelector('input').value + ':' + event.submitter.value;\
+             });\
+             </script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("live form should keep the actor resident");
+        };
+        let form = live_node_after(&html, "<form");
+        let button = live_node_after(&html, "<button");
+        handle
+            .cmds
+            .blocking_send(PageCmd::Submit {
+                form,
+                submitter: Some(button),
+            })
+            .unwrap();
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("prevented submit should update in place");
+        };
+        assert!(html.contains("submit:hi:go"), "{html}");
+    }
+
+    #[test]
+    fn live_form_submit_default_falls_back_to_app() {
+        let (handle, mut events) = live(
+            "<body><form><input name=msg value=hi><button type=submit>Send</button></form><script>document.body.dataset.ready='1';</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("live form should keep the actor resident");
+        };
+        let form = live_node_after(&html, "<form");
+        let button = live_node_after(&html, "<button");
+        handle
+            .cmds
+            .blocking_send(PageCmd::Submit {
+                form,
+                submitter: Some(button),
+            })
+            .unwrap();
+        match events.blocking_recv() {
+            Some(PageEvt::SubmitDefault) => {}
+            other => panic!("unprevented submit should ask app to submit, got {other:?}"),
+        }
+    }
+
     #[test]
     fn live_click_toggles_stylesheet_class_visibility() {
         // The CSS step-1 payoff on a living page: a click that flips a
@@ -3638,10 +4036,13 @@ mod tests {
         let noop = id_of(&html, "id=\"noop\"");
         let real = id_of(&html, "id=\"real\"");
 
-        // Dispatch the no-op first, then the mutating click: the FIRST
-        // event to arrive must already be the mutation (the no-op
-        // dispatch emitted nothing — the dirty bit held).
+        // Dispatch the no-op first: it acknowledges completion without
+        // an Updated render, so the dirty bit still held.
         handle.cmds.blocking_send(PageCmd::Click(noop)).unwrap();
+        match events.blocking_recv() {
+            Some(PageEvt::Settled) => {}
+            other => panic!("no-op click should only settle, got {other:?}"),
+        }
         handle.cmds.blocking_send(PageCmd::Click(real)).unwrap();
         let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
             panic!("expected Updated from the mutating click");

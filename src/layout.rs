@@ -116,6 +116,16 @@ pub struct Row {
     pub items: Vec<Item>,
 }
 
+/// An element subtree laid out as an independent box, positioned relative
+/// to its own top-left. `width` is the widest used column and `height` is
+/// `rows.len()`. `blit` places it into a parent at a `(col, row)` offset —
+/// the primitive under flex-wrap grids (and later columns and floats).
+struct LaidBox {
+    rows: Vec<Row>,
+    width: u16,
+    height: u16,
+}
+
 /// Reconstruct a row's plain text, honoring item start columns (gaps
 /// become spaces). Test/diagnostic helper.
 #[cfg(test)]
@@ -152,6 +162,7 @@ pub fn lay_out(
         layout.flow_node(child, &ctx);
     }
     layout.flush_block();
+    layout.finish_floats();
     layout.finish()
 }
 
@@ -161,6 +172,46 @@ fn body_or_document(dom: &Dom) -> NodeId {
         .into_iter()
         .find(|&id| dom.tag_name(id) == Some("body"))
         .unwrap_or(DOCUMENT)
+}
+
+/// The narrowest a flexible flex-row column may be before the row stacks
+/// vertically instead (the responsive fallback) — below this, columns are
+/// too thin to read.
+const MIN_COL: usize = 12;
+
+/// How a flex container lays its items out (Phase A/B of the 2D arc).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlexMode {
+    /// Wrapping container: shelf-packed 2D grid (e.g. a thumbnail list).
+    Grid,
+    /// Non-wrapping row: side-by-side columns (e.g. sidebar | content).
+    Row,
+    /// Non-wrapping column: stacked block-level items (e.g. a card).
+    Column,
+}
+
+/// Which edge a `float` pins to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FloatSide {
+    Left,
+    Right,
+}
+
+/// A floated box taken out of normal flow (Phase C). It pins to one edge
+/// and narrows the content band of every row it spans `[start_row,
+/// bottom)`; following content flows beside it across blocks (true BFC
+/// behavior — her call) until content passes `bottom` or a `clear`. The
+/// `boxed` content is blitted into those rows when the float is resolved.
+struct Float {
+    side: FloatSide,
+    /// Left column of the float box.
+    col: u16,
+    /// Box width in cells (what it reserves from the band).
+    width: usize,
+    start_row: usize,
+    /// First row past the float (`start_row + boxed.height`).
+    bottom: usize,
+    boxed: LaidBox,
 }
 
 /// How an element participates in flow, resolved from `display`.
@@ -406,6 +457,20 @@ struct Layout<'a> {
     col: usize,
     /// Left indent of the current block.
     indent: usize,
+    /// The current line's left/right content boundaries in cells —
+    /// `indent`/`width` narrowed by any floats active on this row. The
+    /// inline flow starts at `line_left` and wraps at `line_right`;
+    /// `begin_line` recomputes them per row.
+    line_left: usize,
+    line_right: usize,
+    /// Floats taken out of normal flow, narrowing the band of the rows
+    /// they span until content passes their bottom (or a `clear`). Their
+    /// boxes are blitted into those rows once resolved.
+    floats: Vec<Float>,
+    /// When laying a float's OWN box (a fresh sub-layout rooted at the
+    /// floated element), its float is ignored so it doesn't recurse — the
+    /// float only matters to the parent.
+    float_skip: Option<NodeId>,
     /// Inherited horizontal alignment of the current block's lines.
     align: Align,
     /// An inter-word space is owed before the next word.
@@ -440,6 +505,10 @@ impl<'a> Layout<'a> {
             line: Vec::new(),
             col: 0,
             indent: 0,
+            line_left: 0,
+            line_right: width,
+            floats: Vec::new(),
+            float_skip: None,
             align: Align::Left,
             pending_space: false,
             ws: WhiteSpace::Normal,
@@ -464,6 +533,16 @@ impl<'a> Layout<'a> {
             return;
         };
         if SKIP.contains(&tag.as_str()) || self.dom.is_hidden(id) {
+            return;
+        }
+        // A floated element leaves normal flow: pin it to an edge and let the
+        // following content wrap beside it (across blocks, until cleared or
+        // its bottom is passed). Checked before the tag dispatch so a floated
+        // `<img>` floats too; skipped when laying the float's own box.
+        if self.float_skip != Some(id)
+            && let Some(side) = self.float_side(id)
+        {
+            self.flow_float(id, side);
             return;
         }
         match tag.as_str() {
@@ -562,8 +641,14 @@ impl<'a> Layout<'a> {
             return;
         }
         let block_like = matches!(flow, Flow::Block | Flow::ListItem);
+        // A flex container lays its children out as boxes: a wrapping one
+        // as a 2D grid, a row one as side-by-side columns, a column one as
+        // stacked block-level items. Everything else flows normally.
+        let flex = if block_like { self.flex_mode(id) } else { None };
         if block_like {
             self.flush_block();
+            // CSS `clear` drops this block below the floats it clears.
+            self.clear_floats(id);
             if self.gap_before(id, &tag) {
                 self.push_blank();
             }
@@ -588,10 +673,11 @@ impl<'a> Layout<'a> {
             0
         };
         self.indent += indent_add;
-        // At a block boundary the line is empty, so the cursor sits at
-        // the (new) indent. Inline elements don't touch it.
+        // At a block boundary the line is empty; reset to the (new) band
+        // left (indent narrowed by any active floats). Inline elements
+        // don't touch it.
         if block_like {
-            self.col = self.indent;
+            self.begin_line();
         }
 
         // white-space inherits: `<pre>` defaults to Pre, and CSS overrides
@@ -629,8 +715,15 @@ impl<'a> Layout<'a> {
             self.place_text(&t, &cctx);
         }
 
-        for child in self.dom.children(id) {
-            self.flow_node(child, &cctx);
+        match flex {
+            Some(FlexMode::Grid) => self.flow_flex_wrap(id),
+            Some(FlexMode::Row) => self.flow_flex_row(id),
+            Some(FlexMode::Column) => self.stack_flex_items(id),
+            None => {
+                for child in self.dom.children(id) {
+                    self.flow_node(child, &cctx);
+                }
+            }
         }
 
         // ...and `::after` closes it.
@@ -663,7 +756,7 @@ impl<'a> Layout<'a> {
         }
         self.indent -= indent_add;
         if block_like {
-            self.col = self.indent;
+            self.begin_line();
         }
     }
 
@@ -743,6 +836,441 @@ impl<'a> Layout<'a> {
         }
     }
 
+    /// How a flex container lays out, or `None` if it isn't one. A wrapping
+    /// container is a `Grid` (shelf-packed, regardless of direction); a
+    /// non-wrapping one is `Row` (side-by-side columns) or `Column`
+    /// (stacked block-level items) per `flex-direction`/`flex-flow`.
+    fn flex_mode(&self, id: NodeId) -> Option<FlexMode> {
+        if !matches!(
+            self.dom.computed_display(id).as_deref(),
+            Some("flex" | "inline-flex")
+        ) {
+            return None;
+        }
+        let flow = self.dom.computed_style(id, "flex-flow");
+        let has = |prop: Option<&String>, words: &[&str]| {
+            prop.is_some_and(|v| v.split_whitespace().any(|t| words.contains(&t)))
+        };
+        let wrap = has(
+            self.dom.computed_style(id, "flex-wrap").as_ref(),
+            &["wrap", "wrap-reverse"],
+        ) || has(flow.as_ref(), &["wrap", "wrap-reverse"]);
+        if wrap {
+            return Some(FlexMode::Grid);
+        }
+        let column = self
+            .dom
+            .computed_style(id, "flex-direction")
+            .is_some_and(|v| v.trim().starts_with("column"))
+            || has(flow.as_ref(), &["column", "column-reverse"]);
+        Some(if column {
+            FlexMode::Column
+        } else {
+            FlexMode::Row
+        })
+    }
+
+    /// Lay a non-wrapping flex-row out as side-by-side columns. Each child
+    /// box gets its explicit `width`/`max-width` (capped to what's
+    /// available), and the children without one share the remaining width
+    /// equally (an approximation of `flex-grow`). A flexible child with no
+    /// renderable content collapses to nothing (a flex item with no basis,
+    /// content, or grow takes zero width — without this an empty trailing
+    /// `<span>` would steal a column's worth of width and render blank). The
+    /// container's height is the tallest column. If the columns can't fit —
+    /// fixed widths overflow, or a flexible column would fall below
+    /// `MIN_COL` — it falls back to stacking them vertically (the
+    /// responsive default).
+    fn flow_flex_row(&mut self, id: NodeId) {
+        let avail = self.width.saturating_sub(self.indent).max(1);
+        // Each kept column with its fixed width (`Some`) or flexible (`None`);
+        // empty flexible children are dropped here so they take no space.
+        let cols: Vec<(NodeId, Option<usize>)> = self
+            .flex_items(id)
+            .into_iter()
+            .filter_map(|k| {
+                let fixed = self
+                    .css_cells(k, "width")
+                    .or_else(|| self.css_cells(k, "max-width"))
+                    .map(|w| w.min(avail));
+                if fixed.is_none() && self.is_empty_box(k) {
+                    None
+                } else {
+                    Some((k, fixed))
+                }
+            })
+            .collect();
+        if cols.is_empty() {
+            return;
+        }
+        let gaps = cols.len().saturating_sub(1); // 1-cell inter-column gap
+        let sum_fixed: usize = cols.iter().filter_map(|(_, w)| *w).sum();
+        let n_flex = cols.iter().filter(|(_, w)| w.is_none()).count();
+        let flex_each = avail
+            .saturating_sub(gaps + sum_fixed)
+            .checked_div(n_flex)
+            .unwrap_or(0);
+        // Responsive fallback: stack when the columns won't fit.
+        if sum_fixed + gaps >= avail || (n_flex > 0 && flex_each < MIN_COL) {
+            let kids: Vec<NodeId> = cols.iter().map(|(k, _)| *k).collect();
+            self.stack_boxes(&kids, avail);
+            return;
+        }
+        let row_base = self.rows.len();
+        let mut x = 0usize;
+        for (i, (k, w)) in cols.iter().enumerate() {
+            let cw = w.unwrap_or(flex_each).max(1);
+            let b = self.layout_subtree(*k, cw);
+            if b.height > 0 {
+                self.blit(&b, (self.indent + x) as u16, row_base);
+            }
+            x += cw + if i + 1 < cols.len() { 1 } else { 0 };
+        }
+        self.col = self.indent;
+        self.pending_space = false;
+    }
+
+    /// Whether an element's subtree has nothing to render — no non-blank
+    /// text and no replaced/control element (`<img>`, form controls, …).
+    /// Used to collapse empty flexible flex columns. Hidden descendants
+    /// don't count as content.
+    fn is_empty_box(&self, id: NodeId) -> bool {
+        for d in self.dom.descendants(id) {
+            match &self.dom.node(d).data {
+                NodeData::Text(s) if !s.trim().is_empty() => return false,
+                NodeData::Element { .. }
+                    if matches!(
+                        self.dom.tag_name(d),
+                        Some(
+                            "img"
+                                | "input"
+                                | "button"
+                                | "select"
+                                | "textarea"
+                                | "video"
+                                | "canvas"
+                                | "svg"
+                                | "hr"
+                        )
+                    ) && !self.dom.is_hidden(d) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// Lay a flex container's items out as a vertical stack of block-level
+    /// boxes, each at the full available width — `flex-direction:column`,
+    /// and the responsive fallback for a too-narrow row. Blockifies inline
+    /// children (so a card's image and caption stack instead of fusing).
+    fn stack_flex_items(&mut self, id: NodeId) {
+        let kids = self.flex_items(id);
+        let avail = self.width.saturating_sub(self.indent).max(1);
+        self.stack_boxes(&kids, avail);
+    }
+
+    /// Stack a set of child boxes vertically at `width`, each below the
+    /// last (shared by column flex and the row fallback).
+    fn stack_boxes(&mut self, kids: &[NodeId], width: usize) {
+        let mut row = self.rows.len();
+        for &k in kids {
+            let b = self.layout_subtree(k, width);
+            if b.height == 0 {
+                continue;
+            }
+            self.blit(&b, self.indent as u16, row);
+            row += b.height as usize;
+        }
+        self.col = self.indent;
+        self.pending_space = false;
+    }
+
+    /// The element children of a flex container that generate flex items
+    /// (skipping hidden ones and whitespace/text nodes).
+    fn flex_items(&self, id: NodeId) -> Vec<NodeId> {
+        self.dom
+            .children(id)
+            .into_iter()
+            .filter(|&c| {
+                matches!(self.dom.node(c).data, NodeData::Element { .. }) && !self.dom.is_hidden(c)
+            })
+            .collect()
+    }
+
+    // ---- floats (Phase C) ------------------------------------------------
+
+    /// The content band `[left, right]` for a given output row: the block's
+    /// `indent`/`width` narrowed by every float spanning that row. Never
+    /// collapses below a single usable cell (an over-floated row ignores the
+    /// floats rather than render nothing).
+    fn band(&self, row: usize) -> (usize, usize) {
+        let mut left = self.indent;
+        let mut right = self.width;
+        for f in &self.floats {
+            if row >= f.start_row && row < f.bottom {
+                match f.side {
+                    FloatSide::Left => left = left.max(f.col as usize + f.width + 1),
+                    FloatSide::Right => {
+                        right = right.min((f.col as usize).saturating_sub(1));
+                    }
+                }
+            }
+        }
+        if left + 1 >= right {
+            // Band collapsed under the floats: fall back to the block box.
+            (self.indent, self.width.max(self.indent + 1))
+        } else {
+            (left, right)
+        }
+    }
+
+    /// Recompute the line bounds (and reset the cursor) for the row about to
+    /// be built, honoring any floats active on it.
+    fn begin_line(&mut self) {
+        let (l, r) = self.band(self.rows.len());
+        self.line_left = l;
+        self.line_right = r;
+        self.col = l;
+    }
+
+    /// The `float` side of an element (`left`/`right`), or `None`.
+    fn float_side(&self, id: NodeId) -> Option<FloatSide> {
+        match self
+            .dom
+            .computed_style(id, "float")?
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "left" => Some(FloatSide::Left),
+            "right" => Some(FloatSide::Right),
+            _ => None,
+        }
+    }
+
+    /// Take a floated element out of flow: lay it out as a box, pin it to its
+    /// edge (beside any floats already there), and narrow the band so the
+    /// following content flows past it. The box is blitted later, once
+    /// content has filled the rows it spans (`resolve_floats`).
+    fn flow_float(&mut self, id: NodeId, side: FloatSide) {
+        // Floats begin at a line boundary; refresh the band first.
+        self.flush_block();
+        self.begin_line();
+        let avail = self.line_right.saturating_sub(self.line_left).max(1);
+        let explicit = self
+            .css_cells(id, "width")
+            .or_else(|| self.css_cells(id, "max-width"))
+            .map(|w| w.min(avail));
+        let constraint = explicit.unwrap_or(avail).max(1);
+        let boxed = self.layout_subtree_inner(id, constraint, Some(id));
+        if boxed.height == 0 {
+            return;
+        }
+        let w = explicit.unwrap_or(boxed.width as usize).min(avail).max(1);
+        let start_row = self.rows.len();
+        let bottom = start_row + boxed.height as usize;
+        // Pin beside any floats already on this row (line_left/right already
+        // account for them).
+        let col = match side {
+            FloatSide::Left => self.line_left,
+            FloatSide::Right => self.line_right.saturating_sub(w),
+        } as u16;
+        self.floats.push(Float {
+            side,
+            col,
+            width: w,
+            start_row,
+            bottom,
+            boxed,
+        });
+        // Re-narrow the current line for the content that follows.
+        self.begin_line();
+    }
+
+    /// Blit every float whose bottom we've now reached into its reserved
+    /// rows and drop it from the active set (called after each row is
+    /// pushed). Rows it spans already exist (content filled them, or they
+    /// were padded), so the box merges alongside the wrapped content.
+    fn resolve_floats(&mut self) {
+        let reached = self.rows.len();
+        let mut i = 0;
+        while i < self.floats.len() {
+            if self.floats[i].bottom <= reached {
+                let f = self.floats.remove(i);
+                self.blit(&f.boxed, f.col, f.start_row);
+                // The float merged at the left/right edge after the content
+                // items; re-sort so each row stays column-ordered.
+                for r in f.start_row..f.bottom {
+                    if let Some(row) = self.rows.get_mut(r) {
+                        row.items.sort_by_key(|it| it.col);
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Pad blank rows up to the tallest remaining float, then blit them all
+    /// (a float taller than its wrapped content reserves the rest). Called
+    /// at the end of a layout pass.
+    fn finish_floats(&mut self) {
+        let max_bottom = self.floats.iter().map(|f| f.bottom).max().unwrap_or(0);
+        while self.rows.len() < max_bottom {
+            self.push_blank();
+        }
+        self.resolve_floats();
+    }
+
+    /// CSS `clear`: advance past the floats on the named side(s) so the
+    /// cleared block starts below them. Returns whether anything cleared.
+    fn clear_floats(&mut self, id: NodeId) {
+        let Some(sides) = self
+            .dom
+            .computed_style(id, "clear")
+            .map(|v| v.trim().to_ascii_lowercase())
+        else {
+            return;
+        };
+        let (l, r) = match sides.as_str() {
+            "left" => (true, false),
+            "right" => (false, true),
+            "both" => (true, true),
+            _ => return,
+        };
+        let target = self
+            .floats
+            .iter()
+            .filter(|f| match f.side {
+                FloatSide::Left => l,
+                FloatSide::Right => r,
+            })
+            .map(|f| f.bottom)
+            .max();
+        if let Some(t) = target {
+            while self.rows.len() < t {
+                self.push_blank();
+            }
+            self.resolve_floats();
+            self.begin_line();
+        }
+    }
+
+    /// Lay a flex-wrap container's children out as a grid: each child is
+    /// laid out as an independent box, then SHELF-PACKED left→right, the
+    /// shelf wrapping to a new band when the next box won't fit. Assumes a
+    /// block boundary (line empty, `col == indent`); appends finished rows
+    /// directly via `blit` and leaves the cursor back at the indent.
+    fn flow_flex_wrap(&mut self, id: NodeId) {
+        let avail = self.width.saturating_sub(self.indent).max(1);
+        let gap = 1usize; // approximate flex `gap`
+        let mut shelf_top = self.rows.len();
+        let mut x = 0usize; // used width of the current shelf (relative to indent)
+        let mut shelf_height = 0usize;
+        for child in self.flex_items(id) {
+            // An explicit `width` fixes the item's box (it occupies that
+            // width even when its content is narrower); without one the box
+            // is laid out at the available width and shrinks to its content.
+            let explicit = self.css_cells(child, "width").map(|w| w.min(avail).max(1));
+            let constraint = explicit
+                .or_else(|| self.css_cells(child, "max-width").map(|w| w.min(avail)))
+                .unwrap_or(avail)
+                .max(1);
+            let b = self.layout_subtree(child, constraint);
+            if b.height == 0 {
+                continue;
+            }
+            let w = explicit.unwrap_or(b.width as usize).min(avail).max(1);
+            // Wrap to the next shelf when this box won't fit beside the
+            // current one (but never wrap an empty shelf — an over-wide box
+            // takes its own band, clamped to the available width).
+            if x > 0 && x + gap + w > avail {
+                shelf_top += shelf_height;
+                x = 0;
+                shelf_height = 0;
+            }
+            let lead = if x > 0 { gap } else { 0 };
+            let col_off = self.indent + x + lead;
+            self.blit(&b, col_off as u16, shelf_top);
+            x += lead + w;
+            shelf_height = shelf_height.max(b.height as usize);
+        }
+        self.col = self.indent;
+        self.pending_space = false;
+    }
+
+    /// A CSS length property in terminal cells (≈ 2 cells/em, 16px=1em),
+    /// or `None` when unset or in an unsupported unit (`%`/`auto`/…).
+    fn css_cells(&self, id: NodeId, prop: &str) -> Option<usize> {
+        let v = self.dom.computed_style(id, prop)?;
+        css_length_em(&v).map(|em| (em * 2.0).round().max(1.0) as usize)
+    }
+
+    /// Lay an element's subtree out as an independent box at `content_width`,
+    /// positioned relative to its own top-left (`col` 0). Shares the DOM,
+    /// base URL, form/control maps, and image sizes with the parent. The
+    /// recursion that powers grids and (later) columns and floats.
+    fn layout_subtree(&self, id: NodeId, content_width: usize) -> LaidBox {
+        self.layout_subtree_inner(id, content_width, None)
+    }
+
+    /// `layout_subtree`, optionally ignoring the float on the root element
+    /// (used when laying a float's own box so it doesn't recurse).
+    fn layout_subtree_inner(
+        &self,
+        id: NodeId,
+        content_width: usize,
+        skip_float: Option<NodeId>,
+    ) -> LaidBox {
+        let mut sub = Layout::new(
+            self.dom,
+            self.base,
+            content_width.max(1),
+            self.forms,
+            self.controls,
+            self.images,
+        );
+        sub.float_skip = skip_float;
+        sub.flow_node(id, &Ctx::root());
+        sub.flush_block();
+        sub.finish_floats();
+        let rows = sub.finish();
+        let width = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .map(|it| it.col + it.width)
+            .max()
+            .unwrap_or(0);
+        let height = rows.len() as u16;
+        LaidBox {
+            rows,
+            width,
+            height,
+        }
+    }
+
+    /// Copy a laid-out box into the parent's rows, shifting every item's
+    /// `col` by `col_off` and placing box row `r` into parent row
+    /// `row_base + r` (creating parent rows as needed). The 2D placement
+    /// primitive — items keep their node/link so selection re-anchors and
+    /// vertical scroll still index by the parent row grid.
+    fn blit(&mut self, b: &LaidBox, col_off: u16, row_base: usize) {
+        for (r, row) in b.rows.iter().enumerate() {
+            let target = row_base + r;
+            while self.rows.len() <= target {
+                self.rows.push(Row::default());
+            }
+            for it in &row.items {
+                let mut it = it.clone();
+                it.col += col_off;
+                self.rows[target].items.push(it);
+            }
+        }
+    }
+
     /// Flow a run of inline text under the active `white-space` mode.
     fn place_text(&mut self, text: &str, ctx: &Ctx) {
         if text.is_empty() {
@@ -803,14 +1331,14 @@ impl<'a> Layout<'a> {
         let transformed = ctx.transform.apply(word);
         let word = transformed.as_ref();
         let wlen = word.chars().count();
-        let space = self.pending_space && self.col > self.indent;
+        let space = self.pending_space && self.col > self.line_left;
         if self.ws.wraps()
-            && self.col + space as usize + wlen > self.width
-            && self.col > self.indent
+            && self.col + space as usize + wlen > self.line_right
+            && self.col > self.line_left
         {
             self.break_line();
         }
-        let space = self.pending_space && self.col > self.indent;
+        let space = self.pending_space && self.col > self.line_left;
         self.pending_space = false;
         if space {
             if let Some(last) = self.line.last_mut() {
@@ -854,7 +1382,7 @@ impl<'a> Layout<'a> {
             return;
         }
         // pre-wrap: char-budget wrap within the content box, keeping spaces.
-        let avail = self.width.saturating_sub(self.indent).max(1);
+        let avail = self.line_right.saturating_sub(self.line_left).max(1);
         let mut buf = String::new();
         let mut chars = seg.chars().peekable();
         while let Some(c) = chars.next() {
@@ -932,7 +1460,7 @@ impl<'a> Layout<'a> {
     /// wider than the content width is clamped (height rescaled to keep
     /// the aspect the encode will use).
     fn place_image_box(&mut self, id: NodeId, ctx: &Ctx, url: String, w: u16, h: u16) {
-        let avail = self.width.saturating_sub(self.indent).max(1) as u16;
+        let avail = self.line_right.saturating_sub(self.line_left).max(1) as u16;
         let (w, h) = if w > avail {
             (avail, ((h as u32 * avail as u32 / w as u32).max(1)) as u16)
         } else {
@@ -946,13 +1474,14 @@ impl<'a> Layout<'a> {
             self.flush_block();
         } else {
             // Inline: wrap first if the box won't fit the rest of the line.
-            let space = self.pending_space && self.col > self.indent;
-            if self.col + space as usize + w as usize > self.width && self.col > self.indent {
+            let space = self.pending_space && self.col > self.line_left;
+            if self.col + space as usize + w as usize > self.line_right && self.col > self.line_left
+            {
                 self.break_line();
             }
             // An owed inter-item space becomes a one-cell gap (the renderer
             // fills column gaps; no need to pollute a neighbor's text).
-            if self.pending_space && self.col > self.indent {
+            if self.pending_space && self.col > self.line_left {
                 self.col += 1;
             }
             self.pending_space = false;
@@ -1041,11 +1570,11 @@ impl<'a> Layout<'a> {
     /// inter-item spacing/wrapping rules as a word but kept as one unit.
     fn place_atom(&mut self, text: String, kind: ItemKind, node: NodeId, link: Option<Link>) {
         let len = text.chars().count();
-        let space = self.pending_space && self.col > self.indent;
-        if self.col + space as usize + len > self.width && self.col > self.indent {
+        let space = self.pending_space && self.col > self.line_left;
+        if self.col + space as usize + len > self.line_right && self.col > self.line_left {
             self.break_line();
         }
-        let space = self.pending_space && self.col > self.indent;
+        let space = self.pending_space && self.col > self.line_left;
         self.pending_space = false;
         if space {
             if let Some(last) = self.line.last_mut() {
@@ -1079,7 +1608,7 @@ impl<'a> Layout<'a> {
     }
 
     fn push_rule(&mut self) {
-        let dashes = "─".repeat(self.width.saturating_sub(self.indent).min(40));
+        let dashes = "─".repeat(self.line_right.saturating_sub(self.line_left).min(40));
         let len = dashes.chars().count();
         self.push_item(
             dashes,
@@ -1127,21 +1656,25 @@ impl<'a> Layout<'a> {
             self.align_row(&mut items);
         }
         let band = self.line_height;
+        let spacer_indent = self.line_left;
         self.rows.push(Row { items });
-        self.col = self.indent;
         self.pending_space = false;
         self.line_height = 1;
         // Spacer rows carry a (non-empty) marker so `finish`'s blank-row
         // collapse leaves them intact; the renderer draws nothing for them
         // (the image overdraws the box) and selection skips them (no link).
         for _ in 1..band {
-            self.rows.push(image_spacer_row(self.indent));
+            self.rows.push(image_spacer_row(spacer_indent));
         }
+        // A float we've now scrolled past gets blitted into its rows; then
+        // recompute the band/cursor for the next line.
+        self.resolve_floats();
+        self.begin_line();
     }
 
     /// Offset a finished row's items to honor center/right `text-align`.
-    /// The shift is computed within the block's content box `[indent,
-    /// width]`, ignoring a trailing space on the last item.
+    /// The shift is computed within the current line's content band,
+    /// ignoring a trailing space on the last item.
     fn align_row(&self, items: &mut [Item]) {
         if self.align == Align::Left {
             return;
@@ -1149,7 +1682,7 @@ impl<'a> Layout<'a> {
         let Some(last) = items.last() else { return };
         let trailing = last.text.ends_with(' ') as u16;
         let used = (last.col + last.width).saturating_sub(trailing) as usize;
-        let free = self.width.saturating_sub(used);
+        let free = self.line_right.saturating_sub(used);
         if free == 0 {
             return;
         }
@@ -1858,6 +2391,351 @@ mod tests {
         assert!(
             texts(&rows).join(" ").contains("visible"),
             "the element itself is unaffected by its ::before rule"
+        );
+    }
+
+    /// The (row, col) of the first item whose text contains `needle`.
+    fn pos_of(rows: &[Row], needle: &str) -> (usize, u16) {
+        for (r, row) in rows.iter().enumerate() {
+            for it in &row.items {
+                if it.text.contains(needle) {
+                    return (r, it.col);
+                }
+            }
+        }
+        panic!("no item containing {needle:?}");
+    }
+
+    #[test]
+    fn flex_wrap_grid_packs_children_side_by_side_and_wraps() {
+        // Three 10-cell boxes (5em·2) in a wrapping flex container at
+        // width 24: two fit per shelf (10 + 1 gap + 10 = 21 ≤ 24), the
+        // third wraps onto a new band.
+        let rows = lay(
+            r#"<html><head><style>
+                 .grid{display:flex;flex-wrap:wrap}
+                 .cell{width:5em}
+               </style></head>
+               <body><div class="grid">
+                 <div class="cell">one</div>
+                 <div class="cell">two</div>
+                 <div class="cell">three</div>
+               </div></body></html>"#,
+            24,
+        );
+        let (r1, c1) = pos_of(&rows, "one");
+        let (r2, c2) = pos_of(&rows, "two");
+        let (r3, c3) = pos_of(&rows, "three");
+        // one|two share a row, side by side (two is one box-width + gap right).
+        assert_eq!(r1, r2, "first two cells share a shelf: {:?}", texts(&rows));
+        assert_eq!(c1, 0);
+        assert_eq!(c2, 11, "second cell sits past the first box + gap");
+        // three wrapped to a lower row, back at the left edge.
+        assert!(r3 > r1, "third cell wrapped to a new shelf");
+        assert_eq!(c3, 0);
+    }
+
+    #[test]
+    fn flex_wrap_thumbnail_grid_lays_images_in_a_grid() {
+        // safebooru's shape: an `.image-list` flex-wrap container of
+        // `.thumb` boxes, each a fixed-width column holding an image and a
+        // caption. The thumbs must pack into a grid, not stack vertically.
+        let mut images = ImageSizes::new();
+        for n in ["a", "b", "c"] {
+            images.insert(format!("https://example.com/{n}.png"), (10, 3));
+        }
+        let rows = lay_with_images(
+            r#"<html><head><style>
+                 .image-list{display:flex;flex-flow:wrap}
+                 .thumb{display:flex;flex-direction:column;width:6em}
+               </style></head>
+               <body><div class="image-list">
+                 <div class="thumb"><a href="/a"><img src="/a.png"></a><span>cap a</span></div>
+                 <div class="thumb"><a href="/b"><img src="/b.png"></a><span>cap b</span></div>
+                 <div class="thumb"><a href="/c"><img src="/c.png"></a><span>cap c</span></div>
+               </div></body></html>"#,
+            40,
+            &images,
+        );
+        // 6em·2 = 12 cells per thumb; 12+1+12+1+12 = 38 ≤ 40 → all three
+        // pack onto the first band, side by side.
+        let (ra, ca) = pos_of(&rows, "cap a");
+        let (rb, cb) = pos_of(&rows, "cap b");
+        let (rc, cc) = pos_of(&rows, "cap c");
+        assert_eq!(ra, rb, "captions on the same band: {:?}", texts(&rows));
+        assert_eq!(rb, rc);
+        assert!(ca < cb && cb < cc, "thumbs ordered left to right");
+        // Each thumb's image landed at the thumb's left edge, on its own
+        // band above the caption; three images, distinct columns.
+        let img_cols: Vec<u16> = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.is_some())
+            .map(|i| i.col)
+            .collect();
+        assert_eq!(img_cols.len(), 3, "three thumbnail images placed");
+        assert_eq!(img_cols, vec![ca, cb, cc], "images align with captions");
+    }
+
+    #[test]
+    fn flex_column_stacks_block_children() {
+        // A `flex-direction:column` card stacks its children vertically.
+        let rows = lay(
+            r#"<html><head><style>.card{display:flex;flex-direction:column}</style></head>
+               <body><div class="card"><div>top</div><div>bottom</div></div></body></html>"#,
+            40,
+        );
+        let (rt, _) = pos_of(&rows, "top");
+        let (rb, _) = pos_of(&rows, "bottom");
+        assert!(rb > rt, "column flex stacks: {:?}", texts(&rows));
+    }
+
+    #[test]
+    fn flex_column_blockifies_inline_children() {
+        // The thumbnail-card shape: an anchor and a caption span (both
+        // inline) must STACK under flex-direction:column, not fuse on one
+        // line — each flex item is block-level.
+        let rows = lay(
+            r#"<html><head><style>.thumb{display:flex;flex-direction:column}</style></head>
+               <body><div class="thumb"><a href="/x">LINK</a><span>CAPTION</span></div></body></html>"#,
+            40,
+        );
+        let (rl, _) = pos_of(&rows, "LINK");
+        let (rc, _) = pos_of(&rows, "CAPTION");
+        assert!(
+            rc > rl,
+            "inline flex items stack as blocks: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn flex_row_lays_children_as_columns() {
+        // A fixed sidebar (max-width 10em = 20 cells) beside a flexible
+        // content column at width 60: side by side, content past the gap.
+        let rows = lay(
+            r#"<html><head><style>
+                 .row{display:flex;flex-direction:row}
+                 .side{max-width:10em}
+               </style></head>
+               <body><div class="row">
+                 <div class="side">SIDEBAR</div>
+                 <div class="main">CONTENT</div>
+               </div></body></html>"#,
+            60,
+        );
+        let (rs, cs) = pos_of(&rows, "SIDEBAR");
+        let (rc, cc) = pos_of(&rows, "CONTENT");
+        assert_eq!(rs, rc, "columns share a row: {:?}", texts(&rows));
+        assert_eq!(cs, 0, "sidebar at the left edge");
+        assert_eq!(cc, 21, "content past the 20-cell sidebar + 1-cell gap");
+    }
+
+    #[test]
+    fn flex_row_flexible_column_wraps_its_own_content() {
+        // A flexible content column gets the remaining width and wraps its
+        // text WITHIN that column (not across the whole viewport).
+        let rows = lay(
+            r#"<html><head><style>
+                 .row{display:flex;flex-direction:row}
+                 .side{width:6em}
+               </style></head>
+               <body><div class="row">
+                 <div class="side">menu</div>
+                 <div class="main">alpha beta gamma delta epsilon zeta eta theta</div>
+               </div></body></html>"#,
+            40,
+        );
+        // The content column starts at 12 (6em·2) + 1 gap = 13, so every
+        // content word sits at col ≥ 13 and the column wraps onto >1 row.
+        let content_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.items.iter().any(|i| i.col >= 13))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            content_rows.len() >= 2,
+            "flexible column wraps within its width: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn flex_row_empty_flexible_sibling_collapses() {
+        // safebooru's #post-list has THREE flex children: a fixed sidebar, a
+        // flexible content column, and a trailing EMPTY <span>. The empty
+        // span must collapse to zero so the content column gets the FULL
+        // remaining width (else it'd split the width and the grid would
+        // pack half as many thumbnails, leaving the page half blank).
+        let mut images = ImageSizes::new();
+        for n in 0..6 {
+            images.insert(format!("https://example.com/{n}.png"), (10, 5));
+        }
+        let html = r#"<html><head><style>
+             #post-list{display:flex;flex-direction:row;flex-wrap:nowrap}
+             .sidebar{max-width:10em}
+             .image-list{display:flex;flex-flow:wrap}
+             .thumb{display:flex;flex-direction:column;width:10em}
+           </style></head>
+           <body><div id="post-list">
+             <div class="sidebar">tags</div>
+             <div class="content"><div class="image-list">
+               <span class="thumb"><img src="/0.png"></span><span class="thumb"><img src="/1.png"></span>
+               <span class="thumb"><img src="/2.png"></span><span class="thumb"><img src="/3.png"></span>
+               <span class="thumb"><img src="/4.png"></span><span class="thumb"><img src="/5.png"></span>
+             </div></div>
+             <span></span>
+           </div></body></html>"#;
+        // width 80: sidebar 20 cells, gap 1 → content gets ~59 cells; each
+        // thumb is 10em=20 cells, so 2 fit per band (20+1+20=41 ≤ 59). With
+        // the empty span stealing half, content would be ~29 → only 1/band.
+        let rows = lay_with_images(html, 80, &images);
+        let first_band: usize = rows
+            .iter()
+            .find(|r| r.items.iter().any(|i| i.image.is_some()))
+            .map(|r| r.items.iter().filter(|i| i.image.is_some()).count())
+            .unwrap_or(0);
+        assert!(
+            first_band >= 2,
+            "content column got the full width (≥2 thumbs/band), not half: {first_band}"
+        );
+    }
+
+    #[test]
+    fn flex_row_stacks_when_too_narrow() {
+        // Two fixed 10em (=20 cell) columns can't both fit in width 30, so
+        // the row falls back to stacking them vertically.
+        let rows = lay(
+            r#"<html><head><style>
+                 .row{display:flex;flex-direction:row}
+                 .col{width:10em}
+               </style></head>
+               <body><div class="row">
+                 <div class="col">LEFT</div>
+                 <div class="col">RIGHT</div>
+               </div></body></html>"#,
+            30,
+        );
+        let (rl, cl) = pos_of(&rows, "LEFT");
+        let (rr, cr) = pos_of(&rows, "RIGHT");
+        assert!(rr > rl, "narrow row stacks: {:?}", texts(&rows));
+        assert_eq!((cl, cr), (0, 0), "stacked columns are full-width");
+    }
+
+    #[test]
+    fn float_left_wraps_text_beside_then_full_width_below() {
+        // A 12-wide, 2-row float at the left edge; the long paragraph flows
+        // in the narrowed band beside it, then returns to full width below.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/f.png".to_owned(), (12, 2));
+        let words = "aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx";
+        let html = format!(
+            r#"<html><head><style>img{{float:left}}</style></head>
+               <body><img src="/f.png"><p>{words}</p></body></html>"#
+        );
+        let rows = lay_with_images(&html, 40, &images);
+        let img = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .expect("float image");
+        assert_eq!((img.col, img.width, img.height), (0, 12, 2));
+        // Some text rides beside the float (col ≥ 13 = 12 + 1 gap)...
+        let beside = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .any(|i| i.image.is_none() && !i.text.trim().is_empty() && i.col >= 13);
+        assert!(beside, "text wraps beside the float: {:?}", texts(&rows));
+        // ...and some text below the float returns to the left edge (col 0).
+        let below_full_width = rows
+            .iter()
+            .enumerate()
+            .filter(|(r, _)| *r >= img.height as usize)
+            .any(|(_, row)| {
+                row.items
+                    .iter()
+                    .any(|i| !i.text.trim().is_empty() && i.col == 0)
+            });
+        assert!(
+            below_full_width,
+            "text returns to full width below the float: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn float_persists_across_following_blocks() {
+        // Her call: floats wrap content ACROSS sibling blocks (BFC), not just
+        // their own. A tall float beside two separate <p>s wraps both.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/f.png".to_owned(), (12, 6));
+        let rows = lay_with_images(
+            r#"<html><head><style>img{float:left}</style></head>
+               <body><img src="/f.png"><p>one two</p><p>four five</p></body></html>"#,
+            40,
+            &images,
+        );
+        let one = pos_of(&rows, "one");
+        let four = pos_of(&rows, "four");
+        assert!(one.1 >= 13, "first block flows beside the float");
+        assert!(
+            four.1 >= 13,
+            "second block ALSO flows beside the float (across blocks): {:?}",
+            texts(&rows)
+        );
+        assert!(four.0 < 6, "both blocks within the float's height");
+    }
+
+    #[test]
+    fn float_right_pins_to_the_right_edge() {
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/f.png".to_owned(), (10, 3));
+        let rows = lay_with_images(
+            r#"<html><head><style>img{float:right}</style></head>
+               <body><img src="/f.png"><p>alpha beta gamma delta epsilon zeta eta</p></body></html>"#,
+            40,
+            &images,
+        );
+        let img = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .expect("float image");
+        assert_eq!(img.col, 30, "float:right pinned to the right edge (40-10)");
+        // No text overlaps the floated box (everything stays left of col 30).
+        let max_text_right = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.is_none())
+            .map(|i| i.col + i.width)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_text_right <= 30,
+            "text stays left of the right float: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn clear_drops_below_the_float() {
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/f.png".to_owned(), (12, 5));
+        let rows = lay_with_images(
+            r#"<html><head><style>img{float:left}.below{clear:both}</style></head>
+               <body><img src="/f.png"><p>beside</p><p class="below">cleared</p></body></html>"#,
+            40,
+            &images,
+        );
+        let beside = pos_of(&rows, "beside");
+        let cleared = pos_of(&rows, "cleared");
+        assert!(beside.1 >= 13, "first para sits beside the float");
+        assert_eq!(cleared.1, 0, "cleared para is full-width");
+        assert!(
+            cleared.0 >= 5,
+            "clear:both drops the para below the 5-row float: {:?}",
+            texts(&rows)
         );
     }
 
