@@ -78,6 +78,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (None, Some(g)) => {
             let doc = Paragraph::new(browser_lines(g, inner.height as usize)).block(block);
             frame.render_widget(doc, session_area);
+            // Second pass: overlay decoded inline images on their reserved
+            // boxes. Only fully-visible boxes draw (the stateless widget
+            // refuses to clip — safe for sixel); the rest stay alt text.
+            if g.doc.laid_out() {
+                render_inline_images(frame, g, inner, &app.image_protocols);
+            }
         }
         (None, None) => {
             let term = PseudoTerminal::new(app.vt.screen()).block(block);
@@ -119,6 +125,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// The visible slice of a document, gopherus-style: the cursor line is
 /// highlighted when it carries a link.
 fn browser_lines(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
+    if g.doc.laid_out() {
+        return browser_rows(g, height);
+    }
     let end = (g.scroll + height).min(g.doc.lines.len());
     g.doc.lines[g.scroll..end]
         .iter()
@@ -129,10 +138,7 @@ fn browser_lines(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
                     .fg(theme::NEON_CYAN)
                     .add_modifier(Modifier::BOLD),
                 (true, Kind::Document) => Style::new().fg(theme::NEON_GREEN),
-                (true, Kind::Search | Kind::Input) => Style::new().fg(theme::AMBER),
-                (true, Kind::Button) => Style::new()
-                    .fg(theme::NEON_GREEN)
-                    .add_modifier(Modifier::BOLD),
+                (true, Kind::Search) => Style::new().fg(theme::AMBER),
                 (true, _) => Style::new().fg(theme::NEON_PINK),
                 (_, Kind::Error) => Style::new().fg(theme::NEON_PINK),
                 (_, Kind::Heading(1)) => Style::new()
@@ -154,6 +160,112 @@ fn browser_lines(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
         .collect()
 }
 
+/// Render an HTTP laid-out doc: each visible row is a sequence of
+/// positioned item spans, padded to each item's start column. The
+/// selected `(row, item)` is highlighted.
+fn browser_rows(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
+    use crate::layout::{ItemKind, NO_NODE};
+    // The selected link's source node: every item sharing it (a link that
+    // wrapped across rows) highlights as one unit.
+    let sel_node = g
+        .sel_item
+        .and_then(|(r, i)| g.doc.rows.get(r).and_then(|row| row.items.get(i)))
+        .map(|it| it.node);
+    let end = (g.scroll + height).min(g.doc.rows.len());
+    g.doc.rows[g.scroll..end]
+        .iter()
+        .enumerate()
+        .map(|(off, row)| {
+            let row_idx = g.scroll + off;
+            let mut spans: Vec<Span> = Vec::with_capacity(row.items.len() * 2);
+            let mut col = 0u16;
+            for (i, item) in row.items.iter().enumerate() {
+                if item.col > col {
+                    spans.push(Span::raw(" ".repeat((item.col - col) as usize)));
+                }
+                let mut style = match item.kind {
+                    ItemKind::Link => Style::new().fg(theme::NEON_CYAN),
+                    ItemKind::Heading(1) => Style::new()
+                        .fg(theme::NEON_PINK)
+                        .add_modifier(Modifier::BOLD),
+                    ItemKind::Heading(2) => Style::new()
+                        .fg(theme::NEON_CYAN)
+                        .add_modifier(Modifier::BOLD),
+                    ItemKind::Heading(_) => Style::new().fg(theme::NEON_CYAN),
+                    ItemKind::Quote => Style::new().fg(theme::DIM),
+                    ItemKind::Pre => Style::new().fg(theme::NEON_GREEN),
+                    ItemKind::Form => Style::new().fg(theme::AMBER),
+                    ItemKind::Image => Style::new().fg(theme::DIM).add_modifier(Modifier::ITALIC),
+                    ItemKind::Text => Style::new().fg(theme::TEXT),
+                };
+                // Emphasis is orthogonal to kind: a link or heading can
+                // also carry bold/italic/underline/strike from tags or CSS.
+                if item.emph.bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if item.emph.italic {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if item.emph.underline {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                if item.emph.strike {
+                    style = style.add_modifier(Modifier::CROSSED_OUT);
+                }
+                let selected = item.is_interactive()
+                    && match sel_node {
+                        // Highlight all pieces of the selected link (it may
+                        // have wrapped); fall back to the exact item when
+                        // the selection has no source node.
+                        Some(n) if n != NO_NODE => item.node == n,
+                        _ => g.sel_item == Some((row_idx, i)),
+                    };
+                if selected {
+                    style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+                }
+                spans.push(Span::styled(item.text.as_str(), style));
+                col = item.col + item.width;
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Overlay encoded inline images onto their reserved boxes within the
+/// browser viewport. `inner` is the content rect (inside the border);
+/// row `r` of the visible slice maps to screen row `inner.y + r`, the
+/// item's `col` to `inner.x + col`. An image only draws when its whole
+/// box fits the viewport (the stateless widget won't clip — keeps sixel
+/// from corrupting); a partly-scrolled image waits, alt text in its place.
+fn render_inline_images(
+    frame: &mut Frame,
+    g: &BrowserView,
+    inner: ratatui::layout::Rect,
+    protocols: &std::collections::HashMap<(String, u16, u16), ratatui_image::protocol::Protocol>,
+) {
+    let (vw, vh) = (inner.width, inner.height);
+    let end = (g.scroll + vh as usize).min(g.doc.rows.len());
+    for (r, row) in g.doc.rows[g.scroll..end].iter().enumerate() {
+        let top = r as u16;
+        for item in &row.items {
+            let Some(url) = &item.image else { continue };
+            if item.col + item.width > vw || top + item.height > vh {
+                continue;
+            }
+            let key = (url.clone(), item.width, item.height);
+            if let Some(proto) = protocols.get(&key) {
+                let area = ratatui::layout::Rect::new(
+                    inner.x + item.col,
+                    inner.y + top,
+                    item.width,
+                    item.height,
+                );
+                frame.render_widget(ratatui_image::Image::new(proto), area);
+            }
+        }
+    }
+}
+
 /// Status-bar / strip badge for the active browser protocol.
 fn protocol_badge(g: &BrowserView) -> &'static str {
     match &g.doc.url {
@@ -165,6 +277,7 @@ fn protocol_badge(g: &BrowserView) -> &'static str {
             crate::oneshot::Scheme::Whois => " WHOIS ",
             crate::oneshot::Scheme::Dict => " DICT ",
         },
+        Link::JsClick { .. } => " WWW ",
         // Form controls never appear as a document's own URL.
         Link::Form { .. } => " WWW ",
         Link::External(_) => " NET ",
@@ -307,10 +420,12 @@ fn strip_content(app: &App) -> Option<(&'static str, &'static str)> {
     if app.viewer.is_some() {
         Some((" IMG ", " ← / Esc close"))
     } else if let Some(g) = &app.browser {
-        Some((
-            protocol_badge(g),
-            " ↑↓ scroll · → follow · ← back · Esc terminal",
-        ))
+        let hint = if g.doc.laid_out() {
+            " ↑↓←→ move · Enter follow · ⌫ back · Esc terminal"
+        } else {
+            " ↑↓ scroll · → follow · ← back · Esc terminal"
+        };
+        Some((protocol_badge(g), hint))
     } else if app.char_mode() {
         Some((" CHAR ", " keys go directly to remote · server echoes"))
     } else {
@@ -376,12 +491,9 @@ fn status_bar(app: &App) -> Paragraph<'_> {
     // status, the way gopherus does — unless a fetch just went wrong,
     // which must not hide behind the selection hint.
     let selection = app
-        .browser
-        .as_ref()
-        .and_then(|g| g.selected.and_then(|i| g.doc.lines.get(i)))
-        .and_then(|l| l.link.as_ref())
+        .selected_link()
         .filter(|_| !app.notice && app.viewer.is_none());
-    let middle = match (&app.viewer, selection) {
+    let middle = match (&app.viewer, &selection) {
         // While viewing an image: its dimensions and type (unless a
         // notice — e.g. a failed re-encode — needs the bar).
         (Some(v), _) if !app.notice => format!(" {} — {} ", v.url, v.info),

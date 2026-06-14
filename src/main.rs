@@ -1,10 +1,13 @@
 mod app;
 mod cp437;
 mod doc;
+mod dom;
 mod gemini;
 mod gopher;
 mod http;
 mod img;
+mod js;
+mod layout;
 mod oneshot;
 mod telnet;
 mod tls;
