@@ -11,6 +11,7 @@
 //! against the DOM (js.rs) and lays out what they built.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
@@ -221,23 +222,23 @@ fn pool_put(key: PoolKey, io: BufReader<Conn>) {
     }
 }
 
-// ---- Read-only RAM cookie jar -----------------------------------------
+// ---- RAM-only cookie jar ----------------------------------------------
 //
-// We CAPTURE `Set-Cookie` from responses and expose them to page JS via
-// `document.cookie` (lots of sites' logged-out code reads a session
-// cookie and crashes if it's absent). We deliberately DO NOT send cookies
-// back on requests — that's the read-only stance: no cross-request
-// tracking, RAM-only, dies with the process. Sending them back is a
-// future opt-in, not a default. Subset of RFC 6265: name=value plus
-// Domain/Path/Secure/HttpOnly/Max-Age(=0 deletes); Expires/SameSite
-// ignored.
+// Cookies are ON by default, RAM-only, and never persisted. We CAPTURE
+// `Set-Cookie`, expose non-HttpOnly matches to page JS via
+// `document.cookie`, and send matching cookies back on requests. The
+// privacy line is exact-host isolation: `Domain=` is ignored, so a cookie
+// set by `shop.example` is only for `shop.example`, never `example` or
+// `other.example`. `set cookies off` disables capture, sends, and
+// document.cookie exposure without deleting the in-memory jar. Subset of
+// RFC 6265: name=value plus Path/Secure/HttpOnly/Max-Age(=0 deletes);
+// Domain/Expires/SameSite ignored.
 
 #[derive(Clone)]
 struct Cookie {
     name: String,
     value: String,
-    domain: String, // lowercased, no leading dot
-    host_only: bool,
+    domain: String, // exact lowercased host that created it
     path: String,
     secure: bool,
     http_only: bool,
@@ -245,12 +246,28 @@ struct Cookie {
 
 static COOKIE_JAR: std::sync::LazyLock<std::sync::Mutex<Vec<Cookie>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+static COOKIES_ENABLED: AtomicBool = AtomicBool::new(true);
 
 const COOKIE_JAR_MAX: usize = 1000;
+
+#[cfg(test)]
+pub(crate) static COOKIE_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+pub(crate) fn set_cookies_enabled(enabled: bool) {
+    COOKIES_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn cookies_enabled() -> bool {
+    COOKIES_ENABLED.load(Ordering::Relaxed)
+}
 
 /// Store a `Set-Cookie` header value against the response URL. `from_js`
 /// (a `document.cookie` write) forces off HttpOnly, as the platform does.
 fn store_cookie(url: &Url, line: &str, from_js: bool) {
+    if !cookies_enabled() {
+        return;
+    }
     let (nv, rest) = line.split_once(';').unwrap_or((line, ""));
     let Some((name, value)) = nv.split_once('=') else {
         return;
@@ -260,7 +277,7 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
         return;
     }
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    let (mut domain, mut host_only, mut path) = (host.clone(), true, String::from("/"));
+    let (domain, mut path) = (host.clone(), String::from("/"));
     let (mut secure, mut http_only, mut max_age) = (false, false, None::<i64>);
     for attr in rest.split(';') {
         let attr = attr.trim();
@@ -270,10 +287,8 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
                 (k.trim().to_ascii_lowercase(), v.trim().to_string())
             });
         match k.as_str() {
-            "domain" if !v.is_empty() => {
-                domain = v.trim_start_matches('.').to_ascii_lowercase();
-                host_only = false;
-            }
+            // Deliberately ignored: cookies are exact-host only in TRust.
+            "domain" => {}
             "path" if v.starts_with('/') => path = v,
             "secure" => secure = true,
             "httponly" => http_only = true,
@@ -284,10 +299,6 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
     if from_js {
         http_only = false;
     }
-    // A response can't set a cookie for an unrelated domain.
-    if !(host_only || host == domain || host.ends_with(&format!(".{domain}"))) {
-        return;
-    }
     let mut jar = COOKIE_JAR.lock().unwrap();
     jar.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
     if max_age.is_some_and(|m| m <= 0) {
@@ -297,7 +308,6 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
         name,
         value,
         domain,
-        host_only,
         path,
         secure,
         http_only,
@@ -308,17 +318,16 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
 }
 
 fn cookie_domain_match(host: &str, c: &Cookie) -> bool {
-    if c.host_only {
-        host == c.domain
-    } else {
-        host == c.domain || host.ends_with(&format!(".{}", c.domain))
-    }
+    host == c.domain
 }
 
 /// The `document.cookie` string for a page: name=value pairs for every
 /// jar cookie that domain/path/secure-matches, excluding HttpOnly (which
 /// JS can never read).
 pub(crate) fn cookies_for_js(page: &Url) -> String {
+    if !cookies_enabled() {
+        return String::new();
+    }
     let host = page.host_str().unwrap_or_default().to_ascii_lowercase();
     let path = page.path();
     let https = page.scheme() == "https";
@@ -333,10 +342,27 @@ pub(crate) fn cookies_for_js(page: &Url) -> String {
         .join("; ")
 }
 
-/// A `document.cookie = "..."` write from page JS. Never sent to a server
-/// (read-only jar); just readable by later `document.cookie` reads.
+/// A `document.cookie = "..."` write from page JS. Stored in the same
+/// RAM-only, exact-host jar used for requests.
 pub(crate) fn set_cookie_from_js(page: &Url, line: &str) {
     store_cookie(page, line, true);
+}
+
+fn cookies_for_request(url: &Url) -> String {
+    if !cookies_enabled() {
+        return String::new();
+    }
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let path = url.path();
+    let https = url.scheme() == "https";
+    let jar = COOKIE_JAR.lock().unwrap();
+    jar.iter()
+        .filter(|c| !c.secure || https)
+        .filter(|c| cookie_domain_match(&host, c))
+        .filter(|c| path == c.path || path.starts_with(&c.path))
+        .map(|c| format!("{}={}", c.name, c.value))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 async fn dial(scheme: &str, host: &str, port: u16) -> Result<BufReader<Conn>, String> {
@@ -394,7 +420,6 @@ fn finish_response(
         pool_put(key, io);
     }
     let url = &request.url;
-    // Read-only cookie jar: capture Set-Cookie, never send it back.
     for line in &set_cookies {
         store_cookie(url, line, false);
     }
@@ -459,6 +484,10 @@ async fn exchange(
          Connection: keep-alive\r\n",
         request.method, path, host_header, USER_AGENT,
     );
+    let cookie = cookies_for_request(url);
+    if !cookie.is_empty() {
+        head.push_str(&format!("Cookie: {cookie}\r\n"));
+    }
     if let Some((content_type, payload)) = &request.body {
         head.push_str(&format!(
             "Content-Type: {}\r\nContent-Length: {}\r\n",
@@ -1972,7 +2001,9 @@ customElements.define('lit-counter', LitCounter);
     }
 
     #[test]
-    fn cookie_jar_parses_matches_and_stays_read_only() {
+    fn cookie_jar_is_exact_host_and_request_visible() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
         // Unique domain so the process-global jar doesn't collide with
         // other tests (same caveat as the TOFU pins).
         let resp = parse_url("https://shop.ckjar-test.example/p").unwrap();
@@ -1981,35 +2012,43 @@ customElements.define('lit-counter', LitCounter);
             "sid=abc; Domain=ckjar-test.example; Path=/; Secure",
             false,
         );
-        store_cookie(&resp, "secret=xyz; HttpOnly", false); // host-only, hidden from JS
-        store_cookie(&resp, "pref=dark", false); // host-only, readable
+        store_cookie(&resp, "secret=xyz; HttpOnly", false); // sent, hidden from JS
+        store_cookie(&resp, "pref=dark", false); // readable and sent
 
         let page = parse_url("https://shop.ckjar-test.example/foo").unwrap();
         let c = cookies_for_js(&page);
-        assert!(
-            c.contains("sid=abc"),
-            "domain+secure cookie over https: {c}"
-        );
+        assert!(c.contains("sid=abc"), "secure cookie over https: {c}");
         assert!(c.contains("pref=dark"), "host cookie: {c}");
         assert!(!c.contains("secret"), "HttpOnly hidden from JS: {c}");
+        let req = cookies_for_request(&page);
+        assert!(req.contains("sid=abc"), "sent to exact host: {req}");
+        assert!(req.contains("secret=xyz"), "HttpOnly still sent: {req}");
 
-        // A sibling host sees the Domain cookie but not host-only ones.
+        // Domain= is deliberately ignored: no sibling or parent host gets it.
         let sib = parse_url("https://other.ckjar-test.example/").unwrap();
-        let cs = cookies_for_js(&sib);
+        assert!(cookies_for_js(&sib).is_empty(), "sibling sees nothing");
         assert!(
-            cs.contains("sid=abc"),
-            "domain cookie reaches subdomain: {cs}"
+            cookies_for_request(&sib).is_empty(),
+            "sibling sends nothing"
         );
-        assert!(!cs.contains("pref"), "host-only not cross-host: {cs}");
+        let parent = parse_url("https://ckjar-test.example/").unwrap();
+        assert!(
+            cookies_for_request(&parent).is_empty(),
+            "parent sends nothing"
+        );
 
-        // Secure cookies don't surface over http.
+        // Secure cookies don't surface or send over http.
         let http = parse_url("http://shop.ckjar-test.example/").unwrap();
         assert!(
             !cookies_for_js(&http).contains("sid=abc"),
             "secure hidden on http"
         );
+        assert!(
+            !cookies_for_request(&http).contains("sid=abc"),
+            "secure not sent on http"
+        );
 
-        // Max-Age=0 deletes; a JS write is never HttpOnly and is readable.
+        // Max-Age=0 deletes; a JS write is never HttpOnly and is readable/sent.
         store_cookie(&resp, "pref=; Max-Age=0", false);
         assert!(
             !cookies_for_js(&page).contains("pref"),
@@ -2020,12 +2059,23 @@ customElements.define('lit-counter', LitCounter);
             cookies_for_js(&page).contains("fromjs=1"),
             "JS-set cookie readable"
         );
+        assert!(
+            cookies_for_request(&page).contains("fromjs=1"),
+            "JS-set cookie sent to exact host"
+        );
     }
 
     /// A page reads back the `Set-Cookie` from its own response via
-    /// `document.cookie` (read-only jar). The request never sends it back.
+    /// `document.cookie`; matching cookies are also sent on later requests.
+    // Holds COOKIE_TEST_LOCK (a std guard) across awaits to serialize the
+    // process-global jar/enabled flag. Safe: each #[tokio::test] is its own
+    // current-thread runtime on its own thread, so a contending lock() blocks
+    // a separate thread and never the holder.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn document_cookie_reflects_captured_set_cookie() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2058,6 +2108,54 @@ customElements.define('lit-counter', LitCounter);
             !out.contains("tj_secret"),
             "HttpOnly cookie hidden from JS: {out}"
         );
+        server.abort();
+    }
+
+    // Same safe-across-await rationale as
+    // document_cookie_reflects_captured_set_cookie.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn redirect_sends_captured_exact_host_cookie() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        set_cookies_enabled(true);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req);
+                let first = text.starts_with("GET /start ");
+                let has_cookie = text.contains("Cookie:") && text.contains("redirjar=ok");
+                let reply = if first {
+                    "HTTP/1.1 302 Found\r\nLocation: /final\r\nSet-Cookie: redirjar=ok; Path=/\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else if has_cookie {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\ncookie ok"
+                        .to_string()
+                } else {
+                    "HTTP/1.1 302 Found\r\nLocation: /start\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/start")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"cookie ok");
         server.abort();
     }
 

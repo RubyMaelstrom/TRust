@@ -79,8 +79,13 @@ Things it handles along the way:
   jQuery manipulates pages, D3 appends elements, Vue mounts components,
   and pages may `fetch()`/XHR through TRust's own HTTP stack (capped
   per page, never into private address space), run ES modules, see a
-  read-only RAM cookie jar, and keep RAM-only `localStorage` for the
-  session. **Pages with things to click or edit stay alive**: buttons,
+  RAM-only cookie jar, and keep RAM-only `localStorage` for the
+  session. **Cookies are strictly no-cross-site for now**: captured in
+  RAM, never written to disk, and sent back *only* to the exact host
+  that set them — `Domain=` is ignored, so no parent or sibling
+  subdomain ever sees another host's cookie (`set cookies off` disables
+  them entirely). This policy may change going forward, but that is the
+  rule today. **Pages with things to click or edit stay alive**: buttons,
   script-handled links, and forms join the normal navigation — Enter
   dispatches real click/input/change/submit events into the live DOM
   and the page re-renders with whatever the handlers built, your place

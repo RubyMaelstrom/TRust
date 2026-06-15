@@ -948,6 +948,16 @@ impl App {
                     self.status = String::from("Encoding set to UTF-8.");
                 }
                 (Some("image"), Some(proto)) => self.set_image_protocol(proto),
+                (Some("cookies"), Some("on")) => {
+                    http::set_cookies_enabled(true);
+                    self.status = String::from(
+                        "Cookies on: RAM-only, exact-host only, sent with matching requests.",
+                    );
+                }
+                (Some("cookies"), Some("off")) => {
+                    http::set_cookies_enabled(false);
+                    self.status = String::from("Cookies off: no cookie capture, reads, or sends.");
+                }
                 (Some("js"), Some("on")) => {
                     self.js_enabled = true;
                     self.status = String::from(
@@ -960,7 +970,7 @@ impl App {
                 }
                 _ => {
                     self.status = String::from(
-                        "usage: set encoding cp437|utf8 · set image <protocol>|auto · set js on|off",
+                        "usage: set encoding cp437|utf8 · set image <protocol>|auto · set js on|off · set cookies on|off",
                     )
                 }
             },
@@ -1087,6 +1097,7 @@ impl App {
              Enter sends: {eol}\r\n\
              Encoding: {enc}\r\n\
              JavaScript: {js}\r\n\
+             Cookies: {cookies}\r\n\
              Remote options (WILL): {remote}\r\n\
              Local options (DO): {local}\r\n\
              \x1b[36m--------------------\x1b[0m\r\n",
@@ -1096,6 +1107,11 @@ impl App {
                 Encoding::Cp437 => "CP437",
             },
             js = if self.js_enabled { "on" } else { "off" },
+            cookies = if http::cookies_enabled() {
+                "on (RAM-only, exact-host)"
+            } else {
+                "off"
+            },
             remote = option_names(&self.remote_opts),
             local = option_names(&self.local_opts),
         );
