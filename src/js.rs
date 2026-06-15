@@ -931,8 +931,8 @@ fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
     Ok(promise.into())
 }
 
-/// `document.cookie` getter: the jar's name=value pairs for this page
-/// (read-only RAM jar; see http.rs). Empty without a net grant.
+/// `document.cookie` getter: the jar's non-HttpOnly name=value pairs
+/// for this exact host (RAM-only jar; see http.rs). Empty without a net grant.
 fn sys_cookie_get(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let cookies = ctx
         .realm()
@@ -943,8 +943,8 @@ fn sys_cookie_get(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsV
     Ok(str_value(&cookies))
 }
 
-/// `document.cookie = "..."`: store in the RAM jar so later reads see it.
-/// Never sent to a server (read-only jar).
+/// `document.cookie = "..."`: store in the RAM-only exact-host jar so
+/// later reads and matching requests see it.
 fn sys_cookie_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let line = arg_str(args, 0, ctx);
     if let Some(page) = ctx
@@ -4021,6 +4021,97 @@ mod tests {
     /// Diagnostic: run an arbitrary local HTML file through the full
     /// transform and dump the result. `TRUST_JS_DIAG=/path/page.html
     /// cargo test js_diag -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual canary: needs target/canary/vue.global.prod.js"]
+    fn vue_template_compiler_canary() {
+        let Ok(vue) = std::fs::read("target/canary/vue.global.prod.js") else {
+            eprintln!("no target/canary/vue.global.prod.js");
+            return;
+        };
+        let html = "<html><head><script src='/vue.js'></script></head>\n             <body><div id='target'>{{ who }}</div><script>\n             Vue.createApp({ data: function () { return { who: 'TRust template' }; } }).mount('#target');\n             </script></body></html>";
+        let mut env = PageEnv::bare("https://example.com/");
+        env.externals = vec![("/vue.js".to_string(), Some(vue))];
+        let (out, outcome) = transform(html, &env);
+        eprintln!("vue template outcome: {:?}", outcome);
+        for line in out
+            .lines()
+            .filter(|line| line.contains("TRust") || line.contains("failed"))
+        {
+            eprintln!("{}", line.trim());
+        }
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            !outcome.panicked,
+            "Vue template compiler panicked the engine"
+        );
+        assert!(out.contains("TRust template"), "{out}");
+    }
+
+    #[test]
+    #[ignore = "manual canary: needs target/canary/vue.global.prod.js"]
+    fn vue_v_for_template_compiler_canary() {
+        // The real Vue in-browser compiler path for `v-for`: it builds a
+        // `new Function` render whose `with(_ctx)` body feeds `_renderList` a
+        // per-item closure. This is what the boa_ast scope-index fix unblocked;
+        // before it, the per-item binding resolved to the wrong environment and
+        // the list never rendered. Uses the shipped Vue bundle end-to-end.
+        let Ok(vue) = std::fs::read("target/canary/vue.global.prod.js") else {
+            eprintln!("no target/canary/vue.global.prod.js");
+            return;
+        };
+        let html = "<html><head><script src='/vue.js'></script></head>\n             <body><ul id='target'><li v-for='item in items'>{{ item.name }}</li></ul><script>\n             Vue.createApp({ data: function () { return { items: [{ name: 'alpha' }, { name: 'beta' }, { name: 'gamma' }] }; } }).mount('#target');\n             </script></body></html>";
+        let mut env = PageEnv::bare("https://example.com/");
+        env.externals = vec![("/vue.js".to_string(), Some(vue))];
+        let (out, outcome) = transform(html, &env);
+        eprintln!("vue v-for outcome: {outcome:?}");
+        for line in out.lines().filter(|line| {
+            line.contains("alpha") || line.contains("beta") || line.contains("gamma")
+        }) {
+            eprintln!("{}", line.trim());
+        }
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(!outcome.panicked, "Vue v-for compiler panicked the engine");
+        assert!(
+            out.contains("alpha") && out.contains("beta") && out.contains("gamma"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn vue_v_for_style_render_closure_runs() {
+        // Vue's full template compiler emits, for `v-for`, a `new Function`-built
+        // render whose `with(_ctx)` body declares block-scoped consts captured by
+        // a per-item closure that takes the item as a parameter. That shape
+        // tripped a Boa scope-index divergence: dynamic functions skipped the
+        // `optimize_scope_indicies` pass, so the captured const resolved one
+        // environment too high and the per-item closure read the wrong env.
+        // Fixed in the vendored boa_ast (`optimize_function_scope_indicies`).
+        // This pins the whole transform pipeline, no Vue bundle required.
+        let html = r##"<body><ul id="t"></ul><script>
+            var _src = {
+              renderList: function (arr, cb) { return arr.map(cb).join(','); },
+              display: function (x) { return String(x); }
+            };
+            var makeRender = new Function(
+              'lib',
+              "const _lib = lib\n" +
+              "return function render(ctx) {\n" +
+              "  with (ctx) {\n" +
+              "    const { renderList: _rl, display: _ds } = _lib;\n" +
+              "    return _rl(items, function (it) { return _ds(it.name); });\n" +
+              "  }\n" +
+              "}"
+            );
+            var render = makeRender(_src);
+            document.getElementById('t').textContent =
+              render({ items: [{ name: 'a' }, { name: 'b' }] });
+            </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "engine panicked: {outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("a,b"), "{out}");
+    }
+
     #[test]
     #[ignore = "manual diagnostic, needs TRUST_JS_DIAG=<file>"]
     fn js_diag() {

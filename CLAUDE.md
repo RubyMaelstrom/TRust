@@ -36,6 +36,27 @@ don't nag about it.
   RELEASE BINARY — a feature isn't delivered until release is rebuilt
   (a stale release made working JS look broken once).
 
+## BINDING: maximize web compatibility, never fix to a single site
+
+When refining against a particular site (safebooru, danbooru, archive.org,
+SL marketplace, …), the site is a TEST CASE, not the TARGET. Every fix MUST
+aim for the broadest correct behavior across the web — fix the platform
+primitive (the DOM/CSS/JS/layout rule), not the symptom on that one page.
+Her standing rule: "always aim for maximum compatibility across the web
+rather than setting too narrow of a target with our fixes." Concretely:
+- Diagnose to the GENERAL root cause (a missing platform method, a spec
+  behavior we approximate wrong, an engine bug), then fix THAT. The
+  danbooru/archive.org wins were all general platform gains, never
+  per-host special-casing — keep it that way.
+- NO site sniffing, NO `if host == …` branches, NO hard-coded selectors
+  or shapes that only make one page look right. If a fix would only help
+  the current site, it's the wrong fix — widen it or flag the trade-off.
+- Prefer correctness that other sites silently benefit from; verify a fix
+  didn't regress the canaries (jQuery/D3/Vue/Lit) and the other reference
+  sites before calling it done.
+- A site that "renders" via a narrow hack is NOT done; a platform fix that
+  makes that site AND its neighbors render is.
+
 ## Live-testing workflow (and its gotchas)
 
 - Fake servers are small Python scripts in `$CLAUDE_JOB_DIR/tmp/`
@@ -261,8 +282,8 @@ watch, not a roadmap item.
   graph is ~32, full boot 62; 24 cut it off mid-graph),
   `MAX_PAGE_PRELOADS` 96, `MAX_PAGE_SHEETS` 16, `PREFETCH_CONCURRENCY`
   8. `subresource_allowed` / `script_source_allowed` block
-  private-address pivots. No CORS theater (no credentials exist; the cookie jar is
-  read-only and is not sent on requests). **Page fetches run CONCURRENTLY** (see "Parallel fetch"
+  private-address pivots. No CORS theater (cookies are exact-host only; no
+  Domain= cross-site/sibling access). **Page fetches run CONCURRENTLY** (see "Parallel fetch"
   below): `fetch()` and async XHR fire `__http_fetch_async` jobs that
   don't block the JS thread, so `Promise.all([...])` overlaps. Async
   XHR still defers `__finish` via `setTimeout(0)` (callbacks are
@@ -271,17 +292,22 @@ watch, not a roadmap item.
 - Storage: RAM-only, session-lifetime, origin-bucketed local/session
   (`WebStorage` Arc in App). Deviation from "no storage", accepted as
   zero-I/O.
-- **Cookies: READ-ONLY RAM jar** (`COOKIE_JAR` in http.rs, process-global
-  like `POOL`). We CAPTURE `Set-Cookie` from responses (collected in
-  `read_response` before the dedup'ing header HashMap loses the
-  multi-valued ones; stored in `finish_response`) and expose them to page
-  JS via `document.cookie` (`__cookie_get`/`__cookie_set` → `cookies_for_js`
-  /`set_cookie_from_js`; `navigator.cookieEnabled` now true). We
-  DELIBERATELY DO NOT send cookies back on requests — read-only, no
-  cross-request tracking; sending-back is a future opt-in (her call, not a
-  defining decision). Subset of RFC 6265: name=value + Domain/Path/Secure/
-  HttpOnly/Max-Age(=0 deletes); Expires/SameSite ignored; HttpOnly hidden
-  from JS, Secure only over https, domain/path matched. This is what fixed
+- **Cookies: RAM-only, default ON, exact-host only** (`COOKIE_JAR` in
+  http.rs, process-global like `POOL`; `set cookies off` disables capture,
+  sends, and `document.cookie` exposure without deleting the in-memory jar).
+  We CAPTURE `Set-Cookie` from responses (collected in `read_response`
+  before the dedup'ing header HashMap loses the multi-valued ones; stored in
+  `finish_response`), expose non-HttpOnly matches to page JS via
+  `document.cookie` (`__cookie_get`/`__cookie_set` → `cookies_for_js`
+  /`set_cookie_from_js`; `navigator.cookieEnabled` true), and send matching
+  cookies back on requests. Privacy invariant (STRICT NO-CROSS-SITE, her
+  call — this is the policy FOR NOW and may change going forward): cookies
+  are stored in RAM and returned ONLY to the exact host that created them —
+  `Domain=` is ignored, so no parent/sibling subdomain access ever. Subset
+  of RFC 6265: name=value + Path/Secure/
+  HttpOnly/Max-Age(=0 deletes); Domain/Expires/SameSite ignored; HttpOnly
+  hidden from JS but still sent, Secure only over https, path matched. This
+  is what fixed
   old.reddit (its `getLoIdData` reads the loid cookie unguarded).
   Process-global ⇒ tests must use unique hostnames (like the TOFU pins).
 - **CSS visibility (step 1)**: `is_hidden` is a real mini-cascade for
@@ -342,11 +368,39 @@ watch, not a roadmap item.
 1. **Boa's parser recurses on the native stack** — big bundles
    (archive.org) overflow the 2MB tokio blocking thread (= process
    abort, uncatchable). Hence the dedicated 64MB `trust-js` thread.
-2. **`with(this)` panics Boa's VM** ("must be declarative
-   environment") — Vue's in-browser template compiler emits it, so
-   render-function components work but template compilation doesn't.
-   `run_script` catch_unwinds: a panic costs one script,
-   `Outcome.panicked` halts page JS and keeps the partial DOM.
+2. **`with(this)` USED to panic Boa's VM** ("must be declarative
+   environment") — Vue's in-browser template compiler emits it. FULLY
+   FIXED IN THE FORK now (2026-06-15): simple interpolation first (Codex,
+   the runtime band-aids), then `v-for` via the parser fix below — and
+   the band-aids were DELETED once the parser fix subsumed them.
+   ROOT CAUSE of the `v-for` failure: `boa_ast`'s scope analyzer numbers
+   scopes by *lexical nesting depth*, then `optimize_scope_indicies`
+   (`scope_analyzer.rs` `ScopeIndexVisitor`) RE-INDEXES them to match the
+   envs the VM actually pushes (collapsing elided/all-local scopes).
+   `Script`/`Module::analyze_scope` ran that pass; `FunctionExpression::
+   analyze_scope` (the `new Function` path) did NOT — so a dynamically
+   compiled function kept the naive indices, a `with` inside it left every
+   nested binding's locator one env too high, and a `v-for` callback
+   pushing its own env on top landed the stale index in the wrong env
+   (`{{ x }}` happened to be top-of-stack so the old clamp masked it).
+   THE FIX (`vendor/boa_ast-0.21.1`): `FunctionExpression::analyze_scope`
+   now runs `optimize_function_scope_indicies`, a function-aware variant
+   that FORCES the root function's scope slot (matching the engine's
+   `force_function_scope`; a naive `optimize_scope_indicies` would instead
+   elide that slot and OOB-define the function's own captured `const`).
+   Verified: the now-un-ignored Boa test
+   `closure_in_with_captures_block_binding_through_parameter`, the always-run
+   `vue_v_for_style_render_closure_runs` (js.rs), the
+   `vue_v_for_template_compiler_canary` (real Vue 3.5 bundle → `<li>`s), and
+   a live tmux smoke (release) rendering a `v-for` list with a clean `· JS`
+   badge. The trap-#2 runtime band-aids — the `environment_expect` clamp,
+   `declarative_ref_at_or_below`, and the `CreateMappedArgumentsObject`
+   fallback — are GONE; `mapped_arguments_inside_with_environment` and
+   `vue_template_render_function_with_body` still pass without them. NOTE:
+   real-world Vue usually PRECOMPILES templates (ship render fns, which
+   always worked — the canaries); runtime template compilation was the
+   affected path. `run_script` still catch_unwinds as a safety net for any
+   OTHER VM panic.
 3. **Class getters without setters throw in strict mode** — every
    commonly-assigned Element property needs a setter (jQuery does
    `input.type = "radio"`).
@@ -633,9 +687,14 @@ page to last-good static + the `· JS:n!` badge.
   Mouse4 (browser-back thumb button) now triggers browser history back,
   same as Backspace, for all browser docs. Crossterm 0.29 did not expose
   side buttons, so the project patches it via `vendor/crossterm-0.29.0`
-  to surface Mouse4/Mouse5 from SGR button codes 8/9. (Second vendored
-  fork as of 2026-06-15: `vendor/boa_engine-0.21.1` — see the JS engine
-  section. Both are pinned in `[patch.crates-io]`.)
+  to surface Mouse4/Mouse5 from SGR button codes 8/9. (THREE vendored
+  forks as of 2026-06-15: `vendor/crossterm-0.29.0`,
+  `vendor/boa_engine-0.21.1`, and `vendor/boa_ast-0.21.1` — the last two
+  are the JS front+back of Boa, see the JS engine section. All pinned in
+  `[patch.crates-io]`. NOTE: a `[patch]` only applies in the root TRust
+  manifest, so building/testing `boa_engine` standalone uses the REGISTRY
+  `boa_ast`, not our vendored one — boa_ast changes must be driven through
+  TRust.)
 - **TRAP pinned**: live serializer writes `data-trust-node` on
   form/control elements because the app re-parses snapshots into a
   fresh layout DOM; never use layout parse node ids as actor node ids.
@@ -669,8 +728,7 @@ page to last-good static + the `· JS:n!` badge.
   deliberately don't (no idle CPU — the redraw-only-on-events invariant
   holds). Background ticking is a possible later opt-in — don't add it
   unprompted.
-- Later: sending cookies back is a future opt-in decision; Phase 3+:
-  MutationObserver (stub class exists, records nothing).
+- Later: Phase 3+: MutationObserver (stub class exists, records nothing).
 
 ## Telnet negotiation parity
 
@@ -722,10 +780,49 @@ Four landed, all release-verified, fmt/clippy-0, 211 tests:
 Tests added: `wide_module_fanout_runs_instead_of_falling_back`,
 `thrown_errors_carry_a_js_readable_stack`,
 `class_constructor_const_captured_by_closure_does_not_panic` (cap test
-dropped). NEXT fork candidate: trap #2 (`with(this)` VM panic →
-`vm/opcode/arguments.rs:29`, blocks Vue's in-browser template compiler);
-then efficiency (prelude compile-once). See the
-boa-cyclic-module-debug-crash memory for the running fork log.
+dropped). See the boa-cyclic-module-debug-crash memory for the running
+fork log.
+
+### Shipped 2026-06-15 (the Boa fork: trap #2 `with` — NOW COMPLETE, v-for too)
+**Trap #2 (`with(this)` VM panic) is FULLY fixed.** Two stages: (1) Codex
+killed the uncatchable abort + got simple interpolation running via runtime
+band-aids (`declarative_ref_at_or_below` + an `environment_expect` clamp +
+a `CreateMappedArgumentsObject` fallback). (2) Sister fixed `v-for` at the
+PARSER (the real root cause) and DELETED those band-aids.
+ROOT CAUSE (recap): `boa_ast`'s scope analyzer numbers scopes by lexical
+nesting depth, then `optimize_scope_indicies` (`scope_analyzer.rs`
+`ScopeIndexVisitor`) RE-INDEXES to match the envs the VM actually pushes.
+`Script`/`Module::analyze_scope` ran it; `FunctionExpression::analyze_scope`
+(the `new Function` path) did not, so dynamic functions kept naive indices
+and a `with` inside one left every nested binding one env too high — masked
+for top-of-stack `{{ x }}`, fatal for a `v-for` callback that pushes its own
+env (`get/name.rs` OOB read).
+THE FIX (`vendor/boa_ast-0.21.1`, ~25 lines): a new
+`optimize_function_scope_indicies` (sibling of `optimize_scope_indicies`)
+that sets a one-shot `force_function_scope` flag on the visitor;
+`ScopeIndexVisitor::visit_function_like` consumes it (`std::mem::take`, so
+only the ROOT function is forced — nested fns keep escape-analysis) and
+reserves the function's stack slot to match the engine's
+`force_function_scope`. `FunctionExpression::analyze_scope` calls it after
+the escape pass. A naive `optimize_scope_indicies(self, scope)` would NOT
+work — it elides the forced slot and OOB-defines the function's own captured
+`const` ("len 0 index 0"); forcing is the whole trick.
+BAND-AIDS DELETED: the `environment_expect` clamp, `declarative_ref_at_or_below`,
+and the mapped-arguments fallback are reverted to plain `expect`; the parser
+fix subsumes them.
+VERIFIED: full boa suite **861** green (the repro
+`closure_in_with_captures_block_binding_through_parameter` un-ignored), boa_ast
+6, `mapped_arguments_inside_with_environment` +
+`vue_template_render_function_with_body` still pass band-aid-free; TRust **213**
++ new `vue_v_for_style_render_closure_runs` (always-run) and
+`vue_v_for_template_compiler_canary` (real Vue 3.5 bundle → `<li>alpha…`);
+jQuery/D3/Vue/Lit canaries `errors:[]`; live tmux (fresh release binary)
+renders a `v-for` list with a clean `· JS` badge. fmt/clippy-0.
+GATING NOTE: a `[patch]` only applies in the root TRust build, so the boa
+suite was run via a TEMPORARY `[patch.crates-io] boa_ast = { path = .. }` in
+the boa_engine vendor manifest (REMOVED after — don't leave it).
+NEXT fork candidate: efficiency (prelude compile-once, modest payoff — measure
+first).
 
 ### Shipped 2026-06-15 (handoff summary for Codex)
 Big-web rendering push, all uncommitted (she commits), fmt/clippy clean,
@@ -749,14 +846,14 @@ site fixes + revive-on-back:
 - **Revive-on-back**: back to a was-live page reloads it live.
 
 OPEN / next candidates:
-- **Boa fork SHIPPED 2026-06-15** (`vendor/boa_engine-0.21.1`,
-  `[patch.crates-io]`): 4 engine fixes (cyclic-module Debug, module
-  rejection text, error `.stack`, **trap #6**) — see the "Shipped (the Boa
-  fork)" section above and the boa-cyclic-module-debug-crash memory.
-- **Boa trap #2 (NEXT fork candidate)**: `with(this)` panics the VM
-  (`vm/opcode/arguments.rs:29` "must be declarative"), blocking Vue's
-  in-browser template compiler (render-function components already work).
-  Then efficiency (prelude compile-once, modest payoff — measure first).
+- **Boa fork SHIPPED 2026-06-15** (`vendor/boa_engine-0.21.1` +
+  `vendor/boa_ast-0.21.1`, `[patch.crates-io]`): 6 engine fixes — cyclic-module
+  Debug, module rejection text, error `.stack`, **trap #6**, and **trap #2
+  `with(this)` NOW COMPLETE incl. `v-for`** (the boa_ast
+  `optimize_function_scope_indicies` parser fix; runtime band-aids deleted) —
+  see the "Shipped (the Boa fork)" sections above and the
+  boa-cyclic-module-debug-crash memory.
+- **Efficiency (prelude compile-once)**: modest payoff — measure first.
 - **archive.org tile CONTENT vs structure**: the grid scaffolds but tile
   titles/thumbs race WALL_BUDGET (20s) at the bigger real viewport —
   budget/perf, not a bug.
