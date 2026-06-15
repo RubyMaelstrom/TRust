@@ -1094,6 +1094,12 @@ const MAX_TICKS: usize = 200;
 pub struct PageEnv {
     pub url: String,
     pub viewport: (u16, u16),
+    /// Terminal cell size in pixels (width, height) — the picker's font
+    /// size. The reported CSS-pixel viewport is `viewport * cell_px`, so
+    /// the page sees a window proportional to the real terminal (a wide
+    /// terminal looks like a wide browser; SPAs/responsive layouts and
+    /// infinite-scrollers measure against it). 8x16 nominal in tests.
+    pub cell_px: (u16, u16),
     /// Pre-fetched external scripts keyed by raw `src` attribute
     /// (None = the fetch failed).
     pub externals: Vec<(String, Option<Vec<u8>>)>,
@@ -1118,6 +1124,7 @@ impl PageEnv {
         Self {
             url: url.to_string(),
             viewport: (80, 24),
+            cell_px: (8, 16),
             externals: Vec::new(),
             sheets: Vec::new(),
             preloaded: Vec::new(),
@@ -1125,6 +1132,23 @@ impl PageEnv {
             storage: None,
         }
     }
+}
+
+/// Format a rejected/thrown JS value for an error message: its display
+/// form plus an Error's `.stack` when present (diagnostics are worthless
+/// without it). Shared by promise-rejection tracking and module rejection.
+fn describe_rejection(v: &JsValue, ctx: &mut Context) -> String {
+    let mut s = format!("{}", v.display());
+    if let Some(o) = v.as_object()
+        && let Ok(st) = o.get(boa_engine::js_string!("stack"), ctx)
+        && !st.is_undefined()
+        && !st.is_null()
+        && let Ok(st) = st.to_string(ctx)
+        && !st.is_empty()
+    {
+        s.push_str(&format!("\n{}", st.to_std_string_lossy()));
+    }
+    s
 }
 
 /// Run a page's scripts against a real DOM and return the post-JS HTML.
@@ -1151,21 +1175,7 @@ impl boa_engine::context::HostHooks for PageHooks {
                 let reason = boa_engine::object::builtins::JsPromise::from_object(promise.clone())
                     .ok()
                     .map(|p| match p.state() {
-                        PromiseState::Rejected(v) => {
-                            let mut s = format!("{}", v.display());
-                            // Error objects carry a stack — diagnostics
-                            // are worthless without it.
-                            if let Some(o) = v.as_object()
-                                && let Ok(st) = o.get(boa_engine::js_string!("stack"), context)
-                                && !st.is_undefined()
-                                && !st.is_null()
-                                && let Ok(st) = st.to_string(context)
-                                && !st.is_empty()
-                            {
-                                s.push_str(&format!("\n{}", st.to_std_string_lossy()));
-                            }
-                            s
-                        }
+                        PromiseState::Rejected(v) => describe_rejection(&v, context),
                         _ => String::from("(rejection pending)"),
                     })
                     .unwrap_or_else(|| String::from("(unknown rejection)"));
@@ -1233,6 +1243,7 @@ impl boa_engine::module::ModuleLoader for WebModuleLoader {
         if let Some(cached) = self.cache.borrow().get(&key) {
             return Ok(cached.clone());
         }
+
         let preloaded = self.preloaded.borrow_mut().remove(&key);
         let body = match preloaded {
             Some(body) => body,
@@ -1331,7 +1342,10 @@ fn run_module(
             }
             boa_engine::builtins::promise::PromiseState::Fulfilled(_) => None,
             boa_engine::builtins::promise::PromiseState::Rejected(err) => {
-                Some(format!("{}", err.display()))
+                // Was a generic string while the cyclic-module `Debug`
+                // recursion made formatting a module value dangerous; the
+                // fork patched that, so report the real reason + stack.
+                Some(describe_rejection(&err, ctx))
             }
         }
     }));
@@ -1366,6 +1380,7 @@ struct LoadedPage {
 fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
     let page_url = env.url.as_str();
     let viewport = env.viewport;
+    let cell_px = env.cell_px;
     let externals = &env.externals;
     let mut outcome = Outcome::default();
     let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
@@ -1413,12 +1428,13 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
         outcome.errors.push(format!("syscalls: {err}"));
         return Err(outcome);
     }
-    // Nominal pixel viewport for scripts that measure: 8x16 cells.
+    // CSS-pixel viewport from the real terminal: cols/rows times the
+    // terminal's cell pixel size (the picker's font size; 8x16 nominal).
     let cfg = format!(
         "globalThis.__trust_cfg = {{ url: \"{}\", ua: \"TRust/0.1\", width: {}, height: {} }};",
         esc_js(page_url),
-        u32::from(viewport.0) * 8,
-        u32::from(viewport.1) * 16,
+        u32::from(viewport.0) * u32::from(cell_px.0.max(1)),
+        u32::from(viewport.1) * u32::from(cell_px.1.max(1)),
     );
     run_script(&mut ctx, "config", cfg.as_bytes(), &budget, &mut outcome);
     run_script(
@@ -1792,7 +1808,7 @@ fn page_actor(
             PageCmd::Click(node) => {
                 let nav = dispatch_click_in(&mut page, node);
                 drain_js_side(&mut page.ctx, &mut page.outcome);
-                if let Some(url) = nav {
+                if let Some(url) = take_script_navigation(&mut page).or(nav) {
                     if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
                         return;
                     }
@@ -1809,6 +1825,12 @@ fn page_actor(
             } => {
                 dispatch_form_set_in(&mut page, node, &value, checked);
                 drain_js_side(&mut page.ctx, &mut page.outcome);
+                if let Some(url) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 if !finish_dispatch(&mut page, &evts) {
                     return;
                 }
@@ -1820,6 +1842,12 @@ fn page_actor(
                     let _ = evts
                         .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
                     return;
+                }
+                if let Some(url) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                        return;
+                    }
+                    continue;
                 }
                 if !prevented {
                     if evts.blocking_send(PageEvt::SubmitDefault).is_err() {
@@ -1855,6 +1883,19 @@ fn finish_dispatch(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageE
             .is_ok();
     }
     evts.blocking_send(PageEvt::Settled).is_ok()
+}
+
+fn take_script_navigation(page: &mut LoadedPage) -> Option<String> {
+    let v = page
+        .ctx
+        .eval(Source::from_bytes(b"__trust.takeNavigation()"))
+        .ok()?;
+    if v.is_null_or_undefined() {
+        return None;
+    }
+    let s = v.to_string(&mut page.ctx).ok()?.to_std_string_lossy();
+    let trimmed = s.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn prepare_dispatch(page: &mut LoadedPage) {
@@ -2556,6 +2597,33 @@ const PRELUDE: &str = r##"
         hasAttribute(n) { return __dom_get_attr(this.__id, String(n)) !== null; }
         getAttributeNames() { return __dom_attr_names(this.__id); }
         hasAttributes() { return __dom_attr_names(this.__id).length > 0; }
+        // NamedNodeMap, array-like enough for Array.from/iteration/indexing
+        // (Alpine's DOM morph does `Array.from(el.attributes)` — undefined
+        // here threw ToObject and aborted danbooru's whole render). Values
+        // re-read live; the list is a snapshot of names per access.
+        get attributes() {
+            // Plain loop + snapshot values + `this`-based methods: NO
+            // closure capturing a block-scoped local invoked from a native
+            // callback (Boa trap #6 — `.map`/getters here aborted the page
+            // with a define-opcode OOB panic). Values snapshot per access.
+            const names = __dom_attr_names(this.__id) || [];
+            const list = [];
+            for (let i = 0; i < names.length; i++) {
+                const n = names[i];
+                const v = __dom_get_attr(this.__id, n);
+                list.push({
+                    name: n, localName: n, nodeName: n, namespaceURI: null,
+                    prefix: null, specified: true, ownerElement: this,
+                    value: v, nodeValue: v,
+                });
+            }
+            list.item = function (i) { return this[i] || null; };
+            list.getNamedItem = function (nm) {
+                for (var j = 0; j < this.length; j++) if (this[j].name === String(nm)) return this[j];
+                return null;
+            };
+            return list;
+        }
         // Lit's ?attr= boolean bindings commit through this.
         toggleAttribute(name, force) {
             const want = force === undefined ? !this.hasAttribute(name) : !!force;
@@ -2687,13 +2755,13 @@ const PRELUDE: &str = r##"
         webkitMatchesSelector(s) { return this.matches(s); }
         closest(s) { let e = this; while (e && e.nodeType === 1) { if (e.matches(s)) return e; e = e.parentNode; } return null; }
         click() {} focus() {} blur() {} scrollIntoView() {}
-        get offsetWidth() { return 0; }
-        get offsetHeight() { return 0; }
-        get offsetParent() { return null; }
-        get clientWidth() { return 0; }
-        get clientHeight() { return 0; }
-        getBoundingClientRect() { return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
-        getClientRects() { return []; }
+        get offsetWidth() { return g.innerWidth; }
+        get offsetHeight() { return g.innerHeight; }
+        get offsetParent() { return g.document.body; }
+        get clientWidth() { return g.innerWidth; }
+        get clientHeight() { return g.innerHeight; }
+        getBoundingClientRect() { return { x: 0, y: 0, top: 0, left: 0, right: g.innerWidth, bottom: g.innerHeight, width: g.innerWidth, height: g.innerHeight }; }
+        getClientRects() { return [this.getBoundingClientRect()]; }
     }
 
     class Text extends Node {
@@ -2703,6 +2771,7 @@ const PRELUDE: &str = r##"
     }
 
     class Document extends Node {
+        get [Symbol.toStringTag]() { return "HTMLDocument"; }
         get documentElement() { return wrap(__dom_doc_element()); }
         get body() { return this.querySelector("body"); }
         get head() { return this.querySelector("head"); }
@@ -2852,6 +2921,19 @@ const PRELUDE: &str = r##"
         }
         if (node.childNodes) for (const c of node.childNodes) ceScan(c);
     }
+    // define()'s catch-up upgrade, but shadow-piercing: an element
+    // rendered into a shadow root BEFORE its definition (archive.org's
+    // router does this for the late-loaded page component) is invisible
+    // to document.querySelectorAll, so without crossing __sr it would
+    // never upgrade — constructed never, rendered never, empty forever.
+    function ceUpgradeName(node, name, ctor) {
+        if (!node || typeof node !== "object") return;
+        if (node instanceof Element) {
+            if (node.localName === name) upgradeElement(node, ctor);
+            if (node.__sr) ceUpgradeName(node.__sr, name, ctor);
+        }
+        if (node.childNodes) for (const c of node.childNodes) ceUpgradeName(c, name, ctor);
+    }
     function ceDisconnect(node) {
         if (!node || typeof node !== "object") return;
         if (node.__ceConnected && typeof node.disconnectedCallback === "function") {
@@ -2877,9 +2959,7 @@ const PRELUDE: &str = r##"
             try { void (ctor.observedAttributes || []); } catch (e) { /* page's problem */ }
             CE.defs.set(name, ctor);
             CE.tags.set(ctor, name);
-            for (const el of g.document.querySelectorAll(name)) {
-                upgradeElement(el, ctor);
-            }
+            ceUpgradeName(g.document, name, ctor);
             const w = CE.waiting.get(name);
             if (w) { CE.waiting.delete(name); w.resolve(ctor); }
         },
@@ -2956,12 +3036,69 @@ const PRELUDE: &str = r##"
 
     // --- environment ---
     const L = __url_parse(cfg.url, null) || [cfg.url, "", "", "", "", "", "", "", ""];
-    g.location = {
+    const locState = {
         href: L[0], protocol: L[1], host: L[2], hostname: L[3], port: L[4],
         pathname: L[5], search: L[6], hash: L[7], origin: L[8],
-        assign() {}, replace() {}, reload() {},
-        toString() { return this.href; },
     };
+    const setLocParts = (p) => {
+        locState.href = p[0]; locState.protocol = p[1]; locState.host = p[2];
+        locState.hostname = p[3]; locState.port = p[4]; locState.pathname = p[5];
+        locState.search = p[6]; locState.hash = p[7]; locState.origin = p[8];
+    };
+    const withoutHash = (u) => {
+        const i = String(u).indexOf("#");
+        return i < 0 ? String(u) : String(u).slice(0, i);
+    };
+    const fireHashChange = (oldURL, newURL) => {
+        const ev = new Event("hashchange");
+        ev.oldURL = oldURL; ev.newURL = newURL;
+        dispatch(g, ev, false);
+    };
+    const navigateLoc = (u, hashOnly) => {
+        if (u === undefined || u === null) return;
+        const p = __url_parse(String(u), locState.href);
+        if (!p) return;
+        const old = locState.href;
+        setLocParts(p);
+        if (withoutHash(old) === withoutHash(p[0])) {
+            if (old !== p[0]) fireHashChange(old, p[0]);
+        } else if (!hashOnly) {
+            trust.navigation = p[0];
+        }
+    };
+    const updateLoc = (u) => {
+        if (u === undefined || u === null) return;
+        const p = __url_parse(String(u), locState.href);
+        if (p) setLocParts(p);
+    };
+    const loc = {
+        get href() { return locState.href; }, set href(v) { navigateLoc(v, false); },
+        get protocol() { return locState.protocol; }, set protocol(_v) {},
+        get host() { return locState.host; }, set host(_v) {},
+        get hostname() { return locState.hostname; }, set hostname(_v) {},
+        get port() { return locState.port; }, set port(_v) {},
+        get pathname() { return locState.pathname; }, set pathname(v) { navigateLoc(locState.origin + String(v) + locState.search + locState.hash, false); },
+        get search() { return locState.search; }, set search(v) { const q = String(v); navigateLoc(locState.origin + locState.pathname + (q && q[0] === "?" ? q : (q ? "?" + q : "")) + locState.hash, false); },
+        get hash() { return locState.hash; }, set hash(v) { const h = String(v); navigateLoc(withoutHash(locState.href) + (h && h[0] === "#" ? h : (h ? "#" + h : "")), true); },
+        get origin() { return locState.origin; },
+        assign(u) { navigateLoc(u, false); },
+        replace(u) { navigateLoc(u, false); },
+        reload() { trust.navigation = locState.href; },
+        toString() { return locState.href; },
+    };
+    Object.defineProperty(g, "location", {
+        configurable: true, enumerable: true,
+        get() { return loc; },
+        set(v) { navigateLoc(v, false); },
+    });
+    trust.takeNavigation = function () { const n = trust.navigation || null; trust.navigation = null; return n; };
+    // Host objects must NOT look like plain objects. Real browsers tag
+    // them, so `Object.prototype.toString.call(window)` is "[object
+    // Window]". Without this they read as "[object Object]", and a
+    // library that deep-merges/clones (jQuery UI's widget.extend via
+    // isPlainObject) follows window.window / document.defaultView in an
+    // infinite cycle until the recursion limit trips (broke danbooru).
+    try { g[Symbol.toStringTag] = "Window"; } catch (e) { /* frozen global */ }
     g.navigator = {
         userAgent: cfg.ua, language: "en", languages: ["en"],
         platform: "Linux", cookieEnabled: true, onLine: true,
@@ -2975,14 +3112,6 @@ const PRELUDE: &str = r##"
     // History real enough for SPA routers: state round-trips and the
     // URL arguments land in location (router-slot writes state then
     // destructures history.state back — a null there kills routing).
-    const updateLoc = (u) => {
-        if (u === undefined || u === null) return;
-        const p = __url_parse(String(u), g.location.href);
-        if (!p) return;
-        g.location.href = p[0]; g.location.protocol = p[1]; g.location.host = p[2];
-        g.location.hostname = p[3]; g.location.port = p[4]; g.location.pathname = p[5];
-        g.location.search = p[6]; g.location.hash = p[7]; g.location.origin = p[8];
-    };
     g.history = {
         length: 1, state: null, scrollRestoration: "auto",
         pushState(s, _t, u) { this.state = s === undefined ? null : s; this.length += 1; updateLoc(u); },
@@ -3012,9 +3141,156 @@ const PRELUDE: &str = r##"
         }
         unobserve() {} disconnect() { this.__dead = true; } takeRecords() { return []; }
     };
-    g.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+    g.ResizeObserver = class {
+        constructor(cb) { this.__cb = cb; this.__dead = false; }
+        observe(el) {
+            g.setTimeout(() => {
+                if (this.__dead) return;
+                const r = { x: 0, y: 0, top: 0, left: 0, right: g.innerWidth, bottom: g.innerHeight, width: g.innerWidth, height: g.innerHeight };
+                const box = [{ inlineSize: g.innerWidth, blockSize: g.innerHeight }];
+                try { this.__cb([{ target: el, contentRect: r, borderBoxSize: box, contentBoxSize: box, devicePixelContentBoxSize: box }], this); }
+                catch (e) { trust.errors.push("ResizeObserver: " + ((e && e.message) || e)); }
+            }, 0);
+        }
+        unobserve() {} disconnect() { this.__dead = true; }
+    };
     g.requestIdleCallback = (fn) => g.setTimeout(() => fn({ didTimeout: false, timeRemaining: () => 0 }), 0);
     g.cancelIdleCallback = (id) => g.clearTimeout(id);
+
+    // --- crypto: getRandomValues + randomUUID + subtle.digest ---
+    // No CSPRNG here (text browser, no entropy source): random values
+    // are Math.random-derived — fine for request ids / cache keys, NOT
+    // real cryptography. subtle.digest IS a true SHA so libraries that
+    // hash before they fetch work (archive.org's collection search gates
+    // its tile fetch on a SHA-1 request-uid — without this the grid
+    // stays empty). Only digest is implemented; the rest of SubtleCrypto
+    // stays an honest remainder.
+    const __cryptoBytes = (d) => {
+        if (d instanceof ArrayBuffer) return new Uint8Array(d.slice(0));
+        if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
+        return new Uint8Array(0);
+    };
+    const __shaPad = (bytes) => {
+        const ml = bytes.length * 8;
+        const total = (bytes.length + 1 + 8 + 63) & ~63;
+        const m = new Uint8Array(total);
+        m.set(bytes); m[bytes.length] = 0x80;
+        const dv = new DataView(m.buffer);
+        dv.setUint32(total - 8, Math.floor(ml / 0x100000000));
+        dv.setUint32(total - 4, ml >>> 0);
+        return { m, dv, total };
+    };
+    function __sha1(bytes) {
+        const { dv, total } = __shaPad(bytes);
+        let h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
+        const w = new Uint32Array(80);
+        for (let off = 0; off < total; off += 64) {
+            for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);
+            for (let i = 16; i < 80; i++) { const v = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]; w[i] = (v << 1) | (v >>> 31); }
+            let a = h0, b = h1, c = h2, d = h3, e = h4;
+            for (let i = 0; i < 80; i++) {
+                let f, k;
+                if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+                else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+                else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+                else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+                const t = (((a << 5) | (a >>> 27)) + f + e + k + w[i]) >>> 0;
+                e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t;
+            }
+            h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
+        }
+        const out = new Uint8Array(20), o = new DataView(out.buffer);
+        o.setUint32(0, h0); o.setUint32(4, h1); o.setUint32(8, h2); o.setUint32(12, h3); o.setUint32(16, h4);
+        return out;
+    }
+    const __SHA256_K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
+    function __sha256(bytes) {
+        const { dv, total } = __shaPad(bytes);
+        const h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+        const w = new Uint32Array(64);
+        const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+        for (let off = 0; off < total; off += 64) {
+            for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);
+            for (let i = 16; i < 64; i++) {
+                const s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+                const s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+                w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+            }
+            let a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g2 = h[6], hh = h[7];
+            for (let i = 0; i < 64; i++) {
+                const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25), ch = (e & f) ^ (~e & g2);
+                const t1 = (hh + S1 + ch + __SHA256_K[i] + w[i]) >>> 0;
+                const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22), maj = (a & b) ^ (a & c) ^ (b & c);
+                const t2 = (S0 + maj) >>> 0;
+                hh = g2; g2 = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+            }
+            h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0; h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;
+            h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0; h[6] = (h[6] + g2) >>> 0; h[7] = (h[7] + hh) >>> 0;
+        }
+        const out = new Uint8Array(32), o = new DataView(out.buffer);
+        for (let i = 0; i < 8; i++) o.setUint32(i * 4, h[i]);
+        return out;
+    }
+    g.crypto = {
+        getRandomValues(a) {
+            if (a && a.length !== undefined) for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 0x100000000);
+            return a;
+        },
+        randomUUID() {
+            return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (ch) => {
+                const r = Math.random() * 16 | 0;
+                return (ch === "x" ? r : (r & 0x3 | 0x8)).toString(16);
+            });
+        },
+        subtle: {
+            digest(algo, data) {
+                const name = (typeof algo === "string" ? algo : (algo && algo.name) || "").toUpperCase();
+                const bytes = __cryptoBytes(data);
+                if (name === "SHA-1") return Promise.resolve(__sha1(bytes).buffer);
+                if (name === "SHA-256") return Promise.resolve(__sha256(bytes).buffer);
+                return Promise.reject(new Error("Unsupported digest algorithm: " + name));
+            },
+        },
+    };
+
+    // DOMException — a real constructor (extends Error). core-js's
+    // DOMException polyfill does `getBuiltIn("DOMException").prototype`
+    // during feature detection; with it undefined that throws ToObject
+    // ("cannot convert undefined to object") UNCAUGHT, which tore down
+    // danbooru's whole init and stripped its server-rendered post grid.
+    const __DE_CODES = {
+        IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+        InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+        NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11,
+        SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+        InvalidAccessError: 15, SecurityError: 18, NetworkError: 19, AbortError: 20,
+        URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23,
+        InvalidNodeTypeError: 24, DataCloneError: 25,
+    };
+    class DOMException extends Error {
+        constructor(message, name) {
+            super(message === undefined ? "" : String(message));
+            this.name = name === undefined ? "Error" : String(name);
+            this.message = message === undefined ? "" : String(message);
+            this.code = __DE_CODES[this.name] || 0;
+        }
+        get [Symbol.toStringTag]() { return "DOMException"; }
+    }
+    {
+        const legacy = {
+            INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3,
+            WRONG_DOCUMENT_ERR: 4, INVALID_CHARACTER_ERR: 5, NO_DATA_ALLOWED_ERR: 6,
+            NO_MODIFICATION_ALLOWED_ERR: 7, NOT_FOUND_ERR: 8, NOT_SUPPORTED_ERR: 9,
+            INUSE_ATTRIBUTE_ERR: 10, INVALID_STATE_ERR: 11, SYNTAX_ERR: 12,
+            INVALID_MODIFICATION_ERR: 13, NAMESPACE_ERR: 14, INVALID_ACCESS_ERR: 15,
+            VALIDATION_ERR: 16, TYPE_MISMATCH_ERR: 17, SECURITY_ERR: 18, NETWORK_ERR: 19,
+            ABORT_ERR: 20, URL_MISMATCH_ERR: 21, QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23,
+            INVALID_NODE_TYPE_ERR: 24, DATA_CLONE_ERR: 25,
+        };
+        for (const k in legacy) { DOMException[k] = legacy[k]; DOMException.prototype[k] = legacy[k]; }
+    }
+    g.DOMException = DOMException;
+
     g.addEventListener = (t, f) => {
         if (typeof f === "function" || (f && typeof f.handleEvent === "function")) {
             const l = lsFor(g, String(t));
@@ -3066,7 +3342,7 @@ const PRELUDE: &str = r##"
         timers.q.splice(timers.q.indexOf(best), 1);
         timers.now = Math.max(timers.now, best.at);
         if (best.every !== null) timers.q.push({ id: best.id, at: timers.now + best.every, fn: best.fn, every: best.every });
-        try { best.fn(); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e)); }
+        try { best.fn(); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         return true;
     };
 
@@ -3848,6 +4124,48 @@ mod tests {
     }
 
     #[test]
+    fn wide_module_fanout_runs_instead_of_falling_back() {
+        // Regression for the removed import/preload caps: an entry module
+        // that statically imports 30 modules (a 31-preload graph) used to be
+        // SKIPPED wholesale (`MAX_SAFE_MODULE_IMPORTS`/`MAX_SAFE_MODULE_PRELOADS`
+        // = 24) and the page fell back to un-transformed HTML — the blunt
+        // workaround for Boa's cyclic-module crash. With the Boa fork making
+        // that crash a catchable panic instead, a wide *acyclic* graph like
+        // this must just run.
+        const N: usize = 30;
+        let mut env = PageEnv::bare("https://example.com/");
+        let mut imports = String::new();
+        let mut sum = String::new();
+        for i in 0..N {
+            imports.push_str(&format!("import {{ v as v{i} }} from './m{i}.js';\n"));
+            if i > 0 {
+                sum.push('+');
+            }
+            sum.push_str(&format!("v{i}"));
+            env.preloaded.push((
+                format!("https://example.com/m{i}.js"),
+                format!("export const v = {i};").into_bytes(),
+            ));
+        }
+        env.preloaded.push((
+            String::from("https://example.com/main.js"),
+            format!("{imports}document.getElementById('t').textContent = 'sum=' + ({sum});")
+                .into_bytes(),
+        ));
+        assert!(env.preloaded.len() > 24, "graph must exceed the old cap");
+
+        let (out, outcome) = transform(
+            "<body><div id=t></div>\
+             <script type=module src='/main.js'></script></body>",
+            &env,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.modules_skipped, 0);
+        // 0 + 1 + ... + 29 = 435.
+        assert!(out.contains("sum=435"), "{out}");
+    }
+
+    #[test]
     fn adopted_stylesheets_hide_through_the_cascade() {
         // Both adoption orders: replaceSync-then-adopt (Lit's shape)
         // and adopt-then-replaceSync (needs the sheet→scope re-sync).
@@ -4101,6 +4419,92 @@ mod tests {
     }
 
     #[test]
+    fn script_location_assign_navigates_after_click() {
+        let (handle, mut events) = live(
+            r##"<body><button id=go onclick="location.assign('/script-next?x=1')">go</button>
+             <script>void 0;</script></body>"##,
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("expected first Updated");
+        };
+        let id = html
+            .split("x-trust-js:")
+            .nth(1)
+            .and_then(|r| r.split(':').next())
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        handle.cmds.blocking_send(PageCmd::Click(id)).unwrap();
+        match events.blocking_recv() {
+            Some(PageEvt::Navigate(url)) => {
+                assert_eq!(url, "https://example.com/script-next?x=1");
+            }
+            other => panic!("expected script Navigate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_location_href_assignment_navigates_after_form_input() {
+        let (handle, mut events) = live(
+            r##"<body><form><input name=q></form><script>
+             document.querySelector('input').addEventListener('change', function () {
+               window.location.href = '../changed';
+             });</script></body>"##,
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("live form should keep the actor resident");
+        };
+        let input = live_node_after(&html, "name=\"q\"");
+        handle
+            .cmds
+            .blocking_send(PageCmd::SetValue {
+                node: input,
+                value: String::from("go"),
+                checked: None,
+            })
+            .unwrap();
+        match events.blocking_recv() {
+            Some(PageEvt::Navigate(url)) => {
+                assert_eq!(url, "https://example.com/changed");
+            }
+            other => panic!("expected script Navigate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_document_hash_navigation_stays_live_and_fires_hashchange() {
+        let (handle, mut events) = live(
+            r##"<body><button id=go onclick="location.hash = 'route'">route</button>
+             <p id=out></p><script>
+             window.addEventListener('hashchange', function (event) {
+               document.getElementById('out').textContent = location.hash + '|' + event.oldURL + '>' + event.newURL;
+             });</script></body>"##,
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("expected first Updated");
+        };
+        let id = html
+            .split("x-trust-js:")
+            .nth(1)
+            .and_then(|r| r.split(':').next())
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        handle.cmds.blocking_send(PageCmd::Click(id)).unwrap();
+        match events.blocking_recv() {
+            Some(PageEvt::Updated { html, .. }) => {
+                assert!(
+                    html.contains(
+                        "#route|https://example.com/dir/page&gt;https://example.com/dir/page#route"
+                    ),
+                    "{html}"
+                );
+            }
+            other => panic!("hash route should update in place, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn onclick_returning_false_prevents_navigation() {
         let (handle, mut events) = live(
             "<body><a id=go href=\"/away\" onclick=\"\
@@ -4201,19 +4605,67 @@ mod tests {
     }
 
     #[test]
-    fn bare_specifier_imports_reject_honestly() {
+    fn bare_specifier_imports_reject_without_recursive_formatting() {
         let (out, outcome) = page(
             "<body><p>kept</p><script type=module>\
              import {LitElement} from 'lit';\
              </script></body>",
         );
         assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
+        // Real rejection reason now (was a generic "module rejected" while
+        // the cyclic-module `Debug` recursion made formatting dangerous).
+        // Reaching this assert at all proves formatting didn't blow up.
         assert!(
-            outcome.errors[0].contains("cannot resolve module specifier 'lit'"),
+            outcome.errors[0].contains("cannot resolve module specifier")
+                && outcome.errors[0].contains("lit"),
             "{:?}",
             outcome.errors
         );
         assert!(out.contains("kept"), "{out}");
+    }
+
+    #[test]
+    fn thrown_errors_carry_a_js_readable_stack() {
+        // Boa captures a backtrace on every throw (backtrace_limit 50) and
+        // its Display renders it, but materializing the JS error object used
+        // to drop it — page JS saw no `.stack`. The fork surfaces it at the
+        // `JsError::to_opaque` boundary that both catch and rejection use.
+        let (out, outcome) = page(
+            "<body><pre id=out></pre><script>\
+             function inner() { throw new TypeError('boom'); }\
+             function outer() { inner(); }\
+             try { outer(); } catch (e) { \
+               document.getElementById('out').textContent = e.stack || 'NO STACK'; }\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(!out.contains("NO STACK"), "stack was empty: {out}");
+        assert!(out.contains("boom"), "{out}");
+        // The new capability: real call-frame lines, V8-style.
+        assert!(out.contains("    at "), "no stack frames: {out}");
+    }
+
+    #[test]
+    fn class_constructor_const_captured_by_closure_does_not_panic() {
+        // Trap #6 (Boa fork fix): a `const`/`let` in a class-constructor body
+        // captured by a closure used to abort the VM. The constructor pushed a
+        // function scope UNCONDITIONALLY, but boa_parser assigns binding
+        // scope-indices assuming an all-local one is elided — so the captured
+        // const resolved to the empty function env (0 slots) and the define
+        // opcode wrote out of bounds. Real pages (archive.org home, danbooru
+        // tiles, Lit) trip exactly this. The fix makes the constructor honor
+        // the same conditional-push rule regular functions use.
+        let (out, outcome) = page(
+            "<body><pre id=out></pre><script>\
+             class C { constructor() { const x = 7; this.cmp = (a,b) => (a-b) + (x-x); } }\
+             var arr=[3,1,2]; arr.sort(new C().cmp);\
+             document.getElementById('out').textContent = 'sorted=' + arr.join(',');\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(!outcome.panicked, "engine panicked (trap #6 regressed)");
+        // Correct VALUE, not just non-panic: x-x=0 keeps the numeric sort.
+        assert!(out.contains("sorted=1,2,3"), "{out}");
     }
 
     #[test]
@@ -4269,6 +4721,120 @@ mod tests {
             }
             other => panic!("expected Updated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_custom_element_defined_after_insertion_into_shadow_upgrades() {
+        // archive.org's router renders the page component into a shadow
+        // tree BEFORE its module defines it; define()'s catch-up upgrade
+        // must pierce shadow roots (document.querySelectorAll does not),
+        // or the element never constructs and the page stays an empty
+        // shell. The connectedCallback writing a LIGHT-dom node proves it
+        // upgraded AND connected through the shadow boundary.
+        let (out, outcome) = page(
+            "<body><div id=host></div><p id=result>NOT</p><script>\
+             const host = document.getElementById('host');\
+             const sr = host.attachShadow({ mode: 'open' });\
+             sr.innerHTML = '<late-el></late-el>';\
+             class LateEl extends HTMLElement {\
+               connectedCallback() { document.getElementById('result').textContent = 'UPGRADED'; }\
+             }\
+             customElements.define('late-el', LateEl);\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains(">UPGRADED<"), "{out}");
+    }
+
+    #[test]
+    fn crypto_subtle_digest_and_random_work() {
+        // Real SHA-1/SHA-256 (libraries hash request ids before they
+        // fetch — archive.org's collection search gates its tile fetch
+        // on a SHA-1 uid) plus functional getRandomValues/randomUUID.
+        let (out, outcome) = page(
+            "<body><p id=s1></p><p id=s256></p><p id=rng></p><script>\
+             const hex = (b) => [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('');\
+             const enc = new TextEncoder();\
+             Promise.all([\
+               crypto.subtle.digest('SHA-1', enc.encode('abc')).then(b=>{document.getElementById('s1').textContent=hex(b);}),\
+               crypto.subtle.digest('SHA-256', enc.encode('abc')).then(b=>{document.getElementById('s256').textContent=hex(b);}),\
+             ]);\
+             const u = crypto.randomUUID();\
+             const r = crypto.getRandomValues(new Uint8Array(8));\
+             document.getElementById('rng').textContent =\
+               (u.length === 36 && u[14] === '4' && r.length === 8 && typeof r[0] === 'number') ? 'ok' : 'bad';\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("a9993e364706816aba3e25717850c26c9cd0d89d"),
+            "sha1: {out}"
+        );
+        assert!(
+            out.contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            "sha256: {out}"
+        );
+        assert!(out.contains(">ok<"), "rng: {out}");
+    }
+
+    #[test]
+    fn dom_exception_is_a_real_constructor() {
+        // core-js's DOMException polyfill reads getBuiltIn("DOMException")
+        // .prototype during detection; undefined → ToObject throw that
+        // tore down danbooru's init. It must be a real Error subclass.
+        let (out, outcome) = page(
+            "<body><p id=o></p><script>\
+             const e = new DOMException('boom', 'NotFoundError');\
+             document.getElementById('o').textContent = [\
+               e instanceof Error, e.name, e.message, e.code,\
+               DOMException.NOT_FOUND_ERR, Object.prototype.toString.call(e)\
+             ].join('|');\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("true|NotFoundError|boom|8|8|[object DOMException]"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn host_objects_are_tagged_not_plain() {
+        // window/document must report a host tag, else a deep-merge/clone
+        // (jQuery UI widget.extend via isPlainObject) follows window.window
+        // / document.defaultView in an infinite cycle (broke danbooru).
+        let (out, outcome) = page(
+            "<body><p id=o></p><script>\
+             const t = (x) => Object.prototype.toString.call(x);\
+             document.getElementById('o').textContent =\
+               [t(window), t(document), t({})].join('|');\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("[object Window]|[object HTMLDocument]|[object Object]"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn element_attributes_is_an_array_like_named_node_map() {
+        // Alpine.js morphs the DOM with `Array.from(el.attributes)`;
+        // a missing `attributes` made that `Array.from(undefined)` →
+        // ToObject throw that aborted danbooru's post-grid render.
+        let (out, outcome) = page(
+            "<body><div id=root title=hi data-x=7></div><p id=o></p><script>\
+             const d = document.getElementById('root');\
+             const attrs = Array.from(d.attributes);\
+             const by = (n) => attrs.find((a) => a.name === n);\
+             document.getElementById('o').textContent = [\
+               attrs.length, d.attributes.length, by('data-x').value,\
+               by('title').value, by('id').value, d.attributes.getNamedItem('id').value\
+             ].join('|');\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains(">3|3|7|hi|root|root<"), "{out}");
     }
 
     #[test]

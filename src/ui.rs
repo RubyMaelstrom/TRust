@@ -59,6 +59,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let inner = block.inner(session_area);
     app.last_inner = (inner.width, inner.height);
+    app.last_content_area = inner;
 
     match (&app.viewer, &app.browser) {
         (Some(v), _) => {

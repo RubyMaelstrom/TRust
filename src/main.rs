@@ -32,6 +32,27 @@ async fn main() -> ExitCode {
         None => 23,
     };
 
+    // The JS engine runs on dedicated `trust-*` worker threads, each
+    // sandboxed by `catch_unwind` — a Boa VM bug (e.g. a real bundle's
+    // code tripping the define-opcode binding-slot panic) costs one
+    // script and the page degrades, it does NOT take the app down. But
+    // the DEFAULT panic hook still dumps the message + backtrace to the
+    // terminal, painting garbage over the ratatui screen (looks like a
+    // crash). Swallow those here; for a genuine (main-thread) panic,
+    // leave the alt screen first so the message is actually readable.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current()
+            .name()
+            .is_some_and(|n| n.starts_with("trust-"))
+        {
+            return; // caught by catch_unwind on the worker; keep the TUI clean
+        }
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+        ratatui::restore();
+        default_hook(info);
+    }));
+
     let terminal = ratatui::init();
     // Query the terminal for its graphics protocol and font size. This
     // talks on stdin/stdout, so it must happen before the event stream

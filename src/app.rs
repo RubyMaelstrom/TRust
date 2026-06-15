@@ -1,11 +1,13 @@
 //! Application state and the main event loop.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use url::Url;
 
 use crossterm::event::{
-    Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
 use libmudtelnet::telnet::{op_command, op_option};
@@ -26,6 +28,8 @@ use crate::oneshot;
 use crate::telnet;
 use crate::tls;
 use crate::ui;
+
+const RESIZE_WRAP_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// What the input field feeds, mirroring GNU telnet's two states: lines go
 /// to the remote host, or to the `telnet>` command prompt reached with Ctrl-].
@@ -226,6 +230,10 @@ pub struct BrowserView {
 struct ViewPos {
     selected: Option<usize>,
     sel_item: Option<(usize, usize)>,
+    /// The page had a live JS engine when we navigated away. Going back
+    /// to it revives the page (re-runs JS) instead of restoring a frozen
+    /// snapshot whose script links/forms are dead.
+    was_live: bool,
 }
 
 /// What a background fetch produced, by protocol.
@@ -338,6 +346,8 @@ pub struct App {
     /// Animation frame for the fetch-in-flight pulse, advanced by the
     /// run loop's ticker while a fetch is pending.
     pub spinner: usize,
+    /// Last drawn browser/session content rect, in terminal coordinates.
+    pub(crate) last_content_area: ratatui::layout::Rect,
     pub host: Option<String>,
     pub port: u16,
     pub connected: bool,
@@ -427,6 +437,7 @@ impl App {
             cursor: 0,
             select_anchor: None,
             spinner: 0,
+            last_content_area: ratatui::layout::Rect::new(0, 0, 80, 24),
             host,
             port,
             connected: false,
@@ -477,6 +488,8 @@ impl App {
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
         let mut input = EventStream::new();
+        let mut pending_wrap_target: Option<(usize, bool)> = None;
+        let mut wrap_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         // The run loop only redraws on events; this ticker animates the
         // loading pulse while a fetch is pending (and is disabled, via
         // the select guard, the rest of the time).
@@ -493,7 +506,17 @@ impl App {
         while !self.quit {
             terminal.draw(|frame| ui::draw(frame, &mut self))?;
             self.sync_vt_size().await;
-            self.sync_browser_wrap();
+            match self.pending_browser_wrap_target() {
+                Some(target) if pending_wrap_target != Some(target) => {
+                    pending_wrap_target = Some(target);
+                    wrap_sleep = Some(Box::pin(tokio::time::sleep(RESIZE_WRAP_DEBOUNCE)));
+                }
+                Some(_) => {}
+                None => {
+                    pending_wrap_target = None;
+                    wrap_sleep = None;
+                }
+            }
             self.sync_viewer_size();
             self.sync_image_encodes();
 
@@ -527,6 +550,15 @@ impl App {
                         self.drop_live_page();
                     }
                 },
+                _ = async {
+                    if let Some(sleep) = wrap_sleep.as_mut() {
+                        sleep.as_mut().await;
+                    }
+                }, if wrap_sleep.is_some() => {
+                    pending_wrap_target = None;
+                    wrap_sleep = None;
+                    self.sync_browser_wrap();
+                },
                 _ = tick.tick(), if self.loading() => {
                     self.spinner = self.spinner.wrapping_add(1);
                 },
@@ -551,21 +583,36 @@ impl App {
         }
     }
 
+    fn on_mouse_event(&mut self, mouse: MouseEvent) {
+        if self.viewer.is_some() {
+            return; // nothing to scroll in the image viewer
+        }
+        // 3 lines per wheel click, matching terminal convention.
+        match (mouse.kind, self.browser.is_some()) {
+            (MouseEventKind::ScrollUp, false) => self.scroll_by(3),
+            (MouseEventKind::ScrollDown, false) => self.scroll_by(-3),
+            (MouseEventKind::ScrollUp, true) => self.browser_scroll(-3, true),
+            (MouseEventKind::ScrollDown, true) => self.browser_scroll(3, true),
+            (MouseEventKind::Down(MouseButton::Mouse4), true) if self.mode == Mode::Session => {
+                self.browser_back();
+            }
+            (MouseEventKind::Moved, true) if self.mode == Mode::Session => {
+                self.http_mouse_hover(mouse.column, mouse.row);
+            }
+            (MouseEventKind::Down(MouseButton::Left), true)
+                if self.mode == Mode::Session && self.http_mouse_hover(mouse.column, mouse.row) =>
+            {
+                self.browser_follow();
+            }
+            _ => {}
+        }
+    }
+
     async fn on_terminal_event(&mut self, event: TermEvent) {
         let key = match event {
             TermEvent::Key(key) => key,
             TermEvent::Mouse(mouse) => {
-                if self.viewer.is_some() {
-                    return; // nothing to scroll in the image viewer
-                }
-                // 3 lines per wheel click, matching terminal convention.
-                match (mouse.kind, self.browser.is_some()) {
-                    (MouseEventKind::ScrollUp, false) => self.scroll_by(3),
-                    (MouseEventKind::ScrollDown, false) => self.scroll_by(-3),
-                    (MouseEventKind::ScrollUp, true) => self.browser_scroll(-3, true),
-                    (MouseEventKind::ScrollDown, true) => self.browser_scroll(3, true),
-                    _ => {}
-                }
+                self.on_mouse_event(mouse);
                 return;
             }
             _ => return,
@@ -1126,17 +1173,22 @@ impl App {
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("Fetching {target} ...");
-        let js = self
-            .js_enabled
-            .then(|| (self.last_inner, self.web_storage.clone()));
+        let js = self.js_enabled.then(|| {
+            let f = self.picker.font_size();
+            (
+                self.last_inner,
+                (f.width, f.height),
+                self.web_storage.clone(),
+            )
+        });
         tokio::spawn(async move {
             let result = match &target {
                 Link::Gopher(url) => gopher::fetch(url).await.map(Payload::Gopher),
                 Link::Gemini(url) => gemini::fetch(url).await.map(Payload::Gemini),
                 Link::Http(url) => match http::fetch(&http::Request::get(url.clone())).await {
                     Ok(response) => Ok(Payload::Http(match js {
-                        Some((viewport, storage)) => {
-                            http::execute_js(response, viewport, storage).await
+                        Some((viewport, cell_px, storage)) => {
+                            http::execute_js(response, viewport, cell_px, storage).await
                         }
                         None => response,
                     })),
@@ -1159,9 +1211,14 @@ impl App {
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("POSTing to {url} ...");
-        let js = self
-            .js_enabled
-            .then(|| (self.last_inner, self.web_storage.clone()));
+        let js = self.js_enabled.then(|| {
+            let f = self.picker.font_size();
+            (
+                self.last_inner,
+                (f.width, f.height),
+                self.web_storage.clone(),
+            )
+        });
         tokio::spawn(async move {
             let request = http::Request {
                 method: String::from("POST"),
@@ -1173,8 +1230,8 @@ impl App {
             };
             let result = match http::fetch(&request).await {
                 Ok(response) => Ok(Payload::Http(match js {
-                    Some((viewport, storage)) => {
-                        http::execute_js(response, viewport, storage).await
+                    Some((viewport, cell_px, storage)) => {
+                        http::execute_js(response, viewport, cell_px, storage).await
                     }
                     None => response,
                 })),
@@ -1745,6 +1802,9 @@ impl App {
         // whatever living page came before it (freeze: its last render
         // is already the doc going into history).
         self.viewer = None;
+        // Capture before dropping: a doc going into history that had a
+        // living engine should be revived (not restored static) on back.
+        let was_live = self.live_page.is_some();
         self.drop_live_page();
         let replace = std::mem::take(&mut self.replace_nav);
         match &mut self.browser {
@@ -1761,6 +1821,7 @@ impl App {
                 let pos = ViewPos {
                     selected: g.selected,
                     sel_item: g.sel_item,
+                    was_live,
                 };
                 g.history.push((old, pos, g.scroll));
                 g.selected = None;
@@ -1810,6 +1871,64 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn http_mouse_hover(&mut self, col: u16, row: u16) -> bool {
+        let Some(target) = self.http_hit_test(col, row) else {
+            if self.mouse_in_content_area(col, row)
+                && self.browser.as_ref().is_some_and(|g| g.doc.laid_out())
+                && let Some(g) = &mut self.browser
+            {
+                g.sel_item = None;
+            }
+            return false;
+        };
+        if let Some(g) = &mut self.browser {
+            g.sel_item = Some(target);
+        }
+        true
+    }
+
+    fn mouse_in_content_area(&self, col: u16, row: u16) -> bool {
+        let a = self.last_content_area;
+        col >= a.x
+            && col < a.x.saturating_add(a.width)
+            && row >= a.y
+            && row < a.y.saturating_add(a.height)
+    }
+
+    fn http_hit_test(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+        if !self.mouse_in_content_area(col, row) {
+            return None;
+        }
+        let g = self.browser.as_ref()?;
+        if !g.doc.laid_out() {
+            return None;
+        }
+        let local_row = row.saturating_sub(self.last_content_area.y) as usize;
+        let doc_row = g.scroll + local_row;
+        if doc_row >= g.doc.rows.len() {
+            return None;
+        }
+        let local_col = col.saturating_sub(self.last_content_area.x);
+        (g.scroll..=doc_row).rev().find_map(|r| {
+            let row_offset = doc_row.saturating_sub(r);
+            g.doc
+                .rows
+                .get(r)?
+                .items
+                .iter()
+                .enumerate()
+                .find_map(|(i, item)| {
+                    let end = item.col.saturating_add(item.width);
+                    let covers_row = row_offset < item.height.max(1) as usize;
+                    (item.is_interactive()
+                        && covers_row
+                        && local_col >= item.col
+                        && local_col < end)
+                        .then_some((r, i))
+                })
+        })
     }
 
     /// HTTP 2D navigation: Enter follows, Backspace goes back, Up/Down
@@ -2066,6 +2185,16 @@ impl App {
         } else if walk_at_edge && delta != 0 {
             self.browser_walk(dir);
         }
+    }
+
+    fn pending_browser_wrap_target(&self) -> Option<(usize, bool)> {
+        let width = (self.last_inner.0 as usize).max(10);
+        let cp437 = self.encoding == Encoding::Cp437;
+        let g = self.browser.as_ref()?;
+        if g.doc.raw.is_empty() || (g.doc.wrapped_to == width && g.doc.cp437 == cp437) {
+            return None;
+        }
+        Some((width, cp437))
     }
 
     /// Re-wrap (and re-decode) the current document when the panel width
@@ -2460,6 +2589,7 @@ impl App {
     }
 
     fn browser_back(&mut self) {
+        let js = self.js_enabled;
         let Some(g) = &mut self.browser else { return };
         match g.history.pop() {
             Some((doc, pos, scroll)) => {
@@ -2467,8 +2597,22 @@ impl App {
                 g.selected = pos.selected;
                 g.sel_item = pos.sel_item;
                 g.scroll = scroll;
-                // Back leaves a living page: it froze the moment we left.
+                // Revive a page that was interactive when we left it:
+                // re-run its JS so links/forms work again, rather than
+                // restoring a frozen snapshot with dead script links. The
+                // frozen doc shows meanwhile; the reload replaces it in
+                // place (history already popped). Needs JS on + http(s).
+                let revive = pos.was_live && js;
+                let url = g.doc.url.clone();
+                // Whatever living page was foreground froze when we left.
                 self.drop_live_page();
+                if revive && let Link::Http(u) = url {
+                    self.replace_nav = true;
+                    self.start_fetch(Link::Http(u));
+                    // After start_fetch (which sets its own "Fetching"
+                    // status) so the user sees why we're reloading.
+                    self.status = String::from("Reviving page scripts …");
+                }
             }
             None => self.status = String::from("History empty (Esc returns to terminal)."),
         }
@@ -3219,6 +3363,280 @@ mod tests {
         );
     }
 
+    fn mouse(
+        kind: crossterm::event::MouseEventKind,
+        col: u16,
+        row: u16,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        }
+    }
+
+    fn item_point(
+        app: &super::App,
+        pred: impl Fn(&crate::layout::Item) -> bool,
+    ) -> (u16, u16, (usize, usize)) {
+        let g = app.browser.as_ref().expect("a browser");
+        for (r, row) in g.doc.rows.iter().enumerate() {
+            for (i, item) in row.items.iter().enumerate() {
+                if pred(item) {
+                    return (
+                        app.last_content_area.x + item.col,
+                        app.last_content_area.y + r.saturating_sub(g.scroll) as u16,
+                        (r, i),
+                    );
+                }
+            }
+        }
+        panic!("target item not found")
+    }
+
+    #[test]
+    fn http_mouse_hover_selects_clickable_item() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(2, 1, 80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let html = b"<body><p>plain <a href='/next'>next</a></p></body>";
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html,
+            80,
+            &Default::default(),
+        ));
+        app.browser.as_mut().unwrap().sel_item = None;
+        let (x, y, target) = item_point(&app, |it| it.link.is_some());
+
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, x, y));
+
+        assert_eq!(app.browser.as_ref().unwrap().sel_item, Some(target));
+    }
+
+    #[test]
+    fn http_mouse_left_click_activates_link() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(3, 2, 80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let html = b"<body><p><a href='mailto:x@y.z'>mail</a></p></body>";
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html,
+            80,
+            &Default::default(),
+        ));
+        let (x, y, target) = item_point(&app, |it| matches!(it.link, Some(Link::External(_))));
+
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            x,
+            y,
+        ));
+
+        assert_eq!(app.browser.as_ref().unwrap().sel_item, Some(target));
+        assert_eq!(app.status, "external link: mailto:x@y.z");
+    }
+
+    #[test]
+    fn http_mouse_left_click_activates_linked_image_on_bottom_row() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(3, 2, 80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let mut images = crate::layout::ImageSizes::new();
+        images.insert("https://example.com/cat.png".to_owned(), (10, 4));
+        let html = b"<body><a href='mailto:x@y.z'><img src='/cat.png' alt='cat'></a></body>";
+        app.navigate_to(crate::http::parse(&url, "text/html", html, 80, &images));
+
+        let g = app.browser.as_ref().unwrap();
+        let (img_row, img_item) = g
+            .doc
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(r, row)| {
+                row.items
+                    .iter()
+                    .enumerate()
+                    .find(|(_, it)| it.image.is_some() && it.link.is_some())
+                    .map(|(i, _)| (r, i))
+            })
+            .expect("linked image item");
+        let img = &g.doc.rows[img_row].items[img_item];
+        assert_eq!(img.height, 4, "test must cover a multi-row image box");
+        let x = app.last_content_area.x + img.col + img.width - 1;
+        let y = app.last_content_area.y + img_row as u16 + img.height - 1;
+
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            x,
+            y,
+        ));
+
+        assert_eq!(
+            app.browser.as_ref().unwrap().sel_item,
+            Some((img_row, img_item))
+        );
+        assert_eq!(app.status, "external link: mailto:x@y.z");
+    }
+
+    #[test]
+    fn http_mouse_left_click_activates_form_text_box() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(4, 2, 80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let html = b"<body><form><input name=q value=old></form></body>";
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html,
+            80,
+            &Default::default(),
+        ));
+        let (x, y, target) = item_point(&app, |it| matches!(it.link, Some(Link::Form { .. })));
+
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            x,
+            y,
+        ));
+
+        assert_eq!(app.browser.as_ref().unwrap().sel_item, Some(target));
+        assert_eq!(app.mode, super::Mode::Search);
+        assert_eq!(app.input, "old");
+        assert!(matches!(app.search_target, Some(Link::Form { .. })));
+    }
+
+    #[test]
+    fn mouse_hover_does_not_touch_gopherus_selection() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(2, 1, 80, 10);
+        app.navigate_to(gopher_doc(".x."));
+        assert_eq!(selected(&app), Some(1));
+
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, 2, 2));
+
+        assert_eq!(selected(&app), Some(1));
+    }
+
+    fn http_doc(path: &str) -> crate::doc::Doc {
+        let url = url::Url::parse(&format!("https://example.com{path}")).unwrap();
+        crate::http::parse(
+            &url,
+            "text/html",
+            b"<body><p>hi</p></body>",
+            80,
+            &Default::default(),
+        )
+    }
+
+    #[test]
+    fn mouse4_goes_back_in_browser_history() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.browser = Some(super::BrowserView {
+            doc: http_doc("/b"),
+            selected: None,
+            sel_item: None,
+            scroll: 0,
+            history: vec![(
+                http_doc("/a"),
+                super::ViewPos {
+                    selected: None,
+                    sel_item: None,
+                    was_live: false,
+                },
+                7,
+            )],
+        });
+
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Mouse4),
+            0,
+            0,
+        ));
+
+        let g = app.browser.as_ref().unwrap();
+        assert!(
+            matches!(&g.doc.url, Link::Http(u) if u.path() == "/a"),
+            "Mouse4 should navigate back to the previous page"
+        );
+        assert_eq!(g.scroll, 7);
+    }
+
+    #[tokio::test]
+    async fn back_to_a_live_page_revives_it() {
+        // A page that was interactive (had a JS engine) when we left it
+        // is reloaded (re-run JS) on back, not restored as a dead snapshot.
+        let mut app = super::App::new(None, 23);
+        app.js_enabled = true;
+        app.browser = Some(super::BrowserView {
+            doc: http_doc("/b"),
+            selected: None,
+            sel_item: None,
+            scroll: 0,
+            history: vec![(
+                http_doc("/a"),
+                super::ViewPos {
+                    selected: None,
+                    sel_item: None,
+                    was_live: true,
+                },
+                0,
+            )],
+        });
+
+        app.browser_back();
+
+        assert!(app.replace_nav, "revive reloads in place");
+        assert!(app.status.contains("Reviving"), "status: {}", app.status);
+        assert!(app.fetch_rx.is_some(), "a revive fetch was started");
+        assert!(
+            matches!(&app.browser.as_ref().unwrap().doc.url, Link::Http(u) if u.path() == "/a"),
+            "the popped page shows (static) while reviving",
+        );
+    }
+
+    #[tokio::test]
+    async fn back_to_a_non_live_page_stays_static() {
+        // A page that had no engine restores instantly, no reload.
+        let mut app = super::App::new(None, 23);
+        app.js_enabled = true;
+        app.browser = Some(super::BrowserView {
+            doc: http_doc("/b"),
+            selected: None,
+            sel_item: None,
+            scroll: 0,
+            history: vec![(
+                http_doc("/a"),
+                super::ViewPos {
+                    selected: None,
+                    sel_item: None,
+                    was_live: false,
+                },
+                0,
+            )],
+        });
+
+        app.browser_back();
+
+        assert!(!app.replace_nav, "static back does not reload");
+        assert!(app.fetch_rx.is_none(), "no fetch for a static back");
+    }
+
     /// Point an HTTP laid-out doc's item selection at the first item that
     /// matches `pred`.
     fn select_item(app: &mut super::App, pred: impl Fn(&crate::layout::Item) -> bool) {
@@ -3405,7 +3823,8 @@ mod tests {
             js: None,
             live: None,
         };
-        let response = crate::http::execute_js(response, app.last_inner, Default::default()).await;
+        let response =
+            crate::http::execute_js(response, app.last_inner, (8, 16), Default::default()).await;
         app.on_http_response(response, 60);
         app
     }

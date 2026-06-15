@@ -28,6 +28,15 @@ tui-term = "0.3.4"
 url = "2.5.8"
 webpki-roots = "1.0.7"
 
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm-0.29.0" }
+# TRust's Boa fork. Boa is the only viable pure-Rust JS engine, but it's
+# half-finished and we keep hitting its edges; we vendor it so we can fix
+# the engine itself instead of working around it from js.rs. First fix:
+# the cyclic-module `Debug` recursion that turned a recoverable module
+# assert into an uncatchable stack-overflow abort (see src/module/*).
+boa_engine = { path = "vendor/boa_engine-0.21.1" }
+
 # Optimized binary: whole-program LTO and a single codegen unit trade
 # compile time for speed and size; symbols stripped (panic messages
 # still print, just without a backtrace).

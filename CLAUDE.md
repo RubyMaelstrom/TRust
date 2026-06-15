@@ -205,9 +205,14 @@ SPA-routes in the TUI; jQuery 3.7 / D3 7.9 / Vue 3.5 (render-function)
   to one file). **Boa IS the engine, not a placeholder.** It's the only
   viable pure-Rust JS engine (rquickjs/v8/SpiderMonkey are C/C++ and
   would betray the pure-Rust ethos), so the answer to a Boa showstopper
-  is **fork/patch Boa**, not swap it — which is exactly what the
-  cyclic-module `Debug` abort already pushed us toward. Don't architect
-  around a hypothetical engine swap. `page_context()` sets RuntimeLimits
+  is **fork/patch Boa**, not swap it. **WE NOW OWN THAT FORK
+  (2026-06-15):** Boa is vendored at `vendor/boa_engine-0.21.1/` and
+  pinned via `[patch.crates-io] boa_engine = { path = ... }` (same as the
+  crossterm vendor). Her standing call: "Boa is halfway done — improve
+  the engine itself instead of working around its edges." Fix Boa bugs in
+  the fork; don't add js.rs workarounds. First fix shipped: the
+  cyclic-module `Debug` recursion (below). Don't architect around a
+  hypothetical engine swap. `page_context()` sets RuntimeLimits
   (10M loop iterations). Two budgets: `COMPUTE_BUDGET` (2s) caps
   cumulative *execution* time (gates launching more scripts —
   measures compute, not wall, so a slow server can't starve a fast
@@ -302,8 +307,35 @@ watch, not a roadmap item.
   RelativeTimeFormat, getCanonicalLocales. en-only;
   `resolvedOptions`/`supportedLocalesOf` everywhere so detection
   passes; Number/Date `toLocaleString` route through it.
-- Honest remainders: collection-page item list renders empty (its data
-  pipeline needs more platform depth); `crypto.subtle` missing.
+- **crypto** (2026-06-14): `getRandomValues`/`randomUUID` (Math.random
+  — no CSPRNG, fine for ids/keys not real crypto) + `crypto.subtle.digest`
+  (real pure-JS SHA-1 + SHA-256; rest of SubtleCrypto still absent).
+  Libraries that hash before they fetch now work.
+- **Layout-gated SPAs / virtualization** (2026-06-14): three measurement
+  changes so infinite-scrollers and responsive layouts render. (a) The
+  reported CSS-pixel viewport is the REAL terminal size: `viewport (cols,
+  rows) * cell_px` where `cell_px` = the picker's font size, threaded
+  app→`execute_js`→`PageEnv.cell_px` (8x16 nominal in tests). Her call:
+  cells-to-px so a wide terminal looks like a wide browser, for ALL sites
+  not just one. (b) `getBoundingClientRect`/`client|offsetWidth|Height`
+  return the viewport box (were 0) — a heuristic (we have no JS-side
+  layout), enough for scrollers that gate cell rendering on a non-zero
+  measurement. (c) `ResizeObserver` fires once with the viewport rect
+  (was a no-op), like `IntersectionObserver`. Regression-clean: canaries
+  (jQuery/D3/Vue/Lit), old.reddit, safebooru all still render; 202 tests.
+- archive.org collection pages now RENDER their collection UI + tile grid
+  (2026-06-14): bugs fixed — (1) shadow-DOM upgrade gap below, (2) missing
+  `crypto.subtle.digest` (collection search builds a SHA-1 request `uid`
+  before fetching tiles; without digest the fetch threw and the grid
+  stayed empty), (3) the measurement changes above (the infinite-scroller
+  rendered ~0 cells against a 24px viewport). net_diag LIVE: 200
+  `item-tile`s + 106 imgs in the post-JS body; in-app the filters sidebar
+  + search/sort UI + the ~98-cell grid render. REMAINING (budget, not a
+  bug): tile CONTENT (titles/thumbs) population RACES WALL_BUDGET (20s) —
+  the bigger real-terminal viewport makes the scroller request more tiles,
+  so it sometimes serializes mid-"Searching…" with placeholder cells.
+  Consistent tile content needs a budget bump or a faster search-render
+  path — her call (archive.org is a known landmine; don't grind it).
 
 ### JS traps (learned the hard way)
 
@@ -326,19 +358,99 @@ watch, not a roadmap item.
    local is invoked from a NATIVE callback** (Array#sort found it;
    direct calls and `var` capture are fine). Prelude rule: constructor
    locals captured by callback-bound closures use `var` (see
-   Intl.Collator).
+   Intl.Collator). 2026-06-15: an `Element.attributes` getter built with
+   `names.map(n => ({ get value(){ return …el…n… } }))` re-tripped this —
+   `.map` is the native callback, the getters captured the `const el`.
+   ABORTED archive.org's live page (release is panic=unwind so it's
+   "caught", but a corrupted VM still tanks the page → looks like a crash).
+   Rewrote with a plain `for` loop, snapshot values, and `this`-based
+   `item`/`getNamedItem` (no captured-local closures). RULE OF THUMB: in
+   the prelude, don't create closures that capture an outer block-scoped
+   local INSIDE a native callback (`.map`/`.forEach`/`.sort`/getters).
+   SAFETY NET (main.rs, 2026-06-15): a panic hook SWALLOWS panics on the
+   `trust-*` worker threads (they're already `catch_unwind`-sandboxed) so a
+   Boa VM panic from a REAL PAGE's own code degrades the page instead of
+   dumping a backtrace over the ratatui screen. (Trap #6 itself is now
+   FIXED in the fork — see "What's next"; this safety net still guards any
+   OTHER engine panic.) A genuine main-thread panic still restores the terminal +
+   prints. The ·JS:n! badge/notice is how the user learns JS degraded.
+   2026-06-15 archive.org HOME crash — REAL FIX SHIPPED via the Boa fork
+   (replacing Codex's blunt import-count cap, now DELETED). Root cause
+   (gdb-traced): a dynamic `import()` of a statically-imported specifier
+   makes Boa's `assert_eq!(entry, loaded)` (`module/source.rs:420`) fire;
+   building that panic message `Debug`-formats the `Module`, whose Debug
+   recursed through the CYCLIC `loaded_modules` graph → stack overflow
+   *during panic formatting* = an UNCATCHABLE abort. Fixed in the fork:
+   `Module` (`module/mod.rs:68`) and `SourceTextModule` (`source.rs:230`)
+   `Debug` impls now print non-recursive identity only (addr/path/requested
+   specifiers) and never borrow `loaded_modules` (the assert holds it
+   `borrow_mut`). The assert is now an ORDINARY panic → caught by
+   `run_module`'s `catch_unwind` + the trust-* panic hook → graceful
+   degrade, on ANY cyclic-module site. BOTH crude caps removed from js.rs
+   (`MAX_SAFE_MODULE_IMPORTS` and `MAX_SAFE_MODULE_PRELOADS` +
+   `note_unsafe_module_graph`/`module_static_import_count`); regression
+   `wide_module_fanout_runs_instead_of_falling_back` (30 imports / 31
+   preloads → runs) replaces `oversized_module_fanout_falls_back_to_original`.
+   Live: `https://archive.org/` no longer aborts. (Then **trap #6** — the
+   define-opcode binding-slot abort — was ALSO fixed, see "What's next";
+   archive.org HOME now boots fully and renders its homepage UI.)
 7. **Template cloning must propagate `template_contents`**
    (`clone_subtree`/`transplant`) — webcomponents-loader.js probes
    exactly this; failing it makes the loader declare us IE-grade.
-8. **One missing platform method = ONE opaque "not a callable"
-   rejection with no `.stack`** — bisect with the mirror harness +
-   console probes (below). Silent-killers since fixed:
+8. **A missing platform method = ONE "not a callable" rejection.** This
+   USED to be stackless (hence the mirror-harness/console-probe bisection
+   below); the Boa fork now attaches a real `.stack` (2026-06-15), so
+   `app.notice`/`outcome.errors` name the offending script + line:col —
+   READ THE STACK FIRST, the mirror harness is the fallback. Silent-killers
+   since fixed:
    `Element.toggleAttribute`, the ChildNode mixin
    (`replaceWith`/`before`/`after`/`replaceChildren`), anchor URL
    components (`a.pathname` via `__urlPart`), `<base href>` resolution
    (`baseHref()`), `new MyElement()` constructing registered custom
    elements, `attachInternals`, `Event.composedPath`,
-   TextEncoder/Decoder, both serializers dropping `<style>`.
+   TextEncoder/Decoder, both serializers dropping `<style>`,
+   `Element.attributes` (Alpine morphs via `Array.from(el.attributes)`).
+9. **`customElements.define()`'s catch-up upgrade must PIERCE SHADOW
+   ROOTS** (2026-06-14). It used `document.querySelectorAll(name)`
+   (light-DOM only). A custom element rendered into a shadow tree
+   BEFORE its definition — archive.org's router does this for the
+   late-loaded page component — was then never upgraded: constructed
+   never, rendered never, the element sat empty
+   (`<collection-page></collection-page>`). ceScan already crosses
+   `__sr`; define() now uses a shadow-piercing `ceUpgradeName` walk.
+   This single bug was why the whole archive.org collection page was an
+   empty shell.
+10. **Host objects MUST carry a `Symbol.toStringTag`** (2026-06-14).
+    `window` is `g[Symbol.toStringTag]="Window"`, Document gets
+    `"HTMLDocument"`. Without them `Object.prototype.toString.call(window)`
+    is `"[object Object]"`, so a deep-merge/clone that uses an
+    isPlainObject gate (jQuery UI's `widget.extend`) treats `window` as a
+    plain object and follows `window.window` / `document.defaultView`
+    forever → Boa recursion-limit (512) trip. This was danbooru bug #2 of
+    a chain (see below). Add tags to any future host object that
+    self-references.
+
+### danbooru.donmai.us (FIXED, 2026-06-14/15)
+Its post grid is SERVER-rendered (`<div class="posts-container">` with ~20
+`<article class="post-preview">`), but danbooru re-renders it client-side
+(Alpine.js morph) and was dying on a CHAIN of three missing-platform errors,
+each masking the next — leaving the grid empty. All three fixed (general
+wins): (1) missing `DOMException`; (2) host-object `Symbol.toStringTag`
+(toString-call cycle, trap #10); (3) **missing `Element.attributes`** — Alpine
+does `Array.from(el.attributes)`, which was `Array.from(undefined)` → ToObject
+throw inside a jQuery.Deferred (stack-swallowed). Added a NamedNodeMap-like
+`attributes` (array-like via `__dom_attr_names`, live `.value`). Now net_diag
+LIVE /posts: errors:[] and the grid renders (~18 `<article>` + 22 imgs, was
+3/0/4). Diagnosis trick for the stackless ToObject error: Boa doesn't fill
+`.stack` even on throw-catch, so wrap the ToObject builtins (Object.keys/
+entries/getPrototypeOf/…, **Array.from**) to log the offender on null/
+undefined → caught `Array.from(undefined)` instantly. (Aside: timer errors now
+append `e.stack` like the rejection tracker.)
+LAYOUT (2026-06-15): danbooru's `.posts-container` is `display:grid`, and
+`layout::flex_mode` only matched `flex`/`inline-flex` → grid fell to block =
+ONE column. Now `grid`/`inline-grid` map to `FlexMode::Grid` (shelf-packed
+flex-wrap; template tracks ignored — the documented approximation). The grid
+now wraps into columns sized to the terminal.
 
 ### Diagnostics
 
@@ -445,8 +557,14 @@ internals — same invariant as "the app never sees protocol bytes".
 `blocking_recv` = zero idle CPU; auto-Static exit when a page has no
 clickables or forms (articles never hold an engine). ONE live engine
 ever (the foreground page); navigating away
-**freezes** it (final serialized HTML → the Doc.raw history stores;
-back = static, reviving = `reload`); Esc kills it. Budgets are
+**freezes** it (final serialized HTML → the Doc.raw history stores; the
+history entry remembers it was live via `ViewPos.was_live`); Esc kills
+it. **REVIVE-ON-BACK (2026-06-15):** going back to a was-live http(s)
+page (JS on) RELOADS it in place (`browser_back` → `replace_nav` +
+`start_fetch`) so links/forms work again, instead of a dead snapshot;
+the frozen doc shows while it reloads. Pays a full JS reload — her call
+(load times are usually short / improving). Non-live or js-off entries
+restore static instantly as before. Budgets are
 **per-dispatch** (~1s + wire-time extension); a Boa panic degrades the
 page to last-good static + the `· JS:n!` badge.
 
@@ -488,6 +606,36 @@ page to last-good static + the `· JS:n!` badge.
   calls preventDefault, the page owns the update, otherwise
   `PageEvt::SubmitDefault` tells the app to run the existing GET/POST
   submit path. Live forms stay resident even without click listeners.
+- **Step 3 script navigation shipped**: `location.href = ...`,
+  `window.location = ...`, `location.assign(...)`, `replace(...)`, and
+  `reload()` now queue a script navigation that the page actor emits as
+  `PageEvt::Navigate` after click/form dispatch and timer settling.
+  Same-document hash changes stay in the live page, update `location`,
+  and fire `hashchange` with `oldURL`/`newURL` so hash-router SPAs can
+  update in place.
+- **Resize-at-rest shipped**: the interactive run loop no longer
+  re-wraps browser documents on every resize event. It arms a 200ms
+  one-shot sleep only while a browser wrap target is pending, resets it
+  as the target changes, and calls the existing immediate
+  `sync_browser_wrap()` only once the terminal rests. Telnet NAWS still
+  renegotiates immediately via `sync_vt_size()`; direct reparse callers
+  (`refresh_forms`, tests, image relayout) still use the immediate
+  primitive.
+- **HTTP mouse interactions shipped**: mouse hover over an HTTP laid-out
+  clickable item updates the highlighted target; a single left click
+  activates the target through the same path as Enter (links follow,
+  form text fields enter the edit prompt, buttons/forms dispatch their
+  existing action). Scope is deliberately **HTTP laid-out docs only**;
+  gopher/gemini keep the gopherus keyboard/scroll selection model
+  untouched. Mouse wheel behavior is unchanged. Linked decoded images
+  are clickable across their full reserved cell box, not only the top
+  row; hit-testing scans upward for tall interactive items. 2026-06-15:
+  Mouse4 (browser-back thumb button) now triggers browser history back,
+  same as Backspace, for all browser docs. Crossterm 0.29 did not expose
+  side buttons, so the project patches it via `vendor/crossterm-0.29.0`
+  to surface Mouse4/Mouse5 from SGR button codes 8/9. (Second vendored
+  fork as of 2026-06-15: `vendor/boa_engine-0.21.1` — see the JS engine
+  section. Both are pinned in `[patch.crates-io]`.)
 - **TRAP pinned**: live serializer writes `data-trust-node` on
   form/control elements because the app re-parses snapshots into a
   fresh layout DOM; never use layout parse node ids as actor node ids.
@@ -495,22 +643,26 @@ page to last-good static + the `· JS:n!` badge.
   the actor DOM is truth. Static resize/edit reparses still seed from
   `Doc.forms` as before.
 - **Regression coverage added**: actor tests for input/change,
-  prevented submit, and default submit fallback; app tests for prompt
-  edits through the page actor and prevented submits avoiding HTTP
-  fetch. `a_mutationless_click_emits_nothing` now expects `Settled`
-  rather than silence.
+  prevented submit, default submit fallback, script navigation via
+  click/form dispatch, and same-document hash routing; app tests for
+  prompt edits through the page actor, prevented submits avoiding HTTP
+  fetch, HTTP mouse hover, single-click link/form activation,
+  full-height linked-image click activation, and a guard that mouse
+  hover leaves gopherus selection alone.
+  `a_mutationless_click_emits_nothing` now expects `Settled` rather
+  than silence.
+- **Live smoke**: debug tmux runs against throwaway local HTTP servers
+  proved a hash-router link updates in place (`route:#route`), an
+  `onclick` calling `location.assign('/next.html')` navigates to the
+  destination page, HTTP mouse click on a text input opens `input>` with
+  the current value, HTTP mouse click on a link navigates to
+  `next.html`, and a lower-row click inside a multi-row linked image
+  follows that image link. 2026-06-15 Mouse4 smoke: debug tmux
+  against a two-page local HTTP server, Enter to page two, injected
+  `\x1b[<128;10;10M`, returned to page one.
 
 ### Still to build
 
-- **Step 3 — script navigation** (location.href/assign →
-  PageEvt::Navigate), per-dispatch timer drain polish, resize-at-rest.
-  Demo: a hash-router SPA.
-- **Resize at rest** (requirement): re-wrap when the terminal reaches a
-  REST state, not on every Resize — debounce ~200ms after the last
-  Resize (all docs, not only JS pages). No idle wake-ups: arm a sleep
-  future only while a resize is pending (like the loading-heart
-  gating). Telnet NAWS renegotiation stays immediate; only document
-  re-wrap waits.
 - **Timers frozen at rest** (requirement): after the load settle,
   timers advance ONLY during dispatches (each drains due timers under
   its budget). Click→fetch→update works; idle clocks/polling
@@ -533,10 +685,86 @@ lies.
 
 ## What's next
 
-- JS Phase 2b step 3: script navigation (`location.href`/`assign` →
-  `PageEvt::Navigate`), per-dispatch timer drain polish, and
-  resize-at-rest. Demo: a hash-router SPA. Live form integration
-  shipped 2026-06-14; her chat form is now the smoke target.
+### Shipped 2026-06-15 (later — the Boa fork: 4 engine fixes)
+We FORKED Boa (her call: "no half-steps — improve the engine itself, not
+its edges"). Vendored `vendor/boa_engine-0.21.1` + `[patch.crates-io]`.
+**js.rs stays the only crate-importer; fix engine bugs IN the fork.**
+Four landed, all release-verified, fmt/clippy-0, 211 tests:
+1. **Cyclic-module `Debug` recursion → catchable panic** (`module/mod.rs`,
+   `source.rs` Debug impls print non-recursive identity). Killed the
+   uncatchable archive.org abort. Both crude module caps
+   (`MAX_SAFE_MODULE_IMPORTS`, `MAX_SAFE_MODULE_PRELOADS`) DELETED.
+2. **Module rejections report the real reason** (`js.rs` `run_module` +
+   shared `describe_rejection`) — was a generic "module rejected" while the
+   Debug recursion made formatting dangerous; now safe.
+3. **Errors carry a JS-readable `.stack`** (`error.rs` `JsError::to_opaque`).
+   Boa already captured a 50-frame backtrace on throw (`Display` rendered
+   it) but DROPPED it when materializing the JS object — the root of the
+   "opaque, stackless rejection" pain. Now attached V8-style at the single
+   boundary `catch` and promise rejections share. **The mirror-harness /
+   console-probe bisection is largely OBSOLETE — read the stack.**
+4. **TRAP #6 FIXED** (`bytecompiler/class.rs`): the define-opcode
+   binding-slot abort. A class constructor pushed its function scope
+   UNCONDITIONALLY, but `boa_parser` assigns binding scope-indices assuming
+   an all-local, non-required function scope is ELIDED (as regular
+   functions do) — so a `const`/`let` in the ctor body captured by a
+   closure resolved to the empty function env (0 slots) and the define
+   opcode wrote OOB. Fix: the ctor now honors the SAME conditional-push
+   rule `FunctionCompiler::compile` uses. **archive.org HOME went from an
+   empty 1872B shell (`js:None`) to a full JS boot (panicked:false, 62
+   fetches) that RENDERS the homepage UI in-app.** Verified across base/
+   derived(super)/new.target/arguments/nested-block constructors with
+   correct values. Regression: `class_constructor_const_captured_by_closure_does_not_panic`.
+   The prelude `var`-not-`const`-in-constructors rule (trap #6 workaround)
+   is RETIRED — const/let in prelude constructors is safe now (existing
+   `var` usages left as-is; harmless).
+
+Tests added: `wide_module_fanout_runs_instead_of_falling_back`,
+`thrown_errors_carry_a_js_readable_stack`,
+`class_constructor_const_captured_by_closure_does_not_panic` (cap test
+dropped). NEXT fork candidate: trap #2 (`with(this)` VM panic →
+`vm/opcode/arguments.rs:29`, blocks Vue's in-browser template compiler);
+then efficiency (prelude compile-once). See the
+boa-cyclic-module-debug-crash memory for the running fork log.
+
+### Shipped 2026-06-15 (handoff summary for Codex)
+Big-web rendering push, all uncommitted (she commits), fmt/clippy clean,
+207 tests, live-verified in tmux. Five general JS-platform gains + two
+site fixes + revive-on-back:
+- **archive.org collections render** (was an empty shell): shadow-DOM
+  custom-element upgrade gap (define() pierces shadow now), real
+  `crypto.subtle.digest` (SHA-1/256; the search uid), and the
+  measurement changes below. net_diag LIVE: 200 tiles + 106 imgs in the
+  DOM; in-app the filters/search/grid render.
+- **CSS-pixel viewport = real terminal size** (`viewport × cell_px`,
+  cell_px = picker font size, `PageEnv.cell_px`); non-zero
+  getBoundingClientRect/client*; ResizeObserver fires once. Lets
+  layout-gated SPAs/virtualization render. Her cells-to-px call.
+- **danbooru post grid renders** (was 1 col of nothing): `DOMException`,
+  host-object `Symbol.toStringTag` (deep-merge cycle), `Element.attributes`
+  (Alpine morph), and `display:grid`→flex-wrap (was block = one column).
+- **Panic-hook safety net** (main.rs): swallows caught `trust-*` worker
+  panics so a real page's own Boa-VM bug degrades the page instead of
+  dumping a backtrace over the TUI (archive.org's bundle trips trap #6).
+- **Revive-on-back**: back to a was-live page reloads it live.
+
+OPEN / next candidates:
+- **Boa fork SHIPPED 2026-06-15** (`vendor/boa_engine-0.21.1`,
+  `[patch.crates-io]`): 4 engine fixes (cyclic-module Debug, module
+  rejection text, error `.stack`, **trap #6**) — see the "Shipped (the Boa
+  fork)" section above and the boa-cyclic-module-debug-crash memory.
+- **Boa trap #2 (NEXT fork candidate)**: `with(this)` panics the VM
+  (`vm/opcode/arguments.rs:29` "must be declarative"), blocking Vue's
+  in-browser template compiler (render-function components already work).
+  Then efficiency (prelude compile-once, modest payoff — measure first).
+- **archive.org tile CONTENT vs structure**: the grid scaffolds but tile
+  titles/thumbs race WALL_BUDGET (20s) at the bigger real viewport —
+  budget/perf, not a bug.
+- JS Phase 2b follow-up: timer semantics remain deliberately frozen at
+  rest; future work is platform depth such as MutationObserver and any
+  opt-in background ticking decision. Live form integration, script
+  navigation, hash routing, resize-at-rest, and HTTP mouse interactions
+  shipped 2026-06-14.
 - LINEMODE (RFC 1184) — the last negotiation-parity gap. Test against
   *real* servers/BBSes, not only fakes.
 - Remaining GNU command-mode parity: full `set`/`unset`, `display`,

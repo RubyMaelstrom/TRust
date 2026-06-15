@@ -695,6 +695,7 @@ const PREFETCH_CONCURRENCY: usize = 8;
 pub async fn execute_js(
     mut response: Response,
     viewport: (u16, u16),
+    cell_px: (u16, u16),
     storage: crate::js::WebStorage,
 ) -> Response {
     let media = response
@@ -782,6 +783,7 @@ pub async fn execute_js(
     let env = crate::js::PageEnv {
         url: response.url.to_string(),
         viewport,
+        cell_px,
         externals,
         sheets,
         preloaded,
@@ -1206,7 +1208,7 @@ mod tests {
 
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), Default::default()).await;
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let body = String::from_utf8_lossy(&response.body);
         assert!(body.contains("external ran + inline"), "{body}");
         assert!(!body.contains("js is off"), "{body}");
@@ -1276,7 +1278,7 @@ mod tests {
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
         let started = std::time::Instant::now();
-        let response = execute_js(response, (80, 24), Default::default()).await;
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let elapsed = started.elapsed();
         eprintln!("page_fetches_run_concurrently: {N} fetches @ {DELAY_MS}ms took {elapsed:?}");
         let body = String::from_utf8_lossy(&response.body);
@@ -1375,7 +1377,7 @@ mod tests {
         // Page 1: fetch + JSON render; the private-space probe rejects.
         let url = parse_url(&format!("http://127.0.0.1:{port}/page1")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), storage.clone()).await;
+        let response = execute_js(response, (80, 24), (8, 16), storage.clone()).await;
         let body = String::from_utf8_lossy(&response.body);
         assert!(body.contains("fetched trust"), "{body}");
         assert!(body.contains(">blocked<"), "{body}");
@@ -1386,7 +1388,7 @@ mod tests {
         // Page 2: async XHR POST + storage written by page 1.
         let url = parse_url(&format!("http://127.0.0.1:{port}/page2")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), storage.clone()).await;
+        let response = execute_js(response, (80, 24), (8, 16), storage.clone()).await;
         let body = String::from_utf8_lossy(&response.body);
         assert!(body.contains("pong / page1"), "{body}");
         server.abort();
@@ -1417,7 +1419,7 @@ mod tests {
 
         let url = parse_url(&format!("http://127.0.0.1:{port}/counter")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let mut response = execute_js(response, (80, 24), Default::default()).await;
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let mut live = response.live.take().expect("clickable page stays live");
         let body = String::from_utf8_lossy(&response.body).into_owned();
         let node: usize = body
@@ -1481,7 +1483,7 @@ mod tests {
 
         let url = parse_url(&format!("http://127.0.0.1:{port}/expand")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let mut response = execute_js(response, (80, 24), Default::default()).await;
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let body = String::from_utf8_lossy(&response.body).into_owned();
         let outcome = response.js.as_ref().expect("JS ran");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -1526,7 +1528,7 @@ mod tests {
             response.content_type,
             response.body.len()
         );
-        let mut response = execute_js(response, (80, 24), Default::default()).await;
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         eprintln!("js outcome: {:?}", response.js);
         eprintln!("live: {}", response.live.is_some());
         eprintln!(
@@ -1595,7 +1597,7 @@ mod tests {
 
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), Default::default()).await;
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let body = String::from_utf8_lossy(&response.body);
         let outcome = response.js.as_ref().expect("js ran");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -1671,7 +1673,7 @@ mod tests {
         let response = fetch(&Request::get(url)).await.unwrap();
         // Reaching past this line at all is half the test: the old race
         // could stack-overflow and abort the whole test binary.
-        let response = execute_js(response, (80, 24), Default::default()).await;
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let body = String::from_utf8_lossy(&response.body);
         let outcome = response.js.as_ref().expect("js ran");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -1726,7 +1728,7 @@ mod tests {
 
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), Default::default()).await;
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let body = String::from_utf8_lossy(&response.body);
         let outcome = response.js.as_ref().expect("js ran");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -1806,7 +1808,7 @@ customElements.define('lit-counter', LitCounter);
 
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let mut response = execute_js(response, (80, 24), Default::default()).await;
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let body = String::from_utf8_lossy(&response.body).into_owned();
         let outcome = response.js.as_ref().expect("js ran");
         eprintln!(
@@ -2049,7 +2051,7 @@ customElements.define('lit-counter', LitCounter);
         });
         let url = parse_url(&format!("http://127.0.0.1:{port}/")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), Default::default()).await;
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let out = String::from_utf8_lossy(&response.body);
         assert!(out.contains("tjar=ckval123"), "cookie visible to JS: {out}");
         assert!(
