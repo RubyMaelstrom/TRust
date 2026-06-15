@@ -841,11 +841,14 @@ impl<'a> Layout<'a> {
     /// non-wrapping one is `Row` (side-by-side columns) or `Column`
     /// (stacked block-level items) per `flex-direction`/`flex-flow`.
     fn flex_mode(&self, id: NodeId) -> Option<FlexMode> {
-        if !matches!(
-            self.dom.computed_display(id).as_deref(),
-            Some("flex" | "inline-flex")
-        ) {
-            return None;
+        match self.dom.computed_display(id).as_deref() {
+            // CSS grid always wraps into tracks; we approximate it as a
+            // shelf-packed flex-wrap grid (template tracks ignored). Without
+            // this, `display:grid` containers (danbooru's post list) fell to
+            // block layout and stacked one item per row.
+            Some("grid" | "inline-grid") => return Some(FlexMode::Grid),
+            Some("flex" | "inline-flex") => {}
+            _ => return None,
         }
         let flow = self.dom.computed_style(id, "flex-flow");
         let has = |prop: Option<&String>, words: &[&str]| {
