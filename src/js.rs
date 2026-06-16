@@ -394,6 +394,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_node_type", 1, sys_node_type),
         ("__dom_tag", 1, sys_tag),
         ("__dom_get_attr", 2, sys_get_attr),
+        ("__dom_computed", 2, sys_computed_style),
         ("__dom_set_attr", 3, sys_set_attr),
         ("__dom_remove_attr", 2, sys_remove_attr),
         ("__dom_attr_names", 1, sys_attr_names),
@@ -566,6 +567,21 @@ fn sys_set_attr(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
         d.set_attr(id, &name, &value);
     }
     Ok(JsValue::undefined())
+}
+
+/// `getComputedStyle` backing: the cascade's computed value for one property
+/// (inheritance + UA defaults for tracked props; inline-only for the rest),
+/// or null when unset. The prelude falls back to inline style on null.
+fn sys_computed_style(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = arg_str(args, 1, ctx);
+    let dom = page_dom(ctx);
+    let d = dom.borrow();
+    Ok(
+        match arg_node(&d, args, 0).and_then(|id| d.computed_value(id, &name)) {
+            Some(v) => str_value(&v),
+            None => JsValue::null(),
+        },
+    )
 }
 
 fn sys_remove_attr(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -1384,6 +1400,13 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
     let externals = &env.externals;
     let mut outcome = Outcome::default();
     let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
+    // The CSS-pixel viewport (cols/rows × the terminal's cell size) that the
+    // cascade evaluates `@media` against — the same window the page sees as
+    // innerWidth/innerHeight below.
+    dom.borrow_mut().set_viewport_px(
+        u32::from(viewport.0) * u32::from(cell_px.0.max(1)),
+        u32::from(viewport.1) * u32::from(cell_px.1.max(1)),
+    );
     if !env.sheets.is_empty() {
         dom.borrow_mut().attach_external_sheets(&env.sheets);
     }
@@ -3118,7 +3141,30 @@ const PRELUDE: &str = r##"
         replaceState(s, _t, u) { this.state = s === undefined ? null : s; updateLoc(u); },
         back() {}, forward() {}, go() {},
     };
-    g.getComputedStyle = (el) => (el instanceof Element ? el.style : makeStyle());
+    // getComputedStyle is now cascade-backed (read-only): __dom_computed
+    // returns the inherited / UA-defaulted value for tracked properties and
+    // the inline value for the rest, falling back to the element's own inline
+    // style on a miss. Was inline-only (it just handed back el.style).
+    function computedStyleFor(el) {
+        const lookup = (k) => {
+            k = kebab(String(k));
+            let v = null;
+            try { v = __dom_computed(el.__id, k); } catch (e) { v = null; }
+            if (v !== null && v !== undefined) return v;
+            return el.style.getPropertyValue(k) || "";
+        };
+        return new Proxy({}, {
+            get(_, p) {
+                if (typeof p !== "string") return undefined;
+                if (p === "getPropertyValue") return (k) => lookup(k);
+                if (p === "cssText") return el.getAttribute("style") || "";
+                return lookup(p);
+            },
+            set() { return true; }, // computed style is read-only
+            has() { return true; },
+        });
+    }
+    g.getComputedStyle = (el) => (el instanceof Element ? computedStyleFor(el) : makeStyle());
     g.matchMedia = (m) => ({ matches: false, media: String(m), addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} });
     g.alert = () => {}; g.confirm = () => false; g.prompt = () => null;
     g.scroll = g.scrollTo = g.scrollBy = () => {};
@@ -5046,6 +5092,59 @@ mod tests {
         // JS ran: noscript content and the script itself are gone.
         assert!(!out.contains("enable javascript"), "{out}");
         assert!(!out.contains("createElement"), "{out}");
+    }
+
+    #[test]
+    fn get_computed_style_reads_the_cascade_not_just_inline() {
+        // getComputedStyle now resolves sheet rules, inheritance, and UA
+        // defaults via the cascade — it used to see only the inline style
+        // attribute, returning "" for everything a stylesheet set.
+        let (out, outcome) = page(
+            "<head><style>.card{font-weight:bold}</style></head>\
+             <body><div class=card><span id=s>x</span></div>\
+             <b id=b>y</b>\
+             <script>\
+               var s = document.getElementById('s');\
+               var b = document.getElementById('b');\
+               document.body.setAttribute('data-inherit', getComputedStyle(s).fontWeight);\
+               document.body.setAttribute('data-ua', getComputedStyle(b).getPropertyValue('font-weight'));\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("data-inherit=\"bold\""),
+            "sheet font-weight inherits through getComputedStyle: {out}"
+        );
+        assert!(
+            out.contains("data-ua=\"bold\""),
+            "UA <b> default visible through getComputedStyle: {out}"
+        );
+    }
+
+    #[test]
+    fn media_queries_apply_at_the_viewport_width() {
+        // bare() viewport = 80 cols × 8px = 640px wide. A max-width:768px
+        // block matches (hides); a min-width:1000px block doesn't (kept).
+        let (out, outcome) = page(
+            "<head><style>\
+               @media (max-width: 768px) { .mobile-hide { display: none } }\
+               @media (min-width: 1000px) { .desktop-hide { display: none } }\
+             </style></head>\
+             <body>\
+               <p class=mobile-hide>HIDE_AT_NARROW</p>\
+               <p class=desktop-hide>KEEP_AT_NARROW</p>\
+               <script>document.title = 'x';</script>\
+             </body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            !out.contains("HIDE_AT_NARROW"),
+            "max-width:768px matched at 640px → hidden: {out}"
+        );
+        assert!(
+            out.contains("KEEP_AT_NARROW"),
+            "min-width:1000px not matched at 640px → kept: {out}"
+        );
     }
 
     #[test]

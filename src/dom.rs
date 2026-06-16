@@ -66,7 +66,24 @@ pub struct Dom {
     external_sheets: std::collections::HashMap<NodeId, String>,
     /// Lazily built visibility cascade, valid for one epoch.
     style_cache: RefCell<Option<(u64, std::rc::Rc<StyleIndex>)>>,
+    /// Memoized inherited `computed_value` results for the current epoch,
+    /// keyed (node, property index). Inheritance walks ancestors, so the
+    /// layout's per-element reads would re-walk without this; cleared when
+    /// the epoch advances.
+    computed_cache: RefCell<ComputedCache>,
+    /// The CSS-pixel viewport (`cols*cell_px`, `rows*cell_px`) used to
+    /// evaluate `@media` queries when the cascade is built; `(0, 0)` = unknown
+    /// (width/height queries then conservatively don't match, as if skipped).
+    /// Set by `execute_js` from `PageEnv`.
+    viewport_px: (u32, u32),
 }
+
+/// Per-epoch memo for `computed_value`: the epoch the entries are valid for,
+/// and inherited results keyed `(node, property index)`.
+type ComputedCache = (
+    u64,
+    std::collections::HashMap<(NodeId, usize), Option<String>>,
+);
 
 /// The document node is always index 0.
 pub const DOCUMENT: NodeId = 0;
@@ -88,6 +105,8 @@ impl Dom {
             adopted_styles: std::collections::HashMap::new(),
             external_sheets: std::collections::HashMap::new(),
             style_cache: RefCell::new(None),
+            computed_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
+            viewport_px: (0, 0),
         };
         dom.new_node(NodeData::Document);
         dom
@@ -103,6 +122,16 @@ impl Dom {
     fn touch(&mut self) {
         self.dirty = true;
         self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    /// Set the CSS-pixel viewport (`cols*cell_px`, `rows*cell_px`) that
+    /// `@media` queries evaluate against. Invalidates the cascade cache when
+    /// it changes so breakpoint-gated rules re-resolve.
+    pub fn set_viewport_px(&mut self, width: u32, height: u32) {
+        if self.viewport_px != (width, height) {
+            self.viewport_px = (width, height);
+            self.touch();
+        }
     }
 
     /// Parse a full HTML document into a fresh arena.
@@ -316,13 +345,16 @@ impl Dom {
     }
 
     /// Is this element hidden — by the `hidden` attribute, or by the
-    /// `display`/`visibility` mini-cascade (inline style, `<style>`
+    /// cascaded `display`/`visibility`/`opacity` (inline style, `<style>`
     /// elements, shadow sheets, adoptedStyleSheets, fetched `<link>`
     /// sheets)? Winner per property is the lexicographic max of
     /// (!important, inline, specificity, source order) — inline beats
     /// sheets except under !important, the real rules for a single
-    /// author origin. Hidden subtrees don't render. This is visibility,
-    /// not a CSS engine: no inheritance, no @-rules, two properties.
+    /// author origin. Hidden subtrees don't render. This reads the author
+    /// cascade directly (`cascaded`), NOT inheritance: visibility is treated
+    /// like display (a hidden subtree stays hidden; no visible-child-of-
+    /// hidden-parent). For inherited/UA-defaulted values use `computed_value`;
+    /// no @-rules yet.
     pub fn is_hidden(&self, id: NodeId) -> bool {
         if self.attr(id, "hidden").is_some() {
             return true;
@@ -452,8 +484,146 @@ impl Dom {
 
     /// The cascaded value of any tracked property (the layout reads
     /// margin/padding/text-align through this), or `None` when unset.
+    /// Author cascade only (no UA defaults, no inheritance) — the
+    /// non-inherited box properties the layout reads directly, and the
+    /// value the serializer bakes.
     pub fn computed_style(&self, id: NodeId, prop: &str) -> Option<String> {
         self.cascaded(id, prop)
+    }
+
+    /// The computed value of a property — the single inheritance authority.
+    /// For an inherited property (per the registry) an element that doesn't
+    /// set it resolves to the parent's computed value; otherwise this is the
+    /// specified value (author cascade, else the UA default). Memoized per
+    /// epoch because the layout reads it per element. getComputedStyle and
+    /// the layout's inherited-text reads both go through here, so a property
+    /// inherits everywhere by being marked `inherited` once.
+    pub fn computed_value(&self, id: NodeId, name: &str) -> Option<String> {
+        let Some(idx) = PROPS.iter().position(|p| p.name == name) else {
+            // Untracked: no UA default, no inheritance — author cascade.
+            return self.cascaded(id, name);
+        };
+        if !PROPS[idx].inherited {
+            return self.specified(id, name);
+        }
+        if let Some(hit) = self.computed_cache_get(id, idx) {
+            return hit;
+        }
+        let v = self.specified(id, name).or_else(|| {
+            self.nodes[id]
+                .parent
+                .and_then(|p| self.computed_value(p, name))
+        });
+        self.computed_cache_put(id, idx, v.clone());
+        v
+    }
+
+    fn computed_cache_get(&self, id: NodeId, idx: usize) -> Option<Option<String>> {
+        let cache = self.computed_cache.borrow();
+        (cache.0 == self.epoch)
+            .then(|| cache.1.get(&(id, idx)).cloned())
+            .flatten()
+    }
+
+    fn computed_cache_put(&self, id: NodeId, idx: usize, v: Option<String>) {
+        let mut cache = self.computed_cache.borrow_mut();
+        if cache.0 != self.epoch {
+            cache.0 = self.epoch;
+            cache.1.clear();
+        }
+        cache.1.insert((id, idx), v);
+    }
+
+    /// The specified value: the author cascade, or the UA default for the
+    /// element's tag. (Before inheritance — `computed_value` adds that.)
+    fn specified(&self, id: NodeId, name: &str) -> Option<String> {
+        self.cascaded(id, name)
+            .or_else(|| self.ua_default(id, name))
+    }
+
+    /// The user-agent default stylesheet, for the inherited properties the
+    /// layout used to apply as hardcoded tag behavior: `<b>/<strong>` bold,
+    /// `<i>/<em>` italic, `<pre>` pre white-space, and the list marker style
+    /// (`<ul>` disc/circle/square by nesting depth, `<ol>` decimal or its
+    /// `type` attribute). Non-inherited tag defaults stay where they belong:
+    /// block/inline display (the layout's tag tables), `<a>` linking, heading
+    /// sizing, and `<u>/<s>` decoration (`text_decoration`, which accumulates
+    /// rather than inherits).
+    fn ua_default(&self, id: NodeId, name: &str) -> Option<String> {
+        let tag = self.tag_name(id)?;
+        let v = match name {
+            "font-weight" if matches!(tag, "b" | "strong") => "bold",
+            "font-style" if matches!(tag, "i" | "em") => "italic",
+            "white-space" if tag == "pre" => "pre",
+            "list-style-type" if tag == "ul" => self.ul_marker_default(id),
+            "list-style-type" if tag == "ol" => match self.attr(id, "type") {
+                Some("a") => "lower-alpha",
+                Some("A") => "upper-alpha",
+                Some("i") => "lower-roman",
+                Some("I") => "upper-roman",
+                _ => "decimal",
+            },
+            _ => return None,
+        };
+        Some(v.to_string())
+    }
+
+    /// The default bullet for a `<ul>` by nesting depth, matching browsers:
+    /// disc at the top level, circle one deep, square thereafter. An inner
+    /// list inherits this through `computed_value`, so authors can still
+    /// override it anywhere.
+    fn ul_marker_default(&self, id: NodeId) -> &'static str {
+        let mut depth = 0u32;
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            if self.tag_name(c) == Some("ul") {
+                depth += 1;
+            }
+            cur = self.nodes[c].parent;
+        }
+        match depth {
+            0 | 1 => "disc",
+            2 => "circle",
+            _ => "square",
+        }
+    }
+
+    /// The accumulated `(underline, line-through)` for an element's text.
+    /// `text-decoration` is not inherited but PROPAGATED — the lines paint
+    /// across descendant boxes and accumulate — so this walks ancestors→self:
+    /// each `<u>/<ins>` adds underline, each `<s>/<strike>/<del>` adds
+    /// line-through, an author `text-decoration(-line)` adds its named lines,
+    /// and `none` clears both from that point down. Replaces the layout's
+    /// emphasis threading for the two decoration flags.
+    pub fn text_decoration(&self, id: NodeId) -> (bool, bool) {
+        let mut chain = vec![id];
+        while let Some(&c) = chain.last() {
+            match self.nodes[c].parent {
+                Some(p) => chain.push(p),
+                None => break,
+            }
+        }
+        let (mut underline, mut strike) = (false, false);
+        for &e in chain.iter().rev() {
+            match self.tag_name(e) {
+                Some("u" | "ins") => underline = true,
+                Some("s" | "strike" | "del") => strike = true,
+                _ => {}
+            }
+            if let Some(v) = self
+                .cascaded(e, "text-decoration-line")
+                .or_else(|| self.cascaded(e, "text-decoration"))
+            {
+                if v.split_whitespace().any(|t| t == "none") {
+                    underline = false;
+                    strike = false;
+                } else {
+                    underline |= v.contains("underline");
+                    strike |= v.contains("line-through");
+                }
+            }
+        }
+        (underline, strike)
     }
 
     /// The mini-cascade winner for one property (`display` or
@@ -575,6 +745,7 @@ impl Dom {
                 &mut order,
                 index.scopes.entry(scope).or_default(),
                 &mut index.keyframes,
+                self.viewport_px,
             );
         }
         // Adopted sheets cascade after their scope's tree sheets (their
@@ -589,6 +760,7 @@ impl Dom {
                 &mut order,
                 index.scopes.entry(*scope).or_default(),
                 &mut index.keyframes,
+                self.viewport_px,
             );
         }
         index.has_opacity = index
@@ -1110,7 +1282,7 @@ impl Dom {
         // inline style. `display:none`/`visibility:hidden` are already
         // dropped, so they never need baking.
         let mut bake = String::new();
-        for &prop in BAKE_PROPS {
+        for prop in PROPS.iter().filter(|p| p.baked).map(|p| p.name) {
             if let Some(v) = self.cascaded(id, prop) {
                 if prop == "display" && v == "none" {
                     continue;
@@ -1646,92 +1818,93 @@ fn take_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String>
 // unparseable is IGNORED — fail-open always means "visible", never
 // "hidden". `:hover`/`:focus` never match; @-blocks are skipped whole.
 
-/// Properties the cascade tracks. Kept deliberately small: the
-/// box-layout primitives plus the visibility pair. Everything else is
-/// ignored (not stored, fail-open).
-const TRACKED: &[&str] = &[
-    "display",
-    "visibility",
-    "opacity",
-    "animation-name",
-    "animation-fill-mode",
-    "animation",
-    "margin-top",
-    "margin-bottom",
-    "margin-left",
-    "margin-right",
-    "padding-top",
-    "padding-bottom",
-    "padding-left",
-    "text-align",
-    "font-weight",
-    "font-style",
-    "white-space",
-    "text-transform",
-    "text-decoration",
-    "text-decoration-line",
-    "content",
-    "width",
-    "max-width",
-    "min-width",
-    "flex-wrap",
-    "flex-flow",
-    "flex-direction",
-    "float",
-    "clear",
-    "overflow",
-    "position",
-    "flex-grow",
-    "flex-shrink",
-    "flex-basis",
-    "flex",
+/// One CSS property the engine understands — the single source of truth
+/// for the whole property surface. `is_tracked` (what the cascade stores)
+/// and the serializer's bake list both derive from this table, so adding a
+/// property is one entry here, not edits in three places. Kept deliberately
+/// small: the box-layout primitives plus the visibility/animation set;
+/// everything else is ignored (not stored, fail-open).
+struct PropDef {
+    name: &'static str,
+    /// Inherited (CSS sense): when an element doesn't set this property,
+    /// `computed_value` resolves it to the parent's computed value.
+    /// `text-decoration` is deliberately NOT here — it is not inherited but
+    /// *propagated* by painting (and accumulates), handled by
+    /// `text_decoration` instead.
+    inherited: bool,
+    /// Baked into the element's inline `style` on serialization, so the
+    /// re-parsed layout arena (which has no `<style>`) flows the property
+    /// the way the engine computed it. `false` for properties consumed only
+    /// inside the engine and never re-read from serialized HTML: `visibility`
+    /// (hidden nodes are dropped outright), `opacity`/`animation*` (folded
+    /// into `is_hidden`'s slideshow logic), and `content` (baked separately
+    /// as `data-trust-before`/`data-trust-after` attributes).
+    baked: bool,
+}
+
+const fn prop(name: &'static str, inherited: bool, baked: bool) -> PropDef {
+    PropDef {
+        name,
+        inherited,
+        baked,
+    }
+}
+
+#[rustfmt::skip]
+const PROPS: &[PropDef] = &[
+    //    name                    inherited  baked
+    prop("display",              false,     true),
+    prop("visibility",           true,      false),
+    prop("opacity",              false,     false),
+    prop("animation-name",       false,     false),
+    prop("animation-fill-mode",  false,     false),
+    prop("animation",            false,     false),
+    prop("margin-top",           false,     true),
+    prop("margin-bottom",        false,     true),
+    prop("margin-left",          false,     true),
+    prop("margin-right",         false,     true),
+    prop("padding-top",          false,     true),
+    prop("padding-bottom",       false,     true),
+    prop("padding-left",         false,     true),
+    prop("text-align",           true,      true),
+    prop("font-weight",          true,      true),
+    prop("font-style",           true,      true),
+    prop("white-space",          true,      true),
+    prop("text-transform",       true,      true),
+    prop("list-style-type",      true,      true),
+    prop("text-decoration",      false,     true),
+    prop("text-decoration-line", false,     true),
+    prop("content",              false,     false),
+    prop("width",                false,     true),
+    prop("max-width",            false,     true),
+    prop("min-width",            false,     true),
+    prop("flex-wrap",            false,     true),
+    prop("flex-flow",            false,     true),
+    prop("flex-direction",       false,     true),
+    prop("float",                false,     true),
+    prop("clear",                false,     true),
+    prop("overflow",             false,     true),
+    prop("position",             false,     true),
+    prop("flex-grow",            false,     true),
+    prop("flex-shrink",          false,     true),
+    prop("flex-basis",           false,     true),
+    prop("flex",                 false,     true),
+    prop("gap",                  false,     true),
+    prop("column-gap",           false,     true),
+    prop("row-gap",              false,     true),
+    prop("justify-content",      false,     true),
 ];
 
-fn is_tracked(prop: &str) -> bool {
-    TRACKED.contains(&prop)
+fn is_tracked(name: &str) -> bool {
+    PROPS.iter().any(|p| p.name == name)
 }
 
 /// Below this effective opacity an element is treated as invisible (hidden).
 /// Keeps merely-faded content (e.g. `opacity:0.5`) visible.
 const OPACITY_HIDDEN: f32 = 0.05;
 
-/// Properties baked into serialized HTML so the re-parsed layout arena
-/// flows a living page the way the engine (which holds the sheets)
-/// computed. `visibility` is omitted: hidden nodes are dropped outright.
-const BAKE_PROPS: &[&str] = &[
-    "display",
-    "margin-top",
-    "margin-bottom",
-    "margin-left",
-    "margin-right",
-    "padding-top",
-    "padding-bottom",
-    "padding-left",
-    "text-align",
-    "font-weight",
-    "font-style",
-    "white-space",
-    "text-transform",
-    "text-decoration",
-    "text-decoration-line",
-    "width",
-    "max-width",
-    "min-width",
-    "flex-wrap",
-    "flex-flow",
-    "flex-direction",
-    "float",
-    "clear",
-    "overflow",
-    "position",
-    "flex-grow",
-    "flex-shrink",
-    "flex-basis",
-    "flex",
-];
-
-/// Expand a `margin`/`padding` shorthand into its top/right/bottom/left
-/// longhands; pass anything else through unchanged.
+/// Expand a `margin`/`padding`/`list-style` shorthand into the longhands we
+/// track; pass anything else through unchanged.
 fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     if prop == "margin" || prop == "padding" {
         let p: Vec<&str> = value.split_whitespace().collect();
@@ -1749,7 +1922,34 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             (format!("{prop}-left"), l.to_string()),
         ];
     }
+    // `list-style: <type> || <position> || <image>` — we only track the type
+    // keyword (a bare `none` counts as the type, per the shorthand grammar).
+    if prop == "list-style" {
+        return match list_style_shorthand_type(value) {
+            Some(t) => vec![("list-style-type".to_string(), t.to_string())],
+            None => Vec::new(),
+        };
+    }
     vec![(prop.to_string(), value.to_string())]
+}
+
+/// The `list-style-type` keyword inside a `list-style` shorthand, if present.
+fn list_style_shorthand_type(value: &str) -> Option<&str> {
+    const TYPES: &[&str] = &[
+        "none",
+        "disc",
+        "circle",
+        "square",
+        "decimal",
+        "decimal-leading-zero",
+        "lower-alpha",
+        "upper-alpha",
+        "lower-latin",
+        "upper-latin",
+        "lower-roman",
+        "upper-roman",
+    ];
+    value.split_whitespace().find(|t| TYPES.contains(t))
 }
 
 /// One parsed rule, holding its tracked declarations (`(prop, (important,
@@ -1872,15 +2072,17 @@ fn strip_css_comments(css: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Collect a sheet's display/visibility rules into `out`. Whole
-/// @-blocks are skipped (no @media in step 1 — media-query hiding is
-/// usually mobile-only, and skipping keeps content visible); rules
-/// whose selectors don't parse are skipped the same way.
+/// Collect a sheet's tracked rules into `out`. `@keyframes` end-opacity is
+/// harvested; `@media` is evaluated against `viewport` (the CSS-pixel
+/// viewport) and its body spliced in when it matches (dropped otherwise);
+/// other @-blocks are skipped whole. Rules whose selectors don't parse are
+/// skipped (fail-open).
 fn parse_sheet(
     css: &str,
     order: &mut usize,
     out: &mut Vec<StyleRule>,
     keyframes: &mut std::collections::HashMap<String, f32>,
+    viewport: (u32, u32),
 ) {
     let css = strip_css_comments(css);
     let mut rest = css.as_ref();
@@ -1905,6 +2107,26 @@ fn parse_sheet(
                 let (block, tail) = take_block(&after[brace_off..]);
                 if let Some(end) = keyframes_end_opacity(block) {
                     keyframes.insert(name, end);
+                }
+                rest = tail;
+                continue;
+            }
+            // `@media <query> { ... }`: evaluate the query against the
+            // viewport and splice the matching block's rules into the cascade
+            // (recurse, so nested @media and normal rules both work); drop the
+            // body when it doesn't match. The viewport is what `execute_js`
+            // reports (`cols*cell_px`).
+            if let Some(rest_q) = lower.strip_prefix("media")
+                && rest_q
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-')
+                && let Some(brace_off) = after.find('{')
+            {
+                let query = &after[after.len() - rest_q.len()..brace_off];
+                let (block, tail) = take_block(&after[brace_off..]);
+                if media_query_matches(query, viewport) {
+                    parse_sheet(block, order, out, keyframes, viewport);
                 }
                 rest = tail;
                 continue;
@@ -1959,6 +2181,94 @@ fn parse_sheet(
             *order += 1;
         }
     }
+}
+
+/// Does a CSS `@media` query list match the viewport (CSS px; `0` = unknown)?
+/// A comma list is OR. Within one query, conditions join with `and`; a
+/// recognized media type (`screen`/`all`) and the width/height/orientation
+/// features are evaluated, `not`/`only` honored. Anything unrecognized — or a
+/// width/height test with an unknown viewport — makes that query NOT match,
+/// which drops its rules exactly as skipping the whole `@media` block used to.
+fn media_query_matches(query: &str, vp: (u32, u32)) -> bool {
+    query
+        .split(',')
+        .any(|q| media_query_one(&q.trim().to_ascii_lowercase(), vp))
+}
+
+/// One comma-separated media query (already lowercased). A leading
+/// `not`/`only` is a prefix on the whole query (not an `and`-joined part);
+/// the rest is a media type and/or `and`-joined `(feature: value)` conditions.
+fn media_query_one(q: &str, vp: (u32, u32)) -> bool {
+    let mut q = q.trim();
+    let mut negate = false;
+    if let Some(rest) = q.strip_prefix("not ") {
+        negate = true;
+        q = rest.trim();
+    } else if let Some(rest) = q.strip_prefix("only ") {
+        q = rest.trim();
+    }
+    if q.is_empty() {
+        return !negate; // bare `@media { }` / `@media only` applies to all
+    }
+    let mut matches = true;
+    for part in q.split(" and ") {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(inner) = part.strip_prefix('(') {
+            if !media_feature_matches(inner.trim_end_matches(')'), vp) {
+                matches = false;
+            }
+        } else {
+            // A bare token: only `screen`/`all` are our medium; any other type
+            // (print/speech/tv/…) or unknown word can't match.
+            match part {
+                "screen" | "all" => {}
+                _ => matches = false,
+            }
+        }
+    }
+    matches ^ negate
+}
+
+/// A single `feature: value` media condition against the viewport.
+fn media_feature_matches(inner: &str, vp: (u32, u32)) -> bool {
+    let (vw, vh) = vp;
+    let Some((name, value)) = inner.split_once(':') else {
+        return false; // boolean feature (`(color)`) — unrecognized, no match
+    };
+    let value = value.trim();
+    match name.trim() {
+        "min-width" => vw != 0 && media_px(value).is_some_and(|n| vw >= n),
+        "max-width" => vw != 0 && media_px(value).is_some_and(|n| vw <= n),
+        "width" => vw != 0 && media_px(value).is_some_and(|n| vw == n),
+        "min-height" => vh != 0 && media_px(value).is_some_and(|n| vh >= n),
+        "max-height" => vh != 0 && media_px(value).is_some_and(|n| vh <= n),
+        "height" => vh != 0 && media_px(value).is_some_and(|n| vh == n),
+        "orientation" if vw != 0 && vh != 0 => match value {
+            "portrait" => vh >= vw,
+            "landscape" => vw > vh,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// A media-feature length as CSS pixels: `px`/unitless as-is, `em`/`rem` at
+/// 16px. Other units (or unparseable) → `None` (the condition won't match).
+fn media_px(value: &str) -> Option<u32> {
+    let v = value.trim();
+    let split = v
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(v.len());
+    let n: f32 = v[..split].parse().ok()?;
+    let px = match v[split..].trim() {
+        "px" | "" => n,
+        "em" | "rem" => n * 16.0,
+        _ => return None,
+    };
+    Some(px.round().max(0.0) as u32)
 }
 
 /// The opacity at an `@keyframes` animation's END — the value at the highest
@@ -2403,6 +2713,121 @@ mod tests {
         assert_eq!(dom.stylesheet_links(), vec![String::from("/a.css")]);
         dom.attach_external_sheets(&[(String::from("/a.css"), String::from(".x{display:none}"))]);
         assert!(!dom.serialize(DOCUMENT).contains("linked hide"));
+    }
+
+    #[test]
+    fn computed_value_inherits_only_inherited_properties() {
+        // An inherited property flows to a descendant that doesn't set it; a
+        // non-inherited one stays put. This is the single inheritance
+        // authority the layout and getComputedStyle both read through.
+        let dom = Dom::parse_document(
+            "<head><style>#outer{text-align:center;margin-left:4px}</style></head>
+             <body><div id=outer><p id=inner>x</p></div></body>",
+        );
+        let inner = dom.get_by_id("inner").unwrap();
+        assert_eq!(
+            dom.computed_value(inner, "text-align").as_deref(),
+            Some("center"),
+            "text-align inherits"
+        );
+        assert_eq!(
+            dom.computed_value(inner, "margin-left"),
+            None,
+            "margin-left does not inherit"
+        );
+    }
+
+    #[test]
+    fn computed_value_applies_and_inherits_ua_defaults() {
+        // `<b>` is bold via the UA default layer; a nested span inherits it;
+        // an explicit normal weight wins over the inherited bold.
+        let dom = Dom::parse_document(
+            "<body><b id=b>bold <span id=s>still</span>\
+             <span id=n style='font-weight:normal'>not</span></b></body>",
+        );
+        let b = dom.get_by_id("b").unwrap();
+        let s = dom.get_by_id("s").unwrap();
+        let n = dom.get_by_id("n").unwrap();
+        assert_eq!(
+            dom.computed_value(b, "font-weight").as_deref(),
+            Some("bold"),
+            "UA default"
+        );
+        assert_eq!(
+            dom.computed_value(s, "font-weight").as_deref(),
+            Some("bold"),
+            "inherited from <b>"
+        );
+        assert_eq!(
+            dom.computed_value(n, "font-weight").as_deref(),
+            Some("normal"),
+            "own value beats inherited UA default"
+        );
+    }
+
+    #[test]
+    fn text_decoration_accumulates_and_resets() {
+        // Underline + line-through accumulate across nesting (each box adds
+        // its line); `text-decoration:none` clears both from there down.
+        let dom = Dom::parse_document(
+            "<body><u id=u>under <s id=s>both</s>\
+             <span id=clear style='text-decoration:none'>neither</span></u></body>",
+        );
+        let u = dom.get_by_id("u").unwrap();
+        let s = dom.get_by_id("s").unwrap();
+        let clear = dom.get_by_id("clear").unwrap();
+        assert_eq!(dom.text_decoration(u), (true, false), "<u> underlines");
+        assert_eq!(
+            dom.text_decoration(s),
+            (true, true),
+            "<s> inside <u> adds strike, keeps underline"
+        );
+        assert_eq!(
+            dom.text_decoration(clear),
+            (false, false),
+            "text-decoration:none clears both"
+        );
+    }
+
+    #[test]
+    fn computed_value_memo_follows_mutations() {
+        // The memo is epoch-keyed: changing an ancestor's class re-resolves an
+        // inherited value rather than serving a stale cache hit.
+        let mut dom = Dom::parse_document(
+            "<head><style>.up{text-transform:uppercase}</style></head>
+             <body><div id=o><span id=i>x</span></div></body>",
+        );
+        let i = dom.get_by_id("i").unwrap();
+        let o = dom.get_by_id("o").unwrap();
+        assert_eq!(dom.computed_value(i, "text-transform"), None);
+        dom.set_attr(o, "class", "up");
+        assert_eq!(
+            dom.computed_value(i, "text-transform").as_deref(),
+            Some("uppercase"),
+            "mutation invalidates the inherited-value memo"
+        );
+    }
+
+    #[test]
+    fn media_queries_evaluate_against_the_viewport() {
+        let vp = (800, 600); // 800x600 CSS px
+        assert!(media_query_matches("(min-width: 768px)", vp));
+        assert!(!media_query_matches("(min-width: 1000px)", vp));
+        assert!(media_query_matches("(max-width: 1000px)", vp));
+        assert!(media_query_matches("screen and (min-width: 640px)", vp));
+        assert!(!media_query_matches("print", vp), "wrong medium");
+        assert!(
+            media_query_matches("print, (min-width: 640px)", vp),
+            "comma is OR"
+        );
+        assert!(media_query_matches("(orientation: landscape)", vp));
+        assert!(!media_query_matches("(orientation: portrait)", vp));
+        assert!(media_query_matches("(min-width: 40em)", vp), "40em = 640px");
+        assert!(media_query_matches("not (min-width: 1000px)", vp), "not");
+        // Unknown feature, or an unknown viewport, conservatively don't match
+        // (so the rules are dropped, exactly as skipping @media used to).
+        assert!(!media_query_matches("(hover: hover)", vp));
+        assert!(!media_query_matches("(min-width: 768px)", (0, 0)));
     }
 
     #[test]
