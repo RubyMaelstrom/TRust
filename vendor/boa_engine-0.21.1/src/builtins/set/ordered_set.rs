@@ -175,12 +175,16 @@ pub(crate) struct SetLock(JsObject);
 
 impl Finalize for SetLock {
     fn finalize(&self) {
-        // Avoids panicking inside `Finalize`, with the downside of slightly increasing
-        // memory usage if the set could not be borrowed.
-        // TODO: try_downcast_mut
-        self.0
-            .downcast_mut::<OrderedSet>()
-            .expect("SetLock does not point to a set")
-            .unlock();
+        // Avoids panicking inside `Finalize`, with the downside of slightly
+        // increasing memory usage if the set could not be borrowed. Finalizers
+        // must never panic — a panic here aborts the GC (and the whole page).
+        // The set this lock guards can still be borrowed when the lock is
+        // finalized (GC finalization order is not guaranteed), so use the
+        // non-panicking `try_downcast_mut` rather than `downcast_mut().expect()`,
+        // which panicked with `BorrowMutError` on archive.org's Set-heavy
+        // collection rendering and dropped the page to its raw shell.
+        if let Some(mut set) = self.0.try_downcast_mut::<OrderedSet>() {
+            set.unlock();
+        }
     }
 }

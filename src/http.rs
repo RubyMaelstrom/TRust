@@ -67,6 +67,133 @@ pub struct LivePage {
     pub events: tokio::sync::mpsc::Receiver<crate::js::PageEvt>,
 }
 
+/// A successful GET response, cached for one page load.
+#[derive(Debug)]
+pub struct CachedResp {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+pub type FetchOutcome = Result<std::sync::Arc<CachedResp>, ()>;
+pub type SharedFetch = futures::future::Shared<futures::future::BoxFuture<'static, FetchOutcome>>;
+
+/// A per-page subresource cache with in-flight dedup. Shared across the
+/// runtime (the initial `execute_js` prefetch) and the page thread (the
+/// module loader, speculative import prefetch, the page's own `fetch()`).
+/// One GET per URL for the whole load: a `Shared` future means the second
+/// asker — the module loader, a speculative prefetch, or the bundler's
+/// own `fetch()` warm-up of a chunk we already have — joins the single
+/// in-flight request instead of re-downloading it. Browsers do exactly
+/// this within a navigation (memory cache + preload cache). POSTs and
+/// uncached API GETs bypass it (`peek` never inserts), so polling reads
+/// stay fresh.
+#[derive(Default)]
+pub struct PageCache {
+    map: std::sync::Mutex<HashMap<String, SharedFetch>>,
+}
+
+impl std::fmt::Debug for PageCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.map.lock().map(|m| m.len()).unwrap_or(0);
+        write!(f, "PageCache({n} entries)")
+    }
+}
+
+impl PageCache {
+    /// Get-or-start the shared fetch for `url`. The first caller spawns it
+    /// (driven concurrently on the runtime, so speculative prefetch makes
+    /// progress before anyone awaits); every later caller shares that one
+    /// request. The caller is responsible for cap/`subresource_allowed`
+    /// gating BEFORE starting a brand-new fetch (see `page_net_prepare`).
+    pub fn fetch(&self, handle: &tokio::runtime::Handle, url: Url) -> SharedFetch {
+        use futures::future::FutureExt as _;
+        let key = url.to_string();
+        let mut map = self.map.lock().unwrap();
+        if let Some(f) = map.get(&key) {
+            return f.clone();
+        }
+        let fut = async move {
+            match fetch(&Request::get(url)).await {
+                Ok(r) => Ok(std::sync::Arc::new(CachedResp {
+                    status: r.status,
+                    content_type: r.content_type,
+                    body: r.body,
+                })),
+                Err(_) => Err(()),
+            }
+        }
+        .boxed()
+        .shared();
+        map.insert(key, fut.clone());
+        // Drive it now (dropping the JoinHandle doesn't cancel the task):
+        // speculation overlaps with everything, even with no awaiter yet.
+        handle.spawn(fut.clone());
+        fut
+    }
+
+    /// Start (or join) the fetch for `url` and discard the handle — a
+    /// fire-and-forget warm-up for speculative import prefetch. The driver
+    /// task `fetch` spawned keeps it running; a later `fetch`/`peek` for
+    /// the same URL joins it.
+    pub fn prefetch(&self, handle: &tokio::runtime::Handle, url: Url) {
+        // Discard the returned handle; the driver task `fetch` spawned
+        // keeps the request running, so dropping our clone is fine.
+        drop(self.fetch(handle, url));
+    }
+
+    /// An existing entry (in-flight or done) for `url`, or None. The
+    /// page's own `fetch()` uses this to join a known subresource request
+    /// WITHOUT caching arbitrary API GETs — a miss falls through to a
+    /// normal, uncached fetch so polling stays honest.
+    pub fn peek(&self, url: &Url) -> Option<SharedFetch> {
+        self.map.lock().unwrap().get(url.as_str()).cloned()
+    }
+
+    /// Block the calling (page) thread on a shared fetch. The module
+    /// loader needs this: it must NOT `.await` (yielding would let Boa
+    /// interleave another module load and cross up its per-referrer
+    /// `loaded_modules`), and it can't `block_on` (it already runs inside
+    /// one). With a runtime `handle` the fetch is driven on the runtime
+    /// and waited on via a plain channel — no yield to the JS job loop.
+    /// Without one (a no-net page whose cache holds only pre-seeded, ready
+    /// futures) a bare executor resolves it. Speculative prefetch usually
+    /// has the body ready by now, so this rarely waits long.
+    pub fn block_on_fetch(
+        handle: Option<&tokio::runtime::Handle>,
+        fut: SharedFetch,
+    ) -> Option<std::sync::Arc<CachedResp>> {
+        match handle {
+            Some(handle) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                handle.spawn(async move {
+                    let _ = tx.send(fut.await);
+                });
+                rx.recv().ok().and_then(|r| r.ok())
+            }
+            // No runtime: the only entries are pre-seeded ready futures,
+            // and we're already inside the job loop's executor (nesting a
+            // `block_on` there panics) — poll once, which resolves them.
+            None => {
+                use futures::future::FutureExt as _;
+                fut.now_or_never().and_then(|r| r.ok())
+            }
+        }
+    }
+
+    /// Seed an already-fetched body (the initial `execute_js` prefetch).
+    pub fn seed(&self, url: String, status: u16, content_type: String, body: Vec<u8>) {
+        use futures::future::FutureExt as _;
+        let resp = std::sync::Arc::new(CachedResp {
+            status,
+            content_type,
+            body,
+        });
+        let fut = async move { Ok(resp) }.boxed().shared();
+        self.map.lock().unwrap().insert(url, fut);
+    }
+}
+
 /// Parse an absolute http(s) URL.
 pub fn parse_url(s: &str) -> Option<Url> {
     if !(s.starts_with("http://") || s.starts_with("https://")) {
@@ -75,25 +202,41 @@ pub fn parse_url(s: &str) -> Option<Url> {
     Url::parse(s).ok()
 }
 
+/// A process-global monotonic origin shared by every trace line (net
+/// requests in http.rs, JS phase markers in js.rs) so a single load's
+/// timeline reads against one clock. Only consulted when tracing is on.
+pub fn trace_origin() -> Instant {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
+}
+
+/// Milliseconds since `trace_origin`, for trace lines.
+pub fn trace_ms() -> u128 {
+    trace_origin().elapsed().as_millis()
+}
+
 /// Fetch a request, following up to `MAX_REDIRECTS` redirects.
 /// 301/302/303 turn into GET (dropping the body); 307/308 keep both.
 /// `TRUST_NET_TRACE=1` prints one timing line per request to stderr —
-/// the diagnostic for "where did the page-load time go".
+/// the diagnostic for "where did the page-load time go". Each line shows
+/// `@<start>ms +<duration>ms` against the shared `trace_origin`, so the
+/// timeline (which requests overlap, where the gaps are) is reconstructable.
 pub async fn fetch(request: &Request) -> Result<Response, String> {
     if std::env::var_os("TRUST_NET_TRACE").is_none() {
         return fetch_redirecting(request).await;
     }
+    let at = trace_ms();
     let started = std::time::Instant::now();
     let result = fetch_redirecting(request).await;
     let ms = started.elapsed().as_millis();
     match &result {
         Ok(r) => eprintln!(
-            "net: {ms:>5}ms {} {}B {}",
+            "net: @{at:>6}ms +{ms:>5}ms {} {}B {}",
             r.status,
             r.body.len(),
             request.url
         ),
-        Err(e) => eprintln!("net: {ms:>5}ms ERR {} ({e})", request.url),
+        Err(e) => eprintln!("net: @{at:>6}ms +{ms:>5}ms ERR {} ({e})", request.url),
     }
     result
 }
@@ -768,6 +911,13 @@ pub async fn execute_js(
                 .map(|s| (Kind::Preload, s)),
         )
         .collect();
+    if std::env::var_os("TRUST_NET_TRACE").is_some() {
+        eprintln!(
+            "js : @{:>6}ms prefetch start ({} subresources)",
+            trace_ms(),
+            jobs.len()
+        );
+    }
     let results = futures::stream::iter(jobs.into_iter().map(|(kind, raw)| {
         let base = response.url.clone();
         async move {
@@ -777,7 +927,12 @@ pub async fn execute_js(
                 .filter(|u| matches!(u.scheme(), "http" | "https"))
                 .filter(|u| subresource_allowed(&base, u));
             let resp = match &resolved {
-                Some(u) => fetch(&Request::get(u.clone())).await.ok(),
+                Some(u) => {
+                    if std::env::var_os("TRUST_NET_TRACE").is_some() {
+                        eprintln!("src: @{:>6}ms PREFETCH {u}", trace_ms());
+                    }
+                    fetch(&Request::get(u.clone())).await.ok()
+                }
                 None => None,
             };
             (kind, raw, resolved, resp)
@@ -789,12 +944,27 @@ pub async fn execute_js(
     .collect::<Vec<_>>()
     .await;
 
+    // The shared subresource cache. Module preloads seed it; the module
+    // loader, speculative import prefetch, and the page's own fetch() all
+    // share it from here on (no chunk is downloaded twice).
+    let cache = std::sync::Arc::new(PageCache::default());
     let mut externals = Vec::new();
     let mut sheets = Vec::new();
-    let mut preloaded = Vec::new();
     for (kind, raw, resolved, resp) in results {
         match kind {
-            Kind::Script => externals.push((raw, resp.map(|r| r.body))),
+            Kind::Script => {
+                // Seed the cache too: the module entry is a classic-script
+                // <src>, and the loader/bundler reach it through the cache.
+                if let (Some(u), Some(r)) = (resolved.as_ref(), resp.as_ref()) {
+                    cache.seed(
+                        u.to_string(),
+                        r.status,
+                        r.content_type.clone(),
+                        r.body.clone(),
+                    );
+                }
+                externals.push((raw, resp.map(|r| r.body)));
+            }
             Kind::Sheet => {
                 // A failed sheet is simply absent: fail-open, nothing
                 // gets hidden.
@@ -804,7 +974,7 @@ pub async fn execute_js(
             }
             Kind::Preload => {
                 if let (Some(u), Some(r)) = (resolved, resp) {
-                    preloaded.push((u.to_string(), r.body));
+                    cache.seed(u.to_string(), r.status, r.content_type, r.body);
                 }
             }
         }
@@ -815,7 +985,7 @@ pub async fn execute_js(
         cell_px,
         externals,
         sheets,
-        preloaded,
+        cache,
         net: Some(tokio::runtime::Handle::current()),
         storage: Some(storage),
     };
@@ -823,8 +993,17 @@ pub async fn execute_js(
     // parser recursion — see CLAUDE.md). Its first event is `Static`
     // (nothing to interact with: actor already gone, free efficiency)
     // or `Updated` (alive: hand the channels to the app).
+    if std::env::var_os("TRUST_NET_TRACE").is_some() {
+        eprintln!("js : @{:>6}ms prefetch done; spawning page", trace_ms());
+    }
     let (handle, mut events) = crate::js::spawn_page(html, env);
     let first = tokio::time::timeout(Duration::from_secs(60), events.recv()).await;
+    if std::env::var_os("TRUST_NET_TRACE").is_some() {
+        eprintln!(
+            "js : @{:>6}ms first PageEvt received (page rendered)",
+            trace_ms()
+        );
+    }
     let (out, outcome, live) = match first {
         Ok(Some(crate::js::PageEvt::Static { html, outcome })) => (html, outcome, None),
         Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
@@ -1331,6 +1510,91 @@ mod tests {
         assert!(
             elapsed < serial / 2,
             "fetches did not overlap: {elapsed:?} (serial would be ~{serial:?})"
+        );
+        server.abort();
+    }
+
+    /// The speculative-import-prefetch win: an entry module that STATICALLY
+    /// imports many chunks pulls them concurrently (the scanner fires them
+    /// ahead of Boa's serial loader) instead of one-RTT-at-a-time. Mirrors
+    /// `page_fetches_run_concurrently` for the module graph.
+    #[tokio::test]
+    async fn static_module_graph_prefetches_concurrently() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const N: usize = 8;
+        const DELAY_MS: u64 = 120;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                // One task per connection so the server never serializes —
+                // otherwise it would mask client concurrency.
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let js = "Content-Type: text/javascript";
+                    let reply: Vec<u8> = if text.starts_with("GET /page ") {
+                        // The entry (a classic <script src>) statically
+                        // imports m0..m{N-1}; their top-level code runs
+                        // before the entry body, which reports how many ran.
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                         <body><div id=out></div>\
+                         <script type=module src='/entry.js'></script></body>"
+                            .as_bytes()
+                            .to_vec()
+                    } else if text.starts_with("GET /entry.js ") {
+                        let mut imports = String::new();
+                        for i in 0..N {
+                            imports.push_str(&format!("import '/m{i}.js';\n"));
+                        }
+                        format!(
+                            "HTTP/1.1 200 OK\r\n{js}\r\nConnection: close\r\n\r\n\
+                             {imports}\
+                             document.getElementById('out').textContent='got '+(globalThis.__c||0);"
+                        )
+                        .into_bytes()
+                    } else if text.starts_with("GET /m") {
+                        tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+                        format!(
+                            "HTTP/1.1 200 OK\r\n{js}\r\nConnection: close\r\n\r\n\
+                             globalThis.__c=(globalThis.__c||0)+1;"
+                        )
+                        .into_bytes()
+                    } else {
+                        b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                    };
+                    let _ = sock.write_all(&reply).await;
+                });
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let started = std::time::Instant::now();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let elapsed = started.elapsed();
+        let body = String::from_utf8_lossy(&response.body);
+        eprintln!("static_module_graph_prefetches_concurrently: {N}@{DELAY_MS}ms took {elapsed:?}");
+        assert!(
+            body.contains(&format!("got {N}")),
+            "all modules ran: {body}"
+        );
+        let serial = std::time::Duration::from_millis(DELAY_MS * N as u64);
+        assert!(
+            elapsed < serial / 2,
+            "module fetches did not overlap: {elapsed:?} (serial would be ~{serial:?})"
         );
         server.abort();
     }

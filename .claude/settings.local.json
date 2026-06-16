@@ -65,7 +65,8 @@
       "Bash(tmux kill-server *)",
       "Bash(cargo --version)",
       "Bash(echo \"=== FMT EXIT: $? ===\")",
-      "Bash(awk '/const TRACKED/{f=1} f{print NR\": \"$0} f&&/\\\\];/{exit}' src/dom.rs)"
+      "Bash(awk '/const TRACKED/{f=1} f{print NR\": \"$0} f&&/\\\\];/{exit}' src/dom.rs)",
+      "Bash(curl -sS -o /dev/null -w \"%{http_code} %{time_total}s\\\\n\" https://archive.org/)"
     ]
   }
 }
