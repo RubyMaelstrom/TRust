@@ -138,8 +138,11 @@ living-page logic; keep them UNTOUCHED.
 
 - **User-Agent: `TRust/0.1` exactly.** Hand-rolled HTTP/1.1, no
   reqwest/hyper; no gzip unless the wild forces it.
-- `set webcolors` sidelined unless she re-raises it. File uploads/multipart
-  deliberately unsupported. `parse_port` has deliberately no "ssh".
+- `set webcolors` sidelined unless she re-raises it. **CSS borders DEFAULT
+  OFF — `set borders on|off`** (her call: terminal rows are precious; see the
+  border bullet in CSS cascade + [[borders-off-vertical-space]]). File
+  uploads/multipart deliberately unsupported. `parse_port` has deliberately no
+  "ssh".
 - Inline images not ruled out forever, but the line-based doc model
   stays. Animated GIF (someday webm) is her "impress me" stretch goal
   — webm needs a video decoder, don't promise it.
@@ -323,7 +326,14 @@ watch, not a roadmap item.
   attr operators (`~= |= ^= $= *=`), per-Complex specificity,
   paren/quote-aware comma splitting; querySelector shares it.
   `:hover`/`:focus`/unknown pseudos parse but NEVER match (fail-open); an
-  unparseable member kills its whole rule (also fail-open).
+  unparseable member kills its whole rule (also fail-open). **`:scope` matches
+  the QUERY ROOT** (the element a `querySelectorAll`/jQuery `.find()` is rooted
+  on; threaded through `query→matches_complex→matches_compound`, inert in the
+  stylesheet cascade where there's no root). 2026-06-16 fix: jQuery rewrites a
+  context-rooted comma/complex `.find()` into `:scope X, :scope Y`, so without
+  `:scope` such queries matched NOTHING — silently broke deselection-style code
+  (SL Marketplace tabs: `removeClass` over `:scope .tab-header,…` cleared
+  nothing, so both tabs stayed active). General jQuery win, not a site fix.
   - **The property surface is the `PROPS` registry** (one table; `is_tracked`
     + the serializer bake-list derive from it). Adding a property = one row.
   - **Inheritance is general**: `computed_value(id,prop)` is the SINGLE
@@ -354,6 +364,42 @@ watch, not a roadmap item.
     center/space-between/around/evenly) when grow didn't eat the free space;
     grid `justify-content` and `align-items` (~N/A in our 1-row item model)
     not done.
+  - **`border` → box-drawing (Phase 2) — DEFAULT OFF (2026-06-16, her call)**:
+    `set borders on|off` toggles `layout::BORDERS_ENABLED` (atomic, default
+    OFF), read at `parse_seeded`, threaded as an explicit `borders: bool` into
+    `lay_out`/`lay_out_with_carousels` (so tests stay isolated — `lay_b` helper
+    = borders on). When off, `flow_bordered` never triggers; border props STILL
+    cascade/bake so getComputedStyle stays correct. WHY off: terminal vertical
+    space is at a premium (images need full on-screen), and most page borders
+    are subtle 1px underlines not worth a cell row — see
+    [[borders-off-vertical-space]]. The code/showpiece stays. 8 per-side
+    longhands tracked (baked, not inherited; `border`/`border-{side}`/
+    `border-width`/`border-style` shorthands EXPANDED in `expand_box_shorthand`;
+    `border-color` ignored). A block with a visible border (`border_sides` →
+    `[Option<BorderWeight>;4]`) routes through `flow_bordered`: lays the interior
+    in a sub-box (margin handled outside the frame, padding kept —
+    `inner_border_box` field guards recursion + suppresses margin in
+    `gap_before`/`gap_after`/`block_indent`; **also threads `float_skip` so a
+    floated+bordered element can't ping-pong `flow_float`↔`flow_bordered` into a
+    stack overflow, and threads the inherited `Ctx` so a clickable ANCESTOR — an
+    `<a>` wrapping a bordered tab `<div>` — keeps its interior a link**),
+    `frame_box` draws the bordered sides as `ItemKind::Border` glyphs
+    (`ratatui::symbols::line`: solid→light, `double`→double, `thick`/≥3px→
+    heavy, dashed/dotted→dashed), `blit`s. `frame_box` CLIPS interior content to
+    the inner width per-row (overflow can't paint over the right bar; carousel
+    strip rows are left to `visible_col`). A carousel inside a bordered box flags
+    `Carousel::frame_right` so `visible_col` always draws the right frame bar
+    (else it's clipped as off-screen strip content). Uniform per-side: 4
+    sides→frame, bottom/top→rule, left/right→gutter bar. Box fills container
+    width (or CSS `width`), so a `border-bottom` rule spans the block.
+    `ItemKind::Border` renders DIM (ui.rs). NOT done: `border-radius` (square
+    corners), inline-element borders (block only), full per-cell table grids,
+    margin-outside precision is approximated, mixed-weight frames collapse to one
+    weight.
+  - **`text-indent` (Phase 2)**: inherited + baked. Applied at each block's
+    first line (`self.col += resolve_cells(text-indent)` after `begin_line`,
+    skipped while measuring); wrapped lines return to the margin; negative
+    (hanging) indents clamp to 0.
   - **getComputedStyle is cascade-backed**: `__dom_computed` → `computed_value`
     (read-only proxy; inline fallback). NOT inline-only anymore.
   - **Lengths**: `css_length_em` is the one context-free unit parser
@@ -797,6 +843,28 @@ lies.
 
 ## What's next
 
+### Shipped 2026-06-16 (later — borders default-off, border bugfixes, `:scope`)
+All UNCOMMITTED (she commits), fmt/clippy-0, **257 tests**, release-smoked in
+tmux against live SL Marketplace. On top of the Phase-2 work below.
+- **CSS borders DEFAULT OFF** (`set borders on|off`) — her call after seeing
+  them eat rows; code stays, un-triggered. See the border bullet + binding
+  decisions + [[borders-off-vertical-space]]. (This also made the too-tall
+  carousel frame and stacked nav underlines moot.)
+- **Border bugfixes** (found while borders were still on): (1) floated+bordered
+  stack overflow — `flow_bordered` threads `float_skip`; (2) overflow painting
+  over the right bar — `frame_box` clips interior per-row; (3) carousel right
+  frame bar clipped away — `Carousel::frame_right` exempts it in `visible_col`;
+  (4) bordered element inside an `<a>` stopped being clickable — `flow_bordered`
+  threads the inherited `Ctx`. All in the border bullet.
+- **`:scope` selector support** — the big general win: jQuery's context-rooted
+  comma/complex `.find()` (`:scope X, :scope Y`) matched nothing, silently
+  breaking deselection-style code across jQuery sites (SL Marketplace tabs were
+  the symptom — clicking a tab left BOTH active). `:scope` now matches the query
+  root. See the selector-engine paragraph in CSS cascade. NOT a site fix.
+- New ignored diagnostic `http::tests::click_diag` (fetch a real URL, click a
+  link by text via the live actor, dump probe elements' classes before/after) —
+  it's how the `:scope` bug was pinned. Kept like `net_diag`.
+
 ### Shipped 2026-06-16 (CSS engine generalization — Phase 1, 4 steps)
 Audit-first plan (she approved): generalize the cascade so adding CSS "just
 works" instead of nibbling edges. **NO COLOR** (her call — cyberpunk
@@ -823,8 +891,12 @@ the "CSS cascade" section. **Phase 2 IN PROGRESS**: `list-style-type` SHIPPED
 (de-bullets nav `list-style:none`, alpha/roman/decimal, depth-varying nested
 disc/circle/square, `<ol type|start>`/`<li value>`); **`gap`/`column-gap`/
 `row-gap` + `justify-content` SHIPPED** (flex/grid spacing + main-axis
-distribution) — both in "CSS cascade". NEXT Phase 2: border→box-drawing
-(ratatui — the showpiece, its own design beat), text-indent. SKIP bucket (visual-only): gradients, box-shadow,
+distribution); **`border`→box-drawing SHIPPED** (the showpiece: full frames /
+border-bottom rules / border-left bars, light/double/heavy/dashed via
+ratatui::symbols, DIM); **`text-indent` SHIPPED** (first-line indent,
+inherits) — all in "CSS cascade". **PHASE 2 COMPLETE.** A round-2 list if she
+wants more later: letter-spacing, `order` (flex reorder), grid
+justify-content/align-items, `list-style-position`. SKIP bucket (visual-only): gradients, box-shadow,
 border-radius, filters, transforms, z-index.
 
 ### Shipped 2026-06-15 (later — the Boa fork: 4 engine fixes)

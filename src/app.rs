@@ -1021,9 +1021,20 @@ impl App {
                     self.js_enabled = false;
                     self.status = String::from("JavaScript off (on is the default).");
                 }
+                (Some("borders"), Some("on")) => {
+                    crate::layout::set_borders_enabled(true);
+                    self.relayout_browser();
+                    self.status =
+                        String::from("Borders on: CSS borders render as box-drawing chrome.");
+                }
+                (Some("borders"), Some("off")) => {
+                    crate::layout::set_borders_enabled(false);
+                    self.relayout_browser();
+                    self.status = String::from("Borders off (the default): borders aren't drawn.");
+                }
                 _ => {
                     self.status = String::from(
-                        "usage: set encoding cp437|utf8 · set image <protocol>|auto · set js on|off · set cookies on|off",
+                        "usage: set encoding cp437|utf8 · set image <protocol>|auto · set js on|off · set cookies on|off · set borders on|off",
                     )
                 }
             },

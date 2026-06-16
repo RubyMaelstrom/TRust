@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 
+use ratatui::symbols::line;
 use url::Url;
 
 use crate::doc::{Form, Link};
@@ -40,6 +41,21 @@ pub type ImageSizes = HashMap<String, (u16, u16)>;
 /// (synthesized text like list markers).
 pub const NO_NODE: NodeId = usize::MAX;
 
+/// Whether CSS borders render as box-drawing chrome. Session-global,
+/// default OFF (her call — terminal vertical space is at a premium and most
+/// page borders are subtle 1px underlines not worth a cell row each). The
+/// `set borders on` command flips it; `parse_seeded` reads it when laying a
+/// document out. See `Layout::borders`.
+static BORDERS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_borders_enabled(on: bool) {
+    BORDERS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn borders_enabled() -> bool {
+    BORDERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Semantic/styling class of a laid-out item. The view maps these to
 /// terminal styles much as it maps `doc::Kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +74,9 @@ pub enum ItemKind {
     Form,
     /// An image placeholder (alt text for now; real pixels in L3).
     Image,
+    /// A generated border glyph (box-drawing) — rendered as quiet structural
+    /// chrome (the theme's DIM), never selectable or wrapped.
+    Border,
 }
 
 /// One positioned inline box on a row.
@@ -135,6 +154,13 @@ pub struct Carousel {
     pub stops: Vec<u16>,
     /// Current scroll position: a strip column shown at the band's left.
     pub offset: u16,
+    /// Column of the enclosing bordered box's RIGHT frame bar, when this
+    /// carousel sits inside a right-bordered box. The bar lands at the band's
+    /// right edge — inside the strip's column span — so without flagging it as
+    /// static frame chrome `visible_col` would clip it as off-screen strip
+    /// content and the right border would vanish on every strip row. `None`
+    /// when the box has no right border. Set by `frame_box`, moved by `blit`.
+    pub frame_right: Option<u16>,
 }
 
 impl Carousel {
@@ -247,7 +273,16 @@ impl Carousel {
 /// is why later cards rendered blank after scrolling).
 pub fn visible_col(carousels: &[Carousel], row: usize, item: &Item) -> Option<u16> {
     for c in carousels {
-        if c.contains_row(row) && item.col >= c.left {
+        if !c.contains_row(row) {
+            continue;
+        }
+        // The enclosing box's right frame bar sits at the band edge, inside
+        // the strip span: it's static chrome, always drawn at its fixed column
+        // (never scrolled or clipped like strip cards).
+        if item.kind == ItemKind::Border && Some(item.col) == c.frame_right {
+            return Some(item.col);
+        }
+        if item.col >= c.left {
             return c.shows(item.col, item.width).then(|| item.col - c.offset);
         }
     }
@@ -297,8 +332,9 @@ pub fn lay_out(
     forms: &[Form],
     controls: &ControlMap,
     images: &ImageSizes,
+    borders: bool,
 ) -> Vec<Row> {
-    lay_out_with_carousels(dom, base, width, forms, controls, images).0
+    lay_out_with_carousels(dom, base, width, forms, controls, images, borders).0
 }
 
 /// Lay a document out, also returning the horizontally-scrollable strips
@@ -312,8 +348,9 @@ pub fn lay_out_with_carousels(
     forms: &[Form],
     controls: &ControlMap,
     images: &ImageSizes,
+    borders: bool,
 ) -> (Vec<Row>, Vec<Carousel>) {
-    let mut layout = Layout::new(dom, base, width.max(10), forms, controls, images);
+    let mut layout = Layout::new(dom, base, width.max(10), forms, controls, images, borders);
     let root = body_or_document(dom);
     let ctx = Ctx::root();
     for child in dom.children(root) {
@@ -503,6 +540,89 @@ fn capitalize_words(s: &str) -> String {
         }
     }
     out
+}
+
+/// A border's terminal rendering weight, chosen from the CSS `border-style`
+/// (and width): solid→light, `thick`/≥3px→heavy, `double`→double, dashed/
+/// dotted→dashed. `border-color` is ignored (borders render in the theme DIM).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BorderWeight {
+    Light,
+    Heavy,
+    Double,
+    Dashed,
+}
+
+/// The box-drawing glyph set for a weight, from `ratatui::symbols::line`
+/// (dashed reuses the light corners with dashed edges).
+fn line_set(w: BorderWeight) -> line::Set<'static> {
+    match w {
+        BorderWeight::Light => line::NORMAL,
+        BorderWeight::Heavy => line::THICK,
+        BorderWeight::Double => line::DOUBLE,
+        BorderWeight::Dashed => line::Set {
+            horizontal: "┄",
+            vertical: "┊",
+            ..line::NORMAL
+        },
+    }
+}
+
+/// A `border-*-width` value as approximate CSS px (`thin`=1, `medium`=3,
+/// `thick`=5; lengths via their unit), or `None` if unparseable.
+fn border_px(w: &str) -> Option<f32> {
+    match w.trim() {
+        "thin" => Some(1.0),
+        "medium" => Some(3.0),
+        "thick" => Some(5.0),
+        t => {
+            let split = t
+                .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .unwrap_or(t.len());
+            let n: f32 = t[..split].parse().ok()?;
+            Some(match t[split..].trim() {
+                "em" | "rem" => n * 16.0,
+                "pt" => n * 4.0 / 3.0,
+                _ => n, // px / unitless
+            })
+        }
+    }
+}
+
+/// The weight for a visible border from its `border-style` and `border-width`.
+fn border_weight(style: &str, width: Option<&str>) -> BorderWeight {
+    match style {
+        "double" => BorderWeight::Double,
+        "dashed" | "dotted" => BorderWeight::Dashed,
+        _ => {
+            // solid/groove/ridge/inset/outset: heavy only for an explicitly
+            // thick or ≥3px border (the default `medium` stays light).
+            let heavy = match width.map(str::trim) {
+                Some("thick") => true,
+                Some("thin") | Some("medium") | None => false,
+                Some(w) => border_px(w).is_some_and(|px| px >= 3.0),
+            };
+            if heavy {
+                BorderWeight::Heavy
+            } else {
+                BorderWeight::Light
+            }
+        }
+    }
+}
+
+/// Build a framed box's top or bottom edge string of `width` cells: a corner
+/// at each end that has a side border, horizontals between.
+fn edge_string(width: usize, left: Option<&str>, right: Option<&str>, horiz: &str) -> String {
+    let mut s = String::new();
+    for col in 0..width {
+        s.push_str(match col {
+            0 => left.unwrap_or(horiz),
+            c if c + 1 == width => right.unwrap_or(horiz),
+            _ => horiz,
+        });
+    }
+    s
 }
 
 /// Render a list marker for `list-style-type` `kind` at counter `n`: a bullet
@@ -724,6 +844,17 @@ struct Layout<'a> {
     /// not placing it — so `text-align` offsets are ignored (they don't
     /// change content width) and the result is the natural left-packed extent.
     measuring: bool,
+    /// When laying the INTERIOR of a bordered box (`flow_bordered`'s sub-pass),
+    /// this is that element: its own border routing is skipped (no recursion)
+    /// and its margin is suppressed (handled outside the frame; padding kept).
+    inner_border_box: Option<NodeId>,
+    /// Whether CSS borders render as box-drawing chrome. Default OFF (her
+    /// call: in a terminal, vertical space is at a premium and most page
+    /// borders are subtle 1px underlines not worth a whole cell row). The
+    /// `set borders on` session flag turns them on. When off, `flow_bordered`
+    /// never triggers — the border properties still cascade/bake (so
+    /// getComputedStyle stays correct), they just aren't drawn.
+    borders: bool,
 }
 
 impl<'a> Layout<'a> {
@@ -734,6 +865,7 @@ impl<'a> Layout<'a> {
         forms: &'a [Form],
         controls: &'a ControlMap,
         images: &'a ImageSizes,
+        borders: bool,
     ) -> Self {
         Layout {
             dom,
@@ -759,6 +891,8 @@ impl<'a> Layout<'a> {
             carousels: Vec::new(),
             suppressed_controls: std::collections::HashSet::new(),
             measuring: false,
+            inner_border_box: None,
+            borders,
         }
     }
 
@@ -896,6 +1030,23 @@ impl<'a> Layout<'a> {
             return;
         }
         let block_like = matches!(flow, Flow::Block | Flow::ListItem);
+        // A block-level element with a visible border is laid as its own
+        // framed sub-box: lay its interior, draw the bordered sides as
+        // box-drawing, blit. `inner_border_box` guards the recursion (the
+        // interior pass lays this same element without re-entering here).
+        if self.borders && block_like && self.inner_border_box != Some(id) {
+            let sides = self.border_sides(id);
+            if sides.iter().any(Option::is_some) {
+                // Pass the inherited context so a clickable/styled ANCESTOR
+                // (e.g. an `<a>` wrapping a bordered tab `<div>`) still reaches
+                // the interior — the sub-pass re-enters `flow_element(id)` and
+                // rebuilds the element's context from this, exactly as the
+                // non-bordered child path does. Root context would drop the
+                // enclosing link and the bordered tab would stop being a link.
+                self.flow_bordered(id, sides, ctx);
+                return;
+            }
+        }
         // A flex container lays its children out as boxes: a wrapping one
         // as a 2D grid, a row one as side-by-side columns, a column one as
         // stacked block-level items. Everything else flows normally.
@@ -1010,6 +1161,21 @@ impl<'a> Layout<'a> {
         }
         let marker_start_row = self.rows.len();
 
+        // CSS `text-indent` shifts the start of this block's FIRST line (it
+        // inherits, so each block applies it to its own first line). Skipped
+        // while measuring intrinsic width, like `text-align`.
+        if block_like
+            && !self.measuring
+            && let Some(v) = self.dom.computed_value(id, "text-indent")
+            && let Some(cells) = resolve_cells(
+                &v,
+                self.width.saturating_sub(self.indent).max(1),
+                self.viewport_w,
+            )
+        {
+            self.col += cells;
+        }
+
         // CSS `::before` generated content opens the element's content.
         if let Some(t) = self.pseudo_text(id, crate::dom::PseudoEl::Before) {
             self.place_text(&t, &cctx);
@@ -1105,6 +1271,12 @@ impl<'a> Layout<'a> {
     /// The left indent (cells) a block contributes: CSS `margin-left` +
     /// `padding-left` when set (even to 0), else the HTML tag default.
     fn block_indent(&self, id: NodeId, tag: &str) -> usize {
+        if self.inner_border_box == Some(id) {
+            // Bordered interior: the frame sits at the margin; only padding
+            // indents the content inside it.
+            return indent_cells(self.dom.computed_style(id, "padding-left").as_deref())
+                .min(self.width / 4);
+        }
         let ml = self.dom.computed_style(id, "margin-left");
         let pl = self.dom.computed_style(id, "padding-left");
         if ml.is_some() || pl.is_some() {
@@ -1167,6 +1339,14 @@ impl<'a> Layout<'a> {
     /// Whether a block opens with a blank spacer row: CSS top
     /// margin/padding when set, else the tag default (`SPACING`).
     fn gap_before(&self, id: NodeId, tag: &str) -> bool {
+        if self.inner_border_box == Some(id) {
+            // Bordered interior: margin is applied outside the frame; only its
+            // own top padding spaces the content inside.
+            return self
+                .dom
+                .computed_style(id, "padding-top")
+                .is_some_and(|v| vertical_space(&v));
+        }
         let mt = self.dom.computed_style(id, "margin-top");
         let pt = self.dom.computed_style(id, "padding-top");
         if mt.is_some() || pt.is_some() {
@@ -1178,6 +1358,12 @@ impl<'a> Layout<'a> {
 
     /// Whether a block closes with a blank spacer row (bottom side).
     fn gap_after(&self, id: NodeId, tag: &str) -> bool {
+        if self.inner_border_box == Some(id) {
+            return self
+                .dom
+                .computed_style(id, "padding-bottom")
+                .is_some_and(|v| vertical_space(&v));
+        }
         let mb = self.dom.computed_style(id, "margin-bottom");
         let pb = self.dom.computed_style(id, "padding-bottom");
         if mb.is_some() || pb.is_some() {
@@ -1618,6 +1804,7 @@ impl<'a> Layout<'a> {
                 width: strip_w as u16,
                 stops,
                 offset: 0,
+                frame_right: None,
             });
         }
         self.col = self.indent;
@@ -1671,6 +1858,7 @@ impl<'a> Layout<'a> {
                 width: x as u16,
                 stops,
                 offset: 0,
+                frame_right: None,
             });
         }
         self.col = self.indent;
@@ -2074,6 +2262,210 @@ impl<'a> Layout<'a> {
         self.pending_space = false;
     }
 
+    /// The visible border on each side `[top, right, bottom, left]` (its
+    /// rendering weight, or `None`). A side shows iff its `border-*-style` is a
+    /// visible style and its width isn't an explicit `0` (CSS: no style = no
+    /// border; the default width is the visible `medium`).
+    fn border_sides(&self, id: NodeId) -> [Option<BorderWeight>; 4] {
+        ["top", "right", "bottom", "left"].map(|side| self.border_one(id, side))
+    }
+
+    fn border_one(&self, id: NodeId, side: &str) -> Option<BorderWeight> {
+        let style = self
+            .dom
+            .computed_style(id, &format!("border-{side}-style"))?;
+        if style == "none" || style == "hidden" {
+            return None;
+        }
+        let width = self.dom.computed_style(id, &format!("border-{side}-width"));
+        if width.as_deref().and_then(border_px) == Some(0.0) {
+            return None;
+        }
+        Some(border_weight(&style, width.as_deref()))
+    }
+
+    /// Lay a block-level element that has a border: its interior goes in a
+    /// sub-box (margin handled out here, padding kept inside), the bordered
+    /// sides are drawn as box-drawing around it, and the framed box is blitted
+    /// at the current flow position. Reuses the 2D box primitive, so selection
+    /// and scroll keep working.
+    fn flow_bordered(&mut self, id: NodeId, sides: [Option<BorderWeight>; 4], ctx: &Ctx) {
+        let tag = self.dom.tag_name(id).map(str::to_owned).unwrap_or_default();
+        self.flush_block();
+        self.clear_floats(id);
+        if self.gap_before(id, &tag) {
+            self.push_blank();
+        }
+        let avail = self.width.saturating_sub(self.indent).max(1);
+        let frame_w = usize::from(sides[3].is_some()) + usize::from(sides[1].is_some());
+        // The framed box fills its container (a block) or its explicit CSS
+        // width, so e.g. a `border-bottom` rule spans the whole block.
+        let box_w = self
+            .css_cells(id, "width")
+            .unwrap_or(avail)
+            .min(avail)
+            .max(frame_w + 1);
+        let inner_w = box_w - frame_w;
+        // Lay the element's own interior, marking it so the recursion stops
+        // and its margin is suppressed (we applied it out here).
+        let mut sub = Layout::new(
+            self.dom,
+            self.base,
+            inner_w,
+            self.forms,
+            self.controls,
+            self.images,
+            self.borders,
+        );
+        sub.viewport_w = self.viewport_w;
+        sub.inner_border_box = Some(id);
+        // The interior pass must NOT re-float this same element: when `id` is
+        // both floated and bordered, `flow_float` lays its box (skipping the
+        // float) and that box's `flow_element(id)` routes here for the frame.
+        // Without threading the float skip through, this sub's float check
+        // fires again → `flow_float` → back here → infinite recursion (the two
+        // guards live on different fields, each fresh sub resetting the other).
+        sub.float_skip = Some(id);
+        sub.flow_node(id, ctx);
+        sub.flush_block();
+        sub.finish_floats();
+        let (rows, carousels) = sub.finish();
+        let content = LaidBox {
+            height: rows.len() as u16,
+            width: inner_w as u16,
+            rows,
+            carousels,
+        };
+        let framed = self.frame_box(content, sides);
+        if framed.height > 0 {
+            let row_base = self.rows.len();
+            self.blit(&framed, self.indent as u16, row_base);
+        }
+        if self.gap_after(id, &tag) {
+            self.push_blank();
+        }
+        self.col = self.indent;
+        self.pending_space = false;
+    }
+
+    /// Wrap a laid-out `content` box in the frame for its bordered `sides`:
+    /// shift the content in by the present sides, draw top/bottom edge rows
+    /// (with corners) and left/right vertical bars, all as `Border` items. A
+    /// single weight (the first present side's) styles the whole frame.
+    fn frame_box(&self, content: LaidBox, sides: [Option<BorderWeight>; 4]) -> LaidBox {
+        let weight = sides
+            .iter()
+            .flatten()
+            .copied()
+            .next()
+            .unwrap_or(BorderWeight::Light);
+        let set = line_set(weight);
+        let (tp, rt, bt, lt) = (
+            sides[0].is_some(),
+            sides[1].is_some(),
+            sides[2].is_some(),
+            sides[3].is_some(),
+        );
+        let inner_h = content.height as usize;
+        let new_w = content.width as usize + usize::from(lt) + usize::from(rt);
+        let new_h = inner_h + usize::from(tp) + usize::from(bt);
+        let col_shift = u16::from(lt);
+        let row_shift = usize::from(tp);
+        let mut rows: Vec<Row> = (0..new_h).map(|_| Row::default()).collect();
+        // A border is a hard visual boundary: interior content that overflows
+        // the content box (a non-wrapping line, a wide image, a too-wide rail)
+        // must be CLIPPED to the inner width, or the renderer — which just
+        // concatenates over-wide items — pushes the right bar off the line and
+        // the right border vanishes. This mirrors `overflow:hidden`. Clipped
+        // per ROW, not per box: a horizontal-scroll carousel's strip rows keep
+        // their over-wide content (clipped at render time by `visible_col`, so
+        // hard-clipping here would drop the off-screen cards scrolling reveals)
+        // while the box's non-scrolling rows still get their borders protected.
+        let inner_w = content.width;
+        for (r, (target, row)) in rows
+            .iter_mut()
+            .skip(row_shift)
+            .zip(content.rows)
+            .enumerate()
+        {
+            let in_carousel = content.carousels.iter().any(|c| r >= c.start && r < c.end);
+            for mut it in row.items {
+                if !in_carousel {
+                    if it.col >= inner_w {
+                        continue;
+                    }
+                    let max_w = inner_w - it.col;
+                    if it.width > max_w {
+                        it.width = max_w;
+                        it.text = it.text.chars().take(max_w as usize).collect();
+                    }
+                }
+                it.col += col_shift;
+                target.items.push(it);
+            }
+        }
+        let glyph = |col: usize, w: usize, text: String| Item {
+            col: col as u16,
+            width: w as u16,
+            height: 1,
+            text,
+            kind: ItemKind::Border,
+            image: None,
+            emph: Emphasis::default(),
+            node: NO_NODE,
+            link: None,
+        };
+        if tp {
+            let s = edge_string(
+                new_w,
+                lt.then_some(set.top_left),
+                rt.then_some(set.top_right),
+                set.horizontal,
+            );
+            rows[0].items.push(glyph(0, new_w, s));
+        }
+        if bt {
+            let s = edge_string(
+                new_w,
+                lt.then_some(set.bottom_left),
+                rt.then_some(set.bottom_right),
+                set.horizontal,
+            );
+            rows[new_h - 1].items.push(glyph(0, new_w, s));
+        }
+        for row in rows.iter_mut().skip(row_shift).take(inner_h) {
+            if lt {
+                row.items.push(glyph(0, 1, set.vertical.to_owned()));
+            }
+            if rt {
+                row.items.push(glyph(new_w - 1, 1, set.vertical.to_owned()));
+            }
+        }
+        for row in &mut rows {
+            row.items.sort_by_key(|it| it.col);
+        }
+        let mut carousels = content.carousels;
+        for c in &mut carousels {
+            c.start += row_shift;
+            c.end += row_shift;
+            c.left += col_shift;
+            c.right += col_shift;
+            // The right frame bar lands at the band's right edge, inside the
+            // strip's column span — flag it so the render-time carousel clip
+            // (`visible_col`) draws it as static chrome instead of clipping it
+            // as off-screen strip content (which dropped the right border).
+            if rt {
+                c.frame_right = Some(new_w as u16 - 1);
+            }
+        }
+        LaidBox {
+            rows,
+            width: new_w as u16,
+            height: new_h as u16,
+            carousels,
+        }
+    }
+
     /// A CSS length property in terminal cells (≈ 2 cells/em, 16px=1em),
     /// resolving `%`/`vw`/`calc()` against the current band width and the
     /// viewport. `None` when unset (or `auto`/an unsupported unit). Clamped
@@ -2109,6 +2501,7 @@ impl<'a> Layout<'a> {
             self.forms,
             self.controls,
             self.images,
+            self.borders,
         );
         sub.float_skip = skip_float;
         sub.measuring = measure;
@@ -2156,6 +2549,7 @@ impl<'a> Layout<'a> {
             c.end += row_base;
             c.left += col_off;
             c.right += col_off;
+            c.frame_right = c.frame_right.map(|fr| fr + col_off);
             self.carousels.push(c);
         }
     }
@@ -2957,13 +3351,30 @@ mod tests {
             &[],
             &ControlMap::new(),
             &ImageSizes::new(),
+            false,
+        )
+    }
+
+    /// Lay out with borders ON (off is the production default). The border
+    /// tests opt in explicitly so they stay isolated from the session flag.
+    fn lay_b(html: &str, width: usize) -> Vec<Row> {
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        lay_out(
+            &dom,
+            &base,
+            width,
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            true,
         )
     }
 
     fn lay_with_images(html: &str, width: usize, images: &ImageSizes) -> Vec<Row> {
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
-        lay_out(&dom, &base, width, &[], &ControlMap::new(), images)
+        lay_out(&dom, &base, width, &[], &ControlMap::new(), images, false)
     }
 
     #[test]
@@ -2994,7 +3405,7 @@ mod tests {
             }
         }
         let (rows, carousels) =
-            lay_out_with_carousels(&dom, &base, w, &[], &ControlMap::new(), &images);
+            lay_out_with_carousels(&dom, &base, w, &[], &ControlMap::new(), &images, true);
         for c in &carousels {
             println!(
                 "CAROUSEL rows {}..{} band [{},{}] width {} stops {}",
@@ -3725,6 +4136,244 @@ mod tests {
     }
 
     #[test]
+    fn text_indent_offsets_only_the_first_line() {
+        // 2em (4-cell) indent: the first line starts at col 4; the wrapped
+        // continuation returns to the left edge.
+        let rows = lay(
+            r#"<html><head><style>p{text-indent:2em}</style></head>
+               <body><p>aaaa bbbb cccc dddd</p></body></html>"#,
+            12,
+        );
+        let lines: Vec<String> = texts(&rows).into_iter().filter(|l| !l.is_empty()).collect();
+        assert!(
+            lines[0].starts_with("    aaaa"),
+            "first line indented 4 cells: {lines:?}"
+        );
+        assert!(
+            !lines[1].starts_with(' '),
+            "wrapped line not indented: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn full_border_frames_the_content() {
+        let rows = lay_b(
+            r#"<body><div style="border:1px solid">Carded</div></body>"#,
+            40,
+        );
+        let all = texts(&rows);
+        assert!(
+            all.iter().any(|l| l.contains('┌') && l.contains('┐')),
+            "top corners: {all:?}"
+        );
+        assert!(
+            all.iter().any(|l| l.contains('│') && l.contains("Carded")),
+            "content flanked by bars: {all:?}"
+        );
+        assert!(
+            all.iter().any(|l| l.contains('└') && l.contains('┘')),
+            "bottom corners: {all:?}"
+        );
+    }
+
+    #[test]
+    fn border_bottom_is_a_rule_with_no_sides() {
+        let rows = lay_b(
+            r#"<body><h2 style="border-bottom:1px solid">Section</h2></body>"#,
+            40,
+        );
+        let all = texts(&rows);
+        assert!(all.iter().any(|l| l.contains("Section")), "{all:?}");
+        assert!(
+            all.iter().any(|l| l.trim_start().starts_with('─')),
+            "a horizontal rule under the heading: {all:?}"
+        );
+        assert!(
+            !all.iter().any(|l| l.contains('┌') || l.contains('│')),
+            "no frame corners or vertical bars: {all:?}"
+        );
+    }
+
+    #[test]
+    fn border_left_is_a_gutter_bar() {
+        let rows = lay_b(
+            r#"<body><blockquote style="border-left:1px solid">Quote</blockquote></body>"#,
+            40,
+        );
+        let all = texts(&rows);
+        assert!(
+            all.iter().any(|l| l.contains('│') && l.contains("Quote")),
+            "left bar beside the quote: {all:?}"
+        );
+        assert!(
+            !all.iter().any(|l| l.contains('┌') || l.contains('─')),
+            "no top/bottom edges: {all:?}"
+        );
+    }
+
+    #[test]
+    fn bordered_box_clips_overflow_keeping_the_right_border() {
+        // Interior content wider than the box used to paint over the right
+        // border column (the renderer just concatenates over-wide items), so
+        // the right bar vanished. A border is a hard boundary: content clips.
+        let rows = lay_b(
+            r#"<body><div style="overflow:hidden;border:1px solid;width:20ch">SUPERCALIFRAGILISTICEXPIALIDOCIOUS_overflow</div></body>"#,
+            40,
+        );
+        let all = texts(&rows);
+        // Every framed row (top edge, content, bottom edge) ends at the same
+        // right border: the content row must still carry its right `│`.
+        assert!(
+            all.iter().any(|l| l.contains('┐')),
+            "top-right corner present: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .any(|l| l.contains('│') && l.contains("SUPERCALI") && l.trim_end().ends_with('│')),
+            "content row keeps its right bar (overflow clipped): {all:?}"
+        );
+        assert!(
+            all.iter().any(|l| l.contains('┘')),
+            "bottom-right corner present: {all:?}"
+        );
+    }
+
+    #[test]
+    fn bordered_element_inside_a_link_stays_clickable() {
+        // A clickable ancestor (`<a>`) wrapping a bordered block (a tab
+        // `<div>` with `border-bottom`) must keep its interior a link: the
+        // bordered sub-pass inherits the enclosing context instead of rooting
+        // it. Regression — borders used to drop the link, so SL Marketplace's
+        // tab labels stopped being clickable once they gained a border.
+        let rows = lay_b(
+            r#"<body><a href="x-trust-js:6:#"><div style="border-bottom:4px solid">Items</div></a></body>"#,
+            40,
+        );
+        let item = find(&rows, "Items");
+        assert!(
+            item.is_interactive(),
+            "the bordered tab label is still a link"
+        );
+        assert!(
+            matches!(item.link, Some(crate::doc::Link::JsClick { .. })),
+            "it routes through the live click marker: {:?}",
+            item.link
+        );
+    }
+
+    #[test]
+    fn bordered_carousel_keeps_its_right_frame_bar() {
+        // A horizontal-scroll carousel inside a right-bordered box: the right
+        // frame bar lands at the band edge, inside the strip span. It must be
+        // flagged as static chrome so the render-time clip (`visible_col`)
+        // draws it, not clips it as off-screen strip content (the live SL
+        // Marketplace bug: the carousel's right border vanished on strip rows).
+        let dom = Dom::parse_document(
+            r#"<body><div style="overflow:hidden;border:1px solid">
+                 <div style="width:100000px">
+                   <div style="float:left;width:18ch;border:1px solid">one</div>
+                   <div style="float:left;width:18ch;border:1px solid">two</div>
+                   <div style="float:left;width:18ch;border:1px solid">three</div>
+                 </div>
+               </div></body>"#,
+        );
+        let base = Url::parse("https://example.com/").unwrap();
+        let (rows, carousels) = lay_out_with_carousels(
+            &dom,
+            &base,
+            50,
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            true,
+        );
+        assert!(
+            !carousels.is_empty(),
+            "an overflowing strip forms a carousel"
+        );
+        let c = &carousels[0];
+        let fr = c.frame_right.expect("right frame bar column recorded");
+        let row = c.start; // a strip row
+        let bar = rows[row]
+            .items
+            .iter()
+            .find(|it| it.kind == ItemKind::Border && it.col == fr)
+            .expect("right frame bar item present on a strip row");
+        assert_eq!(
+            visible_col(&carousels, row, bar),
+            Some(fr),
+            "the frame bar renders at its fixed column, not clipped away"
+        );
+    }
+
+    #[test]
+    fn floated_bordered_element_does_not_recurse_forever() {
+        // A floated element that ALSO has a border used to ping-pong between
+        // `flow_float` (sets `float_skip`, clears `inner_border_box`) and
+        // `flow_bordered` (the reverse) → stack overflow. It must terminate and
+        // produce a framed, floated box.
+        let rows = lay_b(
+            r#"<body><div style="float:left;border:1px solid;width:10ch">Tile</div><p>After the float runs alongside.</p></body>"#,
+            40,
+        );
+        let all = texts(&rows);
+        assert!(
+            all.iter().any(|l| l.contains('┌') && l.contains('┐')),
+            "floated box is framed: {all:?}"
+        );
+        assert!(
+            all.iter().any(|l| l.contains("Tile")),
+            "float content present: {all:?}"
+        );
+        assert!(
+            all.iter().any(|l| l.contains("After the float")),
+            "following content laid out: {all:?}"
+        );
+    }
+
+    #[test]
+    fn border_style_picks_the_glyph_weight() {
+        // double → double-line, thick → heavy box-drawing.
+        let dbl = lay_b(r#"<body><div style="border:3px double">D</div></body>"#, 30);
+        assert!(
+            texts(&dbl)
+                .iter()
+                .any(|l| l.contains('╔') && l.contains('╗')),
+            "double: {:?}",
+            texts(&dbl)
+        );
+        let thick = lay_b(
+            r#"<body><div style="border:thick solid">T</div></body>"#,
+            30,
+        );
+        assert!(
+            texts(&thick)
+                .iter()
+                .any(|l| l.contains('┏') && l.contains('┓')),
+            "thick: {:?}",
+            texts(&thick)
+        );
+    }
+
+    #[test]
+    fn borders_off_by_default_draw_no_chrome() {
+        // The production default (`lay`, borders off): a bordered box renders
+        // its content with NO box-drawing — terminal vertical space is saved.
+        // `set borders on` (`lay_b`) is the opt-in, covered by the tests above.
+        let rows = lay(
+            r#"<body><div style="border:1px solid">Carded</div></body>"#,
+            40,
+        );
+        let all = texts(&rows);
+        assert!(all.iter().any(|l| l.contains("Carded")), "content: {all:?}");
+        assert!(
+            !all.iter()
+                .any(|l| l.contains('┌') || l.contains('┐') || l.contains('│') || l.contains('└')),
+            "no border glyphs when borders are off: {all:?}"
+        );
+    }
+
+    #[test]
     fn justify_content_distributes_free_space() {
         // 3em (6-cell) boxes, default gap 1 → 13 used of 40, free 27.
         let center = lay(
@@ -4109,8 +4758,15 @@ mod tests {
            </div></div></body></html>"#;
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
-        let (_, carousels) =
-            lay_out_with_carousels(&dom, &base, 20, &[], &ControlMap::new(), &ImageSizes::new());
+        let (_, carousels) = lay_out_with_carousels(
+            &dom,
+            &base,
+            20,
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
         assert_eq!(carousels.len(), 1, "one carousel detected");
         let c = &carousels[0];
         assert_eq!(c.stops.len(), 5, "a snap stop per card");
@@ -4120,8 +4776,15 @@ mod tests {
         let plain = r#"<html><head><style>.wrap{overflow:hidden}.col{width:50em}</style></head>
             <body><div class="wrap"><div class="col">just one wide column</div></div></body></html>"#;
         let dom = Dom::parse_document(plain);
-        let (_, none) =
-            lay_out_with_carousels(&dom, &base, 20, &[], &ControlMap::new(), &ImageSizes::new());
+        let (_, none) = lay_out_with_carousels(
+            &dom,
+            &base,
+            20,
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
         assert!(none.is_empty(), "a single wide column isn't a carousel");
         // Scrolling snaps to the next/prev card edge and clamps at the ends.
         let mut c = c.clone();
@@ -4160,8 +4823,15 @@ mod tests {
            </body></html>"#;
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
-        let (rows, carousels) =
-            lay_out_with_carousels(&dom, &base, 20, &[], &ControlMap::new(), &ImageSizes::new());
+        let (rows, carousels) = lay_out_with_carousels(
+            &dom,
+            &base,
+            20,
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
         assert_eq!(carousels.len(), 1, "one carousel");
         let c = &carousels[0];
         // Every row that holds a card's text must fall inside the band, or
@@ -4214,8 +4884,15 @@ mod tests {
            </div></body></html>"##;
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
-        let (rows, carousels) =
-            lay_out_with_carousels(&dom, &base, 20, &[], &ControlMap::new(), &ImageSizes::new());
+        let (rows, carousels) = lay_out_with_carousels(
+            &dom,
+            &base,
+            20,
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
         assert_eq!(carousels.len(), 1, "one carousel");
         // The page's authored "Next »" control is suppressed...
         assert!(
@@ -4306,8 +4983,15 @@ mod tests {
            </body></html>"##;
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
-        let (rows, carousels) =
-            lay_out_with_carousels(&dom, &base, 40, &[], &ControlMap::new(), &ImageSizes::new());
+        let (rows, carousels) = lay_out_with_carousels(
+            &dom,
+            &base,
+            40,
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
         assert_eq!(carousels.len(), 1, "the deck is one carousel");
         assert_eq!(carousels[0].stops.len(), 3, "three slides → three stops");
         // The page's own controls — arrows AND the dead dot — are all gone.
