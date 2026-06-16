@@ -21,6 +21,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tui-term",
+ "unicode-width",
  "url",
  "webpki-roots",
 ]

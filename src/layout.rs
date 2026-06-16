@@ -21,10 +21,20 @@
 use std::collections::HashMap;
 
 use ratatui::symbols::line;
+use unicode_width::UnicodeWidthStr;
 use url::Url;
 
 use crate::doc::{Form, Link};
 use crate::dom::{DOCUMENT, Dom, NodeData, NodeId};
+
+/// The terminal display width of a string in cells. Wide glyphs (CJK, many
+/// emoji) occupy two cells, combining marks zero — `chars().count()` gets
+/// both wrong and drifts aligned/`pre` text. We measure with the SAME
+/// `unicode-width` ratatui renders with, so an item's `width`/`col` match
+/// where the glyphs actually land on screen.
+fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
 
 /// Map from a control element's `NodeId` to its `(form, field)` indices
 /// (built by `http::extract_forms_arena`), so the layout can surface
@@ -316,7 +326,7 @@ pub fn render_row(row: &Row) -> String {
             col += 1;
         }
         out.push_str(&it.text);
-        col = start + it.text.chars().count();
+        col = start + display_width(&it.text);
     }
     out
 }
@@ -698,6 +708,10 @@ struct Ctx {
     kind: ItemKind,
     emph: Emphasis,
     transform: TextTransform,
+    /// CSS `letter-spacing` resolved to whole cells of gap inserted between
+    /// adjacent characters (inherits; 0 = none). Sub-cell values round to 0,
+    /// so the common subtle tracking is a faithful no-op in a cell grid.
+    letter_spacing: usize,
     node: NodeId,
     link: Option<Link>,
 }
@@ -708,10 +722,30 @@ impl Ctx {
             kind: ItemKind::Text,
             emph: Emphasis::default(),
             transform: TextTransform::None,
+            letter_spacing: 0,
             node: NO_NODE,
             link: None,
         }
     }
+}
+
+/// Insert `cells` spaces between each pair of characters (CSS `letter-spacing`
+/// rendered as whole-cell tracking). A no-op for `cells == 0` or a single
+/// character, so it borrows in the common case.
+fn letter_space(word: &str, cells: usize) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if cells == 0 || word.chars().count() < 2 {
+        return Cow::Borrowed(word);
+    }
+    let gap = " ".repeat(cells);
+    let mut out = String::with_capacity(word.len() + cells * word.chars().count());
+    for (i, c) in word.chars().enumerate() {
+        if i > 0 {
+            out.push_str(&gap);
+        }
+        out.push(c);
+    }
+    Cow::Owned(out)
 }
 
 /// Block-level elements: they break the current line before and after
@@ -1019,6 +1053,15 @@ impl<'a> Layout<'a> {
             .as_deref()
             .and_then(TextTransform::from_css)
             .unwrap_or(TextTransform::None);
+        // `letter-spacing` inherits; resolve it once to whole cells of inter-
+        // character gap (em/px etc. — `%`/`vw` don't apply, so the contextual
+        // args are inert). `normal`/sub-cell values resolve to 0.
+        cctx.letter_spacing = self
+            .dom
+            .computed_value(id, "letter-spacing")
+            .as_deref()
+            .and_then(|v| resolve_cells(v, 1, self.viewport_w))
+            .unwrap_or(0);
 
         // Block vs inline is driven by the cascaded `display` (baked into
         // the serialized HTML by the engine, which has the sheets), with
@@ -1150,16 +1193,35 @@ impl<'a> Layout<'a> {
         };
         // The list marker is deferred: a block-level child (a flex row, a
         // nested `<div>`) flushes the line, so emitting the marker up front
-        // would strand it on a row of its own. Instead we indent the item's
-        // content by the marker width and drop the marker into the gutter on
+        // would strand it on a row of its own. Instead we drop the marker into
         // the item's first content row at block exit (`place_list_marker`).
+        //
+        // `list-style-position`: `outside` (the default) hangs the marker in a
+        // gutter to the LEFT of the content — the content is indented by the
+        // marker width, and wrapped lines align under the content. `inside`
+        // flows the marker as the first token of the FIRST line — the content
+        // is not extra-indented, and wrapped lines align under the marker.
         let list_marker = (flow == Flow::ListItem).then(|| self.next_list_marker(id));
-        let marker_indent = list_marker.as_ref().map_or(0, |m| m.chars().count());
-        if marker_indent > 0 {
-            self.indent += marker_indent;
+        let marker_indent = list_marker.as_ref().map_or(0, |m| display_width(m));
+        let inside_marker = marker_indent > 0
+            && self
+                .dom
+                .computed_value(id, "list-style-position")
+                .as_deref()
+                == Some("inside");
+        // Cells of block indent the marker adds (outside hangs it in a gutter;
+        // inside keeps the content at the margin and reserves first-line space).
+        let marker_added = if inside_marker { 0 } else { marker_indent };
+        if marker_added > 0 {
+            self.indent += marker_added;
             self.begin_line();
         }
         let marker_start_row = self.rows.len();
+        // `inside`: reserve the marker's width at the start of the first line
+        // (like a text-indent) so the deferred marker sits before the text.
+        if inside_marker && !self.measuring {
+            self.col += marker_indent;
+        }
 
         // CSS `text-indent` shifts the start of this block's FIRST line (it
         // inherits, so each block applies it to its own first line). Skipped
@@ -1232,7 +1294,9 @@ impl<'a> Layout<'a> {
                 self.floats = outer;
             }
             if let Some(marker) = list_marker {
-                let gutter = self.indent.saturating_sub(marker_indent);
+                // outside: the gutter is the original margin (indent − the
+                // width we added); inside: the marker sits at the margin itself.
+                let gutter = self.indent.saturating_sub(marker_added);
                 self.place_list_marker(&marker, marker_start_row, gutter);
             }
             if self.gap_after(id, &tag) {
@@ -1246,7 +1310,7 @@ impl<'a> Layout<'a> {
         }
         self.indent -= center_pad;
         self.width = saved_width;
-        self.indent -= marker_indent;
+        self.indent -= marker_added;
         self.indent -= indent_add;
         if block_like {
             self.begin_line();
@@ -1556,7 +1620,9 @@ impl<'a> Layout<'a> {
         let free = avail.saturating_sub(used);
         let (lead, between) = self.justify_offsets(id, free, n);
         let row_base = self.rows.len();
-        let mut x = lead;
+        // Lay every column box first, so `align-items` can offset a column
+        // shorter than the tallest within the row's (cross-axis) height.
+        let mut boxes: Vec<LaidBox> = Vec::with_capacity(n);
         for i in 0..n {
             let cw = widths[i].max(1);
             let mut b = self.layout_subtree(nodes[i], cw);
@@ -1566,8 +1632,15 @@ impl<'a> Layout<'a> {
             if grow[i] > 0.0 {
                 fill_input_box(&mut b, cw);
             }
-            if b.height > 0 {
-                self.blit(&b, (self.indent + x) as u16, row_base);
+            boxes.push(b);
+        }
+        let line_h = boxes.iter().map(|b| b.height as usize).max().unwrap_or(0);
+        let mut x = lead;
+        for i in 0..n {
+            let cw = widths[i].max(1);
+            if boxes[i].height > 0 {
+                let dy = self.align_offset(id, boxes[i].height as usize, line_h);
+                self.blit(&boxes[i], (self.indent + x) as u16, row_base + dy);
             }
             x += cw + if i + 1 < n { gap + between } else { 0 };
         }
@@ -1595,6 +1668,27 @@ impl<'a> Layout<'a> {
             Some("space-around") => (free / (2 * n), free / n),
             Some("space-evenly") => (free / (n + 1), free / (n + 1)),
             _ => (0, 0),
+        }
+    }
+
+    /// `align-items` cross-axis offset (rows from the top of the line/shelf)
+    /// for an item of height `item_h` within a band of height `line_h`. We
+    /// don't stretch item heights, so `stretch`/`baseline`/`normal`/unknown and
+    /// `flex-start` all top-align; only `center` and `flex-end` shift down.
+    fn align_offset(&self, id: NodeId, item_h: usize, line_h: usize) -> usize {
+        let free = line_h.saturating_sub(item_h);
+        if free == 0 {
+            return 0;
+        }
+        match self
+            .dom
+            .computed_style(id, "align-items")
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("center") => free / 2,
+            Some("flex-end" | "end") => free,
+            _ => 0,
         }
     }
 
@@ -2020,13 +2114,30 @@ impl<'a> Layout<'a> {
     /// The element children of a flex container that generate flex items
     /// (skipping hidden ones and whitespace/text nodes).
     fn flex_items(&self, id: NodeId) -> Vec<NodeId> {
-        self.dom
+        let mut kids: Vec<NodeId> = self
+            .dom
             .children(id)
             .into_iter()
             .filter(|&c| {
                 matches!(self.dom.node(c).data, NodeData::Element { .. }) && !self.dom.is_hidden(c)
             })
-            .collect()
+            .collect();
+        // CSS `order`: flex/grid items render in ascending `order` (default 0,
+        // negatives allowed), ties keeping source order — `sort_by_key` is
+        // stable. Only the visual order changes; items keep their node/link so
+        // selection and the source DOM are untouched.
+        if kids.len() > 1 {
+            kids.sort_by_key(|&c| self.order_of(c));
+        }
+        kids
+    }
+
+    /// A flex/grid item's `order` (default 0).
+    fn order_of(&self, id: NodeId) -> i32 {
+        self.dom
+            .computed_style(id, "order")
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(0)
     }
 
     // ---- floats (Phase C) ------------------------------------------------
@@ -2227,36 +2338,70 @@ impl<'a> Layout<'a> {
         let avail = self.width.saturating_sub(self.indent).max(1);
         let gap = self.flex_gap(id, avail, false);
         let row_gap = self.flex_gap(id, avail, true);
-        let mut shelf_top = self.rows.len();
-        let mut x = 0usize; // used width of the current shelf (relative to indent)
-        let mut shelf_height = 0usize;
+        // Lay every item to a box, keeping its packing width: an explicit
+        // `width` reserves that column even when the content is narrower;
+        // without one the box shrinks to its content (capped to `avail`).
+        let mut boxes: Vec<(LaidBox, usize)> = Vec::new();
         for child in self.flex_items(id) {
-            // An explicit `width` fixes the item's box (it occupies that
-            // width even when its content is narrower); without one the box
-            // is laid out at the available width and shrinks to its content.
             let explicit = self.css_cells(child, "width").map(|w| w.min(avail).max(1));
+            let min_w = self
+                .css_cells(child, "min-width")
+                .map(|w| w.min(avail).max(1));
+            // Layout constraint: explicit `width`, else `max-width`, else
+            // `min-width`, else the full row. Honoring `min-width` here is what
+            // makes the ubiquitous responsive-grid cell (`min-width: Nrem` plus
+            // grow, often `max-width: 1fr`) lay out to its floor instead of
+            // ballooning to the whole row (its inner `width:100%` content would
+            // otherwise fill `avail`, so it packed one-per-row).
             let constraint = explicit
                 .or_else(|| self.css_cells(child, "max-width").map(|w| w.min(avail)))
+                .or(min_w)
                 .unwrap_or(avail)
                 .max(1);
             let b = self.layout_subtree(child, constraint);
             if b.height == 0 {
                 continue;
             }
-            let w = explicit.unwrap_or(b.width as usize).min(avail).max(1);
-            // Wrap to the next shelf when this box won't fit beside the
-            // current one (but never wrap an empty shelf — an over-wide box
-            // takes its own band, clamped to the available width).
-            if x > 0 && x + gap + w > avail {
-                shelf_top += shelf_height + row_gap;
-                x = 0;
-                shelf_height = 0;
+            // Packing width: explicit `width` else content width, floored by
+            // `min-width` so a content-narrower-than-floor cell still reserves
+            // its column.
+            let w = explicit
+                .unwrap_or(b.width as usize)
+                .max(min_w.unwrap_or(0))
+                .min(avail)
+                .max(1);
+            boxes.push((b, w));
+        }
+        // Shelf-pack: greedily fill each shelf left→right (always at least one
+        // box — an over-wide box takes its own band), then place the shelf
+        // honoring `justify-content` (main-axis distribution of leftover space)
+        // and `align-items` (cross-axis offset of a short box within the
+        // shelf's height). With neither set this packs exactly as before.
+        let mut shelf_top = self.rows.len();
+        let mut i = 0;
+        while i < boxes.len() {
+            let mut used = boxes[i].1;
+            let mut end = i + 1;
+            while end < boxes.len() && used + gap + boxes[end].1 <= avail {
+                used += gap + boxes[end].1;
+                end += 1;
             }
-            let lead = if x > 0 { gap } else { 0 };
-            let col_off = self.indent + x + lead;
-            self.blit(&b, col_off as u16, shelf_top);
-            x += lead + w;
-            shelf_height = shelf_height.max(b.height as usize);
+            let n = end - i;
+            let shelf_h = boxes[i..end]
+                .iter()
+                .map(|(b, _)| b.height as usize)
+                .max()
+                .unwrap_or(0);
+            let free = avail.saturating_sub(used);
+            let (lead, between) = self.justify_offsets(id, free, n);
+            let mut x = lead;
+            for (k, (b, w)) in boxes.iter().enumerate().take(end).skip(i) {
+                let dy = self.align_offset(id, b.height as usize, shelf_h);
+                self.blit(b, (self.indent + x) as u16, shelf_top + dy);
+                x += *w + if k + 1 < end { gap + between } else { 0 };
+            }
+            shelf_top += shelf_h + row_gap;
+            i = end;
         }
         self.col = self.indent;
         self.pending_space = false;
@@ -2612,8 +2757,9 @@ impl<'a> Layout<'a> {
     /// own text stays clean at its leading edge).
     fn place_word(&mut self, word: &str, ctx: &Ctx) {
         let transformed = ctx.transform.apply(word);
-        let word = transformed.as_ref();
-        let wlen = word.chars().count();
+        let spaced = letter_space(transformed.as_ref(), ctx.letter_spacing);
+        let word = spaced.as_ref();
+        let wlen = display_width(word);
         let space = self.pending_space && self.col > self.line_left;
         if self.ws.wraps()
             && self.col + space as usize + wlen > self.line_right
@@ -2660,25 +2806,25 @@ impl<'a> Layout<'a> {
         let transformed = ctx.transform.apply(seg);
         let seg = transformed.as_ref();
         if !self.ws.wraps() {
-            let len = seg.chars().count();
+            let len = display_width(seg);
             self.push_preserved_item(seg, len, ctx);
             return;
         }
-        // pre-wrap: char-budget wrap within the content box, keeping spaces.
+        // pre-wrap: width-budget wrap within the content box, keeping spaces.
         let avail = self.line_right.saturating_sub(self.line_left).max(1);
         let mut buf = String::new();
         let mut chars = seg.chars().peekable();
         while let Some(c) = chars.next() {
             buf.push(c);
-            if buf.chars().count() >= avail && chars.peek().is_some() {
-                let len = buf.chars().count();
+            if display_width(&buf) >= avail && chars.peek().is_some() {
+                let len = display_width(&buf);
                 self.push_preserved_item(&buf, len, ctx);
                 self.break_line();
                 buf.clear();
             }
         }
         if !buf.is_empty() {
-            let len = buf.chars().count();
+            let len = display_width(&buf);
             self.push_preserved_item(&buf, len, ctx);
         }
     }
@@ -2722,6 +2868,7 @@ impl<'a> Layout<'a> {
             kind,
             emph: ctx.emph,
             transform: ctx.transform,
+            letter_spacing: ctx.letter_spacing,
             node: id,
             link: ctx.link.clone(),
         };
@@ -2883,7 +3030,7 @@ impl<'a> Layout<'a> {
     /// Place a single unbreakable item (a form widget), with the same
     /// inter-item spacing/wrapping rules as a word but kept as one unit.
     fn place_atom(&mut self, text: String, kind: ItemKind, node: NodeId, link: Option<Link>) {
-        let len = text.chars().count();
+        let len = display_width(&text);
         let space = self.pending_space && self.col > self.line_left;
         if self.col + space as usize + len > self.line_right && self.col > self.line_left {
             self.break_line();
@@ -2938,7 +3085,7 @@ impl<'a> Layout<'a> {
         };
         let item = Item {
             col: col as u16,
-            width: marker.chars().count() as u16,
+            width: display_width(marker) as u16,
             height: 1,
             text: marker.to_owned(),
             kind: ItemKind::Text,
@@ -2954,7 +3101,7 @@ impl<'a> Layout<'a> {
 
     fn push_rule(&mut self) {
         let dashes = "─".repeat(self.line_right.saturating_sub(self.line_left).min(40));
-        let len = dashes.chars().count();
+        let len = display_width(&dashes);
         self.push_item(
             dashes,
             len,
@@ -3232,6 +3379,20 @@ fn css_length_em(value: &str) -> Option<f32> {
 /// contextual length resolver.
 fn resolve_cells_f32(value: &str, avail: usize, viewport: usize) -> Option<f32> {
     let v = value.trim();
+    // `var(--name, fallback)`: stylesheets are dropped before layout, so a
+    // referenced custom property is (almost always) undefined here — the
+    // spec-correct result is then the fallback, which is also the common case
+    // for sizing (`min-width: var(--cell, 16rem)`). Resolve the fallback;
+    // a `var()` with no fallback is unresolvable. Nested `var()`/`calc()` in
+    // the fallback resolve recursively.
+    if let Some(inner) = v
+        .strip_prefix("var(")
+        .or_else(|| v.strip_prefix("VAR("))
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        let fallback = inner.split_once(',')?.1.trim();
+        return resolve_cells_f32(fallback, avail, viewport);
+    }
     if let Some(inner) = v
         .strip_prefix("calc(")
         .or_else(|| v.strip_prefix("CALC("))
@@ -4112,6 +4273,43 @@ mod tests {
     }
 
     #[test]
+    fn flex_wrap_min_width_var_cells_pack_into_a_grid() {
+        // archive.org's "Top Collections": a flex-wrap container whose cells
+        // size via `min-width: var(--x, 8em)` + `max-width: var(--y, 1fr)` and
+        // hold `width:100%` content. Two general behaviours under test:
+        //  (1) `var(--name, fallback)` resolves to its fallback (stylesheets are
+        //      gone by layout time, so the custom prop is undefined → fallback);
+        //  (2) `flow_flex_wrap` honours `min-width`, so the cell lays out to its
+        //      floor instead of letting its `width:100%` content balloon to the
+        //      whole row. Without either, the cells packed one-per-row.
+        let rows = lay(
+            r#"<html><body>
+               <section style="display:flex;flex-wrap:wrap">
+                 <article style="min-width:var(--w, 8em);max-width:var(--m, 1fr)"><div style="width:100%">one</div></article>
+                 <article style="min-width:var(--w, 8em);max-width:var(--m, 1fr)"><div style="width:100%">two</div></article>
+                 <article style="min-width:var(--w, 8em);max-width:var(--m, 1fr)"><div style="width:100%">three</div></article>
+               </section></body></html>"#,
+            40,
+        );
+        let (r1, c1) = pos_of(&rows, "one");
+        let (r2, c2) = pos_of(&rows, "two");
+        let (r3, _) = pos_of(&rows, "three");
+        // 8em = 16 cells; at width 40, two cells + a gap fit (16+1+16 ≤ 40).
+        assert_eq!(
+            r1,
+            r2,
+            "min-width var() cells share a shelf: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(c1, 0);
+        assert!(
+            c2 >= 16,
+            "second cell reserves the first's min-width column"
+        );
+        assert!(r3 > r1, "third cell wraps to a new shelf");
+    }
+
+    #[test]
     fn flex_column_gap_controls_spacing() {
         // 5em (10-cell) boxes; an explicit 2em (4-cell) column-gap puts the
         // second at 14 instead of the default-gap 11.
@@ -4398,6 +4596,124 @@ mod tests {
             pos_of(&between, "b").1,
             34,
             "space-between: second pushed right"
+        );
+    }
+
+    #[test]
+    fn grid_justify_content_centers_a_shelf() {
+        // A `display:grid` (shelf-packed) container honours justify-content
+        // per shelf, just like a flex row: 5em·2 = 10-cell boxes, gap 1 →
+        // used 21 of 40, free 19, centred leading = 9.
+        let rows = lay(
+            r#"<html><head><style>.g{display:grid;justify-content:center}.c{width:5em}</style></head>
+               <body><div class="g"><div class="c">a</div><div class="c">b</div></div></body></html>"#,
+            40,
+        );
+        assert_eq!(pos_of(&rows, "a").1, 9, "{:?}", texts(&rows));
+    }
+
+    #[test]
+    fn align_items_center_offsets_a_short_column() {
+        // Two side-by-side columns of unequal height; align-items:center
+        // drops the short column down within the tall column's height.
+        let rows = lay(
+            r#"<html><head><style>.r{display:flex;align-items:center}.c{width:10em}</style></head>
+               <body><div class="r"><div class="c">one<br>two<br>three</div>
+               <div class="c">solo</div></div></body></html>"#,
+            60,
+        );
+        let tall_top = pos_of(&rows, "one").0;
+        let solo = pos_of(&rows, "solo").0;
+        assert!(
+            solo > tall_top,
+            "short column centred below the tall one's top: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn flex_order_reorders_items_visually() {
+        // `order:-1` lays the second item out before the first; the source
+        // DOM (and selection nodes) are untouched — only columns move.
+        let rows = lay(
+            r#"<html><head><style>.r{display:flex}.first{order:1}</style></head>
+               <body><div class="r"><div class="first">alpha</div><div>beta</div></div></body></html>"#,
+            40,
+        );
+        assert!(
+            pos_of(&rows, "beta").1 < pos_of(&rows, "alpha").1,
+            "order:1 pushes alpha after beta: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn letter_spacing_tracks_characters() {
+        // 0.5em ≈ 8px ≈ one cell of gap between each character.
+        let rows = lay(
+            r#"<body><p style="letter-spacing:0.5em">abc</p></body>"#,
+            40,
+        );
+        assert!(
+            texts(&rows).iter().any(|l| l.contains("a b c")),
+            "tracked: {:?}",
+            texts(&rows)
+        );
+        // Sub-cell tracking rounds to nothing — no terminal half-cells.
+        let rows = lay(
+            r#"<body><p style="letter-spacing:0.1em">abc</p></body>"#,
+            40,
+        );
+        assert!(
+            texts(&rows)
+                .iter()
+                .any(|l| l.contains("abc") && !l.contains("a b c")),
+            "subtle tracking is a no-op: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn wide_glyphs_advance_two_terminal_cells() {
+        // A CJK glyph renders two cells wide; the following inline item must
+        // start at col 2, not col 1. `chars().count()` mis-measured this and
+        // drifted aligned/`pre` columns (the wttr.in-class bug) — we now use
+        // the same `unicode-width` ratatui renders with.
+        let rows = lay("<body><pre>中<span>X</span></pre></body>", 40);
+        assert_eq!(
+            pos_of(&rows, "X").1,
+            2,
+            "wide glyph = 2 cells: {:?}",
+            texts(&rows)
+        );
+        // A combining mark adds no width (zero cells).
+        let rows = lay("<body><pre>e\u{0301}<span>Y</span></pre></body>", 40);
+        assert_eq!(
+            pos_of(&rows, "Y").1,
+            1,
+            "base+combining = 1 cell: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn list_style_position_inside_aligns_wrap_under_the_marker() {
+        // outside (default): the content hangs to the right of the marker, so
+        // a wrapped/second line indents under the content. inside: the marker
+        // joins the content flow, so the second line returns to the marker.
+        let outside = lay("<body><ul><li>one<br>two</li></ul></body>", 40);
+        let inside = lay(
+            r#"<body><ul style="list-style-position:inside"><li>one<br>two</li></ul></body>"#,
+            40,
+        );
+        // First line identical in both; the marker sits at the list margin.
+        assert_eq!(pos_of(&outside, "one").1, pos_of(&inside, "one").1);
+        // Second line: outside under the content, inside under the marker.
+        assert!(
+            pos_of(&inside, "two").1 < pos_of(&outside, "two").1,
+            "inside returns the wrap to the marker margin: out={} in={}",
+            pos_of(&outside, "two").1,
+            pos_of(&inside, "two").1
         );
     }
 

@@ -47,6 +47,17 @@ const VOID_ELEMENTS: [&str; 14] = [
     "track", "wbr",
 ];
 
+thread_local! {
+    /// Diagnostic only (`TRUST_NET_TRACE`): `trace_ms()` of the most recent
+    /// DOM mutation, for sizing the DOM-stable→load-finish tail.
+    static LAST_MUTATION_MS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
+}
+
+/// The `trace_ms()` of the last DOM mutation on this thread (diagnostic).
+pub fn last_mutation_ms() -> u128 {
+    LAST_MUTATION_MS.with(|c| c.get())
+}
+
 pub struct Dom {
     nodes: Vec<Node>,
     /// host element → shadow root fragment (attachShadow).
@@ -122,6 +133,12 @@ impl Dom {
     fn touch(&mut self) {
         self.dirty = true;
         self.epoch = self.epoch.wrapping_add(1);
+        // Diagnostic: record WHEN the DOM last changed, so we can size the
+        // gap between DOM-stability and load-finish (the telemetry/idle
+        // tail). Gated on the trace flag.
+        if std::env::var_os("TRUST_NET_TRACE").is_some() {
+            LAST_MUTATION_MS.with(|c| c.set(crate::http::trace_ms()));
+        }
     }
 
     /// Set the CSS-pixel viewport (`cols*cell_px`, `rows*cell_px`) that
@@ -374,6 +391,24 @@ impl Dom {
                 self.cascaded(id, "visibility").as_deref(),
                 Some("hidden" | "collapse")
             )
+        {
+            return true;
+        }
+        // Visually-hidden / "sr-only" accessibility text: the universal idiom
+        // for screen-reader-only content is a 1px, clipped, absolutely
+        // positioned box (Bootstrap `.visually-hidden`, Tailwind / HTML5BP
+        // `.sr-only`, archive.org's `aria-describedby` targets, …). It carries
+        // text meant to be invisible to sighted users — render nothing, as a
+        // browser does, instead of leaking it into the page (it's also often
+        // wider than its sibling content, distorting flex/grid sizing).
+        // `position` is checked first so the hot path short-circuits for the
+        // overwhelming majority of nodes that aren't absolutely positioned.
+        if self.cascaded(id, "position").as_deref() == Some("absolute")
+            && self.cascaded(id, "overflow").as_deref() == Some("hidden")
+            && self
+                .cascaded(id, "width")
+                .as_deref()
+                .is_some_and(css_len_at_most_1px)
         {
             return true;
         }
@@ -1900,7 +1935,9 @@ const PROPS: &[PropDef] = &[
     prop("font-style",           true,      true),
     prop("white-space",          true,      true),
     prop("text-transform",       true,      true),
+    prop("letter-spacing",       true,      true),
     prop("list-style-type",      true,      true),
+    prop("list-style-position",  true,      true),
     prop("text-indent",          true,      true),
     prop("text-decoration",      false,     true),
     prop("text-decoration-line", false,     true),
@@ -1923,6 +1960,8 @@ const PROPS: &[PropDef] = &[
     prop("column-gap",           false,     true),
     prop("row-gap",              false,     true),
     prop("justify-content",      false,     true),
+    prop("align-items",          false,     true),
+    prop("order",                false,     true),
     prop("border-top-width",     false,     true),
     prop("border-right-width",   false,     true),
     prop("border-bottom-width",  false,     true),
@@ -1935,6 +1974,15 @@ const PROPS: &[PropDef] = &[
 
 fn is_tracked(name: &str) -> bool {
     PROPS.iter().any(|p| p.name == name)
+}
+
+/// Whether a CSS length is ≤ 1px — the box size of the "sr-only" visually
+/// hidden clip idiom. Only unitless `0`/`1` and `px` lengths qualify; `em`,
+/// `%`, `auto`, etc. are not the pattern and return `false`.
+fn css_len_at_most_1px(v: &str) -> bool {
+    let v = v.trim();
+    let n = v.strip_suffix("px").unwrap_or(v).trim();
+    n.parse::<f32>().is_ok_and(|x| x <= 1.0)
 }
 
 /// Below this effective opacity an element is treated as invisible (hidden).
@@ -1982,13 +2030,21 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         let (w, s) = parse_border_shorthand(value);
         return border_longhands(&[side], w, s);
     }
-    // `list-style: <type> || <position> || <image>` — we only track the type
-    // keyword (a bare `none` counts as the type, per the shorthand grammar).
+    // `list-style: <type> || <position> || <image>` — we track the type and
+    // position keywords (a bare `none` counts as the type, per the shorthand
+    // grammar; the image and any URL are ignored).
     if prop == "list-style" {
-        return match list_style_shorthand_type(value) {
-            Some(t) => vec![("list-style-type".to_string(), t.to_string())],
-            None => Vec::new(),
-        };
+        let mut out = Vec::new();
+        if let Some(t) = list_style_shorthand_type(value) {
+            out.push(("list-style-type".to_string(), t.to_string()));
+        }
+        if let Some(p) = value
+            .split_whitespace()
+            .find(|t| matches!(*t, "inside" | "outside"))
+        {
+            out.push(("list-style-position".to_string(), p.to_string()));
+        }
+        return out;
     }
     vec![(prop.to_string(), value.to_string())]
 }
@@ -3217,6 +3273,42 @@ mod tests {
             !dom.is_hidden(c),
             "author display:block beats the UA default"
         );
+    }
+
+    #[test]
+    fn visually_hidden_sr_only_is_dropped() {
+        // The universal screen-reader-only idiom (1px clipped absolutely
+        // positioned box) carries text invisible to sighted users — both the
+        // class form (Bootstrap/Tailwind `.sr-only`) and the inline form
+        // (archive.org's `aria-describedby` targets) must be hidden + dropped,
+        // while a normal sibling renders.
+        let dom = Dom::parse_document(
+            "<body>\
+             <span id=a class=sr>screen reader only</span>\
+             <span id=b style=\"position:absolute;overflow:hidden;width:1px;height:1px\">inline hidden</span>\
+             <span id=c>visible</span>\
+             <style>.sr{position:absolute;overflow:hidden;width:1px;height:1px;clip:rect(0,0,0,0)}</style>\
+             </body>",
+        );
+        let a = dom.get_by_id("a").unwrap();
+        let b = dom.get_by_id("b").unwrap();
+        let c = dom.get_by_id("c").unwrap();
+        assert!(dom.is_hidden(a), "class .sr-only hidden");
+        assert!(dom.is_hidden(b), "inline sr-only hidden");
+        assert!(!dom.is_hidden(c), "normal content visible");
+        let html = dom.serialize(DOCUMENT);
+        assert!(
+            !html.contains("screen reader only"),
+            "class sr dropped: {html}"
+        );
+        assert!(!html.contains("inline hidden"), "inline sr dropped: {html}");
+        assert!(html.contains("visible"), "normal kept: {html}");
+        // A wider absolutely-positioned overflow-hidden box is NOT sr-only.
+        let dom2 = Dom::parse_document(
+            "<body><div id=d style=\"position:absolute;overflow:hidden;width:20em\">real</div></body>",
+        );
+        let d = dom2.get_by_id("d").unwrap();
+        assert!(!dom2.is_hidden(d), "a real clipped box is not sr-only");
     }
 
     #[test]

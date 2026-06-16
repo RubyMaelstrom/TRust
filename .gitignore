@@ -3,3 +3,4 @@
 /vendor/boa_engine-0.21.1/benches
 /vendor/boa_engine-0.21.1/tests
 CLAUDE.md
+/vendor/boa_ast-0.21.1/target

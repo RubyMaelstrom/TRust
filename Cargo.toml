@@ -25,6 +25,7 @@ textwrap = "0.16.2"
 tokio = { version = "1.52.3", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time"] }
 tokio-rustls = "0.26.4"
 tui-term = "0.3.4"
+unicode-width = "0.2"
 url = "2.5.8"
 webpki-roots = "1.0.7"
 
@@ -48,6 +49,6 @@ boa_ast = { path = "vendor/boa_ast-0.21.1" }
 # compile time for speed and size; symbols stripped (panic messages
 # still print, just without a backtrace).
 [profile.release]
-lto = true
-codegen-units = 1
+lto = "thin"
+codegen-units = 16
 strip = "symbols"

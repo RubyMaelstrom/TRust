@@ -157,3 +157,62 @@ fn closure_in_with_captures_block_binding_through_parameter() {
         js_str!("1:p,2:p"),
     )]);
 }
+
+/// `this` referenced from a DOUBLY-nested arrow must resolve to the enclosing
+/// (non-arrow) function's `this`, even when that function has no other reason
+/// to materialize a function environment.
+///
+/// FIXED (2026-06-16, brother) in `boa_ast`. `escape_this_in_enclosing_function_scope`
+/// (`scope.rs`) walked outward and marked the nearest *function* scope. But
+/// arrow functions are var/binding boundaries (`function == true`) while NOT
+/// binding their own `this`, so a `this` read from a doubly-nested arrow escaped
+/// onto the *intermediate arrow* scope (a no-op: the index visitor only consults
+/// `escaped_this` for non-arrow functions). The enclosing function therefore
+/// stayed un-materialized and `this` resolved to the outer environment
+/// (global/module), returning `undefined`. This was the archive.org
+/// `SharedResizeObserver` + Sentry crash. Fix: arrow scopes are flagged
+/// (`Scope::mark_arrow`) and skipped as the escape target while still counting
+/// as borders, so `this` reaches the nearest function that actually binds it.
+/// Adding any binding to the enclosing function masked the bug by forcing its
+/// scope to materialize for another reason.
+#[test]
+fn this_in_doubly_nested_arrow_resolves_to_enclosing_function() {
+    run_test_actions([TestAction::assert_eq(
+        indoc! {r#"
+            function Outer() {
+                this.v = 42;
+                this.make = () => () => this.v;
+            }
+            new Outer().make()();
+        "#},
+        42,
+    )]);
+
+    // Class constructor form (the archive.org shape): the constructor only
+    // needs `this` because of the nested arrows.
+    run_test_actions([TestAction::assert_eq(
+        indoc! {r#"
+            class C {
+                constructor() {
+                    this.v = 7;
+                    this.make = () => () => () => this.v;
+                }
+            }
+            new C().make()()();
+        "#},
+        7,
+    )]);
+
+    // The single-arrow case must keep working (the arrow's direct parent IS
+    // the this-binding function).
+    run_test_actions([TestAction::assert_eq(
+        indoc! {r#"
+            function S() {
+                this.v = 5;
+                this.get = () => this.v;
+            }
+            new S().get();
+        "#},
+        5,
+    )]);
+}

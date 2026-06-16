@@ -103,6 +103,11 @@ pub(crate) struct Inner {
     index: Cell<u32>,
     bindings: RefCell<Vec<Binding>>,
     function: bool,
+    // Whether this is an arrow function's scope. Arrow functions do NOT bind
+    // their own `this`, so they are a binding/var boundary (`function == true`)
+    // yet must be SKIPPED when escaping `this` to the enclosing function that
+    // actually binds it. Defaults to false; set for arrow function scopes.
+    arrow: Cell<bool>,
     // Has the `this` been accessed/escaped outside the function environment boundry.
     this_escaped: Cell<bool>,
 }
@@ -118,6 +123,7 @@ impl Scope {
                 index: Cell::default(),
                 bindings: RefCell::default(),
                 function: true,
+                arrow: Cell::new(false),
                 this_escaped: Cell::new(false),
             }),
         }
@@ -134,9 +140,22 @@ impl Scope {
                 index: Cell::new(index),
                 bindings: RefCell::default(),
                 function,
+                arrow: Cell::new(false),
                 this_escaped: Cell::new(false),
             }),
         }
+    }
+
+    /// Marks this scope as an arrow function's scope (does not bind its own
+    /// `this`). See [`Inner::arrow`].
+    pub(crate) fn mark_arrow(&self) {
+        self.inner.arrow.set(true);
+    }
+
+    /// Whether this is an arrow function's scope (does not bind its own `this`).
+    #[must_use]
+    pub fn is_arrow(&self) -> bool {
+        self.inner.arrow.get()
     }
 
     /// Checks if the scope has only local bindings.
@@ -331,12 +350,20 @@ impl Scope {
     }
 
     /// Escape enclosing function environment's `this`.
+    ///
+    /// Walks outward to the nearest function scope that actually binds `this`.
+    /// Arrow function scopes are function/var boundaries (`function == true`)
+    /// but do NOT bind their own `this`, so they are crossed (counting as a
+    /// border) yet skipped as the escape target — otherwise a `this` referenced
+    /// from a doubly-nested arrow would escape onto the intermediate arrow scope
+    /// (which never materializes for `this`), leaving the real enclosing
+    /// function un-materialized and `this` resolving to the wrong environment.
     pub fn escape_this_in_enclosing_function_scope(&self) {
         let mut current = self;
         let mut crossed_function_border = false;
 
         loop {
-            if crossed_function_border && current.is_function() {
+            if crossed_function_border && current.is_function() && !current.is_arrow() {
                 current.inner.this_escaped.set(true);
                 return;
             }

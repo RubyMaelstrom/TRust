@@ -309,6 +309,9 @@ struct PageNet {
     page: url::Url,
     budget: Rc<Budget>,
     fetched: std::cell::Cell<usize>,
+    /// The shared subresource cache, so the page's own `fetch()` can join
+    /// an in-flight/done request for a chunk we already have.
+    cache: std::sync::Arc<crate::http::PageCache>,
 }
 
 impl boa_engine::gc::Finalize for PageNet {}
@@ -336,6 +339,11 @@ unsafe impl boa_engine::gc::Trace for PageStore {
 /// 96 covers its full boot (62 observed) with headroom; still a hard
 /// envelope against runaway pages. PROVISIONAL — her call to keep.
 const MAX_PAGE_FETCHES: usize = 96;
+
+/// Most import specifiers we'll speculatively prefetch from one module's
+/// source. Bounds the wasted bandwidth of a false-positive scan; the
+/// per-page `MAX_PAGE_FETCHES` cap still governs the total.
+const MAX_SPECULATIVE_IMPORTS: usize = 64;
 
 fn page_dom(ctx: &mut Context) -> Rc<RefCell<Dom>> {
     ctx.realm()
@@ -884,7 +892,34 @@ fn page_net_fetch(
     body: Option<(String, Vec<u8>)>,
 ) -> Option<crate::http::Response> {
     let (handle, request) = page_net_prepare(ctx, target, method, body)?;
+    phase(&format!("src: PAGE-SYNC {}", request.url));
     handle.block_on(crate::http::fetch(&request)).ok()
+}
+
+/// Get a module body for `resolved` THROUGH the shared cache, blocking
+/// the page thread (the module-load atomicity rule — never `.await`
+/// here). A hit — the initial prefetch seeded it, or a speculative
+/// prefetch is already fetching it — skips the network entirely (and
+/// costs no cap). A miss starts a fresh, cap-/`subresource_allowed`-gated
+/// request. Shared by the module loader and the entry-module path.
+fn load_module_body(
+    ctx: &mut Context,
+    cache: &std::sync::Arc<crate::http::PageCache>,
+    resolved: &url::Url,
+) -> Option<std::sync::Arc<crate::http::CachedResp>> {
+    if let Some(f) = cache.peek(resolved) {
+        // Ready (seeded) needs no runtime; in-flight is driven via the
+        // handle. No-net pages only ever have ready entries.
+        let handle = ctx
+            .realm()
+            .host_defined()
+            .get::<PageNet>()
+            .map(|n| n.handle.clone());
+        return crate::http::PageCache::block_on_fetch(handle.as_ref(), f);
+    }
+    let (handle, request) = page_net_prepare(ctx, resolved.as_str(), String::from("GET"), None)?;
+    let f = cache.fetch(&handle, request.url);
+    crate::http::PageCache::block_on_fetch(Some(&handle), f)
 }
 
 /// `__http_fetch(url, method, body|null, content_type|null)` →
@@ -910,6 +945,34 @@ fn sys_http_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
 fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let (url_arg, method, body) = fetch_args(args, ctx);
     let (promise, resolvers) = JsPromise::new_pending(ctx);
+    // GET dedup: a chunk the page re-`fetch()`es (the bundler warms up its
+    // own modulepreloads this way) JOINS the cache's single request for
+    // it instead of re-downloading. No new request, no cap spend. Misses
+    // — arbitrary API GETs — fall through to a normal, uncached fetch.
+    if method == "GET"
+        && body.is_none()
+        && let Some(shared) = peek_page_cache(ctx, &url_arg)
+    {
+        phase(&format!("src: PAGE-CACHE {url_arg}"));
+        let realm = ctx.realm().clone();
+        let job = NativeAsyncJob::with_realm(
+            async move |ctx_cell: &RefCell<&mut Context>| {
+                let outcome = shared.await;
+                let mut guard = ctx_cell.borrow_mut();
+                let value = match outcome {
+                    Ok(c) => cached_to_array(&c, &mut guard),
+                    Err(_) => JsValue::null(),
+                };
+                let _ = resolvers
+                    .resolve
+                    .call(&JsValue::undefined(), &[value], &mut guard);
+                Ok(JsValue::undefined())
+            },
+            realm,
+        );
+        ctx.enqueue_job(job.into());
+        return Ok(promise.into());
+    }
     match page_net_prepare(ctx, &url_arg, method, body) {
         None => {
             // Blocked/capped/no net: settle to null now, matching the
@@ -920,6 +983,7 @@ fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
                 .call(&JsValue::undefined(), &[JsValue::null()], ctx);
         }
         Some((_handle, request)) => {
+            phase(&format!("src: PAGE-ASYNC {}", request.url));
             let realm = ctx.realm().clone();
             let job = NativeAsyncJob::with_realm(
                 async move |ctx_cell: &RefCell<&mut Context>| {
@@ -1014,6 +1078,27 @@ fn response_to_array(resp: &crate::http::Response, ctx: &mut Context) -> JsValue
     JsArray::from_iter(vals, ctx).into()
 }
 
+/// Same `[status, content_type, body_text]` shape from a cached response.
+fn cached_to_array(c: &crate::http::CachedResp, ctx: &mut Context) -> JsValue {
+    let vals = vec![
+        JsValue::from(f64::from(c.status)),
+        str_value(&c.content_type),
+        str_value(&String::from_utf8_lossy(&c.body)),
+    ];
+    JsArray::from_iter(vals, ctx).into()
+}
+
+/// An existing shared-cache entry (in-flight or done) for a page GET, or
+/// None. Lets the page's own `fetch()` JOIN a request for a chunk we
+/// already have/are fetching, without creating a cache entry for an
+/// uncached API GET (a miss falls through to a normal, uncached fetch).
+fn peek_page_cache(ctx: &mut Context, target: &str) -> Option<crate::http::SharedFetch> {
+    let host = ctx.realm().host_defined();
+    let net = host.get::<PageNet>()?;
+    let resolved = net.page.join(target).ok()?;
+    net.cache.peek(&resolved)
+}
+
 fn store_bucket(ctx: &mut Context, args: &[JsValue]) -> Option<(WebStorage, String)> {
     let kind = arg_str(args, 0, ctx);
     let host = ctx.realm().host_defined();
@@ -1106,6 +1191,15 @@ fn is_classic(type_attr: &Option<String>) -> bool {
 /// the page non-quiescent and render what exists.
 const MAX_TICKS: usize = 200;
 
+/// Print a JS-phase timeline marker against the shared trace clock, when
+/// `TRUST_NET_TRACE=1`. Pairs with the net trace so a single load's wall
+/// time can be attributed (compute vs network wait, per phase).
+fn phase(label: &str) {
+    if std::env::var_os("TRUST_NET_TRACE").is_some() {
+        eprintln!("js : @{:>6}ms {label}", crate::http::trace_ms());
+    }
+}
+
 /// Everything a page transformation needs from the outside world.
 pub struct PageEnv {
     pub url: String,
@@ -1123,10 +1217,13 @@ pub struct PageEnv {
     /// for the display/visibility cascade (failed fetches are absent —
     /// fail-open, the page just renders un-hidden).
     pub sheets: Vec<(String, String)>,
-    /// Pre-fetched module bodies keyed by RESOLVED absolute URL
-    /// (modulepreload hints + module entry srcs), consumed by the
-    /// module loader before it ever touches the network.
-    pub preloaded: Vec<(String, Vec<u8>)>,
+    /// The shared per-page subresource cache (seeded with the announced
+    /// module preloads). The module loader reads module bodies from it,
+    /// speculative import prefetch fills it ahead of the loader, and the
+    /// page's own `fetch()` joins it — so no chunk is fetched twice and
+    /// the module graph downloads concurrently instead of one RTT at a
+    /// time. See `http::PageCache`.
+    pub cache: std::sync::Arc<crate::http::PageCache>,
     /// Runtime handle for page-initiated fetch/XHR; None = pages get no
     /// network at all (every request resolves to failure).
     pub net: Option<tokio::runtime::Handle>,
@@ -1143,7 +1240,7 @@ impl PageEnv {
             cell_px: (8, 16),
             externals: Vec::new(),
             sheets: Vec::new(),
-            preloaded: Vec::new(),
+            cache: std::sync::Arc::new(crate::http::PageCache::default()),
             net: None,
             storage: None,
         }
@@ -1209,6 +1306,119 @@ impl boa_engine::context::HostHooks for PageHooks {
     }
 }
 
+/// Best-effort scan of JS module source for its STATIC import specifiers,
+/// so we can prefetch them concurrently BEFORE Boa's loader (which we run
+/// serially, to keep module loading atomic) asks for them one at a time.
+/// This is the engine's "preload scanner": it turns the static module
+/// graph from sum-of-RTTs into depth-of-graph-times-RTT, like a browser.
+/// Heuristic and fail-open — a false positive prefetches a dud (cached as
+/// a failure, harmless), a false negative just falls back to the serial
+/// fetch. Recognizes `import…from "x"`, `export…from "x"`, and bare
+/// `import "x"`; only path-like specifiers (`/`, `./`, `../`, absolute
+/// URL) are kept, which filters most stray matches.
+///
+/// Dynamic `import(...)` is deliberately NOT scanned: a router entry
+/// dynamic-imports EVERY route (archive.org: 51), almost all lazy and
+/// never loaded at boot, so prefetching them is pure waste and would
+/// starve the real-module cap. The boot-time dynamic imports a page DOES
+/// fire stay serial here — parallelizing those is the Boa concurrency
+/// follow-up (they need the loader to interleave safely), not the
+/// scanner's job.
+fn scan_module_imports(src: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let n = src.len();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    let mut i = 0;
+    while i < n {
+        // Anchor on the keywords that introduce a module specifier.
+        let kw = if src[i..].starts_with(b"from") {
+            4
+        } else if src[i..].starts_with(b"import") {
+            6
+        } else {
+            i += 1;
+            continue;
+        };
+        // Word boundary before (so `transform`/`reimport` don't match).
+        if i > 0 && is_ident(src[i - 1]) {
+            i += 1;
+            continue;
+        }
+        let mut j = i + kw;
+        while j < n && (src[j] as char).is_whitespace() {
+            j += 1;
+        }
+        // `import(` is a DYNAMIC import — skip it (see the doc comment).
+        if kw == 6 && j < n && src[j] == b'(' {
+            i += kw;
+            continue;
+        }
+        // A quoted string literal here is a STATIC specifier.
+        if j < n && (src[j] == b'"' || src[j] == b'\'' || src[j] == b'`') {
+            let quote = src[j];
+            let start = j + 1;
+            let mut k = start;
+            while k < n && src[k] != quote && src[k] != b'\n' {
+                k += 1;
+            }
+            if k < n && src[k] == quote {
+                if let Ok(spec) = std::str::from_utf8(&src[start..k]) {
+                    let path_like = spec.starts_with('/')
+                        || spec.starts_with("./")
+                        || spec.starts_with("../")
+                        || spec.starts_with("http");
+                    if path_like && !spec.contains("${") {
+                        out.push(spec.to_string());
+                    }
+                }
+                i = k + 1;
+                continue;
+            }
+        }
+        i += kw; // not a specifier site; step past the keyword
+    }
+    out
+}
+
+/// Fire concurrent prefetches for `body`'s import specifiers into the
+/// shared cache, resolved against `base`. Cap- and `subresource_allowed`-
+/// gated and counted like any page fetch; deduped against in-flight
+/// entries. The loader, reaching these modules moments later, finds them
+/// already in flight (or done) instead of paying a fresh round trip.
+fn speculate_imports(ctx: &mut Context, base: &url::Url, body: &[u8]) {
+    let specs = scan_module_imports(body);
+    if specs.is_empty() {
+        return;
+    }
+    let host = ctx.realm().host_defined();
+    let Some(net) = host.get::<PageNet>() else {
+        return;
+    };
+    let handle = net.handle.clone();
+    let cache = net.cache.clone();
+    for spec in specs.into_iter().take(MAX_SPECULATIVE_IMPORTS) {
+        let Some(resolved) = base
+            .join(&spec)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https"))
+        else {
+            continue;
+        };
+        if cache.peek(&resolved).is_some() {
+            continue; // already prefetched, in flight, or done
+        }
+        if !crate::http::subresource_allowed(&net.page, &resolved)
+            || net.fetched.get() >= MAX_PAGE_FETCHES
+            || net.budget.exhausted()
+        {
+            continue;
+        }
+        net.fetched.set(net.fetched.get() + 1);
+        phase(&format!("src: SPECULATE {resolved}"));
+        cache.prefetch(&handle, resolved);
+    }
+}
+
 /// ES modules over the web: imports resolve against the importing
 /// module's URL (carried as the Source path), fetch through the page's
 /// net grant with the same caps and guards as everything else, and
@@ -1216,10 +1426,15 @@ impl boa_engine::context::HostHooks for PageHooks {
 /// reject — honestly.
 struct WebModuleLoader {
     page: Option<url::Url>,
-    cache: RefCell<std::collections::HashMap<String, boa_engine::Module>>,
-    /// Bodies fetched in parallel before the engine started (taken on
-    /// first use; a miss falls back to the network).
-    preloaded: Rc<RefCell<std::collections::HashMap<String, Vec<u8>>>>,
+    /// Parsed `Module` records, deduped per page (Boa needs one record
+    /// per specifier — re-parsing trips an identity assert).
+    modules: RefCell<std::collections::HashMap<String, boa_engine::Module>>,
+    /// The shared subresource cache: module bodies arrive here from the
+    /// initial prefetch, from speculative import prefetch (fired ahead of
+    /// this loader as each module is scanned), and from this loader's own
+    /// fetches. A `Shared` future per URL means a body in flight is never
+    /// re-requested.
+    body: std::sync::Arc<crate::http::PageCache>,
 }
 
 impl boa_engine::module::ModuleLoader for WebModuleLoader {
@@ -1256,47 +1471,47 @@ impl boa_engine::module::ModuleLoader for WebModuleLoader {
                     .with_message(format!("cannot resolve module specifier '{spec}'"))
             })?;
         let key = resolved.to_string();
-        if let Some(cached) = self.cache.borrow().get(&key) {
+        if let Some(cached) = self.modules.borrow().get(&key) {
+            phase(&format!("module CACHE-HIT {key}"));
             return Ok(cached.clone());
         }
 
-        let preloaded = self.preloaded.borrow_mut().remove(&key);
-        let body = match preloaded {
-            Some(body) => body,
-            None => {
-                // Module loads are atomic from Boa's view: this future must
-                // not yield to another module load while a fetch is in
-                // flight, or interleaved loads cross up Boa's per-referrer
-                // loaded_modules. We can't `block_on` here (we're inside the
-                // job loop's `block_on`; nesting tokio runtimes panics), so
-                // spawn the request onto the runtime and block the page
-                // thread on a plain channel. Page fetch/XHR keep their own
-                // async path and still overlap.
-                let fail = || {
-                    boa_engine::JsNativeError::typ()
-                        .with_message(format!("module fetch failed or blocked: {key}"))
-                };
-                let (handle, request) = {
-                    let mut ctx = context.borrow_mut();
-                    page_net_prepare(&mut ctx, &key, String::from("GET"), None)
-                }
-                .ok_or_else(fail)?;
-                let (tx, rx) = std::sync::mpsc::channel();
-                handle.spawn(async move {
-                    let _ = tx.send(crate::http::fetch(&request).await);
-                });
-                rx.recv().map_err(|_| fail())?.map_err(|_| fail())?.body
-            }
+        let fail = || {
+            boa_engine::JsNativeError::typ()
+                .with_message(format!("module fetch failed or blocked: {key}"))
         };
+        // The body comes from the shared cache: already there if the
+        // initial prefetch announced it or a speculative prefetch ran
+        // ahead of us; otherwise we start it now. Either way one request
+        // per URL — the bundler's own `fetch()` of this chunk joins it.
+        // `load_module_body` BLOCKS (never `.await`) so Boa can't
+        // interleave another module load mid-flight and cross up
+        // `loaded_modules`.
+        let hit = self.body.peek(&resolved).is_some();
+        let cached = {
+            let mut ctx = context.borrow_mut();
+            load_module_body(&mut ctx, &self.body, &resolved)
+        }
+        .ok_or_else(fail)?;
+        phase(&format!(
+            "module {} {key}",
+            if hit { "CACHED" } else { "NETWORK" }
+        ));
+        // Prime the NEXT wave: prefetch this module's own imports now, so
+        // they're in flight before Boa serially asks for each.
+        {
+            let mut ctx = context.borrow_mut();
+            speculate_imports(&mut ctx, &resolved, &cached.body);
+        }
         let module = {
             let mut ctx = context.borrow_mut();
             boa_engine::Module::parse(
-                Source::from_bytes(&body).with_path(std::path::Path::new(&key)),
+                Source::from_bytes(&cached.body).with_path(std::path::Path::new(&key)),
                 None,
                 &mut ctx,
             )?
         };
-        self.cache.borrow_mut().insert(key, module.clone());
+        self.modules.borrow_mut().insert(key, module.clone());
         Ok(module)
     }
 }
@@ -1342,7 +1557,7 @@ fn run_module(
     // duplicate-record identity assert. One tracked Module, as intended.
     if let Some((loader, key)) = register {
         loader
-            .cache
+            .modules
             .borrow_mut()
             .insert(key.to_string(), module.clone());
     }
@@ -1394,6 +1609,7 @@ struct LoadedPage {
 /// "render the original HTML with this outcome" (no scripts, or our
 /// own plumbing failed).
 fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
+    phase("load_page start (DOM parse)");
     let page_url = env.url.as_str();
     let viewport = env.viewport;
     let cell_px = env.cell_px;
@@ -1419,12 +1635,10 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
 
     let started = Instant::now();
     let parsed_url = url::Url::parse(page_url).ok();
-    let preloaded: Rc<RefCell<std::collections::HashMap<String, Vec<u8>>>> =
-        Rc::new(RefCell::new(env.preloaded.iter().cloned().collect()));
     let loader = Rc::new(WebModuleLoader {
         page: parsed_url.clone(),
-        cache: RefCell::new(std::collections::HashMap::new()),
-        preloaded: preloaded.clone(),
+        modules: RefCell::new(std::collections::HashMap::new()),
+        body: env.cache.clone(),
     });
     let (mut ctx, hooks) = page_context_with(Some(loader.clone()));
     let budget = Rc::new(Budget::new(WALL_BUDGET));
@@ -1444,6 +1658,7 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
                 page,
                 budget: budget.clone(),
                 fetched: std::cell::Cell::new(0),
+                cache: env.cache.clone(),
             });
         }
     }
@@ -1471,8 +1686,18 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
         // The prelude is ours: if it broke, render without JS and say so.
         return Err(outcome);
     }
+    phase(&format!(
+        "prelude done; {} top-level scripts",
+        scripts.len()
+    ));
 
     for (i, (src, inline, type_attr)) in scripts.iter().enumerate() {
+        let script_started = Instant::now();
+        if std::env::var_os("TRUST_NET_TRACE").is_some() {
+            let label = src.as_deref().unwrap_or("<inline>");
+            let ty = type_attr.as_deref().unwrap_or("classic");
+            phase(&format!("script[{i}] start {ty} {label}"));
+        }
         if !is_classic(type_attr) {
             // ES modules execute for real now; non-module foreign types
             // (importmap, json, ...) still skip.
@@ -1480,55 +1705,38 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
                 match src {
                     Some(src) => {
                         // Load the entry module THROUGH the loader via a
-                        // synthetic importer — do NOT parse + evaluate it
-                        // directly. A module run as the "entry" (its own
-                        // `load_link_evaluate`) is tracked differently by
-                        // Boa than a loader-provided one. archive.org
-                        // dynamically imports its OWN entry URL, and the
-                        // mismatch leaves Boa with two Module records for
-                        // one specifier — tripping an internal identity
-                        // assert whose panic then stack-overflows
-                        // formatting the cyclic module graph (= abort).
-                        // Routing the entry through the loader keeps one
-                        // tracked Module. The loader pulls the body from
-                        // the preload set (left in place for it) or the net.
+                        // synthetic importer (register) — do NOT let Boa
+                        // run it as its own entry. archive.org dynamically
+                        // imports its OWN entry URL; registering it under
+                        // its URL keeps ONE tracked Module (a second record
+                        // for the same specifier trips an identity assert
+                        // whose panic stack-overflows formatting the cyclic
+                        // graph). Its body comes from the shared cache (it
+                        // was seeded as a classic <script>), and we
+                        // speculatively prefetch its imports so the first
+                        // wave is already in flight.
                         let resolved = parsed_url
                             .as_ref()
                             .and_then(|b| b.join(src).ok())
-                            .map(|u| u.to_string());
-                        let pre = resolved
+                            .filter(|u| matches!(u.scheme(), "http" | "https"));
+                        let cached = resolved
                             .as_ref()
-                            .and_then(|k| preloaded.borrow_mut().remove(k));
-                        match pre {
-                            Some(body) => {
-                                let path = resolved.as_deref().unwrap_or(src.as_str());
+                            .and_then(|u| load_module_body(&mut ctx, &env.cache, u));
+                        match (resolved, cached) {
+                            (Some(resolved), Some(cached)) => {
+                                let path = resolved.to_string();
+                                speculate_imports(&mut ctx, &resolved, &cached.body);
                                 run_module(
                                     &mut ctx,
                                     src,
-                                    &body,
-                                    path,
+                                    &cached.body,
+                                    &path,
                                     &budget,
                                     &mut outcome,
-                                    Some((&loader, path)),
+                                    Some((&loader, &path)),
                                 );
                             }
-                            None => {
-                                match page_net_fetch(&mut ctx, src, String::from("GET"), None) {
-                                    Some(resp) => {
-                                        let path = resp.url.to_string();
-                                        run_module(
-                                            &mut ctx,
-                                            src,
-                                            &resp.body,
-                                            &path,
-                                            &budget,
-                                            &mut outcome,
-                                            Some((&loader, &path)),
-                                        );
-                                    }
-                                    None => outcome.modules_skipped += 1,
-                                }
-                            }
+                            _ => outcome.modules_skipped += 1,
                         }
                     }
                     None => {
@@ -1549,6 +1757,10 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
                 }
                 run_jobs_into(&mut ctx, &budget, &mut outcome);
             }
+            phase(&format!(
+                "script[{i}] done +{}ms",
+                script_started.elapsed().as_millis()
+            ));
             continue;
         }
         match src {
@@ -1569,10 +1781,15 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
             break;
         }
         run_jobs_into(&mut ctx, &budget, &mut outcome);
+        phase(&format!(
+            "script[{i}] done +{}ms",
+            script_started.elapsed().as_millis()
+        ));
     }
 
     if !outcome.panicked {
         // Lifecycle: DOMContentLoaded, settle, then load.
+        phase("scripts done; DOMContentLoaded");
         run_script(
             &mut ctx,
             "DOMContentLoaded",
@@ -1580,7 +1797,9 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
             &budget,
             &mut outcome,
         );
+        phase("settle start");
         settle(&mut ctx, &budget, MAX_TICKS, &mut outcome);
+        phase("settle done");
         run_script(
             &mut ctx,
             "load",
@@ -1589,10 +1808,15 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
             &mut outcome,
         );
         run_jobs_into(&mut ctx, &budget, &mut outcome);
+        phase("load done");
     }
 
     drain_js_side(&mut ctx, &mut outcome);
     drain_rejections(&hooks, &mut outcome);
+    phase(&format!(
+        "load finished; last DOM mutation was @{}ms",
+        crate::dom::last_mutation_ms()
+    ));
     outcome.fetches = ctx
         .realm()
         .host_defined()
@@ -1617,11 +1841,18 @@ fn settle(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Ou
     loop {
         run_jobs_into(ctx, budget, outcome);
         if budget.exhausted() || ticks >= max_ticks {
+            phase(&format!(
+                "settle: {ticks} ticks, exhausted={}",
+                budget.exhausted()
+            ));
             break;
         }
         match ctx.eval(Source::from_bytes(b"__trust.tick(1000)")) {
             Ok(v) if v.to_boolean() => ticks += 1,
-            _ => break,
+            _ => {
+                phase(&format!("settle: {ticks} ticks, quiescent"));
+                break;
+            }
         }
     }
 }
@@ -2697,7 +2928,16 @@ const PRELUDE: &str = r##"
         }
         get content() {
             // <template>.content: the inert fragment its markup parses into.
-            return this.localName === "template" ? wrap(__dom_template_content(this.__id)) : undefined;
+            if (this.localName === "template") return wrap(__dom_template_content(this.__id));
+            return this.__content;
+        }
+        // Non-template elements have NO `content` property in the DOM, so a
+        // framework's `.content=${…}` property binding (lit's PropertyPart does
+        // `element[name] = value`) just sets a plain expando — it must NOT throw
+        // the way a getter-without-setter does in strict mode. Templates keep
+        // their read-only fragment; ignore writes there.
+        set content(v) {
+            if (this.localName !== "template") this.__content = v;
         }
         attachShadow(init) {
             const id = __dom_attach_shadow(this.__id);
@@ -4233,23 +4473,170 @@ mod tests {
     }
 
     #[test]
+    fn scan_module_imports_finds_static_skips_dynamic() {
+        let src = br#"
+            import a from "./a.js";
+            import { b } from '/b.js';
+            export { c } from "../c.js";
+            import "/side-effect.js";
+            import x from `./tpl.js`;
+            const r = import("./dynamic.js");
+            const lazy = import(`./route-${name}.js`);
+            import bare from "lodash";
+        "#;
+        let found = scan_module_imports(src);
+        // Static, path-like specifiers — including a non-interpolated
+        // backtick — are caught.
+        for want in ["./a.js", "/b.js", "../c.js", "/side-effect.js", "./tpl.js"] {
+            assert!(found.iter().any(|s| s == want), "missing {want}: {found:?}");
+        }
+        // Dynamic `import(...)` is deliberately skipped (router fan-out).
+        assert!(
+            !found.iter().any(|s| s == "./dynamic.js"),
+            "dynamic import was scanned: {found:?}"
+        );
+        // Interpolated template specifiers are unpredictable — skipped.
+        assert!(
+            !found.iter().any(|s| s.contains("route-")),
+            "interpolated specifier was scanned: {found:?}"
+        );
+        // Bare specifiers (no path) don't resolve here — skipped.
+        assert!(
+            !found.iter().any(|s| s == "lodash"),
+            "bare specifier was scanned: {found:?}"
+        );
+    }
+
+    #[test]
+    fn resize_observer_callback_receives_entries() {
+        // archive.org's SharedResizeObserver does `new ResizeObserver(e =>
+        // requestAnimationFrame(() => { for (let t of e) ... }))`. If our
+        // RO fires the callback without a real entries array (or the value
+        // doesn't survive into the rAF closure), the for-of hits
+        // ToObject(undefined) — the TypeError that drove Sentry. Pin it.
+        let env = PageEnv::bare("https://example.com/");
+        let html = r#"<body><div id=out>no</div><script>
+            const ro = new ResizeObserver(e => {
+                requestAnimationFrame(() => {
+                    let n = 0; for (let t of e) { n++; }
+                    document.getElementById('out').textContent = 'entries=' + n;
+                });
+            });
+            ro.observe(document.body);
+        </script></body>"#;
+        let (out, outcome) = transform(html, &env);
+        assert!(outcome.errors.is_empty(), "errors: {:?}", outcome.errors);
+        assert!(out.contains("entries=1"), "RO entries not delivered: {out}");
+    }
+
+    #[test]
+    fn this_in_doubly_nested_arrow_survives_capture() {
+        // Minimal pin for the Boa `this`-escape fix (the archive.org /
+        // SharedResizeObserver crash, distilled). A non-arrow function whose
+        // ONLY reason to materialize a function environment is a `this`
+        // referenced from a DOUBLY-nested arrow. The old escape analysis
+        // marked the intermediate arrow scope (arrows never materialize for
+        // `this`), so the enclosing function stayed un-materialized and `this`
+        // resolved to the wrong (outer) environment — `f()` returned
+        // undefined. No module/ResizeObserver/Sentry needed: this is pure
+        // engine scoping.
+        let env = PageEnv::bare("https://example.com/");
+        let (out, outcome) = transform(
+            r#"<body><div id=out>no</div><script>
+                function Outer() {
+                    this.v = 42;
+                    this.make = () => () => this.v;
+                }
+                document.getElementById('out').textContent =
+                    'val ' + (new Outer().make()());
+            </script></body>"#,
+            &env,
+        );
+        assert!(outcome.errors.is_empty(), "errors: {:?}", outcome.errors);
+        assert!(out.contains("val 42"), "this lost in nested arrow: {out}");
+    }
+
+    // Regression (2026-06-16): archive.org's `SharedResizeObserver`, wrapped by
+    // Sentry's `Ti` function-instrumentation, threw "cannot convert undefined
+    // to object". Faithful shape: a MODULE with `var t=class{…},n=e(…)`, a
+    // `new ResizeObserver(e => rAF(() => { for (let t of e) this.…(t.target) }))`,
+    // and Sentry's `Ti` wrapping of setTimeout/rAF. Root cause was NOT the
+    // captured `e` (it resolves fine) but the inner arrow's `this`: a `this`
+    // read from a doubly-nested arrow escaped onto the intermediate arrow scope
+    // instead of the class constructor, so the constructor never materialized
+    // and `this.resizeHandlers` was a property access on `undefined`. Fixed in
+    // the Boa fork's scope analyzer (arrow scopes are skipped when escaping
+    // `this`). See `this_in_doubly_nested_arrow_survives_capture` for the
+    // distilled case. Librewolf: 0 errors.
+    #[test]
+    fn sentry_wrapped_resize_observer_keeps_captured_entries() {
+        let env = PageEnv::bare("https://example.com/");
+        env.cache.seed(
+            String::from("https://example.com/lib.js"),
+            200,
+            String::from("text/javascript"),
+            b"export const n = (o) => o;".to_vec(),
+        );
+        env.cache.seed(
+            String::from("https://example.com/main.js"),
+            200,
+            String::from("text/javascript"),
+            br#"import { n as e } from './lib.js';
+                function Ti(fn){
+                    if (typeof fn !== 'function') return fn;
+                    if (fn.__sentry_wrapped__) return fn.__sentry_wrapped__;
+                    const r = function(){ const m = Array.prototype.map.call(arguments, x => Ti(x)); return fn.apply(this, m); };
+                    try { for (let k in fn) if (Object.prototype.hasOwnProperty.call(fn,k)) r[k]=fn[k]; } catch(_){}
+                    try { Object.defineProperty(fn, '__sentry_wrapped__', { value: r, configurable: true }); } catch(_){}
+                    return r;
+                }
+                function fill(o,n,repl){ o[n]=repl(o[n]); }
+                fill(globalThis,'requestAnimationFrame', o => function(cb){ return o.apply(this,[Ti(cb)]); });
+                fill(globalThis,'setTimeout', o => function(){ arguments[0]=Ti(arguments[0]); return o.apply(this,arguments); });
+                var t = class {
+                    constructor() {
+                        this.resizeObserver = new ResizeObserver(e => {
+                            window.requestAnimationFrame(() => {
+                                for (let t of e) this.resizeHandlers.get(t.target);
+                                document.getElementById('out').textContent = 'looped ' + e.length;
+                            });
+                        });
+                        this.resizeHandlers = new Map();
+                    }
+                    add(el) { this.resizeHandlers.set(el, 1); this.resizeObserver.observe(el); }
+                }, n = e({ SharedResizeObserver: () => t });
+                new t().add(document.body);"#
+                .to_vec(),
+        );
+        let (out, outcome) = transform(
+            "<body><div id=out>no</div>\
+             <script type=module src='/main.js'></script></body>",
+            &env,
+        );
+        assert!(outcome.errors.is_empty(), "errors: {:?}", outcome.errors);
+        assert!(out.contains("looped 1"), "captured RO entries lost: {out}");
+    }
+
+    #[test]
     fn preloaded_modules_run_without_network() {
-        // The parallel-prefetch contract: bodies seeded into
-        // PageEnv.preloaded serve the module graph — entry AND imports
-        // — with no net grant at all.
-        let mut env = PageEnv::bare("https://example.com/");
-        env.preloaded = vec![
-            (
-                String::from("https://example.com/main.js"),
-                b"import { x } from './lib.js';\
-                  document.getElementById('t').textContent = x;"
-                    .to_vec(),
-            ),
-            (
-                String::from("https://example.com/lib.js"),
-                b"export const x = 'preloaded graph';".to_vec(),
-            ),
-        ];
+        // The parallel-prefetch contract: bodies seeded into the shared
+        // cache serve the module graph — entry AND imports — with no net
+        // grant at all.
+        let env = PageEnv::bare("https://example.com/");
+        env.cache.seed(
+            String::from("https://example.com/main.js"),
+            200,
+            String::from("text/javascript"),
+            b"import { x } from './lib.js';\
+              document.getElementById('t').textContent = x;"
+                .to_vec(),
+        );
+        env.cache.seed(
+            String::from("https://example.com/lib.js"),
+            200,
+            String::from("text/javascript"),
+            b"export const x = 'preloaded graph';".to_vec(),
+        );
         let (out, outcome) = transform(
             "<body><div id=t></div>\
              <script type=module src='/main.js'></script></body>",
@@ -4270,7 +4657,7 @@ mod tests {
         // that crash a catchable panic instead, a wide *acyclic* graph like
         // this must just run.
         const N: usize = 30;
-        let mut env = PageEnv::bare("https://example.com/");
+        let env = PageEnv::bare("https://example.com/");
         let mut imports = String::new();
         let mut sum = String::new();
         for i in 0..N {
@@ -4279,17 +4666,20 @@ mod tests {
                 sum.push('+');
             }
             sum.push_str(&format!("v{i}"));
-            env.preloaded.push((
+            env.cache.seed(
                 format!("https://example.com/m{i}.js"),
+                200,
+                String::from("text/javascript"),
                 format!("export const v = {i};").into_bytes(),
-            ));
+            );
         }
-        env.preloaded.push((
+        env.cache.seed(
             String::from("https://example.com/main.js"),
+            200,
+            String::from("text/javascript"),
             format!("{imports}document.getElementById('t').textContent = 'sum=' + ({sum});")
                 .into_bytes(),
-        ));
-        assert!(env.preloaded.len() > 24, "graph must exceed the old cap");
+        );
 
         let (out, outcome) = transform(
             "<body><div id=t></div>\

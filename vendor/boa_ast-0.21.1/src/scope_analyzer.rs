@@ -1186,6 +1186,15 @@ impl BindingCollectorVisitor<'_> {
         } else {
             Scope::new(self.scope.clone(), true)
         };
+        // Arrow functions do not bind their own `this`; mark the scope so that
+        // `escape_this_in_enclosing_function_scope` skips past it to the nearest
+        // enclosing function that actually binds `this`. Without this, a `this`
+        // referenced from a doubly-nested arrow escapes onto the intermediate
+        // arrow scope (a no-op, since arrows never materialize for `this`),
+        // leaving the real enclosing function un-materialized and `this` lost.
+        if arrow {
+            function_scope.mark_arrow();
+        }
 
         let function_scopes = function_declaration_instantiation(
             body,

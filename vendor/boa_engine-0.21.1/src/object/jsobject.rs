@@ -280,6 +280,27 @@ impl JsObject {
         None
     }
 
+    /// Non-panicking variant of [`downcast_mut`](Self::downcast_mut): returns
+    /// `None` if the object is not of type `T` **or** is currently borrowed,
+    /// instead of panicking on a borrow conflict.
+    ///
+    /// Intended for `Finalize` implementations, where a panic aborts the
+    /// garbage collector (and, here, the whole page). GC finalization order is
+    /// not guaranteed, so a value may still be borrowed when a guard pointing at
+    /// it is finalized.
+    #[must_use]
+    pub fn try_downcast_mut<T: NativeObject>(&self) -> Option<RefMut<'_, T>> {
+        if self.is::<T>() {
+            let obj = self.try_borrow_mut().ok()?;
+
+            // SAFETY: We have verified that the object is of type `T`, so we can safely cast it.
+            let obj = unsafe { GcRefMut::cast::<Object<T>>(obj) };
+
+            return Some(RefMut::map(obj, |c| c.data_mut()));
+        }
+        None
+    }
+
     /// Checks if this object is an instance of a certain `NativeObject`.
     ///
     /// # Panics
