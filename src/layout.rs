@@ -505,6 +505,73 @@ fn capitalize_words(s: &str) -> String {
     out
 }
 
+/// Render a list marker for `list-style-type` `kind` at counter `n`: a bullet
+/// glyph, a formatted ordinal (`N. `/`a. `/`i. `), or empty for `none`. Each
+/// ordinal carries its trailing `". "`; bullets a trailing space. Unknown
+/// types fall back to a disc, matching the UA default.
+fn format_list_marker(kind: &str, n: u32) -> String {
+    match kind {
+        "none" => String::new(),
+        "circle" => "◦ ".to_owned(),
+        "square" => "▪ ".to_owned(),
+        "decimal" => format!("{n}. "),
+        "decimal-leading-zero" => format!("{n:02}. "),
+        "lower-alpha" | "lower-latin" => format!("{}. ", alpha_marker(n, false)),
+        "upper-alpha" | "upper-latin" => format!("{}. ", alpha_marker(n, true)),
+        "lower-roman" => format!("{}. ", roman_marker(n, false)),
+        "upper-roman" => format!("{}. ", roman_marker(n, true)),
+        _ => "• ".to_owned(),
+    }
+}
+
+/// A bijective base-26 alphabetic ordinal: 1→a, 26→z, 27→aa, … (`0` keeps a
+/// literal `0`). Upper-cased when `upper`.
+fn alpha_marker(mut n: u32, upper: bool) -> String {
+    if n == 0 {
+        return "0".to_owned();
+    }
+    let mut buf = Vec::new();
+    while n > 0 {
+        n -= 1;
+        buf.push(b'a' + (n % 26) as u8);
+        n /= 26;
+    }
+    buf.reverse();
+    let s = String::from_utf8(buf).unwrap_or_default();
+    if upper { s.to_uppercase() } else { s }
+}
+
+/// A Roman-numeral ordinal (1→i, 4→iv, …); out of range (0 or >3999) falls
+/// back to the decimal number. Upper-cased when `upper`.
+fn roman_marker(mut n: u32, upper: bool) -> String {
+    if n == 0 || n > 3999 {
+        return n.to_string();
+    }
+    const VALS: &[(u32, &str)] = &[
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut s = String::new();
+    for &(v, sym) in VALS {
+        while n >= v {
+            s.push_str(sym);
+            n -= v;
+        }
+    }
+    if upper { s.to_uppercase() } else { s }
+}
+
 /// The active inline formatting context, threaded down the recursion.
 #[derive(Clone)]
 struct Ctx {
@@ -608,6 +675,10 @@ struct Layout<'a> {
     controls: &'a ControlMap,
     images: &'a ImageSizes,
     width: usize,
+    /// The full terminal width in cells — the CSS viewport for `vw` units,
+    /// kept distinct from `width` (which floats/centering narrow as blocks
+    /// nest).
+    viewport_w: usize,
     rows: Vec<Row>,
     /// The line currently being built.
     line: Vec<Item>,
@@ -639,8 +710,10 @@ struct Layout<'a> {
     /// inline image rides the line; `break_line` reserves `line_height-1`
     /// spacer rows beneath so the image's box doesn't overwrite later text.
     line_height: u16,
-    /// Open list counters: `None` = `<ul>`, `Some(n)` = `<ol>` next index.
-    list_stack: Vec<Option<u32>>,
+    /// Open lists' item counters (one per nesting level, next index). Every
+    /// level counts; whether the marker shows as a number, letter, roman
+    /// numeral, bullet, or nothing comes from each item's `list-style-type`.
+    list_stack: Vec<u32>,
     /// Horizontally-scrollable strips discovered during the pass.
     carousels: Vec<Carousel>,
     /// Author-supplied carousel/slideshow controls we replace with our own
@@ -669,6 +742,7 @@ impl<'a> Layout<'a> {
             controls,
             images,
             width,
+            viewport_w: width,
             rows: Vec::new(),
             line: Vec::new(),
             col: 0,
@@ -756,7 +830,12 @@ impl<'a> Layout<'a> {
             _ => {}
         }
 
-        // Build the child formatting context for inline elements.
+        // Build the child formatting context for inline elements. The inline
+        // `Ctx` carries only STRUCTURAL state (kind/link/node); the text
+        // styling — emphasis, decoration, transform — now comes straight from
+        // the cascade per element, not threaded by hand. `computed_value`
+        // inherits and applies the UA tag defaults (`<b>` bold, `<i>` italic),
+        // and `text_decoration` propagates `<u>`/`<s>` + author rules.
         let mut cctx = ctx.clone();
         match tag.as_str() {
             "a" => {
@@ -778,10 +857,6 @@ impl<'a> Layout<'a> {
                     cctx.node = id;
                 }
             }
-            "b" | "strong" => cctx.emph.bold = true,
-            "i" | "em" => cctx.emph.italic = true,
-            "u" | "ins" => cctx.emph.underline = true,
-            "s" | "strike" | "del" => cctx.emph.strike = true,
             "blockquote" => cctx.kind = ItemKind::Quote,
             "pre" => cctx.kind = ItemKind::Pre,
             _ => {
@@ -791,32 +866,25 @@ impl<'a> Layout<'a> {
             }
         }
 
-        // CSS font-weight/font-style override the tag defaults and can also
-        // turn emphasis OFF (e.g. `strong{font-weight:normal}`). Both
-        // inherit, which the threaded `cctx` already models.
-        if let Some(w) = self.dom.computed_style(id, "font-weight") {
-            cctx.emph.bold = css_is_bold(&w);
-        }
-        if let Some(s) = self.dom.computed_style(id, "font-style") {
-            cctx.emph.italic = css_is_italic(&s);
-        }
-        // text-decoration(-line) propagates to descendants. A value names
-        // its lines; `none` clears both. Honor the shorthand and longhand.
-        if let Some(d) = self
+        // font-weight / font-style: inherited, with UA defaults for the
+        // emphasis tags, resolved by the cascade. An author rule can turn
+        // emphasis OFF (`strong{font-weight:normal}`) by winning over the UA
+        // default. text-decoration propagates/accumulates across the subtree.
+        cctx.emph.bold = self
             .dom
-            .computed_style(id, "text-decoration-line")
-            .or_else(|| self.dom.computed_style(id, "text-decoration"))
-        {
-            apply_text_decoration(&mut cctx.emph, &d);
-        }
-        if let Some(t) = self
+            .computed_value(id, "font-weight")
+            .is_some_and(|w| css_is_bold(&w));
+        cctx.emph.italic = self
             .dom
-            .computed_style(id, "text-transform")
+            .computed_value(id, "font-style")
+            .is_some_and(|s| css_is_italic(&s));
+        (cctx.emph.underline, cctx.emph.strike) = self.dom.text_decoration(id);
+        cctx.transform = self
+            .dom
+            .computed_value(id, "text-transform")
             .as_deref()
             .and_then(TextTransform::from_css)
-        {
-            cctx.transform = t;
-        }
+            .unwrap_or(TextTransform::None);
 
         // Block vs inline is driven by the cascaded `display` (baked into
         // the serialized HTML by the engine, which has the sheets), with
@@ -865,7 +933,7 @@ impl<'a> Layout<'a> {
         if block_like
             && let Some(a) = self
                 .dom
-                .computed_style(id, "text-align")
+                .computed_value(id, "text-align")
                 .as_deref()
                 .and_then(Align::from_css)
         {
@@ -899,13 +967,14 @@ impl<'a> Layout<'a> {
         // white-space inherits: `<pre>` defaults to Pre, and CSS overrides
         // either (so `pre{white-space:pre-wrap}` or `white-space:nowrap` on
         // any element both work).
+        // white-space inherits and the `<pre>` UA default rides the cascade
+        // now (computed_value), so a single read covers `<pre>`,
+        // `pre{white-space:pre-wrap}`, and an inline `white-space:nowrap`
+        // alike. The field is still saved/restored to isolate siblings.
         let saved_ws = self.ws;
-        if tag == "pre" {
-            self.ws = WhiteSpace::Pre;
-        }
         if let Some(w) = self
             .dom
-            .computed_style(id, "white-space")
+            .computed_value(id, "white-space")
             .as_deref()
             .and_then(WhiteSpace::from_css)
         {
@@ -913,11 +982,17 @@ impl<'a> Layout<'a> {
         }
         let pushed_list = match tag.as_str() {
             "ul" => {
-                self.list_stack.push(None);
+                self.list_stack.push(1);
                 true
             }
             "ol" => {
-                self.list_stack.push(Some(1));
+                // `<ol start=N>` seeds the counter (default 1).
+                let start = self
+                    .dom
+                    .attr(id, "start")
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(1);
+                self.list_stack.push(start);
                 true
             }
             _ => false,
@@ -927,7 +1002,7 @@ impl<'a> Layout<'a> {
         // would strand it on a row of its own. Instead we indent the item's
         // content by the marker width and drop the marker into the gutter on
         // the item's first content row at block exit (`place_list_marker`).
-        let list_marker = (flow == Flow::ListItem).then(|| self.next_list_marker());
+        let list_marker = (flow == Flow::ListItem).then(|| self.next_list_marker(id));
         let marker_indent = list_marker.as_ref().map_or(0, |m| m.chars().count());
         if marker_indent > 0 {
             self.indent += marker_indent;
@@ -1219,7 +1294,7 @@ impl<'a> Layout<'a> {
     /// terminal has no horizontal scroll — her responsive default).
     fn flow_flex_row(&mut self, id: NodeId) {
         let avail = self.width.saturating_sub(self.indent).max(1);
-        let gap = 1usize;
+        let gap = self.flex_gap(id, avail, false);
         let mut nodes = Vec::new();
         let mut basis = Vec::new();
         let mut grow = Vec::new();
@@ -1288,8 +1363,14 @@ impl<'a> Layout<'a> {
                 widths[i] = floor[i] + share;
             }
         }
+        // `justify-content` distributes any leftover free space (when grow
+        // didn't consume it): a leading offset and/or extra spacing between
+        // items. No-op when the row is full (free == 0) or left-packed.
+        let used: usize = widths.iter().map(|w| (*w).max(1)).sum::<usize>() + gaps;
+        let free = avail.saturating_sub(used);
+        let (lead, between) = self.justify_offsets(id, free, n);
         let row_base = self.rows.len();
-        let mut x = 0usize;
+        let mut x = lead;
         for i in 0..n {
             let cw = widths[i].max(1);
             let mut b = self.layout_subtree(nodes[i], cw);
@@ -1302,10 +1383,60 @@ impl<'a> Layout<'a> {
             if b.height > 0 {
                 self.blit(&b, (self.indent + x) as u16, row_base);
             }
-            x += cw + if i + 1 < n { gap } else { 0 };
+            x += cw + if i + 1 < n { gap + between } else { 0 };
         }
         self.col = self.indent;
         self.pending_space = false;
+    }
+
+    /// `justify-content` main-axis distribution of `free` leftover cells across
+    /// `n` items: `(leading offset, extra spacing per inter-item gap)`. Packing
+    /// (`flex-start`/`normal`/unknown) and a full row leave both zero; grow
+    /// items having eaten the free space makes this moot.
+    fn justify_offsets(&self, id: NodeId, free: usize, n: usize) -> (usize, usize) {
+        if free == 0 {
+            return (0, 0);
+        }
+        match self
+            .dom
+            .computed_style(id, "justify-content")
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("flex-end" | "end" | "right") => (free, 0),
+            Some("center") => (free / 2, 0),
+            Some("space-between") if n > 1 => (0, free / (n - 1)),
+            Some("space-around") => (free / (2 * n), free / n),
+            Some("space-evenly") => (free / (n + 1), free / (n + 1)),
+            _ => (0, 0),
+        }
+    }
+
+    /// The flex/grid gap in cells along one axis: the `column-gap`/`row-gap`
+    /// longhand, else the matching part of the `gap` shorthand (`gap: <row>
+    /// [<col>]`, one value sets both), else the default — 1 cell between
+    /// columns (readability, so items never fuse) and 0 between rows/shelves.
+    fn flex_gap(&self, id: NodeId, avail: usize, row_axis: bool) -> usize {
+        let longhand = if row_axis { "row-gap" } else { "column-gap" };
+        if let Some(v) = self.dom.computed_style(id, longhand)
+            && let Some(c) = resolve_cells(&v, avail, self.viewport_w)
+        {
+            return c;
+        }
+        if let Some(g) = self.dom.computed_style(id, "gap") {
+            let toks: Vec<&str> = g.split_whitespace().collect();
+            let tok = if row_axis {
+                toks.first()
+            } else {
+                toks.get(1).or_else(|| toks.first())
+            };
+            if let Some(t) = tok
+                && let Some(c) = resolve_cells(t, avail, self.viewport_w)
+            {
+                return c;
+            }
+        }
+        usize::from(!row_axis)
     }
 
     /// The natural width (cells) of an element's subtree laid out at
@@ -1369,7 +1500,7 @@ impl<'a> Layout<'a> {
         let basis = match basis_css.as_deref().map(str::trim) {
             None | Some("auto") => self.len_or_pct(id, "width", avail),
             Some("content" | "max-content" | "min-content" | "fit-content") => None,
-            Some(v) => len_or_pct_value(v, avail),
+            Some(v) => resolve_cells(v, avail, self.viewport_w),
         };
         // `max-width` caps the basis; if there is no basis yet, an explicit
         // max-width still bounds an auto (content-sized) item via the caller.
@@ -1386,9 +1517,9 @@ impl<'a> Layout<'a> {
     }
 
     /// A `width`/`max-width`-style property as cells, resolving `%` against
-    /// `avail` (the flex row's content width).
+    /// `avail` (the flex row's content width) and `vw` against the viewport.
     fn len_or_pct(&self, id: NodeId, prop: &str, avail: usize) -> Option<usize> {
-        len_or_pct_value(&self.dom.computed_style(id, prop)?, avail)
+        resolve_cells(&self.dom.computed_style(id, prop)?, avail, self.viewport_w)
     }
 
     /// Whether a block is a horizontal-scroll container (a carousel): it
@@ -1906,7 +2037,8 @@ impl<'a> Layout<'a> {
     /// directly via `blit` and leaves the cursor back at the indent.
     fn flow_flex_wrap(&mut self, id: NodeId) {
         let avail = self.width.saturating_sub(self.indent).max(1);
-        let gap = 1usize; // approximate flex `gap`
+        let gap = self.flex_gap(id, avail, false);
+        let row_gap = self.flex_gap(id, avail, true);
         let mut shelf_top = self.rows.len();
         let mut x = 0usize; // used width of the current shelf (relative to indent)
         let mut shelf_height = 0usize;
@@ -1928,7 +2060,7 @@ impl<'a> Layout<'a> {
             // current one (but never wrap an empty shelf — an over-wide box
             // takes its own band, clamped to the available width).
             if x > 0 && x + gap + w > avail {
-                shelf_top += shelf_height;
+                shelf_top += shelf_height + row_gap;
                 x = 0;
                 shelf_height = 0;
             }
@@ -1943,10 +2075,13 @@ impl<'a> Layout<'a> {
     }
 
     /// A CSS length property in terminal cells (≈ 2 cells/em, 16px=1em),
-    /// or `None` when unset or in an unsupported unit (`%`/`auto`/…).
+    /// resolving `%`/`vw`/`calc()` against the current band width and the
+    /// viewport. `None` when unset (or `auto`/an unsupported unit). Clamped
+    /// to ≥1 cell.
     fn css_cells(&self, id: NodeId, prop: &str) -> Option<usize> {
         let v = self.dom.computed_style(id, prop)?;
-        css_length_em(&v).map(|em| (em * 2.0).round().max(1.0) as usize)
+        let avail = self.width.saturating_sub(self.indent).max(1);
+        resolve_cells_f32(&v, avail, self.viewport_w).map(|c| c.round().max(1.0) as usize)
     }
 
     /// Lay an element's subtree out as an independent box at `content_width`,
@@ -2372,17 +2507,27 @@ impl<'a> Layout<'a> {
         self.pending_space = true; // a widget gets a trailing gap
     }
 
-    /// The next list marker text: `N. ` inside an `<ol>` (advancing the
-    /// counter), `• ` inside a `<ul>` or a bare list item.
-    fn next_list_marker(&mut self) -> String {
-        match self.list_stack.last_mut() {
-            Some(Some(n)) => {
-                let m = format!("{n}. ");
-                *n += 1;
-                m
-            }
-            _ => "• ".to_owned(),
+    /// The marker text for a list item: the cascaded `list-style-type`
+    /// (inherited from the `<ul>`/`<ol>`, UA-defaulted by tag/depth) rendered
+    /// against the current level's counter — a bullet glyph, a formatted
+    /// number/letter/roman numeral, or nothing for `none`. `<li value=N>`
+    /// resets the counter; the counter always advances so a mixed list still
+    /// numbers correctly.
+    fn next_list_marker(&mut self, li: NodeId) -> String {
+        if let Some(v) = self
+            .dom
+            .attr(li, "value")
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            && let Some(c) = self.list_stack.last_mut()
+        {
+            *c = v;
         }
+        let counter = self.list_stack.last().copied().unwrap_or(1);
+        if let Some(c) = self.list_stack.last_mut() {
+            *c = c.saturating_add(1);
+        }
+        let kind = self.dom.computed_value(li, "list-style-type");
+        format_list_marker(kind.as_deref().unwrap_or("disc"), counter)
     }
 
     /// Place a deferred list marker in the gutter (`col`) on the item's
@@ -2645,24 +2790,6 @@ fn is_next_glyph(c: char) -> bool {
     matches!(c, '»' | '›' | '❯' | '▶' | '▷' | '→' | '⟩' | '⟫' | '🡢')
 }
 
-/// Fold a CSS `text-decoration`/`text-decoration-line` value into the
-/// emphasis flags. A value lists its lines (`underline`, `line-through`,
-/// possibly with a color/style that we ignore); `none` clears both.
-fn apply_text_decoration(emph: &mut Emphasis, value: &str) {
-    let v = value.to_ascii_lowercase();
-    if v.split_whitespace().any(|t| t == "none") {
-        emph.underline = false;
-        emph.strike = false;
-        return;
-    }
-    if v.contains("underline") {
-        emph.underline = true;
-    }
-    if v.contains("line-through") {
-        emph.strike = true;
-    }
-}
-
 /// A CSS `font-weight` value reads as bold (`bold`/`bolder`/≥600).
 fn css_is_bold(value: &str) -> bool {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -2680,9 +2807,11 @@ fn css_is_italic(value: &str) -> bool {
     )
 }
 
-/// A CSS length as an approximate em-equivalent (≈ one text cell). px
-/// uses 16px≈1em; unitless treated as px; unknown units (`%`/`auto`/
-/// `vh`/…) → `None` (ignored, never spaces).
+/// A context-free CSS length as an em-equivalent (≈ one em ≈ 2 text cells).
+/// `16px≈1em`, `12pt≈1em`, `1ch≈half an em` (one cell), unitless treated as
+/// px; the single place absolute units are understood. Context-dependent
+/// values (`%`/`vw`/`calc()`/`auto`) → `None` here — they go through
+/// `resolve_cells`, which knows the containing block and the viewport.
 fn css_length_em(value: &str) -> Option<f32> {
     let v = value.trim();
     let split = v
@@ -2693,21 +2822,75 @@ fn css_length_em(value: &str) -> Option<f32> {
         "em" | "rem" => Some(n),
         "px" | "" => Some(n / 16.0),
         "pt" => Some(n / 12.0),
+        // 1ch is the advance of "0" — a single cell in a monospace terminal,
+        // i.e. half our 2-cells-per-em density. The natural terminal unit.
+        "ch" => Some(n / 2.0),
         _ => None,
     }
 }
 
-/// A CSS length OR percentage as cells. `%` resolves against `avail` (the
-/// containing flex row's content width); other units go through
-/// `css_length_em` (≈ 2 cells/em). `None` for unsupported values
-/// (`auto`/`vh`/…).
-fn len_or_pct_value(value: &str, avail: usize) -> Option<usize> {
+/// A CSS horizontal length, percentage, `vw`, or `calc()` as a count of
+/// cells (f32, for `calc` arithmetic). `%` resolves against `avail` (the
+/// containing block's content width), `vw` against `viewport` (the full
+/// terminal width), absolute units via `css_length_em` (≈ 2 cells/em).
+/// `None` for `auto` and units we don't resolve here (`vh`/`vmin`/… need a
+/// viewport height the terminal layout doesn't carry). This is the single
+/// contextual length resolver.
+fn resolve_cells_f32(value: &str, avail: usize, viewport: usize) -> Option<f32> {
     let v = value.trim();
+    if let Some(inner) = v
+        .strip_prefix("calc(")
+        .or_else(|| v.strip_prefix("CALC("))
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        return resolve_calc(inner, avail, viewport);
+    }
     if let Some(p) = v.strip_suffix('%') {
         let pct: f32 = p.trim().parse().ok()?;
-        return Some(((pct / 100.0) * avail as f32).round().max(0.0) as usize);
+        return Some((pct / 100.0) * avail as f32);
     }
-    css_length_em(v).map(|em| (em * 2.0).round().max(0.0) as usize)
+    if let Some(n) = v
+        .strip_suffix("vw")
+        .and_then(|n| n.trim().parse::<f32>().ok())
+    {
+        return Some((n / 100.0) * viewport as f32);
+    }
+    css_length_em(v).map(|em| em * 2.0)
+}
+
+/// `resolve_cells_f32` rounded to whole cells (never negative).
+fn resolve_cells(value: &str, avail: usize, viewport: usize) -> Option<usize> {
+    resolve_cells_f32(value, avail, viewport).map(|c| c.round().max(0.0) as usize)
+}
+
+/// A `calc()` body as cells: a whitespace-delimited chain of `+`/`-` terms
+/// (CSS requires spaces around those operators), each a length/percentage/vw
+/// resolved by `resolve_cells_f32`. Returns `None` if any term is
+/// unresolvable or `*`/`/` (unsupported) appears — the caller then ignores
+/// the value, as it did before `calc` was understood at all.
+fn resolve_calc(body: &str, avail: usize, viewport: usize) -> Option<f32> {
+    let s = body.trim();
+    if s.contains('*') || s.contains('/') {
+        return None;
+    }
+    let mut total = 0.0f32;
+    let mut sign = 1.0f32;
+    let mut term_start = 0usize;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i + 3 <= s.len() {
+        let op = &s[i..i + 3];
+        if op == " + " || op == " - " {
+            total += sign * resolve_cells_f32(s[term_start..i].trim(), avail, viewport)?;
+            sign = if bytes[i + 1] == b'+' { 1.0 } else { -1.0 };
+            i += 3;
+            term_start = i;
+        } else {
+            i += 1;
+        }
+    }
+    total += sign * resolve_cells_f32(s[term_start..].trim(), avail, viewport)?;
+    Some(total)
 }
 
 /// Whether a vertical length is big enough to warrant a blank spacer row
@@ -2907,6 +3090,64 @@ mod tests {
     }
 
     #[test]
+    fn list_style_none_removes_markers() {
+        // The nav-menu idiom: a <ul> with list-style:none shows no bullets.
+        let rows = lay(
+            r#"<body><ul style="list-style:none"><li>Home</li><li>About</li></ul></body>"#,
+            40,
+        );
+        let all = texts(&rows).join("\n");
+        assert!(all.contains("Home") && all.contains("About"), "{all:?}");
+        assert!(
+            !all.contains('•'),
+            "no bullets with list-style:none: {all:?}"
+        );
+    }
+
+    #[test]
+    fn list_style_type_alpha_and_roman() {
+        let rows = lay(
+            r#"<body><ol style="list-style-type:lower-alpha"><li>x</li><li>y</li></ol></body>"#,
+            40,
+        );
+        let lines = texts(&rows);
+        assert!(lines.iter().any(|l| l.contains("a. x")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("b. y")), "{lines:?}");
+        let rows = lay(
+            r#"<body><ol style="list-style-type:lower-roman"><li>x</li><li>y</li><li>z</li></ol></body>"#,
+            40,
+        );
+        let lines = texts(&rows);
+        assert!(lines.iter().any(|l| l.contains("i. x")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("ii. y")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("iii. z")), "{lines:?}");
+    }
+
+    #[test]
+    fn nested_ul_markers_vary_by_depth() {
+        let rows = lay(
+            "<body><ul><li>a<ul><li>b<ul><li>c</li></ul></li></ul></li></ul></body>",
+            40,
+        );
+        let all = texts(&rows).join("\n");
+        assert!(all.contains("• a"), "depth 1 disc: {all:?}");
+        assert!(all.contains("◦ b"), "depth 2 circle: {all:?}");
+        assert!(all.contains("▪ c"), "depth 3 square: {all:?}");
+    }
+
+    #[test]
+    fn ol_start_and_li_value_set_the_counter() {
+        let rows = lay(
+            r#"<body><ol start="5"><li>five</li><li value="9">nine</li><li>ten</li></ol></body>"#,
+            40,
+        );
+        let lines = texts(&rows);
+        assert!(lines.iter().any(|l| l.contains("5. five")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("9. nine")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("10. ten")), "{lines:?}");
+    }
+
+    #[test]
     fn pre_preserves_whitespace_and_newlines() {
         let rows = lay("<body><pre>a   b\n  c</pre></body>", 80);
         let lines = texts(&rows);
@@ -3080,6 +3321,35 @@ mod tests {
         assert!(find(&rows, "eee").emph.bold);
         let plain = find(&rows, "a ");
         assert!(!plain.emph.bold && !plain.emph.italic);
+    }
+
+    #[test]
+    fn length_resolver_units_ch_vw_and_calc() {
+        // ch is the natural terminal unit (1ch = 1 cell); % is the
+        // containing block, vw the viewport; calc folds a +/- term chain.
+        assert_eq!(resolve_cells("10ch", 100, 80), Some(10), "1ch = 1 cell");
+        assert_eq!(resolve_cells("50%", 40, 80), Some(20), "% of avail");
+        assert_eq!(resolve_cells("50vw", 40, 80), Some(40), "vw of viewport");
+        assert_eq!(
+            resolve_cells("calc(100% - 4ch)", 40, 80),
+            Some(36),
+            "calc subtracts a ch length from a percentage"
+        );
+        assert_eq!(
+            resolve_cells("calc(50% + 2ch)", 40, 80),
+            Some(22),
+            "calc adds across unit kinds"
+        );
+        // Unsupported values are ignored (None), exactly as before.
+        assert_eq!(resolve_cells("auto", 40, 80), None);
+        assert_eq!(resolve_cells("12vh", 40, 80), None, "no viewport height");
+        assert_eq!(
+            resolve_cells("calc(100% * 2)", 40, 80),
+            None,
+            "no * / in calc"
+        );
+        // ch also flows through the absolute-unit path (indents).
+        assert_eq!(indent_cells(Some("3ch")), 3);
     }
 
     #[test]
@@ -3428,6 +3698,58 @@ mod tests {
         // three wrapped to a lower row, back at the left edge.
         assert!(r3 > r1, "third cell wrapped to a new shelf");
         assert_eq!(c3, 0);
+    }
+
+    #[test]
+    fn flex_column_gap_controls_spacing() {
+        // 5em (10-cell) boxes; an explicit 2em (4-cell) column-gap puts the
+        // second at 14 instead of the default-gap 11.
+        let rows = lay(
+            r#"<html><head><style>.r{display:flex;column-gap:2em}.c{width:5em}</style></head>
+               <body><div class="r"><div class="c">a</div><div class="c">b</div></div></body></html>"#,
+            40,
+        );
+        assert_eq!(pos_of(&rows, "a").1, 0);
+        assert_eq!(pos_of(&rows, "b").1, 14, "10-cell box + 4-cell gap");
+        // The `gap` shorthand's column component (2nd value) works too.
+        let rows = lay(
+            r#"<html><head><style>.r{display:flex;gap:1em 3em}.c{width:5em}</style></head>
+               <body><div class="r"><div class="c">a</div><div class="c">b</div></div></body></html>"#,
+            40,
+        );
+        assert_eq!(
+            pos_of(&rows, "b").1,
+            16,
+            "gap shorthand column = 3em = 6 cells"
+        );
+    }
+
+    #[test]
+    fn justify_content_distributes_free_space() {
+        // 3em (6-cell) boxes, default gap 1 → 13 used of 40, free 27.
+        let center = lay(
+            r#"<html><head><style>.r{display:flex;justify-content:center}.c{width:3em}</style></head>
+               <body><div class="r"><div class="c">a</div><div class="c">b</div></div></body></html>"#,
+            40,
+        );
+        assert_eq!(pos_of(&center, "a").1, 13, "centered: leading = free/2");
+        let end = lay(
+            r#"<html><head><style>.r{display:flex;justify-content:flex-end}.c{width:3em}</style></head>
+               <body><div class="r"><div class="c">a</div><div class="c">b</div></div></body></html>"#,
+            40,
+        );
+        assert_eq!(pos_of(&end, "a").1, 27, "flex-end: leading = free");
+        let between = lay(
+            r#"<html><head><style>.r{display:flex;justify-content:space-between}.c{width:3em}</style></head>
+               <body><div class="r"><div class="c">a</div><div class="c">b</div></div></body></html>"#,
+            40,
+        );
+        assert_eq!(pos_of(&between, "a").1, 0, "space-between: first at left");
+        assert_eq!(
+            pos_of(&between, "b").1,
+            34,
+            "space-between: second pushed right"
+        );
     }
 
     #[test]

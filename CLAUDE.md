@@ -219,8 +219,12 @@ SPA-routes in the TUI; jQuery 3.7 / D3 7.9 / Vue 3.5 (render-function)
 - **dom.rs** — the arena (`Vec<Node>` + `NodeId`; html5ever TreeSink
   builds straight into it; serializer back to HTML drops
   script/noscript/template/style). NOT rcdom in this path. Also owns
-  the selector engine, template-content cloning, and the
-  display/visibility mini-cascade (limits below).
+  the selector engine, template-content cloning, and the **CSS cascade**:
+  one `PROPS` registry (name/inherited/baked — the single source of truth),
+  `cascaded` (author-only winner, for `is_hidden`/baking) and
+  `computed_value` (the single inheritance authority — UA defaults +
+  registry-driven inheritance, memoized per epoch), plus `text_decoration`
+  (propagation/accumulation). See "CSS cascade" below.
 - **js.rs** — the syscall boundary and the **ONLY module allowed to
   import `boa_engine`** (keep it that way — it localizes the Boa surface
   to one file). **Boa IS the engine, not a placeholder.** It's the only
@@ -310,21 +314,69 @@ watch, not a roadmap item.
   is what fixed
   old.reddit (its `getLoIdData` reads the loid cookie unguarded).
   Process-global ⇒ tests must use unique hostnames (like the TOFU pins).
-- **CSS visibility (step 1)**: `is_hidden` is a real mini-cascade for
-  EXACTLY display + visibility. Winner per element/property =
-  lexicographic max of (!important, inline, specificity, source order);
-  `hidden` attr wins outright. Sources in cascade order: tree sheets
-  (`<style>` + fetched `<link>`) in composed document order, then
-  adoptedStyleSheets — SCOPED by tree root (document vs shadow
-  fragment). Selector engine: `:not(compound)`, attr operators
-  (`~= |= ^= $= *=`), per-Complex specificity, paren/quote-aware comma
-  splitting; querySelector shares it. `:hover`/`:focus`/unknown
-  pseudos parse but NEVER match (fail-open); an unparseable member
-  kills its whole rule (also fail-open). LIMITS: visibility treated
-  like display (subtree hides; no visible-child-of-hidden-parent);
-  sibling combinators `+`/`~` unparsed; `:host` ignored; no @-rules; no
-  getComputedStyle integration (still inline-backed, unset reads give
-  ""); rides the JS pipeline (`set js on` + script-bearing pages only).
+- **CSS cascade (generalized 2026-06-16)**: a real cascade, no longer
+  display/visibility-only. Per-property winner = lexicographic max of
+  (!important, inline, specificity, source order); `hidden` attr wins
+  outright. Sources in cascade order: tree sheets (`<style>` + fetched
+  `<link>`) in composed document order, then adoptedStyleSheets — SCOPED by
+  tree root (document vs shadow fragment). Selector engine: `:not(compound)`,
+  attr operators (`~= |= ^= $= *=`), per-Complex specificity,
+  paren/quote-aware comma splitting; querySelector shares it.
+  `:hover`/`:focus`/unknown pseudos parse but NEVER match (fail-open); an
+  unparseable member kills its whole rule (also fail-open).
+  - **The property surface is the `PROPS` registry** (one table; `is_tracked`
+    + the serializer bake-list derive from it). Adding a property = one row.
+  - **Inheritance is general**: `computed_value(id,prop)` is the SINGLE
+    authority — author cascade, else the UA default for the tag
+    (`ua_default`: `<b>/<strong>`→bold, `<i>/<em>`→italic, `<pre>`→pre,
+    `<ul>`→disc/circle/square by depth, `<ol>`→decimal or its `type` attr),
+    else (for `inherited` props) the parent's computed value. Memoized per
+    epoch (`computed_cache`). The layout reads font-weight/font-style/
+    white-space/text-align/text-transform/list-style-type through it; the old
+    `layout.rs` emphasis/ws THREADING IS GONE. `text_decoration(id)` is
+    separate (it PROPAGATES and accumulates `<u>`+`<s>`, `none` resets — not
+    inheritance). UA tag defaults that aren't inherited CSS (block/inline
+    display, `<a>`, heading sizing) stay in the layout/serializer.
+  - **`list-style-type` (Phase 2)**: inherited + baked; `list-style`
+    shorthand expands to it. The layout's `next_list_marker(li)` reads
+    `computed_value` and renders the marker — `none` (no marker), disc/circle/
+    square glyphs, or a formatted counter (`format_list_marker` +
+    `alpha_marker`/`roman_marker`: decimal/decimal-leading-zero/lower|upper-
+    alpha/lower|upper-roman). `list_stack` is now `Vec<u32>` (every level
+    counts); `<ol start>` seeds it, `<li value>` resets it.
+    `list-style-position`/`-image` not done.
+  - **`gap`/`column-gap`/`row-gap` + `justify-content` (Phase 2)**: tracked
+    (baked, not inherited). `flex_gap(id, avail, row_axis)` resolves the
+    longhand or the `gap` shorthand component (defaults: 1 cell between
+    columns for readability, 0 between rows/shelves) — used by `flow_flex_row`
+    and `flow_flex_wrap` (row-gap spaces shelves). `justify_offsets` does
+    `justify-content` main-axis distribution in `flow_flex_row` (flex-end/
+    center/space-between/around/evenly) when grow didn't eat the free space;
+    grid `justify-content` and `align-items` (~N/A in our 1-row item model)
+    not done.
+  - **getComputedStyle is cascade-backed**: `__dom_computed` → `computed_value`
+    (read-only proxy; inline fallback). NOT inline-only anymore.
+  - **Lengths**: `css_length_em` is the one context-free unit parser
+    (em/rem/px/pt + `ch`=1 cell); `resolve_cells`/`resolve_calc` the one
+    contextual resolver (`%` vs containing block, `vw` vs `viewport_w`,
+    `calc()`-lite = `+`/`-` chain; `*`/`/`→ignored). `vh`/`vmin`/`vmax`
+    DEFERRED (layout carries no viewport height).
+  - **`@media` (Phase 1.5, shipped)**: `parse_sheet` evaluates `@media`
+    against `Dom.viewport_px` (set by `execute_js` from `PageEnv` =
+    `cols*cell_px`) and splices matching rule bodies into the cascade.
+    Supports min/max-width, width, min/max-height, height, orientation,
+    `screen`/`all`/`print` type, `and`/comma/`not`/`only`; px + em(16px)
+    lengths. Conservative: an unknown feature, or a width/height test with an
+    unknown viewport (`0`), DOESN'T match (drops the body, == the old skip).
+    **JS-pipeline only** (the serializer drops `<style>`, so it's evaluated
+    once at load + baked; a resize crossing a breakpoint needs a reload — her
+    call). `@media` in JS-off pages / `min-resolution` / `prefers-*` not
+    evaluated.
+  - LIMITS: visibility treated like display (subtree hides; no
+    visible-child-of-hidden-parent); sibling combinators `+`/`~` unparsed;
+    `:host` ignored; other @-rules skipped; NO color (her call — cyberpunk
+    consistency stays); rides the JS pipeline (`set js on` + script-bearing
+    pages only).
 - **Intl**: prelude shim (Boa's `intl_bundled` measured and rejected —
   +11MB ICU, ~2x binary, and HALF-BUILT: `DateTimeFormat().format`
   throws and `DisplayNames` isn't a constructor, both used by
@@ -649,7 +701,9 @@ page to last-good static + the `· JS:n!` badge.
   mutations — dirty-bit, serialized, idempotent-write-free); both
   serializers honor the DOM's visibility primitives (`hidden` attr,
   inline display:none / visibility:hidden via `Dom::is_hidden`).
-  getComputedStyle returns the inline-backed style.
+  getComputedStyle is now CASCADE-backed (`__dom_computed` →
+  `computed_value`: inheritance + UA defaults for tracked props, inline
+  fallback), read-only — see "CSS cascade".
 
 ### Shipped in this session (2026-06-14)
 
@@ -742,6 +796,36 @@ option "remotely enabled" whenever we merely accept a DO, so its table
 lies.
 
 ## What's next
+
+### Shipped 2026-06-16 (CSS engine generalization — Phase 1, 4 steps)
+Audit-first plan (she approved): generalize the cascade so adding CSS "just
+works" instead of nibbling edges. **NO COLOR** (her call — cyberpunk
+consistency stays; color/background OFF). **Ratatui is the renderer** for any
+future visible prop (Style/Modifier/box-drawing, not bare terminal). All
+UNCOMMITTED (she commits), fmt/clippy-0, 237 tests, release-smoked in tmux.
+1. **One property registry** (`PROPS`, dom.rs): `TRACKED`/`BAKE_PROPS`/
+   `is_tracked` collapsed into one `name`/`inherited`/`baked` table.
+2. **Full inheritance unification** (she chose this over foundation-only): UA
+   defaults moved INTO the cascade (`ua_default`); `computed_value` is the
+   single inheritance authority (memoized `computed_cache`); `text_decoration`
+   models propagation/accumulation. The `layout.rs` emphasis/white-space
+   THREADING IS DELETED — layout reads the cascade. 7 gopherus + all layout
+   tests stayed green.
+3. **getComputedStyle cascade-backed**: `__dom_computed` syscall →
+   `computed_value` (read-only proxy, inline fallback). Was inline-only.
+4. **Unified length resolver** (layout.rs): `css_length_em` (one unit parser,
+   +`ch`) + `resolve_cells`/`resolve_calc` (one contextual resolver: `%`,
+   `vw` vs `viewport_w`, `calc()`-lite). `vh`/`vmin`/`vmax` deferred.
+See the "CSS cascade" section above and the trust-project-status memory.
+**Phase 1.5 = `@media` ALSO SHIPPED** (same day): `parse_sheet` evaluates
+`@media` vs `Dom.viewport_px` (JS-pipeline only, baked at load) — details in
+the "CSS cascade" section. **Phase 2 IN PROGRESS**: `list-style-type` SHIPPED
+(de-bullets nav `list-style:none`, alpha/roman/decimal, depth-varying nested
+disc/circle/square, `<ol type|start>`/`<li value>`); **`gap`/`column-gap`/
+`row-gap` + `justify-content` SHIPPED** (flex/grid spacing + main-axis
+distribution) — both in "CSS cascade". NEXT Phase 2: border→box-drawing
+(ratatui — the showpiece, its own design beat), text-indent. SKIP bucket (visual-only): gradients, box-shadow,
+border-radius, filters, transforms, z-index.
 
 ### Shipped 2026-06-15 (later — the Boa fork: 4 engine fixes)
 We FORKED Boa (her call: "no half-steps — improve the engine itself, not
