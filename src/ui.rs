@@ -2,10 +2,10 @@
 //! gopher browser panel when one is open.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
 use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, BrowserView, Encoding, Mode};
@@ -92,6 +92,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
 
+    // An open <select> dropdown overlays everything in the panel.
+    render_select_menu(frame, app, inner);
+
     frame.render_widget(
         input_box(app, input_area.width.saturating_sub(2)),
         input_area,
@@ -121,6 +124,84 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
         frame.render_widget(Paragraph::new(Span::styled(glyph, style)), area);
     }
+}
+
+/// Draw the open `<select>` dropdown as a bordered popup anchored to its
+/// field, the highlighted option inverted. Records the drawn rect (and keeps
+/// the option scroll in sync with the highlight) for the mouse hit-test.
+fn render_select_menu(frame: &mut Frame, app: &mut App, inner: Rect) {
+    let Some(menu) = &app.select_menu else {
+        app.last_select_rect = None;
+        return;
+    };
+    let browser_scroll = app.browser.as_ref().map_or(0, |g| g.scroll);
+    let n = menu.options.len();
+    // Width = widest label (clamped), plus the border; height = the visible
+    // option rows (capped), plus the border.
+    let label_w = menu
+        .options
+        .iter()
+        .map(|(l, _)| l.chars().count())
+        .max()
+        .unwrap_or(4);
+    let body_w = label_w
+        .clamp(6, (inner.width.saturating_sub(2)).max(6) as usize)
+        .min(40);
+    let w = (body_w + 2) as u16;
+    let vis = n.clamp(1, 12);
+    let h = (vis + 2) as u16;
+    // Keep the highlight inside the visible window.
+    let scroll = if menu.highlight < menu.scroll {
+        menu.highlight
+    } else if menu.highlight >= menu.scroll + vis {
+        menu.highlight + 1 - vis
+    } else {
+        menu.scroll
+    };
+    // Anchor under the field; flip above if it would overflow the panel.
+    let field_y = inner.y as isize + menu.anchor_row as isize - browser_scroll as isize;
+    let mut y = field_y + 1;
+    if y + h as isize > inner.bottom() as isize {
+        y = field_y - h as isize;
+    }
+    let y = y.clamp(
+        inner.y as isize,
+        (inner.bottom() as isize - h as isize).max(inner.y as isize),
+    ) as u16;
+    let max_x = inner.right().saturating_sub(w).max(inner.x);
+    let x = inner.x.saturating_add(menu.anchor_col).min(max_x);
+    let rect = Rect::new(x, y, w.min(inner.width), h.min(inner.height));
+
+    let lines: Vec<Line> = menu
+        .options
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(vis)
+        .map(|(i, (label, _))| {
+            let mut text: String = label.chars().take(body_w).collect();
+            while text.chars().count() < body_w {
+                text.push(' ');
+            }
+            let style = if i == menu.highlight {
+                Style::new().fg(theme::BG).bg(theme::NEON_CYAN)
+            } else {
+                Style::new().fg(theme::TEXT)
+            };
+            Line::styled(text, style)
+        })
+        .collect();
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme::NEON_PINK))
+        .style(Style::new().bg(theme::BG));
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
+
+    if let Some(m) = app.select_menu.as_mut() {
+        m.scroll = scroll;
+    }
+    app.last_select_rect = Some(rect);
 }
 
 /// The visible slice of a document, gopherus-style: the cursor line is
@@ -161,6 +242,8 @@ fn browser_lines(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
         .collect()
 }
 
+use crate::layout::visible_col;
+
 /// Render an HTTP laid-out doc: each visible row is a sequence of
 /// positioned item spans, padded to each item's start column. The
 /// selected `(row, item)` is highlighted.
@@ -172,17 +255,27 @@ fn browser_rows(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
         .sel_item
         .and_then(|(r, i)| g.doc.rows.get(r).and_then(|row| row.items.get(i)))
         .map(|it| it.node);
+    let carousels = &g.doc.carousels;
     let end = (g.scroll + height).min(g.doc.rows.len());
     g.doc.rows[g.scroll..end]
         .iter()
         .enumerate()
         .map(|(off, row)| {
             let row_idx = g.scroll + off;
-            let mut spans: Vec<Span> = Vec::with_capacity(row.items.len() * 2);
+            // Items with their on-screen column (carousel offset/clip
+            // applied), ordered left to right so gap-fill stays correct.
+            let mut placed: Vec<(u16, usize, &crate::layout::Item)> = row
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| Some((visible_col(carousels, row_idx, item)?, i, item)))
+                .collect();
+            placed.sort_by_key(|(c, _, _)| *c);
+            let mut spans: Vec<Span> = Vec::with_capacity(placed.len() * 2);
             let mut col = 0u16;
-            for (i, item) in row.items.iter().enumerate() {
-                if item.col > col {
-                    spans.push(Span::raw(" ".repeat((item.col - col) as usize)));
+            for (scol, i, item) in placed {
+                if scol > col {
+                    spans.push(Span::raw(" ".repeat((scol - col) as usize)));
                 }
                 let mut style = match item.kind {
                     ItemKind::Link => Style::new().fg(theme::NEON_CYAN),
@@ -199,6 +292,18 @@ fn browser_rows(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
                     ItemKind::Image => Style::new().fg(theme::DIM).add_modifier(Modifier::ITALIC),
                     ItemKind::Text => Style::new().fg(theme::TEXT),
                 };
+                // A generated carousel scroll control greys out when it can't
+                // page that way (the spec's `:disabled` end state).
+                if let Some(crate::doc::Link::CarouselScroll(dir)) = &item.link {
+                    let active = carousels
+                        .iter()
+                        .filter(|c| c.end > row_idx)
+                        .min_by_key(|c| c.start.abs_diff(row_idx))
+                        .is_some_and(|c| c.can_scroll(i32::from(*dir)));
+                    if !active {
+                        style = Style::new().fg(theme::DIM);
+                    }
+                }
                 // Emphasis is orthogonal to kind: a link or heading can
                 // also carry bold/italic/underline/strike from tags or CSS.
                 if item.emph.bold {
@@ -225,7 +330,7 @@ fn browser_rows(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
                     style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 }
                 spans.push(Span::styled(item.text.as_str(), style));
-                col = item.col + item.width;
+                col = scol + item.width;
             }
             Line::from(spans)
         })
@@ -245,18 +350,25 @@ fn render_inline_images(
     protocols: &std::collections::HashMap<(String, u16, u16), ratatui_image::protocol::Protocol>,
 ) {
     let (vw, vh) = (inner.width, inner.height);
+    let carousels = &g.doc.carousels;
     let end = (g.scroll + vh as usize).min(g.doc.rows.len());
     for (r, row) in g.doc.rows[g.scroll..end].iter().enumerate() {
         let top = r as u16;
         for item in &row.items {
             let Some(url) = &item.image else { continue };
-            if item.col + item.width > vw || top + item.height > vh {
+            // Carousel offset/clip: a strip image scrolled out of its band
+            // (or only partly in it) doesn't draw — snapping keeps whole
+            // cards, so it's never cut.
+            let Some(scol) = visible_col(carousels, g.scroll + r, item) else {
+                continue;
+            };
+            if scol + item.width > vw || top + item.height > vh {
                 continue;
             }
             let key = (url.clone(), item.width, item.height);
             if let Some(proto) = protocols.get(&key) {
                 let area = ratatui::layout::Rect::new(
-                    inner.x + item.col,
+                    inner.x + scol,
                     inner.y + top,
                     item.width,
                     item.height,
@@ -279,8 +391,9 @@ fn protocol_badge(g: &BrowserView) -> &'static str {
             crate::oneshot::Scheme::Dict => " DICT ",
         },
         Link::JsClick { .. } => " WWW ",
-        // Form controls never appear as a document's own URL.
-        Link::Form { .. } => " WWW ",
+        // Form controls and carousel buttons never appear as a document's
+        // own URL.
+        Link::Form { .. } | Link::CarouselScroll(_) => " WWW ",
         Link::External(_) => " NET ",
     }
 }

@@ -225,6 +225,25 @@ pub struct BrowserView {
     history: Vec<(Doc, ViewPos, usize)>,
 }
 
+/// An open `<select>` dropdown overlay. It anchors to the field's document
+/// position and lists the options for ↑↓/click selection — the real-browser
+/// dropdown, replacing the old Enter-cycles-one-option behavior.
+pub struct SelectMenu {
+    /// The `(form, field)` the chosen value is written back to.
+    pub form: usize,
+    pub field: usize,
+    /// `(label, value)` options, in document order.
+    pub options: Vec<(String, String)>,
+    /// The highlighted option (committed on Enter/click).
+    pub highlight: usize,
+    /// First option row shown — kept in sync with `highlight` by the
+    /// renderer, and read by the mouse hit-test.
+    pub scroll: usize,
+    /// The field's document row/column, to place the popup beside it.
+    pub anchor_row: usize,
+    pub anchor_col: u16,
+}
+
 /// A saved selection across history pops — whichever model the doc used.
 #[derive(Clone, Copy, Default)]
 struct ViewPos {
@@ -400,6 +419,12 @@ pub struct App {
     /// A capsule that answered status 60: the prompt is asking for a
     /// name to mint a client identity under.
     pub(crate) cert_for: Option<GeminiUrl>,
+    /// An open `<select>` dropdown, modal over the browser: it captures
+    /// keys/mouse until the user picks an option or cancels.
+    pub(crate) select_menu: Option<SelectMenu>,
+    /// The popup's last drawn screen rect (set by the renderer) so a mouse
+    /// click can hit-test against the option rows.
+    pub(crate) last_select_rect: Option<ratatui::layout::Rect>,
     /// A fetch just failed (or came back empty): the status bar shows
     /// the message even while a link is selected, until the next key.
     pub(crate) notice: bool,
@@ -464,6 +489,8 @@ impl App {
             enc_rx,
             search_target: None,
             cert_for: None,
+            select_menu: None,
+            last_select_rect: None,
             notice: false,
             conn: None,
             events: None,
@@ -490,6 +517,13 @@ impl App {
         let mut input = EventStream::new();
         let mut pending_wrap_target: Option<(usize, bool)> = None;
         let mut wrap_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        // Tracks the `<select>` dropdown across frames. A sixel image is one
+        // escape sequence anchored at its top-left cell; a popup covering the
+        // middle of an image leaves that anchor cell unchanged, so ratatui's
+        // cell diff never re-emits the sequence when the popup closes. Force a
+        // full repaint on close (only when images are present) so the pixels
+        // behind the dropdown come back.
+        let mut menu_was_open = false;
         // The run loop only redraws on events; this ticker animates the
         // loading pulse while a fetch is pending (and is disabled, via
         // the select guard, the rest of the time).
@@ -504,6 +538,11 @@ impl App {
         }
 
         while !self.quit {
+            let menu_open = self.select_menu.is_some();
+            if menu_was_open && !menu_open && !self.image_protocols.is_empty() {
+                terminal.clear()?;
+            }
+            menu_was_open = menu_open;
             terminal.draw(|frame| ui::draw(frame, &mut self))?;
             self.sync_vt_size().await;
             match self.pending_browser_wrap_target() {
@@ -587,6 +626,12 @@ impl App {
         if self.viewer.is_some() {
             return; // nothing to scroll in the image viewer
         }
+        // An open <select> dropdown grabs the mouse: wheel scrolls the
+        // options, a click inside picks one, a click outside cancels.
+        if self.select_menu.is_some() {
+            self.select_menu_mouse(mouse);
+            return;
+        }
         // 3 lines per wheel click, matching terminal convention.
         match (mouse.kind, self.browser.is_some()) {
             (MouseEventKind::ScrollUp, false) => self.scroll_by(3),
@@ -632,6 +677,7 @@ impl App {
                 Mode::Command => Mode::Session,
             };
             self.cert_for = None;
+            self.select_menu = None;
             return;
         }
 
@@ -646,6 +692,13 @@ impl App {
                 self.viewer = None;
                 self.status = String::from("Image closed.");
             }
+            return;
+        }
+
+        // An open <select> dropdown is modal over the browser: it captures
+        // keys until the user picks an option or cancels.
+        if self.mode == Mode::Session && self.select_menu.is_some() {
+            self.select_menu_nav(key);
             return;
         }
 
@@ -1216,6 +1269,9 @@ impl App {
                 Link::JsClick { .. } => {
                     Err(String::from("page-script links need their living page"))
                 }
+                Link::CarouselScroll(_) => Err(String::from(
+                    "carousel controls scroll in place, not fetched",
+                )),
             };
             let _ = tx.send(FetchMsg { target, result }).await;
         });
@@ -1420,9 +1476,18 @@ impl App {
             let top = r as u16; // viewport-relative row of this line
             for item in &row.items {
                 let Some(url) = &item.image else { continue };
+                // Apply the carousel scroll/clip exactly as the renderer does
+                // (`visible_col`): a strip image scrolled into the band needs
+                // encoding now, one scrolled out doesn't. Without this the
+                // encode keyed on the raw strip column, so cards beyond the
+                // first viewport's worth stayed blank once scrolled in.
+                let Some(scol) = crate::layout::visible_col(&g.doc.carousels, g.scroll + r, item)
+                else {
+                    continue;
+                };
                 // Only fully-visible boxes render (stateless Image refuses
                 // to clip sixel); skip the rest until scrolled into view.
-                if item.col + item.width > vw || top + item.height > vh {
+                if scol + item.width > vw || top + item.height > vh {
                     continue;
                 }
                 let key = (url.clone(), item.width, item.height);
@@ -1958,6 +2023,10 @@ impl App {
         match key.code {
             KeyCode::Up => self.http_move(-1, false),
             KeyCode::Down => self.http_move(1, false),
+            // In a carousel, ←/→ scroll the strip a card at a time; elsewhere
+            // they move the selection laterally.
+            KeyCode::Left if self.scroll_selected_carousel(-1) => {}
+            KeyCode::Right if self.scroll_selected_carousel(1) => {}
             KeyCode::Left => self.http_move(-1, true),
             KeyCode::Right => self.http_move(1, true),
             KeyCode::PageUp => self.http_scroll(-page),
@@ -1974,6 +2043,75 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// If the selection sits in a horizontal carousel, scroll it one card
+    /// (`dir` ±1) and re-anchor the selection to the first card now visible.
+    /// Returns whether a carousel handled the key.
+    fn scroll_selected_carousel(&mut self, dir: i32) -> bool {
+        let Some(g) = self.browser.as_mut() else {
+            return false;
+        };
+        let Some((row, _)) = g.sel_item else {
+            return false;
+        };
+        let Some(idx) = g.doc.carousels.iter().position(|c| c.contains_row(row)) else {
+            return false;
+        };
+        g.doc.carousels[idx].scroll_cards(dir);
+        // Re-anchor onto the first interactive card now in the band, so the
+        // highlight stays visible and Enter follows something on screen.
+        let c = &g.doc.carousels[idx];
+        let (start, end, left) = (c.start, c.end, c.left);
+        let target = (start..end).find_map(|r| {
+            g.doc
+                .rows
+                .get(r)?
+                .items
+                .iter()
+                .enumerate()
+                .find_map(|(i, it)| {
+                    (it.link.is_some() && it.col >= left && c.shows(it.col, it.width))
+                        .then_some((r, i))
+                })
+        });
+        if let Some(sel) = target {
+            g.sel_item = Some(sel);
+        }
+        true
+    }
+
+    /// If the activated item is a generated carousel scroll control (the
+    /// `‹`/`›` glyphs), page the nearest carousel in its direction instead of
+    /// navigating. The selection stays on the control so repeated Enter/clicks
+    /// keep paging, like a real scroll button. Returns whether it handled it.
+    fn activate_carousel_control(&mut self) -> bool {
+        let Some(g) = self.browser.as_mut() else {
+            return false;
+        };
+        let Some((row, idx)) = g.sel_item else {
+            return false;
+        };
+        let dir = match g.doc.rows.get(row).and_then(|r| r.items.get(idx)) {
+            Some(it) => match it.link {
+                Some(crate::doc::Link::CarouselScroll(d)) => i32::from(d),
+                _ => return false,
+            },
+            None => return false,
+        };
+        // The control sits just above its band; page the nearest carousel
+        // whose band starts at or below the control's row.
+        let Some(c) = g
+            .doc
+            .carousels
+            .iter_mut()
+            .filter(|c| c.end > row)
+            .min_by_key(|c| c.start.abs_diff(row))
+        else {
+            return false;
+        };
+        c.scroll_page(dir);
+        true
     }
 
     /// Interactive item indices on a row (followable links; form controls
@@ -2251,6 +2389,7 @@ impl App {
             }
             Link::OneShot(url) => oneshot::parse(&url, raw, width),
             Link::Form { .. } | Link::JsClick { .. } | Link::External(_) => return,
+            Link::CarouselScroll(_) => return,
         };
         if g.doc.laid_out() {
             // Re-flow at the new width re-laid the rows; re-anchor the
@@ -2362,6 +2501,12 @@ impl App {
     }
 
     fn browser_follow(&mut self) {
+        // A carousel's own prev/next button scrolls the strip rather than
+        // navigating — its JS click can't reach our parse-time layout, so we
+        // page the band ourselves (the CSS `::scroll-button` behavior).
+        if self.activate_carousel_control() {
+            return;
+        }
         // Auto-route recognized video links (YouTube and its various
         // formats) straight to mpv, in EVERY view — people post these on
         // gopher and gemini too, and following one should play it, not try
@@ -2395,6 +2540,8 @@ impl App {
             Link::External(target) => {
                 self.status = format!("external link: {target}");
             }
+            // Handled by `activate_carousel_control` before this match.
+            Link::CarouselScroll(_) => {}
         }
     }
 
@@ -2540,27 +2687,163 @@ impl App {
                 }
                 self.refresh_forms();
             }
-            FieldKind::Select(options) => {
-                let current = options.iter().position(|(_, v)| *v == value).unwrap_or(0);
-                let next = options[(current + 1) % options.len()].1.clone();
-                if let Some(node) = live_node
-                    && self.dispatch_live_form_set(
-                        node,
-                        next.clone(),
-                        None,
-                        format!("· {name} changed by page script"),
-                    )
-                {
-                    return;
-                }
-                if let Some(g) = &mut self.browser {
-                    g.doc.forms[form].fields[field].value = next;
-                }
-                self.refresh_forms();
-            }
+            FieldKind::Select(options) => self.open_select_menu(form, field, options, &value),
             FieldKind::Submit => self.submit_form(form, field),
             FieldKind::Hidden => {}
         }
+    }
+
+    /// Open the dropdown overlay for a `<select>`, highlighting its current
+    /// value and anchoring to the field's position on the page.
+    fn open_select_menu(
+        &mut self,
+        form: usize,
+        field: usize,
+        options: Vec<(String, String)>,
+        value: &str,
+    ) {
+        if options.is_empty() {
+            return;
+        }
+        let highlight = options.iter().position(|(_, v)| v == value).unwrap_or(0);
+        let (anchor_row, anchor_col) = self.browser.as_ref().map_or((0, 0), |g| match g.sel_item {
+            Some((r, i)) => (
+                r,
+                g.doc
+                    .rows
+                    .get(r)
+                    .and_then(|row| row.items.get(i))
+                    .map_or(0, |it| it.col),
+            ),
+            None => (g.scroll, 0),
+        });
+        self.select_menu = Some(SelectMenu {
+            form,
+            field,
+            options,
+            highlight,
+            scroll: 0,
+            anchor_row,
+            anchor_col,
+        });
+        self.status = String::from("Select — ↑↓ choose · Enter set · Esc cancel");
+    }
+
+    /// Keys while a `<select>` dropdown is open.
+    fn select_menu_nav(&mut self, key: KeyEvent) {
+        let Some(menu) = self.select_menu.as_mut() else {
+            return;
+        };
+        let last = menu.options.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up => menu.highlight = menu.highlight.saturating_sub(1),
+            KeyCode::Down => menu.highlight = (menu.highlight + 1).min(last),
+            KeyCode::Home => menu.highlight = 0,
+            KeyCode::End => menu.highlight = last,
+            KeyCode::PageUp => menu.highlight = menu.highlight.saturating_sub(10),
+            KeyCode::PageDown => menu.highlight = (menu.highlight + 10).min(last),
+            KeyCode::Enter => self.commit_select_highlight(),
+            KeyCode::Esc => {
+                self.select_menu = None;
+                self.status = String::from("Select cancelled.");
+            }
+            _ => {}
+        }
+    }
+
+    /// The dropdown option index under a screen point, if it lands on the
+    /// open menu's option rows (the rect interior, minus its border).
+    fn select_option_at(&self, col: u16, row: u16) -> Option<usize> {
+        let menu = self.select_menu.as_ref()?;
+        let r = self.last_select_rect?;
+        let inside = col > r.x
+            && col < r.right().saturating_sub(1)
+            && row > r.y
+            && row < r.bottom().saturating_sub(1);
+        let idx = menu.scroll + (row.saturating_sub(r.y + 1)) as usize;
+        (inside && idx < menu.options.len()).then_some(idx)
+    }
+
+    /// Mouse while a `<select>` dropdown is open: wheel and hover move the
+    /// highlight, a click picks the option under the cursor (or cancels if
+    /// outside the popup).
+    fn select_menu_mouse(&mut self, mouse: MouseEvent) {
+        let Some(last) = self
+            .select_menu
+            .as_ref()
+            .map(|m| m.options.len().saturating_sub(1))
+        else {
+            return;
+        };
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if let Some(m) = self.select_menu.as_mut() {
+                    m.highlight = m.highlight.saturating_sub(1);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(m) = self.select_menu.as_mut() {
+                    m.highlight = (m.highlight + 1).min(last);
+                }
+            }
+            MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left) => {
+                // Hover follows the cursor (no commit).
+                if let Some(idx) = self.select_option_at(mouse.column, mouse.row)
+                    && let Some(m) = self.select_menu.as_mut()
+                {
+                    m.highlight = idx;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                match self.select_option_at(mouse.column, mouse.row) {
+                    Some(idx) => {
+                        if let Some(m) = self.select_menu.as_mut() {
+                            m.highlight = idx;
+                        }
+                        self.commit_select_highlight();
+                    }
+                    None => {
+                        self.select_menu = None;
+                        self.status = String::from("Select cancelled.");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Commit the highlighted option and close the dropdown.
+    fn commit_select_highlight(&mut self) {
+        let Some(menu) = self.select_menu.take() else {
+            return;
+        };
+        let value = menu.options[menu.highlight].1.clone();
+        self.commit_select(menu.form, menu.field, value);
+    }
+
+    /// Write a chosen `<select>` value back: a living page sees a real
+    /// `change`; otherwise the static field updates and re-renders.
+    fn commit_select(&mut self, form: usize, field: usize, value: String) {
+        let (name, live_node) = self
+            .browser
+            .as_ref()
+            .and_then(|g| g.doc.forms.get(form))
+            .and_then(|f| f.fields.get(field))
+            .map_or((String::new(), None), |f| (f.name.clone(), f.live_node));
+        if let Some(node) = live_node
+            && self.dispatch_live_form_set(
+                node,
+                value.clone(),
+                None,
+                format!("· {name} changed by page script"),
+            )
+        {
+            return;
+        }
+        if let Some(g) = &mut self.browser {
+            g.doc.forms[form].fields[field].value = value;
+        }
+        self.refresh_forms();
     }
 
     /// Fire a form: a living page sees a real submit event first. If page
@@ -3196,6 +3479,7 @@ mod tests {
             forms: Vec::new(),
             rows: Vec::new(),
             image_urls: Vec::new(),
+            carousels: Vec::new(),
         }
     }
 
@@ -3813,7 +4097,7 @@ mod tests {
                 .rows
                 .iter()
                 .flat_map(|r| &r.items)
-                .any(|it| it.text.contains("[msg: hello there]")),
+                .any(|it| it.text.contains("[hello there]")),
             "widget item shows the value"
         );
 
@@ -4286,6 +4570,7 @@ mod tests {
 
     #[test]
     fn form_selects_cycle_and_checkboxes_toggle() {
+        use crossterm::event::{KeyCode, KeyEvent};
         let html = r#"
             <form action="/s">
               <select name="region">
@@ -4317,16 +4602,77 @@ mod tests {
                 .any(|it| it.text.contains(needle))
         };
 
-        app.form_interact(0, 0); // cycle the select
-        let forms = &app.browser.as_ref().unwrap().doc.forms;
-        assert_eq!(forms[0].fields[0].value, "us");
-        assert!(has_widget(&app, "[region: United States ▾]"));
+        // Activating a <select> opens the dropdown, highlighting the
+        // current value; it doesn't change anything until a pick.
+        app.form_interact(0, 0);
+        let menu = app.select_menu.as_ref().expect("dropdown open");
+        assert_eq!(menu.options.len(), 2);
+        assert_eq!(menu.highlight, 0, "starts on the current value");
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.forms[0].fields[0].value,
+            "all"
+        );
+        // Arrow down to "United States" and pick it.
+        app.select_menu_nav(KeyEvent::from(KeyCode::Down));
+        app.select_menu_nav(KeyEvent::from(KeyCode::Enter));
+        assert!(app.select_menu.is_none(), "dropdown closes on pick");
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.forms[0].fields[0].value,
+            "us"
+        );
+        assert!(has_widget(&app, "[United States ▾]"));
+
+        // Esc cancels without changing the value.
+        app.form_interact(0, 0);
+        app.select_menu_nav(KeyEvent::from(KeyCode::Down));
+        app.select_menu_nav(KeyEvent::from(KeyCode::Esc));
+        assert!(app.select_menu.is_none());
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.forms[0].fields[0].value,
+            "us"
+        );
 
         app.form_interact(0, 1); // toggle the box
         assert!(app.browser.as_ref().unwrap().doc.forms[0].fields[1].checked);
         assert!(has_widget(&app, "[x] safe"));
         let g = app.browser.as_ref().unwrap();
-        // The cycled select survived the toggle's re-render (seeding).
+        // The chosen select survived the toggle's re-render (seeding).
         assert_eq!(g.doc.forms[0].fields[0].value, "us");
+    }
+
+    #[test]
+    fn select_menu_hover_moves_highlight() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let mut app = super::App::new(None, 23);
+        app.select_menu = Some(super::SelectMenu {
+            form: 0,
+            field: 0,
+            options: vec![
+                ("A".into(), "a".into()),
+                ("B".into(), "b".into()),
+                ("C".into(), "c".into()),
+            ],
+            highlight: 0,
+            scroll: 0,
+            anchor_row: 0,
+            anchor_col: 0,
+        });
+        // A 10×5 popup at (5,2): border on the edges, options on rows 3,4,5.
+        app.last_select_rect = Some(ratatui::layout::Rect::new(5, 2, 10, 5));
+        let moved = |col, row| MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        // Hovering an option row moves the highlight to it.
+        app.select_menu_mouse(moved(8, 4));
+        assert_eq!(app.select_menu.as_ref().unwrap().highlight, 1);
+        app.select_menu_mouse(moved(8, 5));
+        assert_eq!(app.select_menu.as_ref().unwrap().highlight, 2);
+        // Hovering off the popup leaves the highlight (and the menu) alone.
+        app.select_menu_mouse(moved(8, 30));
+        assert!(app.select_menu.is_some());
+        assert_eq!(app.select_menu.as_ref().unwrap().highlight, 2);
     }
 }

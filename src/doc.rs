@@ -32,6 +32,10 @@ pub enum Link {
     },
     /// A scheme we don't speak (mailto, irc, ...) — shown, not followed.
     External(String),
+    /// A generated carousel scroll control (the CSS `::scroll-button`
+    /// model): activating it pages the nearest carousel by `dir` (−1 toward
+    /// the start, +1 toward the end) rather than navigating.
+    CarouselScroll(i8),
 }
 
 impl fmt::Display for Link {
@@ -45,6 +49,8 @@ impl fmt::Display for Link {
             Link::JsClick { href, .. } if !href.is_empty() => f.write_str(href),
             Link::JsClick { .. } => f.write_str("page script"),
             Link::External(url) => f.write_str(url),
+            Link::CarouselScroll(dir) if *dir < 0 => f.write_str("scroll back"),
+            Link::CarouselScroll(_) => f.write_str("scroll forward"),
         }
     }
 }
@@ -92,7 +98,13 @@ pub struct Field {
 }
 
 impl Field {
-    /// The widget row the browser shows for this control.
+    /// The widget row the browser shows for this control. Editable and
+    /// select widgets lead with the value/placeholder (like a real browser),
+    /// not the form field's `name` — the `name` is internal, redundant with
+    /// the visible `<label>` we render, and verbose enough (e.g.
+    /// `search[category_id]`) to push a row of fields onto separate lines.
+    /// It survives only as a last-resort identifier when nothing else names
+    /// the control.
     pub fn row_label(&self) -> String {
         let name = if self.name.is_empty() {
             self.label.as_str()
@@ -110,6 +122,7 @@ impl Field {
                 format!("[ {label} ]")
             }
             FieldKind::Checkbox => {
+                // The name is this control's visible label here.
                 format!("[{}] {name}", if self.checked { "x" } else { " " })
             }
             FieldKind::Radio => {
@@ -125,18 +138,20 @@ impl Field {
                     .iter()
                     .find(|(_, value)| *value == self.value)
                     .map_or(self.value.as_str(), |(label, _)| label.as_str());
-                format!("[{name}: {shown} ▾]")
+                format!("[{shown} ▾]")
             }
-            FieldKind::Password => {
-                format!("[{name}: {}]", "•".repeat(self.value.chars().count()))
-            }
+            FieldKind::Password if self.value.is_empty() => format!("[{name}]"),
+            FieldKind::Password => format!("[{}]", "•".repeat(self.value.chars().count())),
             FieldKind::Text | FieldKind::Textarea => {
-                let shown = if self.value.is_empty() {
+                // Value, else the placeholder (carried in `label`), else name.
+                let shown = if !self.value.is_empty() {
+                    self.value.as_str()
+                } else if !self.label.is_empty() {
                     self.label.as_str()
                 } else {
-                    self.value.as_str()
+                    name
                 };
-                format!("[{name}: {shown}]")
+                format!("[{shown}]")
             }
         }
     }
@@ -251,6 +266,9 @@ pub struct Doc {
     /// document order. The app's decode pipeline fetches these; once
     /// decoded, a re-layout turns the alt-text placeholders into pixels.
     pub image_urls: Vec<String>,
+    /// Horizontally-scrollable strips (carousels) in `rows`, with their
+    /// scroll offset. Empty except for HTML pages that have one.
+    pub carousels: Vec<crate::layout::Carousel>,
 }
 
 impl Doc {
@@ -360,11 +378,11 @@ mod tests {
     fn renders_field_widgets() {
         assert_eq!(
             field("msg", "", FieldKind::Text).row_label(),
-            "[msg: ]",
-            "empty value, no placeholder"
+            "[msg]",
+            "empty value, no placeholder falls back to the name"
         );
         let mut f = field("pw", "secret", FieldKind::Password);
-        assert_eq!(f.row_label(), "[pw: ••••••]");
+        assert_eq!(f.row_label(), "[••••••]");
         f = field("box", "", FieldKind::Checkbox);
         assert_eq!(f.row_label(), "[ ] box");
         f.checked = true;

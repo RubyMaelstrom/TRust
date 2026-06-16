@@ -891,6 +891,7 @@ pub fn parse_seeded(
         .to_ascii_lowercase();
     let mut forms = Vec::new();
     let mut rows = Vec::new();
+    let mut carousels = Vec::new();
     let mut image_urls = Vec::new();
     let lines = if media.is_empty() || media == "text/html" || media == "application/xhtml+xml" {
         let html = decode_body(content_type, body);
@@ -903,7 +904,10 @@ pub fn parse_seeded(
         let (found, controls) = extract_forms_arena(&dom, url, seed);
         forms = found;
         image_urls = collect_image_urls(&dom, url);
-        rows = crate::layout::lay_out(&dom, url, width, &forms, &controls, images);
+        let (laid, found_carousels) =
+            crate::layout::lay_out_with_carousels(&dom, url, width, &forms, &controls, images);
+        rows = laid;
+        carousels = found_carousels;
         Vec::new()
     } else if media.starts_with("text/") {
         crate::doc::wrap_plain(&decode_body(content_type, body), width)
@@ -924,6 +928,7 @@ pub fn parse_seeded(
         forms,
         rows,
         image_urls,
+        carousels,
     }
 }
 
@@ -2370,7 +2375,7 @@ customElements.define('lit-counter', LitCounter);
         // The hidden field never renders; the others are selectable Form
         // items with the right control links.
         assert!(!has_item(&doc, "cafe123"));
-        let input = item(&doc, "[msg: Type a message...]");
+        let input = item(&doc, "[Type a message...]");
         assert_eq!(input.kind, crate::layout::ItemKind::Form);
         assert_eq!(input.link, Some(Link::Form { form: 0, field: 1 }));
         let button = item(&doc, "[ Send ]");
@@ -2401,7 +2406,7 @@ customElements.define('lit-counter', LitCounter);
         );
         assert_eq!(rewrapped.forms[0].fields[1].value, "hello there");
         assert!(
-            has_item(&rewrapped, "[msg: hello there]"),
+            has_item(&rewrapped, "[hello there]"),
             "widget item shows the typed value"
         );
     }
@@ -2433,7 +2438,7 @@ customElements.define('lit-counter', LitCounter);
         assert_eq!(form.fields[1].value, "all");
         // Each control is a Form item showing its widget label (adjacent
         // inline widgets may carry a trailing separator space).
-        assert!(has_item(&doc, "[region: Everywhere ▾]"));
+        assert!(has_item(&doc, "[Everywhere ▾]"));
         assert!(has_item(&doc, "[x] safe"));
         assert!(has_item(&doc, "[ Search ]"));
     }
