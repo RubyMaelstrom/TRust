@@ -116,6 +116,144 @@ pub struct Row {
     pub items: Vec<Item>,
 }
 
+/// A horizontally-scrollable strip (an `overflow-x` container whose content
+/// is wider than the viewport — a carousel). Its items live in `Doc.rows`
+/// spanning rows `[start, end)`, laid at their full strip columns offset by
+/// `left`; the view shows the window `[offset, offset + width)` clipped to
+/// the on-screen band `[left, right)`, snapping `offset` to `stops` (the
+/// left column of each card) so a card or image is never cut at the edge.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Carousel {
+    pub start: usize,
+    pub end: usize,
+    /// On-screen band the strip is clipped to (cells).
+    pub left: u16,
+    pub right: u16,
+    /// Full strip width in cells (the scrollable extent).
+    pub width: u16,
+    /// Left column (strip coords) of each card — the snap stops.
+    pub stops: Vec<u16>,
+    /// Current scroll position: a strip column shown at the band's left.
+    pub offset: u16,
+}
+
+impl Carousel {
+    /// The band's visible width in cells.
+    pub fn view_width(&self) -> u16 {
+        self.right.saturating_sub(self.left)
+    }
+
+    /// Whether a doc row index falls inside this strip.
+    pub fn contains_row(&self, row: usize) -> bool {
+        row >= self.start && row < self.end
+    }
+
+    /// Whether a strip item at absolute column `col` (width `w`) is fully
+    /// inside the band at the current scroll offset (so it's drawn).
+    pub fn shows(&self, col: u16, w: u16) -> bool {
+        col.checked_sub(self.offset)
+            .is_some_and(|rc| rc >= self.left && rc + w <= self.right)
+    }
+
+    /// Advance the scroll by one card (`dir` ±1), snapping `offset` to a
+    /// card's left edge and never scrolling past the last card.
+    pub fn scroll_cards(&mut self, dir: i32) {
+        let view = self.view_width();
+        // The furthest offset worth scrolling to: the first stop from which
+        // the strip's tail already fits the band.
+        let need = self.width.saturating_sub(view);
+        let max_stop = self
+            .stops
+            .iter()
+            .copied()
+            .find(|&s| s >= need)
+            .unwrap_or_else(|| self.stops.last().copied().unwrap_or(0));
+        if dir > 0 {
+            if let Some(&next) = self
+                .stops
+                .iter()
+                .find(|&&s| s > self.offset && s <= max_stop)
+            {
+                self.offset = next;
+            }
+        } else if let Some(&prev) = self.stops.iter().rev().find(|&&s| s < self.offset) {
+            self.offset = prev;
+        }
+    }
+
+    /// The furthest offset worth scrolling to: the first card stop from
+    /// which the strip's tail already fills the band.
+    fn max_stop(&self) -> u16 {
+        let need = self.width.saturating_sub(self.view_width());
+        self.stops
+            .iter()
+            .copied()
+            .find(|&s| s >= need)
+            .unwrap_or_else(|| self.stops.last().copied().unwrap_or(0))
+    }
+
+    /// Whether the strip can still page in `dir` (±1) — drives the
+    /// `:disabled`/greyed state of a generated scroll control at the ends.
+    pub fn can_scroll(&self, dir: i32) -> bool {
+        if dir > 0 {
+            self.offset < self.max_stop()
+        } else {
+            self.offset > 0
+        }
+    }
+
+    /// Page the strip by ~one visible width (`dir` ±1), snapping to a card
+    /// edge and clamping at the ends — what a prev/next button does in the
+    /// CSS carousel model (a `::scroll-button` scrolls by a page, then the
+    /// scroll-snap pulls to the nearest item). Falls back to one card when a
+    /// whole page would make no progress (a card wider than the band).
+    pub fn scroll_page(&mut self, dir: i32) {
+        let view = self.view_width();
+        let max_stop = self.max_stop();
+        if dir > 0 {
+            let target = self.offset.saturating_add(view).min(max_stop);
+            self.offset = self
+                .stops
+                .iter()
+                .rev()
+                .find(|&&s| s > self.offset && s <= target)
+                .or_else(|| {
+                    self.stops
+                        .iter()
+                        .find(|&&s| s > self.offset && s <= max_stop)
+                })
+                .copied()
+                .unwrap_or(self.offset);
+        } else {
+            let target = self.offset.saturating_sub(view);
+            self.offset = self
+                .stops
+                .iter()
+                .find(|&&s| s < self.offset && s >= target)
+                .or_else(|| self.stops.iter().rev().find(|&&s| s < self.offset))
+                .copied()
+                .unwrap_or(0);
+        }
+    }
+}
+
+/// The on-screen column for an item in doc row `row`, applying any carousel
+/// scroll offset and clipping. `None` means the item is scrolled out of its
+/// carousel's band (don't draw it). Items left of a carousel's band (a
+/// sidebar beside it) and items in non-carousel rows pass through unchanged.
+/// Shared by the renderer AND the image-encode pass so they agree on which
+/// items are visible — a strip image scrolled into the band must be encoded,
+/// one scrolled out must not (the encode pass keying on the raw strip column
+/// is why later cards rendered blank after scrolling).
+pub fn visible_col(carousels: &[Carousel], row: usize, item: &Item) -> Option<u16> {
+    for c in carousels {
+        if c.contains_row(row) && item.col >= c.left {
+            return c.shows(item.col, item.width).then(|| item.col - c.offset);
+        }
+    }
+    Some(item.col)
+}
+
 /// An element subtree laid out as an independent box, positioned relative
 /// to its own top-left. `width` is the widest used column and `height` is
 /// `rows.len()`. `blit` places it into a parent at a `(col, row)` offset —
@@ -124,6 +262,10 @@ struct LaidBox {
     rows: Vec<Row>,
     width: u16,
     height: u16,
+    /// Carousels found inside this box (relative to its top-left); `blit`
+    /// translates and propagates them so a carousel inside a float/flex
+    /// column still reaches the document.
+    carousels: Vec<Carousel>,
 }
 
 /// Reconstruct a row's plain text, honoring item start columns (gaps
@@ -147,6 +289,7 @@ pub fn render_row(row: &Row) -> String {
 /// Lay an HTML document out into rows of items at the given content
 /// width. `base` resolves anchor hrefs to `Link`s; `forms`/`controls`
 /// (from `http::extract_forms_arena`) make form controls selectable.
+#[cfg(test)]
 pub fn lay_out(
     dom: &Dom,
     base: &Url,
@@ -155,6 +298,21 @@ pub fn lay_out(
     controls: &ControlMap,
     images: &ImageSizes,
 ) -> Vec<Row> {
+    lay_out_with_carousels(dom, base, width, forms, controls, images).0
+}
+
+/// Lay a document out, also returning the horizontally-scrollable strips
+/// (carousels) found so the view can clip/scroll them. The strips' items
+/// are already in the returned rows; the `Carousel`s are the scroll
+/// metadata keyed to those rows.
+pub fn lay_out_with_carousels(
+    dom: &Dom,
+    base: &Url,
+    width: usize,
+    forms: &[Form],
+    controls: &ControlMap,
+    images: &ImageSizes,
+) -> (Vec<Row>, Vec<Carousel>) {
     let mut layout = Layout::new(dom, base, width.max(10), forms, controls, images);
     let root = body_or_document(dom);
     let ctx = Ctx::root();
@@ -483,6 +641,16 @@ struct Layout<'a> {
     line_height: u16,
     /// Open list counters: `None` = `<ul>`, `Some(n)` = `<ol>` next index.
     list_stack: Vec<Option<u32>>,
+    /// Horizontally-scrollable strips discovered during the pass.
+    carousels: Vec<Carousel>,
+    /// Author-supplied carousel/slideshow controls we replace with our own
+    /// generated glyphs — skipped when flowed (their markup may come AFTER
+    /// the strip, so removing already-laid items isn't enough).
+    suppressed_controls: std::collections::HashSet<NodeId>,
+    /// This pass is measuring an element's intrinsic width (a flex basis),
+    /// not placing it — so `text-align` offsets are ignored (they don't
+    /// change content width) and the result is the natural left-packed extent.
+    measuring: bool,
 }
 
 impl<'a> Layout<'a> {
@@ -514,6 +682,9 @@ impl<'a> Layout<'a> {
             ws: WhiteSpace::Normal,
             line_height: 1,
             list_stack: Vec::new(),
+            carousels: Vec::new(),
+            suppressed_controls: std::collections::HashSet::new(),
+            measuring: false,
         }
     }
 
@@ -532,7 +703,10 @@ impl<'a> Layout<'a> {
         let Some(tag) = self.dom.tag_name(id).map(str::to_owned) else {
             return;
         };
-        if SKIP.contains(&tag.as_str()) || self.dom.is_hidden(id) {
+        if SKIP.contains(&tag.as_str())
+            || self.dom.is_hidden(id)
+            || self.suppressed_controls.contains(&id)
+        {
             return;
         }
         // A floated element leaves normal flow: pin it to an edge and let the
@@ -545,9 +719,22 @@ impl<'a> Layout<'a> {
             self.flow_float(id, side);
             return;
         }
+        // A slide deck (a container whose children are ALL absolutely
+        // positioned, so they overlap) renders one slide at a time, paged by
+        // generated controls — a carousel of stacked slides. Checked before
+        // the tag dispatch so an inline `<a>` wrapping the slides still routes.
+        if self.dom.is_slideshow_container(id) {
+            self.flow_slideshow(id);
+            return;
+        }
         match tag.as_str() {
             "br" => {
-                self.break_line();
+                // A <br> right after an out-of-flow overlay is spurious in our
+                // flow (the overlay's siblings are absolutely positioned, not
+                // stacked) — skip it so overlay controls stay on one line.
+                if !self.prev_sibling_out_of_flow(id) {
+                    self.break_line();
+                }
                 return;
             }
             "hr" => {
@@ -645,6 +832,10 @@ impl<'a> Layout<'a> {
         // as a 2D grid, a row one as side-by-side columns, a column one as
         // stacked block-level items. Everything else flows normally.
         let flex = if block_like { self.flex_mode(id) } else { None };
+        // A horizontal-scroll container (an `overflow-x` box with content
+        // wider than the viewport — a carousel) lays its content as one wide
+        // strip, clipped to the band and scrolled by the view.
+        let hscroll = block_like && flex.is_none() && self.is_hscroll(id);
         if block_like {
             self.flush_block();
             // CSS `clear` drops this block below the floats it clears.
@@ -653,6 +844,20 @@ impl<'a> Layout<'a> {
                 self.push_blank();
             }
         }
+        // A block that establishes a block formatting context (the classic
+        // `overflow:hidden` clearfix, or `display:flow-root`) CONTAINS its
+        // descendant floats: they size the box and never leak out to
+        // following siblings. We model this by stashing the outer floats so
+        // only the floats this subtree creates are in scope, then flushing
+        // them within the block at exit. Without it a wide float (e.g. a
+        // page's main column) leaks past its wrapper and the footer renders
+        // on top of it. (A carousel lays its own contained strip, so it
+        // doesn't take this path.)
+        let saved_floats = if block_like && flex.is_none() && !hscroll && self.establishes_bfc(id) {
+            Some(std::mem::take(&mut self.floats))
+        } else {
+            None
+        };
 
         // text-align inherits; a block that sets it changes alignment for
         // its own lines and its descendants until they override it.
@@ -673,6 +878,17 @@ impl<'a> Layout<'a> {
             0
         };
         self.indent += indent_add;
+        // A block with an explicit `width`/`max-width` AND horizontal
+        // `margin:auto` constrains its content to that width and positions it
+        // (centered for `margin:0 auto`, the common centered-content wrapper —
+        // e.g. the SL Marketplace's `width:1082px;margin:0 auto` page box).
+        // Narrows the band and shifts it; restored at block exit.
+        let saved_width = self.width;
+        let center_pad = if block_like {
+            self.constrain_block_width(id)
+        } else {
+            0
+        };
         // At a block boundary the line is empty; reset to the (new) band
         // left (indent narrowed by any active floats). Inline elements
         // don't touch it.
@@ -706,22 +922,45 @@ impl<'a> Layout<'a> {
             }
             _ => false,
         };
-        if flow == Flow::ListItem {
-            self.emit_list_marker();
+        // The list marker is deferred: a block-level child (a flex row, a
+        // nested `<div>`) flushes the line, so emitting the marker up front
+        // would strand it on a row of its own. Instead we indent the item's
+        // content by the marker width and drop the marker into the gutter on
+        // the item's first content row at block exit (`place_list_marker`).
+        let list_marker = (flow == Flow::ListItem).then(|| self.next_list_marker());
+        let marker_indent = list_marker.as_ref().map_or(0, |m| m.chars().count());
+        if marker_indent > 0 {
+            self.indent += marker_indent;
+            self.begin_line();
         }
+        let marker_start_row = self.rows.len();
 
         // CSS `::before` generated content opens the element's content.
         if let Some(t) = self.pseudo_text(id, crate::dom::PseudoEl::Before) {
             self.place_text(&t, &cctx);
         }
 
-        match flex {
-            Some(FlexMode::Grid) => self.flow_flex_wrap(id),
-            Some(FlexMode::Row) => self.flow_flex_row(id),
-            Some(FlexMode::Column) => self.stack_flex_items(id),
-            None => {
-                for child in self.dom.children(id) {
-                    self.flow_node(child, &cctx);
+        // An icon-only link (its only content is an `<svg>` we don't
+        // rasterize, leaving the anchor empty and so invisible/unselectable)
+        // surfaces its accessible name as text — e.g. a logo `<a>` wrapping
+        // an SVG renders "Second Life Marketplace".
+        if cctx.link.is_some()
+            && let Some(label) = self.icon_only_label(id)
+        {
+            self.place_text(&label, &cctx);
+        }
+
+        if hscroll {
+            self.flow_hscroll(id);
+        } else {
+            match flex {
+                Some(FlexMode::Grid) => self.flow_flex_wrap(id),
+                Some(FlexMode::Row) => self.flow_flex_row(id),
+                Some(FlexMode::Column) => self.stack_flex_items(id),
+                None => {
+                    for child in self.dom.children(id) {
+                        self.flow_node(child, &cctx);
+                    }
                 }
             }
         }
@@ -745,6 +984,16 @@ impl<'a> Layout<'a> {
 
         if block_like {
             self.flush_block();
+            // Flush this BFC's own floats within it (sizing the box to
+            // contain them), then restore the outer float context.
+            if let Some(outer) = saved_floats {
+                self.finish_floats();
+                self.floats = outer;
+            }
+            if let Some(marker) = list_marker {
+                let gutter = self.indent.saturating_sub(marker_indent);
+                self.place_list_marker(&marker, marker_start_row, gutter);
+            }
             if self.gap_after(id, &tag) {
                 self.push_blank();
             }
@@ -754,6 +1003,9 @@ impl<'a> Layout<'a> {
         if pushed_list {
             self.list_stack.pop();
         }
+        self.indent -= center_pad;
+        self.width = saved_width;
+        self.indent -= marker_indent;
         self.indent -= indent_add;
         if block_like {
             self.begin_line();
@@ -781,14 +1033,60 @@ impl<'a> Layout<'a> {
         let ml = self.dom.computed_style(id, "margin-left");
         let pl = self.dom.computed_style(id, "padding-left");
         if ml.is_some() || pl.is_some() {
-            let cols = indent_cells(ml.as_deref()) + indent_cells(pl.as_deref());
-            cols.min(self.width / 4)
+            let avail = self.width.saturating_sub(self.indent);
+            // A fixed-width block whose width alone meets/exceeds the space it
+            // sits in has no room for a left margin beside it — that margin is
+            // a desktop centering gutter (`margin:0 auto` resolved to px for a
+            // wide reported viewport). Drop it at terminal width; padding,
+            // which is *inside* the box, still applies.
+            let centering_gutter = self
+                .css_cells(id, "width")
+                .or_else(|| self.css_cells(id, "max-width"))
+                .is_some_and(|w| w >= avail);
+            let margin = if centering_gutter {
+                0
+            } else {
+                indent_cells(ml.as_deref())
+            };
+            (margin + indent_cells(pl.as_deref())).min(self.width / 4)
         } else {
             match tag {
                 "ul" | "ol" | "blockquote" | "dd" => 2,
                 _ => 0,
             }
         }
+    }
+
+    /// Constrain a block to its explicit `width`/`max-width` when it carries
+    /// horizontal `margin:auto`, and shift its band to position it (centered
+    /// for both-auto, right for left-auto). Mutates `indent`/`width`; returns
+    /// the left pad added (restored at block exit). 0 = left unconstrained.
+    /// Only acts on auto-margin blocks (a deliberate "center/position me"
+    /// signal) so a bare pixel width never cramps content we'd flow wide.
+    fn constrain_block_width(&mut self, id: NodeId) -> usize {
+        let avail = self.width.saturating_sub(self.indent).max(1);
+        let Some(w) = self
+            .css_cells(id, "width")
+            .or_else(|| self.css_cells(id, "max-width"))
+        else {
+            return 0;
+        };
+        let w = w.min(avail);
+        if w >= avail {
+            return 0; // no room to spare → nothing to position
+        }
+        let ml_auto = self.dom.computed_style(id, "margin-left").as_deref() == Some("auto");
+        let mr_auto = self.dom.computed_style(id, "margin-right").as_deref() == Some("auto");
+        let extra = avail - w;
+        let pad = match (ml_auto, mr_auto) {
+            (true, true) => extra / 2, // margin:0 auto → centered
+            (true, false) => extra,    // margin-left:auto → right-aligned
+            (false, true) => 0,        // margin-right:auto → left-aligned
+            (false, false) => return 0,
+        };
+        self.indent += pad;
+        self.width = self.indent + w;
+        pad
     }
 
     /// Whether a block opens with a blank spacer row: CSS top
@@ -817,6 +1115,16 @@ impl<'a> Layout<'a> {
     /// How an element flows, from its cascaded `display` (falling back to
     /// the HTML tag default when no rule sets it).
     fn flow_of(&self, id: NodeId, tag: &str) -> Flow {
+        if self.dom.computed_display(id).as_deref() == Some("none") {
+            return Flow::None;
+        }
+        // We can't place `position:absolute`/`fixed` boxes at coordinates, so
+        // we render them in normal flow — but as INLINE, not block. An overlay
+        // (slideshow arrows/dots, a badge, a "new" ribbon) then collapses to a
+        // compact run instead of each control claiming its own block line.
+        if self.is_out_of_flow(id) {
+            return Flow::Inline;
+        }
         if let Some(d) = self.dom.computed_display(id) {
             return match d.as_str() {
                 "none" => Flow::None,
@@ -834,6 +1142,34 @@ impl<'a> Layout<'a> {
         } else {
             Flow::Inline
         }
+    }
+
+    /// Whether an element is taken out of normal flow by `position:absolute`
+    /// or `fixed` (an overlay we render compactly inline, since we can't
+    /// position it).
+    fn is_out_of_flow(&self, id: NodeId) -> bool {
+        matches!(
+            self.dom.computed_style(id, "position").as_deref(),
+            Some("absolute" | "fixed")
+        )
+    }
+
+    /// Whether a node's nearest preceding element sibling is out of flow — so
+    /// a `<br>` that merely trails an overlay control is spurious and can be
+    /// dropped (keeping the overlay's controls on one line).
+    fn prev_sibling_out_of_flow(&self, id: NodeId) -> bool {
+        let Some(parent) = self.dom.parent_composed(id) else {
+            return false;
+        };
+        let sibs = self.dom.children(parent);
+        let Some(pos) = sibs.iter().position(|&s| s == id) else {
+            return false;
+        };
+        sibs[..pos]
+            .iter()
+            .rev()
+            .find(|&&s| self.dom.tag_name(s).is_some())
+            .is_some_and(|&s| self.is_out_of_flow(s))
     }
 
     /// How a flex container lays out, or `None` if it isn't one. A wrapping
@@ -873,64 +1209,435 @@ impl<'a> Layout<'a> {
         })
     }
 
-    /// Lay a non-wrapping flex-row out as side-by-side columns. Each child
-    /// box gets its explicit `width`/`max-width` (capped to what's
-    /// available), and the children without one share the remaining width
-    /// equally (an approximation of `flex-grow`). A flexible child with no
-    /// renderable content collapses to nothing (a flex item with no basis,
-    /// content, or grow takes zero width — without this an empty trailing
-    /// `<span>` would steal a column's worth of width and render blank). The
-    /// container's height is the tallest column. If the columns can't fit —
-    /// fixed widths overflow, or a flexible column would fall below
-    /// `MIN_COL` — it falls back to stacking them vertically (the
-    /// responsive default).
+    /// Lay a non-wrapping flex-row out as side-by-side columns using the CSS
+    /// flexbox main-axis algorithm: each item gets a *basis* (`flex-basis`,
+    /// else `width`, resolving `%` against the row; else its content width),
+    /// then free space is handed to `flex-grow` items and overflow is absorbed
+    /// by `flex-shrink` items (down to their min-content width; `flex-shrink:0`
+    /// holds firm). An empty, non-growing item collapses to nothing. If the
+    /// row can't fit even at every item's minimum, it stacks vertically (the
+    /// terminal has no horizontal scroll — her responsive default).
     fn flow_flex_row(&mut self, id: NodeId) {
         let avail = self.width.saturating_sub(self.indent).max(1);
-        // Each kept column with its fixed width (`Some`) or flexible (`None`);
-        // empty flexible children are dropped here so they take no space.
-        let cols: Vec<(NodeId, Option<usize>)> = self
-            .flex_items(id)
-            .into_iter()
-            .filter_map(|k| {
-                let fixed = self
-                    .css_cells(k, "width")
-                    .or_else(|| self.css_cells(k, "max-width"))
-                    .map(|w| w.min(avail));
-                if fixed.is_none() && self.is_empty_box(k) {
-                    None
-                } else {
-                    Some((k, fixed))
+        let gap = 1usize;
+        let mut nodes = Vec::new();
+        let mut basis = Vec::new();
+        let mut grow = Vec::new();
+        let mut shrink = Vec::new();
+        for k in self.flex_items(id) {
+            let (b_css, g, s) = self.flex_props(k, avail);
+            let b = match b_css {
+                Some(w) => w.min(avail),
+                None => {
+                    // `flex-basis:auto`/`width:auto`: size to content. An empty,
+                    // non-growing item takes no column.
+                    if g == 0.0 && self.is_empty_box(k) {
+                        continue;
+                    }
+                    self.measure_width(k, avail)
                 }
-            })
-            .collect();
-        if cols.is_empty() {
+            };
+            nodes.push(k);
+            basis.push(b);
+            grow.push(g);
+            shrink.push(s);
+        }
+        let n = nodes.len();
+        if n == 0 {
             return;
         }
-        let gaps = cols.len().saturating_sub(1); // 1-cell inter-column gap
-        let sum_fixed: usize = cols.iter().filter_map(|(_, w)| *w).sum();
-        let n_flex = cols.iter().filter(|(_, w)| w.is_none()).count();
-        let flex_each = avail
-            .saturating_sub(gaps + sum_fixed)
-            .checked_div(n_flex)
-            .unwrap_or(0);
-        // Responsive fallback: stack when the columns won't fit.
-        if sum_fixed + gaps >= avail || (n_flex > 0 && flex_each < MIN_COL) {
-            let kids: Vec<NodeId> = cols.iter().map(|(k, _)| *k).collect();
-            self.stack_boxes(&kids, avail);
-            return;
+        let gaps = (n - 1) * gap;
+        let total_basis: usize = basis.iter().sum();
+        let mut widths = basis.clone();
+        if total_basis + gaps <= avail {
+            // Free space is distributed to the grow items by their flex-grow.
+            let free = avail - total_basis - gaps;
+            let total_grow: f32 = grow.iter().sum();
+            if total_grow > 0.0 && free > 0 {
+                for i in 0..n {
+                    widths[i] += (free as f32 * grow[i] / total_grow).round() as usize;
+                }
+            }
+        } else {
+            // Overflow: shrink. A shrinkable item can shrink to its min-content
+            // width; a `flex-shrink:0` item keeps its basis. If even the
+            // minimum row overflows, stack instead.
+            let floor: Vec<usize> = (0..n)
+                .map(|i| {
+                    if shrink[i] > 0.0 {
+                        self.measure_width(nodes[i], 1).min(basis[i])
+                    } else {
+                        basis[i]
+                    }
+                })
+                .collect();
+            let sum_floor: usize = floor.iter().sum();
+            if sum_floor + gaps > avail {
+                self.stack_boxes(&nodes, avail);
+                return;
+            }
+            let extra = avail - sum_floor - gaps;
+            let desired: usize = (0..n).map(|i| basis[i] - floor[i]).sum();
+            for i in 0..n {
+                // Hand each item its share of the slack above its minimum,
+                // proportional to how much it wanted (basis − floor); split it
+                // evenly when nothing wants extra.
+                let share = (extra * (basis[i] - floor[i]))
+                    .checked_div(desired)
+                    .unwrap_or(extra / n);
+                widths[i] = floor[i] + share;
+            }
         }
         let row_base = self.rows.len();
         let mut x = 0usize;
-        for (i, (k, w)) in cols.iter().enumerate() {
-            let cw = w.unwrap_or(flex_each).max(1);
-            let b = self.layout_subtree(*k, cw);
+        for i in 0..n {
+            let cw = widths[i].max(1);
+            let mut b = self.layout_subtree(nodes[i], cw);
+            // A text/search input that grew (flex-grow) fills its box like a
+            // real input field, rather than leaving a gap after its short
+            // placeholder. (Buttons/selects don't stretch — see the helper.)
+            if grow[i] > 0.0 {
+                fill_input_box(&mut b, cw);
+            }
             if b.height > 0 {
                 self.blit(&b, (self.indent + x) as u16, row_base);
             }
-            x += cw + if i + 1 < cols.len() { 1 } else { 0 };
+            x += cw + if i + 1 < n { gap } else { 0 };
         }
         self.col = self.indent;
         self.pending_space = false;
+    }
+
+    /// The natural width (cells) of an element's subtree laid out at
+    /// `constraint` — its content basis (at `avail`) or min-content (at 1).
+    fn measure_width(&self, id: NodeId, constraint: usize) -> usize {
+        self.layout_subtree_inner(id, constraint, None, true).width as usize
+    }
+
+    /// A flex item's `(basis, grow, shrink)`. `basis` resolves `flex-basis`
+    /// (else `width`, `%` against `avail`, capped by `max-width`); `None`
+    /// means auto (size to content). Defaults: grow 0, shrink 1.
+    fn flex_props(&self, id: NodeId, avail: usize) -> (Option<usize>, f32, f32) {
+        let mut grow = 0.0f32;
+        let mut shrink = 1.0f32;
+        let mut basis_css: Option<String> = None;
+        // The `flex` shorthand seeds all three (keywords or `grow [shrink]
+        // [basis]`); the longhands below override.
+        if let Some(f) = self.dom.computed_style(id, "flex") {
+            match f.trim().to_ascii_lowercase().as_str() {
+                "none" => {
+                    grow = 0.0;
+                    shrink = 0.0;
+                    basis_css = Some("auto".into());
+                }
+                "auto" => {
+                    grow = 1.0;
+                    shrink = 1.0;
+                    basis_css = Some("auto".into());
+                }
+                "initial" | "" => {}
+                other => {
+                    let mut nums = Vec::new();
+                    for p in other.split_whitespace() {
+                        match p.parse::<f32>() {
+                            Ok(num) => nums.push(num),
+                            Err(_) => basis_css = Some(p.to_string()),
+                        }
+                    }
+                    if let Some(&g) = nums.first() {
+                        grow = g;
+                    }
+                    if let Some(&s) = nums.get(1) {
+                        shrink = s;
+                    }
+                    // A single number (`flex:1`) means basis 0.
+                    if nums.len() == 1 && basis_css.is_none() {
+                        basis_css = Some("0".into());
+                    }
+                }
+            }
+        }
+        if let Some(g) = self.flex_number(id, "flex-grow") {
+            grow = g;
+        }
+        if let Some(s) = self.flex_number(id, "flex-shrink") {
+            shrink = s;
+        }
+        if let Some(b) = self.dom.computed_style(id, "flex-basis") {
+            basis_css = Some(b);
+        }
+        let basis = match basis_css.as_deref().map(str::trim) {
+            None | Some("auto") => self.len_or_pct(id, "width", avail),
+            Some("content" | "max-content" | "min-content" | "fit-content") => None,
+            Some(v) => len_or_pct_value(v, avail),
+        };
+        // `max-width` caps the basis; if there is no basis yet, an explicit
+        // max-width still bounds an auto (content-sized) item via the caller.
+        let basis = match (basis, self.len_or_pct(id, "max-width", avail)) {
+            (Some(b), Some(m)) => Some(b.min(m)),
+            (b, _) => b,
+        };
+        (basis, grow.max(0.0), shrink.max(0.0))
+    }
+
+    /// A unitless flex number (`flex-grow`/`flex-shrink`), or `None`.
+    fn flex_number(&self, id: NodeId, prop: &str) -> Option<f32> {
+        self.dom.computed_style(id, prop)?.trim().parse().ok()
+    }
+
+    /// A `width`/`max-width`-style property as cells, resolving `%` against
+    /// `avail` (the flex row's content width).
+    fn len_or_pct(&self, id: NodeId, prop: &str, avail: usize) -> Option<usize> {
+        len_or_pct_value(&self.dom.computed_style(id, prop)?, avail)
+    }
+
+    /// Whether a block is a horizontal-scroll container (a carousel): it
+    /// clips on the x axis AND has a `hscroll_track` (an over-wide child
+    /// holding several cards).
+    fn is_hscroll(&self, id: NodeId) -> bool {
+        let scrolls = self
+            .dom
+            .computed_style(id, "overflow")
+            .or_else(|| self.dom.computed_style(id, "overflow-x"))
+            .is_some_and(|v| {
+                v.split_whitespace()
+                    .any(|t| matches!(t, "hidden" | "auto" | "scroll" | "clip"))
+            });
+        scrolls && self.hscroll_track(id).is_some()
+    }
+
+    /// The over-wide "track" inside a scroll container `id`: a child wider
+    /// than the viewport whose own element children are the cards (≥3, so a
+    /// real carousel rail — NOT a clearfix wrapping a single wide layout
+    /// column, whose one float child isn't a rail of cards).
+    fn hscroll_track(&self, id: NodeId) -> Option<NodeId> {
+        let avail = self.width.saturating_sub(self.indent).max(1);
+        self.dom.children(id).into_iter().find(|&c| {
+            matches!(self.dom.node(c).data, NodeData::Element { .. })
+                && self.css_cells(c, "width").is_some_and(|w| w > avail)
+                && self
+                    .dom
+                    .children(c)
+                    .iter()
+                    .filter(|&&g| matches!(self.dom.node(g).data, NodeData::Element { .. }))
+                    .count()
+                    >= 3
+        })
+    }
+
+    /// Lay a carousel: a row of card boxes side by side at their full strip
+    /// width, blitted into the doc rows (the view clips this to the band and
+    /// scrolls it). Records a `Carousel` with each card's left column as a
+    /// snap stop so scrolling never cuts a card or image.
+    fn flow_hscroll(&mut self, id: NodeId) {
+        self.flush_block();
+        self.begin_line();
+        let band_left = self.line_left;
+        let avail = self.line_right.saturating_sub(self.line_left).max(1);
+        // The visible band is the scroll container's own width (an
+        // `overflow:hidden` viewport with an explicit `width`/`max-width`
+        // shows exactly that much — e.g. a 700px box reveals ~3 cards), or
+        // the full available width when it sizes from its parent (the SL
+        // Marketplace carousel inherits its width from a sized float
+        // ancestor, which already narrowed `avail`). Cards still lay at their
+        // own widths; only the visible window is clamped.
+        let band_w = self
+            .css_cells(id, "width")
+            .or_else(|| self.css_cells(id, "max-width"))
+            .map(|w| w.min(avail))
+            .unwrap_or(avail)
+            .max(1);
+        // The over-wide inner "track" holds the cards.
+        let track = self.hscroll_track(id).unwrap_or(id);
+        let gap = 1usize;
+        let row_base = self.rows.len();
+        let mut x = 0usize;
+        let mut stops = Vec::new();
+        let mut height = 0usize;
+        for card in self.flex_items(track) {
+            let cw = self
+                .css_cells(card, "width")
+                .or_else(|| self.css_cells(card, "max-width"))
+                .map(|w| w.min(avail))
+                .unwrap_or_else(|| self.measure_width(card, avail))
+                .clamp(1, avail);
+            // Lay the card as a block (ignore its own float), then place it.
+            let b = self.layout_subtree_inner(card, cw, Some(card), false);
+            if b.height == 0 {
+                continue;
+            }
+            stops.push(x as u16);
+            self.blit(&b, (band_left + x) as u16, row_base);
+            x += cw + gap;
+            height = height.max(b.height as usize);
+        }
+        let strip_w = x.saturating_sub(gap);
+        // Only a strip that actually overflows the band is a scroll region.
+        if !stops.is_empty() && strip_w > band_w {
+            // Generate our own prev/next scroll controls (the CSS
+            // `::scroll-button` model — the browser, not the page, provides
+            // them) and hide any the page authored, so a carousel always has
+            // a working pair regardless of what markup it ships.
+            self.emit_scroll_buttons(id, row_base, band_left, band_w, false);
+            self.carousels.push(Carousel {
+                start: row_base,
+                end: row_base + height,
+                left: band_left as u16,
+                right: (band_left + band_w) as u16,
+                width: strip_w as u16,
+                stops,
+                offset: 0,
+            });
+        }
+        self.col = self.indent;
+        self.pending_space = false;
+    }
+
+    /// Lay a slide deck (stacked, absolutely-positioned slides) as a carousel
+    /// showing ONE slide at a time: each slide laid at the full band width,
+    /// side by side, with generated controls to page between them. The opacity
+    /// cascade keeps the inactive slides "in the background" (present but
+    /// off-band, so not rendered) until a control reveals the next — the
+    /// slideshow analogue of the carousel, for JS slideshows whose switching
+    /// we can't drive through the page's own (frozen-timer) script.
+    fn flow_slideshow(&mut self, id: NodeId) {
+        self.flush_block();
+        self.begin_line();
+        let band_left = self.line_left;
+        let band_w = self.line_right.saturating_sub(self.line_left).max(1);
+        // A deck is often the first thing in its box; reserve a row above the
+        // band so the generated prev/next controls have somewhere to sit.
+        if self.rows.is_empty() {
+            self.push_blank();
+        }
+        let row_base = self.rows.len();
+        let mut x = 0usize;
+        let mut stops = Vec::new();
+        let mut height = 0usize;
+        for slide in self.dom.children(id) {
+            if self.dom.tag_name(slide).is_none() {
+                continue; // text/comment node between slides
+            }
+            // Each slide fills the band; lay it and place it one band to the
+            // right of the last, so exactly one shows at a time.
+            let b = self.layout_subtree_inner(slide, band_w, Some(slide), false);
+            if b.height == 0 {
+                continue;
+            }
+            stops.push(x as u16);
+            self.blit(&b, (band_left + x) as u16, row_base);
+            x += band_w; // no gap — one slide per band
+            height = height.max(b.height as usize);
+        }
+        // Two or more slides make a switchable deck; a lone slide just renders.
+        if stops.len() >= 2 {
+            self.emit_scroll_buttons(id, row_base, band_left, band_w, true);
+            self.carousels.push(Carousel {
+                start: row_base,
+                end: row_base + height,
+                left: band_left as u16,
+                right: (band_left + band_w) as u16,
+                width: x as u16,
+                stops,
+                offset: 0,
+            });
+        }
+        self.col = self.indent;
+        self.pending_space = false;
+    }
+
+    /// Generate the carousel's prev/next scroll buttons as glyph items on the
+    /// row just above the band — `‹` at the band's left edge, `›` at its
+    /// right — and remove any author-supplied controls (so there's no
+    /// duplicate text button). Mirrors CSS `::scroll-button(left|right)`:
+    /// browser-generated, always both present, flanking the strip. The view
+    /// greys whichever can't scroll; activation pages the nearest carousel.
+    fn emit_scroll_buttons(
+        &mut self,
+        container: NodeId,
+        row_base: usize,
+        band_left: usize,
+        band_w: usize,
+        all_clickable: bool,
+    ) {
+        // Drop the page's own controls. They may have been laid already
+        // (a carousel's controls precede its track) or be still to come
+        // (a slideshow's arrows/dots follow the deck) — so remove the laid
+        // ones AND mark the nodes to skip when flowed.
+        let page_ctrls = self.carousel_controls(container, all_clickable);
+        for &n in &page_ctrls {
+            self.suppressed_controls.insert(n);
+        }
+        if !page_ctrls.is_empty() {
+            for row in &mut self.rows {
+                row.items.retain(|it| !page_ctrls.contains(&it.node));
+            }
+        }
+        // No room above the band (the strip is the first thing in its box):
+        // skip rather than overwrite the band's top row. Callers that can be
+        // first (slideshows) reserve a row up front so this doesn't bite.
+        if row_base == 0 || band_w < 2 {
+            return;
+        }
+        let row = row_base - 1;
+        let right = band_left + band_w - 1;
+        for (col, glyph, dir) in [(band_left, "‹", -1i8), (right, "›", 1i8)] {
+            self.rows[row].items.push(Item {
+                col: col as u16,
+                width: 1,
+                height: 1,
+                text: glyph.to_string(),
+                kind: ItemKind::Link,
+                image: None,
+                emph: Emphasis::default(),
+                node: NO_NODE,
+                link: Some(Link::CarouselScroll(dir)),
+            });
+        }
+        self.rows[row].items.sort_by_key(|it| it.col);
+    }
+
+    /// The page's own author-supplied prev/next control nodes: clickable
+    /// elements with a prev/next signal that share the scroll container's
+    /// wrapper (the div holding BOTH the scroller and its buttons — how a
+    /// page ties them together) but live OUTSIDE the scrolled content. We
+    /// generate our own glyph controls, so these are returned only to be
+    /// suppressed (their rendered items removed) and avoid a duplicate.
+    /// `all_clickable`: a carousel only suppresses prev/next-looking controls
+    /// (a stray link near the rail must survive); a slideshow's wrapper holds
+    /// ONLY its own navigation (arrows AND dots/thumbnails), so it suppresses
+    /// every clickable to clear the dead dots too.
+    fn carousel_controls(&self, container: NodeId, all_clickable: bool) -> Vec<NodeId> {
+        let Some(wrapper) = self.dom.parent_composed(container) else {
+            return Vec::new();
+        };
+        let inside: std::collections::HashSet<NodeId> =
+            self.dom.descendants(container).into_iter().collect();
+        let mut out = Vec::new();
+        for d in self.dom.descendants(wrapper) {
+            if d == container || inside.contains(&d) {
+                continue; // the cards themselves, not a control
+            }
+            if self.is_clickable(d) && (all_clickable || scroll_control_dir(self.dom, d).is_some())
+            {
+                out.push(d);
+            }
+        }
+        out
+    }
+
+    /// Whether an element is something the user can click/activate: an
+    /// anchor with an href, a `<button>`, or anything carrying `onclick` or
+    /// `role=button`.
+    fn is_clickable(&self, id: NodeId) -> bool {
+        match self.dom.tag_name(id) {
+            Some("a") => self.dom.attr(id, "href").is_some(),
+            Some("button") => true,
+            _ => {
+                self.dom.attr(id, "onclick").is_some()
+                    || self.dom.attr(id, "role") == Some("button")
+            }
+        }
     }
 
     /// Whether an element's subtree has nothing to render — no non-blank
@@ -1039,6 +1746,23 @@ impl<'a> Layout<'a> {
         self.col = l;
     }
 
+    /// Whether a block establishes a new block formatting context, so its
+    /// descendant floats are contained rather than leaking to following
+    /// siblings. We detect the two statically-resolvable triggers: a
+    /// non-`visible` `overflow` (the ubiquitous `overflow:hidden` clearfix)
+    /// and `display:flow-root`. Flex/grid containers and floats already lay
+    /// their content as self-contained boxes, so they're excluded by the
+    /// caller (`flex.is_none()`).
+    fn establishes_bfc(&self, id: NodeId) -> bool {
+        if self.dom.computed_display(id).as_deref() == Some("flow-root") {
+            return true;
+        }
+        self.dom.computed_style(id, "overflow").is_some_and(|v| {
+            v.split_whitespace()
+                .any(|t| matches!(t, "hidden" | "auto" | "scroll" | "clip"))
+        })
+    }
+
     /// The `float` side of an element (`left`/`right`), or `None`.
     fn float_side(&self, id: NodeId) -> Option<FloatSide> {
         match self
@@ -1068,11 +1792,24 @@ impl<'a> Layout<'a> {
             .or_else(|| self.css_cells(id, "max-width"))
             .map(|w| w.min(avail));
         let constraint = explicit.unwrap_or(avail).max(1);
-        let boxed = self.layout_subtree_inner(id, constraint, Some(id));
+        let boxed = self.layout_subtree_inner(id, constraint, Some(id), false);
         if boxed.height == 0 {
             return;
         }
         let w = explicit.unwrap_or(boxed.width as usize).min(avail).max(1);
+        // Responsive fallback: a float that leaves too thin a band beside it
+        // (a desktop-width column dropped into a terminal-width viewport)
+        // becomes an in-flow block — stacked, never overlapped. Mirrors the
+        // flex-row MIN_COL fallback; this is what keeps a full-width main
+        // column from being painted over by what follows it.
+        if avail.saturating_sub(w + 1) < MIN_COL {
+            let row_base = self.rows.len();
+            self.blit(&boxed, self.line_left as u16, row_base);
+            self.col = self.line_left;
+            self.pending_space = false;
+            self.begin_line();
+            return;
+        }
         let start_row = self.rows.len();
         let bottom = start_row + boxed.height as usize;
         // Pin beside any floats already on this row (line_left/right already
@@ -1217,16 +1954,18 @@ impl<'a> Layout<'a> {
     /// base URL, form/control maps, and image sizes with the parent. The
     /// recursion that powers grids and (later) columns and floats.
     fn layout_subtree(&self, id: NodeId, content_width: usize) -> LaidBox {
-        self.layout_subtree_inner(id, content_width, None)
+        self.layout_subtree_inner(id, content_width, None, false)
     }
 
     /// `layout_subtree`, optionally ignoring the float on the root element
-    /// (used when laying a float's own box so it doesn't recurse).
+    /// (used when laying a float's own box so it doesn't recurse). `measure`
+    /// means this is an intrinsic-width measurement (ignore `text-align`).
     fn layout_subtree_inner(
         &self,
         id: NodeId,
         content_width: usize,
         skip_float: Option<NodeId>,
+        measure: bool,
     ) -> LaidBox {
         let mut sub = Layout::new(
             self.dom,
@@ -1237,10 +1976,11 @@ impl<'a> Layout<'a> {
             self.images,
         );
         sub.float_skip = skip_float;
+        sub.measuring = measure;
         sub.flow_node(id, &Ctx::root());
         sub.flush_block();
         sub.finish_floats();
-        let rows = sub.finish();
+        let (rows, carousels) = sub.finish();
         let width = rows
             .iter()
             .flat_map(|r| &r.items)
@@ -1252,6 +1992,7 @@ impl<'a> Layout<'a> {
             rows,
             width,
             height,
+            carousels,
         }
     }
 
@@ -1271,6 +2012,16 @@ impl<'a> Layout<'a> {
                 it.col += col_off;
                 self.rows[target].items.push(it);
             }
+        }
+        // Carousels inside the box move with it: rows by `row_base`, the band
+        // by `col_off` (stops/offset are strip-relative, so unchanged).
+        for c in &b.carousels {
+            let mut c = c.clone();
+            c.start += row_base;
+            c.end += row_base;
+            c.left += col_off;
+            c.right += col_off;
+            self.carousels.push(c);
         }
     }
 
@@ -1424,8 +2175,15 @@ impl<'a> Layout<'a> {
         if alt.is_empty() {
             return;
         }
-        // Flow the alt text, tagged as an image so the view can mark it
-        // and L3 can find the node to render pixels in its place.
+        // A rating widget draws each star as its own icon image with
+        // descriptive alt text ("full star"/"half star"/"empty star"); a
+        // (usually SVG, so undecodable) icon then floods the row with verbose
+        // phrases. Collapse those to a single glyph so a 5-star row reads
+        // "★★★⯨☆" — general to any star-rating markup, keyed on the alt's
+        // accessible text, not on a site.
+        let text = star_glyph(&alt).unwrap_or(&alt);
+        // Flow the text, tagged as an image so the view can mark it and L3
+        // can find the node to render pixels in its place.
         let kind = if ctx.link.is_some() {
             ctx.kind
         } else {
@@ -1438,7 +2196,31 @@ impl<'a> Layout<'a> {
             node: id,
             link: ctx.link.clone(),
         };
-        self.place_text(&alt, &img_ctx);
+        self.place_text(text, &img_ctx);
+    }
+
+    /// The accessible name for an element whose content won't render
+    /// anything (no text, no `<img>`) — an SVG/icon-only link. Reads
+    /// `aria-label`, then `title`, then `alt`. `None` when it has real
+    /// content or no name to show.
+    fn icon_only_label(&self, id: NodeId) -> Option<String> {
+        if !self.dom.text_content(id).trim().is_empty() {
+            return None;
+        }
+        if self
+            .dom
+            .descendants(id)
+            .iter()
+            .any(|&d| self.dom.tag_name(d) == Some("img"))
+        {
+            return None;
+        }
+        ["aria-label", "title", "alt"]
+            .into_iter()
+            .filter_map(|a| self.dom.attr(id, a))
+            .map(str::trim)
+            .find(|v| !v.is_empty())
+            .map(str::to_owned)
     }
 
     /// The absolute URL of an `<img>`'s `src`, resolved against the base.
@@ -1590,24 +2372,45 @@ impl<'a> Layout<'a> {
         self.pending_space = true; // a widget gets a trailing gap
     }
 
-    fn emit_list_marker(&mut self) {
-        let marker = match self.list_stack.last_mut() {
+    /// The next list marker text: `N. ` inside an `<ol>` (advancing the
+    /// counter), `• ` inside a `<ul>` or a bare list item.
+    fn next_list_marker(&mut self) -> String {
+        match self.list_stack.last_mut() {
             Some(Some(n)) => {
                 let m = format!("{n}. ");
                 *n += 1;
                 m
             }
             _ => "• ".to_owned(),
+        }
+    }
+
+    /// Place a deferred list marker in the gutter (`col`) on the item's
+    /// first content row — the first row at/after `from` carrying real
+    /// (non-spacer) content. A markerless empty item places nothing.
+    fn place_list_marker(&mut self, marker: &str, from: usize, col: usize) {
+        let Some(row) = (from..self.rows.len()).find(|&r| {
+            self.rows[r]
+                .items
+                .iter()
+                .any(|it| !it.text.is_empty() || it.image.is_some())
+        }) else {
+            return;
         };
-        let len = marker.chars().count();
-        self.push_item(
-            marker,
-            len,
-            ItemKind::Text,
-            Emphasis::default(),
-            NO_NODE,
-            None,
-        );
+        let item = Item {
+            col: col as u16,
+            width: marker.chars().count() as u16,
+            height: 1,
+            text: marker.to_owned(),
+            kind: ItemKind::Text,
+            image: None,
+            emph: Emphasis::default(),
+            node: NO_NODE,
+            link: None,
+        };
+        let items = &mut self.rows[row].items;
+        items.push(item);
+        items.sort_by_key(|it| it.col);
     }
 
     fn push_rule(&mut self) {
@@ -1679,7 +2482,11 @@ impl<'a> Layout<'a> {
     /// The shift is computed within the current line's content band,
     /// ignoring a trailing space on the last item.
     fn align_row(&self, items: &mut [Item]) {
-        if self.align == Align::Left {
+        // When measuring intrinsic width (for a flex basis / float box), the
+        // alignment offset must NOT count — a centered/right-aligned run's
+        // content is as wide left-packed, and the offset would inflate the
+        // measured width (spreading flex items whose labels are centered).
+        if self.measuring || self.align == Align::Left {
             return;
         }
         let Some(last) = items.last() else { return };
@@ -1711,19 +2518,41 @@ impl<'a> Layout<'a> {
         self.rows.push(Row::default());
     }
 
-    /// Collapse runs of blank rows and trim leading/trailing blanks.
-    fn finish(self) -> Vec<Row> {
-        let mut out: Vec<Row> = Vec::with_capacity(self.rows.len());
-        for row in self.rows {
+    /// Collapse runs of blank rows and trim leading/trailing blanks, and
+    /// remap the carousels' row spans through the collapse. Carousels are
+    /// recorded with absolute row indices during flow; this is where those
+    /// indices get rebased to the final (collapsed) row grid, so a band
+    /// stays aligned with its cards no matter how many blank rows above or
+    /// inside it were dropped. Without this remap the band drifts off its
+    /// cards and the view stops clipping the strip.
+    fn finish(mut self) -> (Vec<Row>, Vec<Carousel>) {
+        let carousels = std::mem::take(&mut self.carousels);
+        let n = self.rows.len();
+        // remap[i] = new index of old row i (for a dropped blank, the index
+        // the next kept row takes). remap[n] = total kept rows, for an
+        // exclusive `end` that points one past the last row.
+        let mut remap = vec![0usize; n + 1];
+        let mut out: Vec<Row> = Vec::with_capacity(n);
+        for (i, row) in self.rows.into_iter().enumerate() {
+            remap[i] = out.len();
             if row.items.is_empty() && out.last().is_none_or(|r| r.items.is_empty()) {
                 continue;
             }
             out.push(row);
         }
+        remap[n] = out.len();
         while out.last().is_some_and(|r| r.items.is_empty()) {
             out.pop();
         }
-        out
+        let carousels = carousels
+            .into_iter()
+            .map(|mut c| {
+                c.start = remap[c.start.min(n)];
+                c.end = remap[c.end.min(n)].min(out.len());
+                c
+            })
+            .collect();
+        (out, carousels)
     }
 }
 
@@ -1750,6 +2579,70 @@ fn image_spacer_row(indent: usize) -> Row {
 
 fn same_run(item: &Item, ctx: &Ctx) -> bool {
     item.kind == ctx.kind && item.emph == ctx.emph && item.node == ctx.node && item.link == ctx.link
+}
+
+/// Pad a flex-grown text/search input's `[…]` widget to fill its allocated
+/// box `cw`, so a grown input reads as a wide input field instead of a short
+/// placeholder with a long trailing gap (how a browser draws an input that
+/// `flex-grow` stretches). Only a lone `[…]` text widget fills — buttons
+/// (`[ … ]`) and selects (`… ▾]`) shouldn't stretch, nor multi-item boxes.
+fn fill_input_box(b: &mut LaidBox, cw: usize) {
+    if b.rows.len() != 1 {
+        return;
+    }
+    let [it] = b.rows[0].items.as_mut_slice() else {
+        return;
+    };
+    if it.kind != ItemKind::Form
+        || !it.text.starts_with('[')
+        || !it.text.ends_with(']')
+        || it.text.starts_with("[ ") // a button "[ Submit ]"
+        || it.text.ends_with("▾]")
+    // a select "[… ▾]"
+    {
+        return;
+    }
+    let cur = it.width as usize;
+    if cw <= cur {
+        return;
+    }
+    it.text.insert_str(it.text.len() - 1, &" ".repeat(cw - cur));
+    it.width = cw as u16;
+    b.width = cw as u16;
+}
+
+/// A carousel scroll control's direction: −1 toward the start (prev/left),
+/// +1 toward the end (next/right), or `None` when the element shows no
+/// (or a contradictory) prev/next signal. Reads the universal carousel
+/// vocabulary from `aria-label`/`class`/`id`/`title`/`rel` and from the
+/// control's own arrow glyph — the same `prev`/`next` meaning CSS
+/// `::scroll-button(left|right)` encodes — so it generalizes across sites.
+fn scroll_control_dir(dom: &Dom, id: NodeId) -> Option<i8> {
+    let mut attrs = String::new();
+    for a in ["aria-label", "class", "id", "title", "rel"] {
+        if let Some(v) = dom.attr(id, a) {
+            attrs.push_str(&v.to_ascii_lowercase());
+            attrs.push(' ');
+        }
+    }
+    let text = dom.text_content(id);
+    let prev = attrs.contains("prev") || text.chars().any(is_prev_glyph);
+    let next = attrs.contains("next") || text.chars().any(is_next_glyph);
+    match (prev, next) {
+        (true, false) => Some(-1),
+        (false, true) => Some(1),
+        _ => None, // no signal, or both (ambiguous)
+    }
+}
+
+/// Left/back arrow glyphs a prev control commonly renders.
+fn is_prev_glyph(c: char) -> bool {
+    matches!(c, '«' | '‹' | '❮' | '◀' | '◁' | '←' | '⟨' | '⟪' | '🡠')
+}
+
+/// Right/forward arrow glyphs a next control commonly renders.
+fn is_next_glyph(c: char) -> bool {
+    matches!(c, '»' | '›' | '❯' | '▶' | '▷' | '→' | '⟩' | '⟫' | '🡢')
 }
 
 /// Fold a CSS `text-decoration`/`text-decoration-line` value into the
@@ -1804,6 +2697,19 @@ fn css_length_em(value: &str) -> Option<f32> {
     }
 }
 
+/// A CSS length OR percentage as cells. `%` resolves against `avail` (the
+/// containing flex row's content width); other units go through
+/// `css_length_em` (≈ 2 cells/em). `None` for unsupported values
+/// (`auto`/`vh`/…).
+fn len_or_pct_value(value: &str, avail: usize) -> Option<usize> {
+    let v = value.trim();
+    if let Some(p) = v.strip_suffix('%') {
+        let pct: f32 = p.trim().parse().ok()?;
+        return Some(((pct / 100.0) * avail as f32).round().max(0.0) as usize);
+    }
+    css_length_em(v).map(|em| (em * 2.0).round().max(0.0) as usize)
+}
+
 /// Whether a vertical length is big enough to warrant a blank spacer row
 /// (≥ half a line).
 fn vertical_space(value: &str) -> bool {
@@ -1816,6 +2722,32 @@ fn indent_cells(value: Option<&str>) -> usize {
         .and_then(css_length_em)
         .map(|em| (em * 2.0).round().max(0.0) as usize)
         .unwrap_or(0)
+}
+
+/// Glyphs a star-rating icon's alt text collapses to (swappable in one
+/// place if a terminal font lacks the half-star).
+const STAR_FULL: &str = "★";
+const STAR_HALF: &str = "⯨";
+const STAR_EMPTY: &str = "☆";
+
+/// Map a star-rating icon image's alt text to a compact glyph, or `None`
+/// when it isn't a star. Keyed on the accessible phrasing rating widgets
+/// share ("full/filled", "half", "empty/blank/unfilled" + "star"), so any
+/// site's image-based stars read as glyphs instead of repeated phrases.
+fn star_glyph(alt: &str) -> Option<&'static str> {
+    let a = alt.to_ascii_lowercase();
+    if !a.contains("star") {
+        return None;
+    }
+    if a.contains("half") {
+        Some(STAR_HALF)
+    } else if a.contains("empty") || a.contains("blank") || a.contains("unfilled") {
+        Some(STAR_EMPTY)
+    } else if a.contains("full") || a.contains("filled") {
+        Some(STAR_FULL)
+    } else {
+        None
+    }
 }
 
 /// `h1`..`h6` → the level; anything else → `None`.
@@ -1849,6 +2781,66 @@ mod tests {
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
         lay_out(&dom, &base, width, &[], &ControlMap::new(), images)
+    }
+
+    #[test]
+    #[ignore = "manual diagnostic: TRUST_LAYOUT_DIAG=<file> TRUST_LAYOUT_W=<cols>"]
+    fn layout_diag() {
+        let Ok(path) = std::env::var("TRUST_LAYOUT_DIAG") else {
+            return;
+        };
+        let html = std::fs::read_to_string(&path).unwrap();
+        let w: usize = std::env::var("TRUST_LAYOUT_W")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(88);
+        let dom = Dom::parse_document(&html);
+        let base = Url::parse("https://marketplace.secondlife.com/").unwrap();
+        // Fake every <img> a small box so image flow exercises.
+        let mut images = ImageSizes::new();
+        for id in dom.descendants(DOCUMENT) {
+            // Skip SVGs: the real decode pipeline never rasters them, so
+            // they fall through to the alt-text path (where star glyphs etc.
+            // resolve) — faking them here would hide that.
+            if dom.tag_name(id) == Some("img")
+                && let Some(src) = dom.attr(id, "src")
+                && !src.trim_end().ends_with(".svg")
+                && let Link::Http(u) = crate::http::resolve(&base, src)
+            {
+                images.insert(u.to_string(), (10, 4));
+            }
+        }
+        let (rows, carousels) =
+            lay_out_with_carousels(&dom, &base, w, &[], &ControlMap::new(), &images);
+        for c in &carousels {
+            println!(
+                "CAROUSEL rows {}..{} band [{},{}] width {} stops {}",
+                c.start,
+                c.end,
+                c.left,
+                c.right,
+                c.width,
+                c.stops.len()
+            );
+        }
+        for (i, row) in rows.iter().enumerate() {
+            let mut s = String::new();
+            let mut col = 0usize;
+            for it in &row.items {
+                while col < it.col as usize {
+                    s.push(' ');
+                    col += 1;
+                }
+                let t = if it.image.is_some() {
+                    format!("[img {}x{}]", it.width, it.height)
+                } else {
+                    it.text.clone()
+                };
+                s.push_str(&t);
+                col = it.col as usize + t.chars().count();
+            }
+            println!("{i:3}|{s}");
+        }
     }
 
     fn texts(rows: &[Row]) -> Vec<String> {
@@ -2514,12 +3506,14 @@ mod tests {
 
     #[test]
     fn flex_row_lays_children_as_columns() {
-        // A fixed sidebar (max-width 10em = 20 cells) beside a flexible
-        // content column at width 60: side by side, content past the gap.
+        // A fixed sidebar (width 10em = 20 cells) beside a growing content
+        // column (`flex:1`) at width 60: side by side, content gets the rest
+        // (a flex item only grows with flex-grow — that's real flexbox).
         let rows = lay(
             r#"<html><head><style>
                  .row{display:flex;flex-direction:row}
-                 .side{max-width:10em}
+                 .side{width:10em}
+                 .main{flex:1}
                </style></head>
                <body><div class="row">
                  <div class="side">SIDEBAR</div>
@@ -2537,11 +3531,13 @@ mod tests {
     #[test]
     fn flex_row_flexible_column_wraps_its_own_content() {
         // A flexible content column gets the remaining width and wraps its
-        // text WITHIN that column (not across the whole viewport).
+        // text WITHIN that column (not across the whole viewport). The fixed
+        // sidebar holds its width (flex-shrink:0) so the content starts past
+        // it and wraps in the remainder.
         let rows = lay(
             r#"<html><head><style>
                  .row{display:flex;flex-direction:row}
-                 .side{width:6em}
+                 .side{width:6em;flex-shrink:0}
                </style></head>
                <body><div class="row">
                  <div class="side">menu</div>
@@ -2607,12 +3603,13 @@ mod tests {
 
     #[test]
     fn flex_row_stacks_when_too_narrow() {
-        // Two fixed 10em (=20 cell) columns can't both fit in width 30, so
-        // the row falls back to stacking them vertically.
+        // Two un-shrinkable 10em (=20 cell) columns can't both fit in width
+        // 30 even at their minimum, so the row falls back to stacking them
+        // vertically (the terminal has no horizontal scroll).
         let rows = lay(
             r#"<html><head><style>
                  .row{display:flex;flex-direction:row}
-                 .col{width:10em}
+                 .col{width:10em;flex-shrink:0}
                </style></head>
                <body><div class="row">
                  <div class="col">LEFT</div>
@@ -2624,6 +3621,446 @@ mod tests {
         let (rr, cr) = pos_of(&rows, "RIGHT");
         assert!(rr > rl, "narrow row stacks: {:?}", texts(&rows));
         assert_eq!((cl, cr), (0, 0), "stacked columns are full-width");
+    }
+
+    #[test]
+    fn flex_width_100_percent_shrinks_a_content_sibling() {
+        // The SL toolbar shape: a small logo beside a `width:100%` box. The
+        // 100% box should take almost all the width (shrinking to fit beside
+        // the logo), not split 50/50 with it.
+        let rows = lay(
+            r#"<html><head><style>
+                 .bar{display:flex}
+                 .grow{width:100%}
+               </style></head>
+               <body><div class="bar">
+                 <div class="logo">L</div>
+                 <div class="grow">SEARCHBAR</div>
+               </div></body></html>"#,
+            60,
+        );
+        let (_, cl) = pos_of(&rows, "L");
+        let (_, cs) = pos_of(&rows, "SEARCHBAR");
+        assert_eq!(cl, 0, "logo at the left edge");
+        assert!(
+            cs <= 4,
+            "search box starts right after the tiny logo, not mid-row: col {cs} ({:?})",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn flex_percent_widths_share_one_row() {
+        // Percent widths resolve against the row, so a content column plus two
+        // 25% columns lay out on a single line.
+        let rows = lay(
+            r#"<html><head><style>.r{display:flex}.q{width:25%}</style></head>
+               <body><div class="r">
+                 <div class="a">AAA</div>
+                 <div class="q">BBB</div>
+                 <div class="q">CCC</div>
+               </div></body></html>"#,
+            80,
+        );
+        let (ra, _) = pos_of(&rows, "AAA");
+        let (rb, cb) = pos_of(&rows, "BBB");
+        let (rc, cc) = pos_of(&rows, "CCC");
+        assert_eq!(ra, rb, "all columns on one row: {:?}", texts(&rows));
+        assert_eq!(rb, rc);
+        assert!(cb < cc, "ordered left to right");
+    }
+
+    #[test]
+    fn centered_labels_do_not_inflate_flex_basis() {
+        // A flex item whose content is `text-align:center` must size to its
+        // content width, not the centered offset within the measure width —
+        // else centered nav tabs spread their flex row apart (the SL
+        // Marketplace toolbar bug). Measurement now ignores alignment.
+        let rows = lay(
+            r#"<html><head><style>
+                 .row{display:flex}
+                 .tab{text-align:center}
+               </style></head>
+               <body><div class="row">
+                 <div class="tab">AA</div><div class="tab">BB</div>
+               </div></body></html>"#,
+            80,
+        );
+        let (ra, ca) = pos_of(&rows, "AA");
+        let (rb, cb) = pos_of(&rows, "BB");
+        assert_eq!(ra, rb, "tabs share one row: {:?}", texts(&rows));
+        assert!(
+            cb - ca <= 4,
+            "centered tabs pack adjacent, not spread across the row: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn grown_text_input_fills_its_box() {
+        // A `flex-grow` text input fills its allocated width (a wide search
+        // bar) instead of leaving a long gap after its short placeholder —
+        // how a browser draws a stretched input.
+        let rows = lay(
+            r#"<html><head><style>
+                 .row{display:flex}
+                 .grow{flex-grow:1}
+               </style></head>
+               <body><div class="row">
+                 <input class="grow" type="text" placeholder="find">
+                 <button>Go</button>
+               </div></body></html>"#,
+            40,
+        );
+        let input = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.text.contains("find"))
+            .expect("the input widget");
+        assert!(
+            input.width >= 20,
+            "grown input fills its box (not just '[find]'): width {}",
+            input.width
+        );
+        // The Go button is NOT stretched (only text inputs fill).
+        let go = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.text.contains("Go"))
+            .expect("the button");
+        assert!(go.width <= 6, "button keeps its size: width {}", go.width);
+    }
+
+    #[test]
+    fn block_width_with_margin_auto_centers_content() {
+        // A fixed-width block with `margin:0 auto` constrains its content and
+        // centers it (the centered-page-wrapper idiom — the SL Marketplace's
+        // `#body-shadow-repeating{width:1082px;margin:0 auto}`), instead of
+        // spanning the full terminal.
+        let rows = lay(
+            r#"<html><head><style>
+                 .page{width:20em;margin:0 auto}
+               </style></head>
+               <body><div class="page"><p>HELLO</p></div></body></html>"#,
+            80,
+        );
+        let (_, c) = pos_of(&rows, "HELLO");
+        // 20em = 40 cells, centered in 80 → left pad (80-40)/2 = 20.
+        assert!(
+            (18..=22).contains(&(c as usize)),
+            "centered near col 20, got {c}: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn block_bare_width_without_auto_margin_is_not_constrained() {
+        // A width with NO auto margin keeps full-width flow — we don't cramp
+        // content on a bare pixel width; only auto margins signal "position me".
+        let rows = lay(
+            r#"<html><head><style>.x{width:20em}</style></head>
+               <body><div class="x"><p>HELLO</p></div></body></html>"#,
+            80,
+        );
+        let (_, c) = pos_of(&rows, "HELLO");
+        assert_eq!(
+            c,
+            0,
+            "bare-width block flows at the left, unconstrained: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn carousel_lays_a_scrollable_strip_that_snaps() {
+        // An overflow-x container with an over-wide track of ≥3 cards is a
+        // carousel: a strip wider than the viewport, scrolled card-by-card.
+        let html = r#"<html><head><style>
+             .scroller{overflow:hidden}
+             .track{width:500em}
+             .card{width:6em;float:left}
+           </style></head>
+           <body><div class="scroller"><div class="track">
+             <div class="card">one</div><div class="card">two</div>
+             <div class="card">three</div><div class="card">four</div>
+             <div class="card">five</div>
+           </div></div></body></html>"#;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (_, carousels) =
+            lay_out_with_carousels(&dom, &base, 20, &[], &ControlMap::new(), &ImageSizes::new());
+        assert_eq!(carousels.len(), 1, "one carousel detected");
+        let c = &carousels[0];
+        assert_eq!(c.stops.len(), 5, "a snap stop per card");
+        assert!(c.width as usize > 20, "the strip overflows the viewport");
+        assert_eq!(c.offset, 0, "starts at the first card");
+        // A clearfix wrapping ONE wide column is NOT a carousel.
+        let plain = r#"<html><head><style>.wrap{overflow:hidden}.col{width:50em}</style></head>
+            <body><div class="wrap"><div class="col">just one wide column</div></div></body></html>"#;
+        let dom = Dom::parse_document(plain);
+        let (_, none) =
+            lay_out_with_carousels(&dom, &base, 20, &[], &ControlMap::new(), &ImageSizes::new());
+        assert!(none.is_empty(), "a single wide column isn't a carousel");
+        // Scrolling snaps to the next/prev card edge and clamps at the ends.
+        let mut c = c.clone();
+        c.scroll_cards(1);
+        assert!(
+            c.offset > 0 && c.stops.contains(&c.offset),
+            "→ snaps forward"
+        );
+        c.scroll_cards(-1);
+        assert_eq!(c.offset, 0, "← snaps back to the start");
+    }
+
+    #[test]
+    fn carousel_band_stays_aligned_after_blank_row_collapse() {
+        // The bug: carousels are recorded with absolute row indices during
+        // flow, but `finish` later collapses/trims blank rows. A heading with
+        // top margin emits a leading blank that gets trimmed, shifting every
+        // row below it up by one — including the cards — while the recorded
+        // band stayed put. The band then no longer covered its cards, so the
+        // view stopped clipping the strip and every card showed (the SL
+        // Marketplace "Featured Items" wide-strip bug). `finish` now remaps
+        // the band through the collapse; here the band must still contain
+        // every row that holds a card.
+        let html = r#"<html><head><style>
+             .scroller{overflow:hidden}
+             .track{width:500em}
+             .card{width:6em;float:left}
+           </style></head>
+           <body>
+             <h2>Featured</h2>
+             <div class="scroller"><div class="track">
+               <div class="card">one</div><div class="card">two</div>
+               <div class="card">three</div><div class="card">four</div>
+               <div class="card">five</div>
+             </div></div>
+           </body></html>"#;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (rows, carousels) =
+            lay_out_with_carousels(&dom, &base, 20, &[], &ControlMap::new(), &ImageSizes::new());
+        assert_eq!(carousels.len(), 1, "one carousel");
+        let c = &carousels[0];
+        // Every row that holds a card's text must fall inside the band, or
+        // the view won't clip it (off-band cards leak as a wide strip).
+        for (r, row) in rows.iter().enumerate() {
+            let is_card = row
+                .items
+                .iter()
+                .any(|it| matches!(it.text.as_str(), "one" | "two" | "three" | "four" | "five"));
+            if is_card {
+                assert!(
+                    c.contains_row(r),
+                    "card row {r} must be inside the band [{}, {}): {:?}",
+                    c.start,
+                    c.end,
+                    texts(&rows)
+                );
+            }
+        }
+        // And the band's top edge is exactly the first card row (not drifted
+        // past it onto blank rows below).
+        let first_card_row = rows
+            .iter()
+            .position(|row| row.items.iter().any(|it| it.text == "one"))
+            .expect("a card row");
+        assert_eq!(c.start, first_card_row, "band starts on the card row");
+    }
+
+    #[test]
+    fn carousel_generates_glyph_scroll_buttons_and_hides_author_controls() {
+        use crate::doc::Link;
+        // The SL Marketplace shape: a wrapper div holds BOTH the page's own
+        // prev/next buttons and the scroll container. We follow the CSS
+        // `::scroll-button` model — generate our own `‹`/`›` glyph controls
+        // and suppress the page's author-supplied ones (so no duplicate).
+        let html = r##"<html><head><style>
+             .scroller{overflow:hidden}
+             .track{width:500em}
+             .card{width:6em;float:left}
+           </style></head>
+           <body><div class="featured">
+             <div class="controls">
+               <a class="next" href="#"><span>Next &raquo;</span></a>
+             </div>
+             <div class="scroller"><div class="track">
+               <div class="card">one</div><div class="card">two</div>
+               <div class="card">three</div><div class="card">four</div>
+               <div class="card">five</div>
+             </div></div>
+           </div></body></html>"##;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (rows, carousels) =
+            lay_out_with_carousels(&dom, &base, 20, &[], &ControlMap::new(), &ImageSizes::new());
+        assert_eq!(carousels.len(), 1, "one carousel");
+        // The page's authored "Next »" control is suppressed...
+        assert!(
+            !rows
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.text.contains("Next")),
+            "author-supplied control hidden: {:?}",
+            texts(&rows)
+        );
+        // ...and replaced with our own generated prev/next glyph controls.
+        let buttons: Vec<i8> = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter_map(|it| match it.link {
+                Some(Link::CarouselScroll(d)) => Some(d),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(buttons.len(), 2, "a prev and a next button generated");
+        assert!(
+            buttons.contains(&-1) && buttons.contains(&1),
+            "both directions"
+        );
+        // The glyphs sit on the row just above the band, flanking it.
+        let c = &carousels[0];
+        let prev = rows
+            .iter()
+            .enumerate()
+            .flat_map(|(r, row)| row.items.iter().map(move |it| (r, it)))
+            .find(|(_, it)| it.link == Some(Link::CarouselScroll(-1)))
+            .expect("prev button");
+        assert_eq!(prev.0 + 1, c.start, "button row sits just above the band");
+        assert_eq!(prev.1.col, c.left, "‹ flanks the band's left edge");
+
+        // The disabled state mirrors the spec's `:disabled`: at the start you
+        // can't go back but can go forward; at the end, the reverse.
+        let mut c = c.clone();
+        assert!(
+            !c.can_scroll(-1) && c.can_scroll(1),
+            "start: prev off, next on"
+        );
+        c.scroll_page(1);
+        assert!(
+            c.offset > 0 && c.stops.contains(&c.offset),
+            "→ pages to a card"
+        );
+        for _ in 0..20 {
+            c.scroll_page(1);
+        }
+        let pinned = c.offset;
+        c.scroll_page(1);
+        assert_eq!(c.offset, pinned, "→ clamps at the end");
+        assert!(
+            c.can_scroll(-1) && !c.can_scroll(1),
+            "end: prev on, next off"
+        );
+        c.scroll_page(-1);
+        assert!(c.offset < pinned, "← pages back");
+    }
+
+    #[test]
+    fn slideshow_deck_renders_slides_side_by_side_with_paging_controls() {
+        use crate::doc::Link;
+        // A deck of stacked, absolutely-positioned slides (one revealed by
+        // opacity) becomes a one-at-a-time carousel: all slides kept "in the
+        // background" but laid one band apart, with generated prev/next
+        // controls. (An <h2> above gives the controls a row to sit on.)
+        // The deck's own controls (arrows + a dot) follow it in document
+        // order, like a real JS slideshow — they must be suppressed even
+        // though they're laid AFTER the deck.
+        let html = r##"<html><head><style>
+             .slide { position: absolute; opacity: 0 }
+             .slide.active { opacity: 1 }
+           </style></head>
+           <body>
+             <h2>Banner</h2>
+             <div class="show">
+               <div class="deck">
+                 <div class="slide active">ALPHA</div>
+                 <div class="slide">BETA</div>
+                 <div class="slide">GAMMA</div>
+               </div>
+               <a class="prev-slide" href="#">PREVARROW</a>
+               <a class="next-slide" href="#">NEXTARROW</a>
+               <a class="dot" href="#">DOTLINK</a>
+             </div>
+           </body></html>"##;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (rows, carousels) =
+            lay_out_with_carousels(&dom, &base, 40, &[], &ControlMap::new(), &ImageSizes::new());
+        assert_eq!(carousels.len(), 1, "the deck is one carousel");
+        assert_eq!(carousels[0].stops.len(), 3, "three slides → three stops");
+        // The page's own controls — arrows AND the dead dot — are all gone.
+        for ctrl in ["PREVARROW", "NEXTARROW", "DOTLINK"] {
+            assert!(
+                !rows
+                    .iter()
+                    .flat_map(|r| &r.items)
+                    .any(|it| it.text.contains(ctrl)),
+                "author control {ctrl} suppressed: {:?}",
+                texts(&rows)
+            );
+        }
+        // All three slides are present (kept in the background), even though
+        // two are opacity:0 — the deck exemption keeps them alive.
+        let col_of = |t: &str| {
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .find(|it| it.text.contains(t))
+                .unwrap_or_else(|| panic!("{t} missing: {:?}", texts(&rows)))
+                .col
+        };
+        assert!(col_of("ALPHA") < col_of("BETA"), "slides laid side by side");
+        assert!(col_of("BETA") < col_of("GAMMA"));
+        // Generated prev/next controls page the deck.
+        let buttons = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|it| matches!(it.link, Some(Link::CarouselScroll(_))))
+            .count();
+        assert_eq!(buttons, 2, "prev/next generated: {:?}", texts(&rows));
+        // Only one slide occupies the band at a time (band = one slide wide).
+        let c = &carousels[0];
+        assert_eq!(
+            c.view_width(),
+            c.stops[1],
+            "the band holds exactly one slide"
+        );
+    }
+
+    #[test]
+    fn out_of_flow_overlay_controls_collapse_to_one_line() {
+        // `position:absolute`/`fixed` overlays (slideshow arrows + dots) can't
+        // be coordinate-positioned, so we render them inline and drop a `<br>`
+        // that only trails an overlay — keeping the controls on one line under
+        // the slide instead of stacking three rows.
+        let rows = lay(
+            r#"<html><head><style>
+                 .arrow{position:absolute}
+                 .dots{position:absolute}
+               </style></head>
+               <body>
+                 <div class="slide">IMG</div>
+                 <a class="arrow">PREV</a><a class="arrow">NEXT</a>
+                 <br>
+                 <div class="dots">DOTS</div>
+               </body></html>"#,
+            80,
+        );
+        let (r_img, _) = pos_of(&rows, "IMG");
+        let (r_prev, _) = pos_of(&rows, "PREV");
+        let (r_next, _) = pos_of(&rows, "NEXT");
+        let (r_dots, _) = pos_of(&rows, "DOTS");
+        assert!(
+            r_img < r_prev,
+            "the slide stays above its controls: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(r_prev, r_next, "arrows share one line: {:?}", texts(&rows));
+        assert_eq!(
+            r_next,
+            r_dots,
+            "dots join the arrows' line (the trailing <br> is dropped): {:?}",
+            texts(&rows)
+        );
     }
 
     #[test]
@@ -2740,6 +4177,98 @@ mod tests {
             "clear:both drops the para below the 5-row float: {:?}",
             texts(&rows)
         );
+    }
+
+    #[test]
+    fn list_marker_shares_row_with_block_child() {
+        // A list item whose content is block-level (a flex row / nested
+        // <div>) must keep its bullet on the content's first row, not
+        // stranded on a row of its own above it.
+        let rows = lay(
+            r#"<html><head><style>li>div{display:flex}</style></head>
+               <body><ul><li><div><a href="/a">Animals</a><span>90,831</span></div></li></ul></body></html>"#,
+            60,
+        );
+        let (rm, cm) = pos_of(&rows, "•");
+        let (ra, ca) = pos_of(&rows, "Animals");
+        assert_eq!(
+            rm,
+            ra,
+            "bullet shares the content's first row: {:?}",
+            texts(&rows)
+        );
+        assert!(cm < ca, "bullet sits in the gutter left of the content");
+    }
+
+    #[test]
+    fn star_rating_images_become_glyphs() {
+        // Image-based star ratings collapse their verbose alt text to glyphs.
+        let rows = lay(
+            r#"<body><span><img alt="full star"><img alt="full star"><img alt="half star"><img alt="empty star"></span></body>"#,
+            40,
+        );
+        let line = texts(&rows).join("");
+        assert!(line.contains('★'), "full→★: {line:?}");
+        assert!(line.contains('⯨'), "half→⯨: {line:?}");
+        assert!(line.contains('☆'), "empty→☆: {line:?}");
+        assert!(
+            !line.to_lowercase().contains("star"),
+            "no verbose phrases left: {line:?}"
+        );
+        // A non-star icon keeps its alt text.
+        assert_eq!(star_glyph("shopping cart"), None);
+    }
+
+    #[test]
+    fn bfc_overflow_hidden_contains_floats() {
+        // A float inside an `overflow:hidden` wrapper (the ubiquitous
+        // clearfix) must NOT leak past it: the following block renders
+        // full-width below, not flowed into the float's narrowed band. This
+        // is what keeps a page's footer off its floated main column.
+        let rows = lay(
+            r#"<html><head><style>
+                 .wrap{overflow:hidden}
+                 .col{float:left;width:6em}
+               </style></head>
+               <body><div class="wrap"><div class="col">SIDEBAR</div></div>
+               <p>FOLLOWING</p></body></html>"#,
+            40,
+        );
+        let (rs, _) = pos_of(&rows, "SIDEBAR");
+        let (rf, cf) = pos_of(&rows, "FOLLOWING");
+        assert!(
+            rf > rs,
+            "following block clears the contained float: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(
+            cf,
+            0,
+            "following block is full-width, not in the float's band: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn wide_float_stacks_below_following_content() {
+        // A float as wide as the viewport leaves no usable band beside it,
+        // so it drops in-flow as a block and the next block stacks below —
+        // never painted over (the bug that put a page footer on top of its
+        // sidebar/main column at terminal widths).
+        let rows = lay(
+            r#"<html><head><style>.main{float:left;width:60em}</style></head>
+               <body><div class="main">MAIN COLUMN</div><p>FOOTER</p></body></html>"#,
+            40,
+        );
+        let (rm, cm) = pos_of(&rows, "MAIN COLUMN");
+        let (rf, cf) = pos_of(&rows, "FOOTER");
+        assert_eq!(cm, 0, "wide float starts at the left edge");
+        assert!(
+            rf > rm,
+            "footer stacks below the wide float, not over it: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(cf, 0, "footer is full-width");
     }
 
     #[test]

@@ -327,11 +327,115 @@ impl Dom {
         if self.attr(id, "hidden").is_some() {
             return true;
         }
-        self.cascaded(id, "display").as_deref() == Some("none")
+        // UA default `dialog:not([open]) { display:none }`: a closed dialog
+        // is a modal that hasn't been shown — never render its content (its
+        // text otherwise bleeds into the page). An author rule setting the
+        // dialog's `display` wins, so only apply when the cascade is silent.
+        if self.tag_name(id) == Some("dialog")
+            && self.attr(id, "open").is_none()
+            && self.cascaded(id, "display").is_none()
+        {
+            return true;
+        }
+        if self.cascaded(id, "display").as_deref() == Some("none")
             || matches!(
                 self.cascaded(id, "visibility").as_deref(),
                 Some("hidden" | "collapse")
             )
+        {
+            return true;
+        }
+        // `opacity:0` is invisible — treat it as hidden, like the W3C/Bootstrap
+        // slideshow idiom (`.slides{opacity:0}`, the active slide revealed by
+        // an `animation-fill-mode:forwards` fade-in). Gated so a page with no
+        // opacity rules pays nothing on this hot path.
+        let has_inline_opacity = || {
+            self.attr(id, "style")
+                .is_some_and(|s| s.contains("opacity"))
+        };
+        if (self.style_index().has_opacity || has_inline_opacity())
+            && self.effective_opacity(id) < OPACITY_HIDDEN
+            // ...but a slide in a deck is kept "in the background" (the layout
+            // renders one at a time and a control reveals the next), so it
+            // must survive serialization rather than being dropped here.
+            && !self
+                .parent_composed(id)
+                .is_some_and(|p| self.is_slideshow_container(p))
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Whether an element holds a slide deck: ≥2 element children, ALL of them
+    /// absolutely positioned (so they stack/overlap rather than sit in flow) —
+    /// the structural signature of a JS slideshow's slides. A box with one
+    /// absolute overlay among normal children (a badge on a card) is excluded
+    /// because not every child is positioned. The layout shows one slide and
+    /// generates controls to page between them, like the carousel.
+    pub fn is_slideshow_container(&self, id: NodeId) -> bool {
+        let mut count = 0usize;
+        for c in self.children(id) {
+            if self.tag_name(c).is_none() {
+                continue; // text/comment node — only element children count
+            }
+            if !matches!(
+                self.computed_style(c, "position").as_deref(),
+                Some("absolute" | "fixed")
+            ) {
+                return false; // a static child → not an all-absolute deck
+            }
+            count += 1;
+        }
+        count >= 2
+    }
+
+    /// The element's effective opacity for visibility: its cascaded `opacity`
+    /// (default 1), or — when an `animation-fill-mode:forwards|both` animation
+    /// names a keyframe set whose END opacity is known — that resting value.
+    /// So `.slides{opacity:0}` hides, while `.slides.active{animation:fade-in
+    /// forwards}` (ending `opacity:1`) shows, with no slideshow-specific code.
+    fn effective_opacity(&self, id: NodeId) -> f32 {
+        let base = self
+            .cascaded(id, "opacity")
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(1.0);
+        // Only a near-invisible base is worth the animation lookup; a normally
+        // opaque (or merely faded) element shows as-is.
+        if base >= OPACITY_HIDDEN {
+            return base;
+        }
+        let (name, fill) = self.animation_of(id);
+        if let Some(name) = name
+            && matches!(fill.as_deref(), Some("forwards" | "both"))
+            && let Some(&end) = self.style_index().keyframes.get(&name)
+        {
+            return end;
+        }
+        base
+    }
+
+    /// The element's animation name and fill-mode, from the longhands
+    /// (`animation-name`/`animation-fill-mode`) or the `animation` shorthand.
+    fn animation_of(&self, id: NodeId) -> (Option<String>, Option<String>) {
+        let mut name = self.cascaded(id, "animation-name");
+        let mut fill = self.cascaded(id, "animation-fill-mode");
+        if (name.is_none() || fill.is_none())
+            && let Some(shorthand) = self.cascaded(id, "animation")
+        {
+            for tok in shorthand.split_whitespace() {
+                match tok {
+                    "forwards" | "backwards" | "both" => {
+                        fill.get_or_insert_with(|| tok.to_string());
+                    }
+                    _ if is_anim_keyword_or_time(tok) => {}
+                    _ => {
+                        name.get_or_insert_with(|| tok.to_string());
+                    }
+                }
+            }
+        }
+        (name.filter(|n| n != "none" && !n.is_empty()), fill)
     }
 
     /// The cascaded `display` value for an element (the mini-cascade
@@ -465,8 +569,13 @@ impl Dom {
                 },
                 _ => continue,
             };
-            let scope = index.scopes.entry(self.tree_scope(id)).or_default();
-            parse_sheet(&css, &mut order, scope);
+            let scope = self.tree_scope(id);
+            parse_sheet(
+                &css,
+                &mut order,
+                index.scopes.entry(scope).or_default(),
+                &mut index.keyframes,
+            );
         }
         // Adopted sheets cascade after their scope's tree sheets (their
         // order values are necessarily higher); cross-scope order is
@@ -475,8 +584,18 @@ impl Dom {
         let mut adopted: Vec<_> = self.adopted_styles.iter().collect();
         adopted.sort_by_key(|(scope, _)| **scope);
         for (scope, css) in adopted {
-            parse_sheet(css, &mut order, index.scopes.entry(*scope).or_default());
+            parse_sheet(
+                css,
+                &mut order,
+                index.scopes.entry(*scope).or_default(),
+                &mut index.keyframes,
+            );
         }
+        index.has_opacity = index
+            .scopes
+            .values()
+            .flatten()
+            .any(|r| r.decls.iter().any(|(k, _)| k == "opacity"));
         index
     }
 
@@ -915,16 +1034,23 @@ impl Dom {
         if is_click && !is_anchor {
             out.push_str(&format!("<a href=\"x-trust-js:{id}:\">"));
             // An icon-only clickable would render as an empty (and so
-            // unselectable) link: give it a visible label.
+            // unselectable) link: give it a visible handle. A named one
+            // shows its accessible name; an unnamed one (a CSS-drawn
+            // carousel dot, an icon button) gets a compact marker rather
+            // than the noisy "[button]".
             if self.text_content(id).trim().is_empty() {
-                let label = self
+                match self
                     .attr(id, "aria-label")
                     .or_else(|| self.attr(id, "title"))
                     .or_else(|| self.attr(id, "value"))
-                    .unwrap_or("button");
-                out.push('[');
-                out.push_str(&escape_text(label));
-                out.push(']');
+                {
+                    Some(label) => {
+                        out.push('[');
+                        out.push_str(&escape_text(label));
+                        out.push(']');
+                    }
+                    None => out.push('·'),
+                }
             }
         }
         out.push('<');
@@ -1526,9 +1652,14 @@ fn take_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String>
 const TRACKED: &[&str] = &[
     "display",
     "visibility",
+    "opacity",
+    "animation-name",
+    "animation-fill-mode",
+    "animation",
     "margin-top",
     "margin-bottom",
     "margin-left",
+    "margin-right",
     "padding-top",
     "padding-bottom",
     "padding-left",
@@ -1548,11 +1679,21 @@ const TRACKED: &[&str] = &[
     "flex-direction",
     "float",
     "clear",
+    "overflow",
+    "position",
+    "flex-grow",
+    "flex-shrink",
+    "flex-basis",
+    "flex",
 ];
 
 fn is_tracked(prop: &str) -> bool {
     TRACKED.contains(&prop)
 }
+
+/// Below this effective opacity an element is treated as invisible (hidden).
+/// Keeps merely-faded content (e.g. `opacity:0.5`) visible.
+const OPACITY_HIDDEN: f32 = 0.05;
 
 /// Properties baked into serialized HTML so the re-parsed layout arena
 /// flows a living page the way the engine (which holds the sheets)
@@ -1562,6 +1703,7 @@ const BAKE_PROPS: &[&str] = &[
     "margin-top",
     "margin-bottom",
     "margin-left",
+    "margin-right",
     "padding-top",
     "padding-bottom",
     "padding-left",
@@ -1580,6 +1722,12 @@ const BAKE_PROPS: &[&str] = &[
     "flex-direction",
     "float",
     "clear",
+    "overflow",
+    "position",
+    "flex-grow",
+    "flex-shrink",
+    "flex-basis",
+    "flex",
 ];
 
 /// Expand a `margin`/`padding` shorthand into its top/right/bottom/left
@@ -1630,6 +1778,13 @@ fn consider(slot: &mut Option<(CascadeKey, String)>, key: CascadeKey, value: &st
 #[derive(Default)]
 struct StyleIndex {
     scopes: std::collections::HashMap<NodeId, Vec<StyleRule>>,
+    /// `@keyframes <name>` → the animation's END opacity (the `to`/`100%`
+    /// keyframe), for honoring an `animation-fill-mode:forwards` reveal/hide.
+    /// Only opacity is extracted (the one keyframe property visibility needs).
+    keyframes: std::collections::HashMap<String, f32>,
+    /// Whether any rule sets `opacity` at all — lets `is_hidden` skip the
+    /// opacity cascade entirely on the overwhelming majority of pages.
+    has_opacity: bool,
 }
 
 /// Parse one `prop: value [!important]` declaration. The value is
@@ -1721,7 +1876,12 @@ fn strip_css_comments(css: &str) -> Cow<'_, str> {
 /// @-blocks are skipped (no @media in step 1 — media-query hiding is
 /// usually mobile-only, and skipping keeps content visible); rules
 /// whose selectors don't parse are skipped the same way.
-fn parse_sheet(css: &str, order: &mut usize, out: &mut Vec<StyleRule>) {
+fn parse_sheet(
+    css: &str,
+    order: &mut usize,
+    out: &mut Vec<StyleRule>,
+    keyframes: &mut std::collections::HashMap<String, f32>,
+) {
     let css = strip_css_comments(css);
     let mut rest = css.as_ref();
     loop {
@@ -1730,8 +1890,27 @@ fn parse_sheet(css: &str, order: &mut usize, out: &mut Vec<StyleRule>) {
             return;
         }
         if let Some(after) = rest.strip_prefix('@') {
-            // @charset/@import end at ';'; block at-rules at their
-            // balanced '}' — whichever comes first.
+            // `@keyframes <name> { ... }` (and the -webkit- prefix): we read
+            // only the END opacity, to honor an animation that reveals/hides
+            // an element via `animation-fill-mode:forwards` (slideshow fades).
+            let lower = after.trim_start().to_ascii_lowercase();
+            if let Some(rest_name) = lower
+                .strip_prefix("keyframes")
+                .or_else(|| lower.strip_prefix("-webkit-keyframes"))
+                && let Some(brace_off) = after.find('{')
+            {
+                let name = after[after.len() - rest_name.len()..brace_off]
+                    .trim()
+                    .to_string();
+                let (block, tail) = take_block(&after[brace_off..]);
+                if let Some(end) = keyframes_end_opacity(block) {
+                    keyframes.insert(name, end);
+                }
+                rest = tail;
+                continue;
+            }
+            // Other @-rules (@charset/@import end at ';'; block at-rules at
+            // their balanced '}') are skipped whole.
             rest = match (after.find(';'), after.find('{')) {
                 (Some(s), Some(b)) if s < b => &after[s + 1..],
                 (_, Some(b)) => take_block(&after[b..]).1,
@@ -1780,6 +1959,84 @@ fn parse_sheet(css: &str, order: &mut usize, out: &mut Vec<StyleRule>) {
             *order += 1;
         }
     }
+}
+
+/// The opacity at an `@keyframes` animation's END — the value at the highest
+/// keyframe offset (`to`/`100%`). `None` if no keyframe sets opacity. Only
+/// the END matters: with `animation-fill-mode:forwards` that's the resting
+/// state, so a fade-in resolves to its `to{opacity:1}` (visible) and a
+/// fade-out to `to{opacity:0}` (hidden).
+fn keyframes_end_opacity(block: &str) -> Option<f32> {
+    let mut best: Option<(f32, f32)> = None; // (offset, opacity)
+    let mut rest = block;
+    while let Some(brace) = rest.find('{') {
+        let sel = &rest[..brace];
+        let (decls, tail) = take_block(&rest[brace..]);
+        rest = tail;
+        let offset = sel
+            .split(',')
+            .filter_map(keyframe_offset)
+            .fold(f32::MIN, f32::max);
+        if offset == f32::MIN {
+            continue;
+        }
+        for decl in decls.split(';') {
+            if let Some((k, v, _)) = parse_decl(decl)
+                && k == "opacity"
+                && let Ok(o) = v.trim().parse::<f32>()
+                && best.is_none_or(|(bo, _)| offset >= bo)
+            {
+                best = Some((offset, o));
+            }
+        }
+    }
+    best.map(|(_, o)| o)
+}
+
+/// A keyframe selector offset as a 0..1 fraction (`from`=0, `to`=1, `N%`).
+fn keyframe_offset(sel: &str) -> Option<f32> {
+    match sel.trim() {
+        "from" => Some(0.0),
+        "to" => Some(1.0),
+        s => s
+            .strip_suffix('%')
+            .and_then(|p| p.trim().parse::<f32>().ok())
+            .map(|p| p / 100.0),
+    }
+}
+
+/// Whether an `animation` shorthand token is a non-name part (a time, a
+/// timing function, an iteration count, a direction/fill/play keyword) — so
+/// the remaining token can be taken as the `animation-name`.
+fn is_anim_keyword_or_time(tok: &str) -> bool {
+    const KW: &[&str] = &[
+        "none",
+        "normal",
+        "reverse",
+        "alternate",
+        "alternate-reverse",
+        "infinite",
+        "running",
+        "paused",
+        "linear",
+        "ease",
+        "ease-in",
+        "ease-out",
+        "ease-in-out",
+        "step-start",
+        "step-end",
+    ];
+    if KW.contains(&tok) {
+        return true;
+    }
+    let num = tok
+        .strip_suffix("ms")
+        .or_else(|| tok.strip_suffix('s'))
+        .unwrap_or(tok);
+    num.parse::<f32>().is_ok()
+        || tok.parse::<f32>().is_ok()
+        || tok.starts_with("cubic-bezier")
+        || tok.starts_with("steps")
 }
 
 /// `input` starts at '{'; return (inner text, after-the-matching-'}').
@@ -1995,6 +2252,44 @@ mod tests {
         assert!(!html.contains("secret"), "{html}");
         assert!(!html.contains("shut menu"), "{html}");
         assert!(html.contains("open menu"), "{html}");
+    }
+
+    #[test]
+    fn css_opacity_hides_and_animation_reveals_one_slide() {
+        // The W3C/Bootstrap slideshow idiom: every slide is opacity:0, and
+        // the active one is revealed by a fade-in whose end state (fill-mode
+        // forwards) is opacity:1. Honoring opacity (and the animation's end
+        // opacity) shows exactly the active slide — no slideshow-specific code.
+        let dom = Dom::parse_document(
+            "<head><style>
+                @keyframes fade-in { from { opacity: 0 } to { opacity: 1 } }
+                @keyframes fade-out { from { opacity: 1 } to { opacity: 0 } }
+                .slide { opacity: 0 }
+                .slide.active { animation-name: fade-in; animation-fill-mode: forwards }
+                .slide.leaving { animation-name: fade-out; animation-fill-mode: forwards }
+                .faded { opacity: 0.5 }
+             </style></head>
+             <body>
+               <div class='slide active'>shown slide</div>
+               <div class='slide'>hidden slide</div>
+               <div class='slide leaving'>leaving slide</div>
+               <div class='faded'>still visible</div>
+             </body>",
+        );
+        let html = dom.serialize(DOCUMENT);
+        assert!(html.contains("shown slide"), "active slide visible: {html}");
+        assert!(
+            !html.contains("hidden slide"),
+            "opacity:0 slide hidden: {html}"
+        );
+        assert!(
+            !html.contains("leaving slide"),
+            "fade-out ends opacity:0 → hidden: {html}"
+        );
+        assert!(
+            html.contains("still visible"),
+            "merely-faded (0.5) stays visible: {html}"
+        );
     }
 
     #[test]
@@ -2230,13 +2525,15 @@ mod tests {
         let dom = Dom::parse_document(
             "<body><button id=b>Push</button>\
              <button id=icon aria-label=menu></button>\
+             <span id=dot></span>\
              <a id=plain href='/normal'>plain</a>\
              <a id=hot href='/hot'>hot</a></body>",
         );
         let b = dom.get_by_id("b").unwrap();
         let icon = dom.get_by_id("icon").unwrap();
+        let dot = dom.get_by_id("dot").unwrap();
         let hot = dom.get_by_id("hot").unwrap();
-        let clickable = std::collections::HashSet::from([b, icon, hot]);
+        let clickable = std::collections::HashSet::from([b, icon, dot, hot]);
         let html = dom.serialize_live(DOCUMENT, &clickable);
         // Buttons wrapped; icon-only ones get a readable label.
         assert!(
@@ -2246,6 +2543,9 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("[menu]"), "{html}");
+        // An unnamed icon-only clickable (a CSS dot) gets a compact marker,
+        // not the noisy "[button]".
+        assert!(html.contains('·') && !html.contains("[button]"), "{html}");
         // The live anchor's href is rewritten with the original kept;
         // the plain one is untouched (the zero-overhead path).
         assert!(
@@ -2327,6 +2627,34 @@ mod tests {
         assert_eq!(dom.computed_style(p, "margin-top").as_deref(), Some("1em"));
         let html = dom.serialize(p);
         assert!(html.contains("margin-top:1em"), "bakes margin: {html}");
+    }
+
+    #[test]
+    fn closed_dialog_is_hidden_open_one_renders() {
+        // UA default `dialog:not([open]){display:none}`: a closed dialog's
+        // content must not render (modal text otherwise bleeds into the
+        // page), an open one does, and an author `display` rule wins.
+        let dom = Dom::parse_document(
+            "<body><dialog id=a>shut</dialog><dialog id=b open>shown</dialog></body>",
+        );
+        let a = dom.get_by_id("a").unwrap();
+        let b = dom.get_by_id("b").unwrap();
+        assert!(dom.is_hidden(a), "closed dialog hidden");
+        assert!(!dom.is_hidden(b), "open dialog renders");
+        // Serialization drops the hidden one, keeps the open one.
+        let html = dom.serialize(DOCUMENT);
+        assert!(!html.contains("shut"), "closed dialog dropped: {html}");
+        assert!(html.contains("shown"), "open dialog kept: {html}");
+        // An author rule setting the dialog's display overrides the UA
+        // default — a closed dialog forced visible renders.
+        let dom = Dom::parse_document(
+            "<body><dialog id=c>forced</dialog><style>#c{display:block}</style></body>",
+        );
+        let c = dom.get_by_id("c").unwrap();
+        assert!(
+            !dom.is_hidden(c),
+            "author display:block beats the UA default"
+        );
     }
 
     #[test]
