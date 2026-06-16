@@ -697,6 +697,74 @@ impl Dom {
         winner.map(|(_, v)| v)
     }
 
+    /// An element's computed value for a custom property (`--foo`): its own
+    /// cascaded declaration, else inherited from the composed parent (custom
+    /// properties inherit). `None` if undefined up the whole chain.
+    fn custom_prop(&self, id: NodeId, name: &str) -> Option<String> {
+        if let Some(v) = self.cascaded(id, name) {
+            return Some(v);
+        }
+        self.parent_composed(id)
+            .and_then(|p| self.custom_prop(p, name))
+    }
+
+    /// Substitute every `var(--name, fallback)` in a CSS value with the
+    /// element's computed custom-property value (cascaded + inherited), falling
+    /// back to the (recursively resolved) fallback, then to empty when neither
+    /// exists. Balanced-paren aware so `var()` inside `calc()` and nested
+    /// `var()` both resolve. A no-op when the value has no `var(`.
+    fn resolve_vars(&self, id: NodeId, value: &str) -> String {
+        if !value.contains("var(") {
+            return value.to_owned();
+        }
+        let mut out = String::new();
+        let mut rest = value;
+        let mut guard = 0;
+        while let Some(pos) = rest.find("var(") {
+            guard += 1;
+            if guard > 64 {
+                out.push_str(rest);
+                return out;
+            }
+            out.push_str(&rest[..pos]);
+            let after = &rest[pos + 4..];
+            // Find the `)` that closes this `var(`.
+            let mut depth = 1usize;
+            let mut end = None;
+            for (i, c) in after.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else {
+                out.push_str(&rest[pos..]); // unbalanced: leave as-is
+                return out;
+            };
+            let inner = &after[..end];
+            let (name, fallback) = match inner.split_once(',') {
+                Some((n, f)) => (n.trim(), Some(f.trim())),
+                None => (inner.trim(), None),
+            };
+            let resolved = self
+                .custom_prop(id, name)
+                .or_else(|| fallback.map(str::to_owned))
+                .map(|v| self.resolve_vars(id, &v))
+                .unwrap_or_default();
+            out.push_str(&resolved);
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+
     /// The resolved `content` text for an element's `::before`/`::after`
     /// box, or `None` when no rule sets it (or it resolves to `none`/an
     /// unsupported value like `counter()`). Reads only pseudo-element rules
@@ -1322,6 +1390,15 @@ impl Dom {
                 if prop == "display" && v == "none" {
                     continue;
                 }
+                // Resolve `var(--x, …)` to the defined custom-property value
+                // now, while the stylesheets (and so the `--x` definitions) are
+                // still here — the re-parsed layout arena has neither.
+                let v = self.resolve_vars(id, &v);
+                // An undefined `var()` with no fallback resolves to nothing —
+                // don't bake an empty declaration.
+                if v.trim().is_empty() {
+                    continue;
+                }
                 bake.push_str(prop);
                 bake.push(':');
                 bake.push_str(&escape_attr(&v));
@@ -1481,6 +1558,10 @@ impl Dom {
         let Some(tag) = self.tag_name(id) else {
             return false;
         };
+        // `:root` is the document root element (`<html>` in HTML).
+        if c.root && tag != "html" {
+            return false;
+        }
         if let Some(want) = &c.tag
             && want != "*"
             && want != tag
@@ -1583,6 +1664,10 @@ struct Compound {
     /// nothing (it silently broke deselection-style code). Inert in the
     /// stylesheet cascade (no query root there).
     scope: bool,
+    /// `:root`: matches the document root element (`<html>`). The conventional
+    /// home of custom-property definitions (`:root { --foo: … }`), so matching
+    /// it is what lets `var(--foo)` resolve to a root-defined value.
+    root: bool,
     /// `::before`/`::after`: the rule targets a generated-content box on
     /// the matched element, NOT the element itself. The element-property
     /// cascade skips these; `pseudo_content` consults only these.
@@ -1637,6 +1722,7 @@ impl Compound {
             && self.nots.is_empty()
             && !self.never
             && !self.scope
+            && !self.root
             && self.pseudo.is_none()
     }
 
@@ -1843,6 +1929,9 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     // cascade. See `Compound::scope`.
                     compound.scope = true;
                     compound.pseudos += 1;
+                } else if name == "root" {
+                    compound.root = true;
+                    compound.pseudos += 1;
                 } else {
                     // Valid CSS we can never satisfy (no pointer, no
                     // focus, no positional matching yet): parse, count
@@ -1945,6 +2034,9 @@ const PROPS: &[PropDef] = &[
     prop("width",                false,     true),
     prop("max-width",            false,     true),
     prop("min-width",            false,     true),
+    prop("height",               false,     true),
+    prop("aspect-ratio",         false,     true),
+    prop("object-fit",           false,     true),
     prop("flex-wrap",            false,     true),
     prop("flex-flow",            false,     true),
     prop("flex-direction",       false,     true),
@@ -1973,7 +2065,10 @@ const PROPS: &[PropDef] = &[
 ];
 
 fn is_tracked(name: &str) -> bool {
-    PROPS.iter().any(|p| p.name == name)
+    // Custom properties (`--foo`) are always stored so `var()` references can
+    // resolve to their defined (cascaded, inherited) value at bake time, not
+    // just the fallback. They inherit and are case-folded like everything else.
+    name.starts_with("--") || PROPS.iter().any(|p| p.name == name)
 }
 
 /// Whether a CSS length is ≤ 1px — the box size of the "sr-only" visually
@@ -3202,6 +3297,61 @@ mod tests {
         assert!(html.contains("fallback"), "{html}");
         // The light children don't ALSO render outside their slots.
         assert_eq!(html.matches("Hello").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn custom_properties_resolve_through_the_cascade() {
+        // A custom property defined on an ancestor inherits to a descendant and
+        // resolves in its `var()` reference to the DEFINED value (not just the
+        // fallback) — the lever for sites whose cell sizing rides custom props
+        // (archive.org's `--infinitescrollercellminwidth`). Resolved at bake,
+        // while the stylesheets are still present.
+        let dom = Dom::parse_document(
+            "<body><div id=root style=\"--cell: 12rem\">\
+             <p id=c style=\"min-width: var(--cell, 16rem)\">x</p></div></body>",
+        );
+        let c = dom.get_by_id("c").unwrap();
+        let html = dom.serialize(c);
+        // The resolved value is baked; it's appended after the original so the
+        // re-parsed inline cascade (later-wins) uses 12rem, not the fallback.
+        assert!(
+            html.contains("min-width:12rem"),
+            "defined --cell wins: {html}"
+        );
+
+        // A class-defined custom property (in a dropped stylesheet) resolves too.
+        let dom = Dom::parse_document(
+            "<body><div class=scope><p id=c style=\"min-width: var(--cell, 16rem)\">x</p></div>\
+             <style>.scope{--cell:10rem}</style></body>",
+        );
+        let c = dom.get_by_id("c").unwrap();
+        assert!(
+            dom.serialize(c).contains("min-width:10rem"),
+            "stylesheet-defined --cell resolves"
+        );
+
+        // Defined on `:root` — the conventional home for custom properties.
+        let dom = Dom::parse_document(
+            "<html><head><style>:root{--cell:8rem}</style></head>\
+             <body><p id=c style=\"min-width: var(--cell, 16rem)\">x</p></body></html>",
+        );
+        let c = dom.get_by_id("c").unwrap();
+        assert!(
+            dom.serialize(c).contains("min-width:8rem"),
+            ":root-defined --cell resolves"
+        );
+    }
+
+    #[test]
+    fn custom_property_falls_back_when_undefined() {
+        let dom = Dom::parse_document(
+            "<body><p id=c style=\"min-width: var(--cell, 16rem)\">x</p></body>",
+        );
+        let c = dom.get_by_id("c").unwrap();
+        assert!(
+            dom.serialize(c).contains("min-width:16rem"),
+            "undefined --cell uses the fallback"
+        );
     }
 
     #[test]

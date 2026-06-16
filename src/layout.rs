@@ -114,6 +114,12 @@ pub struct Item {
     pub node: NodeId,
     /// Present on followable items (anchors).
     pub link: Option<Link>,
+    /// `object-fit: cover` on an `Image` item: the renderer encodes with
+    /// `Resize::Crop` (fill the box, clipping overflow) instead of the default
+    /// `Resize::Fit` (letterbox). Only meaningful when a CSS box forces an
+    /// aspect different from the image's intrinsic one. Always `false` for
+    /// non-image items.
+    pub crop: bool,
 }
 
 /// Inline text emphasis, set by tags (`<b>`/`<i>`/`<u>`/`<s>`) and by CSS
@@ -958,7 +964,7 @@ impl<'a> Layout<'a> {
         if self.float_skip != Some(id)
             && let Some(side) = self.float_side(id)
         {
-            self.flow_float(id, side);
+            self.flow_float(id, side, ctx);
             return;
         }
         // A slide deck (a container whose children are ALL absolutely
@@ -1257,9 +1263,9 @@ impl<'a> Layout<'a> {
             self.flow_hscroll(id);
         } else {
             match flex {
-                Some(FlexMode::Grid) => self.flow_flex_wrap(id),
-                Some(FlexMode::Row) => self.flow_flex_row(id),
-                Some(FlexMode::Column) => self.stack_flex_items(id),
+                Some(FlexMode::Grid) => self.flow_flex_wrap(id, &cctx),
+                Some(FlexMode::Row) => self.flow_flex_row(id, &cctx),
+                Some(FlexMode::Column) => self.stack_flex_items(id, &cctx),
                 None => {
                     for child in self.dom.children(id) {
                         self.flow_node(child, &cctx);
@@ -1542,7 +1548,7 @@ impl<'a> Layout<'a> {
     /// holds firm). An empty, non-growing item collapses to nothing. If the
     /// row can't fit even at every item's minimum, it stacks vertically (the
     /// terminal has no horizontal scroll — her responsive default).
-    fn flow_flex_row(&mut self, id: NodeId) {
+    fn flow_flex_row(&mut self, id: NodeId, ctx: &Ctx) {
         let avail = self.width.saturating_sub(self.indent).max(1);
         let gap = self.flex_gap(id, avail, false);
         let mut nodes = Vec::new();
@@ -1598,7 +1604,7 @@ impl<'a> Layout<'a> {
                 .collect();
             let sum_floor: usize = floor.iter().sum();
             if sum_floor + gaps > avail {
-                self.stack_boxes(&nodes, avail);
+                self.stack_boxes(&nodes, avail, ctx);
                 return;
             }
             let extra = avail - sum_floor - gaps;
@@ -1625,7 +1631,7 @@ impl<'a> Layout<'a> {
         let mut boxes: Vec<LaidBox> = Vec::with_capacity(n);
         for i in 0..n {
             let cw = widths[i].max(1);
-            let mut b = self.layout_subtree(nodes[i], cw);
+            let mut b = self.layout_subtree(nodes[i], cw, ctx);
             // A text/search input that grew (flex-grow) fills its box like a
             // real input field, rather than leaving a gap after its short
             // placeholder. (Buttons/selects don't stretch — see the helper.)
@@ -1722,7 +1728,8 @@ impl<'a> Layout<'a> {
     /// The natural width (cells) of an element's subtree laid out at
     /// `constraint` — its content basis (at `avail`) or min-content (at 1).
     fn measure_width(&self, id: NodeId, constraint: usize) -> usize {
-        self.layout_subtree_inner(id, constraint, None, true).width as usize
+        self.layout_subtree_inner(id, constraint, None, true, &Ctx::root())
+            .width as usize
     }
 
     /// A flex item's `(basis, grow, shrink)`. `basis` resolves `flex-basis`
@@ -1873,7 +1880,7 @@ impl<'a> Layout<'a> {
                 .unwrap_or_else(|| self.measure_width(card, avail))
                 .clamp(1, avail);
             // Lay the card as a block (ignore its own float), then place it.
-            let b = self.layout_subtree_inner(card, cw, Some(card), false);
+            let b = self.layout_subtree_inner(card, cw, Some(card), false, &Ctx::root());
             if b.height == 0 {
                 continue;
             }
@@ -1932,7 +1939,7 @@ impl<'a> Layout<'a> {
             }
             // Each slide fills the band; lay it and place it one band to the
             // right of the last, so exactly one shows at a time.
-            let b = self.layout_subtree_inner(slide, band_w, Some(slide), false);
+            let b = self.layout_subtree_inner(slide, band_w, Some(slide), false, &Ctx::root());
             if b.height == 0 {
                 continue;
             }
@@ -2002,6 +2009,7 @@ impl<'a> Layout<'a> {
                 text: glyph.to_string(),
                 kind: ItemKind::Link,
                 image: None,
+                crop: false,
                 emph: Emphasis::default(),
                 node: NO_NODE,
                 link: Some(Link::CarouselScroll(dir)),
@@ -2058,7 +2066,10 @@ impl<'a> Layout<'a> {
     /// Used to collapse empty flexible flex columns. Hidden descendants
     /// don't count as content.
     fn is_empty_box(&self, id: NodeId) -> bool {
-        for d in self.dom.descendants(id) {
+        // The node ITSELF counts: a flex item that *is* a replaced element
+        // (`descendants` excludes the root) — e.g. a bare `<img>` with no
+        // explicit width — is not empty and must not be collapsed away.
+        for d in std::iter::once(id).chain(self.dom.descendants(id)) {
             match &self.dom.node(d).data {
                 NodeData::Text(s) if !s.trim().is_empty() => return false,
                 NodeData::Element { .. }
@@ -2089,18 +2100,18 @@ impl<'a> Layout<'a> {
     /// boxes, each at the full available width — `flex-direction:column`,
     /// and the responsive fallback for a too-narrow row. Blockifies inline
     /// children (so a card's image and caption stack instead of fusing).
-    fn stack_flex_items(&mut self, id: NodeId) {
+    fn stack_flex_items(&mut self, id: NodeId, ctx: &Ctx) {
         let kids = self.flex_items(id);
         let avail = self.width.saturating_sub(self.indent).max(1);
-        self.stack_boxes(&kids, avail);
+        self.stack_boxes(&kids, avail, ctx);
     }
 
     /// Stack a set of child boxes vertically at `width`, each below the
     /// last (shared by column flex and the row fallback).
-    fn stack_boxes(&mut self, kids: &[NodeId], width: usize) {
+    fn stack_boxes(&mut self, kids: &[NodeId], width: usize, ctx: &Ctx) {
         let mut row = self.rows.len();
         for &k in kids {
-            let b = self.layout_subtree(k, width);
+            let b = self.layout_subtree(k, width, ctx);
             if b.height == 0 {
                 continue;
             }
@@ -2212,7 +2223,7 @@ impl<'a> Layout<'a> {
     /// edge (beside any floats already there), and narrow the band so the
     /// following content flows past it. The box is blitted later, once
     /// content has filled the rows it spans (`resolve_floats`).
-    fn flow_float(&mut self, id: NodeId, side: FloatSide) {
+    fn flow_float(&mut self, id: NodeId, side: FloatSide, ctx: &Ctx) {
         // Floats begin at a line boundary; refresh the band first.
         self.flush_block();
         self.begin_line();
@@ -2222,7 +2233,7 @@ impl<'a> Layout<'a> {
             .or_else(|| self.css_cells(id, "max-width"))
             .map(|w| w.min(avail));
         let constraint = explicit.unwrap_or(avail).max(1);
-        let boxed = self.layout_subtree_inner(id, constraint, Some(id), false);
+        let boxed = self.layout_subtree_inner(id, constraint, Some(id), false, ctx);
         if boxed.height == 0 {
             return;
         }
@@ -2334,7 +2345,7 @@ impl<'a> Layout<'a> {
     /// shelf wrapping to a new band when the next box won't fit. Assumes a
     /// block boundary (line empty, `col == indent`); appends finished rows
     /// directly via `blit` and leaves the cursor back at the indent.
-    fn flow_flex_wrap(&mut self, id: NodeId) {
+    fn flow_flex_wrap(&mut self, id: NodeId, ctx: &Ctx) {
         let avail = self.width.saturating_sub(self.indent).max(1);
         let gap = self.flex_gap(id, avail, false);
         let row_gap = self.flex_gap(id, avail, true);
@@ -2358,7 +2369,7 @@ impl<'a> Layout<'a> {
                 .or(min_w)
                 .unwrap_or(avail)
                 .max(1);
-            let b = self.layout_subtree(child, constraint);
+            let b = self.layout_subtree(child, constraint, ctx);
             if b.height == 0 {
                 continue;
             }
@@ -2556,6 +2567,7 @@ impl<'a> Layout<'a> {
             text,
             kind: ItemKind::Border,
             image: None,
+            crop: false,
             emph: Emphasis::default(),
             node: NO_NODE,
             link: None,
@@ -2625,19 +2637,24 @@ impl<'a> Layout<'a> {
     /// positioned relative to its own top-left (`col` 0). Shares the DOM,
     /// base URL, form/control maps, and image sizes with the parent. The
     /// recursion that powers grids and (later) columns and floats.
-    fn layout_subtree(&self, id: NodeId, content_width: usize) -> LaidBox {
-        self.layout_subtree_inner(id, content_width, None, false)
+    fn layout_subtree(&self, id: NodeId, content_width: usize, inherit: &Ctx) -> LaidBox {
+        self.layout_subtree_inner(id, content_width, None, false, inherit)
     }
 
     /// `layout_subtree`, optionally ignoring the float on the root element
     /// (used when laying a float's own box so it doesn't recurse). `measure`
     /// means this is an intrinsic-width measurement (ignore `text-align`).
+    /// `inherit` seeds the sub-layout's root context so a child laid in a
+    /// separate pass (a flex/grid item) still inherits an enclosing `<a>`'s
+    /// link (and emphasis) — otherwise its contents would lose interactivity,
+    /// exactly as a bordered box would without `flow_bordered` threading `ctx`.
     fn layout_subtree_inner(
         &self,
         id: NodeId,
         content_width: usize,
         skip_float: Option<NodeId>,
         measure: bool,
+        inherit: &Ctx,
     ) -> LaidBox {
         let mut sub = Layout::new(
             self.dom,
@@ -2648,9 +2665,10 @@ impl<'a> Layout<'a> {
             self.images,
             self.borders,
         );
+        sub.viewport_w = self.viewport_w;
         sub.float_skip = skip_float;
         sub.measuring = measure;
-        sub.flow_node(id, &Ctx::root());
+        sub.flow_node(id, inherit);
         sub.flush_block();
         sub.finish_floats();
         let (rows, carousels) = sub.finish();
@@ -2917,16 +2935,15 @@ impl<'a> Layout<'a> {
     /// horizontally and wraps into a grid, rather than stacking. CSS
     /// `display:block` (and flex/grid/table/list-item, where the box is a
     /// block-level child) puts it on its own line. The reserved rows for
-    /// its height are emitted by `break_line` from `line_height`. A box
-    /// wider than the content width is clamped (height rescaled to keep
-    /// the aspect the encode will use).
+    /// its height are emitted by `break_line` from `line_height`.
+    ///
+    /// The box is the CSS replaced-element used size (`image_used_box`): CSS
+    /// `width`/`height`/`aspect-ratio`/`object-fit` and the `<img>` width/height
+    /// attributes, falling back to the intrinsic decoded box. `w`/`h` are the
+    /// intrinsic cell box (the encode's source).
     fn place_image_box(&mut self, id: NodeId, ctx: &Ctx, url: String, w: u16, h: u16) {
         let avail = self.line_right.saturating_sub(self.line_left).max(1) as u16;
-        let (w, h) = if w > avail {
-            (avail, ((h as u32 * avail as u32 / w as u32).max(1)) as u16)
-        } else {
-            (w, h)
-        };
+        let (w, h, crop) = self.image_used_box(id, w, h, avail);
         let block = matches!(
             self.dom.computed_display(id).as_deref(),
             Some("block" | "flex" | "grid" | "table" | "list-item")
@@ -2952,6 +2969,7 @@ impl<'a> Layout<'a> {
             width: w,
             height: h,
             image: Some(url),
+            crop,
             text: String::new(),
             kind: ItemKind::Image,
             emph: Emphasis::default(),
@@ -2966,6 +2984,83 @@ impl<'a> Layout<'a> {
         } else {
             self.pending_space = true; // a trailing gap after the image
         }
+    }
+
+    /// The CSS replaced-element used box (cells) for an image, plus whether to
+    /// `object-fit: cover` (crop). `iw`/`ih` are the intrinsic decoded cell box,
+    /// `avail` the content width it may occupy.
+    ///
+    /// Width = CSS `width` (length/`%` against the containing block), clamped by
+    /// `min-width`/`max-width`, capped at `avail`; else intrinsic. Height = CSS
+    /// `height` (a length, vertical units); else from `aspect-ratio`; else, for
+    /// a `height:100%` image, the nearest ancestor box with an `aspect-ratio`;
+    /// else the `<img width/height>` attribute ratio; else the intrinsic box
+    /// scaled to the used width (the previous behaviour, so an image with no CSS
+    /// sizing is unchanged). A safety cap bounds a pathological CSS height.
+    fn image_used_box(&self, id: NodeId, iw: u16, ih: u16, avail: u16) -> (u16, u16, bool) {
+        let avail = avail.max(1) as usize;
+        let (iw, ih) = (iw.max(1) as usize, ih.max(1) as usize);
+
+        // Used width.
+        let mut used_w = self.css_cells(id, "width").unwrap_or(iw);
+        if let Some(mn) = self.css_cells(id, "min-width") {
+            used_w = used_w.max(mn);
+        }
+        if let Some(mx) = self.css_cells(id, "max-width") {
+            used_w = used_w.min(mx);
+        }
+        let used_w = used_w.min(avail).max(1);
+
+        // Used height (rows).
+        let raw_h = self.dom.computed_style(id, "height");
+        let intrinsic_h = (ih * used_w / iw).max(1);
+        let used_h = if let Some(h) = raw_h.as_deref().and_then(css_length_rows) {
+            h
+        } else if let Some(ar) = self.css_aspect_ratio(id) {
+            rows_for_ratio(used_w, ar)
+        } else if raw_h.as_deref() == Some("100%") {
+            self.container_box_rows(id, used_w).unwrap_or(intrinsic_h)
+        } else if let Some(ar) = self.img_attr_ratio(id) {
+            rows_for_ratio(used_w, ar)
+        } else {
+            intrinsic_h
+        };
+        let used_h = used_h.clamp(1, IMG_CSS_MAX_ROWS);
+
+        let crop = self.dom.computed_style(id, "object-fit").as_deref() == Some("cover");
+        (used_w as u16, used_h as u16, crop)
+    }
+
+    /// The `aspect-ratio` (width÷height) computed for an element, or `None`
+    /// for `auto`/unset/unparseable. Accepts `R`, `W / H`, and the
+    /// `auto W / H` form (the `auto` keyword is ignored).
+    fn css_aspect_ratio(&self, id: NodeId) -> Option<f32> {
+        parse_ratio(&self.dom.computed_style(id, "aspect-ratio")?)
+    }
+
+    /// The intrinsic ratio from the `<img width=… height=…>` presentation
+    /// attributes (browsers derive a default `aspect-ratio` from them to avoid
+    /// layout shift). Unitless integers only.
+    fn img_attr_ratio(&self, id: NodeId) -> Option<f32> {
+        let w: f32 = self.dom.attr(id, "width")?.trim().parse().ok()?;
+        let h: f32 = self.dom.attr(id, "height")?.trim().parse().ok()?;
+        (w > 0.0 && h > 0.0).then_some(w / h)
+    }
+
+    /// Height in rows of the nearest ancestor that establishes a definite box
+    /// via `aspect-ratio` — for a `height:100%` image filling a sized container
+    /// (e.g. a square tile: `aspect-ratio:1` wrapper, `img{width/height:100%}`).
+    /// The ancestor's width is the image's used width (it fills the cell).
+    fn container_box_rows(&self, id: NodeId, used_w: usize) -> Option<usize> {
+        let mut cur = self.dom.parent_composed(id);
+        for _ in 0..6 {
+            let p = cur?;
+            if let Some(ar) = self.css_aspect_ratio(p) {
+                return Some(rows_for_ratio(used_w, ar));
+            }
+            cur = self.dom.parent_composed(p);
+        }
+        None
     }
 
     /// Flow a form control. A control known to the form extraction (in
@@ -3090,6 +3185,7 @@ impl<'a> Layout<'a> {
             text: marker.to_owned(),
             kind: ItemKind::Text,
             image: None,
+            crop: false,
             emph: Emphasis::default(),
             node: NO_NODE,
             link: None,
@@ -3127,6 +3223,7 @@ impl<'a> Layout<'a> {
             width: width as u16,
             height: 1,
             image: None,
+            crop: false,
             text,
             kind,
             emph,
@@ -3254,6 +3351,7 @@ fn image_spacer_row(indent: usize) -> Row {
             width: 0,
             height: 1,
             image: None,
+            crop: false,
             text: String::new(),
             kind: ItemKind::Image,
             emph: Emphasis::default(),
@@ -3346,6 +3444,41 @@ fn css_is_italic(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "italic" | "oblique"
     )
+}
+
+/// Safety backstop on a CSS-forced image height (rows). Well-built pages
+/// constrain images with a sized box, but a pathological `height: 5000px`
+/// shouldn't reserve hundreds of rows and wreck scroll/selection — this is a
+/// guard, not a layout cap (cf. `IMG_MAX_CELLS` for intrinsic boxes).
+const IMG_CSS_MAX_ROWS: usize = 48;
+
+/// A vertical CSS length as terminal rows. The cell is ~2:1 (col:row), so 1em
+/// ≈ 1 row (vs ≈ 2 cols horizontally) and 1px ≈ 1/16 row. `%`/`auto`/`vh`
+/// return `None` (a `100%`/`%` height resolves against a container instead).
+fn css_length_rows(value: &str) -> Option<usize> {
+    css_length_em(value).map(|em| em.round().max(1.0) as usize)
+}
+
+/// Parse a CSS `aspect-ratio` to width÷height. `R`, `W / H`, and `auto W / H`
+/// (the `auto` keyword ignored); `auto`/unset/zero/unparseable → `None`.
+fn parse_ratio(value: &str) -> Option<f32> {
+    let v = value.trim().trim_start_matches("auto").trim();
+    if v.is_empty() {
+        return None;
+    }
+    let ratio = if let Some((a, b)) = v.split_once('/') {
+        a.trim().parse::<f32>().ok()? / b.trim().parse::<f32>().ok()?
+    } else {
+        v.parse::<f32>().ok()?
+    };
+    (ratio.is_finite() && ratio > 0.0).then_some(ratio)
+}
+
+/// Rows for a box `width_cols` wide at pixel aspect `ratio` (width÷height).
+/// With the nominal 8×16 cell: `height_px = width_px / ratio`, so
+/// `rows = cols / (2·ratio)` (a 1:1 box is half as many rows as columns).
+fn rows_for_ratio(width_cols: usize, ratio: f32) -> usize {
+    (width_cols as f32 / (2.0 * ratio)).round().max(1.0) as usize
 }
 
 /// A context-free CSS length as an em-equivalent (≈ one em ≈ 2 text cells).
@@ -4091,6 +4224,105 @@ mod tests {
             .iter()
             .all(|r| r.items.iter().all(|i| i.image.is_none() && i.width == 0));
         assert!(spacers, "3 reserved spacer rows follow the image");
+    }
+
+    fn image_item(rows: &[Row]) -> &Item {
+        rows.iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .expect("an image item")
+    }
+
+    #[test]
+    fn flex_children_inherit_an_ancestor_anchor_link() {
+        // archive's tile: an <a> wraps a flex container holding the image and
+        // label. Flex items are laid in a separate sub-pass (layout_subtree),
+        // so without threading the inherited Ctx they'd lose the anchor's link
+        // — no hover, no click. Both the image and the label must stay links.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/t.png".to_owned(), (8, 8));
+        let rows = lay_with_images(
+            r#"<body><a href="/dest"><div style="display:flex"><img src="/t.png"><span>Label</span></div></a></body>"#,
+            40,
+            &images,
+        );
+        let img = image_item(&rows);
+        assert!(
+            img.link.is_some(),
+            "image inside flex-in-anchor stays a link"
+        );
+        let label = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("Label"))
+            .expect("label");
+        assert!(
+            label.link.is_some(),
+            "label inside flex-in-anchor stays a link"
+        );
+    }
+
+    #[test]
+    fn css_box_overrides_intrinsic_image_with_object_fit_cover() {
+        // archive.org's collection tile: width:100%; height:160px;
+        // object-fit:cover on a small source. The used box is the CSS box
+        // (uniform across tiles), cropped — not the intrinsic size.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/t.png".to_owned(), (8, 8));
+        let rows = lay_with_images(
+            r#"<body><img src="/t.png" style="width:100%;height:160px;object-fit:cover"></body>"#,
+            40,
+            &images,
+        );
+        let img = image_item(&rows);
+        assert_eq!(img.width, 40, "width:100% fills the content width");
+        assert_eq!(img.height, 10, "160px is 10 rows");
+        assert!(img.crop, "object-fit:cover crops");
+    }
+
+    #[test]
+    fn aspect_ratio_sets_image_height_from_width() {
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/a.png".to_owned(), (30, 30));
+        let rows = lay_with_images(
+            r#"<body><img src="/a.png" style="width:20em;aspect-ratio:2 / 1"></body>"#,
+            80,
+            &images,
+        );
+        let img = image_item(&rows);
+        // 20em = 40 cols; 2:1 ratio => 40 / (2*2) = 10 rows.
+        assert_eq!((img.width, img.height), (40, 10));
+        assert!(!img.crop);
+    }
+
+    #[test]
+    fn img_width_height_attrs_give_default_ratio() {
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/b.png".to_owned(), (50, 50));
+        let rows = lay_with_images(
+            r#"<body><img src="/b.png" width="200" height="100" style="width:100%"></body>"#,
+            40,
+            &images,
+        );
+        let img = image_item(&rows);
+        // width:100% => 40 cols; attr ratio 200:100 = 2:1 => 40/(2*2) = 10 rows.
+        assert_eq!((img.width, img.height), (40, 10));
+    }
+
+    #[test]
+    fn container_aspect_ratio_sizes_a_full_height_image() {
+        // Square tile: aspect-ratio:1 wrapper, img width/height:100%.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/c.png".to_owned(), (5, 20));
+        let rows = lay_with_images(
+            r#"<body><div style="aspect-ratio:1 / 1"><img src="/c.png" style="width:100%;height:100%;object-fit:cover"></div></body>"#,
+            40,
+            &images,
+        );
+        let img = image_item(&rows);
+        // width 40; height:100% of a 1:1 container of width 40 => 40/2 = 20 rows.
+        assert_eq!((img.width, img.height), (40, 20));
+        assert!(img.crop);
     }
 
     #[test]
