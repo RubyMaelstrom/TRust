@@ -348,7 +348,10 @@ fn render_inline_images(
     frame: &mut Frame,
     g: &BrowserView,
     inner: ratatui::layout::Rect,
-    protocols: &std::collections::HashMap<(String, u16, u16), ratatui_image::protocol::Protocol>,
+    protocols: &std::collections::HashMap<
+        (String, u16, u16, bool),
+        ratatui_image::protocol::Protocol,
+    >,
 ) {
     let (vw, vh) = (inner.width, inner.height);
     let carousels = &g.doc.carousels;
@@ -366,7 +369,7 @@ fn render_inline_images(
             if scol + item.width > vw || top + item.height > vh {
                 continue;
             }
-            let key = (url.clone(), item.width, item.height);
+            let key = (url.clone(), item.width, item.height, item.crop);
             if let Some(proto) = protocols.get(&key) {
                 let area = ratatui::layout::Rect::new(
                     inner.x + scol,

@@ -310,9 +310,13 @@ struct ImgLoadMsg {
     decoded: Option<DecodedImage>,
 }
 
+/// Cache/dedup key for an encoded inline image: URL, cell box, and whether it
+/// was `object-fit: cover`-cropped (the same image+box can render Fit or Crop).
+type EncKey = (String, u16, u16, bool);
+
 /// One inline-image box finished encoding to a terminal protocol.
 struct EncMsg {
-    key: (String, u16, u16),
+    key: EncKey,
     protocol: Option<Protocol>,
 }
 
@@ -403,13 +407,13 @@ pub struct App {
     image_cache: HashMap<String, DecodedImage>,
     /// In-flight parallel page-image fetch+decode batch.
     imgs_rx: Option<mpsc::Receiver<ImgLoadMsg>>,
-    /// Encoded inline-image protocols, keyed by `(url, cell_w, cell_h)`.
+    /// Encoded inline-image protocols, keyed by `(url, cell_w, cell_h, crop)`.
     /// Scroll doesn't change the box, so it never re-encodes on scroll.
-    pub(crate) image_protocols: HashMap<(String, u16, u16), Protocol>,
+    pub(crate) image_protocols: HashMap<EncKey, Protocol>,
     /// Boxes currently being encoded (one async encode per key in flight).
     /// Non-empty drives the loading pulse (the channel is persistent so it
     /// can't gate the pulse itself).
-    image_encoding: HashSet<(String, u16, u16)>,
+    image_encoding: HashSet<EncKey>,
     /// Persistent channel for finished inline-image encodes.
     enc_tx: mpsc::Sender<EncMsg>,
     enc_rx: mpsc::Receiver<EncMsg>,
@@ -1344,7 +1348,8 @@ impl App {
             let result = img::decode(&raw).and_then(|(image, mime)| {
                 let info = format!("{}×{} {mime}", image.width(), image.height());
                 let panel = ratatui::layout::Size::new(size.0, size.1);
-                img::encode(&picker, image, panel).map(|protocol| (protocol, info))
+                // The full-screen image viewer fits (contains) the panel.
+                img::encode(&picker, image, panel, false).map(|protocol| (protocol, info))
             });
             let _ = tx.blocking_send(ImgMsg {
                 url,
@@ -1482,7 +1487,7 @@ impl App {
             return;
         }
         let end = (g.scroll + vh as usize).min(g.doc.rows.len());
-        let mut wanted: Vec<(String, u16, u16)> = Vec::new();
+        let mut wanted: Vec<EncKey> = Vec::new();
         for (r, row) in g.doc.rows[g.scroll..end].iter().enumerate() {
             let top = r as u16; // viewport-relative row of this line
             for item in &row.items {
@@ -1501,7 +1506,7 @@ impl App {
                 if scol + item.width > vw || top + item.height > vh {
                     continue;
                 }
-                let key = (url.clone(), item.width, item.height);
+                let key = (url.clone(), item.width, item.height, item.crop);
                 if !self.image_protocols.contains_key(&key)
                     && !self.image_encoding.contains(&key)
                     && !wanted.contains(&key)
@@ -1517,18 +1522,18 @@ impl App {
 
     /// Spawn one blocking encode of a decoded image to a terminal protocol
     /// for the given cell box; the result lands over `enc_rx`.
-    fn request_image_encode(&mut self, key: (String, u16, u16)) {
+    fn request_image_encode(&mut self, key: EncKey) {
         let Some(decoded) = self.image_cache.get(&key.0) else {
             return;
         };
         let raw = decoded.raw.clone();
         let picker = self.picker.clone();
         let tx = self.enc_tx.clone();
-        let (_, w, h) = key.clone();
+        let (_, w, h, crop) = key.clone();
         self.image_encoding.insert(key.clone());
         tokio::task::spawn_blocking(move || {
             let protocol = crate::img::decode(&raw).ok().and_then(|(image, _)| {
-                crate::img::encode(&picker, image, ratatui::layout::Size::new(w, h)).ok()
+                crate::img::encode(&picker, image, ratatui::layout::Size::new(w, h), crop).ok()
             });
             let _ = tx.blocking_send(EncMsg { key, protocol });
         });
@@ -4269,7 +4274,7 @@ mod tests {
         let (image, mime) = crate::img::decode(&raw).expect("test image decodes");
         let info = format!("{}×{} {mime}", image.width(), image.height());
         let size = ratatui::layout::Size::new(app.last_inner.0, app.last_inner.1);
-        let protocol = crate::img::encode(&app.picker, image, size).unwrap();
+        let protocol = crate::img::encode(&app.picker, image, size, false).unwrap();
         app.on_img(super::ImgMsg {
             url,
             raw: raw.into(),

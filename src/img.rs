@@ -38,12 +38,25 @@ pub fn decode(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
     Ok((image, mime))
 }
 
-/// Scale-to-fit encode for a panel of `size` cells. The result is a
-/// fixed `Protocol` for the stateless `Image` widget; re-encode when
-/// the panel size or the protocol type changes.
-pub fn encode(picker: &Picker, image: DynamicImage, size: Size) -> Result<Protocol, String> {
+/// Encode an image to fill a panel of `size` cells. `crop` selects the CSS
+/// `object-fit` behaviour: `false` → `Resize::Fit` (contain — scale to fit,
+/// preserving aspect, letterboxing); `true` → `Resize::Crop` (cover — fill the
+/// box, clipping overflow). The result is a fixed `Protocol` for the stateless
+/// `Image` widget; re-encode when the panel size, crop mode, or protocol type
+/// changes.
+pub fn encode(
+    picker: &Picker,
+    image: DynamicImage,
+    size: Size,
+    crop: bool,
+) -> Result<Protocol, String> {
+    let resize = if crop {
+        Resize::Crop(None)
+    } else {
+        Resize::Fit(Some(FilterType::Lanczos3))
+    };
     picker
-        .new_protocol(image, size, Resize::Fit(Some(FilterType::Lanczos3)))
+        .new_protocol(image, size, resize)
         .map_err(|e| e.to_string())
 }
 
@@ -80,9 +93,20 @@ mod tests {
     fn encodes_to_fit_with_halfblocks() {
         let (image, _) = decode(&red_png()).unwrap();
         let picker = Picker::halfblocks();
-        let protocol = encode(&picker, image, Size::new(20, 10)).unwrap();
+        let protocol = encode(&picker, image, Size::new(20, 10), false).unwrap();
         let size = protocol.size();
         assert!(size.width > 0 && size.width <= 20);
         assert!(size.height > 0 && size.height <= 10);
+    }
+
+    #[test]
+    fn encodes_with_crop_to_cover() {
+        // object-fit: cover crops to fill the box (here a wide box from a
+        // square source) rather than letterboxing.
+        let (image, _) = decode(&red_png()).unwrap();
+        let picker = Picker::halfblocks();
+        let protocol = encode(&picker, image, Size::new(20, 4), true).unwrap();
+        let size = protocol.size();
+        assert!(size.width > 0 && size.height > 0);
     }
 }
