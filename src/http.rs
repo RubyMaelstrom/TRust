@@ -904,8 +904,15 @@ pub fn parse_seeded(
         let (found, controls) = extract_forms_arena(&dom, url, seed);
         forms = found;
         image_urls = collect_image_urls(&dom, url);
-        let (laid, found_carousels) =
-            crate::layout::lay_out_with_carousels(&dom, url, width, &forms, &controls, images);
+        let (laid, found_carousels) = crate::layout::lay_out_with_carousels(
+            &dom,
+            url,
+            width,
+            &forms,
+            &controls,
+            images,
+            crate::layout::borders_enabled(),
+        );
         rows = laid;
         carousels = found_carousels;
         Vec::new()
@@ -1543,6 +1550,73 @@ mod tests {
             other => panic!("expected Updated, got {other:?}"),
         }
         server.abort();
+    }
+
+    /// Diagnostic: fetch a REAL url, find a clickable by its link text,
+    /// click it through the live actor, and dump the classes of two probe
+    /// elements before/after. `TRUST_CLICK_DIAG=<url> TRUST_CLICK_TEXT=<linktext>
+    /// TRUST_CLICK_PROBE=<substr> cargo test click_diag -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "manual diagnostic, needs TRUST_CLICK_DIAG=<url>"]
+    async fn click_diag() {
+        let Ok(target) = std::env::var("TRUST_CLICK_DIAG") else {
+            eprintln!("set TRUST_CLICK_DIAG");
+            return;
+        };
+        let link_text = std::env::var("TRUST_CLICK_TEXT").unwrap_or_default();
+        let url = parse_url(&target).expect("absolute http(s) url");
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = execute_js(response, (120, 40), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body).to_string();
+        // Probe: the class attr of the element whose text follows it.
+        let class_near = |html: &str, text: &str| -> String {
+            match html.find(text) {
+                Some(at) => {
+                    let pre = &html[..at];
+                    let ci = pre.rfind("class=\"").map(|i| i + 7).unwrap_or(0);
+                    let end = html[ci..].find('"').map(|e| ci + e).unwrap_or(ci);
+                    html[ci..end].to_string()
+                }
+                None => "<absent>".into(),
+            }
+        };
+        eprintln!("BEFORE Items   class = {:?}", class_near(&body, "Items"));
+        eprintln!(
+            "BEFORE Merch   class = {:?}",
+            class_near(&body, "Merchants/Stores")
+        );
+        // Marker on the clickable wrapping link_text.
+        let at = body.find(&link_text).expect("link text in body");
+        let marker = body[..at]
+            .rfind("x-trust-js:")
+            .map(|i| {
+                body[i + "x-trust-js:".len()..]
+                    .split(':')
+                    .next()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .expect("marker");
+        eprintln!("clicking node {marker} (\"{link_text}\")");
+        let live = response.live.as_mut().expect("page is live");
+        live.handle
+            .cmds
+            .send(crate::js::PageCmd::Click(marker))
+            .await
+            .unwrap();
+        match live.events.recv().await {
+            Some(crate::js::PageEvt::Updated { html, outcome }) => {
+                eprintln!("AFTER errors = {:?}", outcome.errors);
+                eprintln!("AFTER  Items  class = {:?}", class_near(&html, "Items"));
+                eprintln!(
+                    "AFTER  Merch  class = {:?}",
+                    class_near(&html, "Merchants/Stores")
+                );
+            }
+            other => eprintln!("AFTER event = {other:?}"),
+        }
+        drop(response.live.take());
     }
 
     /// Diagnostic: fetch a REAL url through the full JS pipeline and

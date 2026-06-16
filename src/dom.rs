@@ -649,7 +649,7 @@ impl Dom {
             for r in rules {
                 // `div::before{…}` rules target a generated box, not the
                 // element — skip them in the element-property cascade.
-                if rule_pseudo(r).is_some() || !self.matches_complex(id, &r.selector.0) {
+                if rule_pseudo(r).is_some() || !self.matches_complex(id, &r.selector.0, None) {
                     continue;
                 }
                 for (pk, (imp, v)) in &r.decls {
@@ -671,7 +671,7 @@ impl Dom {
         let rules = index.scopes.get(&self.tree_scope(id))?;
         let mut winner: Option<(CascadeKey, String)> = None;
         for r in rules {
-            if rule_pseudo(r) != Some(which) || !self.matches_complex(id, &r.selector.0) {
+            if rule_pseudo(r) != Some(which) || !self.matches_complex(id, &r.selector.0, None) {
                 continue;
             }
             for (pk, (imp, v)) in &r.decls {
@@ -1381,7 +1381,8 @@ impl Dom {
     pub fn query(&self, root: NodeId, selectors: &SelectorList, first_only: bool) -> Vec<NodeId> {
         let mut out = Vec::new();
         for d in self.descendants(root) {
-            if self.matches(d, selectors) {
+            // `:scope` in the selector resolves to this query root.
+            if self.matches_scoped(d, selectors, Some(root)) {
                 out.push(d);
                 if first_only {
                     break;
@@ -1392,14 +1393,26 @@ impl Dom {
     }
 
     pub fn matches(&self, id: NodeId, selectors: &SelectorList) -> bool {
-        selectors.0.iter().any(|c| self.matches_complex(id, &c.0))
+        self.matches_scoped(id, selectors, None)
     }
 
-    fn matches_complex(&self, id: NodeId, parts: &[(Combinator, Compound)]) -> bool {
+    fn matches_scoped(&self, id: NodeId, selectors: &SelectorList, scope: Option<NodeId>) -> bool {
+        selectors
+            .0
+            .iter()
+            .any(|c| self.matches_complex(id, &c.0, scope))
+    }
+
+    fn matches_complex(
+        &self,
+        id: NodeId,
+        parts: &[(Combinator, Compound)],
+        scope: Option<NodeId>,
+    ) -> bool {
         let Some(((comb, compound), rest)) = parts.split_last() else {
             return false;
         };
-        if !self.matches_compound(id, compound) {
+        if !self.matches_compound(id, compound, scope) {
             return false;
         }
         if rest.is_empty() {
@@ -1408,11 +1421,11 @@ impl Dom {
         match comb {
             Combinator::Child => self.nodes[id]
                 .parent
-                .is_some_and(|p| self.matches_complex(p, rest)),
+                .is_some_and(|p| self.matches_complex(p, rest, scope)),
             Combinator::Descendant | Combinator::None => {
                 let mut up = self.nodes[id].parent;
                 while let Some(a) = up {
-                    if self.matches_complex(a, rest) {
+                    if self.matches_complex(a, rest, scope) {
                         return true;
                     }
                     up = self.nodes[a].parent;
@@ -1422,8 +1435,12 @@ impl Dom {
         }
     }
 
-    fn matches_compound(&self, id: NodeId, c: &Compound) -> bool {
+    fn matches_compound(&self, id: NodeId, c: &Compound, scope: Option<NodeId>) -> bool {
         if c.never {
+            return false;
+        }
+        // `:scope` matches only the query root (None in the cascade → never).
+        if c.scope && scope != Some(id) {
             return false;
         }
         let Some(tag) = self.tag_name(id) else {
@@ -1457,7 +1474,7 @@ impl Dom {
                 }
             }
         }
-        c.nots.iter().all(|n| !self.matches_compound(id, n))
+        c.nots.iter().all(|n| !self.matches_compound(id, n, scope))
     }
 }
 
@@ -1525,6 +1542,12 @@ struct Compound {
     /// fine, match never (fail-open — a never-matching hide rule hides
     /// nothing, and its comma-siblings stay alive).
     never: bool,
+    /// `:scope`: matches the element a rooted query (`querySelectorAll`/
+    /// jQuery `.find()`) was called on. jQuery rewrites context-rooted comma/
+    /// complex selectors to `:scope X, :scope Y`, so without this they match
+    /// nothing (it silently broke deselection-style code). Inert in the
+    /// stylesheet cascade (no query root there).
+    scope: bool,
     /// `::before`/`::after`: the rule targets a generated-content box on
     /// the matched element, NOT the element itself. The element-property
     /// cascade skips these; `pseudo_content` consults only these.
@@ -1578,6 +1601,7 @@ impl Compound {
             && self.attrs.is_empty()
             && self.nots.is_empty()
             && !self.never
+            && !self.scope
             && self.pseudo.is_none()
     }
 
@@ -1779,6 +1803,11 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         PseudoEl::After
                     });
                     compound.pseudos += 1;
+                } else if name == "scope" {
+                    // Matches the query root (set by `query`); inert in the
+                    // cascade. See `Compound::scope`.
+                    compound.scope = true;
+                    compound.pseudos += 1;
                 } else {
                     // Valid CSS we can never satisfy (no pointer, no
                     // focus, no positional matching yet): parse, count
@@ -1872,6 +1901,7 @@ const PROPS: &[PropDef] = &[
     prop("white-space",          true,      true),
     prop("text-transform",       true,      true),
     prop("list-style-type",      true,      true),
+    prop("text-indent",          true,      true),
     prop("text-decoration",      false,     true),
     prop("text-decoration-line", false,     true),
     prop("content",              false,     false),
@@ -1893,6 +1923,14 @@ const PROPS: &[PropDef] = &[
     prop("column-gap",           false,     true),
     prop("row-gap",              false,     true),
     prop("justify-content",      false,     true),
+    prop("border-top-width",     false,     true),
+    prop("border-right-width",   false,     true),
+    prop("border-bottom-width",  false,     true),
+    prop("border-left-width",    false,     true),
+    prop("border-top-style",     false,     true),
+    prop("border-right-style",   false,     true),
+    prop("border-bottom-style",  false,     true),
+    prop("border-left-style",    false,     true),
 ];
 
 fn is_tracked(name: &str) -> bool {
@@ -1903,17 +1941,12 @@ fn is_tracked(name: &str) -> bool {
 /// Keeps merely-faded content (e.g. `opacity:0.5`) visible.
 const OPACITY_HIDDEN: f32 = 0.05;
 
-/// Expand a `margin`/`padding`/`list-style` shorthand into the longhands we
-/// track; pass anything else through unchanged.
+/// Expand a `margin`/`padding`/`border*`/`list-style` shorthand into the
+/// longhands we track; pass anything else through unchanged.
 fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     if prop == "margin" || prop == "padding" {
-        let p: Vec<&str> = value.split_whitespace().collect();
-        let (t, r, b, l) = match p.as_slice() {
-            [a] => (*a, *a, *a, *a),
-            [a, b] => (*a, *b, *a, *b),
-            [a, b, c] => (*a, *b, *c, *b),
-            [a, b, c, d] => (*a, *b, *c, *d),
-            _ => return Vec::new(),
+        let Some([t, r, b, l]) = four_sides(value) else {
+            return Vec::new();
         };
         return vec![
             (format!("{prop}-top"), t.to_string()),
@@ -1921,6 +1954,33 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             (format!("{prop}-bottom"), b.to_string()),
             (format!("{prop}-left"), l.to_string()),
         ];
+    }
+    // `border-width`/`border-style`: 1–4 values, top/right/bottom/left.
+    if let Some(kind) = prop
+        .strip_prefix("border-")
+        .filter(|k| *k == "width" || *k == "style")
+    {
+        let Some(sides) = four_sides(value) else {
+            return Vec::new();
+        };
+        return ["top", "right", "bottom", "left"]
+            .iter()
+            .zip(sides)
+            .map(|(side, v)| (format!("border-{side}-{kind}"), v.to_string()))
+            .collect();
+    }
+    // `border` / `border-{side}`: a `width || style || color` shorthand. We
+    // keep the width and style (color is ignored), per side.
+    if prop == "border" {
+        let (w, s) = parse_border_shorthand(value);
+        return border_longhands(&["top", "right", "bottom", "left"], w, s);
+    }
+    if let Some(side) = prop
+        .strip_prefix("border-")
+        .filter(|s| matches!(*s, "top" | "right" | "bottom" | "left"))
+    {
+        let (w, s) = parse_border_shorthand(value);
+        return border_longhands(&[side], w, s);
     }
     // `list-style: <type> || <position> || <image>` — we only track the type
     // keyword (a bare `none` counts as the type, per the shorthand grammar).
@@ -1931,6 +1991,55 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         };
     }
     vec![(prop.to_string(), value.to_string())]
+}
+
+/// The top/right/bottom/left values of a CSS 1–4-value box shorthand.
+fn four_sides(value: &str) -> Option<[&str; 4]> {
+    let p: Vec<&str> = value.split_whitespace().collect();
+    match p.as_slice() {
+        [a] => Some([a, a, a, a]),
+        [a, b] => Some([a, b, a, b]),
+        [a, b, c] => Some([a, b, c, b]),
+        [a, b, c, d] => Some([a, b, c, d]),
+        _ => None,
+    }
+}
+
+/// The `(width, style)` of a `border`/`border-<side>` shorthand (color
+/// dropped). Order-independent: the style keyword and a width token (`thin`/
+/// `medium`/`thick` or a length) are picked out; anything else is the color.
+fn parse_border_shorthand(value: &str) -> (Option<&str>, Option<&str>) {
+    const STYLES: &[&str] = &[
+        "none", "hidden", "solid", "dashed", "dotted", "double", "groove", "ridge", "inset",
+        "outset",
+    ];
+    let mut width = None;
+    let mut style = None;
+    for tok in value.split_whitespace() {
+        if STYLES.contains(&tok) {
+            style = Some(tok);
+        } else if tok == "thin"
+            || tok == "medium"
+            || tok == "thick"
+            || tok.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+        {
+            width = Some(tok);
+        }
+    }
+    (width, style)
+}
+
+fn border_longhands(sides: &[&str], w: Option<&str>, s: Option<&str>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for side in sides {
+        if let Some(w) = w {
+            out.push((format!("border-{side}-width"), w.to_string()));
+        }
+        if let Some(s) = s {
+            out.push((format!("border-{side}-style"), s.to_string()));
+        }
+    }
+    out
 }
 
 /// The `list-style-type` keyword inside a `list-style` shorthand, if present.
@@ -2910,6 +3019,34 @@ mod tests {
         assert_eq!(q("[data-k=w]"), 0);
         assert_eq!(q("p, span"), 3);
         assert_eq!(q("*"), 8); // html, head, body, div, p, span, div, p
+    }
+
+    #[test]
+    fn scope_pseudo_matches_the_query_root() {
+        // jQuery rewrites a context-rooted comma `.find()` to
+        // `:scope X, :scope Y`. `:scope` must resolve to the element the query
+        // is rooted on, or the query returns nothing — the SL Marketplace
+        // tab-deselection bug (`removeClass` over `:scope .tab-header,…`).
+        let dom = Dom::parse_document(
+            "<body><div id=box><span class=a>1</span><span class=b>2</span>\
+             <span class=a>3</span></div><span class=a>outside</span></body>",
+        );
+        let box_id = dom.get_by_id("box").unwrap();
+        let q = |root: NodeId, s: &str| {
+            let sel = SelectorList::parse(s).unwrap();
+            dom.query(root, &sel, false).len()
+        };
+        // Rooted at #box, `:scope .a` finds the two inside, not the outsider.
+        assert_eq!(q(box_id, ":scope .a"), 2, ":scope roots at #box");
+        // The exact jQuery shape: a comma list of :scope-prefixed selectors.
+        assert_eq!(
+            q(box_id, ":scope .a, :scope .b"),
+            3,
+            "comma :scope list ORs"
+        );
+        // Inert in the cascade / scopeless match (no query root → never).
+        let b = dom.query(box_id, &SelectorList::parse(".b").unwrap(), true)[0];
+        assert!(!dom.matches(b, &SelectorList::parse(":scope").unwrap()));
     }
 
     #[test]

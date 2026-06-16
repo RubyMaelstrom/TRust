@@ -2,3 +2,4 @@
 *.js
 /vendor/boa_engine-0.21.1/benches
 /vendor/boa_engine-0.21.1/tests
+CLAUDE.md

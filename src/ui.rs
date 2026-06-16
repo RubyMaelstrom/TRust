@@ -290,6 +290,7 @@ fn browser_rows(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
                     ItemKind::Pre => Style::new().fg(theme::NEON_GREEN),
                     ItemKind::Form => Style::new().fg(theme::AMBER),
                     ItemKind::Image => Style::new().fg(theme::DIM).add_modifier(Modifier::ITALIC),
+                    ItemKind::Border => Style::new().fg(theme::DIM),
                     ItemKind::Text => Style::new().fg(theme::TEXT),
                 };
                 // A generated carousel scroll control greys out when it can't

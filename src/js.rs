@@ -4327,6 +4327,71 @@ mod tests {
         assert!(out.contains("stays"), "{out}");
     }
 
+    #[test]
+    fn live_click_moves_active_tab_border_via_cascade_rebake() {
+        // A tab UI on a living page: clicking the inactive tab moves the
+        // `selected` class, and the re-serialization RE-BAKES the cascade so
+        // the active border follows — the new tab gains `border-bottom:4px`,
+        // the old one drops to `1px`. This is the SL Marketplace tab case.
+        let (handle, mut events) = live(
+            "<head><style>.tab{border-bottom:1px solid}.tab.selected{border-bottom:4px solid}</style></head>\
+             <body>\
+             <a href=\"#\" class=tablink><div class=\"tab selected\" id=t1>Items</div></a>\
+             <a href=\"#\" class=tablink><div class=tab id=t2>Merchants</div></a>\
+             <script>\
+             document.querySelectorAll('.tablink').forEach(function(a){\
+               a.addEventListener('click', function(e){\
+                 e.preventDefault();\
+                 document.querySelectorAll('.tab').forEach(function(d){d.classList.remove('selected');});\
+                 a.querySelector('.tab').classList.add('selected');\
+               });\
+             });</script></body>",
+        );
+        // The baked border-bottom width on the tab div with the given id.
+        let border_of = |html: &str, id: &str| -> String {
+            let at = html.find(&format!("id=\"{id}\"")).expect("tab present");
+            let style_at = html[at..].find("style=\"").expect("baked style") + at + 7;
+            let end = html[style_at..].find('"').unwrap() + style_at;
+            html[style_at..end]
+                .split(';')
+                .find_map(|d| {
+                    d.trim()
+                        .strip_prefix("border-bottom-width:")
+                        .map(str::to_string)
+                })
+                .unwrap_or_default()
+        };
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("expected first Updated");
+        };
+        assert_eq!(border_of(&html, "t1"), "4px", "Items starts active");
+        assert_eq!(border_of(&html, "t2"), "1px", "Merchants starts inactive");
+
+        let at = html.find("Merchants").unwrap();
+        let marker = html[..at]
+            .rfind("x-trust-js:")
+            .map(|i| {
+                html[i + "x-trust-js:".len()..]
+                    .split(':')
+                    .next()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .unwrap();
+        handle.cmds.blocking_send(PageCmd::Click(marker)).unwrap();
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("expected Updated after click");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(
+            border_of(&html, "t1"),
+            "1px",
+            "Items deactivated after click"
+        );
+        assert_eq!(border_of(&html, "t2"), "4px", "Merchants now active");
+    }
+
     fn live_node_after(html: &str, marker: &str) -> usize {
         let start = html.find(marker).expect("marker in live html");
         let rest = &html[start..];
