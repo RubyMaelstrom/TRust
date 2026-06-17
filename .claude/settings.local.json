@@ -71,7 +71,11 @@
       "Bash(TRUST_NET_DIAG='https://www.youtube.com/results?search_query=peanut+butter' TRUST_DIAG_VP=200x50 TRUST_NET_DIAG_OUT=/tmp/yt_search_settle.html cargo test --release diag_all_errors -- --ignored --nocapture)",
       "WebFetch(domain:wpt.live)",
       "WebFetch(domain:acid3.acidtests.org)",
-      "WebFetch(domain:css3test.com)"
+      "WebFetch(domain:css3test.com)",
+      "Bash(curl -sLO https://unpkg.com/react@18/umd/react.production.min.js)",
+      "Bash(curl -sLO https://unpkg.com/react-dom@18/umd/react-dom.production.min.js)",
+      "Bash(curl -sLO https://unpkg.com/react@18/umd/react.development.js)",
+      "Bash(curl -sLO https://unpkg.com/react-dom@18/umd/react-dom.development.js)"
     ]
   }
 }

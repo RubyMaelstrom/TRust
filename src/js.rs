@@ -2967,9 +2967,38 @@ const PRELUDE: &str = r##"
         }
         return null;
     }
-    function fireFormEvents(el) {
+    function fireFormEvents(el, withClick) {
+        // Toggling a checkbox/radio dispatches a click as part of the user
+        // activation, BEFORE input/change. It matters: React detects
+        // checkbox/radio changes off the CLICK event (its change plugin's
+        // shouldUseClickEvent path), not input/change, so without this a
+        // controlled checkbox never fires onChange. The checked value is
+        // already set, so listeners read the post-toggle state.
+        if (withClick) dispatch(el, new Event("click", { bubbles: true, cancelable: true }), false);
         dispatch(el, new Event("input", { bubbles: true }), false);
         dispatch(el, new Event("change", { bubbles: true }), false);
+    }
+    // Set a control property as a USER edit would, NOT a script write.
+    // Frameworks (React, Vue, Preact) install an instance-level "value
+    // tracker" — an own getter/setter that shadows the prototype's — and
+    // suppress their onChange when the new value matches what the tracker
+    // last saw. A plain `el.value = x` goes THROUGH that tracker, so the
+    // change looks like a no-op and onChange never fires. Walking to the
+    // prototype accessor and invoking its setter bypasses the instance
+    // tracker (the same trick React Testing Library / Enzyme use), so the
+    // following input/change event registers as a genuine user change.
+    // With no tracker installed this is identical to `el[prop] = value`.
+    function nativeSet(el, prop, value) {
+        let p = Object.getPrototypeOf(el);
+        while (p) {
+            const d = Object.getOwnPropertyDescriptor(p, prop);
+            if (d) {
+                if (typeof d.set === "function") { d.set.call(el, value); return; }
+                break;
+            }
+            p = Object.getPrototypeOf(p);
+        }
+        el[prop] = value;
     }
     trust.formSet = function (id, value, checked) {
         const el = wrap(id);
@@ -2977,19 +3006,20 @@ const PRELUDE: &str = r##"
         value = value === null || value === undefined ? "" : String(value);
         const tag = el.localName;
         const type = String(el.type || "").toLowerCase();
+        const isToggle = tag === "input" && (type === "checkbox" || type === "radio");
         let changed = false;
-        if (tag === "input" && (type === "checkbox" || type === "radio")) {
+        if (isToggle) {
             const want = !!checked;
             if (type === "radio" && want && el.name) {
                 const scope = nearestForm(el) || g.document;
                 for (const r of scope.querySelectorAll("input")) {
                     if (r !== el && String(r.type || "").toLowerCase() === "radio" && r.name === el.name && r.checked) {
-                        r.checked = false;
+                        nativeSet(r, "checked", false);
                         changed = true;
                     }
                 }
             }
-            if (el.checked !== want) { el.checked = want; changed = true; }
+            if (el.checked !== want) { nativeSet(el, "checked", want); changed = true; }
         } else if (tag === "select") {
             for (const o of el.querySelectorAll("option")) {
                 const ov = o.getAttribute("value") === null ? o.textContent : o.getAttribute("value");
@@ -3003,9 +3033,9 @@ const PRELUDE: &str = r##"
         } else if (tag === "textarea") {
             if (el.textContent !== value) { el.textContent = value; changed = true; }
         } else {
-            if (el.value !== value) { el.value = value; changed = true; }
+            if (el.value !== value) { nativeSet(el, "value", value); changed = true; }
         }
-        if (changed) fireFormEvents(el);
+        if (changed) fireFormEvents(el, isToggle);
         return changed;
     };
     trust.formSubmit = function (formId, submitterId) {
@@ -3308,7 +3338,17 @@ const PRELUDE: &str = r##"
         set disabled(v) { if (v) this.setAttribute("disabled", ""); else this.removeAttribute("disabled"); }
         get hidden() { return this.hasAttribute("hidden"); }
         set hidden(v) { if (v) this.setAttribute("hidden", ""); else this.removeAttribute("hidden"); }
-        get type() { return this.getAttribute("type") || ""; }
+        // <input>'s type IDL attribute defaults to "text" when the content
+        // attribute is absent (HTML spec: limited to known values, missing →
+        // Text). Code keys off this default constantly — React's change-event
+        // plugin does `supportedInputTypes[input.type]` and treats a "" type
+        // as a non-text input, so controlled inputs never fire onChange. Other
+        // elements keep "" when type is absent.
+        get type() {
+            const t = this.getAttribute("type");
+            if (this.localName === "input") return t === null ? "text" : t.toLowerCase();
+            return t === null ? "" : t;
+        }
         set type(v) { this.setAttribute("type", String(v)); }
         get href() { const r = this.getAttribute("href"); if (r === null) return ""; const u = __url_parse(r, baseHref()); return u ? u[0] : r; }
         set href(v) { this.setAttribute("href", String(v)); }
@@ -4549,6 +4589,52 @@ const PRELUDE: &str = r##"
         "resize", "scroll", "hashchange", "popstate", "message",
         "error", "online", "offline", "focus", "blur", "languagechange",
     ]);
+    // GlobalEventHandlers on* IDL attributes on Document and Element (they
+    // share Node.prototype). The spec backs each by add/removeEventListener;
+    // `this`-relative so a setter registers on the node itself. Two reasons
+    // this matters broadly: (1) feature detection — libraries probe event
+    // support via `('on'+name) in document` / `in element` (React's change
+    // plugin gates the whole `input`-event path on `'oninput' in document`,
+    // and without it falls back to a legacy keyup/selectionchange polyfill
+    // that never sees our input dispatch → controlled inputs go dead); (2)
+    // `el.onclick = fn` assignment works as a real listener.
+    function installHandlerProps(proto, types) {
+        for (const type of types) {
+            Object.defineProperty(proto, "on" + type, {
+                configurable: true,
+                enumerable: false,
+                get() { return (this.__on && this.__on[type]) || null; },
+                set(v) {
+                    if (!this.__on) this.__on = {};
+                    const prev = this.__on[type];
+                    if (prev) this.removeEventListener(type, prev);
+                    const fn = typeof v === "function" ? v : null;
+                    this.__on[type] = fn;
+                    if (fn) this.addEventListener(type, fn);
+                },
+            });
+        }
+    }
+    installHandlerProps(Node.prototype, [
+        "click", "dblclick", "auxclick", "contextmenu",
+        "mousedown", "mouseup", "mousemove", "mouseover", "mouseout",
+        "mouseenter", "mouseleave", "wheel",
+        "keydown", "keyup", "keypress",
+        "input", "beforeinput", "change", "submit", "reset", "invalid",
+        "focus", "blur", "focusin", "focusout",
+        "select", "selectionchange",
+        "scroll", "load", "error", "abort", "loadstart", "loadend", "progress",
+        "drag", "dragstart", "dragend", "dragenter", "dragleave", "dragover", "drop",
+        "pointerdown", "pointerup", "pointermove", "pointerover", "pointerout",
+        "pointerenter", "pointerleave", "pointercancel", "gotpointercapture", "lostpointercapture",
+        "touchstart", "touchend", "touchmove", "touchcancel",
+        "animationstart", "animationend", "animationiteration",
+        "transitionstart", "transitionend", "transitioncancel",
+        "copy", "cut", "paste", "compositionstart", "compositionupdate", "compositionend",
+        "play", "pause", "ended", "canplay", "canplaythrough", "durationchange",
+        "timeupdate", "volumechange", "waiting", "seeked", "seeking",
+        "toggle", "cancel", "close",
+    ]);
     g.performance = { now: () => 0, timing: {}, mark() {}, measure() {}, getEntriesByType: () => [] };
 
     // RAM-only, session-lifetime storage: origin-bucketed maps shared
@@ -5256,6 +5342,14 @@ mod tests {
                 .filter_map(Result::ok)
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|e| e == "js"))
+                // React ships as two bundles (react + react-dom) that must
+                // load together; the dedicated `react_canary` drives them.
+                // Loading react-dom alone here would falsely error.
+                .filter(|p| {
+                    !p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("react"))
+                })
                 .collect(),
             Err(_) => {
                 eprintln!("no target/canary/ directory — see the doc comment for setup");
@@ -5314,6 +5408,93 @@ mod tests {
                 "{name} blew the page compute budget: {:?}",
                 outcome.elapsed
             );
+        }
+    }
+
+    /// React canary: boots the real React 18 + ReactDOM UMD bundles and
+    /// renders a tree via `createRoot`. React is the biggest framework gap
+    /// (no React in the jQuery/D3/Vue/Lit set); its scheduler
+    /// (MessageChannel-driven) and synthetic-event system exercise platform
+    /// primitives the others don't. Set TRUST_REACT_DEV=1 to load the
+    /// development bundles (better error messages, far slower).
+    ///
+    /// ```sh
+    /// cd target/canary
+    /// curl -LO https://unpkg.com/react@18/umd/react.production.min.js
+    /// curl -LO https://unpkg.com/react-dom@18/umd/react-dom.production.min.js
+    /// cargo test --release react_canary -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "manual canary: needs React bundles in target/canary/ and --release timings"]
+    fn react_canary() {
+        let dev = std::env::var("TRUST_REACT_DEV").is_ok();
+        let (rf, rdf) = if dev {
+            ("react.development.js", "react-dom.development.js")
+        } else {
+            ("react.production.min.js", "react-dom.production.min.js")
+        };
+        let (Ok(react), Ok(react_dom)) = (
+            std::fs::read(format!("target/canary/{rf}")),
+            std::fs::read(format!("target/canary/{rdf}")),
+        ) else {
+            eprintln!("no React bundles in target/canary/ — see the doc comment");
+            return;
+        };
+        const PROBE: &str = r##"
+            function out(s) { document.body.appendChild(document.createTextNode("\n" + s)); }
+            try {
+                out("React " + React.version);
+                var e = React.createElement;
+                var App = function () {
+                    var st = React.useState("initial");
+                    var count = st[0];
+                    var setCount = st[1];
+                    React.useEffect(function () {
+                        setCount("after-effect");
+                    }, []);
+                    return e("div", { className: "react-app" }, [
+                        e("h1", { key: "h" }, "React renders inside TRust"),
+                        e("p", { key: "p", className: "made-by-react" }, "a paragraph from React"),
+                        e("span", { key: "s", className: "effect-state" }, "state: " + count),
+                        e("button", { key: "b", onClick: function () { setCount("clicked"); } }, "click me"),
+                    ]);
+                };
+                var root = ReactDOM.createRoot(document.getElementById("target"));
+                root.render(e(App));
+                out("BOOTED-REACT");
+            } catch (err) { out("react boot failed: " + (err && (err.stack || err.message) || err)); }
+        "##;
+        let html = format!(
+            "<html><head>\
+             <script src=\"/react.js\"></script>\
+             <script src=\"/react-dom.js\"></script>\
+             </head><body><div id=\"target\">static placeholder</div>\
+             <script>{PROBE}</script></body></html>"
+        );
+        let mut env = PageEnv::bare("https://example.com/");
+        env.externals = vec![
+            ("/react.js".to_string(), Some(react)),
+            ("/react-dom.js".to_string(), Some(react_dom)),
+        ];
+        let started = Instant::now();
+        let (out, outcome) = transform(&html, &env);
+        eprintln!(
+            "react canary: {:?} total ({:?} in scripts), panicked={}, errors={:?}",
+            started.elapsed(),
+            outcome.elapsed,
+            outcome.panicked,
+            outcome.errors,
+        );
+        for line in out
+            .lines()
+            .filter(|l| l.contains("BOOTED-REACT") || l.contains("failed") || l.contains("React "))
+        {
+            eprintln!("  probe> {}", line.trim());
+        }
+        for marker in ["react-app", "made-by-react", "React renders inside TRust"] {
+            if out.contains(marker) {
+                eprintln!("  proof in rendered HTML: {marker}");
+            }
         }
     }
 
@@ -5700,6 +5881,361 @@ mod tests {
         }
         // The actor exited: the event channel is closed.
         assert!(events.blocking_recv().is_none());
+    }
+
+    /// React synthetic-event system, end-to-end through the page actor:
+    /// a `useState` counter whose `onClick` is delegated at the root
+    /// container. A real click must bubble to React's root listener, map
+    /// the target DOM node back to its fiber, fire the handler, and
+    /// re-render. Manual (needs the bundles), like `react_canary`.
+    #[test]
+    #[ignore = "manual canary: needs React bundles in target/canary/"]
+    fn react_clicks_drive_a_state_counter() {
+        let (Ok(react), Ok(react_dom)) = (
+            std::fs::read("target/canary/react.production.min.js"),
+            std::fs::read("target/canary/react-dom.production.min.js"),
+        ) else {
+            eprintln!("no React bundles in target/canary/");
+            return;
+        };
+        const PROBE: &str = r##"
+            var e = React.createElement;
+            function App() {
+                var st = React.useState(0);
+                var n = st[0], setN = st[1];
+                return e("div", { className: "react-app" }, [
+                    e("h1", { key: "h" }, "count: " + n),
+                    e("button", { key: "b", onClick: function () { setN(n + 1); } }, "increment"),
+                ]);
+            }
+            ReactDOM.createRoot(document.getElementById("target")).render(e(App));
+        "##;
+        let html = format!(
+            "<html><head>\
+             <script src=\"/react.js\"></script>\
+             <script src=\"/react-dom.js\"></script>\
+             </head><body><div id=\"target\"></div>\
+             <script>{PROBE}</script></body></html>"
+        );
+        let mut env = PageEnv::bare("https://example.com/");
+        env.externals = vec![
+            ("/react.js".to_string(), Some(react)),
+            ("/react-dom.js".to_string(), Some(react_dom)),
+        ];
+        let (handle, mut events) = spawn_page(html, env);
+
+        // Drain to the render that actually shows the React tree (the actor
+        // may emit a clickable shell first, then the filled render).
+        let mut html = String::new();
+        for _ in 0..4 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html: h, outcome })
+                | Some(PageEvt::Static { html: h, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    html = h;
+                    if html.contains("count: 0") {
+                        break;
+                    }
+                }
+                other => panic!("expected Updated/Static, got {other:?}"),
+            }
+        }
+        assert!(html.contains("count: 0"), "initial render missing: {html}");
+        let button = html
+            .split("x-trust-js:")
+            .nth(1)
+            .and_then(|r| r.split(':').next())
+            .expect("a clickable marker for the React button")
+            .parse::<usize>()
+            .unwrap();
+
+        handle.cmds.blocking_send(PageCmd::Click(button)).unwrap();
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("expected Updated after React click");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            html.contains("count: 1"),
+            "React onClick did not re-render through the synthetic event system: {html}"
+        );
+    }
+
+    /// React controlled inputs: a text field whose `value` is React state
+    /// and whose `onChange` writes it back. React installs a value-tracker
+    /// on the input (an instance `value` setter) and only fires onChange if
+    /// the tracker sees a real change. Our `formSet` sets `el.value` then
+    /// fires `input` — this proves the change still reaches React.
+    #[test]
+    #[ignore = "manual canary: needs React bundles in target/canary/"]
+    fn react_controlled_input_reflects_set_value() {
+        let (Ok(react), Ok(react_dom)) = (
+            std::fs::read("target/canary/react.production.min.js"),
+            std::fs::read("target/canary/react-dom.production.min.js"),
+        ) else {
+            eprintln!("no React bundles in target/canary/");
+            return;
+        };
+        const PROBE: &str = r##"
+            var e = React.createElement;
+            function App() {
+                var st = React.useState("");
+                var text = st[0], setText = st[1];
+                return e("div", { className: "react-app" }, [
+                    e("input", { key: "i", id: "field", value: text,
+                        onChange: function (ev) { setText(ev.target.value); } }),
+                    e("p", { key: "p", className: "echo" }, "echo: " + text),
+                ]);
+            }
+            ReactDOM.createRoot(document.getElementById("target")).render(e(App));
+        "##;
+        let html = format!(
+            "<html><head>\
+             <script src=\"/react.js\"></script>\
+             <script src=\"/react-dom.js\"></script>\
+             </head><body><div id=\"target\"></div>\
+             <script>{PROBE}</script></body></html>"
+        );
+        let mut env = PageEnv::bare("https://example.com/");
+        env.externals = vec![
+            ("/react.js".to_string(), Some(react)),
+            ("/react-dom.js".to_string(), Some(react_dom)),
+        ];
+        let (handle, mut events) = spawn_page(html, env);
+
+        let mut html = String::new();
+        for _ in 0..4 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html: h, outcome })
+                | Some(PageEvt::Static { html: h, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    html = h;
+                    if html.contains("echo:") {
+                        break;
+                    }
+                }
+                other => panic!("expected Updated/Static, got {other:?}"),
+            }
+        }
+        // Find the input field's actor node id (data-trust-node on controls).
+        let field = html
+            .split("data-trust-node=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .expect("a data-trust-node on the input")
+            .parse::<usize>()
+            .unwrap();
+
+        handle
+            .cmds
+            .blocking_send(PageCmd::SetValue {
+                node: field,
+                value: "hello".into(),
+                checked: None,
+            })
+            .unwrap();
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("expected Updated after SetValue");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            html.contains("echo: hello"),
+            "React onChange did not see the controlled-input value: {html}"
+        );
+    }
+
+    /// A TodoMVC-shaped React app driven end-to-end through the page actor:
+    /// the live proof that controlled inputs, form submit, keyed list
+    /// rendering, checkbox toggle, and delete all compose. Written with
+    /// `createElement` (no JSX/Babel — that's a build step that doesn't ship
+    /// to most production sites; the runtime is what we care about).
+    #[test]
+    #[ignore = "manual canary: needs React bundles in target/canary/"]
+    fn react_todomvc_app_runs_through_the_actor() {
+        let (Ok(react), Ok(react_dom)) = (
+            std::fs::read("target/canary/react.production.min.js"),
+            std::fs::read("target/canary/react-dom.production.min.js"),
+        ) else {
+            eprintln!("no React bundles in target/canary/");
+            return;
+        };
+        const PROBE: &str = r##"
+            var e = React.createElement, useState = React.useState, useRef = React.useRef;
+            function TodoApp() {
+                var ts = useState([]); var todos = ts[0], setTodos = ts[1];
+                var ds = useState(""); var draft = ds[0], setDraft = ds[1];
+                var nextId = useRef(1);
+                function add(ev) {
+                    ev.preventDefault();
+                    var t = draft.trim(); if (!t) return;
+                    setTodos(todos.concat([{ id: nextId.current++, text: t, done: false }]));
+                    setDraft("");
+                }
+                function toggle(id) {
+                    setTodos(todos.map(function (t) {
+                        return t.id === id ? { id: t.id, text: t.text, done: !t.done } : t;
+                    }));
+                }
+                function remove(id) {
+                    setTodos(todos.filter(function (t) { return t.id !== id; }));
+                }
+                var left = todos.filter(function (t) { return !t.done; }).length;
+                return e("div", { className: "todoapp" }, [
+                    e("form", { key: "f", onSubmit: add }, [
+                        e("input", { key: "i", id: "new-todo", value: draft,
+                            onChange: function (ev) { setDraft(ev.target.value); } }),
+                        e("button", { key: "a", type: "submit" }, "ADD"),
+                    ]),
+                    e("ul", { key: "l", className: "todo-list" }, todos.map(function (t) {
+                        return e("li", { key: t.id, className: t.done ? "completed" : "active" }, [
+                            e("input", { key: "c", type: "checkbox", className: "toggle",
+                                checked: t.done, onChange: function () { toggle(t.id); } }),
+                            e("label", { key: "t" }, t.text),
+                            e("button", { key: "d", className: "destroy",
+                                onClick: function () { remove(t.id); } }, "DEL-" + t.id),
+                        ]);
+                    })),
+                    e("span", { key: "n", className: "todo-count" }, left + " left"),
+                ]);
+            }
+            ReactDOM.createRoot(document.getElementById("target")).render(e(TodoApp));
+        "##;
+        let html = format!(
+            "<html><head>\
+             <script src=\"/react.js\"></script>\
+             <script src=\"/react-dom.js\"></script>\
+             </head><body><div id=\"target\"></div>\
+             <script>{PROBE}</script></body></html>"
+        );
+        let mut env = PageEnv::bare("https://example.com/");
+        env.externals = vec![
+            ("/react.js".to_string(), Some(react)),
+            ("/react-dom.js".to_string(), Some(react_dom)),
+        ];
+        let (handle, mut events) = spawn_page(html, env);
+
+        // Helpers over the serialized snapshot. The actor node id of the
+        // first element whose serialization (from `marker` onward) carries a
+        // data-trust-node — used to find a specific control by a preceding
+        // attribute like `id="new-todo"` or the `<form` tag.
+        fn node_after(html: &str, marker: &str) -> usize {
+            let from = html.find(marker).unwrap_or_else(|| panic!("no {marker:?}"));
+            html[from..]
+                .split("data-trust-node=\"")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .expect("a data-trust-node")
+                .parse()
+                .unwrap()
+        }
+        // The actor node id of the clickable whose wrapped content holds `text`.
+        fn marker_for(html: &str, text: &str) -> usize {
+            for seg in html.split("x-trust-js:").skip(1) {
+                let id: usize = seg.split(':').next().unwrap().parse().unwrap();
+                let content = seg
+                    .split_once("\">")
+                    .map(|(_, c)| c.split("</a>").next().unwrap_or(""))
+                    .unwrap_or("");
+                if content.contains(text) {
+                    return id;
+                }
+            }
+            panic!("no clickable marker containing {text:?} in {html}");
+        }
+        let drain = |events: &mut tokio::sync::mpsc::Receiver<PageEvt>, want: &str| -> String {
+            use tokio::sync::mpsc::error::TryRecvError;
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match events.try_recv() {
+                    Ok(PageEvt::Updated { html, outcome })
+                    | Ok(PageEvt::Static { html, outcome }) => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        if html.contains(want) {
+                            return html;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(TryRecvError::Empty) => {
+                        if Instant::now() > deadline {
+                            panic!("timeout waiting for {want:?}");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(TryRecvError::Disconnected) => panic!("actor closed waiting for {want:?}"),
+                }
+            }
+        };
+
+        // Adds a todo: type into the controlled input, then submit the form
+        // (the ADD button is type=submit — the app routes such controls to
+        // PageCmd::Submit, exactly as it would for a user pressing it).
+        let add_todo = |handle: &PageHandle,
+                        events: &mut tokio::sync::mpsc::Receiver<PageEvt>,
+                        html: &str,
+                        text: &str|
+         -> String {
+            let input = node_after(html, "id=\"new-todo\"");
+            handle
+                .cmds
+                .blocking_send(PageCmd::SetValue {
+                    node: input,
+                    value: text.into(),
+                    checked: None,
+                })
+                .unwrap();
+            let html = drain(events, text);
+            let form = node_after(&html, "<form");
+            let submitter = node_after(&html, "type=\"submit\"");
+            handle
+                .cmds
+                .blocking_send(PageCmd::Submit {
+                    form,
+                    submitter: Some(submitter),
+                })
+                .unwrap();
+            html
+        };
+
+        // Initial render: empty list, "0 left".
+        let html = drain(&mut events, "0 left");
+
+        // Add the first todo and confirm it renders as an active item.
+        add_todo(&handle, &mut events, &html, "buy milk");
+        let html = drain(&mut events, "1 left");
+        assert!(
+            html.contains(">buy milk</label>"),
+            "todo not rendered: {html}"
+        );
+        assert!(
+            html.contains("class=\"active\""),
+            "todo should be active: {html}"
+        );
+
+        // Add a second todo.
+        add_todo(&handle, &mut events, &html, "walk dog");
+        let html = drain(&mut events, "2 left");
+
+        // Toggle the first todo complete via its checkbox.
+        let check1 = node_after(&html, "class=\"toggle\"");
+        handle
+            .cmds
+            .blocking_send(PageCmd::SetValue {
+                node: check1,
+                value: String::new(),
+                checked: Some(true),
+            })
+            .unwrap();
+        let html = drain(&mut events, "1 left");
+        assert!(
+            html.contains("class=\"completed\""),
+            "checkbox toggle did not mark the todo completed: {html}"
+        );
+
+        // Delete the second todo (its destroy button reads "DEL-2").
+        let del2 = marker_for(&html, "DEL-2");
+        handle.cmds.blocking_send(PageCmd::Click(del2)).unwrap();
+        let html = drain(&mut events, "0 left");
+        assert!(!html.contains("walk dog"), "deleted todo lingered: {html}");
+        assert!(html.contains("buy milk"), "wrong todo deleted: {html}");
     }
 
     #[test]

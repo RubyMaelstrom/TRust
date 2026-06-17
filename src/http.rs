@@ -1209,7 +1209,22 @@ pub(crate) fn extract_forms_arena(
 ) -> (Vec<Form>, std::collections::HashMap<usize, (usize, usize)>) {
     let mut forms = Vec::new();
     let mut map = std::collections::HashMap::new();
-    walk_forms_arena(dom, crate::dom::DOCUMENT, None, base, &mut forms, &mut map);
+    // Controls outside any `<form>` share an implicit form owner (HTML's
+    // null-form-owner concept): they're still interactive — typed into,
+    // toggled — they just don't submit anywhere. React/SPA inputs are very
+    // often formless (search-as-you-type, filters, settings), so without
+    // this they'd render as inert stubs the user can't edit. Created lazily
+    // (only if such a control exists), appended like any other form.
+    let mut implicit = None;
+    walk_forms_arena(
+        dom,
+        crate::dom::DOCUMENT,
+        None,
+        base,
+        &mut forms,
+        &mut map,
+        &mut implicit,
+    );
 
     // Seed values typed into a previous parse of this page (resize/edit
     // re-parses must not lose what was entered), shape permitting.
@@ -1239,6 +1254,7 @@ fn walk_forms_arena(
     base: &Url,
     forms: &mut Vec<Form>,
     map: &mut std::collections::HashMap<usize, (usize, usize)>,
+    implicit: &mut Option<usize>,
 ) {
     for child in dom.children(id) {
         match dom.tag_name(child) {
@@ -1257,7 +1273,7 @@ fn walk_forms_arena(
                     live_node: live_node(dom, child),
                 });
                 let form = forms.len() - 1;
-                walk_forms_arena(dom, child, Some(form), base, forms, map);
+                walk_forms_arena(dom, child, Some(form), base, forms, map, implicit);
                 // A form with no submit control still needs a trigger: a
                 // synthetic submit, surfaced as an item on the form node.
                 if !forms[form].fields.is_empty()
@@ -1278,9 +1294,32 @@ fn walk_forms_arena(
                 }
             }
             Some(tag @ ("input" | "button" | "select" | "textarea")) => {
-                let Some(form) = current else { continue };
                 let Some(field) = field_from_arena(dom, child, tag) else {
                     continue;
+                };
+                // A formless submit control (a bare <button>/<input type=submit>
+                // with no form owner) has nothing to submit — its onClick is the
+                // whole interaction, so leave it to the JsClick stub path rather
+                // than claiming it as a form field here.
+                if current.is_none() && field.kind == FieldKind::Submit {
+                    continue;
+                }
+                // Bind to the enclosing <form>, or to the lazily-created
+                // implicit form for an editable control with no form owner: a
+                // text field stays editable, a checkbox toggleable — the live
+                // page sees the input/change/click events. It gets no synthetic
+                // submit (nowhere to submit to).
+                let form = match current {
+                    Some(f) => f,
+                    None => *implicit.get_or_insert_with(|| {
+                        forms.push(Form {
+                            method: FormMethod::Get,
+                            action: base.clone(),
+                            fields: Vec::new(),
+                            live_node: None,
+                        });
+                        forms.len() - 1
+                    }),
                 };
                 let renders = field.kind != FieldKind::Hidden;
                 forms[form].fields.push(field);
@@ -1288,7 +1327,7 @@ fn walk_forms_arena(
                     map.insert(child, (form, forms[form].fields.len() - 1));
                 }
             }
-            _ => walk_forms_arena(dom, child, current, base, forms, map),
+            _ => walk_forms_arena(dom, child, current, base, forms, map, implicit),
         }
     }
 }
