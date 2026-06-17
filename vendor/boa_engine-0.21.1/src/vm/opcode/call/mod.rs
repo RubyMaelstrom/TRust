@@ -33,9 +33,7 @@ impl CallEval {
             .calling_convention_get_function(argument_count.into());
 
         let Some(object) = func.as_object() else {
-            return Err(JsNativeError::typ()
-                .with_message(format!("{} is not a callable function", func.display()))
-                .into());
+            return Err(not_callable_error(&func));
         };
 
         // Taken from `13.3.6.1 Runtime Semantics: Evaluation`
@@ -117,9 +115,7 @@ impl CallEvalSpread {
         let func = context.vm.stack.calling_convention_get_function(0);
 
         let Some(object) = func.as_object() else {
-            return Err(JsNativeError::typ()
-                .with_message(format!("{} is not a callable function", func.display()))
-                .into());
+            return Err(not_callable_error(&func));
         };
         // Taken from `13.3.6.1 Runtime Semantics: Evaluation`
         //            `CallExpression : CoverCallExpressionAndAsyncArrowHead`
@@ -201,12 +197,25 @@ impl Call {
     #[cold]
     #[inline(never)]
     fn handle_not_callable(func: &JsValue) -> JsError {
-        // Name the offending value (`undefined is not a callable function`) so
-        // a missing platform method is legible instead of a bare type error.
-        JsNativeError::typ()
-            .with_message(format!("{} is not a callable function", func.display()))
-            .into()
+        not_callable_error(func)
     }
+}
+
+/// Build a "not a callable function" error. Names the offending value
+/// (`undefined is not a callable function`) and, when that value is
+/// `undefined`, the property it was read from (`… (reading 'foo')`, recorded by
+/// `GetPropertyByName`) — so a missing platform method is legible instead of a
+/// bare type error. This is the primary tool for finding unimplemented APIs.
+#[cold]
+#[inline(never)]
+pub(crate) fn not_callable_error(func: &JsValue) -> JsError {
+    let mut message = format!("{} is not a callable function", func.display());
+    if func.is_undefined() {
+        if let Some(name) = super::get::property::take_undefined_get() {
+            message.push_str(&format!(" (reading '{}')", name.to_std_string_escaped()));
+        }
+    }
+    JsNativeError::typ().with_message(message).into()
 }
 
 impl Operation for Call {
@@ -244,9 +253,7 @@ impl CallSpread {
             .calling_convention_get_function(argument_count);
 
         let Some(object) = func.as_object() else {
-            return Err(JsNativeError::typ()
-                .with_message(format!("{} is not a callable function", func.display()))
-                .into());
+            return Err(not_callable_error(&func));
         };
 
         object.__call__(argument_count).resolve(context)?;

@@ -1,9 +1,34 @@
 use crate::{
-    Context, JsResult,
+    Context, JsResult, JsString,
     object::{internal_methods::InternalMethodPropertyContext, shape::slot::SlotAttributes},
     property::PropertyKey,
     vm::opcode::{Operation, VaryingOperand},
 };
+
+thread_local! {
+    /// Diagnostic: the name of the most recent property whose GET resolved to
+    /// `undefined`. A method call `obj.foo()` compiles to `GetPropertyByName
+    /// "foo"` immediately before `Call`, so when the call then fails with
+    /// "undefined is not a callable function" the call opcode can name `foo` —
+    /// turning a missing platform method from a bare type error into a legible
+    /// one (the single biggest lever for finding unimplemented APIs). Recorded
+    /// only on the slow path (an absent property always misses the inline
+    /// cache), so normal property access pays nothing. Best-effort: an
+    /// `undefined` argument evaluated after the callee can overwrite it, and
+    /// it's cleared when read.
+    static LAST_UNDEFINED_GET: std::cell::Cell<Option<JsString>> = const { std::cell::Cell::new(None) };
+}
+
+/// Record a property name whose GET resolved to `undefined` (see
+/// [`LAST_UNDEFINED_GET`]).
+pub(crate) fn record_undefined_get(name: &JsString) {
+    LAST_UNDEFINED_GET.with(|c| c.set(Some(name.clone())));
+}
+
+/// Take (and clear) the last property name recorded by [`record_undefined_get`].
+pub(crate) fn take_undefined_get() -> Option<JsString> {
+    LAST_UNDEFINED_GET.with(std::cell::Cell::take)
+}
 
 /// `GetPropertyByName` implements the Opcode Operation for `Opcode::GetPropertyByName`
 ///
@@ -52,10 +77,17 @@ impl GetPropertyByName {
 
         drop(object_borrowed);
 
-        let key: PropertyKey = ic.name.clone().into();
+        let name = ic.name.clone();
+        let key: PropertyKey = name.clone().into();
 
         let context = &mut InternalMethodPropertyContext::new(context);
         let result = object.__get__(&key, receiver.clone(), context)?;
+
+        // Diagnostic: name a missing property so a later "not a callable
+        // function" can report it (see `LAST_UNDEFINED_GET`).
+        if result.is_undefined() {
+            record_undefined_get(&name);
+        }
 
         // Cache the property.
         let slot = *context.slot();

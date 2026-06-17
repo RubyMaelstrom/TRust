@@ -28,12 +28,12 @@ use crate::dom::{DOCUMENT, Dom, SelectorList};
 /// deadline bounds compute + network together, and on expiry we render
 /// whatever the DOM holds. Runaway *compute* is bounded more tightly by
 /// `COMPUTE_BUDGET` and per-call by `LOOP_LIMIT`.
-pub const WALL_BUDGET: Duration = Duration::from_secs(20);
+pub const WALL_BUDGET: Duration = Duration::from_secs(60);
 
 /// Cumulative *execution* time a page's scripts get before we stop
 /// launching more. Measures compute, not wall clock (the wire is async
 /// and free), so a slow server can't starve a fast page of its scripts.
-pub const COMPUTE_BUDGET: Duration = Duration::from_secs(2);
+pub const COMPUTE_BUDGET: Duration = Duration::from_secs(30);
 
 /// Most loop iterations any single script evaluation may run. Real-world
 /// bundle boots measured in the canary use a few hundred thousand at
@@ -2978,8 +2978,28 @@ const PRELUDE: &str = r##"
     // `class X extends HTMLElement { constructor(){ super(); ... } }`
     // initializes the EXISTING wrapper.
     const CE = { defs: new Map(), tags: new Map(), waiting: new Map(), upgrading: null };
-    class Node {
+    // EventTarget is the root of the node + window hierarchy (Node and Window
+    // both extend it), so the spec's listener methods live here ONCE and
+    // everything inherits them. It must be declared before Node/Window (class
+    // bindings aren't hoisted). Polyfills save/augment the "native" OFF this
+    // prototype — ShadyDOM does `L(EventTarget.prototype,"addEventListener")`
+    // and installs `__shady_*` accessors here — so nodes inherit those too.
+    // (`lsFor`/`dispatch` are hoisted function declarations, defined above.)
+    class EventTarget {
+        addEventListener(type, fn) {
+            // Functions AND `{ handleEvent }` objects (Lit's EventParts register
+            // themselves as listeners).
+            if (typeof fn === "function" || (fn && typeof fn.handleEvent === "function")) {
+                const l = lsFor(this, String(type));
+                if (!l.includes(fn)) l.push(fn);
+            }
+        }
+        removeEventListener(type, fn) { const l = lsFor(this, String(type)); const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); }
+        dispatchEvent(ev) { return dispatch(this, ev, false); }
+    }
+    class Node extends EventTarget {
         constructor(id) {
+            super();
             if (CE.upgrading !== null) {
                 const target = CE.upgrading;
                 CE.upgrading = null;
@@ -3073,16 +3093,10 @@ const PRELUDE: &str = r##"
         hasChildNodes() { return __dom_children(this.__id).length > 0; }
         compareDocumentPosition() { return 0; }
         normalize() {}
-        addEventListener(type, fn) {
-            // Functions AND `{ handleEvent }` objects (Lit's EventParts
-            // register themselves as listeners).
-            if (typeof fn === "function" || (fn && typeof fn.handleEvent === "function")) {
-                const l = lsFor(this, String(type));
-                if (!l.includes(fn)) l.push(fn);
-            }
-        }
-        removeEventListener(type, fn) { const l = lsFor(this, String(type)); const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); }
-        dispatchEvent(ev) { return dispatch(this, ev, false); }
+        // addEventListener/removeEventListener/dispatchEvent are inherited from
+        // EventTarget.prototype now (Node extends EventTarget, per spec). Keeping
+        // them solely there means a polyfill that augments EventTarget.prototype
+        // (ShadyDOM's `__shady_*` accessors) is visible on every node too.
         querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
         querySelectorAll(s) { return __dom_query(this.__id, String(s), false).map(wrap); }
         getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
@@ -3153,6 +3167,37 @@ const PRELUDE: &str = r##"
     class Element extends Node {
         get tagName() { return (__dom_tag(this.__id) || "").toUpperCase(); }
         get localName() { return __dom_tag(this.__id) || ""; }
+        // <canvas> 2d context. We paint no raster, but sites use it to
+        // normalise CSS colours (Web Animations sets `ctx.fillStyle = colour`
+        // and reads it back) and to measure text. A pass-through stub stores/
+        // echoes its properties and no-ops drawing — enough that the code
+        // doesn't throw, without pretending to paint. Canvas-only; other tags
+        // report no context, so `el.getContext && el.getContext('2d')` probes
+        // still fail correctly off-canvas.
+        getContext(kind) {
+            if (this.tagName !== "CANVAS" || String(kind) !== "2d") return null;
+            return this.__ctx2d || (this.__ctx2d = {
+                canvas: this,
+                fillStyle: "#000000", strokeStyle: "#000000",
+                font: "10px sans-serif", globalAlpha: 1, lineWidth: 1,
+                lineCap: "butt", lineJoin: "miter", textAlign: "start", textBaseline: "alphabetic",
+                save() {}, restore() {}, scale() {}, rotate() {}, translate() {},
+                transform() {}, setTransform() {}, resetTransform() {},
+                beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
+                bezierCurveTo() {}, quadraticCurveTo() {}, arc() {}, arcTo() {},
+                rect() {}, ellipse() {}, fill() {}, stroke() {}, clip() {},
+                clearRect() {}, fillRect() {}, strokeRect() {},
+                fillText() {}, strokeText() {}, drawImage() {},
+                measureText(t) { return { width: String(t).length * 6 }; },
+                getImageData() { return { data: new Uint8ClampedArray(0), width: 0, height: 0 }; },
+                putImageData() {}, createImageData() { return { data: new Uint8ClampedArray(0), width: 0, height: 0 }; },
+                createLinearGradient() { return { addColorStop() {} }; },
+                createRadialGradient() { return { addColorStop() {} }; },
+                createPattern() { return null; },
+                setLineDash() {}, getLineDash() { return []; },
+            });
+        }
+        toDataURL() { return this.tagName === "CANVAS" ? "data:," : undefined; }
         getAttribute(n) { return __dom_get_attr(this.__id, String(n)); }
         setAttribute(n, v) {
             n = String(n); v = String(v);
@@ -3299,6 +3344,13 @@ const PRELUDE: &str = r##"
             return el;
         }
         get style() { if (!this.__style) this.__style = styleFor(this); return this.__style; }
+        // `el.style = "color:red"` — the [PutForwards=cssText] behaviour: assigning
+        // a string to .style sets inline cssText (a getter-only .style throws in
+        // strict mode, which silently broke YouTube's renderers in attr callbacks).
+        set style(v) {
+            if (v === null || v === undefined || String(v).trim() === "") this.removeAttribute("style");
+            else this.setAttribute("style", String(v));
+        }
         get dataset() {
             if (!this.__ds) {
                 const el = this;
@@ -3385,6 +3437,9 @@ const PRELUDE: &str = r##"
                         getElementsByTagName: (t) => html.getElementsByTagName(t),
                         querySelector: (s) => html.querySelector(s),
                         querySelectorAll: (s) => html.querySelectorAll(s),
+                        createRange: () => new Range(),
+                        createNodeIterator: (r, w) => new NodeIterator(r, w),
+                        createTreeWalker: (r, w) => new TreeWalker(r, w),
                     };
                 },
             };
@@ -3408,10 +3463,21 @@ const PRELUDE: &str = r##"
         createTreeWalker(root, whatToShow) { return new TreeWalker(root, whatToShow); }
         createNodeIterator(root, whatToShow) { return new NodeIterator(root, whatToShow); }
         createDocumentFragment() { return wrap(__dom_create_fragment()); }
+        createRange() { return new Range(); }
         getElementById(i) { return wrap(__dom_get_by_id(String(i))); }
         getElementsByName(n) { return this.querySelectorAll("[name=" + String(n) + "]"); }
         createEvent(type) { const C = EVENT_INTERFACES[String(type)] || Event; return new C(""); }
         hasFocus() { return true; }
+        // A TRust document is always a visible, focused, non-prerendering
+        // foreground page. SPAs routinely DEFER heavy rendering until
+        // `visibilityState === "visible"` (or skip work while `prerendering`),
+        // so leaving these undefined makes such pages wait forever for a state
+        // they never see. (YouTube's kevlar gates feed work on visibility.)
+        get visibilityState() { return "visible"; }
+        get hidden() { return false; }
+        get prerendering() { return false; }
+        get wasDiscarded() { return false; }
+        get visibilityStates() { return ["visible"]; }
         write(s) { const host = this.body || this.documentElement; if (host) host.insertAdjacentHTML("beforeend", String(s)); }
         writeln(s) { this.write(s + "\n"); }
         open() {} close() {}
@@ -3522,6 +3588,7 @@ const PRELUDE: &str = r##"
                 createDocumentFragment: () => g.document.createDocumentFragment(),
                 createNodeIterator: (r, w) => new NodeIterator(r, w),
                 createTreeWalker: (r, w) => new TreeWalker(r, w),
+                createRange: () => new Range(),
                 importNode: (n, deep) => n.cloneNode(!!deep),
                 getElementsByTagName: (t) => {
                     const want = String(t).toLowerCase();
@@ -3540,6 +3607,17 @@ const PRELUDE: &str = r##"
                 querySelector: (s) => docEl.querySelector(s),
                 querySelectorAll: (s) => docEl.querySelectorAll(s),
             };
+        }
+    }
+    // `new XMLSerializer().serializeToString(node)` — the inverse of DOMParser.
+    // Delegates to our HTML serializer (outerHTML); documents serialize their root.
+    class XMLSerializer {
+        serializeToString(node) {
+            if (!node) return "";
+            if (node.outerHTML !== undefined && node.outerHTML !== null) return node.outerHTML;
+            if (node.documentElement) return node.documentElement.outerHTML || "";
+            if (node.nodeType === 3 || node.nodeType === 8) return String(node.nodeValue || "");
+            return node.innerHTML !== undefined ? node.innerHTML : "";
         }
     }
     class ShadowRoot extends Node {
@@ -3693,13 +3771,16 @@ const PRELUDE: &str = r##"
     // `window[name].prototype`) reference them and check `instanceof`. We
     // model the common node types on `Node`/`Text`/`Element`; expose the rest
     // with a roughly-correct chain so the constructors and prototypes exist.
-    class EventTarget {}
+    // The global is a `Window` in real browsers: code references the bare
+    // `Window` interface (a ReferenceError without it — webcomponentsjs does
+    // this) and checks `window instanceof Window`. Window IS an EventTarget.
+    class Window extends EventTarget {}
     class CharacterData extends Node {}
     class CDATASection extends Text {}
     class ProcessingInstruction extends CharacterData {}
     class DocumentType extends Node {}
     class Attr extends Node {}
-    g.EventTarget = EventTarget; g.CharacterData = CharacterData;
+    g.EventTarget = EventTarget; g.Window = Window; g.CharacterData = CharacterData;
     g.CDATASection = CDATASection; g.ProcessingInstruction = ProcessingInstruction;
     g.DocumentType = DocumentType; g.Attr = Attr;
     g.Node = Node; g.Element = Element; g.HTMLElement = Element;
@@ -3720,6 +3801,7 @@ const PRELUDE: &str = r##"
     g.TreeWalker = TreeWalker;
     g.NodeIterator = NodeIterator;
     g.DOMParser = DOMParser;
+    g.XMLSerializer = XMLSerializer;
     g.NodeFilter = {
         SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_COMMENT: 128,
         FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
@@ -3731,7 +3813,70 @@ const PRELUDE: &str = r##"
     g.HTMLTextAreaElement = HTMLTextAreaElement; g.HTMLFormElement = HTMLFormElement;
     g.HTMLAnchorElement = HTMLAnchorElement; g.HTMLImageElement = HTMLImageElement;
     g.HTMLScriptElement = HTMLScriptElement; g.HTMLButtonElement = HTMLButtonElement;
+    // The rest of the standard HTML element interface zoo. Browsers expose a
+    // constructor for every element kind; boot code patches their prototypes
+    // and feature-detects them (YouTube's kevlar reads bare `HTMLTemplateElement`,
+    // `HTMLDivElement`, … — a ReferenceError on the first missing one). Each is
+    // a distinct Element subclass so prototypes and `instanceof` behave; the
+    // guard skips the explicit ones defined above. (Our createElement still
+    // returns generic Element instances — these exist for the global surface,
+    // not per-tag typing.)
+    for (const __n of ["Area","Audio","BR","Base","Body","Canvas","Data","DataList",
+        "Details","Dialog","Div","DList","Embed","FieldSet","Heading","Head","HR",
+        "Html","IFrame","Label","Legend","LI","Link","Map","Media","Menu","Meta",
+        "Meter","Mod","Object","OList","OptGroup","Option","Output","Paragraph",
+        "Param","Picture","Pre","Progress","Quote","Slot","Source","Span","Style",
+        "TableCaption","TableCell","TableCol","Table","TableRow","TableSection",
+        "Template","Time","Title","Track","UList","Unknown","Video"]) {
+        const __cn = "HTML" + __n + "Element";
+        if (!g[__cn]) {
+            const __C = class extends Element {};
+            try { Object.defineProperty(__C, "name", { value: __cn }); } catch (e) {}
+            g[__cn] = __C;
+        }
+    }
     g.Image = class { constructor() { return g.document.createElement("img"); } };
+    // `new Audio(src)` — the legacy HTMLAudioElement constructor (parallel to
+    // Image). Returns an <audio> element with no-op media methods: TRust never
+    // plays audio (the video→mpv / no-media ethos), but sites construct one for
+    // sound-effect preloading and feature detection — a bare `Audio` reference
+    // (ReferenceError when absent) silently broke YouTube's whole renderer family.
+    g.Audio = class {
+        constructor(src) {
+            const el = g.document.createElement("audio");
+            if (src !== undefined && src !== null) el.setAttribute("src", String(src));
+            el.play = () => Promise.resolve();
+            el.pause = () => {};
+            el.load = () => {};
+            el.canPlayType = () => "";
+            return el;
+        }
+    };
+    // Blob/File — a standard data container. We don't do real binary I/O, but
+    // sites construct Blobs (object URLs, sanitizer/worker plumbing, feature
+    // detection) and a bare `Blob` reference (ReferenceError when absent) silently
+    // broke YouTube renderers. Tracks size/type and stringifies its text parts.
+    g.Blob = class Blob {
+        constructor(parts, opts) {
+            this.__parts = Array.isArray(parts) ? parts.slice() : (parts ? [parts] : []);
+            let size = 0;
+            for (const p of this.__parts) {
+                if (typeof p === "string") size += p.length;
+                else if (p && typeof p.byteLength === "number") size += p.byteLength;
+                else if (p && typeof p.size === "number") size += p.size;
+                else size += String(p).length;
+            }
+            this.size = size;
+            this.type = (opts && opts.type) ? String(opts.type).toLowerCase() : "";
+        }
+        slice(_s, _e, type) { return new g.Blob([], { type: type || this.type }); }
+        text() { return Promise.resolve(this.__parts.map((p) => (typeof p === "string" ? p : "")).join("")); }
+        arrayBuffer() { return Promise.resolve(new ArrayBuffer(0)); }
+        stream() { return null; }
+    };
+    g.File = class File extends g.Blob {
+        constructor(parts, name, opts) { super(parts, opts); this.name = String(name); this.lastModified = (opts && opts.lastModified) || Date.now(); }
+    };
 
     g.window = g; g.self = g; g.top = g; g.parent = g;
     g.document = wrap(0);
@@ -3801,6 +3946,10 @@ const PRELUDE: &str = r##"
     // isPlainObject) follows window.window / document.defaultView in an
     // infinite cycle until the recursion limit trips (broke danbooru).
     try { g[Symbol.toStringTag] = "Window"; } catch (e) { /* frozen global */ }
+    // ...and put the global on Window.prototype so `window instanceof Window`
+    // holds and `Window.prototype` reads resolve. The own properties set
+    // above are unaffected by the reparent; guard in case the global is frozen.
+    try { Object.setPrototypeOf(g, Window.prototype); } catch (e) { /* frozen global */ }
     g.navigator = {
         userAgent: cfg.ua, language: "en", languages: ["en"],
         platform: "Linux", cookieEnabled: true, onLine: true,
@@ -3847,7 +3996,53 @@ const PRELUDE: &str = r##"
     g.matchMedia = (m) => ({ matches: false, media: String(m), addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} });
     g.alert = () => {}; g.confirm = () => false; g.prompt = () => null;
     g.scroll = g.scrollTo = g.scrollBy = () => {};
-    g.getSelection = () => ({ toString: () => "", rangeCount: 0, removeAllRanges() {} });
+    // DOM Range: feature-detected/instanceof'd at boot, and used for
+    // measurement + HTML-string parsing (createContextualFragment, jQuery's
+    // `$.parseHTML` fallback). We hold endpoints honestly but approximate
+    // geometry with the viewport box like the element rect stubs.
+    class Range {
+        constructor() {
+            this.startContainer = g.document; this.endContainer = g.document;
+            this.startOffset = 0; this.endOffset = 0; this.collapsed = true;
+            this.commonAncestorContainer = g.document;
+        }
+        __upd() { this.collapsed = this.startContainer === this.endContainer && this.startOffset === this.endOffset; this.commonAncestorContainer = this.startContainer; }
+        setStart(node, off) { this.startContainer = node; this.startOffset = off | 0; this.__upd(); }
+        setEnd(node, off) { this.endContainer = node; this.endOffset = off | 0; this.__upd(); }
+        setStartBefore(node) { if (node && node.parentNode) this.setStart(node.parentNode, 0); }
+        setStartAfter(node) { if (node && node.parentNode) this.setStart(node.parentNode, 0); }
+        setEndBefore(node) { if (node && node.parentNode) this.setEnd(node.parentNode, 0); }
+        setEndAfter(node) { if (node && node.parentNode) this.setEnd(node.parentNode, 0); }
+        selectNode(node) { this.startContainer = this.endContainer = this.commonAncestorContainer = node; this.collapsed = false; }
+        selectNodeContents(node) { this.selectNode(node); }
+        collapse(toStart) {
+            if (toStart) { this.endContainer = this.startContainer; this.endOffset = this.startOffset; }
+            else { this.startContainer = this.endContainer; this.startOffset = this.endOffset; }
+            this.collapsed = true;
+        }
+        cloneRange() { const r = new Range(); r.startContainer = this.startContainer; r.endContainer = this.endContainer; r.startOffset = this.startOffset; r.endOffset = this.endOffset; r.collapsed = this.collapsed; r.commonAncestorContainer = this.commonAncestorContainer; return r; }
+        cloneContents() { return g.document.createDocumentFragment(); }
+        extractContents() { return g.document.createDocumentFragment(); }
+        deleteContents() {}
+        insertNode(node) { const c = this.startContainer; if (c && c.insertBefore) c.insertBefore(node, (c.childNodes && c.childNodes[this.startOffset]) || null); }
+        surroundContents(node) { this.insertNode(node); }
+        createContextualFragment(html) { const tpl = g.document.createElement("template"); tpl.innerHTML = String(html); return tpl.content; }
+        getBoundingClientRect() { return { x: 0, y: 0, top: 0, left: 0, right: g.innerWidth, bottom: g.innerHeight, width: g.innerWidth, height: g.innerHeight }; }
+        getClientRects() { return [this.getBoundingClientRect()]; }
+        detach() {}
+        toString() { return ""; }
+    }
+    g.Range = Range;
+    class Selection {
+        constructor() { this.rangeCount = 0; this.isCollapsed = true; this.type = "None"; this.anchorNode = null; this.focusNode = null; }
+        toString() { return ""; }
+        getRangeAt() { return new Range(); }
+        addRange() {} removeAllRanges() {} removeRange() {} empty() {}
+        collapse() {} collapseToStart() {} collapseToEnd() {} selectAllChildren() {}
+        setBaseAndExtent() {} extend() {} containsNode() { return false; }
+    }
+    g.Selection = Selection;
+    g.getSelection = () => new Selection();
     g.MutationObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
     // No viewport here, so everything observed intersects, once,
     // asynchronously — infinite scrollers and lazy tiles render their
@@ -3879,7 +4074,13 @@ const PRELUDE: &str = r##"
         }
         unobserve() {} disconnect() { this.__dead = true; }
     };
-    g.requestIdleCallback = (fn) => g.setTimeout(() => fn({ didTimeout: false, timeRemaining: () => 0 }), 0);
+    // timeRemaining MUST be positive: idle-chunked work loops are written
+    // `while (deadline.timeRemaining() > 0 && hasWork()) process()`, so a 0
+    // budget means the loop body never runs, no progress is made, and it
+    // reschedules forever (YouTube stamps its feed this way). Report the spec's
+    // 50ms cap (constant — a well-behaved chunked loop then drains in one slice,
+    // which is what we want since we render once, not per frame).
+    g.requestIdleCallback = (fn) => g.setTimeout(() => fn({ didTimeout: false, timeRemaining: () => 50 }), 0);
     g.cancelIdleCallback = (id) => g.clearTimeout(id);
 
     // --- crypto: getRandomValues + randomUUID + subtle.digest ---
@@ -4332,10 +4533,65 @@ const PRELUDE: &str = r##"
         forEach(fn) { for (const k of Object.keys(this.__h)) fn(this.__h[k], k, this); }
     }
     g.Headers = Headers;
+    // AbortSignal is a real EventTarget (it dispatches "abort"), and the
+    // statics `abort`/`timeout`/`any` are widely referenced — YouTube's
+    // kevlar bundle reads the bare `AbortSignal` global, a ReferenceError
+    // without it.
+    class AbortSignal extends EventTarget {
+        constructor() { super(); this.aborted = false; this.reason = undefined; this.onabort = null; }
+        throwIfAborted() { if (this.aborted) throw this.reason; }
+        __abort(reason) {
+            if (this.aborted) return;
+            this.aborted = true;
+            this.reason = reason !== undefined ? reason : new DOMException("signal is aborted without reason", "AbortError");
+            const ev = new Event("abort");
+            if (typeof this.onabort === "function") { try { this.onabort.call(this, ev); } catch (e) {} }
+            this.dispatchEvent(ev);
+        }
+        static abort(reason) { const s = new AbortSignal(); s.__abort(reason); return s; }
+        static timeout(ms) {
+            const s = new AbortSignal();
+            g.setTimeout(() => s.__abort(new DOMException("signal timed out", "TimeoutError")), Number(ms) || 0);
+            return s;
+        }
+        static any(signals) {
+            const s = new AbortSignal();
+            for (const sig of signals || []) {
+                if (sig && sig.aborted) { s.__abort(sig.reason); break; }
+                if (sig && sig.addEventListener) sig.addEventListener("abort", () => s.__abort(sig.reason));
+            }
+            return s;
+        }
+    }
+    g.AbortSignal = AbortSignal;
     g.AbortController = class AbortController {
-        constructor() { this.signal = { aborted: false, reason: undefined, onabort: null, addEventListener() {}, removeEventListener() {} }; }
-        abort() { this.signal.aborted = true; }
+        constructor() { this.signal = new AbortSignal(); }
+        abort(reason) { this.signal.__abort(reason); }
     };
+
+    // MessageChannel/MessagePort: schedulers (Polymer, React, async libs) use a
+    // channel's port to post a macrotask to themselves. We deliver across the
+    // pair on a virtual-time timer (a macrotask), which is exactly that role.
+    class MessagePort extends EventTarget {
+        constructor() { super(); this.onmessage = null; this.__other = null; }
+        postMessage(data) {
+            const other = this.__other;
+            if (!other) return;
+            g.setTimeout(() => {
+                const ev = new Event("message"); ev.data = data;
+                if (typeof other.onmessage === "function") { try { other.onmessage.call(other, ev); } catch (e) {} }
+                other.dispatchEvent(ev);
+            }, 0);
+        }
+        start() {} close() { this.__other = null; }
+    }
+    class MessageChannel {
+        constructor() {
+            this.port1 = new MessagePort(); this.port2 = new MessagePort();
+            this.port1.__other = this.port2; this.port2.__other = this.port1;
+        }
+    }
+    g.MessagePort = MessagePort; g.MessageChannel = MessageChannel;
 
     g.fetch = function (input, init) {
         try {

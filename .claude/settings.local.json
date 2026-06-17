@@ -66,7 +66,9 @@
       "Bash(cargo --version)",
       "Bash(echo \"=== FMT EXIT: $? ===\")",
       "Bash(awk '/const TRACKED/{f=1} f{print NR\": \"$0} f&&/\\\\];/{exit}' src/dom.rs)",
-      "Bash(curl -sS -o /dev/null -w \"%{http_code} %{time_total}s\\\\n\" https://archive.org/)"
+      "Bash(curl -sS -o /dev/null -w \"%{http_code} %{time_total}s\\\\n\" https://archive.org/)",
+      "Bash(TRUST_NET_DIAG=\"https://www.youtube.com/\" cargo test --release net_diag -- --ignored --nocapture)",
+      "Bash(TRUST_NET_DIAG='https://www.youtube.com/results?search_query=peanut+butter' TRUST_DIAG_VP=200x50 TRUST_NET_DIAG_OUT=/tmp/yt_search_settle.html cargo test --release diag_all_errors -- --ignored --nocapture)"
     ]
   }
 }
