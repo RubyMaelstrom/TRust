@@ -172,7 +172,7 @@ impl AsyncGenerator {
             || state == AsyncGeneratorState::SuspendedYield
         {
             // a. Perform AsyncGeneratorResume(generator, completion).
-            Self::resume(&generator, completion, context);
+            Self::resume(&generator, completion, context)?;
         }
 
         // 11. Return promiseCapability.[[Promise]].
@@ -236,7 +236,7 @@ impl AsyncGenerator {
         // 9. Else if state is suspended-yield, then
         else if state == AsyncGeneratorState::SuspendedYield {
             // a. Perform AsyncGeneratorResume(generator, completion).
-            Self::resume(&generator, completion, context);
+            Self::resume(&generator, completion, context)?;
         }
         // 10. Else,
         //     a. Assert: state is either executing or draining-queue.
@@ -323,7 +323,7 @@ impl AsyncGenerator {
         // 10. If state is suspended-yield, then
         if state == AsyncGeneratorState::SuspendedYield {
             // a. Perform AsyncGeneratorResume(generator, completion).
-            Self::resume(&generator, completion, context);
+            Self::resume(&generator, completion, context)?;
         }
 
         // 11. Else,
@@ -442,7 +442,7 @@ impl AsyncGenerator {
         generator: &JsObject<AsyncGenerator>,
         completion: CompletionRecord,
         context: &mut Context,
-    ) {
+    ) -> JsResult<()> {
         // 1. Assert: generator.[[AsyncGeneratorState]] is either suspended-start or suspended-yield.
         assert!(matches!(
             generator.borrow().data().state,
@@ -474,12 +474,25 @@ impl AsyncGenerator {
         // 7. Resume the suspended evaluation of genContext using completion as the result of the operation that suspended it. Let result be the Completion Record returned by the resumed computation.
         generator.borrow_mut().data_mut().context = Some(generator_context);
 
-        // 8. Assert: result is never an abrupt completion.
-        assert!(!result.is_throw_completion());
+        // 8. Assert: result is never an abrupt completion — for ordinary
+        //    (catchable) errors, which the generator turns into rejections
+        //    internally. The one exception is a host-imposed uncatchable error
+        //    (a `RuntimeLimit` or the fuzz instruction limit): it breaks out of
+        //    the VM past that handling and arrives here as a throw. Don't
+        //    assert (and don't `to_opaque` it — that panics); propagate it so
+        //    the driving native fn (`next`/`return`/`throw`) returns it and the
+        //    host job runner stops execution.
+        if result.is_throw_completion() {
+            let CompletionRecord::Throw(err) = result else {
+                unreachable!("is_throw_completion() is true")
+            };
+            return Err(err);
+        }
 
         // 9. Assert: When we return here, genContext has already been removed from the execution context stack and
         //    callerContext is the currently running execution context.
         // 10. Return unused.
+        Ok(())
     }
 
     /// `AsyncGeneratorAwaitReturn ( generator )`

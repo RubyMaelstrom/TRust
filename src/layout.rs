@@ -3027,7 +3027,25 @@ impl<'a> Layout<'a> {
         };
         let used_h = used_h.clamp(1, IMG_CSS_MAX_ROWS);
 
-        let crop = self.dom.computed_style(id, "object-fit").as_deref() == Some("cover");
+        let object_fit = self.dom.computed_style(id, "object-fit");
+        let crop = object_fit.as_deref() == Some("cover");
+        // `object-fit: contain` fits the image INSIDE its box preserving
+        // aspect, letterboxing the slack. Our renderer never UPSCALES
+        // (`Fit`, deliberate), so a box larger than the decoded image just
+        // reserves blank rows beneath it — a gap before whatever follows.
+        // (archive.org collection tiles set a tall `height` on the cover's
+        // box, so the title printed a half-dozen blank rows below the cover.)
+        // Reserve exactly what gets drawn: the decoded box scaled to fit,
+        // never up — no wasted letterbox in a terminal. `cover` (crop) and
+        // the default `fill` keep the author's box.
+        if object_fit.as_deref() == Some("contain") {
+            let scale = (used_w as f32 / iw as f32)
+                .min(used_h as f32 / ih as f32)
+                .min(1.0);
+            let fit_w = ((iw as f32) * scale).round().max(1.0) as usize;
+            let fit_h = ((ih as f32) * scale).round().max(1.0) as usize;
+            return (fit_w as u16, fit_h as u16, crop);
+        }
         (used_w as u16, used_h as u16, crop)
     }
 
@@ -3695,7 +3713,14 @@ mod tests {
                 && !src.trim_end().ends_with(".svg")
                 && let Link::Http(u) = crate::http::resolve(&base, src)
             {
-                images.insert(u.to_string(), (10, 4));
+                let (fw, fh) = std::env::var("TRUST_FAKE_IMG")
+                    .ok()
+                    .and_then(|s| {
+                        let (w, h) = s.split_once('x')?;
+                        Some((w.parse().ok()?, h.parse().ok()?))
+                    })
+                    .unwrap_or((10, 4));
+                images.insert(u.to_string(), (fw, fh));
             }
         }
         let (rows, carousels) =
@@ -4278,6 +4303,48 @@ mod tests {
         assert_eq!(img.width, 40, "width:100% fills the content width");
         assert_eq!(img.height, 10, "160px is 10 rows");
         assert!(img.crop, "object-fit:cover crops");
+    }
+
+    #[test]
+    fn object_fit_contain_reserves_the_fitted_box_not_a_letterbox() {
+        // archive.org collection tile: a small cover with width:100% and a
+        // tall box, object-fit:contain. The box would upscale to fill the
+        // width (40 wide → 20 tall here), but the renderer never upscales,
+        // so it would draw the 20×10 cover and leave ~10 blank rows beneath
+        // — the title floated a half-screen below the image. `contain` must
+        // reserve what's actually drawn (the fitted, never-upscaled box) so
+        // the next content sits directly under the image.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/cover.png".to_owned(), (20, 10));
+        let rows = lay_with_images(
+            r#"<body><img src="/cover.png" style="width:100%;height:100%;object-fit:contain"><p>title</p></body>"#,
+            40,
+            &images,
+        );
+        let img = image_item(&rows);
+        // The box is the fitted decoded size (20×10), NOT the upscaled
+        // width:100% box (40×20) that would reserve ~10 blank rows below.
+        assert_eq!(
+            (img.width, img.height),
+            (20, 10),
+            "contain reserves the fitted decoded box, not the upscaled width"
+        );
+        assert!(!img.crop, "contain does not crop");
+        // The title follows the image's (fitted) box + the single block
+        // spacer — no half-screen of reserved letterbox rows between them.
+        let img_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.image.is_some()))
+            .unwrap();
+        let title_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.text.contains("title")))
+            .unwrap();
+        assert!(
+            title_row - img_row <= img.height as usize + 1,
+            "title sits just under the image (row {title_row} vs image box at {img_row}+{})",
+            img.height
+        );
     }
 
     #[test]

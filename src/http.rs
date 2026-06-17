@@ -1599,6 +1599,98 @@ mod tests {
         server.abort();
     }
 
+    /// The loader-concurrency win (Lever B): sibling DYNAMIC `import()`s
+    /// overlap on the network. This isolates the `load_imported_module`
+    /// `.await` change from speculation — the import scanner deliberately
+    /// skips dynamic `import()` (a router fans out to every route), so
+    /// these bodies are NOT prefetched. With the old blocking loader each
+    /// `import()` parked the page thread on its own RTT and they ran
+    /// strictly serial (the archive.org boot staircase); awaiting lets the
+    /// concurrently-enqueued graph-load jobs fetch at once. Mirrors the
+    /// real boot pattern (`Promise.all([import(a), import(b), …])`).
+    #[tokio::test]
+    async fn dynamic_sibling_imports_load_concurrently() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const N: usize = 8;
+        const DELAY_MS: u64 = 120;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                // One task per connection so the server never serializes —
+                // otherwise it would mask the client concurrency we test.
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let js = "Content-Type: text/javascript";
+                    let reply: Vec<u8> = if text.starts_with("GET /page ") {
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                         <body><div id=out></div>\
+                         <script type=module src='/entry.js'></script></body>"
+                            .as_bytes()
+                            .to_vec()
+                    } else if text.starts_with("GET /entry.js ") {
+                        // Dynamic, NOT static, imports — the scanner won't
+                        // prefetch these, so the overlap is the loader's.
+                        let mut specs = String::new();
+                        for i in 0..N {
+                            if i > 0 {
+                                specs.push(',');
+                            }
+                            specs.push_str(&format!("import('/m{i}.js')"));
+                        }
+                        format!(
+                            "HTTP/1.1 200 OK\r\n{js}\r\nConnection: close\r\n\r\n\
+                             await Promise.all([{specs}]);\
+                             document.getElementById('out').textContent='got '+(globalThis.__c||0);"
+                        )
+                        .into_bytes()
+                    } else if text.starts_with("GET /m") {
+                        tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+                        format!(
+                            "HTTP/1.1 200 OK\r\n{js}\r\nConnection: close\r\n\r\n\
+                             globalThis.__c=(globalThis.__c||0)+1;"
+                        )
+                        .into_bytes()
+                    } else {
+                        b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                    };
+                    let _ = sock.write_all(&reply).await;
+                });
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let started = std::time::Instant::now();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let elapsed = started.elapsed();
+        let body = String::from_utf8_lossy(&response.body);
+        eprintln!("dynamic_sibling_imports_load_concurrently: {N}@{DELAY_MS}ms took {elapsed:?}");
+        assert!(
+            body.contains(&format!("got {N}")),
+            "all modules ran: {body}"
+        );
+        let serial = std::time::Duration::from_millis(DELAY_MS * N as u64);
+        assert!(
+            elapsed < serial / 2,
+            "dynamic sibling imports did not overlap: {elapsed:?} (serial would be ~{serial:?})"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn page_js_gets_fetch_xhr_and_session_storage() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1749,6 +1841,166 @@ mod tests {
         server.abort();
     }
 
+    /// Lever A (settle-when-interactive): a live page paints its SHELL the
+    /// moment it's interactive — BEFORE `settle_page` drains the data
+    /// fetches a DOMContentLoaded handler kicks off — then emits a filled
+    /// render once they land. This is what drops archive.org's first paint
+    /// from ~9s (waiting for its serial collections pagination) to ~5s.
+    #[tokio::test]
+    async fn execute_js_paints_shell_before_background_fetch_fills_it() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let reply: &[u8] = if text.starts_with("GET /page ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                          <body><button onclick=\"void 0\">menu</button>\
+                          <div id=tiles>SHELL</div>\
+                          <script>document.addEventListener('DOMContentLoaded',function(){\
+                          fetch('/data').then(function(r){return r.text();}).then(function(t){\
+                          document.getElementById('tiles').textContent=t;});});</script></body>"
+                    } else if text.starts_with("GET /data ") {
+                        // Delay so the shell is forced out before this lands.
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nBACKGROUND-TILE"
+                    } else {
+                        b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    let _ = sock.write_all(reply).await;
+                });
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut live = response.live.take().expect("clickable page stays live");
+        let shell = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(shell.contains("SHELL"), "shell painted: {shell}");
+        assert!(
+            !shell.contains("BACKGROUND-TILE"),
+            "first paint precedes the background fetch resolving: {shell}"
+        );
+
+        // The background fetch resolves, mutates the DOM, and a filled
+        // render follows on the live channel.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), live.events.recv()).await {
+            Ok(Some(crate::js::PageEvt::Updated { html, .. })) => {
+                assert!(
+                    html.contains("BACKGROUND-TILE"),
+                    "filled render carries the fetched content: {html}"
+                );
+            }
+            other => panic!("expected a filled Updated, got {other:?}"),
+        }
+        server.abort();
+    }
+
+    /// Regression for the Lever-A first-paint stamp: a live page's `load`
+    /// event must STILL fire after the shell paints. `outcome.elapsed` is
+    /// the cumulative-COMPUTE accumulator `run_script`'s budget gate reads
+    /// (`>= COMPUTE_BUDGET` 2s ⇒ skip). The actor used to overwrite it with
+    /// WALL-clock at first paint; on any page that took >2s of wall to
+    /// reach interactive (archive.org: serial module graph) the `load`
+    /// event was then skipped — the page settled but its load handlers
+    /// never ran ("load: skipped, page JS budget exhausted"; the page
+    /// half-loaded). Here the entry module burns ~2.1s of WALL on a slow
+    /// fetch (module top-level work is NOT charged to `outcome.elapsed`),
+    /// so without the fix the shell-paint stamp pushes `elapsed` past the
+    /// 2s gate and `load` is skipped; with it `load` runs and fills `#out`.
+    #[tokio::test]
+    async fn load_event_fires_even_when_wall_time_at_first_paint_exceeds_compute_budget() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let reply: Vec<u8> = if text.starts_with("GET /page ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                          <body><button onclick=\"void 0\">menu</button>\
+                          <div id=out>SHELL</div>\
+                          <script type=module src='/entry.js'></script></body>"
+                            .to_vec()
+                    } else if text.starts_with("GET /entry.js ") {
+                        // Register a load handler, then burn WALL (not
+                        // compute) on a slow fetch so first paint lands past
+                        // the 2s COMPUTE_BUDGET. Top-level module work isn't
+                        // charged to outcome.elapsed, so the only thing that
+                        // can push the gate over is the (buggy) wall stamp.
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n\
+                          window.addEventListener('load', function(){\
+                          document.getElementById('out').textContent='LOADED';});\
+                          await fetch('/slow');"
+                            .to_vec()
+                    } else if text.starts_with("GET /slow ") {
+                        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok"
+                            .to_vec()
+                    } else {
+                        b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                    };
+                    let _ = sock.write_all(&reply).await;
+                });
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut live = response.live.take().expect("clickable page stays live");
+
+        // Drain to the settled render: the shell paints first ("SHELL"),
+        // then the `load` handler's mutation arrives ("LOADED").
+        let mut last = String::from_utf8_lossy(&response.body).into_owned();
+        let mut last_errors = response.js.map(|o| o.errors).unwrap_or_default();
+        while let Ok(Some(evt)) =
+            tokio::time::timeout(Duration::from_secs(10), live.events.recv()).await
+        {
+            if let crate::js::PageEvt::Updated { html, outcome } = evt {
+                last = html;
+                last_errors = outcome.errors;
+            }
+        }
+        assert!(
+            last.contains("LOADED"),
+            "load handler ran and filled #out: {last}"
+        );
+        assert!(
+            !last_errors.iter().any(|e| e.contains("load: skipped")),
+            "load event was not budget-skipped: {last_errors:?}"
+        );
+        server.abort();
+    }
+
     /// Her expandtest.html, byte-for-byte through the full live path.
     #[tokio::test]
     async fn execute_js_live_path_handles_the_expander_page() {
@@ -1884,6 +2136,67 @@ mod tests {
     }
 
     /// Diagnostic: fetch a REAL url through the full JS pipeline and
+    /// Full JS-error survey at a chosen viewport (`TRUST_DIAG_VP=WxH`,
+    /// default 200x50), draining the whole live settle so it sees EVERY
+    /// unique error + stack the way the running app accumulates them — not
+    /// just the load-time set `net_diag` shows. This is how the post-fix
+    /// archive error count was tracked down.
+    /// `TRUST_NET_DIAG=<url> cargo test --release diag_all_errors -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual diagnostic, needs TRUST_NET_DIAG=<url>"]
+    async fn diag_all_errors() {
+        let Ok(target) = std::env::var("TRUST_NET_DIAG") else {
+            return;
+        };
+        let vp: (u16, u16) = std::env::var("TRUST_DIAG_VP")
+            .ok()
+            .and_then(|s| {
+                s.split_once('x')
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+            })
+            .unwrap_or((200, 50));
+        let url = parse_url(&target).unwrap();
+        let resp = fetch(&Request::get(url)).await.unwrap();
+        let mut resp = execute_js(resp, vp, (8, 16), Default::default()).await;
+        let mut errs: Vec<String> = resp
+            .js
+            .as_ref()
+            .map(|o| o.errors.clone())
+            .unwrap_or_default();
+        eprintln!("--- load errors: {} ---", errs.len());
+        if let Some(mut live) = resp.live.take() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(left, live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { outcome, .. })) => {
+                        for e in outcome.errors {
+                            if !errs.contains(&e) {
+                                errs.push(e);
+                            }
+                        }
+                    }
+                    Ok(Some(crate::js::PageEvt::Trouble(es))) => {
+                        for e in es {
+                            if !errs.contains(&e) {
+                                errs.push(e);
+                            }
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        eprintln!("=== {} UNIQUE ERRORS ===", errs.len());
+        for (i, e) in errs.iter().enumerate() {
+            eprintln!("\n[{i}] {e}");
+        }
+    }
+
     /// report. `TRUST_NET_DIAG=https://… cargo test net_diag -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "manual diagnostic, needs TRUST_NET_DIAG=<url>"]

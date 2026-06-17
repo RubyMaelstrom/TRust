@@ -1267,7 +1267,7 @@ impl Dom {
         clickable: &std::collections::HashSet<NodeId>,
     ) -> String {
         let mut out = String::new();
-        self.serialize_live_node(root, None, clickable, &mut out);
+        self.serialize_live_node(root, None, clickable, false, &mut out);
         out
     }
 
@@ -1276,12 +1276,13 @@ impl Dom {
         id: NodeId,
         host: Option<NodeId>,
         clickable: &std::collections::HashSet<NodeId>,
+        in_anchor: bool,
         out: &mut String,
     ) {
         let NodeData::Element { name, attrs, .. } = &self.nodes[id].data else {
             return self.serialize_node_with(
                 id,
-                &mut |c, o| self.serialize_live_node(c, host, clickable, o),
+                &mut |c, o| self.serialize_live_node(c, host, clickable, in_anchor, o),
                 out,
             );
         };
@@ -1295,18 +1296,30 @@ impl Dom {
             let assigned = self.slot_assigned(h, self.attr(id, "name"));
             if assigned.is_empty() {
                 for c in self.children(id) {
-                    self.serialize_live_node(c, host, clickable, out);
+                    self.serialize_live_node(c, host, clickable, in_anchor, out);
                 }
             } else {
                 for c in assigned {
-                    self.serialize_live_node(c, None, clickable, out);
+                    self.serialize_live_node(c, None, clickable, in_anchor, out);
                 }
             }
             return;
         }
         let is_click = clickable.contains(&id);
         let is_anchor = tag == "a";
-        if is_click && !is_anchor {
+        // A non-anchor clickable becomes a followable `<a>` marker — BUT
+        // never nest one inside an existing anchor. An `<a>` inside an `<a>`
+        // is invalid HTML; when the app re-parses this serialized output for
+        // layout, html5ever's adoption agency SPLITS the outer anchor into
+        // empty fragments that still carry its `aria-label`, which then leaks
+        // as duplicated link text (archive.org tiles: a `<button class=info>`
+        // wrapped inside the tile's own `<a>` printed the title three times).
+        // Inside an anchor the clickable simply inherits that anchor's link.
+        let wrap = is_click && !is_anchor && !in_anchor;
+        // Whether this element opens an anchor context for its descendants:
+        // a real `<a>`, the wrapper we just emitted, or an already-open one.
+        let child_in_anchor = in_anchor || is_anchor || is_click;
+        if wrap {
             out.push_str(&format!("<a href=\"x-trust-js:{id}:\">"));
             // An icon-only clickable would render as an empty (and so
             // unselectable) link: give it a visible handle. A named one
@@ -1353,18 +1366,18 @@ impl Dom {
         if !VOID_ELEMENTS.contains(&tag) {
             if let Some(root) = self.shadow_root(id) {
                 for c in self.children(root) {
-                    self.serialize_live_node(c, Some(id), clickable, out);
+                    self.serialize_live_node(c, Some(id), clickable, child_in_anchor, out);
                 }
             } else {
                 for c in self.children(id) {
-                    self.serialize_live_node(c, host, clickable, out);
+                    self.serialize_live_node(c, host, clickable, child_in_anchor, out);
                 }
             }
             out.push_str("</");
             out.push_str(tag);
             out.push('>');
         }
-        if is_click && !is_anchor {
+        if wrap {
             out.push_str("</a>");
         }
     }
@@ -3266,6 +3279,49 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("href=\"/normal\""), "{html}");
+    }
+
+    #[test]
+    fn clickable_inside_an_anchor_is_not_wrapped_in_a_nested_anchor() {
+        // archive.org tiles: an info <button> nested inside the tile's own
+        // <a aria-label="…">. Wrapping the button in its own x-trust-js <a>
+        // makes an <a>-in-<a>; when the app re-parses this serialized output
+        // for layout, html5ever's adoption agency SPLITS the outer anchor
+        // into empty fragments that still carry aria-label — leaking the
+        // title as two extra link lines. The nested clickable must stay
+        // UN-wrapped (it inherits the surrounding anchor's link).
+        let dom = Dom::parse_document(
+            "<body><a id=tile href='/details/x' aria-label='Tile Title'>\
+               <button id=info aria-label='info'>i</button>\
+               <h3>Tile Title</h3>\
+             </a></body>",
+        );
+        let tile = dom.get_by_id("tile").unwrap();
+        let info = dom.get_by_id("info").unwrap();
+        let clickable = std::collections::HashSet::from([tile, info]);
+        let html = dom.serialize_live(DOCUMENT, &clickable);
+        // Exactly one anchor in the output: the tile. The nested button got
+        // no wrapper marker.
+        assert_eq!(html.matches("<a ").count(), 1, "one anchor only: {html}");
+        assert!(
+            !html.contains(&format!("x-trust-js:{info}:")),
+            "info button not wrapped in a nested anchor: {html}"
+        );
+        // The tile anchor still routes through the actor (href rewritten).
+        assert!(
+            html.contains(&format!("x-trust-js:{tile}:/details/x")),
+            "{html}"
+        );
+        // The decisive check: re-parsing the serialized output keeps the
+        // anchor INTACT — no adoption-agency split — so its aria-label never
+        // leaks as duplicate text.
+        let reparsed = Dom::parse_document(&html);
+        let anchors = reparsed
+            .descendants(DOCUMENT)
+            .into_iter()
+            .filter(|&d| reparsed.tag_name(d) == Some("a"))
+            .count();
+        assert_eq!(anchors, 1, "anchor survives re-parse un-split: {html}");
     }
 
     #[test]
