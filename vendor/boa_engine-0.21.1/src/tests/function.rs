@@ -127,12 +127,15 @@ fn not_a_function() {
                 let b = true;
             "#}),
         // A non-callable OBJECT still reports the bare message (a different
-        // internal-method path); a non-object callee now names the value.
+        // internal-method path); a non-object callee now names the value, and
+        // when that value is `undefined` read from a property, the property
+        // name too (V8 says "x.a is not a function" — naming the property is
+        // the primary lever for finding unimplemented platform methods).
         TestAction::assert_native_error("a()", JsNativeErrorKind::Type, "not a callable function"),
         TestAction::assert_native_error(
             "a.a()",
             JsNativeErrorKind::Type,
-            "undefined is not a callable function",
+            "undefined is not a callable function (reading 'a')",
         ),
         TestAction::assert_native_error(
             "b()",

@@ -22,7 +22,12 @@ use url::Url;
 use crate::doc::{Doc, DocLine, Field, FieldKind, Form, FormMethod, Kind, Link};
 use crate::tls;
 
-const MAX_BODY: usize = 5 * 1024 * 1024;
+// Per-response ceiling — a memory guard, not a correctness limit. The big
+// web ships large app bundles: YouTube's `kevlar_base` is ~10.5 MB of
+// minified JS, so 5 MB silently dropped it. 16 MB clears today's giants with
+// headroom while staying bounded (bodies are transient: parsed, then only the
+// post-JS HTML is retained).
+const MAX_BODY: usize = 16 * 1024 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REDIRECTS: usize = 10;
 const USER_AGENT: &str = "TRust/0.1";
@@ -713,6 +718,20 @@ async fn read_response<R: AsyncRead + Unpin>(
             .get("connection")
             .is_some_and(|c| c.to_ascii_lowercase().contains("close"));
 
+    // TRust never plays video/audio — video is mpv's job (the `v` key /
+    // YouTube auto-route). Downloading media bodies is pure waste: they're
+    // large and a real budget sink (YouTube prefetches feed-tile video
+    // previews via fetch() this way, which starves the actual page render).
+    // Skip the body entirely so a page falls back to its static poster /
+    // thumbnail. The unread body means this socket can't be pooled. General
+    // policy, not a site rule — any video/audio response anywhere is dropped.
+    if headers.get("content-type").is_some_and(|c| {
+        let c = c.trim_start().to_ascii_lowercase();
+        c.starts_with("video/") || c.starts_with("audio/")
+    }) {
+        return Ok((status, headers, Vec::new(), false, set_cookies));
+    }
+
     let body = if matches!(status, 204 | 304) || matches!(status, 100..=199) {
         Vec::new()
     } else if headers
@@ -724,7 +743,10 @@ async fn read_response<R: AsyncRead + Unpin>(
         body
     } else if let Some(len) = headers.get("content-length").and_then(|l| l.parse().ok()) {
         if len > MAX_BODY {
-            return Err(String::from("response exceeds 5 MB cap"));
+            return Err(format!(
+                "response exceeds {} MB cap",
+                MAX_BODY / (1024 * 1024)
+            ));
         }
         let (body, complete) = read_exactly(io, len).await?;
         reusable &= complete;
@@ -762,7 +784,10 @@ async fn read_chunked<R: AsyncRead + Unpin>(
             }
         }
         if out.len() + size > MAX_BODY {
-            return Err(String::from("response exceeds 5 MB cap"));
+            return Err(format!(
+                "response exceeds {} MB cap",
+                MAX_BODY / (1024 * 1024)
+            ));
         }
         let start = out.len();
         out.resize(start + size, 0);
@@ -824,7 +849,10 @@ async fn read_to_eof<R: AsyncRead + Unpin>(io: &mut BufReader<R>) -> Result<Vec<
         }
         raw.extend_from_slice(&buf[..n]);
         if raw.len() > MAX_BODY {
-            return Err(String::from("response exceeds 5 MB cap"));
+            return Err(format!(
+                "response exceeds {} MB cap",
+                MAX_BODY / (1024 * 1024)
+            ));
         }
     }
 }
@@ -2164,15 +2192,17 @@ mod tests {
             .map(|o| o.errors.clone())
             .unwrap_or_default();
         eprintln!("--- load errors: {} ---", errs.len());
+        let mut last_html: Option<String> = None;
         if let Some(mut live) = resp.live.take() {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(70);
             loop {
                 let left = deadline.saturating_duration_since(std::time::Instant::now());
                 if left.is_zero() {
                     break;
                 }
                 match tokio::time::timeout(left, live.events.recv()).await {
-                    Ok(Some(crate::js::PageEvt::Updated { outcome, .. })) => {
+                    Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                        last_html = Some(html);
                         for e in outcome.errors {
                             if !errs.contains(&e) {
                                 errs.push(e);
@@ -2186,6 +2216,15 @@ mod tests {
                             }
                         }
                     }
+                    Ok(Some(crate::js::PageEvt::Static { html, outcome })) => {
+                        last_html = Some(html);
+                        for e in outcome.errors {
+                            if !errs.contains(&e) {
+                                errs.push(e);
+                            }
+                        }
+                        break;
+                    }
                     Ok(Some(_)) => {}
                     Ok(None) | Err(_) => break,
                 }
@@ -2194,6 +2233,14 @@ mod tests {
         eprintln!("=== {} UNIQUE ERRORS ===", errs.len());
         for (i, e) in errs.iter().enumerate() {
             eprintln!("\n[{i}] {e}");
+        }
+        // The post-SETTLE body (net_diag dumps only the first-paint shell; a
+        // live SPA fills its content during settle). Dump it for inspection.
+        if let Some(html) = last_html {
+            if let Ok(out) = std::env::var("TRUST_NET_DIAG_OUT") {
+                std::fs::write(&out, &html).unwrap();
+                eprintln!("post-settle body ({}B) -> {out}", html.len());
+            }
         }
     }
 
