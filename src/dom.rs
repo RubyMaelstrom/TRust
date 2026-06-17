@@ -1567,6 +1567,83 @@ impl Dom {
                 }
                 false
             }
+            Combinator::NextSibling => self
+                .prev_element_sibling(id)
+                .is_some_and(|s| self.matches_complex(s, rest, scope)),
+            Combinator::SubsequentSibling => {
+                let mut sib = self.prev_element_sibling(id);
+                while let Some(s) = sib {
+                    if self.matches_complex(s, rest, scope) {
+                        return true;
+                    }
+                    sib = self.prev_element_sibling(s);
+                }
+                false
+            }
+        }
+    }
+
+    /// The nearest preceding sibling that is an element (skips text/comments).
+    fn prev_element_sibling(&self, id: NodeId) -> Option<NodeId> {
+        let mut p = self.nodes[id].prev_sibling;
+        while let Some(s) = p {
+            if self.tag_name(s).is_some() {
+                return Some(s);
+            }
+            p = self.nodes[s].prev_sibling;
+        }
+        None
+    }
+
+    /// `:empty` — the element has no element children and no text children
+    /// with non-whitespace content (comments don't count).
+    fn is_element_empty(&self, id: NodeId) -> bool {
+        let mut child = self.nodes[id].first_child;
+        while let Some(c) = child {
+            match &self.nodes[c].data {
+                NodeData::Element { .. } => return false,
+                NodeData::Text(t) if !t.chars().all(char::is_whitespace) => return false,
+                _ => {}
+            }
+            child = self.nodes[c].next_sibling;
+        }
+        true
+    }
+
+    /// The element's 1-based position among its parent's element children
+    /// (`of_type`: only same-tag siblings; `from_end`: counted from the
+    /// last). `None` if it has no parent or isn't an element.
+    fn nth_position(&self, id: NodeId, of_type: bool, from_end: bool) -> Option<i32> {
+        let parent = self.nodes[id].parent?;
+        let my_tag = self.tag_name(id)?;
+        let mut sibs = Vec::new();
+        let mut child = self.nodes[parent].first_child;
+        while let Some(c) = child {
+            if let Some(t) = self.tag_name(c)
+                && (!of_type || t == my_tag)
+            {
+                sibs.push(c);
+            }
+            child = self.nodes[c].next_sibling;
+        }
+        let idx = sibs.iter().position(|&s| s == id)?;
+        Some(if from_end {
+            (sibs.len() - idx) as i32
+        } else {
+            (idx + 1) as i32
+        })
+    }
+
+    fn matches_structural(&self, id: NodeId, st: &Structural) -> bool {
+        match st {
+            Structural::Empty => self.is_element_empty(id),
+            Structural::Nth {
+                nth,
+                of_type,
+                from_end,
+            } => self
+                .nth_position(id, *of_type, *from_end)
+                .is_some_and(|pos| nth.matches(pos)),
         }
     }
 
@@ -1613,6 +1690,13 @@ impl Dom {
                 }
             }
         }
+        if !c
+            .structural
+            .iter()
+            .all(|st| self.matches_structural(id, st))
+        {
+            return false;
+        }
         c.nots.iter().all(|n| !self.matches_compound(id, n, scope))
     }
 }
@@ -1644,10 +1728,12 @@ fn escape_attr(s: &str) -> Cow<'_, str> {
 
 /// The workhorse selector grammar: `tag`, `*`, `#id`, `.class`,
 /// `[attr]`, `[attr⊙=value]` (⊙ ∈ {ε, ~, |, ^, $, *}), `:not(compound)`,
-/// compounds thereof, descendant (space) and child (`>`) combinators,
-/// comma lists. Interaction pseudos (`:hover`…) and pseudo-elements
-/// parse but never match — valid CSS that can't be true in our world.
-/// The exotic combinators wait for a page that actually needs them.
+/// the structural pseudo-classes (`:empty`, `:first-child`/`:last-child`/
+/// `:only-child`, `:*-of-type`, `:nth-child(An+B)` and friends), compounds
+/// thereof, and the descendant (space), child (`>`), next-sibling (`+`) and
+/// subsequent-sibling (`~`) combinators, in comma lists. Interaction pseudos
+/// (`:hover`…) and pseudo-elements parse but never match — valid CSS that
+/// can't be true in our world.
 pub struct SelectorList(Vec<Complex>);
 
 struct Complex(Vec<(Combinator, Compound)>);
@@ -1658,6 +1744,10 @@ enum Combinator {
     None,
     Descendant,
     Child,
+    /// `A + B`: B's immediately-preceding element sibling is A.
+    NextSibling,
+    /// `A ~ B`: some preceding element sibling of B is A.
+    SubsequentSibling,
 }
 
 /// The `::before` / `::after` generated-content pseudo-elements (CSS2
@@ -1677,10 +1767,13 @@ struct Compound {
     attrs: Vec<AttrSel>,
     /// `:not(...)` arguments: the compound matches only if none do.
     nots: Vec<Compound>,
-    /// `:hover`, `:nth-child(…)` and other pseudos we can't satisfy: parse
-    /// fine, match never (fail-open — a never-matching hide rule hides
-    /// nothing, and its comma-siblings stay alive).
+    /// `:hover`, `:focus` and other pseudos we can't satisfy: parse fine,
+    /// match never (fail-open — a never-matching hide rule hides nothing,
+    /// and its comma-siblings stay alive).
     never: bool,
+    /// Structural pseudo-classes (`:empty`, `:nth-child(…)`, `:first-child`,
+    /// `:*-of-type`, …) the element must satisfy. All must hold (AND).
+    structural: Vec<Structural>,
     /// `:scope`: matches the element a rooted query (`querySelectorAll`/
     /// jQuery `.find()`) was called on. jQuery rewrites context-rooted comma/
     /// complex selectors to `:scope X, :scope Y`, so without this they match
@@ -1703,6 +1796,94 @@ struct AttrSel {
     name: String,
     op: AttrOp,
     value: Option<String>,
+}
+
+/// `An+B` (the `:nth-child` micro-grammar): position `p` (1-based) matches
+/// when `p = a*k + b` for some integer `k ≥ 0`.
+struct Nth {
+    a: i32,
+    b: i32,
+}
+
+impl Nth {
+    fn matches(&self, pos: i32) -> bool {
+        if self.a == 0 {
+            pos == self.b
+        } else {
+            let diff = pos - self.b;
+            diff % self.a == 0 && diff / self.a >= 0
+        }
+    }
+}
+
+/// A structural pseudo-class: a positional/childless test that depends on
+/// the element's siblings, not its own attributes.
+enum Structural {
+    /// `:empty` — no element or non-empty text children.
+    Empty,
+    /// `:nth-child(An+B)` and its variants. `of_type` counts only same-tag
+    /// siblings; `from_end` counts position from the last sibling.
+    /// (`:first-child` = `nth(1)`, `:last-child` = `nth(1)` from end, etc.)
+    Nth {
+        nth: Nth,
+        of_type: bool,
+        from_end: bool,
+    },
+}
+
+/// Parse the `An+B` argument of `:nth-child(...)` etc. — `odd`, `even`,
+/// `2n+1`, `-n+3`, `n`, `3`, `+3`, with optional internal whitespace.
+fn parse_nth(s: &str) -> Option<Nth> {
+    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    let s = s.to_ascii_lowercase();
+    match s.as_str() {
+        "odd" => return Some(Nth { a: 2, b: 1 }),
+        "even" => return Some(Nth { a: 2, b: 0 }),
+        _ => {}
+    }
+    if let Some(npos) = s.find('n') {
+        let a = match &s[..npos] {
+            "" | "+" => 1,
+            "-" => -1,
+            x => x.parse().ok()?,
+        };
+        let b_str = &s[npos + 1..];
+        let b = if b_str.is_empty() {
+            0
+        } else {
+            b_str.strip_prefix('+').unwrap_or(b_str).parse().ok()?
+        };
+        Some(Nth { a, b })
+    } else {
+        Some(Nth {
+            a: 0,
+            b: s.parse().ok()?,
+        })
+    }
+}
+
+/// The simple structural pseudo-classes (no argument), expanded to their
+/// `:nth`-equivalents. `:only-*` is the conjunction of first and last.
+fn structural_simple(name: &str) -> Option<Vec<Structural>> {
+    let first = |of_type| Structural::Nth {
+        nth: Nth { a: 0, b: 1 },
+        of_type,
+        from_end: false,
+    };
+    let last = |of_type| Structural::Nth {
+        nth: Nth { a: 0, b: 1 },
+        of_type,
+        from_end: true,
+    };
+    Some(match name {
+        "first-child" => vec![first(false)],
+        "last-child" => vec![last(false)],
+        "only-child" => vec![first(false), last(false)],
+        "first-of-type" => vec![first(true)],
+        "last-of-type" => vec![last(true)],
+        "only-of-type" => vec![first(true), last(true)],
+        _ => return None,
+    })
 }
 
 /// CSS attribute selector operators: `=`, `~=`, `|=`, `^=`, `$=`, `*=`.
@@ -1746,6 +1927,7 @@ impl Compound {
             && !self.never
             && !self.scope
             && !self.root
+            && self.structural.is_empty()
             && self.pseudo.is_none()
     }
 
@@ -1827,6 +2009,12 @@ fn parse_complex(input: &str) -> Option<Complex> {
                 chars.next();
             } else if c == '>' {
                 pending = Combinator::Child;
+                chars.next();
+            } else if c == '+' {
+                pending = Combinator::NextSibling;
+                chars.next();
+            } else if c == '~' {
+                pending = Combinator::SubsequentSibling;
                 chars.next();
             } else {
                 break;
@@ -1955,15 +2143,36 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                 } else if name == "root" {
                     compound.root = true;
                     compound.pseudos += 1;
+                } else if name == "empty" {
+                    compound.structural.push(Structural::Empty);
+                    compound.pseudos += 1;
+                } else if let Some(simple) = structural_simple(&name) {
+                    compound.structural.extend(simple);
+                    compound.pseudos += 1;
+                } else if let Some((of_type, from_end)) = match name.as_str() {
+                    "nth-child" => Some((false, false)),
+                    "nth-last-child" => Some((false, true)),
+                    "nth-of-type" => Some((true, false)),
+                    "nth-last-of-type" => Some((true, true)),
+                    _ => None,
+                } {
+                    // A malformed/absent An+B fails the parse (rule ignored,
+                    // fail-open) rather than silently mismatching.
+                    let nth = parse_nth(&arg?)?;
+                    compound.structural.push(Structural::Nth {
+                        nth,
+                        of_type,
+                        from_end,
+                    });
+                    compound.pseudos += 1;
                 } else {
-                    // Valid CSS we can never satisfy (no pointer, no
-                    // focus, no positional matching yet): parse, count
-                    // for specificity, never match.
+                    // Valid CSS we can never satisfy (no pointer, no focus):
+                    // parse, count for specificity, never match.
                     compound.never = true;
                     compound.pseudos += 1;
                 }
             }
-            c if c.is_ascii_whitespace() || c == '>' => break,
+            c if c.is_ascii_whitespace() || c == '>' || c == '+' || c == '~' => break,
             _ => {
                 let tag = take_name(chars)?;
                 compound.tag = Some(tag.to_ascii_lowercase());
@@ -3171,13 +3380,14 @@ mod tests {
     #[test]
     fn css_cascade_fails_open() {
         // :hover can't be true here; @media blocks are skipped whole; a
-        // selector list with an unparseable member dies entirely (the
-        // spec's rule, and it fails toward VISIBLE).
+        // selector list with an unparseable member (`:nth-child()` — an
+        // empty An+B) dies entirely (the spec's rule, and it fails toward
+        // VISIBLE).
         let dom = Dom::parse_document(
             "<head><style>
                 .x:hover { display: none }
                 @media (max-width: 600px) { .x { display: none } }
-                .x ~ p, .y { display: none }
+                :nth-child(), .y { display: none }
                 .z { display: none }
              </style></head>
              <body><p class=x>pointer</p><p class=y>comma survivor</p>\
@@ -3488,6 +3698,63 @@ mod tests {
         // Inert in the cascade / scopeless match (no query root → never).
         let b = dom.query(box_id, &SelectorList::parse(".b").unwrap(), true)[0];
         assert!(!dom.matches(b, &SelectorList::parse(":scope").unwrap()));
+    }
+
+    #[test]
+    fn sibling_combinators_match() {
+        let dom = Dom::parse_document(
+            "<body><ul><li class=a>1</li><li class=b>2</li><li class=c>3</li></ul></body>",
+        );
+        let q = |s: &str| {
+            dom.query(DOCUMENT, &SelectorList::parse(s).unwrap(), false)
+                .len()
+        };
+        // `.a + li` = the li immediately after .a (just one).
+        assert_eq!(q(".a + li"), 1, "next-sibling matches one");
+        // `.a ~ li` = every following li sibling (two).
+        assert_eq!(q(".a ~ li"), 2, "subsequent-sibling matches all following");
+        // `.c + li` = nothing follows .c.
+        assert_eq!(q(".c + li"), 0, "no sibling after last");
+    }
+
+    #[test]
+    fn structural_pseudo_classes_match() {
+        let dom = Dom::parse_document(
+            "<body><ul id=list>\
+             <li>1</li><li>2</li><li>3</li><li>4</li><li>5</li>\
+             </ul><div id=empty></div><div id=ws>   </div><div id=full>x</div></body>",
+        );
+        let root = DOCUMENT;
+        let q = |s: &str| {
+            dom.query(root, &SelectorList::parse(s).unwrap(), false)
+                .len()
+        };
+        assert_eq!(q("li:first-child"), 1);
+        assert_eq!(q("li:last-child"), 1);
+        assert_eq!(q("li:only-child"), 0, "5 li children: none is only-child");
+        assert_eq!(q("li:nth-child(2)"), 1);
+        assert_eq!(q("li:nth-child(odd)"), 3, "1,3,5");
+        assert_eq!(q("li:nth-child(even)"), 2, "2,4");
+        assert_eq!(q("li:nth-child(2n+1)"), 3, "same as odd");
+        assert_eq!(q("li:nth-last-child(1)"), 1, "== last-child");
+        // :empty — whitespace-only counts as empty (Selectors-4); text doesn't.
+        assert_eq!(q("#empty:empty"), 1);
+        assert_eq!(q("#ws:empty"), 1, "whitespace-only is empty");
+        assert_eq!(q("#full:empty"), 0, "text content is not empty");
+    }
+
+    #[test]
+    fn of_type_pseudo_classes_match() {
+        let dom = Dom::parse_document(
+            "<body id=b><h1>t</h1><p>a</p><p>b</p><span>s</span><p>c</p></body>",
+        );
+        let b = dom.get_by_id("b").unwrap();
+        let q = |s: &str| dom.query(b, &SelectorList::parse(s).unwrap(), false).len();
+        assert_eq!(q("p:first-of-type"), 1, "first p");
+        assert_eq!(q("p:last-of-type"), 1, "last p");
+        assert_eq!(q("h1:only-of-type"), 1, "the lone h1");
+        assert_eq!(q("p:only-of-type"), 0, "three p's");
+        assert_eq!(q("p:nth-of-type(2)"), 1, "second p");
     }
 
     #[test]
