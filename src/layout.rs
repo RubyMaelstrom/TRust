@@ -998,7 +998,7 @@ impl<'a> Layout<'a> {
                 return;
             }
             "input" | "textarea" | "select" | "button" => {
-                self.flow_form_control(id, &tag);
+                self.flow_form_control(id, &tag, ctx.link.clone());
                 return;
             }
             _ => {}
@@ -3084,7 +3084,7 @@ impl<'a> Layout<'a> {
     /// Flow a form control. A control known to the form extraction (in
     /// `controls`) becomes a selectable `Link::Form` widget showing the
     /// field's current value; anything else falls back to a plain stub.
-    fn flow_form_control(&mut self, id: NodeId, tag: &str) {
+    fn flow_form_control(&mut self, id: NodeId, tag: &str, ambient: Option<Link>) {
         if let Some(&(form, field)) = self.controls.get(&id) {
             let label = self.field_label(form, field);
             if label.is_empty() {
@@ -3093,7 +3093,7 @@ impl<'a> Layout<'a> {
             self.place_atom(label, ItemKind::Form, id, Some(Link::Form { form, field }));
             return;
         }
-        self.place_form_stub(id, tag);
+        self.place_form_stub(id, tag, ambient);
     }
 
     /// The widget label for a `(form, field)` (`Field::row_label`), empty
@@ -3106,9 +3106,13 @@ impl<'a> Layout<'a> {
             .unwrap_or_default()
     }
 
-    /// A non-interactive stub for a control we couldn't bind to a form
-    /// (e.g. one outside any `<form>`), keeping the page readable.
-    fn place_form_stub(&mut self, id: NodeId, tag: &str) {
+    /// A stub for a control we couldn't bind to a form (e.g. one outside
+    /// any `<form>`), keeping the page readable. When the control is wrapped
+    /// in a living-page click marker (`ambient` is its `Link::JsClick`) — a
+    /// React/Vue `<button onClick>` is the common case — the stub adopts that
+    /// link so it stays selectable and the click reaches the engine. Without
+    /// an ambient link it's an inert placeholder, as before.
+    fn place_form_stub(&mut self, id: NodeId, tag: &str, ambient: Option<Link>) {
         if self.dom.is_hidden(id) {
             return;
         }
@@ -3137,7 +3141,7 @@ impl<'a> Layout<'a> {
                 format!("[{hint}]")
             }
         };
-        self.place_atom(stub, ItemKind::Form, id, None);
+        self.place_atom(stub, ItemKind::Form, id, ambient);
     }
 
     /// Place a single unbreakable item (a form widget), with the same
