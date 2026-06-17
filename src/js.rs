@@ -450,9 +450,12 @@ unsafe impl boa_engine::gc::Trace for PageStore {
 /// Most page-initiated requests (fetch/XHR/module loads) per page.
 /// Was 24 (Phase 2a); archive.org's home alone needs ~32 module loads
 /// before any data — at 24 the app's chunks were cut off mid-graph.
-/// 96 covers its full boot (62 observed) with headroom; still a hard
-/// envelope against runaway pages. PROVISIONAL — her call to keep.
-const MAX_PAGE_FETCHES: usize = 96;
+/// 96 covered its full boot (62 observed); 256 covers a large static
+/// module graph too (css3test's `tests.js` statically imports 154 spec
+/// modules — under 96 the graph never linked). Still a hard envelope
+/// against runaway pages; `subresource_allowed` separately blocks
+/// private-address pivots regardless of count. PROVISIONAL — her call.
+const MAX_PAGE_FETCHES: usize = 256;
 
 /// Most import specifiers we'll speculatively prefetch from one module's
 /// source. Bounds the wasted bandwidth of a false-positive scan; the
@@ -535,6 +538,8 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_attach_shadow", 1, sys_attach_shadow),
         ("__dom_shadow_root", 1, sys_shadow_root),
         ("__dom_adopt_styles", 2, sys_adopt_styles),
+        ("__css_parse", 1, sys_css_parse),
+        ("__css_supports_selector", 1, sys_css_supports_selector),
         ("__dom_template_content", 1, sys_template_content),
         ("__http_fetch", 4, sys_http_fetch),
         ("__http_fetch_async", 4, sys_http_fetch_async),
@@ -699,7 +704,7 @@ fn sys_computed_style(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
     let dom = page_dom(ctx);
     let d = dom.borrow();
     Ok(
-        match arg_node(&d, args, 0).and_then(|id| d.computed_value(id, &name)) {
+        match arg_node(&d, args, 0).and_then(|id| d.computed_value_resolved(id, &name)) {
             Some(v) => str_value(&v),
             None => JsValue::null(),
         },
@@ -908,6 +913,27 @@ fn sys_adopt_styles(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
         d.set_adopted_styles(scope, &css);
     }
     Ok(JsValue::undefined())
+}
+
+/// `__css_parse(text)` → the CSSOM rule tree as a JSON string (the prelude
+/// `JSON.parse`s it into CSSStyleRule/CSSMediaRule/… for `<style>.sheet`).
+/// Uses the same CSS tokenizing as the cascade, so what CSSOM reports and
+/// what the cascade honors stay one source of truth.
+fn sys_css_parse(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let css = arg_str(args, 0, ctx);
+    Ok(str_value(&crate::dom::parse_cssom_json(&css)))
+}
+
+/// `__css_supports_selector(selector)` → whether the selector engine can
+/// parse it. Backs `CSS.supports("selector(…)")` — honest about the subset
+/// we actually evaluate.
+fn sys_css_supports_selector(
+    _: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let sel = arg_str(args, 0, ctx);
+    Ok(JsValue::from(crate::dom::selector_parses(&sel)))
 }
 
 fn sys_template_content(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -3344,6 +3370,18 @@ const PRELUDE: &str = r##"
             return el;
         }
         get style() { if (!this.__style) this.__style = styleFor(this); return this.__style; }
+        // <style>.sheet — the parsed CSSOM view of this element's CSS text.
+        // Re-parsed when textContent changes (code sets textContent then
+        // reads .sheet.cssRules). Other elements have no sheet.
+        get sheet() {
+            if (this.tagName !== "STYLE") return null;
+            const text = this.textContent || "";
+            if (!this.__sheet || this.__sheetText !== text) {
+                this.__sheet = makeStyleSheet(text, this);
+                this.__sheetText = text;
+            }
+            return this.__sheet;
+        }
         // `el.style = "color:red"` — the [PutForwards=cssText] behaviour: assigning
         // a string to .style sets inline cssText (a getter-only .style throws in
         // strict mode, which silently broke YouTube's renderers in attr callbacks).
@@ -3745,12 +3783,158 @@ const PRELUDE: &str = r##"
             if ((scope.__adopted || []).includes(sheet)) adoptedSync(scope);
         }
     };
-    class CSSStyleSheet {
-        constructor() { this.cssRules = []; this.__text = ""; }
-        replace(t) { this.replaceSync(t); return Promise.resolve(this); }
-        replaceSync(t) { this.__text = String(t); sheetSync(this); }
-        insertRule(r) { this.__text += "\n" + String(r); sheetSync(this); return 0; }
+    // ---- CSSOM: <style>.sheet.cssRules and the CSSRule hierarchy ----
+    // __css_parse(text) → a JSON rule tree (dom.rs parse_cssom_json); we
+    // wrap it as the standard CSSRule subclasses so stylesheet-introspection
+    // and feature-detection code (css3test's Supports.atrule/descriptorvalue,
+    // CSS-in-JS libraries) read real rules. Distinct classes so
+    // `constructor.name`/`instanceof` answer correctly.
+    function parseCss(text) {
+        try { return JSON.parse(__css_parse(String(text || ""))); } catch (e) { return []; }
+    }
+    // A CSSStyleDeclaration over a rule's [name,value] pairs. Read-mostly
+    // (rule edits don't flow back into our cascade); covers the surface
+    // introspection code reads: length/item/getPropertyValue/cssText and
+    // camelCase-or-kebab property access.
+    function ruleStyle(pairs) {
+        const order = [];
+        const map = new Map();
+        for (const pv of pairs || []) {
+            if (!map.has(pv[0])) order.push(pv[0]);
+            map.set(pv[0], pv[1]);
+        }
+        const base = {
+            get length() { return order.length; },
+            item(i) { return order[Number(i)] || ""; },
+            getPropertyValue(k) { const v = map.get(String(k).toLowerCase()); return v == null ? "" : v; },
+            getPropertyPriority() { return ""; },
+            setProperty(k, v) { k = String(k).toLowerCase(); if (!map.has(k)) order.push(k); map.set(k, String(v)); },
+            removeProperty(k) { k = String(k).toLowerCase(); const v = map.get(k) || ""; if (map.delete(k)) { const i = order.indexOf(k); if (i >= 0) order.splice(i, 1); } return v; },
+            get cssText() { return order.map((k) => k + ": " + map.get(k) + ";").join(" "); },
+            set cssText(_) {},
+        };
+        return new Proxy(base, {
+            get(t, p) {
+                if (p in t) return t[p];
+                if (typeof p === "string") {
+                    if (/^\d+$/.test(p)) return order[Number(p)] || "";
+                    const v = map.get(kebab(p));
+                    return v == null ? "" : v;
+                }
+                return undefined;
+            },
+            set(t, p, v) {
+                if (p in t) { t[p] = v; return true; }
+                if (typeof p === "string") base.setProperty(kebab(p), v);
+                return true;
+            },
+            has(t, p) { return (p in t) || (typeof p === "string" && map.has(kebab(p))); },
+        });
+    }
+    function mediaList(q) {
+        q = String(q || "");
+        const parts = q.split(",").map((s) => s.trim()).filter(Boolean);
+        const ml = {
+            get mediaText() { return q; },
+            set mediaText(v) { q = String(v); },
+            get length() { return parts.length; },
+            item(i) { return parts[Number(i)] || null; },
+            toString() { return q; },
+        };
+        parts.forEach((p, i) => { ml[i] = p; });
+        return ml;
+    }
+    // Array subclassing is finicky across engines; a plain array-like with
+    // copied indices is safe and gives length/[i]/item/iteration + an
+    // honest `constructor.name`.
+    class CSSRuleList {
+        constructor(items) { this.length = items.length; for (let i = 0; i < items.length; i++) this[i] = items[i]; }
+        item(i) { return this[Number(i)] ?? null; }
+        [Symbol.iterator]() { return Array.prototype[Symbol.iterator].call(this); }
+    }
+    function ruleList(items) { return new CSSRuleList(items); }
+
+    class CSSRule { get cssText() { return ""; } get parentStyleSheet() { return null; } }
+    class CSSStyleRule extends CSSRule {
+        constructor(j) { super(); this.selectorText = j.sel || ""; this.style = ruleStyle(j.d); }
+        get type() { return 1; }
+        get cssText() { return this.selectorText + " { " + this.style.cssText + " }"; }
+    }
+    class CSSGroupingRule extends CSSRule {
+        constructor(j) { super(); this.cssRules = buildRules(j.r); }
+        insertRule(_r, i) { return i || 0; }
         deleteRule() {}
+    }
+    class CSSMediaRule extends CSSGroupingRule {
+        constructor(j) { super(j); this.media = mediaList(j.q); this.conditionText = j.q || ""; }
+        get type() { return 4; }
+    }
+    class CSSSupportsRule extends CSSGroupingRule {
+        constructor(j) { super(j); this.conditionText = j.q || ""; }
+        get type() { return 12; }
+    }
+    class CSSContainerRule extends CSSGroupingRule {
+        constructor(j) { super(j); this.conditionText = j.q || ""; this.containerName = ""; }
+    }
+    class CSSLayerBlockRule extends CSSGroupingRule {
+        constructor(j) { super(j); this.name = j.q || ""; }
+    }
+    class CSSFontFaceRule extends CSSRule {
+        constructor(j) { super(); this.style = ruleStyle(j.d); }
+        get type() { return 5; }
+    }
+    class CSSPageRule extends CSSRule {
+        constructor(j) { super(); this.selectorText = j.sel || ""; this.style = ruleStyle(j.d); }
+        get type() { return 6; }
+    }
+    class CSSKeyframeRule extends CSSRule {
+        constructor(j) { super(); this.keyText = j.key || ""; this.style = ruleStyle(j.d); }
+        get type() { return 8; }
+    }
+    class CSSKeyframesRule extends CSSRule {
+        constructor(j) { super(); this.name = j.name || ""; this.cssRules = buildRules(j.r); }
+        get type() { return 7; }
+    }
+    class CSSImportRule extends CSSRule {
+        constructor(j) { super(); this.href = j.q || ""; this.media = mediaList(""); }
+        get type() { return 3; }
+    }
+    class CSSNamespaceRule extends CSSRule { get type() { return 10; } }
+    class CSSCounterStyleRule extends CSSRule {
+        constructor(j) { super(); this.name = j.name || ""; this.style = ruleStyle(j.d); }
+    }
+    class CSSPropertyRule extends CSSRule {
+        constructor(j) { super(); this.name = j.name || ""; }
+    }
+    const RULE_CTORS = {
+        style: CSSStyleRule, media: CSSMediaRule, supports: CSSSupportsRule,
+        container: CSSContainerRule, layer: CSSLayerBlockRule, scope: CSSGroupingRule,
+        document: CSSGroupingRule, "font-face": CSSFontFaceRule, page: CSSPageRule,
+        keyframes: CSSKeyframesRule, keyframe: CSSKeyframeRule, import: CSSImportRule,
+        namespace: CSSNamespaceRule, "counter-style": CSSCounterStyleRule,
+        property: CSSPropertyRule, "font-feature-values": CSSRule,
+    };
+    function buildRules(arr) {
+        const out = [];
+        for (const j of arr || []) { const C = RULE_CTORS[j.t]; if (C) out.push(new C(j)); }
+        return ruleList(out);
+    }
+
+    class CSSStyleSheet {
+        constructor() { this.__text = ""; this.__rules = null; this.ownerNode = null; this.media = mediaList(""); }
+        get cssRules() { return this.__rules || (this.__rules = ruleList([])); }
+        get rules() { return this.cssRules; }
+        replace(t) { this.replaceSync(t); return Promise.resolve(this); }
+        replaceSync(t) { this.__text = String(t); this.__rules = buildRules(parseCss(this.__text)); sheetSync(this); }
+        insertRule(r, i) { this.__text += "\n" + String(r); this.__rules = buildRules(parseCss(this.__text)); sheetSync(this); return i || 0; }
+        deleteRule() {}
+    }
+    function makeStyleSheet(text, owner) {
+        const s = new CSSStyleSheet();
+        s.__text = String(text || "");
+        s.__rules = buildRules(parseCss(s.__text));
+        s.ownerNode = owner || null;
+        return s;
     }
 
     // Distinct subclasses so `instanceof` answers honestly (false for
@@ -3807,6 +3991,14 @@ const PRELUDE: &str = r##"
         FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
     };
     g.CSSStyleSheet = CSSStyleSheet;
+    g.CSSRule = CSSRule; g.CSSStyleRule = CSSStyleRule;
+    g.CSSGroupingRule = CSSGroupingRule; g.CSSMediaRule = CSSMediaRule;
+    g.CSSSupportsRule = CSSSupportsRule; g.CSSContainerRule = CSSContainerRule;
+    g.CSSLayerBlockRule = CSSLayerBlockRule; g.CSSFontFaceRule = CSSFontFaceRule;
+    g.CSSPageRule = CSSPageRule; g.CSSKeyframeRule = CSSKeyframeRule;
+    g.CSSKeyframesRule = CSSKeyframesRule; g.CSSImportRule = CSSImportRule;
+    g.CSSNamespaceRule = CSSNamespaceRule; g.CSSCounterStyleRule = CSSCounterStyleRule;
+    g.CSSPropertyRule = CSSPropertyRule; g.CSSRuleList = CSSRuleList;
     g.customElements = customElements;
     g.SVGElement = SVGElement;
     g.HTMLInputElement = HTMLInputElement; g.HTMLSelectElement = HTMLSelectElement;
@@ -3994,6 +4186,53 @@ const PRELUDE: &str = r##"
     }
     g.getComputedStyle = (el) => (el instanceof Element ? computedStyleFor(el) : makeStyle());
     g.matchMedia = (m) => ({ matches: false, media: String(m), addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} });
+    // window.CSS — feature detection (used across the web, not just
+    // css3test). `supports("selector(…)")` runs the real selector engine
+    // (honest); the property/value form leans on the style declaration's
+    // own acceptance (permissive, like the rest of our CSS surface — we
+    // recognize broadly, we don't validate values). `escape` is the CSSOM
+    // serialization algorithm.
+    function cssEscape(value) {
+        value = String(value);
+        const len = value.length;
+        let out = "";
+        for (let i = 0; i < len; i++) {
+            const c = value.charCodeAt(i);
+            if (c === 0) { out += "�"; continue; }
+            if ((c >= 0x1 && c <= 0x1f) || c === 0x7f ||
+                (i === 0 && c >= 0x30 && c <= 0x39) ||
+                (i === 1 && c >= 0x30 && c <= 0x39 && value.charCodeAt(0) === 0x2d)) {
+                out += "\\" + c.toString(16) + " "; continue;
+            }
+            if (i === 0 && len === 1 && c === 0x2d) { out += "\\" + value.charAt(i); continue; }
+            if (c >= 0x80 || c === 0x2d || c === 0x5f ||
+                (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)) {
+                out += value.charAt(i); continue;
+            }
+            out += "\\" + value.charAt(i);
+        }
+        return out;
+    }
+    const CSS = {
+        escape: cssEscape,
+        supports(prop, value) {
+            if (value === undefined) {
+                let cond = String(prop).trim();
+                const m = /^selector\(([\s\S]*)\)$/.exec(cond);
+                if (m) return __css_supports_selector(m[1].trim());
+                if (cond[0] === "(" && cond[cond.length - 1] === ")") cond = cond.slice(1, -1);
+                const c = cond.indexOf(":");
+                if (c < 0) return false;
+                return CSS.supports(cond.slice(0, c).trim(), cond.slice(c + 1).trim());
+            }
+            try {
+                const d = document.createElement("_").style;
+                d.setProperty(String(prop), String(value));
+                return d.getPropertyValue(String(prop)) !== "";
+            } catch (e) { return false; }
+        },
+    };
+    g.CSS = CSS;
     g.alert = () => {}; g.confirm = () => false; g.prompt = () => null;
     g.scroll = g.scrollTo = g.scrollBy = () => {};
     // DOM Range: feature-detected/instanceof'd at boot, and used for
@@ -4225,6 +4464,34 @@ const PRELUDE: &str = r##"
     };
     g.removeEventListener = (t, f) => { const l = lsFor(g, String(t)); const i = l.indexOf(f); if (i >= 0) l.splice(i, 1); };
     g.dispatchEvent = (ev) => dispatch(g, ev, false);
+    // `on<event>` IDL attributes (window.onload = fn). Standard semantics:
+    // the attribute is backed by an event listener, so the existing
+    // dispatch loop fires it — get returns the handler, set swaps the
+    // backing listener. Defining them as properties of the global object
+    // is ALSO what lets a module's bare `onload = fn` resolve (Boa's
+    // module scope assigns through the global object; without the property
+    // it throws "cannot assign to uninitialized global property"). css3test
+    // runs its entire suite from `onload`.
+    function installEventHandlers(obj, add, remove, types) {
+        for (const type of types) {
+            let current = null;
+            Object.defineProperty(obj, "on" + type, {
+                configurable: true,
+                enumerable: true,
+                get() { return current; },
+                set(v) {
+                    if (current) remove(type, current);
+                    current = typeof v === "function" ? v : null;
+                    if (current) add(type, current);
+                },
+            });
+        }
+    }
+    installEventHandlers(g, g.addEventListener, g.removeEventListener, [
+        "load", "unload", "beforeunload", "pageshow", "pagehide",
+        "resize", "scroll", "hashchange", "popstate", "message",
+        "error", "online", "offline", "focus", "blur", "languagechange",
+    ]);
     g.performance = { now: () => 0, timing: {}, mark() {}, measure() {}, getEntriesByType: () => [] };
 
     // RAM-only, session-lifetime storage: origin-bucketed maps shared
@@ -5125,6 +5392,134 @@ mod tests {
             out.contains("&lt;p&gt;hi&lt;/p&gt;&lt;b&gt;bold&lt;/b&gt;"),
             "{out}"
         );
+    }
+
+    // ---- CSSOM surface: CSS.supports, <style>.sheet, on* handlers ----
+
+    #[test]
+    fn css_supports_and_escape() {
+        let html = r##"<body><pre id="o"></pre><script>
+            function L(k,v){ document.getElementById('o').textContent += k+'='+v+'\n'; }
+            L('disp', CSS.supports('display','flex'));
+            L('emptyval', CSS.supports('display',''));
+            L('cond', CSS.supports('(display: grid)'));
+            L('sel', CSS.supports('selector(a > b.c)'));
+            L('emptysel', CSS.supports('selector()'));
+            L('escape', CSS.escape('#id.cls'));
+            L('escdigit', CSS.escape('1a'));
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("disp=true"), "{out}");
+        // An empty value is rejected (the declaration doesn't stick).
+        assert!(out.contains("emptyval=false"), "{out}");
+        assert!(out.contains("cond=true"), "{out}");
+        // The selector form runs the real selector engine.
+        assert!(out.contains("sel=true"), "{out}");
+        assert!(out.contains("emptysel=false"), "{out}");
+        // CSSOM escape: non-ident chars escaped, leading digit hex-escaped.
+        assert!(out.contains(r"escape=\#id\.cls"), "{out}");
+        assert!(out.contains(r"escdigit=\31 a"), "{out}");
+    }
+
+    #[test]
+    fn style_sheet_exposes_cssom_rules() {
+        // <style>.sheet.cssRules: a style rule (with its declaration block),
+        // a nested @media, an @font-face descriptor block, and an UNKNOWN
+        // at-rule that must be DROPPED (real browsers omit unrecognized
+        // at-rules — feature detection relies on it).
+        let html = r##"<body><pre id="o"></pre><style id="s"></style><script>
+            function L(k,v){ document.getElementById('o').textContent += k+'='+v+'\n'; }
+            var st = document.getElementById('s');
+            st.textContent = 'a.x{color:red;margin:0}'
+                + '@media (min-width:1px){p{display:block}}'
+                + '@font-face{font-family:Z;src:url(z)}'
+                + '@totallyunknown foo{bar:1}';
+            var r = st.sheet.cssRules;
+            L('len', r.length);
+            L('r0', r[0].constructor.name);
+            L('sel', r[0].selectorText);
+            L('r0len', r[0].style.length);
+            L('color', r[0].style.getPropertyValue('color'));
+            L('media', r[1].constructor.name);
+            L('mq', r[1].media.mediaText);
+            L('child', r[1].cssRules[0].selectorText);
+            L('ff', r[2].constructor.name);
+            L('ffdesc', r[2].style.length >= 1);
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("len=3"), "unknown at-rule dropped: {out}");
+        assert!(out.contains("r0=CSSStyleRule"), "{out}");
+        assert!(out.contains("sel=a.x"), "{out}");
+        assert!(out.contains("r0len=2"), "{out}");
+        assert!(out.contains("color=red"), "{out}");
+        assert!(out.contains("media=CSSMediaRule"), "{out}");
+        assert!(out.contains("mq=(min-width:1px)"), "{out}");
+        assert!(out.contains("child=p"), "{out}");
+        assert!(out.contains("ff=CSSFontFaceRule"), "{out}");
+        assert!(out.contains("ffdesc=true"), "{out}");
+    }
+
+    #[test]
+    fn cssom_interface_globals_present() {
+        let html = r##"<body><pre id="o"></pre><script>
+            var names = ['CSS','CSSStyleSheet','CSSRule','CSSStyleRule','CSSMediaRule',
+                'CSSSupportsRule','CSSFontFaceRule','CSSKeyframesRule','CSSKeyframeRule',
+                'CSSPageRule','CSSImportRule','CSSRuleList'];
+            document.getElementById('o').textContent =
+                names.filter(function(n){ return n in window; }).join(',');
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        for n in [
+            "CSS",
+            "CSSStyleSheet",
+            "CSSRule",
+            "CSSStyleRule",
+            "CSSMediaRule",
+            "CSSFontFaceRule",
+            "CSSKeyframesRule",
+            "CSSRuleList",
+        ] {
+            assert!(out.contains(n), "missing global {n}: {out}");
+        }
+    }
+
+    #[test]
+    fn window_onload_fires_and_var_resolves_in_computed() {
+        // The on* IDL attribute fires on load, and getComputedStyle resolves
+        // var() (css3test's whole run lives in onload; Supports.variable reads
+        // a var()-backed margin-right back).
+        let html = r##"<body><pre id="o"></pre>
+            <p id="d" style="--x:10px;margin-right:var(--x)"></p><script>
+            onload = function(){
+                var d = document.getElementById('d');
+                document.getElementById('o').textContent =
+                    'fired mr=' + getComputedStyle(d).marginRight;
+            };
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("fired mr=10px"), "{out}");
+    }
+
+    #[test]
+    fn module_can_assign_window_onload() {
+        // A module is strict-mode: a bare `onload = fn` must resolve to the
+        // settable global property, not throw "cannot assign to uninitialized
+        // global property" (the css3test blocker).
+        let html = r##"<body><pre id="o"></pre><script type="module">
+            onload = () => { document.getElementById('o').textContent = 'module-onload'; };
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("module-onload"), "{out}");
     }
 
     #[test]

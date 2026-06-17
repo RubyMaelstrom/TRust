@@ -553,6 +553,16 @@ impl Dom {
         v
     }
 
+    /// `computed_value` with `var()` references substituted — what
+    /// getComputedStyle exposes to JS. CSS variables resolve in computed
+    /// style (`Supports.variable` sets `margin-right:var(--x)` and reads
+    /// `marginRight` back as the substituted value). A no-op when the value
+    /// has no `var(`.
+    pub fn computed_value_resolved(&self, id: NodeId, name: &str) -> Option<String> {
+        self.computed_value(id, name)
+            .map(|v| self.resolve_vars(id, &v))
+    }
+
     fn computed_cache_get(&self, id: NodeId, idx: usize) -> Option<Option<String>> {
         let cache = self.computed_cache.borrow();
         (cache.0 == self.epoch)
@@ -2641,6 +2651,239 @@ fn take_block(input: &str) -> (&str, &str) {
     (&input[1.min(input.len())..], "")
 }
 
+// ---- CSSOM: stylesheet text → a rule tree exposed to page JS ---------
+//
+// `parse_sheet` above is a CASCADE builder: it drops untracked properties,
+// flattens `@media` against the viewport, and keeps only the data layout
+// needs. CSSOM is a different view — page JS reads `<style>.sheet.cssRules`
+// for raw fidelity (`selectorText`, every declaration, at-rule structure),
+// e.g. feature-detection libraries and css3test's `Supports.atrule`. So
+// this is a separate, lossless-ish parser whose output (compact JSON) the
+// js.rs prelude wraps as CSSStyleRule/CSSMediaRule/etc. Unknown at-rules
+// are DROPPED — a real browser omits unrecognized at-rules from cssRules,
+// which is exactly what at-rule feature detection relies on.
+
+/// Whether the selector engine can parse `sel` (backs `CSS.supports(
+/// "selector(…)")`). Honest: only selectors we can actually evaluate.
+pub fn selector_parses(sel: &str) -> bool {
+    let sel = sel.trim();
+    !sel.is_empty() && SelectorList::parse(sel).is_some()
+}
+
+/// Parse a stylesheet into the CSSOM rule tree as compact JSON.
+pub fn parse_cssom_json(css: &str) -> String {
+    let css = strip_css_comments(css);
+    cssom_rules_json(css.as_ref())
+}
+
+/// One JSON array of rules from a chunk of stylesheet text (recurses for
+/// grouping at-rules like `@media`).
+fn cssom_rules_json(css: &str) -> String {
+    let mut out = String::from("[");
+    let mut rest = css;
+    let mut first = true;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(after) = rest.strip_prefix('@') {
+            let (json, tail) = at_rule_json(after);
+            rest = tail;
+            if let Some(j) = json {
+                push_item(&mut out, &mut first, &j);
+            }
+            continue;
+        }
+        let Some(brace) = rest.find('{') else { break };
+        let sel = rest[..brace].trim().to_string();
+        let (block, tail) = take_block(&rest[brace..]);
+        rest = tail;
+        // Keep every braced rule with a non-empty prelude: CSSOM is a text
+        // view, so `selectorText` is preserved even for selectors the
+        // engine can't evaluate (the cascade drops those separately).
+        if sel.is_empty() {
+            continue;
+        }
+        let item = format!(
+            "{{\"t\":\"style\",\"sel\":{},\"d\":{}}}",
+            json_string(&sel),
+            decls_json(block)
+        );
+        push_item(&mut out, &mut first, &item);
+    }
+    out.push(']');
+    out
+}
+
+/// An at-rule body (text after the `@`). Returns its JSON (None = unknown,
+/// dropped) and the tail after its `;` or closing `}`.
+fn at_rule_json(after: &str) -> (Option<String>, &str) {
+    let name_end = after
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .unwrap_or(after.len());
+    let raw_name = after[..name_end].to_ascii_lowercase();
+    let name = raw_name
+        .trim_start_matches("-webkit-")
+        .trim_start_matches("-moz-")
+        .trim_start_matches("-o-")
+        .trim_start_matches("-ms-");
+    let semi = after.find(';');
+    let brace = after.find('{');
+    let statement = match (semi, brace) {
+        (Some(s), Some(b)) => s < b,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => true,
+    };
+    if statement {
+        let end = semi.map(|s| s + 1).unwrap_or(after.len());
+        let prelude = after[name_end..semi.unwrap_or(after.len())].trim();
+        return (statement_at_rule_json(name, prelude), &after[end..]);
+    }
+    let b = brace.unwrap();
+    let prelude = after[name_end..b].trim().to_string();
+    let (body, tail) = take_block(&after[b..]);
+    (block_at_rule_json(name, &prelude, body), tail)
+}
+
+fn block_at_rule_json(name: &str, prelude: &str, body: &str) -> Option<String> {
+    let grouping = |t: &str| {
+        Some(format!(
+            "{{\"t\":\"{}\",\"q\":{},\"r\":{}}}",
+            t,
+            json_string(prelude),
+            cssom_rules_json(body)
+        ))
+    };
+    match name {
+        "media" => grouping("media"),
+        "supports" => grouping("supports"),
+        "container" => grouping("container"),
+        "scope" => grouping("scope"),
+        "layer" => grouping("layer"),
+        "document" => grouping("document"),
+        "keyframes" => Some(format!(
+            "{{\"t\":\"keyframes\",\"name\":{},\"r\":{}}}",
+            json_string(prelude),
+            keyframes_rules_json(body)
+        )),
+        "font-face" => Some(format!(
+            "{{\"t\":\"font-face\",\"d\":{}}}",
+            decls_json(body)
+        )),
+        "page" => Some(format!(
+            "{{\"t\":\"page\",\"sel\":{},\"d\":{}}}",
+            json_string(prelude),
+            decls_json(body)
+        )),
+        "counter-style" => Some(format!(
+            "{{\"t\":\"counter-style\",\"name\":{},\"d\":{}}}",
+            json_string(prelude),
+            decls_json(body)
+        )),
+        "property" => Some(format!(
+            "{{\"t\":\"property\",\"name\":{},\"d\":{}}}",
+            json_string(prelude),
+            decls_json(body)
+        )),
+        "font-feature-values" => Some(format!(
+            "{{\"t\":\"font-feature-values\",\"name\":{},\"d\":[]}}",
+            json_string(prelude)
+        )),
+        _ => None,
+    }
+}
+
+fn statement_at_rule_json(name: &str, prelude: &str) -> Option<String> {
+    match name {
+        // @charset never appears in cssRules in real browsers — drop it.
+        "import" => Some(format!(
+            "{{\"t\":\"import\",\"q\":{}}}",
+            json_string(prelude)
+        )),
+        "namespace" => Some(format!(
+            "{{\"t\":\"namespace\",\"q\":{}}}",
+            json_string(prelude)
+        )),
+        "layer" => Some(format!(
+            "{{\"t\":\"layer\",\"q\":{},\"r\":[]}}",
+            json_string(prelude)
+        )),
+        _ => None,
+    }
+}
+
+/// `@keyframes` body: a list of keyframe rules whose "selector" is the
+/// keyText (`0%`/`from`/`to`).
+fn keyframes_rules_json(body: &str) -> String {
+    let mut out = String::from("[");
+    let mut rest = body;
+    let mut first = true;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let Some(brace) = rest.find('{') else { break };
+        let key = rest[..brace].trim().to_string();
+        let (block, tail) = take_block(&rest[brace..]);
+        rest = tail;
+        let item = format!(
+            "{{\"t\":\"keyframe\",\"key\":{},\"d\":{}}}",
+            json_string(&key),
+            decls_json(block)
+        );
+        push_item(&mut out, &mut first, &item);
+    }
+    out.push(']');
+    out
+}
+
+/// A declaration block → JSON array of `[name, value]` pairs (raw, NOT
+/// filtered by `is_tracked` — CSSOM reports what was written). Naive
+/// `;`-split, matching `parse_sheet`.
+fn decls_json(block: &str) -> String {
+    let mut out = String::from("[");
+    let mut first = true;
+    for decl in block.split(';') {
+        let Some((k, v, _important)) = parse_decl(decl) else {
+            continue;
+        };
+        let item = format!("[{},{}]", json_string(&k), json_string(&v));
+        push_item(&mut out, &mut first, &item);
+    }
+    out.push(']');
+    out
+}
+
+fn push_item(out: &mut String, first: &mut bool, item: &str) {
+    if !*first {
+        out.push(',');
+    }
+    *first = false;
+    out.push_str(item);
+}
+
+/// A JSON-encoded string literal (quotes + escapes).
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 // ---- html5ever integration ------------------------------------------
 
 struct Sink {
@@ -2792,6 +3035,40 @@ impl TreeSink for Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_cssom_json_preserves_rule_structure() {
+        // Style rule keeps selectorText + every declaration; @media nests its
+        // children; @font-face is a descriptor block; an unknown at-rule is
+        // dropped (browsers omit unrecognized at-rules from cssRules).
+        let json = parse_cssom_json(
+            "a.x { color: red; margin: 0 } \
+             @media (min-width: 1px) { p { display: block } } \
+             @font-face { font-family: Z } \
+             @bogusrule q { z: 1 }",
+        );
+        assert!(json.contains(r#""t":"style""#), "{json}");
+        assert!(json.contains(r#""sel":"a.x""#), "{json}");
+        assert!(json.contains(r#"["color","red"]"#), "{json}");
+        assert!(json.contains(r#"["margin","0"]"#), "{json}");
+        assert!(json.contains(r#""t":"media""#), "{json}");
+        assert!(json.contains(r#""q":"(min-width: 1px)""#), "{json}");
+        assert!(json.contains(r#""t":"font-face""#), "{json}");
+        // The unknown at-rule contributes no rule.
+        assert!(
+            !json.contains("bogusrule"),
+            "unknown at-rule dropped: {json}"
+        );
+        assert!(!json.contains(r#"["z","1"]"#), "{json}");
+    }
+
+    #[test]
+    fn selector_parses_accepts_real_rejects_empty() {
+        assert!(selector_parses("a > b.c"));
+        assert!(selector_parses(":scope .tab"));
+        assert!(!selector_parses(""));
+        assert!(!selector_parses("   "));
+    }
 
     #[test]
     fn parses_and_serializes_a_document() {

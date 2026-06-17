@@ -2236,11 +2236,11 @@ mod tests {
         }
         // The post-SETTLE body (net_diag dumps only the first-paint shell; a
         // live SPA fills its content during settle). Dump it for inspection.
-        if let Some(html) = last_html {
-            if let Ok(out) = std::env::var("TRUST_NET_DIAG_OUT") {
-                std::fs::write(&out, &html).unwrap();
-                eprintln!("post-settle body ({}B) -> {out}", html.len());
-            }
+        if let Some(html) = last_html
+            && let Ok(out) = std::env::var("TRUST_NET_DIAG_OUT")
+        {
+            std::fs::write(&out, &html).unwrap();
+            eprintln!("post-settle body ({}B) -> {out}", html.len());
         }
     }
 
