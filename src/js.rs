@@ -2016,7 +2016,13 @@ fn settle_page(page: &mut LoadedPage) {
             &page.budget,
             &mut page.outcome,
         );
-        run_jobs_into(&mut page.ctx, &page.budget, &mut page.outcome);
+        // The load handler can schedule post-load work as a timer — the very
+        // common `setTimeout(finish, 0)` pattern (every WPT testharness page
+        // completes this way; many SPAs defer init like this). Drain to
+        // quiescence (timers + microtasks), not just the microtask queue, so
+        // that work runs as part of the load settle. Still budget/MAX_TICKS-
+        // bounded, and once quiescent timers stay frozen at rest.
+        settle(&mut page.ctx, &page.budget, MAX_TICKS, &mut page.outcome);
         phase("load done");
     }
 
@@ -2742,6 +2748,7 @@ const PRELUDE: &str = r##"
         w = t === 9 ? new Document(id)
             : t === 1 ? new Element(id)
             : t === 3 ? new Text(id)
+            : t === 8 ? new Comment(id)
             : t === 11 ? new DocumentFragment(id)
             : new Node(id);
         W.set(id, w);
@@ -2776,7 +2783,9 @@ const PRELUDE: &str = r##"
             this.target = null;
             this.currentTarget = null;
             this.isTrusted = false;
-            this.detail = opts && opts.detail;
+            // CustomEvent.detail (and UIEvent.detail) default to null, not
+            // undefined, when not supplied.
+            this.detail = opts && "detail" in opts ? opts.detail : null;
             this.timeStamp = 0;
             // Per-interface EventInit members (MouseEventInit.clientX,
             // KeyboardEventInit.key, MessageEventInit.data, …) become event
@@ -2785,7 +2794,15 @@ const PRELUDE: &str = r##"
             // standard fields set above.
             if (opts) for (const k in opts) if (!(k in this)) this[k] = opts[k];
         }
-        preventDefault() { this.defaultPrevented = true; }
+        // Cancelling only takes effect on a cancelable event (spec): a
+        // preventDefault on a non-cancelable event is a no-op. Real code and
+        // the platform both read defaultPrevented to decide whether to run
+        // the default action.
+        preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
+        // Legacy alias: returnValue is the inverse of defaultPrevented;
+        // assigning false cancels (honoring cancelable), true can't un-cancel.
+        get returnValue() { return !this.defaultPrevented; }
+        set returnValue(v) { if (!v) this.preventDefault(); }
         stopPropagation() { this.__stop = true; }
         stopImmediatePropagation() { this.__stop = this.__stopNow = true; }
         // Legacy DOM init for events made via document.createEvent(): deprecated
@@ -2798,10 +2815,12 @@ const PRELUDE: &str = r##"
             this.defaultPrevented = false;
         }
         initCustomEvent(type, bubbles, cancelable, detail) {
+            // type is a mandatory WebIDL argument.
+            if (arguments.length < 1) throw new TypeError("initCustomEvent requires a type");
             this.type = String(type);
             this.bubbles = !!bubbles;
             this.cancelable = !!cancelable;
-            this.detail = detail;
+            this.detail = detail === undefined ? null : detail;
             this.defaultPrevented = false;
         }
         // The same walk dispatch() bubbles along: shadow hop via __host.
@@ -3369,6 +3388,9 @@ const PRELUDE: &str = r##"
             else if (pos === "afterend" && this.parentNode) this.parentNode.insertBefore(el, this.nextSibling);
             return el;
         }
+        insertAdjacentText(p, text) {
+            this.insertAdjacentElement(String(p).toLowerCase(), document.createTextNode(String(text)));
+        }
         get style() { if (!this.__style) this.__style = styleFor(this); return this.__style; }
         // <style>.sheet — the parsed CSSOM view of this element's CSS text.
         // Re-parsed when textContent changes (code sets textContent then
@@ -3436,11 +3458,39 @@ const PRELUDE: &str = r##"
         getClientRects() { return [this.getBoundingClientRect()]; }
     }
 
-    class Text extends Node {
-        get data() { return __dom_text(this.__id); }
-        set data(v) { __dom_set_text(this.__id, String(v)); }
+    // CharacterData: the shared text-bearing interface for Text and Comment.
+    // `data` is [LegacyNullToEmptyString] — null becomes "" (but undefined
+    // stringifies to "undefined"); `length` is the data's UTF-16 length.
+    class CharacterData extends Node {
+        get data() { return __dom_text(this.__id) || ""; }
+        set data(v) { __dom_set_text(this.__id, v === null ? "" : String(v)); }
+        get nodeValue() { return this.data; }
+        set nodeValue(v) { this.data = v; }
         get length() { return this.data.length; }
+        // offset/count are WebIDL `unsigned long` — ToUint32 (`>>> 0`) maps a
+        // negative like `-2**32 + 2` to 2; `offset > length` is an
+        // IndexSizeError; count is clamped to the remaining length.
+        substringData(offset, count) {
+            if (arguments.length < 2) throw new TypeError("2 arguments required");
+            const d = this.data, o = offset >>> 0;
+            if (o > d.length) throw new DOMException("offset out of bounds", "IndexSizeError");
+            return d.slice(o, o + Math.min(count >>> 0, d.length - o));
+        }
+        appendData(s) {
+            if (arguments.length < 1) throw new TypeError("1 argument required");
+            this.data = this.data + String(s);
+        }
+        insertData(offset, s) { this.replaceData(offset, 0, s); }
+        deleteData(offset, count) { this.replaceData(offset, count, ""); }
+        replaceData(offset, count, s) {
+            if (arguments.length < 3) throw new TypeError("3 arguments required");
+            const d = this.data, o = offset >>> 0;
+            if (o > d.length) throw new DOMException("offset out of bounds", "IndexSizeError");
+            const c = Math.min(count >>> 0, d.length - o);
+            this.data = d.slice(0, o) + String(s) + d.slice(o + c);
+        }
     }
+    class Text extends CharacterData {}
 
     class Document extends Node {
         get [Symbol.toStringTag]() { return "HTMLDocument"; }
@@ -3522,7 +3572,7 @@ const PRELUDE: &str = r##"
     }
 
     class DocumentFragment extends Node {}
-    class Comment extends Node {}
+    class Comment extends CharacterData {}
     // Lit walks comment markers with one of these.
     class TreeWalker {
         constructor(root, whatToShow) {
@@ -3959,11 +4009,18 @@ const PRELUDE: &str = r##"
     // `Window` interface (a ReferenceError without it — webcomponentsjs does
     // this) and checks `window instanceof Window`. Window IS an EventTarget.
     class Window extends EventTarget {}
-    class CharacterData extends Node {}
     class CDATASection extends Text {}
     class ProcessingInstruction extends CharacterData {}
     class DocumentType extends Node {}
     class Attr extends Node {}
+    // querySelectorAll/getElementsBy* return real Arrays (so .map/.forEach/
+    // spread all work); these constructors exist for the `'NodeList' in window`
+    // / `instanceof` feature checks code performs. NamedNodeMap is the type of
+    // Element.attributes.
+    class NodeList {}
+    class HTMLCollection {}
+    class NamedNodeMap {}
+    g.NodeList = NodeList; g.HTMLCollection = HTMLCollection; g.NamedNodeMap = NamedNodeMap;
     g.EventTarget = EventTarget; g.Window = Window; g.CharacterData = CharacterData;
     g.CDATASection = CDATASection; g.ProcessingInstruction = ProcessingInstruction;
     g.DocumentType = DocumentType; g.Attr = Attr;
@@ -5520,6 +5577,89 @@ mod tests {
         assert!(!outcome.panicked, "{outcome:?}");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("module-onload"), "{out}");
+    }
+
+    #[test]
+    fn event_preventdefault_honors_cancelable_and_returnvalue() {
+        // preventDefault() is a no-op on a non-cancelable event; returnValue
+        // mirrors defaultPrevented and cancels (cancelable-gated) when false.
+        let html = r##"<body><pre id="o"></pre><script>
+            function L(k,v){ document.getElementById('o').textContent += k+'='+v+'\n'; }
+            var c = new Event('x', { cancelable: true });
+            c.preventDefault(); L('cancelable', c.defaultPrevented);
+            var n = new Event('y', { cancelable: false });
+            n.preventDefault(); L('noncancelable', n.defaultPrevented);
+            var r = new Event('z', { cancelable: true });
+            r.returnValue = false; L('returnvalue', r.defaultPrevented);
+            L('rv_get', new Event('w').returnValue);
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("cancelable=true"), "{out}");
+        assert!(
+            out.contains("noncancelable=false"),
+            "non-cancelable no-op: {out}"
+        );
+        assert!(out.contains("returnvalue=true"), "{out}");
+        assert!(
+            out.contains("rv_get=true"),
+            "returnValue defaults true: {out}"
+        );
+    }
+
+    #[test]
+    fn custom_event_init_defaults_and_insert_adjacent_text() {
+        // initCustomEvent: detail defaults to null, type is mandatory.
+        // insertAdjacentText inserts a real text node at each position.
+        let html = r##"<body><div id="host">[<span id="m">x</span>]</div>
+            <pre id="o"></pre><script>
+            function L(k,v){ document.getElementById('o').textContent += k+'='+v+'\n'; }
+            var e = document.createEvent ? document.createEvent('CustomEvent') : new CustomEvent('t');
+            e.initCustomEvent('t', false, false);
+            L('detail', e.detail);
+            var threw = false; try { e.initCustomEvent(); } catch (x) { threw = true; }
+            L('mandatory', threw);
+            var m = document.getElementById('m');
+            m.insertAdjacentText('beforebegin', 'B');
+            m.insertAdjacentText('afterend', 'A');
+            L('host', document.getElementById('host').textContent);
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("detail=null"), "detail defaults null: {out}");
+        assert!(out.contains("mandatory=true"), "type is mandatory: {out}");
+        assert!(out.contains("host=[BxA]"), "text inserted around #m: {out}");
+    }
+
+    #[test]
+    fn character_data_comment_and_text_have_data_length_and_methods() {
+        // Comment/Text are CharacterData: data (null→"" but undefined→
+        // "undefined"), UTF-16 length, and the edit methods.
+        let html = r##"<body><pre id="o"></pre><script>
+            function L(k,v){ document.getElementById('o').textContent += k+'='+v+'\n'; }
+            var c = document.createComment('test');
+            L('cdata', c.data); L('clen', c.length);
+            c.data = null; L('cnull', '['+c.data+']');
+            c.data = 'undef-' ; c.appendData('end'); L('append', c.data);
+            var t = document.createTextNode('hello');
+            t.deleteData(0, 1); L('del', t.data);
+            t.insertData(0, 'J'); L('ins', t.data);
+            L('sub', document.createTextNode('abcdef').substringData(2, 3));
+            L('star', document.createComment('🌠x').length);
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("cdata=test"), "comment data: {out}");
+        assert!(out.contains("clen=4"), "comment length: {out}");
+        assert!(out.contains("cnull=[]"), "data=null → empty: {out}");
+        assert!(out.contains("append=undef-end"), "appendData: {out}");
+        assert!(out.contains("del=ello"), "deleteData: {out}");
+        assert!(out.contains("ins=Jello"), "insertData: {out}");
+        assert!(out.contains("sub=cde"), "substringData: {out}");
+        assert!(out.contains("star=3"), "🌠 is 2 UTF-16 units + x: {out}");
     }
 
     #[test]

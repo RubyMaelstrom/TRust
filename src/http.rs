@@ -2274,6 +2274,105 @@ mod tests {
         drop(response.live.take());
     }
 
+    /// Run a web-platform-tests page and report its testharness results.
+    /// WPT's `testharness.js` only renders a visible table under a real
+    /// runner; standalone it stays silent. So — exactly like a real WPT
+    /// runner — we hook `add_completion_callback` (injected as a trailing
+    /// script) and serialize each subtest's status+name+message into a
+    /// `<pre id=wptresult>`, then read it back after settle. This is the
+    /// gap-finder: every FAIL names a platform primitive we're missing or
+    /// get wrong. `TRUST_NET_DIAG=<wpt url> [TRUST_DIAG_VP=WxH]
+    /// cargo test --release wpt_diag -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual diagnostic, needs TRUST_NET_DIAG=<wpt url>"]
+    async fn wpt_diag() {
+        let Ok(target) = std::env::var("TRUST_NET_DIAG") else {
+            eprintln!("set TRUST_NET_DIAG to a wpt.live test URL");
+            return;
+        };
+        let vp: (u16, u16) = std::env::var("TRUST_DIAG_VP")
+            .ok()
+            .and_then(|s| {
+                s.split_once('x')
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+            })
+            .unwrap_or((200, 50));
+        let url = parse_url(&target).expect("absolute http(s) url");
+        let mut resp = fetch(&Request::get(url)).await.unwrap();
+        // Append the results hook AFTER the page's scripts (so testharness.js
+        // has defined add_completion_callback and the page's tests are
+        // registered). html5ever reparents a trailing script into <body>.
+        let inject = r#"<script>(function(){
+          function names(s){return ['PASS','FAIL','TIMEOUT','NOTRUN','OPTIONAL'][s]||('S'+s);}
+          function put(id,txt){var p=document.createElement('pre');p.id=id;p.textContent=txt;(document.body||document.documentElement).appendChild(p);}
+          function dump(tests,status){
+            var s='HARNESS '+names(status.status)+(status.message?' '+status.message:'')+'\n';
+            for(var i=0;i<tests.length;i++){s+=names(tests[i].status)+' | '+tests[i].name+(tests[i].message?' | '+tests[i].message:'')+'\n';}
+            put('wptresult',s);
+          }
+          if(typeof add_completion_callback==='function'){add_completion_callback(dump);}
+          else{put('wptresult','NO-HARNESS (testharness.js did not load/run)');}
+        })();</script>"#;
+        let mut body = String::from_utf8_lossy(&resp.body).to_string();
+        // Insert after the page's own scripts so testharness.js is loaded and
+        // the page's tests are registered. Prefer just before </head>.
+        let at = ["</head>", "</body>", "</html>"]
+            .iter()
+            .find_map(|m| body.find(m))
+            .unwrap_or(body.len());
+        body.insert_str(at, inject);
+        resp.body = body.into_bytes();
+
+        let mut resp = execute_js(resp, vp, (8, 16), Default::default()).await;
+        eprintln!("js outcome: {:?}", resp.js);
+        let mut html = String::from_utf8_lossy(&resp.body).to_string();
+        // Completion runs during settle, so a static page already carries the
+        // result in its body — only drain a live page if it isn't there yet.
+        if !html.contains("wptresult")
+            && let Some(mut live) = resp.live.take()
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(70);
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(left, live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html: h, .. }))
+                    | Ok(Some(crate::js::PageEvt::Static { html: h, .. })) => {
+                        html = h;
+                        if html.contains("wptresult") {
+                            break;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        // Extract the injected <pre id=wptresult> content.
+        let results = html
+            .split_once("id=\"wptresult\">")
+            .and_then(|(_, rest)| rest.split_once("</pre>"))
+            .map(|(r, _)| html_unescape(r))
+            .unwrap_or_else(|| "(no wptresult — harness never completed)".to_string());
+        let fails = results.lines().filter(|l| l.starts_with("FAIL")).count();
+        let passes = results.lines().filter(|l| l.starts_with("PASS")).count();
+        eprintln!("=== WPT {target}\n=== {passes} PASS / {fails} FAIL ===\n{results}");
+        if let Ok(out) = std::env::var("TRUST_NET_DIAG_OUT") {
+            std::fs::write(&out, &html).unwrap();
+        }
+    }
+
+    /// Minimal HTML entity decode for reading serialized text back out.
+    fn html_unescape(s: &str) -> String {
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&")
+    }
+
     /// A real module graph: page → entry module → static import →
     /// dynamic import, all fetched through our stack.
     #[tokio::test]
