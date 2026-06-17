@@ -34,7 +34,7 @@ impl CallEval {
 
         let Some(object) = func.as_object() else {
             return Err(JsNativeError::typ()
-                .with_message("not a callable function")
+                .with_message(format!("{} is not a callable function", func.display()))
                 .into());
         };
 
@@ -118,7 +118,7 @@ impl CallEvalSpread {
 
         let Some(object) = func.as_object() else {
             return Err(JsNativeError::typ()
-                .with_message("not a callable function")
+                .with_message(format!("{} is not a callable function", func.display()))
                 .into());
         };
         // Taken from `13.3.6.1 Runtime Semantics: Evaluation`
@@ -190,7 +190,7 @@ impl Call {
             .calling_convention_get_function(argument_count.into());
 
         let Some(object) = func.as_object() else {
-            return Err(Self::handle_not_callable());
+            return Err(Self::handle_not_callable(&func));
         };
 
         object.__call__(argument_count.into()).resolve(context)?;
@@ -200,9 +200,11 @@ impl Call {
 
     #[cold]
     #[inline(never)]
-    fn handle_not_callable() -> JsError {
+    fn handle_not_callable(func: &JsValue) -> JsError {
+        // Name the offending value (`undefined is not a callable function`) so
+        // a missing platform method is legible instead of a bare type error.
         JsNativeError::typ()
-            .with_message("not a callable function")
+            .with_message(format!("{} is not a callable function", func.display()))
             .into()
     }
 }
@@ -243,7 +245,7 @@ impl CallSpread {
 
         let Some(object) = func.as_object() else {
             return Err(JsNativeError::typ()
-                .with_message("not a callable function")
+                .with_message(format!("{} is not a callable function", func.display()))
                 .into());
         };
 

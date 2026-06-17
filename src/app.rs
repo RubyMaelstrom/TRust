@@ -324,6 +324,32 @@ struct EncMsg {
 /// aspect). Layout clamps width further to the content width.
 const IMG_MAX_CELLS: (f32, f32) = (80.0, 24.0);
 
+thread_local! {
+    /// Set TRUE on exactly one thread: the `#[tokio::main]` driver thread
+    /// that owns the live terminal and polls the run loop (set in `main`,
+    /// right after `ratatui::init`). The global panic hook reads it as an
+    /// ALLOWLIST: it restores the terminal (`ratatui::restore()`) ONLY for a
+    /// panic on the owner thread — a genuine render/run-loop panic, where we
+    /// want the alt screen torn down so the backtrace is readable.
+    ///
+    /// EVERY other thread — tokio workers (the fetch + image-load tasks),
+    /// the blocking image decode/encode pool, the `trust-*` JS workers — is
+    /// already sandboxed by `catch_unwind`/tokio upstream, so its panic costs
+    /// one operation and is swallowed. Restoring the terminal from one of
+    /// THOSE threads was the bug: it drops the alt screen and disables raw
+    /// mode (via `disable_raw_mode`) out from under the still-running run
+    /// loop — the page keeps working, but the render is corrupt and the mouse
+    /// SGR stream leaks as text. An allowlist (own-thread-only) makes that
+    /// impossible regardless of which background op panics, where a denylist
+    /// (skip the threads we happened to think of) leaked any we missed.
+    ///
+    /// Safe because the `#[tokio::main]` `block_on` root future — our run
+    /// loop — never migrates off its thread, even multi-threaded with
+    /// spawned tasks (verified). So the owner flag set at run-loop entry
+    /// stays valid for every draw.
+    pub(crate) static TERMINAL_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub struct App {
     pub mode: Mode,
     /// Terminal emulation of the remote byte stream, rendered by tui-term.
@@ -518,6 +544,8 @@ impl App {
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
+        // (Terminal ownership for the panic hook is claimed in `main`, on this
+        // same `block_on` thread — see `TERMINAL_OWNER`.)
         let mut input = EventStream::new();
         let mut pending_wrap_target: Option<(usize, bool)> = None;
         let mut wrap_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
@@ -1532,9 +1560,18 @@ impl App {
         let (_, w, h, crop) = key.clone();
         self.image_encoding.insert(key.clone());
         tokio::task::spawn_blocking(move || {
-            let protocol = crate::img::decode(&raw).ok().and_then(|(image, _)| {
-                crate::img::encode(&picker, image, ratatui::layout::Size::new(w, h), crop).ok()
-            });
+            // Runs on a tokio BLOCKING thread. Sandbox it: a decode/encode
+            // panic (a malformed image, or a ratatui-image sixel edge case
+            // on an odd box) must fail this ONE image to alt text, never
+            // unwind the worker. The terminal is safe regardless — only the
+            // run-loop thread restores it (see TERMINAL_OWNER).
+            let protocol = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::img::decode(&raw).ok().and_then(|(image, _)| {
+                    crate::img::encode(&picker, image, ratatui::layout::Size::new(w, h), crop).ok()
+                })
+            }))
+            .ok()
+            .flatten();
             let _ = tx.blocking_send(EncMsg { key, protocol });
         });
     }
@@ -1671,7 +1708,7 @@ impl App {
             self.open_image(Link::Http(response.url), response.body);
             return;
         }
-        let doc = http::parse(
+        let doc = crate::http::parse(
             &response.url,
             &response.content_type,
             &response.body,
@@ -1717,8 +1754,18 @@ impl App {
     /// Enter on a `Link::JsClick`: send the click to the living page.
     fn dispatch_click(&mut self, node: usize) {
         let Some(handle) = &self.live_page else {
-            self.status = String::from("This page's scripts are no longer running (reload?).");
-            self.notice = true;
+            // The page's engine is gone — it froze (navigated away) or died
+            // during load (e.g. a runaway script tripped the iteration
+            // limit). Progressive-enhancement fallback: if this clickable is
+            // an anchor with a real href, just navigate it, the way a browser
+            // falls back to the `<a href>` when JS isn't available. Pure
+            // JS-only controls (no href) genuinely need a reload.
+            if let Some(url) = self.selected_web_url() {
+                self.dispatch_open(&url, 80);
+            } else {
+                self.status = String::from("This page's scripts are no longer running (reload?).");
+                self.notice = true;
+            }
             return;
         };
         match handle.cmds.try_send(crate::js::PageCmd::Click(node)) {
@@ -1869,6 +1916,17 @@ impl App {
             }
             _ => g.scroll.min(max_scroll),
         };
+        // A live update can introduce images that weren't in the prior
+        // render: archive.org's collection tiles (and any SPA's lazily
+        // mounted thumbnails) are fetched AFTER first paint and filled in
+        // during settle, arriving here — not on the initial-load path that
+        // kicks off the parallel image pipeline. Without this the tiles'
+        // <img>s never decode and stay alt text. `start_image_loads` skips
+        // anything already cached, so a shell image still in flight (not
+        // yet cached) is merely re-fetched by the new batch, never lost,
+        // and the per-batch channel still closes when done (idle-CPU gate).
+        let image_urls = g.doc.image_urls.clone();
+        self.start_image_loads(url, image_urls);
     }
 
     /// Find the `(row, item)` matching `target` in fresh rows: same arena
@@ -3269,9 +3327,16 @@ async fn load_one_image(
     let raw: std::sync::Arc<[u8]> = resp.body.into();
     let for_decode = raw.clone();
     let cell = tokio::task::spawn_blocking(move || {
-        crate::img::decode(&for_decode)
-            .ok()
-            .map(|(image, _mime)| natural_cell_box(&image, font))
+        // Background blocking thread — sandbox the decode like the encode: a
+        // bad image fails to None, never unwinds the worker. The terminal is
+        // safe regardless (only the run loop restores it — TERMINAL_OWNER).
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::img::decode(&for_decode)
+                .ok()
+                .map(|(image, _mime)| natural_cell_box(&image, font))
+        }))
+        .ok()
+        .flatten()
     })
     .await
     .ok()??;
@@ -4156,6 +4221,55 @@ mod tests {
         app.on_page_evt(evt);
     }
 
+    /// A live SPA's anchor with a click listener becomes a `JsClick` marker
+    /// that normally routes through the page actor. If the engine is gone
+    /// (it died during load — e.g. a runaway script tripped the iteration
+    /// limit), following such a link must FALL BACK to navigating its real
+    /// href (progressive enhancement, what a browser does when JS is
+    /// unavailable) instead of dead-ending on "scripts are no longer
+    /// running". archive.org/details is the live case: most of its links are
+    /// listener-wrapped anchors with real `/search.php?...` hrefs.
+    #[tokio::test]
+    async fn dead_engine_click_falls_back_to_navigating_the_href() {
+        let mut app = live_form_app(
+            r#"<a href="/next" onclick="window.x=1">go</a><button onclick="void 0">b</button><script>window.y=1</script>"#,
+        )
+        .await;
+        assert!(app.live_page.is_some(), "page started live");
+        // Select the anchor — wrapped as a JsClick carrying href "/next".
+        let sel = {
+            let g = app.browser.as_ref().unwrap();
+            g.doc.rows.iter().enumerate().find_map(|(r, row)| {
+                row.items.iter().enumerate().find_map(|(i, it)| {
+                    matches!(&it.link, Some(Link::JsClick { href, .. }) if href.contains("next"))
+                        .then_some((r, i))
+                })
+            })
+        }
+        .expect("the listener-bound anchor became a JsClick with its href");
+        app.browser.as_mut().unwrap().sel_item = Some(sel);
+        // The engine dies (what the RuntimeLimit panic does to the actor).
+        app.drop_live_page();
+        assert!(app.live_page.is_none());
+        // Following it now navigates the href instead of dead-ending.
+        app.browser_follow();
+        assert!(
+            app.loading(),
+            "dead-engine click kicked off a navigation (status: {})",
+            app.status
+        );
+        assert!(
+            app.status.contains("/next"),
+            "navigated to the anchor's href: {}",
+            app.status
+        );
+        assert!(
+            !app.status.contains("no longer running"),
+            "did not dead-end: {}",
+            app.status
+        );
+    }
+
     #[tokio::test]
     async fn live_form_field_edits_through_the_page_actor() {
         let html = r#"
@@ -4239,6 +4353,46 @@ mod tests {
         );
     }
 
+    /// Regression: a live update that introduces an image (mounted AFTER
+    /// first paint) must start the image pipeline for it. archive.org's
+    /// collection tiles are `services/img/<id>` raster thumbnails fetched
+    /// post-DOMContentLoaded — they arrive in the FILLED render via the
+    /// live channel, not on the initial-load path. Here a `setTimeout(0)`
+    /// (fires during settle) mounts an `<img>`, so the shell has no image
+    /// but the fill does; `replace_live_doc` must kick off the decode or
+    /// the tile stays alt text forever.
+    #[tokio::test]
+    async fn live_update_loads_images_mounted_after_first_paint() {
+        let html = r#"
+            <button onclick="void 0">menu</button>
+            <div id="grid"></div>
+            <script>
+              setTimeout(function () {
+                var img = document.createElement('img');
+                img.src = 'tile.png';
+                img.alt = 'tile';
+                document.getElementById('grid').appendChild(img);
+              }, 0);
+            </script>"#;
+        let mut app = live_form_app(html).await;
+        assert!(app.live_page.is_some(), "clickable page stays live");
+        // The shell painted first, before the setTimeout fired — no image
+        // yet, so the initial-load path started no batch.
+        assert!(app.imgs_rx.is_none(), "shell carried no images");
+        // Drain the filled render the settle (setTimeout) produced.
+        drain_page_event(&mut app).await;
+        let g = app.browser.as_ref().unwrap();
+        assert!(
+            g.doc.image_urls.iter().any(|u| u.ends_with("tile.png")),
+            "filled render carries the mounted tile image: {:?}",
+            g.doc.image_urls
+        );
+        assert!(
+            app.imgs_rx.is_some(),
+            "the live update kicked off the image pipeline for the new tile"
+        );
+    }
+
     #[tokio::test]
     async fn form_submits_via_the_button_item() {
         let mut app = chat_app();
@@ -4266,6 +4420,120 @@ mod tests {
         // A POST fetch to the form action is now in flight (hidden +
         // typed fields encoded).
         assert!(app.loading(), "submit kicked off a fetch");
+    }
+
+    /// Render a grid of `object-fit:contain` tile images (archive.org's
+    /// collection tiles) to a TestBackend and assert it doesn't panic. The
+    /// abort on `/details/<id>` is in the render path (layout + JS are
+    /// clean): the contain-fit change makes the (now shorter) covers fit the
+    /// viewport, so render_inline_images actually draws them.
+    #[tokio::test]
+    async fn rendering_a_grid_of_contain_tile_images_does_not_panic() {
+        use ratatui::{Terminal, backend::TestBackend};
+        // A real raster "cover" (landscape, like a librivox cover).
+        let cover = image::RgbImage::from_fn(140, 90, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 90])
+        });
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(cover)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let cell = super::natural_cell_box(
+            &image::load_from_memory(&png).unwrap(),
+            (8u16, 16u16).into(),
+        );
+
+        // A wrapping grid of tiles, each: <a> → contain cover + title.
+        let mut tiles = String::new();
+        for i in 0..18 {
+            tiles.push_str(&format!(
+                r#"<a href="/d{i}"><div style="display:flex;height:16rem;justify-content:center">
+                   <img src="/c{i}.png" style="width:100%;height:100%;object-fit:contain"></div>
+                   <h3>Tile {i}</h3></a>"#
+            ));
+        }
+        let html =
+            format!(r#"<body><div style="display:flex;flex-wrap:wrap">{tiles}</div></body>"#);
+        let base = url::Url::parse("https://ex.com/").unwrap();
+        let mut images = crate::layout::ImageSizes::new();
+        for i in 0..18 {
+            images.insert(format!("https://ex.com/c{i}.png"), cell);
+        }
+
+        let mut app = super::App::new(None, 23);
+        // A few viewport sizes incl. a narrow single-column one (her shot).
+        for (w, h) in [(90u16, 40u16), (44, 30), (38, 50)] {
+            app.last_inner = (w.saturating_sub(2), h.saturating_sub(5));
+            app.image_protocols.clear();
+            let doc = crate::http::parse(
+                &base,
+                "text/html; charset=utf-8",
+                html.as_bytes(),
+                app.last_inner.0 as usize,
+                &images,
+            );
+            app.navigate_to(doc);
+            // Encode a protocol for every laid-out image item, the way
+            // sync_image_encodes → on_enc would before a draw.
+            let keys: Vec<super::EncKey> = app
+                .browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .rows
+                .iter()
+                .flat_map(|r| &r.items)
+                .filter_map(|it| it.image.clone().map(|u| (u, it.width, it.height, it.crop)))
+                .collect();
+            for key in keys {
+                if app.image_protocols.contains_key(&key) {
+                    continue;
+                }
+                let (image, _) = crate::img::decode(&png).unwrap();
+                let size = ratatui::layout::Size::new(key.1, key.2);
+                if let Ok(proto) = crate::img::encode(&app.picker, image, size, key.3) {
+                    app.image_protocols.insert(key, proto);
+                }
+            }
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            // Scroll through and redraw — encodes/areas shift as tiles enter.
+            for _ in 0..6 {
+                app.browser.as_mut().unwrap().scroll += 4;
+                term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            }
+        }
+    }
+
+    /// The image-encode sandbox contract: a panic on the blocking thread
+    /// (a malformed image, a ratatui-image sixel edge case) is CAUGHT — it
+    /// yields no protocol and the task completes normally, never unwinding
+    /// the worker or aborting the process. And — the crux of the
+    /// `/details/<id>` partial-crash bug — a background thread NEVER owns the
+    /// terminal, so the panic hook leaves the live TUI untouched even when
+    /// the contain-fit change lets many tile covers actually encode.
+    #[tokio::test]
+    async fn a_panicking_image_encode_is_contained() {
+        // (The caught panic still logs a line via the default hook — that's
+        // expected; the point is that it's caught, not fatal.)
+        let result = tokio::task::spawn_blocking(|| {
+            let protocol: Option<u8> =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<u8> {
+                    panic!("simulated ratatui-image encode panic");
+                }))
+                .ok()
+                .flatten();
+            // A spawned/blocking thread is NOT the terminal owner, so the
+            // global hook would not restore the screen for this panic.
+            (protocol, super::TERMINAL_OWNER.with(|c| c.get()))
+        })
+        .await;
+        let (protocol, owns_terminal) = result.expect("blocking task did not abort");
+        assert_eq!(protocol, None, "the panic was caught → no protocol");
+        assert!(
+            !owns_terminal,
+            "a background thread must never own the terminal (hook leaves the TUI alone)"
+        );
     }
 
     /// Deliver a decoded+encoded image to the app, the way the

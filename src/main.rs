@@ -32,28 +32,57 @@ async fn main() -> ExitCode {
         None => 23,
     };
 
-    // The JS engine runs on dedicated `trust-*` worker threads, each
-    // sandboxed by `catch_unwind` — a Boa VM bug (e.g. a real bundle's
-    // code tripping the define-opcode binding-slot panic) costs one
-    // script and the page degrades, it does NOT take the app down. But
-    // the DEFAULT panic hook still dumps the message + backtrace to the
-    // terminal, painting garbage over the ratatui screen (looks like a
-    // crash). Swallow those here; for a genuine (main-thread) panic,
-    // leave the alt screen first so the message is actually readable.
-    let default_hook = std::panic::take_hook();
+    let terminal = ratatui::init();
+    // This thread (the `#[tokio::main]` `block_on` driver) owns the live
+    // terminal, and the run loop never migrates off it (verified). Claim it
+    // BEFORE installing the hook below, which gates on this flag.
+    app::TERMINAL_OWNER.with(|c| c.set(true));
+    // `ratatui::init()` just installed a panic hook that calls
+    // `ratatui::restore()` UNCONDITIONALLY, on EVERY panic, on ANY thread,
+    // before the previous hook. That is the partial-crash bug: background
+    // work — the `trust-*` JS workers, the tokio fetch and image-load tasks,
+    // the blocking image decode/encode pool — is all sandboxed by
+    // `catch_unwind`/tokio (a panic there costs one operation, the page
+    // degrades), but ratatui's hook tears the alt screen down and disables
+    // raw mode (leaking the mouse SGR stream as text) out from under a run
+    // loop that's still running and that the user can still type into. Wrap
+    // ratatui's hook with an ownership gate: restore (and print the
+    // backtrace) ONLY for a panic on THIS terminal-owner thread — a genuine
+    // render/run-loop fault — and leave the live TUI untouched for every
+    // background-thread panic. See `app::TERMINAL_OWNER`.
+    let ratatui_hook = std::panic::take_hook(); // = restore(); default(info)
     std::panic::set_hook(Box::new(move |info| {
-        if std::thread::current()
-            .name()
-            .is_some_and(|n| n.starts_with("trust-"))
-        {
-            return; // caught by catch_unwind on the worker; keep the TUI clean
+        // Optional diagnostic: log EVERY panic (thread + backtrace) to a file,
+        // regardless of thread. Off unless the env var is set; this is how we
+        // pin down a background-op panic that the gate (correctly) swallows.
+        if let Ok(path) = std::env::var("TRUST_PANIC_LOG") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let name = std::thread::current()
+                    .name()
+                    .unwrap_or("<unnamed>")
+                    .to_string();
+                let owner = app::TERMINAL_OWNER.with(|c| c.get());
+                let bt = std::backtrace::Backtrace::force_capture();
+                let _ = writeln!(
+                    f,
+                    "=== PANIC thread={name:?} terminal_owner={owner} ===\n{info}\n{bt}\n"
+                );
+            }
         }
+        if !app::TERMINAL_OWNER.with(|c| c.get()) {
+            return; // background panic, caught downstream — keep the TUI clean
+        }
+        // A real render/run-loop panic: drop mouse capture, then let
+        // ratatui's hook restore the screen and the default hook print.
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
-        ratatui::restore();
-        default_hook(info);
+        ratatui_hook(info);
     }));
 
-    let terminal = ratatui::init();
     // Query the terminal for its graphics protocol and font size. This
     // talks on stdin/stdout, so it must happen before the event stream
     // exists (which would eat the reply) — hence here, not in App.

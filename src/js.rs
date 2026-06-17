@@ -76,7 +76,7 @@ impl Budget {
 /// What a page's scripts did, for the status bar (`· JS:n!`) and
 /// `app.notice`: per-script failures are collected, never fatal — a
 /// broken script renders a partial page, not a blank one.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Outcome {
     pub errors: Vec<String>,
     pub elapsed: Duration,
@@ -233,6 +233,120 @@ fn page_context_with(loader: Option<Rc<WebModuleLoader>>) -> (Context, Rc<PageHo
     // Recursion (512) and stack-size defaults are kept: deep enough for
     // real bundles, shallow enough to stop runaway recursion fast.
     (ctx, hooks)
+}
+
+/// A runaway loop trips Boa's per-frame loop-iteration cap (`LOOP_LIMIT`).
+/// That error is UNCATCHABLE by design (the DoS stop — keeping it catchable
+/// would let a page nest fresh-budget calls and spin ~unbounded CPU). The bug
+/// these tests pin: when the limit is hit inside ASYNC/CALLBACK context (a
+/// promise reaction, the Promise executor, an async fn, an async generator, a
+/// native callback, …), Boa's reject paths called `to_opaque` on the
+/// uncatchable error, which `panic!`s — and that panic, drained outside any
+/// `catch_unwind`, killed the resident page actor (every later click then hit
+/// "scripts are no longer running"). The fork now PROPAGATES the uncatchable
+/// error out of the job instead; here we assert each shape (a) doesn't panic
+/// and (b) leaves the engine HEALTHY (a fresh script still runs) — i.e. the
+/// page stays fully live, not a dead snapshot.
+#[cfg(test)]
+mod runtime_limit_in_async {
+    use super::*;
+
+    fn assert_clean(label: &str, src: &str) {
+        let (mut ctx, _h) = page_context_with(None);
+        ctx.runtime_limits_mut().set_loop_iteration_limit(1000);
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(&mut ctx, label, src.as_bytes(), &budget, &mut outcome);
+        run_jobs_into(&mut ctx, &budget, &mut outcome);
+        assert!(
+            !outcome.panicked,
+            "{label}: engine panicked instead of propagating cleanly: {:?}",
+            outcome.errors
+        );
+        // The engine must remain usable — the limit aborted one job, not the
+        // whole context. A fresh script runs cleanly afterward.
+        let mut after = Outcome::default();
+        run_script(
+            &mut ctx,
+            "after",
+            b"globalThis.__ok = 2;",
+            &budget,
+            &mut after,
+        );
+        assert!(
+            !after.panicked && after.errors.is_empty(),
+            "{label}: engine unhealthy after the limit: panicked={} {:?}",
+            after.panicked,
+            after.errors
+        );
+    }
+
+    const RUNAWAY: &str = "for(var i=0;i<1e9;i++){}";
+
+    #[test]
+    fn promise_then() {
+        assert_clean(
+            "then",
+            &format!("Promise.resolve().then(function(){{{RUNAWAY}}});"),
+        );
+    }
+    #[test]
+    fn promise_executor() {
+        assert_clean(
+            "executor",
+            &format!("new Promise(function(){{{RUNAWAY}}});"),
+        );
+    }
+    #[test]
+    fn promise_finally() {
+        assert_clean(
+            "finally",
+            &format!("Promise.resolve().finally(function(){{{RUNAWAY}}});"),
+        );
+    }
+    #[test]
+    fn promise_reject_handler() {
+        assert_clean(
+            "rejectcb",
+            &format!("Promise.reject(0).then(null,function(){{{RUNAWAY}}});"),
+        );
+    }
+    #[test]
+    fn promise_all_member() {
+        assert_clean(
+            "all",
+            &format!("Promise.all([Promise.resolve().then(function(){{{RUNAWAY}}})]);"),
+        );
+    }
+    #[test]
+    fn async_fn() {
+        assert_clean("asyncfn", &format!("(async function(){{{RUNAWAY}}})();"));
+    }
+    #[test]
+    fn async_fn_after_await() {
+        assert_clean(
+            "asyncawait",
+            &format!("(async function(){{await 0;{RUNAWAY}}})();"),
+        );
+    }
+    #[test]
+    fn async_generator() {
+        assert_clean(
+            "asyncgen",
+            &format!("(async function*(){{{RUNAWAY}}})().next();"),
+        );
+    }
+    #[test]
+    fn sync_generator() {
+        assert_clean("gen", &format!("(function*(){{{RUNAWAY}}})().next();"));
+    }
+    #[test]
+    fn native_callback() {
+        assert_clean(
+            "sort",
+            &format!("[3,1,2].sort(function(){{{RUNAWAY}return 0;}});"),
+        );
+    }
 }
 
 /// Run one script, tolerating failure: an exception (including a tripped
@@ -896,12 +1010,14 @@ fn page_net_fetch(
     handle.block_on(crate::http::fetch(&request)).ok()
 }
 
-/// Get a module body for `resolved` THROUGH the shared cache, blocking
-/// the page thread (the module-load atomicity rule — never `.await`
-/// here). A hit — the initial prefetch seeded it, or a speculative
-/// prefetch is already fetching it — skips the network entirely (and
-/// costs no cap). A miss starts a fresh, cap-/`subresource_allowed`-gated
-/// request. Shared by the module loader and the entry-module path.
+/// Get a module body for `resolved` THROUGH the shared cache, BLOCKING
+/// the page thread. This is the ENTRY-module bootstrap path only: it runs
+/// once, before the job loop, where there are no sibling jobs to overlap
+/// with — so blocking here costs nothing. The in-graph loader uses
+/// `module_fetch` + `.await` instead (concurrent). A hit — the initial
+/// prefetch seeded it, or a speculative prefetch is already fetching it —
+/// skips the network entirely (and costs no cap). A miss starts a fresh,
+/// cap-/`subresource_allowed`-gated request.
 fn load_module_body(
     ctx: &mut Context,
     cache: &std::sync::Arc<crate::http::PageCache>,
@@ -920,6 +1036,25 @@ fn load_module_body(
     let (handle, request) = page_net_prepare(ctx, resolved.as_str(), String::from("GET"), None)?;
     let f = cache.fetch(&handle, request.url);
     crate::http::PageCache::block_on_fetch(Some(&handle), f)
+}
+
+/// The shared fetch for a module url, acquired under a brief context
+/// borrow so the in-graph loader can `.await` it WITHOUT holding the
+/// borrow — letting the spec's concurrently-enqueued sibling imports
+/// overlap. A cache hit (seeded / speculatively prefetched / already in
+/// flight) joins the existing request; a miss starts a fresh,
+/// cap-/`subresource_allowed`-gated one. Returns the `Shared` future to
+/// await; `None` only when a brand-new fetch is blocked (cap/private).
+fn module_fetch(
+    ctx: &mut Context,
+    cache: &std::sync::Arc<crate::http::PageCache>,
+    resolved: &url::Url,
+) -> Option<crate::http::SharedFetch> {
+    if let Some(f) = cache.peek(resolved) {
+        return Some(f);
+    }
+    let (handle, request) = page_net_prepare(ctx, resolved.as_str(), String::from("GET"), None)?;
+    Some(cache.fetch(&handle, request.url))
 }
 
 /// `__http_fetch(url, method, body|null, content_type|null)` →
@@ -1484,27 +1619,43 @@ impl boa_engine::module::ModuleLoader for WebModuleLoader {
         // initial prefetch announced it or a speculative prefetch ran
         // ahead of us; otherwise we start it now. Either way one request
         // per URL — the bundler's own `fetch()` of this chunk joins it.
-        // `load_module_body` BLOCKS (never `.await`) so Boa can't
-        // interleave another module load mid-flight and cross up
-        // `loaded_modules`.
+        //
+        // We acquire the shared fetch under a brief borrow, then `.await`
+        // it WITHOUT holding the context, so the sibling module-load jobs
+        // the spec's `inner_load` enqueued concurrently actually overlap
+        // on the network instead of each parking the page thread in turn.
+        // (The old code BLOCKED here — `block_on_fetch`'s synchronous recv
+        // serialized the whole graph into one-fetch-per-RTT and let a
+        // single slow chunk stall everything. Awaiting is what the async
+        // `ModuleLoader` trait + the concurrent job executor are for.)
         let hit = self.body.peek(&resolved).is_some();
-        let cached = {
+        let fetch = {
             let mut ctx = context.borrow_mut();
-            load_module_body(&mut ctx, &self.body, &resolved)
+            module_fetch(&mut ctx, &self.body, &resolved)
         }
         .ok_or_else(fail)?;
+        let cached = fetch.await.ok().ok_or_else(fail)?;
         phase(&format!(
             "module {} {key}",
             if hit { "CACHED" } else { "NETWORK" }
         ));
-        // Prime the NEXT wave: prefetch this module's own imports now, so
-        // they're in flight before Boa serially asks for each.
-        {
-            let mut ctx = context.borrow_mut();
-            speculate_imports(&mut ctx, &resolved, &cached.body);
+        // Re-check after the await: a concurrent load of the SAME url may
+        // have parsed it while we were on the wire. Module identity per
+        // url MUST be stable — Boa's per-referrer `loaded_modules` holds a
+        // single record and asserts it — so the first job to reach `parse`
+        // wins and every other sharer returns that record. Parse + insert
+        // below is synchronous (no `.await` between this check and the
+        // insert), so exactly one job parses a given url; the re-check
+        // can't race it.
+        if let Some(cached) = self.modules.borrow().get(&key) {
+            return Ok(cached.clone());
         }
         let module = {
             let mut ctx = context.borrow_mut();
+            // Prime the NEXT wave before parsing this one: prefetch this
+            // module's own imports so they're in flight before the loader
+            // asks for each.
+            speculate_imports(&mut ctx, &resolved, &cached.body);
             boa_engine::Module::parse(
                 Source::from_bytes(&cached.body).with_path(std::path::Path::new(&key)),
                 None,
@@ -1788,7 +1939,15 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
     }
 
     if !outcome.panicked {
-        // Lifecycle: DOMContentLoaded, settle, then load.
+        // Fire DOMContentLoaded, then RETURN at this "interactive"
+        // boundary: scripts have run and the page shell is built, but the
+        // post-DOMContentLoaded settle (which DRAINS background network —
+        // e.g. an SPA's data fetches) is deferred to `settle_page`. The
+        // actor paints the shell here before that settle, so a data-driven
+        // page shows its chrome immediately instead of waiting for every
+        // background fetch (see `page_actor`). The one-shot `transform`
+        // path calls `settle_page` straight away, so its render is
+        // unchanged.
         phase("scripts done; DOMContentLoaded");
         run_script(
             &mut ctx,
@@ -1797,31 +1956,10 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
             &budget,
             &mut outcome,
         );
-        phase("settle start");
-        settle(&mut ctx, &budget, MAX_TICKS, &mut outcome);
-        phase("settle done");
-        run_script(
-            &mut ctx,
-            "load",
-            b"__trust.readyState = \"complete\"; __trust.fire(window, \"load\", false);",
-            &budget,
-            &mut outcome,
-        );
-        run_jobs_into(&mut ctx, &budget, &mut outcome);
-        phase("load done");
     }
 
     drain_js_side(&mut ctx, &mut outcome);
     drain_rejections(&hooks, &mut outcome);
-    phase(&format!(
-        "load finished; last DOM mutation was @{}ms",
-        crate::dom::last_mutation_ms()
-    ));
-    outcome.fetches = ctx
-        .realm()
-        .host_defined()
-        .get::<PageNet>()
-        .map_or(0, |n| n.fetched.get());
     Ok(LoadedPage {
         ctx,
         dom,
@@ -1831,6 +1969,43 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
         page_url: parsed_url,
         hooks,
     })
+}
+
+/// Drain the post-DOMContentLoaded lifecycle: settle (background network +
+/// timers), the `load` event, then a final job drain. This is where a
+/// page's in-flight fetches (and the DOM mutations they cause) complete —
+/// split out of `load_page` so the actor can paint the interactive shell
+/// FIRST and let this run after. Idempotent-ish: a page with no pending
+/// network/timers settles instantly here (so the shell == the full
+/// render), which keeps the one-shot path and non-network tests unchanged.
+fn settle_page(page: &mut LoadedPage) {
+    if !page.outcome.panicked {
+        phase("settle start");
+        settle(&mut page.ctx, &page.budget, MAX_TICKS, &mut page.outcome);
+        phase("settle done");
+        run_script(
+            &mut page.ctx,
+            "load",
+            b"__trust.readyState = \"complete\"; __trust.fire(window, \"load\", false);",
+            &page.budget,
+            &mut page.outcome,
+        );
+        run_jobs_into(&mut page.ctx, &page.budget, &mut page.outcome);
+        phase("load done");
+    }
+
+    drain_js_side(&mut page.ctx, &mut page.outcome);
+    drain_rejections(&page.hooks, &mut page.outcome);
+    phase(&format!(
+        "load finished; last DOM mutation was @{}ms",
+        crate::dom::last_mutation_ms()
+    ));
+    page.outcome.fetches = page
+        .ctx
+        .realm()
+        .host_defined()
+        .get::<PageNet>()
+        .map_or(0, |n| n.fetched.get());
 }
 
 /// Drain due timers and microtasks until quiet, budget-bounded.
@@ -1871,23 +2046,41 @@ fn run_jobs_into(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
         .get::<PageNet>()
         .map(|n| n.handle.clone());
     let exec = ctx.downcast_job_executor::<PageJobExecutor>();
-    let result = match (handle, exec) {
-        (Some(handle), Some(exec)) => {
-            let remaining = budget.remaining();
-            if remaining.is_zero() {
-                return;
+    // catch_unwind the drain, like `run_script`/`run_module` already do: a
+    // job's execution can panic on a Boa edge (e.g. a host uncatchable limit
+    // reaching a reject path the fork doesn't yet propagate cleanly), and that
+    // panic must cost the page, NOT unwind and kill the resident actor thread
+    // — which would leave the page a dead engine ("scripts no longer running"
+    // on every click). The asymmetry of leaving THIS drain unprotected while
+    // `eval`/module-eval were wrapped is exactly what made archive.org's
+    // promise-reaction limit kill the engine. The DOM mutations so far stay
+    // serializable (RefCell guards release during unwind).
+    let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match (handle, exec) {
+            (Some(handle), Some(exec)) => {
+                let remaining = budget.remaining();
+                if remaining.is_zero() {
+                    return Ok(());
+                }
+                let cell = RefCell::new(ctx);
+                handle.block_on(async {
+                    tokio::time::timeout(remaining, exec.run_jobs_async(&cell))
+                        .await
+                        .unwrap_or(Ok(())) // deadline reached: render what we have
+                })
             }
-            let cell = RefCell::new(ctx);
-            handle.block_on(async {
-                tokio::time::timeout(remaining, exec.run_jobs_async(&cell))
-                    .await
-                    .unwrap_or(Ok(())) // deadline reached: render what we have
-            })
+            _ => ctx.run_jobs(),
         }
-        _ => ctx.run_jobs(),
-    };
-    if let Err(err) = result {
-        outcome.errors.push(format!("async job: {err}"));
+    }));
+    match drained {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => outcome.errors.push(format!("async job: {err}")),
+        Err(_) => {
+            outcome.errors.push(String::from(
+                "async job: engine panic (Boa bug) — page JS halted",
+            ));
+            outcome.panicked = true;
+        }
     }
 }
 
@@ -1941,6 +2134,7 @@ pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
     match load_page(html, env) {
         Err(outcome) => (html.to_string(), outcome),
         Ok(mut page) => {
+            settle_page(&mut page);
             page.outcome.elapsed = page.started.elapsed();
             let out = page.dom.borrow().serialize(DOCUMENT);
             (out, std::mem::take(&mut page.outcome))
@@ -2039,19 +2233,64 @@ fn page_actor(
             return;
         }
     };
-    page.outcome.elapsed = page.started.elapsed();
-
-    let (out, has_clickables) = extract_live(&mut page);
-    let outcome = std::mem::take(&mut page.outcome);
-    if !has_clickables {
-        let _ = evts.blocking_send(PageEvt::Static { html: out, outcome });
-        return;
+    // First paint: if the interactive shell is already a live page (has
+    // clickables), emit it NOW — before `settle_page` drains background
+    // network. A data-driven SPA (e.g. archive.org, which then serially
+    // paginates ~14 collection requests) shows its chrome immediately
+    // instead of blocking first paint on every background fetch. For a
+    // page with no post-interactive work the shell == the settled render,
+    // so this is a harmless duplicate; for a static article (no
+    // clickables) we skip it and fall through to the Static path. Timers
+    // stay frozen at rest — `settle_page` advances them once, here, not in
+    // the idle dispatch loop.
+    let (shell, shell_clickable) = extract_live(&mut page);
+    // The shell render reports wall-clock elapsed for the status bar, but
+    // we must NOT write that back onto `page.outcome.elapsed`: that field
+    // is the cumulative-COMPUTE accumulator `run_script`'s budget gate
+    // reads, and `settle_page` still has to fire the `load` event through
+    // it. Stamping wall time here (≈ shell-paint wall, which dwarfs the 2s
+    // COMPUTE_BUDGET) made `load` skip every time — the page settled but
+    // its load handlers never ran. Stamp the CLONE we send instead.
+    let mut shell_outcome = page.outcome.clone();
+    shell_outcome.elapsed = page.started.elapsed();
+    let painted_live = shell_clickable
+        && evts
+            .blocking_send(PageEvt::Updated {
+                html: shell,
+                outcome: shell_outcome,
+            })
+            .is_ok();
+    if shell_clickable && !painted_live {
+        return; // app dropped the handle while we painted the shell
     }
-    if evts
-        .blocking_send(PageEvt::Updated { html: out, outcome })
-        .is_err()
-    {
-        return;
+    // We've consumed the current DOM into the shell render; clear the
+    // dirty bit so we can tell whether the settle below actually changes
+    // anything. A page with no background work settles to the SAME DOM —
+    // we then skip the redundant second emit, so non-network pages emit
+    // exactly one load render (the shell), preserving the existing actor
+    // contract; only a page that mutates during settle (archive's tiles)
+    // gets a second, filled-in render.
+    let _ = page.dom.borrow_mut().take_dirty();
+
+    // Drain the rest of the lifecycle (background network + timers).
+    settle_page(&mut page);
+    page.outcome.elapsed = page.started.elapsed();
+    let changed = page.dom.borrow_mut().take_dirty();
+    if painted_live && !changed {
+        // Shell already reflects the settled page; nothing new to send.
+    } else {
+        let (out, has_clickables) = extract_live(&mut page);
+        let outcome = std::mem::take(&mut page.outcome);
+        if !has_clickables && !painted_live {
+            let _ = evts.blocking_send(PageEvt::Static { html: out, outcome });
+            return;
+        }
+        if evts
+            .blocking_send(PageEvt::Updated { html: out, outcome })
+            .is_err()
+        {
+            return;
+        }
     }
 
     // The dispatch loop: blocked (zero CPU) until the app speaks or
@@ -2506,16 +2745,39 @@ const PRELUDE: &str = r##"
             this.type = String(type);
             this.bubbles = !!(opts && opts.bubbles);
             this.cancelable = !!(opts && opts.cancelable);
+            this.composed = !!(opts && opts.composed);
             this.defaultPrevented = false;
             this.target = null;
             this.currentTarget = null;
             this.isTrusted = false;
             this.detail = opts && opts.detail;
             this.timeStamp = 0;
+            // Per-interface EventInit members (MouseEventInit.clientX,
+            // KeyboardEventInit.key, MessageEventInit.data, …) become event
+            // properties. We don't model each interface's dictionary, so copy
+            // any extra init members generically — without clobbering the
+            // standard fields set above.
+            if (opts) for (const k in opts) if (!(k in this)) this[k] = opts[k];
         }
         preventDefault() { this.defaultPrevented = true; }
         stopPropagation() { this.__stop = true; }
         stopImmediatePropagation() { this.__stop = this.__stopNow = true; }
+        // Legacy DOM init for events made via document.createEvent(): deprecated
+        // but still used by feature-detection (webcomponentsjs probes it) and a
+        // lot of older code. initCustomEvent is the CustomEvent variant.
+        initEvent(type, bubbles, cancelable) {
+            this.type = String(type);
+            this.bubbles = !!bubbles;
+            this.cancelable = !!cancelable;
+            this.defaultPrevented = false;
+        }
+        initCustomEvent(type, bubbles, cancelable, detail) {
+            this.type = String(type);
+            this.bubbles = !!bubbles;
+            this.cancelable = !!cancelable;
+            this.detail = detail;
+            this.defaultPrevented = false;
+        }
         // The same walk dispatch() bubbles along: shadow hop via __host.
         composedPath() {
             if (!this.target) return [];
@@ -2525,7 +2787,64 @@ const PRELUDE: &str = r##"
             if (this.target !== g) path.push(g);
             return path;
         }
+        // Legacy positional init for the typed createEvent() interfaces. The
+        // type-specific tail (view/detail/coords/keys) is accepted and stored
+        // generically; the first three args are the real Event init.
+        initUIEvent(type, bubbles, cancelable, view, detail) {
+            this.initEvent(type, bubbles, cancelable);
+            this.view = view; this.detail = detail;
+        }
+        initMouseEvent(type, bubbles, cancelable, view, detail, sx, sy, cx, cy, ctrl, alt, shift, meta, button, related) {
+            this.initEvent(type, bubbles, cancelable);
+            this.view = view; this.detail = detail;
+            this.screenX = sx; this.screenY = sy; this.clientX = cx; this.clientY = cy;
+            this.ctrlKey = ctrl; this.altKey = alt; this.shiftKey = shift; this.metaKey = meta;
+            this.button = button; this.relatedTarget = related;
+        }
+        initKeyboardEvent(type, bubbles, cancelable, view, key) {
+            this.initEvent(type, bubbles, cancelable);
+            this.view = view; this.key = key;
+        }
     }
+    // The standard Event-interface hierarchy. Real browsers expose all of
+    // these as constructable globals with distinct prototypes; code (and
+    // polyfills like webcomponentsjs) reference `window.MouseEvent`, do
+    // `new KeyboardEvent(...)`, and check `e instanceof MouseEvent`. They
+    // inherit Event's constructor (which already copies init-dict members),
+    // so `new MouseEvent("click", { clientX: 5 })` sets `clientX`.
+    class UIEvent extends Event {}
+    class MouseEvent extends UIEvent {}
+    class PointerEvent extends MouseEvent {}
+    class WheelEvent extends MouseEvent {}
+    class DragEvent extends MouseEvent {}
+    class KeyboardEvent extends UIEvent {}
+    class FocusEvent extends UIEvent {}
+    class InputEvent extends UIEvent {}
+    class TouchEvent extends UIEvent {}
+    class CompositionEvent extends UIEvent {}
+    class PopStateEvent extends Event {}
+    class HashChangeEvent extends Event {}
+    class MessageEvent extends Event {}
+    class ErrorEvent extends Event {}
+    class PromiseRejectionEvent extends Event {}
+    class ProgressEvent extends Event {}
+    class SubmitEvent extends Event {}
+    class StorageEvent extends Event {}
+    class AnimationEvent extends Event {}
+    class TransitionEvent extends Event {}
+    class ClipboardEvent extends Event {}
+    class PageTransitionEvent extends Event {}
+    class CloseEvent extends Event {}
+    // createEvent("MouseEvent") must yield a MouseEvent, etc. (legacy path).
+    const EVENT_INTERFACES = {
+        Event, CustomEvent: Event, Events: Event, HTMLEvents: Event,
+        UIEvent, UIEvents: UIEvent, MouseEvent, MouseEvents: MouseEvent,
+        PointerEvent, WheelEvent, DragEvent, KeyboardEvent, KeyEvents: KeyboardEvent,
+        FocusEvent, InputEvent, TouchEvent, CompositionEvent, PopStateEvent,
+        HashChangeEvent, MessageEvent, ErrorEvent, ProgressEvent, SubmitEvent,
+        StorageEvent, AnimationEvent, TransitionEvent, ClipboardEvent,
+        PageTransitionEvent, CloseEvent,
+    };
     // on<event> attributes compile lazily at first dispatch and re-only
     // when the attribute text changes (zero cost at page load). Old-web
     // semantics: a handler returning false prevents the default.
@@ -2564,7 +2883,7 @@ const PRELUDE: &str = r##"
                     if (typeof fn === "function") fn.call(cur, ev);
                     else fn.handleEvent(ev);
                 }
-                catch (e) { trust.errors.push(ev.type + " handler: " + ((e && e.message) || e)); }
+                catch (e) { trust.errors.push(ev.type + " handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
                 if (ev.__stopNow) break;
             }
             if (ev.__stop) break;
@@ -3087,10 +3406,11 @@ const PRELUDE: &str = r##"
         createComment(s) { return wrap(__dom_create_comment(s === undefined ? "" : String(s))); }
         importNode(n, deep) { return n.cloneNode(!!deep); }
         createTreeWalker(root, whatToShow) { return new TreeWalker(root, whatToShow); }
+        createNodeIterator(root, whatToShow) { return new NodeIterator(root, whatToShow); }
         createDocumentFragment() { return wrap(__dom_create_fragment()); }
         getElementById(i) { return wrap(__dom_get_by_id(String(i))); }
         getElementsByName(n) { return this.querySelectorAll("[name=" + String(n) + "]"); }
-        createEvent() { return new Event(""); }
+        createEvent(type) { const C = EVENT_INTERFACES[String(type)] || Event; return new C(""); }
         hasFocus() { return true; }
         write(s) { const host = this.body || this.documentElement; if (host) host.insertAdjacentHTML("beforeend", String(s)); }
         writeln(s) { this.write(s + "\n"); }
@@ -3128,6 +3448,98 @@ const PRELUDE: &str = r##"
                     return n;
                 }
             }
+        }
+    }
+    // NodeIterator: a flat document-order walk over a subtree (root first,
+    // then descendants). DOMPurify drives sanitization with one of these
+    // (`ownerDocument.createNodeIterator(body, …)`). Live, not a snapshot —
+    // a sanitizer that removes the current node detaches it, so iteration
+    // would stop at that subtree; benign for the content we run it on.
+    class NodeIterator {
+        constructor(root, whatToShow) {
+            this.root = root;
+            this.referenceNode = root;
+            this.pointerBeforeReferenceNode = true;
+            this.whatToShow = (whatToShow === undefined ? 0xFFFFFFFF : whatToShow) >>> 0;
+        }
+        __shows(n) {
+            const bit = n.nodeType === 1 ? 1 : n.nodeType === 3 ? 4 : n.nodeType === 8 ? 128 : 0;
+            return (this.whatToShow & bit) !== 0;
+        }
+        // The document-order successor of `n` within `root`.
+        __after(n) {
+            let next = n.firstChild;
+            if (next) return next;
+            let cur = n;
+            while (cur && cur !== this.root) {
+                if (cur.nextSibling) return cur.nextSibling;
+                cur = cur.parentNode;
+            }
+            return null;
+        }
+        nextNode() {
+            let node = this.referenceNode;
+            let before = this.pointerBeforeReferenceNode;
+            for (;;) {
+                if (before) { before = false; }
+                else {
+                    const nx = this.__after(node);
+                    if (!nx) return null;
+                    node = nx;
+                }
+                if (this.__shows(node)) {
+                    this.referenceNode = node;
+                    this.pointerBeforeReferenceNode = false;
+                    return node;
+                }
+            }
+        }
+        previousNode() { return null; }
+        detach() {}
+    }
+    // DOMParser: parse a markup string into a detached document. `text/html`
+    // parses into a fresh <body> (the common case — DOMPurify, jQuery, and
+    // template libraries feed body-level fragments / whole documents alike).
+    // The parsed nodes live in the same arena, so their `ownerDocument`
+    // (the real document) carries createNodeIterator/importNode — which is
+    // exactly what a sanitizer reaches for through them.
+    class DOMParser {
+        parseFromString(str, _type) {
+            const docEl = g.document.createElement("html");
+            const head = g.document.createElement("head");
+            const body = g.document.createElement("body");
+            docEl.appendChild(head);
+            docEl.appendChild(body);
+            body.innerHTML = String(str === undefined ? "" : str);
+            return {
+                nodeType: 9,
+                documentElement: docEl,
+                head: head,
+                body: body,
+                createElement: (t) => g.document.createElement(t),
+                createTextNode: (s) => g.document.createTextNode(s),
+                createComment: (s) => g.document.createComment(s),
+                createDocumentFragment: () => g.document.createDocumentFragment(),
+                createNodeIterator: (r, w) => new NodeIterator(r, w),
+                createTreeWalker: (r, w) => new TreeWalker(r, w),
+                importNode: (n, deep) => n.cloneNode(!!deep),
+                getElementsByTagName: (t) => {
+                    const want = String(t).toLowerCase();
+                    const list = Array.from(docEl.getElementsByTagName(t));
+                    // getElementsByTagName matches descendants only; the root
+                    // <html> answers `'html'` itself (DOMPurify's whole-doc path).
+                    if (docEl.localName === want || want === "*") list.unshift(docEl);
+                    return list;
+                },
+                getElementById: (i) => {
+                    for (const e of docEl.querySelectorAll("[id]")) {
+                        if (e.id === String(i)) return e;
+                    }
+                    return null;
+                },
+                querySelector: (s) => docEl.querySelector(s),
+                querySelectorAll: (s) => docEl.querySelectorAll(s),
+            };
         }
     }
     class ShadowRoot extends Node {
@@ -3275,12 +3687,39 @@ const PRELUDE: &str = r##"
     class HTMLScriptElement extends Element {}
     class HTMLButtonElement extends Element {}
 
+    // Standard DOM node interfaces real browsers expose as global
+    // constructors. Code and polyfills (webcomponentsjs walks
+    // `["Text","Comment","CDATASection","ProcessingInstruction"]` and reads
+    // `window[name].prototype`) reference them and check `instanceof`. We
+    // model the common node types on `Node`/`Text`/`Element`; expose the rest
+    // with a roughly-correct chain so the constructors and prototypes exist.
+    class EventTarget {}
+    class CharacterData extends Node {}
+    class CDATASection extends Text {}
+    class ProcessingInstruction extends CharacterData {}
+    class DocumentType extends Node {}
+    class Attr extends Node {}
+    g.EventTarget = EventTarget; g.CharacterData = CharacterData;
+    g.CDATASection = CDATASection; g.ProcessingInstruction = ProcessingInstruction;
+    g.DocumentType = DocumentType; g.Attr = Attr;
     g.Node = Node; g.Element = Element; g.HTMLElement = Element;
     g.Text = Text; g.Document = Document; g.HTMLDocument = Document;
     g.DocumentFragment = DocumentFragment; g.Comment = Comment;
     g.Event = Event; g.CustomEvent = Event;
+    g.UIEvent = UIEvent; g.MouseEvent = MouseEvent; g.PointerEvent = PointerEvent;
+    g.WheelEvent = WheelEvent; g.DragEvent = DragEvent; g.KeyboardEvent = KeyboardEvent;
+    g.FocusEvent = FocusEvent; g.InputEvent = InputEvent; g.TouchEvent = TouchEvent;
+    g.CompositionEvent = CompositionEvent; g.PopStateEvent = PopStateEvent;
+    g.HashChangeEvent = HashChangeEvent; g.MessageEvent = MessageEvent;
+    g.ErrorEvent = ErrorEvent; g.PromiseRejectionEvent = PromiseRejectionEvent;
+    g.ProgressEvent = ProgressEvent; g.SubmitEvent = SubmitEvent;
+    g.StorageEvent = StorageEvent; g.AnimationEvent = AnimationEvent;
+    g.TransitionEvent = TransitionEvent; g.ClipboardEvent = ClipboardEvent;
+    g.PageTransitionEvent = PageTransitionEvent; g.CloseEvent = CloseEvent;
     g.ShadowRoot = ShadowRoot;
     g.TreeWalker = TreeWalker;
+    g.NodeIterator = NodeIterator;
+    g.DOMParser = DOMParser;
     g.NodeFilter = {
         SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_COMMENT: 128,
         FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
@@ -4396,6 +4835,40 @@ mod tests {
         assert!(!outcome.panicked, "engine panicked: {outcome:?}");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("a,b"), "{out}");
+    }
+
+    #[test]
+    fn dom_parser_drives_a_sanitizer_style_walk() {
+        // DOMPurify's core path: `new DOMParser().parseFromString(s,'text/html')`,
+        // then walk it via `node.ownerDocument.createNodeIterator(body, …)`,
+        // then read `body.innerHTML`. Without DOMParser the bundle threw
+        // "DOMParser is not defined" / "not a callable function" and dropped
+        // its content (archive.org collection pages).
+        let html = r##"<body><div id="out"></div><script>
+            const doc = new DOMParser().parseFromString('<p>hi</p><b>bold</b><!--c-->', 'text/html');
+            const body = doc.body;
+            const it = body.ownerDocument.createNodeIterator(
+                body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT | NodeFilter.SHOW_COMMENT, null);
+            const seen = [];
+            let n;
+            while ((n = it.nextNode())) {
+                seen.push(n.nodeType === 1 ? n.tagName.toLowerCase()
+                        : n.nodeType === 3 ? 't:' + n.textContent : 'comment');
+            }
+            document.getElementById('out').textContent = seen.join('|') + ' :: ' + body.innerHTML;
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // Root (body) first, then descendants in document order.
+        assert!(
+            out.contains("body|p|t:hi|b|t:bold|comment"),
+            "node iterator walked the parsed tree: {out}"
+        );
+        assert!(
+            out.contains("&lt;p&gt;hi&lt;/p&gt;&lt;b&gt;bold&lt;/b&gt;"),
+            "{out}"
+        );
     }
 
     #[test]

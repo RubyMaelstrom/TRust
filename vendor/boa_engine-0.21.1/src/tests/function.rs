@@ -126,13 +126,19 @@ fn not_a_function() {
                 let a = {};
                 let b = true;
             "#}),
+        // A non-callable OBJECT still reports the bare message (a different
+        // internal-method path); a non-object callee now names the value.
         TestAction::assert_native_error("a()", JsNativeErrorKind::Type, "not a callable function"),
         TestAction::assert_native_error(
             "a.a()",
             JsNativeErrorKind::Type,
-            "not a callable function",
+            "undefined is not a callable function",
         ),
-        TestAction::assert_native_error("b()", JsNativeErrorKind::Type, "not a callable function"),
+        TestAction::assert_native_error(
+            "b()",
+            JsNativeErrorKind::Type,
+            "true is not a callable function",
+        ),
     ]);
 }
 

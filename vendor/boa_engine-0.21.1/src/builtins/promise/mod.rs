@@ -144,6 +144,12 @@ macro_rules! if_abrupt_reject_promise {
         match $value {
             // 1. If value is an abrupt completion, then
             Err(err) => {
+                // A non-catchable error (a host `RuntimeLimit` / fuzz limit)
+                // must not be turned into a catchable rejection — and
+                // `to_opaque` panics on it. Propagate it so the host stops.
+                if !err.is_catchable() {
+                    return Err(err);
+                }
                 let err = err.to_opaque($context);
                 // a. Perform ? Call(capability.[[Reject]], undefined, « value.[[Value]] »).
                 $capability
@@ -435,6 +441,12 @@ impl BuiltInConstructor for Promise {
 
         // 10. If completion is an abrupt completion, then
         if let Err(e) = completion {
+            // A non-catchable error (a host `RuntimeLimit` / fuzz limit) must
+            // not become a catchable rejection — and `to_opaque` panics on it.
+            // Propagate it so the host job runner stops execution.
+            if !e.is_catchable() {
+                return Err(e);
+            }
             let e = e.to_opaque(context);
             // a. Perform ? Call(resolvingFunctions.[[Reject]], undefined, « completion.[[Value]] »).
             resolving_functions
@@ -2266,15 +2278,21 @@ fn new_promise_reaction_job(
                 }
             },
             //   e. Else, let handlerResult be Completion(HostCallJobCallback(handler, undefined, « argument »)).
-            Some(handler) => context
-                .host_hooks()
-                .call_job_callback(
-                    handler,
-                    &JsValue::undefined(),
-                    std::slice::from_ref(&argument),
-                    context,
-                )
-                .map_err(|e| e.to_opaque(context)),
+            Some(handler) => match context.host_hooks().call_job_callback(
+                handler,
+                &JsValue::undefined(),
+                std::slice::from_ref(&argument),
+                context,
+            ) {
+                Ok(v) => Ok(v),
+                // A non-catchable error — a host-imposed `RuntimeLimit` or the
+                // fuzz instruction limit — must NOT become a catchable promise
+                // rejection (it would let JS swallow the limit), and
+                // `to_opaque` panics on it. Abort the whole job so the error
+                // propagates out to the host job runner, which stops execution.
+                Err(e) if !e.is_catchable() => return Err(e),
+                Err(e) => Err(e.to_opaque(context)),
+            },
         };
 
         match promise_capability {
