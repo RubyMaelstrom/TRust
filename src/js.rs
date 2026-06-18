@@ -41,6 +41,58 @@ pub const COMPUTE_BUDGET: Duration = Duration::from_secs(30);
 /// in well under a second.
 const LOOP_LIMIT: u64 = 10_000_000;
 
+/// GC policy for the (vendored) boa_gc mark-sweep collector. Boa's stock
+/// policy — a 1 MiB floor grown only ~1.43× per collection — thrashes
+/// full stop-the-world marks on real bundles: it takes ~19 ever-larger
+/// collections to chase a heavy page's growing live set up to steady state
+/// (measured on YouTube's 10.5 MiB base: >50% of *execution* time in the
+/// GC). The collector is non-generational, so every collection is a full
+/// mark over the whole live set — making frequent collection of a large
+/// live set the worst case.
+///
+/// Our policy keeps the floor LOW and the budget tight while the live set is
+/// small (so a small live set still gets cheap, cache-friendly frequent
+/// collection — a high threshold measurably *regresses* moderate sites like
+/// react.dev by ~20%, blowing the cache with accumulated garbage and
+/// inflating ALL execution, not just GC), and only lets the budget run loose
+/// ([`GC_BIG_GROWTH_PERCENT`]) once the live set exceeds [`GC_BIG_LIVE`] —
+/// past cache, where marking is out-of-cache regardless so the only win left
+/// is doing fewer (expensive) full marks. `TRUST_GC_FLOOR` (MiB),
+/// `TRUST_GC_GROWTH`/`TRUST_GC_BIG_GROWTH` (percent), `TRUST_GC_BIG_LIVE`
+/// (MiB) override for tuning. See `js::tests::{engine_profile,gc_floor_win}`.
+const GC_FLOOR: usize = 1024 * 1024;
+// Below GC_BIG_LIVE the policy matches Boa's stock ~1.43x growth, so moderate
+// pages (react.dev's live set is ~4 MiB) behave exactly as before — they have
+// nothing to gain from GC tuning anyway (their collections are already cheap).
+// The win is reserved for large-live-set heavy pages, which thrash under stock.
+const GC_GROWTH_PERCENT: usize = 143;
+const GC_BIG_LIVE: usize = 16 * 1024 * 1024;
+const GC_BIG_GROWTH_PERCENT: usize = 400;
+
+/// Apply the GC policy to the current thread's collector, honoring the
+/// `TRUST_GC_*` overrides.
+fn apply_gc_policy() {
+    let mib = |name: &str, default: usize| -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|m| m.saturating_mul(1024 * 1024).max(1))
+            .unwrap_or(default)
+    };
+    let pct = |name: &str, default: usize| -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    boa_engine::gc::set_gc_threshold(mib("TRUST_GC_FLOOR", GC_FLOOR));
+    boa_engine::gc::set_gc_growth_percent(pct("TRUST_GC_GROWTH", GC_GROWTH_PERCENT));
+    boa_engine::gc::set_gc_big_growth(
+        mib("TRUST_GC_BIG_LIVE", GC_BIG_LIVE),
+        pct("TRUST_GC_BIG_GROWTH", GC_BIG_GROWTH_PERCENT),
+    );
+}
+
 /// A page-wide execution deadline, shared by every script on the page.
 /// Page-initiated network time extends it: the wall budget meters JS,
 /// not the wire.
@@ -232,6 +284,11 @@ fn page_context_with(loader: Option<Rc<WebModuleLoader>>) -> (Context, Rc<PageHo
     limits.set_loop_iteration_limit(LOOP_LIMIT);
     // Recursion (512) and stack-size defaults are kept: deep enough for
     // real bundles, shallow enough to stop runaway recursion fast.
+    // Replace Boa's thrashy GC policy (see GC_FLOOR/GC_GROWTH_PERCENT). The
+    // policy is thread-local on the GC, so set it every time we build a page
+    // context — the trust-js thread is reused across navigations, and each
+    // fresh context's heap starts (near) empty as the old one drops.
+    apply_gc_policy();
     (ctx, hooks)
 }
 
@@ -2032,6 +2089,19 @@ fn settle_page(page: &mut LoadedPage) {
         "load finished; last DOM mutation was @{}ms",
         crate::dom::last_mutation_ms()
     ));
+    if std::env::var_os("TRUST_NET_TRACE").is_some() {
+        // Reading the live set after a forced collection tells us the page's
+        // true GC footprint — used to size the GC policy (see GC_BIG_LIVE).
+        let before = boa_engine::gc::gc_profile();
+        boa_engine::gc::force_collect();
+        let after = boa_engine::gc::gc_profile();
+        phase(&format!(
+            "GC: {} collections, {:?} total; live set ~{} MiB",
+            before.0,
+            before.1,
+            after.2 / (1024 * 1024)
+        ));
+    }
     page.outcome.fetches = page
         .ctx
         .realm()
@@ -5180,6 +5250,160 @@ mod tests {
         eprintln!("  - parse+compile:                 {:?}", parse_acc / N);
         eprintln!("  - evaluate:                      {:?}", eval_acc / N);
         eprintln!("tiny post-prelude page call:       {tiny_call:?}");
+    }
+
+    /// Engine profiler: load an arbitrary JS bundle into a faithful page
+    /// context (DOM + syscalls + config + PRELUDE, exactly as `load_page`
+    /// builds it) and split its cost into parse / compile / execute, plus
+    /// GC stats (vendored boa_gc instrumentation). The bundle runs as a
+    /// classic top-level script. Heavy real bundles (the YouTube kevlar
+    /// base) won't fully boot without their page environment, but they
+    /// still exercise parse+compile of the whole file and a large slab of
+    /// execution — enough to find where the engine spends its seconds.
+    ///   TRUST_JS_BENCH=/tmp/kevlar.js cargo test --release engine_profile \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual measurement, needs TRUST_JS_BENCH=<file>"]
+    fn engine_profile() {
+        let Ok(path) = std::env::var("TRUST_JS_BENCH") else {
+            eprintln!("set TRUST_JS_BENCH to a .js file");
+            return;
+        };
+        let src = std::fs::read(&path).unwrap();
+        eprintln!("--- engine profile: {path} ({} bytes) ---", src.len());
+
+        // Faithful page context: DOM arena + syscalls + config + PRELUDE.
+        let html = r#"<html><head></head><body><div id="content"></div></body></html>"#;
+        let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://www.youtube.com/", ua: "TRust/0.1", width: 1600, height: 800 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+
+        // GC policy comes from page_context_with's apply_gc_policy, honoring
+        // TRUST_GC_FLOOR (MiB) / TRUST_GC_GROWTH (percent).
+        if std::env::var_os("TRUST_NO_OPT").is_some() {
+            ctx.set_optimizer_options(boa_engine::optimizer::OptimizerOptions::empty());
+            eprintln!("AST optimizer DISABLED");
+        }
+
+        // Per-phase GC deltas: (collections, gc time).
+        let g = |a: (usize, Duration, usize), b: (usize, Duration, usize)| (b.0 - a.0, b.1 - a.1);
+
+        let gc0 = boa_engine::gc::gc_profile();
+        let t = Instant::now();
+        let script = boa_engine::Script::parse(Source::from_bytes(&src), None, &mut ctx).unwrap();
+        let parse = t.elapsed();
+        let gc1 = boa_engine::gc::gc_profile();
+
+        let t = Instant::now();
+        script.codeblock(&mut ctx).unwrap();
+        let compile = t.elapsed();
+        let gc2 = boa_engine::gc::gc_profile();
+
+        let t = Instant::now();
+        let res =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| script.evaluate(&mut ctx)));
+        let execute = t.elapsed();
+        let gc3 = boa_engine::gc::gc_profile();
+
+        let (pc, pt) = g(gc0, gc1);
+        let (cc, ct) = g(gc1, gc2);
+        let (ec, et) = g(gc2, gc3);
+        eprintln!("parse:           {parse:?}  (gc: {pc} colls, {pt:?})");
+        eprintln!("compile:         {compile:?}  (gc: {cc} colls, {ct:?})");
+        eprintln!("execute:         {execute:?}  (gc: {ec} colls, {et:?})");
+        eprintln!("TOTAL:           {:?}", parse + compile + execute);
+        match res {
+            Ok(Ok(_)) => eprintln!("result:          ran clean"),
+            Ok(Err(e)) => {
+                let s = e.to_string();
+                eprintln!("result:          threw: {}", &s[..s.len().min(160)]);
+            }
+            Err(_) => eprintln!("result:          PANIC"),
+        }
+        eprintln!("--- GC totals ---");
+        eprintln!("collections:     {}", gc3.0 - gc0.0);
+        eprintln!("gc time:         {:?}", gc3.1 - gc0.1);
+        eprintln!("bytes live:      {} MiB", gc3.2 / (1024 * 1024));
+    }
+
+    /// Quantify the GC policy win, stock vs TRust default, on two
+    /// fully-executing churn workloads (the kevlar profile throws early, so
+    /// it under-represents the execute phase where real SPAs live):
+    ///   - SMALL live set (~1% retained): the moderate-page case. The TRust
+    ///     policy must NOT regress this (it stays stock below GC_BIG_LIVE).
+    ///   - LARGE live set (live > GC_BIG_LIVE): the heavy-page case (full
+    ///     YouTube keeps a big live set across a long execute). This is where
+    ///     stock thrashes full marks and the TRust policy wins.
+    ///   cargo test --release gc_floor_win -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual measurement"]
+    fn gc_floor_win() {
+        // ~1% retained — most framework allocations die young; the live set
+        // stays small (a few hundred KiB).
+        const SMALL_LIVE: &str = r#"
+            var keep = [];
+            for (var i = 0; i < 400000; i++) {
+                var o = { id: i, name: "item-" + i, tags: [i, i * 2, i * 3],
+                          meta: { a: i & 1, b: "x" + (i % 7) } };
+                if ((i % 256) === 0) keep.push(o);
+            }
+            keep.length;
+        "#;
+        // Build a big live set (>16 MiB) first, then churn lots of garbage on
+        // top of it — the heavy-SPA pattern (big retained framework/DOM state
+        // + constant short-lived allocation).
+        const LARGE_LIVE: &str = r#"
+            var keep = [];
+            for (var i = 0; i < 120000; i++) {
+                keep.push({ id: i, name: "node-" + i, kids: [i, i + 1, i + 2] });
+            }
+            for (var j = 0; j < 600000; j++) {
+                var t = { x: j, y: "g" + j, z: [j] };
+            }
+            keep.length;
+        "#;
+        let run = |src: &str, floor: usize, growth: usize, big_live: usize, big: usize| {
+            let mut ctx = page_context_with(None).0;
+            boa_engine::gc::set_gc_threshold(floor * 1024 * 1024);
+            boa_engine::gc::set_gc_growth_percent(growth);
+            boa_engine::gc::set_gc_big_growth(big_live * 1024 * 1024, big);
+            boa_engine::gc::force_collect(); // reclaim the prior run's heap first
+            let g0 = boa_engine::gc::gc_profile();
+            let t = Instant::now();
+            ctx.eval(Source::from_bytes(src.as_bytes())).unwrap();
+            let dt = t.elapsed();
+            let g1 = boa_engine::gc::gc_profile();
+            (dt, g1.0 - g0.0, g1.1 - g0.1)
+        };
+        for (label, src) in [
+            ("SMALL live set", SMALL_LIVE),
+            ("LARGE live set", LARGE_LIVE),
+        ] {
+            eprintln!("--- {label} ---");
+            // Stock Boa: 1 MiB floor, grow-only ~1.43x (big_growth == base).
+            let (dt, c, gct) = run(src, 1, 143, 16, 143);
+            eprintln!("  stock        : {dt:>12?}  ({c} colls, {gct:?} GC)");
+            // TRust default.
+            let (dt, c, gct) = run(
+                src,
+                GC_FLOOR / (1024 * 1024),
+                GC_GROWTH_PERCENT,
+                GC_BIG_LIVE / (1024 * 1024),
+                GC_BIG_GROWTH_PERCENT,
+            );
+            eprintln!("  trust default: {dt:>12?}  ({c} colls, {gct:?} GC)");
+        }
     }
 
     #[test]
