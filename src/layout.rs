@@ -3641,6 +3641,21 @@ impl<'a> Layout<'a> {
             let fit_h = ((ih as f32) * scale).round().max(1.0) as usize;
             return (fit_w as u16, fit_h as u16, crop);
         }
+        // The renderer always FITS the decoded image into this box (never
+        // upscales or stretches), so reserving MORE rows than it actually draws
+        // at `used_w` just leaves blank rows beneath it — a gap before the next
+        // line. The attr / `aspect-ratio` height is a CSS-pixel ratio that
+        // assumes a nominal 2:1 cell, but the DECODED box carries the terminal's
+        // real cell aspect: on a non-2:1 font (e.g. foot) a `height:auto`
+        // square thumbnail then over-reserves a row, printing a black gap
+        // between the image and its caption. Cap to what's drawn — the decoded
+        // box scaled to the used width. `cover` (crop) fills its taller box by
+        // cropping, so it keeps the author box.
+        let used_h = if crop {
+            used_h
+        } else {
+            used_h.min(intrinsic_h)
+        };
         (used_w as u16, used_h as u16, crop)
     }
 
@@ -4249,10 +4264,13 @@ fn resolve_calc(body: &str, avail: usize, viewport: usize) -> Option<f32> {
     Some(total)
 }
 
-/// Whether a vertical length is big enough to warrant a blank spacer row
-/// (≥ half a line).
+/// Whether a vertical length is big enough to warrant a blank spacer row.
+/// A terminal row is precious (~1em of height), so we spend one only when the
+/// gap EXCEEDS half a line: an exactly-half-row gap — `8px`/`0.5em`/`1ch`, the
+/// web's ubiquitous "tight" spacing (a thumbnail-to-caption tab, an icon-row
+/// pad) — no longer costs a whole blank line. Gaps over half a row still do.
 fn vertical_space(value: &str) -> bool {
-    css_length_em(value).is_some_and(|em| em >= 0.5)
+    css_length_em(value).is_some_and(|em| em > 0.5)
 }
 
 /// A horizontal length as an indent in cells (≈ 2 cells per em).
@@ -5425,6 +5443,51 @@ mod tests {
         assert!(
             title_row - img_row <= img.height as usize + 1,
             "title sits just under the image (row {title_row} vs image box at {img_row}+{})",
+            img.height
+        );
+    }
+
+    #[test]
+    fn auto_height_image_reserves_no_letterbox_row_on_a_non_2to1_font() {
+        // erome thumbnail: <img width=250 height=250 style="width:100%;
+        // height:auto"> in a column. The attr ratio is 1:1, so the height comes
+        // from `rows_for_ratio` — which assumes a nominal 2:1 cell (→ used_w/2
+        // = 16 rows). But the DECODED box carries the real cell aspect: on a
+        // taller-than-2:1 font (foot) the 250×250 square decodes to 32×14, so
+        // the renderer (Fit, no upscale) draws only 14 rows and leaves a blank
+        // 15th/16th — a black gap between the thumbnail and its count caption.
+        // The used box must reserve what's actually drawn: 14 rows, no gap.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/t.jpg".to_owned(), (32, 14));
+        // The caption is a margin-less span (like erome's overlay count), so any
+        // gap below the image is a letterbox row, not a block margin.
+        let rows = lay_with_images(
+            r#"<body><div><img width="250" height="250" src="/t.jpg" style="display:block;width:100%;height:auto"></div><span>9 265</span></body>"#,
+            32,
+            &images,
+        );
+        let img = image_item(&rows);
+        assert_eq!(
+            (img.width, img.height),
+            (32, 14),
+            "auto-height image reserves the drawn box (32x14), not the 2:1 \
+             ratio box (32x16) that would letterbox a blank row beneath it"
+        );
+        let img_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.image.is_some()))
+            .unwrap();
+        let caption_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.text.contains("9 265")))
+            .unwrap();
+        // The caption sits on the row immediately after the image's drawn box —
+        // no reserved letterbox row between them.
+        assert_eq!(
+            caption_row - img_row,
+            img.height as usize,
+            "caption sits directly under the image box (row {caption_row} vs \
+             image at {img_row} + {} drawn rows)",
             img.height
         );
     }
