@@ -1825,6 +1825,19 @@ impl App {
     /// code always lands in the status bar.
     fn on_http_response(&mut self, mut response: http::Response, width: usize) {
         let live = response.live.take();
+        // A bot-mitigation interstitial (AWS WAF / Cloudflare): the request
+        // got a JS proof-of-work challenge, not the real page, so anything we
+        // render is an empty shell. Don't navigate into the blank shell —
+        // keep the prior page and say plainly why nothing loaded.
+        if let Some(label) = response.challenge.take() {
+            drop(live);
+            self.status = format!(
+                "{}: bot wall ({label}) — the real page is gated behind a challenge TRust can't pass.",
+                response.url
+            );
+            self.notice = true;
+            return;
+        }
         if response.body.is_empty() {
             self.status = format!(
                 "{}: HTTP {} (empty response)",
@@ -4402,6 +4415,33 @@ mod tests {
         assert_eq!(app.cursor, "hello there".chars().count());
     }
 
+    #[test]
+    fn a_bot_challenge_surfaces_a_notice_without_navigating() {
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (80, 10);
+        let response = crate::http::Response {
+            url: url::Url::parse("https://www.imdb.com/list/ls123/").unwrap(),
+            status: 202,
+            content_type: String::from("text/html"),
+            // The challenge interstitial: an empty shell with no real content.
+            body: b"<html><body><div id=\"challenge-container\"></div></body></html>".to_vec(),
+            js: None,
+            live: None,
+            challenge: Some(String::from("AWS WAF (challenge)")),
+        };
+        app.on_http_response(response, 60);
+        assert!(app.notice, "the wall is surfaced as a persistent notice");
+        assert!(
+            app.browser.is_none(),
+            "we don't navigate into the blank challenge shell"
+        );
+        assert!(
+            app.status.contains("bot wall") && app.status.contains("AWS WAF (challenge)"),
+            "status explains the wall: {}",
+            app.status
+        );
+    }
+
     async fn live_form_app(html: &str) -> super::App {
         let base = url::Url::parse("https://example.com/chat").unwrap();
         let mut app = super::App::new(None, 23);
@@ -4413,6 +4453,7 @@ mod tests {
             body: html.as_bytes().to_vec(),
             js: None,
             live: None,
+            challenge: None,
         };
         let response =
             crate::http::execute_js(response, app.last_inner, (8, 16), Default::default()).await;
