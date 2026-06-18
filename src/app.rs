@@ -4148,6 +4148,58 @@ mod tests {
     }
 
     #[test]
+    fn an_inline_image_does_not_shift_following_text_left() {
+        // An inline image carries empty text but a real width box (its pixels
+        // are overlaid in a second pass). The render pass must reserve those
+        // columns so text after it stays at its laid-out column — else the row
+        // collapses left UNDER the image (the header logo painting over the
+        // nav links; an avatar over its post title).
+        let mut images = crate::layout::ImageSizes::new();
+        images.insert("https://example.com/logo.png".to_owned(), (6, 2));
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let doc = crate::http::parse(
+            &url,
+            "text/html",
+            br#"<body><span style="display:inline-flex"><img src="/logo.png" style="display:block"></span><a href="/f">Forums</a></body>"#,
+            80,
+            &images,
+        );
+        let g = super::BrowserView {
+            doc,
+            selected: None,
+            sel_item: None,
+            scroll: 0,
+            history: vec![],
+        };
+        let lines = crate::ui::browser_rows(&g, 24);
+        let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        let forums_item = g
+            .doc
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("Forums"))
+            .expect("Forums laid out");
+        let img = g
+            .doc
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .expect("image laid out");
+        let forums_col = rendered.find("Forums").expect("Forums rendered");
+        assert_eq!(
+            forums_col, forums_item.col as usize,
+            "rendered 'Forums' column matches the layout (not shifted under the image)"
+        );
+        assert!(
+            forums_col >= (img.col + img.width) as usize,
+            "'Forums' renders after the image box (col {forums_col}, image ends {})",
+            img.col + img.width
+        );
+    }
+
+    #[test]
     fn mouse4_goes_back_in_browser_history() {
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;

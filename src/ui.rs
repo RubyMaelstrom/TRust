@@ -274,7 +274,7 @@ use crate::layout::visible_col;
 /// Render an HTTP laid-out doc: each visible row is a sequence of
 /// positioned item spans, padded to each item's start column. The
 /// selected `(row, item)` is highlighted.
-fn browser_rows(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
+pub(crate) fn browser_rows(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
     use crate::layout::{ItemKind, NO_NODE};
     // The selected link's source node: every item sharing it (a link that
     // wrapped across rows) highlights as one unit.
@@ -358,6 +358,17 @@ fn browser_rows(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
                     style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 }
                 spans.push(Span::styled(item.text.as_str(), style));
+                // An item can reserve more columns than its text fills — an
+                // inline image carries an empty string but a real W×H box (the
+                // pixels are overlaid in the second pass). Pad the remainder
+                // with spaces so the row's visible width tracks `item.width`;
+                // without this an image collapses to zero width and every
+                // following item slides left UNDER it (the header logo painting
+                // over the nav links, an avatar over its post title).
+                let text_w = crate::layout::display_width(&item.text) as u16;
+                if item.width > text_w {
+                    spans.push(Span::raw(" ".repeat((item.width - text_w) as usize)));
+                }
                 col = scol + item.width;
             }
             Line::from(spans)

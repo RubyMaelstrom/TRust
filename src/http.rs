@@ -2423,14 +2423,21 @@ mod tests {
             return;
         };
         let url = parse_url(&target).expect("absolute http(s) url");
+        let vp: (u16, u16) = std::env::var("TRUST_DIAG_VP")
+            .ok()
+            .and_then(|s| {
+                s.split_once('x')
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+            })
+            .unwrap_or((80, 24));
         let response = fetch(&Request::get(url)).await.unwrap();
         eprintln!(
-            "fetched: status={} content_type={:?} body={}B",
+            "fetched: status={} content_type={:?} body={}B vp={vp:?}",
             response.status,
             response.content_type,
             response.body.len()
         );
-        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut response = execute_js(response, vp, (8, 16), Default::default()).await;
         eprintln!("js outcome: {:?}", response.js);
         eprintln!("live: {}", response.live.is_some());
         eprintln!(

@@ -32,8 +32,24 @@ use crate::dom::{DOCUMENT, Dom, NodeData, NodeId};
 /// both wrong and drifts aligned/`pre` text. We measure with the SAME
 /// `unicode-width` ratatui renders with, so an item's `width`/`col` match
 /// where the glyphs actually land on screen.
-fn display_width(s: &str) -> usize {
+pub(crate) fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
+}
+
+/// The longest leading prefix of `s` whose display width is `<= max` cells —
+/// for truncating a clipped (`overflow:hidden`) line before its ellipsis.
+fn truncate_to_width(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = display_width(c.encode_utf8(&mut [0u8; 4]));
+        if w + cw > max {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out
 }
 
 /// Map from a control element's `NodeId` to its `(form, field)` indices
@@ -895,6 +911,15 @@ struct Layout<'a> {
     /// never triggers — the border properties still cascade/bake (so
     /// getComputedStyle stays correct), they just aren't drawn.
     borders: bool,
+    /// A `white-space:nowrap` + `overflow:hidden` box clips its single line at
+    /// this content-right edge: `Some(right)` while inside one. Nowrap text
+    /// can't wrap, so without this a long string overflows its box and paints
+    /// over neighbours (a truncated post title bleeding into the sidebar). The
+    /// classic single-line-ellipsis card idiom.
+    clip_right: Option<usize>,
+    /// Set once the active clip box has been truncated, so the rest of its
+    /// (unwrappable) words are dropped instead of laid past the cut.
+    clip_done: bool,
 }
 
 impl<'a> Layout<'a> {
@@ -933,7 +958,18 @@ impl<'a> Layout<'a> {
             measuring: false,
             inner_border_box: None,
             borders,
+            clip_right: None,
+            clip_done: false,
         }
+    }
+
+    /// Whether an element clips overflow (a non-`visible` `overflow`), so a
+    /// `white-space:nowrap` line inside it is truncated at its box edge.
+    fn clips_overflow(&self, id: NodeId) -> bool {
+        self.dom.computed_style(id, "overflow").is_some_and(|v| {
+            v.split_whitespace()
+                .any(|t| matches!(t, "hidden" | "clip" | "auto" | "scroll"))
+        })
     }
 
     fn flow_node(&mut self, id: NodeId, ctx: &Ctx) {
@@ -960,8 +996,20 @@ impl<'a> Layout<'a> {
         // A floated element leaves normal flow: pin it to an edge and let the
         // following content wrap beside it (across blocks, until cleared or
         // its bottom is passed). Checked before the tag dispatch so a floated
-        // `<img>` floats too; skipped when laying the float's own box.
+        // `<img>` floats too; skipped when laying the float's own box. CSS
+        // ignores `float` on a flex item; we drop it only for an INLINE-level
+        // flex item (it then flows inline) — the nav split-button's
+        // `inline-flex;float:left` toggle that otherwise dropped to its own
+        // row. A block-level floated flex child (a latest-post avatar `<div
+        // float:left>`) keeps floating, so its sibling text still wraps beside.
+        // We also drop a float inside an out-of-flow (absolute/fixed) ancestor,
+        // which we already render as a compact inline overlay — honoring the
+        // float there just splits the overlay (a search bar's magnifier `<i
+        // float:left>` in an absolutely-positioned icon span).
+        let drop_float = (self.parent_is_flex_container(id) && self.is_inline_level(id))
+            || self.parent_out_of_flow(id);
         if self.float_skip != Some(id)
+            && !drop_float
             && let Some(side) = self.float_side(id)
         {
             self.flow_float(id, side, ctx);
@@ -1074,9 +1122,24 @@ impl<'a> Layout<'a> {
         // the HTML tag default as the fallback. This is what lets an
         // inline-styled `<li>` nav flow across one row instead of becoming
         // a vertical bullet tower.
-        let flow = self.flow_of(id, &tag);
+        let mut flow = self.flow_of(id, &tag);
         if flow == Flow::None {
             return;
+        }
+        // A block-level flex/grid box that is itself a flex item of an
+        // INLINE-level flex container (`inline-flex` parent) and whose content
+        // is a single inline run (icon + text) is laid inline, not as its own
+        // block row — a nav link / split button sits in the parent's row (which
+        // we lay by inline recursion). XenForo's `display:flex` "Log in" /
+        // "Register" links each dropped to a row of their own otherwise. A flex
+        // item with block rows (a stacked title/date column) is left alone
+        // (`flex_items_all_inline` is keyed on each child's tag default).
+        if matches!(flow, Flow::Block)
+            && self.is_flex_or_grid(id)
+            && self.parent_is_inline_flex(id)
+            && self.flex_items_all_inline(id)
+        {
+            flow = Flow::Inline;
         }
         let block_like = matches!(flow, Flow::Block | Flow::ListItem);
         // A block-level element with a visible border is laid as its own
@@ -1180,6 +1243,16 @@ impl<'a> Layout<'a> {
         {
             self.ws = w;
         }
+        // A `white-space:nowrap` + `overflow:hidden` box truncates its single
+        // line at its content edge (the single-line-ellipsis card idiom). The
+        // band is already set (`begin_line` above), so `line_right` is this
+        // box's right; clip there. Saved/restored so siblings/children that
+        // inherit `nowrap` but DON'T clip overflow lay normally.
+        let saved_clip = (self.clip_right, self.clip_done);
+        if block_like && self.ws == WhiteSpace::Nowrap && self.clips_overflow(id) {
+            self.clip_right = Some(self.line_right);
+            self.clip_done = false;
+        }
         let pushed_list = match tag.as_str() {
             "ul" => {
                 self.list_stack.push(1);
@@ -1244,6 +1317,12 @@ impl<'a> Layout<'a> {
             self.col += cells;
         }
 
+        // An inline element's left margin becomes a leading gap (block margins
+        // go through `block_indent` / the band instead).
+        if !block_like && self.inline_h_margin(id, "margin-left") {
+            self.pending_space = true;
+        }
+
         // CSS `::before` generated content opens the element's content.
         if let Some(t) = self.pseudo_text(id, crate::dom::PseudoEl::Before) {
             self.place_text(&t, &cctx);
@@ -1279,14 +1358,28 @@ impl<'a> Layout<'a> {
             self.place_text(&t, &cctx);
         }
 
-        // A button-less form carries its synthetic submit on the form
-        // node: emit it on its own row at the end of the form.
+        // An inline element's right margin becomes a trailing gap (the icon's
+        // `margin-right` separating it from the label that follows).
+        if !block_like && self.inline_h_margin(id, "margin-right") {
+            self.pending_space = true;
+        }
+
+        // A button-less form carries its synthetic submit on the form node. A
+        // BLOCK form emits it on its own row at the end; an INLINE-level form
+        // (the header search bar, `display:inline-flex`) keeps it inline so the
+        // bar reads `[Search…] [ Submit ]` on one row instead of two.
         if tag == "form"
             && let Some(&(form, field)) = self.controls.get(&id)
         {
             let label = self.field_label(form, field);
             if !label.is_empty() {
-                self.flush_block();
+                let inline_form = matches!(
+                    self.dom.computed_display(id).as_deref(),
+                    Some("inline" | "inline-block" | "inline-flex" | "inline-grid")
+                );
+                if !inline_form {
+                    self.flush_block();
+                }
                 self.place_atom(label, ItemKind::Form, id, Some(Link::Form { form, field }));
             }
         }
@@ -1310,6 +1403,7 @@ impl<'a> Layout<'a> {
             }
         }
         self.ws = saved_ws;
+        (self.clip_right, self.clip_done) = saved_clip;
         self.align = saved_align;
         if pushed_list {
             self.list_stack.pop();
@@ -1336,6 +1430,26 @@ impl<'a> Layout<'a> {
             return (!v.is_empty()).then(|| v.to_owned());
         }
         self.dom.pseudo_content(id, which)
+    }
+
+    /// Whether an inline element's horizontal margin (`margin-left` or
+    /// `-right`) is positive — rendered as a single-cell gap (terminal cells
+    /// are too coarse for sub-cell spacing). An icon `<i style="margin-
+    /// right:.3em">` separating from its label, a nav `<li style="margin-
+    /// right:1em">` separating links: the margin is the only thing keeping the
+    /// glyph off the next word, and we were dropping it. `pending_space` is a
+    /// flag, so this only ENSURES a gap — it never doubles an existing one.
+    fn inline_h_margin(&self, id: NodeId, prop: &str) -> bool {
+        self.dom
+            .computed_style(id, prop)
+            .and_then(|v| {
+                resolve_cells(
+                    &v,
+                    self.width.saturating_sub(self.indent).max(1),
+                    self.viewport_w,
+                )
+            })
+            .is_some_and(|c| c > 0)
     }
 
     /// The left indent (cells) a block contributes: CSS `margin-left` +
@@ -1475,6 +1589,97 @@ impl<'a> Layout<'a> {
         }
     }
 
+    /// Whether `id` sits inside an atomic inline box — an `inline-block` /
+    /// `inline-flex` / `inline-grid` ancestor reached before any block-level
+    /// ancestor. Such a box is inline-level from the OUTSIDE: its block-level
+    /// content (the classic case is a `display:block` avatar `<img>` inside an
+    /// `inline-flex` wrapper) must NOT break the surrounding line, or each one
+    /// towers onto its own row — XenForo's "most reactions" grid and every
+    /// forum-row avatar. Plain inline ancestors (`<a>`, `<span>`) are
+    /// transparent (keep walking); a block/flex/grid ancestor is a real block
+    /// formatting context and stops the walk (the element stays block-level).
+    fn in_atomic_inline_context(&self, id: NodeId) -> bool {
+        let mut cur = self.dom.parent_composed(id);
+        for _ in 0..8 {
+            let Some(p) = cur else { return false };
+            match self.dom.computed_display(p).as_deref() {
+                Some("inline-block" | "inline-flex" | "inline-grid") => return true,
+                Some("inline" | "contents") => {} // transparent — keep walking
+                Some(_) => return false,          // an explicit block-level box
+                None => {
+                    // No explicit display rule: the tag default decides.
+                    let tag = self.dom.tag_name(p).unwrap_or("");
+                    if tag == "li" || BLOCK.contains(&tag) {
+                        return false;
+                    }
+                    // inline by default (`<a>`/`<span>`/…): transparent.
+                }
+            }
+            cur = self.dom.parent_composed(p);
+        }
+        false
+    }
+
+    /// Whether an element's computed `display` is a flex/grid container.
+    fn is_flex_or_grid(&self, id: NodeId) -> bool {
+        matches!(
+            self.dom.computed_display(id).as_deref(),
+            Some("flex" | "inline-flex" | "grid" | "inline-grid")
+        )
+    }
+
+    /// Whether `id`'s parent is taken out of normal flow (`position:absolute`/
+    /// `fixed`) — which we render as a compact inline overlay, so a float
+    /// inside it shouldn't break the line.
+    fn parent_out_of_flow(&self, id: NodeId) -> bool {
+        self.dom
+            .parent_composed(id)
+            .is_some_and(|p| self.is_out_of_flow(p))
+    }
+
+    /// Whether `id`'s parent is a flex/grid container — so `id` is a flex item
+    /// (CSS ignores `float` on flex items).
+    fn parent_is_flex_container(&self, id: NodeId) -> bool {
+        self.dom
+            .parent_composed(id)
+            .is_some_and(|p| self.is_flex_or_grid(p))
+    }
+
+    /// Whether `id`'s parent is an INLINE-level flex/grid container
+    /// (`inline-flex`/`inline-grid`), which we lay by inline recursion — so a
+    /// block-level flex child of it would wrongly take its own row.
+    fn parent_is_inline_flex(&self, id: NodeId) -> bool {
+        self.dom.parent_composed(id).is_some_and(|p| {
+            matches!(
+                self.dom.computed_display(p).as_deref(),
+                Some("inline-flex" | "inline-grid")
+            )
+        })
+    }
+
+    /// Whether `id`'s computed `display` is an inline-level box (so a `float`
+    /// on it, when it's a flex item, can be dropped and it flows inline).
+    fn is_inline_level(&self, id: NodeId) -> bool {
+        matches!(
+            self.dom.computed_display(id).as_deref(),
+            Some("inline" | "inline-block" | "inline-flex" | "inline-grid")
+        )
+    }
+
+    /// Whether every flex item of `id` is an inline-by-default element (a nav
+    /// link's icon `<i>` + text `<span>`, a split button) — so the box is a
+    /// single inline run, not a column of block rows. Keyed on each child's
+    /// TAG default (a `<div>` row stays block even when styled `inline-block`),
+    /// so a stacked title/date column (`<div>` items) is NOT pulled inline.
+    fn flex_items_all_inline(&self, id: NodeId) -> bool {
+        let items = self.flex_items(id);
+        !items.is_empty()
+            && items.iter().all(|&c| {
+                let tag = self.dom.tag_name(c).unwrap_or("");
+                tag != "li" && !BLOCK.contains(&tag)
+            })
+    }
+
     /// Whether an element is taken out of normal flow by `position:absolute`
     /// or `fixed` (an overlay we render compactly inline, since we can't
     /// position it).
@@ -1549,7 +1754,13 @@ impl<'a> Layout<'a> {
     /// row can't fit even at every item's minimum, it stacks vertically (the
     /// terminal has no horizontal scroll — her responsive default).
     fn flow_flex_row(&mut self, id: NodeId, ctx: &Ctx) {
-        let avail = self.width.saturating_sub(self.indent).max(1);
+        // Lay within the float-narrowed band (the block boundary already ran
+        // `begin_line`), not the raw block box — so a flex row beside a float
+        // (a latest-post avatar floated left of its title/date flex) flows to
+        // the float's right instead of painting over it. `flow_flex_wrap`
+        // already uses the band; this keeps the two consistent. With no active
+        // float the band IS the block box, so behaviour is unchanged.
+        let avail = self.line_right.saturating_sub(self.line_left).max(1);
         let gap = self.flex_gap(id, avail, false);
         let mut nodes = Vec::new();
         let mut basis = Vec::new();
@@ -1646,11 +1857,11 @@ impl<'a> Layout<'a> {
             let cw = widths[i].max(1);
             if boxes[i].height > 0 {
                 let dy = self.align_offset(id, boxes[i].height as usize, line_h);
-                self.blit(&boxes[i], (self.indent + x) as u16, row_base + dy);
+                self.blit(&boxes[i], (self.line_left + x) as u16, row_base + dy);
             }
             x += cw + if i + 1 < n { gap + between } else { 0 };
         }
-        self.col = self.indent;
+        self.col = self.line_left;
         self.pending_space = false;
     }
 
@@ -2070,6 +2281,13 @@ impl<'a> Layout<'a> {
         // (`descendants` excludes the root) — e.g. a bare `<img>` with no
         // explicit width — is not empty and must not be collapsed away.
         for d in std::iter::once(id).chain(self.dom.descendants(id)) {
+            // A `::before`/`::after` glyph (an icon-only nav button, the
+            // "Members ▾" split trigger) is visible content — don't collapse it.
+            if self.pseudo_text(d, crate::dom::PseudoEl::Before).is_some()
+                || self.pseudo_text(d, crate::dom::PseudoEl::After).is_some()
+            {
+                return false;
+            }
             match &self.dom.node(d).data {
                 NodeData::Text(s) if !s.trim().is_empty() => return false,
                 NodeData::Element { .. }
@@ -2102,12 +2320,18 @@ impl<'a> Layout<'a> {
     /// children (so a card's image and caption stack instead of fusing).
     fn stack_flex_items(&mut self, id: NodeId, ctx: &Ctx) {
         let kids = self.flex_items(id);
-        let avail = self.width.saturating_sub(self.indent).max(1);
+        // Within the float-narrowed band (set by the block boundary's
+        // `begin_line`), not the raw block box — so a stacked column beside a
+        // float (a latest-post avatar floated left of its title/date column)
+        // flows to its right instead of painting over it.
+        let avail = self.line_right.saturating_sub(self.line_left).max(1);
         self.stack_boxes(&kids, avail, ctx);
     }
 
     /// Stack a set of child boxes vertically at `width`, each below the
-    /// last (shared by column flex and the row fallback).
+    /// last (shared by column flex and the row fallback). Blits at the band
+    /// left so the column clears an active float (`line_left == indent` when
+    /// none is active, leaving the common case unchanged).
     fn stack_boxes(&mut self, kids: &[NodeId], width: usize, ctx: &Ctx) {
         let mut row = self.rows.len();
         for &k in kids {
@@ -2115,10 +2339,10 @@ impl<'a> Layout<'a> {
             if b.height == 0 {
                 continue;
             }
-            self.blit(&b, self.indent as u16, row);
+            self.blit(&b, self.line_left as u16, row);
             row += b.height as usize;
         }
-        self.col = self.indent;
+        self.col = self.line_left;
         self.pending_space = false;
     }
 
@@ -2346,7 +2570,11 @@ impl<'a> Layout<'a> {
     /// block boundary (line empty, `col == indent`); appends finished rows
     /// directly via `blit` and leaves the cursor back at the indent.
     fn flow_flex_wrap(&mut self, id: NodeId, ctx: &Ctx) {
-        let avail = self.width.saturating_sub(self.indent).max(1);
+        // Lay within the float-narrowed band (the block boundary already ran
+        // `begin_line`), not the raw block box — so a wrapping grid beside a
+        // float clears it instead of painting over it. `line_left == indent`
+        // with no active float, so the common case is unchanged.
+        let avail = self.line_right.saturating_sub(self.line_left).max(1);
         let gap = self.flex_gap(id, avail, false);
         let row_gap = self.flex_gap(id, avail, true);
         // Lay every item to a box, keeping its packing width: an explicit
@@ -2408,13 +2636,13 @@ impl<'a> Layout<'a> {
             let mut x = lead;
             for (k, (b, w)) in boxes.iter().enumerate().take(end).skip(i) {
                 let dy = self.align_offset(id, b.height as usize, shelf_h);
-                self.blit(b, (self.indent + x) as u16, shelf_top + dy);
+                self.blit(b, (self.line_left + x) as u16, shelf_top + dy);
                 x += *w + if k + 1 < end { gap + between } else { 0 };
             }
             shelf_top += shelf_h + row_gap;
             i = end;
         }
-        self.col = self.indent;
+        self.col = self.line_left;
         self.pending_space = false;
     }
 
@@ -2776,8 +3004,35 @@ impl<'a> Layout<'a> {
     fn place_word(&mut self, word: &str, ctx: &Ctx) {
         let transformed = ctx.transform.apply(word);
         let spaced = letter_space(transformed.as_ref(), ctx.letter_spacing);
-        let word = spaced.as_ref();
-        let wlen = display_width(word);
+        let mut text: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(spaced.as_ref());
+        let mut wlen = display_width(&text);
+        // Clip inside a `nowrap`+`overflow:hidden` box: the line can't wrap, so
+        // a word reaching the box's right edge is truncated with `…` and the
+        // rest of the (unwrappable) words are dropped. Keeps a long post title
+        // from bleeding out of its card into a neighbour.
+        if let Some(right) = self.clip_right {
+            if self.clip_done {
+                self.pending_space = false;
+                return;
+            }
+            let space = self.pending_space && self.col > self.line_left;
+            let start = self.col + space as usize;
+            if start + wlen > right {
+                self.clip_done = true;
+                let room = right.saturating_sub(start);
+                if room == 0 {
+                    self.pending_space = false;
+                    return;
+                }
+                // Leave one cell for the ellipsis (drop it only if the whole
+                // box is a single cell wide).
+                let mut t = truncate_to_width(&text, room.saturating_sub(1));
+                t.push('…');
+                wlen = display_width(&t);
+                text = std::borrow::Cow::Owned(t);
+            }
+        }
+        let word = text.as_ref();
         let space = self.pending_space && self.col > self.line_left;
         if self.ws.wraps()
             && self.col + space as usize + wlen > self.line_right
@@ -2909,6 +3164,30 @@ impl<'a> Layout<'a> {
         {
             return None;
         }
+        // A disclosure trigger (`aria-haspopup`) opens a menu/panel we can't
+        // action yet (its content is AJAX-loaded on click). Its accessible name
+        // is a UI affordance, not body text — surfacing it leaks a phantom word
+        // (the search bar's settings cog reading "Search"). Drop it; when the
+        // panel does open, the content arrives as real text. (A labelled
+        // trigger has non-empty text and already returned above.)
+        if self.dom.attr(id, "aria-haspopup").is_some() {
+            return None;
+        }
+        // An icon-glyph control isn't empty ON SCREEN — a `::before`/`::after`
+        // Font-Awesome / Nerd-Font glyph (or an icon `<i>` carrying one) IS the
+        // visible affordance, so don't ALSO dump its accessible name as body
+        // text. This is the "Toggle expanded" arrow, a decorative search/close
+        // icon, etc. Only a genuinely invisible anchor (an undecoded `<svg>`
+        // with no glyph — a logo) still surfaces its label.
+        if std::iter::once(id)
+            .chain(self.dom.descendants(id))
+            .any(|d| {
+                self.pseudo_text(d, crate::dom::PseudoEl::Before).is_some()
+                    || self.pseudo_text(d, crate::dom::PseudoEl::After).is_some()
+            })
+        {
+            return None;
+        }
         ["aria-label", "title", "alt"]
             .into_iter()
             .filter_map(|a| self.dom.attr(id, a))
@@ -2944,10 +3223,14 @@ impl<'a> Layout<'a> {
     fn place_image_box(&mut self, id: NodeId, ctx: &Ctx, url: String, w: u16, h: u16) {
         let avail = self.line_right.saturating_sub(self.line_left).max(1) as u16;
         let (w, h, crop) = self.image_used_box(id, w, h, avail);
+        // A `display:block` image is block-level — UNLESS it's the content of
+        // an atomic inline box (an `inline-flex`/`inline-block` avatar/icon
+        // wrapper), in which case it rides the line like any inline image so a
+        // row of avatars flows into a grid instead of a vertical tower.
         let block = matches!(
             self.dom.computed_display(id).as_deref(),
             Some("block" | "flex" | "grid" | "table" | "list-item")
-        );
+        ) && !self.in_atomic_inline_context(id);
         if block {
             self.flush_block();
         } else {
@@ -3001,8 +3284,20 @@ impl<'a> Layout<'a> {
         let avail = avail.max(1) as usize;
         let (iw, ih) = (iw.max(1) as usize, ih.max(1) as usize);
 
-        // Used width.
-        let mut used_w = self.css_cells(id, "width").unwrap_or(iw);
+        // Used width. A percentage resolves against the CONTAINING BLOCK — the
+        // nearest ancestor with a definite (length) width — not the whole flow
+        // box. The avatar/thumbnail idiom (`<a style="width:36px"><img
+        // style="width:100%">`) depends on this: the image fills the 36px box,
+        // not the column it sits in. Falls back to the flow box (`css_cells`)
+        // when no ancestor pins a length width (a genuine full-bleed image).
+        let raw_w = self.dom.computed_style(id, "width");
+        let mut used_w = match raw_w.as_deref().and_then(parse_percent) {
+            Some(pct) => {
+                let basis = self.definite_ancestor_width(id).unwrap_or(avail);
+                (pct * basis as f32).round().max(1.0) as usize
+            }
+            None => self.css_cells(id, "width").unwrap_or(iw),
+        };
         if let Some(mn) = self.css_cells(id, "min-width") {
             used_w = used_w.max(mn);
         }
@@ -3018,8 +3313,15 @@ impl<'a> Layout<'a> {
             h
         } else if let Some(ar) = self.css_aspect_ratio(id) {
             rows_for_ratio(used_w, ar)
-        } else if raw_h.as_deref() == Some("100%") {
-            self.container_box_rows(id, used_w).unwrap_or(intrinsic_h)
+        } else if let Some(pct) = raw_h.as_deref().and_then(parse_percent) {
+            // A percentage height resolves against the containing block's
+            // definite height (the avatar wrapper's `height:24px`), else a
+            // square-tile `aspect-ratio` ancestor, else the intrinsic box.
+            if let Some(basis) = self.definite_ancestor_height(id) {
+                (pct * basis as f32).round().max(1.0) as usize
+            } else {
+                self.container_box_rows(id, used_w).unwrap_or(intrinsic_h)
+            }
         } else if let Some(ar) = self.img_attr_ratio(id) {
             rows_for_ratio(used_w, ar)
         } else {
@@ -3075,6 +3377,50 @@ impl<'a> Layout<'a> {
             let p = cur?;
             if let Some(ar) = self.css_aspect_ratio(p) {
                 return Some(rows_for_ratio(used_w, ar));
+            }
+            cur = self.dom.parent_composed(p);
+        }
+        None
+    }
+
+    /// Content width (cells) of the nearest ancestor establishing a definite
+    /// (length, non-percentage) `width` — the containing block for a
+    /// percentage width on `id`. The avatar/thumbnail idiom (`<a
+    /// style="width:36px"><img style="width:100%">`) is why this exists: the
+    /// image fills the 36px box, not the whole flow column it sits in. `None`
+    /// when no ancestor pins a length width — the caller then falls back to the
+    /// flow box (the prior behaviour, correct for a genuine full-bleed image).
+    fn definite_ancestor_width(&self, id: NodeId) -> Option<usize> {
+        let mut cur = self.dom.parent_composed(id);
+        for _ in 0..8 {
+            let p = cur?;
+            if let Some(em) = self
+                .dom
+                .computed_style(p, "width")
+                .as_deref()
+                .and_then(css_length_em)
+            {
+                return Some((em * 2.0).round().max(1.0) as usize);
+            }
+            cur = self.dom.parent_composed(p);
+        }
+        None
+    }
+
+    /// Height (rows) of the nearest ancestor establishing a definite (length,
+    /// non-percentage) `height` — the containing block for a percentage height
+    /// on `id` (the avatar wrapper's `height:24px`). `None` when none does.
+    fn definite_ancestor_height(&self, id: NodeId) -> Option<usize> {
+        let mut cur = self.dom.parent_composed(id);
+        for _ in 0..8 {
+            let p = cur?;
+            if let Some(rows) = self
+                .dom
+                .computed_style(p, "height")
+                .as_deref()
+                .and_then(css_length_rows)
+            {
+                return Some(rows);
             }
             cur = self.dom.parent_composed(p);
         }
@@ -3479,6 +3825,13 @@ const IMG_CSS_MAX_ROWS: usize = 48;
 /// return `None` (a `100%`/`%` height resolves against a container instead).
 fn css_length_rows(value: &str) -> Option<usize> {
     css_length_em(value).map(|em| em.round().max(1.0) as usize)
+}
+
+/// A CSS percentage (`"75%"`) as a fraction (`0.75`); `None` for any other
+/// value. The one place a `%` becomes a multiplier for containing-block sizing.
+fn parse_percent(value: &str) -> Option<f32> {
+    let n: f32 = value.trim().strip_suffix('%')?.trim().parse().ok()?;
+    Some(n / 100.0)
 }
 
 /// Parse a CSS `aspect-ratio` to width÷height. `R`, `W / H`, and `auto W / H`
@@ -4307,6 +4660,245 @@ mod tests {
         assert_eq!(img.width, 40, "width:100% fills the content width");
         assert_eq!(img.height, 10, "160px is 10 rows");
         assert!(img.crop, "object-fit:cover crops");
+    }
+
+    #[test]
+    fn percentage_image_resolves_against_its_definite_ancestor_not_the_flow_box() {
+        // The avatar/thumbnail idiom, universal on forums/social sites: a
+        // fixed-size wrapper (`width/height:36px`) holding `<img
+        // style="width:100%;height:100%">`. The image must fill the 36px box
+        // (≈ 5 cols, ≈ 2 rows), NOT the 80-col flow box it sits in — else a
+        // tiny avatar reserves a screen-wide, 16-row-tall block and shoves the
+        // whole page apart (the firesofheaven.org / XenForo forum-index bug).
+        let mut images = ImageSizes::new();
+        // Decoded square (the encode source); the used box ignores this scale.
+        images.insert("https://example.com/a.png".to_owned(), (6, 3));
+        let rows = lay_with_images(
+            r#"<body><a style="display:inline-flex;width:36px;height:36px"><img src="/a.png" style="width:100%;height:100%"></a></body>"#,
+            80,
+            &images,
+        );
+        let img = image_item(&rows);
+        // 36px → 2.25em → ≈5 cols / ≈2 rows; far below the 80-col flow box.
+        assert_eq!(
+            (img.width, img.height),
+            (5, 2),
+            "avatar img fills its 36px wrapper, not the flow box"
+        );
+    }
+
+    #[test]
+    fn block_images_in_inline_atomic_boxes_flow_into_a_grid() {
+        // XenForo's "most reactions" block: a <ul> of inline-block <li>s, each
+        // an inline-flex avatar wrapper around a `display:block` <img>. The
+        // block images must NOT each break the line into a vertical tower —
+        // they ride the line and wrap into a grid, like any inline image.
+        let mut images = ImageSizes::new();
+        for n in 0..6 {
+            images.insert(format!("https://example.com/a{n}.png"), (4, 2));
+        }
+        let lis: String = (0..6)
+            .map(|n| {
+                format!(
+                    r#"<li style="display:inline-block"><a style="display:inline-flex;width:32px;height:32px"><img src="/a{n}.png" style="display:block;width:100%;height:100%"></a></li>"#
+                )
+            })
+            .collect();
+        let html = format!("<body><ul style=\"list-style-type:none\">{lis}</ul></body>");
+        let rows = lay_with_images(&html, 24, &images);
+        let img_rows = rows
+            .iter()
+            .filter(|r| r.items.iter().any(|i| i.image.is_some()))
+            .count();
+        let total: usize = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.is_some())
+            .count();
+        assert_eq!(total, 6, "all six avatars present");
+        // 6 avatars at ~4 cells wrap into a couple of shelves — a grid, NOT
+        // one image per row (which was the bug: 6 separate rows).
+        assert!(
+            (2..=3).contains(&img_rows),
+            "block avatars wrap into a grid, got {img_rows} image rows"
+        );
+    }
+
+    #[test]
+    fn a_stacked_column_beside_a_left_float_clears_it() {
+        // XenForo's latest-post block: a left-floated avatar, then a column of
+        // title/date. The column must lay to the float's RIGHT, not paint over
+        // it at column 0 (flex/stack layout used the block box, ignoring the
+        // float-narrowed band).
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/av.png".to_owned(), (5, 2));
+        let rows = lay_with_images(
+            r#"<body><div style="display:inline-flex"><div style="float:left"><img src="/av.png" style="display:block"></div><div style="display:flex;flex-direction:column"><div>Title</div><div>Date</div></div></div></body>"#,
+            40,
+            &images,
+        );
+        let img = image_item(&rows);
+        let title = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("Title"))
+            .expect("title");
+        assert!(
+            title.col >= img.col + img.width,
+            "title clears the floated avatar (title col {}, avatar ends {})",
+            title.col,
+            img.col + img.width
+        );
+    }
+
+    #[test]
+    fn nowrap_overflow_hidden_truncates_with_an_ellipsis() {
+        // The single-line-ellipsis card idiom (`white-space:nowrap;
+        // overflow:hidden`): a too-long line is clipped at the box edge with an
+        // ellipsis instead of overflowing it (a forum post title bleeding into
+        // the sidebar). Laid in a 10-cell box.
+        let rows = lay(
+            r#"<body><div style="white-space:nowrap;overflow:hidden">Permanently banned forever</div></body>"#,
+            10,
+        );
+        let line = texts(&rows)[0].clone();
+        assert!(
+            display_width(&line) <= 10,
+            "clipped to the box width: {line:?}"
+        );
+        assert!(
+            line.ends_with('…'),
+            "truncation marked with an ellipsis: {line:?}"
+        );
+        assert!(
+            line.starts_with("Perman"),
+            "keeps the leading text: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_nowrap_box_without_overflow_clip_is_not_truncated() {
+        // `nowrap` alone (no overflow clip) still overflows, as before — only
+        // the clip context truncates.
+        let rows = lay(
+            r#"<body><div style="white-space:nowrap">Permanently banned forever</div></body>"#,
+            10,
+        );
+        let line = texts(&rows)[0].clone();
+        assert!(
+            line.contains("forever"),
+            "uncut without overflow clip: {line:?}"
+        );
+        assert!(!line.contains('…'), "no ellipsis without a clip: {line:?}");
+    }
+
+    #[test]
+    fn an_inline_horizontal_margin_separates_an_icon_from_its_label() {
+        // An icon `<i style="margin-right:…">` abutting its label: the margin is
+        // the only separator, dropped before — a terminal renders it as one
+        // cell of gap. (Subforum icons crammed against their text.)
+        let rows = lay(
+            r#"<body><span><i style="margin-right:1em">X</i>Label</span></body>"#,
+            40,
+        );
+        let line = texts(&rows)[0].clone();
+        assert!(
+            line.contains("X Label"),
+            "the icon's right margin separates it from the label: {line:?}"
+        );
+    }
+
+    #[test]
+    fn an_icon_glyph_control_does_not_leak_its_aria_label() {
+        // A disclosure trigger whose visible content is a `::before` glyph (the
+        // "Toggle expanded" arrow) must NOT also dump its aria-label as body
+        // text — the glyph IS the affordance.
+        let rows = lay(
+            r#"<body><a href="/x" aria-label="Toggle expanded"><i data-trust-before="▾"></i></a></body>"#,
+            40,
+        );
+        let line = texts(&rows).join(" ");
+        assert!(
+            !line.contains("Toggle expanded"),
+            "aria-label suppressed when a glyph shows: {line:?}"
+        );
+        assert!(line.contains('▾'), "the glyph still renders: {line:?}");
+    }
+
+    #[test]
+    fn an_aria_haspopup_trigger_does_not_leak_its_label() {
+        // An empty disclosure trigger (`aria-haspopup`) opens an AJAX panel we
+        // can't action yet; its accessible name is a UI affordance, not body
+        // text. The search bar's settings cog (`aria-label="Search"`) must not
+        // render a phantom "Search".
+        let rows = lay(
+            r#"<body><a href="/x" aria-haspopup="true" aria-label="Search"></a></body>"#,
+            40,
+        );
+        let line = texts(&rows).join(" ");
+        assert!(
+            !line.contains("Search"),
+            "an empty haspopup trigger's label is suppressed: {line:?}"
+        );
+    }
+
+    #[test]
+    fn float_on_an_inline_flex_item_flows_inline_not_its_own_row() {
+        // CSS ignores `float` on a flex item. An inline-flex split-trigger
+        // (`float:left`) inside an inline-flex nav group must flow inline with
+        // the label, not drop to its own row (the "Members ▾" toggle).
+        let rows = lay(
+            r#"<body><div style="display:inline-flex"><span>Members</span><a href="/x" style="display:inline-flex;float:left" data-trust-after="▾"></a></div></body>"#,
+            40,
+        );
+        let members_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.text.contains("Members")))
+            .expect("Members laid out");
+        let arrow_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.text.contains('▾')))
+            .expect("arrow laid out");
+        assert_eq!(
+            arrow_row, members_row,
+            "the floated trigger shares the label's row, not its own"
+        );
+    }
+
+    #[test]
+    fn float_inside_an_absolute_overlay_flows_inline() {
+        // A float inside an absolutely-positioned overlay (which we render as a
+        // compact inline run) must not break the line — a search bar's
+        // magnifier `<i float:left>` in an `position:absolute` icon span.
+        let rows = lay(
+            r#"<body><span>text</span><span style="position:absolute"><i style="float:left" data-trust-before="🔍"></i></span><span>after</span></body>"#,
+            40,
+        );
+        // Everything stays on one row (the float doesn't flush).
+        let real_rows = rows
+            .iter()
+            .filter(|r| r.items.iter().any(|i| !i.text.is_empty()))
+            .count();
+        assert_eq!(
+            real_rows, 1,
+            "the absolute overlay's float doesn't break the line"
+        );
+    }
+
+    #[test]
+    fn percentage_image_without_a_definite_ancestor_still_fills_the_flow_box() {
+        // A genuine full-bleed image (`width:100%` with no sized ancestor)
+        // must keep filling the content width — the fallback when no ancestor
+        // pins a length width, preserving the prior behaviour.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/hero.png".to_owned(), (8, 4));
+        let rows = lay_with_images(
+            r#"<body><div><img src="/hero.png" style="width:100%"></div></body>"#,
+            40,
+            &images,
+        );
+        let img = image_item(&rows);
+        assert_eq!(img.width, 40, "width:100% still fills the flow box");
     }
 
     #[test]
