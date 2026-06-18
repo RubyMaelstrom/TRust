@@ -434,27 +434,53 @@ impl Dom {
         false
     }
 
-    /// Whether an element holds a slide deck: ≥2 element children, ALL of them
-    /// absolutely positioned (so they stack/overlap rather than sit in flow) —
-    /// the structural signature of a JS slideshow's slides. A box with one
-    /// absolute overlay among normal children (a badge on a card) is excluded
-    /// because not every child is positioned. The layout shows one slide and
-    /// generates controls to page between them, like the carousel.
+    /// Whether an element holds a slide deck: ≥2 SLIDE-MATERIAL children, all of
+    /// them absolutely positioned (so they stack/overlap rather than sit in
+    /// flow) — the structural signature of a JS slideshow's slides. The layout
+    /// shows one slide and generates controls to page between them.
+    ///
+    /// "Slide material" excludes inline overlay CHROME — a `position:absolute`
+    /// `<span>` badge/caption/ribbon anchored to a corner (a thumbnail's view
+    /// count, a "NEW" tag, a price). Those sit in a corner ALONGSIDE the
+    /// content, they don't stack over it, so they aren't slides. Without this a
+    /// single image plus two corner badges (the erome.com album card: an `<a>`
+    /// wrapping an `<img>` and two count `<span>`s, all three absolute) was
+    /// misread as a 3-slide carousel, painting spurious dead prev/next arrows
+    /// over every thumbnail. A `<span>`/`<a>` that WRAPS replaced media is still
+    /// a slide (an anchor-wrapped image carousel), and a static slide-material
+    /// child still disqualifies the deck (an ordinary card with one overlay).
     pub fn is_slideshow_container(&self, id: NodeId) -> bool {
         let mut count = 0usize;
         for c in self.children(id) {
-            if self.tag_name(c).is_none() {
+            let Some(tag) = self.tag_name(c) else {
                 continue; // text/comment node — only element children count
+            };
+            if is_inline_overlay_chrome(tag) && !self.contains_replaced_media(c) {
+                continue; // a corner badge/caption, not a slide
             }
             if !matches!(
                 self.computed_style(c, "position").as_deref(),
                 Some("absolute" | "fixed")
             ) {
-                return false; // a static child → not an all-absolute deck
+                return false; // a static slide → an ordinary card, not a deck
             }
             count += 1;
         }
         count >= 2
+    }
+
+    /// Whether `id` is, or contains, a replaced media element (`<img>`,
+    /// `<picture>`, `<video>`, `<canvas>`, `<iframe>`, `<object>`, `<embed>`) —
+    /// so an inline wrapper carrying one (an `<a>`/`<span>` slide around an
+    /// image) counts as slide material. `<svg>` is deliberately NOT counted: a
+    /// tiny inline icon glyph inside a badge is chrome, not media.
+    fn contains_replaced_media(&self, id: NodeId) -> bool {
+        std::iter::once(id).chain(self.descendants(id)).any(|n| {
+            matches!(
+                self.tag_name(n),
+                Some("img" | "picture" | "video" | "canvas" | "iframe" | "object" | "embed")
+            )
+        })
     }
 
     /// The element's effective opacity for visibility: its cascaded `opacity`
@@ -795,6 +821,43 @@ impl Dom {
         }
         let raw = winner.map(|(_, v)| v)?;
         self.parse_content_value(id, &raw)
+    }
+
+    /// The cascade-winning value of `prop` on `id`'s `::before`/`::after`
+    /// pseudo-element, or `None` if no matching rule sets it.
+    pub fn pseudo_style(&self, id: NodeId, which: PseudoEl, prop: &str) -> Option<String> {
+        let index = self.style_index();
+        let rules = index.scopes.get(&self.tree_scope(id))?;
+        let mut winner: Option<(CascadeKey, String)> = None;
+        for r in rules {
+            if rule_pseudo(r) != Some(which) || !self.matches_complex(id, &r.selector.0, None) {
+                continue;
+            }
+            for (pk, (imp, v)) in &r.decls {
+                if pk == prop {
+                    consider(&mut winner, (*imp, false, r.specificity, r.order), v);
+                }
+            }
+        }
+        winner.map(|(_, v)| v)
+    }
+
+    /// Whether `id` carries the clearfix idiom — a `::before`/`::after`
+    /// pseudo-element that `clear`s floats (`.clearfix`, Bootstrap's `.row`,
+    /// `.group`, …). Such a block CONTAINS its descendant floats (the universal
+    /// pre-flexbox containment pattern: `::after{content:"";clear:both}`), so
+    /// the layout treats it as a block formatting context. Without it a float
+    /// grid leaks past its row and the next section paints on top of it.
+    pub fn has_clearing_pseudo(&self, id: NodeId) -> bool {
+        // The baked marker (set by the serializer when the real CSS was still
+        // in scope) — the layout re-parses without the `::after{clear}` rule.
+        if self.attr(id, "data-trust-clearfix").is_some() {
+            return true;
+        }
+        [PseudoEl::Before, PseudoEl::After].into_iter().any(|p| {
+            self.pseudo_style(id, p, "clear")
+                .is_some_and(|v| matches!(v.trim(), "both" | "left" | "right"))
+        })
     }
 
     /// Resolve a `content` value to display text: a quoted string (with CSS
@@ -1466,6 +1529,14 @@ impl Dom {
                 out.push_str(&escape_attr(&t));
                 out.push('"');
             }
+        }
+        // Bake the clearfix signal for the same reason: the layout re-parses
+        // this HTML with no `<style>`, so a `::after{clear:both}` rule (which
+        // can't live in an inline `style`) would otherwise be lost and a float
+        // grid would leak past its row. (`has_clearing_pseudo` reads the rule
+        // here, the attribute at layout time.)
+        if self.has_clearing_pseudo(id) {
+            out.push_str(" data-trust-clearfix=\"\"");
         }
     }
 
@@ -2310,6 +2381,46 @@ fn css_len_at_most_1px(v: &str) -> bool {
     let v = v.trim();
     let n = v.strip_suffix("px").unwrap_or(v).trim();
     n.parse::<f32>().is_ok_and(|x| x <= 1.0)
+}
+
+/// Inline-by-default phrasing elements that, used as a `position:absolute`
+/// overlay, are CHROME on a card — a corner badge (a view/photo count), a
+/// caption, a price tag, a "NEW" ribbon — not a slide of a deck. They sit in a
+/// corner alongside the content rather than stacking over it, so they must not
+/// count toward a slideshow's slides (see `is_slideshow_container`). A real
+/// deck's slides are block containers (`<div>`/`<li>`/`<figure>`) or media.
+fn is_inline_overlay_chrome(tag: &str) -> bool {
+    matches!(
+        tag,
+        "span"
+            | "i"
+            | "b"
+            | "em"
+            | "strong"
+            | "small"
+            | "label"
+            | "sub"
+            | "sup"
+            | "abbr"
+            | "cite"
+            | "code"
+            | "mark"
+            | "s"
+            | "u"
+            | "q"
+            | "samp"
+            | "kbd"
+            | "var"
+            | "time"
+            | "big"
+            | "tt"
+            | "ins"
+            | "del"
+            | "data"
+            | "output"
+            | "bdi"
+            | "bdo"
+    )
 }
 
 /// Below this effective opacity an element is treated as invisible (hidden).
