@@ -5345,7 +5345,8 @@ mod tests {
     ///   - LARGE live set (live > GC_BIG_LIVE): the heavy-page case (full
     ///     YouTube keeps a big live set across a long execute). This is where
     ///     stock thrashes full marks and the TRust policy wins.
-    ///   cargo test --release gc_floor_win -- --ignored --nocapture
+    ///
+    /// `cargo test --release gc_floor_win -- --ignored --nocapture`
     #[test]
     #[ignore = "manual measurement"]
     fn gc_floor_win() {

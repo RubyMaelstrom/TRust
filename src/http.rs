@@ -207,6 +207,28 @@ pub fn parse_url(s: &str) -> Option<Url> {
     Url::parse(s).ok()
 }
 
+/// Fetch a web URL, https-first with an http fallback. If the target is
+/// https and the attempt fails at the connection level (DNS/TCP/TLS), the
+/// SAME host+path is retried over plain http. Used for a bare hostname
+/// typed without a scheme — explicit-scheme URLs never set this fallback.
+/// An http *status* error is returned as-is (4xx/5xx is `Ok` here); only a
+/// connection-level `Err` triggers the retry, and if the retry also fails
+/// the ORIGINAL https error is reported.
+pub async fn fetch_web_default(url: &Url) -> Result<Response, String> {
+    let first = fetch(&Request::get(url.clone())).await;
+    if first.is_ok() || url.scheme() != "https" {
+        return first;
+    }
+    let http_str = format!("http://{}", &url.as_str()["https://".len()..]);
+    let Some(http_url) = parse_url(&http_str) else {
+        return first;
+    };
+    match fetch(&Request::get(http_url)).await {
+        Ok(response) => Ok(response),
+        Err(_) => first,
+    }
+}
+
 /// A process-global monotonic origin shared by every trace line (net
 /// requests in http.rs, JS phase markers in js.rs) so a single load's
 /// timeline reads against one clock. Only consulted when tracing is on.
@@ -1503,6 +1525,53 @@ mod tests {
         assert_eq!(response.content_type, "text/html; charset=utf-8");
         let outcome = response.js.expect("outcome recorded");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        server.abort();
+    }
+
+    // A bare hostname opened without a scheme tries https first and falls
+    // back to plain http when the TLS connection fails. The server peeks the
+    // first byte: 0x16 = a TLS ClientHello (the https attempt) — drop it so
+    // the handshake fails fast; 'G' = the http GET retry — serve it.
+    #[tokio::test]
+    async fn fetch_web_default_falls_back_to_http() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut first = [0u8; 1];
+                match sock.read(&mut first).await {
+                    Ok(1) if first[0] == b'G' => {
+                        let mut buf = [0u8; 1024];
+                        let _ = sock.read(&mut buf).await; // drain the headers
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                                  <body>plain http served</body>",
+                            )
+                            .await;
+                    }
+                    // A TLS ClientHello (or empty read): drop the socket so the
+                    // https handshake fails and the caller retries over http.
+                    _ => {}
+                }
+            }
+        });
+
+        let https = parse_url(&format!("https://127.0.0.1:{port}/")).unwrap();
+        let response = fetch_web_default(&https)
+            .await
+            .expect("the http fallback served the page");
+        assert_eq!(response.url.scheme(), "http", "fell back to http");
+        assert!(
+            String::from_utf8_lossy(&response.body).contains("plain http served"),
+            "got: {}",
+            String::from_utf8_lossy(&response.body)
+        );
         server.abort();
     }
 

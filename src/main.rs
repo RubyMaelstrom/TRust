@@ -27,17 +27,20 @@ use std::process::ExitCode;
 async fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let host = args.next();
-    let port = match args.next() {
+    // The port is OPTIONAL: with no port a bare host opens as the web (https,
+    // falling back to http) — HTTP is the default now. A given port keeps its
+    // protocol (23→telnet, 70→gopher, 1965→gemini, ...; see `dispatch_open`).
+    let start_port = match args.next() {
         // Numeric, or a well-known service name ("telnet", "smtp", ...)
         // like GNU telnet's getservbyname.
         Some(p) => match app::parse_port(&p) {
-            Some(p) => p,
+            Some(p) => Some(p),
             None => {
                 eprintln!("trust: bad port or service name: {p}");
                 return ExitCode::FAILURE;
             }
         },
-        None => 23,
+        None => None,
     };
 
     let terminal = ratatui::init();
@@ -99,7 +102,8 @@ async fn main() -> ExitCode {
     // Capture the mouse so wheel events scroll our scrollback instead of
     // being translated into arrow keys by the terminal emulator.
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-    let mut app = app::App::new(host, port);
+    let mut app = app::App::new(host, start_port.unwrap_or(23));
+    app.start_port = start_port;
     app.set_picker(picker);
     let result = app.run(terminal).await;
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
