@@ -75,7 +75,8 @@
       "Bash(curl -sLO https://unpkg.com/react@18/umd/react.production.min.js)",
       "Bash(curl -sLO https://unpkg.com/react-dom@18/umd/react-dom.production.min.js)",
       "Bash(curl -sLO https://unpkg.com/react@18/umd/react.development.js)",
-      "Bash(curl -sLO https://unpkg.com/react-dom@18/umd/react-dom.development.js)"
+      "Bash(curl -sLO https://unpkg.com/react-dom@18/umd/react-dom.development.js)",
+      "Bash(ldd --version)"
     ]
   }
 }

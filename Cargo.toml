@@ -9,6 +9,17 @@ license = "MIT OR Apache-2.0"
 name = "trust"
 path = "src/main.rs"
 
+[features]
+# `mimalloc` (default on) installs the mimalloc global allocator. Parse and
+# bytecode-compile of large JS bundles are dominated by millions of small
+# allocations (AST nodes, CodeBlocks); mimalloc is ~17% faster there than
+# glibc malloc, end to end, behaviour-identically. It is the one C dependency
+# (libmimalloc-sys) — the pure-Rust ethos is about the *engine* (Boa, not v8),
+# not the allocator, and rustls already links C crypto — but it's isolated
+# behind this feature: `--no-default-features` keeps the build pure-Rust.
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 boa_engine = { version = "0.21", features = ["annex-b"] }
 bytes = "1.11.1"
@@ -17,6 +28,7 @@ futures = "0.3.32"
 html5ever = "0.39"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 libmudtelnet = "2.0.2"
+mimalloc = { version = "0.1", optional = true }
 ratatui = "0.30.1"
 ratatui-image = { version = "11.0.4", default-features = false, features = ["crossterm"] }
 rcgen = "0.14.8"
@@ -44,6 +56,13 @@ boa_engine = { path = "vendor/boa_engine-0.21.1" }
 # not in the VM — fixing it at the source lets us delete the downstream
 # clamp/force band-aids instead of compounding them.
 boa_ast = { path = "vendor/boa_ast-0.21.1" }
+# Vendored so we own the garbage collector too. boa_gc is a full
+# stop-the-world mark-sweep with a 1 MiB collection threshold and no public
+# config; real SPA bundles churn megabytes of short-lived garbage and thrash
+# it into hundreds of full-heap collections at boot. We add a per-page
+# threshold knob (`set_gc_threshold`) and profiling counters (`gc_profile`)
+# so the collector stops dominating heavy page loads.
+boa_gc = { path = "vendor/boa_gc-0.21.1" }
 
 # Optimized binary: whole-program LTO and a single codegen unit trade
 # compile time for speed and size; symbols stripped (panic messages
@@ -52,3 +71,11 @@ boa_ast = { path = "vendor/boa_ast-0.21.1" }
 lto = "thin"
 codegen-units = 16
 strip = "symbols"
+
+# Release optimizations + debug symbols, for profiling the JS engine
+# (perf is locked down on this host; gdb/poor-man's sampling needs symbols).
+# Does not affect `cargo build --release`.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

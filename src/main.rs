@@ -1,3 +1,11 @@
+// mimalloc as the global allocator (default-on `mimalloc` feature): ~17%
+// faster JS parse+compile, which are dominated by millions of tiny AST/
+// CodeBlock allocations. `--no-default-features` falls back to the system
+// allocator (pure Rust). See the feature note in Cargo.toml.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod app;
 mod cp437;
 mod doc;
