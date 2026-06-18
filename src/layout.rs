@@ -385,8 +385,18 @@ pub fn lay_out_with_carousels(
     let mut layout = Layout::new(dom, base, width.max(10), forms, controls, images, borders);
     let root = body_or_document(dom);
     let ctx = Ctx::root();
-    for child in dom.children(root) {
-        layout.flow_node(child, &ctx);
+    // A page-covering modal overlay (age gate, consent wall, login dialog,
+    // lightbox) is painted ON TOP of the page in a real browser — the page
+    // behind it is inert. We can't composite layers in a cell grid, so we
+    // surface only that overlay's subtree and defer the page; the live-page JS
+    // that dismisses the overlay reveals the page on the next render.
+    layout.modal_root = layout.find_modal_overlay();
+    if let Some(modal) = layout.modal_root {
+        layout.flow_node(modal, &ctx);
+    } else {
+        for child in dom.children(root) {
+            layout.flow_node(child, &ctx);
+        }
     }
     layout.flush_block();
     layout.finish_floats();
@@ -399,6 +409,17 @@ fn body_or_document(dom: &Dom) -> NodeId {
         .into_iter()
         .find(|&id| dom.tag_name(id) == Some("body"))
         .unwrap_or(DOCUMENT)
+}
+
+/// Whether a CSS length is zero (`0`, `0px`, `0%`, `0em`, …) — its leading
+/// numeric part parses to 0. `auto`/empty/non-numeric → false.
+fn is_zero_length(value: &str) -> bool {
+    let num: String = value
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'))
+        .collect();
+    num.parse::<f32>().map(|n| n == 0.0).unwrap_or(false)
 }
 
 /// The narrowest a flexible flex-row column may be before the row stacks
@@ -920,6 +941,15 @@ struct Layout<'a> {
     /// Set once the active clip box has been truncated, so the rest of its
     /// (unwrappable) words are dropped instead of laid past the cut.
     clip_done: bool,
+    /// The topmost page-covering modal overlay, if any — an out-of-flow
+    /// element that covers the viewport (or is a semantic dialog) AND holds
+    /// real content (an age gate, consent wall, login modal, lightbox). A
+    /// cell grid can't composite transparent layers, so instead of stacking
+    /// the overlay below the page in document order we surface ONLY this
+    /// subtree (the page behind it is deferred — the live-page JS that
+    /// dismisses the overlay reveals it). `is_out_of_flow` exempts this node
+    /// so its content flows as a normal block, not the compact inline overlay.
+    modal_root: Option<NodeId>,
 }
 
 impl<'a> Layout<'a> {
@@ -960,6 +990,7 @@ impl<'a> Layout<'a> {
             borders,
             clip_right: None,
             clip_done: false,
+            modal_root: None,
         }
     }
 
@@ -1693,10 +1724,135 @@ impl<'a> Layout<'a> {
     /// or `fixed` (an overlay we render compactly inline, since we can't
     /// position it).
     fn is_out_of_flow(&self, id: NodeId) -> bool {
+        // The surfaced modal flows as a normal block (its content IS the page
+        // now), not the compact inline overlay we give other out-of-flow boxes.
+        if Some(id) == self.modal_root {
+            return false;
+        }
         matches!(
             self.dom.computed_style(id, "position").as_deref(),
             Some("absolute" | "fixed")
         )
+    }
+
+    /// The topmost page-covering modal overlay in the document, if any. A cell
+    /// grid can't composite transparent layers; instead of stacking such an
+    /// overlay below the page in document order (where it reads as duplicate
+    /// content — an age gate UNDER the login it should cover), we surface only
+    /// this subtree and defer the page behind it. Topmost = the largest
+    /// `(z-index, document order)`, matching CSS paint order (equal z-index
+    /// paints later-in-tree on top). See `is_modal_overlay` for what qualifies.
+    fn find_modal_overlay(&self) -> Option<NodeId> {
+        let root = body_or_document(self.dom);
+        self.dom
+            .descendants(root)
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, id)| self.is_modal_overlay(id))
+            .max_by_key(|&(order, id)| (self.z_order(id), order))
+            .map(|(_, id)| id)
+    }
+
+    /// Whether `id` is a page-covering modal overlay: out of flow
+    /// (`absolute`/`fixed`), not hidden, holding real content (so a bare
+    /// decorative backdrop doesn't qualify), AND either covering the viewport
+    /// geometrically or carrying dialog semantics (`role=dialog`/`aria-modal`/
+    /// `<dialog open>`). The agreed detection — geometry OR semantics — for
+    /// age gates, consent walls, login modals, and lightboxes.
+    fn is_modal_overlay(&self, id: NodeId) -> bool {
+        self.is_out_of_flow(id)
+            && !self.dom.is_hidden(id)
+            && (self.covers_viewport(id) || self.is_semantic_dialog(id))
+            && self.overlay_has_content(id)
+    }
+
+    /// Whether `id`'s used box covers the whole viewport — width and height
+    /// each either fill it (`100%`/`100vw`/`100vh`) or pin both opposite
+    /// offsets to zero (`inset:0`). A `%`/inset fill is viewport-sized only
+    /// when the containing block IS the viewport: always for `position:fixed`,
+    /// for `absolute` only with no positioned ancestor. Viewport units
+    /// (`vw`/`vh`) are viewport-sized regardless of containing block.
+    fn covers_viewport(&self, id: NodeId) -> bool {
+        let val = |p: &str| {
+            self.dom
+                .computed_style(id, p)
+                .map(|v| v.trim().to_ascii_lowercase())
+        };
+        let is_zero = |v: Option<String>| v.is_some_and(|v| is_zero_length(&v));
+        let w = val("width");
+        let h = val("height");
+        let w_vw = w.as_deref() == Some("100vw");
+        let h_vh = h.as_deref() == Some("100vh");
+        let w_pct = w.as_deref() == Some("100%") || (is_zero(val("left")) && is_zero(val("right")));
+        let h_pct = h.as_deref() == Some("100%") || (is_zero(val("top")) && is_zero(val("bottom")));
+        if !((w_vw || w_pct) && (h_vh || h_pct)) {
+            return false;
+        }
+        if w_vw && h_vh {
+            return true;
+        }
+        match self.dom.computed_style(id, "position").as_deref() {
+            Some("fixed") => true,
+            Some("absolute") => !self.has_positioned_ancestor(id),
+            _ => false,
+        }
+    }
+
+    /// Whether any ancestor (up to the body) is positioned — so a `%`/inset
+    /// fill on `id` is relative to that ancestor, not the viewport.
+    fn has_positioned_ancestor(&self, id: NodeId) -> bool {
+        let mut cur = self.dom.parent_composed(id);
+        while let Some(p) = cur {
+            if matches!(self.dom.tag_name(p), Some("body" | "html")) {
+                break;
+            }
+            if matches!(
+                self.dom.computed_style(p, "position").as_deref(),
+                Some("relative" | "absolute" | "fixed" | "sticky")
+            ) {
+                return true;
+            }
+            cur = self.dom.parent_composed(p);
+        }
+        false
+    }
+
+    /// Whether `id` carries dialog semantics — `role=dialog`/`alertdialog`,
+    /// `aria-modal=true`, or an open `<dialog>`.
+    fn is_semantic_dialog(&self, id: NodeId) -> bool {
+        matches!(self.dom.attr(id, "role"), Some("dialog" | "alertdialog"))
+            || self.dom.attr(id, "aria-modal") == Some("true")
+            || (self.dom.tag_name(id) == Some("dialog") && self.dom.attr(id, "open").is_some())
+    }
+
+    /// Whether an overlay holds real content (visible text or a clickable/form
+    /// control) rather than being a bare backdrop (a full-bleed `<img>` layer).
+    /// The guard that keeps decorative `position:fixed` backdrops from being
+    /// mistaken for the modal they sit behind.
+    fn overlay_has_content(&self, id: NodeId) -> bool {
+        self.dom
+            .descendants(id)
+            .into_iter()
+            .any(|d| match &self.dom.node(d).data {
+                NodeData::Text(s) => !s.trim().is_empty(),
+                NodeData::Element { .. } => {
+                    let tag = self.dom.tag_name(d).unwrap_or("");
+                    matches!(tag, "button" | "input" | "select" | "textarea" | "summary")
+                        || (tag == "a" && self.dom.attr(d, "href").is_some())
+                        || self.dom.attr(d, "role") == Some("button")
+                        || self.dom.attr(d, "onclick").is_some()
+                }
+                _ => false,
+            })
+    }
+
+    /// The `z-index` of `id` as an integer (`auto`/unset/unparseable → 0), for
+    /// ordering overlapping overlays.
+    fn z_order(&self, id: NodeId) -> i32 {
+        self.dom
+            .computed_style(id, "z-index")
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(0)
     }
 
     /// Whether a node's nearest preceding element sibling is out of flow — so
@@ -4743,6 +4899,126 @@ mod tests {
             .iter()
             .all(|r| r.items.iter().all(|i| i.image.is_none() && i.width == 0));
         assert!(spacers, "3 reserved spacer rows follow the image");
+    }
+
+    /// Whether any laid item's text contains `needle`.
+    fn shows(rows: &[Row], needle: &str) -> bool {
+        rows.iter()
+            .flat_map(|r| &r.items)
+            .any(|i| i.text.contains(needle))
+    }
+
+    #[test]
+    fn a_fullviewport_modal_surfaces_and_defers_the_page() {
+        // erome's pattern: a full-viewport position:fixed age gate sits in the
+        // DOM beside the page. A browser paints it ON TOP (the page is hidden
+        // behind it). We can't composite, so we surface only the overlay and
+        // defer the page — not stack the gate below the login it should cover.
+        let rows = lay(
+            r#"<body>
+                 <div id="page"><a href="/in">LoginLink</a></div>
+                 <div style="position:fixed;width:100%;height:100%">
+                   <p>AgeGate</p><a href="/enter">EnterButton</a>
+                 </div>
+               </body>"#,
+            80,
+        );
+        assert!(shows(&rows, "AgeGate"), "the overlay content renders");
+        assert!(shows(&rows, "EnterButton"), "the overlay control renders");
+        assert!(
+            !shows(&rows, "LoginLink"),
+            "the page behind the overlay is deferred"
+        );
+    }
+
+    #[test]
+    fn a_bare_backdrop_overlay_does_not_surface() {
+        // A full-viewport position:fixed layer holding only a decorative
+        // backdrop image is NOT a modal — it has no content. The page must
+        // still render (the `.bg` divs erome stacks behind its gate).
+        let rows = lay(
+            r#"<body>
+                 <div id="page"><a href="/in">LoginLink</a></div>
+                 <div style="position:fixed;width:100%;height:100%">
+                   <img src="/bg.jpg" style="position:absolute;width:auto;min-width:100%;height:auto">
+                 </div>
+               </body>"#,
+            80,
+        );
+        assert!(
+            shows(&rows, "LoginLink"),
+            "a bare backdrop doesn't defer the page"
+        );
+    }
+
+    #[test]
+    fn a_small_absolute_overlay_does_not_defer_the_page() {
+        // Regression: a small absolutely-positioned badge/control is chrome,
+        // not a page-covering modal — it stays inline and never hides content.
+        let rows = lay(
+            r#"<body>
+                 <div id="page"><a href="/in">LoginLink</a></div>
+                 <span style="position:absolute"><a href="/x">Badge</a></span>
+               </body>"#,
+            80,
+        );
+        assert!(shows(&rows, "LoginLink"), "the page still renders");
+    }
+
+    #[test]
+    fn a_semantic_dialog_overlay_surfaces_without_full_geometry() {
+        // A role=dialog overlay surfaces on semantics alone (need not cover the
+        // viewport geometrically), and defers the page behind it.
+        let rows = lay(
+            r#"<body>
+                 <div id="page"><a href="/in">LoginLink</a></div>
+                 <div role="dialog" style="position:fixed">
+                   <p>DialogBody</p><button>Okay</button>
+                 </div>
+               </body>"#,
+            80,
+        );
+        assert!(shows(&rows, "DialogBody"), "the dialog renders");
+        assert!(!shows(&rows, "LoginLink"), "the page is deferred");
+    }
+
+    #[test]
+    fn an_absolute_full_percent_box_in_a_positioned_ancestor_is_not_a_modal() {
+        // `width:100%;height:100%` on an absolute element resolves against its
+        // positioned ancestor, NOT the viewport — a cover image inside a sized
+        // relative box must not be mistaken for a page-covering modal.
+        let rows = lay(
+            r#"<body>
+                 <div id="page"><a href="/in">LoginLink</a></div>
+                 <div style="position:relative;width:80px;height:48px">
+                   <div style="position:absolute;width:100%;height:100%"><a href="/x">Cover</a></div>
+                 </div>
+               </body>"#,
+            80,
+        );
+        assert!(
+            shows(&rows, "LoginLink"),
+            "an ancestor-relative full box isn't a modal"
+        );
+    }
+
+    #[test]
+    fn the_topmost_overlay_wins_by_z_index() {
+        // Two full-viewport modals: the higher z-index is painted on top, so
+        // it's the one we surface (despite coming first in document order).
+        let rows = lay(
+            r#"<body>
+                 <div style="position:fixed;width:100%;height:100%;z-index:50">
+                   <a href="/a">TopModal</a>
+                 </div>
+                 <div style="position:fixed;width:100%;height:100%;z-index:10">
+                   <a href="/b">LowModal</a>
+                 </div>
+               </body>"#,
+            80,
+        );
+        assert!(shows(&rows, "TopModal"), "the higher-z overlay surfaces");
+        assert!(!shows(&rows, "LowModal"), "the lower-z overlay is deferred");
     }
 
     fn image_item(rows: &[Row]) -> &Item {
