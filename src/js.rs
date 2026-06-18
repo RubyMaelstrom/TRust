@@ -4236,6 +4236,79 @@ const PRELUDE: &str = r##"
     g.File = class File extends g.Blob {
         constructor(parts, name, opts) { super(parts, opts); this.name = String(name); this.lastModified = (opts && opts.lastModified) || Date.now(); }
     };
+    // The text behind a Blob/File: its string parts joined (the bytes our
+    // Blob keeps; non-string parts have no captured data here, so "").
+    const blobText = (b) => {
+        if (b === null || b === undefined) return "";
+        if (typeof b === "string") return b;
+        if (Array.isArray(b.__parts)) return b.__parts.map((p) => (typeof p === "string" ? p : "")).join("");
+        return "";
+    };
+    // Text -> its UTF-8 bytes as a binary (latin1) string, so btoa() and
+    // ArrayBuffer views see real bytes (not surrogate-pair chars).
+    const utf8Binary = (s) => {
+        const bytes = new g.TextEncoder().encode(s);
+        let out = "";
+        for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+        return out;
+    };
+    // FileReader: async reads off a Blob/File. We already hold the blob's
+    // bytes in JS, so the read is local; we still settle on a macrotask
+    // (setTimeout 0) like the platform, firing loadstart -> load -> loadend
+    // (or error) and the matching on* handlers.
+    g.FileReader = class FileReader extends EventTarget {
+        constructor() {
+            super();
+            this.readyState = 0; // EMPTY
+            this.result = null;
+            this.error = null;
+            this.onloadstart = null; this.onprogress = null; this.onload = null;
+            this.onabort = null; this.onerror = null; this.onloadend = null;
+        }
+        get EMPTY() { return 0; }
+        get LOADING() { return 1; }
+        get DONE() { return 2; }
+        __fire(t) {
+            const ev = new Event(t); ev.target = this; ev.currentTarget = this;
+            const on = this["on" + t];
+            if (typeof on === "function") { try { on.call(this, ev); } catch (e) { trust.errors.push("filereader on" + t + ": " + ((e && e.message) || e)); } }
+            try { dispatch(this, ev, false); } catch (e) {}
+        }
+        __read(blob, makeResult) {
+            this.readyState = 1; // LOADING
+            this.result = null; this.error = null;
+            this.__fire("loadstart");
+            const self = this;
+            g.setTimeout(() => {
+                try {
+                    const r = makeResult(blob);
+                    self.result = r; self.readyState = 2;
+                    self.__fire("progress"); self.__fire("load"); self.__fire("loadend");
+                } catch (e) {
+                    self.error = g.DOMException ? new g.DOMException(String((e && e.message) || e), "NotReadableError") : e;
+                    self.readyState = 2;
+                    self.__fire("error"); self.__fire("loadend");
+                }
+            }, 0);
+        }
+        readAsText(blob) { this.__read(blob, (b) => blobText(b)); }
+        readAsBinaryString(blob) { this.__read(blob, (b) => utf8Binary(blobText(b))); }
+        readAsDataURL(blob) {
+            this.__read(blob, (b) => {
+                const type = (b && b.type) || "application/octet-stream";
+                return "data:" + type + ";base64," + g.btoa(utf8Binary(blobText(b)));
+            });
+        }
+        readAsArrayBuffer(blob) {
+            this.__read(blob, (b) => g.TextEncoder ? new g.TextEncoder().encode(blobText(b)).buffer : new ArrayBuffer(0));
+        }
+        abort() {
+            if (this.readyState !== 1) return;
+            this.readyState = 2; this.result = null;
+            this.__fire("abort"); this.__fire("loadend");
+        }
+    };
+    g.FileReader.EMPTY = 0; g.FileReader.LOADING = 1; g.FileReader.DONE = 2;
 
     g.window = g; g.self = g; g.top = g; g.parent = g;
     g.document = wrap(0);
@@ -5405,6 +5478,74 @@ mod tests {
             );
             eprintln!("  trust default: {dt:>12?}  ({c} colls, {gct:?} GC)");
         }
+    }
+
+    #[test]
+    fn file_reader_reads_blobs_asynchronously() {
+        // FileReader is built by PRELUDE on the syscalls, so the test needs a
+        // faithful page context (DOM + syscalls + config + PRELUDE), exactly
+        // as `load_page` builds it — a bare `page_context()` has no prelude.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "fr.js",
+            br##"
+            globalThis.out = {};
+            // readAsText returns the blob's text via an on* handler.
+            const r1 = new FileReader();
+            r1.onload = function () { out.text = r1.result; out.state = r1.readyState; };
+            r1.readAsText(new Blob(["hello world"], { type: "text/plain" }));
+            // readAsDataURL via addEventListener; UTF-8 bytes -> base64.
+            const r2 = new FileReader();
+            r2.addEventListener("load", () => { out.url = r2.result; });
+            r2.readAsDataURL(new Blob(["\u00e9"]));
+            // The legacy constants exist on both the instance and constructor.
+            out.consts = (new FileReader().DONE === 2 && FileReader.EMPTY === 0 && FileReader.LOADING === 1);
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // Reads settle on a macrotask (setTimeout 0): advance virtual time.
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.text"), "hello world");
+        // "é" is UTF-8 C3 A9 -> base64 w6k=; default type is octet-stream.
+        assert_eq!(
+            s(&mut ctx, b"out.url"),
+            "data:application/octet-stream;base64,w6k="
+        );
+        assert_eq!(s(&mut ctx, b"String(out.state)"), "2");
+        assert!(
+            ctx.eval(Source::from_bytes(b"out.consts"))
+                .unwrap()
+                .to_boolean()
+        );
     }
 
     #[test]

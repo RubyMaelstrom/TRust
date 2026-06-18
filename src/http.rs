@@ -63,6 +63,13 @@ pub struct Response {
     /// The living page behind this response, when its JS left
     /// something to interact with.
     pub live: Option<LivePage>,
+    /// Set when the response is a bot-mitigation interstitial (AWS WAF,
+    /// Cloudflare, …) rather than the real page — a short human-readable
+    /// label like `"AWS WAF (challenge)"`. These walls serve a JS
+    /// proof-of-work / fingerprint challenge a non-browser client can't
+    /// pass, so what we render is an empty shell; the label lets the UI
+    /// say so instead of showing a blank page. See `detect_challenge`.
+    pub challenge: Option<String>,
 }
 
 /// A page kept alive for interaction: commands in, renders out.
@@ -580,6 +587,32 @@ async fn fetch_once(request: &Request) -> Result<Response, String> {
 
 /// Build the Response and return a still-healthy connection to the
 /// pool.
+/// Recognise a bot-mitigation interstitial from response headers. Walls
+/// like AWS WAF and Cloudflare answer a normal request with a JS challenge
+/// page (proof-of-work + browser fingerprint) instead of the real content;
+/// a non-browser client can't pass it, so the body we'd render is an empty
+/// shell. Detecting it from the response header — host-agnostic, no
+/// site-sniffing — lets the UI tell the user what happened rather than
+/// showing a blank page. Returns a short label, e.g. `"AWS WAF (challenge)"`.
+fn detect_challenge(headers: &Headers) -> Option<String> {
+    // AWS WAF: `x-amzn-waf-action: challenge|captcha|block` (HTTP 202/405).
+    // `allow` is the pass-through value — not a wall.
+    if let Some(action) = headers.get("x-amzn-waf-action") {
+        let action = action.trim().to_ascii_lowercase();
+        if action != "allow" && !action.is_empty() {
+            return Some(format!("AWS WAF ({action})"));
+        }
+    }
+    // Cloudflare managed challenge: `cf-mitigated: challenge` (HTTP 403/503).
+    if let Some(m) = headers.get("cf-mitigated") {
+        let m = m.trim().to_ascii_lowercase();
+        if m != "allow" && !m.is_empty() {
+            return Some(format!("Cloudflare ({m})"));
+        }
+    }
+    None
+}
+
 fn finish_response(
     request: &Request,
     (status, headers, body, reusable, set_cookies): (u16, Headers, Vec<u8>, bool, Vec<String>),
@@ -607,6 +640,7 @@ fn finish_response(
             body: Vec::new(),
             js: None,
             live: None,
+            challenge: None,
         });
     }
     let content_type = headers
@@ -620,6 +654,7 @@ fn finish_response(
         body,
         js: None,
         live: None,
+        challenge: detect_challenge(&headers),
     })
 }
 
@@ -1474,6 +1509,33 @@ mod tests {
             .iter()
             .flat_map(|r| &r.items)
             .any(|it| it.text.contains(needle))
+    }
+
+    #[test]
+    fn detects_bot_mitigation_challenges_from_headers() {
+        let h = |k: &str, v: &str| {
+            let mut m = Headers::new();
+            m.insert(k.to_string(), v.to_string());
+            m
+        };
+        // AWS WAF (IMDb, Amazon storefronts, …): the challenge action.
+        assert_eq!(
+            detect_challenge(&h("x-amzn-waf-action", "challenge")).as_deref(),
+            Some("AWS WAF (challenge)")
+        );
+        assert_eq!(
+            detect_challenge(&h("x-amzn-waf-action", "captcha")).as_deref(),
+            Some("AWS WAF (captcha)")
+        );
+        // `allow` is the pass-through value — the real page, not a wall.
+        assert_eq!(detect_challenge(&h("x-amzn-waf-action", "allow")), None);
+        // Cloudflare managed challenge.
+        assert_eq!(
+            detect_challenge(&h("cf-mitigated", "challenge")).as_deref(),
+            Some("Cloudflare (challenge)")
+        );
+        // An ordinary response is not a wall.
+        assert_eq!(detect_challenge(&Headers::new()), None);
     }
 
     #[tokio::test]

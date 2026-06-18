@@ -76,7 +76,8 @@
       "Bash(curl -sLO https://unpkg.com/react-dom@18/umd/react-dom.production.min.js)",
       "Bash(curl -sLO https://unpkg.com/react@18/umd/react.development.js)",
       "Bash(curl -sLO https://unpkg.com/react-dom@18/umd/react-dom.development.js)",
-      "Bash(ldd --version)"
+      "Bash(ldd --version)",
+      "Bash(TRUST_NET_DIAG='https://www.imdb.com/list/ls4157260380/' TRUST_NET_DIAG_OUT=/tmp/imdb_postjs.html cargo test --release net_diag -- --ignored --nocapture)"
     ]
   }
 }
