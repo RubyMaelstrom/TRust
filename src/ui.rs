@@ -17,6 +17,9 @@ pub mod theme {
     pub const NEON_PINK: Color = Color::Rgb(0xff, 0x2b, 0xd6);
     pub const NEON_CYAN: Color = Color::Rgb(0x00, 0xff, 0xf9);
     pub const NEON_GREEN: Color = Color::Rgb(0x39, 0xff, 0x14);
+    /// Soft pastel green for interactive fields (form controls, input
+    /// prompts/badges) — gentler than the bright NEON_GREEN.
+    pub const PASTEL_GREEN: Color = Color::Rgb(0xa8, 0xe6, 0xa1);
     pub const AMBER: Color = Color::Rgb(0xff, 0xb0, 0x00);
     pub const DIM: Color = Color::Rgb(0x6e, 0x4e, 0x9e);
     pub const TEXT: Color = Color::Rgb(0xc8, 0xc8, 0xdc);
@@ -24,12 +27,25 @@ pub mod theme {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [session_area, input_area, status_area] = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(3),
-        Constraint::Length(1),
-    ])
-    .areas(frame.area());
+    // While browsing or viewing an image the input field can't be typed
+    // into, so its 3-row box is dropped and those rows go to the content
+    // panel; everything folds into the single status line. The box returns
+    // for command/search/line entry (and the char-mode strip).
+    let collapse_input =
+        app.mode == Mode::Session && (app.browser.is_some() || app.viewer.is_some());
+    let (session_area, input_area, status_area) = if collapse_input {
+        let [session_area, status_area] =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+        (session_area, None, status_area)
+    } else {
+        let [session_area, input_area, status_area] = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .areas(frame.area());
+        (session_area, Some(input_area), status_area)
+    };
 
     let (title, border_color) = match (&app.viewer, &app.browser) {
         (Some(v), _) => (format!("░▒▓ TRUST :: {} ▓▒░", v.url), theme::NEON_PINK),
@@ -60,6 +76,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let inner = block.inner(session_area);
     app.last_inner = (inner.width, inner.height);
     app.last_content_area = inner;
+    app.last_status_row = status_area.y;
 
     match (&app.viewer, &app.browser) {
         (Some(v), _) => {
@@ -95,34 +112,44 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // An open <select> dropdown overlays everything in the panel.
     render_select_menu(frame, app, inner);
 
-    frame.render_widget(
-        input_box(app, input_area.width.saturating_sub(2)),
-        input_area,
-    );
+    if let Some(input_area) = input_area {
+        frame.render_widget(
+            input_box(app, input_area.width.saturating_sub(2)),
+            input_area,
+        );
+    }
     frame.render_widget(status_bar(app), status_area);
 
-    // Fetch in flight: a tiny beating heart at the right end of the
-    // entry bar, animated by the run loop's ticker. Lub, dub, rest —
-    // filled bold, hollow, filled again, then dim through the diastole.
-    if app.loading() && app.mode == Mode::Session && input_area.width > 8 {
-        let (glyph, style) = match app.spinner % 6 {
-            0 => (
-                "♥",
-                Style::new()
-                    .fg(theme::NEON_PINK)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            1 => ("♡", Style::new().fg(theme::NEON_PINK)),
-            2 => ("♥", Style::new().fg(theme::NEON_PINK)),
-            _ => ("♡", Style::new().fg(theme::DIM)),
+    // Fetch in flight: a tiny beating heart, animated by the run loop's
+    // ticker. Lub, dub, rest — filled bold, hollow, filled again, then dim
+    // through the diastole. It rides the entry box's right edge when the
+    // box is shown, otherwise the status line's right end.
+    if app.loading() {
+        let area = match input_area {
+            Some(a) if a.width > 8 => Some(Rect::new(a.right().saturating_sub(3), a.y + 1, 1, 1)),
+            Some(_) => None,
+            None if status_area.width > 4 => Some(Rect::new(
+                status_area.right().saturating_sub(2),
+                status_area.y,
+                1,
+                1,
+            )),
+            None => None,
         };
-        let area = ratatui::layout::Rect::new(
-            input_area.right().saturating_sub(3),
-            input_area.y + 1,
-            1,
-            1,
-        );
-        frame.render_widget(Paragraph::new(Span::styled(glyph, style)), area);
+        if let Some(area) = area {
+            let (glyph, style) = match app.spinner % 6 {
+                0 => (
+                    "♥",
+                    Style::new()
+                        .fg(theme::NEON_PINK)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                1 => ("♡", Style::new().fg(theme::NEON_PINK)),
+                2 => ("♥", Style::new().fg(theme::NEON_PINK)),
+                _ => ("♡", Style::new().fg(theme::DIM)),
+            };
+            frame.render_widget(Paragraph::new(Span::styled(glyph, style)), area);
+        }
     }
 }
 
@@ -220,7 +247,7 @@ fn browser_lines(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
                     .fg(theme::NEON_CYAN)
                     .add_modifier(Modifier::BOLD),
                 (true, Kind::Document) => Style::new().fg(theme::NEON_GREEN),
-                (true, Kind::Search) => Style::new().fg(theme::AMBER),
+                (true, Kind::Search) => Style::new().fg(theme::PASTEL_GREEN),
                 (true, _) => Style::new().fg(theme::NEON_PINK),
                 (_, Kind::Error) => Style::new().fg(theme::NEON_PINK),
                 (_, Kind::Heading(1)) => Style::new()
@@ -288,7 +315,7 @@ fn browser_rows(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
                     ItemKind::Heading(_) => Style::new().fg(theme::NEON_CYAN),
                     ItemKind::Quote => Style::new().fg(theme::DIM),
                     ItemKind::Pre => Style::new().fg(theme::NEON_GREEN),
-                    ItemKind::Form => Style::new().fg(theme::AMBER),
+                    ItemKind::Form => Style::new().fg(theme::PASTEL_GREEN),
                     ItemKind::Image => Style::new().fg(theme::DIM).add_modifier(Modifier::ITALIC),
                     ItemKind::Border => Style::new().fg(theme::DIM),
                     ItemKind::Text => Style::new().fg(theme::TEXT),
@@ -465,10 +492,10 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
     let minting_identity = app.cert_for.is_some();
     let (prompt, accent) = match app.mode {
         Mode::Session => ("❯ ", theme::NEON_GREEN),
-        Mode::Command => ("trust> ", theme::AMBER),
-        Mode::Search if minting_identity => ("name> ", theme::AMBER),
-        Mode::Search if editing_field => ("input> ", theme::AMBER),
-        Mode::Search => ("search> ", theme::AMBER),
+        Mode::Command => ("trust> ", theme::PASTEL_GREEN),
+        Mode::Search if minting_identity => ("name> ", theme::PASTEL_GREEN),
+        Mode::Search if editing_field => ("input> ", theme::PASTEL_GREEN),
+        Mode::Search => ("search> ", theme::PASTEL_GREEN),
     };
 
     // Window the text horizontally so the cursor (and the prompt) stay
@@ -512,7 +539,7 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
             " COMMAND ",
             Style::new()
                 .fg(theme::BG)
-                .bg(theme::AMBER)
+                .bg(theme::PASTEL_GREEN)
                 .add_modifier(Modifier::BOLD),
         )),
         Mode::Search => block.title(Line::styled(
@@ -525,7 +552,7 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
             },
             Style::new()
                 .fg(theme::BG)
-                .bg(theme::AMBER)
+                .bg(theme::PASTEL_GREEN)
                 .add_modifier(Modifier::BOLD),
         )),
     };
@@ -534,21 +561,14 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
 }
 
 /// Badge and hint for the dimmed strip when keys bypass the input field.
+/// Only the character-at-a-time strip remains: browsing and the image
+/// viewer drop the input box entirely (see `draw`'s collapse path), so
+/// their badges/hints live solely on the status line.
 fn strip_content(app: &App) -> Option<(&'static str, &'static str)> {
-    if app.viewer.is_some() {
-        Some((" IMG ", " ← / Esc close"))
-    } else if let Some(g) = &app.browser {
-        let hint = if g.doc.laid_out() {
-            " ↑↓←→ move · Enter follow · ⌫ back · Esc terminal"
-        } else {
-            " ↑↓ scroll · → follow · ← back · Esc terminal"
-        };
-        Some((protocol_badge(g), hint))
-    } else if app.char_mode() {
-        Some((" CHAR ", " keys go directly to remote · server echoes"))
-    } else {
-        None
-    }
+    app.char_mode().then_some((
+        " CHAR ",
+        " keys go directly to remote · server echoes · Tab/Ctrl-] cmds",
+    ))
 }
 
 fn status_bar(app: &App) -> Paragraph<'_> {
@@ -561,12 +581,16 @@ fn status_bar(app: &App) -> Paragraph<'_> {
     } else {
         (" LINK:DOWN ", theme::NEON_PINK)
     };
-    let hint = match (app.mode, app.browser.is_some(), app.char_mode()) {
-        (Mode::Session, ..) if app.viewer.is_some() => "· ← Esc close · Ctrl-] commands",
-        (Mode::Session, true, _) => "· ↑↓ → ← navigate · Ctrl-] commands",
-        (Mode::Session, false, true) => "· CHAR mode · Ctrl-] commands",
-        (Mode::Session, false, false) => "· Enter send · Esc/Ctrl-] commands",
-        (Mode::Command, ..) => "· Enter run · Esc back · open/close/mode/send/set/status/quit",
+    let laid_out = app.browser.as_ref().map(|g| g.doc.laid_out());
+    let hint = match (app.mode, laid_out, app.char_mode()) {
+        (Mode::Session, _, _) if app.viewer.is_some() => "· ← Esc close · Tab cmds",
+        (Mode::Session, Some(true), _) => {
+            "· ↑↓←→ move · Enter follow · ⌫ back · Esc stop · Tab cmds"
+        }
+        (Mode::Session, Some(false), _) => "· ↑↓ scroll · → follow · ← back · Esc stop · Tab cmds",
+        (Mode::Session, None, true) => "· keys go to remote · Tab/Ctrl-] cmds",
+        (Mode::Session, None, false) => "· Enter send · Tab/Esc cmds",
+        (Mode::Command, ..) => "· Enter run · Esc/Tab back · open <url>/close/finger/set/quit",
         (Mode::Search, ..) if app.cert_for.is_some() => "· Enter mints the identity · Esc cancel",
         (Mode::Search, ..) if matches!(app.search_target, Some(Link::Form { .. })) => {
             "· Enter set · Esc cancel"

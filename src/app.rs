@@ -397,8 +397,15 @@ pub struct App {
     pub spinner: usize,
     /// Last drawn browser/session content rect, in terminal coordinates.
     pub(crate) last_content_area: ratatui::layout::Rect,
+    /// Screen row of the bottom status line as of the last draw, so a click
+    /// on it (or the top address bar) can open the command console.
+    pub(crate) last_status_row: u16,
     pub host: Option<String>,
     pub port: u16,
+    /// Port explicitly given at startup (CLI), if any. `None` means the
+    /// startup target had no port → it opens as web (https, falling back to
+    /// http), the way a bare host typed in the command console does.
+    pub(crate) start_port: Option<u16>,
     pub connected: bool,
     /// Whether the live connection is wrapped in TLS.
     pub tls: bool,
@@ -425,6 +432,8 @@ pub struct App {
     auto_protocol: ProtocolType,
     /// In-flight fetch, if any.
     fetch_rx: Option<mpsc::Receiver<FetchMsg>>,
+    /// Handle to the in-flight fetch task, so Esc can abort it.
+    fetch_task: Option<tokio::task::JoinHandle<()>>,
     /// In-flight image decode/encode, if any.
     img_rx: Option<mpsc::Receiver<ImgMsg>>,
     /// Decoded page images (inline `<img>`), keyed by absolute URL.
@@ -493,8 +502,10 @@ impl App {
             select_anchor: None,
             spinner: 0,
             last_content_area: ratatui::layout::Rect::new(0, 0, 80, 24),
+            last_status_row: 23,
             host,
             port,
+            start_port: None,
             connected: false,
             tls: false,
             status: String::from("No connection. Ctrl-] for commands."),
@@ -510,6 +521,7 @@ impl App {
             picker: Picker::halfblocks(),
             auto_protocol: ProtocolType::Halfblocks,
             fetch_rx: None,
+            fetch_task: None,
             img_rx: None,
             image_cache: HashMap::new(),
             imgs_rx: None,
@@ -566,7 +578,7 @@ impl App {
         terminal.draw(|frame| ui::draw(frame, &mut self))?;
         self.sync_vt_size().await;
         if let Some(host) = self.host.clone() {
-            self.dispatch_open(&host, self.port);
+            self.dispatch_open(&host, self.start_port);
         }
 
         while !self.quit {
@@ -655,6 +667,14 @@ impl App {
     }
 
     fn on_mouse_event(&mut self, mouse: MouseEvent) {
+        // A left-click on the top address bar or the bottom status line opens
+        // the command console — a discoverable alternative to Tab/Ctrl-], in
+        // EVERY mode and view (handled before the viewer/dropdown/browser
+        // grabs below, since the chrome rows never overlap them).
+        if self.is_chrome_click(&mouse) {
+            self.open_command();
+            return;
+        }
         if self.viewer.is_some() {
             return; // nothing to scroll in the image viewer
         }
@@ -674,15 +694,75 @@ impl App {
                 self.browser_back();
             }
             (MouseEventKind::Moved, true) if self.mode == Mode::Session => {
-                self.http_mouse_hover(mouse.column, mouse.row);
+                self.browser_mouse_hover(mouse.column, mouse.row);
             }
             (MouseEventKind::Down(MouseButton::Left), true)
-                if self.mode == Mode::Session && self.http_mouse_hover(mouse.column, mouse.row) =>
+                if self.mode == Mode::Session
+                    && self.browser_mouse_hover(mouse.column, mouse.row) =>
             {
                 self.browser_follow();
             }
             _ => {}
         }
+    }
+
+    /// A left-click on the top address bar (the bordered title row) or the
+    /// bottom status line. Active in every mode (the chrome is always drawn).
+    fn is_chrome_click(&self, mouse: &MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+        let title_row = self.last_content_area.y.saturating_sub(1);
+        mouse.row == title_row || mouse.row == self.last_status_row
+    }
+
+    /// Open the command console (the same state Tab/Ctrl-] enters).
+    fn open_command(&mut self) {
+        self.mode = Mode::Command;
+        self.cert_for = None;
+        self.select_menu = None;
+    }
+
+    /// Mouse hover/click target in the browser, dispatching by layout model:
+    /// HTTP laid-out docs use the 2D item hit-test, gopher/gemini the
+    /// line-based one. Returns whether an interactive target was hit.
+    fn browser_mouse_hover(&mut self, col: u16, row: u16) -> bool {
+        match self.browser.as_ref() {
+            Some(g) if g.doc.laid_out() => self.http_mouse_hover(col, row),
+            Some(_) => self.gopher_mouse_hover(col, row),
+            None => false,
+        }
+    }
+
+    /// gopher/gemini hover: select the link line under the cursor (sticky —
+    /// hovering off a link leaves the highlight where it is, matching the
+    /// gopherus keyboard/scroll model). Returns whether a link was hit.
+    fn gopher_mouse_hover(&mut self, col: u16, row: u16) -> bool {
+        let Some(idx) = self.gopher_hit_test(col, row) else {
+            return false;
+        };
+        if let Some(g) = &mut self.browser {
+            g.selected = Some(idx);
+        }
+        true
+    }
+
+    /// The gopher/gemini document line under the cursor, if it carries a link.
+    fn gopher_hit_test(&self, col: u16, row: u16) -> Option<usize> {
+        if !self.mouse_in_content_area(col, row) {
+            return None;
+        }
+        let g = self.browser.as_ref()?;
+        if g.doc.laid_out() {
+            return None;
+        }
+        let local_row = row.saturating_sub(self.last_content_area.y) as usize;
+        let line_idx = g.scroll + local_row;
+        g.doc
+            .lines
+            .get(line_idx)
+            .filter(|l| l.link.is_some())
+            .map(|_| line_idx)
     }
 
     async fn on_terminal_event(&mut self, event: TermEvent) {
@@ -703,6 +783,23 @@ impl App {
         // crossterm reports as Ctrl-5; the kitty protocol reports Ctrl-].
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
+        {
+            self.mode = match self.mode {
+                Mode::Session | Mode::Search => Mode::Command,
+                Mode::Command => Mode::Session,
+            };
+            self.cert_for = None;
+            self.select_menu = None;
+            return;
+        }
+
+        // Tab opens the command console — a friendlier alias for Ctrl-].
+        // In character-at-a-time sessions Tab is a real keystroke the remote
+        // needs (menus/forms), so it's only intercepted when keys aren't
+        // already going straight to the remote.
+        if key.code == KeyCode::Tab
+            && key.modifiers.is_empty()
+            && !(self.mode == Mode::Session && self.char_mode())
         {
             self.mode = match self.mode {
                 Mode::Session | Mode::Search => Mode::Command,
@@ -967,13 +1064,13 @@ impl App {
                 Some(host) => {
                     let port = match parts.next() {
                         Some(p) => match parse_port(p) {
-                            Some(p) => p,
+                            Some(p) => Some(p),
                             None => {
                                 self.status = format!("bad port or service name: {p}");
                                 return;
                             }
                         },
-                        None => 23,
+                        None => None,
                     };
                     self.dispatch_open(host, port);
                 }
@@ -1127,9 +1224,11 @@ impl App {
                 }
                 None => self.status = String::from("usage: dict <word> [server]"),
             },
-            // A bare URL opens directly, as if `open` had been typed.
-            Some(target) if target.contains("://") => {
-                let port = parts.next().and_then(parse_port).unwrap_or(23);
+            // A bare URL — or a bare hostname/IP — opens directly, as if
+            // `open` had been typed (the address-bar habit). A schemeless
+            // host with no port becomes https (falling back to http).
+            Some(target) if target.contains("://") || looks_like_host(target) => {
+                let port = parts.next().and_then(parse_port);
                 self.dispatch_open(target, port);
             }
             // TODO for GNU telnet parity: full set/unset, display,
@@ -1217,7 +1316,13 @@ impl App {
     /// Route an open target to the right protocol: gopher:// and
     /// gemini:// URLs (or ports 70/1965) get the browser, everything
     /// else is telnet (TLS for telnets:// / port 992).
-    fn dispatch_open(&mut self, target: &str, port: u16) {
+    /// Open a target. An explicit scheme always wins. With no scheme, a
+    /// well-known port keeps its protocol (23→telnet, 992→telnets, 70→gopher,
+    /// 1965→gemini, 79→finger); a bare host with no port — or any other port —
+    /// opens as the WEB (HTTP is the default now, replacing telnet). `port` is
+    /// the explicitly-supplied port, if any; a `host:port` in the target wins
+    /// over it.
+    fn dispatch_open(&mut self, target: &str, port: Option<u16>) {
         if let Some(url) = GopherUrl::parse(target) {
             self.start_fetch(Link::Gopher(url));
         } else if let Some(url) = GeminiUrl::parse(target) {
@@ -1228,38 +1333,56 @@ impl App {
             self.start_fetch(Link::OneShot(url));
         } else if let Some(rest) = target.strip_prefix("telnet://") {
             let (host, url_port) = split_host_port(rest.trim_end_matches('/'));
-            self.open(host.to_string(), url_port.unwrap_or(port), false);
+            self.open(host.to_string(), url_port.or(port).unwrap_or(23), false);
         } else if let Some(rest) = target.strip_prefix("telnets://") {
             let (host, url_port) = split_host_port(rest.trim_end_matches('/'));
-            let port = url_port.unwrap_or(if port == 23 { 992 } else { port });
-            self.open(host.to_string(), port, true);
-        } else if port == 70 {
-            self.start_fetch(Link::Gopher(GopherUrl {
-                host: target.to_string(),
-                port,
-                item_type: '1',
-                selector: String::new(),
-            }));
-        } else if port == 1965 {
-            self.start_fetch(Link::Gemini(GeminiUrl {
-                host: target.to_string(),
-                port,
-                path: String::from("/"),
-            }));
-        } else if port == 79 {
-            // Finger with an empty query: who is logged in.
-            self.start_fetch(Link::OneShot(oneshot::OneShotUrl {
-                scheme: oneshot::Scheme::Finger,
-                host: target.to_string(),
-                port,
-                query: String::new(),
-            }));
+            self.open(host.to_string(), url_port.or(port).unwrap_or(992), true);
         } else {
-            // A bare host:port works without the separate port argument;
-            // telnets convention: port 992 is telnet over TLS.
-            let (host, url_port) = split_host_port(target);
-            let port = url_port.unwrap_or(port);
-            self.open(host.to_string(), port, port == 992);
+            // No scheme: a trailing `:port` on the host wins over the argument.
+            let (host, embedded) = split_host_port(target);
+            match embedded.or(port) {
+                Some(23) => self.open(host.to_string(), 23, false),
+                Some(992) => self.open(host.to_string(), 992, true),
+                Some(70) => self.start_fetch(Link::Gopher(GopherUrl {
+                    host: host.to_string(),
+                    port: 70,
+                    item_type: '1',
+                    selector: String::new(),
+                })),
+                Some(1965) => self.start_fetch(Link::Gemini(GeminiUrl {
+                    host: host.to_string(),
+                    port: 1965,
+                    path: String::from("/"),
+                })),
+                // Finger with an empty query: who is logged in.
+                Some(79) => self.start_fetch(Link::OneShot(oneshot::OneShotUrl {
+                    scheme: oneshot::Scheme::Finger,
+                    host: host.to_string(),
+                    port: 79,
+                    query: String::new(),
+                })),
+                other => self.start_web(host, other),
+            }
+        }
+    }
+
+    /// Open a bare host as the web. With no port it's https with an http
+    /// fallback (a bare hostname typed without a scheme — see
+    /// `http::fetch_web_default`); port 443 is https, 80 or any other port is
+    /// plain http on that port.
+    fn start_web(&mut self, host: &str, port: Option<u16>) {
+        let (raw, fallback) = match port {
+            None => (format!("https://{host}/"), true),
+            Some(443) => (format!("https://{host}/"), false),
+            Some(80) => (format!("http://{host}/"), false),
+            Some(p) => (format!("http://{host}:{p}/"), false),
+        };
+        match http::parse_url(&raw) {
+            Some(url) => self.start_fetch_opts(Link::Http(url), fallback),
+            None => {
+                self.status = format!("bad host: {host}");
+                self.notice = true;
+            }
         }
     }
 
@@ -1282,6 +1405,13 @@ impl App {
     /// Fetch a document in the background; the result arrives in the
     /// select loop as a FetchMsg.
     fn start_fetch(&mut self, target: Link) {
+        self.start_fetch_opts(target, false);
+    }
+
+    /// Fetch a document in the background. With `fallback_http`, an https web
+    /// target that fails to connect is retried over plain http — for a bare
+    /// host opened without a scheme (see `http::fetch_web_default`).
+    fn start_fetch_opts(&mut self, target: Link, fallback_http: bool) {
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("Fetching {target} ...");
@@ -1293,19 +1423,26 @@ impl App {
                 self.web_storage.clone(),
             )
         });
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = match &target {
                 Link::Gopher(url) => gopher::fetch(url).await.map(Payload::Gopher),
                 Link::Gemini(url) => gemini::fetch(url).await.map(Payload::Gemini),
-                Link::Http(url) => match http::fetch(&http::Request::get(url.clone())).await {
-                    Ok(response) => Ok(Payload::Http(match js {
-                        Some((viewport, cell_px, storage)) => {
-                            http::execute_js(response, viewport, cell_px, storage).await
-                        }
-                        None => response,
-                    })),
-                    Err(err) => Err(err),
-                },
+                Link::Http(url) => {
+                    let fetched = if fallback_http {
+                        http::fetch_web_default(url).await
+                    } else {
+                        http::fetch(&http::Request::get(url.clone())).await
+                    };
+                    match fetched {
+                        Ok(response) => Ok(Payload::Http(match js {
+                            Some((viewport, cell_px, storage)) => {
+                                http::execute_js(response, viewport, cell_px, storage).await
+                            }
+                            None => response,
+                        })),
+                        Err(err) => Err(err),
+                    }
+                }
                 Link::OneShot(url) => oneshot::fetch(url).await.map(Payload::OneShot),
                 Link::External(url) => Err(format!("cannot fetch foreign scheme: {url}")),
                 Link::Form { .. } => Err(String::from("form controls are not fetchable")),
@@ -1318,6 +1455,7 @@ impl App {
             };
             let _ = tx.send(FetchMsg { target, result }).await;
         });
+        self.fetch_task = Some(task);
     }
 
     /// POST a form-encoded body to a web URL (her use case; the UX can
@@ -1334,7 +1472,7 @@ impl App {
                 self.web_storage.clone(),
             )
         });
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let request = http::Request {
                 method: String::from("POST"),
                 url: url.clone(),
@@ -1359,6 +1497,7 @@ impl App {
                 })
                 .await;
         });
+        self.fetch_task = Some(task);
     }
 
     /// Decode and scale-to-fit encode an image off the UI thread; the
@@ -1578,6 +1717,7 @@ impl App {
 
     fn on_fetch(&mut self, msg: FetchMsg) {
         self.fetch_rx = None;
+        self.fetch_task = None;
         self.notice = false;
         let failed = msg.result.is_err();
         if failed {
@@ -1751,6 +1891,31 @@ impl App {
         self.pending_live_submit = None;
     }
 
+    /// Esc in the browser: stop any in-flight load and kill the page's JS
+    /// engine, leaving whatever has rendered frozen on screen. It never
+    /// closes the browser or drops to the telnet terminal; when nothing is
+    /// loading and no engine is alive it's a no-op — you stay on the page.
+    /// (A Boa run already executing on a worker thread finishes its current
+    /// budget window in the background — there's no mid-run cancel into the
+    /// engine — but the UI stops waiting at once and the resident page actor
+    /// is dropped, which ends it.)
+    fn stop_loading(&mut self) {
+        let was_active = self.fetch_rx.is_some()
+            || self.imgs_rx.is_some()
+            || self.live_page.is_some()
+            || self.page_busy;
+        if let Some(task) = self.fetch_task.take() {
+            task.abort();
+        }
+        self.fetch_rx = None;
+        self.imgs_rx = None;
+        self.drop_live_page();
+        if was_active {
+            self.notice = true;
+            self.status = String::from("Stopped — load cancelled, page scripts killed.");
+        }
+    }
+
     /// Enter on a `Link::JsClick`: send the click to the living page.
     fn dispatch_click(&mut self, node: usize) {
         let Some(handle) = &self.live_page else {
@@ -1761,7 +1926,7 @@ impl App {
             // falls back to the `<a href>` when JS isn't available. Pure
             // JS-only controls (no href) genuinely need a reload.
             if let Some(url) = self.selected_web_url() {
-                self.dispatch_open(&url, 80);
+                self.dispatch_open(&url, None);
             } else {
                 self.status = String::from("This page's scripts are no longer running (reload?).");
                 self.notice = true;
@@ -1881,7 +2046,7 @@ impl App {
         }
         if let Some(url) = navigate {
             // An un-prevented click on a live anchor: a real navigation.
-            self.dispatch_open(&url, 80);
+            self.dispatch_open(&url, None);
         }
     }
 
@@ -2019,11 +2184,7 @@ impl App {
             KeyCode::Right | KeyCode::Enter => self.browser_follow(),
             KeyCode::Left => self.browser_back(),
             KeyCode::Char('v' | 'V') => self.open_in_mpv(),
-            KeyCode::Esc => {
-                self.browser = None;
-                self.drop_live_page();
-                self.status = String::from("Browser closed.");
-            }
+            KeyCode::Esc => self.stop_loading(),
             _ => {}
         }
     }
@@ -2110,11 +2271,7 @@ impl App {
             KeyCode::Enter => self.browser_follow(),
             KeyCode::Backspace => self.browser_back(),
             KeyCode::Char('v' | 'V') => self.open_in_mpv(),
-            KeyCode::Esc => {
-                self.browser = None;
-                self.drop_live_page();
-                self.status = String::from("Browser closed.");
-            }
+            KeyCode::Esc => self.stop_loading(),
             _ => {}
         }
     }
@@ -3203,6 +3360,16 @@ pub(crate) fn parse_port(s: &str) -> Option<u16> {
     })
 }
 
+/// Whether a bare console token looks like a web host/address — a dotted
+/// name (`example.com`, `192.168.0.1`), `host:port`, or `localhost` — so it
+/// opens as if `open` had been typed. Conservative on purpose: real command
+/// typos (no dot, no `localhost`) still fall through to the usage hint.
+/// Tokens are whitespace-split, so they never contain spaces.
+fn looks_like_host(s: &str) -> bool {
+    let host = s.split(':').next().unwrap_or(s);
+    host == "localhost" || (host.contains('.') && !host.starts_with('.') && !host.ends_with('.'))
+}
+
 /// Split a trailing `:port` off a host string, the way users write
 /// telnet targets (`isharmud.com:23`). Hosts with more than one colon
 /// (raw IPv6 literals) are left whole.
@@ -3899,18 +4066,61 @@ mod tests {
         assert!(matches!(app.search_target, Some(Link::Form { .. })));
     }
 
-    #[test]
-    fn mouse_hover_does_not_touch_gopherus_selection() {
+    #[tokio::test]
+    async fn gopher_mouse_hover_and_click_select_and_follow_links() {
+        use crossterm::event::{MouseButton, MouseEventKind};
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
         app.last_inner = (80, 10);
         app.last_content_area = ratatui::layout::Rect::new(2, 1, 80, 10);
-        app.navigate_to(gopher_doc(".x."));
+        // Lines: 0 info, 1 link, 2 info, 3 link, 4 info. Default = first link.
+        app.navigate_to(gopher_doc(".x.x."));
         assert_eq!(selected(&app), Some(1));
 
-        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, 2, 2));
+        // Hovering the second link line (doc line 3 → screen row y+3) selects it.
+        app.on_mouse_event(mouse(MouseEventKind::Moved, 4, 4));
+        assert_eq!(selected(&app), Some(3));
 
+        // Hovering a non-link line leaves the highlight where it is (sticky,
+        // matching the gopherus model — unlike HTTP, which clears it).
+        app.on_mouse_event(mouse(MouseEventKind::Moved, 4, 1));
+        assert_eq!(selected(&app), Some(3));
+
+        // A left-click on the first link line selects AND follows it.
+        app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 4, 2));
         assert_eq!(selected(&app), Some(1));
+        assert!(
+            app.status.starts_with("Fetching gopher://test.host"),
+            "got: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn clicking_the_chrome_bars_opens_the_command_console() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        // Content at (2,1)→ title row is 0; status line at row 13.
+        app.last_content_area = ratatui::layout::Rect::new(2, 1, 80, 10);
+        app.last_status_row = 13;
+        let click = |row| mouse(MouseEventKind::Down(MouseButton::Left), 5, row);
+
+        // The top address bar (the bordered title row) opens the console.
+        app.on_mouse_event(click(0));
+        assert_eq!(app.mode, super::Mode::Command);
+
+        // So does the bottom status line.
+        app.mode = super::Mode::Session;
+        app.on_mouse_event(click(13));
+        assert_eq!(app.mode, super::Mode::Command);
+
+        // A click in the content area does not (no link there → no-op).
+        app.mode = super::Mode::Session;
+        app.navigate_to(gopher_doc("..."));
+        app.on_mouse_event(click(3));
+        assert_eq!(app.mode, super::Mode::Session);
     }
 
     fn http_doc(path: &str) -> crate::doc::Doc {
@@ -4698,9 +4908,10 @@ mod tests {
         );
         assert!(app.browser.is_some() && app.viewer.is_some());
 
-        // `open <host>` for telnet must take the screen, not connect
-        // invisibly behind the browser.
-        app.execute_command("open 127.0.0.1 1").await;
+        // `open <host> 23` for telnet must take the screen, not connect
+        // invisibly behind the browser. (Port 23 still routes to telnet;
+        // a bare host or other port would open the web instead.)
+        app.execute_command("open 127.0.0.1 23").await;
         assert!(app.browser.is_none(), "browser closed");
         assert!(app.viewer.is_none(), "viewer closed");
     }
@@ -4736,6 +4947,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tab_toggles_the_command_console() {
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+        // No host → starts at the command prompt.
+        let mut app = super::App::new(None, 23);
+        assert_eq!(app.mode, super::Mode::Command);
+        // Tab folds the console away (back to the session)...
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Tab)))
+            .await;
+        assert_eq!(app.mode, super::Mode::Session);
+        // ...and Tab opens it again.
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Tab)))
+            .await;
+        assert_eq!(app.mode, super::Mode::Command);
+    }
+
+    #[tokio::test]
+    async fn esc_stops_loading_and_keeps_the_browser_open() {
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session; // browsing captures session-mode keys
+        app.last_inner = (80, 10);
+        app.navigate_to(gopher_doc(".x."));
+        assert!(app.browser.is_some());
+        // Simulate an in-flight fetch.
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        app.fetch_rx = Some(rx);
+        assert!(app.loading());
+
+        // Esc stops the load but does NOT close the browser or drop to the
+        // telnet terminal (the new web-first behaviour).
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Esc)))
+            .await;
+        assert!(!app.loading(), "the load was cancelled");
+        assert!(app.browser.is_some(), "browser stays open on Esc");
+        assert!(app.status.starts_with("Stopped"), "got: {}", app.status);
+    }
+
+    #[test]
+    fn host_like_tokens_are_recognized() {
+        use super::looks_like_host;
+        assert!(looks_like_host("example.com"));
+        assert!(looks_like_host("www.rubymaelstrom.com"));
+        assert!(looks_like_host("192.168.0.1"));
+        assert!(looks_like_host("localhost"));
+        assert!(looks_like_host("localhost:8080"));
+        assert!(looks_like_host("shop.example:1701"));
+        // Bare words (command typos) are not host-like.
+        assert!(!looks_like_host("reload"));
+        assert!(!looks_like_host("quit"));
+        assert!(!looks_like_host("status"));
+    }
+
+    #[tokio::test]
     async fn bare_urls_open_and_telnet_urls_split_ports() {
         let mut app = super::App::new(None, 23);
 
@@ -4757,10 +5021,42 @@ mod tests {
         assert_eq!(app.port, 992);
         assert!(app.tls || !app.connected, "TLS path taken");
 
-        // Bare host:port works through plain `open` too.
-        app.execute_command("open bbs.example:1701").await;
+        // A bare host:port on a telnet port still opens telnet (host:port split).
+        app.execute_command("open bbs.example:23").await;
         assert_eq!(app.host.as_deref(), Some("bbs.example"));
-        assert_eq!(app.port, 1701);
+        assert_eq!(app.port, 23);
+
+        // A bare host:port on any other port opens the WEB over http now.
+        app.execute_command("open shop.example:1701").await;
+        assert!(
+            app.status.starts_with("Fetching http://shop.example:1701/"),
+            "got: {}",
+            app.status
+        );
+
+        // A bare hostname with no port opens the web — https by default.
+        app.execute_command("open www.rubymaelstrom.com").await;
+        assert!(
+            app.status
+                .starts_with("Fetching https://www.rubymaelstrom.com/"),
+            "got: {}",
+            app.status
+        );
+
+        // The same hostname typed WITHOUT `open` (the address-bar habit)
+        // opens too; a non-host typo still falls through to the usage hint.
+        app.execute_command("duckduckgo.com").await;
+        assert!(
+            app.status.starts_with("Fetching https://duckduckgo.com/"),
+            "got: {}",
+            app.status
+        );
+        app.execute_command("notacommand").await;
+        assert!(
+            app.status.starts_with("unknown command"),
+            "got: {}",
+            app.status
+        );
     }
 
     #[tokio::test]
