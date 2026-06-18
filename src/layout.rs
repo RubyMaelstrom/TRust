@@ -1391,6 +1391,15 @@ impl<'a> Layout<'a> {
             if let Some(outer) = saved_floats {
                 self.finish_floats();
                 self.floats = outer;
+            } else if self.dom.has_clearing_pseudo(id) {
+                // The clearfix idiom: a `::after{clear:both}` is a generated box
+                // that drops below the floats preceding it, so the element ends
+                // BELOW them. This both contains a float grid that's its own
+                // children (`.row::after`) and clears leaked floats for what
+                // follows (a standalone `<div class="clearfix">`) — the
+                // universal pre-flexbox containment pattern. Without it the next
+                // section (pagination, "suggested users") paints over the grid.
+                self.clear_to(true, true);
             }
             if let Some(marker) = list_marker {
                 // outside: the gutter is the original margin (indent − the
@@ -2402,6 +2411,72 @@ impl<'a> Layout<'a> {
         }
     }
 
+    /// Like `band`, but floats ABUT — no inter-float readability gap. Adjacent
+    /// floats in a grid pack tight (the `+1` in `band` is the gap between a
+    /// float and the TEXT beside it, not between two floats), so a row of
+    /// equal-width floats fits the same count a browser shows instead of losing
+    /// one column to accumulated gaps. Used only to place the next float.
+    fn float_band(&self, row: usize) -> (usize, usize) {
+        let mut left = self.indent;
+        let mut right = self.width;
+        for f in &self.floats {
+            if row >= f.start_row && row < f.bottom {
+                match f.side {
+                    FloatSide::Left => left = left.max(f.col as usize + f.width),
+                    FloatSide::Right => right = right.min(f.col as usize),
+                }
+            }
+        }
+        (left, right.max(left + 1))
+    }
+
+    /// Where a `w`-wide float lands on `side`: its `(start_row, col)`. Floats
+    /// march left→right on the current SHELF; when the next won't fit beside it,
+    /// the float WRAPS to a fresh shelf BELOW the whole current one — CSS float
+    /// flow turned into an aligned grid of rows (a browser keeps the cards equal
+    /// height, so its rows align; we align the shelf instead of tucking a
+    /// wrapped card into a shorter neighbour's gap, which reads as jank in a
+    /// terminal). The tight `float_band` lets equal-width cards pack the same
+    /// count per row a browser shows.
+    fn float_slot(&self, side: FloatSide, w: usize) -> (usize, usize) {
+        let here = self.rows.len();
+        // The current shelf's top row. Floats don't push content rows, so
+        // `self.rows.len()` can't track it on its own — the shelf is the highest
+        // `start_row` among the floats placed so far (clamped to the cursor for
+        // floats that follow real content).
+        let shelf_top = self
+            .floats
+            .iter()
+            .map(|f| f.start_row)
+            .max()
+            .unwrap_or(here)
+            .max(here);
+        let (l, r) = self.float_band(shelf_top);
+        if r.saturating_sub(l) >= w {
+            let col = match side {
+                FloatSide::Left => l,
+                FloatSide::Right => r - w,
+            };
+            return (shelf_top, col);
+        }
+        // No room beside the shelf → drop to a new shelf just below it (the
+        // tallest card on this shelf sets the row, so the grid stays aligned).
+        let next = self
+            .floats
+            .iter()
+            .filter(|f| f.start_row == shelf_top)
+            .map(|f| f.bottom)
+            .max()
+            .unwrap_or(shelf_top + 1)
+            .max(here);
+        let (l, r) = self.float_band(next);
+        let col = match side {
+            FloatSide::Left => l,
+            FloatSide::Right => r.saturating_sub(w),
+        };
+        (next, col)
+    }
+
     /// Recompute the line bounds (and reset the cursor) for the row about to
     /// be built, honoring any floats active on it.
     fn begin_line(&mut self) {
@@ -2451,23 +2526,33 @@ impl<'a> Layout<'a> {
         // Floats begin at a line boundary; refresh the band first.
         self.flush_block();
         self.begin_line();
-        let avail = self.line_right.saturating_sub(self.line_left).max(1);
+        // A float keeps its CSS width (a `%` already resolves against the FULL
+        // containing block), NOT the band narrowed by earlier floats — a grid
+        // item holds its column width and WRAPS to a new shelf rather than being
+        // squeezed into the leftover gap. With no explicit width it sizes to
+        // content within the current band (a floated image). The width is
+        // FLOORED (`css_cells_floor`): `N` columns of `round(100/N %)` can sum
+        // past 100% and drop the last column (a 25% grid rounds 23.5→24, so 4×24
+        // overflows a 94-cell row and only 3 fit); flooring keeps all `N`.
+        let full = self.width.saturating_sub(self.indent).max(1);
         let explicit = self
-            .css_cells(id, "width")
-            .or_else(|| self.css_cells(id, "max-width"))
-            .map(|w| w.min(avail));
+            .css_cells_floor(id, "width")
+            .or_else(|| self.css_cells_floor(id, "max-width"))
+            .map(|w| w.min(full));
+        let avail = self.line_right.saturating_sub(self.line_left).max(1);
         let constraint = explicit.unwrap_or(avail).max(1);
         let boxed = self.layout_subtree_inner(id, constraint, Some(id), false, ctx);
         if boxed.height == 0 {
             return;
         }
-        let w = explicit.unwrap_or(boxed.width as usize).min(avail).max(1);
-        // Responsive fallback: a float that leaves too thin a band beside it
-        // (a desktop-width column dropped into a terminal-width viewport)
-        // becomes an in-flow block — stacked, never overlapped. Mirrors the
-        // flex-row MIN_COL fallback; this is what keeps a full-width main
-        // column from being painted over by what follows it.
-        if avail.saturating_sub(w + 1) < MIN_COL {
+        let w = explicit.unwrap_or(boxed.width as usize).min(full).max(1);
+        // Responsive fallback: a float so WIDE that even on an EMPTY row it
+        // leaves too thin a band beside it (a desktop-width main column dropped
+        // into a terminal-width viewport) becomes an in-flow block — stacked,
+        // never overlapped. Measured against the FULL row, not the leftover gap,
+        // so an ordinary grid float WRAPS (below) instead of being misread as a
+        // too-wide column and stacked in-flow under its neighbour.
+        if full.saturating_sub(w + 1) < MIN_COL {
             let row_base = self.rows.len();
             self.blit(&boxed, self.line_left as u16, row_base);
             self.col = self.line_left;
@@ -2475,17 +2560,13 @@ impl<'a> Layout<'a> {
             self.begin_line();
             return;
         }
-        let start_row = self.rows.len();
+        // Drop to the lowest shelf where it fits — beside the current row's
+        // floats if there's room, else wrapped to a fresh row below them.
+        let (start_row, col) = self.float_slot(side, w);
         let bottom = start_row + boxed.height as usize;
-        // Pin beside any floats already on this row (line_left/right already
-        // account for them).
-        let col = match side {
-            FloatSide::Left => self.line_left,
-            FloatSide::Right => self.line_right.saturating_sub(w),
-        } as u16;
         self.floats.push(Float {
             side,
-            col,
+            col: col as u16,
             width: w,
             start_row,
             bottom,
@@ -2546,6 +2627,12 @@ impl<'a> Layout<'a> {
             "both" => (true, true),
             _ => return,
         };
+        self.clear_to(l, r);
+    }
+
+    /// Advance below the active floats on the given side(s) and resolve them —
+    /// the shared mechanic of CSS `clear` and the clearfix `::after`.
+    fn clear_to(&mut self, l: bool, r: bool) {
         let target = self
             .floats
             .iter()
@@ -2861,6 +2948,15 @@ impl<'a> Layout<'a> {
         resolve_cells_f32(&v, avail, self.viewport_w).map(|c| c.round().max(1.0) as usize)
     }
 
+    /// Like `css_cells`, but FLOORS the result. For a grid column width, `N`
+    /// rounded `(100/N)%` widths can sum past the row and drop the last column;
+    /// flooring keeps every column (each loses ≤1 cell, absorbed by the slack).
+    fn css_cells_floor(&self, id: NodeId, prop: &str) -> Option<usize> {
+        let v = self.dom.computed_style(id, prop)?;
+        let avail = self.width.saturating_sub(self.indent).max(1);
+        resolve_cells_f32(&v, avail, self.viewport_w).map(|c| c.floor().max(1.0) as usize)
+    }
+
     /// Lay an element's subtree out as an independent box at `content_width`,
     /// positioned relative to its own top-left (`col` 0). Shares the DOM,
     /// base URL, form/control maps, and image sizes with the parent. The
@@ -3116,6 +3212,18 @@ impl<'a> Layout<'a> {
             && w > 0
             && h > 0
         {
+            // A full-bleed, out-of-flow, auto-height image is a decorative
+            // background layer (a `position:fixed/absolute` `<img
+            // min-width:100%;height:auto>` painted behind the page). A terminal
+            // can't composite layers, and reserving its full pixel height
+            // buries the real content under dozens of blank rows. Drop it — the
+            // out-of-flow CONTAINER already collapses to inline; this is the
+            // same compaction for its image. (An in-flow full-width hero, or a
+            // sized absolute cover with a definite box, still renders.)
+            let avail = self.line_right.saturating_sub(self.line_left).max(1) as u16;
+            if self.is_background_layer_image(id, w, h, avail) {
+                return;
+            }
             self.place_image_box(id, ctx, url, w, h);
             return;
         }
@@ -3267,6 +3375,35 @@ impl<'a> Layout<'a> {
         } else {
             self.pending_space = true; // a trailing gap after the image
         }
+    }
+
+    /// Whether an image is a decorative full-bleed background layer — a
+    /// `position:fixed`/`absolute` `<img>` sized to FILL its container with no
+    /// definite height (`width:100%`/`min-width:100%`, `height:auto`). A real
+    /// browser paints these behind the page; a terminal can't composite layers,
+    /// and reserving the image's full pixel height (~48 rows) buries the page's
+    /// real content under blank space. We already collapse the out-of-flow
+    /// CONTAINER to inline; this extends that compaction to its background image.
+    ///
+    /// Tight on purpose, so it can't swallow real content: the image (or its
+    /// parent) must be out of flow, its used width must fill the whole band
+    /// (full-bleed), AND its height must fall through to the intrinsic scale —
+    /// no CSS `height` length/`%`, no `aspect-ratio`, no `<img width/height>`.
+    /// A sized absolute cover (definite height via the box/ancestor) and any
+    /// IN-FLOW full-width image keep their real box.
+    fn is_background_layer_image(&self, id: NodeId, iw: u16, ih: u16, avail: u16) -> bool {
+        if !(self.is_out_of_flow(id) || self.parent_out_of_flow(id)) {
+            return false;
+        }
+        let (used_w, ..) = self.image_used_box(id, iw, ih, avail);
+        if used_w < avail {
+            return false; // not full-bleed — a positioned thumbnail/badge
+        }
+        let raw_h = self.dom.computed_style(id, "height");
+        raw_h.as_deref().and_then(css_length_rows).is_none()
+            && raw_h.as_deref().and_then(parse_percent).is_none()
+            && self.css_aspect_ratio(id).is_none()
+            && self.img_attr_ratio(id).is_none()
     }
 
     /// The CSS replaced-element used box (cells) for an image, plus whether to
@@ -4684,6 +4821,79 @@ mod tests {
             (img.width, img.height),
             (5, 2),
             "avatar img fills its 36px wrapper, not the flow box"
+        );
+    }
+
+    #[test]
+    fn fullbleed_out_of_flow_background_image_is_dropped() {
+        // erome.com's full-page backdrop: `<div class="bg" position:fixed>`
+        // holding `<img min-width:100%;height:auto;position:absolute>`. A real
+        // browser paints it BEHIND the page; a terminal can't composite layers,
+        // and reserving its ~48-row pixel box buries the login box under blank
+        // space. Drop it — a decorative background layer renders nothing.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/bg.jpg".to_owned(), (40, 30));
+        let rows = lay_with_images(
+            r#"<body>
+                 <div style="position:fixed;width:100%;height:100%">
+                   <img src="/bg.jpg" style="width:auto;min-width:100%;height:auto;position:absolute">
+                 </div>
+                 <p>Hello</p>
+               </body>"#,
+            80,
+            &images,
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .all(|i| i.image.is_none()),
+            "the full-bleed background image is dropped, not laid out"
+        );
+        // The real content sits at the top, not 48 blank rows down.
+        assert!(
+            rows.iter().take(2).any(|r| render_row(r).contains("Hello")),
+            "real content rides to the top: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn an_in_flow_full_width_image_is_not_treated_as_a_background() {
+        // The narrowing guard: an IN-FLOW full-width hero (`<img width:100%>`,
+        // no positioning) is real content and must still render its box — only
+        // an OUT-OF-FLOW full-bleed backdrop is dropped.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/hero.jpg".to_owned(), (40, 10));
+        let rows = lay_with_images(
+            r#"<body><img src="/hero.jpg" style="width:100%;height:auto"></body>"#,
+            80,
+            &images,
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .any(|i| i.image.is_some()),
+            "an in-flow full-width image still lays out"
+        );
+    }
+
+    #[test]
+    fn a_sized_absolute_cover_image_keeps_its_box() {
+        // The other guard: a `position:absolute` cover with a DEFINITE height
+        // (`height:100%` against a sized box) is a real thumbnail/cover, not a
+        // background — it keeps its box.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/cover.jpg".to_owned(), (20, 20));
+        let rows = lay_with_images(
+            r#"<body><div style="width:80px;height:48px;position:relative"><img src="/cover.jpg" style="position:absolute;width:100%;height:100%"></div></body>"#,
+            80,
+            &images,
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .any(|i| i.image.is_some()),
+            "a sized absolute cover keeps its box"
         );
     }
 
@@ -6244,6 +6454,46 @@ mod tests {
     }
 
     #[test]
+    fn image_with_absolute_corner_badges_is_not_a_carousel() {
+        use crate::doc::Link;
+        // The thumbnail-card idiom (erome.com album, every thumbnail grid): an
+        // anchor holding a fill `<img>` plus two `position:absolute` `<span>`
+        // corner badges (a view count, a photo/video count). All three children
+        // are absolute, so the old "≥2 all-absolute children = deck" heuristic
+        // misread it as a 3-slide carousel and painted dead prev/next arrows
+        // over every card. The badges are CHROME, not slides: no carousel, no
+        // scroll buttons — just the image and its overlay text.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/t.png".to_owned(), (20, 20));
+        let rows = lay_with_images(
+            r#"<body><div style="position:relative">
+                 <a href="/a" style="position:absolute;width:100%;height:100%">
+                   <img src="/t.png" width="250" height="250" style="display:block;width:100%;height:auto;position:absolute">
+                   <span style="position:absolute">181</span>
+                   <span style="position:absolute">14</span>
+                 </a>
+               </div></body>"#,
+            40,
+            &images,
+        );
+        // No generated carousel paging controls.
+        let scroll_buttons = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|it| matches!(it.link, Some(Link::CarouselScroll(_))))
+            .count();
+        assert_eq!(scroll_buttons, 0, "no carousel arrows: {:?}", texts(&rows));
+        // The thumbnail still renders as a real image box.
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .any(|i| i.image.is_some()),
+            "the thumbnail image renders: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
     fn out_of_flow_overlay_controls_collapse_to_one_line() {
         // `position:absolute`/`fixed` overlays (slideshow arrows + dots) can't
         // be coordinate-positioned, so we render them inline and drop a `<br>`
@@ -6486,6 +6736,116 @@ mod tests {
             texts(&rows)
         );
         assert_eq!(cf, 0, "footer is full-width");
+    }
+
+    #[test]
+    fn float_grid_wraps_into_aligned_rows() {
+        // Equal-width left floats (a 25%, i.e. 4-up, grid) pack four across,
+        // then WRAP to a fresh row aligned at the left edge below — the 5th
+        // float must NOT tuck under the 4th (the erome.com /explore album-grid
+        // jank: "6 across, then one underneath the 6th"). Wider tracks them
+        // packing tight (no inter-float gap) so a browser's column count holds.
+        let html = r#"<html><head><style>.c{float:left;width:25%}</style></head>
+            <body><div>
+              <div class="c">AA</div><div class="c">BB</div>
+              <div class="c">CC</div><div class="c">DD</div>
+              <div class="c">EE</div><div class="c">FF</div>
+            </div></body></html>"#;
+        let rows = lay(html, 40);
+        let (ra, ca) = pos_of(&rows, "AA");
+        let (rb, cb) = pos_of(&rows, "BB");
+        let (rc, cc) = pos_of(&rows, "CC");
+        let (rd, cd) = pos_of(&rows, "DD");
+        let (re, ce) = pos_of(&rows, "EE");
+        let (rf, cf) = pos_of(&rows, "FF");
+        // AA BB CC DD share the first row, left→right.
+        assert_eq!((ra, rb, rc), (rb, rc, rd), "first four share a row");
+        assert!(
+            ca < cb && cb < cc && cc < cd,
+            "left→right: {:?}",
+            texts(&rows)
+        );
+        // EE FF wrap to a NEW row below, EE aligned back under AA — not tucked
+        // under DD.
+        assert!(re > ra, "fifth float wraps below: {:?}", texts(&rows));
+        assert_eq!(ce, ca, "wrapped row aligns at the left edge");
+        assert_eq!(rf, re, "EE and FF share the wrapped row");
+        assert!(cf > ce);
+    }
+
+    #[test]
+    fn clearfix_pseudo_contains_floats() {
+        // A `.row`/`.clearfix` (`::after{clear:both}`) contains its floats like
+        // a BFC, so content after it clears BELOW the float grid instead of
+        // being painted over it (the erome.com pagination + "suggested users"
+        // bleeding onto the thumbnails).
+        let html = r#"<html><head><style>
+            .row::after{content:"";display:table;clear:both}
+            .c{float:left;width:50%}
+          </style></head>
+          <body>
+            <div class="row"><div class="c">LEFT</div><div class="c">RIGHT</div></div>
+            <p>BELOW</p>
+          </body></html>"#;
+        let rows = lay(html, 40);
+        let (rl, _) = pos_of(&rows, "LEFT");
+        let (rbelow, cbelow) = pos_of(&rows, "BELOW");
+        assert!(
+            rbelow > rl,
+            "content after a clearfix row clears below its floats: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(cbelow, 0, "and returns to the full-width left edge");
+    }
+
+    #[test]
+    fn percentage_float_columns_floor_so_all_fit() {
+        // Four 25% floats in a row whose width makes 25% fractional (38 cells →
+        // 9.5). Rounding each to 10 sums to 40 > 38 and drops the 4th to a new
+        // row; flooring to 9 keeps all four across (the erome /explore narrow
+        // 4-up grid that was rendering only 3). Wider/markup-free so the count
+        // is unambiguous.
+        let html = r#"<html><head><style>.c{float:left;width:25%}</style></head>
+            <body><div>
+              <div class="c">AA</div><div class="c">BB</div>
+              <div class="c">CC</div><div class="c">DD</div>
+            </div></body></html>"#;
+        let rows = lay(html, 38);
+        let (ra, _) = pos_of(&rows, "AA");
+        let (rd, _) = pos_of(&rows, "DD");
+        assert_eq!(ra, rd, "all four columns share one row: {:?}", texts(&rows));
+    }
+
+    #[test]
+    fn standalone_clearfix_div_clears_a_float_grid() {
+        // erome /explore's exact shape: a float grid, a STANDALONE
+        // `<div class="clearfix">` (bootstrap's single-colon `:after{clear:both}`
+        // in a big comma list), then a full-width `float:left` section
+        // ("suggested users"). The section must land BELOW the whole grid, not
+        // float up onto the first row over the thumbnails.
+        let html = r#"<html><head><style>
+            .clearfix:after, .row:after { clear: both }
+            .col { float:left; width:25% }
+            .full { float:left; width:100% }
+          </style></head>
+          <body>
+            <div class="row">
+              <div class="col">AA</div><div class="col">BB</div>
+              <div class="col">CC</div><div class="col">DD</div>
+              <div class="col">EE</div>
+            </div>
+            <div class="clearfix"></div>
+            <div class="full">SUGGESTED</div>
+          </body></html>"#;
+        let rows = lay(html, 40);
+        let (re, _) = pos_of(&rows, "EE"); // the wrapped 2nd-row cell
+        let (rs, cs) = pos_of(&rows, "SUGGESTED");
+        assert!(
+            rs > re,
+            "the suggested section clears below the whole grid: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(cs, 0, "and is full-width at the left edge");
     }
 
     #[test]
