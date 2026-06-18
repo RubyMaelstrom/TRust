@@ -598,8 +598,8 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__css_parse", 1, sys_css_parse),
         ("__css_supports_selector", 1, sys_css_supports_selector),
         ("__dom_template_content", 1, sys_template_content),
-        ("__http_fetch", 4, sys_http_fetch),
-        ("__http_fetch_async", 4, sys_http_fetch_async),
+        ("__http_fetch", 5, sys_http_fetch),
+        ("__http_fetch_async", 5, sys_http_fetch_async),
         ("__cookie_get", 0, sys_cookie_get),
         ("__cookie_set", 1, sys_cookie_set),
         ("__storage_get", 2, sys_storage_get),
@@ -1058,6 +1058,7 @@ fn page_net_prepare(
     target: &str,
     method: String,
     body: Option<(String, Vec<u8>)>,
+    headers: Vec<(String, String)>,
 ) -> Option<(tokio::runtime::Handle, crate::http::Request)> {
     let host = ctx.realm().host_defined();
     let net = host.get::<PageNet>()?;
@@ -1074,6 +1075,7 @@ fn page_net_prepare(
         method,
         url: resolved,
         body,
+        headers,
     };
     Some((net.handle.clone(), request))
 }
@@ -1087,8 +1089,9 @@ fn page_net_fetch(
     target: &str,
     method: String,
     body: Option<(String, Vec<u8>)>,
+    headers: Vec<(String, String)>,
 ) -> Option<crate::http::Response> {
-    let (handle, request) = page_net_prepare(ctx, target, method, body)?;
+    let (handle, request) = page_net_prepare(ctx, target, method, body, headers)?;
     phase(&format!("src: PAGE-SYNC {}", request.url));
     handle.block_on(crate::http::fetch(&request)).ok()
 }
@@ -1116,7 +1119,13 @@ fn load_module_body(
             .map(|n| n.handle.clone());
         return crate::http::PageCache::block_on_fetch(handle.as_ref(), f);
     }
-    let (handle, request) = page_net_prepare(ctx, resolved.as_str(), String::from("GET"), None)?;
+    let (handle, request) = page_net_prepare(
+        ctx,
+        resolved.as_str(),
+        String::from("GET"),
+        None,
+        Vec::new(),
+    )?;
     let f = cache.fetch(&handle, request.url);
     crate::http::PageCache::block_on_fetch(Some(&handle), f)
 }
@@ -1136,7 +1145,13 @@ fn module_fetch(
     if let Some(f) = cache.peek(resolved) {
         return Some(f);
     }
-    let (handle, request) = page_net_prepare(ctx, resolved.as_str(), String::from("GET"), None)?;
+    let (handle, request) = page_net_prepare(
+        ctx,
+        resolved.as_str(),
+        String::from("GET"),
+        None,
+        Vec::new(),
+    )?;
     Some(cache.fetch(&handle, request.url))
 }
 
@@ -1146,8 +1161,8 @@ fn module_fetch(
 /// runtime while the JS thread blocks. The one blocking caller is legacy
 /// synchronous XHR — async fetch/XHR go through `sys_http_fetch_async`.
 fn sys_http_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let (url_arg, method, body) = fetch_args(args, ctx);
-    Ok(match page_net_fetch(ctx, &url_arg, method, body) {
+    let (url_arg, method, body, headers) = fetch_args(args, ctx);
+    Ok(match page_net_fetch(ctx, &url_arg, method, body, headers) {
         Some(resp) => response_to_array(&resp, ctx),
         None => JsValue::null(),
     })
@@ -1161,7 +1176,7 @@ fn sys_http_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
 /// (Boa's job executor polls them concurrently). This is the whole
 /// reason `Promise.all([fetch(a), fetch(b)])` now runs in parallel.
 fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let (url_arg, method, body) = fetch_args(args, ctx);
+    let (url_arg, method, body, headers) = fetch_args(args, ctx);
     let (promise, resolvers) = JsPromise::new_pending(ctx);
     // GET dedup: a chunk the page re-`fetch()`es (the bundler warms up its
     // own modulepreloads this way) JOINS the cache's single request for
@@ -1191,7 +1206,7 @@ fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
         ctx.enqueue_job(job.into());
         return Ok(promise.into());
     }
-    match page_net_prepare(ctx, &url_arg, method, body) {
+    match page_net_prepare(ctx, &url_arg, method, body, headers) {
         None => {
             // Blocked/capped/no net: settle to null now, matching the
             // sync syscall's contract (the prelude turns null into a
@@ -1256,9 +1271,20 @@ fn sys_cookie_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
     Ok(JsValue::undefined())
 }
 
-/// Parse the shared `(url, method, body)` arguments of the fetch
-/// syscalls: method normalized, body paired with its content type.
-fn fetch_args(args: &[JsValue], ctx: &mut Context) -> (String, String, Option<(String, Vec<u8>)>) {
+/// Parse the shared `(url, method, body, content_type, headers)` arguments of
+/// the fetch syscalls: method normalized, body paired with its content type,
+/// extra request headers parsed from the newline-delimited `k\nv\nk\nv` blob
+/// the prelude builds from `setRequestHeader`/`init.headers`.
+#[allow(clippy::type_complexity)]
+fn fetch_args(
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> (
+    String,
+    String,
+    Option<(String, Vec<u8>)>,
+    Vec<(String, String)>,
+) {
     let url_arg = arg_str(args, 0, ctx);
     let mut method: String = arg_str(args, 1, ctx)
         .chars()
@@ -1282,7 +1308,28 @@ fn fetch_args(args: &[JsValue], ctx: &mut Context) -> (String, String, Option<(S
             b.into_bytes(),
         )
     });
-    (url_arg, method, body)
+    let headers = args
+        .get(4)
+        .filter(|v| !v.is_null_or_undefined())
+        .map(|_| parse_header_blob(&arg_str(args, 4, ctx)))
+        .unwrap_or_default();
+    (url_arg, method, body, headers)
+}
+
+/// Parse a `name\nvalue\nname\nvalue` header blob into pairs (empty names
+/// dropped). The prelude joins headers this way; values hold no newlines.
+fn parse_header_blob(blob: &str) -> Vec<(String, String)> {
+    if blob.is_empty() {
+        return Vec::new();
+    }
+    blob.split('\n')
+        .collect::<Vec<_>>()
+        .chunks(2)
+        .filter_map(|c| match c {
+            [k, v] if !k.is_empty() => Some(((*k).to_string(), (*v).to_string())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A fetched response as the `[status, content_type, body_text]` array
@@ -2003,7 +2050,18 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
                     let body = String::from_utf8_lossy(body);
                     run_script(&mut ctx, src, body.as_bytes(), &budget, &mut outcome);
                 }
-                _ => outcome.errors.push(format!("{src}: not fetched")),
+                _ => {
+                    // A deliberately blocked ad/tracker script is expected,
+                    // not a page error — don't light the JS-error badge for it.
+                    let blocked = parsed_url
+                        .as_ref()
+                        .and_then(|b| b.join(src).ok())
+                        .and_then(|u| u.host_str().map(crate::http::is_ad_or_tracker_host))
+                        .unwrap_or(false);
+                    if !blocked {
+                        outcome.errors.push(format!("{src}: not fetched"));
+                    }
+                }
             },
             None => {
                 let name = format!("inline#{}", i + 1);
@@ -2637,6 +2695,18 @@ fn extract_live(page: &mut LoadedPage) -> (String, bool) {
     // interactive below it).
     let mut candidates: HashSet<usize> = inherent.into_iter().collect();
     candidates.extend(listeners.iter().copied());
+    // Delegated clicks on styled elements: a plain `<div class="enter">` with
+    // no intrinsic clickable markup is still a click target when it advertises
+    // interactivity with `cursor:pointer` AND a composed ancestor carries a
+    // click listener. That's jQuery's `$(document).on('click', '.enter', fn)`
+    // delegation — the selector lives in jQuery's closure where we can't read
+    // it, but `cursor:pointer` is the library-agnostic affordance a sighted
+    // user clicks, and the listening ancestor confirms a handler is waiting.
+    for &d in &everyone {
+        if dom.computed_style(d, "cursor").as_deref() == Some("pointer") && listens(d) {
+            candidates.insert(d);
+        }
+    }
     candidates.retain(|&c| !matches!(dom.tag_name(c), None | Some("html" | "body")));
     let mut containers: HashSet<usize> = HashSet::new();
     let interactive: Vec<usize> = candidates
@@ -4475,6 +4545,24 @@ const PRELUDE: &str = r##"
     g.CSS = CSS;
     g.alert = () => {}; g.confirm = () => false; g.prompt = () => null;
     g.scroll = g.scrollTo = g.scrollBy = () => {};
+    // window.open: open a new browsing context. A single-view TUI has none, so
+    // this is a no-op that returns a minimal stub window (NEVER null — page
+    // code routinely chains `window.open(...).focus()`) and never throws. A
+    // missing `window.open` was an UNCAUGHT TypeError that aborted click
+    // handlers mid-flow (erome's age gate calls `window.open(url)` then
+    // `location.href = ...`; the throw killed the navigation). We deliberately
+    // don't navigate the current view for a programmatic popup — ad/popunder
+    // scripts abuse it — so flows that fall back to `location.href` proceed.
+    g.open = function (url) {
+        const u = url === undefined ? "" : String(url);
+        return {
+            closed: false, name: "",
+            focus() {}, blur() {}, print() {}, close() { this.closed = true; },
+            postMessage() {}, moveTo() {}, resizeTo() {}, scroll() {}, scrollTo() {},
+            location: { href: u, assign() {}, replace() {}, reload() {}, toString() { return u; } },
+            document: g.document, opener: g,
+        };
+    };
     // DOM Range: feature-detected/instanceof'd at boot, and used for
     // measurement + HTML-string parsing (createContextualFragment, jQuery's
     // `$.parseHTML` fallback). We hold endpoints honestly but approximate
@@ -4695,6 +4783,27 @@ const PRELUDE: &str = r##"
         for (const k in legacy) { DOMException[k] = legacy[k]; DOMException.prototype[k] = legacy[k]; }
     }
     g.DOMException = DOMException;
+
+    // MediaError — the interface a media element's `.error` exposes. Ad/video
+    // SDKs (tsyndicate, players) reference the global during feature
+    // detection; without it a bare `MediaError` reference throws
+    // ReferenceError and aborts their init. Constants live on both the
+    // constructor and the prototype, per the IDL.
+    {
+        const codes = {
+            MEDIA_ERR_ABORTED: 1, MEDIA_ERR_NETWORK: 2,
+            MEDIA_ERR_DECODE: 3, MEDIA_ERR_SRC_NOT_SUPPORTED: 4,
+        };
+        class MediaError {
+            constructor(code, message) {
+                this.code = code === undefined ? 0 : code | 0;
+                this.message = message === undefined ? "" : String(message);
+            }
+            get [Symbol.toStringTag]() { return "MediaError"; }
+        }
+        for (const k in codes) { MediaError[k] = codes[k]; MediaError.prototype[k] = codes[k]; }
+        g.MediaError = MediaError;
+    }
 
     g.addEventListener = (t, f) => {
         if (typeof f === "function" || (f && typeof f.handleEvent === "function")) {
@@ -5146,6 +5255,18 @@ const PRELUDE: &str = r##"
     }
     g.MessagePort = MessagePort; g.MessageChannel = MessageChannel;
 
+    // Flatten a header map ({lowercased-name: value}) into the `k\nv\nk\nv`
+    // blob the `__http_fetch` syscalls forward to the request. Lets a page's
+    // `setRequestHeader`/`init.headers` (X-Requested-With, Authorization, …)
+    // actually reach the wire instead of being dropped.
+    function __hdrBlob(h) {
+        let s = "";
+        for (const k in h) {
+            if (!Object.prototype.hasOwnProperty.call(h, k)) continue;
+            s += (s ? "\n" : "") + k + "\n" + h[k];
+        }
+        return s;
+    }
     g.fetch = function (input, init) {
         try {
             const url = input && typeof input === "object" && input.url !== undefined ? String(input.url) : String(input);
@@ -5155,9 +5276,10 @@ const PRELUDE: &str = r##"
                 if (body instanceof URLSearchParams) body = body.toString();
                 else return Promise.reject(new TypeError("fetch: unsupported body type"));
             }
-            const ctype = new Headers(init && init.headers).get("content-type")
+            const H = new Headers(init && init.headers);
+            const ctype = H.get("content-type")
                 || (body !== null ? "text/plain;charset=UTF-8" : null);
-            return __http_fetch_async(url, method, body, ctype).then(function (r) {
+            return __http_fetch_async(url, method, body, ctype, __hdrBlob(H.__h)).then(function (r) {
                 if (!r) throw new TypeError("fetch failed or blocked: " + url);
                 const status = r[0], respCType = r[1], text = r[2];
                 return {
@@ -5223,15 +5345,16 @@ const PRELUDE: &str = r##"
         send(body) {
             const b = body === undefined || body === null ? null : String(body);
             const ctype = this.__h["content-type"] || (b !== null ? "text/plain;charset=UTF-8" : null);
+            const hdrs = __hdrBlob(this.__h);
             if (this.__sync) {
-                this.__finish(__http_fetch(this.__url, this.__method || "GET", b, ctype));
+                this.__finish(__http_fetch(this.__url, this.__method || "GET", b, ctype, hdrs));
             } else {
                 // The request runs concurrently, but its callbacks are
                 // macrotasks (not microtasks): defer __finish into the
                 // timer queue so promise reactions still run first, as on
                 // the real platform.
                 const xhr = this;
-                __http_fetch_async(this.__url, this.__method || "GET", b, ctype)
+                __http_fetch_async(this.__url, this.__method || "GET", b, ctype, hdrs)
                     .then(function (r) { g.setTimeout(function () { xhr.__finish(r); }, 0); });
             }
         }
@@ -5545,6 +5668,82 @@ mod tests {
             ctx.eval(Source::from_bytes(b"out.consts"))
                 .unwrap()
                 .to_boolean()
+        );
+    }
+
+    #[test]
+    fn window_open_returns_a_stub_and_never_throws() {
+        // A missing `window.open` was an uncaught TypeError that aborted click
+        // handlers mid-flow (erome's age gate calls `window.open(url)` then
+        // `location.href = ...`; the throw killed the navigation). It must
+        // return a non-null window-like stub (code chains `.focus()`) and not
+        // navigate. PRELUDE-built, so this needs a faithful page context.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "open.js",
+            br##"
+            globalThis.out = {};
+            // The erome shape: open a popup, then keep using the page. Neither
+            // call may throw, and window.open must hand back a usable object.
+            const w = window.open("https://example.com/o/p-1", "_blank");
+            out.notNull = (w !== null && w !== undefined);
+            w.focus(); w.close();              // chained calls must be callable
+            out.closed = w.closed;
+            out.href = w.location.href;         // the stub remembers the url
+            // window.open() with no args is valid too.
+            out.bare = (typeof window.open() === "object");
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let b = |ctx: &mut Context, e: &[u8]| ctx.eval(Source::from_bytes(e)).unwrap().to_boolean();
+        let s = |ctx: &mut Context, e: &[u8]| {
+            ctx.eval(Source::from_bytes(e))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert!(b(&mut ctx, b"out.notNull"), "window.open returns non-null");
+        assert!(b(&mut ctx, b"out.closed"), "close() sets closed");
+        assert!(b(&mut ctx, b"out.bare"), "window.open() with no args works");
+        assert_eq!(s(&mut ctx, b"out.href"), "https://example.com/o/p-1");
+    }
+
+    #[test]
+    fn parse_header_blob_splits_name_value_pairs() {
+        assert!(parse_header_blob("").is_empty());
+        assert_eq!(
+            parse_header_blob("x-requested-with\nXMLHttpRequest\nauthorization\nBearer t"),
+            vec![
+                ("x-requested-with".to_string(), "XMLHttpRequest".to_string()),
+                ("authorization".to_string(), "Bearer t".to_string()),
+            ]
+        );
+        // Empty name dropped; an odd trailing key (no value) ignored.
+        assert_eq!(
+            parse_header_blob("\nv\nk2\nv2\nk3"),
+            vec![("k2".to_string(), "v2".to_string())]
         );
     }
 

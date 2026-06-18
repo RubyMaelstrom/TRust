@@ -2346,7 +2346,13 @@ const PROPS: &[PropDef] = &[
     prop("float",                false,     true),
     prop("clear",                false,     true),
     prop("overflow",             false,     true),
+    prop("cursor",               false,     false),
     prop("position",             false,     true),
+    prop("z-index",              false,     true),
+    prop("top",                  false,     true),
+    prop("right",                false,     true),
+    prop("bottom",               false,     true),
+    prop("left",                 false,     true),
     prop("flex-grow",            false,     true),
     prop("flex-shrink",          false,     true),
     prop("flex-basis",           false,     true),
@@ -2439,6 +2445,19 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             (format!("{prop}-right"), r.to_string()),
             (format!("{prop}-bottom"), b.to_string()),
             (format!("{prop}-left"), l.to_string()),
+        ];
+    }
+    // `inset`: 1–4 values, top/right/bottom/left (the offset shorthand a
+    // full-viewport modal often uses, `inset:0`).
+    if prop == "inset" {
+        let Some([t, r, b, l]) = four_sides(value) else {
+            return Vec::new();
+        };
+        return vec![
+            ("top".to_string(), t.to_string()),
+            ("right".to_string(), r.to_string()),
+            ("bottom".to_string(), b.to_string()),
+            ("left".to_string(), l.to_string()),
         ];
     }
     // `border-width`/`border-style`: 1–4 values, top/right/bottom/left.

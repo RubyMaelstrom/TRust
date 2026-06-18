@@ -39,6 +39,11 @@ pub struct Request {
     pub url: Url,
     /// (content-type, payload) for POST and friends.
     pub body: Option<(String, Vec<u8>)>,
+    /// Extra request headers the page set (XHR `setRequestHeader`, fetch
+    /// `init.headers`) — `X-Requested-With`, `Authorization`, a custom
+    /// `Accept`, etc. Managed headers (Host/Cookie/Content-Length/…) are NOT
+    /// taken from here; see `exchange`. Empty for normal navigations.
+    pub headers: Vec<(String, String)>,
 }
 
 impl Request {
@@ -47,6 +52,7 @@ impl Request {
             method: String::from("GET"),
             url,
             body: None,
+            headers: Vec::new(),
         }
     }
 }
@@ -680,14 +686,36 @@ async fn exchange(
         ("http", 80) | ("https", 443) => host.to_string(),
         _ => format!("{host}:{port}"),
     };
+    // Headers we manage ourselves — a page-supplied copy is ignored so we
+    // never emit a duplicate or let a page spoof transport/identity headers.
+    // `accept` is the exception: a page (XHR/fetch) may legitimately ask for
+    // `application/json`, so its value overrides our HTML default.
+    const MANAGED: &[&str] = &[
+        "host",
+        "user-agent",
+        "content-length",
+        "content-type",
+        "connection",
+        "cookie",
+        "accept-encoding",
+    ];
+    let page_accept = request
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("accept"))
+        .map(|(_, v)| v.as_str());
     let mut head = format!(
         "{} {} HTTP/1.1\r\n\
          Host: {}\r\n\
          User-Agent: {}\r\n\
-         Accept: text/html, text/*;q=0.8, */*;q=0.1\r\n\
+         Accept: {}\r\n\
          Accept-Encoding: identity\r\n\
          Connection: keep-alive\r\n",
-        request.method, path, host_header, USER_AGENT,
+        request.method,
+        path,
+        host_header,
+        USER_AGENT,
+        page_accept.unwrap_or("text/html, text/*;q=0.8, */*;q=0.1"),
     );
     let cookie = cookies_for_request(url);
     if !cookie.is_empty() {
@@ -699,6 +727,22 @@ async fn exchange(
             content_type,
             payload.len()
         ));
+    }
+    // Page-supplied headers (X-Requested-With — which servers read as
+    // `$request->ajax()` — Authorization, X-CSRF-TOKEN, …), minus the managed
+    // set and `accept` (already folded in above). A header with no value or a
+    // CR/LF (injection) is dropped.
+    for (k, v) in &request.headers {
+        let lk = k.to_ascii_lowercase();
+        if MANAGED.contains(&lk.as_str())
+            || lk == "accept"
+            || k.is_empty()
+            || k.contains(['\r', '\n', ':'])
+            || v.contains(['\r', '\n'])
+        {
+            continue;
+        }
+        head.push_str(&format!("{k}: {v}\r\n"));
     }
     head.push_str("\r\n");
 
@@ -1106,10 +1150,61 @@ pub async fn execute_js(
     response
 }
 
+/// Known ad / tracker network domains we neither fetch nor run. A terminal
+/// browser can't render ads and shouldn't pretend they loaded: running an ad
+/// SDK wastes the wire, leaks privacy, and triggers behaviours a single-view
+/// client can't satisfy — erome's age gate only takes its broken pop-under
+/// branch (content to a 2nd tab, ad to the main frame) when its ad SDK defines
+/// `window.NativeAd`; blocked, it takes the clean no-ad path and the page
+/// loads. This is the recognised ad-blocker category — host-based and GENERAL
+/// (every site benefits), NOT per-site special-casing. Matched by exact host
+/// or subdomain (`cdn.tsyndicate.com` matches `tsyndicate.com`).
+const AD_TRACKER_HOSTS: &[&str] = &[
+    "tsyndicate.com",
+    "magsrv.com",
+    "pemsrv.com",
+    "exoclick.com",
+    "exosrv.com",
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googletagservices.com",
+    "googletagmanager.com",
+    "google-analytics.com",
+    "adservice.google.com",
+    "amazon-adsystem.com",
+    "adnxs.com",
+    "criteo.com",
+    "taboola.com",
+    "outbrain.com",
+    "scorecardresearch.com",
+    "quantserve.com",
+    "moatads.com",
+    "popads.net",
+    "popcash.net",
+    "propellerads.com",
+    "juicyads.com",
+    "trafficjunky.net",
+    "adsterra.com",
+];
+
+/// Whether `host` is, or is a subdomain of, a known ad/tracker network.
+pub(crate) fn is_ad_or_tracker_host(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    AD_TRACKER_HOSTS
+        .iter()
+        .any(|&d| h == d || h.ends_with(&format!(".{d}")))
+}
+
 /// A public page must not pivot us into fetching subresources (scripts,
 /// page-initiated fetch/XHR) from private address space; same-host is
-/// always fine (localhost dev included).
+/// always fine (localhost dev included). Known ad/tracker networks are
+/// blocked outright (see `AD_TRACKER_HOSTS`).
 pub(crate) fn subresource_allowed(page: &Url, script: &Url) -> bool {
+    if let Some(url::Host::Domain(d)) = script.host()
+        && is_ad_or_tracker_host(d)
+    {
+        return false;
+    }
     if page.host() == script.host() {
         return true;
     }
@@ -2282,23 +2377,12 @@ mod tests {
         let response = fetch(&Request::get(url)).await.unwrap();
         let mut response = execute_js(response, (120, 40), (8, 16), Default::default()).await;
         let body = String::from_utf8_lossy(&response.body).to_string();
-        // Probe: the class attr of the element whose text follows it.
-        let class_near = |html: &str, text: &str| -> String {
-            match html.find(text) {
-                Some(at) => {
-                    let pre = &html[..at];
-                    let ci = pre.rfind("class=\"").map(|i| i + 7).unwrap_or(0);
-                    let end = html[ci..].find('"').map(|e| ci + e).unwrap_or(ci);
-                    html[ci..end].to_string()
-                }
-                None => "<absent>".into(),
-            }
-        };
-        eprintln!("BEFORE Items   class = {:?}", class_near(&body, "Items"));
-        eprintln!(
-            "BEFORE Merch   class = {:?}",
-            class_near(&body, "Merchants/Stores")
-        );
+        // Probe substring whose presence we report before/after the click
+        // (e.g. `id="disclaimer"` — is the overlay still in the DOM?).
+        let probe =
+            std::env::var("TRUST_CLICK_PROBE").unwrap_or_else(|_| "id=\"disclaimer\"".into());
+        eprintln!("js errors at load = {:?}", response.js.map(|j| j.errors));
+        eprintln!("BEFORE probe {probe:?} present = {}", body.contains(&probe));
         // Marker on the clickable wrapping link_text.
         let at = body.find(&link_text).expect("link text in body");
         let marker = body[..at]
@@ -2319,17 +2403,62 @@ mod tests {
             .send(crate::js::PageCmd::Click(marker))
             .await
             .unwrap();
-        match live.events.recv().await {
-            Some(crate::js::PageEvt::Updated { html, outcome }) => {
-                eprintln!("AFTER errors = {:?}", outcome.errors);
-                eprintln!("AFTER  Items  class = {:?}", class_near(&html, "Items"));
-                eprintln!(
-                    "AFTER  Merch  class = {:?}",
-                    class_near(&html, "Merchants/Stores")
-                );
+        // Drain a few events so we see Updated/Navigate/Settled, not just the
+        // first. Time-bounded: after the dispatch settles no more events come,
+        // so don't block waiting for the actor to time out.
+        for _ in 0..4 {
+            let ev = match tokio::time::timeout(Duration::from_secs(8), live.events.recv()).await {
+                Ok(ev) => ev,
+                Err(_) => {
+                    eprintln!("EVT <no more within 8s>");
+                    break;
+                }
+            };
+            match ev {
+                Some(crate::js::PageEvt::Updated { html, outcome }) => {
+                    eprintln!("EVT Updated: errors={:?}", outcome.errors);
+                    eprintln!(
+                        "   probe {probe:?} present AFTER = {}",
+                        html.contains(&probe)
+                    );
+                }
+                Some(crate::js::PageEvt::Static { html, outcome }) => {
+                    eprintln!("EVT Static: errors={:?}", outcome.errors);
+                    eprintln!(
+                        "   probe {probe:?} present AFTER = {}",
+                        html.contains(&probe)
+                    );
+                    break;
+                }
+                Some(crate::js::PageEvt::Navigate(u)) => eprintln!("EVT Navigate -> {u}"),
+                Some(crate::js::PageEvt::SubmitDefault) => eprintln!("EVT SubmitDefault"),
+                Some(other) => {
+                    eprintln!("EVT {other:?}");
+                    break;
+                }
+                None => {
+                    eprintln!("EVT <channel closed>");
+                    break;
+                }
             }
-            other => eprintln!("AFTER event = {other:?}"),
         }
+        // Re-fetch the page (same process-global COOKIE_JAR) to see whether the
+        // click's server POST marked our session — i.e. is the overlay STILL
+        // served on a fresh navigation? (erome's gate persists across pages
+        // unless the disclaimer POST's session sticks.)
+        let again = fetch(&Request::get(parse_url(&target).unwrap()))
+            .await
+            .unwrap();
+        let again_body = String::from_utf8_lossy(&again.body);
+        eprintln!(
+            "RE-FETCH probe {probe:?} present = {} ({}B)",
+            again_body.contains(&probe),
+            again.body.len()
+        );
+        eprintln!(
+            "RE-FETCH sent cookies = {:?}",
+            cookies_for_request(&parse_url(&target).unwrap())
+        );
         drop(response.live.take());
     }
 
@@ -2872,6 +3001,31 @@ customElements.define('lit-counter', LitCounter);
         ));
     }
 
+    #[test]
+    fn ad_and_tracker_networks_are_blocked() {
+        // Exact host and subdomains of a known ad/tracker network are blocked;
+        // unrelated hosts (even a lookalike that merely contains the name) are
+        // not. A terminal browser can't render ads — running their SDKs only
+        // breaks pages (erome's pop-under gate). General, host-based, no
+        // per-site sniffing.
+        assert!(is_ad_or_tracker_host("tsyndicate.com"));
+        assert!(is_ad_or_tracker_host("cdn.tsyndicate.com"));
+        assert!(is_ad_or_tracker_host("a.magsrv.com"));
+        assert!(is_ad_or_tracker_host("www.googletagmanager.com"));
+        assert!(!is_ad_or_tracker_host("example.com"));
+        assert!(!is_ad_or_tracker_host("nottsyndicate.com"));
+        assert!(!is_ad_or_tracker_host("tsyndicate.com.evil.example"));
+        let page = Url::parse("https://www.erome.com/").unwrap();
+        assert!(!subresource_allowed(
+            &page,
+            &Url::parse("https://cdn.tsyndicate.com/sdk/v1/n.js").unwrap()
+        ));
+        assert!(subresource_allowed(
+            &page,
+            &Url::parse("https://www.erome.com/js/main.js").unwrap()
+        ));
+    }
+
     #[tokio::test]
     async fn speaks_http_with_redirects_chunking_and_post() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -2971,6 +3125,7 @@ customElements.define('lit-counter', LitCounter);
                 String::from("application/x-www-form-urlencoded"),
                 b"k=v&x=y".to_vec(),
             )),
+            headers: Vec::new(),
         };
         let response = fetch(&request).await.unwrap();
         assert_eq!(response.status, 200);
@@ -3211,6 +3366,7 @@ customElements.define('lit-counter', LitCounter);
             method: String::from("POST"),
             url,
             body: Some((String::from("text/plain"), b"hi".to_vec())),
+            headers: Vec::new(),
         };
         let resp = fetch(&request).await.unwrap();
         assert_eq!(resp.body, b"ok");
@@ -3220,6 +3376,77 @@ customElements.define('lit-counter', LitCounter);
             "POSTs never reuse pooled connections"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn request_headers_reach_the_wire_but_managed_ones_cannot_be_spoofed() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // A page's request headers (XHR setRequestHeader / fetch init.headers)
+        // must reach the server — `X-Requested-With` is what `$request->ajax()`
+        // reads (erome's disclaimer accept needs it). But a page must NOT be
+        // able to spoof transport/identity headers (Host, Cookie, …), and a
+        // page-supplied `Accept` overrides our default without duplicating it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap2 = captured.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 2048];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            *cap2.lock().unwrap() = String::from_utf8_lossy(&req).into_owned();
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+        });
+        let url = parse_url(&format!("http://127.0.0.1:{port}/x")).unwrap();
+        let request = Request {
+            method: String::from("GET"),
+            url,
+            body: None,
+            headers: vec![
+                ("X-Requested-With".into(), "XMLHttpRequest".into()),
+                ("Authorization".into(), "Bearer tok".into()),
+                ("Accept".into(), "application/json".into()),
+                ("Host".into(), "evil.example".into()),
+                ("Cookie".into(), "spoof=1".into()),
+            ],
+        };
+        let resp = fetch(&request).await.unwrap();
+        assert_eq!(resp.body, b"ok");
+        server.abort();
+        let head = captured.lock().unwrap().clone();
+        assert!(
+            head.contains("X-Requested-With: XMLHttpRequest"),
+            "X-Requested-With forwarded: {head}"
+        );
+        assert!(
+            head.contains("Authorization: Bearer tok"),
+            "Authorization forwarded: {head}"
+        );
+        assert!(
+            head.contains("Accept: application/json"),
+            "page Accept overrides default: {head}"
+        );
+        assert_eq!(
+            head.matches("Accept:").count(),
+            1,
+            "no duplicate Accept header: {head}"
+        );
+        assert!(
+            !head.contains("evil.example"),
+            "Host cannot be spoofed: {head}"
+        );
+        assert!(
+            !head.contains("spoof=1"),
+            "Cookie cannot be spoofed: {head}"
+        );
     }
 
     #[tokio::test]

@@ -1480,6 +1480,7 @@ impl App {
                     String::from("application/x-www-form-urlencoded"),
                     body.into_bytes(),
                 )),
+                headers: Vec::new(),
             };
             let result = match http::fetch(&request).await {
                 Ok(response) => Ok(Payload::Http(match js {
