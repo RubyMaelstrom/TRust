@@ -859,10 +859,11 @@ const SPACING: &[&str] = &[
     "ul",
 ];
 
-/// Elements whose subtree never renders as page text.
+/// Elements whose subtree never renders as page text. (`<video>`/`<audio>`
+/// are NOT here — they render as a media representation via `flow_media`.)
 const SKIP: &[&str] = &[
-    "audio", "base", "canvas", "head", "iframe", "link", "math", "meta", "noscript", "object",
-    "script", "style", "svg", "template", "title", "video",
+    "base", "canvas", "head", "iframe", "link", "math", "meta", "noscript", "object", "script",
+    "style", "svg", "template", "title",
 ];
 
 struct Layout<'a> {
@@ -1022,6 +1023,29 @@ impl<'a> Layout<'a> {
             || self.dom.is_hidden(id)
             || self.suppressed_controls.contains(&id)
         {
+            return;
+        }
+        // A `<video>`/`<audio>` element renders as a media representation — its
+        // poster (when present) plus a labelled link to the playable source —
+        // not as an inline player a terminal can't run. Following it auto-opens
+        // mpv. Handled before float/slideshow dispatch so it always applies.
+        if matches!(tag.as_str(), "video" | "audio") {
+            self.flow_media(id, &tag, ctx);
+            return;
+        }
+        // A media-player WRAPPER: an element directly holding a `position:
+        // absolute` `<video>`/`<audio>` tech (the video.js / Plyr / JW pattern —
+        // the tech fills an aspect-ratio box, surrounded by control chrome:
+        // big-play button, poster overlay, control bar). Render only the media
+        // representation and SKIP the whole subtree, so the chrome (empty
+        // buttons → `[  ]`, a poster-click anchor → `·`) doesn't leak. A plain
+        // in-flow `<video>` (e.g. in a `<figure>` with a real `<figcaption>`)
+        // isn't a player tech, so its siblings still flow.
+        if let Some(media) = self.dom.children(id).into_iter().find(|&c| {
+            matches!(self.dom.tag_name(c), Some("video" | "audio")) && self.is_out_of_flow(c)
+        }) {
+            let mtag = self.dom.tag_name(media).unwrap_or("video").to_owned();
+            self.flow_media(media, &mtag, ctx);
             return;
         }
         // A floated element leaves normal flow: pin it to an edge and let the
@@ -1369,6 +1393,19 @@ impl<'a> Layout<'a> {
             self.place_text(&label, &cctx);
         }
 
+        // Top-right corner overlays (an absolutely-positioned `⋯` menu / badge
+        // pinned to this positioned block's top-right corner) are laid LAST,
+        // right-aligned on the first content row, instead of flowing inline
+        // below the content. Captured before the children so we can both skip
+        // them in the flow below and know the block's first row + right edge.
+        let corner_overlays = if block_like && self.is_positioned(id) {
+            self.corner_overlay_children(id)
+        } else {
+            Vec::new()
+        };
+        let corner_start_row = self.rows.len();
+        let corner_band = (self.line_left, self.line_right);
+
         if hscroll {
             self.flow_hscroll(id);
         } else {
@@ -1378,6 +1415,27 @@ impl<'a> Layout<'a> {
                 Some(FlexMode::Column) => self.stack_flex_items(id, &cctx),
                 None => {
                     for child in self.dom.children(id) {
+                        if corner_overlays.contains(&child) {
+                            continue;
+                        }
+                        self.flow_node(child, &cctx);
+                    }
+                }
+            }
+            // Absolutely-positioned children are NOT flex items (excluded from
+            // `flex_items`), but they still generate boxes painted over the
+            // container. The flex passes above skip them, so flow them here as
+            // overlays (the compact out-of-flow path) — otherwise a flex box
+            // whose only content is an abspos image (a framed foreground, a
+            // `inset:0` media layer) would render nothing. A backdrop among them
+            // is dropped in `place_image`; a framed foreground renders. A corner
+            // overlay is handled separately (right-aligned below), so skip it.
+            if flex.is_some() {
+                for child in self.dom.children(id) {
+                    if matches!(self.dom.node(child).data, NodeData::Element { .. })
+                        && self.is_out_of_flow(child)
+                        && !corner_overlays.contains(&child)
+                    {
                         self.flow_node(child, &cctx);
                     }
                 }
@@ -1437,6 +1495,15 @@ impl<'a> Layout<'a> {
                 // width we added); inside: the marker sits at the margin itself.
                 let gutter = self.indent.saturating_sub(marker_added);
                 self.place_list_marker(&marker, marker_start_row, gutter);
+            }
+            if !corner_overlays.is_empty() {
+                self.place_corner_overlays(
+                    &corner_overlays,
+                    corner_start_row,
+                    corner_band.0,
+                    corner_band.1,
+                    &cctx,
+                );
             }
             if self.gap_after(id, &tag) {
                 self.push_blank();
@@ -1720,6 +1787,57 @@ impl<'a> Layout<'a> {
             })
     }
 
+    /// Whether an element is positioned (so it's the containing block for its
+    /// `position:absolute` descendants).
+    fn is_positioned(&self, id: NodeId) -> bool {
+        matches!(
+            self.dom.computed_style(id, "position").as_deref(),
+            Some("relative" | "absolute" | "fixed" | "sticky")
+        )
+    }
+
+    /// The direct children of a positioned block that are top-right corner
+    /// overlays — `position:absolute`, anchored to the right edge (`right` set,
+    /// `left` auto) at the TOP (no `bottom` anchor). The web's badge/menu-in-
+    /// the-corner idiom: a comment's options `⋯`, a card's "NEW" ribbon, a count
+    /// badge. We can't position boxes freely, so instead of dropping them to a
+    /// compact inline run BELOW the content, we right-align them on the block's
+    /// FIRST line — where a browser paints them over the top-right corner.
+    fn corner_overlay_children(&self, id: NodeId) -> Vec<NodeId> {
+        self.dom
+            .children(id)
+            .into_iter()
+            .filter(|&c| self.is_top_right_overlay(c))
+            .collect()
+    }
+
+    /// Whether `id` is a top-right corner overlay (see `corner_overlay_children`):
+    /// `position:absolute`, `right` anchored (set, not `auto`), `left` not
+    /// anchored, and not `bottom`-anchored without a matching `top` (a bottom
+    /// corner badge isn't a first-line element). Hidden overlays don't count.
+    fn is_top_right_overlay(&self, id: NodeId) -> bool {
+        if self.dom.computed_style(id, "position").as_deref() != Some("absolute")
+            || self.dom.is_hidden(id)
+        {
+            return false;
+        }
+        let off = |p: &str| {
+            self.dom
+                .computed_style(id, p)
+                .map(|v| v.trim().to_ascii_lowercase())
+        };
+        let set = |v: &Option<String>| v.as_deref().is_some_and(|v| v != "auto");
+        let (top, right, bottom, left) = (off("top"), off("right"), off("bottom"), off("left"));
+        // Right-anchored, not left-anchored (else it spans / pins left).
+        if !set(&right) || set(&left) {
+            return false;
+        }
+        // A TOP corner: top-anchored, OR free of a bottom anchor (so it sits at
+        // the box top by default). Both top and bottom anchored → stretched, but
+        // its content still begins at the top, so treat `top` as the anchor.
+        set(&top) || !set(&bottom)
+    }
+
     /// Whether an element is taken out of normal flow by `position:absolute`
     /// or `fixed` (an overlay we render compactly inline, since we can't
     /// position it).
@@ -1733,6 +1851,24 @@ impl<'a> Layout<'a> {
             self.dom.computed_style(id, "position").as_deref(),
             Some("absolute" | "fixed")
         )
+    }
+
+    /// Whether `id` is the surfaced modal overlay or sits inside it — so its
+    /// images count as the modal's foreground content (the page-backdrop drops
+    /// must spare them). When a modal is surfaced the layout only flows that
+    /// subtree, but the check walks ancestors so it's correct regardless.
+    fn within_modal(&self, id: NodeId) -> bool {
+        let Some(m) = self.modal_root else {
+            return false;
+        };
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            if c == m {
+                return true;
+            }
+            cur = self.dom.parent_composed(c);
+        }
+        false
     }
 
     /// The topmost page-covering modal overlay in the document, if any. A cell
@@ -2519,7 +2655,15 @@ impl<'a> Layout<'a> {
             .children(id)
             .into_iter()
             .filter(|&c| {
-                matches!(self.dom.node(c).data, NodeData::Element { .. }) && !self.dom.is_hidden(c)
+                matches!(self.dom.node(c).data, NodeData::Element { .. })
+                    && !self.dom.is_hidden(c)
+                    // An absolutely-positioned child of a flex container is NOT
+                    // a flex item (CSS Flexbox §4) — it's taken out of flow and
+                    // positioned over the container. Including it laid decorative
+                    // overlays (a blurred `object-fit:cover` backdrop behind a
+                    // contained image, a badge) as real columns beside the
+                    // content. Out-of-flow children flow via their own path.
+                    && !self.is_out_of_flow(c)
             })
             .collect();
         // CSS `order`: flex/grid items render in ascending `order` (default 0,
@@ -3197,6 +3341,39 @@ impl<'a> Layout<'a> {
         }
     }
 
+    /// Lay each top-right corner overlay as its own box and place it right-
+    /// aligned on the block's first content row (`row`), packing multiple
+    /// overlays leftward from the right edge (`right`). The overlay's clickable
+    /// content (a `⋯` options menu, a badge link) keeps its node/link so it
+    /// stays selectable. See `corner_overlay_children`.
+    fn place_corner_overlays(
+        &mut self,
+        overlays: &[NodeId],
+        row: usize,
+        left: usize,
+        right: usize,
+        ctx: &Ctx,
+    ) {
+        let mut edge = right;
+        for &ov in overlays {
+            let constraint = edge.saturating_sub(left).max(1);
+            let boxed = self.layout_subtree(ov, constraint, ctx);
+            if boxed.height == 0 || boxed.width == 0 {
+                continue;
+            }
+            let w = (boxed.width as usize).min(constraint);
+            let col = edge.saturating_sub(w).max(left);
+            self.blit(&boxed, col as u16, row);
+            // Keep the target row column-ordered (the overlay merges to the
+            // right of the in-flow content already on the row), so the renderer
+            // and hit-testing read it in column order.
+            if let Some(r) = self.rows.get_mut(row) {
+                r.items.sort_by_key(|it| it.col);
+            }
+            edge = col.saturating_sub(1);
+        }
+    }
+
     /// Flow a run of inline text under the active `white-space` mode.
     fn place_text(&mut self, text: &str, ctx: &Ctx) {
         if text.is_empty() {
@@ -3360,6 +3537,130 @@ impl<'a> Layout<'a> {
         self.push_item(text.to_owned(), len, ctx.kind, ctx.emph, ctx.node, None);
     }
 
+    /// Render a `<video>`/`<audio>` element as a media representation: the
+    /// video poster (when present and decoded) as a clickable thumbnail, plus
+    /// a labelled link (`▶ Video · 720p HD` / `♪ Audio`). Both carry a link to
+    /// the playable source, so following it auto-launches mpv (see
+    /// `is_playable_media_url` in app.rs). Audio, or a poster-less / not-yet-
+    /// decoded video, falls back to the link alone — fully general (not every
+    /// embed has a preview frame).
+    fn flow_media(&mut self, id: NodeId, tag: &str, ctx: &Ctx) {
+        // The playable URL: the element's own `src`, else the first `<source>`.
+        let Some((media_url, src_node)) = self.media_source(id) else {
+            return; // no playable source — nothing to represent
+        };
+        // The representation links to the media; following it launches mpv.
+        let mut mctx = ctx.clone();
+        mctx.link = Some(crate::http::resolve(self.base, &media_url));
+        mctx.kind = ItemKind::Link;
+        mctx.node = id;
+
+        self.flush_block();
+        self.begin_line();
+
+        // The video poster (its own preview frame), when present AND decoded,
+        // renders as a clickable thumbnail. Sized by its decoded box (NOT the
+        // `<video>`'s CSS — that carries a `height:0`/`padding-top` 16:9 hack
+        // a poster must not inherit), capped to the content width.
+        let poster = (tag == "video")
+            .then(|| self.dom.attr(id, "poster"))
+            .flatten()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|p| match crate::http::resolve(self.base, p) {
+                Link::Http(u) => Some(u.to_string()),
+                _ => None,
+            });
+        if let Some(poster) = poster
+            && let Some(&(iw, ih)) = self.images.get(&poster)
+            && iw > 0
+            && ih > 0
+        {
+            let avail = self.line_right.saturating_sub(self.line_left).max(1) as u16;
+            let w = iw.min(avail).max(1);
+            // Keep aspect if width-capped.
+            let h = ((ih as u32 * w as u32) / iw as u32).max(1) as u16;
+            self.line.push(Item {
+                col: self.col as u16,
+                width: w,
+                height: h,
+                image: Some(poster),
+                crop: false,
+                text: String::new(),
+                kind: ItemKind::Image,
+                emph: Emphasis::default(),
+                node: id,
+                link: mctx.link.clone(),
+            });
+            self.col += w as usize;
+            self.line_height = self.line_height.max(h);
+            self.break_line();
+        }
+
+        // The caption / fallback link.
+        let label = self.media_label(tag, src_node);
+        self.place_text(&label, &mctx);
+        self.break_line();
+    }
+
+    /// The playable URL of a `<video>`/`<audio>` element and the chosen
+    /// `<source>` node (for its quality label): the element's own `src` if set,
+    /// else the first `<source>` with an http(s) `src` (browser source order).
+    fn media_source(&self, id: NodeId) -> Option<(String, Option<NodeId>)> {
+        if let Some(src) = self
+            .dom
+            .attr(id, "src")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            && let Link::Http(u) = crate::http::resolve(self.base, src)
+        {
+            return Some((u.to_string(), None));
+        }
+        for c in self.dom.descendants(id) {
+            if self.dom.tag_name(c) == Some("source")
+                && let Some(src) = self
+                    .dom
+                    .attr(c, "src")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                && let Link::Http(u) = crate::http::resolve(self.base, src)
+            {
+                return Some((u.to_string(), Some(c)));
+            }
+        }
+        None
+    }
+
+    /// The caption for a media representation: a glyph + kind + optional
+    /// quality from the chosen `<source>`'s `res`/`label` (`▶ Video · 720p HD`).
+    fn media_label(&self, tag: &str, src_node: Option<NodeId>) -> String {
+        let (glyph, kind) = if tag == "audio" {
+            ('♪', "Audio")
+        } else {
+            ('▶', "Video")
+        };
+        let mut quality = String::new();
+        if let Some(sn) = src_node {
+            let res = self
+                .dom
+                .attr(sn, "res")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|r| format!("{r}p"));
+            let lab = self
+                .dom
+                .attr(sn, "label")
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(res.as_deref().unwrap_or("")))
+                .map(str::to_owned);
+            let parts: Vec<String> = [res, lab].into_iter().flatten().collect();
+            if !parts.is_empty() {
+                quality = format!(" · {}", parts.join(" "));
+            }
+        }
+        format!("{glyph} {kind}{quality}")
+    }
+
     fn place_image(&mut self, id: NodeId, ctx: &Ctx) {
         // A decoded image (size known) lays out as a real W×H box; an
         // undecoded or failed one falls back to its alt text.
@@ -3377,7 +3678,25 @@ impl<'a> Layout<'a> {
             // same compaction for its image. (An in-flow full-width hero, or a
             // sized absolute cover with a definite box, still renders.)
             let avail = self.line_right.saturating_sub(self.line_left).max(1) as u16;
-            if self.is_background_layer_image(id, w, h, avail) {
+            // A framed foreground — an out-of-flow image filling a positioned
+            // ancestor that declares a constrained box (`aspect-ratio` or a
+            // definite width) — is real content sized to its frame, never a
+            // backdrop, so the drops below must spare it (it fills its own
+            // small box, which would otherwise read as "full-bleed"). Then drop
+            // the layers a terminal can't composite: a full-bleed page
+            // background, or a cover/fill backdrop sitting BEHIND an in-flow
+            // content sibling (the blurred-duplicate gallery/lightbox idiom).
+            // An image inside the surfaced modal (a lightbox/dialog we're
+            // showing in place of the page) is the modal's FOREGROUND content,
+            // never a page backdrop — a lightbox's slide is typically a
+            // full-bleed image whose every wrapper is `position:absolute`, so
+            // the background/backdrop heuristics below would wrongly drop the
+            // one thing the modal exists to show. Spare it.
+            if !self.within_modal(id)
+                && !self.framed_foreground(id)
+                && (self.is_background_layer_image(id, w, h, avail)
+                    || self.is_backdrop_overlay_image(id))
+            {
                 return;
             }
             self.place_image_box(id, ctx, url, w, h);
@@ -3412,10 +3731,12 @@ impl<'a> Layout<'a> {
         self.place_text(text, &img_ctx);
     }
 
-    /// The accessible name for an element whose content won't render
-    /// anything (no text, no `<img>`) — an SVG/icon-only link. Reads
-    /// `aria-label`, then `title`, then `alt`. `None` when it has real
-    /// content or no name to show.
+    /// The visible handle for an element whose content won't otherwise render
+    /// anything (no text, no `<img>`) — an SVG/icon-only link. Prefers the
+    /// recognized icon GLYPH (an `<svg>`/sprite Font-Awesome icon — the header
+    /// bell/bookmark/gear, the comment ⋯), else the accessible name
+    /// (`aria-label`/`title`/`alt`). `None` when it has real content, a pseudo
+    /// glyph already draws it, or it's an unnamed disclosure trigger.
     fn icon_only_label(&self, id: NodeId) -> Option<String> {
         if !self.dom.text_content(id).trim().is_empty() {
             return None;
@@ -3428,21 +3749,9 @@ impl<'a> Layout<'a> {
         {
             return None;
         }
-        // A disclosure trigger (`aria-haspopup`) opens a menu/panel we can't
-        // action yet (its content is AJAX-loaded on click). Its accessible name
-        // is a UI affordance, not body text — surfacing it leaks a phantom word
-        // (the search bar's settings cog reading "Search"). Drop it; when the
-        // panel does open, the content arrives as real text. (A labelled
-        // trigger has non-empty text and already returned above.)
-        if self.dom.attr(id, "aria-haspopup").is_some() {
-            return None;
-        }
-        // An icon-glyph control isn't empty ON SCREEN — a `::before`/`::after`
-        // Font-Awesome / Nerd-Font glyph (or an icon `<i>` carrying one) IS the
-        // visible affordance, so don't ALSO dump its accessible name as body
-        // text. This is the "Toggle expanded" arrow, a decorative search/close
-        // icon, etc. Only a genuinely invisible anchor (an undecoded `<svg>`
-        // with no glyph — a logo) still surfaces its label.
+        // A `::before`/`::after` Font-Awesome / Nerd-Font glyph (an icon `<i>`)
+        // already draws ON SCREEN — don't ALSO surface a glyph or label, or it
+        // doubles. (The "Toggle expanded" arrow, a decorative search/close.)
         if std::iter::once(id)
             .chain(self.dom.descendants(id))
             .any(|d| {
@@ -3450,6 +3759,20 @@ impl<'a> Layout<'a> {
                     || self.pseudo_text(d, crate::dom::PseudoEl::After).is_some()
             })
         {
+            return None;
+        }
+        // An SVG/sprite icon renders as its Unicode glyph — the dominant web
+        // icon idiom (a terminal can't usefully rasterize an icon-sized SVG).
+        // This wins over the disclosure-trigger suppression below so an icon
+        // menu (the search cog) shows its glyph rather than vanishing.
+        if let Some(g) = self.dom.icon_glyph(id) {
+            return Some(g.to_string());
+        }
+        // A disclosure trigger (`aria-haspopup`) with no icon opens a menu we
+        // can't action yet (AJAX on click); its accessible name is a UI
+        // affordance, not body text — surfacing it leaks a phantom word (the
+        // search bar's settings cog reading "Search"). Drop it.
+        if self.dom.attr(id, "aria-haspopup").is_some() {
             return None;
         }
         ["aria-label", "title", "alt"]
@@ -3560,6 +3883,117 @@ impl<'a> Layout<'a> {
             && raw_h.as_deref().and_then(parse_percent).is_none()
             && self.css_aspect_ratio(id).is_none()
             && self.img_attr_ratio(id).is_none()
+    }
+
+    /// Whether an out-of-flow image is the FOREGROUND of a definite media frame
+    /// — the gallery/lightbox idiom `<div style="aspect-ratio:..;
+    /// position:relative"><img style="position:absolute;inset:0"></div>`. Such
+    /// an image is real content sized to its (constrained) frame, never a page
+    /// backdrop, so the background/backdrop drops must spare it even though it
+    /// fills its small box (which would otherwise read as "full-bleed").
+    fn framed_foreground(&self, id: NodeId) -> bool {
+        self.media_frame(id).is_some()
+    }
+
+    /// The constrained positioned ancestor an out-of-flow image is framed by —
+    /// the containing block (nearest positioned ancestor) when it declares a
+    /// definite box: an `aspect-ratio`, or a definite (non-`100%`) width. `None`
+    /// for an in-flow image, or when the containing block is an unconstrained
+    /// (viewport-/parent-filling) wrapper — that's a backdrop, not a frame.
+    fn media_frame(&self, id: NodeId) -> Option<NodeId> {
+        if !self.is_out_of_flow(id) {
+            return None;
+        }
+        let mut cur = self.dom.parent_composed(id);
+        for _ in 0..4 {
+            let p = cur?;
+            if matches!(
+                self.dom.computed_style(p, "position").as_deref(),
+                Some("relative" | "absolute" | "fixed" | "sticky")
+            ) {
+                return (self.css_aspect_ratio(p).is_some() || self.has_definite_frame_width(p))
+                    .then_some(p);
+            }
+            cur = self.dom.parent_composed(p);
+        }
+        None
+    }
+
+    /// Whether an element declares a definite, non-`100%` width — a fixed media
+    /// frame (`width:300px`, `width:min(100%,1043px)`), as opposed to a
+    /// box-filling `width:100%`/`auto` wrapper.
+    fn has_definite_frame_width(&self, id: NodeId) -> bool {
+        match self.dom.computed_style(id, "width") {
+            Some(w) => {
+                let w = w.trim();
+                !w.eq_ignore_ascii_case("auto")
+                    && !w.ends_with('%')
+                    && !w.eq_ignore_ascii_case("100vw")
+                    && self.css_cells(id, "width").is_some()
+            }
+            None => false,
+        }
+    }
+
+    /// Whether an image is a non-compositable BACKDROP layer behind real
+    /// content — a cover/fill image filling an out-of-flow overlay (`inset:0` /
+    /// `100%×100%`) that sits behind an in-flow content sibling. The blurred-
+    /// duplicate gallery/lightbox idiom: a `position:absolute` overlay holds an
+    /// `object-fit:cover` copy painted under the sharp `position:relative`
+    /// image. A terminal can't composite the blur, so we keep the foreground
+    /// (the in-flow sibling) and drop this layer.
+    fn is_backdrop_overlay_image(&self, id: NodeId) -> bool {
+        // The out-of-flow overlay this image fills (itself if positioned, else
+        // its positioned parent — the `<div absolute><img cover>` shape).
+        let container = if self.is_out_of_flow(id) {
+            id
+        } else {
+            match self.dom.parent_composed(id) {
+                Some(p) if self.is_out_of_flow(p) => p,
+                _ => return false,
+            }
+        };
+        // A backdrop spans its whole box (`inset:0` / `100%×100%`)...
+        if !self.fills_parent(container) {
+            return false;
+        }
+        // ...reads as a cropped fill layer (not a contained foreground)...
+        let cover = matches!(
+            self.dom.computed_style(id, "object-fit").as_deref(),
+            Some("cover" | "fill")
+        ) || self.fills_parent(id);
+        if !cover {
+            return false;
+        }
+        // ...and sits BEHIND real foreground content: a sibling of the overlay
+        // that is in normal flow and not empty (the sharp image / card body).
+        let Some(parent) = self.dom.parent_composed(container) else {
+            return false;
+        };
+        self.dom.children(parent).into_iter().any(|s| {
+            s != container
+                && matches!(self.dom.node(s).data, NodeData::Element { .. })
+                && !self.is_out_of_flow(s)
+                && !self.dom.is_hidden(s)
+                && !self.is_empty_box(s)
+        })
+    }
+
+    /// Whether an element is sized to fill its containing block on both axes —
+    /// `width`/`height` each `100%`/`100vw`/`100vh`, or both opposite offsets
+    /// pinned to zero (`inset:0`).
+    fn fills_parent(&self, id: NodeId) -> bool {
+        let val = |p: &str| {
+            self.dom
+                .computed_style(id, p)
+                .map(|v| v.trim().to_ascii_lowercase())
+        };
+        let is_zero = |v: Option<String>| v.is_some_and(|v| is_zero_length(&v));
+        let fill_w = matches!(val("width").as_deref(), Some("100%" | "100vw"))
+            || (is_zero(val("left")) && is_zero(val("right")));
+        let fill_h = matches!(val("height").as_deref(), Some("100%" | "100vh"))
+            || (is_zero(val("top")) && is_zero(val("bottom")));
+        fill_w && fill_h
     }
 
     /// The CSS replaced-element used box (cells) for an image, plus whether to
@@ -3775,7 +4209,17 @@ impl<'a> Layout<'a> {
             return;
         }
         let stub = match tag {
-            "button" => format!("[ {} ]", self.dom.text_content(id).trim()),
+            "button" => {
+                // An icon-only / empty button renders nothing: a clickable one
+                // is already surfaced by the serializer's glyph/label handle
+                // (see `Dom` serialize) — a `[  ]` stub beside it is noise.
+                let text = self.dom.text_content(id);
+                let text = text.trim();
+                if text.is_empty() {
+                    return;
+                }
+                format!("[ {text} ]")
+            }
             "select" => "[ select ▾ ]".to_owned(),
             "textarea" => "[ textarea ]".to_owned(),
             _ if kind == "submit" || kind == "button" => {
@@ -4193,6 +4637,35 @@ fn css_length_em(value: &str) -> Option<f32> {
 /// `None` for `auto` and units we don't resolve here (`vh`/`vmin`/… need a
 /// viewport height the terminal layout doesn't carry). This is the single
 /// contextual length resolver.
+/// Which CSS math comparison function to fold over its arguments.
+enum Fold {
+    Min,
+    Max,
+    Clamp,
+}
+
+/// Split a comma-separated argument list, respecting nested parentheses (so a
+/// `min(100%, calc(50% + 2px))` keeps the inner comma-free calc intact). Used
+/// for the `min()`/`max()`/`clamp()` argument lists.
+fn split_args(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
 fn resolve_cells_f32(value: &str, avail: usize, viewport: usize) -> Option<f32> {
     let v = value.trim();
     // `var(--name, fallback)`: stylesheets are dropped before layout, so a
@@ -4215,6 +4688,39 @@ fn resolve_cells_f32(value: &str, avail: usize, viewport: usize) -> Option<f32> 
         .and_then(|r| r.strip_suffix(')'))
     {
         return resolve_calc(inner, avail, viewport);
+    }
+    // `min()`/`max()`/`clamp()` — the modern responsive sizing functions
+    // (`width: min(100%, 1043px)` = "fill the container but cap at 1043px").
+    // Comma-separated arguments, each a length/percentage/calc resolved by us;
+    // an unresolvable argument is skipped (so a `min(100% - 5px, 200px)` whose
+    // bare-math arg we can't parse still yields the other bound, rather than
+    // dropping the whole value as it did before these were understood at all).
+    let lower = v.to_ascii_lowercase();
+    for (name, fold) in [
+        ("min(", Fold::Min),
+        ("max(", Fold::Max),
+        ("clamp(", Fold::Clamp),
+    ] {
+        if lower.starts_with(name)
+            && let Some(inner) = v.get(name.len()..).and_then(|r| r.strip_suffix(')'))
+        {
+            let args: Vec<f32> = split_args(inner)
+                .into_iter()
+                .filter_map(|a| resolve_cells_f32(a.trim(), avail, viewport))
+                .collect();
+            return match fold {
+                Fold::Min => args.into_iter().reduce(f32::min),
+                Fold::Max => args.into_iter().reduce(f32::max),
+                // clamp(MIN, VAL, MAX) = max(MIN, min(VAL, MAX)); degrade
+                // gracefully if a bound was unresolvable.
+                Fold::Clamp => match args.as_slice() {
+                    [lo, val, hi] => Some(val.clamp(*lo, *hi)),
+                    [a, b] => Some(a.max(*b)),
+                    [a] => Some(*a),
+                    _ => None,
+                },
+            };
+        }
     }
     if let Some(p) = v.strip_suffix('%') {
         let pct: f32 = p.trim().parse().ok()?;
@@ -4919,6 +5425,106 @@ mod tests {
         assert!(spacers, "3 reserved spacer rows follow the image");
     }
 
+    #[test]
+    fn a_video_renders_as_poster_plus_caption_linking_to_the_source() {
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/poster.jpg".to_owned(), (40, 22));
+        let rows = lay_with_images(
+            r#"<body><video poster="/poster.jpg"><source src="/clip_720p.mp4" type="video/mp4" res="720" label="HD"></video></body>"#,
+            80,
+            &images,
+        );
+        let poster = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .expect("a poster image item");
+        assert_eq!(
+            poster.image.as_deref(),
+            Some("https://example.com/poster.jpg")
+        );
+        assert!(
+            matches!(&poster.link, Some(Link::Http(u)) if u.as_str().ends_with("clip_720p.mp4")),
+            "poster links to the media source"
+        );
+        assert!(
+            shows(&rows, "▶ Video · 720p HD"),
+            "caption present: {:?}",
+            texts(&rows)
+        );
+        // The caption is itself a link to the media.
+        let cap = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("▶ Video"))
+            .expect("a caption item");
+        assert!(matches!(&cap.link, Some(Link::Http(u)) if u.as_str().ends_with("clip_720p.mp4")));
+    }
+
+    #[test]
+    fn a_videojs_transformed_player_still_renders_poster_and_caption() {
+        // The real shape after video.js initialises: the <video> is renamed,
+        // class vjs-tech, position:absolute, src set directly, inside a
+        // video-js wrapper alongside control divs.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/poster.jpg".to_owned(), (80, 23));
+        let rows = lay_with_images(
+            r#"<body><div class="video-js vjs-16-9" style="position:relative">
+                 <video class="vjs-tech" poster="/poster.jpg" src="/clip_720p.mp4"
+                        style="display:inline-block;width:100%;height:100%;position:absolute;top:0;left:0"></video>
+                 <div class="vjs-poster" style="background-image:url(/poster.jpg)"></div>
+                 <button class="vjs-big-play-button"><span class="vjs-control-text">Play Video</span></button>
+               </div></body>"#,
+            120,
+            &images,
+        );
+        let has_poster = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .any(|i| i.image.as_deref() == Some("https://example.com/poster.jpg"));
+        assert!(has_poster, "poster renders: {:?}", texts(&rows));
+        assert!(
+            shows(&rows, "▶ Video"),
+            "caption renders: {:?}",
+            texts(&rows)
+        );
+        // The player chrome (big-play button etc.) is suppressed — only the
+        // media representation renders, no leaked control labels.
+        assert!(
+            !shows(&rows, "Play Video"),
+            "player chrome suppressed: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn an_svg_icon_link_renders_its_glyph_not_its_label() {
+        // The logged-in header idiom: `<a><svg class="...fa-bell"></svg></a>`.
+        // An icon-only anchor renders the icon GLYPH (the web's dominant icon
+        // form) rather than vanishing or dumping its aria-label.
+        let rows = lay(
+            r##"<body><a href="/n" aria-label="Notifications"><svg class="svg-fa svg-fas-fa-bell"><use href="#fas-fa-bell"></use></svg></a></body>"##,
+            80,
+        );
+        assert!(shows(&rows, "🔔"), "bell glyph: {:?}", texts(&rows));
+        assert!(!shows(&rows, "Notifications"), "{:?}", texts(&rows));
+    }
+
+    #[test]
+    fn an_audio_with_no_poster_renders_a_link_only() {
+        let rows = lay_with_images(
+            r#"<body><audio><source src="/track.mp3" type="audio/mpeg"></audio></body>"#,
+            80,
+            &ImageSizes::new(),
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .all(|i| i.image.is_none())
+        );
+        assert!(shows(&rows, "♪ Audio"), "{:?}", texts(&rows));
+    }
+
     /// Whether any laid item's text contains `needle`.
     fn shows(rows: &[Row], needle: &str) -> bool {
         rows.iter()
@@ -4981,6 +5587,96 @@ mod tests {
             80,
         );
         assert!(shows(&rows, "LoginLink"), "the page still renders");
+    }
+
+    #[test]
+    fn a_surfaced_modal_keeps_its_foreground_image() {
+        // A lightbox: a position:fixed overlay whose content is a full-bleed
+        // image wrapped in absolutely-positioned layers (every ancestor is
+        // out-of-flow). The image is the modal's FOREGROUND — render it, don't
+        // drop it as a page backdrop. (`Close` makes the overlay qualify as a
+        // modal; the image alone has no "content".)
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/slide.jpg".to_string(), (80, 60));
+        let dom = Dom::parse_document(
+            r##"<body>
+                 <div id="page"><a href="/in">PageLink</a></div>
+                 <div style="position:fixed;width:100%;height:100%">
+                   <div style="position:absolute;top:0;right:0;bottom:0;left:0">
+                     <img src="/slide.jpg" style="width:auto;max-width:100%;height:auto">
+                   </div>
+                   <a href="#close">Close</a>
+                 </div>
+               </body>"##,
+        );
+        let base = Url::parse("https://example.com/").unwrap();
+        let rows = lay_out(&dom, &base, 80, &[], &ControlMap::new(), &images, false);
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .any(|i| i.image.as_deref() == Some("https://example.com/slide.jpg")),
+            "the lightbox slide image renders: {:?}",
+            texts(&rows)
+        );
+        assert!(
+            !shows(&rows, "PageLink"),
+            "the page behind the lightbox is deferred"
+        );
+    }
+
+    #[test]
+    fn a_top_right_corner_overlay_rides_the_first_line() {
+        // erome's comment options idiom: a `position:relative` block holds its
+        // content plus a `position:absolute;top:0;right:0` `⋯` menu. The overlay
+        // is right-aligned ON the first content line, not dropped to its own row
+        // below it.
+        let rows = lay(
+            r#"<body><div style="position:relative">
+                 <div>comment body</div>
+                 <div style="position:absolute;top:0;right:0"><a href="/opts">X</a></div>
+               </div></body>"#,
+            40,
+        );
+        let first = &rows[0];
+        let link = first
+            .items
+            .iter()
+            .find(|i| i.link.is_some())
+            .expect("the overlay link is on the FIRST row");
+        assert_eq!(link.text.trim(), "X");
+        let text = first
+            .items
+            .iter()
+            .find(|i| i.text.contains("comment"))
+            .expect("the comment text is on the first row too");
+        // Right-aligned: to the right of the content, near the band's right edge.
+        assert!(
+            link.col > text.col && (link.col as usize) >= 40 - 3,
+            "overlay right-aligned: link@{} text@{}",
+            link.col,
+            text.col
+        );
+    }
+
+    #[test]
+    fn a_bottom_or_full_bleed_overlay_is_not_first_lined() {
+        // A bottom-anchored badge, and a full-bleed `inset:0` overlay (both
+        // offsets pinned, so it's a layer not a corner), are NOT corner badges:
+        // they keep the ordinary out-of-flow inline path, below the content.
+        let rows = lay(
+            r#"<body><div style="position:relative">
+                 <div>line one</div>
+                 <div style="position:absolute;bottom:0;right:0"><a href="/b">BOT</a></div>
+                 <div style="position:absolute;top:0;left:0;right:0"><a href="/f">FULL</a></div>
+               </div></body>"#,
+            40,
+        );
+        // Neither sits on the first row (which holds the content).
+        let first = render_row(&rows[0]);
+        assert!(
+            !first.contains("BOT") && !first.contains("FULL"),
+            "first row holds content only: {first:?}"
+        );
     }
 
     #[test]

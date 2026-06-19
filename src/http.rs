@@ -1303,10 +1303,14 @@ pub fn parse_seeded(
 fn collect_image_urls(dom: &crate::dom::Dom, base: &Url) -> Vec<String> {
     let mut urls = Vec::new();
     for id in dom.descendants(crate::dom::DOCUMENT) {
-        if dom.tag_name(id) != Some("img") {
-            continue;
-        }
-        let Some(src) = dom.attr(id, "src").map(str::trim).filter(|s| !s.is_empty()) else {
+        // `<img src>` and `<video poster>` (the poster renders as the video's
+        // clickable thumbnail) both feed the decode pipeline.
+        let src = match dom.tag_name(id) {
+            Some("img") => dom.attr(id, "src"),
+            Some("video") => dom.attr(id, "poster"),
+            _ => None,
+        };
+        let Some(src) = src.map(str::trim).filter(|s| !s.is_empty()) else {
             continue;
         };
         if let Link::Http(u) = resolve(base, src) {
@@ -2403,6 +2407,9 @@ mod tests {
             .send(crate::js::PageCmd::Click(marker))
             .await
             .unwrap();
+        // The newest post-click snapshot, dumped to TRUST_NET_DIAG_OUT for
+        // inspection (e.g. a JS-built lightbox/modal the click opens).
+        let mut last_html: Option<String> = None;
         // Drain a few events so we see Updated/Navigate/Settled, not just the
         // first. Time-bounded: after the dispatch settles no more events come,
         // so don't block waiting for the actor to time out.
@@ -2421,6 +2428,7 @@ mod tests {
                         "   probe {probe:?} present AFTER = {}",
                         html.contains(&probe)
                     );
+                    last_html = Some(html);
                 }
                 Some(crate::js::PageEvt::Static { html, outcome }) => {
                     eprintln!("EVT Static: errors={:?}", outcome.errors);
@@ -2428,6 +2436,7 @@ mod tests {
                         "   probe {probe:?} present AFTER = {}",
                         html.contains(&probe)
                     );
+                    last_html = Some(html);
                     break;
                 }
                 Some(crate::js::PageEvt::Navigate(u)) => eprintln!("EVT Navigate -> {u}"),
@@ -2459,6 +2468,12 @@ mod tests {
             "RE-FETCH sent cookies = {:?}",
             cookies_for_request(&parse_url(&target).unwrap())
         );
+        if let Some(html) = last_html
+            && let Ok(out) = std::env::var("TRUST_NET_DIAG_OUT")
+        {
+            std::fs::write(&out, &html).unwrap();
+            eprintln!("post-click body ({}B) -> {out}", html.len());
+        }
         drop(response.live.take());
     }
 
