@@ -820,6 +820,19 @@ impl Dom {
             }
         }
         let raw = winner.map(|(_, v)| v)?;
+        // A hidden pseudo-element generates no rendered content. The common
+        // width-reservation idiom `[data-content]::before { content:
+        // attr(data-content); visibility:hidden }` (Primer's UnderlineNav tabs,
+        // many tab/button components) paints a hidden bold copy of the label
+        // purely to reserve its selected width — rendering it doubles the label
+        // ("CodeCode IssuesIssues"). Honor the pseudo's own visibility/display.
+        if matches!(
+            self.pseudo_style(id, which, "visibility").as_deref(),
+            Some("hidden" | "collapse")
+        ) || self.pseudo_style(id, which, "display").as_deref() == Some("none")
+        {
+            return None;
+        }
         self.parse_content_value(id, &raw)
     }
 
@@ -961,11 +974,20 @@ impl Dom {
     }
 
     fn is_stylesheet_link(&self, id: NodeId) -> bool {
-        self.tag_name(id) == Some("link")
-            && self.attr(id, "rel").is_some_and(|r| {
-                r.split_ascii_whitespace()
-                    .any(|w| w.eq_ignore_ascii_case("stylesheet"))
-            })
+        if self.tag_name(id) != Some("link") {
+            return false;
+        }
+        let Some(rel) = self.attr(id, "rel") else {
+            return false;
+        };
+        let mut words = rel.split_ascii_whitespace();
+        // An applied stylesheet has `rel="stylesheet"`. `rel="alternate
+        // stylesheet"` is an ALTERNATE — not applied unless the user selects it
+        // (HTML §4.6.7) — and a `disabled` sheet is off; neither contributes to
+        // the cascade, so don't fetch or attach them.
+        let is_sheet = words.clone().any(|w| w.eq_ignore_ascii_case("stylesheet"));
+        let is_alternate = words.any(|w| w.eq_ignore_ascii_case("alternate"));
+        is_sheet && !is_alternate && self.attr(id, "disabled").is_none()
     }
 
     /// Raw hrefs of external stylesheets, document order, so the fetch
@@ -2386,6 +2408,13 @@ const PROPS: &[PropDef] = &[
     prop("gap",                  false,     true),
     prop("column-gap",           false,     true),
     prop("row-gap",              false,     true),
+    prop("grid-template-columns", false,    true),
+    prop("grid-template-rows",   false,     true),
+    prop("grid-auto-flow",       false,     true),
+    prop("grid-auto-columns",    false,     true),
+    prop("grid-auto-rows",       false,     true),
+    prop("grid-column",          false,     true),
+    prop("grid-row",             false,     true),
     prop("justify-content",      false,     true),
     prop("align-items",          false,     true),
     prop("order",                false,     true),
@@ -2513,6 +2542,25 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         let (w, s) = parse_border_shorthand(value);
         return border_longhands(&[side], w, s);
     }
+    // `grid-gap`/`grid-row-gap`/`grid-column-gap`: the deprecated aliases of
+    // `gap`/`row-gap`/`column-gap` (still emitted by older toolchains and
+    // GitHub's Primer). Normalize to the modern names the layout reads.
+    if let Some(rest) = prop.strip_prefix("grid-")
+        && matches!(rest, "gap" | "row-gap" | "column-gap")
+    {
+        return vec![(rest.to_string(), value.to_string())];
+    }
+    // `grid-template: <rows> / <columns>` (the area form is ignored — we don't
+    // place by name). Split on the top-level `/` into the two track lists.
+    if prop == "grid-template" {
+        if let Some((rows, cols)) = split_top_level_slash(value) {
+            return vec![
+                ("grid-template-rows".to_string(), rows.trim().to_string()),
+                ("grid-template-columns".to_string(), cols.trim().to_string()),
+            ];
+        }
+        return Vec::new();
+    }
     // `list-style: <type> || <position> || <image>` — we track the type and
     // position keywords (a bare `none` counts as the type, per the shorthand
     // grammar; the image and any URL are ignored).
@@ -2530,6 +2578,22 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         return out;
     }
     vec![(prop.to_string(), value.to_string())]
+}
+
+/// Split a value on the first `/` at paren-depth 0 (so a `minmax(a, b)` or
+/// `repeat(2, 1fr)` track keeps its inner contents). `None` if there is no
+/// top-level slash. Used for the `grid-template: rows / columns` shorthand.
+fn split_top_level_slash(value: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    for (i, b) in value.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'/' if depth == 0 => return Some((&value[..i], &value[i + 1..])),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The top/right/bottom/left values of a CSS 1–4-value box shorthand.
@@ -3711,6 +3775,58 @@ mod tests {
         assert_eq!(dom.stylesheet_links(), vec![String::from("/a.css")]);
         dom.attach_external_sheets(&[(String::from("/a.css"), String::from(".x{display:none}"))]);
         assert!(!dom.serialize(DOCUMENT).contains("linked hide"));
+    }
+
+    #[test]
+    fn alternate_and_disabled_stylesheets_are_skipped() {
+        // Only applied stylesheets feed the cascade and the fetch list: an
+        // `alternate` stylesheet (user-selectable, off by default) and a
+        // `disabled` one don't apply (HTML §4.6.7), so we neither fetch nor
+        // attach them — they must not crowd real sheets out of the fetch cap.
+        let dom = Dom::parse_document(
+            "<head>\
+             <link rel=stylesheet href='/main.css'>\
+             <link rel='alternate stylesheet' href='/theme-dark.css'>\
+             <link rel=stylesheet href='/late.css' disabled>\
+             </head><body></body>",
+        );
+        assert_eq!(dom.stylesheet_links(), vec![String::from("/main.css")]);
+    }
+
+    #[test]
+    fn hidden_pseudo_element_generates_no_content() {
+        // The width-reservation idiom: a hidden bold copy of a tab label via
+        // `::before{content:attr(data-content);visibility:hidden}`. Its content
+        // must NOT render (else the label doubles — GitHub's "CodeCode"). A
+        // visible `::before` still renders.
+        let dom = Dom::parse_document(
+            "<head><style>\
+             .tab::before{content:attr(data-content);visibility:hidden}\
+             .tag::before{content:\"#\"}\
+             </style></head>\
+             <body><span class=tab data-content=Code>Code</span>\
+             <span class=tag>topic</span></body>",
+        );
+        let tab = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&i| dom.attr(i, "class") == Some("tab"))
+            .unwrap();
+        let tag = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&i| dom.attr(i, "class") == Some("tag"))
+            .unwrap();
+        assert_eq!(
+            dom.pseudo_content(tab, PseudoEl::Before),
+            None,
+            "hidden ::before renders nothing"
+        );
+        assert_eq!(
+            dom.pseudo_content(tag, PseudoEl::Before).as_deref(),
+            Some("#"),
+            "visible ::before still renders"
+        );
     }
 
     #[test]

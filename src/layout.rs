@@ -438,6 +438,42 @@ enum FlexMode {
     Column,
 }
 
+/// One `grid-template-columns`/`-rows` track sizing function. Fixed lengths
+/// are pre-resolved to cells (against the grid's content box) at parse time;
+/// intrinsic (`auto`/content) and flexible (`fr`) tracks size during the
+/// track-sizing pass once item content widths are known. The subset CSS Grid
+/// callers actually use; `repeat()` is expanded before this, named lines are
+/// dropped, and an unparseable token bails the whole grid to the shelf-pack
+/// fallback (so `display:grid` without a usable template is unchanged).
+#[derive(Clone)]
+enum TrackSpec {
+    /// A definite length (`px`/`em`/`%`/`ch`/`calc()`/`min|max|clamp()`), cells.
+    Fixed(f32),
+    /// A flexible `<flex>` track (`Nfr`): shares leftover space by weight.
+    Fr(f32),
+    /// `auto`: content-sized, and stretches to fill leftover when no `fr` track
+    /// claims it (CSS grid §11.5 — auto maximums absorb free space).
+    Auto,
+    /// `min-content`: the largest unbreakable content size (we approximate with
+    /// the item's measured content width, same as max-content).
+    MinContent,
+    /// `max-content`: the content's preferred (unconstrained) width.
+    MaxContent,
+    /// `minmax(min, max)`: a floor and a growth limit.
+    Minmax(Box<TrackSpec>, Box<TrackSpec>),
+    /// `fit-content(L)`: content-sized but capped at `L` cells.
+    FitContent(f32),
+}
+
+/// A grid item's resolved placement: zero-based column/row start and span.
+#[derive(Clone, Copy)]
+struct GridPlace {
+    col: usize,
+    col_span: usize,
+    row: usize,
+    row_span: usize,
+}
+
 /// Which edge a `float` pins to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FloatSide {
@@ -1004,6 +1040,24 @@ impl<'a> Layout<'a> {
         })
     }
 
+    /// Whether an element clips/scrolls its horizontal (flex main) axis —
+    /// `overflow` or `overflow-x` set to `auto`/`scroll`/`hidden`/`clip`. Such
+    /// a container is a scroll context, so a non-wrapping flex row that
+    /// overflows keeps its items side by side (clipped) instead of reflowing
+    /// into a vertical stack. See `flow_flex_row`.
+    fn clips_x(&self, id: NodeId) -> bool {
+        [
+            self.dom.computed_style(id, "overflow"),
+            self.dom.computed_style(id, "overflow-x"),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|v| {
+            v.split_whitespace()
+                .any(|t| matches!(t, "hidden" | "clip" | "auto" | "scroll"))
+        })
+    }
+
     fn flow_node(&mut self, id: NodeId, ctx: &Ctx) {
         match &self.dom.node(id).data {
             NodeData::Text(s) => {
@@ -1410,7 +1464,14 @@ impl<'a> Layout<'a> {
             self.flow_hscroll(id);
         } else {
             match flex {
-                Some(FlexMode::Grid) => self.flow_flex_wrap(id, &cctx),
+                // An explicit `grid-template-columns` lays the page's own
+                // tracks (`flow_grid_tracks`); a bare/auto-fill-less grid or an
+                // unparseable template falls back to the shelf-packed grid.
+                Some(FlexMode::Grid) => {
+                    if !self.flow_grid_tracks(id, &cctx) {
+                        self.flow_flex_wrap(id, &cctx);
+                    }
+                }
                 Some(FlexMode::Row) => self.flow_flex_row(id, &cctx),
                 Some(FlexMode::Column) => self.stack_flex_items(id, &cctx),
                 None => {
@@ -2102,33 +2163,51 @@ impl<'a> Layout<'a> {
                 }
             }
         } else {
-            // Overflow: shrink. A shrinkable item can shrink to its min-content
-            // width; a `flex-shrink:0` item keeps its basis. If even the
-            // minimum row overflows, stack instead.
+            // Overflow: shrink. A shrinkable item can shrink to its minimum —
+            // its explicit `min-width` if set (a hard floor; flexbox never
+            // shrinks an item below it), else its min-content width capped at
+            // its basis. A `flex-shrink:0` item keeps its basis.
             let floor: Vec<usize> = (0..n)
                 .map(|i| {
-                    if shrink[i] > 0.0 {
+                    let auto_min = if shrink[i] > 0.0 {
                         self.measure_width(nodes[i], 1).min(basis[i])
                     } else {
                         basis[i]
-                    }
+                    };
+                    self.css_cells(nodes[i], "min-width")
+                        .map_or(auto_min, |mw| mw.min(avail))
                 })
                 .collect();
             let sum_floor: usize = floor.iter().sum();
             if sum_floor + gaps > avail {
-                self.stack_boxes(&nodes, avail, ctx);
-                return;
-            }
-            let extra = avail - sum_floor - gaps;
-            let desired: usize = (0..n).map(|i| basis[i] - floor[i]).sum();
-            for i in 0..n {
-                // Hand each item its share of the slack above its minimum,
-                // proportional to how much it wanted (basis − floor); split it
-                // evenly when nothing wants extra.
-                let share = (extra * (basis[i] - floor[i]))
-                    .checked_div(desired)
-                    .unwrap_or(extra / n);
-                widths[i] = floor[i] + share;
+                // Even at every item's minimum the row overflows. Normally we
+                // reflow it into a vertical stack (the terminal's responsive
+                // default — a too-wide nav or card row stacks into a column).
+                // But a flex container that CLIPS/scrolls its main axis
+                // (`overflow`/`overflow-x: auto|scroll|hidden|clip`) is a scroll
+                // context: a browser keeps its items side by side and scrolls
+                // the overflow rather than reflowing. The terminal has no
+                // horizontal scroll, so we keep them side by side and let the
+                // overflow clip at the box edge — this is what keeps a code
+                // view's fixed line-number gutter beside its (clipped) code
+                // instead of dropping the gutter above it.
+                if !self.clips_x(id) {
+                    self.stack_boxes(&nodes, avail, ctx);
+                    return;
+                }
+                widths = floor;
+            } else {
+                let extra = avail - sum_floor - gaps;
+                let desired: usize = (0..n).map(|i| basis[i].saturating_sub(floor[i])).sum();
+                for i in 0..n {
+                    // Hand each item its share of the slack above its minimum,
+                    // proportional to how much it wanted (basis − floor); split
+                    // it evenly when nothing wants extra.
+                    let share = (extra * basis[i].saturating_sub(floor[i]))
+                        .checked_div(desired)
+                        .unwrap_or(extra / n);
+                    widths[i] = floor[i] + share;
+                }
             }
         }
         // `justify-content` distributes any leftover free space (when grow
@@ -3031,6 +3110,428 @@ impl<'a> Layout<'a> {
         }
         self.col = self.line_left;
         self.pending_space = false;
+    }
+
+    /// Lay a `display:grid` container that declares an explicit
+    /// `grid-template-columns`, honoring its track sizing and each item's
+    /// `grid-column`/`grid-row` placement. This is what lets a page's own grid
+    /// CSS drive the layout instead of a one-size approximation — GitHub's
+    /// `Layout` is a fixed `auto` sidebar column beside a flexible
+    /// `minmax(0, calc(…))` main column, and we now place them exactly where
+    /// the stylesheet asks. Returns `false` (the caller falls back to the
+    /// shelf-packed `flow_flex_wrap`) when there is no usable template:
+    /// `repeat()` — including `auto-fill`/`auto-fit` — is supported, but a
+    /// missing template, named grid areas, or any unparseable token bail, so a
+    /// bare `display:grid` is unchanged.
+    fn flow_grid_tracks(&mut self, id: NodeId, ctx: &Ctx) -> bool {
+        let avail = self.line_right.saturating_sub(self.line_left).max(1);
+        let col_gap = self.flex_gap(id, avail, false);
+        let row_gap = self.flex_gap(id, avail, true);
+        let Some(template) = self.dom.computed_style(id, "grid-template-columns") else {
+            return false;
+        };
+        let Some(specs) = self.parse_track_list(&template, avail as f32, col_gap as f32) else {
+            return false;
+        };
+        let ncols = specs.len();
+        let items = self.flex_items(id);
+        if ncols == 0 || items.is_empty() {
+            return false;
+        }
+
+        // Placement: resolve each item's column/row (explicit `grid-column`/
+        // `grid-row`, else auto-flow).
+        let column_flow = self
+            .dom
+            .computed_style(id, "grid-auto-flow")
+            .is_some_and(|v| v.contains("column"));
+        let places = self.place_grid_items(&items, ncols, column_flow);
+
+        // Track sizing. An intrinsic (`auto`/content) track sizes to the widest
+        // item that occupies ONLY it; a spanning item contributes to no single
+        // track (a documented approximation — its own width is still honored
+        // when laid). Fixed/`fr` tracks ignore content.
+        let mut content_w = vec![0f32; ncols];
+        for (it, pl) in items.iter().zip(&places) {
+            if pl.col_span == 1 && pl.col < ncols && self.track_is_intrinsic(&specs[pl.col]) {
+                content_w[pl.col] = content_w[pl.col].max(self.measure_width(*it, avail) as f32);
+            }
+        }
+        let widths = self.size_grid_tracks(&specs, &content_w, avail, col_gap);
+
+        // Column x offsets (cumulative track widths + gaps).
+        let mut col_x = vec![0usize; ncols];
+        let mut acc = 0usize;
+        for c in 0..ncols {
+            col_x[c] = acc;
+            acc += widths[c] + col_gap;
+        }
+
+        // Lay every item across its spanned columns; remember its grid row.
+        let grid_top = self.rows.len();
+        let mut laid: Vec<(GridPlace, LaidBox)> = Vec::new();
+        let mut nrows = 1usize;
+        for (it, pl) in items.iter().zip(&places) {
+            if pl.col >= ncols {
+                continue;
+            }
+            let end = (pl.col + pl.col_span).min(ncols);
+            let span = end - pl.col;
+            let w = (widths[pl.col..end].iter().sum::<usize>() + col_gap * span.saturating_sub(1))
+                .max(1);
+            let b = self.layout_subtree(*it, w, ctx);
+            if b.height == 0 {
+                continue;
+            }
+            nrows = nrows.max(pl.row + pl.row_span);
+            laid.push((*pl, b));
+        }
+
+        // Row heights = the tallest box starting in each row (a row-spanning
+        // box is approximated to its first row). Then row y offsets.
+        let mut row_h = vec![0usize; nrows];
+        for (pl, b) in &laid {
+            if pl.row < nrows {
+                row_h[pl.row] = row_h[pl.row].max(b.height as usize);
+            }
+        }
+        let mut row_y = vec![0usize; nrows];
+        let mut acc = 0usize;
+        for r in 0..nrows {
+            row_y[r] = acc;
+            acc += row_h[r] + row_gap;
+        }
+
+        // Blit each item at its column/row origin within the grid.
+        for (pl, b) in &laid {
+            let x = col_x.get(pl.col).copied().unwrap_or(0);
+            let y = grid_top + row_y.get(pl.row).copied().unwrap_or(0);
+            self.blit(b, (self.line_left + x) as u16, y);
+        }
+        self.col = self.line_left;
+        self.pending_space = false;
+        true
+    }
+
+    /// Parse a `grid-template-columns`/`-rows` value into per-track sizing
+    /// functions, expanding `repeat()` (`auto-fill`/`auto-fit` counted against
+    /// `avail`). Fixed lengths resolve to cells now (against the grid's content
+    /// box, `avail`); intrinsic/`fr` tracks resolve during sizing. `None` (the
+    /// caller falls back) for `none`/empty or any token we can't parse.
+    fn parse_track_list(&self, value: &str, avail: f32, gap: f32) -> Option<Vec<TrackSpec>> {
+        let v = value.trim();
+        if v.is_empty() || v.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        // Named grid areas / line-name-only templates aren't placed by us.
+        let mut tracks = Vec::new();
+        for tok in split_track_tokens(v) {
+            if let Some(inner) = tok
+                .strip_prefix("repeat(")
+                .and_then(|r| r.strip_suffix(')'))
+            {
+                let (count_s, list_s) = inner.split_once(',')?;
+                let list = self.parse_track_list(list_s, avail, gap)?;
+                let count_s = count_s.trim();
+                let count = if count_s.eq_ignore_ascii_case("auto-fill")
+                    || count_s.eq_ignore_ascii_case("auto-fit")
+                {
+                    let unit: f32 = list.iter().map(|t| self.track_repeat_min(t)).sum::<f32>()
+                        + gap * (list.len() as f32 - 1.0).max(0.0);
+                    if unit <= 0.0 {
+                        return None; // no definite repeat width → can't count
+                    }
+                    (((avail + gap) / (unit + gap)).floor() as usize).clamp(1, 1000)
+                } else {
+                    count_s.parse::<usize>().ok()?.clamp(1, 1000)
+                };
+                for _ in 0..count {
+                    tracks.extend(list.iter().cloned());
+                }
+            } else if let Some(spec) = self.parse_one_track(&tok, avail) {
+                tracks.push(spec);
+            } else {
+                return None;
+            }
+        }
+        (!tracks.is_empty()).then_some(tracks)
+    }
+
+    /// Parse a single track sizing function (`auto`, `Nfr`, a length,
+    /// `minmax()`, `fit-content()`, `min/max-content`). `None` if unparseable.
+    fn parse_one_track(&self, tok: &str, avail: f32) -> Option<TrackSpec> {
+        let t = tok.trim();
+        match t {
+            "auto" => return Some(TrackSpec::Auto),
+            "min-content" => return Some(TrackSpec::MinContent),
+            "max-content" => return Some(TrackSpec::MaxContent),
+            _ => {}
+        }
+        if let Some(inner) = t.strip_prefix("minmax(").and_then(|r| r.strip_suffix(')')) {
+            let (a, b) = split_args(inner)
+                .split_first()
+                .and_then(|(a, rest)| rest.first().map(|b| (a.trim(), b.trim())))?;
+            let min = self.parse_one_track(a, avail)?;
+            let max = self.parse_one_track(b, avail)?;
+            return Some(TrackSpec::Minmax(Box::new(min), Box::new(max)));
+        }
+        if let Some(inner) = t
+            .strip_prefix("fit-content(")
+            .and_then(|r| r.strip_suffix(')'))
+        {
+            let cap = resolve_cells_f32(inner.trim(), avail as usize, self.viewport_w)?;
+            return Some(TrackSpec::FitContent(cap.max(0.0)));
+        }
+        if let Some(num) = t.strip_suffix("fr") {
+            let f: f32 = num.trim().parse().ok()?;
+            return Some(TrackSpec::Fr(f.max(0.0)));
+        }
+        resolve_cells_f32(t, avail as usize, self.viewport_w).map(|c| TrackSpec::Fixed(c.max(0.0)))
+    }
+
+    /// Whether a track sizes to content (so the content-width pass must measure
+    /// its items): `auto`/`min|max-content`/`fit-content`, or a `minmax()` with
+    /// an intrinsic bound.
+    fn track_is_intrinsic(&self, spec: &TrackSpec) -> bool {
+        match spec {
+            TrackSpec::Auto
+            | TrackSpec::MinContent
+            | TrackSpec::MaxContent
+            | TrackSpec::FitContent(_) => true,
+            TrackSpec::Minmax(min, max) => {
+                self.track_is_intrinsic(min) || self.track_is_intrinsic(max)
+            }
+            _ => false,
+        }
+    }
+
+    /// A track's definite minimum size in cells — used to count `auto-fill`/
+    /// `auto-fit` repetitions. `0` for tracks with no definite floor
+    /// (`auto`/`fr`/content), which makes a pure-`fr` `auto-fill` uncountable.
+    fn track_repeat_min(&self, spec: &TrackSpec) -> f32 {
+        match spec {
+            TrackSpec::Fixed(c) => *c,
+            TrackSpec::FitContent(cap) => *cap,
+            TrackSpec::Minmax(min, _) => self.track_repeat_min(min),
+            _ => 0.0,
+        }
+    }
+
+    /// A track's `(base, fr)` for sizing: its floor in cells and its `fr`
+    /// growth weight (0 = inflexible). `content` is the measured content width
+    /// for intrinsic tracks.
+    fn track_base_fr(&self, spec: &TrackSpec, content: f32) -> (f32, f32) {
+        match spec {
+            TrackSpec::Fixed(c) => (*c, 0.0),
+            TrackSpec::Fr(f) => (0.0, *f),
+            TrackSpec::Auto | TrackSpec::MaxContent | TrackSpec::MinContent => (content, 0.0),
+            TrackSpec::FitContent(cap) => (content.min(*cap), 0.0),
+            TrackSpec::Minmax(min, max) => {
+                let (min_base, _) = self.track_base_fr(min, content);
+                match max.as_ref() {
+                    TrackSpec::Fr(f) => (min_base, *f),
+                    TrackSpec::Fixed(c) => (c.max(min_base), 0.0),
+                    other => {
+                        let (max_base, _) = self.track_base_fr(other, content);
+                        (max_base.max(min_base), 0.0)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve track sizing functions to concrete cell widths: place bases,
+    /// hand leftover space to `fr` tracks by weight, and — since a terminal has
+    /// no horizontal scroll — proportionally compress an over-wide template to
+    /// fit (the common `fr` case never overflows, so fixed tracks keep their
+    /// size).
+    fn size_grid_tracks(
+        &self,
+        specs: &[TrackSpec],
+        content_w: &[f32],
+        avail: usize,
+        gap: usize,
+    ) -> Vec<usize> {
+        let n = specs.len();
+        let mut base = vec![0f32; n];
+        let mut fr = vec![0f32; n];
+        for i in 0..n {
+            let (b, f) = self.track_base_fr(&specs[i], content_w[i]);
+            base[i] = b.max(0.0);
+            fr[i] = f.max(0.0);
+        }
+        let gaps = gap as f32 * (n as f32 - 1.0).max(0.0);
+        let base_sum: f32 = base.iter().sum();
+        let fr_sum: f32 = fr.iter().sum();
+        let mut size = base.clone();
+        let free = avail as f32 - base_sum - gaps;
+        if free > 0.0 && fr_sum > 0.0 {
+            for i in 0..n {
+                size[i] += free * fr[i] / fr_sum;
+            }
+        }
+        let total: f32 = size.iter().sum::<f32>() + gaps;
+        if total > avail as f32 {
+            let usable = (avail as f32 - gaps).max(n as f32);
+            let s: f32 = size.iter().sum();
+            if s > 0.0 {
+                let k = usable / s;
+                for v in &mut size {
+                    *v *= k;
+                }
+            }
+        }
+        size.into_iter()
+            .map(|c| c.round().max(1.0) as usize)
+            .collect()
+    }
+
+    /// Assign every grid item a `(col, col_span, row, row_span)`: honor an
+    /// explicit `grid-column`/`grid-row` (line numbers + `span`), and auto-place
+    /// the rest along the `grid-auto-flow` axis into the first free cells,
+    /// tracking occupancy so placed and auto items never overlap.
+    fn place_grid_items(
+        &self,
+        items: &[NodeId],
+        ncols: usize,
+        column_flow: bool,
+    ) -> Vec<GridPlace> {
+        let mut occ: Vec<Vec<bool>> = Vec::new();
+        let mut out = Vec::with_capacity(items.len());
+        let (mut cur_r, mut cur_c) = (0usize, 0usize);
+        for &it in items {
+            let (cstart, cspan) = self.parse_grid_line(it, "grid-column", ncols);
+            let (rstart, rspan) = self.parse_grid_line(it, "grid-row", 0);
+            let cspan = cspan.clamp(1, ncols);
+            let rspan = rspan.max(1);
+            let place = if let Some(c) = cstart {
+                let c = c.min(ncols - cspan);
+                let mut r = rstart.unwrap_or(0);
+                while !grid_cells_free(&occ, r, c, rspan, cspan, ncols) {
+                    r += 1;
+                }
+                GridPlace {
+                    col: c,
+                    col_span: cspan,
+                    row: r,
+                    row_span: rspan,
+                }
+            } else if let Some(r) = rstart {
+                let mut c = 0;
+                while !grid_cells_free(&occ, r, c, rspan, cspan, ncols) && c + cspan < ncols {
+                    c += 1;
+                }
+                GridPlace {
+                    col: c.min(ncols - cspan),
+                    col_span: cspan,
+                    row: r,
+                    row_span: rspan,
+                }
+            } else {
+                let (mut r, mut c) = (cur_r, cur_c);
+                if column_flow {
+                    while !grid_cells_free(&occ, r, c, rspan, cspan, ncols) {
+                        r += 1;
+                        if r > occ.len() + items.len() {
+                            r = 0;
+                            c = (c + 1).min(ncols - cspan);
+                        }
+                    }
+                } else {
+                    loop {
+                        if c + cspan <= ncols && grid_cells_free(&occ, r, c, rspan, cspan, ncols) {
+                            break;
+                        }
+                        c += 1;
+                        if c + cspan > ncols {
+                            c = 0;
+                            r += 1;
+                        }
+                    }
+                }
+                GridPlace {
+                    col: c,
+                    col_span: cspan,
+                    row: r,
+                    row_span: rspan,
+                }
+            };
+            grid_mark(
+                &mut occ,
+                place.row,
+                place.col,
+                place.row_span,
+                place.col_span,
+                ncols,
+            );
+            if column_flow {
+                cur_c = place.col;
+                cur_r = place.row + place.row_span;
+            } else {
+                cur_r = place.row;
+                cur_c = place.col + place.col_span;
+                if cur_c >= ncols {
+                    cur_c = 0;
+                    cur_r += 1;
+                }
+            }
+            out.push(place);
+        }
+        out
+    }
+
+    /// Parse an item's `grid-column`/`grid-row` into `(start, span)`: `start` is
+    /// a zero-based track index (`None` = auto-placed). Supports `N`, `N / M`,
+    /// `N / span S`, `span S`, and the `1 / -1` (span all columns) idiom; named
+    /// lines/areas fall through to auto. `ntracks` is the column count (for the
+    /// `-1` end line), `0` for rows (negatives there → auto).
+    fn parse_grid_line(&self, id: NodeId, prop: &str, ntracks: usize) -> (Option<usize>, usize) {
+        let Some(v) = self.dom.computed_style(id, prop) else {
+            return (None, 1);
+        };
+        let v = v.trim();
+        if v.is_empty() || v == "auto" {
+            return (None, 1);
+        }
+        let parts: Vec<&str> = v.split('/').map(str::trim).collect();
+        let span_of = |s: &str| {
+            s.strip_prefix("span ")
+                .and_then(|n| n.trim().parse::<usize>().ok())
+        };
+        match parts.as_slice() {
+            [a] => {
+                if let Some(s) = span_of(a) {
+                    (None, s.max(1))
+                } else if let Ok(line) = a.parse::<i32>() {
+                    ((line > 0).then(|| (line - 1) as usize), 1)
+                } else {
+                    (None, 1)
+                }
+            }
+            [a, b] => {
+                let start = a
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|l| *l > 0)
+                    .map(|l| (l - 1) as usize);
+                if let Some(s) = span_of(b) {
+                    (start, s.max(1))
+                } else if let (Some(si), Ok(e)) = (start, b.parse::<i32>()) {
+                    let ei = if e > 0 {
+                        (e - 1) as usize
+                    } else if ntracks > 0 {
+                        // `-1` is the line after the last track.
+                        (ntracks as i32 + 1 + e).max(0) as usize
+                    } else {
+                        si + 1
+                    };
+                    (Some(si), ei.saturating_sub(si).max(1))
+                } else {
+                    (start, 1)
+                }
+            }
+            _ => (None, 1),
+        }
     }
 
     /// The visible border on each side `[top, right, bottom, left]` (its
@@ -4023,7 +4524,13 @@ impl<'a> Layout<'a> {
                 let basis = self.definite_ancestor_width(id).unwrap_or(avail);
                 (pct * basis as f32).round().max(1.0) as usize
             }
-            None => self.css_cells(id, "width").unwrap_or(iw),
+            None => self
+                .css_cells(id, "width")
+                .or_else(|| {
+                    self.img_attr_px(id, "width")
+                        .map(|px| (px / 8.0).round().max(1.0) as usize)
+                })
+                .unwrap_or(iw),
         };
         if let Some(mn) = self.css_cells(id, "min-width") {
             used_w = used_w.max(mn);
@@ -4051,6 +4558,10 @@ impl<'a> Layout<'a> {
             }
         } else if let Some(ar) = self.img_attr_ratio(id) {
             rows_for_ratio(used_w, ar)
+        } else if let Some(px) = self.img_attr_px(id, "height") {
+            // `<img height=N>` alone (no matching width attr to form a ratio):
+            // the presentation-hint height in rows.
+            (px / 16.0).round().max(1.0) as usize
         } else {
             intrinsic_h
         };
@@ -4098,6 +4609,18 @@ impl<'a> Layout<'a> {
     /// `auto W / H` form (the `auto` keyword is ignored).
     fn css_aspect_ratio(&self, id: NodeId) -> Option<f32> {
         parse_ratio(&self.dom.computed_style(id, "aspect-ratio")?)
+    }
+
+    /// An `<img width=N>` / `<img height=N>` presentation-hint attribute as a
+    /// CSS pixel length. The HTML spec maps these unitless content attributes
+    /// to the `width`/`height` properties at the lowest cascade priority, so
+    /// they size a replaced element only when no CSS (`style`/sheet) sets it.
+    /// Honoring them is what gives a bare `<img width="64">` (GitHub's
+    /// achievement badge) its 64px box instead of decoding at intrinsic size.
+    fn img_attr_px(&self, id: NodeId, attr: &str) -> Option<f32> {
+        let v = self.dom.attr(id, attr)?;
+        let n: f32 = v.trim().parse().ok()?;
+        (n > 0.0).then_some(n)
     }
 
     /// The intrinsic ratio from the `<img width=… height=…>` presentation
@@ -4664,6 +5187,83 @@ fn split_args(s: &str) -> Vec<&str> {
     }
     out.push(&s[start..]);
     out
+}
+
+/// Split a `grid-template-*` value into its whitespace-separated track tokens,
+/// keeping a parenthesised group (`minmax(a, b)`, `repeat(2, 1fr)`,
+/// `fit-content(20%)`) intact and dropping `[line-name]` groups (we don't
+/// place by named lines).
+fn split_track_tokens(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut in_names = false;
+    let mut cur = String::new();
+    for ch in s.chars() {
+        match ch {
+            '[' => in_names = true,
+            ']' => in_names = false,
+            _ if in_names => {}
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Whether the `rspan × cspan` block of grid cells at `(r, c)` is unoccupied
+/// (and fits within `ncols`). Rows beyond the current occupancy are empty.
+fn grid_cells_free(
+    occ: &[Vec<bool>],
+    r: usize,
+    c: usize,
+    rspan: usize,
+    cspan: usize,
+    ncols: usize,
+) -> bool {
+    if c + cspan > ncols {
+        return false;
+    }
+    for row in occ.iter().skip(r).take(rspan) {
+        if row[c..c + cspan].iter().any(|&b| b) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Mark the `rspan × cspan` block of grid cells at `(r, c)` occupied, growing
+/// the occupancy grid as needed.
+fn grid_mark(
+    occ: &mut Vec<Vec<bool>>,
+    r: usize,
+    c: usize,
+    rspan: usize,
+    cspan: usize,
+    ncols: usize,
+) {
+    for rr in r..r + rspan {
+        while occ.len() <= rr {
+            occ.push(vec![false; ncols]);
+        }
+        for cell in occ[rr][c..(c + cspan).min(ncols)].iter_mut() {
+            *cell = true;
+        }
+    }
 }
 
 fn resolve_cells_f32(value: &str, avail: usize, viewport: usize) -> Option<f32> {
@@ -6753,6 +7353,141 @@ mod tests {
     }
 
     #[test]
+    fn grid_template_columns_places_a_fixed_sidebar_beside_a_flexible_main() {
+        // GitHub's profile `Layout`: a two-track grid, a fixed sidebar (column
+        // 1) beside a flexible main column (column 2, `minmax(0,1fr)`). The
+        // page's own `grid-template-columns` drives this — without honoring it
+        // the main column collapsed to min-content (one word per line).
+        let rows = lay(
+            r#"<html><head><style>
+                 .g{display:grid;grid-template-columns:20em minmax(0,1fr)}
+                 .side{grid-column:1}
+                 .main{grid-column:2}
+               </style></head>
+               <body><div class="g">
+                 <div class="side">sidebar</div>
+                 <div class="main">the main column has plenty of room to breathe here</div>
+               </div></body></html>"#,
+            80,
+        );
+        let (sr, sc) = pos_of(&rows, "sidebar");
+        let (mr, mc) = pos_of(&rows, "plenty");
+        assert_eq!(sr, mr, "sidebar and main share a row: {:?}", texts(&rows));
+        assert_eq!(sc, 0, "sidebar at the left edge");
+        // 20em = 40 cells; main starts past the sidebar track (+gap).
+        assert!(
+            mc >= 40,
+            "main column sits right of the 40-cell sidebar: {mc}"
+        );
+        // Main is wide, not one-word-per-line: several words share its first row.
+        let main_row = render_row(&rows[mr]);
+        assert!(
+            main_row.contains("plenty of room"),
+            "main text flows wide, not per-word: {main_row:?}"
+        );
+    }
+
+    #[test]
+    fn grid_template_columns_fr_tracks_split_space_evenly() {
+        // `1fr 1fr 1fr` makes three equal columns sharing the free space.
+        let rows = lay(
+            r#"<html><head><style>.g{display:grid;grid-template-columns:1fr 1fr 1fr}</style></head>
+               <body><div class="g"><div>aaa</div><div>bbb</div><div>ccc</div></div></body></html>"#,
+            62,
+        );
+        let (ra, ca) = pos_of(&rows, "aaa");
+        let (rb, cb) = pos_of(&rows, "bbb");
+        let (rc, cc) = pos_of(&rows, "ccc");
+        assert_eq!(ra, rb, "fr columns share a row: {:?}", texts(&rows));
+        assert_eq!(ra, rc);
+        assert_eq!(ca, 0);
+        // 62 − 2 gaps = 60 / 3 ≈ 20 per track → columns at 0, ~21, ~42.
+        assert!((20..=22).contains(&cb), "second fr column ~21: {cb}");
+        assert!(cc >= 40, "third fr column to the right: {cc}");
+    }
+
+    #[test]
+    fn grid_column_span_lays_an_item_across_tracks() {
+        // `grid-column: 1 / -1` (span all) is the full-width banner idiom; the
+        // following auto-placed items flow onto the next row.
+        let rows = lay(
+            r#"<html><head><style>.g{display:grid;grid-template-columns:1fr 1fr}
+                 .full{grid-column:1 / -1}</style></head>
+               <body><div class="g">
+                 <div class="full">banner</div>
+                 <div>left</div><div>right</div>
+               </div></body></html>"#,
+            40,
+        );
+        let (br, _) = pos_of(&rows, "banner");
+        let (lr, lc) = pos_of(&rows, "left");
+        let (rr, rc) = pos_of(&rows, "right");
+        assert!(
+            lr > br,
+            "banner spans row 1; left drops below: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(lr, rr, "left and right share row 2");
+        assert_eq!(lc, 0);
+        assert!(rc >= 19, "right column in the second half: {rc}");
+    }
+
+    #[test]
+    fn grid_without_a_template_falls_back_to_shelf_pack() {
+        // A `display:grid` with no resolvable `grid-template-columns` keeps the
+        // shelf-packed behaviour (danbooru's post grid) — grid-template support
+        // is additive, never a regression for templateless grids.
+        let rows = lay(
+            r#"<html><head><style>.g{display:grid}.c{width:5em}</style></head>
+               <body><div class="g"><div class="c">one</div><div class="c">two</div></div></body></html>"#,
+            40,
+        );
+        let (r1, _) = pos_of(&rows, "one");
+        let (r2, c2) = pos_of(&rows, "two");
+        assert_eq!(r1, r2, "shelf-packed side by side: {:?}", texts(&rows));
+        assert_eq!(c2, 11, "5em box (10 cells) + 1 gap");
+    }
+
+    #[test]
+    fn grid_repeat_auto_fill_counts_columns_against_the_container() {
+        // `repeat(auto-fill, 10em)` at width 64: 20-cell tracks, gap 1 →
+        // floor((64+1)/(20+1)) = 3 columns; the fourth item wraps.
+        let rows = lay(
+            r#"<html><head><style>.g{display:grid;grid-template-columns:repeat(auto-fill,10em)}</style></head>
+               <body><div class="g"><div>a</div><div>b</div><div>c</div><div>d</div></div></body></html>"#,
+            64,
+        );
+        let (ra, _) = pos_of(&rows, "a");
+        let (rc, _) = pos_of(&rows, "c");
+        let (rd, _) = pos_of(&rows, "d");
+        assert_eq!(
+            ra,
+            rc,
+            "three columns share the first row: {:?}",
+            texts(&rows)
+        );
+        assert!(rd > ra, "the fourth item wraps to a new row");
+    }
+
+    #[test]
+    fn img_width_attribute_sizes_a_replaced_element() {
+        // A bare `<img width="64">` (no CSS width) is an HTML presentation hint:
+        // 64px → 8 cells, height from the decoded aspect ratio. GitHub's
+        // achievement badge relies on this — without it the badge decoded at its
+        // intrinsic size (~22 cells) and ballooned.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/badge.png".to_owned(), (22, 11));
+        let rows = lay_with_images(
+            r#"<body><img src="/badge.png" width="64"></body>"#,
+            80,
+            &images,
+        );
+        let img = image_item(&rows);
+        assert_eq!(img.width, 8, "64px width attr → 8 cells");
+        assert_eq!(img.height, 4, "height scales with the decoded box: 11·8/22");
+    }
+
+    #[test]
     fn align_items_center_offsets_a_short_column() {
         // Two side-by-side columns of unequal height; align-items:center
         // drops the short column down within the tall column's height.
@@ -7048,6 +7783,38 @@ mod tests {
         let (rr, cr) = pos_of(&rows, "RIGHT");
         assert!(rr > rl, "narrow row stacks: {:?}", texts(&rows));
         assert_eq!((cl, cr), (0, 0), "stacked columns are full-width");
+    }
+
+    #[test]
+    fn a_clipping_flex_row_keeps_its_gutter_beside_unbreakable_content() {
+        // GitHub's blob/code view: a `display:flex` pane that CLIPS its
+        // overflow (`overflow:auto`) holding a fixed line-number gutter
+        // (`min-width:72px`) and a code column of `white-space:pre` lines wider
+        // than the row. The row overflows even at min-content, but a
+        // scroll-context container must keep the gutter BESIDE the code
+        // (clipped at the box edge), not reflow it ABOVE the code (the
+        // responsive stack fallback — right for an overflow:visible nav, wrong
+        // for a scroll pane: it dropped every line number above the file).
+        let long = "X".repeat(120);
+        let html = format!(
+            r#"<body><div style="display:flex;overflow:auto">
+                 <div style="min-width:72px">1</div>
+                 <div style="white-space:pre;width:100%">{long}</div>
+               </div></body>"#
+        );
+        let rows = lay(&html, 40);
+        let (rn, cn) = pos_of(&rows, "1");
+        let (rc, cc) = pos_of(&rows, &long);
+        assert_eq!(
+            rn,
+            rc,
+            "gutter rides the code's row, not stacked above it: {:?}",
+            texts(&rows)
+        );
+        assert!(
+            cc >= cn + 9,
+            "code clears the 72px (=9 cell) min-width gutter (gutter col {cn}, code col {cc})"
+        );
     }
 
     #[test]

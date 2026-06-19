@@ -974,9 +974,13 @@ fn decode_body(content_type: &str, body: &[u8]) -> String {
 /// Most external scripts fetched for one page.
 const MAX_PAGE_SCRIPTS: usize = 16;
 
-/// External stylesheets fetched for the visibility cascade; pages
-/// rarely carry more than a handful of `<link rel=stylesheet>`.
-const MAX_PAGE_SHEETS: usize = 16;
+/// External stylesheets fetched for the cascade. A browser has no such cap;
+/// it's only a lid on hostile pages. It must clear a real design system's
+/// sheet count — GitHub links ~33 distinct sheets (Primer, theme variants,
+/// per-view + per-component CSS modules), with structural sheets (the nav, the
+/// repo layout) LAST. At the old 16 those were dropped after the leading color-
+/// theme sheets, so menus rendered un-collapsed and grids lost their tracks.
+const MAX_PAGE_SHEETS: usize = 48;
 
 /// Module-graph prefetches (`<link rel=modulepreload>` + module entry
 /// srcs); archive.org announces ~32. Matches MAX_PAGE_FETCHES in
@@ -1010,9 +1014,10 @@ pub async fn execute_js(
         return response;
     }
     let html = decode_body(&response.content_type, &response.body);
-    // Cheap pre-filter: no script tag, no engine spin-up at all.
+    // Cheap pre-filter: no script tag, no engine spin-up — but still bake the
+    // page's CSS so a script-less page lays out per its stylesheets.
     if !html.to_ascii_lowercase().contains("<script") {
-        return response;
+        return css_only(response, viewport, cell_px).await;
     }
     // All subresources — classic scripts, stylesheets, and the module
     // graph the page announces up front (modulepreload + module entry
@@ -1138,8 +1143,11 @@ pub async fn execute_js(
         Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
             (html, outcome, Some(LivePage { handle, events }))
         }
-        // Died, hung, or spoke out of turn: render the page as fetched.
-        _ => return response,
+        // Died, hung, or spoke out of turn (most often: the page's JS is too
+        // slow to first-paint within the timeout — a big GitHub code file).
+        // Fall back to a CSS-only render so it still lays out per its own
+        // stylesheets (flex gutter, collapsed menus) instead of UA defaults.
+        _ => return css_only(response, viewport, cell_px).await,
     };
     response.body = out.into_bytes();
     // The serializer emits UTF-8 regardless of the original charset;
@@ -1147,6 +1155,63 @@ pub async fn execute_js(
     response.content_type = String::from("text/html; charset=utf-8");
     response.js = Some(outcome);
     response.live = live;
+    response
+}
+
+/// Fetch a page's external stylesheets — the same set + caps `execute_js`
+/// uses — concurrently, returning `(href, css)` in document order.
+async fn fetch_page_sheets(html: &str, base: &Url) -> Vec<(String, String)> {
+    let jobs: Vec<String> = crate::js::external_stylesheets(html)
+        .into_iter()
+        .take(MAX_PAGE_SHEETS)
+        .collect();
+    futures::stream::iter(jobs.into_iter().map(|raw| {
+        let base = base.clone();
+        async move {
+            let resolved = base
+                .join(&raw)
+                .ok()
+                .filter(|u| matches!(u.scheme(), "http" | "https"))
+                .filter(|u| subresource_allowed(&base, u));
+            let resp = match &resolved {
+                Some(u) => fetch(&Request::get(u.clone())).await.ok(),
+                None => None,
+            };
+            (raw, resp)
+        }
+    }))
+    .buffered(PREFETCH_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .filter_map(|(raw, resp)| resp.map(|r| (raw, decode_body(&r.content_type, &r.body))))
+    .collect()
+}
+
+/// Render an HTML page with ONLY its CSS cascade applied (no JS): fetch its
+/// stylesheets and bake the cascade into the serialized DOM. The path for
+/// every page JS won't transform — no `<script>`, `set js off`, and the
+/// `execute_js` load-timeout/early-exit fallback — so the page still lays out
+/// per its own CSS instead of UA defaults (see `crate::js::css_bake`).
+pub async fn css_only(
+    mut response: Response,
+    viewport: (u16, u16),
+    cell_px: (u16, u16),
+) -> Response {
+    let media = response
+        .content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !(media.is_empty() || media == "text/html" || media == "application/xhtml+xml") {
+        return response;
+    }
+    let html = decode_body(&response.content_type, &response.body);
+    let sheets = fetch_page_sheets(&html, &response.url).await;
+    response.body = crate::js::css_bake(&html, &sheets, viewport, cell_px).into_bytes();
+    response.content_type = String::from("text/html; charset=utf-8");
     response
 }
 
@@ -2505,6 +2570,11 @@ mod tests {
             .as_ref()
             .map(|o| o.errors.clone())
             .unwrap_or_default();
+        let mut cons: Vec<String> = resp
+            .js
+            .as_ref()
+            .map(|o| o.console.clone())
+            .unwrap_or_default();
         eprintln!("--- load errors: {} ---", errs.len());
         let mut last_html: Option<String> = None;
         if let Some(mut live) = resp.live.take() {
@@ -2520,6 +2590,11 @@ mod tests {
                         for e in outcome.errors {
                             if !errs.contains(&e) {
                                 errs.push(e);
+                            }
+                        }
+                        for c in outcome.console {
+                            if !cons.contains(&c) {
+                                cons.push(c);
                             }
                         }
                     }
@@ -2547,6 +2622,10 @@ mod tests {
         eprintln!("=== {} UNIQUE ERRORS ===", errs.len());
         for (i, e) in errs.iter().enumerate() {
             eprintln!("\n[{i}] {e}");
+        }
+        eprintln!("=== {} CONSOLE LINES ===", cons.len());
+        for (i, c) in cons.iter().enumerate() {
+            eprintln!("\n(c{i}) {c}");
         }
         // The post-SETTLE body (net_diag dumps only the first-paint shell; a
         // live SPA fills its content during settle). Dump it for inspection.

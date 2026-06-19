@@ -445,17 +445,39 @@ impl<'ast> VisitorMut<'ast> for BindingEscapeAnalyzer<'_> {
                 node.contains_direct_eval,
             ),
             ClassElement::FieldDefinition(field) | ClassElement::StaticFieldDefinition(field) => {
+                // The property name is evaluated in the enclosing scope, but the
+                // initializer runs in the field's own function scope (the
+                // collector built it as `function == true`). The escape pass must
+                // ENTER that scope so a reference to an enclosing-function binding
+                // crosses the field's function border and is marked escaping —
+                // otherwise it stays "local" while the initializer is compiled to
+                // a SEPARATE CodeBlock, yielding `Local(None)` ("access of
+                // uninitialized binding") at runtime.
                 self.visit_property_name_mut(&mut field.name)?;
+                if self.direct_eval {
+                    field.scope.escape_all_bindings();
+                }
+                std::mem::swap(&mut self.scope, &mut field.scope);
                 if let Some(e) = &mut field.initializer {
                     self.visit_expression_mut(e)?;
                 }
+                std::mem::swap(&mut self.scope, &mut field.scope);
+                field.scope.reorder_binding_indices();
                 ControlFlow::Continue(())
             }
             ClassElement::PrivateFieldDefinition(field)
             | ClassElement::PrivateStaticFieldDefinition(field) => {
+                // See FieldDefinition above: enter the field's own function scope
+                // so escapes are detected across its border.
+                if self.direct_eval {
+                    field.scope.escape_all_bindings();
+                }
+                std::mem::swap(&mut self.scope, &mut field.scope);
                 if let Some(e) = &mut field.initializer {
                     self.visit_expression_mut(e)?;
                 }
+                std::mem::swap(&mut self.scope, &mut field.scope);
+                field.scope.reorder_binding_indices();
                 ControlFlow::Continue(())
             }
             ClassElement::StaticBlock(node) => {
