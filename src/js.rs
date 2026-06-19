@@ -2321,6 +2321,32 @@ fn drain_js_side(ctx: &mut Context, outcome: &mut Outcome) {
 /// Run a page's scripts against a real DOM and return the post-JS HTML
 /// (one-shot: the engine is dropped). Never fails: any error lands in
 /// the Outcome and the best available document is returned.
+/// Apply ONLY the CSS cascade to a page — no JS. Parses the HTML, attaches
+/// the (already-fetched) external stylesheets, and serializes; the serializer
+/// bakes every cascaded property onto each element, exactly as the full JS
+/// pipeline does. Used whenever JS won't run — a page with no `<script>`,
+/// `set js off`, or the JS-load-timeout fallback — so the page still lays out
+/// per its OWN stylesheets (flex, grid, visibility:hidden, …) instead of bare
+/// UA defaults. Without this, e.g. GitHub's code view (when its heavy JS times
+/// out) renders line numbers stacked above the code and nav menus expanded,
+/// because `display:flex`/`visibility:hidden` from its sheets never apply.
+pub fn css_bake(
+    html: &str,
+    sheets: &[(String, String)],
+    viewport: (u16, u16),
+    cell_px: (u16, u16),
+) -> String {
+    let mut dom = Dom::parse_document(html);
+    dom.set_viewport_px(
+        u32::from(viewport.0) * u32::from(cell_px.0.max(1)),
+        u32::from(viewport.1) * u32::from(cell_px.1.max(1)),
+    );
+    if !sheets.is_empty() {
+        dom.attach_external_sheets(sheets);
+    }
+    dom.serialize(DOCUMENT)
+}
+
 pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
     match load_page(html, env) {
         Err(outcome) => (html.to_string(), outcome),
@@ -2875,8 +2901,17 @@ pub fn has_scripts(html: &str) -> bool {
 
 /// Collect external stylesheet hrefs (raw attribute values, document
 /// order) so the fetch pipeline can download them for the cascade.
+/// De-duplicated by URL (keeping first-occurrence order): a page that links
+/// the same sheet many times — GitHub references `primer-react-css` six times —
+/// must not spend the fetch budget re-downloading it, which crowds out other
+/// needed sheets (the cascade applies a sheet once regardless).
 pub fn external_stylesheets(html: &str) -> Vec<String> {
-    Dom::parse_document(html).stylesheet_links()
+    let mut seen = std::collections::HashSet::new();
+    Dom::parse_document(html)
+        .stylesheet_links()
+        .into_iter()
+        .filter(|href| seen.insert(href.clone()))
+        .collect()
 }
 
 /// The module graph the page announces up front:
@@ -3836,6 +3871,14 @@ const PRELUDE: &str = r##"
         get cookie() { return __cookie_get(); }
         set cookie(v) { __cookie_set(String(v)); }
         get location() { return g.location; }
+        // The document's origin domain. Spec returns the origin's effective
+        // domain (the host); a terminal browser has no frames, so the host IS
+        // the domain. The setter is the legacy same-origin relaxation — store
+        // it so a `document.domain = document.domain` round-trips, but it has
+        // no cross-origin effect here. Missing this throws on sites that read
+        // it (GitHub's behaviors bundle: "Unable to get document domain").
+        get domain() { return this.__domain !== undefined ? this.__domain : g.location.hostname; }
+        set domain(v) { this.__domain = String(v); }
         get defaultView() { return g; }
         get documentURI() { return g.location.href; }
         get URL() { return g.location.href; }
@@ -3860,7 +3903,7 @@ const PRELUDE: &str = r##"
                         querySelectorAll: (s) => html.querySelectorAll(s),
                         createRange: () => new Range(),
                         createNodeIterator: (r, w) => new NodeIterator(r, w),
-                        createTreeWalker: (r, w) => new TreeWalker(r, w),
+                        createTreeWalker: (r, w, f) => new TreeWalker(r, w, f),
                     };
                 },
             };
@@ -3881,7 +3924,7 @@ const PRELUDE: &str = r##"
         createTextNode(s) { return wrap(__dom_create_text(s === undefined ? "" : String(s))); }
         createComment(s) { return wrap(__dom_create_comment(s === undefined ? "" : String(s))); }
         importNode(n, deep) { return n.cloneNode(!!deep); }
-        createTreeWalker(root, whatToShow) { return new TreeWalker(root, whatToShow); }
+        createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
         createNodeIterator(root, whatToShow) { return new NodeIterator(root, whatToShow); }
         createDocumentFragment() { return wrap(__dom_create_fragment()); }
         createRange() { return new Range(); }
@@ -3907,34 +3950,121 @@ const PRELUDE: &str = r##"
     class DocumentFragment extends Node {}
     class Comment extends CharacterData {}
     // Lit walks comment markers with one of these.
+    // A spec-faithful DOM TreeWalker (https://dom.spec.whatwg.org/#interface-treewalker).
+    // The full traversal surface — firstChild/lastChild/next|previousSibling/
+    // next|previousNode/parentNode — and the NodeFilter (whatToShow bitmask +
+    // the acceptNode callback) are required: Primer React's focus zone builds
+    // `createTreeWalker(root, SHOW_ELEMENT, {acceptNode})` and drives it with
+    // `firstChild()`/`nextNode()` to find focusable elements. A walker missing
+    // those methods threw `… is not a callable (reading 'firstChild')` during
+    // React render, which GitHub's top-level boundary turned into "Unable to
+    // load page." (FILTER_ACCEPT=1, FILTER_REJECT=2, FILTER_SKIP=3.)
     class TreeWalker {
-        constructor(root, whatToShow) {
+        constructor(root, whatToShow, filter) {
             this.root = root;
             this.currentNode = root;
             this.whatToShow = (whatToShow === undefined ? 0xFFFFFFFF : whatToShow) >>> 0;
+            this.filter = filter || null;
         }
-        __shows(n) {
-            const bit = n.nodeType === 1 ? 1 : n.nodeType === 3 ? 4 : n.nodeType === 8 ? 128 : 0;
-            return (this.whatToShow & bit) !== 0;
+        __filter(n) {
+            const t = n.nodeType;
+            const bit = (t >= 1 && t <= 32) ? (1 << (t - 1)) : 0;
+            if ((this.whatToShow & bit) === 0) return 3; // FILTER_SKIP
+            const f = this.filter;
+            if (f === null) return 1; // FILTER_ACCEPT
+            return typeof f === "function" ? f(n) : f.acceptNode(n);
         }
-        nextNode() {
-            let n = this.currentNode;
-            for (;;) {
-                let next = n.firstChild;
-                if (!next) {
-                    let cur = n;
-                    while (!next && cur && cur !== this.root) {
-                        next = cur.nextSibling;
-                        cur = cur.parentNode;
-                    }
+        // "traverse children", first=true -> firstChild(), false -> lastChild().
+        __children(first) {
+            let node = first ? this.currentNode.firstChild : this.currentNode.lastChild;
+            while (node) {
+                const result = this.__filter(node);
+                if (result === 1) { this.currentNode = node; return node; }
+                if (result === 3) {
+                    const child = first ? node.firstChild : node.lastChild;
+                    if (child) { node = child; continue; }
                 }
-                if (!next) return null;
-                n = next;
-                if (this.__shows(n)) {
-                    this.currentNode = n;
-                    return n;
+                while (node) {
+                    const sibling = first ? node.nextSibling : node.previousSibling;
+                    if (sibling) { node = sibling; break; }
+                    const parent = node.parentNode;
+                    if (!parent || parent === this.root || parent === this.currentNode) return null;
+                    node = parent;
                 }
             }
+            return null;
+        }
+        firstChild() { return this.__children(true); }
+        lastChild() { return this.__children(false); }
+        // "traverse siblings", next=true -> nextSibling(), false -> previousSibling().
+        __siblings(next) {
+            let node = this.currentNode;
+            if (node === this.root) return null;
+            for (;;) {
+                let sibling = next ? node.nextSibling : node.previousSibling;
+                while (sibling) {
+                    node = sibling;
+                    const result = this.__filter(node);
+                    if (result === 1) { this.currentNode = node; return node; }
+                    sibling = next ? node.firstChild : node.lastChild;
+                    if (result === 2 || !sibling) sibling = next ? node.nextSibling : node.previousSibling;
+                }
+                node = node.parentNode;
+                if (!node || node === this.root) return null;
+                if (this.__filter(node) === 1) return null;
+            }
+        }
+        nextSibling() { return this.__siblings(true); }
+        previousSibling() { return this.__siblings(false); }
+        parentNode() {
+            let node = this.currentNode;
+            while (node && node !== this.root) {
+                node = node.parentNode;
+                if (node && this.__filter(node) === 1) { this.currentNode = node; return node; }
+            }
+            return null;
+        }
+        nextNode() {
+            let node = this.currentNode;
+            let result = 1; // FILTER_ACCEPT
+            for (;;) {
+                while (result !== 2 && node.firstChild) {
+                    node = node.firstChild;
+                    result = this.__filter(node);
+                    if (result === 1) { this.currentNode = node; return node; }
+                }
+                let temporary = node;
+                let broke = false;
+                while (temporary) {
+                    if (temporary === this.root) return null;
+                    const sibling = temporary.nextSibling;
+                    if (sibling) { node = sibling; broke = true; break; }
+                    temporary = temporary.parentNode;
+                }
+                if (!broke) return null;
+                result = this.__filter(node);
+                if (result === 1) { this.currentNode = node; return node; }
+            }
+        }
+        previousNode() {
+            let node = this.currentNode;
+            while (node !== this.root) {
+                let sibling = node.previousSibling;
+                while (sibling) {
+                    node = sibling;
+                    let result = this.__filter(node);
+                    while (result !== 2 && node.lastChild) {
+                        node = node.lastChild;
+                        result = this.__filter(node);
+                    }
+                    if (result === 1) { this.currentNode = node; return node; }
+                    sibling = node.previousSibling;
+                }
+                if (node === this.root || !node.parentNode) return null;
+                node = node.parentNode;
+                if (this.__filter(node) === 1) { this.currentNode = node; return node; }
+            }
+            return null;
         }
     }
     // NodeIterator: a flat document-order walk over a subtree (root first,
@@ -4008,7 +4138,7 @@ const PRELUDE: &str = r##"
                 createComment: (s) => g.document.createComment(s),
                 createDocumentFragment: () => g.document.createDocumentFragment(),
                 createNodeIterator: (r, w) => new NodeIterator(r, w),
-                createTreeWalker: (r, w) => new TreeWalker(r, w),
+                createTreeWalker: (r, w, f) => new TreeWalker(r, w, f),
                 createRange: () => new Range(),
                 importNode: (n, deep) => n.cloneNode(!!deep),
                 getElementsByTagName: (t) => {
@@ -5039,7 +5169,38 @@ const PRELUDE: &str = r##"
         "timeupdate", "volumechange", "waiting", "seeked", "seeking",
         "toggle", "cancel", "close",
     ]);
-    g.performance = { now: () => 0, timing: {}, mark() {}, measure() {}, getEntriesByType: () => [] };
+    // Performance + the Performance Timeline API. We keep no real timing
+    // buffer, so the getEntries* trio returns empty arrays — but they MUST
+    // exist: GitHub's React Router calls `performance.getEntriesByName(url,
+    // "resource")` during render to detect a prefetch, and a missing method
+    // throws a TypeError its top-level error boundary catches ("Unable to load
+    // page"). All no-ops/empty are safe (no entry found -> the caller skips
+    // the optimization).
+    g.performance = {
+        now: () => 0,
+        timeOrigin: 0,
+        timing: {}, navigation: {}, memory: {},
+        mark() { return undefined; },
+        measure() { return undefined; },
+        clearMarks() {}, clearMeasures() {}, clearResourceTimings() {},
+        setResourceTimingBufferSize() {},
+        getEntries: () => [],
+        getEntriesByName: () => [],
+        getEntriesByType: () => [],
+        addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
+        toJSON() { return {}; },
+    };
+    // PerformanceObserver: observing never delivers entries (we keep no
+    // buffer), but the constructor + methods must exist (libraries probe it).
+    if (typeof g.PerformanceObserver === "undefined") {
+        g.PerformanceObserver = class PerformanceObserver {
+            constructor(cb) { this.__cb = cb; }
+            observe() {}
+            disconnect() {}
+            takeRecords() { return []; }
+        };
+        g.PerformanceObserver.supportedEntryTypes = [];
+    }
 
     // RAM-only, session-lifetime storage: origin-bucketed maps shared
     // across pages, dead with the process, never disk.
@@ -5347,6 +5508,99 @@ const PRELUDE: &str = r##"
         forEach(fn) { for (const k of Object.keys(this.__h)) fn(this.__h[k], k, this); }
     }
     g.Headers = Headers;
+    // The wire body for a request/response: the platform accepts strings,
+    // URLSearchParams, Blob/File, and ArrayBuffer views; our syscall takes a
+    // string, so flatten to one. Unknown objects stringify (no multipart —
+    // FormData is deliberately unsupported), null stays null.
+    const __bodyText = (body) => {
+        if (body === null || body === undefined) return null;
+        if (typeof body === "string") return body;
+        if (body instanceof URLSearchParams) return body.toString();
+        if (Array.isArray(body.__parts)) return blobText(body); // Blob/File
+        if (typeof body.byteLength === "number") {
+            try {
+                const v = body instanceof ArrayBuffer ? new Uint8Array(body)
+                    : new Uint8Array(body.buffer || body);
+                let s = ""; for (let i = 0; i < v.length; i++) s += String.fromCharCode(v[i]);
+                return s;
+            } catch (e) { return ""; }
+        }
+        return String(body);
+    };
+    // Body mixin shared by Request and Response: the consumption methods read
+    // the captured body once (lenient — we don't throw on re-read, unlike the
+    // spec, to avoid breaking defensive double-reads).
+    const __bodyMethods = {
+        text() { this.bodyUsed = true; return Promise.resolve(__bodyText(this.__body) || ""); },
+        json() { this.bodyUsed = true; try { return Promise.resolve(JSON.parse(__bodyText(this.__body) || "")); } catch (e) { return Promise.reject(e); } },
+        arrayBuffer() {
+            this.bodyUsed = true;
+            const bin = utf8Binary(__bodyText(this.__body) || "");
+            const buf = new ArrayBuffer(bin.length); const view = new Uint8Array(buf);
+            for (let i = 0; i < bin.length; i++) view[i] = bin.charCodeAt(i) & 0xff;
+            return Promise.resolve(buf);
+        },
+        blob() {
+            this.bodyUsed = true;
+            const t = (this.headers && this.headers.get && this.headers.get("content-type")) || "";
+            return Promise.resolve(new g.Blob([__bodyText(this.__body) || ""], { type: t || "" }));
+        },
+        formData() { return Promise.reject(new TypeError("formData unsupported")); },
+    };
+    // Fetch API Request (https://fetch.spec.whatwg.org/#request-class). The bare
+    // `Request` global is referenced by many bundles (GitHub's react-core throws
+    // a ReferenceError without it).
+    class Request {
+        constructor(input, init) {
+            init = init || {};
+            const fromReq = input instanceof Request;
+            this.url = fromReq ? input.url
+                : String((input && input.url !== undefined) ? input.url : input);
+            this.method = String(init.method || (fromReq ? input.method : null) || "GET").toUpperCase();
+            this.headers = new Headers(init.headers !== undefined ? init.headers : (fromReq ? input.headers : undefined));
+            this.__body = init.body !== undefined ? init.body : (fromReq ? input.__body : null);
+            this.credentials = init.credentials || (fromReq ? input.credentials : "same-origin");
+            this.mode = init.mode || (fromReq ? input.mode : "cors");
+            this.cache = init.cache || (fromReq ? input.cache : "default");
+            this.redirect = init.redirect || (fromReq ? input.redirect : "follow");
+            this.referrer = init.referrer !== undefined ? init.referrer : (fromReq ? input.referrer : "about:client");
+            this.referrerPolicy = init.referrerPolicy || (fromReq ? input.referrerPolicy : "");
+            this.integrity = init.integrity || (fromReq ? input.integrity : "");
+            this.keepalive = init.keepalive !== undefined ? !!init.keepalive : (fromReq ? input.keepalive : false);
+            this.signal = init.signal || (fromReq ? input.signal : null);
+            this.destination = "";
+            this.bodyUsed = false;
+            this.body = null; // no ReadableStream
+        }
+        clone() { return new Request(this); }
+    }
+    Object.assign(Request.prototype, __bodyMethods);
+    g.Request = Request;
+    // Fetch API Response (https://fetch.spec.whatwg.org/#response-class).
+    class Response {
+        constructor(body, init) {
+            init = init || {};
+            this.__body = body !== undefined ? body : null;
+            this.status = init.status !== undefined ? (init.status | 0) : 200;
+            this.statusText = init.statusText !== undefined ? String(init.statusText) : "";
+            this.headers = new Headers(init.headers);
+            this.ok = this.status >= 200 && this.status < 300;
+            this.url = init.url ? String(init.url) : "";
+            this.redirected = false;
+            this.type = "default";
+            this.bodyUsed = false;
+            this.body = null; // no ReadableStream
+        }
+        clone() {
+            const r = new Response(this.__body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url });
+            r.type = this.type; r.redirected = this.redirected; return r;
+        }
+        static error() { const r = new Response(null, { status: 0 }); r.type = "error"; return r; }
+        static redirect(url, status) { const r = new Response(null, { status: status || 302 }); r.headers.set("location", String(url)); return r; }
+        static json(data, init) { const r = new Response(JSON.stringify(data), init); if (!r.headers.has("content-type")) r.headers.set("content-type", "application/json"); return r; }
+    }
+    Object.assign(Response.prototype, __bodyMethods);
+    g.Response = Response;
     // AbortSignal is a real EventTarget (it dispatches "abort"), and the
     // statics `abort`/`timeout`/`any` are widely referenced — YouTube's
     // kevlar bundle reads the bare `AbortSignal` global, a ReferenceError
@@ -5421,35 +5675,20 @@ const PRELUDE: &str = r##"
     }
     g.fetch = function (input, init) {
         try {
-            const url = input && typeof input === "object" && input.url !== undefined ? String(input.url) : String(input);
-            const method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
-            let body = init && init.body !== undefined && init.body !== null ? init.body : null;
-            if (body !== null && typeof body !== "string") {
-                if (body instanceof URLSearchParams) body = body.toString();
-                else return Promise.reject(new TypeError("fetch: unsupported body type"));
-            }
-            const H = new Headers(init && init.headers);
-            const ctype = H.get("content-type")
+            // Normalize input+init into a Request (input may be a URL string,
+            // a Request, or a URL object).
+            const req = new Request(input, init);
+            const url = req.url;
+            const body = __bodyText(req.__body);
+            const ctype = req.headers.get("content-type")
                 || (body !== null ? "text/plain;charset=UTF-8" : null);
-            return __http_fetch_async(url, method, body, ctype, __hdrBlob(H.__h)).then(function (r) {
+            return __http_fetch_async(url, req.method, body, ctype, __hdrBlob(req.headers.__h)).then(function (r) {
                 if (!r) throw new TypeError("fetch failed or blocked: " + url);
                 const status = r[0], respCType = r[1], text = r[2];
-                return {
-                    ok: status >= 200 && status < 300,
-                    status: status,
-                    statusText: "",
-                    url: url,
-                    redirected: false,
-                    type: "basic",
-                    bodyUsed: false,
-                    headers: new Headers({ "content-type": respCType }),
-                    text() { return Promise.resolve(text); },
-                    json() { try { return Promise.resolve(JSON.parse(text)); } catch (e) { return Promise.reject(e); } },
-                    clone() { return this; },
-                    arrayBuffer() { return Promise.reject(new TypeError("arrayBuffer unsupported")); },
-                    blob() { return Promise.reject(new TypeError("blob unsupported")); },
-                    formData() { return Promise.reject(new TypeError("formData unsupported")); },
-                };
+                const hdrs = {}; if (respCType) hdrs["content-type"] = respCType;
+                const resp = new Response(text, { status: status, statusText: "", headers: hdrs, url: url });
+                resp.type = "basic";
+                return resp;
             });
         } catch (e) { return Promise.reject(e); }
     };
@@ -5823,6 +6062,217 @@ mod tests {
         );
     }
 
+    /// A spec TreeWalker with a NodeFilter callback drives Primer React's
+    /// focus zone (`createTreeWalker(root, SHOW_ELEMENT, {acceptNode})` +
+    /// `firstChild()`/`nextNode()`). A walker missing those traversal methods
+    /// or ignoring the filter threw during GitHub's render → "Unable to load
+    /// page." This walks a tree collecting only elements the filter accepts.
+    /// `css_bake` applies a page's CSS with no JS at all — the path for
+    /// no-`<script>` pages, `set js off`, and the JS-load-timeout fallback
+    /// (a big GitHub code file). It must bake cascaded properties (so the
+    /// layout flexes/grids per the page) and drop hidden subtrees (so a
+    /// `visibility:hidden` nav menu collapses instead of rendering expanded).
+    #[test]
+    fn css_bake_applies_the_cascade_without_js() {
+        let html = r#"<html><head><style>
+            .row { display: flex; }
+            @media (min-width: 200px) { .menu { visibility: hidden; } }
+        </style></head><body>
+            <div class="row"><span>left</span><span>right</span></div>
+            <div class="menu"><a>SECRET-MENU-ITEM</a></div>
+        </body></html>"#;
+        // 200 cols * 8px = 1600px wide, so the @media (min-width:200px) matches.
+        let out = css_bake(html, &[], (200, 50), (8, 16));
+        assert!(
+            out.contains("display:flex"),
+            "flex should be baked onto .row: {out}"
+        );
+        assert!(
+            !out.contains("SECRET-MENU-ITEM"),
+            "a visibility:hidden subtree must be dropped (menu collapses): {out}"
+        );
+    }
+
+    #[test]
+    fn tree_walker_honors_the_filter_and_traverses() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body>
+               <div id="root">
+                 <button class="ok">A</button>
+                 <span><a class="ok">B</a><i>skip</i></span>
+                 <button class="ok">C</button>
+               </div></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+
+        // Collect, in document order, every element with class "ok" — exactly
+        // the firstChild()+nextNode()+acceptNode pattern Primer uses.
+        let probe = br#"
+            (function () {
+                const root = document.getElementById("root");
+                const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+                    acceptNode: (n) => n.classList && n.classList.contains("ok")
+                        ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP,
+                });
+                const out = [];
+                let n = w.firstChild();
+                while (n) { out.push(n.textContent); n = w.nextNode(); }
+                return out.join(",");
+            })()
+        "#;
+        let v = ctx
+            .eval(Source::from_bytes(probe))
+            .unwrap()
+            .to_string(&mut ctx)
+            .unwrap()
+            .to_std_string_escaped();
+        assert_eq!(v, "A,B,C", "TreeWalker filtered traversal wrong");
+    }
+
+    /// The Performance Timeline getEntries* methods must exist and return
+    /// arrays. GitHub's React Router calls `performance.getEntriesByName(url,
+    /// "resource")` during render; a missing method is a TypeError its
+    /// top-level error boundary catches, blanking the page with "Unable to
+    /// load page." PRELUDE-built, so this needs a faithful page context.
+    #[test]
+    fn performance_timeline_methods_exist_and_return_arrays() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+
+        let probe = br#"
+            (function () {
+                const p = performance;
+                const arr = (v) => Array.isArray(v);
+                const ok = typeof p.getEntriesByName === "function"
+                    && typeof p.getEntries === "function"
+                    && typeof p.getEntriesByType === "function"
+                    && arr(p.getEntriesByName("https://x/y", "resource"))
+                    && arr(p.getEntries())
+                    && arr(p.getEntriesByType("resource"))
+                    && typeof p.clearMarks === "function"
+                    && typeof p.clearResourceTimings === "function"
+                    && typeof PerformanceObserver === "function";
+                // A PerformanceObserver must construct + observe without throwing.
+                new PerformanceObserver(() => {}).observe({ type: "resource" });
+                return ok;
+            })()
+        "#;
+        let v = ctx.eval(Source::from_bytes(probe)).unwrap();
+        assert!(v.to_boolean(), "performance timeline shim incomplete");
+    }
+
+    #[test]
+    fn request_and_response_are_constructable_and_consumable() {
+        // The Fetch API Request/Response globals are PRELUDE-built, so this
+        // needs a faithful page context (DOM + syscalls + config + PRELUDE).
+        // GitHub's react-core throws a bare `Request is not defined` without it.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "req.js",
+            br##"
+            globalThis.out = {};
+            const req = new Request("https://example.com/api", {
+                method: "post", headers: { "X-Test": "1" }, body: '{"a":1}',
+            });
+            out.url = req.url;
+            out.method = req.method;          // upper-cased
+            out.hdr = req.headers.get("x-test");
+            out.isReq = req instanceof Request;
+            // clone() copies fields and is a fresh Request
+            const c = req.clone();
+            out.cloneOk = (c instanceof Request) && c !== req && c.method === "POST";
+            // a Request accepted as fetch input would carry its body
+            req.text().then((t) => { out.body = t; });
+
+            const res = new Response('{"b":2}', { status: 201, statusText: "Created", headers: { "Content-Type": "application/json" } });
+            out.status = res.status;
+            out.ok = res.ok;                  // 201 -> true
+            out.isRes = res instanceof Response;
+            res.json().then((j) => { out.json = j.b; });
+
+            const r404 = new Response("nope", { status: 404 });
+            out.ok404 = r404.ok;              // false
+            const rj = Response.json({ z: 9 });
+            out.rjType = rj.headers.get("content-type");
+            const rr = Response.redirect("https://example.com/x", 301);
+            out.loc = rr.headers.get("location");
+            out.rrStatus = rr.status;
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // Body reads resolve as microtasks; drain to settle them.
+        settle(&mut ctx, &budget, 2, &mut outcome);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.url"), "https://example.com/api");
+        assert_eq!(s(&mut ctx, b"out.method"), "POST");
+        assert_eq!(s(&mut ctx, b"out.hdr"), "1");
+        assert_eq!(s(&mut ctx, b"String(out.isReq)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.cloneOk)"), "true");
+        assert_eq!(s(&mut ctx, b"out.body"), "{\"a\":1}");
+        assert_eq!(s(&mut ctx, b"String(out.status)"), "201");
+        assert_eq!(s(&mut ctx, b"String(out.ok)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.isRes)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.json)"), "2");
+        assert_eq!(s(&mut ctx, b"String(out.ok404)"), "false");
+        assert_eq!(s(&mut ctx, b"out.rjType"), "application/json");
+        assert_eq!(s(&mut ctx, b"out.loc"), "https://example.com/x");
+        assert_eq!(s(&mut ctx, b"String(out.rrStatus)"), "301");
+    }
+
     #[test]
     fn window_open_returns_a_stub_and_never_throws() {
         // A missing `window.open` was an uncaught TypeError that aborted click
@@ -5919,6 +6369,69 @@ mod tests {
             .to_number(&mut ctx)
             .unwrap();
         assert_eq!(y, 42.0);
+    }
+
+    /// A class field initializer that references an enclosing-function binding
+    /// must see that binding as ESCAPING — the initializer is compiled to its
+    /// own CodeBlock, so a "local" (register) binding there has no allocated
+    /// slot and the engine emits a guaranteed `access of uninitialized binding`
+    /// throw. This was the GitHub code-view / TanStack Query boot failure
+    /// (`new class { #S = i }` inside a webpack module function). Fixed in the
+    /// boa_ast fork: `BindingEscapeAnalyzer` now enters the field's own function
+    /// scope. See [[boa-cyclic-module-debug-crash]] #10.
+    #[test]
+    fn class_field_initializer_capturing_an_enclosing_var_is_not_uninitialized() {
+        // (name, src, expected String(RESULT)) — every case must run clean.
+        let cases: &[(&str, &str, &str)] = &[
+            // The minimal TanStack repro: private field = outer function var.
+            (
+                "private-field",
+                r#"function f(){ var i={a:1}; var r=new class{ #S=i; get(){return this.#S.a} }; globalThis.RESULT=r.get(); } f();"#,
+                "1",
+            ),
+            // Public field too (same scope mechanism).
+            (
+                "public-field",
+                r#"function f(){ var i={a:7}; var r=new class{ S=i; }; globalThis.RESULT=r.S.a; } f();"#,
+                "7",
+            ),
+            // Outer binding is a `let` rather than `var`.
+            (
+                "let-capture",
+                r#"function f(){ let i={a:3}; var r=new class{ #S=i; get(){return this.#S.a} }; globalThis.RESULT=r.get(); } f();"#,
+                "3",
+            ),
+            // Class declaration form (not just `new class{}` expression).
+            (
+                "class-declaration",
+                r#"function f(){ var i={a:9}; class C{ #S=i; get(){return this.#S.a} } globalThis.RESULT=new C().get(); } f();"#,
+                "9",
+            ),
+            // Static field initializer capturing an enclosing var.
+            (
+                "static-field",
+                r#"function f(){ var i={a:5}; class C{ static S=i; } globalThis.RESULT=C.S.a; } f();"#,
+                "5",
+            ),
+        ];
+        for (name, src, expected) in cases {
+            let mut ctx = page_context();
+            let budget = Budget::new(WALL_BUDGET);
+            let mut outcome = Outcome::default();
+            run_script(&mut ctx, name, src.as_bytes(), &budget, &mut outcome);
+            assert!(
+                outcome.errors.is_empty(),
+                "{name}: unexpected errors: {:?}",
+                outcome.errors
+            );
+            let result = ctx
+                .eval(Source::from_bytes(b"String(globalThis.RESULT)"))
+                .ok()
+                .and_then(|v| v.to_string(&mut ctx).ok())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_else(|| "<none>".into());
+            assert_eq!(result, *expected, "{name}: wrong result");
+        }
     }
 
     #[test]
@@ -8224,6 +8737,23 @@ mod tests {
     }
 
     #[test]
+    fn document_domain_reports_the_host_and_round_trips() {
+        // `document.domain` returns the document's host (GitHub's behaviors
+        // bundle throws "Unable to get document domain" without it). The legacy
+        // setter is accepted and round-trips, but has no cross-origin effect.
+        let (out, outcome) = page(
+            "<body><p id=a></p><p id=b></p><script>\
+             document.getElementById('a').textContent = document.domain;\
+             document.domain = document.domain;\
+             document.getElementById('b').textContent = 'set:' + document.domain;\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains(">example.com</p>"), "{out}");
+        assert!(out.contains(">set:example.com</p>"), "{out}");
+    }
+
+    #[test]
     fn broken_scripts_do_not_take_the_page_down() {
         let (out, outcome) = page(
             "<body><p>original</p>\
@@ -8241,6 +8771,29 @@ mod tests {
         assert!(out.contains("original"), "{out}");
         assert!(out.contains("<em>one</em>"), "{out}");
         assert!(out.contains("<strong>two</strong>"), "{out}");
+    }
+
+    #[test]
+    fn external_stylesheets_are_deduplicated() {
+        // A page that links the same sheet repeatedly (GitHub references
+        // `primer-react-css` six times) must yield it once, so duplicates don't
+        // burn the fetch budget and push real sheets — the marketing nav, the
+        // page layout — past the cap (which left menus un-collapsed).
+        let html = "<head>\
+             <link rel=stylesheet href='/primer.css'>\
+             <link rel=stylesheet href='/a.css'>\
+             <link rel=stylesheet href='/primer.css'>\
+             <link rel=stylesheet href='/primer.css'>\
+             <link rel=stylesheet href='/b.css'>\
+             </head><body></body>";
+        assert_eq!(
+            external_stylesheets(html),
+            vec![
+                "/primer.css".to_string(),
+                "/a.css".to_string(),
+                "/b.css".to_string()
+            ]
+        );
     }
 
     #[test]

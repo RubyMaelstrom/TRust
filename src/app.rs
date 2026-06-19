@@ -1419,14 +1419,11 @@ impl App {
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("Fetching {target} ...");
-        let js = self.js_enabled.then(|| {
-            let f = self.picker.font_size();
-            (
-                self.last_inner,
-                (f.width, f.height),
-                self.web_storage.clone(),
-            )
-        });
+        let f = self.picker.font_size();
+        let viewport = self.last_inner;
+        let cell_px = (f.width, f.height);
+        let storage = self.web_storage.clone();
+        let js_on = self.js_enabled;
         let task = tokio::spawn(async move {
             let result = match &target {
                 Link::Gopher(url) => gopher::fetch(url).await.map(Payload::Gopher),
@@ -1438,11 +1435,12 @@ impl App {
                         http::fetch(&http::Request::get(url.clone())).await
                     };
                     match fetched {
-                        Ok(response) => Ok(Payload::Http(match js {
-                            Some((viewport, cell_px, storage)) => {
-                                http::execute_js(response, viewport, cell_px, storage).await
-                            }
-                            None => response,
+                        // JS on: full transform. JS off: still bake the page's
+                        // CSS so it lays out per its own stylesheets.
+                        Ok(response) => Ok(Payload::Http(if js_on {
+                            http::execute_js(response, viewport, cell_px, storage).await
+                        } else {
+                            http::css_only(response, viewport, cell_px).await
                         })),
                         Err(err) => Err(err),
                     }
@@ -1468,14 +1466,11 @@ impl App {
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("POSTing to {url} ...");
-        let js = self.js_enabled.then(|| {
-            let f = self.picker.font_size();
-            (
-                self.last_inner,
-                (f.width, f.height),
-                self.web_storage.clone(),
-            )
-        });
+        let f = self.picker.font_size();
+        let viewport = self.last_inner;
+        let cell_px = (f.width, f.height);
+        let storage = self.web_storage.clone();
+        let js_on = self.js_enabled;
         let task = tokio::spawn(async move {
             let request = http::Request {
                 method: String::from("POST"),
@@ -1487,11 +1482,10 @@ impl App {
                 headers: Vec::new(),
             };
             let result = match http::fetch(&request).await {
-                Ok(response) => Ok(Payload::Http(match js {
-                    Some((viewport, cell_px, storage)) => {
-                        http::execute_js(response, viewport, cell_px, storage).await
-                    }
-                    None => response,
+                Ok(response) => Ok(Payload::Http(if js_on {
+                    http::execute_js(response, viewport, cell_px, storage).await
+                } else {
+                    http::css_only(response, viewport, cell_px).await
                 })),
                 Err(err) => Err(err),
             };
