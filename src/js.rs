@@ -2138,6 +2138,9 @@ fn settle_page(page: &mut LoadedPage) {
         // that work runs as part of the load settle. Still budget/MAX_TICKS-
         // bounded, and once quiescent timers stay frozen at rest.
         settle(&mut page.ctx, &page.budget, MAX_TICKS, &mut page.outcome);
+        // Fire `load` on any image whose reveal a handler is waiting for, so a
+        // fade-in-on-load image is shown rather than hidden at `opacity:0`.
+        settle_image_loads(&mut page.ctx, &page.budget, MAX_TICKS, &mut page.outcome);
         phase("load done");
     }
 
@@ -2189,6 +2192,34 @@ fn settle(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Ou
                 break;
             }
         }
+    }
+}
+
+/// How many scan→settle passes the synthetic-image-load driver makes. One
+/// reveals the current content; a couple more catch images a `load` handler
+/// inserts in turn (lightGallery loads the slide, then preloads its
+/// neighbours). Bounded so a pathological load handler can't loop forever.
+const IMG_LOAD_PASSES: usize = 3;
+
+/// Schedule synthetic `<img>` `load` events for anything waiting on one, then
+/// settle so the handlers run, repeating a few passes to catch images those
+/// handlers insert (see `trust.scanImageLoads`). The reveal-on-load idiom would
+/// otherwise leave such images at `opacity:0` forever (a headless DOM never
+/// fires `load`), and the layout drops an invisible image. A no-op on a page
+/// where nothing listens for `load`.
+fn settle_image_loads(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Outcome) {
+    for _ in 0..IMG_LOAD_PASSES {
+        let scheduled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.eval(Source::from_bytes(b"__trust.scanImageLoads()"))
+                .ok()
+                .and_then(|v| v.as_number())
+                .unwrap_or(0.0)
+        }))
+        .unwrap_or(0.0);
+        if scheduled < 1.0 {
+            break;
+        }
+        settle(ctx, budget, max_ticks, outcome);
     }
 }
 
@@ -2602,6 +2633,15 @@ fn dispatch_form_set_in(page: &mut LoadedPage, node: usize, value: &str, checked
         DISPATCH_TICKS,
         &mut dispatch_outcome,
     );
+    // An interaction can mount images that reveal on `load` (clicking a
+    // thumbnail opens a lightbox slide); fire their loads and settle the
+    // reveal handlers so the image shows in this same dispatch.
+    settle_image_loads(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
     page.outcome.errors.extend(dispatch_outcome.errors);
 }
 
@@ -2629,6 +2669,15 @@ fn dispatch_submit_in(page: &mut LoadedPage, form: usize, submitter: Option<usiz
     };
     let mut dispatch_outcome = Outcome::default();
     settle(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
+    // An interaction can mount images that reveal on `load` (clicking a
+    // thumbnail opens a lightbox slide); fire their loads and settle the
+    // reveal handlers so the image shows in this same dispatch.
+    settle_image_loads(
         &mut page.ctx,
         &page.budget,
         DISPATCH_TICKS,
@@ -2763,6 +2812,15 @@ fn dispatch_click_in(page: &mut LoadedPage, node: usize) -> Option<String> {
     };
     let mut dispatch_outcome = Outcome::default();
     settle(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
+    // An interaction can mount images that reveal on `load` (clicking a
+    // thumbnail opens a lightbox slide); fire their loads and settle the
+    // reveal handlers so the image shows in this same dispatch.
+    settle_image_loads(
         &mut page.ctx,
         &page.budget,
         DISPATCH_TICKS,
@@ -3078,6 +3136,42 @@ const PRELUDE: &str = r##"
     trust.fire = function (target, type, bubble) {
         dispatch(target, new Event(type), bubble);
     };
+    // A headless DOM never decodes images, so the `load` event a real browser
+    // fires when an image fetch succeeds never happens here. The ubiquitous
+    // "reveal on load" idiom — an `<img>` painted at `opacity:0` (or hidden)
+    // until a `load` handler reveals it (lightGallery's lightbox, lazy-loaders,
+    // masonry, fade-in carousels) — then leaves the image invisible forever,
+    // and the layout drops an `opacity:0` image entirely. We DO fetch and show
+    // images in the layout/render pipeline, so optimistically firing `load` is
+    // the correct default. Only imgs something is actually waiting on (a `load`
+    // listener / `onload`) are fired, so an ordinary page pays nothing. The
+    // event is deferred to a macrotask: a library inserts the `<img>` and THEN
+    // binds its handler, so a browser fires `load` on the next turn, once the
+    // handler is registered — we match that. Returns the count newly scheduled
+    // so the actor can re-scan for images a load handler itself inserts
+    // (lightGallery preloads the adjacent slides).
+    trust.__imgLoaded = new Set();
+    trust.scanImageLoads = function () {
+        let imgs;
+        try { imgs = g.document.querySelectorAll("img"); } catch (e) { return 0; }
+        const pending = [];
+        for (let i = 0; i < imgs.length; i++) {
+            const im = imgs[i];
+            const id = im.__id;
+            if (typeof id !== "number" || trust.__imgLoaded.has(id)) continue;
+            if (!im.getAttribute("src")) continue;
+            const m = LS.get(im);
+            const listening =
+                (m && m.get("load") && m.get("load").length) || typeof im.onload === "function";
+            if (!listening) continue;
+            trust.__imgLoaded.add(id);
+            pending.push(im);
+        }
+        if (pending.length) setTimeout(function () {
+            for (const im of pending) { try { dispatch(im, new Event("load"), false); } catch (e) {} }
+        }, 0);
+        return pending.length;
+    };
     // The actor's entry points: dispatch a user click; enumerate nodes
     // with click listeners (delegation hosts included — the actor sorts
     // containers from buttons).
@@ -3379,9 +3473,68 @@ const PRELUDE: &str = r##"
         });
     }
 
+    // Container types mpv routinely plays — what a media element honestly
+    // reports it "can play" (we present media via mpv on follow, see layout's
+    // `flow_media` + `is_playable_media_url`).
+    const MEDIA_MIME = /^(?:video|audio)\/(?:mp4|webm|ogg|mpeg|mp3|aac|x-aac|x-m4a|mp4a-latm|flac|x-flac|wav|x-wav|x-matroska|quicktime|x-msvideo|x-flv|3gpp2?|x-ms-wmv)$/;
+    function emptyTimeRanges() { return { length: 0, start() { return 0; }, end() { return 0; } }; }
+    function emptyTrackList() { const l = []; l.getTrackById = () => null; l.addEventListener = () => {}; l.removeEventListener = () => {}; return l; }
     class Element extends Node {
         get tagName() { return (__dom_tag(this.__id) || "").toUpperCase(); }
         get localName() { return __dom_tag(this.__id) || ""; }
+        // --- HTMLMediaElement surface, on <video>/<audio> ---
+        // TRust presents media via mpv (a followed link), not inline playback.
+        // But a player library (video.js, Plyr, JW Player, …) probes the
+        // element and, finding it reports it can't play, shows "No compatible
+        // source was found for this media" AND strips the <source> — so the
+        // layout never sees the media to represent. Reporting honest support
+        // for the formats mpv plays, plus benign media-element state, keeps the
+        // <source> in the DOM and the error away. Gated to media tags so it
+        // doesn't pollute other elements; general (helps every player lib).
+        get __isMedia() {
+            let m = this.__media;
+            if (m === undefined) { const t = this.tagName; m = this.__media = (t === "VIDEO" || t === "AUDIO"); }
+            return m;
+        }
+        canPlayType(type) {
+            if (!this.__isMedia) return undefined;
+            const t = String(type || "").toLowerCase().split(";")[0].trim();
+            return MEDIA_MIME.test(t) || t === "application/x-mpegurl"
+                || t === "application/vnd.apple.mpegurl" || t === "application/dash+xml"
+                ? "maybe" : "";
+        }
+        load() {}
+        play() { return Promise.resolve(); }
+        pause() {}
+        addTextTrack() { return { mode: "disabled", cues: null, activeCues: null, addCue() {}, removeCue() {}, addEventListener() {}, removeEventListener() {} }; }
+        fastSeek(t) { if (this.__isMedia) this.__ct = +t || 0; }
+        get readyState() { return this.__isMedia ? 0 : undefined; }
+        get networkState() { return this.__isMedia ? 0 : undefined; }
+        get error() { return this.__isMedia ? null : undefined; }
+        get ended() { return this.__isMedia ? false : undefined; }
+        get seeking() { return this.__isMedia ? false : undefined; }
+        get duration() { return this.__isMedia ? NaN : undefined; }
+        get videoWidth() { return this.__isMedia ? 0 : undefined; }
+        get videoHeight() { return this.__isMedia ? 0 : undefined; }
+        get currentSrc() { return this.__isMedia ? (this.getAttribute("src") || "") : undefined; }
+        get buffered() { return this.__isMedia ? emptyTimeRanges() : undefined; }
+        get played() { return this.__isMedia ? emptyTimeRanges() : undefined; }
+        get seekable() { return this.__isMedia ? emptyTimeRanges() : undefined; }
+        get textTracks() { return this.__isMedia ? (this.__tt || (this.__tt = emptyTrackList())) : undefined; }
+        get audioTracks() { return this.__isMedia ? (this.__at || (this.__at = emptyTrackList())) : undefined; }
+        get videoTracks() { return this.__isMedia ? (this.__vt || (this.__vt = emptyTrackList())) : undefined; }
+        get paused() { return this.__isMedia ? (this.__paused !== false) : undefined; }
+        set paused(v) { this.__paused = !!v; }
+        get currentTime() { return this.__isMedia ? (this.__ct || 0) : undefined; }
+        set currentTime(v) { this.__ct = +v || 0; }
+        get volume() { return this.__isMedia ? (this.__vol === undefined ? 1 : this.__vol) : undefined; }
+        set volume(v) { this.__vol = +v; }
+        get muted() { return this.__isMedia ? !!this.__muted : undefined; }
+        set muted(v) { this.__muted = !!v; }
+        get playbackRate() { return this.__isMedia ? (this.__pbr === undefined ? 1 : this.__pbr) : undefined; }
+        set playbackRate(v) { this.__pbr = +v; }
+        get defaultPlaybackRate() { return this.__isMedia ? 1 : undefined; }
+        set defaultPlaybackRate(_v) {}
         // <canvas> 2d context. We paint no raster, but sites use it to
         // normalise CSS colours (Web Animations sets `ctx.fillStyle = colour`
         // and reads it back) and to measure text. A pass-through stub stores/
@@ -4274,10 +4427,9 @@ const PRELUDE: &str = r##"
         constructor(src) {
             const el = g.document.createElement("audio");
             if (src !== undefined && src !== null) el.setAttribute("src", String(src));
-            el.play = () => Promise.resolve();
-            el.pause = () => {};
-            el.load = () => {};
-            el.canPlayType = () => "";
+            // play/pause/load/canPlayType come from the HTMLMediaElement
+            // surface on the Element prototype (canPlayType now reports honest
+            // support for mpv-playable formats).
             return el;
         }
     };
@@ -6309,6 +6461,50 @@ mod tests {
         assert!(!outcome.panicked, "{outcome:?}");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("fired mr=10px"), "{out}");
+    }
+
+    #[test]
+    fn image_load_event_fires_and_reveals_hidden_images() {
+        // The "reveal on load" idiom: an <img> painted at opacity:0 until a load
+        // handler reveals it (lightGallery's lightbox, lazy-loaders, fade-ins).
+        // A headless DOM never decodes images, so we fire a synthetic `load`;
+        // without it the image stays opacity:0 and the layout/serializer drops
+        // it entirely. The handler runs AND the revealed image survives.
+        let html = r#"<body><pre id="o"></pre>
+            <img id="pic" src="https://example.com/p.jpg" style="opacity:0">
+            <script>
+              var pic = document.getElementById('pic');
+              pic.addEventListener('load', function () {
+                pic.style.opacity = '1';
+                document.getElementById('o').textContent = 'loaded';
+              });
+            </script></body>"#;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("loaded"), "the load handler fired: {out}");
+        assert!(
+            out.contains(r#"id="pic""#),
+            "the revealed image survives serialization (no longer opacity:0): {out}"
+        );
+    }
+
+    #[test]
+    fn an_image_with_no_load_listener_is_left_alone() {
+        // The scan only fires `load` where something is waiting on it: an
+        // ordinary image (no load handler) is untouched — no needless events on
+        // image-heavy pages.
+        let html = r#"<body><pre id="o">start</pre>
+            <img id="pic" src="https://example.com/p.jpg">
+            <script>
+              // No load listener bound; if a spurious load fired and bubbled to
+              // window it would not change this, but assert the page is intact.
+              document.getElementById('o').textContent = 'ok';
+            </script></body>"#;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("ok") && out.contains(r#"id="pic""#), "{out}");
     }
 
     #[test]

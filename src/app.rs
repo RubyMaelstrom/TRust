@@ -694,7 +694,11 @@ impl App {
                 self.browser_back();
             }
             (MouseEventKind::Moved, true) if self.mode == Mode::Session => {
-                self.browser_mouse_hover(mouse.column, mouse.row);
+                let on_link = self.browser_mouse_hover(mouse.column, mouse.row);
+                // Hovering onto a link supersedes a sticky `notice` (the
+                // mpv-launch confirmation, a fetch error) so the bar shows the
+                // link preview again instead of pinning the old message.
+                self.notice = self.notice && !on_link;
             }
             (MouseEventKind::Down(MouseButton::Left), true)
                 if self.mode == Mode::Session
@@ -2762,6 +2766,15 @@ impl App {
             self.launch_mpv(url);
             return;
         }
+        // A direct link to media mpv can play (a video/audio file, or the
+        // source behind a `<video>`/`<audio>` representation) opens in mpv too
+        // — in every view, automatic for everything mpv routinely plays.
+        if let Some(url) = self.selected_web_url()
+            && is_playable_media_url(&url)
+        {
+            self.launch_mpv(url);
+            return;
+        }
         let Some(link) = self.selected_link() else {
             return;
         };
@@ -2804,13 +2817,20 @@ impl App {
         self.launch_mpv(url);
     }
 
-    /// Spawn mpv on a URL, detached. Shared by the `v` key and the
-    /// automatic YouTube routing.
+    /// Spawn mpv on a URL, detached. Shared by the `v` key, the automatic
+    /// YouTube routing, and the `<video>`/`<audio>` → mpv path.
     fn launch_mpv(&mut self, url: String) {
         // notice so the confirmation/error shows over the selected-link
         // hint until the next keypress.
         self.notice = true;
-        match std::process::Command::new("mpv")
+        let mut cmd = std::process::Command::new("mpv");
+        // Many media hosts hotlink-protect their files with a Referer check —
+        // erome's mp4s 403 without one. Hand mpv the current page as referrer
+        // so a direct media URL plays (harmless for yt-dlp-handled links).
+        if let Some(Link::Http(page)) = self.browser.as_ref().map(|g| &g.doc.url) {
+            cmd.arg(format!("--referrer={page}"));
+        }
+        match cmd
             .arg(&url)
             // Detach from our tty so mpv can't fight ratatui for the screen;
             // it opens its own window. We don't wait on it.
@@ -3436,6 +3456,28 @@ fn is_youtube_video_url(url: &str) -> bool {
     }
 }
 
+/// Whether a URL points at media mpv routinely plays directly — a video or
+/// audio file, or a streaming manifest. Extension-based (direct media files,
+/// which is what `<video>`/`<audio>` sources and direct media links almost
+/// always are); following such a link auto-launches mpv, like YouTube does.
+fn is_playable_media_url(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(u.scheme(), "http" | "https") {
+        return false;
+    }
+    let path = u.path().to_ascii_lowercase();
+    const EXTS: &[&str] = &[
+        // video
+        ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".mpg", ".mpeg", ".ogv",
+        ".ts", ".m2ts", ".3gp", ".ogm", // adaptive-streaming manifests mpv plays
+        ".m3u8", ".mpd", // audio
+        ".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav", ".wma", ".mka", ".weba",
+    ];
+    EXTS.iter().any(|e| path.ends_with(e))
+}
+
 const SEND_USAGE: &str = "usage: send brk|ip|ao|ayt|ec|el|ga|nop|escape";
 
 /// Map GNU telnet `send` argument names to IAC command codes (RFC 854).
@@ -3981,6 +4023,34 @@ mod tests {
     }
 
     #[test]
+    fn hovering_a_link_clears_a_sticky_notice_so_the_preview_shows() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(2, 1, 80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let html = b"<body><p>plain <a href='/next'>next</a></p></body>";
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html,
+            80,
+            &Default::default(),
+        ));
+        // A sticky message is up (the mpv-launch confirmation / a fetch error),
+        // which the status bar pins over the selected-link preview.
+        app.notice = true;
+        let (x, y, _) = item_point(&app, |it| it.link.is_some());
+
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, x, y));
+
+        assert!(
+            !app.notice,
+            "hovering a link releases the notice so the link preview shows"
+        );
+    }
+
+    #[test]
     fn http_mouse_left_click_activates_link() {
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
@@ -4327,6 +4397,25 @@ mod tests {
         assert!(!yt("https://notyoutube.com/watch"));
         assert!(!yt("mailto:x@y.z"));
         assert!(!yt("not a url"));
+    }
+
+    #[test]
+    fn playable_media_recognizer_covers_audio_and_video() {
+        use super::is_playable_media_url as m;
+        // Video, audio, and streaming manifests → mpv on follow:
+        assert!(m("https://v1.erome.com/8335/BRbvsH39/UDODP8WH_720p.mp4"));
+        assert!(m("https://cdn.example.com/clip.webm?token=abc"));
+        assert!(m("https://example.com/a/b/movie.MKV")); // case-insensitive
+        assert!(m("https://example.com/song.mp3"));
+        assert!(m("https://example.com/voice.opus"));
+        assert!(m("https://example.com/stream/index.m3u8"));
+        assert!(m("https://example.com/manifest.mpd"));
+        // Not media — normal navigation:
+        assert!(!m("https://example.com/page.html"));
+        assert!(!m("https://example.com/")); // no extension
+        assert!(!m("https://example.com/image.png"));
+        assert!(!m("mailto:x@y.z"));
+        assert!(!m("not a url"));
     }
 
     #[test]

@@ -1096,6 +1096,30 @@ impl Dom {
         out
     }
 
+    /// The terminal glyph for an icon element/subtree — the dominant web icon
+    /// idiom is a Font-Awesome-style `<svg class="...fa-NAME"><use href=
+    /// "#...fa-NAME"></svg>` (also `icon-NAME`/`bi-NAME`). We don't rasterize
+    /// SVG (an icon-sized raster is an unreadable smear in a terminal); instead
+    /// we recognize the icon by NAME and render its Unicode glyph. Scans `id`
+    /// and its descendants for the first recognizable name. `None` when nothing
+    /// matches (a non-icon `<svg>` — a D3 chart, a logo — stays unrendered).
+    pub fn icon_glyph(&self, id: NodeId) -> Option<&'static str> {
+        for n in std::iter::once(id).chain(self.descendants(id)) {
+            for attr in ["class", "href", "xlink:href"] {
+                if let Some(v) = self.attr(n, attr) {
+                    for tok in v.split(|c: char| c.is_whitespace()) {
+                        if let Some(name) = icon_token_name(tok)
+                            && let Some(g) = icon_glyph_for(name)
+                        {
+                            return Some(g);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn set_text(&mut self, id: NodeId, text: &str) {
         match &mut self.nodes[id].data {
             // Idempotent writes are free: no dirty, no redraw.
@@ -1395,22 +1419,24 @@ impl Dom {
         if wrap {
             out.push_str(&format!("<a href=\"x-trust-js:{id}:\">"));
             // An icon-only clickable would render as an empty (and so
-            // unselectable) link: give it a visible handle. A named one
-            // shows its accessible name; an unnamed one (a CSS-drawn
-            // carousel dot, an icon button) gets a compact marker rather
-            // than the noisy "[button]".
+            // unselectable) link: give it a visible handle. An icon control
+            // (an `<svg>`/`<use>` Font-Awesome-style glyph — the dominant web
+            // icon idiom) shows the icon's GLYPH; a named-but-glyphless one
+            // shows its accessible name; an unnamed one (a CSS-drawn carousel
+            // dot) gets a compact marker rather than the noisy "[button]".
             if self.text_content(id).trim().is_empty() {
-                match self
+                if let Some(glyph) = self.icon_glyph(id) {
+                    out.push_str(glyph);
+                } else if let Some(label) = self
                     .attr(id, "aria-label")
                     .or_else(|| self.attr(id, "title"))
                     .or_else(|| self.attr(id, "value"))
                 {
-                    Some(label) => {
-                        out.push('[');
-                        out.push_str(&escape_text(label));
-                        out.push(']');
-                    }
-                    None => out.push('·'),
+                    out.push('[');
+                    out.push_str(&escape_text(label));
+                    out.push(']');
+                } else {
+                    out.push('·');
                 }
             }
         }
@@ -2879,6 +2905,88 @@ fn media_feature_matches(inner: &str, vp: (u32, u32)) -> bool {
 
 /// A media-feature length as CSS pixels: `px`/unitless as-is, `em`/`rem` at
 /// 16px. Other units (or unparseable) → `None` (the condition won't match).
+/// The icon NAME inside a token, if it carries a Font-Awesome / icon-set
+/// prefix: `fa-NAME` / `fas-fa-NAME` (FA), `bi-NAME` (Bootstrap Icons),
+/// `icon-NAME`. Returns the longest trailing icon name (`svg-fas-fa-ellipsis`
+/// → `ellipsis`, `#fas-fa-ellipsis` → `ellipsis`). A bare `fa`/`svg-fa` (no
+/// dash-name) is not a name.
+fn icon_token_name(tok: &str) -> Option<&str> {
+    let tok = tok.trim_start_matches('#');
+    for sep in ["fa-", "bi-", "icon-"] {
+        if let Some(pos) = tok.rfind(sep) {
+            let name = &tok[pos + sep.len()..];
+            // A real icon name is non-empty, alphanumeric/dash (drop a trailing
+            // state class accidentally glued on by the rfind on the wrong sep).
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+/// The Unicode glyph for a recognized icon name (Font-Awesome vocabulary, the
+/// de-facto web icon naming). Covers the common UI/nav set; an unknown name
+/// returns `None` (the caller falls back to the accessible name, then a marker).
+fn icon_glyph_for(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "ellipsis" | "ellipsis-h" => "⋯",
+        "ellipsis-v" | "ellipsis-vertical" => "⋮",
+        "bars" | "list" | "list-ul" => "☰",
+        "bell" | "bell-o" => "🔔",
+        "bookmark" | "bookmark-o" => "🔖",
+        "rss" | "rss-square" | "feed" => "📡",
+        "cog" | "cogs" | "gear" | "gears" | "sliders" => "⚙",
+        "user" | "user-circle" | "circle-user" | "user-o" => "👤",
+        "users" | "user-group" | "people-group" => "👥",
+        "heart" | "heart-o" => "♥",
+        "comment" | "comments" | "comment-dots" | "message" | "comment-o" => "💬",
+        "search" | "magnifying-glass" => "🔍",
+        "upload" | "cloud-upload" | "cloud-arrow-up" | "arrow-up-from-bracket" => "⬆",
+        "download" | "cloud-download" | "cloud-arrow-down" | "arrow-down-to-bracket" => "⬇",
+        "share" | "share-alt" | "share-nodes" | "arrow-up-from-square" => "↗",
+        "link" | "chain" => "🔗",
+        "camera" | "camera-retro" => "📷",
+        "image" | "images" | "photo" | "picture-o" => "🖼",
+        "eye" => "👁",
+        "eye-slash" => "🙈",
+        "video" | "video-camera" | "film" | "clapperboard" => "🎬",
+        "play" | "circle-play" | "play-circle" => "▶",
+        "pause" => "⏸",
+        "times" | "xmark" | "close" | "x" | "remove" => "✕",
+        "check" | "check-circle" | "circle-check" => "✓",
+        "plus" | "add" => "＋",
+        "minus" => "−",
+        "star" | "star-o" => "★",
+        "home" | "house" => "⌂",
+        "envelope" | "envelope-o" | "mail" | "inbox" => "✉",
+        "gear-complex" => "⚙",
+        "trash" | "trash-o" | "trash-can" | "trash-alt" => "🗑",
+        "edit" | "pen" | "pencil" | "pen-to-square" | "pencil-alt" => "✎",
+        "lock" => "🔒",
+        "unlock" | "lock-open" => "🔓",
+        "flag" | "flag-o" => "⚑",
+        "thumbs-up" | "thumbs-o-up" => "👍",
+        "thumbs-down" | "thumbs-o-down" => "👎",
+        "retweet" | "repeat" => "🔁",
+        "gift" => "🎁",
+        "fire" => "🔥",
+        "bolt" | "flash" => "⚡",
+        "globe" | "earth" => "🌐",
+        "gear-six" => "⚙",
+        "chevron-down" | "angle-down" | "caret-down" | "sort-down" => "▾",
+        "chevron-up" | "angle-up" | "caret-up" | "sort-up" => "▴",
+        "chevron-left" | "angle-left" | "caret-left" => "◂",
+        "chevron-right" | "angle-right" | "caret-right" => "▸",
+        "arrow-up" => "↑",
+        "arrow-down" => "↓",
+        "arrow-left" => "←",
+        "arrow-right" => "→",
+        "external-link" | "arrow-up-right-from-square" | "up-right-from-square" => "↗",
+        _ => return None,
+    })
+}
+
 fn media_px(value: &str) -> Option<u32> {
     let v = value.trim();
     let split = v
@@ -3925,15 +4033,17 @@ mod tests {
         let dom = Dom::parse_document(
             "<body><button id=b>Push</button>\
              <button id=icon aria-label=menu></button>\
+             <button id=opts><svg class=\"svg-fa svg-fas-fa-ellipsis\"><use href=\"#fas-fa-ellipsis\"></use></svg></button>\
              <span id=dot></span>\
              <a id=plain href='/normal'>plain</a>\
              <a id=hot href='/hot'>hot</a></body>",
         );
         let b = dom.get_by_id("b").unwrap();
         let icon = dom.get_by_id("icon").unwrap();
+        let opts = dom.get_by_id("opts").unwrap();
         let dot = dom.get_by_id("dot").unwrap();
         let hot = dom.get_by_id("hot").unwrap();
-        let clickable = std::collections::HashSet::from([b, icon, dot, hot]);
+        let clickable = std::collections::HashSet::from([b, icon, opts, dot, hot]);
         let html = dom.serialize_live(DOCUMENT, &clickable);
         // Buttons wrapped; icon-only ones get a readable label.
         assert!(
@@ -3943,6 +4053,11 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("[menu]"), "{html}");
+        // A wrapped icon-only button renders the icon GLYPH as its handle (the
+        // dominant web icon idiom) — the comment's ⋯ menu — not "·"/"[button]".
+        // (An icon-only ANCHOR `<a><svg></a>` is glyphed by the layout instead,
+        // see `icon_only_label`, since anchors aren't wrapped.)
+        assert!(html.contains('⋯'), "ellipsis icon glyph: {html}");
         // An unnamed icon-only clickable (a CSS dot) gets a compact marker,
         // not the noisy "[button]".
         assert!(html.contains('·') && !html.contains("[button]"), "{html}");
