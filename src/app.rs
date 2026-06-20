@@ -2265,19 +2265,18 @@ impl App {
         let local_col = col.saturating_sub(self.last_content_area.x);
         (g.scroll..=doc_row).rev().find_map(|r| {
             let row_offset = doc_row.saturating_sub(r);
-            g.doc
-                .rows
-                .get(r)?
-                .items
-                .iter()
-                .enumerate()
-                .find_map(|(i, item)| {
-                    let end = item.col.saturating_add(item.width);
+            let row = g.doc.rows.get(r)?;
+            // Use the SAME on-screen placement the renderer draws (carousel
+            // clip + gap-fill + overlap-append), so a click lands on the item
+            // actually under the cursor — not the raw `item.col`, which diverges
+            // when items overlap (an overlay drawn after the content it covers).
+            crate::layout::visual_columns(row, &g.doc.carousels, r)
+                .into_iter()
+                .find_map(|(i, start)| {
+                    let item = &row.items[i];
+                    let end = start.saturating_add(item.width);
                     let covers_row = row_offset < item.height.max(1) as usize;
-                    (item.is_interactive()
-                        && covers_row
-                        && local_col >= item.col
-                        && local_col < end)
+                    (item.is_interactive() && covers_row && local_col >= start && local_col < end)
                         .then_some((r, i))
                 })
         })

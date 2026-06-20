@@ -337,6 +337,35 @@ pub fn visible_col(carousels: &[Carousel], row: usize, item: &Item) -> Option<u1
     Some(item.col)
 }
 
+/// The on-screen start column of every item in `row` after carousel clipping,
+/// gap-fill, and overlap-append — the EXACT placement `ui::browser_rows` draws,
+/// so hit-testing lands on what's actually on screen. A terminal can't overlay
+/// text, so an item whose visible column falls inside an earlier item is
+/// appended right after it (never drawn on top); thus each on-screen column
+/// maps to exactly one item. Without this the renderer (which appends overlaps)
+/// and the hit-test (which read raw `item.col`) disagreed: a clickable overlay
+/// placed over an input — the homepage search bar's clear button — was drawn in
+/// one place but only hoverable in another. Returns `(item_index,
+/// visual_start_col)` left to right; `row.items[i].width` gives the extent.
+/// Carousel-clipped items (not drawn) are omitted.
+pub fn visual_columns(row: &Row, carousels: &[Carousel], row_idx: usize) -> Vec<(usize, u16)> {
+    let mut placed: Vec<(u16, usize)> = row
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| Some((visible_col(carousels, row_idx, item)?, i)))
+        .collect();
+    placed.sort_by_key(|&(c, _)| c);
+    let mut out = Vec::with_capacity(placed.len());
+    let mut col = 0u16;
+    for (scol, i) in placed {
+        let start = scol.max(col);
+        out.push((i, start));
+        col = start + row.items[i].width;
+    }
+    out
+}
+
 /// How far above the scroll top to look for an image whose box reaches down
 /// into the viewport (a tall banner scrolled partly off the top). Bounds the
 /// per-frame back-scan; an image taller than this many cells (~5000px) is not
@@ -2076,11 +2105,21 @@ impl<'a> Layout<'a> {
     /// `position:absolute`, `right` anchored (set, not `auto`), `left` not
     /// anchored, and not `bottom`-anchored without a matching `top` (a bottom
     /// corner badge isn't a first-line element). Hidden overlays don't count.
+    /// A transparent single-child wrapper (a link/span) is SEEN THROUGH to the
+    /// overlay it wraps — the live serializer wraps a clickable overlay (the
+    /// search bar's clear/submit buttons over the input) in an `<a>`, which
+    /// would otherwise hide the overlay from this test and let it claim its own
+    /// row below the input (the homepage search field then sat a row above the
+    /// nav).
     fn is_top_right_overlay(&self, id: NodeId) -> bool {
-        if self.dom.computed_style(id, "position").as_deref() != Some("absolute")
-            || self.dom.is_hidden(id)
-        {
+        if self.dom.is_hidden(id) {
             return false;
+        }
+        if self.dom.computed_style(id, "position").as_deref() != Some("absolute") {
+            // See through a transparent wrapper to a sole overlay child.
+            return self
+                .sole_element_child(id)
+                .is_some_and(|c| self.is_top_right_overlay(c));
         }
         let off = |p: &str| {
             self.dom
@@ -2097,6 +2136,22 @@ impl<'a> Layout<'a> {
         // the box top by default). Both top and bottom anchored → stretched, but
         // its content still begins at the top, so treat `top` as the anchor.
         set(&top) || !set(&bottom)
+    }
+
+    /// The sole ELEMENT child of `id` (ignoring whitespace/text nodes), or
+    /// `None` if there are zero or several — used to see through a transparent
+    /// wrapper (an `<a>`/`<span>` the serializer added around one control).
+    fn sole_element_child(&self, id: NodeId) -> Option<NodeId> {
+        let mut found = None;
+        for c in self.dom.children(id) {
+            if matches!(self.dom.node(c).data, NodeData::Element { .. }) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(c);
+            }
+        }
+        found
     }
 
     /// Whether an element is taken out of normal flow by `position:absolute`
@@ -2750,13 +2805,31 @@ impl<'a> Layout<'a> {
         let mut x = 0usize;
         let mut stops = Vec::new();
         let mut height = 0usize;
+        // A rail card is narrower than the rail. A card whose declared width
+        // reaches or exceeds the band is full-bleed (a `width:100%` slide) or
+        // carries a JS-computed width sized against a fictional viewport (slick
+        // sets a per-slide pixel width that's unusable in our cell/geometry
+        // model) — laying it at the full band shows ONE slide and makes a
+        // fixed-aspect tile image fill the whole screen. Size such a card to
+        // show a few across the band instead (the defining behaviour of a
+        // carousel; ~3 mirrors the common rail). A reliable sub-band width is
+        // honored as-is, and a card with no width keeps its measured content
+        // width, so existing rails (SL Marketplace) are unchanged.
+        // Subtract the inter-card gaps so THREE cards + their two gaps fit the
+        // band EXACTLY: a card whose right edge spills even one cell past the
+        // band fails `Carousel::shows` (full-containment) and its whole image is
+        // dropped — `band_w/3` overshoots by the gaps, which is why the 3rd
+        // featured card rendered its title but not its (band-wide) image.
+        let multi_card_w = (band_w.saturating_sub(2 * gap) / 3).max(1);
         for card in self.flex_items(track) {
-            let cw = self
+            let cw = match self
                 .css_cells(card, "width")
                 .or_else(|| self.css_cells(card, "max-width"))
-                .map(|w| w.min(avail))
-                .unwrap_or_else(|| self.measure_width(card, avail))
-                .clamp(1, avail);
+            {
+                Some(w) if w >= band_w => multi_card_w,
+                Some(w) => w.clamp(1, avail),
+                None => self.measure_width(card, avail).clamp(1, avail),
+            };
             // Lay the card as a block (ignore its own float), then place it.
             let b = self.layout_subtree_inner(card, cw, Some(card), false, &Ctx::root());
             if b.height == 0 {
@@ -4835,10 +4908,18 @@ impl<'a> Layout<'a> {
         } else if let Some(ar) = self.css_aspect_ratio(id) {
             rows_for_ratio(used_w, ar)
         } else if let Some(pct) = raw_h.as_deref().and_then(parse_percent) {
-            // A percentage height resolves against the containing block's
-            // definite height (the avatar wrapper's `height:24px`), else a
-            // square-tile `aspect-ratio` ancestor, else the intrinsic box.
-            if let Some(basis) = self.definite_ancestor_height(id) {
+            // A percentage height resolves against the containing block.
+            // Priority: (1) the intrinsic-ratio "aspect box" — a height:0
+            // container whose percentage `padding-bottom` (resolved against
+            // WIDTH per CSS 2.1 §8.4) establishes the box for an absolutely
+            // positioned `height:100%` child to fill (the universal responsive
+            // image/thumbnail idiom — Humble Bundle's tiles, padding-bottom
+            // hacks everywhere); then (2) a definite-height ancestor (the
+            // avatar wrapper's `height:24px`); then (3) a square-tile
+            // `aspect-ratio` ancestor; else the intrinsic box.
+            if let Some(rows) = self.intrinsic_ratio_container_rows(id, used_w) {
+                (pct * rows as f32).round().max(1.0) as usize
+            } else if let Some(basis) = self.definite_ancestor_height(id) {
                 (pct * basis as f32).round().max(1.0) as usize
             } else {
                 self.container_box_rows(id, used_w).unwrap_or(intrinsic_h)
@@ -4929,6 +5010,40 @@ impl<'a> Layout<'a> {
             let p = cur?;
             if let Some(ar) = self.css_aspect_ratio(p) {
                 return Some(rows_for_ratio(used_w, ar));
+            }
+            cur = self.dom.parent_composed(p);
+        }
+        None
+    }
+
+    /// Rows of the nearest "intrinsic-ratio" container — the responsive-image
+    /// idiom of a `height:0` box whose percentage `padding-bottom` (and/or
+    /// `padding-top`) reserves the height. CSS 2.1 §8.4: percentage padding
+    /// resolves against the containing block's WIDTH, so `padding-bottom:56.25%`
+    /// on a full-width box reserves a 16:9 height. The box collapses the content
+    /// height to 0 and an absolutely positioned `width/height:100%` child fills
+    /// the padding box. Without this every such thumbnail renders as a 1-row
+    /// strip (Humble Bundle's tiles; the technique predates `aspect-ratio` and
+    /// is still ubiquitous). Only a height:0/auto container qualifies — a real
+    /// fixed-height padded box keeps its own height. `used_w` is the image's
+    /// used width (it fills 100% of the container).
+    fn intrinsic_ratio_container_rows(&self, id: NodeId, used_w: usize) -> Option<usize> {
+        let mut cur = self.dom.parent_composed(id);
+        for _ in 0..6 {
+            let p = cur?;
+            let h_zero = match self.dom.computed_style(p, "height").as_deref() {
+                Some(h) => css_length_em(h) == Some(0.0) || h.trim() == "auto",
+                None => true,
+            };
+            if h_zero {
+                let frac: f32 = ["padding-bottom", "padding-top"]
+                    .iter()
+                    .filter_map(|prop| first_percent(self.dom.computed_style(p, prop).as_deref()?))
+                    .sum();
+                if frac > 0.0 {
+                    // height_px = frac · width_px, so the box ratio is 1/frac.
+                    return Some(rows_for_ratio(used_w, 1.0 / frac));
+                }
             }
             cur = self.dom.parent_composed(p);
         }
@@ -5396,6 +5511,21 @@ fn parse_percent(value: &str) -> Option<f32> {
     Some(n / 100.0)
 }
 
+/// The first percentage anywhere in a value, as a fraction — including inside
+/// `calc(…)`. The aspect-box padding is frequently authored as
+/// `calc(57.305% + 0em)` (a `% + 0` to defeat some preprocessor), so a strict
+/// `strip_suffix('%')` misses it. Scans for a `%` and reads the number before
+/// it. Used only for the responsive-padding ratio, where the value is a single
+/// length whose `%` term is the ratio.
+fn first_percent(value: &str) -> Option<f32> {
+    let pct = value.find('%')?;
+    let start = value[..pct]
+        .rfind(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .map_or(0, |i| i + 1);
+    let n: f32 = value[start..pct].parse().ok()?;
+    Some(n / 100.0)
+}
+
 /// Parse a CSS `aspect-ratio` to width÷height. `R`, `W / H`, and `auto W / H`
 /// (the `auto` keyword ignored); `auto`/unset/zero/unparseable → `None`.
 fn parse_ratio(value: &str) -> Option<f32> {
@@ -5627,34 +5757,137 @@ fn resolve_cells(value: &str, avail: usize, viewport: usize) -> Option<usize> {
     resolve_cells_f32(value, avail, viewport).map(|c| c.round().max(0.0) as usize)
 }
 
-/// A `calc()` body as cells: a whitespace-delimited chain of `+`/`-` terms
-/// (CSS requires spaces around those operators), each a length/percentage/vw
-/// resolved by `resolve_cells_f32`. Returns `None` if any term is
-/// unresolvable or `*`/`/` (unsupported) appears — the caller then ignores
-/// the value, as it did before `calc` was understood at all.
+/// A `calc()` body as cells. A real expression evaluator: `+ - * /` with the
+/// correct precedence (`* /` bind tighter than `+ -`) and parenthesised
+/// grouping. A value carrying a unit/`%`/`vw` resolves to cells via
+/// `resolve_cells_f32`; a UNITLESS number is a scalar (per the CSS calc
+/// grammar — `3` is a number, only `3px` is a length), so
+/// `calc((100% - 3.75em) / 3)` is a third of the container, the ubiquitous
+/// 3-column flex/grid item width (Humble Bundle's bundle item grid). Returns
+/// `None` on a parse failure or an unresolvable term, so the caller ignores
+/// the value as it did before `calc` was understood at all.
 fn resolve_calc(body: &str, avail: usize, viewport: usize) -> Option<f32> {
-    let s = body.trim();
-    if s.contains('*') || s.contains('/') {
-        return None;
-    }
-    let mut total = 0.0f32;
-    let mut sign = 1.0f32;
-    let mut term_start = 0usize;
-    let bytes = s.as_bytes();
-    let mut i = 0usize;
-    while i + 3 <= s.len() {
-        let op = &s[i..i + 3];
-        if op == " + " || op == " - " {
-            total += sign * resolve_cells_f32(s[term_start..i].trim(), avail, viewport)?;
-            sign = if bytes[i + 1] == b'+' { 1.0 } else { -1.0 };
-            i += 3;
-            term_start = i;
-        } else {
-            i += 1;
+    let mut p = CalcParser {
+        s: body.as_bytes(),
+        pos: 0,
+        avail,
+        viewport,
+    };
+    let v = p.sum()?;
+    p.skip_ws();
+    (p.pos == p.s.len()).then_some(v)
+}
+
+/// Recursive-descent evaluator for a `calc()` body (`sum := product ((+|-)
+/// product)*`, `product := value ((*|/) value)*`, `value := (sum) | number |
+/// length`). CSS requires whitespace around `+`/`-` (to disambiguate signed
+/// numbers); `*`/`/` need none, so a value token ends at a top-level space,
+/// `*`, `/`, or `)`.
+struct CalcParser<'a> {
+    s: &'a [u8],
+    pos: usize,
+    avail: usize,
+    viewport: usize,
+}
+
+impl CalcParser<'_> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.s.len() && self.s[self.pos] == b' ' {
+            self.pos += 1;
         }
     }
-    total += sign * resolve_cells_f32(s[term_start..].trim(), avail, viewport)?;
-    Some(total)
+
+    fn sum(&mut self) -> Option<f32> {
+        let mut acc = self.product()?;
+        loop {
+            self.skip_ws();
+            match self.s.get(self.pos) {
+                Some(&op @ (b'+' | b'-')) => {
+                    self.pos += 1;
+                    let rhs = self.product()?;
+                    acc = if op == b'+' { acc + rhs } else { acc - rhs };
+                }
+                _ => return Some(acc),
+            }
+        }
+    }
+
+    fn product(&mut self) -> Option<f32> {
+        let mut acc = self.value()?;
+        loop {
+            self.skip_ws();
+            match self.s.get(self.pos) {
+                Some(&op @ (b'*' | b'/')) => {
+                    self.pos += 1;
+                    let rhs = self.value()?;
+                    if op == b'/' {
+                        if rhs == 0.0 {
+                            return None;
+                        }
+                        acc /= rhs;
+                    } else {
+                        acc *= rhs;
+                    }
+                }
+                _ => return Some(acc),
+            }
+        }
+    }
+
+    fn value(&mut self) -> Option<f32> {
+        self.skip_ws();
+        // Parenthesised sub-expression: resolve the balanced group.
+        if self.s.get(self.pos) == Some(&b'(') {
+            let start = self.pos + 1;
+            let mut depth = 0usize;
+            let mut i = self.pos;
+            while i < self.s.len() {
+                match self.s[i] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            if depth != 0 {
+                return None;
+            }
+            let inner = std::str::from_utf8(&self.s[start..i]).ok()?;
+            self.pos = i + 1;
+            return resolve_calc(inner, self.avail, self.viewport);
+        }
+        // A value token runs to the next top-level space / `*` / `/` / `)`,
+        // but a nested function call (`min(...)`, `var(...)`) carries balanced
+        // parens whose internal commas/spaces stay part of the token.
+        let start = self.pos;
+        let mut depth = 0usize;
+        while let Some(&c) = self.s.get(self.pos) {
+            match c {
+                b'(' => depth += 1,
+                b')' if depth == 0 => break,
+                b')' => depth -= 1,
+                b' ' | b'*' | b'/' if depth == 0 => break,
+                _ => {}
+            }
+            self.pos += 1;
+        }
+        let tok = std::str::from_utf8(&self.s[start..self.pos]).ok()?.trim();
+        if tok.is_empty() {
+            return None;
+        }
+        // A unitless number is a scalar (calc multiplier/divisor); anything with
+        // a unit or `%` is a length resolved against the containing block.
+        if let Ok(n) = tok.parse::<f32>() {
+            Some(n)
+        } else {
+            resolve_cells_f32(tok, self.avail, self.viewport)
+        }
+    }
 }
 
 /// Whether a vertical length is big enough to warrant a blank spacer row.
@@ -6200,10 +6433,21 @@ mod tests {
         // Unsupported values are ignored (None), exactly as before.
         assert_eq!(resolve_cells("auto", 40, 80), None);
         assert_eq!(resolve_cells("12vh", 40, 80), None, "no viewport height");
+        // calc multiplication/division (a unitless number is a scalar).
         assert_eq!(
             resolve_cells("calc(100% * 2)", 40, 80),
-            None,
-            "no * / in calc"
+            Some(80),
+            "calc multiplies a percentage by a scalar"
+        );
+        assert_eq!(
+            resolve_cells("calc((100% - 4ch) / 3)", 40, 80),
+            Some(12),
+            "calc divides a grouped sub-expression — the 3-column item width"
+        );
+        assert_eq!(
+            resolve_cells("calc(100% / 3)", 60, 80),
+            Some(20),
+            "calc divides a percentage by a scalar"
         );
         // ch also flows through the absolute-unit path (indents).
         assert_eq!(indent_cells(Some("3ch")), 3);
@@ -6609,6 +6853,41 @@ mod tests {
             link.col,
             text.col
         );
+    }
+
+    #[test]
+    fn a_corner_overlay_wrapped_in_a_link_rides_the_first_line() {
+        // The live serializer wraps a clickable overlay in an `<a>` (so it
+        // becomes a JsClick link). That wrapper is not itself positioned, so the
+        // corner-overlay test must see THROUGH a sole-child wrapper to the
+        // abspos overlay it holds — else the overlay claims its own row below the
+        // content. This is the homepage search bar: a `position:absolute`
+        // clear/submit button over the `display:block` input, wrapped in the
+        // serializer's anchor, was pushing the whole search field a row above
+        // the nav.
+        let rows = lay(
+            r#"<body><div style="position:relative">
+                 <div>comment body</div>
+                 <a href="/opts"><button style="position:absolute;top:0;right:0;bottom:0;left:auto">X</button></a>
+               </div></body>"#,
+            40,
+        );
+        let first = &rows[0];
+        let link = first
+            .items
+            .iter()
+            .find(|i| i.link.is_some())
+            .expect("the wrapped overlay link is on the FIRST row");
+        assert!(
+            link.text.contains('X'),
+            "the overlay is the link, got {:?}",
+            link.text
+        );
+        assert!(
+            first.items.iter().any(|i| i.text.contains("comment")),
+            "the content is on the first row too"
+        );
+        assert!(link.col as usize > 10, "the overlay is right-aligned");
     }
 
     #[test]
@@ -7243,6 +7522,33 @@ mod tests {
         let img = image_item(&rows);
         // width:100% => 40 cols; attr ratio 200:100 = 2:1 => 40/(2*2) = 10 rows.
         assert_eq!((img.width, img.height), (40, 10));
+    }
+
+    #[test]
+    fn intrinsic_ratio_padding_box_sizes_a_full_height_image() {
+        // The responsive-image idiom: a `height:0` container whose percentage
+        // `padding-bottom` reserves the box height (CSS 2.1 §8.4: percentage
+        // padding resolves against the containing block's WIDTH), with an
+        // absolutely-positioned `width/height:100%` image filling it. This is
+        // Humble Bundle's bundle tiles and the ubiquitous pre-`aspect-ratio`
+        // technique; without it the image collapsed to a 1-row strip (the
+        // container's `height:0`).
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/tile.jpg".to_owned(), (40, 23));
+        let rows = lay_with_images(
+            r#"<body><div style="padding-bottom:calc(57.30519481% + 0em);height:0;position:relative;"><img src="/tile.jpg" width="616" height="353" style="display:block;width:100%;height:100%;object-fit:cover;position:absolute"></div></body>"#,
+            40,
+            &images,
+        );
+        let img = image_item(&rows);
+        // width:100% => 40 cols; padding-bottom 57.305% of the width gives
+        // height_px = .573·width, so rows = 40·.573/2 ≈ 11 — not 1.
+        assert_eq!(img.width, 40);
+        assert_eq!(
+            img.height, 11,
+            "aspect-box padding must reserve real height"
+        );
+        assert!(img.crop);
     }
 
     #[test]
@@ -8446,6 +8752,89 @@ mod tests {
         );
         c.scroll_cards(-1);
         assert_eq!(c.offset, 0, "← snaps back to the start");
+    }
+
+    #[test]
+    fn carousel_full_bleed_cards_show_several_across_not_one() {
+        // A slick.js-style rail: an over-wide track of `width:100%` slides
+        // (slick also sets a JS-computed per-slide pixel width sized against a
+        // fictional viewport, equally unusable). Laying each at the full band
+        // shows ONE slide — and a fixed-aspect tile image then fills the whole
+        // screen (Humble Bundle's Featured carousel). A rail card is narrower
+        // than the rail, so a full-bleed/over-band card is sized to show a few
+        // across instead.
+        let html = r#"<html><head><style>
+             .scroller{overflow:hidden}
+             .track{width:500em}
+             .card{width:100%;float:left}
+           </style></head>
+           <body><div class="scroller"><div class="track">
+             <div class="card">one</div><div class="card">two</div>
+             <div class="card">three</div><div class="card">four</div>
+           </div></div></body></html>"#;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (_, carousels) = lay_out_with_carousels(
+            &dom,
+            &base,
+            60,
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
+        assert_eq!(carousels.len(), 1, "still a carousel");
+        let c = &carousels[0];
+        assert_eq!(c.stops.len(), 4, "a snap stop per card");
+        // Card pitch (stop spacing) is ~a third of the 60-cell band, so ~3
+        // cards show — NOT the full band (one full-bleed slide). The card width
+        // subtracts the two inter-card gaps so 3 cards + 2 gaps fit EXACTLY:
+        // (60 - 2)/3 = 19, + 1 gap = pitch 20.
+        let pitch = c.stops[1] - c.stops[0];
+        assert_eq!(pitch, 20, "full-bleed cards are sized to show several");
+        // The crux: the THIRD card fits fully inside the band, so
+        // `Carousel::shows` draws its (band-wide) image instead of clipping the
+        // whole card — `band_w/3` overshot by the gaps and dropped it (Humble's
+        // 3rd Featured card showed its title but not its image).
+        let card_w = pitch - 1;
+        assert!(
+            c.shows(c.left + c.stops[2], card_w),
+            "the 3rd card (and its image) is fully visible, not clipped"
+        );
+    }
+
+    #[test]
+    fn visual_columns_append_overlapping_items_so_paint_and_hit_test_agree() {
+        use crate::doc::Link;
+        // A terminal can't overlay text, so the renderer appends an item whose
+        // column falls inside an earlier one — a clickable overlay placed over an
+        // input (the homepage search bar's clear button). The hit-test reads the
+        // SAME placement, so the overlay is clickable exactly where it's drawn.
+        let mk = |col, width, text: &str, link: Option<Link>| Item {
+            col,
+            width,
+            height: 1,
+            text: text.into(),
+            kind: ItemKind::Text,
+            image: None,
+            emph: Emphasis::default(),
+            node: NO_NODE,
+            link,
+            crop: false,
+        };
+        let row = Row {
+            items: vec![
+                mk(10, 8, "[Search]", None), // input: cols 10..18
+                mk(11, 7, "[Clear]", Some(Link::External("x".into()))), // overlaps
+                mk(20, 6, "Log In", Some(Link::External("y".into()))),
+            ],
+        };
+        // The overlay is appended after the input (at 18, not its raw col 11),
+        // and the trailing nav item closes up behind it (no phantom gap).
+        assert_eq!(
+            visual_columns(&row, &[], 0),
+            vec![(0, 10), (1, 18), (2, 25)]
+        );
     }
 
     #[test]

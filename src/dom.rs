@@ -658,6 +658,7 @@ impl Dom {
                 Some("I") => "upper-roman",
                 _ => "decimal",
             },
+            "display" => ua_display(tag),
             _ => return None,
         };
         Some(v.to_string())
@@ -2600,6 +2601,39 @@ fn is_tracked(name: &str) -> bool {
     // resolve to their defined (cascaded, inherited) value at bake time, not
     // just the fallback. They inherit and are case-folded like everything else.
     name.starts_with("--") || PROPS.iter().any(|p| p.name == name)
+}
+
+/// The HTML user-agent stylesheet's default `display` for a tag — what a
+/// browser's `getComputedStyle(el).display` reports for an element with no
+/// author `display`. jQuery's `.show()` reads an element's default display
+/// (by computing the display of a throwaway element of the same tag) so it
+/// can restore it; when that read comes back empty it falls back to a
+/// temp-`<iframe>` probe (`iframe.contentWindow.document`) the prelude can't
+/// satisfy, which threw and tore down jQuery's whole `.show()`/render path on
+/// humblebundle.com. Reporting the UA display keeps jQuery off the iframe
+/// path. This feeds `getComputedStyle` only; the layout owns the real display
+/// via `computed_display` (author cascade + the layout's own tag tables).
+fn ua_display(tag: &str) -> &'static str {
+    match tag {
+        "address" | "article" | "aside" | "blockquote" | "body" | "details" | "dialog" | "div"
+        | "dl" | "dd" | "dt" | "fieldset" | "figcaption" | "figure" | "footer" | "form" | "h1"
+        | "h2" | "h3" | "h4" | "h5" | "h6" | "header" | "hgroup" | "hr" | "html" | "main"
+        | "nav" | "ol" | "p" | "pre" | "section" | "summary" | "ul" => "block",
+        "li" => "list-item",
+        "table" => "table",
+        "thead" => "table-header-group",
+        "tbody" => "table-row-group",
+        "tfoot" => "table-footer-group",
+        "tr" => "table-row",
+        "td" | "th" => "table-cell",
+        "caption" => "table-caption",
+        "colgroup" => "table-column-group",
+        "col" => "table-column",
+        "button" | "input" | "select" | "textarea" | "meter" | "progress" => "inline-block",
+        "head" | "title" | "meta" | "link" | "style" | "script" | "base" | "noscript"
+        | "template" | "source" | "track" | "datalist" => "none",
+        _ => "inline",
+    }
 }
 
 /// Whether a CSS length is ≤ 1px — the box size of the "sr-only" visually
