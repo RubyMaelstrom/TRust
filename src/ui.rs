@@ -2,10 +2,12 @@
 //! gopher browser panel when one is open.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use tui_term::widget::PseudoTerminal;
 
 use crate::app::{App, BrowserView, Encoding, Mode};
@@ -82,14 +84,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (Some(v), _) => {
             frame.render_widget(block, session_area);
             // Center the scaled image in the panel; the protocol was
-            // encoded to fit it, but clamp anyway (a resize may not
-            // have re-encoded yet).
+            // encoded to fit it. `centered` clamps the box to the panel (a
+            // resize may not have re-encoded yet).
             let size = v.protocol.size();
-            let image_area = ratatui::layout::Rect::new(
-                inner.x + inner.width.saturating_sub(size.width) / 2,
-                inner.y + inner.height.saturating_sub(size.height) / 2,
-                size.width.min(inner.width),
-                size.height.min(inner.height),
+            let image_area = inner.centered(
+                Constraint::Length(size.width),
+                Constraint::Length(size.height),
             );
             frame.render_widget(ratatui_image::Image::new(&v.protocol), image_area);
         }
@@ -104,6 +104,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             if g.doc.laid_out() {
                 render_inline_images(frame, g, inner, &app.image_protocols);
             }
+            // Scroll-position indicator on the right border, when the document
+            // overflows the panel.
+            render_browser_scrollbar(frame, g, session_area, inner);
         }
         (None, None) => {
             let term = PseudoTerminal::new(app.vt.screen()).block(block);
@@ -423,6 +426,42 @@ fn render_inline_images(
             frame.render_widget(SlicedImage::new(proto, position), inner);
         }
     }
+}
+
+/// Draw a scroll-position indicator on the panel's right border when the
+/// document is taller than the viewport. The thumb's size and position track
+/// `scroll` against the total row/line count, like a real browser's scrollbar.
+/// Rendered over the right border (between the corners) so it costs no content
+/// width; absent entirely when the whole document fits.
+fn render_browser_scrollbar(frame: &mut Frame, g: &BrowserView, session_area: Rect, inner: Rect) {
+    let total = if g.doc.laid_out() {
+        g.doc.rows.len()
+    } else {
+        g.doc.lines.len()
+    };
+    let viewport = inner.height as usize;
+    if total <= viewport {
+        return; // fits — no scrollbar, the border stays whole
+    }
+    // `content_length` is the SCROLLABLE range (max scroll = total − viewport),
+    // not the row count, so the thumb reaches both ends exactly: top at
+    // `scroll == 0`, bottom at the last scroll position.
+    let mut state = ScrollbarState::new(total - viewport)
+        .position(g.scroll)
+        .viewport_content_length(viewport);
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .thumb_symbol("█")
+        .thumb_style(Style::new().fg(theme::NEON_CYAN))
+        .track_symbol(Some("│"))
+        .track_style(Style::new().fg(theme::DIM))
+        .begin_symbol(None)
+        .end_symbol(None);
+    // The right border column, excluding the corner rows (vertical margin 1).
+    let area = session_area.inner(Margin {
+        vertical: 1,
+        horizontal: 0,
+    });
+    frame.render_stateful_widget(bar, area, &mut state);
 }
 
 /// Status-bar / strip badge for the active browser protocol.
