@@ -195,6 +195,33 @@ fn date_ctor_parse_call() {
 }
 
 #[test]
+fn date_parse_lenient_fractional_seconds() {
+    // The spec format is exactly `.sss`, but browsers (and so we, in the fork)
+    // accept any number of fractional digits — real-world timestamps carry
+    // microseconds (Python `isoformat`, databases) or nanoseconds — taking the
+    // first three as milliseconds and discarding the rest. Fewer than three are
+    // zero-padded. humblebundle.com emits `…02.200128Z`; rejecting it gave an
+    // Invalid Date that threw in the page's DOMContentLoaded handler.
+    let expected = timestamp_from_utc(2020, 7, 8, 9, 16, 15, 200);
+    run_test_actions([
+        // microseconds, nanoseconds, four digits — all truncate to 200ms.
+        TestAction::assert_eq("Date.parse('2020-07-08T09:16:15.200128Z')", expected),
+        TestAction::assert_eq("Date.parse('2020-07-08T09:16:15.200128456Z')", expected),
+        TestAction::assert_eq("Date.parse('2020-07-08T09:16:15.2001Z')", expected),
+        // microseconds with a numeric offset.
+        TestAction::assert_eq(
+            "Date.parse('2020-07-08T09:16:15.200128+00:00')",
+            expected,
+        ),
+        // three and fewer digits (zero-padded): all 200ms.
+        TestAction::assert_eq("Date.parse('2020-07-08T09:16:15.200Z')", expected),
+        TestAction::assert_eq("Date.parse('2020-07-08T09:16:15.2Z')", expected),
+        // a bare `.` with no digit stays invalid.
+        TestAction::assert_eq("Number.isNaN(Date.parse('2020-07-08T09:16:15.Z'))", true),
+    ]);
+}
+
+#[test]
 fn date_ctor_utc_call() {
     run_test_actions([TestAction::assert_eq(
         "Date.UTC(2020, 6, 8, 9, 16, 15, 779)",

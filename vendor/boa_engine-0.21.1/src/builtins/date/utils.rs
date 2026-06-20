@@ -1023,13 +1023,48 @@ impl<'a> DateParser<'a> {
                 return self.finish();
             }
         };
-        self.millisecond = self.parse_n_ascii_digits::<3>()? as u32;
+        self.millisecond = self.parse_fractional_seconds()?;
         if self.input.peek().is_some() {
             self.parse_timezone()?;
             self.finish()
         } else {
             self.finish_local()
         }
+    }
+
+    /// Parse the fractional-seconds digits after the `.`, returning
+    /// milliseconds. The ECMAScript Date Time String Format specifies exactly
+    /// `.sss` (three digits), but every major engine (V8, SpiderMonkey, JSC)
+    /// leniently accepts ANY number of fractional digits — real-world
+    /// timestamps routinely carry microseconds (Python `isoformat`, databases:
+    /// `…02.200128Z`) or nanoseconds — taking the first three as milliseconds
+    /// and discarding the rest. Fewer than three digits are zero-padded
+    /// (`.2` == 200ms). At least one digit is required. This matches browser
+    /// behaviour so a page parsing a microsecond timestamp doesn't get an
+    /// Invalid Date (humblebundle.com's bundle pages do exactly this).
+    #[allow(clippy::as_conversions)]
+    fn parse_fractional_seconds(&mut self) -> Option<u32> {
+        let mut millisecond = 0u32;
+        let mut count = 0u32;
+        while let Some(&&c) = self.input.peek() {
+            if !c.is_ascii_digit() {
+                break;
+            }
+            self.input.next();
+            if count < 3 {
+                millisecond = millisecond * 10 + u32::from(c & 0x0F);
+            }
+            count += 1;
+        }
+        if count == 0 {
+            // A `.` must be followed by at least one digit.
+            return None;
+        }
+        // Zero-pad to milliseconds when fewer than three digits were given.
+        for _ in count..3 {
+            millisecond *= 10;
+        }
+        Some(millisecond)
     }
 
     #[allow(clippy::as_conversions)]

@@ -294,18 +294,14 @@ pub(crate) fn browser_rows(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
         .enumerate()
         .map(|(off, row)| {
             let row_idx = g.scroll + off;
-            // Items with their on-screen column (carousel offset/clip
-            // applied), ordered left to right so gap-fill stays correct.
-            let mut placed: Vec<(u16, usize, &crate::layout::Item)> = row
-                .items
-                .iter()
-                .enumerate()
-                .filter_map(|(i, item)| Some((visible_col(carousels, row_idx, item)?, i, item)))
-                .collect();
-            placed.sort_by_key(|(c, _, _)| *c);
+            // Each item's on-screen start column (carousel clip + gap-fill +
+            // overlap-append), shared with the hit-test so the drawn position
+            // and the clickable position always agree.
+            let placed = crate::layout::visual_columns(row, carousels, row_idx);
             let mut spans: Vec<Span> = Vec::with_capacity(placed.len() * 2);
             let mut col = 0u16;
-            for (scol, i, item) in placed {
+            for (i, scol) in placed {
+                let item = &row.items[i];
                 if scol > col {
                     spans.push(Span::raw(" ".repeat((scol - col) as usize)));
                 }

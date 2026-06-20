@@ -3802,11 +3802,18 @@ const PRELUDE: &str = r##"
             for (let i = 0; i < names.length; i++) {
                 const n = names[i];
                 const v = __dom_get_attr(this.__id, n);
-                list.push({
+                const attr = {
                     name: n, localName: n, nodeName: n, namespaceURI: null,
                     prefix: null, specified: true, ownerElement: this,
                     value: v, nodeValue: v,
-                });
+                };
+                list.push(attr);
+                // NamedNodeMap named-property access: `attributes[name]` returns
+                // the Attr (WebIDL named getter). jQuery's event-support probe
+                // reads `div.attributes["onsubmit"].expando`; without this it
+                // was undefined → ToObject throw that aborted jQuery's boot.
+                // Skip names that would clobber the array length / methods.
+                if (n !== "length" && n !== "item" && n !== "getNamedItem") list[n] = attr;
             }
             list.item = function (i) { return this[i] || null; };
             list.getNamedItem = function (nm) {
@@ -5100,15 +5107,21 @@ const PRELUDE: &str = r##"
     g.Selection = Selection;
     g.getSelection = () => new Selection();
     g.MutationObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
-    // The terminal has no live scroll and timers freeze at rest, so we still
-    // REPORT every observed target as intersecting, once, asynchronously — else
+    // The terminal has no live scroll and timers freeze at rest, so we REPORT
+    // every observed target as FULLY intersecting, once, asynchronously — else
     // below-the-fold lazy/virtualized content (infinite scrollers, lazy tiles)
     // would never materialize, since the scroll that would reveal it can't
-    // happen. But the record now carries the element's REAL box (a layout pass
-    // backs getBoundingClientRect) and a real intersection rect/ratio against
-    // the viewport, so measure-then-render code downstream sees true geometry.
-    // Forcing isIntersecting true regardless of the ratio is the one deliberate
-    // deviation the medium demands.
+    // happen. We render the whole document into the scrollback, so for
+    // visibility purposes the WHOLE document is the viewport: every observed
+    // element is fully in view. Hence `isIntersecting:true`, `intersectionRatio:
+    // 1`, and `intersectionRect == boundingClientRect`, ALL consistent — a
+    // lazy-loader that gates on `intersectionRatio > 0` and ignores
+    // `isIntersecting` (vanilla-lazyload does exactly this) then loads its
+    // below-fold images instead of leaving them blank (humblebundle.com bundle
+    // item grids). `boundingClientRect` stays the element's REAL box (a layout
+    // pass backs getBoundingClientRect), so measure-then-render code downstream
+    // still sees true geometry; only the intersection signal is the deliberate
+    // whole-document-is-visible deviation the medium demands.
     g.__viewportRect = () => {
         const vw = g.innerWidth, vh = g.innerHeight;
         return { x: 0, y: 0, left: 0, top: 0, right: vw, bottom: vh, width: vw, height: vh };
@@ -5119,17 +5132,9 @@ const PRELUDE: &str = r##"
             g.setTimeout(() => {
                 if (this.__dead) return;
                 const r = (el && el.getBoundingClientRect) ? el.getBoundingClientRect() : g.__viewportRect();
-                const vw = g.innerWidth, vh = g.innerHeight;
-                const il = Math.max(r.left, 0), it = Math.max(r.top, 0);
-                const iw = Math.max(0, Math.min(r.right, vw) - il);
-                const ih = Math.max(0, Math.min(r.bottom, vh) - it);
-                const irect = { x: il, y: it, left: il, top: it, right: il + iw, bottom: it + ih,
-                                width: iw, height: ih };
-                const area = (r.width || 0) * (r.height || 0);
-                const ratio = area > 0 ? (iw * ih) / area : 0;
                 try {
-                    this.__cb([{ isIntersecting: true, intersectionRatio: ratio, target: el,
-                        time: 0, boundingClientRect: r, intersectionRect: irect, rootBounds: g.__viewportRect() }], this);
+                    this.__cb([{ isIntersecting: true, intersectionRatio: 1, target: el,
+                        time: 0, boundingClientRect: r, intersectionRect: r, rootBounds: g.__viewportRect() }], this);
                 } catch (e) { trust.errors.push("IntersectionObserver: " + ((e && e.message) || e)); }
             }, 0);
         }
@@ -5490,6 +5495,20 @@ const PRELUDE: &str = r##"
         try { best.fn(); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         return true;
     };
+    // The clocks advance with VIRTUAL time, not the wall clock. A click that
+    // triggers an animation (jQuery's `.slideUp`/`.fadeOut`, used by Humble's
+    // "Dismiss banner") drives its frames off `Date.now()`/`performance.now()`;
+    // our dispatch settle advances `timers.now` 1000ms a tick, but the real
+    // wall clock barely moves in that microsecond burst, so a wall-clock
+    // `Date.now()` made the animation see ~0 elapsed and never finish (the
+    // banner never slid away). Anchoring the clocks to the virtual timer base
+    // lets click-driven animations run to completion within the dispatch —
+    // consistent with timers being frozen at rest and advancing only on
+    // interaction. `Date.now()` keeps a realistic absolute base so timestamps
+    // still look real; `performance.now()` is the elapsed virtual time.
+    const __epoch0 = Date.now();
+    Date.now = () => __epoch0 + timers.now;
+    g.performance.now = () => timers.now;
 
     // --- console into the outcome's ring ---
     const log = (level) => (...a) => {
@@ -5680,8 +5699,25 @@ const PRELUDE: &str = r##"
             resolvedOptions() { return Object.assign({ locale: "en-US", numeric: "always", style: "long" }, this.__o); }
             static supportedLocalesOf(l) { return supEn(l); }
         }
+        // Intl.NumberFormat/DateTimeFormat/Collator are specced callable
+        // WITHOUT `new` (legacy web-compat — they construct an instance
+        // either way); only the newer ctors require `new`. ES classes throw
+        // when called as functions, so wrap the three legacy ones in a
+        // function that forwards to `new`, preserving prototype/instanceof
+        // and the static supportedLocalesOf. Humble Bundle does
+        // `Intl.NumberFormat(locale, opts).format(amount)` (no `new`).
+        const callable = (Cls) => {
+            const F = function (locales, options) { return new Cls(locales, options); };
+            F.prototype = Cls.prototype;
+            F.prototype.constructor = F;
+            F.supportedLocalesOf = Cls.supportedLocalesOf;
+            return F;
+        };
         g.Intl = {
-            NumberFormat, DateTimeFormat, Collator, DisplayNames, PluralRules, RelativeTimeFormat,
+            NumberFormat: callable(NumberFormat),
+            DateTimeFormat: callable(DateTimeFormat),
+            Collator: callable(Collator),
+            DisplayNames, PluralRules, RelativeTimeFormat,
             getCanonicalLocales: localeList,
         };
         Number.prototype.toLocaleString = function (locales, options) { return new NumberFormat(locales, options).format(this); };
@@ -7447,6 +7483,63 @@ mod tests {
     }
 
     #[test]
+    fn a_click_driven_animation_completes_within_the_dispatch() {
+        // Humble's "Dismiss banner" calls jQuery `.slideUp({duration:500, done:
+        // remove})`: it steps an animation off `Date.now()` and removes the
+        // element only on completion. The dispatch settle advances VIRTUAL time
+        // (1000ms a tick), so the clocks must track it — a wall-clock
+        // `Date.now()` barely moves in that microsecond burst, so the animation
+        // saw ~0 elapsed and the banner never went away. Here a click starts a
+        // `Date.now()`/`requestAnimationFrame` animation that removes the
+        // element after 500ms; it must finish inside the one dispatch.
+        // The handler is DELEGATED on an ancestor and matched by selector (how
+        // Backbone — Humble's framework — binds `click .js-dismiss-button`), so
+        // this also exercises that the synthetic click BUBBLES to the delegate.
+        let (handle, mut events) = live(
+            r##"<body><div id="banner">BANNER</div><button class="js-dismiss-button">close</button><script>
+            document.addEventListener('click', function (e) {
+                if (!(e.target.closest && e.target.closest('.js-dismiss-button'))) return;
+                var el = document.getElementById('banner');
+                var start = Date.now(), dur = 500;
+                (function step() {
+                    if (Date.now() - start >= dur) { el.parentNode.removeChild(el); return; }
+                    requestAnimationFrame(step);
+                })();
+            });
+            </script></body>"##,
+        );
+        let mut rendered = String::new();
+        for _ in 0..4 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) | Some(PageEvt::Static { html, .. }) => {
+                    rendered = html;
+                    if rendered.contains("BANNER") {
+                        break;
+                    }
+                }
+                other => panic!("expected a render, got {other:?}"),
+            }
+        }
+        assert!(rendered.contains("BANNER"), "initial render: {rendered}");
+        let button = rendered
+            .split("x-trust-js:")
+            .nth(1)
+            .and_then(|r| r.split(':').next())
+            .expect("a clickable marker for the button")
+            .parse::<usize>()
+            .unwrap();
+        handle.cmds.blocking_send(PageCmd::Click(button)).unwrap();
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("expected Updated after the click");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            !html.contains("BANNER"),
+            "the 500ms click-driven animation must complete and remove the element: {html}"
+        );
+    }
+
+    #[test]
     fn a_page_with_nothing_to_click_goes_static() {
         let (_handle, mut events) = live(
             "<body><p id=t>quiet</p><script>\
@@ -8841,6 +8934,30 @@ mod tests {
     }
 
     #[test]
+    fn named_node_map_supports_named_property_access() {
+        // A real NamedNodeMap exposes each attribute by name as well as by
+        // index (WebIDL named getter): `el.attributes["title"]` returns the
+        // Attr. jQuery's event-support probe reads
+        // `div.attributes[eventName].expando` after setAttribute; without the
+        // named getter that was `undefined.expando` → a ToObject throw that
+        // aborted jQuery's boot on humblebundle.com.
+        let (out, outcome) = page(
+            "<body><div id=root title=hi></div><p id=o></p><script>\
+             const d = document.getElementById('root');\
+             d.setAttribute('onsubmit', 't');\
+             const named = d.attributes['title'];\
+             const probe = false === d.attributes['onsubmit'].expando;\
+             document.getElementById('o').textContent =\
+               [named.value, named.name, probe, String(d.attributes['nope'])].join('|');\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // named['title'] resolves to its Attr; the jQuery probe runs without
+        // throwing; a missing name is undefined (not an error).
+        assert!(out.contains(">hi|title|false|undefined<"), "{out}");
+    }
+
+    #[test]
     fn webcomponents_loader_feature_probes_pass() {
         // The exact probes @webcomponents/webcomponents-loader.js runs
         // (archive.org ships it). Failing any of them makes a real page
@@ -8898,14 +9015,44 @@ mod tests {
             ok.push(new Intl.RelativeTimeFormat().format(-2, "day") === "2 days ago");
             ok.push(Intl.NumberFormat.supportedLocalesOf(["en-US", "fr"]).join(",") === "en-US");
             ok.push(new Intl.NumberFormat().resolvedOptions().locale === "en-US");
+            // NumberFormat/DateTimeFormat/Collator are specced callable WITHOUT
+            // `new` (Humble Bundle does `Intl.NumberFormat(loc,opts).format(x)`);
+            // instanceof and the prototype methods must still work either way.
+            ok.push(Intl.NumberFormat("en", { style: "currency", currency: "EUR" }).format(12.99) === "€12.99");
+            ok.push(Intl.NumberFormat() instanceof Intl.NumberFormat);
+            ok.push(Intl.DateTimeFormat(0, { year: "numeric", month: "numeric", day: "numeric" })
+                .format(new Date(2026, 5, 12)) === "2026-06-12");
+            ok.push(typeof Intl.Collator("en").compare === "function");
             document.getElementById('out').textContent = ok.join(' ');
             </script></body>"##,
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(
-            out.contains("true true true true true true true true true true true"),
+            out.contains(
+                "true true true true true true true true true true true true true true true"
+            ),
             "Intl probes failed: {out}"
         );
+    }
+
+    #[test]
+    fn date_parses_microsecond_timestamps_like_a_browser() {
+        // Real-world servers emit sub-millisecond ISO timestamps (Python
+        // `isoformat`, databases): `…02.200128Z` (microseconds). Browsers
+        // accept any number of fractional digits, truncating to milliseconds;
+        // Boa rejected anything but exactly 3 → an Invalid Date that threw in
+        // humblebundle.com's bundle-page DOMContentLoaded handler. Fixed in the
+        // Boa fork (lenient fractional-seconds parse).
+        let (out, outcome) = page(
+            "<body><p id=o></p><script>\
+             const ms = Date.parse('2026-06-20T11:52:02.200128Z');\
+             const ns = new Date('2026-06-20T11:52:02.200128456Z');\
+             document.getElementById('o').textContent =\
+               [!isNaN(ms), new Date(ms).getUTCMilliseconds(), ns.toISOString()].join('|');\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains(">true|200|2026-06-20T11:52:02.200Z<"), "{out}");
     }
 
     #[test]
@@ -8931,10 +9078,33 @@ mod tests {
     }
 
     #[test]
+    fn computed_style_reports_ua_default_display() {
+        // getComputedStyle(el).display reports the HTML UA stylesheet default
+        // for an element with no author `display` (block/inline/list-item/…).
+        // jQuery's `.show()` reads this to learn an element's default display;
+        // an empty value sent it down a temp-`<iframe>` probe
+        // (`iframe.contentWindow.document`) the prelude can't satisfy, throwing
+        // and tearing down Marionette's render path on humblebundle.com. An
+        // author rule still wins over the UA default.
+        let (out, outcome) = page(
+            "<head><style>#styled{display:flex}</style></head>\
+             <body><div id=d>x</div><span id=s>y</span><li id=l>z</li>\
+             <div id=styled>w</div><p id=o></p><script>\
+             const g = (id) => getComputedStyle(document.getElementById(id)).display;\
+             document.getElementById('o').textContent =\
+               [g('d'), g('s'), g('l'), g('styled')].join('|');\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains(">block|inline|list-item|flex<"), "{out}");
+    }
+
+    #[test]
     fn intersection_observer_reports_the_targets_real_box() {
-        // The observer still fires for every target (the no-scroll terminal
-        // safeguard) but the record now carries the element's REAL box and a
-        // real ratio — a 40x16 box fully inside the 640x384 viewport = ratio 1.
+        // The observer fires for every target (the no-scroll terminal safeguard)
+        // with the element's REAL box for `boundingClientRect` and a FULL
+        // intersection (ratio 1) — we render the whole document, so every
+        // observed element is treated as fully visible.
         let (out, outcome) = page(
             r##"<body><div id=probe>HELLO</div><div id=out></div><script>
             var io = new IntersectionObserver(function (entries) {
@@ -8948,7 +9118,43 @@ mod tests {
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(
             out.contains("true 40 1"),
-            "IO record should carry the real box + ratio, got: {out}"
+            "IO record should carry the real box + full ratio, got: {out}"
+        );
+    }
+
+    #[test]
+    fn intersection_observer_loads_below_fold_lazy_images() {
+        // vanilla-lazyload (and others) gate on `intersectionRatio > 0` and
+        // IGNORE `isIntersecting`. A below-the-fold element's real ratio is 0,
+        // so such a lazy-loader left every below-fold image blank — Humble
+        // Bundle's bundle-item grid loads only the top rows. Since we render the
+        // whole document, an observed element reports ratio 1 regardless of its
+        // box position, so the loader materializes all of them. The probe sits
+        // far below the viewport, yet its ratio is still positive.
+        let (out, outcome) = page(
+            r##"<body><div style="height:5000px"></div>
+            <img id=lazy data-lazy="/x.png"><div id=out></div><script>
+            var io = new IntersectionObserver(function (entries) {
+                entries.forEach(function (e) {
+                    // The vanilla-lazyload condition, verbatim.
+                    if (e.intersectionRatio > 0) {
+                        e.target.src = e.target.getAttribute('data-lazy');
+                        io.unobserve(e.target);
+                    }
+                });
+            });
+            io.observe(document.getElementById('lazy'));
+            window.__after = function () {
+                document.getElementById('out').textContent =
+                    'src=' + (document.getElementById('lazy').getAttribute('src') || 'NONE');
+            };
+            setTimeout(window.__after, 0);
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("src=/x.png"),
+            "a below-fold lazy image must still load, got: {out}"
         );
     }
 
