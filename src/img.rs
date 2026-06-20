@@ -153,6 +153,141 @@ mod tests {
         assert!(size.height > 0 && size.height <= 10);
     }
 
+    /// Tall photographic-ish test image: a gradient plus per-pixel variation so
+    /// the sixel payload is dense (a flat fill compresses to almost nothing and
+    /// would understate the cost).
+    #[cfg(test)]
+    fn tall_png(w: u32, h: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(w, h);
+        // Smooth two-axis gradient (banner/screenshot-like), no high-frequency
+        // noise — a realistic lower bound on sixel density.
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let r = ((x * 255) / w) as u8;
+            let g = ((y * 255) / h) as u8;
+            let b = (((x + y) * 255) / (w + h)) as u8;
+            *px = image::Rgb([r, g, b]);
+        }
+        let mut bytes = Vec::new();
+        DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    /// Manual: `cargo test --release image_scroll_bench -- --ignored --nocapture`.
+    /// Compares the per-frame *main-thread draw cost* of scrolling a tall inline
+    /// image three ways, all forced to sixel (foot's protocol):
+    ///   A. current `SlicedImage` (encode once, slice the cached sixel per frame),
+    ///   B. old static `Image` blit (render the whole pre-encoded protocol — the
+    ///      pre-partial "only draw when fully visible" path),
+    ///   C. a #2-style per-scroll re-encode (crop the visible pixel rect + encode
+    ///      a fresh sixel each frame — the hand-rolled slice decoder).
+    /// Reports one-time encode cost, per-frame draw cost, and emitted sixel bytes.
+    #[test]
+    #[ignore = "manual perf measurement; run with --release --nocapture"]
+    fn image_scroll_bench() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+        use ratatui_image::picker::ProtocolType;
+        use ratatui_image::sliced::{SignedPosition, SlicedImage};
+        use std::time::Instant;
+
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Sixel);
+        let f = picker.font_size();
+        // A tall banner: full terminal width, several screens tall.
+        let cols: u16 = 60;
+        let rows: u16 = 150;
+        let vh: u16 = 40; // viewport height in cells
+        let (iw, ih) = (
+            u32::from(cols) * u32::from(f.width),
+            u32::from(rows) * u32::from(f.height),
+        );
+        let png = tall_png(iw, ih);
+        let (image, _) = decode(&png).unwrap();
+        let box_size = Size::new(cols, rows);
+        eprintln!(
+            "image {iw}x{ih}px -> {cols}x{rows} cells, font {}x{}, viewport {vh} rows",
+            f.width, f.height
+        );
+
+        // --- one-time encode costs ---
+        let t = Instant::now();
+        let sliced = encode_sliced(&picker, image.clone(), box_size, false).unwrap();
+        eprintln!("A encode_sliced (once): {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let proto = encode(&picker, image.clone(), box_size, false).unwrap();
+        eprintln!("B encode (once):        {:?}", t.elapsed());
+
+        let scrolls: Vec<i16> = (0..=(rows - vh) as i16).collect();
+        let reps = 20;
+        let area = Rect::new(0, 0, cols, vh);
+
+        // --- A: current SlicedImage, per-frame slice of the cached sixel ---
+        let mut payload_a = 0usize;
+        let t = Instant::now();
+        for _ in 0..reps {
+            for &s in &scrolls {
+                let mut buf = Buffer::empty(area);
+                let pos = SignedPosition::from((0, -s));
+                SlicedImage::new(&sliced, pos).render(area, &mut buf);
+                payload_a = buf[(0, 0)].symbol().len().max(payload_a);
+            }
+        }
+        let a_total = t.elapsed();
+        let a_frames = reps * scrolls.len();
+        eprintln!(
+            "A SlicedImage draw:  {:>8.3} ms/frame  (peak {payload_a} sixel bytes/frame)",
+            a_total.as_secs_f64() * 1000.0 / a_frames as f64
+        );
+
+        // --- B: old static blit of the whole pre-encoded protocol ---
+        // The pre-partial path only drew a fully-visible image; per scroll it
+        // re-blits the whole protocol string into the buffer (no slicing).
+        let full = Rect::new(0, 0, cols, rows);
+        let t = Instant::now();
+        for _ in 0..reps {
+            for _ in &scrolls {
+                let mut buf = Buffer::empty(full);
+                ratatui_image::Image::new(&proto).render(full, &mut buf);
+            }
+        }
+        let b_total = t.elapsed();
+        eprintln!(
+            "B static Image blit: {:>8.3} ms/frame",
+            b_total.as_secs_f64() * 1000.0 / (reps * scrolls.len()) as f64
+        );
+
+        // --- C: #2-style per-scroll re-encode of the visible pixel slice ---
+        let fh = u32::from(f.height);
+        let mut payload_c = 0usize;
+        let t = Instant::now();
+        for &s in &scrolls {
+            let y0 = (s.max(0) as u32) * fh;
+            let slice_h = u32::from(vh) * fh;
+            let cropped = image.crop_imm(
+                0,
+                y0.min(ih.saturating_sub(1)),
+                iw,
+                slice_h.min(ih - y0.min(ih - 1)),
+            );
+            let p = encode(&picker, cropped, Size::new(cols, vh), false).unwrap();
+            let mut buf = Buffer::empty(area);
+            ratatui_image::Image::new(&p).render(area, &mut buf);
+            payload_c = buf[(0, 0)].symbol().len().max(payload_c);
+        }
+        let c_total = t.elapsed();
+        eprintln!(
+            "C #2 re-encode/frame: {:>8.3} ms/frame  (peak {payload_c} sixel bytes/frame)",
+            c_total.as_secs_f64() * 1000.0 / scrolls.len() as f64
+        );
+    }
+
     #[test]
     fn encodes_with_crop_to_cover() {
         // object-fit: cover crops to fill the box (here a wide box from a

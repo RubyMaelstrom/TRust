@@ -2637,6 +2637,106 @@ mod tests {
         }
     }
 
+    /// Fetch a page, run JS through settle, decode the REAL images, lay it out,
+    /// and dump every image's rendered box (col,row,WxH) + the element's CSS.
+    /// This is the ground-truth for image-sizing bugs (too-big/too-small).
+    /// `TRUST_NET_DIAG=<url> [TRUST_DIAG_VP=WxH] cargo test --release img_box_diag -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual diagnostic, needs TRUST_NET_DIAG=<url>"]
+    async fn img_box_diag() {
+        let Ok(target) = std::env::var("TRUST_NET_DIAG") else {
+            return;
+        };
+        let vp: (u16, u16) = std::env::var("TRUST_DIAG_VP")
+            .ok()
+            .and_then(|s| {
+                s.split_once('x')
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+            })
+            .unwrap_or((200, 50));
+        let url = parse_url(&target).unwrap();
+        let resp = fetch(&Request::get(url.clone())).await.unwrap();
+        let mut resp = execute_js(resp, vp, (8, 16), Default::default()).await;
+        // Drain settle so the SPA swaps its data-image-url placeholders.
+        let mut last_html: Option<String> = None;
+        if let Some(mut live) = resp.live.take() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(left, live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, .. }))
+                    | Ok(Some(crate::js::PageEvt::Static { html, .. })) => last_html = Some(html),
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        let html = last_html.unwrap_or_else(|| String::from_utf8_lossy(&resp.body).to_string());
+        let dom = crate::dom::Dom::parse_document(&html);
+        // Decode every real <img src>.
+        let mut images = crate::layout::ImageSizes::new();
+        let mut srcs: Vec<(crate::dom::NodeId, url::Url)> = Vec::new();
+        for id in dom.descendants(crate::dom::DOCUMENT) {
+            if dom.tag_name(id) == Some("img")
+                && let Some(src) = dom.attr(id, "src")
+                && !src.trim_end().ends_with(".svg")
+                && let Link::Http(u) = resolve(&url, src)
+            {
+                srcs.push((id, u));
+            }
+        }
+        for (_, u) in &srcs {
+            if images.contains_key(u.as_str()) {
+                continue;
+            }
+            if let Ok(r) = fetch(&Request::get(u.clone())).await
+                && let Ok((im, _)) = crate::img::decode(&r.body)
+            {
+                use image::GenericImageView;
+                let (w, h) = im.dimensions();
+                images.insert(u.to_string(), (w as u16, h as u16));
+            }
+        }
+        eprintln!("decoded {} images", images.len());
+        let (rows, _car) = crate::layout::lay_out_with_carousels(
+            &dom,
+            &url,
+            vp.0 as usize,
+            &[],
+            &crate::layout::ControlMap::new(),
+            &images,
+            false,
+        );
+        for (y, row) in rows.iter().enumerate() {
+            for it in &row.items {
+                if let Some(src) = &it.image {
+                    let tail: String = src
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(src)
+                        .chars()
+                        .take(30)
+                        .collect();
+                    let cw = dom.computed_style(it.node, "width").unwrap_or_default();
+                    let ch = dom.computed_style(it.node, "height").unwrap_or_default();
+                    let cls = dom
+                        .attr(it.node, "class")
+                        .unwrap_or("")
+                        .chars()
+                        .take(28)
+                        .collect::<String>();
+                    eprintln!(
+                        "row{y:>3} col{:>3} {:>3}x{:<3} css(w={cw},h={ch}) [{cls}] {tail}",
+                        it.col, it.width, it.height
+                    );
+                }
+            }
+        }
+    }
+
     /// report. `TRUST_NET_DIAG=https://… cargo test net_diag -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "manual diagnostic, needs TRUST_NET_DIAG=<url>"]

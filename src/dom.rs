@@ -436,6 +436,40 @@ impl Dom {
         {
             return true;
         }
+        // A box collapsed to ZERO on an axis, with `overflow:hidden`/`clip` on
+        // that axis, clips ALL its content to nothing — the standard "keep it
+        // in the DOM but show nothing" idiom (a preloaded hero copy, a closed
+        // `max-height:0` drawer/accordion, a `height:0` mega-menu). A browser
+        // paints none of it; we used to render it (Steam's
+        // `.menu_takeover_background{height:0;overflow:hidden}` preload copy of
+        // the banner drew a full-width 1-row sliver). EXCEPTION: a `height:0`
+        // box whose PADDING reserves the height is the responsive-image
+        // "intrinsic ratio" box (`padding-bottom:56.25%` → a 16:9 thumbnail
+        // whose absolutely-positioned child fills the padding box, Humble
+        // Bundle's tiles) — its content box is zero but the padding box isn't,
+        // so it is NOT empty; spare it (`intrinsic_ratio_container_rows` sizes
+        // the child off exactly this).
+        let clips = |v: Option<String>| {
+            v.as_deref().is_some_and(|s| {
+                let mut toks = s.split_whitespace().peekable();
+                toks.peek().is_some() && toks.all(|t| matches!(t, "hidden" | "clip"))
+            })
+        };
+        let overflow = self.cascaded(id, "overflow");
+        let zero = |prop| {
+            self.cascaded(id, prop)
+                .as_deref()
+                .is_some_and(css_len_is_zero)
+        };
+        let oy = clips(self.cascaded(id, "overflow-y")) || clips(overflow.clone());
+        let ox = clips(self.cascaded(id, "overflow-x")) || clips(overflow);
+        let h_zero = zero("height") || zero("max-height");
+        let w_zero = zero("width") || zero("max-width");
+        if (oy && h_zero && !self.has_axis_padding(id, true))
+            || (ox && w_zero && !self.has_axis_padding(id, false))
+        {
+            return true;
+        }
         // `opacity:0` is invisible — treat it as hidden, like the W3C/Bootstrap
         // slideshow idiom (`.slides{opacity:0}`, the active slide revealed by
         // an `animation-fill-mode:forwards` fade-in). Gated so a page with no
@@ -456,6 +490,24 @@ impl Dom {
             return true;
         }
         false
+    }
+
+    /// Whether an element reserves height (`vertical`) or width via positive
+    /// padding on that axis — the responsive-image "intrinsic ratio" idiom
+    /// (`padding-bottom:56.25%` on a `height:0` box). A non-zero/`auto`/unknown
+    /// value counts (we only treat a provably-zero box as empty), so this
+    /// returns `true` to SPARE a box from the zero-axis hide above.
+    fn has_axis_padding(&self, id: NodeId, vertical: bool) -> bool {
+        let props: [&str; 2] = if vertical {
+            ["padding-top", "padding-bottom"]
+        } else {
+            ["padding-left", "padding-right"]
+        };
+        props.iter().any(|p| {
+            self.cascaded(id, p)
+                .as_deref()
+                .is_some_and(|v| !css_len_is_zero(v))
+        })
     }
 
     /// Whether an element holds a slide deck: ≥2 SLIDE-MATERIAL children, all of
@@ -2643,6 +2695,18 @@ fn css_len_at_most_1px(v: &str) -> bool {
     let v = v.trim();
     let n = v.strip_suffix("px").unwrap_or(v).trim();
     n.parse::<f32>().is_ok_and(|x| x <= 1.0)
+}
+
+/// Whether a CSS length/percentage is exactly zero (`0`, `0px`, `0%`, `0em`,
+/// …) — its leading numeric part parses to 0. `auto`/empty/`calc(…)`/
+/// non-numeric → false (we can't prove those zero, so we never hide on them).
+fn css_len_is_zero(v: &str) -> bool {
+    let num: String = v
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'))
+        .collect();
+    !num.is_empty() && num.parse::<f32>().map(|n| n == 0.0).unwrap_or(false)
 }
 
 /// Inline-by-default phrasing elements that, used as a `position:absolute`
@@ -4924,6 +4988,52 @@ mod tests {
         );
         let d = dom2.get_by_id("d").unwrap();
         assert!(!dom2.is_hidden(d), "a real clipped box is not sr-only");
+    }
+
+    #[test]
+    fn zero_axis_overflow_hidden_box_is_hidden_but_padding_ratio_box_renders() {
+        // A box collapsed to zero on an axis with `overflow:hidden` on that
+        // axis clips ALL its content — Steam's `.menu_takeover_background`
+        // preload copy of the banner (`height:0;overflow:hidden`) drew a
+        // full-width 1-row sliver. Hide it (and its image child).
+        let dom = Dom::parse_document(
+            "<body>\
+             <div id=a style=\"height:0;overflow:hidden\"><img src=banner.jpg></div>\
+             <div id=b style=\"max-height:0;overflow:hidden\">collapsed drawer</div>\
+             <div id=c style=\"width:0;overflow-x:hidden\">narrow</div>\
+             <div id=d style=\"height:0;overflow:hidden;padding-bottom:56.25%\"><img id=di src=tile.jpg></div>\
+             <div id=e style=\"height:0\">no clip, not hidden</div>\
+             <div id=f style=\"height:0;overflow:auto\">scrollable, not hidden</div>\
+             </body>",
+        );
+        let g = |i| dom.get_by_id(i).unwrap();
+        assert!(dom.is_hidden(g("a")), "height:0 + overflow:hidden hidden");
+        assert!(
+            dom.is_hidden(g("b")),
+            "max-height:0 + overflow:hidden hidden"
+        );
+        assert!(dom.is_hidden(g("c")), "width:0 + overflow-x:hidden hidden");
+        // The responsive-image intrinsic-ratio box (padding reserves height)
+        // is NOT empty — its absolutely-positioned child fills the padding box.
+        assert!(
+            !dom.is_hidden(g("d")),
+            "padding-bottom ratio box renders (responsive image idiom)"
+        );
+        assert!(!dom.is_hidden(g("di")), "the ratio box's image renders");
+        assert!(
+            !dom.is_hidden(g("e")),
+            "height:0 with visible overflow is not hidden"
+        );
+        assert!(
+            !dom.is_hidden(g("f")),
+            "height:0 with overflow:auto is not hidden"
+        );
+        let html = dom.serialize(DOCUMENT);
+        assert!(
+            !html.contains("banner.jpg"),
+            "hidden banner dropped: {html}"
+        );
+        assert!(html.contains("tile.jpg"), "ratio-box image kept: {html}");
     }
 
     #[test]

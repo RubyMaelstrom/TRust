@@ -1257,6 +1257,7 @@ impl<'a> Layout<'a> {
         if SKIP.contains(&tag.as_str())
             || self.dom.is_hidden(id)
             || self.suppressed_controls.contains(&id)
+            || self.is_clipped_offscreen(id)
         {
             return;
         }
@@ -2334,6 +2335,142 @@ impl<'a> Layout<'a> {
             Some("fixed") => true,
             Some("absolute") => !self.has_positioned_ancestor(id),
             _ => false,
+        }
+    }
+
+    /// Whether an out-of-flow (`absolute`/`fixed`) box is positioned outside the
+    /// clip of its containing block — so a browser CLIPS it to invisibility and
+    /// we must not render it. This is the one faithful, representable piece of
+    /// absolute positioning in a line model: "off-screen" simply means "emit
+    /// nothing" (no layers, no compositing, no pixel canvas). It generalizes the
+    /// carousel-next-slide case (Steam's spotlight slide 2 is `position:absolute;
+    /// left:90%` inside `.carousel_items{overflow:hidden}` — parked off-canvas)
+    /// to any off-screen drawer / off-canvas menu / peeked slide.
+    ///
+    /// STANDARDS: an `overflow:hidden`/`clip` element clips an absolutely
+    /// positioned descendant ONLY when it is that descendant's containing block
+    /// (the nearest positioned ancestor) — the classic "abspos escapes
+    /// `overflow:hidden` unless the overflow box is positioned" rule. We resolve
+    /// the box's rect in containing-block-FRACTION units (so `%` offsets/sizes
+    /// need no pixel geometry) and drop it only when it is MAJORITY-clipped. The
+    /// one terminal deviation: a browser would paint a thin visible sliver of a
+    /// barely-overlapping box; we can't render a fractional slice of an arbitrary
+    /// positioned box, and such a sliver (the edge of the next carousel page) is
+    /// never useful, so ≥75%-clipped is treated as gone. A length/`auto`/`calc`
+    /// offset we can't resolve to a fraction stays INDETERMINATE → kept (we never
+    /// drop on uncertain geometry).
+    fn is_clipped_offscreen(&self, id: NodeId) -> bool {
+        if !self.is_out_of_flow(id) {
+            return false;
+        }
+        // The clip comes from the containing block (nearest positioned ancestor);
+        // for `fixed` / no positioned ancestor it is the viewport, which always
+        // clips. A containing block that doesn't clip can't hide the box.
+        let cb = self.positioned_containing_block(id);
+        let (clip_x, clip_y) = match cb {
+            Some(c) => (self.clips_hard(c, false), self.clips_hard(c, true)),
+            None => (true, true),
+        };
+        if !clip_x && !clip_y {
+            return false;
+        }
+        // Visible fraction per clipped axis; an unclipped or indeterminate axis
+        // contributes 1.0 (can't conclude "hidden" from it).
+        let vx = if clip_x {
+            self.axis_visible_fraction(id, false).unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        let vy = if clip_y {
+            self.axis_visible_fraction(id, true).unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        vx * vy < OFFSCREEN_VISIBLE_MIN
+    }
+
+    /// The containing block of an out-of-flow box: its nearest ancestor with a
+    /// non-`static` `position` (`relative`/`absolute`/`fixed`/`sticky`). `None`
+    /// at `body`/`html` — i.e. the initial containing block (viewport).
+    fn positioned_containing_block(&self, id: NodeId) -> Option<NodeId> {
+        let mut cur = self.dom.parent_composed(id);
+        while let Some(p) = cur {
+            if matches!(self.dom.tag_name(p), Some("body" | "html")) {
+                return None;
+            }
+            if matches!(
+                self.dom.computed_style(p, "position").as_deref(),
+                Some("relative" | "absolute" | "fixed" | "sticky")
+            ) {
+                return Some(p);
+            }
+            cur = self.dom.parent_composed(p);
+        }
+        None
+    }
+
+    /// The element's `overflow` on one axis, honoring the `overflow-x`/`-y`
+    /// longhands over the `overflow: <x> <y>` shorthand (single value = both).
+    fn axis_overflow(&self, id: NodeId, vertical: bool) -> Option<String> {
+        let longhand = if vertical { "overflow-y" } else { "overflow-x" };
+        if let Some(v) = self.dom.computed_style(id, longhand) {
+            return Some(v.trim().to_ascii_lowercase());
+        }
+        let sh = self.dom.computed_style(id, "overflow")?;
+        let mut toks = sh.split_whitespace();
+        let x = toks.next();
+        let y = toks.next().or(x);
+        (if vertical { y } else { x }).map(|s| s.to_ascii_lowercase())
+    }
+
+    /// Whether an element hard-clips one axis (`overflow:hidden`/`clip`) — the
+    /// cases where content positioned outside the box is painted nowhere
+    /// (`scroll`/`auto` are excluded: their off-box content is reachable).
+    fn clips_hard(&self, id: NodeId, vertical: bool) -> bool {
+        matches!(
+            self.axis_overflow(id, vertical).as_deref(),
+            Some("hidden" | "clip")
+        )
+    }
+
+    /// The fraction of an out-of-flow box VISIBLE within its containing block on
+    /// one axis (`0.0` fully clipped … `1.0` fully inside), resolved purely from
+    /// `%`/zero offsets+size (in CB-fraction units). `None` when the span is
+    /// indeterminate (a length/`auto`/`calc` we won't convert without pixel
+    /// geometry) — the caller then keeps the box.
+    fn axis_visible_fraction(&self, id: NodeId, vertical: bool) -> Option<f32> {
+        let (start_p, end_p, size_p) = if vertical {
+            ("top", "bottom", "height")
+        } else {
+            ("left", "right", "width")
+        };
+        let frac = |p: &str| {
+            self.dom
+                .computed_style(id, p)
+                .and_then(|v| css_axis_fraction(&v))
+        };
+        let (start, end, size) = (frac(start_p), frac(end_p), frac(size_p));
+        // Box start (s) and size (w) as fractions of the CB content box [0,1].
+        let (s, w) = match (start, end, size) {
+            (Some(s), _, Some(w)) => (s, Some(w)),
+            (Some(s), Some(e), None) => (s, Some((1.0 - s - e).max(0.0))),
+            (Some(s), None, None) => (s, None),
+            (None, Some(e), Some(w)) => (1.0 - e - w, Some(w)),
+            (None, Some(e), None) => {
+                // Right/bottom-anchored, size unknown: only a far edge at/past
+                // the near edge proves it fully off (e.g. `right:100%`).
+                return if 1.0 - e <= 0.0 { Some(0.0) } else { None };
+            }
+            _ => return None,
+        };
+        match w {
+            Some(w) if w > 0.0 => {
+                let visible = (s + w).min(1.0) - s.max(0.0);
+                Some((visible.max(0.0) / w).clamp(0.0, 1.0))
+            }
+            // Unknown width: conclude only when the start is itself off-screen.
+            _ if s >= 1.0 => Some(0.0),
+            _ => None,
         }
     }
 
@@ -5511,6 +5648,22 @@ fn parse_percent(value: &str) -> Option<f32> {
     Some(n / 100.0)
 }
 
+/// A positioning offset/size as a fraction of the containing block: a `%` →
+/// fraction, a zero length → `0.0`, anything else (a non-zero length, `auto`,
+/// `calc(…)`) → `None`. Used by `axis_visible_fraction` to resolve an
+/// out-of-flow box's rect without pixel geometry; `None` keeps the box (we
+/// never drop on a span we can't pin down). See `is_clipped_offscreen`.
+fn css_axis_fraction(value: &str) -> Option<f32> {
+    parse_percent(value).or_else(|| is_zero_length(value).then_some(0.0))
+}
+
+/// Below this visible fraction (i.e. ≥75% clipped by its containing block) an
+/// out-of-flow box is treated as off-screen and dropped — a browser would paint
+/// only a useless sliver of the next carousel page / off-canvas panel, which a
+/// line model can't render as a fractional slice anyway. See
+/// `is_clipped_offscreen`.
+const OFFSCREEN_VISIBLE_MIN: f32 = 0.25;
+
 /// The first percentage anywhere in a value, as a fraction — including inside
 /// `calc(…)`. The aspect-box padding is frequently authored as
 /// `calc(57.305% + 0em)` (a `% + 0` to defeat some preprocessor), so a strict
@@ -6118,6 +6271,63 @@ mod tests {
 
     fn texts(rows: &[Row]) -> Vec<String> {
         rows.iter().map(render_row).collect()
+    }
+
+    fn all_text(rows: &[Row]) -> String {
+        texts(rows).join("\n")
+    }
+
+    #[test]
+    fn offscreen_clipped_absolute_box_is_dropped_onscreen_sibling_kept() {
+        // A carousel's next slide: `position:absolute;left:90%;width:90%` parked
+        // off-canvas in an `overflow:hidden` positioned container is clipped to
+        // invisible in a browser (Steam's spotlight slide 2). The active slide
+        // (`left:0`) stays. We render neither the off-screen box nor its subtree.
+        let html = "<body><div style=\"position:relative;overflow:hidden\">\
+            <div style=\"position:relative;left:0;width:90%\">ACTIVE</div>\
+            <div style=\"position:absolute;top:0;left:90%;width:90%\">OFFSCREEN</div>\
+            </div></body>";
+        let out = all_text(&lay(html, 100));
+        assert!(out.contains("ACTIVE"), "active slide kept: {out:?}");
+        assert!(
+            !out.contains("OFFSCREEN"),
+            "off-screen slide dropped: {out:?}"
+        );
+    }
+
+    #[test]
+    fn offscreen_clip_needs_a_clipping_containing_block() {
+        // The SAME off-canvas box, but the containing block does NOT clip
+        // (`overflow:visible`): a browser paints it overflowing, so we keep it
+        // (e.g. a dropdown/tooltip that escapes its parent). Standards: an
+        // abspos box is clipped only by a CLIPPING containing block.
+        let html = "<body><div style=\"position:relative;overflow:visible\">\
+            <div style=\"position:absolute;top:0;left:90%;width:90%\">ESCAPES</div>\
+            </div></body>";
+        assert!(
+            all_text(&lay(html, 100)).contains("ESCAPES"),
+            "non-clipping parent keeps it"
+        );
+    }
+
+    #[test]
+    fn onscreen_and_indeterminate_absolute_boxes_are_kept() {
+        // On-screen (left:0), a corner overlay (right:0, size unknown), and a
+        // length offset we can't resolve to a fraction all stay — we only drop
+        // on a provably off-screen %-resolved span.
+        let onscreen = "<body><div style=\"position:relative;overflow:hidden\">\
+            <div style=\"position:absolute;top:0;left:0;width:50%\">INFLOWISH</div></div></body>";
+        let corner = "<body><div style=\"position:relative;overflow:hidden\">\
+            <span style=\"position:absolute;top:0;right:0\">BADGE</span>x</div></body>";
+        let modal = "<body><div style=\"position:relative;overflow:hidden\">\
+            <div style=\"position:absolute;top:0;left:0;right:0;bottom:0\">MODAL</div></div></body>";
+        let px = "<body><div style=\"position:relative;overflow:hidden\">\
+            <div style=\"position:absolute;left:1200px;width:90%\">PXOFFSET</div></div></body>";
+        assert!(all_text(&lay(onscreen, 100)).contains("INFLOWISH"));
+        assert!(all_text(&lay(corner, 100)).contains("BADGE"));
+        assert!(all_text(&lay(modal, 100)).contains("MODAL"));
+        // A non-zero length offset is indeterminate without pixel geometry → kept.
+        assert!(all_text(&lay(px, 100)).contains("PXOFFSET"));
     }
 
     #[test]
