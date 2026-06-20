@@ -6,8 +6,8 @@ use std::time::Duration;
 use url::Url;
 
 use crossterm::event::{
-    Event as TermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
-    MouseEvent, MouseEventKind,
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use futures::StreamExt;
 use libmudtelnet::telnet::{op_command, op_option};
@@ -583,7 +583,30 @@ impl App {
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
         // (Terminal ownership for the panic hook is claimed in `main`, on this
         // same `block_on` thread — see `TERMINAL_OWNER`.)
-        let mut input = EventStream::new();
+        // Terminal input runs on its own reader thread feeding an mpsc channel
+        // (the same shape as the telnet/fetch/image channels), NOT crossterm's
+        // async `EventStream`. The reason is the coalescing drain below: a burst
+        // of scroll/key events must be applied with ONE redraw, which means
+        // peeking for already-queued events. The async stream can't be peeked
+        // safely — its `poll_next` registers a single wake-task keyed on the
+        // first waker to poll it and won't re-register while that task is live,
+        // so polling it with a throwaway waker (`now_or_never`) strands the real
+        // `select!` waker and deadlocks input. A channel drains with `try_recv`
+        // with no such hazard. (crossterm's own `EventStream` uses an identical
+        // background-reader thread internally; we just own the channel.)
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<TermEvent>();
+        std::thread::Builder::new()
+            .name("trust-input".into())
+            .spawn(move || {
+                // Blocking reads off the (already mouse-captured, query-drained)
+                // stdin; a closed receiver (app quit) or a read error ends it.
+                while let Ok(event) = crossterm::event::read() {
+                    if input_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn terminal input reader");
         let mut pending_wrap_target: Option<(usize, bool)> = None;
         let mut wrap_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         // Tracks the `<select>` dropdown across frames. A sixel image is one
@@ -629,10 +652,9 @@ impl App {
             self.sync_image_encodes();
 
             tokio::select! {
-                event = input.next() => match event {
-                    Some(Ok(event)) => self.on_terminal_event(event).await,
-                    Some(Err(err)) => return Err(err),
-                    None => break,
+                event = input_rx.recv() => match event {
+                    Some(event) => self.on_terminal_event(event).await,
+                    None => break, // the input reader thread ended
                 },
                 event = recv_opt(&mut self.events) => match event {
                     Some(event) => self.on_telnet_event(event).await,
@@ -670,6 +692,29 @@ impl App {
                 _ = tick.tick(), if self.loading() => {
                     self.spinner = self.spinner.wrapping_add(1);
                 },
+            }
+
+            // Coalesce input bursts into one redraw. A held arrow/wheel or key
+            // autorepeat queues many scroll/key events; the `select!` above
+            // takes ONE per loop and then redraws, and on an image-heavy HTTP
+            // page each redraw emits a large sixel payload — so the backlog
+            // drains slower than it fills and the view "slideshows" while input
+            // lags behind. Drain every terminal event that is ALREADY queued and
+            // apply it now, so the whole burst collapses into the single redraw
+            // at the top of the next iteration. Self-adapting: `try_recv` finds
+            // nothing when idle (idle stays idle, no busy-poll) and cheap
+            // text/vt100 redraws never build a backlog, so only the slow sixel
+            // pages actually coalesce. The cap guarantees we return to a draw
+            // even under a continuous flood (e.g. mouse-move spam during a drag).
+            let mut drained = 0;
+            while !self.quit && drained < 512 {
+                match input_rx.try_recv() {
+                    Ok(ev) => {
+                        self.on_terminal_event(ev).await;
+                        drained += 1;
+                    }
+                    Err(_) => break, // Empty (nothing queued) or Disconnected
+                }
             }
         }
         Ok(())
