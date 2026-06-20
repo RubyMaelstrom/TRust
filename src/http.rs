@@ -301,6 +301,25 @@ async fn fetch_redirecting(request: &Request) -> Result<Response, String> {
             "http" | "https" => {}
             other => return Err(format!("redirect leaves the web: {other}://")),
         }
+        // Referrer policy is per hop: re-evaluate the carried `Referer` against
+        // the new target the way a browser does — never leak an https URL onto
+        // an http (downgraded) hop, reduce a cross-origin hop to an origin.
+        // The Referer's own value is the source document.
+        if let Some(pos) = request
+            .headers
+            .iter()
+            .position(|(k, _)| k.eq_ignore_ascii_case("referer"))
+        {
+            match Url::parse(&request.headers[pos].1)
+                .ok()
+                .and_then(|src| referrer_for(&src, &target))
+            {
+                Some(v) => request.headers[pos].1 = v,
+                None => {
+                    request.headers.remove(pos);
+                }
+            }
+        }
         if matches!(response.status, 301..=303) {
             request.method = String::from("GET");
             request.body = None;
@@ -1280,6 +1299,60 @@ pub(crate) fn subresource_allowed(page: &Url, script: &Url) -> bool {
         }
         Some(url::Host::Ipv6(ip)) => !(ip.is_loopback() || ip.is_unspecified()),
         None => false,
+    }
+}
+
+/// Two URLs share an origin (scheme + host + port, default ports folded).
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// The `Referer` value to send when the document at `page` requests
+/// `target`, under the browser default referrer policy
+/// (`strict-origin-when-cross-origin`):
+///   - `page` isn't http(s): no referrer.
+///   - https → http (a downgrade): no referrer (never leak a secure URL).
+///   - same origin: the full page URL, minus fragment and credentials.
+///   - cross origin: the page's origin only (`scheme://host[:port]/`).
+///
+/// This is host-agnostic browser behaviour. Hotlink-protected image/media
+/// CDNs (gelbooru and many boorus, plenty of CDNs) answer a refererless
+/// request with a 302/403 to a placeholder instead of the file; sending
+/// what a browser sends is what makes their subresources load.
+pub fn referrer_for(page: &Url, target: &Url) -> Option<String> {
+    if !matches!(page.scheme(), "http" | "https") {
+        return None;
+    }
+    if page.scheme() == "https" && target.scheme() == "http" {
+        return None;
+    }
+    if same_origin(page, target) {
+        let mut r = page.clone();
+        r.set_fragment(None);
+        let _ = r.set_username("");
+        let _ = r.set_password(None);
+        Some(r.to_string())
+    } else {
+        Some(format!("{}/", page.origin().ascii_serialization()))
+    }
+}
+
+/// Add a `Referer` header to `req` (for `page`) unless the page-supplied
+/// headers already carry one. Used by every document-initiated request —
+/// subresource loads and the page's own `fetch()`/XHR — so they look like
+/// a browser's. No-op when policy says to send nothing.
+pub fn set_referrer(req: &mut Request, page: &Url) {
+    if req
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("referer"))
+    {
+        return;
+    }
+    if let Some(referer) = referrer_for(page, &req.url) {
+        req.headers.push((String::from("Referer"), referer));
     }
 }
 
@@ -3193,6 +3266,178 @@ customElements.define('lit-counter', LitCounter);
             &local_page,
             &Url::parse("http://localhost:8000/app.js").unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn a_referer_unblocks_a_hotlink_protected_image() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // A booru-style image CDN: a refererless GET is bounced with a 302 to
+        // a placeholder; a GET carrying a Referer gets the bytes. This is the
+        // gelbooru thumbnail behaviour, hermetic. `set_referrer` (what the
+        // image-load path now applies) must make the second case happen.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&req);
+                let has_referer = head.lines().any(|l| {
+                    l.to_ascii_lowercase().starts_with("referer:") && l.contains("127.0.0.1")
+                });
+                let resp: &[u8] = if has_referer {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\nPNG"
+                } else {
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = sock.write_all(resp).await;
+            }
+        });
+        let page = parse_url(&format!("http://127.0.0.1:{port}/index.php")).unwrap();
+        let img = parse_url(&format!("http://127.0.0.1:{port}/thumb.png")).unwrap();
+
+        // Without a Referer: the CDN bounces us (non-200 → no image).
+        let bare = fetch(&Request::get(img.clone())).await.unwrap();
+        assert_eq!(bare.status, 403, "refererless request is bounced");
+
+        // With the browser-default Referer: we get the image bytes.
+        let mut req = Request::get(img);
+        set_referrer(&mut req, &page);
+        let ok = fetch(&req).await.unwrap();
+        assert_eq!(ok.status, 200, "a Referer unblocks the image");
+        assert_eq!(ok.body, b"PNG");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_referer_is_re_evaluated_across_a_cross_origin_redirect() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // Referrer policy is per hop. A same-origin request carries the FULL
+        // page URL; if it redirects to a DIFFERENT origin, the Referer must be
+        // reduced to the origin (no path leak), exactly as a browser does.
+        async fn one_shot<F>(reply: F) -> (u16, std::sync::Arc<std::sync::Mutex<String>>)
+        where
+            F: FnOnce(u16) -> Vec<u8> + Send + 'static,
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let cap = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let cap2 = cap.clone();
+            tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                *cap2.lock().unwrap() = String::from_utf8_lossy(&req).into_owned();
+                let _ = sock.write_all(&reply(port)).await;
+            });
+            (port, cap)
+        }
+
+        // B: the redirect target on a different origin — captures the Referer.
+        let (b_port, b_cap) = one_shot(|_| {
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
+        })
+        .await;
+        // A: same origin as the page; 302s to B.
+        let (a_port, _a_cap) = one_shot(move |_| {
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{b_port}/landing\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        })
+        .await;
+
+        let page = parse_url(&format!("http://127.0.0.1:{a_port}/some/page?q=1")).unwrap();
+        let start = parse_url(&format!("http://127.0.0.1:{a_port}/start")).unwrap();
+        let mut req = Request::get(start);
+        set_referrer(&mut req, &page); // same-origin → full page URL
+        assert!(
+            req.headers
+                .iter()
+                .any(|(k, v)| k == "Referer" && v.contains("/some/page"))
+        );
+
+        let resp = fetch(&req).await.unwrap();
+        assert_eq!(resp.body, b"ok", "followed the redirect to B");
+        let at_b = b_cap.lock().unwrap().clone();
+        let referer_line = at_b
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("referer:"))
+            .unwrap_or("");
+        assert!(
+            referer_line.contains(&format!("http://127.0.0.1:{a_port}/"))
+                && !referer_line.contains("/some/page"),
+            "cross-origin redirect reduced the Referer to the origin: {referer_line:?}"
+        );
+    }
+
+    #[test]
+    fn referrer_follows_strict_origin_when_cross_origin() {
+        let page = Url::parse("https://gelbooru.com/index.php?page=post&s=list#frag").unwrap();
+        // Cross-origin (the image CDN): origin only, with a trailing slash —
+        // exactly what unblocks a hotlink-protected booru thumbnail.
+        let cdn = Url::parse("https://img4.gelbooru.com/thumbnails/x.jpg").unwrap();
+        assert_eq!(
+            referrer_for(&page, &cdn).as_deref(),
+            Some("https://gelbooru.com/")
+        );
+        // Same-origin: full URL, fragment stripped, query kept.
+        let same = Url::parse("https://gelbooru.com/css/style.css").unwrap();
+        assert_eq!(
+            referrer_for(&page, &same).as_deref(),
+            Some("https://gelbooru.com/index.php?page=post&s=list")
+        );
+        // Credentials are never leaked in a same-origin referrer.
+        let creds = Url::parse("https://user:pw@site.test/a").unwrap();
+        let creds_sub = Url::parse("https://site.test/b.js").unwrap();
+        assert_eq!(
+            referrer_for(&creds, &creds_sub).as_deref(),
+            Some("https://site.test/a")
+        );
+        // HTTPS → HTTP downgrade: send nothing.
+        let insecure = Url::parse("http://img.site.test/x.jpg").unwrap();
+        assert_eq!(referrer_for(&page, &insecure), None);
+        // A non-http(s) page (data:, file:) has no referrer to give.
+        let data = Url::parse("data:text/html,<p>").unwrap();
+        assert_eq!(referrer_for(&data, &cdn), None);
+
+        // set_referrer wires it onto a request, and never clobbers a
+        // page-supplied one.
+        let mut req = Request::get(cdn.clone());
+        set_referrer(&mut req, &page);
+        assert_eq!(
+            req.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("referer"))
+                .map(|(_, v)| v.as_str()),
+            Some("https://gelbooru.com/")
+        );
+        let mut req2 = Request::get(cdn);
+        req2.headers
+            .push(("Referer".into(), "https://override.test/".into()));
+        set_referrer(&mut req2, &page);
+        assert_eq!(
+            req2.headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("referer"))
+                .count(),
+            1,
+            "page-supplied Referer is kept, not duplicated"
+        );
     }
 
     #[test]
