@@ -504,6 +504,35 @@ unsafe impl boa_engine::gc::Trace for PageStore {
     boa_engine::gc::empty_trace!();
 }
 
+/// The geometry box map's cache: the DOM epoch it was built for, and each
+/// element's pixel box keyed by node. Stale (epoch mismatch) entries are
+/// rebuilt lazily on the next `__dom_rect` read — free for pages that never
+/// measure, one layout pass for those that do, reused until the next mutation.
+type GeomCache = (
+    u64,
+    std::collections::HashMap<crate::dom::NodeId, crate::layout::PxRect>,
+);
+
+/// Backing for the JS geometry APIs (`getBoundingClientRect`, `offset*`/
+/// `client*`, IntersectionObserver/ResizeObserver). Holds the immutable layout
+/// inputs the measure pass needs (the page base, content width in cells, the
+/// terminal's cell pixel size, and whether borders draw) plus the lazily built,
+/// epoch-keyed box map. See `sys_rect` and `layout::measure_boxes`.
+#[derive(boa_engine::JsData)]
+struct PageGeom {
+    base: url::Url,
+    width_cells: u16,
+    cell_px: (u16, u16),
+    borders: bool,
+    cache: Rc<RefCell<GeomCache>>,
+}
+
+impl boa_engine::gc::Finalize for PageGeom {}
+// SAFETY: holds no GC-managed objects.
+unsafe impl boa_engine::gc::Trace for PageGeom {
+    boa_engine::gc::empty_trace!();
+}
+
 /// Most page-initiated requests (fetch/XHR/module loads) per page.
 /// Was 24 (Phase 2a); archive.org's home alone needs ~32 module loads
 /// before any data — at 24 the app's chunks were cut off mid-graph.
@@ -557,6 +586,28 @@ fn ids_array(ids: Vec<usize>, ctx: &mut Context) -> JsValue {
     JsArray::from_iter(ids.into_iter().map(|i| JsValue::from(i as f64)), ctx).into()
 }
 
+/// Diagnostic (`TRUST_JS_PROFILE`): dump and reset the Boa VM sampling
+/// profile — the hottest JS leaf frames since the last dump, each as
+/// `source-url :: function`. The profiler samples the synchronous and async
+/// instruction loops; it's zero-cost when the env var is unset. Invaluable for
+/// engine-perf dives because hardware perf counters are locked on this host
+/// (see CLAUDE.md) — and it disambiguates "stuck in JS" from "stuck in Rust"
+/// (a phase with elapsed wall time but no samples is Rust-side, e.g. layout or
+/// the cascade, not the engine).
+fn dump_vm_profile(tag: &str) {
+    let (total, prof) = boa_engine::vm::profile::take_vm_profile();
+    if total == 0 {
+        return;
+    }
+    eprintln!(
+        "js : @{:>6}ms VM profile [{tag}] ({total} samples, hottest leaf frames)",
+        crate::http::trace_ms()
+    );
+    for (k, n) in prof.iter().take(25) {
+        eprintln!("{n:>10} ({:>4.1}%)  {k}", 100.0 * *n as f64 / total as f64);
+    }
+}
+
 /// Register every `__dom_*` / `__url_parse` syscall. Each is a plain fn
 /// pointer fetching the arena from host-defined state.
 fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
@@ -577,6 +628,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_tag", 1, sys_tag),
         ("__dom_get_attr", 2, sys_get_attr),
         ("__dom_computed", 2, sys_computed_style),
+        ("__dom_rect", 1, sys_rect),
         ("__dom_set_attr", 3, sys_set_attr),
         ("__dom_remove_attr", 2, sys_remove_attr),
         ("__dom_attr_names", 1, sys_attr_names),
@@ -589,6 +641,8 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_query", 3, sys_query),
         ("__dom_matches", 2, sys_matches),
         ("__dom_get_by_id", 1, sys_get_by_id),
+        ("__dom_upgrade_candidates", 2, sys_upgrade_candidates),
+        ("__dom_ce_candidates", 1, sys_ce_candidates),
         ("__dom_clone", 2, sys_clone),
         ("__dom_doc_element", 0, sys_doc_element),
         ("__url_parse", 2, sys_url_parse),
@@ -768,6 +822,65 @@ fn sys_computed_style(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
     )
 }
 
+/// Geometry backing for `getBoundingClientRect`/`offset*`/`client*` and the
+/// observers: the element's box as `[left, top, width, height]` in CSS pixels,
+/// or null when it has no laid-out box (the prelude then falls back to the
+/// viewport box). The map is built once per DOM epoch by one layout pass over
+/// the live arena (`layout::measure_boxes`) and reused until the next mutation
+/// — lazy, so a page that never measures pays nothing.
+fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some((base, width_cells, cell_px, borders, cache)) = ({
+        let host = ctx.realm().host_defined();
+        host.get::<PageGeom>().map(|g| {
+            (
+                g.base.clone(),
+                g.width_cells,
+                g.cell_px,
+                g.borders,
+                g.cache.clone(),
+            )
+        })
+    }) else {
+        return Ok(JsValue::null());
+    };
+    let dom = page_dom(ctx);
+    let d = dom.borrow();
+    let Some(id) = arg_node(&d, args, 0) else {
+        return Ok(JsValue::null());
+    };
+    let epoch = d.epoch();
+    {
+        let mut c = cache.borrow_mut();
+        if c.0 != epoch {
+            let (forms, controls) = crate::http::extract_forms_arena(&d, &base, None);
+            c.1 = crate::layout::measure_boxes(
+                &d,
+                &base,
+                width_cells as usize,
+                &forms,
+                &controls,
+                cell_px,
+                borders,
+            );
+            c.0 = epoch;
+        }
+    }
+    let rect = cache.borrow().1.get(&id).copied();
+    Ok(match rect {
+        Some(r) => JsArray::from_iter(
+            [
+                JsValue::from(r.left),
+                JsValue::from(r.top),
+                JsValue::from(r.width),
+                JsValue::from(r.height),
+            ],
+            ctx,
+        )
+        .into(),
+        None => JsValue::null(),
+    })
+}
+
 fn sys_remove_attr(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let name = arg_str(args, 1, ctx);
     let dom = page_dom(ctx);
@@ -933,6 +1046,37 @@ fn sys_get_by_id(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
     let dom = page_dom(ctx);
     let d = dom.borrow();
     Ok(id_value(d.get_by_id(&target)))
+}
+
+/// `(rootId, name)` → the composed-tree element ids (shadow-piercing, document
+/// order) whose tag is `name`. Backs `customElements.define`'s catch-up upgrade
+/// without the per-node JS tree walk it used to do.
+fn sys_upgrade_candidates(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = arg_str(args, 1, ctx).to_ascii_lowercase();
+    let dom = page_dom(ctx);
+    let ids = {
+        let d = dom.borrow();
+        match arg_node(&d, args, 0) {
+            Some(root) => d.elements_by_tag_composed(root, &name),
+            None => Vec::new(),
+        }
+    };
+    Ok(ids_array(ids, ctx))
+}
+
+/// `(rootId)` → the composed-subtree element ids (root included, shadow-
+/// piercing) whose tag is a custom-element name (contains a hyphen). Backs
+/// `ceScan`'s insertion-time upgrade/connect pass without the per-node JS walk.
+fn sys_ce_candidates(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let ids = {
+        let d = dom.borrow();
+        match arg_node(&d, args, 0) {
+            Some(root) => d.custom_elements_composed(root),
+            None => Vec::new(),
+        }
+    };
+    Ok(ids_array(ids, ctx))
 }
 
 fn sys_clone(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -1942,6 +2086,19 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
                 cache: env.cache.clone(),
             });
         }
+        // Geometry backing: a layout pass over this same arena answers the JS
+        // box APIs. Needs an absolute base to resolve hrefs during layout; if
+        // the page URL didn't parse, `__dom_rect` is simply absent and the
+        // getters keep their viewport-box fallback.
+        if let Some(base) = parsed_url.clone() {
+            host.insert(PageGeom {
+                base,
+                width_cells: viewport.0,
+                cell_px,
+                borders: crate::layout::borders_enabled(),
+                cache: Rc::new(RefCell::new((u64::MAX, std::collections::HashMap::new()))),
+            });
+        }
     }
     if let Err(err) = register_syscalls(&mut ctx) {
         outcome.errors.push(format!("syscalls: {err}"));
@@ -2090,6 +2247,7 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
         // path calls `settle_page` straight away, so its render is
         // unchanged.
         phase("scripts done; DOMContentLoaded");
+        dump_vm_profile("scripts");
         run_script(
             &mut ctx,
             "DOMContentLoaded",
@@ -2101,6 +2259,7 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
 
     drain_js_side(&mut ctx, &mut outcome);
     drain_rejections(&hooks, &mut outcome);
+    dump_vm_profile("DOMContentLoaded");
     Ok(LoadedPage {
         ctx,
         dom,
@@ -2777,11 +2936,17 @@ fn extract_live(page: &mut LoadedPage) -> (String, bool) {
     // delegation — the selector lives in jQuery's closure where we can't read
     // it, but `cursor:pointer` is the library-agnostic affordance a sighted
     // user clicks, and the listening ancestor confirms a handler is waiting.
+    let cursor_t = Instant::now();
     for &d in &everyone {
         if dom.computed_style(d, "cursor").as_deref() == Some("pointer") && listens(d) {
             candidates.insert(d);
         }
     }
+    phase(&format!(
+        "extract_live: cursor loop over {} nodes +{}ms",
+        everyone.len(),
+        cursor_t.elapsed().as_millis()
+    ));
     candidates.retain(|&c| !matches!(dom.tag_name(c), None | Some("html" | "body")));
     let mut containers: HashSet<usize> = HashSet::new();
     let interactive: Vec<usize> = candidates
@@ -2806,7 +2971,12 @@ fn extract_live(page: &mut LoadedPage) -> (String, bool) {
         )
     });
     let has_any = !clickable.is_empty() || has_forms;
+    let ser_t = Instant::now();
     let html = dom.serialize_live(crate::dom::DOCUMENT, &clickable);
+    phase(&format!(
+        "extract_live: serialize_live +{}ms",
+        ser_t.elapsed().as_millis()
+    ));
     drop(dom);
     // Extraction itself is not a page mutation.
     let _ = page.dom.borrow_mut().take_dirty();
@@ -3817,13 +3987,44 @@ const PRELUDE: &str = r##"
         webkitMatchesSelector(s) { return this.matches(s); }
         closest(s) { let e = this; while (e && e.nodeType === 1) { if (e.matches(s)) return e; e = e.parentNode; } return null; }
         click() {} focus() {} blur() {} scrollIntoView() {}
-        get offsetWidth() { return g.innerWidth; }
-        get offsetHeight() { return g.innerHeight; }
+        // Geometry: a layout pass over the live DOM gives each element its REAL
+        // box (CSS pixels, quantized to terminal cells — what we actually
+        // paint). `__dom_rect` returns [left, top, width, height] for a laid-out
+        // element, or null when it has none (un-rendered / detached /
+        // display:none), in which case we keep the generous viewport-box
+        // fallback so measurement gates ("render once I have a non-zero size")
+        // still fire. Coordinates are document-origin (page scroll is not
+        // threaded in yet, so they read viewport-relative at the top of the
+        // page, where load-time measurement happens).
+        __rect() {
+            let r = null;
+            try { r = __dom_rect(this.__id); } catch (e) { r = null; }
+            if (r) {
+                const left = r[0], top = r[1], width = r[2], height = r[3];
+                return { x: left, y: top, left, top, width, height,
+                         right: left + width, bottom: top + height,
+                         toJSON() { return this; } };
+            }
+            return { x: 0, y: 0, left: 0, top: 0, right: g.innerWidth, bottom: g.innerHeight,
+                     width: g.innerWidth, height: g.innerHeight, toJSON() { return this; } };
+        }
+        getBoundingClientRect() { return this.__rect(); }
+        getClientRects() { return [this.__rect()]; }
+        get offsetWidth() { return this.__rect().width; }
+        get offsetHeight() { return this.__rect().height; }
+        get offsetTop() { return this.__rect().top; }
+        get offsetLeft() { return this.__rect().left; }
         get offsetParent() { return g.document.body; }
-        get clientWidth() { return g.innerWidth; }
-        get clientHeight() { return g.innerHeight; }
-        getBoundingClientRect() { return { x: 0, y: 0, top: 0, left: 0, right: g.innerWidth, bottom: g.innerHeight, width: g.innerWidth, height: g.innerHeight }; }
-        getClientRects() { return [this.getBoundingClientRect()]; }
+        get clientWidth() { return this.__rect().width; }
+        get clientHeight() { return this.__rect().height; }
+        get clientTop() { return 0; }
+        get clientLeft() { return 0; }
+        get scrollWidth() { return this.__rect().width; }
+        get scrollHeight() { return this.__rect().height; }
+        get scrollTop() { return 0; }
+        set scrollTop(_v) {}
+        get scrollLeft() { return 0; }
+        set scrollLeft(_v) {}
     }
 
     // CharacterData: the shared text-bearing interface for Text and Comment.
@@ -4217,26 +4418,32 @@ const PRELUDE: &str = r##"
         }
     }
     function ceScan(node) {
-        if (!node || typeof node !== "object") return;
-        if (node instanceof Element) {
-            const ctor = CE.defs.get(node.localName);
-            if (ctor) { upgradeElement(node, ctor); maybeConnect(node); }
-            if (node.__sr) ceScan(node.__sr);
+        if (!node || typeof node !== "object" || node.__id === undefined) return;
+        // Rust returns just the custom-element candidates (hyphenated tags) in
+        // the inserted subtree, shadow roots included and the root itself — so
+        // we wrap/visit only those, never the non-custom bulk of the subtree
+        // (the old per-node JS recursion wrapped every node it walked).
+        const ids = __dom_ce_candidates(node.__id);
+        for (let i = 0; i < ids.length; i++) {
+            const el = wrap(ids[i]);
+            const ctor = CE.defs.get(el.localName);
+            if (ctor) { upgradeElement(el, ctor); maybeConnect(el); }
         }
-        if (node.childNodes) for (const c of node.childNodes) ceScan(c);
     }
     // define()'s catch-up upgrade, but shadow-piercing: an element
     // rendered into a shadow root BEFORE its definition (archive.org's
     // router does this for the late-loaded page component) is invisible
     // to document.querySelectorAll, so without crossing __sr it would
     // never upgrade — constructed never, rendered never, empty forever.
-    function ceUpgradeName(node, name, ctor) {
-        if (!node || typeof node !== "object") return;
-        if (node instanceof Element) {
-            if (node.localName === name) upgradeElement(node, ctor);
-            if (node.__sr) ceUpgradeName(node.__sr, name, ctor);
-        }
-        if (node.childNodes) for (const c of node.childNodes) ceUpgradeName(c, name, ctor);
+    function ceUpgradeName(name, ctor) {
+        // The candidate set — every composed-tree element with this tag, shadow
+        // roots included — is computed in Rust in a single pointer walk (see
+        // __dom_upgrade_candidates) instead of recursing the whole document in
+        // JS on every define(). Only the matching elements are wrapped and
+        // upgraded; the old walk materialized a wrapper + a childNodes syscall
+        // for ALL ~16.8k nodes per define on a big page.
+        const ids = __dom_upgrade_candidates(g.document.__id, name);
+        for (let i = 0; i < ids.length; i++) upgradeElement(wrap(ids[i]), ctor);
     }
     function ceDisconnect(node) {
         if (!node || typeof node !== "object") return;
@@ -4263,7 +4470,7 @@ const PRELUDE: &str = r##"
             try { void (ctor.observedAttributes || []); } catch (e) { /* page's problem */ }
             CE.defs.set(name, ctor);
             CE.tags.set(ctor, name);
-            ceUpgradeName(g.document, name, ctor);
+            ceUpgradeName(name, ctor);
             const w = CE.waiting.get(name);
             if (w) { CE.waiting.delete(name); w.resolve(ctor); }
         },
@@ -4893,18 +5100,36 @@ const PRELUDE: &str = r##"
     g.Selection = Selection;
     g.getSelection = () => new Selection();
     g.MutationObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
-    // No viewport here, so everything observed intersects, once,
-    // asynchronously — infinite scrollers and lazy tiles render their
-    // content instead of waiting for a scroll that can't happen.
+    // The terminal has no live scroll and timers freeze at rest, so we still
+    // REPORT every observed target as intersecting, once, asynchronously — else
+    // below-the-fold lazy/virtualized content (infinite scrollers, lazy tiles)
+    // would never materialize, since the scroll that would reveal it can't
+    // happen. But the record now carries the element's REAL box (a layout pass
+    // backs getBoundingClientRect) and a real intersection rect/ratio against
+    // the viewport, so measure-then-render code downstream sees true geometry.
+    // Forcing isIntersecting true regardless of the ratio is the one deliberate
+    // deviation the medium demands.
+    g.__viewportRect = () => {
+        const vw = g.innerWidth, vh = g.innerHeight;
+        return { x: 0, y: 0, left: 0, top: 0, right: vw, bottom: vh, width: vw, height: vh };
+    };
     g.IntersectionObserver = class {
         constructor(cb) { this.__cb = cb; this.__dead = false; }
         observe(el) {
             g.setTimeout(() => {
                 if (this.__dead) return;
-                const r = { top: 0, left: 0, bottom: 1, right: 1, width: 1, height: 1 };
+                const r = (el && el.getBoundingClientRect) ? el.getBoundingClientRect() : g.__viewportRect();
+                const vw = g.innerWidth, vh = g.innerHeight;
+                const il = Math.max(r.left, 0), it = Math.max(r.top, 0);
+                const iw = Math.max(0, Math.min(r.right, vw) - il);
+                const ih = Math.max(0, Math.min(r.bottom, vh) - it);
+                const irect = { x: il, y: it, left: il, top: it, right: il + iw, bottom: it + ih,
+                                width: iw, height: ih };
+                const area = (r.width || 0) * (r.height || 0);
+                const ratio = area > 0 ? (iw * ih) / area : 0;
                 try {
-                    this.__cb([{ isIntersecting: true, intersectionRatio: 1, target: el,
-                        time: 0, boundingClientRect: r, intersectionRect: r, rootBounds: r }], this);
+                    this.__cb([{ isIntersecting: true, intersectionRatio: ratio, target: el,
+                        time: 0, boundingClientRect: r, intersectionRect: irect, rootBounds: g.__viewportRect() }], this);
                 } catch (e) { trust.errors.push("IntersectionObserver: " + ((e && e.message) || e)); }
             }, 0);
         }
@@ -4915,8 +5140,8 @@ const PRELUDE: &str = r##"
         observe(el) {
             g.setTimeout(() => {
                 if (this.__dead) return;
-                const r = { x: 0, y: 0, top: 0, left: 0, right: g.innerWidth, bottom: g.innerHeight, width: g.innerWidth, height: g.innerHeight };
-                const box = [{ inlineSize: g.innerWidth, blockSize: g.innerHeight }];
+                const r = (el && el.getBoundingClientRect) ? el.getBoundingClientRect() : g.__viewportRect();
+                const box = [{ inlineSize: r.width, blockSize: r.height }];
                 try { this.__cb([{ target: el, contentRect: r, borderBoxSize: box, contentBoxSize: box, devicePixelContentBoxSize: box }], this); }
                 catch (e) { trust.errors.push("ResizeObserver: " + ((e && e.message) || e)); }
             }, 0);
@@ -5095,6 +5320,25 @@ const PRELUDE: &str = r##"
     };
     g.removeEventListener = (t, f) => { const l = lsFor(g, String(t)); const i = l.indexOf(f); if (i >= 0) l.splice(i, 1); };
     g.dispatchEvent = (ev) => dispatch(g, ev, false);
+    // `window.postMessage(message[, targetOrigin][, transfer])` (HTML web
+    // messaging). With no foreign frames the only valid target is ourselves, so
+    // we deliver `message` to our own window ASYNCHRONOUSLY (a task) as a
+    // `MessageEvent` carrying data/origin/source — exactly the observable spec
+    // behaviour a single-window page sees. `targetOrigin`/`transfer` are
+    // accepted and ignored (no cross-origin gate, nothing to transfer). A
+    // structured-clone is approximated as identity. Pages post to themselves to
+    // defer work or hand off across a microtask boundary (Steam's focus-restore
+    // handshake posts `"FocusRestoreReady"` and listens for it); a missing
+    // `window.postMessage` was an uncaught TypeError in that timer.
+    g.postMessage = function (message) {
+        setTimeout(function () {
+            g.dispatchEvent(new MessageEvent("message", {
+                data: message,
+                origin: (g.location && g.location.origin) || "",
+                source: g,
+            }));
+        }, 0);
+    };
     // `on<event>` IDL attributes (window.onload = fn). Standard semantics:
     // the attribute is backed by an event listener, so the existing
     // dispatch loop fires it — get returns the handler, set swaps the
@@ -5992,6 +6236,68 @@ mod tests {
             );
             eprintln!("  trust default: {dt:>12?}  ({c} colls, {gct:?} GC)");
         }
+    }
+
+    #[test]
+    fn window_post_message_delivers_to_self_as_a_message_event() {
+        // `window.postMessage` (HTML web messaging). With no foreign frames the
+        // only target is ourselves, so the message arrives asynchronously as a
+        // `message` MessageEvent carrying its data. Steam's focus-restore
+        // handshake posts a string to itself and listens for it; a missing
+        // `window.postMessage` was an uncaught TypeError there.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "pm.js",
+            br##"
+            globalThis.out = {};
+            window.addEventListener("message", function (e) {
+                out.data = e.data;
+                out.type = e.type;
+                out.isMessageEvent = (e instanceof MessageEvent);
+                out.selfSource = (e.source === window);
+            });
+            // Delivery is async (a task): not seen synchronously.
+            window.postMessage("FocusRestoreReady");
+            out.syncSeen = ("data" in out);
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // Delivered on a macrotask (setTimeout 0): advance virtual time.
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"String(out.syncSeen)"), "false");
+        assert_eq!(s(&mut ctx, b"out.data"), "FocusRestoreReady");
+        assert_eq!(s(&mut ctx, b"out.type"), "message");
+        assert_eq!(s(&mut ctx, b"String(out.isMessageEvent)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.selfSource)"), "true");
     }
 
     #[test]
@@ -8413,6 +8719,37 @@ mod tests {
     }
 
     #[test]
+    fn define_catch_up_upgrades_every_existing_instance_in_order() {
+        // define()'s catch-up upgrade is now backed by a Rust composed-tree
+        // walk (__dom_upgrade_candidates), not a JS per-node recursion — it
+        // must still find EVERY pre-existing instance (GitHub SSRs many of one
+        // custom element) and upgrade them in document order, including one
+        // inside a shadow root. Each connectedCallback appends its data-n to a
+        // shared log; the log proves count, completeness, and order.
+        let (out, outcome) = page(
+            "<body><div id=log></div>\
+             <my-el data-n=1></my-el><my-el data-n=2></my-el>\
+             <div id=host></div>\
+             <my-el data-n=4></my-el><script>\
+             const host = document.getElementById('host');\
+             const sr = host.attachShadow({ mode: 'open' });\
+             sr.innerHTML = '<my-el data-n=3></my-el>';\
+             class MyEl extends HTMLElement {\
+               connectedCallback() {\
+                 const l = document.getElementById('log');\
+                 l.textContent = l.textContent + this.getAttribute('data-n');\
+               }\
+             }\
+             customElements.define('my-el', MyEl);\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // All four instances upgraded+connected, in document (pre-)order — the
+        // shadow instance (#3) sits at its host's tree position.
+        assert!(out.contains(">1234<"), "expected log 1234, got: {out}");
+    }
+
+    #[test]
     fn crypto_subtle_digest_and_random_work() {
         // Real SHA-1/SHA-256 (libraries hash request ids before they
         // fetch — archive.org's collection search gates its tile fetch
@@ -8568,6 +8905,50 @@ mod tests {
         assert!(
             out.contains("true true true true true true true true true true true"),
             "Intl probes failed: {out}"
+        );
+    }
+
+    #[test]
+    fn element_geometry_reports_real_cell_boxes() {
+        // getBoundingClientRect / offset* now return the element's REAL laid-out
+        // box (a layout pass over the live DOM), not the viewport fiction.
+        // "HELLO" is 5 cells; cell_px is 8x16 → 40px wide, 16px tall. The
+        // viewport is 80x24 cells (640x384px), so a real box (40x16) is
+        // unmistakably distinct from the old fallback (640x384).
+        let (out, outcome) = page(
+            r##"<body><div id=probe>HELLO</div><div id=out></div><script>
+            var p = document.getElementById('probe');
+            var r = p.getBoundingClientRect();
+            document.getElementById('out').textContent =
+                [r.left, r.width, r.height, p.offsetWidth, p.offsetHeight].join(' ');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("0 40 16 40 16"),
+            "geometry should be the real cell box, got: {out}"
+        );
+    }
+
+    #[test]
+    fn intersection_observer_reports_the_targets_real_box() {
+        // The observer still fires for every target (the no-scroll terminal
+        // safeguard) but the record now carries the element's REAL box and a
+        // real ratio — a 40x16 box fully inside the 640x384 viewport = ratio 1.
+        let (out, outcome) = page(
+            r##"<body><div id=probe>HELLO</div><div id=out></div><script>
+            var io = new IntersectionObserver(function (entries) {
+                var e = entries[0];
+                document.getElementById('out').textContent =
+                    [e.isIntersecting, e.boundingClientRect.width, e.intersectionRatio].join(' ');
+            });
+            io.observe(document.getElementById('probe'));
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("true 40 1"),
+            "IO record should carry the real box + ratio, got: {out}"
         );
     }
 

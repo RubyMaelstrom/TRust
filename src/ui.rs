@@ -97,8 +97,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             let doc = Paragraph::new(browser_lines(g, inner.height as usize)).block(block);
             frame.render_widget(doc, session_area);
             // Second pass: overlay decoded inline images on their reserved
-            // boxes. Only fully-visible boxes draw (the stateless widget
-            // refuses to clip — safe for sixel); the rest stay alt text.
+            // boxes. Each box encodes once to a `SlicedProtocol`; the renderer
+            // clips it to its on-screen slice (sixel bands stripped), so a
+            // partly-scrolled image draws its visible portion and undecoded
+            // boxes stay alt text.
             if g.doc.laid_out() {
                 render_inline_images(frame, g, inner, &app.image_protocols);
             }
@@ -387,36 +389,38 @@ fn render_inline_images(
     g: &BrowserView,
     inner: ratatui::layout::Rect,
     protocols: &std::collections::HashMap<
-        (String, u16, u16, bool),
-        ratatui_image::protocol::Protocol,
+        crate::app::EncKey,
+        ratatui_image::sliced::SlicedProtocol,
     >,
 ) {
-    let (vw, vh) = (inner.width, inner.height);
+    use ratatui_image::sliced::{SignedPosition, SlicedImage};
+    let vh = inner.height;
     let carousels = &g.doc.carousels;
     let end = (g.scroll + vh as usize).min(g.doc.rows.len());
-    for (r, row) in g.doc.rows[g.scroll..end].iter().enumerate() {
-        let top = r as u16;
+    // Back-scan above the viewport: a tall image whose top scrolled off the top
+    // still reaches into view; `SlicedImage` clips it (a negative `y` skips the
+    // off-screen rows — sixel bands — and the bottom is dropped).
+    let start = g.scroll.saturating_sub(crate::layout::MAX_IMAGE_LOOKBACK);
+    for (off, row) in g.doc.rows[start..end].iter().enumerate() {
+        let doc_row = start + off;
         for item in &row.items {
             let Some(url) = &item.image else { continue };
             // Carousel offset/clip: a strip image scrolled out of its band
-            // (or only partly in it) doesn't draw — snapping keeps whole
-            // cards, so it's never cut.
-            let Some(scol) = visible_col(carousels, g.scroll + r, item) else {
+            // doesn't draw — snapping keeps whole cards, so it's never cut.
+            let Some(scol) = visible_col(carousels, doc_row, item) else {
                 continue;
             };
-            if scol + item.width > vw || top + item.height > vh {
+            let key = crate::app::EncKey::for_item(url, item);
+            let Some(proto) = protocols.get(&key) else {
                 continue;
-            }
-            let key = (url.clone(), item.width, item.height, item.crop);
-            if let Some(proto) = protocols.get(&key) {
-                let area = ratatui::layout::Rect::new(
-                    inner.x + scol,
-                    inner.y + top,
-                    item.width,
-                    item.height,
-                );
-                frame.render_widget(ratatui_image::Image::new(proto), area);
-            }
+            };
+            // Position the box's top-left relative to the content rect; `y` may
+            // be negative (scrolled above the top). One scroll-independent
+            // encode serves every position, so a partly-visible image renders
+            // at the same scale as a fully-visible one (no resize-on-scroll).
+            let position =
+                SignedPosition::from((scol as i16, (doc_row as isize - g.scroll as isize) as i16));
+            frame.render_widget(SlicedImage::new(proto, position), inner);
         }
     }
 }

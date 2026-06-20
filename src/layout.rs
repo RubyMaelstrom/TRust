@@ -67,6 +67,22 @@ pub type ImageSizes = HashMap<String, (u16, u16)>;
 /// (synthesized text like list markers).
 pub const NO_NODE: NodeId = usize::MAX;
 
+/// A laid-out element's box in CSS pixels — the backing for the JS geometry
+/// APIs (`getBoundingClientRect`, `offset*`/`client*`, IntersectionObserver/
+/// ResizeObserver records). `left`/`top` are the element's document-origin
+/// position and `width`/`height` its size, each a whole number of terminal
+/// cells scaled by the cell's pixel size. The cell quantization is deliberate:
+/// the geometry a page reads back must agree with what we actually paint, so a
+/// page that measures and then renders sees the box it will really get (we
+/// cannot draw sub-cell, so reporting sub-cell precision would be a fiction).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PxRect {
+    pub left: f64,
+    pub top: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 /// Whether CSS borders render as box-drawing chrome. Session-global,
 /// default OFF (her call — terminal vertical space is at a premium and most
 /// page borders are subtle 1px underlines not worth a cell row each). The
@@ -321,6 +337,12 @@ pub fn visible_col(carousels: &[Carousel], row: usize, item: &Item) -> Option<u1
     Some(item.col)
 }
 
+/// How far above the scroll top to look for an image whose box reaches down
+/// into the viewport (a tall banner scrolled partly off the top). Bounds the
+/// per-frame back-scan; an image taller than this many cells (~5000px) is not
+/// realistic.
+pub const MAX_IMAGE_LOOKBACK: usize = 256;
+
 /// An element subtree laid out as an independent box, positioned relative
 /// to its own top-left. `width` is the widest used column and `height` is
 /// `rows.len()`. `blit` places it into a parent at a `(col, row)` offset —
@@ -383,24 +405,124 @@ pub fn lay_out_with_carousels(
     borders: bool,
 ) -> (Vec<Row>, Vec<Carousel>) {
     let mut layout = Layout::new(dom, base, width.max(10), forms, controls, images, borders);
-    let root = body_or_document(dom);
-    let ctx = Ctx::root();
-    // A page-covering modal overlay (age gate, consent wall, login dialog,
-    // lightbox) is painted ON TOP of the page in a real browser — the page
-    // behind it is inert. We can't composite layers in a cell grid, so we
-    // surface only that overlay's subtree and defer the page; the live-page JS
-    // that dismisses the overlay reveals the page on the next render.
-    layout.modal_root = layout.find_modal_overlay();
-    if let Some(modal) = layout.modal_root {
-        layout.flow_node(modal, &ctx);
-    } else {
-        for child in dom.children(root) {
-            layout.flow_node(child, &ctx);
+    layout.flow_all();
+    layout.finish()
+}
+
+/// A node's bounding box in whole terminal cells, accumulated as items and
+/// descendants are unioned in. Half-open: `[x0, x1) × [y0, y1)`.
+#[derive(Clone, Copy)]
+struct CellRect {
+    x0: u16,
+    y0: u16,
+    x1: u16,
+    y1: u16,
+}
+
+impl CellRect {
+    fn union(&mut self, o: &CellRect) {
+        self.x0 = self.x0.min(o.x0);
+        self.y0 = self.y0.min(o.y0);
+        self.x1 = self.x1.max(o.x1);
+        self.y1 = self.y1.max(o.y1);
+    }
+}
+
+/// Lay `dom` out and return each element's box in CSS pixels, keyed by
+/// `NodeId` — the backing for the JS geometry APIs. Runs the same flow as
+/// `lay_out_with_carousels` (so the reported boxes match the rendered page),
+/// harvests every laid item's cell rectangle onto its source node, then unions
+/// each node's rectangle up into its ancestors (so a block's box spans its
+/// content, as `getBoundingClientRect` requires) and scales cells to pixels by
+/// `cell_px`. Coordinates are document-origin (the top-left of the page); the
+/// live viewport scroll is not threaded in yet, so they read as
+/// viewport-relative at the top of the page, which is where load-time
+/// measurement happens. A node with no laid items (an un-rendered or
+/// `display:none` subtree) is simply absent — the JS getter falls back to the
+/// viewport box for those, preserving the generous measurement-gate behavior.
+/// Shadow-tree nodes keep their own box but do not union into their light-DOM
+/// host (the walk follows the light tree). Images lay out from CSS/attribute
+/// sizing only — this pass has no decoded intrinsic dimensions (no `ImageSizes`
+/// in the JS thread), so an unsized image's box is approximate.
+///
+/// The box is the element's RENDERED content extent — deliberately, so a page
+/// that measures and then renders sees the geometry it will really get (the
+/// binding rule: report what we paint). A plain block's declared CSS `width`/
+/// `height` is therefore NOT reflected unless the layout actually reserves it
+/// (as it does for flex/grid tracks, sized images, etc.); making blocks reserve
+/// their declared box is a layout change that geometry would then follow for
+/// free — see the geometry notes in CLAUDE.md.
+pub fn measure_boxes(
+    dom: &Dom,
+    base: &Url,
+    width: usize,
+    forms: &[Form],
+    controls: &ControlMap,
+    cell_px: (u16, u16),
+    borders: bool,
+) -> HashMap<NodeId, PxRect> {
+    let images = ImageSizes::new();
+    let mut layout = Layout::new(dom, base, width.max(10), forms, controls, &images, borders);
+    layout.tag_all_nodes = true;
+    layout.flow_all();
+    let (rows, _carousels) = layout.finish();
+
+    // Each laid item contributes a cell rectangle to its source node. An
+    // inline image's `height` already counts the rows it reserves.
+    let mut cells: HashMap<NodeId, CellRect> = HashMap::new();
+    for (y, row) in rows.iter().enumerate() {
+        let y = y as u16;
+        for item in &row.items {
+            if item.node == NO_NODE {
+                continue;
+            }
+            let r = CellRect {
+                x0: item.col,
+                y0: y,
+                x1: item.col.saturating_add(item.width),
+                y1: y.saturating_add(item.height.max(1)),
+            };
+            cells
+                .entry(item.node)
+                .and_modify(|c| c.union(&r))
+                .or_insert(r);
         }
     }
-    layout.flush_block();
-    layout.finish_floats();
-    layout.finish()
+
+    // Union each node's rectangle up into its ancestors. `descendants` is
+    // document (pre-)order, so visiting it in reverse reaches every child
+    // before its parent — one O(n) bottom-up pass. Each child has already
+    // absorbed its own subtree, so unioning the direct children suffices.
+    for &id in dom.descendants(DOCUMENT).iter().rev() {
+        let mut acc = cells.get(&id).copied();
+        for child in dom.children(id) {
+            if let Some(cr) = cells.get(&child) {
+                match acc {
+                    Some(ref mut a) => a.union(cr),
+                    None => acc = Some(*cr),
+                }
+            }
+        }
+        if let Some(acc) = acc {
+            cells.insert(id, acc);
+        }
+    }
+
+    let (cw, ch) = (f64::from(cell_px.0.max(1)), f64::from(cell_px.1.max(1)));
+    cells
+        .into_iter()
+        .map(|(id, c)| {
+            (
+                id,
+                PxRect {
+                    left: f64::from(c.x0) * cw,
+                    top: f64::from(c.y0) * ch,
+                    width: f64::from(c.x1 - c.x0) * cw,
+                    height: f64::from(c.y1 - c.y0) * ch,
+                },
+            )
+        })
+        .collect()
 }
 
 /// The `<body>` element, or the document node if there isn't one.
@@ -987,6 +1109,13 @@ struct Layout<'a> {
     /// dismisses the overlay reveals it). `is_out_of_flow` exempts this node
     /// so its content flows as a normal block, not the compact inline overlay.
     modal_root: Option<NodeId>,
+    /// Measurement pass only (`measure_boxes`): tag every laid item with the
+    /// nearest enclosing element so each element's box can be recovered (and
+    /// unioned up) for the JS geometry APIs. OFF for rendering, where items
+    /// coalesce by source node — tagging would fragment inline runs at element
+    /// boundaries (same visual output, but a different item vector), so the two
+    /// passes are kept separate and the render path is untouched.
+    tag_all_nodes: bool,
 }
 
 impl<'a> Layout<'a> {
@@ -1028,6 +1157,7 @@ impl<'a> Layout<'a> {
             clip_right: None,
             clip_done: false,
             modal_root: None,
+            tag_all_nodes: false,
         }
     }
 
@@ -1056,6 +1186,28 @@ impl<'a> Layout<'a> {
             v.split_whitespace()
                 .any(|t| matches!(t, "hidden" | "clip" | "auto" | "scroll"))
         })
+    }
+
+    /// Flow the whole document into rows (shared by `lay_out_with_carousels`
+    /// and `measure_boxes`). Caller then takes `finish()`.
+    fn flow_all(&mut self) {
+        let root = body_or_document(self.dom);
+        let ctx = Ctx::root();
+        // A page-covering modal overlay (age gate, consent wall, login dialog,
+        // lightbox) is painted ON TOP of the page in a real browser — the page
+        // behind it is inert. We can't composite layers in a cell grid, so we
+        // surface only that overlay's subtree and defer the page; the live-page
+        // JS that dismisses the overlay reveals the page on the next render.
+        self.modal_root = self.find_modal_overlay();
+        if let Some(modal) = self.modal_root {
+            self.flow_node(modal, &ctx);
+        } else {
+            for child in self.dom.children(root) {
+                self.flow_node(child, &ctx);
+            }
+        }
+        self.flush_block();
+        self.finish_floats();
     }
 
     fn flow_node(&mut self, id: NodeId, ctx: &Ctx) {
@@ -1111,12 +1263,16 @@ impl<'a> Layout<'a> {
         // `inline-flex;float:left` toggle that otherwise dropped to its own
         // row. A block-level floated flex child (a latest-post avatar `<div
         // float:left>`) keeps floating, so its sibling text still wraps beside.
-        // We also drop a float inside an out-of-flow (absolute/fixed) ancestor,
-        // which we already render as a compact inline overlay — honoring the
-        // float there just splits the overlay (a search bar's magnifier `<i
-        // float:left>` in an absolutely-positioned icon span).
+        // Same INLINE-only rule inside an out-of-flow (absolute/fixed) ancestor:
+        // we render small overlays as a compact inline run, so an inline-level
+        // float there would split it (a search bar's magnifier `<i float:left>`
+        // in an absolutely-positioned icon span) — but a BLOCK-level float inside
+        // an absolutely-positioned CONTAINER must still float (the abspos box is
+        // its formatting context). That's Steam's `.supernav_container`
+        // (`position:absolute`) holding `display:block;float:left` nav items: a
+        // horizontal floated row, not a vertical stack.
         let drop_float = (self.parent_is_flex_container(id) && self.is_inline_level(id))
-            || self.parent_out_of_flow(id);
+            || (self.parent_out_of_flow(id) && self.is_inline_box(id));
         if self.float_skip != Some(id)
             && !drop_float
             && let Some(side) = self.float_side(id)
@@ -1125,10 +1281,13 @@ impl<'a> Layout<'a> {
             return;
         }
         // A slide deck (a container whose children are ALL absolutely
-        // positioned, so they overlap) renders one slide at a time, paged by
-        // generated controls — a carousel of stacked slides. Checked before
-        // the tag dispatch so an inline `<a>` wrapping the slides still routes.
-        if self.dom.is_slideshow_container(id) {
+        // positioned, so they OVERLAP at one spot) renders one slide at a time,
+        // paged by generated controls — a carousel of stacked slides. Checked
+        // before the tag dispatch so an inline `<a>` wrapping the slides still
+        // routes. A virtual-scroll list ALSO has all-absolute children, but they
+        // TILE at distinct `top`s instead of overlapping; that's a positioned
+        // row stack (flowed as rows below), not a deck.
+        if self.dom.is_slideshow_container(id) && !self.has_positioned_row_stack(id) {
             self.flow_slideshow(id);
             return;
         }
@@ -1168,6 +1327,13 @@ impl<'a> Layout<'a> {
         // inherits and applies the UA tag defaults (`<b>` bold, `<i>` italic),
         // and `text_decoration` propagates `<u>`/`<s>` + author rules.
         let mut cctx = ctx.clone();
+        // Geometry measurement: attribute every item to its nearest element so
+        // `measure_boxes` can recover per-element boxes. A descendant element
+        // overrides this with its own id, so each item carries the closest
+        // enclosing element. No effect on rendering (flag is off there).
+        if self.tag_all_nodes {
+            cctx.node = id;
+        }
         match tag.as_str() {
             "a" => {
                 if let Some(href) = self.dom.attr(id, "href") {
@@ -1536,6 +1702,14 @@ impl<'a> Layout<'a> {
 
         if block_like {
             self.flush_block();
+            // A positioned-row-stack member (a virtual list's row) that produced
+            // no rows — a BLANK line, e.g. an empty line in a code view — must
+            // still occupy ONE row, or the parallel column (the line-number
+            // gutter) slides up under the wrong line. Each positioned row is a
+            // discrete line; an empty one is a blank line, not nothing.
+            if self.rows.len() == corner_start_row && self.in_positioned_row_stack(id) {
+                self.rows.push(Row::default());
+            }
             // Flush this BFC's own floats within it (sizing the box to
             // contain them), then restore the outer float context.
             if let Some(outer) = saved_floats {
@@ -1834,6 +2008,23 @@ impl<'a> Layout<'a> {
         )
     }
 
+    /// Whether `id` is an inline-level box by its EFFECTIVE display — the
+    /// author's cascaded `display` if set, otherwise the tag's UA default
+    /// (`<i>`/`<span>`/`<a>` inline, `<div>`/`<li>`/headings block). Unlike
+    /// `is_inline_level` (cascade-only, blind to UA defaults) this sees an
+    /// un-styled `<i>` as inline. Distinguishes a small floated overlay glyph
+    /// we render compactly (erome's `<i float:left>`) from a real floated
+    /// layout block (Steam's `display:block;float:left` nav item).
+    fn is_inline_box(&self, id: NodeId) -> bool {
+        match self.dom.computed_display(id).as_deref() {
+            Some(d) => matches!(d, "inline" | "inline-block" | "inline-flex" | "inline-grid"),
+            None => {
+                let tag = self.dom.tag_name(id).unwrap_or("");
+                tag != "li" && !BLOCK.contains(&tag)
+            }
+        }
+    }
+
     /// Whether every flex item of `id` is an inline-by-default element (a nav
     /// link's icon `<i>` + text `<span>`, a split button) — so the box is a
     /// single inline run, not a column of block rows. Keyed on each child's
@@ -1857,6 +2048,15 @@ impl<'a> Layout<'a> {
         )
     }
 
+    /// The children that form a positioned (virtual-scroll) stack: ≥2
+    /// `position:absolute` element children that set `top`, with ≥2 DISTINCT
+    /// `top` values (so they tile vertically — a virtual list — rather than
+    /// overlapping at one corner like stacked badges). Returned sorted by `top`
+    /// ascending, so a scroller's pixel-positioned rows lay in their true
+    /// vertical order instead of collapsing into one inline pile. Corner
+    /// overlays are excluded (they keep their right-aligned first-row path);
+    /// when the children don't look like a positioned list this returns empty,
+    /// leaving the compact inline-overlay behavior for badges/backdrops intact.
     /// The direct children of a positioned block that are top-right corner
     /// overlays — `position:absolute`, anchored to the right edge (`right` set,
     /// `left` auto) at the TOP (no `bottom` anchor). The web's badge/menu-in-
@@ -1900,18 +2100,105 @@ impl<'a> Layout<'a> {
     }
 
     /// Whether an element is taken out of normal flow by `position:absolute`
-    /// or `fixed` (an overlay we render compactly inline, since we can't
-    /// position it).
+    /// or `fixed` — an overlay we render compactly inline, since we can't
+    /// pixel-position it.
+    ///
+    /// EXCEPTION: an absolutely-positioned element that is one of several
+    /// positioned siblings tiling at DISTINCT `top`s is laid IN FLOW as a block
+    /// (`in_positioned_row_stack`). That's a positioned LAYOUT — a virtual
+    /// scroller's rows, a positioned column of items — not a lone overlay; a
+    /// browser places each at its `top`, so collapsing them all onto one inline
+    /// line (the way we treat a badge) is simply wrong. We can't honor the
+    /// pixel `top`, but flowing them as blocks in document order keeps them on
+    /// their own rows in the right sequence (CLAUDE.md: bend compliance only as
+    /// the terminal forces — position by document order, not pixels).
     fn is_out_of_flow(&self, id: NodeId) -> bool {
         // The surfaced modal flows as a normal block (its content IS the page
         // now), not the compact inline overlay we give other out-of-flow boxes.
         if Some(id) == self.modal_root {
             return false;
         }
-        matches!(
+        if !matches!(
             self.dom.computed_style(id, "position").as_deref(),
             Some("absolute" | "fixed")
-        )
+        ) {
+            return false;
+        }
+        !self.in_positioned_row_stack(id)
+    }
+
+    /// Whether `id` is one of several absolutely-positioned siblings that tile
+    /// at DISTINCT `top` offsets — a positioned layout (a virtual list's rows),
+    /// as opposed to a lone overlay/badge or a deck of OVERLAPPING slides (same
+    /// `top`). Cheap-gated: only an element that is itself a positioned row with
+    /// a `top` pays the sibling scan.
+    fn in_positioned_row_stack(&self, id: NodeId) -> bool {
+        self.abs_top_px(id).is_some()
+            && self
+                .dom
+                .parent_composed(id)
+                .is_some_and(|p| self.has_positioned_row_stack(p))
+    }
+
+    /// Whether `id`'s children form a positioned row stack: ≥2 absolutely-
+    /// positioned children that tile at DISTINCT `top`s. This is what tells a
+    /// virtual-scroll list (rows at increasing tops) apart from a slide deck
+    /// (slides OVERLAPPING at the same top) or a lone overlay — the former
+    /// flows as rows, the latter two keep their own paths.
+    fn has_positioned_row_stack(&self, id: NodeId) -> bool {
+        let mut first: Option<f32> = None;
+        let mut count = 0u32;
+        let mut distinct = false;
+        for c in self.dom.children(id) {
+            if let Some(t) = self.row_top_px(c) {
+                count += 1;
+                match first {
+                    None => first = Some(t),
+                    Some(f) if (t - f).abs() > f32::EPSILON => distinct = true,
+                    _ => {}
+                }
+            }
+        }
+        count >= 2 && distinct
+    }
+
+    /// A positioned row's `top` in pixels: the element's own absolute `top`, or
+    /// the `top` of an absolute child it wraps (a virtual list wraps each row in
+    /// an inline `<a>` whose absolute inner cell carries the `top`). `None` when
+    /// neither is a positioned-with-`top` box. Reads `position`/`top` directly
+    /// (not `is_out_of_flow`) to avoid recursion.
+    fn row_top_px(&self, id: NodeId) -> Option<f32> {
+        if let Some(t) = self.abs_top_px(id) {
+            return Some(t);
+        }
+        self.dom
+            .children(id)
+            .into_iter()
+            .filter(|&c| matches!(self.dom.node(c).data, NodeData::Element { .. }))
+            .find_map(|c| self.abs_top_px(c))
+    }
+
+    /// An element's explicit `top` as a pixel number when it is `position:
+    /// absolute|fixed`; `None` otherwise or when `top` is unset/`auto`. Only the
+    /// magnitude matters (for distinguishing distinct rows); placement is by
+    /// document order.
+    fn abs_top_px(&self, id: NodeId) -> Option<f32> {
+        if !matches!(
+            self.dom.computed_style(id, "position").as_deref(),
+            Some("absolute" | "fixed")
+        ) {
+            return None;
+        }
+        let v = self.dom.computed_style(id, "top")?;
+        let v = v.trim();
+        if v.is_empty() || v == "auto" {
+            return None;
+        }
+        let num: String = v
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+            .collect();
+        num.parse::<f32>().ok()
     }
 
     /// Whether `id` is the surfaced modal overlay or sits inside it — so its
@@ -5463,6 +5750,72 @@ mod tests {
         lay_out(&dom, &base, width, &[], &ControlMap::new(), images, false)
     }
 
+    fn measure(html: &str, width: usize) -> (Dom, HashMap<NodeId, PxRect>) {
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let boxes = measure_boxes(&dom, &base, width, &[], &ControlMap::new(), (8, 16), false);
+        (dom, boxes)
+    }
+
+    #[test]
+    fn measure_boxes_reports_cell_boxes_and_unions_into_ancestors() {
+        let (dom, m) = measure(
+            r#"<body><div id="wrap"><span id="a">AB</span><span id="b">CD</span></div></body>"#,
+            40,
+        );
+        let by_id = |id: &str| {
+            let n = dom
+                .descendants(DOCUMENT)
+                .into_iter()
+                .find(|&n| dom.attr(n, "id") == Some(id))
+                .unwrap();
+            *m.get(&n)
+                .unwrap_or_else(|| panic!("{id} should have a laid-out box"))
+        };
+        let a = by_id("a");
+        let b = by_id("b");
+        let wrap = by_id("wrap");
+        // Each "AB"/"CD" is 2 cells wide; cell_px is 8x16 → 16px wide, 16px tall.
+        assert_eq!(a.width, 16.0);
+        assert_eq!(a.height, 16.0);
+        assert_eq!(b.width, 16.0);
+        // The two inline spans sit side by side on the same row.
+        assert_eq!(a.top, b.top);
+        assert_eq!(b.left, a.left + a.width);
+        // The wrapping block's box spans both children — the ancestor union, so
+        // a block reports the bounding box of its content (what gBCR requires).
+        assert_eq!(wrap.left, a.left);
+        assert_eq!(wrap.top, a.top);
+        assert_eq!(wrap.width, 32.0);
+        assert_eq!(wrap.height, 16.0);
+    }
+
+    #[test]
+    fn measure_boxes_stacks_blocks_vertically() {
+        // Two stacked blocks: the second's box sits strictly below the first's,
+        // proving the y coordinate tracks document rows (cell_px height 16).
+        let (dom, m) = measure(
+            r#"<body><div id="top">one</div><div id="bot">two</div></body>"#,
+            40,
+        );
+        let by_id = |id: &str| {
+            let n = dom
+                .descendants(DOCUMENT)
+                .into_iter()
+                .find(|&n| dom.attr(n, "id") == Some(id))
+                .unwrap();
+            *m.get(&n).unwrap()
+        };
+        let top = by_id("top");
+        let bot = by_id("bot");
+        assert!(
+            bot.top >= top.top + top.height,
+            "second block ({}) should start at or below the first's bottom ({})",
+            bot.top,
+            top.top + top.height
+        );
+    }
+
     #[test]
     #[ignore = "manual diagnostic: TRUST_LAYOUT_DIAG=<file> TRUST_LAYOUT_W=<cols>"]
     fn layout_diag() {
@@ -6577,6 +6930,52 @@ mod tests {
     }
 
     #[test]
+    fn absolutely_positioned_sibling_rows_flow_as_rows_not_one_pile() {
+        // A browser places `position:absolute` children at their `top`. When a
+        // positioned container holds several such siblings at DISTINCT tops (a
+        // positioned layout — any virtual scroller's rows), we can't pixel-place
+        // them, but they must each take their own row in document order, NOT
+        // collapse onto one inline line. (The single-overlay/badge case keeps
+        // the compact inline path — see the overlay tests.)
+        let rows = lay(
+            r#"<body><div style="position:relative;height:60px">
+                 <div style="position:absolute;top:0px">alpha</div>
+                 <div style="position:absolute;top:20px">beta</div>
+                 <div style="position:absolute;top:40px">gamma</div>
+               </div></body>"#,
+            40,
+        );
+        let t = texts(&rows);
+        let pos = |s: &str| t.iter().position(|l| l.contains(s)).unwrap();
+        assert!(
+            pos("alpha") < pos("beta") && pos("beta") < pos("gamma"),
+            "rows in document order: {t:?}"
+        );
+        assert!(
+            !t.iter().any(|l| l.contains("alpha") && l.contains("beta")),
+            "rows are not piled onto one line: {t:?}"
+        );
+    }
+
+    #[test]
+    fn a_lone_absolute_overlay_still_flows_inline_not_as_its_own_block() {
+        // The general rule must NOT disturb a single positioned overlay/badge:
+        // with no distinct-top sibling it stays on the compact inline path, so
+        // the content it overlays still leads.
+        let rows = lay(
+            r#"<body><div style="position:relative">label
+                 <span style="position:absolute;top:0;right:0">x</span>
+               </div></body>"#,
+            40,
+        );
+        let t = texts(&rows);
+        assert!(
+            t.first().is_some_and(|l| l.contains("label")),
+            "the lone overlay didn't push content into its own stack: {t:?}"
+        );
+    }
+
+    #[test]
     fn a_nowrap_box_without_overflow_clip_is_not_truncated() {
         // `nowrap` alone (no overflow clip) still overflows, as before — only
         // the clip context truncates.
@@ -6682,6 +7081,35 @@ mod tests {
         assert_eq!(
             real_rows, 1,
             "the absolute overlay's float doesn't break the line"
+        );
+    }
+
+    #[test]
+    fn block_floats_in_an_absolute_container_pack_horizontally() {
+        // Steam's `#global_header` nav: a `position:absolute` `.supernav_container`
+        // holding `display:block;float:left` menu items. The abspos box is the
+        // floats' formatting context, so they pack into one horizontal row — not
+        // the vertical stack we'd get if the abspos parent dropped its BLOCK
+        // floats (inline-level floats there still drop — see the overlay test
+        // above). Regression for the Steam header stacking vertically.
+        let rows = lay(
+            r#"<body><div style="position:absolute">
+               <a style="display:block;float:left">STORE</a>
+               <a style="display:block;float:left">COMMUNITY</a>
+               <a style="display:block;float:left">ABOUT</a>
+               </div></body>"#,
+            80,
+        );
+        let row_of = |label: &str| {
+            rows.iter()
+                .position(|r| r.items.iter().any(|i| i.text.contains(label)))
+                .unwrap_or_else(|| panic!("{label} laid out: {:?}", texts(&rows)))
+        };
+        let (s, c, a) = (row_of("STORE"), row_of("COMMUNITY"), row_of("ABOUT"));
+        assert!(
+            s == c && c == a,
+            "the three block floats share one row (got STORE@{s} COMMUNITY@{c} ABOUT@{a}): {:?}",
+            texts(&rows)
         );
     }
 

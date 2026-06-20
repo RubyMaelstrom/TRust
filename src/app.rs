@@ -17,6 +17,7 @@ use tui_term::vt100;
 
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
+use ratatui_image::sliced::SlicedProtocol;
 
 use crate::cp437;
 use crate::doc::{Doc, Link};
@@ -310,14 +311,36 @@ struct ImgLoadMsg {
     decoded: Option<DecodedImage>,
 }
 
-/// Cache/dedup key for an encoded inline image: URL, cell box, and whether it
-/// was `object-fit: cover`-cropped (the same image+box can render Fit or Crop).
-type EncKey = (String, u16, u16, bool);
+/// Cache/dedup key for an encoded inline image: URL, cell box `(w, h)`, and
+/// whether it was `object-fit: cover`-cropped (the same image+box can render
+/// Fit or Crop). The key is SCROLL-INDEPENDENT: each box encodes ONCE to a
+/// `SlicedProtocol` that the renderer (`ui::render_inline_images`) clips to any
+/// vertical slice at draw time, so scrolling a tall image never re-encodes it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct EncKey {
+    pub(crate) url: String,
+    pub(crate) w: u16,
+    pub(crate) h: u16,
+    pub(crate) crop: bool,
+}
 
-/// One inline-image box finished encoding to a terminal protocol.
+impl EncKey {
+    /// The cache key for an image item's box. Shared by the encode pass and the
+    /// renderer so they key (and so find) the same encoded protocol.
+    pub(crate) fn for_item(url: &str, item: &crate::layout::Item) -> Self {
+        EncKey {
+            url: url.to_string(),
+            w: item.width,
+            h: item.height,
+            crop: item.crop,
+        }
+    }
+}
+
+/// One inline-image box finished encoding to a sliced terminal protocol.
 struct EncMsg {
     key: EncKey,
-    protocol: Option<Protocol>,
+    protocol: Option<SlicedProtocol>,
 }
 
 /// Cap a decoded image's natural cell box (never upscales; preserves
@@ -443,8 +466,10 @@ pub struct App {
     /// In-flight parallel page-image fetch+decode batch.
     imgs_rx: Option<mpsc::Receiver<ImgLoadMsg>>,
     /// Encoded inline-image protocols, keyed by `(url, cell_w, cell_h, crop)`.
-    /// Scroll doesn't change the box, so it never re-encodes on scroll.
-    pub(crate) image_protocols: HashMap<EncKey, Protocol>,
+    /// Each is a `SlicedProtocol` (encoded once for the whole box; the renderer
+    /// clips it to any vertical slice), so scroll never re-encodes. Bounded to
+    /// the on-screen set by `sync_image_encodes` (entries scrolled away evict).
+    pub(crate) image_protocols: HashMap<EncKey, SlicedProtocol>,
     /// Boxes currently being encoded (one async encode per key in flight).
     /// Non-empty drives the loading pulse (the channel is persistent so it
     /// can't gate the pulse itself).
@@ -1641,61 +1666,59 @@ impl App {
         }
     }
 
-    /// Encode every inline image that is fully visible in the current
-    /// viewport but not yet encoded for its box. Runs each encode on a
-    /// blocking task (parallel), keyed by `(url, w, h)` so scroll — which
-    /// never changes the box — never re-encodes. Called each loop tick
-    /// before the draw, like `sync_browser_wrap`.
+    /// Encode every inline image whose box reaches the current viewport but
+    /// isn't yet encoded. One `SlicedProtocol` per box, on a blocking task
+    /// (parallel), keyed by `(url, w, h, crop)` so scroll — which never changes
+    /// the box — never re-encodes (the renderer slices the cached protocol).
+    /// Also EVICTS protocols whose boxes have scrolled out of range, so the
+    /// cache stays bounded to the on-screen set instead of growing for the
+    /// whole session. Called each loop tick before the draw, like
+    /// `sync_browser_wrap`.
     fn sync_image_encodes(&mut self) {
-        let (vw, vh) = (self.last_inner.0, self.last_inner.1);
+        let vh = self.last_inner.1;
         let Some(g) = &self.browser else { return };
         if !g.doc.laid_out() {
             return;
         }
         let end = (g.scroll + vh as usize).min(g.doc.rows.len());
-        let mut wanted: Vec<EncKey> = Vec::new();
-        for (r, row) in g.doc.rows[g.scroll..end].iter().enumerate() {
-            let top = r as u16; // viewport-relative row of this line
+        // Start the scan above the viewport top: a tall image whose top row is
+        // already scrolled off the top still reaches down into view (the
+        // renderer draws its lower slice).
+        let start = g.scroll.saturating_sub(crate::layout::MAX_IMAGE_LOOKBACK);
+        let mut live: HashSet<EncKey> = HashSet::new();
+        for (off, row) in g.doc.rows[start..end].iter().enumerate() {
+            let doc_row = start + off;
             for item in &row.items {
                 let Some(url) = &item.image else { continue };
                 // Apply the carousel scroll/clip exactly as the renderer does
-                // (`visible_col`): a strip image scrolled into the band needs
-                // encoding now, one scrolled out doesn't. Without this the
-                // encode keyed on the raw strip column, so cards beyond the
-                // first viewport's worth stayed blank once scrolled in.
-                let Some(scol) = crate::layout::visible_col(&g.doc.carousels, g.scroll + r, item)
-                else {
-                    continue;
-                };
-                // Only fully-visible boxes render (stateless Image refuses
-                // to clip sixel); skip the rest until scrolled into view.
-                if scol + item.width > vw || top + item.height > vh {
+                // (`visible_col`): a strip image scrolled into the band is live,
+                // one scrolled out of the band isn't.
+                if crate::layout::visible_col(&g.doc.carousels, doc_row, item).is_none() {
                     continue;
                 }
-                let key = (url.clone(), item.width, item.height, item.crop);
-                if !self.image_protocols.contains_key(&key)
-                    && !self.image_encoding.contains(&key)
-                    && !wanted.contains(&key)
-                {
-                    wanted.push(key);
-                }
+                live.insert(EncKey::for_item(url, item));
             }
         }
+        // Bound the cache: drop protocols for boxes no longer in range.
+        self.image_protocols.retain(|k, _| live.contains(k));
+        let wanted: Vec<EncKey> = live
+            .into_iter()
+            .filter(|k| !self.image_protocols.contains_key(k) && !self.image_encoding.contains(k))
+            .collect();
         for key in wanted {
             self.request_image_encode(key);
         }
     }
 
-    /// Spawn one blocking encode of a decoded image to a terminal protocol
-    /// for the given cell box; the result lands over `enc_rx`.
+    /// Spawn one blocking encode of a decoded image to a sliced terminal
+    /// protocol for the given cell box; the result lands over `enc_rx`.
     fn request_image_encode(&mut self, key: EncKey) {
-        let Some(decoded) = self.image_cache.get(&key.0) else {
+        let Some(decoded) = self.image_cache.get(&key.url) else {
             return;
         };
         let raw = decoded.raw.clone();
         let picker = self.picker.clone();
         let tx = self.enc_tx.clone();
-        let (_, w, h, crop) = key.clone();
         self.image_encoding.insert(key.clone());
         tokio::task::spawn_blocking(move || {
             // Runs on a tokio BLOCKING thread. Sandbox it: a decode/encode
@@ -1703,9 +1726,10 @@ impl App {
             // on an odd box) must fail this ONE image to alt text, never
             // unwind the worker. The terminal is safe regardless — only the
             // run-loop thread restores it (see TERMINAL_OWNER).
+            let box_size = ratatui::layout::Size::new(key.w, key.h);
             let protocol = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::img::decode(&raw).ok().and_then(|(image, _)| {
-                    crate::img::encode(&picker, image, ratatui::layout::Size::new(w, h), crop).ok()
+                    crate::img::encode_sliced(&picker, image, box_size, key.crop).ok()
                 })
             }))
             .ok()
@@ -4870,15 +4894,15 @@ mod tests {
                 .rows
                 .iter()
                 .flat_map(|r| &r.items)
-                .filter_map(|it| it.image.clone().map(|u| (u, it.width, it.height, it.crop)))
+                .filter_map(|it| it.image.as_deref().map(|u| super::EncKey::for_item(u, it)))
                 .collect();
             for key in keys {
                 if app.image_protocols.contains_key(&key) {
                     continue;
                 }
                 let (image, _) = crate::img::decode(&png).unwrap();
-                let size = ratatui::layout::Size::new(key.1, key.2);
-                if let Ok(proto) = crate::img::encode(&app.picker, image, size, key.3) {
+                let size = ratatui::layout::Size::new(key.w, key.h);
+                if let Ok(proto) = crate::img::encode_sliced(&app.picker, image, size, key.crop) {
                     app.image_protocols.insert(key, proto);
                 }
             }
@@ -4890,6 +4914,92 @@ mod tests {
                 term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
             }
         }
+    }
+
+    /// The core of the `SlicedProtocol` switch: a box encodes ONCE and every
+    /// scroll position reuses it (the key is scroll-independent), so scrolling a
+    /// tall image never re-encodes — and a box scrolled out of range is evicted
+    /// so the cache stays bounded to the on-screen set.
+    #[tokio::test]
+    async fn scrolling_reuses_one_encode_and_evicts_when_out_of_range() {
+        use ratatui::layout::Size;
+        let png = crate::img::red_png();
+        let (decoded, _) = crate::img::decode(&png).unwrap();
+        let cell = super::natural_cell_box(&decoded, (8u16, 16u16).into());
+        let base = url::Url::parse("https://ex.com/").unwrap();
+        let mut images = crate::layout::ImageSizes::new();
+        images.insert("https://ex.com/banner.png".to_string(), cell);
+        // Image near the top, then a long column of text (> MAX_IMAGE_LOOKBACK
+        // rows) so it can scroll entirely out of the encode scan range.
+        let mut body = String::from(r#"<body><img src="/banner.png">"#);
+        for i in 0..320 {
+            body.push_str(&format!("<p>line {i}</p>"));
+        }
+        body.push_str("</body>");
+
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (40, 12);
+        let doc = crate::http::parse(
+            &base,
+            "text/html; charset=utf-8",
+            body.as_bytes(),
+            40,
+            &images,
+        );
+        app.navigate_to(doc);
+        // Seed the decoded cache + ONE box-keyed encode, as the pipeline would.
+        app.image_cache.insert(
+            "https://ex.com/banner.png".to_string(),
+            super::DecodedImage {
+                raw: png.clone().into(),
+                cell,
+            },
+        );
+        let key = app
+            .browser
+            .as_ref()
+            .unwrap()
+            .doc
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find_map(|it| it.image.as_deref().map(|u| super::EncKey::for_item(u, it)))
+            .expect("an image item is laid out");
+        let proto =
+            crate::img::encode_sliced(&app.picker, decoded, Size::new(key.w, key.h), key.crop)
+                .unwrap();
+        app.image_protocols.insert(key.clone(), proto);
+
+        // Scroll line-by-line through the image: the box key is scroll-invariant,
+        // so it is ALREADY cached and sync requests NOTHING new (no per-line
+        // re-encode) and never drops the still-visible encode.
+        for scroll in 0..8usize {
+            app.browser.as_mut().unwrap().scroll = scroll;
+            app.sync_image_encodes();
+            assert!(
+                app.image_encoding.is_empty(),
+                "scroll {scroll} spawned a re-encode"
+            );
+            assert!(
+                app.image_protocols.contains_key(&key),
+                "scroll {scroll} dropped the visible encode"
+            );
+        }
+
+        // Scrolled far past the image (beyond the look-back window): it's evicted
+        // so the protocol cache stays bounded to the on-screen set.
+        let total = app.browser.as_ref().unwrap().doc.rows.len();
+        let far = total.saturating_sub(12);
+        assert!(
+            far > crate::layout::MAX_IMAGE_LOOKBACK + key.h as usize,
+            "page must be tall enough to scroll the image fully out of range"
+        );
+        app.browser.as_mut().unwrap().scroll = far;
+        app.sync_image_encodes();
+        assert!(
+            !app.image_protocols.contains_key(&key),
+            "an off-screen image's encode should be evicted (#3)"
+        );
     }
 
     /// The image-encode sandbox contract: a panic on the blocking thread

@@ -82,6 +82,14 @@ pub struct Dom {
     /// layout's per-element reads would re-walk without this; cleared when
     /// the epoch advances.
     computed_cache: RefCell<ComputedCache>,
+    /// Memoized selector-match results for the current epoch: for an element,
+    /// the indices (into its tree scope's rule vec) of every author rule whose
+    /// selector matches it. Selector matching is the cascade's dominant cost on
+    /// CSS-heavy pages, and the layout/serializer read 30+ properties per
+    /// element — without this each read re-matched every rule (O(elements ×
+    /// rules × props)). With it, each element is matched ONCE per epoch (via the
+    /// rightmost-key buckets), then every property/pseudo read reuses the list.
+    matched_cache: RefCell<MatchedCache>,
     /// The CSS-pixel viewport (`cols*cell_px`, `rows*cell_px`) used to
     /// evaluate `@media` queries when the cascade is built; `(0, 0)` = unknown
     /// (width/height queries then conservatively don't match, as if skipped).
@@ -94,6 +102,14 @@ pub struct Dom {
 type ComputedCache = (
     u64,
     std::collections::HashMap<(NodeId, usize), Option<String>>,
+);
+
+/// Per-epoch memo for `matched_rules`: the epoch the entries are valid for, and
+/// the matching author-rule indices (into the element's tree-scope rule vec)
+/// per element, shared via `Rc` so every property read clones cheaply.
+type MatchedCache = (
+    u64,
+    std::collections::HashMap<NodeId, std::rc::Rc<Vec<u32>>>,
 );
 
 /// The document node is always index 0.
@@ -117,6 +133,7 @@ impl Dom {
             external_sheets: std::collections::HashMap::new(),
             style_cache: RefCell::new(None),
             computed_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
+            matched_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
             viewport_px: (0, 0),
         };
         dom.new_node(NodeData::Document);
@@ -126,6 +143,13 @@ impl Dom {
     /// True when anything mutated since the last call; resets the flag.
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
+    }
+
+    /// The monotonic mutation counter. Anything memoized against the DOM's
+    /// current shape (the geometry box map in `js.rs`, like the cascade
+    /// caches here) keys on this and rebuilds when it advances.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Every mutation comes through here: the dirty bit for the living
@@ -717,10 +741,11 @@ impl Dom {
         }
         let index = self.style_index();
         if let Some(rules) = index.scopes.get(&self.tree_scope(id)) {
-            for r in rules {
+            for &ri in self.matched_rules(id).iter() {
+                let r = &rules[ri as usize];
                 // `div::before{…}` rules target a generated box, not the
                 // element — skip them in the element-property cascade.
-                if rule_pseudo(r).is_some() || !self.matches_complex(id, &r.selector.0, None) {
+                if rule_pseudo(r).is_some() {
                     continue;
                 }
                 for (pk, (imp, v)) in &r.decls {
@@ -809,8 +834,9 @@ impl Dom {
         let index = self.style_index();
         let rules = index.scopes.get(&self.tree_scope(id))?;
         let mut winner: Option<(CascadeKey, String)> = None;
-        for r in rules {
-            if rule_pseudo(r) != Some(which) || !self.matches_complex(id, &r.selector.0, None) {
+        for &ri in self.matched_rules(id).iter() {
+            let r = &rules[ri as usize];
+            if rule_pseudo(r) != Some(which) {
                 continue;
             }
             for (pk, (imp, v)) in &r.decls {
@@ -842,8 +868,9 @@ impl Dom {
         let index = self.style_index();
         let rules = index.scopes.get(&self.tree_scope(id))?;
         let mut winner: Option<(CascadeKey, String)> = None;
-        for r in rules {
-            if rule_pseudo(r) != Some(which) || !self.matches_complex(id, &r.selector.0, None) {
+        for &ri in self.matched_rules(id).iter() {
+            let r = &rules[ri as usize];
+            if rule_pseudo(r) != Some(which) {
                 continue;
             }
             for (pk, (imp, v)) in &r.decls {
@@ -957,7 +984,85 @@ impl Dom {
             .values()
             .flatten()
             .any(|r| r.decls.iter().any(|(k, _)| k == "opacity"));
+        // Build the rightmost-key buckets so `matched_rules` tests only
+        // candidate rules per element instead of the whole scope.
+        index.buckets = index
+            .scopes
+            .iter()
+            .map(|(scope, rules)| (*scope, RuleBuckets::build(rules)))
+            .collect();
         index
+    }
+
+    /// The author rules (by index into the element's tree-scope rule vec) whose
+    /// selectors match `id`, in the cascade context (no `:scope` root).
+    /// Memoized per epoch: matching is the cascade's hot cost and the layout /
+    /// serializer read 30+ properties per element, so doing it once and reusing
+    /// the list is what keeps a CSS-heavy page (GitHub: ~8k rules) from going
+    /// O(elements × rules × props). Candidate rules come from the rightmost-key
+    /// buckets; only those are full-matched.
+    fn matched_rules(&self, id: NodeId) -> std::rc::Rc<Vec<u32>> {
+        {
+            let cache = self.matched_cache.borrow();
+            if cache.0 == self.epoch
+                && let Some(hit) = cache.1.get(&id)
+            {
+                return hit.clone();
+            }
+        }
+        let index = self.style_index();
+        let scope = self.tree_scope(id);
+        let matched = match (index.scopes.get(&scope), index.buckets.get(&scope)) {
+            (Some(rules), Some(b)) => {
+                let mut out: Vec<u32> = Vec::new();
+                let test = |dom: &Dom, ri: u32, out: &mut Vec<u32>| {
+                    if dom.matches_complex(id, &rules[ri as usize].selector.0, None) {
+                        out.push(ri);
+                    }
+                };
+                for &ri in &b.universal {
+                    test(self, ri, &mut out);
+                }
+                if let Some(idv) = self.attr(id, "id")
+                    && let Some(v) = b.by_id.get(idv)
+                {
+                    for &ri in v {
+                        test(self, ri, &mut out);
+                    }
+                }
+                if let Some(classes) = self.attr(id, "class") {
+                    for cls in classes.split_ascii_whitespace() {
+                        if let Some(v) = b.by_class.get(cls) {
+                            for &ri in v {
+                                test(self, ri, &mut out);
+                            }
+                        }
+                    }
+                }
+                if let Some(tag) = self.tag_name(id)
+                    && let Some(v) = b.by_tag.get(tag)
+                {
+                    for &ri in v {
+                        test(self, ri, &mut out);
+                    }
+                }
+                // Cascade order is carried by each rule's `order` (the cascade
+                // tiebreaker), so the matched list need not be ordered — but
+                // sort for deterministic iteration, and dedup so a repeated
+                // class token (`class="box box"`) can't list a rule twice.
+                out.sort_unstable();
+                out.dedup();
+                std::rc::Rc::new(out)
+            }
+            _ => std::rc::Rc::new(Vec::new()),
+        };
+        let mut cache = self.matched_cache.borrow_mut();
+        if cache.0 != self.epoch {
+            cache.0 = self.epoch;
+            cache.1.clear();
+        }
+        cache.1.insert(id, matched.clone());
+        matched
     }
 
     /// adoptedStyleSheets text for a scope (DOCUMENT or a shadow root),
@@ -1060,6 +1165,68 @@ impl Dom {
 
     pub fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
         self.shadow_roots.get(&host).copied()
+    }
+
+    /// Composed-tree element ids whose tag is `name`, in document (pre-)order,
+    /// piercing shadow roots — the catch-up upgrade set `customElements.define`
+    /// needs. Done in Rust as a pointer walk (no per-node child Vec, no JS
+    /// wrapper) because the prelude formerly walked the whole tree per `define`
+    /// in JS — a `__dom_children`/`wrap` storm that dominated big-page boot
+    /// (GitHub: ~O(defines × 16.8k nodes)).
+    pub fn elements_by_tag_composed(&self, root: NodeId, name: &str) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        if !self.is_valid(root) {
+            return out;
+        }
+        let mut stack: Vec<NodeId> = vec![root];
+        while let Some(id) = stack.pop() {
+            if self.tag_name(id) == Some(name) {
+                out.push(id);
+            }
+            self.push_composed_children(id, &mut stack);
+        }
+        out
+    }
+
+    /// Composed-tree element ids (root included, shadow-piercing, document
+    /// order) whose tag is a custom-element name — i.e. contains a hyphen (the
+    /// HTML naming rule for autonomous custom elements). Backs `ceScan`'s
+    /// insertion-time upgrade/connect pass: the prelude can then touch only the
+    /// custom-element candidates instead of wrapping every node in the inserted
+    /// subtree.
+    pub fn custom_elements_composed(&self, root: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        if !self.is_valid(root) {
+            return out;
+        }
+        let mut stack: Vec<NodeId> = vec![root];
+        while let Some(id) = stack.pop() {
+            if self.tag_name(id).is_some_and(|t| t.contains('-')) {
+                out.push(id);
+            }
+            self.push_composed_children(id, &mut stack);
+        }
+        out
+    }
+
+    /// Push `id`'s composed children (light children, then shadow-root
+    /// children) onto `stack` in reverse, so a LIFO pop yields them in
+    /// document order (pre-order: a parent is processed before its children).
+    fn push_composed_children(&self, id: NodeId, stack: &mut Vec<NodeId>) {
+        let start = stack.len();
+        let mut c = self.nodes[id].first_child;
+        while let Some(cid) = c {
+            stack.push(cid);
+            c = self.nodes[cid].next_sibling;
+        }
+        if let Some(shadow) = self.shadow_root(id) {
+            let mut c = self.nodes[shadow].first_child;
+            while let Some(cid) = c {
+                stack.push(cid);
+                c = self.nodes[cid].next_sibling;
+            }
+        }
+        stack[start..].reverse();
     }
 
     /// Where innerHTML-ish operations land: a template's content
@@ -2690,6 +2857,11 @@ fn consider(slot: &mut Option<(CascadeKey, String)>, key: CascadeKey, value: &st
 #[derive(Default)]
 struct StyleIndex {
     scopes: std::collections::HashMap<NodeId, Vec<StyleRule>>,
+    /// Per-scope rule index, keyed by each rule's rightmost-compound key
+    /// (id/class/tag/universal) — the standard browser "rule hash" so an
+    /// element only tests rules that could possibly match it (see
+    /// `matched_rules`). Parallel to `scopes`; values index into it.
+    buckets: std::collections::HashMap<NodeId, RuleBuckets>,
     /// `@keyframes <name>` → the animation's END opacity (the `to`/`100%`
     /// keyframe), for honoring an `animation-fill-mode:forwards` reveal/hide.
     /// Only opacity is extracted (the one keyframe property visibility needs).
@@ -2697,6 +2869,43 @@ struct StyleIndex {
     /// Whether any rule sets `opacity` at all — lets `is_hidden` skip the
     /// opacity cascade entirely on the overwhelming majority of pages.
     has_opacity: bool,
+}
+
+/// Rules of one scope, bucketed by the rightmost compound's most-selective
+/// simple key. An element gathers candidates from the buckets matching its own
+/// id/classes/tag plus `universal` (rules whose subject has no id/class/tag,
+/// e.g. `*`, `[attr]`, pseudo-only), then full-matches only those. Each rule
+/// lands in exactly one bucket, so the candidate sets are disjoint.
+#[derive(Default)]
+struct RuleBuckets {
+    by_id: std::collections::HashMap<String, Vec<u32>>,
+    by_class: std::collections::HashMap<String, Vec<u32>>,
+    by_tag: std::collections::HashMap<String, Vec<u32>>,
+    universal: Vec<u32>,
+}
+
+impl RuleBuckets {
+    fn build(rules: &[StyleRule]) -> Self {
+        let mut b = RuleBuckets::default();
+        for (i, r) in rules.iter().enumerate() {
+            let i = i as u32;
+            // The subject (rightmost) compound decides the bucket; the most
+            // selective key present wins (id > first class > tag).
+            match r.selector.0.last().map(|(_, c)| c) {
+                Some(c) if c.id.is_some() => {
+                    b.by_id.entry(c.id.clone().unwrap()).or_default().push(i);
+                }
+                Some(c) if !c.classes.is_empty() => {
+                    b.by_class.entry(c.classes[0].clone()).or_default().push(i);
+                }
+                Some(c) if c.tag.as_deref().is_some_and(|t| t != "*") => {
+                    b.by_tag.entry(c.tag.clone().unwrap()).or_default().push(i);
+                }
+                _ => b.universal.push(i),
+            }
+        }
+        b
+    }
 }
 
 /// Parse one `prop: value [!important]` declaration. The value is
@@ -2854,35 +3063,37 @@ fn parse_sheet(
             continue;
         }
         let Some(brace) = rest.find('{') else { return };
-        let selector_text = &rest[..brace];
+        let selector_text = rest[..brace].trim();
         let (block, after) = take_block(&rest[brace..]);
         rest = after;
-        let mut decls: Vec<(String, (bool, String))> = Vec::new();
-        for decl in block.split(';') {
-            let Some((k, v, important)) = parse_decl(decl) else {
-                continue;
-            };
-            for (pk, pv) in expand_box_shorthand(&k, &v) {
-                if !is_tracked(&pk) {
-                    continue;
-                }
-                // Within one block a later declaration wins unless it
-                // would demote !important.
-                if let Some(slot) = decls.iter_mut().find(|(n, _)| *n == pk) {
-                    if important >= slot.1.0 {
-                        slot.1 = (important, pv);
-                    }
-                } else {
-                    decls.push((pk, (important, pv)));
-                }
-            }
-        }
-        if decls.is_empty() {
-            continue;
-        }
-        let Some(SelectorList(complexes)) = SelectorList::parse(selector_text.trim()) else {
-            continue;
-        };
+        parse_style_rule(selector_text, block, order, out, viewport);
+    }
+}
+
+/// Process one style-rule body into `out`: emit its own declarations for the
+/// already-concrete selector list `resolved`, then recurse into any nested
+/// rules (CSS Nesting), expanding each nested selector's `&` against
+/// `resolved`. A nested `@media` applies its body to `resolved` when it
+/// matches the viewport. `resolved` never carries an unexpanded `&` — the
+/// top-level caller passes the raw selector and `expand_nesting` resolves the
+/// `&` before each recursion.
+///
+/// Without this, a nested rule's declarations would leak onto the parent: the
+/// width-reservation/underline idiom `.tab { &::after { width:100% } }` (Steam's
+/// `.supernav`, Primer, many design systems) would make `.tab` itself
+/// `width:100%`, breaking horizontal nav layouts.
+fn parse_style_rule(
+    resolved: &str,
+    block: &str,
+    order: &mut usize,
+    out: &mut Vec<StyleRule>,
+    viewport: (u32, u32),
+) {
+    let (decl_text, nested) = split_block(block);
+    let decls = collect_decls(&decl_text);
+    if !decls.is_empty()
+        && let Some(SelectorList(complexes)) = SelectorList::parse(resolved.trim())
+    {
         for selector in complexes {
             out.push(StyleRule {
                 specificity: selector.specificity(),
@@ -2893,6 +3104,144 @@ fn parse_sheet(
             *order += 1;
         }
     }
+    for (nsel, nblock) in nested {
+        // A nested grouping at-rule (CSS Nesting allows `@media`/`@supports`
+        // inside a style rule). Evaluate `@media`; on a match apply its body to
+        // the SAME parent selector. Other nested at-rules are skipped whole —
+        // never leak their declarations onto the parent.
+        if let Some(at) = nsel.strip_prefix('@') {
+            let at = at.trim_start();
+            let lower = at.to_ascii_lowercase();
+            if let Some(rest_q) = lower.strip_prefix("media")
+                && rest_q
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-')
+                && media_query_matches(&at[5..], viewport)
+            {
+                parse_style_rule(resolved, nblock, order, out, viewport);
+            }
+            continue;
+        }
+        let child = expand_nesting(nsel, resolved);
+        parse_style_rule(&child, nblock, order, out, viewport);
+    }
+}
+
+/// Parse a declaration block's text into tracked `(prop, (important, value))`
+/// pairs (later wins; never demote `!important`); shorthands are expanded.
+fn collect_decls(decl_text: &str) -> Vec<(String, (bool, String))> {
+    let mut decls: Vec<(String, (bool, String))> = Vec::new();
+    for decl in decl_text.split(';') {
+        let Some((k, v, important)) = parse_decl(decl) else {
+            continue;
+        };
+        for (pk, pv) in expand_box_shorthand(&k, &v) {
+            if !is_tracked(&pk) {
+                continue;
+            }
+            if let Some(slot) = decls.iter_mut().find(|(n, _)| *n == pk) {
+                if important >= slot.1.0 {
+                    slot.1 = (important, pv);
+                }
+            } else {
+                decls.push((pk, (important, pv)));
+            }
+        }
+    }
+    decls
+}
+
+/// Split a rule body into its declaration text and its nested rules
+/// `(prelude, body)` (CSS Nesting). A top-level `{` begins a nested rule whose
+/// prelude is the text back to the previous `;`/`}`; the remaining segments are
+/// declarations. String/paren/bracket aware so a `;` or `{` inside `url(...)`,
+/// `[attr=…]`, or a quoted value (`content:"{"`) doesn't split. The common
+/// nesting-free block borrows its text unchanged.
+fn split_block(block: &str) -> (Cow<'_, str>, Vec<(&str, &str)>) {
+    if !block.contains('{') {
+        return (Cow::Borrowed(block), Vec::new());
+    }
+    let bytes = block.as_bytes();
+    let mut decls = String::new();
+    let mut nested: Vec<(&str, &str)> = Vec::new();
+    let mut seg_start = 0usize;
+    let mut in_str: Option<u8> = None;
+    let (mut paren, mut bracket) = (0i32, 0i32);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => in_str = Some(c),
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b';' if paren == 0 && bracket == 0 => {
+                let seg = &block[seg_start..i];
+                if !seg.trim().is_empty() {
+                    decls.push_str(seg);
+                    decls.push(';');
+                }
+                seg_start = i + 1;
+            }
+            b'{' if paren == 0 && bracket == 0 => {
+                let prelude = block[seg_start..i].trim();
+                let (inner, tail) = take_block(&block[i..]);
+                if !prelude.is_empty() {
+                    nested.push((prelude, inner));
+                }
+                i += block[i..].len() - tail.len();
+                seg_start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let seg = &block[seg_start..];
+    if !seg.trim().is_empty() {
+        decls.push_str(seg);
+        decls.push(';');
+    }
+    (Cow::Owned(decls), nested)
+}
+
+/// Expand a nested selector against its parent (CSS Nesting `&`). Returns a
+/// concrete comma-joined selector list. Each `&` is replaced by the parent; a
+/// nested selector with no `&` is a descendant (`parent nested`). When the
+/// parent is itself a list, the product over (parent × nested) parts is taken
+/// — equivalent to substituting `:is(parent)` for matching, without needing
+/// `:is`.
+fn expand_nesting(nested: &str, parent: &str) -> String {
+    let parents = split_top_level(parent, ',');
+    let mut out: Vec<String> = Vec::new();
+    for n in split_top_level(nested, ',') {
+        let n = n.trim();
+        if n.is_empty() {
+            continue;
+        }
+        for p in &parents {
+            let p = p.trim();
+            if n.contains('&') {
+                out.push(n.replace('&', p));
+            } else {
+                out.push(format!("{p} {n}"));
+            }
+        }
+    }
+    out.join(", ")
 }
 
 /// Does a CSS `@media` query list match the viewport (CSS px; `0` = unknown)?
@@ -3830,6 +4179,62 @@ mod tests {
     }
 
     #[test]
+    fn css_nesting_keeps_nested_declarations_off_the_parent() {
+        // CSS Nesting (2023): `.supernav { &::after { display:block; width:100% } }`
+        // is Steam's nav-underline idiom (Primer and many design systems too).
+        // The `&::after` declarations must target the ::after box, NOT leak onto
+        // `.supernav` itself — leaking `width:100%` onto a floated nav item makes
+        // every item fill the line and stack vertically. Likewise a plain nested
+        // rule resolves to a descendant selector.
+        let dom = Dom::parse_document(
+            "<head><style>\
+             .supernav{float:left}\
+             .supernav{ &::after{ content:\"\"; display:block; width:100% } }\
+             .card{ color:x; & .title{ font-weight:bold } }\
+             </style></head>\
+             <body>\
+             <a class=supernav>STORE</a>\
+             <div class=card><span class=title>Hi</span></div></body>",
+        );
+        let by = |cls: &str| {
+            dom.descendants(DOCUMENT)
+                .into_iter()
+                .find(|&i| dom.attr(i, "class") == Some(cls))
+                .unwrap()
+        };
+        let nav = by("supernav");
+        // The nested `&::after` decls did NOT contaminate the element itself.
+        assert_eq!(
+            dom.computed_value(nav, "width"),
+            None,
+            "nested ::after width:100% must not apply to .supernav"
+        );
+        assert_ne!(
+            dom.computed_value(nav, "display").as_deref(),
+            Some("block"),
+            "nested ::after display:block must not apply to .supernav"
+        );
+        assert_eq!(
+            dom.computed_value(nav, "float").as_deref(),
+            Some("left"),
+            "the parent's own float survives"
+        );
+        // The decls landed on the ::after box instead.
+        assert_eq!(
+            dom.pseudo_style(nav, PseudoEl::After, "width").as_deref(),
+            Some("100%"),
+            "nested ::after width:100% reaches the pseudo box"
+        );
+        // A bare nested rule (`& .title`) resolves to a descendant.
+        let title = by("title");
+        assert_eq!(
+            dom.computed_value(title, "font-weight").as_deref(),
+            Some("bold"),
+            "`.card & .title` applies to the descendant"
+        );
+    }
+
+    #[test]
     fn computed_value_inherits_only_inherited_properties() {
         // An inherited property flows to a descendant that doesn't set it; a
         // non-inherited one stays put. This is the single inheritance
@@ -3919,6 +4324,71 @@ mod tests {
             dom.computed_value(i, "text-transform").as_deref(),
             Some("uppercase"),
             "mutation invalidates the inherited-value memo"
+        );
+    }
+
+    #[test]
+    fn rule_hash_buckets_resolve_the_same_cascade_as_a_full_scan() {
+        // The rule-hash (rightmost-key buckets + per-element match memo) must
+        // pick exactly the rules a full scan would. Exercises every bucket and
+        // the cases a naive bucketing would get wrong: a multi-class subject
+        // where the element has only one of the classes (must NOT match), a
+        // universal/attribute subject (always tested), an id subject, a tag
+        // subject, and specificity ordering across buckets.
+        let dom = Dom::parse_document(
+            "<head><style>\
+               div { letter-spacing: 1px }\
+               .box { letter-spacing: 2px }\
+               .box.active { letter-spacing: 3px }\
+               [data-on] { text-indent: 9px }\
+               #hero { letter-spacing: 5px }\
+             </style></head>\
+             <body>\
+               <div id=hero class='box active' data-on>h</div>\
+               <div id=plain class='box'>p</div>\
+               <span id=s class='active'>s</span>\
+             </body>",
+        );
+        let hero = dom.get_by_id("hero").unwrap();
+        let plain = dom.get_by_id("plain").unwrap();
+        let s = dom.get_by_id("s").unwrap();
+        // hero matches div/.box/.box.active/[data-on]/#hero; #hero wins
+        // letter-spacing on specificity, and the attribute rule still applies.
+        assert_eq!(
+            dom.computed_style(hero, "letter-spacing").as_deref(),
+            Some("5px")
+        );
+        assert_eq!(
+            dom.computed_style(hero, "text-indent").as_deref(),
+            Some("9px")
+        );
+        // plain has .box but NOT .active, so `.box.active` must not win.
+        assert_eq!(
+            dom.computed_style(plain, "letter-spacing").as_deref(),
+            Some("2px")
+        );
+        // <span> has .active but lacks .box, so `.box.active` must not match it
+        // even though it shares the bucket key (`box`) is irrelevant — `active`
+        // is the bucket key and the second class is verified.
+        assert_eq!(dom.computed_style(s, "letter-spacing"), None);
+    }
+
+    #[test]
+    fn matched_rules_memo_follows_mutations() {
+        // The per-element match memo is epoch-keyed: toggling a class must
+        // re-match (the element gains the `.active` rule), not serve a stale
+        // matched-rule list.
+        let mut dom = Dom::parse_document(
+            "<head><style>.active{letter-spacing:3px}</style></head>\
+             <body><div id=d>x</div></body>",
+        );
+        let d = dom.get_by_id("d").unwrap();
+        assert_eq!(dom.computed_style(d, "letter-spacing"), None);
+        dom.set_attr(d, "class", "active");
+        assert_eq!(
+            dom.computed_style(d, "letter-spacing").as_deref(),
+            Some("3px"),
+            "mutation invalidates the matched-rules memo"
         );
     }
 
