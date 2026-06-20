@@ -82,7 +82,8 @@
       "Bash(timeout 12 curl -s -o /dev/null -w \"github: %{http_code} %{size_download}B\\\\n\" https://github.com/rubymaelstrom)",
       "Bash(echo \"exit=$?\")",
       "Bash(TRUST_NET_DIAG=https://humblebundle.com TRUST_DIAG_VP=200x50 TRUST_NET_DIAG_OUT=/tmp/humble_postjs.html cargo test --release net_diag -- --ignored --nocapture)",
-      "Bash(TRUST_NET_DIAG='https://store.steampowered.com/' TRUST_DIAG_VP=200x50 TRUST_NET_DIAG_OUT=/tmp/steam_post.html cargo test --release net_diag -- --ignored --nocapture)"
+      "Bash(TRUST_NET_DIAG='https://store.steampowered.com/' TRUST_DIAG_VP=200x50 TRUST_NET_DIAG_OUT=/tmp/steam_post.html cargo test --release net_diag -- --ignored --nocapture)",
+      "Bash(TRUST_NET_DIAG='https://gelbooru.com/index.php?page=post&s=list&tags=all' TRUST_NET_DIAG_OUT=/tmp/gelbooru.html TRUST_DIAG_VP=200x50 cargo test --release net_diag -- --ignored --nocapture)"
     ]
   }
 }

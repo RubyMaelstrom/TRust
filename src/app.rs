@@ -1154,7 +1154,7 @@ impl App {
                 Some(target) => match http::parse_url(&target) {
                     Some(url) => {
                         let body = parts.collect::<Vec<_>>().join(" ");
-                        self.start_post(url, body);
+                        self.start_post(url, body, None);
                     }
                     None => self.status = String::from("post needs an http(s):// URL"),
                 },
@@ -1452,7 +1452,7 @@ impl App {
             Some(p) => (format!("http://{host}:{p}/"), false),
         };
         match http::parse_url(&raw) {
-            Some(url) => self.start_fetch_opts(Link::Http(url), fallback),
+            Some(url) => self.start_fetch_opts(Link::Http(url), fallback, None),
             None => {
                 self.status = format!("bad host: {host}");
                 self.notice = true;
@@ -1479,13 +1479,39 @@ impl App {
     /// Fetch a document in the background; the result arrives in the
     /// select loop as a FetchMsg.
     fn start_fetch(&mut self, target: Link) {
-        self.start_fetch_opts(target, false);
+        self.start_fetch_opts(target, false, None);
+    }
+
+    /// The `Referer` source for a navigation that originates from the page on
+    /// screen (a followed link, a form submit, a live-page navigation): the
+    /// current document's URL when it's a web page. None for any other source
+    /// — a typed URL, the CLI, history back — which carry no referrer, and for
+    /// a non-web current page (gopher/gemini have no referer concept).
+    fn http_referrer(&self) -> Option<url::Url> {
+        match self.browser.as_ref().map(|g| &g.doc.url) {
+            Some(Link::Http(u)) => Some(u.clone()),
+            _ => None,
+        }
+    }
+
+    /// Follow `target` as if a link on the current page was clicked: a web
+    /// target carries the page's Referer (browser default policy); a foreign
+    /// scheme falls back to the plain address-bar dispatch (no referrer).
+    fn navigate_from_page(&mut self, target: &str) {
+        match http::parse_url(target) {
+            Some(url) => {
+                let referrer = self.http_referrer();
+                self.start_fetch_opts(Link::Http(url), false, referrer);
+            }
+            None => self.dispatch_open(target, None),
+        }
     }
 
     /// Fetch a document in the background. With `fallback_http`, an https web
     /// target that fails to connect is retried over plain http — for a bare
-    /// host opened without a scheme (see `http::fetch_web_default`).
-    fn start_fetch_opts(&mut self, target: Link, fallback_http: bool) {
+    /// host opened without a scheme (see `http::fetch_web_default`). `referrer`
+    /// is the page a link/form was followed from, when policy says to send one.
+    fn start_fetch_opts(&mut self, target: Link, fallback_http: bool, referrer: Option<url::Url>) {
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("Fetching {target} ...");
@@ -1502,7 +1528,11 @@ impl App {
                     let fetched = if fallback_http {
                         http::fetch_web_default(url).await
                     } else {
-                        http::fetch(&http::Request::get(url.clone())).await
+                        let mut req = http::Request::get(url.clone());
+                        if let Some(page) = &referrer {
+                            http::set_referrer(&mut req, page);
+                        }
+                        http::fetch(&req).await
                     };
                     match fetched {
                         // JS on: full transform. JS off: still bake the page's
@@ -1532,7 +1562,7 @@ impl App {
 
     /// POST a form-encoded body to a web URL (her use case; the UX can
     /// grow content-type options once the target application is known).
-    fn start_post(&mut self, url: url::Url, body: String) {
+    fn start_post(&mut self, url: url::Url, body: String, referrer: Option<url::Url>) {
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("POSTing to {url} ...");
@@ -1542,7 +1572,7 @@ impl App {
         let storage = self.web_storage.clone();
         let js_on = self.js_enabled;
         let task = tokio::spawn(async move {
-            let request = http::Request {
+            let mut request = http::Request {
                 method: String::from("POST"),
                 url: url.clone(),
                 body: Some((
@@ -1551,6 +1581,9 @@ impl App {
                 )),
                 headers: Vec::new(),
             };
+            if let Some(page) = &referrer {
+                http::set_referrer(&mut request, page);
+            }
             let result = match http::fetch(&request).await {
                 Ok(response) => Ok(Payload::Http(if js_on {
                     http::execute_js(response, viewport, cell_px, storage).await
@@ -2007,7 +2040,7 @@ impl App {
             // falls back to the `<a href>` when JS isn't available. Pure
             // JS-only controls (no href) genuinely need a reload.
             if let Some(url) = self.selected_web_url() {
-                self.dispatch_open(&url, None);
+                self.navigate_from_page(&url);
             } else {
                 self.status = String::from("This page's scripts are no longer running (reload?).");
                 self.notice = true;
@@ -2126,8 +2159,9 @@ impl App {
             self.submit_form_static(form, field);
         }
         if let Some(url) = navigate {
-            // An un-prevented click on a live anchor: a real navigation.
-            self.dispatch_open(&url, None);
+            // An un-prevented click on a live anchor: a real navigation, so it
+            // carries the page's Referer like any followed link.
+            self.navigate_from_page(&url);
         }
     }
 
@@ -2853,7 +2887,10 @@ impl App {
                 other => self.status = format!("item type '{other}' not supported yet"),
             },
             Link::Gemini(url) => self.start_fetch(Link::Gemini(url)),
-            Link::Http(url) => self.start_fetch(Link::Http(url)),
+            Link::Http(url) => {
+                let referrer = self.http_referrer();
+                self.start_fetch_opts(Link::Http(url), false, referrer);
+            }
             Link::OneShot(url) => self.start_fetch(Link::OneShot(url)),
             Link::Form { form, field } => self.form_interact(form, field),
             Link::JsClick { node, .. } => self.dispatch_click(node),
@@ -3195,13 +3232,14 @@ impl App {
         };
         let query = form.encode(pressed);
         let action = form.action.clone();
+        let referrer = self.http_referrer();
         match form.method {
             FormMethod::Get => {
                 let mut url = action;
                 url.set_query((!query.is_empty()).then_some(query.as_str()));
-                self.start_fetch(Link::Http(url));
+                self.start_fetch_opts(Link::Http(url), false, referrer);
             }
-            FormMethod::Post => self.start_post(action, query),
+            FormMethod::Post => self.start_post(action, query, referrer),
         }
     }
 
@@ -3605,7 +3643,12 @@ async fn load_one_image(
     if !http::subresource_allowed(page, &parsed) {
         return None;
     }
-    let resp = http::fetch(&http::Request::get(parsed)).await.ok()?;
+    // Send a Referer like a browser does: many image/media CDNs (gelbooru
+    // and most boorus, plenty of others) hotlink-protect and 302/403 a
+    // refererless request to a placeholder instead of the file.
+    let mut req = http::Request::get(parsed);
+    http::set_referrer(&mut req, page);
+    let resp = http::fetch(&req).await.ok()?;
     if resp.status != 200 || resp.body.is_empty() {
         return None;
     }

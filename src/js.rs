@@ -1215,12 +1215,15 @@ fn page_net_prepare(
         return None;
     }
     net.fetched.set(net.fetched.get() + 1);
-    let request = crate::http::Request {
+    let mut request = crate::http::Request {
         method,
         url: resolved,
         body,
         headers,
     };
+    // A document-initiated request carries the page's Referer (browser
+    // default policy) unless the page set one itself.
+    crate::http::set_referrer(&mut request, &net.page);
     Some((net.handle.clone(), request))
 }
 
