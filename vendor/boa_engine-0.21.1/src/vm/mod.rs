@@ -57,6 +57,57 @@ pub mod flowgraph;
 #[cfg(test)]
 mod tests;
 
+/// Lightweight, runtime-gated sampling profiler (TRust diagnostic).
+///
+/// When `TRUST_JS_PROFILE` is set, the synchronous instruction loop records
+/// the leaf frame's `path :: function` every `SAMPLE_EVERY` instructions into
+/// a histogram. `take_vm_profile` drains it sorted hottest-first. Zero cost
+/// when the env var is unset (one cached thread-local bool read per loop).
+pub mod profile {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+
+    /// Sample one frame in this many executed instructions.
+    const SAMPLE_EVERY: u64 = 4096;
+
+    thread_local! {
+        pub(crate) static PROF_ON: bool = std::env::var_os("TRUST_JS_PROFILE").is_some();
+        static PROF_CTR: Cell<u64> = const { Cell::new(0) };
+        static PROF_HIST: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
+        static PROF_TOTAL: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[inline]
+    pub(crate) fn on() -> bool {
+        PROF_ON.with(|b| *b)
+    }
+
+    /// Bump the instruction counter; return true when it's time to sample.
+    #[inline]
+    pub(crate) fn tick() -> bool {
+        PROF_CTR.with(|c| {
+            let n = c.get().wrapping_add(1);
+            c.set(n);
+            n % SAMPLE_EVERY == 0
+        })
+    }
+
+    pub(crate) fn record(key: String) {
+        PROF_TOTAL.with(|t| t.set(t.get() + 1));
+        PROF_HIST.with(|h| *h.borrow_mut().entry(key).or_insert(0) += 1);
+    }
+
+    /// Drain the histogram, sorted hottest-first, plus the total sample count.
+    #[must_use]
+    pub fn take_vm_profile() -> (u64, Vec<(String, u64)>) {
+        let total = PROF_TOTAL.with(Cell::take);
+        let mut v: Vec<(String, u64)> =
+            PROF_HIST.with(|h| h.borrow_mut().drain().collect());
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        (total, v)
+    }
+}
+
 /// Virtual Machine.
 #[derive(Debug)]
 pub struct Vm {
@@ -809,6 +860,7 @@ impl Context {
         }
 
         let mut runtime_budget: u32 = budget;
+        let profiling = profile::on();
 
         while let Some(byte) = self
             .vm
@@ -819,6 +871,11 @@ impl Context {
             .get(self.vm.frame.pc as usize)
         {
             let opcode = Opcode::decode(*byte);
+
+            if profiling && profile::tick() {
+                let cb = &self.vm.frame.code_block;
+                profile::record(format!("{} :: {}", cb.path(), cb.name().to_std_string_escaped()));
+            }
 
             match self.execute_one(
                 |context, opcode| {
@@ -845,6 +902,8 @@ impl Context {
             self.trace_call_frame();
         }
 
+        let profiling = profile::on();
+
         while let Some(byte) = self
             .vm
             .frame
@@ -854,6 +913,11 @@ impl Context {
             .get(self.vm.frame.pc as usize)
         {
             let opcode = Opcode::decode(*byte);
+
+            if profiling && profile::tick() {
+                let cb = &self.vm.frame.code_block;
+                profile::record(format!("{} :: {}", cb.path(), cb.name().to_std_string_escaped()));
+            }
 
             match self.execute_one(Self::execute_bytecode_instruction, opcode) {
                 ControlFlow::Continue(()) => {}

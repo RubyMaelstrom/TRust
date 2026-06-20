@@ -78,7 +78,9 @@
       "Bash(curl -sLO https://unpkg.com/react-dom@18/umd/react-dom.development.js)",
       "Bash(ldd --version)",
       "Bash(TRUST_NET_DIAG='https://www.imdb.com/list/ls4157260380/' TRUST_NET_DIAG_OUT=/tmp/imdb_postjs.html cargo test --release net_diag -- --ignored --nocapture)",
-      "Bash(TRUST_NET_DIAG=\"https://github.com/RubyMaelstrom/\" TRUST_DIAG_VP=200x50 TRUST_NET_DIAG_OUT=/tmp/gh_profile.html cargo test --release net_diag -- --ignored --nocapture)"
+      "Bash(TRUST_NET_DIAG=\"https://github.com/RubyMaelstrom/\" TRUST_DIAG_VP=200x50 TRUST_NET_DIAG_OUT=/tmp/gh_profile.html cargo test --release net_diag -- --ignored --nocapture)",
+      "Bash(timeout 12 curl -s -o /dev/null -w \"github: %{http_code} %{size_download}B\\\\n\" https://github.com/rubymaelstrom)",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }
