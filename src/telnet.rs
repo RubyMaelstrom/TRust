@@ -27,6 +27,10 @@ pub enum Command {
     SendIac(u8),
     /// The rendering area changed; renegotiate NAWS if it is active.
     Resize { cols: u16, rows: u16 },
+    /// Request a LINEMODE MODE change (RFC 1184): `edit` true asks the
+    /// server for local line editing, false for character-at-a-time. Only
+    /// sent while LINEMODE is active; the server confirms with an ACK.
+    LineModeRequest { edit: bool },
     /// Close the connection.
     Close,
 }
@@ -46,6 +50,14 @@ pub enum Event {
     Negotiation {
         command: u8,
         option: u8,
+    },
+    /// LINEMODE (RFC 1184) state changed. `active` is whether the option is
+    /// in effect at all; `edit` is the MODE EDIT bit (true = the client does
+    /// local line editing, false = character-at-a-time). The app folds this
+    /// into its line/character input decision alongside ECHO.
+    LineMode {
+        active: bool,
+        edit: bool,
     },
     /// The session ended, with an error message if it ended abnormally.
     Closed(Option<String>),
@@ -92,8 +104,24 @@ fn compat_table() -> CompatibilityTable {
     // subnegotiations expect no reply, and pausing output is meaningless
     // here — the remote feeds a vt100 emulator, not a real tty.
     table.support_local(op_option::LFLOW);
-    // TODO for GNU telnet parity: LINEMODE (RFC 1184).
+    // LINEMODE (RFC 1184): we are the line-editing party, so we WILL it when
+    // a server sends DO. The MODE/SLC/FORWARDMASK subnegotiations are handled
+    // in linemode_reply.
+    table.support_local(op_option::LINEMODE);
     table
+}
+
+/// RFC 1184 LINEMODE subnegotiation vocabulary.
+mod linemode {
+    /// Subcommands (the first payload byte after the option).
+    pub const MODE: u8 = 1;
+    pub const FORWARDMASK: u8 = 2;
+    pub const SLC: u8 = 3;
+    /// MODE mask bits.
+    pub const EDIT: u8 = 0x01;
+    pub const MODE_ACK: u8 = 0x04;
+    /// SLC flag bit: acknowledgement.
+    pub const SLC_ACK: u8 = 0x80;
 }
 
 /// Terminal names offered through TTYPE (RFC 1091), most capable first.
@@ -145,6 +173,70 @@ fn suboption_reply(
         }
         _ => None,
     }
+}
+
+/// Handle a LINEMODE (RFC 1184) subnegotiation. `payload` is the bytes
+/// between `IAC SB LINEMODE` and `IAC SE`, subcommand byte first. Returns the
+/// reply to send (if any) and the new EDIT state (if a MODE settled it).
+/// Loop-safe: only un-acknowledged requests get an answer.
+fn linemode_reply(parser: &mut Parser, payload: &[u8]) -> (Option<TelnetEvents>, Option<bool>) {
+    match payload.split_first() {
+        // MODE <mask>: adopt the EDIT bit. A request (ACK clear) is adopted
+        // and acknowledged; a MODE already carrying ACK is the server
+        // confirming our own request, so we only record its EDIT state.
+        Some((&linemode::MODE, rest)) => {
+            let mask = rest.first().copied().unwrap_or(0);
+            let edit = mask & linemode::EDIT != 0;
+            if mask & linemode::MODE_ACK != 0 {
+                return (None, Some(edit));
+            }
+            let ack = mask | linemode::MODE_ACK;
+            let reply =
+                parser.subnegotiation(op_option::LINEMODE, Bytes::from(vec![linemode::MODE, ack]));
+            (reply, Some(edit))
+        }
+        // SLC: accept the server's special-character assignments by echoing
+        // every un-acknowledged triple back with SLC_ACK set. We forward
+        // control characters to the remote verbatim, so the server's values
+        // stand. ACK'd triples confirm our own replies — ignored, which
+        // terminates the handshake.
+        Some((&linemode::SLC, triples)) => (slc_ack(parser, triples), None),
+        // FORWARDMASK: declined. We forward whole lines on Enter (and each
+        // key in character mode), not via a per-character mask.
+        Some((&op_command::DO, rest)) if rest.first() == Some(&linemode::FORWARDMASK) => {
+            let reply = parser.subnegotiation(
+                op_option::LINEMODE,
+                Bytes::from(vec![op_command::WONT, linemode::FORWARDMASK]),
+            );
+            (reply, None)
+        }
+        _ => (None, None),
+    }
+}
+
+/// Build the SLC reply: every triple the server has not acknowledged is
+/// echoed back with SLC_ACK set. Returns None when nothing needs answering
+/// (all triples already acknowledged), which ends the handshake.
+fn slc_ack(parser: &mut Parser, triples: &[u8]) -> Option<TelnetEvents> {
+    let mut out = vec![linemode::SLC];
+    for triple in triples.chunks_exact(3) {
+        let (func, flags, ch) = (triple[0], triple[1], triple[2]);
+        if flags & linemode::SLC_ACK == 0 {
+            out.extend_from_slice(&[func, flags | linemode::SLC_ACK, ch]);
+        }
+    }
+    if out.len() == 1 {
+        return None;
+    }
+    parser.subnegotiation(op_option::LINEMODE, Bytes::from(out))
+}
+
+/// Build a LINEMODE MODE request (RFC 1184) asking the server for local line
+/// editing (`edit` true) or character-at-a-time (`edit` false). The ACK bit
+/// is clear: this is a request the server confirms.
+fn linemode_mode_request(parser: &mut Parser, edit: bool) -> Option<TelnetEvents> {
+    let mask = if edit { linemode::EDIT } else { 0 };
+    parser.subnegotiation(op_option::LINEMODE, Bytes::from(vec![linemode::MODE, mask]))
 }
 
 /// Option states as actually negotiated on the wire, tracked from
@@ -252,6 +344,9 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
     let mut buf = vec![0u8; 8192];
     let mut ttype_sends = 0usize;
     let mut opts = OptionStates::default();
+    // LINEMODE (RFC 1184) state, mirrored to the app via Event::LineMode.
+    let mut linemode_active = false;
+    let mut linemode_edit = false;
 
     loop {
         tokio::select! {
@@ -287,6 +382,25 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                                 {
                                     return;
                                 }
+                                // Agreeing to LINEMODE (server DO → our WILL)
+                                // starts it in the cooked default (EDIT on)
+                                // until a MODE says otherwise; DONT ends it.
+                                if neg.option == op_option::LINEMODE {
+                                    let active = neg.command == op_command::DO;
+                                    if active != linemode_active {
+                                        linemode_active = active;
+                                        if active {
+                                            linemode_edit = true;
+                                        }
+                                        let evt = Event::LineMode {
+                                            active,
+                                            edit: linemode_edit,
+                                        };
+                                        if events.send(evt).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
                                 let event = Event::Negotiation {
                                     command: neg.command,
                                     option: neg.option,
@@ -296,7 +410,29 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                                 }
                             }
                             TelnetEvents::Subnegotiation(sub) => {
-                                if let Some(reply) = suboption_reply(
+                                if sub.option == op_option::LINEMODE {
+                                    let (reply, new_edit) =
+                                        linemode_reply(&mut parser, &sub.buffer);
+                                    if let Some(reply) = reply
+                                        && write_or_close(&mut writer, &reply.to_bytes(), &events)
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                    if let Some(edit) = new_edit
+                                        && edit != linemode_edit
+                                    {
+                                        linemode_edit = edit;
+                                        let evt = Event::LineMode {
+                                            active: linemode_active,
+                                            edit,
+                                        };
+                                        if events.send(evt).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                } else if let Some(reply) = suboption_reply(
                                     &mut parser,
                                     &opts,
                                     sub.option,
@@ -308,7 +444,6 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                                 {
                                     return;
                                 }
-                                // TODO: LINEMODE subnegotiation for GNU telnet parity.
                             }
                             TelnetEvents::IAC(_) => {}
                             TelnetEvents::DecompressImmediate(_) => {
@@ -342,6 +477,16 @@ async fn run_session<S: AsyncRead + AsyncWrite + Unpin>(
                         && write_or_close(&mut writer, &sub.to_bytes(), &events).await.is_err() {
                             return;
                         }
+                }
+                Some(Command::LineModeRequest { edit }) => {
+                    // Only meaningful while LINEMODE is active; the server
+                    // confirms (or amends) with an ACK we adopt above.
+                    if linemode_active
+                        && let Some(sub) = linemode_mode_request(&mut parser, edit)
+                        && write_or_close(&mut writer, &sub.to_bytes(), &events).await.is_err()
+                    {
+                        return;
+                    }
                 }
                 Some(Command::Close) | None => {
                     let _ = events.send(Event::Closed(None)).await;
@@ -735,6 +880,192 @@ mod tests {
         assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
 
         handle.commands.send(Command::SendIac(243)).await.unwrap();
+        server.await.unwrap();
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn linemode_acks_mode_and_reports_edit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 3];
+            sock.write_all(&[255, 253, 34]).await.unwrap(); // IAC DO LINEMODE
+            sock.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, [255, 251, 34]); // IAC WILL LINEMODE
+
+            // MODE EDIT|TRAPSIG (0x03) → echo the mask back with MODE_ACK set.
+            sock.write_all(&[255, 250, 34, 1, 0x03, 255, 240])
+                .await
+                .unwrap();
+            let mut reply = [0u8; 7];
+            sock.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [255, 250, 34, 1, 0x07, 255, 240]); // MODE 0x03|ACK
+
+            // MODE with EDIT clear (character-at-a-time) → MODE_ACK only.
+            sock.write_all(&[255, 250, 34, 1, 0x00, 255, 240])
+                .await
+                .unwrap();
+            let mut reply = [0u8; 7];
+            sock.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [255, 250, 34, 1, 0x04, 255, 240]); // MODE ACK, EDIT clear
+        });
+
+        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
+
+        // Agreeing to LINEMODE reports it active in the cooked default (EDIT on).
+        let event = events.recv().await.unwrap();
+        assert!(
+            matches!(
+                event,
+                Event::LineMode {
+                    active: true,
+                    edit: true
+                }
+            ),
+            "got {event:?}"
+        );
+        let event = events.recv().await.unwrap();
+        assert!(
+            matches!(
+                event,
+                Event::Negotiation {
+                    command: op_command::DO,
+                    option: op_option::LINEMODE,
+                }
+            ),
+            "got {event:?}"
+        );
+        // MODE EDIT|TRAPSIG keeps EDIT on (no change → no event); the MODE
+        // clear flips us into character mode.
+        let event = events.recv().await.unwrap();
+        assert!(
+            matches!(
+                event,
+                Event::LineMode {
+                    active: true,
+                    edit: false
+                }
+            ),
+            "got {event:?}"
+        );
+
+        server.await.unwrap();
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn linemode_acks_unacknowledged_slc_triples() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 3];
+            sock.write_all(&[255, 253, 34]).await.unwrap(); // IAC DO LINEMODE
+            sock.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, [255, 251, 34]); // IAC WILL LINEMODE
+
+            // SLC list: two un-acked triples plus one already carrying SLC_ACK.
+            // Only the un-acked pair is echoed back with SLC_ACK (0x80) set;
+            // the already-acked triple is the server confirming our reply and
+            // gets no answer (this terminates the handshake).
+            sock.write_all(&[
+                255, 250, 34, 3, // IAC SB LINEMODE SLC
+                3, 3, 3, // (func 3, SLC_DEFAULT, char 3)
+                4, 2, 4, // (func 4, SLC_VALUE, char 4)
+                5, 0x82, 21, // (func 5, SLC_VALUE|ACK, char 21) — already acked
+                255, 240, // IAC SE
+            ])
+            .await
+            .unwrap();
+            let mut reply = [0u8; 12];
+            sock.read_exact(&mut reply).await.unwrap();
+            assert_eq!(
+                reply,
+                [
+                    255, 250, 34, 3, // IAC SB LINEMODE SLC
+                    3, 0x83, 3, // func 3, SLC_DEFAULT|ACK
+                    4, 0x82, 4, // func 4, SLC_VALUE|ACK
+                    255, 240, // IAC SE
+                ]
+            );
+        });
+
+        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
+
+        server.await.unwrap();
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn linemode_declines_forwardmask() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 3];
+            sock.write_all(&[255, 253, 34]).await.unwrap(); // IAC DO LINEMODE
+            sock.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, [255, 251, 34]); // IAC WILL LINEMODE
+
+            // DO FORWARDMASK <mask> → we refuse with WONT FORWARDMASK.
+            sock.write_all(&[255, 250, 34, 253, 2, 0, 0, 0, 0, 255, 240])
+                .await
+                .unwrap();
+            let mut reply = [0u8; 7];
+            sock.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [255, 250, 34, 252, 2, 255, 240]); // WONT FORWARDMASK
+        });
+
+        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        let event = events.recv().await.unwrap();
+        assert!(matches!(event, Event::Connected { .. }), "got {event:?}");
+
+        server.await.unwrap();
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn linemode_request_sends_a_mode_subnegotiation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 3];
+            sock.write_all(&[255, 253, 34]).await.unwrap(); // IAC DO LINEMODE
+            sock.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, [255, 251, 34]); // IAC WILL LINEMODE
+
+            // The client's `mode character` request: MODE EDIT clear, no ACK.
+            let mut reply = [0u8; 7];
+            sock.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [255, 250, 34, 1, 0, 255, 240]);
+        });
+
+        let (handle, mut events) = connect("127.0.0.1".into(), port, (80, 24), false);
+        // The request is dropped unless LINEMODE is active, so wait for it.
+        loop {
+            match events.recv().await.unwrap() {
+                Event::LineMode { active: true, .. } => break,
+                Event::Closed(_) => panic!("closed before LINEMODE activated"),
+                _ => {}
+            }
+        }
+        handle
+            .commands
+            .send(Command::LineModeRequest { edit: false })
+            .await
+            .unwrap();
+
         server.await.unwrap();
         drop(handle);
     }

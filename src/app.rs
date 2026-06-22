@@ -41,6 +41,9 @@ pub enum Mode {
     /// Query entry for a gopher type-7 search, a gemini 1x input, or an
     /// HTML form field (the target lives in `search_target`).
     Search,
+    /// In-page find (Ctrl-F) over the open browser doc. The query lives in
+    /// `input`; matches/highlights live in `find`.
+    Find,
 }
 
 /// Manual override for the line/char decision (GNU telnet's `mode` command).
@@ -245,6 +248,35 @@ pub struct SelectMenu {
     pub anchor_col: u16,
 }
 
+/// In-page find state (Ctrl-F). The query text itself lives in `App.input`
+/// (reusing the line editor); this holds the located matches and which one
+/// is active. Browser-only — telnet sessions never enter find.
+#[derive(Default)]
+pub struct FindState {
+    /// The lowercased query `matches` was computed for, so a keystroke that
+    /// doesn't change the query (a cursor move) skips the rescan and keeps
+    /// the active match put.
+    last_query: String,
+    /// Every match, in document order.
+    pub matches: Vec<FindMatch>,
+    /// Index into `matches` of the active match — the one scrolled to and
+    /// drawn reversed. None when there are no matches.
+    pub current: Option<usize>,
+}
+
+/// One find match: a char range within a doc line (gopher/gemini line model)
+/// or within a row's item (HTTP 2D layout model).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FindMatch {
+    /// Row index (HTTP) or line index (gopher/gemini) the match sits on.
+    pub line: usize,
+    /// Item index within the row for the HTTP model; None for the line model.
+    pub item: Option<usize>,
+    /// Char offsets of the match within the item/line text.
+    pub start: usize,
+    pub end: usize,
+}
+
 /// A saved selection across history pops — whichever model the doc used.
 #[derive(Clone, Copy, Default)]
 struct ViewPos {
@@ -408,6 +440,11 @@ pub struct App {
     remote_opts: HashSet<u8>,
     /// Options the server has enabled on our side (DO ...).
     local_opts: HashSet<u8>,
+    /// LINEMODE (RFC 1184) is in effect on this connection (we WILL'd it).
+    linemode_active: bool,
+    /// LINEMODE EDIT bit: true = the server wants local line editing, false
+    /// = character-at-a-time. Only meaningful while `linemode_active`.
+    linemode_edit: bool,
     /// The local-echo entry field at the bottom of the screen.
     pub input: String,
     /// Cursor position in `input`, counted in chars.
@@ -486,6 +523,8 @@ pub struct App {
     /// An open `<select>` dropdown, modal over the browser: it captures
     /// keys/mouse until the user picks an option or cancels.
     pub(crate) select_menu: Option<SelectMenu>,
+    /// In-page find (Ctrl-F) state while `mode == Mode::Find`; None otherwise.
+    pub(crate) find: Option<FindState>,
     /// The popup's last drawn screen rect (set by the renderer) so a mouse
     /// click can hit-test against the option rows.
     pub(crate) last_select_rect: Option<ratatui::layout::Rect>,
@@ -522,6 +561,8 @@ impl App {
             bells_seen: 0,
             remote_opts: HashSet::new(),
             local_opts: HashSet::new(),
+            linemode_active: false,
+            linemode_edit: false,
             input: String::new(),
             cursor: 0,
             select_anchor: None,
@@ -557,6 +598,7 @@ impl App {
             search_target: None,
             cert_for: None,
             select_menu: None,
+            find: None,
             last_select_rect: None,
             notice: false,
             conn: None,
@@ -858,8 +900,15 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
         {
+            // Ctrl-] from find dismisses the find box (clearing its query)
+            // on the way to the command console.
+            if self.mode == Mode::Find {
+                self.input.clear();
+                self.cursor = 0;
+            }
+            self.find = None;
             self.mode = match self.mode {
-                Mode::Session | Mode::Search => Mode::Command,
+                Mode::Session | Mode::Search | Mode::Find => Mode::Command,
                 Mode::Command => Mode::Session,
             };
             self.cert_for = None;
@@ -875,8 +924,13 @@ impl App {
             && key.modifiers.is_empty()
             && !(self.mode == Mode::Session && self.char_mode())
         {
+            if self.mode == Mode::Find {
+                self.input.clear();
+                self.cursor = 0;
+            }
+            self.find = None;
             self.mode = match self.mode {
-                Mode::Session | Mode::Search => Mode::Command,
+                Mode::Session | Mode::Search | Mode::Find => Mode::Command,
                 Mode::Command => Mode::Session,
             };
             self.cert_for = None;
@@ -903,6 +957,59 @@ impl App {
         if self.mode == Mode::Session && self.select_menu.is_some() {
             self.select_menu_nav(key);
             return;
+        }
+
+        // Ctrl-F opens in-page find over a browser doc. In a telnet session
+        // (no browser) it falls through to the remote, so full-screen apps
+        // keep their Ctrl-F (the char-mode invariant is untouched).
+        if self.mode == Mode::Session
+            && self.browser.is_some()
+            && key.code == KeyCode::Char('f')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.open_find();
+            return;
+        }
+
+        // Find mode owns navigation keys (next/prev/close); text-editing keys
+        // fall through to the shared line editor below, after which the
+        // query is re-scanned (a no-op when it didn't change).
+        if self.mode == Mode::Find {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Esc => {
+                    self.close_find();
+                    return;
+                }
+                KeyCode::Enter => {
+                    if shift {
+                        self.find_prev();
+                    } else {
+                        self.find_next();
+                    }
+                    return;
+                }
+                // Ctrl-F / Ctrl-G cycle matches; Up/Down do too, so prev works
+                // even where the terminal can't deliver Shift-Enter.
+                KeyCode::Char('f' | 'g') if ctrl => {
+                    if shift {
+                        self.find_prev();
+                    } else {
+                        self.find_next();
+                    }
+                    return;
+                }
+                KeyCode::Up => {
+                    self.find_prev();
+                    return;
+                }
+                KeyCode::Down => {
+                    self.find_next();
+                    return;
+                }
+                _ => {}
+            }
         }
 
         // The browser captures session-mode keys while open. HTTP laid-out
@@ -957,6 +1064,8 @@ impl App {
                         self.mode = Mode::Session;
                         self.run_search(&line);
                     }
+                    // Find handles Enter (next/prev) in its own block above.
+                    Mode::Find => {}
                 }
             }
             // In session mode, control chords bypass the input field and go
@@ -1011,6 +1120,12 @@ impl App {
             KeyCode::End => self.move_cursor(self.input.chars().count(), shift),
             _ => {}
         }
+
+        // A text edit in the find box re-scans the doc (no-op if the query
+        // didn't actually change, e.g. cursor moves).
+        if self.mode == Mode::Find {
+            self.recompute_find();
+        }
     }
 
     /// Replace the emulator with a fresh one, sized to the current widget.
@@ -1038,8 +1153,123 @@ impl App {
     fn active_history(&mut self) -> &mut History {
         match self.mode {
             Mode::Session => &mut self.session_history,
-            Mode::Command | Mode::Search => &mut self.command_history,
+            // Find never pushes/recalls history (its Up/Down navigate matches),
+            // but the shared editor calls `detach()` while typing — harmless.
+            Mode::Command | Mode::Search | Mode::Find => &mut self.command_history,
         }
+    }
+
+    /// Open in-page find over the current browser doc (Ctrl-F).
+    fn open_find(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+        self.select_anchor = None;
+        self.mode = Mode::Find;
+        self.find = Some(FindState::default());
+        self.status =
+            String::from("Find: type to search · Enter/↓ next · Shift-Enter/↑ prev · Esc close");
+    }
+
+    /// Close find, dropping matches/highlights and returning to the browser.
+    fn close_find(&mut self) {
+        self.find = None;
+        self.input.clear();
+        self.cursor = 0;
+        self.select_anchor = None;
+        self.mode = Mode::Session;
+        self.status = String::from("Find closed.");
+    }
+
+    /// Re-scan the doc for the current query. A no-op when the query is
+    /// unchanged (so cursor moves keep the active match put); otherwise it
+    /// rebuilds matches, picks the nearest one at/after the current scroll,
+    /// and scrolls to it.
+    fn recompute_find(&mut self) {
+        let query = self.input.to_ascii_lowercase();
+        if self.find.as_ref().is_some_and(|f| f.last_query == query) {
+            return;
+        }
+        let mut matches = Vec::new();
+        if let Some(g) = self.browser.as_ref()
+            && !query.is_empty()
+        {
+            if g.doc.laid_out() {
+                for (r, row) in g.doc.rows.iter().enumerate() {
+                    for (i, item) in row.items.iter().enumerate() {
+                        push_text_matches(&item.text, &query, r, Some(i), &mut matches);
+                    }
+                }
+            } else {
+                for (l, line) in g.doc.lines.iter().enumerate() {
+                    push_text_matches(&line.text, &query, l, None, &mut matches);
+                }
+            }
+        }
+        // Jump to the first match at or after the current scroll, else the top.
+        let scroll = self.browser.as_ref().map_or(0, |g| g.scroll);
+        let current = (!matches.is_empty())
+            .then(|| matches.iter().position(|m| m.line >= scroll).unwrap_or(0));
+        if let Some(f) = self.find.as_mut() {
+            f.last_query = query;
+            f.matches = matches;
+            f.current = current;
+        }
+        self.scroll_to_current_match();
+        self.update_find_status();
+    }
+
+    /// Advance the active match (wrapping), scrolling it into view.
+    fn find_next(&mut self) {
+        if let Some(f) = self.find.as_mut()
+            && !f.matches.is_empty()
+        {
+            let n = f.matches.len();
+            f.current = Some(f.current.map_or(0, |c| (c + 1) % n));
+        }
+        self.scroll_to_current_match();
+        self.update_find_status();
+    }
+
+    /// Retreat the active match (wrapping), scrolling it into view.
+    fn find_prev(&mut self) {
+        if let Some(f) = self.find.as_mut()
+            && !f.matches.is_empty()
+        {
+            let n = f.matches.len();
+            f.current = Some(f.current.map_or(n - 1, |c| (c + n - 1) % n));
+        }
+        self.scroll_to_current_match();
+        self.update_find_status();
+    }
+
+    /// Centre the viewport on the active match's line/row.
+    fn scroll_to_current_match(&mut self) {
+        let line = {
+            let Some(f) = self.find.as_ref() else { return };
+            let Some(ci) = f.current else { return };
+            match f.matches.get(ci) {
+                Some(m) => m.line,
+                None => return,
+            }
+        };
+        let height = self.last_inner.1 as usize;
+        if let Some(g) = self.browser.as_mut() {
+            let max_scroll = g.doc.extent().saturating_sub(height.max(1));
+            g.scroll = line.saturating_sub(height / 2).min(max_scroll);
+        }
+    }
+
+    /// Refresh the status line with the find query and match counter.
+    fn update_find_status(&mut self) {
+        let Some(f) = self.find.as_ref() else { return };
+        self.status = if self.input.is_empty() {
+            String::from("Find: type to search · Esc close")
+        } else if f.matches.is_empty() {
+            format!("Find \"{}\" · no matches", self.input)
+        } else {
+            let n = f.current.map_or(0, |c| c + 1);
+            format!("Find \"{}\" · {}/{}", self.input, n, f.matches.len())
+        };
     }
 
     /// True when keystrokes should bypass the input field, GNU telnet
@@ -1049,7 +1279,13 @@ impl App {
             && match self.mode_override {
                 Some(InputMode::Character) => true,
                 Some(InputMode::Line) => false,
-                None => self.remote_opts.contains(&op_option::ECHO),
+                // ECHO dominates (it covers password prompts even under
+                // LINEMODE); otherwise an active LINEMODE with EDIT clear
+                // also means character-at-a-time.
+                None => {
+                    self.remote_opts.contains(&op_option::ECHO)
+                        || (self.linemode_active && !self.linemode_edit)
+                }
             }
     }
 
@@ -1122,6 +1358,21 @@ impl App {
         }
     }
 
+    /// Under active LINEMODE, tell the server about a `mode` change so the
+    /// negotiated state stays in sync (RFC 1184 MODE request). A no-op when
+    /// LINEMODE isn't active — the kludge ECHO/SGA path needs no MODE; the
+    /// server's ACK updates `linemode_edit`, so `mode auto` then follows it.
+    async fn request_linemode(&self, edit: bool) {
+        if self.linemode_active
+            && let Some(conn) = &self.conn
+        {
+            let _ = conn
+                .commands
+                .send(telnet::Command::LineModeRequest { edit })
+                .await;
+        }
+    }
+
     async fn execute_command(&mut self, line: &str) {
         let mut parts = line.split_whitespace();
         match parts.next() {
@@ -1163,10 +1414,12 @@ impl App {
             Some("mode" | "m") => match parts.next() {
                 Some("character" | "char") => {
                     self.mode_override = Some(InputMode::Character);
+                    self.request_linemode(false).await;
                     self.status = String::from("Input mode forced to character-at-a-time.");
                 }
                 Some("line") => {
                     self.mode_override = Some(InputMode::Line);
+                    self.request_linemode(true).await;
                     self.status = String::from("Input mode forced to line-by-line.");
                 }
                 Some("auto") => {
@@ -1355,6 +1608,8 @@ impl App {
         let mode = match (self.mode_override, self.char_mode()) {
             (Some(InputMode::Character), _) => "character (forced)",
             (Some(InputMode::Line), _) => "line (forced)",
+            (None, true) if self.linemode_active => "character (LINEMODE)",
+            (None, false) if self.linemode_active => "line (LINEMODE)",
             (None, true) => "character (negotiated)",
             (None, false) => "line (negotiated)",
         };
@@ -2125,6 +2380,9 @@ impl App {
         let mut trouble: Vec<String> = Vec::new();
         let mut navigate: Option<String> = None;
         let mut submit_default = false;
+        // A click-triggered native submit carries its form/submitter arena
+        // nodes (the app didn't pre-record them the way the Submit path does).
+        let mut submit_nodes: Option<(usize, usize)> = None;
         let pending_submit = self.pending_live_submit.take();
         let mut pending = Some(evt);
         loop {
@@ -2135,6 +2393,9 @@ impl App {
                 Some(PageEvt::Trouble(errors)) => trouble.extend(errors),
                 Some(PageEvt::Settled) => {}
                 Some(PageEvt::SubmitDefault) => submit_default = true,
+                Some(PageEvt::SubmitForm { form, submitter }) => {
+                    submit_nodes = Some((form, submitter));
+                }
                 Some(PageEvt::Navigate(url)) => navigate = Some(url),
                 None => break,
             }
@@ -2156,6 +2417,11 @@ impl App {
             self.notice = true;
         }
         if submit_default && let Some((form, field)) = pending_submit {
+            self.submit_form_static(form, field);
+        }
+        if let Some((form_node, submitter_node)) = submit_nodes
+            && let Some((form, field)) = self.form_indices_for_nodes(form_node, submitter_node)
+        {
             self.submit_form_static(form, field);
         }
         if let Some(url) = navigate {
@@ -3210,6 +3476,32 @@ impl App {
         self.refresh_forms();
     }
 
+    /// Map a click-triggered submit's `(form, submitter)` arena nodes to its
+    /// doc-model `(form_index, field_index)`. The submitter falls back to the
+    /// form's Submit control (then field 0) when it isn't itself a tracked
+    /// field, so the native GET/POST still encodes a submit button.
+    fn form_indices_for_nodes(
+        &self,
+        form_node: usize,
+        submitter_node: usize,
+    ) -> Option<(usize, usize)> {
+        use crate::doc::FieldKind;
+        let g = self.browser.as_ref()?;
+        let form_index = g
+            .doc
+            .forms
+            .iter()
+            .position(|f| f.live_node == Some(form_node))?;
+        let form = &g.doc.forms[form_index];
+        let field = form
+            .fields
+            .iter()
+            .position(|f| f.live_node == Some(submitter_node))
+            .or_else(|| form.fields.iter().position(|f| f.kind == FieldKind::Submit))
+            .unwrap_or(0);
+        Some((form_index, field))
+    }
+
     /// Fire a form: a living page sees a real submit event first. If page
     /// JS does not preventDefault(), the static HTTP submit proceeds.
     fn submit_form(&mut self, form: usize, pressed: usize) {
@@ -3373,6 +3665,8 @@ impl App {
         self.tls = false;
         self.remote_opts.clear();
         self.local_opts.clear();
+        self.linemode_active = false;
+        self.linemode_edit = false;
         let padlock = if use_tls { " (TLS)" } else { "" };
         self.status = format!("Trying {host}:{port}{padlock}...");
         self.host = Some(host);
@@ -3414,11 +3708,17 @@ impl App {
                 }
                 _ => {}
             },
+            telnet::Event::LineMode { active, edit } => {
+                self.linemode_active = active;
+                self.linemode_edit = edit;
+            }
             telnet::Event::Closed(reason) => {
                 self.connected = false;
                 self.tls = false;
                 self.remote_opts.clear();
                 self.local_opts.clear();
+                self.linemode_active = false;
+                self.linemode_edit = false;
                 self.conn = None;
                 self.events = None;
                 self.status = match reason {
@@ -3596,6 +3896,38 @@ fn iac_code(name: &str) -> Option<u8> {
 }
 
 /// Human-readable names for negotiated options in `status` output.
+/// Append every case-insensitive (ASCII-folded) occurrence of `query`
+/// (already lowercased) in `text` as non-overlapping char-offset ranges.
+/// Non-ASCII case is matched exactly — an honest limitation; find queries
+/// are virtually always ASCII.
+fn push_text_matches(
+    text: &str,
+    query: &str,
+    line: usize,
+    item: Option<usize>,
+    out: &mut Vec<FindMatch>,
+) {
+    let lower: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let q: Vec<char> = query.chars().collect();
+    if q.is_empty() || q.len() > lower.len() {
+        return;
+    }
+    let mut i = 0;
+    while i + q.len() <= lower.len() {
+        if lower[i..i + q.len()] == q[..] {
+            out.push(FindMatch {
+                line,
+                item,
+                start: i,
+                end: i + q.len(),
+            });
+            i += q.len();
+        } else {
+            i += 1;
+        }
+    }
+}
+
 fn option_names(opts: &HashSet<u8>) -> String {
     if opts.is_empty() {
         return String::from("(none)");
@@ -3611,6 +3943,7 @@ fn option_names(opts: &HashSet<u8>) -> String {
             op_option::STATUS => String::from("STATUS"),
             op_option::TSPEED => String::from("TSPEED"),
             op_option::LFLOW => String::from("LFLOW"),
+            op_option::LINEMODE => String::from("LINEMODE"),
             op_option::NEWENVIRON => String::from("NEW-ENVIRON"),
             other => other.to_string(),
         })
@@ -4347,7 +4680,7 @@ mod tests {
             scroll: 0,
             history: vec![],
         };
-        let lines = crate::ui::browser_rows(&g, 24);
+        let lines = crate::ui::browser_rows(&g, 24, None);
         let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         let forums_item = g
             .doc
@@ -4373,6 +4706,151 @@ mod tests {
             "'Forums' renders after the image box (col {forums_col}, image ends {})",
             img.col + img.width
         );
+    }
+
+    /// Build an App showing a browser doc parsed from `body` with `mime`.
+    fn app_browsing(mime: &str, body: &str) -> super::App {
+        let images = crate::layout::ImageSizes::new();
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let doc = crate::http::parse(&url, mime, body.as_bytes(), 80, &images);
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.browser = Some(super::BrowserView {
+            doc,
+            selected: None,
+            sel_item: None,
+            scroll: 0,
+            history: vec![],
+        });
+        app
+    }
+
+    #[test]
+    fn push_text_matches_is_case_insensitive_and_nonoverlapping() {
+        let mut out = Vec::new();
+        super::push_text_matches("Foo foo fOo bar", "foo", 7, None, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!((out[0].start, out[0].end), (0, 3));
+        assert_eq!((out[1].start, out[1].end), (4, 7));
+        assert_eq!((out[2].start, out[2].end), (8, 11));
+        assert_eq!(out[0].line, 7);
+        // Overlapping query advances past each hit (no double-count).
+        let mut out = Vec::new();
+        super::push_text_matches("aaaa", "aa", 0, None, &mut out);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn find_over_a_line_model_doc_navigates_and_wraps() {
+        // text/plain → line model (rows empty).
+        let mut app = app_browsing("text/plain", "alpha beta\ngamma beta delta\nbeta");
+        assert!(!app.browser.as_ref().unwrap().doc.laid_out());
+
+        app.open_find();
+        assert_eq!(app.mode, super::Mode::Find);
+        app.input = String::from("beta");
+        app.cursor = 4;
+        app.recompute_find();
+
+        let f = app.find.as_ref().unwrap();
+        assert_eq!(f.matches.len(), 3);
+        assert!(f.matches.iter().all(|m| m.item.is_none()));
+        assert_eq!(
+            f.matches.iter().map(|m| m.line).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(f.current, Some(0));
+
+        app.find_next();
+        assert_eq!(app.find.as_ref().unwrap().current, Some(1));
+        app.find_next();
+        app.find_next();
+        assert_eq!(app.find.as_ref().unwrap().current, Some(0), "wraps forward");
+        app.find_prev();
+        assert_eq!(
+            app.find.as_ref().unwrap().current,
+            Some(2),
+            "wraps backward"
+        );
+    }
+
+    #[test]
+    fn find_over_an_http_doc_matches_within_items() {
+        let mut app = app_browsing(
+            "text/html",
+            "<body><p>alpha beta</p><p>gamma beta</p></body>",
+        );
+        assert!(app.browser.as_ref().unwrap().doc.laid_out());
+
+        app.open_find();
+        app.input = String::from("beta");
+        app.cursor = 4;
+        app.recompute_find();
+
+        let f = app.find.as_ref().unwrap();
+        assert_eq!(f.matches.len(), 2);
+        assert!(f.matches.iter().all(|m| m.item.is_some()));
+        assert_eq!(f.current, Some(0));
+    }
+
+    #[test]
+    fn find_scrolls_the_active_match_into_view() {
+        let body: String = (0..100)
+            .map(|i| {
+                if i == 60 {
+                    "needle".to_string()
+                } else {
+                    format!("line {i}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = app_browsing("text/plain", &body);
+        app.last_inner = (80, 24);
+
+        app.open_find();
+        app.input = String::from("needle");
+        app.cursor = 6;
+        app.recompute_find();
+
+        let g = app.browser.as_ref().unwrap();
+        // The match on line 60 is centred (60 - 24/2 = 48), within the viewport.
+        assert!(
+            g.scroll <= 60 && 60 < g.scroll + 24,
+            "match visible (scroll {})",
+            g.scroll
+        );
+        assert_eq!(g.scroll, 48);
+    }
+
+    #[tokio::test]
+    async fn ctrl_f_opens_find_only_with_a_browser_and_esc_closes() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let ctrl_f = || Event::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+
+        // No browser: Ctrl-F is not intercepted (it would reach the remote).
+        let mut bare = super::App::new(None, 23);
+        bare.mode = super::Mode::Session;
+        bare.on_terminal_event(ctrl_f()).await;
+        assert_ne!(
+            bare.mode,
+            super::Mode::Find,
+            "no find without a browser doc"
+        );
+
+        // With a browser: Ctrl-F opens find, typing finds, Esc closes.
+        let mut app = app_browsing("text/plain", "find the beta here");
+        app.on_terminal_event(ctrl_f()).await;
+        assert_eq!(app.mode, super::Mode::Find);
+        for c in "beta".chars() {
+            app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Char(c))))
+                .await;
+        }
+        assert_eq!(app.find.as_ref().unwrap().matches.len(), 1);
+        app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Esc)))
+            .await;
+        assert_eq!(app.mode, super::Mode::Session);
+        assert!(app.find.is_none(), "Esc clears find state");
     }
 
     #[test]
@@ -5318,6 +5796,39 @@ mod tests {
         app.on_terminal_event(Event::Key(KeyEvent::from(KeyCode::Esc)))
             .await;
         assert_eq!(app.mode, super::Mode::Session);
+    }
+
+    #[test]
+    fn char_mode_follows_linemode_edit_with_echo_dominant() {
+        use super::{InputMode, op_option};
+
+        let mut app = super::App::new(Some(String::from("h")), 23);
+        app.connected = true;
+
+        // No LINEMODE, no ECHO → line mode (local editing).
+        assert!(!app.char_mode());
+
+        // LINEMODE active with EDIT set stays line mode...
+        app.linemode_active = true;
+        app.linemode_edit = true;
+        assert!(!app.char_mode());
+        // ...and EDIT clear flips to character-at-a-time.
+        app.linemode_edit = false;
+        assert!(app.char_mode());
+
+        // ECHO dominates even under LINEMODE EDIT (password prompts): the
+        // server echoing forces character mode regardless of the EDIT bit.
+        app.linemode_edit = true;
+        app.remote_opts.insert(op_option::ECHO);
+        assert!(app.char_mode());
+        app.remote_opts.remove(&op_option::ECHO);
+
+        // A manual override still wins over the negotiated state.
+        app.linemode_edit = false; // negotiated character mode
+        app.mode_override = Some(InputMode::Line);
+        assert!(!app.char_mode());
+        app.mode_override = Some(InputMode::Character);
+        assert!(app.char_mode());
     }
 
     #[tokio::test]

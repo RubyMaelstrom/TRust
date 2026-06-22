@@ -19,6 +19,7 @@
 //! controls fold in later.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use ratatui::symbols::line;
 use unicode_width::UnicodeWidthStr;
@@ -494,6 +495,7 @@ pub fn measure_boxes(
     let mut layout = Layout::new(dom, base, width.max(10), forms, controls, &images, borders);
     layout.tag_all_nodes = true;
     layout.flow_all();
+    let declared = std::mem::take(&mut layout.declared_boxes);
     let (rows, _carousels) = layout.finish();
 
     // Each laid item contributes a cell rectangle to its source node. An
@@ -531,6 +533,21 @@ pub fn measure_boxes(
                     None => acc = Some(*cr),
                 }
             }
+        }
+        // Geometry Phase 2: raise this block's box to its declared definite
+        // floor (recorded during the tagged flow), so a sized block reports its
+        // CSS box even when its content paints fewer cells. Done here, AFTER it
+        // has absorbed its own/child content (so it has an origin even when all
+        // its content lives in child elements — e.g. `<div w><span>·</span>`),
+        // and BEFORE its parent unions it in (so a floored child also grows its
+        // ancestors). A block with no content at all has no origin → no floor →
+        // viewport fallback (a Phase-1 limit; measure-then-render containers
+        // carry placeholder content).
+        if let (Some(a), Some(&(fw, fh))) = (acc.as_mut(), declared.get(&id)) {
+            let fw = u16::try_from(fw).unwrap_or(u16::MAX);
+            let fh = u16::try_from(fh).unwrap_or(u16::MAX);
+            a.x1 = a.x1.max(a.x0.saturating_add(fw));
+            a.y1 = a.y1.max(a.y0.saturating_add(fh));
         }
         if let Some(acc) = acc {
             cells.insert(id, acc);
@@ -1145,6 +1162,15 @@ struct Layout<'a> {
     /// boundaries (same visual output, but a different item vector), so the two
     /// passes are kept separate and the render path is untouched.
     tag_all_nodes: bool,
+    /// Measurement pass only: each block's declared definite box `(width
+    /// cells, height rows)` — the floor `measure_boxes` raises a node's
+    /// content-extent rect to, so a `<div style="width:240px;height:135px">`
+    /// reports its CSS box to `getBoundingClientRect`/`offset*` even when its
+    /// content paints fewer cells. Only DEFINITE lengths are recorded (px/em/
+    /// ch/%-of-a-definite-container); `auto`/indefinite `%`-height/`vh` are
+    /// left out. Populated under `tag_all_nodes`, so the render path never
+    /// touches it. See [[js-geometry-real-boxes]] Phase 2.
+    declared_boxes: HashMap<NodeId, (usize, usize)>,
 }
 
 impl<'a> Layout<'a> {
@@ -1187,6 +1213,7 @@ impl<'a> Layout<'a> {
             clip_done: false,
             modal_root: None,
             tag_all_nodes: false,
+            declared_boxes: HashMap::new(),
         }
     }
 
@@ -1447,6 +1474,34 @@ impl<'a> Layout<'a> {
             flow = Flow::Inline;
         }
         let block_like = matches!(flow, Flow::Block | Flow::ListItem);
+        // Geometry Phase 2: record this block's declared definite box as the
+        // floor `measure_boxes` raises its content-extent rect to, so a sized
+        // block reports its CSS box to `getBoundingClientRect`/`offset*` even
+        // when its content paints fewer cells. Done here (before the band is
+        // narrowed below) so `%` widths resolve against the CONTAINING block,
+        // and before the border/flex branches so every block-like element is
+        // covered. Measurement pass only — never touches rendering. Width takes
+        // the larger of `width`/`min-width` (clamped to the band, our model has
+        // no horizontal scroll); height the larger of `height`/`min-height` as
+        // whole rows (`%`/`vh`/`auto` are indefinite → no floor, matching CSS).
+        if self.tag_all_nodes && block_like {
+            let avail = self.width.saturating_sub(self.indent).max(1);
+            let floor_w = self
+                .css_cells(id, "width")
+                .into_iter()
+                .chain(self.css_cells(id, "min-width"))
+                .max()
+                .map(|w| w.min(avail));
+            let floor_h = ["height", "min-height"]
+                .into_iter()
+                .filter_map(|p| self.dom.computed_style(id, p))
+                .filter_map(|v| css_length_rows(&v))
+                .max();
+            if floor_w.is_some() || floor_h.is_some() {
+                self.declared_boxes
+                    .insert(id, (floor_w.unwrap_or(0), floor_h.unwrap_or(0)));
+            }
+        }
         // A block-level element with a visible border is laid as its own
         // framed sub-box: lay its interior, draw the bordered sides as
         // box-drawing, blit. `inner_border_box` guards the recursion (the
@@ -1860,18 +1915,27 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// Constrain a block to its explicit `width`/`max-width` when it carries
-    /// horizontal `margin:auto`, and shift its band to position it (centered
-    /// for both-auto, right for left-auto). Mutates `indent`/`width`; returns
-    /// the left pad added (restored at block exit). 0 = left unconstrained.
-    /// Only acts on auto-margin blocks (a deliberate "center/position me"
-    /// signal) so a bare pixel width never cramps content we'd flow wide.
+    /// Constrain a block to its definite `width`/`max-width`, narrowing the
+    /// content band so its content wraps within the declared width (geometry
+    /// Phase 2 — honoring the box the page asks for). Auto margins position it:
+    /// centered for both-auto, right for left-auto, otherwise left-aligned.
+    /// Mutates `indent`/`width`; returns the left pad added (restored at block
+    /// exit). 0 = left unconstrained (no definite width, or it meets/exceeds the
+    /// band — we never cramp below the available width, and `auto`/intrinsic
+    /// widths resolve to `None` so they flow wide as before).
     fn constrain_block_width(&mut self, id: NodeId) -> usize {
         let avail = self.width.saturating_sub(self.indent).max(1);
-        let Some(w) = self
-            .css_cells(id, "width")
-            .or_else(|| self.css_cells(id, "max-width"))
-        else {
+        // A definite `width` is an explicit target — narrow to it regardless of
+        // margins. A bare `max-width` (no `width`) is only a CEILING: an
+        // auto-width block under it already fills the band, so we narrow to it
+        // ONLY to position it via an auto margin (the centered/`margin:0 auto`
+        // content wrapper). Treating `max-width` as the width WITHOUT an auto
+        // margin breaks flex/auto layouts — Steam's `.sale_capsule{max-width:
+        // 50%}` flex capsules narrowed the band to 50% and shrank their
+        // `width:100%` thumbnails (the cap is the flex item's, sized by the flex
+        // pass, not a block width to re-narrow here).
+        let definite_w = self.css_cells(id, "width");
+        let Some(w) = definite_w.or_else(|| self.css_cells(id, "max-width")) else {
             return 0;
         };
         let w = w.min(avail);
@@ -1885,6 +1949,9 @@ impl<'a> Layout<'a> {
             (true, true) => extra / 2, // margin:0 auto → centered
             (true, false) => extra,    // margin-left:auto → right-aligned
             (false, true) => 0,        // margin-right:auto → left-aligned
+            // No auto margin: narrow only for an explicit `width`. A bare
+            // `max-width` is just a ceiling here → leave the band alone.
+            (false, false) if definite_w.is_some() => 0,
             (false, false) => return 0,
         };
         self.indent += pad;
@@ -2284,13 +2351,57 @@ impl<'a> Layout<'a> {
     /// paints later-in-tree on top). See `is_modal_overlay` for what qualifies.
     fn find_modal_overlay(&self) -> Option<NodeId> {
         let root = body_or_document(self.dom);
-        self.dom
+        let candidate = self
+            .dom
             .descendants(root)
             .into_iter()
             .enumerate()
             .filter(|&(_, id)| self.is_modal_overlay(id))
             .max_by_key(|&(order, id)| (self.z_order(id), order))
-            .map(|(_, id)| id)
+            .map(|(_, id)| id)?;
+        // The geometry test also matches a full-viewport BACKGROUND layer (a
+        // hero / `position:fixed; inset:0` slideshow). That isn't a modal — a
+        // modal paints ON TOP of the page, a background sits BEHIND it. Reject
+        // the candidate when the page's own in-flow content stacks above it
+        // (pixiv's logged-out top is a fixed slideshow at `z-index:auto` behind
+        // a `position:relative; z-index:1` signup card — treating the slide as a
+        // modal hid the entire login page). Explicit dialog semantics
+        // (`role=dialog`/`aria-modal`/`<dialog open>`) are always honored.
+        if !self.is_semantic_dialog(candidate) && self.content_paints_above(candidate) {
+            return None;
+        }
+        Some(candidate)
+    }
+
+    /// Whether the page's normal-flow content paints ABOVE `overlay` — the proof
+    /// that `overlay` is a full-viewport BACKGROUND layer, not a modal. A real
+    /// modal lifts above the document flow; a background sits below it. We
+    /// compare `z-index` only against in-flow (`relative`/`sticky`)
+    /// content-bearing boxes OUTSIDE the overlay's own subtree and ancestry —
+    /// out-of-flow chrome (a fixed footer/header) isn't "the page behind the
+    /// modal", so excluding it avoids false negatives that would hide a genuine
+    /// modal sitting beneath such chrome.
+    fn content_paints_above(&self, overlay: NodeId) -> bool {
+        let oz = self.z_order(overlay);
+        // Exclude the overlay, its subtree (its own content) and its ancestors
+        // (whose stacking context carries the overlay along).
+        let mut excluded: HashSet<NodeId> = self.dom.descendants(overlay).into_iter().collect();
+        excluded.insert(overlay);
+        let mut up = self.dom.parent_composed(overlay);
+        while let Some(p) = up {
+            excluded.insert(p);
+            up = self.dom.parent_composed(p);
+        }
+        let root = body_or_document(self.dom);
+        self.dom.descendants(root).into_iter().any(|id| {
+            !excluded.contains(&id)
+                && matches!(
+                    self.dom.computed_style(id, "position").as_deref(),
+                    Some("relative" | "sticky")
+                )
+                && self.z_order(id) > oz
+                && self.overlay_has_content(id)
+        })
     }
 
     /// Whether `id` is a page-covering modal overlay: out of flow
@@ -2676,16 +2787,49 @@ impl<'a> Layout<'a> {
                 }
                 widths = floor;
             } else {
-                let extra = avail - sum_floor - gaps;
-                let desired: usize = (0..n).map(|i| basis[i].saturating_sub(floor[i])).sum();
-                for i in 0..n {
-                    // Hand each item its share of the slack above its minimum,
-                    // proportional to how much it wanted (basis − floor); split
-                    // it evenly when nothing wants extra.
-                    let share = (extra * basis[i].saturating_sub(floor[i]))
-                        .checked_div(desired)
-                        .unwrap_or(extra / n);
-                    widths[i] = floor[i] + share;
+                // CSS flexbox shrink resolution (§9.7 "Resolving Flexible
+                // Lengths"): each item shrinks from its basis proportional to
+                // `flex-shrink × flex-base-size`; an item that would shrink past
+                // its minimum freezes there and the remaining overflow re-absorbs
+                // across the rest. So EQUAL-basis items shrink to EQUAL widths — a
+                // row of same-size cards stays uniform — instead of being spread
+                // by their min-content (the old `floor + proportional-extra` split
+                // gave a wider-captioned card a wider column, hence a wider image).
+                widths = basis.clone();
+                let mut frozen: Vec<bool> = shrink.iter().map(|&s| s <= 0.0).collect();
+                loop {
+                    let frozen_w: usize = (0..n).filter(|&i| frozen[i]).map(|i| widths[i]).sum();
+                    let remaining = avail.saturating_sub(gaps).saturating_sub(frozen_w);
+                    let live: Vec<usize> = (0..n).filter(|&i| !frozen[i]).collect();
+                    let live_basis: usize = live.iter().map(|&i| basis[i]).sum();
+                    if live.is_empty() || live_basis <= remaining {
+                        // The unfrozen items now fit at their basis — done.
+                        for &i in &live {
+                            widths[i] = basis[i];
+                        }
+                        break;
+                    }
+                    let scaled: f32 = live.iter().map(|&i| shrink[i] * basis[i] as f32).sum();
+                    if scaled <= 0.0 {
+                        break;
+                    }
+                    let overflow = (live_basis - remaining) as f32;
+                    let mut froze = false;
+                    for &i in &live {
+                        let reduce = overflow * (shrink[i] * basis[i] as f32) / scaled;
+                        let w = (basis[i] as f32 - reduce).round().max(0.0) as usize;
+                        if w <= floor[i] {
+                            // Hit the minimum: freeze and let the rest re-absorb.
+                            widths[i] = floor[i];
+                            frozen[i] = true;
+                            froze = true;
+                        } else {
+                            widths[i] = w;
+                        }
+                    }
+                    if !froze {
+                        break;
+                    }
                 }
             }
         }
@@ -2729,7 +2873,13 @@ impl<'a> Layout<'a> {
     /// (`flex-start`/`normal`/unknown) and a full row leave both zero; grow
     /// items having eaten the free space makes this moot.
     fn justify_offsets(&self, id: NodeId, free: usize, n: usize) -> (usize, usize) {
-        if free == 0 {
+        // While measuring intrinsic (max-content) width, `justify-content` must
+        // not apply: the flex base size is the items packed at their natural
+        // widths, never spread across the row. A nested `justify-content:flex-end`
+        // block (a capsule's right-aligned price) otherwise pushed its content to
+        // the row's right edge, so the whole item measured ~`avail` and the
+        // shrink pass split the columns by caption length instead of evenly.
+        if free == 0 || self.measuring {
             return (0, 0);
         }
         match self
@@ -5017,6 +5167,17 @@ impl<'a> Layout<'a> {
         // when no ancestor pins a length width (a genuine full-bleed image).
         let raw_w = self.dom.computed_style(id, "width");
         let mut used_w = match raw_w.as_deref().and_then(parse_percent) {
+            // Intrinsic sizing (a flex basis / float / table-cell measurement):
+            // a percentage width on a replaced element is treated as `auto` and
+            // contributes its intrinsic (decoded) width — CSS Sizing §5.1
+            // (percentages on auto-sized boxes are indefinite for min/max-content
+            // contributions). Resolving the `%` against the row instead made
+            // every `width:100%` image measure to the FULL row width, so a flex
+            // row of same-size capsules all reported ~`avail` and the shrink pass
+            // then split them by their captions' min-content (a discounted
+            // two-price capsule got a wider column → wider image). Using the
+            // intrinsic width makes those columns equal.
+            Some(_) if self.measuring => iw,
             Some(pct) => {
                 let basis = self.definite_ancestor_width(id).unwrap_or(avail);
                 (pct * basis as f32).round().max(1.0) as usize
@@ -6202,6 +6363,145 @@ mod tests {
         );
     }
 
+    fn box_by_id(dom: &Dom, m: &HashMap<NodeId, PxRect>, id: &str) -> PxRect {
+        let n = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&n| dom.attr(n, "id") == Some(id))
+            .unwrap();
+        *m.get(&n)
+            .unwrap_or_else(|| panic!("{id} should have a laid-out box"))
+    }
+
+    #[test]
+    fn declared_block_width_floors_geometry() {
+        // Geometry Phase 2: a sized block reports its declared CSS box even when
+        // its content paints fewer cells. "240px" = 30 cells; cell_px 8 → 240px.
+        let (dom, m) = measure(
+            r#"<body><div id="card" style="width:240px">x</div></body>"#,
+            80,
+        );
+        let card = box_by_id(&dom, &m, "card");
+        assert_eq!(card.width, 240.0, "declared width is the geometry floor");
+    }
+
+    #[test]
+    fn declared_box_floors_when_content_lives_in_a_child_element() {
+        // A sized block whose content is a child element (not direct text) has
+        // no item tagged to itself — its text is tagged to the child. The floor
+        // must still apply once the block absorbs the child's box (the bug the
+        // live smoke caught: reported 10x20 instead of 240x160).
+        let (dom, m) = measure(
+            r#"<body><div id="sz" style="width:240px;height:160px"><span>.</span></div></body>"#,
+            80,
+        );
+        let sz = box_by_id(&dom, &m, "sz");
+        assert_eq!(sz.width, 240.0, "declared width floors a child-only block");
+        assert_eq!(
+            sz.height, 160.0,
+            "declared height floors a child-only block"
+        );
+    }
+
+    #[test]
+    fn declared_block_height_floors_geometry_but_not_render() {
+        // Declared height floors the REPORTED box ("160px" = 10 rows × 16 =
+        // 160px) but is NOT reserved on screen — the next block sits right below
+        // the content, not 160px down (terminal rows are precious; height stays
+        // geometry-only, the documented deviation).
+        let (dom, m) = measure(
+            r#"<body><div id="box" style="height:160px">x</div><div id="after">y</div></body>"#,
+            80,
+        );
+        let bx = box_by_id(&dom, &m, "box");
+        let after = box_by_id(&dom, &m, "after");
+        assert_eq!(bx.height, 160.0, "declared height is the geometry floor");
+        assert!(
+            after.top < bx.height,
+            "following block ({}) must not be pushed down to the reserved height ({})",
+            after.top,
+            bx.height
+        );
+    }
+
+    #[test]
+    fn definite_block_width_narrows_the_band() {
+        // Part 2 (render): a definite block width narrows the content band, so
+        // text wraps within it. "80px" = 10 cells; the same text flows on one
+        // row at full width.
+        let words = "aaa bbb ccc ddd eee fff";
+        let (dom, narrow) = measure(
+            &format!(r#"<body><div id="n" style="width:80px">{words}</div></body>"#),
+            80,
+        );
+        let (dom2, wide) = measure(&format!(r#"<body><div id="n">{words}</div></body>"#), 80);
+        let n = box_by_id(&dom, &narrow, "n");
+        let w = box_by_id(&dom2, &wide, "n");
+        assert_eq!(w.height, 16.0, "unconstrained text flows on one row");
+        assert!(
+            n.height > w.height,
+            "a definite width should wrap the text taller ({} vs {})",
+            n.height,
+            w.height
+        );
+    }
+
+    #[test]
+    fn percent_height_stays_indefinite() {
+        // `%` height resolves against an indefinite (auto-height) container, so
+        // it computes to auto — no floor. The block reports its content extent.
+        let (dom, m) = measure(r#"<body><div id="p" style="height:50%">x</div></body>"#, 80);
+        let p = box_by_id(&dom, &m, "p");
+        assert_eq!(p.height, 16.0, "percent height is indefinite → no floor");
+    }
+
+    #[test]
+    fn auto_and_overwide_width_do_not_cramp() {
+        // `width:auto` and a width that meets/exceeds the band both flow wide —
+        // the band is never narrowed below the available width.
+        let words = "one two three four five";
+        let (da, auto) = measure(
+            &format!(r#"<body><div id="d" style="width:auto">{words}</div></body>"#),
+            80,
+        );
+        let (df, full) = measure(
+            &format!(r#"<body><div id="d" style="width:100%">{words}</div></body>"#),
+            80,
+        );
+        let (dp, plain) = measure(&format!(r#"<body><div id="d">{words}</div></body>"#), 80);
+        let h = |d: &Dom, m: &HashMap<NodeId, PxRect>| box_by_id(d, m, "d").height;
+        let plain_h = h(&dp, &plain);
+        assert_eq!(h(&da, &auto), plain_h, "width:auto flows like no width");
+        assert_eq!(h(&df, &full), plain_h, "width:100% flows like no width");
+        assert_eq!(plain_h, 16.0, "the text fits on one row at width 80");
+    }
+
+    #[test]
+    fn bare_max_width_does_not_narrow_the_band() {
+        // A bare `max-width` (no `width`, no auto margin) is only a ceiling — an
+        // auto-width block already fills the band, so it must NOT be narrowed.
+        // (This narrowed Steam's `.sale_capsule{max-width:50%}` flex capsules
+        // and shrank their `width:100%` thumbnails to a sliver.) The text fits
+        // on one row at full width; an explicit `width:50%` of the same text
+        // wraps taller.
+        let words = "one two three four five six seven eight nine ten";
+        let (dm, mw) = measure(
+            &format!(r#"<body><div id="d" style="max-width:50%">{words}</div></body>"#),
+            80,
+        );
+        let (dw, wd) = measure(
+            &format!(r#"<body><div id="d" style="width:50%">{words}</div></body>"#),
+            80,
+        );
+        let max_h = box_by_id(&dm, &mw, "d").height;
+        let wid_h = box_by_id(&dw, &wd, "d").height;
+        assert_eq!(max_h, 16.0, "a bare max-width must not narrow → one row");
+        assert!(
+            wid_h > max_h,
+            "an explicit width:50% narrows and wraps ({wid_h} vs {max_h})"
+        );
+    }
+
     #[test]
     #[ignore = "manual diagnostic: TRUST_LAYOUT_DIAG=<file> TRUST_LAYOUT_W=<cols>"]
     fn layout_diag() {
@@ -6983,6 +7283,33 @@ mod tests {
     }
 
     #[test]
+    fn a_full_viewport_background_layer_is_not_a_modal() {
+        // pixiv's logged-out top: a `position:fixed; inset:0` background
+        // slideshow (z-index:auto) sits BEHIND the real page content (a
+        // `position:relative; z-index:1` signup card). The slide matches the
+        // modal GEOMETRY test, but a modal paints ON TOP — here the card paints
+        // ABOVE the slide (positioned, higher z), so the slide is a background,
+        // not a modal. Treating it as a modal deferred the entire login page
+        // (only the slide's caption rendered). Both must render.
+        let rows = lay(
+            r#"<body>
+                 <div style="position:fixed;top:0;right:0;bottom:0;left:0">
+                   <p>SlideCaption</p>
+                 </div>
+                 <div style="position:relative;z-index:1">
+                   <a href="/signup">CreateAccount</a><a href="/login">LoginButton</a>
+                 </div>
+               </body>"#,
+            80,
+        );
+        assert!(
+            shows(&rows, "CreateAccount"),
+            "the in-flow signup card is NOT deferred behind the background slide"
+        );
+        assert!(shows(&rows, "LoginButton"), "the login control renders");
+    }
+
+    #[test]
     fn a_small_absolute_overlay_does_not_defer_the_page() {
         // Regression: a small absolutely-positioned badge/control is chrome,
         // not a page-covering modal — it stays inline and never hides content.
@@ -7599,6 +7926,44 @@ mod tests {
             s == c && c == a,
             "the three block floats share one row (got STORE@{s} COMMUNITY@{c} ABOUT@{a}): {:?}",
             texts(&rows)
+        );
+    }
+
+    #[test]
+    fn uniform_flex_capsules_shrink_to_equal_columns() {
+        // Steam's "Special Offers" rows: a `display:flex` row of same-size image
+        // capsules (`width:100%` thumb + a price caption), each
+        // `flex-grow:0;flex-shrink:1` (content-sized). A DISCOUNTED capsule shows
+        // two prices ("59,99€ 17,99€"), so its caption is wider — and TRust used
+        // to size each column to its content's min-content, handing that capsule
+        // a wider column and therefore a wider image. With (a) intrinsic-width
+        // measurement of `width:100%` images and (b) the CSS flex-shrink
+        // algorithm, equal-basis items shrink to EQUAL widths regardless of
+        // caption length.
+        let mut images = ImageSizes::new();
+        for f in ["a", "b", "c"] {
+            images.insert(format!("https://example.com/{f}.jpg"), (40, 20));
+        }
+        let rows = lay_with_images(
+            r#"<body><div style="display:flex;width:100%;gap:1px">
+                 <a style="display:block;flex-grow:0;flex-shrink:1"><img src="/a.jpg" style="width:100%"><div>9,99€</div></a>
+                 <a style="display:block;flex-grow:0;flex-shrink:1"><img src="/b.jpg" style="width:100%"><div>59,99€ 17,99€</div></a>
+                 <a style="display:block;flex-grow:0;flex-shrink:1"><img src="/c.jpg" style="width:100%"><div>4,99€</div></a>
+               </div></body>"#,
+            60,
+            &images,
+        );
+        // The three capsule images fill their (equal) columns: equal widths.
+        let widths: Vec<u16> = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.is_some())
+            .map(|i| i.width)
+            .collect();
+        assert_eq!(widths.len(), 3, "three capsule images: {widths:?}");
+        assert!(
+            widths.iter().all(|&w| w == widths[0]),
+            "same-size capsules get equal columns regardless of caption width: {widths:?}"
         );
     }
 

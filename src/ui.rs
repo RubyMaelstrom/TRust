@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, BrowserView, Encoding, Mode};
+use crate::app::{App, BrowserView, Encoding, FindState, Mode};
 use crate::doc::{Kind, Link};
 
 pub mod theme {
@@ -94,7 +94,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             frame.render_widget(ratatui_image::Image::new(&v.protocol), image_area);
         }
         (None, Some(g)) => {
-            let doc = Paragraph::new(browser_lines(g, inner.height as usize)).block(block);
+            let doc = Paragraph::new(browser_lines(g, inner.height as usize, app.find.as_ref()))
+                .block(block);
             frame.render_widget(doc, session_area);
             // Second pass: overlay decoded inline images on their reserved
             // boxes. Each box encodes once to a `SlicedProtocol`; the renderer
@@ -238,9 +239,57 @@ fn render_select_menu(frame: &mut Frame, app: &mut App, inner: Rect) {
 
 /// The visible slice of a document, gopherus-style: the cursor line is
 /// highlighted when it carries a link.
-fn browser_lines(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
+/// The find-match char ranges on a given line/item, each tagged with whether
+/// it is the active match. Already in document order (so sorted).
+fn find_ranges(
+    find: Option<&FindState>,
+    line: usize,
+    item: Option<usize>,
+) -> Vec<(usize, usize, bool)> {
+    let Some(f) = find else {
+        return Vec::new();
+    };
+    let cur = f
+        .current
+        .and_then(|c| f.matches.get(c))
+        .map(|m| (m.line, m.item, m.start));
+    f.matches
+        .iter()
+        .filter(|m| m.line == line && m.item == item)
+        .map(|m| (m.start, m.end, cur == Some((m.line, m.item, m.start))))
+        .collect()
+}
+
+/// Split `text` into styled spans: `base` everywhere, BOLD on each match, and
+/// REVERSED+BOLD on the active one. `ranges` = (start, end, is_current) char
+/// offsets, sorted and non-overlapping.
+fn match_spans(text: &str, base: Style, ranges: &[(usize, usize, bool)]) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans = Vec::new();
+    let mut pos = 0usize;
+    for &(s, e, current) in ranges {
+        let s = s.min(chars.len());
+        let e = e.min(chars.len()).max(s);
+        if s > pos {
+            spans.push(Span::styled(chars[pos..s].iter().collect::<String>(), base));
+        }
+        let mstyle = if current {
+            base.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            base.add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(chars[s..e].iter().collect::<String>(), mstyle));
+        pos = e;
+    }
+    if pos < chars.len() {
+        spans.push(Span::styled(chars[pos..].iter().collect::<String>(), base));
+    }
+    spans
+}
+
+fn browser_lines<'a>(g: &'a BrowserView, height: usize, find: Option<&FindState>) -> Vec<Line<'a>> {
     if g.doc.laid_out() {
-        return browser_rows(g, height);
+        return browser_rows(g, height, find);
     }
     let end = (g.scroll + height).min(g.doc.lines.len());
     g.doc.lines[g.scroll..end]
@@ -269,7 +318,12 @@ fn browser_lines(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
             if g.selected == Some(g.scroll + i) && line.link.is_some() {
                 style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
             }
-            Line::styled(line.text.as_str(), style)
+            let ranges = find_ranges(find, g.scroll + i, None);
+            if ranges.is_empty() {
+                Line::styled(line.text.as_str(), style)
+            } else {
+                Line::from(match_spans(&line.text, style, &ranges))
+            }
         })
         .collect()
 }
@@ -279,7 +333,11 @@ use crate::layout::visible_col;
 /// Render an HTTP laid-out doc: each visible row is a sequence of
 /// positioned item spans, padded to each item's start column. The
 /// selected `(row, item)` is highlighted.
-pub(crate) fn browser_rows(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
+pub(crate) fn browser_rows<'a>(
+    g: &'a BrowserView,
+    height: usize,
+    find: Option<&FindState>,
+) -> Vec<Line<'a>> {
     use crate::layout::{ItemKind, NO_NODE};
     // The selected link's source node: every item sharing it (a link that
     // wrapped across rows) highlights as one unit.
@@ -358,7 +416,12 @@ pub(crate) fn browser_rows(g: &BrowserView, height: usize) -> Vec<Line<'_>> {
                 if selected {
                     style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 }
-                spans.push(Span::styled(item.text.as_str(), style));
+                let ranges = find_ranges(find, row_idx, Some(i));
+                if ranges.is_empty() {
+                    spans.push(Span::styled(item.text.as_str(), style));
+                } else {
+                    spans.extend(match_spans(&item.text, style, &ranges));
+                }
                 // An item can reserve more columns than its text fills — an
                 // inline image carries an empty string but a real W×H box (the
                 // pixels are overlaid in the second pass). Pad the remainder
@@ -546,6 +609,7 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
         Mode::Search if minting_identity => ("name> ", theme::PASTEL_GREEN),
         Mode::Search if editing_field => ("input> ", theme::PASTEL_GREEN),
         Mode::Search => ("search> ", theme::PASTEL_GREEN),
+        Mode::Find => ("find> ", theme::PASTEL_GREEN),
     };
 
     // Window the text horizontally so the cursor (and the prompt) stay
@@ -605,6 +669,13 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
                 .bg(theme::PASTEL_GREEN)
                 .add_modifier(Modifier::BOLD),
         )),
+        Mode::Find => block.title(Line::styled(
+            " FIND ",
+            Style::new()
+                .fg(theme::BG)
+                .bg(theme::PASTEL_GREEN)
+                .add_modifier(Modifier::BOLD),
+        )),
     };
 
     Paragraph::new(line).block(block)
@@ -646,6 +717,7 @@ fn status_bar(app: &App) -> Paragraph<'_> {
             "· Enter set · Esc cancel"
         }
         (Mode::Search, ..) => "· Enter search · Esc cancel",
+        (Mode::Find, ..) => "· Enter/↓ next · Shift-Enter/↑ prev · Esc close",
     };
     let mut spans = vec![Span::styled(
         label,
@@ -684,7 +756,7 @@ fn status_bar(app: &App) -> Paragraph<'_> {
     // which must not hide behind the selection hint.
     let selection = app
         .selected_link()
-        .filter(|_| !app.notice && app.viewer.is_none());
+        .filter(|_| !app.notice && app.viewer.is_none() && app.mode != Mode::Find);
     let middle = match (&app.viewer, &selection) {
         // While viewing an image: its dimensions and type (unless a
         // notice — e.g. a failed re-encode — needs the bar).
