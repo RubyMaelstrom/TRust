@@ -979,7 +979,7 @@ async fn read_to_eof<R: AsyncRead + Unpin>(io: &mut BufReader<R>) -> Result<Vec<
 
 /// Decode the body per the content-type charset: UTF-8 by default,
 /// Latin-1 (and its windows-1252 sibling, near enough) by byte map.
-fn decode_body(content_type: &str, body: &[u8]) -> String {
+pub(crate) fn decode_body(content_type: &str, body: &[u8]) -> String {
     let charset = content_type
         .split(';')
         .find_map(|p| p.trim().strip_prefix("charset="))
@@ -1949,6 +1949,64 @@ mod tests {
         server.abort();
     }
 
+    // A <script src> the page INJECTS at runtime (the SDK-loader idiom — how
+    // reCAPTCHA/analytics/embeds load) is fetched and executed, and its `load`
+    // event fires for code that waits on `script.onload`. Without this an
+    // injected dependency silently never loads (pixiv login's reCAPTCHA hung
+    // the submit polling for a `grecaptcha` that never arrived).
+    #[tokio::test]
+    async fn an_injected_external_script_is_fetched_executed_and_fires_load() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let reply: Vec<u8> = if text.starts_with("GET /page ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                          <body><pre id=out>before</pre><script>\
+                          var s=document.createElement('script');\
+                          s.src='/sdk.js';\
+                          s.onload=function(){var o=document.getElementById('out');o.textContent=o.textContent+' loaded';};\
+                          document.body.appendChild(s);\
+                          </script></body>"
+                            .to_vec()
+                    } else if text.starts_with("GET /sdk.js ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n\
+                          document.getElementById('out').textContent='sdk-ran';"
+                            .to_vec()
+                    } else {
+                        b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                    };
+                    let _ = sock.write_all(&reply).await;
+                });
+            }
+        });
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(body.contains("sdk-ran"), "injected script ran: {body}");
+        assert!(body.contains("sdk-ran loaded"), "load event fired: {body}");
+        assert!(
+            response.js.map(|j| j.errors.is_empty()).unwrap_or(true),
+            "no JS errors"
+        );
+        server.abort();
+    }
+
     /// The speculative-import-prefetch win: an entry module that STATICALLY
     /// imports many chunks pulls them concurrently (the scanner fires them
     /// ahead of Boa's serial loader) instead of one-RTT-at-a-time. Mirrors
@@ -2615,6 +2673,154 @@ mod tests {
         drop(response.live.take());
     }
 
+    /// Diagnostic: load a REAL login-style page live, fill the email +
+    /// password fields, submit, and report what the page does — whether the
+    /// submit button gets enabled, whether a `submit`/navigation results, and
+    /// any errors. `TRUST_NET_DIAG=<url> cargo test --release form_fill_submit_diag -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual diagnostic, needs TRUST_NET_DIAG=<url>"]
+    async fn form_fill_submit_diag() {
+        let Ok(target) = std::env::var("TRUST_NET_DIAG") else {
+            eprintln!("set TRUST_NET_DIAG to a login URL");
+            return;
+        };
+        let url = parse_url(&target).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = execute_js(response, (120, 40), (8, 16), Default::default()).await;
+        let live = response.live.as_mut().expect("page is live");
+        // Drain the settle so the React form is mounted.
+        let mut html = String::from_utf8_lossy(&response.body).to_string();
+        async fn drain(live: &mut LivePage, html: &mut String) {
+            while let Ok(Some(ev)) =
+                tokio::time::timeout(Duration::from_secs(15), live.events.recv()).await
+            {
+                match ev {
+                    crate::js::PageEvt::Updated { html: h, outcome } => {
+                        eprintln!(
+                            "  Updated errors={:?} console={:?}",
+                            outcome.errors, outcome.console
+                        );
+                        *html = h;
+                    }
+                    crate::js::PageEvt::Navigate(u) => {
+                        eprintln!("  >>> Navigate -> {u}");
+                        return;
+                    }
+                    crate::js::PageEvt::SubmitDefault => {
+                        eprintln!("  >>> SubmitDefault (TRust would run the GET/POST)");
+                        return;
+                    }
+                    other => eprintln!("  {other:?}"),
+                }
+            }
+        }
+        drain(live, &mut html).await;
+        // data-trust-node id of the first tag matching `pred`.
+        let node = |html: &str, pred: &dyn Fn(&str) -> bool| -> Option<usize> {
+            for m in html.match_indices("data-trust-node=\"") {
+                let tag_start = html[..m.0].rfind('<')?;
+                // `data-trust-node` is appended last, so the tag's other attrs
+                // (type/name/...) all precede `m.0` — an ASCII boundary.
+                let tag = &html[tag_start..m.0];
+                if pred(tag) {
+                    let v = &html[m.0 + 17..];
+                    return v[..v.find('"')?].parse().ok();
+                }
+            }
+            None
+        };
+        let email = node(&html, &|t| {
+            t.starts_with("<input") && t.contains("type=\"text\"")
+        });
+        let password = node(&html, &|t| {
+            t.starts_with("<input") && t.contains("type=\"password\"")
+        });
+        let submit_text =
+            std::env::var("TRUST_FORM_SUBMIT_TEXT").unwrap_or_else(|_| "ログイン".into());
+        // The submit button: the `<button>` whose exact text is the login
+        // label (`>ログイン</button>` — not the substring inside
+        // "…でログイン"), which sits in the email/password form after the
+        // password field. Extract owned values so no borrow of `html` lingers.
+        let needle = format!(">{submit_text}</button>");
+        let button: Option<(usize, bool)> = html.match_indices(&needle).find_map(|(at, _)| {
+            let tstart = html[..at].rfind("<button")?;
+            let btag = &html[tstart..=at];
+            let tnode = btag.find("data-trust-node=\"")? + 17;
+            let n = btag[tnode..].split('"').next()?.parse::<usize>().ok()?;
+            Some((n, btag.contains("disabled")))
+        });
+        eprintln!(
+            "email node={email:?} password node={password:?} submit={:?}",
+            button.map(|b| b.0)
+        );
+        if let Some((_, disabled)) = button {
+            eprintln!("BEFORE fill, submit button disabled = {disabled}");
+        }
+        if let Some(n) = email {
+            live.handle
+                .cmds
+                .send(crate::js::PageCmd::SetValue {
+                    node: n,
+                    value: "tester@example.com".into(),
+                    checked: None,
+                })
+                .await
+                .unwrap();
+            drain(live, &mut html).await;
+        }
+        if let Some(n) = password {
+            live.handle
+                .cmds
+                .send(crate::js::PageCmd::SetValue {
+                    node: n,
+                    value: "hunter2password".into(),
+                    checked: None,
+                })
+                .await
+                .unwrap();
+            drain(live, &mut html).await;
+        }
+        // Re-find the button after fills (node ids stable; re-read disabled).
+        let after = html.match_indices(&needle).find_map(|(at, _)| {
+            let tstart = html[..at].rfind("<button")?;
+            Some(&html[tstart..at])
+        });
+        eprintln!(
+            "AFTER fill, submit button tag has disabled = {:?}",
+            after.map(|t| t.contains("disabled"))
+        );
+        // The form node = the <form> enclosing the password field.
+        let form = html
+            .find("type=\"password\"")
+            .and_then(|pi| html[..pi].rfind("<form"))
+            .and_then(|fs| {
+                let tag = &html[fs..html[fs..].find('>').map(|i| fs + i)?];
+                let tn = tag.find("data-trust-node=\"")? + 17;
+                tag[tn..].split('"').next()?.parse::<usize>().ok()
+            });
+        // CLICK the button exactly as the app does when the user presses it
+        // (a live submit button is a JsClick, NOT a Submit field) — so we
+        // exercise the real click→form-submission path, not a synthetic Submit.
+        eprintln!(
+            "clicking login button: node={:?} (form={form:?})",
+            button.map(|b| b.0)
+        );
+        let _ = form;
+        if let Some((btn, _)) = button {
+            live.handle
+                .cmds
+                .send(crate::js::PageCmd::Click(btn))
+                .await
+                .unwrap();
+            drain(live, &mut html).await;
+        }
+        if let Ok(out) = std::env::var("TRUST_NET_DIAG_OUT") {
+            std::fs::write(&out, html.as_bytes()).unwrap();
+            eprintln!("final html -> {out}");
+        }
+        drop(response.live.take());
+    }
+
     /// Diagnostic: fetch a REAL url through the full JS pipeline and
     /// Full JS-error survey at a chosen viewport (`TRUST_DIAG_VP=WxH`,
     /// default 200x50), draining the whole live settle so it sees EVERY
@@ -2768,9 +2974,16 @@ mod tests {
             if let Ok(r) = fetch(&Request::get(u.clone())).await
                 && let Ok((im, _)) = crate::img::decode(&r.body)
             {
-                use image::GenericImageView;
-                let (w, h) = im.dimensions();
-                images.insert(u.to_string(), (w as u16, h as u16));
+                // Store the CELL box the real pipeline lays out with (px→cells
+                // via the font size, capped to 80x24 preserving aspect), NOT raw
+                // pixels — raw px made every image read ~hundreds of cells wide
+                // and clamp to `avail`, distorting flex-basis measurement.
+                let nat = ratatui_image::Resize::natural_size(&im, (8, 16).into());
+                let (cw, ch) = (nat.width.max(1) as f32, nat.height.max(1) as f32);
+                let scale = (80.0 / cw).min(24.0 / ch).min(1.0);
+                let w = (cw * scale).round().max(1.0) as u16;
+                let h = (ch * scale).round().max(1.0) as u16;
+                images.insert(u.to_string(), (w, h));
             }
         }
         eprintln!("decoded {} images", images.len());
@@ -2826,7 +3039,20 @@ mod tests {
                     .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
             })
             .unwrap_or((80, 24));
-        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = fetch(&Request::get(url)).await.unwrap();
+        // TRUST_DIAG_INJECT=<file>: splice a probe <script> at the very top of
+        // <head> so it runs before the page's own scripts (mirror-harness style).
+        if let Ok(inj) = std::env::var("TRUST_DIAG_INJECT") {
+            let js = std::fs::read_to_string(&inj).unwrap();
+            let mut body = String::from_utf8_lossy(&response.body).to_string();
+            let at = body
+                .find("<head>")
+                .map(|i| i + "<head>".len())
+                .or_else(|| body.find("<head "))
+                .unwrap_or(0);
+            body.insert_str(at, &format!("<script>{js}</script>"));
+            response.body = body.into_bytes();
+        }
         eprintln!(
             "fetched: status={} content_type={:?} body={}B vp={vp:?}",
             response.status,
@@ -2840,6 +3066,36 @@ mod tests {
             "body after: {}",
             String::from_utf8_lossy(&response.body[..response.body.len().min(1200)])
         );
+        // TRUST_DIAG_SETTLE: for a LIVE page, `execute_js` returns the
+        // interactive SHELL (before `settle_page` fires `load` and drains
+        // background timers), so the default dump misses anything an SPA mounts
+        // after first paint — and the console/errors of that work. Drain the
+        // actor's post-shell `Updated` events to capture the SETTLED render +
+        // accumulated console instead. (A blank-shell SPA whose mount throws
+        // only AFTER the shell — e.g. pixiv's React login — is invisible
+        // without this.)
+        if std::env::var_os("TRUST_DIAG_SETTLE").is_some()
+            && let Some(live) = response.live.as_mut()
+        {
+            for _ in 0..6 {
+                match tokio::time::timeout(Duration::from_secs(20), live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                        eprintln!(
+                            "SETTLED EVT errors={:?} console={:?}",
+                            outcome.errors, outcome.console
+                        );
+                        response.body = html.into_bytes();
+                    }
+                    Ok(Some(other)) => {
+                        eprintln!("SETTLED EVT {other:?}");
+                    }
+                    _ => {
+                        eprintln!("SETTLED <no more within 20s>");
+                        break;
+                    }
+                }
+            }
+        }
         if let Ok(out) = std::env::var("TRUST_NET_DIAG_OUT") {
             std::fs::write(&out, &response.body).unwrap();
             eprintln!("full post-JS body ({}B) -> {out}", response.body.len());

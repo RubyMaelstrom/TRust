@@ -53,9 +53,11 @@ Any gopher, gemini, or http(s) URL opens a shared browser panel with
 gopherus-style navigation: **Up/Down** move through the page with the
 link highlight riding the center of the screen, **Right/Enter**
 follows, **Left** goes back (position restored), **Esc** returns to
-the terminal. Pages re-wrap live when you resize. Fetches run in the
-background with timeouts and size caps — a little heart beats at the
-right end of the entry bar while one is in flight.
+the terminal. **Ctrl-F** finds in the page — type to highlight matches
+as you go, **Enter/↓** and **Shift-Enter/↑** step through them (with a
+match counter), **Esc** closes. Pages re-wrap live when you resize.
+Fetches run in the background with timeouts and size caps — a little
+heart beats at the right end of the entry bar while one is in flight.
 
 Things it handles along the way:
 
@@ -149,7 +151,7 @@ reply — parses into the same line-based model the browser renders.
 ## Status
 
 Done: the telnet core with option negotiation, NAWS, TERMINAL-TYPE,
-TSPEED, NEW-ENVIRON, STATUS, LFLOW, BINARY, probe replies, CP437; TOFU
+TSPEED, NEW-ENVIRON, STATUS, LFLOW, LINEMODE, BINARY, probe replies, CP437; TOFU
 TLS and `telnets://`; the full browser stack across gopher, gemini
 (including client identities), and the text web (HTML forms, images);
 finger/whois/dict; service-name ports.
@@ -163,6 +165,6 @@ display/visibility mini-cascade reads the page's stylesheets — inline,
 `<style>`, shadow/adopted sheets, fetched `<link>` CSS — so
 class-hidden menus collapse and class-toggled panels genuinely open.
 
-Still to come: LINEMODE and the long tail of GNU command-mode parity
-(`set`/`unset`, `display`, `logout`, `z`, `!`, `.telnetrc`). Maybe
-someday: inline images, animated GIFs.
+Still to come: the long tail of GNU command-mode parity (`set`/`unset`,
+`display`, `logout`, `z`, `!`, `.telnetrc`). Maybe someday: inline
+images, animated GIFs.

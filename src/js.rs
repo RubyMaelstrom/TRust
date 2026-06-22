@@ -427,7 +427,9 @@ pub fn run_script(
     // the DOM mutations made so far stay serializable. (RefCell guards
     // release during unwind, so the arena stays consistent.)
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ctx.eval(Source::from_bytes(source))
+        // Tag the source with its URL/label so backtraces name the file
+        // (classic scripts were anonymous "unknown" — modules already do this).
+        ctx.eval(Source::from_bytes(source).with_path(std::path::Path::new(name)))
     }));
     match result {
         Ok(Ok(_)) => {}
@@ -654,6 +656,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_template_content", 1, sys_template_content),
         ("__http_fetch", 5, sys_http_fetch),
         ("__http_fetch_async", 5, sys_http_fetch_async),
+        ("__dom_run_injected_script", 1, sys_run_injected_script),
         ("__cookie_get", 0, sys_cookie_get),
         ("__cookie_set", 1, sys_cookie_set),
         ("__storage_get", 2, sys_storage_get),
@@ -1389,6 +1392,109 @@ fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
         }
     }
     Ok(promise.into())
+}
+
+/// `__dom_run_injected_script(nodeId)` — run a `<script>` element that page
+/// JS inserted into the live document (the universal SDK-loader idiom
+/// `document.body.appendChild(scriptEl)`: reCAPTCHA/hCaptcha, lazy analytics,
+/// payment/embed widgets, A/B tools). A real browser fetches+executes such a
+/// script; TRust never did, so a runtime-injected dependency silently never
+/// loaded — pixiv's login injects `recaptcha/enterprise.js` then polls
+/// `window.grecaptcha` forever, so the submit hung. Classic scripts only
+/// (the prelude already gates type + first-insertion): a `src` is fetched
+/// then evaluated, inline text is evaluated, and a `load`/`error` event fires
+/// on the element for code that waits on `script.onload`. The fetch reuses
+/// the same cap-/`subresource_allowed`-gated async job `fetch()` uses, so it
+/// overlaps with other work and can't pivot to private address space.
+fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let (node_id, src, text) = {
+        let dom = page_dom(ctx);
+        let d = dom.borrow();
+        let Some(id) = arg_node(&d, args, 0) else {
+            return Ok(JsValue::undefined());
+        };
+        (
+            id,
+            d.attr(id, "src").map(str::to_string),
+            d.text_content(id),
+        )
+    };
+    match src {
+        Some(src) if !src.trim().is_empty() => {
+            match page_net_prepare(ctx, &src, String::from("GET"), None, vec![]) {
+                // Blocked/capped/cross-private: report a failed load like a browser.
+                None => fire_script_event(ctx, node_id, "error"),
+                Some((_handle, request)) => {
+                    phase(&format!("src: INJECT {}", request.url));
+                    let name = request.url.to_string();
+                    let realm = ctx.realm().clone();
+                    let job = NativeAsyncJob::with_realm(
+                        async move |cell: &RefCell<&mut Context>| {
+                            // Await without borrowing the context (so injected
+                            // loads overlap like every other async fetch).
+                            let result = crate::http::fetch(&request).await;
+                            let mut guard = cell.borrow_mut();
+                            match result {
+                                Ok(resp) => {
+                                    let body =
+                                        crate::http::decode_body(&resp.content_type, &resp.body);
+                                    eval_injected(&mut guard, &name, body.as_bytes());
+                                    fire_script_event(&mut guard, node_id, "load");
+                                }
+                                Err(_) => fire_script_event(&mut guard, node_id, "error"),
+                            }
+                            Ok(JsValue::undefined())
+                        },
+                        realm,
+                    );
+                    ctx.enqueue_job(job.into());
+                }
+            }
+        }
+        _ if !text.trim().is_empty() => {
+            // Inline injected script: evaluate its text. Run as a (ready) async
+            // job so we don't re-enter `ctx.eval` from inside this syscall.
+            let realm = ctx.realm().clone();
+            let job = NativeAsyncJob::with_realm(
+                async move |cell: &RefCell<&mut Context>| {
+                    let mut guard = cell.borrow_mut();
+                    eval_injected(&mut guard, "injected-inline", text.as_bytes());
+                    Ok(JsValue::undefined())
+                },
+                realm,
+            );
+            ctx.enqueue_job(job.into());
+        }
+        _ => {}
+    }
+    Ok(JsValue::undefined())
+}
+
+/// Evaluate an injected script's source in the page realm, routing any error
+/// to `__trust.errors` (so the `JS:n!` badge + diagnostics see it) and
+/// surviving a Boa VM panic — one bad injected script can't kill the actor.
+fn eval_injected(ctx: &mut Context, name: &str, source: &[u8]) {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.eval(Source::from_bytes(source).with_path(std::path::Path::new(name)))
+    }));
+    if let Ok(Err(err)) = res {
+        let msg = format!("{name}: {err}");
+        let esc = msg
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        let _ = ctx.eval(Source::from_bytes(
+            format!("__trust.errors.push(\"{esc}\")").as_bytes(),
+        ));
+    }
+}
+
+/// Fire a `load`/`error` event on an injected script element (and call its
+/// `on<type>` handler), for loaders that wait on `script.onload`.
+fn fire_script_event(ctx: &mut Context, node_id: usize, ty: &str) {
+    let _ = ctx.eval(Source::from_bytes(
+        format!("__trust.scriptEvent({node_id}, \"{ty}\")").as_bytes(),
+    ));
 }
 
 /// `document.cookie` getter: the jar's non-HttpOnly name=value pairs
@@ -2565,6 +2671,12 @@ pub enum PageEvt {
     /// The page did not prevent a form submit; the app should perform
     /// the normal HTTP form submission it already prepared.
     SubmitDefault,
+    /// A CLICK on a submit control fired the form's `submit` event and the
+    /// page did not prevent it — the app should run the native GET/POST for
+    /// this form. Carries the form + submitter arena nodes (the app maps them
+    /// to its doc-model indices); unlike `SubmitDefault` the app hasn't
+    /// pre-recorded which form, because the click path didn't know.
+    SubmitForm { form: usize, submitter: usize },
 }
 
 #[derive(Debug)]
@@ -2686,6 +2798,19 @@ fn page_actor(
                     }
                     continue; // app decides; we stay alive until dropped
                 }
+                // Clicking a submit control runs the form-submission algorithm.
+                // If the page didn't prevent the `submit`, the app runs the
+                // native GET/POST (a prevented submit falls through to the
+                // re-render below — the page owns the update).
+                if let Some((form, submitter)) = take_click_submit(&mut page) {
+                    if evts
+                        .blocking_send(PageEvt::SubmitForm { form, submitter })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 if !finish_dispatch(&mut page, &evts) {
                     return;
                 }
@@ -2768,6 +2893,23 @@ fn take_script_navigation(page: &mut LoadedPage) -> Option<String> {
     let s = v.to_string(&mut page.ctx).ok()?.to_std_string_lossy();
     let trimmed = s.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// After a click, whether it triggered an UN-PREVENTED form submit (a click
+/// on a submit control whose `submit` event the page didn't cancel). Returns
+/// the `(form, submitter)` arena nodes so the app runs the native GET/POST; a
+/// prevented submit (page owns it) and a non-submit click both return None.
+fn take_click_submit(page: &mut LoadedPage) -> Option<(usize, usize)> {
+    let v = page
+        .ctx
+        .eval(Source::from_bytes(
+            b"(function(){var s=__trust.lastClickSubmit;__trust.lastClickSubmit=null;\
+              return (s && !s.prevented) ? (s.form + ',' + s.submitter) : '';})()",
+        ))
+        .ok()?;
+    let s = v.to_string(&mut page.ctx).ok()?.to_std_string_lossy();
+    let (f, sub) = s.split_once(',')?;
+    Some((f.trim().parse().ok()?, sub.trim().parse().ok()?))
 }
 
 fn prepare_dispatch(page: &mut LoadedPage) {
@@ -3161,6 +3303,27 @@ const PRELUDE: &str = r##"
         return w;
     }
 
+    // A <script> element runs when it is FIRST inserted into the document
+    // (HTML "prepare a script") — the universal SDK-loader idiom
+    // `document.body.appendChild(scriptEl)` (reCAPTCHA, lazy analytics, embeds).
+    // Tracked so re-insertion never re-runs it (the spec's "already started"
+    // flag). Classic scripts only; a non-JS `type` is left inert. Scripts
+    // parsed from innerHTML do NOT execute (spec), so this only fires for
+    // genuine element-node insertion through appendChild/insertBefore.
+    const SCRIPTS_STARTED = new Set();
+    function maybeRunScript(node) {
+        if (!node || node.localName !== "script" || SCRIPTS_STARTED.has(node.__id)) return;
+        const ty = (node.getAttribute("type") || "").trim().toLowerCase();
+        if (ty && ty !== "text/javascript" && ty !== "application/javascript" && ty !== "text/ecmascript") return;
+        // Only a script connected to the document runs (not one built up inside
+        // a detached fragment, which executes when ITS root is later inserted).
+        let n = node, connected = false;
+        while (n) { if (n.nodeType === 9) { connected = true; break; } n = n.parentNode; }
+        if (!connected) return;
+        SCRIPTS_STARTED.add(node.__id);
+        __dom_run_injected_script(node.__id);
+    }
+
     // The document base URL: <base href> when present (archive.org sets
     // one; SPA routers resolve '.' against it), the page URL otherwise.
     function baseHref() {
@@ -3383,12 +3546,55 @@ const PRELUDE: &str = r##"
     // The actor's entry points: dispatch a user click; enumerate nodes
     // with click listeners (delegation hosts included — the actor sorts
     // containers from buttons).
+    // The submit control at or above `el` (the default action of clicking it
+    // is to submit its form). A <button>'s type defaults to "submit";
+    // type="button"/"reset" do not submit. <input type=submit|image> too.
+    function submitControlFor(el) {
+        let n = el;
+        while (n && n.nodeType === 1) {
+            const tag = n.localName;
+            if (tag === "button") return (n.getAttribute("type") || "submit").toLowerCase() === "submit" ? n : null;
+            if (tag === "input") { const ty = (n.getAttribute("type") || "").toLowerCase(); return (ty === "submit" || ty === "image") ? n : null; }
+            n = n.parentNode;
+        }
+        return null;
+    }
     trust.click = function (id) {
+        trust.lastClickSubmit = null;
         const t = wrap(id);
         if (!t) return false;
         const ev = new Event("click", { bubbles: true, cancelable: true });
         dispatch(t, ev, false);
-        return ev.defaultPrevented;
+        if (ev.defaultPrevented) return true;
+        // The default action of activating a submit control is to submit its
+        // form (HTML). A live <button>/<input type=submit> reaches the app as a
+        // JsClick, so without this a click fired only a `click` event and the
+        // form's `submit` handler (e.g. React's onSubmit, bound on the <form>)
+        // never ran — pixiv's login button did "nothing". Fire a real submit;
+        // page JS may preventDefault (then it owns the update) — else the app
+        // runs the native GET/POST.
+        const btn = submitControlFor(t);
+        if (btn) {
+            const form = nearestForm(btn);
+            if (form) {
+                const sev = new Event("submit", { bubbles: true, cancelable: true });
+                sev.submitter = btn;
+                dispatch(form, sev, false);
+                trust.lastClickSubmit = { form: form.__id, submitter: btn.__id, prevented: sev.defaultPrevented };
+                return sev.defaultPrevented;
+            }
+        }
+        return false;
+    };
+    // Fire a load/error event on an injected <script> (and its on<type>
+    // handler), for loaders that wait on `script.onload` instead of polling.
+    trust.scriptEvent = function (id, type) {
+        const t = wrap(id);
+        if (!t) return;
+        const ev = new Event(type);
+        dispatch(t, ev, false);
+        const on = t["on" + type];
+        if (typeof on === "function") { try { on.call(t, ev); } catch (e) { trust.errors.push("script on" + type + ": " + ((e && e.message) || e)); } }
     };
     trust.clickables = function () {
         const out = [];
@@ -3580,12 +3786,14 @@ const PRELUDE: &str = r##"
             if (c && c.nodeType === 11 && !c.__host) { for (const k of c.childNodes) this.appendChild(k); return c; }
             __dom_append(this.__id, c.__id);
             if (CE.defs.size) ceScan(c);
+            maybeRunScript(c);
             return c;
         }
         insertBefore(c, ref) {
             if (c && c.nodeType === 11 && !c.__host) { for (const k of c.childNodes) this.insertBefore(k, ref); return c; }
             __dom_insert_before(this.__id, c.__id, ref ? ref.__id : null);
             if (CE.defs.size) ceScan(c);
+            maybeRunScript(c);
             return c;
         }
         removeChild(c) { if (CE.defs.size) ceDisconnect(c); __dom_detach(c.__id); return c; }
@@ -3594,6 +3802,7 @@ const PRELUDE: &str = r##"
             __dom_insert_before(this.__id, n.__id, old.__id);
             __dom_detach(old.__id);
             if (CE.defs.size) ceScan(n);
+            maybeRunScript(n);
             return old;
         }
         remove() { if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); }
@@ -3838,14 +4047,86 @@ const PRELUDE: &str = r##"
         set className(v) { this.setAttribute("class", v); }
         get name() { return this.getAttribute("name") || ""; }
         set name(v) { this.setAttribute("name", v); }
-        get value() { const v = this.getAttribute("value"); return v === null ? "" : v; }
-        set value(v) { this.setAttribute("value", String(v)); }
+        get value() {
+            const ln = this.localName;
+            // <select>.value is the value of its first selected option (HTML
+            // spec), not a `value` content attribute — selects have none.
+            if (ln === "select") { const o = this.__selectedOption(); return o ? o.value : ""; }
+            // <option>.value falls back to its text when the attribute is absent
+            // (matches the form-submit option logic), so a valueless <option>
+            // still round-trips its label.
+            if (ln === "option") { const v = this.getAttribute("value"); return v === null ? this.textContent : v; }
+            const v = this.getAttribute("value"); return v === null ? "" : v;
+        }
+        set value(v) {
+            if (this.localName === "select") { this.__selectValue(String(v)); return; }
+            this.setAttribute("value", String(v));
+        }
+        // --- HTMLSelectElement surface (options/index/multiple) ---
+        // `options` is the select's <option> descendants (optgroups included, per
+        // spec) as a real Array — `.length`/`[i]` and `.filter`/iteration all
+        // work natively, like every other collection the prelude hands back.
+        __options() { return this.localName === "select" ? this.querySelectorAll("option") : []; }
+        __selectedOption() {
+            const os = this.__options();
+            for (const o of os) if (o.selected) return o;
+            // A single (non-multiple) select with nothing explicitly selected
+            // defaults to its first option (HTML spec).
+            return (!this.multiple && os.length) ? os[0] : null;
+        }
+        __selectValue(val) {
+            const os = this.__options(); let matched = false;
+            for (const o of os) {
+                const m = !matched && o.value === val;
+                o.selected = m;
+                if (m) matched = true;
+            }
+        }
+        get options() { return this.localName === "select" ? this.__options() : undefined; }
+        get selectedOptions() { return this.localName === "select" ? this.__options().filter((o) => o.selected) : undefined; }
+        get selectedIndex() {
+            if (this.localName !== "select") return undefined;
+            const os = this.__options();
+            for (let i = 0; i < os.length; i++) if (os[i].selected) return i;
+            return this.multiple ? -1 : (os.length ? 0 : -1);
+        }
+        set selectedIndex(i) {
+            if (this.localName !== "select") return;
+            const os = this.__options(); i = Number(i);
+            for (let k = 0; k < os.length; k++) os[k].selected = (k === i);
+        }
+        get multiple() { return this.hasAttribute("multiple"); }
+        set multiple(v) { if (v) this.setAttribute("multiple", ""); else this.removeAttribute("multiple"); }
         get checked() { return this.hasAttribute("checked"); }
         set checked(v) { if (v) this.setAttribute("checked", ""); else this.removeAttribute("checked"); }
         get disabled() { return this.hasAttribute("disabled"); }
         set disabled(v) { if (v) this.setAttribute("disabled", ""); else this.removeAttribute("disabled"); }
+        // HTMLOptionElement.selected / .defaultSelected. A headless DOM has no
+        // separate "dirty selectedness", so both reflect the `selected` content
+        // attribute — which is ALSO what the layout/form code reads to know
+        // which option is current (`option[selected]`). React's <select> commit
+        // (`postMountWrapper`/`updateOptions`) reads+writes both on every option,
+        // so getter-only would throw in strict mode. (`option.disabled` already
+        // works above; it's read in the same loop.)
+        get selected() { return this.hasAttribute("selected"); }
+        set selected(v) { if (v) this.setAttribute("selected", ""); else this.removeAttribute("selected"); }
+        get defaultSelected() { return this.hasAttribute("selected"); }
+        set defaultSelected(v) { if (v) this.setAttribute("selected", ""); else this.removeAttribute("selected"); }
         get hidden() { return this.hasAttribute("hidden"); }
         set hidden(v) { if (v) this.setAttribute("hidden", ""); else this.removeAttribute("hidden"); }
+        // Reflected string IDL attributes (HTML spec): the getter returns the
+        // content attribute or "" — NOT undefined — so the universal idiom
+        // `el.lang.toLowerCase()` / `el.dir === "rtl"` works. pixiv reads
+        // `document.documentElement.lang.toLowerCase()` at boot; without this
+        // it got `undefined.toLowerCase()` and threw, killing the whole bundle.
+        get lang() { return this.getAttribute("lang") || ""; }
+        set lang(v) { this.setAttribute("lang", String(v)); }
+        get dir() { return this.getAttribute("dir") || ""; }
+        set dir(v) { this.setAttribute("dir", String(v)); }
+        get title() { return this.getAttribute("title") || ""; }
+        set title(v) { this.setAttribute("title", String(v)); }
+        get slot() { return this.getAttribute("slot") || ""; }
+        set slot(v) { this.setAttribute("slot", String(v)); }
         // <input>'s type IDL attribute defaults to "text" when the content
         // attribute is absent (HTML spec: limited to known values, missing →
         // Text). Code keys off this default constantly — React's change-event
@@ -3886,15 +4167,52 @@ const PRELUDE: &str = r##"
         get content() {
             // <template>.content: the inert fragment its markup parses into.
             if (this.localName === "template") return wrap(__dom_template_content(this.__id));
+            // HTMLMetaElement.content reflects the `content` attribute (HTML
+            // spec). pixiv stashes its boot config as JSON in
+            // `<meta id="meta-global-data" content='{…}'>` and does
+            // `JSON.parse(meta.content)`; without reflection that was an
+            // expando `undefined` → `JSON.parse(undefined)` → SyntaxError.
+            if (this.localName === "meta") return this.getAttribute("content") || "";
             return this.__content;
         }
-        // Non-template elements have NO `content` property in the DOM, so a
-        // framework's `.content=${…}` property binding (lit's PropertyPart does
-        // `element[name] = value`) just sets a plain expando — it must NOT throw
-        // the way a getter-without-setter does in strict mode. Templates keep
-        // their read-only fragment; ignore writes there.
+        // Non-template, non-meta elements have NO `content` property in the DOM,
+        // so a framework's `.content=${…}` property binding (lit's PropertyPart
+        // does `element[name] = value`) just sets a plain expando — it must NOT
+        // throw the way a getter-without-setter does in strict mode. Templates
+        // keep their read-only fragment; <meta> reflects its attribute.
         set content(v) {
-            if (this.localName !== "template") this.__content = v;
+            if (this.localName === "template") return;
+            if (this.localName === "meta") { this.setAttribute("content", String(v)); return; }
+            this.__content = v;
+        }
+        // HTMLIFrameElement.contentDocument / .contentWindow. TRust runs no
+        // nested browsing context, but the near-universal idiom
+        // `iframe.contentDocument || iframe.contentWindow.document` (analytics
+        // beacons, sandboxed injectors, the Cloudflare JS-detection script
+        // pixiv embeds) reads them unconditionally — returning undefined made
+        // `contentWindow.document` throw. Hand back a blank same-arena document
+        // facade (the one `document.implementation.createHTMLDocument` already
+        // builds for jQuery); anything written into it is inert (never rendered
+        // or executed), which is the right graceful degrade for a frame we don't
+        // load. Cached on the (identity-stable) wrapper. Non-frame elements
+        // have no such property, so they keep returning undefined.
+        get contentDocument() {
+            if (this.localName !== "iframe" && this.localName !== "frame") return undefined;
+            return this.__contentDoc || (this.__contentDoc = document.implementation.createHTMLDocument(""));
+        }
+        get contentWindow() {
+            if (this.localName !== "iframe" && this.localName !== "frame") return undefined;
+            if (!this.__contentWin) {
+                this.__contentWin = {
+                    document: this.contentDocument,
+                    location: { href: "about:blank", replace() {}, assign() {} },
+                    parent: g, top: g, self: undefined, frameElement: this,
+                    postMessage() {}, focus() {}, blur() {},
+                    addEventListener() {}, removeEventListener() {},
+                };
+                this.__contentWin.self = this.__contentWin;
+            }
+            return this.__contentWin;
         }
         attachShadow(init) {
             const id = __dom_attach_shadow(this.__id);
@@ -8258,6 +8576,74 @@ mod tests {
         assert_eq!(border_of(&html, "t2"), "4px", "Merchants now active");
     }
 
+    #[test]
+    fn clicking_a_submit_button_fires_the_form_submit() {
+        // A live <button type=submit> reaches the app as a JsClick (the live
+        // serializer wraps every button). Clicking it must run the form-
+        // submission algorithm so the form's own `submit` handler (React's
+        // onSubmit is bound on the <form>, not the button) fires — pixiv's
+        // login button did "nothing" because only a bare click event went out.
+        let (handle, mut events) = live(
+            "<body><form id=f><input name=q><button type=submit>Go</button></form>\
+             <pre id=out>idle</pre><script>\
+             document.getElementById('f').addEventListener('submit', function (e) {\
+                 e.preventDefault();\
+                 document.getElementById('out').textContent = 'submitted:' + (e.submitter ? e.submitter.textContent : 'none');\
+             });</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("live form should keep the actor resident");
+        };
+        let button = live_node_after(&html, "<button");
+        handle.cmds.blocking_send(PageCmd::Click(button)).unwrap();
+        // Submit was prevented → the page owns the update; the handler ran and
+        // saw the submitter, and the app is NOT asked to navigate.
+        let html2 = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => break html,
+                Some(PageEvt::Settled) => continue,
+                other => panic!("expected the prevented submit to re-render, got {other:?}"),
+            }
+        };
+        assert!(html2.contains("submitted:Go"), "{html2}");
+    }
+
+    #[test]
+    fn clicking_a_submit_button_without_a_handler_asks_the_app_to_submit() {
+        // A LIVE page (has JS) whose <form> has NO `submit` handler: a click on
+        // its submit button fires an un-prevented submit, so the app runs the
+        // native GET/POST (the event carries the form + submitter nodes). The
+        // button's own click listener doesn't preventDefault — it just makes
+        // the page live so the button reaches the app as a JsClick.
+        let (handle, mut events) = live(
+            "<body><form action=\"/go\"><input name=q value=hi>\
+             <button type=submit>Go</button></form>\
+             <script>document.querySelector('button').addEventListener('click', function () {});</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("a live form keeps the actor resident");
+        };
+        let at = html.find("Go").expect("button label");
+        let button = html[..at]
+            .rfind("x-trust-js:")
+            .map(|i| {
+                html[i + "x-trust-js:".len()..]
+                    .split(':')
+                    .next()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .expect("button marker");
+        handle.cmds.blocking_send(PageCmd::Click(button)).unwrap();
+        match events.blocking_recv() {
+            Some(PageEvt::SubmitForm { .. }) => {}
+            other => {
+                panic!("unprevented submit-button click should ask app to submit, got {other:?}")
+            }
+        }
+    }
+
     fn live_node_after(html: &str, marker: &str) -> usize {
         let start = html.find(marker).expect("marker in live html");
         let rest = &html[start..];
@@ -9103,6 +9489,83 @@ mod tests {
     }
 
     #[test]
+    fn reflected_string_attributes_return_empty_not_undefined() {
+        // HTML reflected string IDL attributes (lang/dir/title/slot) must return
+        // the content attribute or "" — NEVER undefined. pixiv boots with
+        // `document.documentElement.lang.toLowerCase()`; an undefined `lang`
+        // made `.toLowerCase()` throw "cannot convert undefined to object"
+        // (Boa's wording for a property read off undefined), killing its whole
+        // bundle before `window.pixiv` was defined.
+        let (out, outcome) = page(
+            "<html lang=\"JA\"><head></head><body dir=rtl title=hi>\
+             <div id=o></div><script>\
+             const h = document.documentElement;\
+             document.getElementById('o').textContent = [\
+               h.lang.toLowerCase(), typeof h.dir, document.body.dir,\
+               document.body.title, typeof document.body.slot,\
+             ].join('|');\
+             document.documentElement.lang = 'en';\
+             document.getElementById('o').setAttribute('data-set', document.documentElement.getAttribute('lang'));\
+             </script></body></html>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // lang reflects (lowercased by the caller), absent attrs are "" (string).
+        assert!(out.contains(">ja|string|rtl|hi|string<"), "{out}");
+        // The setter reflects back to the content attribute.
+        assert!(out.contains("data-set=\"en\""), "{out}");
+    }
+
+    #[test]
+    fn meta_content_reflects_its_attribute_for_json_boot_config() {
+        // HTMLMetaElement.content reflects the `content` attribute. pixiv stashes
+        // its boot config as JSON in `<meta id=meta-global-data content='{…}'>`
+        // and does `JSON.parse(meta.content)`; an expando-`undefined` content
+        // made that a SyntaxError. A non-<meta> element still gets a plain
+        // `.content` expando (lit's `.content=` property binding) and <template>
+        // keeps its fragment.
+        let (out, outcome) = page(
+            "<head><meta id=cfg content='{\"token\":\"abc\",\"n\":1}'></head>\
+             <body><div id=o></div><div id=lit></div><script>\
+             const cfg = JSON.parse(document.getElementById('cfg').content);\
+             document.getElementById('lit').content = 42;\
+             document.getElementById('o').textContent =\
+               cfg.token + '|' + cfg.n + '|' + document.getElementById('lit').content;\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains(">abc|1|42<"), "{out}");
+    }
+
+    #[test]
+    fn iframe_content_document_and_window_are_a_blank_facade() {
+        // `iframe.contentDocument || iframe.contentWindow.document` is the
+        // universal frame-access idiom (analytics beacons, the Cloudflare
+        // JS-detection script pixiv embeds). With no nested browsing context we
+        // hand back a blank same-arena document facade so the idiom doesn't
+        // throw; anything written into it is inert. Non-frame elements have no
+        // such property (undefined).
+        let (out, outcome) = page(
+            r##"<body><div id=o></div><script>
+            var f = document.createElement('iframe');
+            document.body.appendChild(f);
+            // The exact CF beacon shape: contentDocument first, else window.document.
+            var d = f.contentDocument || f.contentWindow.document;
+            var s = d.createElement('script');
+            d.getElementsByTagName('head')[0].appendChild(s);
+            var div = document.createElement('div');
+            document.getElementById('o').textContent = [
+              typeof d, d === f.contentWindow.document,
+              d.getElementsByTagName('head').length, typeof div.contentDocument,
+            ].join('|');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // a document facade, window.document is the SAME object, head exists,
+        // and a plain <div> has no contentDocument.
+        assert!(out.contains(">object|true|1|undefined<"), "{out}");
+    }
+
+    #[test]
     fn intersection_observer_reports_the_targets_real_box() {
         // The observer fires for every target (the no-scroll terminal safeguard)
         // with the element's REAL box for `boundingClientRect` and a FULL
@@ -9283,6 +9746,82 @@ mod tests {
         assert!(out.contains("count=2 first=one"), "{out}");
         assert!(out.contains("data-seen=\"yes\""), "{out}");
         assert!(out.contains("class=\"done\""), "{out}");
+    }
+
+    #[test]
+    fn select_options_surface_drives_react_style_option_mounting() {
+        // React's <select> commit (postMountWrapper/updateOptions) reads
+        // `select.options`, iterates `.length`, and reads/writes each option's
+        // `.value`/`.selected`/`.defaultSelected`. A missing
+        // `HTMLSelectElement.options` made `select.options` undefined, so
+        // `undefined.length` threw a ToObject TypeError that aborted React's
+        // whole render — pixiv's login page mounts a language <select>, so the
+        // crash left the form a blank shell. Exercise the same surface plus the
+        // controlled-select `value` setter, and confirm the selection lands on
+        // the `selected` attribute the layout reads.
+        let (out, outcome) = page(
+            "<body><select id=s>\
+               <option value=en>English</option>\
+               <option value=ja>\u{65e5}\u{672c}\u{8a9e}</option>\
+               <option>plain</option>\
+             </select><pre id=o></pre><script>\
+             var s = document.getElementById('s');\
+             var opts = s.options, n = opts.length, want = 'ja';\
+             for (var i = 0; i < n; i++) {\
+               var hit = opts[i].value === want;\
+               if (opts[i].selected !== hit) opts[i].selected = hit;\
+               if (hit) opts[i].defaultSelected = true;\
+             }\
+             var r = 'len=' + n + ' val=' + s.value + ' idx=' + s.selectedIndex\
+               + ' sel=' + s.selectedOptions.length + ' third=' + opts[2].value;\
+             s.value = 'en';\
+             r += ' after=' + s.selectedIndex + '/' + s.value;\
+             document.getElementById('o').textContent = r;\
+             </script></body>",
+        );
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // .options is iterable+indexable; .value/.selectedIndex/.selectedOptions
+        // read the selection; a valueless <option> falls back to its text; the
+        // controlled `value=` setter re-points the selection.
+        assert!(
+            out.contains("len=3 val=ja idx=1 sel=1 third=plain after=0/en"),
+            "{out}"
+        );
+        // The final selection ("en") carries the `selected` attribute the layout
+        // and form-submit path read.
+        assert!(out.contains("value=\"en\" selected"), "{out}");
+    }
+
+    #[test]
+    fn an_injected_inline_script_executes() {
+        // The universal SDK-loader idiom: page JS builds a <script> and appends
+        // it to the document; a real browser runs it. We never did, so a
+        // runtime-injected dependency silently never loaded (pixiv's login
+        // injects reCAPTCHA this way then polls for it forever). An inline
+        // injected script's text now evaluates, mutating the live DOM.
+        let (out, outcome) = page(
+            "<body><pre id=o>before</pre><script>\
+             var s = document.createElement('script');\
+             s.textContent = \"document.getElementById('o').textContent = 'injected-ran';\";\
+             document.body.appendChild(s);\
+             </script></body>",
+        );
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("injected-ran"), "{out}");
+        // Re-appending the same script must NOT re-run it (HTML "already
+        // started" flag), so the text stays as the first run left it.
+        let (out2, _) = page(
+            "<body><pre id=o>x</pre><script>\
+             var c = 0; window.__n = function(){ return ++c; };\
+             var s = document.createElement('script');\
+             s.textContent = \"document.getElementById('o').textContent = String(window.__n());\";\
+             document.body.appendChild(s);\
+             document.body.appendChild(s);\
+             </script></body>",
+        );
+        assert!(out2.contains(">1<"), "ran once, not twice: {out2}");
     }
 
     #[test]
