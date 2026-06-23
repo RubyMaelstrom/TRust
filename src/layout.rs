@@ -387,6 +387,26 @@ struct LaidBox {
     carousels: Vec<Carousel>,
 }
 
+/// A cell placed in a table grid (CSS 2.1 §17.5): its element and the
+/// top-left grid coordinates + span it occupies after `colspan`/`rowspan`
+/// resolution.
+struct TableCell {
+    id: NodeId,
+    row: usize,
+    col: usize,
+    rowspan: usize,
+    colspan: usize,
+}
+
+/// A declared `width` on a table/cell/column: a pixel length (already in
+/// cells) or a percentage fraction of the table width (CSS 2.1 §17.5.2 —
+/// "a percentage value for a column width is relative to the table width").
+#[derive(Clone, Copy)]
+enum TrackWidth {
+    Px(usize),
+    Pct(f32),
+}
+
 /// Reconstruct a row's plain text, honoring item start columns (gaps
 /// become spaces). Test/diagnostic helper.
 #[cfg(test)]
@@ -594,6 +614,13 @@ fn is_zero_length(value: &str) -> bool {
 /// vertically instead (the responsive fallback) — below this, columns are
 /// too thin to read.
 const MIN_COL: usize = 12;
+
+/// How deeply tables may nest before a table degrades to block-stacked cells.
+/// Real pages rarely nest more than a few (slackware's border trick is ~4);
+/// the lid keeps the per-cell content measurement — which re-descends each
+/// cell's subtree — from overflowing the layout stack on a pathologically deep
+/// table tree.
+const MAX_TABLE_DEPTH: usize = 8;
 
 /// How a flex container lays its items out (Phase A/B of the 2D arc).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1126,6 +1153,25 @@ struct Layout<'a> {
     /// not placing it — so `text-align` offsets are ignored (they don't
     /// change content width) and the result is the natural left-packed extent.
     measuring: bool,
+    /// How many `display:table` formatting contexts enclose this layout. A
+    /// table cell lays its content in a fresh sub-layout that inherits this +1,
+    /// so a nested table knows its depth. Two uses: beyond `MAX_TABLE_DEPTH` a
+    /// table degrades to block-stacked cells (a hard recursion lid — a page can
+    /// nest tables arbitrarily, and the per-cell content measurement re-descends
+    /// the subtree, so unbounded nesting would overflow the stack); and the
+    /// expensive auto column measurement is skipped while `measuring` (a nested
+    /// table contributes an approximate width to its ancestor's measurement
+    /// instead of recursively measuring again — without this the per-cell
+    /// min/max passes compound multiplicatively with nesting depth).
+    table_depth: usize,
+    /// The element this sub-layout was spun up to lay out (a float / flex / grid
+    /// item, or a bordered interior) — the ROOT of `layout_subtree_inner`. Its
+    /// own `width` was ALREADY consumed by the parent to size the box this
+    /// subtree fills, so `constrain_block_width` must NOT re-narrow on it again
+    /// (a `float:left;width:16.66%` column would otherwise resolve its `%`
+    /// against the already-narrowed band a second time and collapse — erome's
+    /// thumbnail grid). `None` for the page's top-level layout.
+    subtree_root: Option<NodeId>,
     /// When laying the INTERIOR of a bordered box (`flow_bordered`'s sub-pass),
     /// this is that element: its own border routing is skipped (no recursion)
     /// and its margin is suppressed (handled outside the frame; padding kept).
@@ -1207,6 +1253,8 @@ impl<'a> Layout<'a> {
             carousels: Vec::new(),
             suppressed_controls: std::collections::HashSet::new(),
             measuring: false,
+            table_depth: 0,
+            subtree_root: None,
             inner_border_box: None,
             borders,
             clip_right: None,
@@ -1510,6 +1558,20 @@ impl<'a> Layout<'a> {
                     .insert(id, (floor_w.unwrap_or(0), floor_h.unwrap_or(0)));
             }
         }
+        // A `display:table` element establishes a table formatting context: its
+        // rows lay their cells side by side into computed columns (CSS 2.1 §17),
+        // instead of stacking every `<td>` as its own block. Routed before the
+        // border/flex/block dispatch so the whole table subtree is laid by the
+        // table algorithm. `flow_table` does its own block framing.
+        if block_like
+            && matches!(
+                self.dom.effective_display(id).as_deref(),
+                Some("table" | "inline-table")
+            )
+        {
+            self.flow_table(id, ctx);
+            return;
+        }
         // A block-level element with a visible border is laid as its own
         // framed sub-box: lay its interior, draw the bordered sides as
         // box-drawing, blit. `inner_border_box` guards the recursion (the
@@ -1559,16 +1621,25 @@ impl<'a> Layout<'a> {
         };
 
         // text-align inherits; a block that sets it changes alignment for
-        // its own lines and its descendants until they override it.
+        // its own lines and its descendants until they override it. The CSS
+        // value wins; otherwise the legacy presentational hints `<center>` and
+        // the `align` attribute (HTML §15.3 maps `align` to `text-align`) still
+        // align old table-layout pages — slackware centers its title cell and
+        // right-aligns its footer this way.
         let saved_align = self.align;
-        if block_like
-            && let Some(a) = self
+        if block_like {
+            if let Some(a) = self
                 .dom
                 .computed_value(id, "text-align")
                 .as_deref()
                 .and_then(Align::from_css)
-        {
-            self.align = a;
+            {
+                self.align = a;
+            } else if tag == "center" {
+                self.align = Align::Center;
+            } else if let Some(a) = self.dom.attr(id, "align").and_then(Align::from_css) {
+                self.align = a;
+            }
         }
 
         let indent_add = if block_like {
@@ -1932,6 +2003,16 @@ impl<'a> Layout<'a> {
     /// band — we never cramp below the available width, and `auto`/intrinsic
     /// widths resolve to `None` so they flow wide as before).
     fn constrain_block_width(&mut self, id: NodeId) -> usize {
+        // The root of this sub-layout (a float / flex / grid item) was already
+        // sized to its `width` by the parent pass — the constraint this subtree
+        // fills IS that width. Re-narrowing on the element's own `width` here
+        // double-counts it: a `float:left;width:16.66%` column would resolve its
+        // `%` against the already-narrowed band a second time (16.66% of a 27-
+        // cell float box → a 5-cell band), collapsing the column's content (the
+        // erome thumbnail grid regressed exactly this way). Leave the band whole.
+        if self.subtree_root == Some(id) {
+            return 0;
+        }
         let avail = self.width.saturating_sub(self.indent).max(1);
         // A definite `width` is an explicit target — narrow to it regardless of
         // margins. A bare `max-width` (no `width`) is only a CEILING: an
@@ -3868,6 +3949,529 @@ impl<'a> Layout<'a> {
         true
     }
 
+    /// Lay a `display:table` element (CSS 2.1 §17 — the table formatting
+    /// model). Builds the cell grid (honoring `colspan`/`rowspan`), computes
+    /// column widths by the automatic table layout algorithm (§17.5.2.2; the
+    /// fixed algorithm when `table-layout:fixed` + a definite width), lays each
+    /// cell's content as its own sub-box at its column width (so nested tables
+    /// recurse), sizes rows to their tallest cell, and blits the cells side by
+    /// side. We draw NO cell borders/grid lines (her call: terminal rows are
+    /// precious) — the columns alone carry the layout, which is the whole point
+    /// for the ubiquitous old table-as-layout page (slackware.com).
+    fn flow_table(&mut self, id: NodeId, ctx: &Ctx) {
+        // Block framing: tables are block-level boxes.
+        self.flush_block();
+        self.clear_floats(id);
+        if self.gap_before(id, "table") {
+            self.push_blank();
+        }
+
+        // Recursion lid: a table nested past `MAX_TABLE_DEPTH` degrades to
+        // block-stacked content (its rows/cells flow as ordinary blocks). The
+        // per-cell content measurement re-descends each cell's subtree, so a
+        // pathologically deep table tree (some wikis nest navboxes very deep)
+        // would otherwise overflow the layout stack.
+        if self.table_depth >= MAX_TABLE_DEPTH {
+            for child in self.dom.children(id) {
+                self.flow_node(child, ctx);
+            }
+            self.flush_block();
+            if self.gap_after(id, "table") {
+                self.push_blank();
+            }
+            return;
+        }
+
+        let band = self.line_right.saturating_sub(self.line_left).max(1);
+        let rows = self.table_cell_rows(id);
+        let (cells, ncols) = build_table_grid(self, &rows);
+        if cells.is_empty() || ncols == 0 {
+            if self.gap_after(id, "table") {
+                self.push_blank();
+            }
+            return;
+        }
+
+        let bs = self.table_border_spacing(id); // horizontal cell spacing, cells
+        let cellpad_px = self
+            .dom
+            .attr(id, "cellpadding")
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .unwrap_or(0.0);
+
+        // While measuring an ancestor's width, size columns cheaply (no per-cell
+        // min/max content measurement) — the table contributes an approximate
+        // width and we don't recursively re-measure every nested table.
+        let cheap = self.measuring;
+        let widths = self.table_column_widths(id, &cells, ncols, band, bs, cheap);
+        // Every cell sub-layout is one table level deeper.
+        self.table_depth += 1;
+        // Column x offsets (left edge of each column), with inter-column spacing.
+        let mut col_x = vec![0usize; ncols];
+        let mut acc = 0usize;
+        for c in 0..ncols {
+            col_x[c] = acc;
+            acc += widths[c] + bs;
+        }
+        let table_w = acc.saturating_sub(bs).max(1);
+        // A table narrower than its band is positioned by its horizontal auto
+        // margins / `align`/`<center>` context: centered or right-aligned.
+        let lead = self.table_lead(id, table_w, band);
+
+        // Lay every cell at its spanned-column width (parallel to `cells`).
+        // Each entry is `(box, horizontal pad, vertical pad)`.
+        let table_top = self.rows.len();
+        let mut laid: Vec<(LaidBox, usize, usize)> = Vec::with_capacity(cells.len());
+        let mut nrows = 0usize;
+        for cell in &cells {
+            let end = (cell.col + cell.colspan).min(ncols);
+            let span = end.saturating_sub(cell.col).max(1);
+            let cell_w = (widths[cell.col..end].iter().sum::<usize>() + bs * (span - 1)).max(1);
+            // Cellpadding (HTML attr) insets content when the cell sets no CSS
+            // padding of its own (CSS padding, applied by the cell's own
+            // `block_indent`, wins per the presentational-hint priority).
+            let has_css_pad = ["padding", "padding-left", "padding-right", "padding-top"]
+                .iter()
+                .any(|p| self.dom.computed_style(cell.id, p).is_some());
+            let (ph, pv) = if has_css_pad || cellpad_px == 0.0 {
+                (0, 0)
+            } else {
+                (
+                    (cellpad_px / 8.0).round() as usize,
+                    (cellpad_px / 16.0).round() as usize,
+                )
+            };
+            let inner_w = cell_w.saturating_sub(2 * ph).max(1);
+            // Propagate `measuring`: when this whole table is being laid only to
+            // measure an ancestor's width, its cells (and any nested tables in
+            // them) are measured too — never re-entering the expensive auto
+            // algorithm, which is what would compound exponentially with depth.
+            let b = self.layout_subtree_inner(cell.id, inner_w, None, self.measuring, ctx);
+            nrows = nrows.max(cell.row + cell.rowspan);
+            laid.push((b, ph, pv));
+        }
+        self.table_depth -= 1;
+        if nrows == 0 {
+            if self.gap_after(id, "table") {
+                self.push_blank();
+            }
+            return;
+        }
+
+        // Row heights: the tallest single-row cell sets each row; a row-spanning
+        // cell whose box exceeds its spanned rows pushes the deficit onto its
+        // last row (CSS 2.1 §17.5.3 — the row height is the max the cells need).
+        let mut row_h = vec![0usize; nrows];
+        for (cell, (b, _ph, pv)) in cells.iter().zip(&laid) {
+            if cell.rowspan <= 1 && cell.row < nrows {
+                row_h[cell.row] = row_h[cell.row].max(b.height as usize + 2 * pv);
+            }
+        }
+        // Second pass for spanning cells: ensure the spanned rows together fit.
+        for (cell, (b, _ph, pv)) in cells.iter().zip(&laid) {
+            if cell.rowspan <= 1 {
+                continue;
+            }
+            let need = b.height as usize + 2 * pv;
+            let end = (cell.row + cell.rowspan).min(nrows);
+            let have: usize = row_h[cell.row..end].iter().sum();
+            if need > have && end > cell.row {
+                row_h[end - 1] += need - have;
+            }
+        }
+        let mut row_y = vec![0usize; nrows];
+        let mut acc = 0usize;
+        for r in 0..nrows {
+            row_y[r] = acc;
+            acc += row_h[r] + bs;
+        }
+        let table_h = acc.saturating_sub(bs);
+
+        // Blit each cell at its column/row origin, vertically aligned in the
+        // (possibly taller) row band per `valign`/`vertical-align`.
+        for (cell, (b, ph, pv)) in cells.iter().zip(&laid) {
+            let end = (cell.row + cell.rowspan).min(nrows);
+            let span_h = row_h[cell.row..end].iter().sum::<usize>() + bs * (end - cell.row - 1);
+            let cell_h = b.height as usize + 2 * pv;
+            let dy = self.cell_valign_offset(Some(cell.id), cell_h, span_h);
+            let x = self.line_left + lead + col_x.get(cell.col).copied().unwrap_or(0) + ph;
+            self.blit(b, x as u16, table_top + row_y[cell.row] + dy + pv);
+        }
+
+        // Reserve the table's full height, then resume below it.
+        while self.rows.len() < table_top + table_h {
+            self.push_blank();
+        }
+        self.col = self.line_left;
+        self.pending_space = false;
+        if self.gap_after(id, "table") {
+            self.push_blank();
+        }
+    }
+
+    /// The cells of each table row, in visual order (header-group rows first,
+    /// then body/implicit rows, then footer-group rows — CSS 2.1 §17.2.1).
+    /// Each entry is one row's `table-cell` children; an empty row (a spacer
+    /// `<tr>`) yields an empty inner vec so it still reserves its grid row.
+    fn table_cell_rows(&self, table: NodeId) -> Vec<Vec<NodeId>> {
+        let mut header = Vec::new();
+        let mut body = Vec::new();
+        let mut footer = Vec::new();
+        // Anonymous-row generation (a misparented `table-cell` directly under
+        // the table) is approximated by collecting stray cells into one row.
+        let mut stray = Vec::new();
+        for child in self.dom.children(table) {
+            match self.dom.effective_display(child).as_deref() {
+                Some("table-header-group") => header.extend(self.group_rows(child)),
+                Some("table-footer-group") => footer.extend(self.group_rows(child)),
+                Some("table-row-group") => body.extend(self.group_rows(child)),
+                Some("table-row") => body.push(self.row_cells(child)),
+                Some("table-cell") => stray.push(child),
+                _ => {} // columns, captions, whitespace: not rows
+            }
+        }
+        if !stray.is_empty() {
+            body.push(stray);
+        }
+        header.extend(body);
+        header.extend(footer);
+        header
+    }
+
+    /// The `table-row` children of a row group, each resolved to its cells.
+    fn group_rows(&self, group: NodeId) -> Vec<Vec<NodeId>> {
+        self.dom
+            .children(group)
+            .into_iter()
+            .filter(|&r| self.dom.effective_display(r).as_deref() == Some("table-row"))
+            .map(|r| self.row_cells(r))
+            .collect()
+    }
+
+    /// The `table-cell` children of a row.
+    fn row_cells(&self, row: NodeId) -> Vec<NodeId> {
+        self.dom
+            .children(row)
+            .into_iter()
+            .filter(|&c| self.dom.effective_display(c).as_deref() == Some("table-cell"))
+            .collect()
+    }
+
+    /// A cell's `colspan`/`rowspan` (the HTML attributes), clamped to ≥1 and a
+    /// sane ceiling (a hostile `colspan=100000` can't blow up the grid).
+    fn cell_span(&self, id: NodeId, attr: &str) -> usize {
+        self.dom
+            .attr(id, attr)
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 1000)
+    }
+
+    /// A declared `width` on a table/cell — the CSS `width` if set, else the
+    /// HTML `width` presentational attribute (HTML §15.3.13 maps it to the
+    /// `width` property). `None` for `auto`/unset. A bare number on the
+    /// attribute is CSS pixels.
+    fn declared_track_width(&self, id: NodeId) -> Option<TrackWidth> {
+        let raw = self
+            .dom
+            .computed_style(id, "width")
+            .or_else(|| self.dom.attr(id, "width").map(|s| s.trim().to_string()))?;
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("auto") || raw.is_empty() {
+            return None;
+        }
+        if let Some(p) = parse_percent(raw) {
+            return Some(TrackWidth::Pct(p));
+        }
+        if let Some(em) = css_length_em(raw) {
+            return Some(TrackWidth::Px((em * 2.0).round().max(1.0) as usize));
+        }
+        raw.parse::<f32>()
+            .ok()
+            .filter(|n| *n > 0.0)
+            .map(|n| TrackWidth::Px((n / 8.0).round().max(1.0) as usize))
+    }
+
+    /// Horizontal cell spacing (cells): CSS `border-spacing` if set, else the
+    /// HTML `cellspacing` attribute (HTML §15.3.13 maps it to `border-spacing`).
+    /// Default 0 — a terminal's columns are separated by cellpadding/content.
+    fn table_border_spacing(&self, table: NodeId) -> usize {
+        let raw = self
+            .dom
+            .computed_style(table, "border-spacing")
+            .or_else(|| {
+                self.dom
+                    .attr(table, "cellspacing")
+                    .map(|s| s.trim().to_string())
+            });
+        let Some(raw) = raw else { return 0 };
+        let first = raw.split_whitespace().next().unwrap_or("0");
+        css_length_em(first)
+            .map(|em| (em * 2.0).round() as usize)
+            .or_else(|| {
+                first
+                    .parse::<f32>()
+                    .ok()
+                    .map(|n| (n / 8.0).round() as usize)
+            })
+            .unwrap_or(0)
+    }
+
+    /// Position a table narrower than its band: centered when it has
+    /// `margin:0 auto` or sits in a centering (`<center>`/`text-align:center`)
+    /// context, right-aligned for `margin-left:auto`, else flush left.
+    fn table_lead(&self, id: NodeId, table_w: usize, band: usize) -> usize {
+        let slack = band.saturating_sub(table_w);
+        if slack == 0 {
+            return 0;
+        }
+        let ml_auto = self.dom.computed_style(id, "margin-left").as_deref() == Some("auto");
+        let mr_auto = self.dom.computed_style(id, "margin-right").as_deref() == Some("auto");
+        // The HTML `align` attribute on a table centers/right-floats the table
+        // itself (not its text — that's why it's resolved here, not via the
+        // text-align hint path).
+        let attr_align = self
+            .dom
+            .attr(id, "align")
+            .map(|s| s.trim().to_ascii_lowercase());
+        match (ml_auto, mr_auto) {
+            (true, false) => slack,    // margin-left:auto → right
+            (true, true) => slack / 2, // margin:0 auto → centered
+            _ if attr_align.as_deref() == Some("center") => slack / 2,
+            _ if attr_align.as_deref() == Some("right") => slack,
+            _ if self.align == Align::Center => slack / 2,
+            _ if self.align == Align::Right => slack,
+            _ => 0,
+        }
+    }
+
+    /// Vertical offset of a cell within its (possibly taller) row band, per the
+    /// cell's `valign` attribute / `vertical-align` (top default, middle,
+    /// bottom). Baseline is approximated as top in the cell line model.
+    fn cell_valign_offset(&self, cell: Option<NodeId>, cell_h: usize, span_h: usize) -> usize {
+        let slack = span_h.saturating_sub(cell_h);
+        if slack == 0 {
+            return 0;
+        }
+        let Some(id) = cell else { return 0 };
+        let v = self
+            .dom
+            .attr(id, "valign")
+            .map(|s| s.trim().to_ascii_lowercase())
+            .or_else(|| self.dom.computed_style(id, "vertical-align"));
+        match v.as_deref() {
+            Some("bottom") => slack,
+            Some("middle") => slack / 2,
+            _ => 0,
+        }
+    }
+
+    /// Automatic table layout (CSS 2.1 §17.5.2.2): per-column min/max content
+    /// widths from the cells, spanning cells widened across their columns, then
+    /// the table width resolved and distributed over the columns. Falls back to
+    /// the fixed algorithm when `table-layout:fixed` with a definite width.
+    fn table_column_widths(
+        &self,
+        table: NodeId,
+        cells: &[TableCell],
+        ncols: usize,
+        band: usize,
+        bs: usize,
+        cheap: bool,
+    ) -> Vec<usize> {
+        let spacing = bs * ncols.saturating_sub(1);
+        let avail = band.saturating_sub(spacing).max(1);
+
+        // The table's own declared width (the column percentages resolve
+        // against the used table width; px/% resolve against the band).
+        let table_spec = self.declared_track_width(table).map(|w| match w {
+            TrackWidth::Px(px) => px.min(band),
+            TrackWidth::Pct(p) => ((p * band as f32).round() as usize).min(band),
+        });
+
+        // The per-column explicit width preference (a declared `width` on the
+        // column's first single-span cell). Always cheap to gather.
+        let mut col_w: Vec<Option<TrackWidth>> = vec![None; ncols];
+        for cell in cells {
+            if cell.colspan == 1 && cell.col < ncols && col_w[cell.col].is_none() {
+                col_w[cell.col] = self.declared_track_width(cell.id);
+            }
+        }
+
+        // Cheap mode (we're inside an ancestor's width measurement): don't
+        // re-measure every cell's content — honor declared column widths and
+        // divide the rest equally. Bounds the work so nested-table measurement
+        // stays linear instead of compounding with depth.
+        if cheap {
+            let tw = table_spec.unwrap_or(band).min(band);
+            return self.fixed_columns(&col_w, ncols, tw, bs);
+        }
+
+        // Per-column min/max content widths (the automatic algorithm).
+        let mut col_min = vec![1usize; ncols];
+        let mut col_max = vec![1usize; ncols];
+        // Single-column cells first.
+        for cell in cells {
+            if cell.colspan != 1 || cell.col >= ncols {
+                continue;
+            }
+            let (mn, mx) = self.cell_min_max(cell.id, avail);
+            col_min[cell.col] = col_min[cell.col].max(mn);
+            col_max[cell.col] = col_max[cell.col].max(mx);
+        }
+        // Spanning cells: widen their columns so the span fits (§17.5.2.2 step
+        // 3 — widen all spanned columns by approximately the same amount).
+        for cell in cells {
+            if cell.colspan <= 1 {
+                continue;
+            }
+            let end = (cell.col + cell.colspan).min(ncols);
+            let span = end.saturating_sub(cell.col);
+            if span == 0 {
+                continue;
+            }
+            let (mn, mx) = self.cell_min_max(cell.id, avail);
+            let inner_bs = bs * (span - 1);
+            distribute_deficit(&mut col_min[cell.col..end], mn.saturating_sub(inner_bs));
+            distribute_deficit(&mut col_max[cell.col..end], mx.saturating_sub(inner_bs));
+        }
+
+        // Fixed layout: a definite table width + `table-layout:fixed` ignores
+        // content and divides by declared column widths (§17.5.2.1).
+        let fixed = self
+            .dom
+            .computed_style(table, "table-layout")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("fixed"));
+        if let Some(tw) = table_spec.filter(|_| fixed) {
+            return self.fixed_columns(&col_w, ncols, tw, bs);
+        }
+
+        let min_sum: usize = col_min.iter().sum();
+        let max_sum: usize = col_max.iter().sum();
+        // Used table content width (§17.5.2.2): with a specified width, the
+        // greater of it and MIN; auto uses MAX when it fits the band, else the
+        // band — always at least MIN.
+        let content_avail = avail;
+        let used = match table_spec {
+            Some(w) => w.saturating_sub(spacing).max(min_sum),
+            None => {
+                if max_sum <= content_avail {
+                    max_sum.max(min_sum)
+                } else {
+                    content_avail.max(min_sum)
+                }
+            }
+        };
+
+        // Target per column: an explicit width (px, or % of the used table
+        // width) clamped to its min; otherwise its max-content.
+        let table_used_w = used + spacing;
+        let mut target: Vec<usize> = (0..ncols)
+            .map(|c| {
+                let t = match col_w[c] {
+                    Some(TrackWidth::Px(px)) => px,
+                    Some(TrackWidth::Pct(p)) => (p * table_used_w as f32).round() as usize,
+                    None => col_max[c],
+                };
+                t.max(col_min[c]).max(1)
+            })
+            .collect();
+
+        let target_sum: usize = target.iter().sum();
+        if target_sum < used {
+            // Grow: distribute slack to the auto (no explicit width) columns by
+            // their max-content; if none are auto, grow all proportionally.
+            let extra = used - target_sum;
+            let auto: Vec<usize> = (0..ncols).filter(|&c| col_w[c].is_none()).collect();
+            if !auto.is_empty() {
+                let weight: usize = auto.iter().map(|&c| col_max[c].max(1)).sum();
+                grow_by_weight(&mut target, &auto, extra, |c| col_max[c].max(1), weight);
+            } else {
+                let all: Vec<usize> = (0..ncols).collect();
+                let snapshot: Vec<usize> = target.iter().map(|&w| w.max(1)).collect();
+                let weight: usize = snapshot.iter().sum::<usize>().max(1);
+                grow_by_weight(&mut target, &all, extra, |c| snapshot[c], weight);
+            }
+        } else if target_sum > used {
+            // Shrink toward each column's min, proportional to the slack above
+            // it; if that's not enough (mins overflow the band), scale the mins.
+            let mut over = target_sum - used;
+            let head: usize = (0..ncols).map(|c| target[c] - col_min[c]).sum();
+            for c in 0..ncols {
+                let slack_above = target[c] - col_min[c];
+                let cut = (over * slack_above)
+                    .checked_div(head)
+                    .unwrap_or(0)
+                    .min(slack_above);
+                target[c] -= cut;
+            }
+            // Any residual (rounding, or min-overflow): trim widest-first.
+            over = target.iter().sum::<usize>().saturating_sub(used);
+            while over > 0 {
+                let widest = (0..ncols).max_by_key(|&c| target[c]).unwrap_or(0);
+                if target[widest] <= 1 {
+                    break;
+                }
+                target[widest] -= 1;
+                over -= 1;
+            }
+        }
+        target
+    }
+
+    /// Fixed table layout column widths (§17.5.2.1): declared column widths are
+    /// honored, remaining space is divided equally over the rest.
+    fn fixed_columns(
+        &self,
+        col_w: &[Option<TrackWidth>],
+        ncols: usize,
+        table_w: usize,
+        bs: usize,
+    ) -> Vec<usize> {
+        let content = table_w.saturating_sub(bs * ncols.saturating_sub(1)).max(1);
+        let mut widths = vec![0usize; ncols];
+        let mut fixed_total = 0usize;
+        let mut autos = Vec::new();
+        for c in 0..ncols {
+            match col_w[c] {
+                Some(TrackWidth::Px(px)) => {
+                    widths[c] = px.min(content);
+                    fixed_total += widths[c];
+                }
+                Some(TrackWidth::Pct(p)) => {
+                    widths[c] = (p * content as f32).round() as usize;
+                    fixed_total += widths[c];
+                }
+                None => autos.push(c),
+            }
+        }
+        let rest = content.saturating_sub(fixed_total);
+        if !autos.is_empty() {
+            let each = (rest / autos.len()).max(1);
+            for &c in &autos {
+                widths[c] = each;
+            }
+        }
+        for w in &mut widths {
+            *w = (*w).max(1);
+        }
+        widths
+    }
+
+    /// A cell's min-content and max-content widths (cells): the narrowest its
+    /// content wraps to, and its preferred unwrapped width (capped at the
+    /// table's available width). A specified `width` raises the minimum (§17.5.2.2
+    /// step 1 — "if W is greater than MCW, W is the minimum cell width").
+    fn cell_min_max(&self, id: NodeId, avail: usize) -> (usize, usize) {
+        let mut mn = self.measure_width(id, 1).max(1);
+        let mut mx = self.measure_width(id, avail).max(mn);
+        if let Some(TrackWidth::Px(px)) = self.declared_track_width(id) {
+            mn = mn.max(px.min(avail));
+            mx = mx.max(px.min(avail));
+        }
+        (mn, mx)
+    }
+
     /// Parse a `grid-template-columns`/`-rows` value into per-track sizing
     /// functions, expanding `repeat()` (`auto-fill`/`auto-fit` counted against
     /// `avail`). Fixed lengths resolve to cells now (against the grid's content
@@ -4447,6 +5051,8 @@ impl<'a> Layout<'a> {
         );
         sub.viewport_w = self.viewport_w;
         sub.float_skip = skip_float;
+        sub.subtree_root = Some(id);
+        sub.table_depth = self.table_depth;
         sub.measuring = measure;
         sub.flow_node(id, inherit);
         sub.flush_block();
@@ -5817,6 +6423,92 @@ fn parse_percent(value: &str) -> Option<f32> {
     Some(n / 100.0)
 }
 
+/// Build a table's cell grid (CSS 2.1 §17.5 / the HTML cell-placement
+/// algorithm): walk each row's cells left→right, skipping slots already
+/// claimed by a `rowspan` from above, and record each cell's resolved
+/// top-left coordinate and span. Returns the placed cells and the column
+/// count. `rows` is one inner vec of cell ids per table row, in visual order.
+fn build_table_grid(layout: &Layout, rows: &[Vec<NodeId>]) -> (Vec<TableCell>, usize) {
+    let mut cells = Vec::new();
+    let mut ncols = 0usize;
+    // Slots occupied by a rowspan reaching down from an earlier row.
+    let mut occupied: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    for (r, row) in rows.iter().enumerate() {
+        let mut c = 0usize;
+        for &cell in row {
+            while occupied.contains(&(r, c)) {
+                c += 1;
+            }
+            let colspan = layout.cell_span(cell, "colspan");
+            let rowspan = layout.cell_span(cell, "rowspan");
+            for rr in r..r + rowspan {
+                for cc in c..c + colspan {
+                    occupied.insert((rr, cc));
+                }
+            }
+            cells.push(TableCell {
+                id: cell,
+                row: r,
+                col: c,
+                rowspan,
+                colspan,
+            });
+            ncols = ncols.max(c + colspan);
+            c += colspan;
+        }
+    }
+    (cells, ncols)
+}
+
+/// Raise the widths in `slice` so their sum is at least `need`, adding the
+/// deficit in approximately equal parts (CSS 2.1 §17.5.2.2 step 3 — widen all
+/// spanned columns by roughly the same amount).
+fn distribute_deficit(slice: &mut [usize], need: usize) {
+    let n = slice.len();
+    if n == 0 {
+        return;
+    }
+    let have: usize = slice.iter().sum();
+    if need <= have {
+        return;
+    }
+    let extra = need - have;
+    let base = extra / n;
+    let mut rem = extra % n;
+    for w in slice.iter_mut() {
+        *w += base + usize::from(rem > 0);
+        rem = rem.saturating_sub(1);
+    }
+}
+
+/// Grow the listed `cols` of `target` by `extra` cells total, in proportion to
+/// each column's `weight` (the largest residual takes the rounding remainder).
+fn grow_by_weight(
+    target: &mut [usize],
+    cols: &[usize],
+    extra: usize,
+    weight: impl Fn(usize) -> usize,
+    total_weight: usize,
+) {
+    if extra == 0 || cols.is_empty() || total_weight == 0 {
+        return;
+    }
+    let mut given = 0usize;
+    for &c in cols {
+        let share = extra * weight(c) / total_weight;
+        target[c] += share;
+        given += share;
+    }
+    // Hand the rounding remainder to the widest-weighted column.
+    let mut left = extra - given;
+    while left > 0 {
+        if let Some(&c) = cols.iter().max_by_key(|&&c| weight(c)) {
+            target[c] += 1;
+        }
+        left -= 1;
+    }
+}
+
 /// A positioning offset/size as a fraction of the containing block: a `%` →
 /// fraction, a zero length → `0.0`, anything else (a non-zero length, `auto`,
 /// `calc(…)`) → `None`. Used by `axis_visible_fraction` to resolve an
@@ -7138,6 +7830,163 @@ mod tests {
             .iter()
             .all(|r| r.items.iter().all(|i| i.image.is_none() && i.width == 0));
         assert!(spacers, "3 reserved spacer rows follow the image");
+    }
+
+    #[test]
+    fn a_float_columns_percentage_width_is_not_applied_twice_to_its_content() {
+        // erome's /explore thumbnail grid: Bootstrap float columns
+        // (`float:left;width:16.66%`) each holding a `width:100%` image. The
+        // float pass already sizes the column box to 16.66% of the row; laying
+        // its subtree must NOT re-resolve the column's own `width:16.66%`
+        // against that already-narrowed box (16.66% of the column → a sliver),
+        // which collapsed every thumbnail to a few cells. The image should fill
+        // its column, not a fraction of it.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/t.jpg".to_owned(), (30, 14));
+        // Six 16.66% float columns across a 120-cell row → ~20-cell columns.
+        let cols: String = (0..6)
+            .map(|_| {
+                r#"<div style="float:left;width:16.66666667%">
+                     <img src="/t.jpg" style="width:100%;height:auto" alt="x">
+                   </div>"#
+                    .to_owned()
+            })
+            .collect();
+        let rows = lay_with_images(&format!("<body><div>{cols}</div></body>"), 120, &images);
+        let img = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .expect("a thumbnail image");
+        // 16.66% of 120 ≈ 20 cells. The image should fill (near) the whole
+        // column, not collapse to a sliver (the regression rendered ~3 cells).
+        assert!(
+            img.width >= 16,
+            "the thumbnail fills its float column (got {} cells, expected ~20)",
+            img.width
+        );
+    }
+
+    /// The grid row index a text first appears on (for table layout tests).
+    fn row_index_of(rows: &[Row], needle: &str) -> usize {
+        rows.iter()
+            .position(|r| r.items.iter().any(|i| i.text.contains(needle)))
+            .unwrap_or_else(|| panic!("no row containing {needle:?}"))
+    }
+
+    #[test]
+    fn table_cells_lay_side_by_side_not_stacked() {
+        // The core of CSS table layout: cells in one row share the SAME grid
+        // rows, in distinct columns — not each `<td>` on its own line (the old
+        // block-stacking behavior, which broke every table-as-layout page).
+        let rows = lay(
+            "<body><table><tr><td>LeftCell</td><td>RightCell</td></tr></table></body>",
+            60,
+        );
+        assert_eq!(
+            row_index_of(&rows, "LeftCell"),
+            row_index_of(&rows, "RightCell"),
+            "both cells are on the same row"
+        );
+        assert!(
+            find(&rows, "RightCell").col > find(&rows, "LeftCell").col,
+            "the second cell is to the RIGHT of the first"
+        );
+    }
+
+    #[test]
+    fn table_rows_stack_vertically() {
+        // Rows stack; their cells align into shared columns.
+        let rows = lay(
+            "<body><table>\
+             <tr><td>r1a</td><td>r1b</td></tr>\
+             <tr><td>r2a</td><td>r2b</td></tr></table></body>",
+            60,
+        );
+        assert!(row_index_of(&rows, "r2a") > row_index_of(&rows, "r1a"));
+        // Same column for cells stacked in a column.
+        assert_eq!(find(&rows, "r1a").col, find(&rows, "r2a").col);
+        assert_eq!(find(&rows, "r1b").col, find(&rows, "r2b").col);
+    }
+
+    #[test]
+    fn a_layout_table_puts_a_narrow_menu_beside_a_wide_content_column() {
+        // The slackware.com pattern: a `width:10%` menu cell beside an
+        // auto-width content cell. The menu column stays narrow and the content
+        // column takes the rest, both on the same rows (side by side).
+        let words = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do";
+        let rows = lay(
+            &format!(
+                "<body><table width=\"100%\"><tr valign=\"top\">\
+                 <td width=\"10%\">Menu</td>\
+                 <td>{words}</td></tr></table></body>"
+            ),
+            80,
+        );
+        assert_eq!(
+            row_index_of(&rows, "Menu"),
+            row_index_of(&rows, "lorem"),
+            "the menu sits beside the content, not above it"
+        );
+        let content_col = find(&rows, "lorem").col;
+        assert!(
+            content_col >= 8,
+            "the content column starts past the narrow menu (col {content_col})"
+        );
+    }
+
+    #[test]
+    fn a_colspan_cell_spans_its_columns() {
+        // A header spanning both columns sits above two cells that share its
+        // width — its content starts at the table's left edge, the second-row
+        // cells in two columns beneath it.
+        let rows = lay(
+            "<body><table>\
+             <tr><td colspan=\"2\">Header</td></tr>\
+             <tr><td>colA</td><td>colB</td></tr></table></body>",
+            60,
+        );
+        assert!(row_index_of(&rows, "Header") < row_index_of(&rows, "colA"));
+        assert_eq!(
+            row_index_of(&rows, "colA"),
+            row_index_of(&rows, "colB"),
+            "the two spanned cells are on one row"
+        );
+        assert!(find(&rows, "colB").col > find(&rows, "colA").col);
+    }
+
+    #[test]
+    fn a_nested_table_lays_out_inside_its_cell() {
+        // slackware nests a table inside every cell (the bgcolor border trick);
+        // the inner table must lay out within its cell's column, not collapse.
+        let rows = lay(
+            "<body><table><tr>\
+             <td><table><tr><td>InnerL</td><td>InnerR</td></tr></table></td>\
+             <td>Outer</td></tr></table></body>",
+            60,
+        );
+        // The inner cells lay side by side, and the outer second cell is right
+        // of both of them on the same row.
+        assert_eq!(row_index_of(&rows, "InnerL"), row_index_of(&rows, "Outer"));
+        assert!(find(&rows, "InnerR").col > find(&rows, "InnerL").col);
+        assert!(find(&rows, "Outer").col > find(&rows, "InnerR").col);
+    }
+
+    #[test]
+    fn deeply_nested_tables_lay_out_without_overflowing() {
+        // The per-cell content measurement re-descends each cell's subtree, so
+        // an arbitrarily deep table tree could overflow the layout stack.
+        // `MAX_TABLE_DEPTH` degrades a table nested past the lid to block-stacked
+        // content — this still terminates and surfaces the innermost content.
+        let mut html = String::from("DEEPEST");
+        for i in 0..40 {
+            html = format!("<table><tr><td>L{i} {html}</td><td>x</td></tr></table>");
+        }
+        let rows = lay(&format!("<body>{html}</body>"), 80);
+        assert!(
+            all_text(&rows).contains("DEEPEST"),
+            "the innermost cell content still renders past the depth lid"
+        );
     }
 
     #[test]

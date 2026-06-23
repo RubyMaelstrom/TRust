@@ -634,6 +634,19 @@ impl Dom {
         self.cascaded(id, "display")
     }
 
+    /// The EFFECTIVE `display` — the author's cascaded `display` if set, else
+    /// the tag's UA-stylesheet default (so an un-styled `<table>` reports
+    /// `"table"`, a `<tr>` `"table-row"`, a `<td>` `"table-cell"`). Unlike
+    /// `computed_display` (cascade-only, `None` when no rule sets it) this is
+    /// never `None` for a known element, so the layout can route the CSS table
+    /// formatting context off a bare HTML `<table>` with no CSS at all.
+    pub fn effective_display(&self, id: NodeId) -> Option<String> {
+        if let Some(d) = self.computed_display(id) {
+            return Some(d);
+        }
+        Some(ua_display(self.tag_name(id)?).to_string())
+    }
+
     /// The cascaded value of any tracked property (the layout reads
     /// margin/padding/text-align through this), or `None` when unset.
     /// Author cascade only (no UA defaults, no inheritance) — the

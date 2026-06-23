@@ -58,6 +58,16 @@ fn wsdiag(msg: &str) {
     }
 }
 
+/// How many payload bytes to echo into the frame log (`TRUST_WS_DIAG_CAP`,
+/// default 300). Bump it to inspect full socket.io packets (a chat-completion
+/// frame is several KB) without recompiling.
+fn diag_cap() -> usize {
+    std::env::var("TRUST_WS_DIAG_CAP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300)
+}
+
 const OP_CONT: u8 = 0x0;
 const OP_TEXT: u8 = 0x1;
 const OP_BINARY: u8 = 0x2;
@@ -134,7 +144,7 @@ async fn run_session(
                     }
                 };
                 wsdiag(&format!("WS frame op={opcode:#x} fin={fin} len={} head={:?}",
-                    payload.len(), String::from_utf8_lossy(&payload[..payload.len().min(300)])));
+                    payload.len(), String::from_utf8_lossy(&payload[..payload.len().min(diag_cap())])));
                 match opcode {
                     OP_PING => {
                         // Reply to a server ping with a pong (RFC 6455 §5.5.3).
@@ -365,7 +375,7 @@ async fn write_frame(
     }
     wsdiag(&format!(
         "WS send op={opcode:#x} len={len} head={:?}",
-        String::from_utf8_lossy(&payload[..payload.len().min(120)])
+        String::from_utf8_lossy(&payload[..payload.len().min(diag_cap())])
     ));
     let mask = mask_key();
     frame.extend_from_slice(&mask);
