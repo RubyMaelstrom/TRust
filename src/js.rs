@@ -3200,7 +3200,7 @@ fn extract_live(page: &mut LoadedPage) -> (String, bool) {
         matches!(
             dom.tag_name(d),
             Some("form" | "input" | "button" | "select" | "textarea")
-        )
+        ) || dom.is_contenteditable_host(d)
     });
     let has_any = !clickable.is_empty() || has_forms;
     let ser_t = Instant::now();
@@ -3735,10 +3735,33 @@ const PRELUDE: &str = r##"
         }
         el[prop] = value;
     }
+    // A truthy `contenteditable` attribute marks an editing host (the editor
+    // root). Mirrors `Dom::is_contenteditable_host` so both sides agree on which
+    // element the edit targets.
+    function ceHost(el) {
+        if (!el || el.nodeType !== 1 || !el.hasAttribute("contenteditable")) return false;
+        const v = (el.getAttribute("contenteditable") || "").trim().toLowerCase();
+        return v === "" || v === "true" || v === "plaintext-only";
+    }
     trust.formSet = function (id, value, checked) {
         const el = wrap(id);
         if (!el) return false;
         value = value === null || value === undefined ? "" : String(value);
+        // A contenteditable host edits like a field but isn't a form control:
+        // drive it with the real editing algorithm — a cancelable `beforeinput`,
+        // then (unless the editor handled it) replace the content and fire
+        // `input`. A rich editor (ProseMirror/TipTap) that preventDefaults owns
+        // the change; a plain editable, or one that reconciles from DOM
+        // mutations (its MutationObserver), takes our content + input event.
+        if (ceHost(el)) {
+            const bev = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: value });
+            dispatch(el, bev, false);
+            if (bev.defaultPrevented) return true;
+            if (el.textContent === value) return false;
+            el.textContent = value;
+            dispatch(el, new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }), false);
+            return true;
+        }
         const tag = el.localName;
         const type = String(el.type || "").toLowerCase();
         const isToggle = tag === "input" && (type === "checkbox" || type === "radio");
@@ -4005,9 +4028,45 @@ const PRELUDE: &str = r##"
     const MEDIA_MIME = /^(?:video|audio)\/(?:mp4|webm|ogg|mpeg|mp3|aac|x-aac|x-m4a|mp4a-latm|flac|x-flac|wav|x-wav|x-matroska|quicktime|x-msvideo|x-flv|3gpp2?|x-ms-wmv)$/;
     function emptyTimeRanges() { return { length: 0, start() { return 0; }, end() { return 0; } }; }
     function emptyTrackList() { const l = []; l.getTrackById = () => null; l.addEventListener = () => {}; l.removeEventListener = () => {}; return l; }
+    // The WebIDL brand for an HTML element, i.e. what
+    // `Object.prototype.toString.call(el)` must report ("[object HTMLDivElement]").
+    // Spec requires every platform object to carry its interface name as its
+    // @@toStringTag; without it elements stringified as "[object Object]", which
+    // broke the very common is-an-Element idiom `toString.call(x).includes("Element")`
+    // (Tippy.js returns an empty array — and then `.destroy()` throws — when its
+    // element check fails). Irregular tags map explicitly; hyphenated/generic tags
+    // are the base HTMLElement; everything else is HTML<Cap>Element (which also
+    // harmlessly names truly-unknown tags rather than tracking HTMLUnknownElement).
+    const HTML_IFACE_IRREGULAR = {
+        a: "Anchor", p: "Paragraph", ul: "UList", ol: "OList", li: "LI", dl: "DList",
+        br: "BR", hr: "HR", img: "Image", q: "Quote", blockquote: "Quote",
+        ins: "Mod", del: "Mod", caption: "TableCaption", col: "TableCol",
+        colgroup: "TableCol", table: "Table", tbody: "TableSection",
+        thead: "TableSection", tfoot: "TableSection", tr: "TableRow", td: "TableCell",
+        th: "TableCell", textarea: "TextArea", iframe: "IFrame", frame: "Frame",
+        frameset: "FrameSet", datalist: "DataList", optgroup: "OptGroup",
+        fieldset: "FieldSet", h1: "Heading", h2: "Heading", h3: "Heading",
+        h4: "Heading", h5: "Heading", h6: "Heading",
+    };
+    // Known elements with no specific interface (report the base HTMLElement).
+    const HTML_IFACE_GENERIC = new Set(["abbr", "address", "article", "aside", "b",
+        "bdi", "bdo", "cite", "code", "dd", "dfn", "dt", "em", "figcaption", "figure",
+        "footer", "header", "hgroup", "i", "kbd", "main", "mark", "nav", "noscript",
+        "rp", "rt", "ruby", "s", "samp", "section", "small", "strong", "sub",
+        "summary", "sup", "u", "var", "wbr", "center", "acronym", "big", "nobr",
+        "tt", "strike"]);
+    function htmlInterfaceName(local) {
+        const t = String(local || "").toLowerCase();
+        if (!t) return "HTMLUnknownElement";
+        if (t.indexOf("-") >= 0 || HTML_IFACE_GENERIC.has(t)) return "HTMLElement";
+        const irr = HTML_IFACE_IRREGULAR[t];
+        if (irr) return "HTML" + irr + "Element";
+        return "HTML" + t.charAt(0).toUpperCase() + t.slice(1) + "Element";
+    }
     class Element extends Node {
         get tagName() { return (__dom_tag(this.__id) || "").toUpperCase(); }
         get localName() { return __dom_tag(this.__id) || ""; }
+        get [Symbol.toStringTag]() { return htmlInterfaceName(this.localName); }
         // --- HTMLMediaElement surface, on <video>/<audio> ---
         // TRust presents media via mpv (a followed link), not inline playback.
         // But a player library (video.js, Plyr, JW Player, …) probes the
@@ -4521,10 +4580,20 @@ const PRELUDE: &str = r##"
             this.data = d.slice(0, o) + String(s) + d.slice(o + c);
         }
     }
-    class Text extends CharacterData {}
+    class Text extends CharacterData { get [Symbol.toStringTag]() { return "Text"; } }
 
     class Document extends Node {
         get [Symbol.toStringTag]() { return "HTMLDocument"; }
+        // A document has NO owner document (DOM §`Document` overrides Node's
+        // `ownerDocument` to null). Inheriting Node's "return the document" here
+        // made `document.ownerDocument === document`, which sent ProseMirror's
+        // shadow-root getSelection shim (`() => n.ownerDocument.getSelection()`)
+        // into infinite recursion when it patched a missing `document.getSelection`.
+        get ownerDocument() { return null; }
+        // `document.getSelection()` is the Selection API alias for
+        // `window.getSelection()`. Without it ProseMirror monkey-patches the
+        // root's prototype to add one — see `ownerDocument` above.
+        getSelection() { return g.getSelection(); }
         get documentElement() { return wrap(__dom_doc_element()); }
         get body() { return this.querySelector("body"); }
         get head() { return this.querySelector("head"); }
@@ -4610,8 +4679,8 @@ const PRELUDE: &str = r##"
         open() {} close() {}
     }
 
-    class DocumentFragment extends Node {}
-    class Comment extends CharacterData {}
+    class DocumentFragment extends Node { get [Symbol.toStringTag]() { return "DocumentFragment"; } }
+    class Comment extends CharacterData { get [Symbol.toStringTag]() { return "Comment"; } }
     // Lit walks comment markers with one of these.
     // A spec-faithful DOM TreeWalker (https://dom.spec.whatwg.org/#interface-treewalker).
     // The full traversal surface — firstChild/lastChild/next|previousSibling/
@@ -4835,6 +4904,7 @@ const PRELUDE: &str = r##"
         }
     }
     class ShadowRoot extends Node {
+        get [Symbol.toStringTag]() { return "ShadowRoot"; }
         get host() { return this.__host || null; }
         get mode() { return this.__mode || "open"; }
         get innerHTML() { return __dom_inner_html(this.__id); }
@@ -5121,7 +5191,7 @@ const PRELUDE: &str = r##"
 
     // Distinct subclasses so `instanceof` answers honestly (false for
     // our wrappers): Vue picks SVG namespaces by SVGElement checks.
-    class SVGElement extends Element {}
+    class SVGElement extends Element { get [Symbol.toStringTag]() { return "SVGElement"; } }
     class HTMLInputElement extends Element {}
     class HTMLSelectElement extends Element {}
     class HTMLTextAreaElement extends Element {}
@@ -8915,6 +8985,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn contenteditable_host_is_an_editable_field() {
+        // A `contenteditable` div is a typeable field. The host keeps the page
+        // resident (like a form control); SetValue drives the real editing
+        // algorithm — a cancelable `beforeinput`, then the content is replaced
+        // and `input` fires (inputType "insertText") — so a listener sees the
+        // edit and the host's text reflects it. This is the general
+        // rich-text-editor input path (ProseMirror/TipTap, Quill, comment boxes).
+        let html = "<body>\
+             <div contenteditable=\"true\" id=\"ed\" data-placeholder=\"Type here\"></div>\
+             <pre id=\"out\"></pre>\
+             <script>\
+               const ed = document.getElementById('ed');\
+               ed.addEventListener('input', (e) => { \
+                 document.getElementById('out').textContent = 'in:' + ed.textContent + '|it:' + e.inputType; });\
+             </script></body>";
+        let env = PageEnv::bare("https://example.com/");
+        let (handle, mut events) = spawn_page(html.to_string(), env);
+        // First render: the live shell. The contenteditable host keeps it live.
+        let first = match events.blocking_recv() {
+            Some(PageEvt::Updated { html, outcome }) => {
+                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                html
+            }
+            other => panic!("expected a live Updated shell, got {other:?}"),
+        };
+        // The host carries a data-trust-node (it routes to the editable path).
+        let node = first
+            .split("data-trust-node=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .expect("a data-trust-node on the contenteditable host")
+            .parse::<usize>()
+            .unwrap();
+        handle
+            .cmds
+            .blocking_send(PageCmd::SetValue {
+                node,
+                value: "hello world".into(),
+                checked: None,
+            })
+            .unwrap();
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("expected Updated after editing the contenteditable");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            html.contains("in:hello world|it:insertText"),
+            "input listener did not see the edit: {html}"
+        );
+        assert!(
+            html.contains("hello world"),
+            "host content not updated: {html}"
+        );
+    }
+
     /// A TodoMVC-shaped React app driven end-to-end through the page actor:
     /// the live proof that controlled inputs, form submit, keyed list
     /// rendering, checkbox toggle, and delete all compose. Written with
@@ -9998,6 +10124,54 @@ mod tests {
         assert!(!outcome.panicked, "engine panicked (trap #6 regressed)");
         // Correct VALUE, not just non-panic: x-x=0 keeps the numeric sort.
         assert!(out.contains("sorted=1,2,3"), "{out}");
+    }
+
+    #[test]
+    fn inline_cache_revalidates_prototype_shape_on_mutation() {
+        // Boa fork fix: the monomorphic property inline cache guarded only the
+        // RECEIVER shape. For a direct-prototype hit the cached slot indexes the
+        // PROTOTYPE's own storage, so mutating the prototype (delete/redefine)
+        // shifts those slots while the receiver shape is untouched — leaving the
+        // cached index stale. Before the fix case (1) ABORTED the VM with an
+        // out-of-bounds (len 1, index 1) and case (2) could return a silently
+        // WRONG value. The fork now also pins the prototype-holder shape and
+        // re-validates it on every hit.
+        let (out, outcome) = page(
+            "<body><pre id=out></pre><script>\
+             var log = [];\
+             (function () {\
+               var proto = { a: 1, b: 2 };\
+               var o = Object.create(proto);\
+               function read() { return o.b; }\
+               read(); read();           /* warm the cache (prototype hit) */\
+               delete proto.a;           /* b shifts from slot 1 -> slot 0 */\
+               log.push('b=' + read());  /* must be 2, must not panic */\
+             })();\
+             (function () {\
+               var proto = { x: 10, y: 20 };\
+               var o = Object.create(proto);\
+               function readY() { return o.y; }\
+               readY(); readY();\
+               delete proto.x;           /* y -> slot 0 */\
+               proto.z = 99;             /* z reuses the old slot 1 */\
+               log.push('y=' + readY()); /* must still be 20, not 99 */\
+             })();\
+             document.getElementById('out').textContent = log.join(' ');\
+             </script></body>",
+        );
+        assert!(
+            !outcome.panicked,
+            "engine panicked (inline-cache prototype OOB regressed)"
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("b=2"),
+            "stale prototype slot (OOB case): {out}"
+        );
+        assert!(
+            out.contains("y=20"),
+            "stale prototype slot (wrong-value case): {out}"
+        );
     }
 
     #[test]
@@ -11248,6 +11422,51 @@ mod tests {
         assert!(
             out.contains("a=function,svg=function,path=function,base=true"),
             "SVG interfaces: {out}"
+        );
+    }
+
+    #[test]
+    fn dom_nodes_carry_their_webidl_brand() {
+        // Every platform object must report its interface name as
+        // @@toStringTag, so `Object.prototype.toString.call(node)` is
+        // "[object HTMLDivElement]" / "[object Text]" — not "[object Object]".
+        // The is-an-Element idiom `toString.call(x).includes("Element")` (Tippy.js
+        // uses exactly this; a miss makes it return [] and then `.destroy()`
+        // throws) depends on it. Irregular tags map to their real interface.
+        let (out, outcome) = page(
+            "<body><p id=o></p><a id=lnk></a><script>\
+             const b = (x) => Object.prototype.toString.call(x);\
+             const div = document.createElement('div');\
+             const btn = document.createElement('button');\
+             const p = document.getElementById('o');\
+             const a = document.getElementById('lnk');\
+             const txt = document.createTextNode('hi');\
+             const isEl = (x) => ['Element','Fragment'].some((t)=>b(x).slice(8,-1).indexOf(t)>=0);\
+             p.textContent = 'div=' + b(div) + '|btn=' + b(btn) + '|p=' + b(p)\
+               + '|a=' + b(a) + '|txt=' + b(txt) + '|isEl=' + isEl(div);\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("div=[object HTMLDivElement]"),
+            "div brand: {out}"
+        );
+        assert!(
+            out.contains("btn=[object HTMLButtonElement]"),
+            "btn brand: {out}"
+        );
+        assert!(
+            out.contains("p=[object HTMLParagraphElement]"),
+            "p brand: {out}"
+        );
+        assert!(
+            out.contains("a=[object HTMLAnchorElement]"),
+            "a brand: {out}"
+        );
+        assert!(out.contains("txt=[object Text]"), "text brand: {out}");
+        assert!(
+            out.contains("isEl=true"),
+            "tippy-style element check: {out}"
         );
     }
 

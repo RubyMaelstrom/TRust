@@ -396,6 +396,21 @@ impl Dom {
     /// like display (a hidden subtree stays hidden; no visible-child-of-
     /// hidden-parent). For inherited/UA-defaulted values use `computed_value`;
     /// no @-rules yet.
+    /// Whether `id` is the host of an editing region — it carries a truthy
+    /// `contenteditable` attribute (`""`/`true`/`plaintext-only`). This is the
+    /// editor ROOT (where the attribute sits); descendants merely inherit
+    /// editability and are not themselves hosts. TRust treats such a host like a
+    /// textarea: one editable widget whose subtree we don't flow.
+    pub fn is_contenteditable_host(&self, id: NodeId) -> bool {
+        match self.attr(id, "contenteditable") {
+            Some(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                v.is_empty() || v == "true" || v == "plaintext-only"
+            }
+            None => false,
+        }
+    }
+
     pub fn is_hidden(&self, id: NodeId) -> bool {
         if self.attr(id, "hidden").is_some() {
             return true;
@@ -1654,7 +1669,11 @@ impl Dom {
         // as duplicated link text (archive.org tiles: a `<button class=info>`
         // wrapped inside the tile's own `<a>` printed the title three times).
         // Inside an anchor the clickable simply inherits that anchor's link.
-        let wrap = is_click && !is_anchor && !in_anchor;
+        // A contenteditable host is routed to the editable-field path (it gets a
+        // `data-trust-node` below and the form walk binds it), so never wrap it
+        // as a JsClick — that would make it "follow" instead of "edit" even
+        // though rich editors also register click listeners on their root.
+        let wrap = is_click && !is_anchor && !in_anchor && !self.is_contenteditable_host(id);
         // Whether this element opens an anchor context for its descendants:
         // a real `<a>`, the wrapper we just emitted, or an already-open one.
         let child_in_anchor = in_anchor || is_anchor || is_click;
@@ -1700,7 +1719,9 @@ impl Dom {
         // The app re-parses this serialized HTML into a fresh layout DOM,
         // so form controls need an explicit pointer back to the resident
         // page actor's original node ids.
-        if matches!(tag, "form" | "input" | "button" | "select" | "textarea") {
+        if matches!(tag, "form" | "input" | "button" | "select" | "textarea")
+            || self.is_contenteditable_host(id)
+        {
             out.push_str(&format!(" data-trust-node=\"{id}\""));
         }
         out.push('>');

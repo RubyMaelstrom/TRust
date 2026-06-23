@@ -1698,9 +1698,80 @@ fn walk_forms_arena(
                     map.insert(child, (form, forms[form].fields.len() - 1));
                 }
             }
+            _ if dom.is_contenteditable_host(child) => {
+                // A `contenteditable` host (a rich-text editor root — ProseMirror/
+                // TipTap, Quill, a comment box) edits like a textarea but isn't a
+                // form control. Surface it as a synthetic, un-submitted Textarea
+                // field so it rides the existing editable machinery (selection, the
+                // edit prompt, the live `SetValue` path). Bound to the enclosing
+                // form, or the implicit form when formless; `name` stays empty so it
+                // never contributes to a submit. Its own markup is the editor's — we
+                // don't recurse into it (the host is one widget).
+                let form = match current {
+                    Some(f) => f,
+                    None => *implicit.get_or_insert_with(|| {
+                        forms.push(Form {
+                            method: FormMethod::Get,
+                            action: base.clone(),
+                            fields: Vec::new(),
+                            live_node: None,
+                        });
+                        forms.len() - 1
+                    }),
+                };
+                // Whitespace-only content is an EMPTY editor (a plain editable's
+                // stray newline, ProseMirror's `<p><br></p>`) — treat it as empty
+                // so the placeholder shows instead of a blank `[]`; real content
+                // (including its own leading/trailing spaces) is kept verbatim.
+                let raw = dom.text_content(child);
+                let value = if raw.trim().is_empty() {
+                    String::new()
+                } else {
+                    raw
+                };
+                forms[form].fields.push(Field {
+                    name: String::new(),
+                    value,
+                    checked: false,
+                    label: contenteditable_placeholder(dom, child),
+                    kind: FieldKind::Textarea,
+                    live_node: live_node(dom, child),
+                });
+                map.insert(child, (form, forms[form].fields.len() - 1));
+            }
             _ => walk_forms_arena(dom, child, current, base, forms, map, implicit),
         }
     }
+}
+
+/// The placeholder hint for a `contenteditable` host: its own hint attribute,
+/// else a descendant's (rich editors put the placeholder on an inner block —
+/// ProseMirror writes `data-placeholder` on the first paragraph). Empty when
+/// none is declared, which renders as an empty `[]` box like any blank field.
+fn contenteditable_placeholder(dom: &crate::dom::Dom, id: usize) -> String {
+    for attr in [
+        "aria-label",
+        "aria-placeholder",
+        "placeholder",
+        "data-placeholder",
+        "title",
+    ] {
+        if let Some(v) = dom.attr(id, attr)
+            && !v.trim().is_empty()
+        {
+            return v.trim().to_string();
+        }
+    }
+    for d in dom.descendants(id) {
+        for attr in ["data-placeholder", "aria-placeholder", "placeholder"] {
+            if let Some(v) = dom.attr(d, attr)
+                && !v.trim().is_empty()
+            {
+                return v.trim().to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 /// Build a `Field` from an arena control element (mirrors `field_from`
@@ -2732,76 +2803,222 @@ mod tests {
         };
         let link_text = std::env::var("TRUST_CLICK_TEXT").unwrap_or_default();
         let url = parse_url(&target).expect("absolute http(s) url");
-        let response = fetch(&Request::get(url)).await.unwrap();
-        let mut response = execute_js(response, (120, 40), (8, 16), Default::default()).await;
-        let body = String::from_utf8_lossy(&response.body).to_string();
+        // Same auth seeding as net_diag: TRUST_DIAG_COOKIE seeds the jar before
+        // the cold fetch so a cookie-gated SPA serves its authenticated render.
+        if let Ok(cookies) = std::env::var("TRUST_DIAG_COOKIE") {
+            for c in cookies.split(';') {
+                let c = c.trim();
+                if !c.is_empty() {
+                    set_cookie_from_js(&url, c);
+                }
+            }
+        }
+        let mut response = fetch(&Request::get(url)).await.unwrap();
+        // TRUST_DIAG_INJECT=<file>: splice a probe <script> at the top of <head>.
+        if let Ok(inj) = std::env::var("TRUST_DIAG_INJECT") {
+            let js = std::fs::read_to_string(&inj).unwrap();
+            let mut b = String::from_utf8_lossy(&response.body).to_string();
+            let at = b
+                .find("<head>")
+                .map(|i| i + "<head>".len())
+                .or_else(|| b.find("<head "))
+                .unwrap_or(0);
+            b.insert_str(at, &format!("<script>{js}</script>"));
+            response.body = b.into_bytes();
+        }
+        let vp: (u16, u16) = std::env::var("TRUST_DIAG_VP")
+            .ok()
+            .and_then(|s| {
+                s.split_once('x')
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+            })
+            .unwrap_or((120, 40));
+        let mut response = execute_js(response, vp, (8, 16), Default::default()).await;
+        let mut body = String::from_utf8_lossy(&response.body).to_string();
         // Probe substring whose presence we report before/after the click
         // (e.g. `id="disclaimer"` — is the overlay still in the DOM?).
         let probe =
             std::env::var("TRUST_CLICK_PROBE").unwrap_or_else(|_| "id=\"disclaimer\"".into());
-        eprintln!("js errors at load = {:?}", response.js.map(|j| j.errors));
+        eprintln!(
+            "js errors at load = {:?}",
+            response.js.as_ref().map(|j| &j.errors)
+        );
+        // TRUST_DIAG_SETTLE: drain post-shell Updated events so an SPA that mounts
+        // its clickable (the suggestion buttons, the editor) AFTER first paint is
+        // present before we look for the click target.
+        if std::env::var_os("TRUST_DIAG_SETTLE").is_some()
+            && let Some(live) = response.live.as_mut()
+        {
+            for _ in 0..6 {
+                match tokio::time::timeout(Duration::from_secs(20), live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                        eprintln!(
+                            "SETTLE EVT errors={:?} console={:?}",
+                            outcome.errors, outcome.console
+                        );
+                        body = html;
+                    }
+                    Ok(Some(other)) => eprintln!("SETTLE EVT {other:?}"),
+                    _ => {
+                        eprintln!("SETTLE <no more within 20s>");
+                        break;
+                    }
+                }
+            }
+        }
         eprintln!("BEFORE probe {probe:?} present = {}", body.contains(&probe));
-        // Marker on the clickable wrapping link_text.
-        let at = body.find(&link_text).expect("link text in body");
-        let marker = body[..at]
-            .rfind("x-trust-js:")
-            .map(|i| {
-                body[i + "x-trust-js:".len()..]
-                    .split(':')
-                    .next()
-                    .unwrap()
-                    .parse::<usize>()
-                    .unwrap()
-            })
-            .expect("marker");
-        eprintln!("clicking node {marker} (\"{link_text}\")");
-        let live = response.live.as_mut().expect("page is live");
-        live.handle
-            .cmds
-            .send(crate::js::PageCmd::Click(marker))
-            .await
-            .unwrap();
-        // The newest post-click snapshot, dumped to TRUST_NET_DIAG_OUT for
+        // The newest post-action snapshot, dumped to TRUST_NET_DIAG_OUT for
         // inspection (e.g. a JS-built lightbox/modal the click opens).
         let mut last_html: Option<String> = None;
-        // Drain a few events so we see Updated/Navigate/Settled, not just the
-        // first. Time-bounded: after the dispatch settles no more events come,
-        // so don't block waiting for the actor to time out.
-        for _ in 0..4 {
-            let ev = match tokio::time::timeout(Duration::from_secs(8), live.events.recv()).await {
-                Ok(ev) => ev,
-                Err(_) => {
-                    eprintln!("EVT <no more within 8s>");
-                    break;
+        // Optional SetValue before any click (TRUST_SET_FIND=<substr in the target
+        // tag, e.g. id="chat-input"> + TRUST_SET_VALUE=<text>): exercise the
+        // editable path — a contenteditable host or a textarea — then a follow-on
+        // click (type a chat message, then press Send via TRUST_CLICK_FIND2).
+        if let (Some(find), Ok(val)) = (
+            std::env::var("TRUST_SET_FIND")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            std::env::var("TRUST_SET_VALUE"),
+        ) && let Some(node) = body.find(&find).and_then(|at| {
+            let tstart = body[..at].rfind('<')?;
+            let tag = &body[tstart..body[tstart..].find('>').map(|i| tstart + i)?];
+            let tn = tag.find("data-trust-node=\"")? + 17;
+            tag[tn..].split('"').next()?.parse::<usize>().ok()
+        }) {
+            eprintln!("--- SetValue node {node} = {val:?} (found via {find:?}) ---");
+            let live = response.live.as_mut().expect("page is live");
+            live.handle
+                .cmds
+                .send(crate::js::PageCmd::SetValue {
+                    node,
+                    value: val,
+                    checked: None,
+                })
+                .await
+                .unwrap();
+            for _ in 0..4 {
+                match tokio::time::timeout(Duration::from_secs(8), live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                        eprintln!(
+                            "SET EVT errors={:?} console={:?}",
+                            outcome.errors, outcome.console
+                        );
+                        body = html.clone();
+                        last_html = Some(html);
+                    }
+                    Ok(Some(other)) => eprintln!("SET EVT {other:?}"),
+                    _ => {
+                        eprintln!("SET <no more within 8s>");
+                        break;
+                    }
                 }
-            };
-            match ev {
-                Some(crate::js::PageEvt::Updated { html, outcome }) => {
-                    eprintln!("EVT Updated: errors={:?}", outcome.errors);
-                    eprintln!(
-                        "   probe {probe:?} present AFTER = {}",
-                        html.contains(&probe)
-                    );
-                    last_html = Some(html);
+            }
+        }
+        // Marker on the clickable wrapping link_text (skipped when empty).
+        if !link_text.is_empty() {
+            let at = body.find(&link_text).expect("link text in body");
+            let marker = body[..at]
+                .rfind("x-trust-js:")
+                .map(|i| {
+                    body[i + "x-trust-js:".len()..]
+                        .split(':')
+                        .next()
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap()
+                })
+                .expect("marker");
+            eprintln!("clicking node {marker} (\"{link_text}\")");
+            let live = response.live.as_mut().expect("page is live");
+            live.handle
+                .cmds
+                .send(crate::js::PageCmd::Click(marker))
+                .await
+                .unwrap();
+            // Drain a few events so we see Updated/Navigate/Settled, not just the
+            // first. Time-bounded: after the dispatch settles no more events come,
+            // so don't block waiting for the actor to time out.
+            for _ in 0..4 {
+                let ev =
+                    match tokio::time::timeout(Duration::from_secs(8), live.events.recv()).await {
+                        Ok(ev) => ev,
+                        Err(_) => {
+                            eprintln!("EVT <no more within 8s>");
+                            break;
+                        }
+                    };
+                match ev {
+                    Some(crate::js::PageEvt::Updated { html, outcome }) => {
+                        eprintln!("EVT Updated: errors={:?}", outcome.errors);
+                        eprintln!("   console={:?}", outcome.console);
+                        eprintln!(
+                            "   probe {probe:?} present AFTER = {}",
+                            html.contains(&probe)
+                        );
+                        last_html = Some(html);
+                    }
+                    Some(crate::js::PageEvt::Static { html, outcome }) => {
+                        eprintln!("EVT Static: errors={:?}", outcome.errors);
+                        eprintln!("   console={:?}", outcome.console);
+                        eprintln!(
+                            "   probe {probe:?} present AFTER = {}",
+                            html.contains(&probe)
+                        );
+                        last_html = Some(html);
+                        break;
+                    }
+                    Some(crate::js::PageEvt::Navigate(u)) => eprintln!("EVT Navigate -> {u}"),
+                    Some(crate::js::PageEvt::SubmitDefault) => eprintln!("EVT SubmitDefault"),
+                    Some(other) => {
+                        eprintln!("EVT {other:?}");
+                        break;
+                    }
+                    None => {
+                        eprintln!("EVT <channel closed>");
+                        break;
+                    }
                 }
-                Some(crate::js::PageEvt::Static { html, outcome }) => {
-                    eprintln!("EVT Static: errors={:?}", outcome.errors);
-                    eprintln!(
-                        "   probe {probe:?} present AFTER = {}",
-                        html.contains(&probe)
-                    );
-                    last_html = Some(html);
-                    break;
-                }
-                Some(crate::js::PageEvt::Navigate(u)) => eprintln!("EVT Navigate -> {u}"),
-                Some(crate::js::PageEvt::SubmitDefault) => eprintln!("EVT SubmitDefault"),
-                Some(other) => {
-                    eprintln!("EVT {other:?}");
-                    break;
-                }
-                None => {
-                    eprintln!("EVT <channel closed>");
-                    break;
+            }
+        }
+        // Optional SECOND click (TRUST_CLICK_FIND2=<substr in the target tag, e.g.
+        // `id="send-message-button"`>): resolve the node from THIS run's post-click
+        // HTML (ids drift across runs) and click it — e.g. fill the editor via a
+        // suggestion click, then click the send button to test submission.
+        if let Some(find2) = std::env::var("TRUST_CLICK_FIND2")
+            .ok()
+            .filter(|s| !s.is_empty())
+            && let Some(html) = last_html.as_ref()
+            && let Some(node2) = html.find(&find2).and_then(|at| {
+                let tstart = html[..at].rfind('<')?;
+                let tag = &html[tstart..html[tstart..].find('>').map(|i| tstart + i)?];
+                let tn = tag.find("data-trust-node=\"")? + 17;
+                tag[tn..].split('"').next()?.parse::<usize>().ok()
+            })
+        {
+            eprintln!("--- second click: node {node2} (found via {find2:?}) ---");
+            let live = response.live.as_mut().expect("page is live");
+            live.handle
+                .cmds
+                .send(crate::js::PageCmd::Click(node2))
+                .await
+                .unwrap();
+            for _ in 0..4 {
+                match tokio::time::timeout(Duration::from_secs(8), live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                        eprintln!("EVT2 Updated: errors={:?}", outcome.errors);
+                        eprintln!("   console={:?}", outcome.console);
+                        last_html = Some(html);
+                    }
+                    Ok(Some(crate::js::PageEvt::Navigate(u))) => eprintln!("EVT2 Navigate -> {u}"),
+                    Ok(Some(crate::js::PageEvt::SubmitDefault)) => eprintln!("EVT2 SubmitDefault"),
+                    Ok(Some(other)) => {
+                        eprintln!("EVT2 {other:?}");
+                        break;
+                    }
+                    _ => {
+                        eprintln!("EVT2 <no more within 8s>");
+                        break;
+                    }
                 }
             }
         }
@@ -4531,6 +4748,47 @@ customElements.define('lit-counter', LitCounter);
         let button = item(&doc, "[ Send ]");
         assert_eq!(button.kind, crate::layout::ItemKind::Form);
         assert_eq!(button.link, Some(Link::Form { form: 0, field: 2 }));
+    }
+
+    #[test]
+    fn contenteditable_host_becomes_an_editable_field() {
+        // A `contenteditable` div (a rich-text editor root — ProseMirror/TipTap,
+        // a comment box) is surfaced as a synthetic, un-submitted Textarea field
+        // in an implicit form, so it rides the existing editable machinery. Its
+        // placeholder (here `data-placeholder`) is the widget label, and the
+        // whitespace-only initial content reads as an empty editor.
+        let base = Url::parse("https://example.com/").unwrap();
+        let doc = parse(
+            &base,
+            "text/html",
+            b"<body><div contenteditable=\"true\" data-placeholder=\"Type here\">\n</div></body>",
+            60,
+            &Default::default(),
+        );
+        assert_eq!(doc.forms.len(), 1);
+        let field = &doc.forms[0].fields[0];
+        assert_eq!(field.kind, FieldKind::Textarea);
+        assert!(
+            field.name.is_empty(),
+            "an editor is not a submitted control"
+        );
+        assert!(field.value.is_empty(), "whitespace-only is an empty editor");
+        let widget = item(&doc, "[Type here]");
+        assert_eq!(widget.kind, crate::layout::ItemKind::Form);
+        assert_eq!(widget.link, Some(Link::Form { form: 0, field: 0 }));
+
+        // `contenteditable="false"` is explicitly NOT editable.
+        let doc2 = parse(
+            &base,
+            "text/html",
+            b"<body><div contenteditable=\"false\">x</div></body>",
+            60,
+            &Default::default(),
+        );
+        assert!(
+            doc2.forms.is_empty(),
+            "contenteditable=false is not a field"
+        );
     }
 
     #[test]

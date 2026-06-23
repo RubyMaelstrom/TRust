@@ -1348,6 +1348,14 @@ impl<'a> Layout<'a> {
             self.flow_slideshow(id);
             return;
         }
+        // A `contenteditable` host bound to a field (the form walk made it a
+        // synthetic textarea) renders as ONE editable widget — its value or
+        // placeholder — and its subtree is skipped (the editor's own markup is
+        // not ours to flow). Same path as a real textarea control.
+        if self.controls.contains_key(&id) && self.dom.is_contenteditable_host(id) {
+            self.flow_form_control(id, "textarea", ctx.link.clone());
+            return;
+        }
         match tag.as_str() {
             "br" => {
                 // A <br> right after an out-of-flow overlay is spurious in our
