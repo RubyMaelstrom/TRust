@@ -185,6 +185,40 @@ impl CodeBlock {
         self.source_info.function_name()
     }
 
+    /// Whether this code block (and, recursively, every nested function in its
+    /// constant pool) is free of references into the **global declarative
+    /// scope** (`BindingLocatorScope::GlobalDeclarative`, i.e. `scope == 1`).
+    ///
+    /// Such a reference resolves at runtime by *slot index* into the realm's
+    /// shared, accumulating global declarative environment, and that index
+    /// depends on how many global lexical (`let`/`const`/`class`) bindings
+    /// earlier scripts created — so a block carrying one is valid only on the
+    /// page it was compiled against. A block free of them touches globals only
+    /// by name (`GlobalObject`) or through its own pushed stack scopes, both of
+    /// which are realm-portable.
+    ///
+    /// This is the defensive half of the cross-page CDN compile cache's
+    /// realm-portability gate (JS-engine performance plan, Phase 2): the other
+    /// half, [`Script::global_declarations_are_replayable`](crate::Script::global_declarations_are_replayable),
+    /// rejects a script whose global declarations can't be replayed from
+    /// bytecode; this rejects one that *reads* a binding an earlier script
+    /// created. Only blocks passing both are safe to reuse across pages.
+    #[must_use]
+    pub fn is_realm_portable(&self) -> bool {
+        use boa_ast::scope::BindingLocatorScope;
+        if self
+            .bindings
+            .iter()
+            .any(|b| matches!(b.scope(), BindingLocatorScope::GlobalDeclarative))
+        {
+            return false;
+        }
+        self.constants.iter().all(|c| match c {
+            Constant::Function(code) => code.is_realm_portable(),
+            Constant::String(_) | Constant::BigInt(_) | Constant::Scope(_) => true,
+        })
+    }
+
     /// Retrieves the path of this code block.
     #[must_use]
     pub fn path(&self) -> &SourcePath {
