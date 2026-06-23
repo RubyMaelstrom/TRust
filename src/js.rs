@@ -665,6 +665,100 @@ pub fn run_script(
     outcome.elapsed += started.elapsed();
 }
 
+/// Process-global detached image of the compiled PRELUDE — the in-memory
+/// compiled-code cache's first consumer (JS-engine performance plan, Step 4,
+/// built on the K1/K2 keystone `CodeBlockImage`).
+///
+/// The prelude is the same ~65 KB of JS on every page, and its parse+compile is
+/// the bulk of the per-page prelude cost. A compiled `CodeBlock` is normally
+/// pinned to the thread + GC heap that built it, but a `CodeBlockImage` is the
+/// detached, `Send + Sync`, `Gc`-free form: we compile the prelude ONCE per
+/// process, store its image here, and rehydrate a fresh `Gc<CodeBlock>` into
+/// each page thread's own heap — no re-parse, no re-compile.
+///
+/// Sound to reuse across realms because the prelude is a single top-level IIFE:
+/// it declares NO top-level `let`/`const`/`function`/`var` (every global is a
+/// `globalThis.X = …` property write from inside the IIFE), so its compiled
+/// `<main>` block references no realm global-binding slots and runs identically
+/// in any realm — exactly the cross-realm path the keystone tests exercise. It
+/// also has no dynamic `import()` (the only runtime use of the carrier script's
+/// own AST), so the empty shell it is installed into is never dereferenced.
+static PRELUDE_IMAGE: std::sync::OnceLock<boa_engine::vm::CodeBlockImage> =
+    std::sync::OnceLock::new();
+
+/// Run the PRELUDE through the process-global compiled-code cache: the first
+/// page parses + compiles it and stores the detached image; every later page
+/// (on its own `trust-js`/`trust-page` thread) rehydrates that image and skips
+/// both the 65 KB parse and the compile, paying only execution — which every
+/// realm must pay regardless, since the prelude's globals are installed by
+/// *running* the IIFE, not by declaring them.
+///
+/// The parse-skipping twin of [`run_script`] for our one always-present,
+/// always-identical script: same budget gate, `catch_unwind`, and error/panic
+/// accounting, so a (hypothetical) prelude failure degrades the page exactly as
+/// before. `TRUST_NO_PRELUDE_CACHE` forces the cold `run_script` path — the A/B
+/// toggle and safety valve, like `TRUST_NO_PARALLEL_PARSE` for parallel parse.
+fn run_prelude(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
+    if std::env::var_os("TRUST_NO_PRELUDE_CACHE").is_some() {
+        run_script(ctx, "prelude", PRELUDE.as_bytes(), budget, outcome);
+        return;
+    }
+    if budget.exhausted() || outcome.elapsed >= COMPUTE_BUDGET {
+        outcome
+            .errors
+            .push(String::from("prelude: skipped, page JS budget exhausted"));
+        return;
+    }
+    let started = Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(image) = PRELUDE_IMAGE.get() {
+            // Cache hit: rehydrate the compiled block into THIS thread's heap and
+            // install it into an empty carrier script (parsing "" is ~free and
+            // binds the script to this page's realm). No 65 KB parse, no compile.
+            let t = phase_begin();
+            let shell = boa_engine::Script::parse(Source::from_bytes("".as_bytes()), None, ctx)?;
+            phase_end(Phase::Parse, t);
+            let t = phase_begin();
+            shell.set_codeblock(boa_engine::vm::CodeBlock::from_image(image));
+            phase_end(Phase::Compile, t);
+            let t = phase_begin();
+            let r = shell.evaluate(ctx);
+            phase_end(Phase::Execute, t);
+            r
+        } else {
+            // Cold (first page of the process, or a rare concurrent-first race):
+            // parse + compile the real prelude, cache its detached image for
+            // later pages, then run. A lost `set` race is harmless — the winner's
+            // image serves the cache and our own freshly compiled block still
+            // runs this page (`let _ =` discards the rejected value).
+            let src =
+                Source::from_bytes(PRELUDE.as_bytes()).with_path(std::path::Path::new("prelude"));
+            let t = phase_begin();
+            let script = boa_engine::Script::parse(src, None, ctx)?;
+            phase_end(Phase::Parse, t);
+            let t = phase_begin();
+            let cb = script.codeblock(ctx)?;
+            let _ = PRELUDE_IMAGE.set(cb.to_image());
+            phase_end(Phase::Compile, t);
+            let t = phase_begin();
+            let r = script.evaluate(ctx);
+            phase_end(Phase::Execute, t);
+            r
+        }
+    }));
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => outcome.errors.push(format!("prelude: {err}")),
+        Err(_) => {
+            outcome.errors.push(String::from(
+                "prelude: engine panic (Boa bug) — page JS halted",
+            ));
+            outcome.panicked = true;
+        }
+    }
+    outcome.elapsed += started.elapsed();
+}
+
 /// Max parse workers in the parallel-parse pool (Step 5a of the JS-engine
 /// performance plan). Bounded like `PREFETCH_CONCURRENCY` so a page with
 /// hundreds of `<script>`s can't spawn a thread storm; clamped to core count
@@ -2877,13 +2971,7 @@ fn load_page(
         u32::from(viewport.1) * u32::from(cell_px.1.max(1)),
     );
     run_script(&mut ctx, "config", cfg.as_bytes(), &budget, &mut outcome);
-    run_script(
-        &mut ctx,
-        "prelude",
-        PRELUDE.as_bytes(),
-        &budget,
-        &mut outcome,
-    );
+    run_prelude(&mut ctx, &budget, &mut outcome);
     if !outcome.errors.is_empty() {
         // The prelude is ours: if it broke, render without JS and say so.
         return Err(outcome);
@@ -8330,12 +8418,44 @@ mod tests {
         }
         let tiny_call = t.elapsed() / N;
 
+        // (e) the CACHED path (Step 4 prelude compile cache): compile the image
+        // ONCE, then per page rehydrate it into an empty carrier script and run —
+        // exactly what `run_prelude` does on every page after the first. The A/B
+        // against (b)/(c). `rehydrate` isolates `from_image` (the work that
+        // replaces parse+compile); `cached_total` is the whole per-page cost.
+        let image = {
+            let mut c = build_ctx();
+            let script =
+                boa_engine::Script::parse(Source::from_bytes(PRELUDE.as_bytes()), None, &mut c)
+                    .unwrap();
+            script.codeblock(&mut c).unwrap().to_image()
+        };
+        let (mut rehydrate_acc, mut cached_total_acc) = (Duration::ZERO, Duration::ZERO);
+        for _ in 0..N {
+            let mut c = build_ctx();
+            let t = Instant::now();
+            let shell =
+                boa_engine::Script::parse(Source::from_bytes("".as_bytes()), None, &mut c).unwrap();
+            let t_re = Instant::now();
+            shell.set_codeblock(boa_engine::vm::CodeBlock::from_image(&image));
+            rehydrate_acc += t_re.elapsed();
+            shell.evaluate(&mut c).unwrap();
+            cached_total_acc += t.elapsed();
+        }
+        let cached_total = cached_total_acc / N;
+
         eprintln!("--- PRELUDE cost (avg of {N}, release recommended) ---");
         eprintln!("PRELUDE size:                      {} bytes", PRELUDE.len());
         eprintln!("context build (+syscalls+config):  {ctx_build:?}");
         eprintln!("PRELUDE total (parse+compile+run): {prelude_total:?}");
-        eprintln!("  - parse+compile:                 {:?}", parse_acc / N);
-        eprintln!("  - evaluate:                      {:?}", eval_acc / N);
+        eprintln!("  - parse (Script::parse):         {:?}", parse_acc / N);
+        eprintln!("  - compile+run (evaluate):        {:?}", eval_acc / N);
+        eprintln!("CACHED total (rehydrate+run):      {cached_total:?}");
+        eprintln!("  - rehydrate (from_image):        {:?}", rehydrate_acc / N);
+        eprintln!(
+            "saved per cached page:             {:?}",
+            prelude_total.saturating_sub(cached_total)
+        );
         eprintln!("tiny post-prelude page call:       {tiny_call:?}");
     }
 
@@ -8758,6 +8878,151 @@ mod tests {
             direct.as_number(),
             "the rehydrated code block must compute the same value as the original"
         );
+    }
+
+    // ---- Step 4: prelude compile cache (the keystone's first consumer) -----
+    //
+    // `run_prelude` compiles the prelude ONCE per process into a `CodeBlockImage`
+    // and, on every later page, rehydrates it into an empty carrier script —
+    // skipping the 65 KB parse and the compile. The gate below proves the novel
+    // path: the keystone tests rehydrate a block into a shell parsed from the
+    // SAME source; here the shell is parsed from "" and the block comes from the
+    // real prelude, in a DIFFERENT realm. If this holds, the empty-shell trick is
+    // sound and needs no fork change.
+
+    /// Build a faithful page context (DOM + syscalls + config), exactly as
+    /// `load_page` does — the prelude is built on those syscalls.
+    fn cache_test_ctx() -> Context {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body><p>hi</p></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx
+    }
+
+    /// A fingerprint of the platform the prelude installs: core interfaces, a few
+    /// recently-shipped ones, and a live DOM round trip through the wrapper/
+    /// classList machinery, all serialized to one comparable string.
+    fn prelude_fingerprint(ctx: &mut Context) -> String {
+        const PROBE: &[u8] = br##"JSON.stringify({
+            document: typeof document,
+            querySelector: typeof document.querySelector,
+            Element: typeof Element,
+            Node: typeof Node,
+            Event: typeof Event,
+            MutationObserver: typeof MutationObserver,
+            fetch: typeof fetch,
+            localStorage: typeof localStorage,
+            readyState: __trust.readyState,
+            errors: __trust.errors.length,
+            text: document.querySelector('p').textContent,
+            tag: document.querySelector('p').tagName,
+            classList: (function(){ var d=document.createElement('div'); d.className='a b'; return d.classList.contains('b') && !d.classList.contains('c'); })()
+        })"##;
+        ctx.eval(Source::from_bytes(PROBE))
+            .unwrap()
+            .to_string(ctx)
+            .unwrap()
+            .to_std_string_escaped()
+    }
+
+    /// THE Phase-1 correctness gate: a prelude run from a REHYDRATED
+    /// `CodeBlockImage` installed into an EMPTY carrier script builds the
+    /// byte-identical platform as a cold `eval(PRELUDE)`.
+    #[test]
+    fn cached_prelude_builds_the_same_platform_as_a_cold_eval() {
+        // A compile-time guarantee the image can live in a shared `static
+        // OnceLock` reachable from every page thread.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<boa_engine::vm::CodeBlockImage>();
+
+        // Cold: parse + compile + run the real prelude.
+        let mut cold = cache_test_ctx();
+        cold.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+        let cold_fp = prelude_fingerprint(&mut cold);
+
+        // Detach a compiled image from one realm...
+        let image = {
+            let mut img_ctx = cache_test_ctx();
+            let script = boa_engine::Script::parse(
+                Source::from_bytes(PRELUDE.as_bytes()),
+                None,
+                &mut img_ctx,
+            )
+            .unwrap();
+            script.codeblock(&mut img_ctx).unwrap().to_image()
+        };
+
+        // ...and run it via an EMPTY carrier script in a FRESH realm — the cached
+        // path `run_prelude` takes on every page after the first.
+        let mut cached = cache_test_ctx();
+        let shell = boa_engine::Script::parse(Source::from_bytes("".as_bytes()), None, &mut cached)
+            .unwrap();
+        shell.set_codeblock(boa_engine::vm::CodeBlock::from_image(&image));
+        shell.evaluate(&mut cached).unwrap();
+        let cached_fp = prelude_fingerprint(&mut cached);
+
+        assert_eq!(
+            cold_fp, cached_fp,
+            "a rehydrated prelude must build the identical platform as a cold eval"
+        );
+        // ...and the fingerprint is the real thing, not two matching blanks.
+        assert!(
+            cold_fp.contains(r#""text":"hi""#),
+            "probe sanity: {cold_fp}"
+        );
+        assert!(cold_fp.contains(r#""tag":"P""#), "probe sanity: {cold_fp}");
+        assert!(
+            cold_fp.contains(r#""classList":true"#),
+            "probe sanity: {cold_fp}"
+        );
+        assert!(
+            cold_fp.contains(r#""MutationObserver":"function""#),
+            "probe sanity: {cold_fp}"
+        );
+    }
+
+    /// `run_prelude` itself (the production entry) installs a working platform —
+    /// on the cold compile AND on the cached rehydrate. The first call populates
+    /// the process-global `PRELUDE_IMAGE`, so the second is DEFINITELY the cached
+    /// path regardless of cross-test ordering.
+    #[test]
+    fn run_prelude_installs_the_platform_cold_and_cached() {
+        let budget = Budget::new(WALL_BUDGET);
+        let run = || {
+            let mut ctx = cache_test_ctx();
+            let mut outcome = Outcome::default();
+            run_prelude(&mut ctx, &budget, &mut outcome);
+            (ctx, outcome)
+        };
+
+        // First call: cold-or-cached by test order, but GUARANTEES the cache is
+        // populated afterwards.
+        let (mut first, o1) = run();
+        assert!(o1.errors.is_empty(), "{:?}", o1.errors);
+        assert!(!o1.panicked);
+
+        // Second call: DEFINITELY the cached rehydrate path.
+        let (mut second, o2) = run();
+        assert!(o2.errors.is_empty(), "{:?}", o2.errors);
+        assert!(!o2.panicked);
+
+        assert_eq!(
+            prelude_fingerprint(&mut first),
+            prelude_fingerprint(&mut second)
+        );
+        assert!(PRELUDE_IMAGE.get().is_some(), "cache must be populated");
     }
 
     // ---- Step 5a: parallel parse (raw_parse off-thread + compile_raw) ------
