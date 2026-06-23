@@ -68,6 +68,17 @@ boa_ast = { path = "vendor/boa_ast-0.21.1" }
 # threshold knob (`set_gc_threshold`) and profiling counters (`gc_profile`)
 # so the collector stops dominating heavy page loads.
 boa_gc = { path = "vendor/boa_gc-0.21.1" }
+# Vendored so we own the parser too — specifically to expose a RAW parse
+# (`Parser::parse_script_raw`) that builds the AST without the scope-analysis
+# pass the public entries force on. Raw parse touches no scope and no realm, so
+# it can run on a worker thread with a private interner; this is the keystone of
+# parallel parse (the JS-engine perf plan's Step 5a): the lexer/parser bulk of
+# the "parse" phase moves off the page's `Context` thread, while scope analysis
+# + compile stay sequential on the page thread (global lexical bindings resolve
+# by slot index, so their order must be preserved). The analyzed AST holds
+# `JsString` locators and is not `Send`; the raw one is, which is what lets it
+# cross threads.
+boa_parser = { path = "vendor/boa_parser-0.21.1" }
 
 # Optimized binary: whole-program LTO and a single codegen unit trade
 # compile time for speed and size; symbols stripped (panic messages

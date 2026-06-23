@@ -76,7 +76,7 @@ unsafe impl Trace for CodeBlockFlags {
 ///
 /// If any exception happens and gets cought by this handler, the `pc` will be set to `end` of the
 /// [`Handler`] and remove any environments or stack values that where pushed after the handler.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Handler {
     pub(crate) start: u32,
     pub(crate) end: u32,

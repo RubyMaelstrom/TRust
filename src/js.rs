@@ -457,7 +457,12 @@ mod runtime_limit_in_async {
 // "compile"; the decision-gate page (Steam) is classic-script-dominated so this
 // is benign, but a module-dominated page's "compile" is a lower bound. (3) A
 // handful of internal `__trust.*` control evals (tick/scanImageLoads) are
-// negligible and left unmeasured.
+// negligible and left unmeasured. (4) With parallel parse (Step 5a) ON, the
+// raw parse of external classic scripts runs on worker threads, so its CPU is
+// NOT in this (page-thread) accumulator — "parse" here drops toward zero and
+// `measured JS CPU` falls below `/usr/bin/time` User (which sums all threads).
+// That gap IS the parallel-parse win; read wall, not the per-phase split, to
+// size it.
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct PhaseProfile {
@@ -641,6 +646,194 @@ pub fn run_script(
         phase_end(Phase::Parse, t);
         let t = phase_begin();
         script.codeblock(ctx)?;
+        phase_end(Phase::Compile, t);
+        let t = phase_begin();
+        let r = script.evaluate(ctx);
+        phase_end(Phase::Execute, t);
+        r
+    }));
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => outcome.errors.push(format!("{name}: {err}")),
+        Err(_) => {
+            outcome
+                .errors
+                .push(format!("{name}: engine panic (Boa bug) — page JS halted"));
+            outcome.panicked = true;
+        }
+    }
+    outcome.elapsed += started.elapsed();
+}
+
+/// Max parse workers in the parallel-parse pool (Step 5a of the JS-engine
+/// performance plan). Bounded like `PREFETCH_CONCURRENCY` so a page with
+/// hundreds of `<script>`s can't spawn a thread storm; clamped to core count
+/// and job count below.
+const PARSE_CONCURRENCY: usize = 8;
+
+/// The raw-parse half of parallel parse. External classic scripts are lexed and
+/// parsed to ASTs on a pool of big-stack worker threads — OFF the page thread —
+/// while the page thread runs the prelude and earlier scripts. Scope analysis
+/// and bytecode compilation stay on the page thread, in document order, because
+/// global lexical bindings (`let`/`const`/`class`) resolve at runtime by slot
+/// index into one shared global environment, so their declaration order must be
+/// preserved (see `boa_engine::Script::compile_raw`). Each worker parses with a
+/// private interner that rides along with its AST; no interner merge is needed
+/// because the shared scope links scripts by `JsString` name, not interner index.
+struct ParsePool {
+    rx: std::sync::mpsc::Receiver<(usize, Result<boa_engine::RawScript, String>)>,
+    buffered: std::collections::HashMap<usize, Result<boa_engine::RawScript, String>>,
+    dispatched: std::collections::HashSet<usize>,
+}
+
+impl ParsePool {
+    /// Whether script `index` went to the pool (the rest are parsed inline).
+    fn was_dispatched(&self, index: usize) -> bool {
+        self.dispatched.contains(&index)
+    }
+
+    /// Take script `index`'s raw parse, buffering any other results that arrive
+    /// first. Blocks only if the worker hasn't finished `index` yet — usually
+    /// it has, having overlapped the page thread's earlier work. Only called for
+    /// dispatched indices.
+    fn take(&mut self, index: usize) -> Result<boa_engine::RawScript, String> {
+        if let Some(result) = self.buffered.remove(&index) {
+            return result;
+        }
+        loop {
+            match self.rx.recv() {
+                Ok((i, result)) if i == index => return result,
+                Ok((i, result)) => {
+                    self.buffered.insert(i, result);
+                }
+                // All workers exited without producing `index` — only possible
+                // if every spawn failed; surface a per-script error, page lives.
+                Err(_) => return Err(String::from("parse worker exited without a result")),
+            }
+        }
+    }
+}
+
+/// Dispatch raw-parse jobs for every external classic script that has a fetched
+/// body, returning a [`ParsePool`] to collect them — or `None` when there are
+/// fewer than two such scripts (a single bundle is one parse unit, so a pool
+/// would only add thread overhead; the loop then parses inline as before).
+///
+/// One parser id is allocated per script from the page `Context` up front
+/// (tagged-template call-site identity must stay unique across separately parsed
+/// scripts, exactly as the in-context parse path allocates them), so this
+/// borrows `ctx` briefly before any worker starts.
+fn dispatch_parallel_parse(
+    scripts: &[(Option<String>, String, Option<String>, usize)],
+    externals: &[(String, Option<Vec<u8>>)],
+    ctx: &mut Context,
+) -> Option<ParsePool> {
+    // Kill switch: `TRUST_NO_PARALLEL_PARSE` forces the sequential path (parse
+    // inline on this thread). A safety valve for a concurrency feature touching
+    // the engine, and the A/B toggle for measuring the win.
+    if std::env::var_os("TRUST_NO_PARALLEL_PARSE").is_some() {
+        return None;
+    }
+    let mut jobs: Vec<(usize, String, Vec<u8>, u32)> = Vec::new();
+    for (i, (src, _inline, type_attr, _node)) in scripts.iter().enumerate() {
+        if !is_classic(type_attr) {
+            continue;
+        }
+        // Inline scripts stay on the page thread (small, and the body is already
+        // in hand); only external bundles — where the parse cost lives — go to
+        // the pool. A not-fetched / ad-blocked external has no body to parse.
+        let Some(src) = src else { continue };
+        let Some((_, Some(body))) = externals.iter().find(|(k, _)| k == src) else {
+            continue;
+        };
+        let id = ctx.next_parser_identifier();
+        jobs.push((i, src.clone(), body.clone(), id));
+    }
+    if jobs.len() < 2 {
+        return None;
+    }
+    let dispatched: std::collections::HashSet<usize> = jobs.iter().map(|(i, ..)| *i).collect();
+    let n_workers = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(2)
+        .min(jobs.len())
+        .min(PARSE_CONCURRENCY);
+    let queue = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::from(jobs)));
+    let (tx, rx) = std::sync::mpsc::channel();
+    for w in 0..n_workers {
+        let queue = std::sync::Arc::clone(&queue);
+        let tx = tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("trust-parse-{w}"))
+            // Same 64MB stack as the page thread: Boa's recursive-descent parser
+            // can overflow a 2 MB stack on a big bundle (an uncatchable abort,
+            // trap #1). The panic hook in main.rs covers `trust-*` threads.
+            .stack_size(PAGE_STACK)
+            .spawn(move || {
+                loop {
+                    let job = queue.lock().expect("parse queue poisoned").pop_front();
+                    let Some((index, name, body, id)) = job else {
+                        break;
+                    };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let src = Source::from_bytes(&body).with_path(std::path::Path::new(&name));
+                        boa_engine::Script::raw_parse(src, id)
+                    }))
+                    .unwrap_or_else(|_| Err(String::from("raw parse panicked (Boa bug)")));
+                    if tx.send((index, result)).is_err() {
+                        break; // page thread is gone; stop early
+                    }
+                }
+            });
+        if spawned.is_err() {
+            // A worker failed to spawn; the others still drain the queue. Its tx
+            // clone drops with the failed closure, so the channel still closes
+            // when the live workers finish.
+        }
+    }
+    drop(tx); // the spawned workers hold the only live senders now
+    Some(ParsePool {
+        rx,
+        buffered: std::collections::HashMap::new(),
+        dispatched,
+    })
+}
+
+/// Run a script whose raw parse already happened off the page thread (see
+/// [`ParsePool`]): compile (scope analysis + bytecode, here on the page thread,
+/// in document order) then evaluate. The parse-skipping twin of [`run_script`] —
+/// same budget gate, `catch_unwind`, and error/panic accounting, so a bad script
+/// costs only itself.
+fn run_prepared(
+    ctx: &mut Context,
+    name: &str,
+    prepared: Result<boa_engine::RawScript, String>,
+    budget: &Budget,
+    outcome: &mut Outcome,
+) {
+    if budget.exhausted() || outcome.elapsed >= COMPUTE_BUDGET {
+        outcome
+            .errors
+            .push(format!("{name}: skipped, page JS budget exhausted"));
+        return;
+    }
+    let raw = match prepared {
+        Ok(raw) => raw,
+        // A raw-parse failure (syntax error, or a worker panic) — same surface
+        // as `Script::parse` returning Err inside `run_script`.
+        Err(err) => {
+            outcome.errors.push(format!("{name}: {err}"));
+            return;
+        }
+    };
+    let started = Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        // Parse is done off-thread; `compile_raw` runs the deferred scope
+        // analysis + bytecode compile (swapping in the worker interner for the
+        // duration), then evaluate. Same compile/execute phase timing as
+        // `run_script`; "parse" for this script was charged to a worker thread.
+        let t = phase_begin();
+        let script = boa_engine::Script::compile_raw(raw, None, ctx)?;
         phase_end(Phase::Compile, t);
         let t = phase_begin();
         let r = script.evaluate(ctx);
@@ -2700,6 +2893,13 @@ fn load_page(
         scripts.len()
     ));
 
+    // Parallel parse (Step 5a): external classic scripts raw-parse on a worker
+    // pool NOW, overlapping the rest of this thread's work (the prelude already
+    // ran; earlier scripts' execution and later scripts' parse now overlap). The
+    // loop below still compiles + runs each in document order — only the lex/
+    // parse phase moved off this thread.
+    let mut parse_pool = dispatch_parallel_parse(&scripts, externals, &mut ctx);
+
     for (i, (src, inline, type_attr, node)) in scripts.iter().enumerate() {
         let script_started = Instant::now();
         if std::env::var_os("TRUST_NET_TRACE").is_some() {
@@ -2780,8 +2980,16 @@ fn load_page(
         match src {
             Some(src) => match externals.iter().find(|(k, _)| k == src) {
                 Some((_, Some(body))) => {
-                    let body = String::from_utf8_lossy(body);
-                    run_script(&mut ctx, src, body.as_bytes(), &budget, &mut outcome);
+                    // If this script was raw-parsed on the pool, compile + run
+                    // the prepared AST; otherwise (pool inactive — <2 externals)
+                    // parse it inline as before.
+                    if let Some(pool) = parse_pool.as_mut().filter(|p| p.was_dispatched(i)) {
+                        let prepared = pool.take(i);
+                        run_prepared(&mut ctx, src, prepared, &budget, &mut outcome);
+                    } else {
+                        let body = String::from_utf8_lossy(body);
+                        run_script(&mut ctx, src, body.as_bytes(), &budget, &mut outcome);
+                    }
                 }
                 _ => {
                     // A deliberately blocked ad/tracker script is expected,
@@ -3992,11 +4200,21 @@ const PRELUDE: &str = r##"
 
     // The document base URL: <base href> when present (archive.org sets
     // one; SPA routers resolve '.' against it), the page URL otherwise.
+    // CACHED — a full querySelector("base[href]") on every .href/.src read was
+    // ~5% of Steam's settle profile. The resolved base only changes on
+    // navigation (location) or a runtime <base href> mutation/insertion, each of
+    // which resets the cache (setLocParts; the `<base>` guards in setAttribute/
+    // removeAttribute and the child-mutation methods). `null` = (re)compute; any
+    // real resolved base is a non-null string (so "" stays a valid cache hit).
+    // NOT tracked (self-heals on the next navigation, both vanishingly rare): a
+    // `<base>` injected via innerHTML, or a case-variant setAttribute("HREF").
+    let baseHrefCache = null;
     function baseHref() {
+        if (baseHrefCache !== null) return baseHrefCache;
         const b = g.document.querySelector("base[href]");
-        if (!b) return g.location.href;
+        if (!b) return (baseHrefCache = g.location.href);
         const u = __url_parse(b.getAttribute("href") || "", g.location.href);
-        return u ? u[0] : g.location.href;
+        return (baseHrefCache = u ? u[0] : g.location.href);
     }
 
     // --- events: listener registry + synchronous bubble dispatch ---
@@ -4503,6 +4721,7 @@ const PRELUDE: &str = r##"
             if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
+            if (c.__ln === "base") baseHrefCache = null; // maybeRunScript already read .localName
             return c;
         }
         insertBefore(c, ref) {
@@ -4511,9 +4730,10 @@ const PRELUDE: &str = r##"
             if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
+            if (c.__ln === "base") baseHrefCache = null;
             return c;
         }
-        removeChild(c) { if (MO.length) moChildRemove(this, c); if (CE.defs.size) ceDisconnect(c); __dom_detach(c.__id); return c; }
+        removeChild(c) { if (c.__ln === "base") baseHrefCache = null; if (MO.length) moChildRemove(this, c); if (CE.defs.size) ceDisconnect(c); __dom_detach(c.__id); return c; }
         replaceChild(n, old) {
             const prev = old.previousSibling, next = old.nextSibling;
             if (CE.defs.size) ceDisconnect(old);
@@ -4523,9 +4743,10 @@ const PRELUDE: &str = r##"
                 removedNodes: [old], previousSibling: prev, nextSibling: next });
             if (CE.defs.size) ceScan(n);
             maybeRunScript(n);
+            if (n.__ln === "base" || old.__ln === "base") baseHrefCache = null;
             return old;
         }
-        remove() { const p = this.parentNode; if (p && MO.length) moChildRemove(p, this); if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); }
+        remove() { if (this.__ln === "base") baseHrefCache = null; const p = this.parentNode; if (p && MO.length) moChildRemove(p, this); if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); }
         append(...ns) { for (const n of ns) this.appendChild(n && typeof n === "object" ? n : g.document.createTextNode(String(n))); }
         prepend(...ns) { const f = this.firstChild; for (const n of ns) this.insertBefore(n && typeof n === "object" ? n : g.document.createTextNode(String(n)), f); }
         // The ChildNode mixin: lit's svg templates go through
@@ -4693,8 +4914,17 @@ const PRELUDE: &str = r##"
     }
 
     class Element extends Node {
-        get tagName() { return (__dom_tag(this.__id) || "").toUpperCase(); }
-        get localName() { return __dom_tag(this.__id) || ""; }
+        // nodeType and the tag are IMMUTABLE for a node: `wrap()` already
+        // dispatched this class BY node type, and an element's local name never
+        // changes. So return a constant nodeType (no `__dom_node_type` syscall)
+        // and lazily cache the tag — killing the per-access syscalls that
+        // jQuery's `each`/`data`/`add` pound (profile-directed: `nodeType`/
+        // `nodeName`/`tagName` getters were ~8% of Steam's settle phase; a
+        // getter-hammering micro-bench runs ~25% faster).
+        get nodeType() { return 1; }
+        get localName() { let t = this.__ln; if (t === undefined) t = this.__ln = __dom_tag(this.__id) || ""; return t; }
+        get tagName() { let t = this.__tn; if (t === undefined) t = this.__tn = this.localName.toUpperCase(); return t; }
+        get nodeName() { return this.tagName; }
         get [Symbol.toStringTag]() { return htmlInterfaceName(this.localName); }
         // --- HTMLMediaElement surface, on <video>/<audio> ---
         // TRust presents media via mpv (a followed link), not inline playback.
@@ -4780,11 +5010,32 @@ const PRELUDE: &str = r##"
             });
         }
         toDataURL() { return this.tagName === "CANVAS" ? "data:," : undefined; }
-        getAttribute(n) { return __dom_get_attr(this.__id, String(n)); }
+        // getAttribute is hammered by every framework's traversal/normalisation
+        // (jQuery's .attr/.hasClass, event delegation, and the value/checked/id/
+        // class IDL getters below all route here). A per-element read cache
+        // (`__ac`) elides the repeat `__dom_get_attr` syscalls. It's a null-proto
+        // bag so attribute names like "constructor"/"__proto__" stay plain keys;
+        // the syscall only ever returns a string or null, so a cached `undefined`
+        // uniquely means "not cached yet".
+        // CORRECTNESS: every attribute write on the live page funnels through
+        // setAttribute/removeAttribute (style/dataset/classList/className/value/
+        // checked all route here; nothing mutates an attr Rust-side mid-page), so
+        // those two are the only invalidation points. Because Rust matches
+        // attribute names case-INSENSITIVELY, a write DROPS the whole bag instead
+        // of patching one raw-cased key (cheap, and immune to mixed-case access).
+        getAttribute(n) {
+            n = String(n);
+            const c = this.__ac || (this.__ac = Object.create(null));
+            const v = c[n];
+            if (v !== undefined) return v;
+            return (c[n] = __dom_get_attr(this.__id, n));
+        }
         setAttribute(n, v) {
             n = String(n); v = String(v);
             const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             __dom_set_attr(this.__id, n, v);
+            this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
+            if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, n.toLowerCase(), old, v);
             if (MO.length) moAttr(this, n, old);
         }
@@ -4793,10 +5044,12 @@ const PRELUDE: &str = r##"
             n = String(n);
             const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             __dom_remove_attr(this.__id, n);
+            this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
+            if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, n.toLowerCase(), old, null);
             if (MO.length) moAttr(this, n, old);
         }
-        hasAttribute(n) { return __dom_get_attr(this.__id, String(n)) !== null; }
+        hasAttribute(n) { return this.getAttribute(n) !== null; }
         getAttributeNames() { return __dom_attr_names(this.__id); }
         hasAttributes() { return __dom_attr_names(this.__id).length > 0; }
         // NamedNodeMap, array-like enough for Array.from/iteration/indexing
@@ -5206,9 +5459,11 @@ const PRELUDE: &str = r##"
             this.data = d.slice(0, o) + String(s) + d.slice(o + c);
         }
     }
-    class Text extends CharacterData { get [Symbol.toStringTag]() { return "Text"; } }
+    class Text extends CharacterData { get nodeType() { return 3; } get nodeName() { return "#text"; } get [Symbol.toStringTag]() { return "Text"; } }
 
     class Document extends Node {
+        get nodeType() { return 9; }
+        get nodeName() { return "#document"; }
         get [Symbol.toStringTag]() { return "HTMLDocument"; }
         // A document has NO owner document (DOM §`Document` overrides Node's
         // `ownerDocument` to null). Inheriting Node's "return the document" here
@@ -5371,8 +5626,8 @@ const PRELUDE: &str = r##"
         hasFocus() { return true; }
     }
 
-    class DocumentFragment extends Node { get [Symbol.toStringTag]() { return "DocumentFragment"; } }
-    class Comment extends CharacterData { get [Symbol.toStringTag]() { return "Comment"; } }
+    class DocumentFragment extends Node { get nodeType() { return 11; } get nodeName() { return "#document-fragment"; } get [Symbol.toStringTag]() { return "DocumentFragment"; } }
+    class Comment extends CharacterData { get nodeType() { return 8; } get nodeName() { return "#comment"; } get [Symbol.toStringTag]() { return "Comment"; } }
     // Lit walks comment markers with one of these.
     // A spec-faithful DOM TreeWalker (https://dom.spec.whatwg.org/#interface-treewalker).
     // The full traversal surface — firstChild/lastChild/next|previousSibling/
@@ -5596,6 +5851,8 @@ const PRELUDE: &str = r##"
         }
     }
     class ShadowRoot extends Node {
+        get nodeType() { return 11; }
+        get nodeName() { return "#document-fragment"; }
         get [Symbol.toStringTag]() { return "ShadowRoot"; }
         get host() { return this.__host || null; }
         get mode() { return this.__mode || "open"; }
@@ -6130,6 +6387,7 @@ const PRELUDE: &str = r##"
         locState.href = p[0]; locState.protocol = p[1]; locState.host = p[2];
         locState.hostname = p[3]; locState.port = p[4]; locState.pathname = p[5];
         locState.search = p[6]; locState.hash = p[7]; locState.origin = p[8];
+        baseHrefCache = null; // the base resolves against location.href
     };
     const withoutHash = (u) => {
         const i = String(u).indexOf("#");
@@ -6374,6 +6632,7 @@ const PRELUDE: &str = r##"
     // does (a record object per mutation) a GC mid-iteration trips
     // "Object already borrowed". Arrays have no such finalizer.
     const MO = [];               // live observers (each with a per-observer record queue)
+    const MO_EMPTY = Object.freeze([]); // shared empty addedNodes/removedNodes (frozen ⇒ safe to share)
     let moQueued = false;        // a delivery microtask is already scheduled
     let moChain = 0;             // consecutive delivery turns without the queue going quiet
     let moDisabled = false;      // tripped if an observer-feeds-observer loop runs away
@@ -6424,29 +6683,59 @@ const PRELUDE: &str = r##"
     // "childList" | "attributes" | "characterData"; oldValue is nulled per
     // observer unless one of its matching registrations asked for it (spec).
     function moNotify(rec) {
+        // 1-entry cache for the subtree ancestor test within THIS mutation:
+        // multiple subtree observers commonly share a root (Steam registers 3
+        // separate `#document subtree` observers), and they are scanned
+        // consecutively, so the same `__dom_contains(root, target)` was run
+        // once per observer. Caching the last (rootId -> result) collapses
+        // those identical syscalls to one — no allocation, no semantic change.
+        let cAid = null, cRes = false;
+        // Deferred sibling capture: an insert/remove passes `__sib` (the node)
+        // instead of pre-read `previousSibling`/`nextSibling`. We resolve them
+        // ONCE, lazily, at the first matching observer — so a childList mutation
+        // on a DETACHED subtree (jQuery builds offscreen; ~80% of Steam's) that
+        // matches nobody pays NO sibling syscalls/wraps. Computed here it is
+        // still synchronous with the mutation (insert: after `__dom_append`;
+        // remove: before `__dom_detach`, since moNotify runs inside moChildRemove
+        // before the detach), so the snapshot is spec-correct.
+        let sibDone = false, prevSib = null, nextSib = null;
+        // Resolve the record's type to booleans ONCE — moNotify runs per mutation
+        // and the inner loop is per (observer × registration), so re-comparing
+        // the `rec.type` string each iteration was the bulk of its cost.
+        const isCL = rec.type === "childList", isAttr = rec.type === "attributes";
         for (let i = 0; i < MO.length; i++) {
             const o = MO[i], regs = o.__targets;
             let matched = false, wantOld = false;
             for (let j = 0; j < regs.length; j++) {
                 const opts = regs[j];
-                if (rec.type === "childList" ? !opts.childList
-                    : rec.type === "attributes" ? !opts.attributes
-                    : !opts.characterData) continue;
-                if (!(opts.target === rec.target || (opts.subtree && moIsAncestor(opts.target, rec.target)))) continue;
-                if (rec.type === "attributes" && opts.attributeFilter &&
+                if (isCL ? !opts.childList : isAttr ? !opts.attributes : !opts.characterData) continue;
+                let hit = opts.target === rec.target;
+                if (!hit && opts.subtree) {
+                    const aid = opts.target.__id;
+                    if (aid === cAid) hit = cRes;
+                    else { cRes = moIsAncestor(opts.target, rec.target); cAid = aid; hit = cRes; }
+                }
+                if (!hit) continue;
+                if (isAttr && opts.attributeFilter &&
                     opts.attributeFilter.indexOf(rec.attributeName) < 0) continue;
                 matched = true;
-                if ((rec.type === "attributes" && opts.attributeOldValue) ||
-                    (rec.type === "characterData" && opts.characterDataOldValue)) { wantOld = true; break; }
+                if ((isAttr && opts.attributeOldValue) ||
+                    (!isCL && !isAttr && opts.characterDataOldValue)) { wantOld = true; break; }
             }
             if (!matched) continue;
+            if (rec.__sib !== undefined && !sibDone) {
+                sibDone = true;
+                const s = rec.__sib;
+                prevSib = s ? wrap(__dom_prev(s.__id)) : null;
+                nextSib = s ? wrap(__dom_next(s.__id)) : null;
+            }
             o.__records.push({
                 type: rec.type,
                 target: rec.target,
-                addedNodes: rec.addedNodes || [],
-                removedNodes: rec.removedNodes || [],
-                previousSibling: rec.previousSibling || null,
-                nextSibling: rec.nextSibling || null,
+                addedNodes: rec.addedNodes || MO_EMPTY,
+                removedNodes: rec.removedNodes || MO_EMPTY,
+                previousSibling: rec.__sib !== undefined ? prevSib : (rec.previousSibling || null),
+                nextSibling: rec.__sib !== undefined ? nextSib : (rec.nextSibling || null),
                 attributeName: rec.attributeName || null,
                 attributeNamespace: null,
                 oldValue: wantOld ? (rec.oldValue === undefined ? null : rec.oldValue) : null,
@@ -6459,13 +6748,15 @@ const PRELUDE: &str = r##"
     // zero-observer fast path before touching the DOM for siblings/oldValue.
     function moChildInsert(parent, node) {        // call AFTER the insert
         if (!MO.length) return;
-        moNotify({ type: "childList", target: parent, addedNodes: [node],
-            previousSibling: node.previousSibling, nextSibling: node.nextSibling });
+        // `__sib: node` defers prev/next-sibling capture into moNotify (resolved
+        // only if some observer matches — see there). Was: eager
+        // `previousSibling: node.previousSibling, …`, 2 syscalls + 2 wraps on
+        // EVERY insert including the detached ones nobody observes.
+        moNotify({ type: "childList", target: parent, addedNodes: [node], __sib: node });
     }
     function moChildRemove(parent, node) {        // call BEFORE the detach
         if (!MO.length) return;
-        moNotify({ type: "childList", target: parent, removedNodes: [node],
-            previousSibling: node.previousSibling, nextSibling: node.nextSibling });
+        moNotify({ type: "childList", target: parent, removedNodes: [node], __sib: node });
     }
     function moChildBulk(target, removed, added) { // innerHTML / textContent / insertAdjacentHTML
         if (!MO.length) return;
@@ -8367,6 +8658,334 @@ mod tests {
         assert_eq!(p.parse_n, 0, "armed off but parse recorded: {p:?}");
         assert_eq!(p.compile_n, 0, "armed off but compile recorded: {p:?}");
         assert_eq!(p.execute_n, 0, "armed off but execute recorded: {p:?}");
+    }
+
+    // ---- K1/K2 keystone: detachable compiled-code image ------------------
+    //
+    // A compiled `CodeBlock` is pinned to its compiling thread's GC heap
+    // (nested functions are `Gc<CodeBlock>`) and uses non-`Send` `JsString`/
+    // `Rc` throughout, so it can't be cached across pages or handed to a
+    // compile worker. `CodeBlock::to_image` detaches it into an owned, `Send`
+    // `CodeBlockImage`; `CodeBlock::from_image` rehydrates one on ANY thread.
+    // These three tests are the feasibility proof for the cache /
+    // compile-on-arrival / parallel-compile cluster (see
+    // JS_ENGINE_PERFORMANCE_PLAN.md). The fixture exercises every coupled
+    // payload: a nested function (recursive `Gc<CodeBlock>`), a closure over a
+    // captured local (`Scope`), a `BigInt` constant, string constants, and
+    // property inline caches.
+    const KEYSTONE_FIXTURE: &[u8] = br#"
+        function add(a, b) { return a + b; }
+        function make() {
+            var base = 10n;               // BigInt constant, captured by the closure
+            return function (x) { return base + BigInt(x); };
+        }
+        var o = { tag: "trust", n: 7 };   // string constants + property inline caches
+        add(2, 3) + Number(make()(o.n)) + o.tag.length
+    "#;
+
+    /// Compile a source to a detached image (the dehydrate half).
+    fn keystone_image_of(src: &[u8]) -> boa_engine::vm::CodeBlockImage {
+        let mut ctx = Context::default();
+        let script = boa_engine::Script::parse(Source::from_bytes(src), None, &mut ctx).unwrap();
+        // `codeblock` compiles + memoizes the block; dehydrate it.
+        script.codeblock(&mut ctx).unwrap().to_image()
+    }
+
+    /// Dehydrate → rehydrate → dehydrate is a fixpoint: the round-trip loses
+    /// nothing (bytecode, the recursive nested-function tree, scopes, the
+    /// bigint, strings, bindings, the source map all survive byte-for-byte).
+    #[test]
+    fn code_block_image_round_trips_losslessly() {
+        let image = keystone_image_of(KEYSTONE_FIXTURE);
+        let rehydrated = boa_engine::vm::CodeBlock::from_image(&image);
+        let image_again = rehydrated.to_image();
+        assert_eq!(
+            image, image_again,
+            "dehydrate → rehydrate → dehydrate must be lossless"
+        );
+    }
+
+    /// The image is `Send` and rehydrates into a DIFFERENT thread's own
+    /// `boa_gc` heap — the cross-page-cache / compile-worker scenario, the
+    /// whole point of K1. Re-dehydrating there and comparing proves the remote
+    /// rehydration is faithful.
+    #[test]
+    fn code_block_image_is_send_and_rehydrates_on_another_thread() {
+        fn assert_send<T: Send>() {}
+        assert_send::<boa_engine::vm::CodeBlockImage>();
+
+        let image = keystone_image_of(KEYSTONE_FIXTURE);
+        let expected = image.clone();
+        let remote = std::thread::spawn(move || {
+            // No `Context` needed: `from_image` only allocates `Gc`s into this
+            // thread's heap.
+            boa_engine::vm::CodeBlock::from_image(&image).to_image()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            expected, remote,
+            "rehydration on another thread must reproduce the image"
+        );
+    }
+
+    /// A rehydrated block, installed as a fresh script's body in a DIFFERENT
+    /// realm and evaluated, computes the identical result as the original — the
+    /// exact "compile in realm A, run in realm B" path a cross-page cache uses.
+    #[test]
+    fn rehydrated_code_block_executes_identically() {
+        // Direct: compile + run in realm A.
+        let mut ctx_a = Context::default();
+        let script_a =
+            boa_engine::Script::parse(Source::from_bytes(KEYSTONE_FIXTURE), None, &mut ctx_a)
+                .unwrap();
+        let image = script_a.codeblock(&mut ctx_a).unwrap().to_image();
+        let direct = script_a.evaluate(&mut ctx_a).unwrap();
+
+        // Rehydrated: install the detached image as a fresh script's body in
+        // realm B and evaluate it.
+        let mut ctx_b = Context::default();
+        let script_b =
+            boa_engine::Script::parse(Source::from_bytes(KEYSTONE_FIXTURE), None, &mut ctx_b)
+                .unwrap();
+        script_b.set_codeblock(boa_engine::vm::CodeBlock::from_image(&image));
+        let rehydrated = script_b.evaluate(&mut ctx_b).unwrap();
+
+        // add(2,3)=5; Number(make()(7))=Number(10n+7n)=17; "trust".length=5.
+        assert_eq!(direct.as_number(), Some(27.0), "fixture sanity check");
+        assert_eq!(
+            rehydrated.as_number(),
+            direct.as_number(),
+            "the rehydrated code block must compute the same value as the original"
+        );
+    }
+
+    // ---- Step 5a: parallel parse (raw_parse off-thread + compile_raw) ------
+    //
+    // `Script::raw_parse` runs the lex/parse on a worker with a PRIVATE interner
+    // (the bulk of the parse phase, off the page thread); `Script::compile_raw`
+    // runs the deferred scope analysis against the SHARED realm scope and
+    // compiles on the page thread. These tests prove the split is behaviour-
+    // identical to the sequential `Script::parse` path, including the two things
+    // that make it subtle: cross-script bindings resolve correctly even though
+    // each script used a different interner (the shared scope links by NAME),
+    // and tagged-template call sites stay distinct across separately parsed
+    // scripts (the per-script parser id).
+
+    /// Raw-parse `src` on a SEPARATE thread — proving `RawScript: Send` and that
+    /// the parse really leaves the owning thread, exactly as the pool does.
+    fn raw_parse_on_worker(src: &str, id: u32) -> Result<boa_engine::RawScript, String> {
+        let owned = src.to_string();
+        std::thread::spawn(move || {
+            boa_engine::Script::raw_parse(Source::from_bytes(owned.as_bytes()), id)
+        })
+        .join()
+        .expect("parse worker panicked")
+    }
+
+    /// Drive `sources` (document order) through the parallel-parse path: each is
+    /// raw-parsed on a worker, then compiled + evaluated in order in one context
+    /// — exactly what `load_page`'s loop does — returning the last value.
+    fn last_via_parallel_parse(sources: &[&str]) -> JsValue {
+        let mut ctx = Context::default();
+        let mut last = JsValue::undefined();
+        for src in sources {
+            let id = ctx.next_parser_identifier();
+            let raw = raw_parse_on_worker(src, id).expect("raw parse failed");
+            let script = boa_engine::Script::compile_raw(raw, None, &mut ctx).expect("compile_raw");
+            last = script.evaluate(&mut ctx).expect("evaluate");
+        }
+        last
+    }
+
+    /// The same `sources` the ORIGINAL way (sequential `Script::parse` +
+    /// evaluate, one shared interner) — the equivalence baseline.
+    fn last_via_sequential_parse(sources: &[&str]) -> JsValue {
+        let mut ctx = Context::default();
+        let mut last = JsValue::undefined();
+        for src in sources {
+            let script =
+                boa_engine::Script::parse(Source::from_bytes(src.as_bytes()), None, &mut ctx)
+                    .unwrap();
+            last = script.evaluate(&mut ctx).unwrap();
+        }
+        last
+    }
+
+    /// A single script: the off-thread raw parse + swapped-interner compile must
+    /// compute the identical result as the in-context `Script::parse` path. The
+    /// keystone fixture exercises bigint, closures, string constants, and ICs.
+    #[test]
+    fn raw_parse_compile_matches_direct_parse() {
+        let mut ctx_seq = Context::default();
+        let direct =
+            boa_engine::Script::parse(Source::from_bytes(KEYSTONE_FIXTURE), None, &mut ctx_seq)
+                .unwrap()
+                .evaluate(&mut ctx_seq)
+                .unwrap();
+
+        let mut ctx_par = Context::default();
+        let id = ctx_par.next_parser_identifier();
+        let raw = raw_parse_on_worker(std::str::from_utf8(KEYSTONE_FIXTURE).unwrap(), id).unwrap();
+        let prepared = boa_engine::Script::compile_raw(raw, None, &mut ctx_par)
+            .unwrap()
+            .evaluate(&mut ctx_par)
+            .unwrap();
+
+        assert_eq!(direct.as_number(), Some(27.0), "fixture sanity check");
+        assert_eq!(
+            prepared.as_number(),
+            direct.as_number(),
+            "off-thread raw parse + compile_raw must match Script::parse"
+        );
+    }
+
+    /// Scripts that lean on each other across the boundary: a global `var`
+    /// (resolved by name on the global object), top-level `let`/`const`
+    /// (resolved by SLOT INDEX into one shared global lexical env, so the
+    /// cross-script declaration order must be preserved), a function declared in
+    /// one and called in another, and a property name interned separately in
+    /// each script (the shared scope must link them by name, not interner index).
+    /// The parallel path must reproduce the sequential result exactly.
+    #[test]
+    fn parallel_parse_preserves_cross_script_globals() {
+        let sources = [
+            r#"globalThis.out = "";
+               var v = 10;
+               let lx = 5;
+               function bump(o){ return o.count + 1; }"#,
+            r#"var w = v + 20;          // reads script 1's global var
+               let ly = lx + 7;         // reads script 1's global let; new slot AFTER lx
+               const obj = { count: 100 };"#,
+            r#"[v, w, lx, ly, bump(obj)].join(",")"#,
+        ];
+        let parallel = last_via_parallel_parse(&sources)
+            .as_string()
+            .expect("a string result")
+            .to_std_string_lossy();
+        let sequential = last_via_sequential_parse(&sources)
+            .as_string()
+            .expect("a string result")
+            .to_std_string_lossy();
+        assert_eq!(parallel, "10,30,5,12,101", "parallel-parse result wrong");
+        assert_eq!(
+            parallel, sequential,
+            "parallel parse must match sequential parse exactly"
+        );
+    }
+
+    /// Two scripts with the SAME tag function and SAME template content. Their
+    /// tagged-template call sites are distinct, so per spec they produce distinct
+    /// (frozen) template arrays — but only if each script parsed with a unique
+    /// parser id; a collision would make them share one cached template object.
+    /// This guards the per-script id allocation through the pool.
+    #[test]
+    fn parallel_parse_keeps_tagged_template_sites_distinct() {
+        let sources = [
+            r#"function tag(s){ return s; } globalThis.A = tag`shared`;"#,
+            r#"function tag(s){ return s; } globalThis.B = tag`shared`;
+               globalThis.A !== globalThis.B"#,
+        ];
+        assert_eq!(
+            last_via_parallel_parse(&sources).as_boolean(),
+            Some(true),
+            "tagged-template sites in separately parsed scripts must stay distinct"
+        );
+    }
+
+    /// The immutable-property fast paths (constant `nodeType` per wrapper class,
+    /// lazily cached tag) must return the SAME values the per-access syscalls
+    /// did. These are the getters jQuery's `each`/`data`/`add` hammer; the
+    /// MO/jQuery hot-path pass made them syscall-free. Guards the constants and
+    /// the cache against a future wrong value.
+    #[test]
+    fn node_type_and_tag_getters_stay_correct() {
+        let html = r##"<html><body><div id=o></div><script>
+            const el = document.createElement('P');
+            const tx = document.createTextNode('hi');
+            const cm = document.createComment('c');
+            const fr = document.createDocumentFragment();
+            const ok =
+                el.nodeType === 1 && tx.nodeType === 3 && cm.nodeType === 8 &&
+                fr.nodeType === 11 && document.nodeType === 9 &&
+                // Element name getters agree and derive from the (cached) tag.
+                el.nodeName === el.tagName && el.tagName === el.localName.toUpperCase() &&
+                // Repeated access is stable (cache returns the same value).
+                el.tagName === el.tagName && el.localName === el.localName &&
+                // Non-element node names are the spec constants.
+                tx.nodeName === "#text" && cm.nodeName === "#comment" &&
+                fr.nodeName === "#document-fragment" && document.nodeName === "#document";
+            document.getElementById('o').setAttribute('data-ok', String(ok));
+        </script></body></html>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(r#"data-ok="true""#),
+            "node type/name getters returned a wrong value: {out}"
+        );
+    }
+
+    #[test]
+    fn getattribute_cache_reflects_writes() {
+        // The per-element read cache (`__ac`) must never go stale: every
+        // attribute write nukes it, so a read after a set/remove — through ANY
+        // writer that funnels into setAttribute/removeAttribute (className,
+        // classList, dataset, style) — sees the new value. Mixed-case access
+        // stays correct too (Rust matches attribute names case-insensitively).
+        let html = r##"<html><body><div id=o></div><div id=t class="a" data-x="1" title="hi"></div><script>
+            const el = document.getElementById('t'), log = [];
+            log.push(el.getAttribute('class'));   // a   (cold)
+            log.push(el.getAttribute('class'));    // a   (cache hit)
+            el.setAttribute('class', 'b');
+            log.push(el.getAttribute('class'));    // b   (cache dropped)
+            el.className = 'c';                    // className -> setAttribute
+            log.push(el.getAttribute('class'));    // c
+            el.classList.add('d');                 // classList -> setAttribute
+            log.push(el.getAttribute('class'));    // c d
+            el.dataset.x = '2';                    // dataset -> setAttribute
+            log.push(el.getAttribute('data-x'));   // 2
+            el.style.color = 'x';                  // an unrelated write must not corrupt other reads
+            log.push(el.getAttribute('data-x'));   // 2 (re-fetched correctly)
+            log.push(String(el.getAttribute('title') === el.getAttribute('TITLE'))); // case-insensitive agree
+            el.setAttribute('title', 'bye');
+            log.push(el.getAttribute('TITLE'));    // bye (mixed-case read not stale after lowercase write)
+            el.removeAttribute('title');
+            log.push(String(el.getAttribute('title'))); // null
+            document.getElementById('o').textContent = log.join('|');
+        </script></body></html>"##;
+        let (out, outcome) = page(html);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("a|a|b|c|c d|2|2|true|bye|null"),
+            "attribute read cache went stale: {out}"
+        );
+    }
+
+    #[test]
+    fn base_href_cache_invalidates_on_nav_and_base_changes() {
+        // The cached base URL must refresh on (a) a location change, (b) a
+        // runtime <base> insertion, and (c) a <base href> mutation. page()
+        // loads at https://example.com/a/page, so "foo" resolves there first.
+        let html = r##"<html><body><div id=o></div><a id=a href="foo">x</a><script>
+            const a = document.getElementById('a'), log = [];
+            log.push(a.href);                       // -> https://example.com/a/foo
+            log.push(a.href);                       // cache hit, identical
+            history.pushState(null, '', '/x/y');    // location change nulls the base cache
+            log.push(a.href);                       // -> https://example.com/x/foo
+            const b = document.createElement('base');
+            b.setAttribute('href', 'https://cdn.example.com/p/');
+            document.body.appendChild(b);           // runtime <base> insertion
+            log.push(a.href);                       // -> https://cdn.example.com/p/foo
+            b.setAttribute('href', 'https://cdn.example.com/q/'); // mutate the base
+            log.push(a.href);                       // -> https://cdn.example.com/q/foo
+            document.getElementById('o').textContent = log.join(' ');
+        </script></body></html>"##;
+        let (out, outcome) = page(html);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("https://example.com/a/foo https://example.com/a/foo https://example.com/x/foo https://cdn.example.com/p/foo https://cdn.example.com/q/foo"),
+            "base href cache did not invalidate: {out}"
+        );
     }
 
     /// Quantify the GC policy win, stock vs TRust default, on two

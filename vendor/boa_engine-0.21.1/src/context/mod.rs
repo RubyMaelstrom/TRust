@@ -645,7 +645,13 @@ impl Context {
     }
 
     /// Increment and get the parser identifier.
-    pub(crate) fn next_parser_identifier(&mut self) -> u32 {
+    ///
+    /// Public so an off-thread raw parse ([`Script::raw_parse`](crate::Script::raw_parse))
+    /// can be handed a process-unique id — these distinguish tagged-template
+    /// call sites across separately parsed scripts, so a parallel-parse pool
+    /// must allocate them from the page `Context` exactly as the in-context
+    /// parse path does.
+    pub fn next_parser_identifier(&mut self) -> u32 {
         self.parser_identifier += 1;
         self.parser_identifier
     }

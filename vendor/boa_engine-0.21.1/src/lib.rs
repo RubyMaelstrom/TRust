@@ -124,7 +124,7 @@ pub mod prelude {
         module::{IntoJsModule, Module},
         native_function::NativeFunction,
         object::{JsData, JsObject, NativeObject},
-        script::Script,
+        script::{RawScript, Script},
         string::{JsStr, JsString},
         symbol::JsSymbol,
         value::{JsValue, JsVariant, js_object, js_value},

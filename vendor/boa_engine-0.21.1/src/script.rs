@@ -12,11 +12,13 @@ use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHashMap;
 
+use boa_ast::SourceText as AstSourceText;
 use boa_gc::{Finalize, Gc, GcRefCell, Trace};
+use boa_interner::Interner;
 use boa_parser::{Parser, Source, source::ReadChar};
 
 use crate::{
-    Context, HostDefined, JsResult, JsString, JsValue, Module, SpannedSourceText,
+    Context, HostDefined, JsNativeError, JsResult, JsString, JsValue, Module, SpannedSourceText,
     bytecompiler::{ByteCompiler, global_declaration_instantiation_context},
     js_string,
     realm::Realm,
@@ -53,6 +55,38 @@ struct Inner {
     host_defined: HostDefined,
     path: Option<PathBuf>,
 }
+
+/// A raw-parsed script paired with the private interner that named its
+/// identifiers — the unit of work for parallel parsing (the JS-engine
+/// performance plan's Step 5a).
+///
+/// [`Script::raw_parse`] produces one on *any* thread, with no [`Context`] and
+/// without scope analysis (the bulk of the "parse" phase — lexing and AST
+/// construction — thus runs off the page thread). [`Script::compile_raw`]
+/// consumes it on the page thread, running the deferred scope analysis against
+/// the *shared* realm scope and then compiling. Scope analysis and compilation
+/// stay sequential there because global lexical bindings (`let`/`const`/
+/// `class`) resolve at runtime by slot index into one shared global
+/// environment, so their declaration order must be preserved.
+#[derive(Debug)]
+pub struct RawScript {
+    code: boa_ast::Script,
+    source: AstSourceText,
+    interner: Interner,
+    path: Option<PathBuf>,
+}
+
+// SAFETY: a `RawScript` is only ever *moved* between threads (a parse worker to
+// the page thread), never shared (`&RawScript` does not cross threads). Its one
+// field the compiler can't prove `Send` is `Interner`: its `InternedStr` map
+// keys hold `NonNull` pointers into the interner's own `FixedString` heap
+// buffers. Moving the interner moves the owners of those buffers but not the
+// heap allocations themselves, so the pointers stay valid — a move is sound.
+// Everything else is plainly movable: the raw (pre-`analyze_scope`) AST holds
+// only `Sym`s (interner indices) and owned data — no `Rc`, `JsString`, or
+// thread-affine handle — and `SourceText` is an owned UTF-16 buffer. There is
+// no interior thread-affinity, so the whole value is sound to send.
+unsafe impl Send for RawScript {}
 
 impl Script {
     /// Gets the realm of this script.
@@ -111,6 +145,124 @@ impl Script {
         })
     }
 
+    /// Raw-parse `src` into a [`RawScript`] on the current thread — the worker
+    /// half of parallel parse. Needs no [`Context`] and runs no scope analysis,
+    /// so it can execute on any thread with a private interner.
+    ///
+    /// `identifier` must be a process-unique parser id (allocate one per script
+    /// from [`Context::next_parser_identifier`] on the owning thread): it makes
+    /// tagged-template call-site identities distinct across separately parsed
+    /// scripts, exactly as the in-`Context` parse path does. The script is
+    /// parsed in sloppy mode — a `"use strict"` prologue is honoured by the
+    /// parser itself — matching [`Script::parse`], which only forces strict
+    /// from [`Context::is_strict`] (always false for a top-level page script).
+    ///
+    /// Compile the result with [`Script::compile_raw`] on the page thread.
+    ///
+    /// # Errors
+    /// Returns the formatted syntax error (a `String`, so it can cross back to
+    /// the page thread) on any parse failure.
+    pub fn raw_parse<R: ReadChar>(
+        src: Source<'_, R>,
+        identifier: u32,
+    ) -> Result<RawScript, String> {
+        let path = src.path().map(Path::to_path_buf);
+        let mut interner = Interner::new();
+        let mut parser = Parser::new(src);
+        parser.set_identifier(identifier);
+        let (code, source) = parser
+            .parse_script_raw(&mut interner)
+            .map_err(|e| e.to_string())?;
+        Ok(RawScript {
+            code,
+            source,
+            interner,
+            path,
+        })
+    }
+
+    /// Compile a [`RawScript`] (from [`Script::raw_parse`], possibly produced on
+    /// another thread) into a runnable `Script` bound to `context`'s realm —
+    /// the page-thread half of parallel parse.
+    ///
+    /// Runs the scope analysis `raw_parse` deferred, against the *shared* realm
+    /// scope and in call order, so global lexical bindings get their slot
+    /// indices in document order; then compiles the code block. The raw script's
+    /// private interner is swapped into `context` for the duration of analysis +
+    /// compilation (the AST names identifiers by that interner's `Sym`s) and the
+    /// page interner is restored before returning — so anything the returned
+    /// script does at runtime (e.g. a later `eval`) parses against the page
+    /// interner as usual. This is sound because the resulting code block is
+    /// interner-independent: it names every identifier by `JsString`, not by
+    /// interner index, so the worker interner can be dropped once compilation
+    /// finishes.
+    ///
+    /// # Errors
+    /// Propagates scope-analysis and global-declaration syntax errors.
+    pub fn compile_raw(
+        raw: RawScript,
+        realm: Option<Realm>,
+        context: &mut Context,
+    ) -> JsResult<Self> {
+        let RawScript {
+            code,
+            source,
+            mut interner,
+            path,
+        } = raw;
+        // Swap the worker interner in so `analyze_scope` and the byte compiler
+        // resolve the AST's `Sym` indices against the interner that produced
+        // them. The page interner MUST be restored on every path — including a
+        // panic out of the compiler (a Boa bug) — or the context would keep
+        // wearing the worker interner; hence the catch/restore/resume below
+        // rather than a plain swap pair.
+        std::mem::swap(context.interner_mut(), &mut interner);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::compile_swapped(code, source, realm, path, context)
+        }));
+        std::mem::swap(context.interner_mut(), &mut interner);
+        match outcome {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// The body of [`Script::compile_raw`], with the worker interner already
+    /// installed as `context`'s interner. Mirrors [`Script::parse`]'s
+    /// post-parse steps (analyze → optimize → wrap) and then compiles.
+    fn compile_swapped(
+        mut code: boa_ast::Script,
+        source: AstSourceText,
+        realm: Option<Realm>,
+        path: Option<PathBuf>,
+        context: &mut Context,
+    ) -> JsResult<Self> {
+        let scope = context.realm().scope().clone();
+        code.analyze_scope(&scope, context.interner()).map_err(|reason| {
+            JsNativeError::syntax().with_message(format!("invalid scope analysis: {reason}"))
+        })?;
+        if !context.optimizer_options().is_empty() {
+            context.optimize_statement_list(code.statements_mut());
+        }
+        let source_text = SourceText::new(source);
+        let script = Self {
+            inner: Gc::new(Inner {
+                realm: realm.unwrap_or_else(|| context.realm().clone()),
+                source: code,
+                source_text,
+                codeblock: GcRefCell::default(),
+                loaded_modules: GcRefCell::default(),
+                host_defined: HostDefined::default(),
+                path,
+            }),
+        };
+        // Compile now, against the (swapped-in) worker interner — the produced
+        // code block is interner-independent, so it stays valid once we restore
+        // the page interner and drop the worker one.
+        script.codeblock(context)?;
+        Ok(script)
+    }
+
     /// Compiles the codeblock of this script.
     ///
     /// This is a no-op if this has been called previously.
@@ -159,6 +311,21 @@ impl Script {
         *codeblock = Some(cb.clone());
 
         Ok(cb)
+    }
+
+    /// Installs a precompiled code block as this script's body, so the next
+    /// evaluation runs it instead of compiling the source.
+    ///
+    /// This is the execution seam for a rehydrated
+    /// [`CodeBlockImage`](crate::vm::CodeBlockImage)
+    /// ([`CodeBlock::from_image`](crate::vm::CodeBlock::from_image)): parse a
+    /// `Script` to obtain a realm, install a code block compiled elsewhere (an
+    /// in-memory cache, a compile worker), then [`evaluate`](Self::evaluate). It
+    /// replaces any previously compiled or installed block; the caller is
+    /// responsible for the block having been compiled against an equivalent
+    /// source and realm scope.
+    pub fn set_codeblock(&self, codeblock: Gc<CodeBlock>) {
+        *self.inner.codeblock.borrow_mut() = Some(codeblock);
     }
 
     /// Evaluates this script and returns its result.
