@@ -64,6 +64,35 @@ impl Binding {
     }
 }
 
+/// A heap- and thread-independent, owned image of a [`Scope`].
+///
+/// A live [`Scope`] is an `Rc` graph (a parent `outer` chain plus
+/// interior-mutable bindings), so it is neither `Send` nor detachable from the
+/// process that built it. `ScopeImage` is the flat, owned form used to detach a
+/// compiled-code artifact from the engine (see `boa_engine`'s `CodeBlockImage`,
+/// the K1/K2 keystone): every identifier is carried as owned UTF-16
+/// (`Vec<u16>`), never an interner index, so the image is `Send` and portable
+/// across threads and GC heaps. Round-trips losslessly via
+/// [`Scope::to_image`] / [`Scope::from_image`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeImage {
+    unique_id: u32,
+    index: u32,
+    function: bool,
+    arrow: bool,
+    this_escaped: bool,
+    bindings: Vec<BindingImage>,
+    outer: Option<Box<ScopeImage>>,
+}
+
+/// Owned image of a single [`Binding`] within a [`ScopeImage`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BindingImage {
+    name: Vec<u16>,
+    index: u32,
+    flags: u8,
+}
+
 /// A scope maps bound identifiers to their binding positions.
 ///
 /// It can be either a global scope or a function scope or a declarative scope.
@@ -142,6 +171,62 @@ impl Scope {
                 function,
                 arrow: Cell::new(false),
                 this_escaped: Cell::new(false),
+            }),
+        }
+    }
+
+    /// Detaches this scope (and its `outer` chain) into an owned, `Send`
+    /// [`ScopeImage`]. The dehydration half of the K1/K2 keystone; see
+    /// [`ScopeImage`].
+    #[must_use]
+    pub fn to_image(&self) -> ScopeImage {
+        ScopeImage {
+            unique_id: self.inner.unique_id,
+            index: self.inner.index.get(),
+            function: self.inner.function,
+            arrow: self.inner.arrow.get(),
+            this_escaped: self.inner.this_escaped.get(),
+            bindings: self
+                .inner
+                .bindings
+                .borrow()
+                .iter()
+                .map(|b| BindingImage {
+                    name: b.name.to_vec(),
+                    index: b.index,
+                    flags: b.flags.bits(),
+                })
+                .collect(),
+            outer: self.inner.outer.as_ref().map(|o| Box::new(o.to_image())),
+        }
+    }
+
+    /// Reconstructs a live [`Scope`] (re-allocating the `Rc` graph) from an
+    /// owned [`ScopeImage`]. The rehydration half of the keystone; runs on any
+    /// thread and needs no [`crate`]-level context. The scope's `unique_id`
+    /// (its runtime identity) and binding indices/flags are preserved exactly.
+    #[must_use]
+    pub fn from_image(image: &ScopeImage) -> Self {
+        let outer = image.outer.as_ref().map(|o| Self::from_image(o));
+        Self {
+            inner: Rc::new(Inner {
+                unique_id: image.unique_id,
+                outer,
+                index: Cell::new(image.index),
+                bindings: RefCell::new(
+                    image
+                        .bindings
+                        .iter()
+                        .map(|b| Binding {
+                            name: JsString::from(b.name.as_slice()),
+                            index: b.index,
+                            flags: BindingFlags::from_bits_retain(b.flags),
+                        })
+                        .collect(),
+                ),
+                function: image.function,
+                arrow: Cell::new(image.arrow),
+                this_escaped: Cell::new(image.this_escaped),
             }),
         }
     }
@@ -651,6 +736,43 @@ impl BindingLocator {
     pub fn set_binding_index(&mut self, index: u32) {
         self.binding_index = index;
     }
+
+    /// Detaches this binding locator into an owned, `Send` [`BindingLocatorImage`].
+    ///
+    /// Part of the K1/K2 keystone (see [`ScopeImage`]): the binding name is
+    /// carried as owned UTF-16, and the scope/index fields are plain integers,
+    /// so the image is portable across threads and GC heaps.
+    #[must_use]
+    pub fn to_image(&self) -> BindingLocatorImage {
+        BindingLocatorImage {
+            name: self.name.to_vec(),
+            scope: self.scope,
+            binding_index: self.binding_index,
+            unique_scope_id: self.unique_scope_id,
+        }
+    }
+
+    /// Reconstructs a [`BindingLocator`] from an owned [`BindingLocatorImage`].
+    #[must_use]
+    pub fn from_image(image: &BindingLocatorImage) -> Self {
+        Self {
+            name: JsString::from(image.name.as_slice()),
+            scope: image.scope,
+            binding_index: image.binding_index,
+            unique_scope_id: image.unique_scope_id,
+        }
+    }
+}
+
+/// A heap- and thread-independent, owned image of a [`BindingLocator`].
+///
+/// See [`BindingLocator::to_image`] / [`BindingLocator::from_image`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingLocatorImage {
+    name: Vec<u16>,
+    scope: u32,
+    binding_index: u32,
+    unique_scope_id: u32,
 }
 
 /// Action that is returned when a fallible binding operation.

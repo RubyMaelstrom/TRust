@@ -16,6 +16,24 @@ impl SourceText {
         }
     }
 
+    /// Constructs a `SourceText` from already-collected UTF-16 code points.
+    ///
+    /// Used to rehydrate a detached compiled-code image (see
+    /// `boa_engine`'s `CodeBlockImage`): the source text round-trips as plain
+    /// owned `Vec<u16>`, with no engine/heap coupling.
+    #[must_use]
+    pub fn from_code_points(source_text: Vec<u16>) -> Self {
+        Self { source_text }
+    }
+
+    /// Returns the raw UTF-16 code points backing this source text.
+    ///
+    /// The dehydration counterpart of [`SourceText::from_code_points`].
+    #[must_use]
+    pub fn as_code_points(&self) -> &[u16] {
+        &self.source_text
+    }
+
     /// Get current `LinearPosition`.
     #[must_use]
     pub fn cur_linear_position(&self) -> LinearPosition {

@@ -202,6 +202,20 @@ pub(crate) struct ByteCode {
     pub(crate) bytecode: Box<[u8]>,
 }
 
+impl ByteCode {
+    /// The raw encoded instruction bytes. Used to dehydrate a [`CodeBlock`] into
+    /// a portable image (see `vm::code_block_image`).
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytecode
+    }
+
+    /// Wrap already-encoded instruction bytes (the rehydration counterpart of
+    /// [`ByteCode::bytes`]).
+    pub(crate) fn from_bytes(bytecode: Box<[u8]>) -> Self {
+        Self { bytecode }
+    }
+}
+
 /// The enum representation of [`VaryingOperand`] values.
 enum VaryingOperandVariant {
     U8(u8),

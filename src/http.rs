@@ -1993,6 +1993,77 @@ mod tests {
         server.abort();
     }
 
+    // Parallel parse (Step 5a): TWO external classic scripts trip the parse
+    // pool (raw-parsed off the page thread), and they interact across the
+    // boundary — `b.js` reads a global set by `a.js` and the inline script runs
+    // too. The whole point is that this is byte-identical to sequential
+    // execution: scripts must still compile + run in document order, so the
+    // cross-script global resolves and every mutation lands.
+    #[tokio::test]
+    async fn execute_js_runs_parallel_parsed_scripts_in_order() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).into_owned();
+                let reply: Vec<u8> = if text.starts_with("GET /page ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                      <body><div id=out></div>\
+                      <script src=\"/a.js\"></script>\
+                      <script src=\"/b.js\"></script>\
+                      <script>document.getElementById('out')\
+                      .setAttribute('data-inline', 'I');</script></body>"
+                        .to_vec()
+                } else if text.starts_with("GET /a.js ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n\
+                      window.SHARED = 40;\
+                      document.getElementById('out').setAttribute('data-a', 'A');"
+                        .to_vec()
+                } else if text.starts_with("GET /b.js ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n\
+                      document.getElementById('out').textContent = 'sum=' + (window.SHARED + 2);"
+                        .to_vec()
+                } else {
+                    b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                };
+                let _ = sock.write_all(&reply).await;
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body);
+        // b.js read a.js's global → it ran AFTER a.js (document order preserved).
+        assert!(
+            body.contains("sum=42"),
+            "cross-script global / order: {body}"
+        );
+        // a.js's and the inline script's mutations both landed.
+        assert!(body.contains("data-a=\"A\""), "a.js mutation: {body}");
+        assert!(
+            body.contains("data-inline=\"I\""),
+            "inline mutation: {body}"
+        );
+        let outcome = response.js.expect("outcome recorded");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        server.abort();
+    }
+
     // A socket.io-style app opens its WebSocket DURING page load (from a
     // top-level script), not from a later click. The `PageWs` host must
     // therefore be registered BEFORE scripts run — it used to be wired up only

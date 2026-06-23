@@ -38,11 +38,13 @@ pub use runtime_limits::RuntimeLimits;
 pub use {
     call_frame::{CallFrame, GeneratorResumeKind},
     code_block::CodeBlock,
+    code_block_image::CodeBlockImage,
     source_info::{NativeSourceInfo, SourcePath},
 };
 
 mod call_frame;
 mod code_block;
+mod code_block_image;
 mod completion_record;
 mod inline_cache;
 mod runtime_limits;
@@ -874,7 +876,20 @@ impl Context {
 
             if profiling && profile::tick() {
                 let cb = &self.vm.frame.code_block;
-                profile::record(format!("{} :: {}", cb.path(), cb.name().to_std_string_escaped()));
+                let name = cb.name().to_std_string_escaped();
+                profile::record(if name.is_empty() {
+                    // Resolve an anonymous function to its source line:col via the
+                    // bytecode source map, so the sampling profile can pin which
+                    // arrow/anon expression is hot (a bare "path :: " is useless).
+                    match cb.source_info().map().find(self.vm.frame.pc) {
+                        Some(p) => {
+                            format!("{} :: anon@{}:{}", cb.path(), p.line_number(), p.column_number())
+                        }
+                        None => format!("{} :: anon", cb.path()),
+                    }
+                } else {
+                    format!("{} :: {}", cb.path(), name)
+                });
             }
 
             match self.execute_one(
@@ -916,7 +931,20 @@ impl Context {
 
             if profiling && profile::tick() {
                 let cb = &self.vm.frame.code_block;
-                profile::record(format!("{} :: {}", cb.path(), cb.name().to_std_string_escaped()));
+                let name = cb.name().to_std_string_escaped();
+                profile::record(if name.is_empty() {
+                    // Resolve an anonymous function to its source line:col via the
+                    // bytecode source map, so the sampling profile can pin which
+                    // arrow/anon expression is hot (a bare "path :: " is useless).
+                    match cb.source_info().map().find(self.vm.frame.pc) {
+                        Some(p) => {
+                            format!("{} :: anon@{}:{}", cb.path(), p.line_number(), p.column_number())
+                        }
+                        None => format!("{} :: anon", cb.path()),
+                    }
+                } else {
+                    format!("{} :: {}", cb.path(), name)
+                });
             }
 
             match self.execute_one(Self::execute_bytecode_instruction, opcode) {
