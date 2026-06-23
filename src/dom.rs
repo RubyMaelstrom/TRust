@@ -1322,6 +1322,23 @@ impl Dom {
         }
     }
 
+    /// The `<body>` of an iframe's nested document, when the JS prelude has
+    /// realized one (a same-origin scripted/`srcdoc` frame builds an
+    /// `<html><head><body>` subtree under the `<iframe>`; see
+    /// `FrameDocument`). The serializers flow this body inline so the frame's
+    /// content lays out as a normal block instead of the RAWTEXT the HTML
+    /// parser otherwise makes of `<iframe>` children. `None` for an empty or
+    /// cross-origin (never-loaded) frame.
+    pub fn frame_body(&self, id: NodeId) -> Option<NodeId> {
+        let html = self
+            .children(id)
+            .into_iter()
+            .find(|&c| self.tag_name(c) == Some("html"))?;
+        self.children(html)
+            .into_iter()
+            .find(|&c| self.tag_name(c) == Some("body"))
+    }
+
     /// The host's light children assigned to a slot (by name, or the
     /// default slot). Text nodes always belong to the default slot.
     fn slot_assigned(&self, host: NodeId, slot_name: Option<&str>) -> Vec<NodeId> {
@@ -1579,6 +1596,24 @@ impl Dom {
                 {
                     return;
                 }
+                // An iframe/frame with realized same-origin content: flow the
+                // nested document's body inline as a block, so the re-parse
+                // lays it out normally instead of as the RAWTEXT the HTML
+                // parser makes of <iframe> children. Empty/cross-origin frames
+                // emit nothing (unchanged).
+                if matches!(tag, "iframe" | "frame") {
+                    if let Some(body) = self.frame_body(id) {
+                        let kids = self.children(body);
+                        if !kids.is_empty() {
+                            out.push_str("<div data-trust-frame=\"\">");
+                            for c in kids {
+                                self.serialize_node(c, host, out);
+                            }
+                            out.push_str("</div>");
+                        }
+                    }
+                    return;
+                }
                 // <slot> inside a shadow tree: project the host's light
                 // children (or the slot's own fallback content).
                 if tag == "slot"
@@ -1655,6 +1690,23 @@ impl Dom {
         };
         let tag: &str = &name.local;
         if matches!(tag, "script" | "noscript" | "template" | "style") || self.is_hidden(id) {
+            return;
+        }
+        // iframe/frame nested-document content flows inline as a block (see the
+        // static serializer + `frame_body`): scripted/`srcdoc` frame content
+        // renders, RAWTEXT re-parse is avoided, empty/cross-origin frames emit
+        // nothing.
+        if matches!(tag, "iframe" | "frame") {
+            if let Some(body) = self.frame_body(id) {
+                let kids = self.children(body);
+                if !kids.is_empty() {
+                    out.push_str("<div data-trust-frame=\"\">");
+                    for c in kids {
+                        self.serialize_live_node(c, host, clickable, in_anchor, out);
+                    }
+                    out.push_str("</div>");
+                }
+            }
             return;
         }
         if tag == "slot"

@@ -2602,7 +2602,7 @@ fn load_page(
         run_script(
             &mut ctx,
             "DOMContentLoaded",
-            b"__trust.readyState = \"interactive\"; __trust.fire(document, \"DOMContentLoaded\", true);",
+            b"__trust.readyState = \"interactive\"; __trust.hydrateFrames(); __trust.fire(document, \"DOMContentLoaded\", true);",
             &budget,
             &mut outcome,
         );
@@ -3960,6 +3960,15 @@ const PRELUDE: &str = r##"
         }, 0);
         return pending.length;
     };
+    // Realize the nested document of any same-origin `srcdoc` frame that no
+    // script touched, so its declarative content still flows into the page.
+    // (Scripted frames hydrate the moment their contentDocument is read.)
+    trust.hydrateFrames = function () {
+        let frames;
+        try { frames = g.document.querySelectorAll("iframe[srcdoc], frame[srcdoc]"); } catch (e) { return 0; }
+        for (let i = 0; i < frames.length; i++) { try { frames[i].contentDocument; } catch (e) {} }
+        return frames.length;
+    };
     // The actor's entry points: dispatch a user click; enumerate nodes
     // with click listeners (delegation hosts included — the actor sorts
     // containers from buttons).
@@ -4393,6 +4402,47 @@ const PRELUDE: &str = r##"
         if (irr) return "HTML" + irr + "Element";
         return "HTML" + t.charAt(0).toUpperCase() + t.slice(1) + "Element";
     }
+    // A real DOMTokenList (https://dom.spec.whatwg.org/#interface-domtokenlist)
+    // backs `element.classList` (and `relList`). It MUST be a class with a
+    // shared prototype, not a bare object literal: legacy classList polyfills
+    // (W3Schools' common-deps, html5shiv-era shims) feature-detect a method on
+    // an instance, then patch `DOMTokenList.prototype` — so the global has to
+    // exist AND prototype patches have to reach every instance. The methods read
+    // the live `class` attribute through `__el` so the list stays in sync with
+    // direct `setAttribute("class", …)` writes.
+    class DOMTokenList {
+        constructor(el) { this.__el = el; }
+        __get() { return (this.__el.getAttribute("class") || "").split(/\s+/).filter(Boolean); }
+        __set(l) { this.__el.setAttribute("class", l.join(" ")); }
+        add(...cs) { const l = this.__get(); for (const c of cs) if (!l.includes(String(c))) l.push(String(c)); this.__set(l); }
+        remove(...cs) { const ss = cs.map(String); this.__set(this.__get().filter((x) => !ss.includes(x))); }
+        toggle(c, force) {
+            const has = this.__get().includes(String(c));
+            const want = force === undefined ? !has : !!force;
+            if (want && !has) this.add(c);
+            if (!want && has) this.remove(c);
+            return want;
+        }
+        replace(oldT, newT) {
+            const l = this.__get(); const i = l.indexOf(String(oldT));
+            if (i < 0) return false;
+            if (!l.includes(String(newT))) l[i] = String(newT); else l.splice(i, 1);
+            this.__set(l); return true;
+        }
+        contains(c) { return this.__get().includes(String(c)); }
+        item(i) { return this.__get()[i] ?? null; }
+        supports() { return true; }
+        get length() { return this.__get().length; }
+        get value() { return this.__el.getAttribute("class") || ""; }
+        set value(v) { this.__el.setAttribute("class", String(v)); }
+        toString() { return this.__el.getAttribute("class") || ""; }
+        forEach(fn, thisArg) { this.__get().forEach((t, i) => fn.call(thisArg, t, i, this)); }
+        keys() { return this.__get().keys(); }
+        values() { return this.__get().values(); }
+        entries() { return this.__get().entries(); }
+        [Symbol.iterator]() { return this.__get()[Symbol.iterator](); }
+    }
+
     class Element extends Node {
         get tagName() { return (__dom_tag(this.__id) || "").toUpperCase(); }
         get localName() { return __dom_tag(this.__id) || ""; }
@@ -4556,10 +4606,19 @@ const PRELUDE: &str = r##"
             // (matches the form-submit option logic), so a valueless <option>
             // still round-trips its label.
             if (ln === "option") { const v = this.getAttribute("value"); return v === null ? this.textContent : v; }
+            // <textarea> has NO `value` content attribute — its value is its raw
+            // text content (HTML spec), which is also what the form submit path
+            // and `formSet` read/write. Reading the (always-absent) attribute
+            // returned "" and broke every "grab the textarea, do something with
+            // its text" script — the W3Schools tryit editor writes
+            // `textarea.value` into its result iframe, so an empty read rendered
+            // a blank result.
+            if (ln === "textarea") return this.textContent;
             const v = this.getAttribute("value"); return v === null ? "" : v;
         }
         set value(v) {
             if (this.localName === "select") { this.__selectValue(String(v)); return; }
+            if (this.localName === "textarea") { this.textContent = String(v); return; }
             this.setAttribute("value", String(v));
         }
         // --- HTMLSelectElement surface (options/index/multiple) ---
@@ -4688,32 +4747,31 @@ const PRELUDE: &str = r##"
             if (this.localName === "meta") { this.setAttribute("content", String(v)); return; }
             this.__content = v;
         }
-        // HTMLIFrameElement.contentDocument / .contentWindow. TRust runs no
-        // nested browsing context, but the near-universal idiom
+        // HTMLIFrameElement.contentDocument / .contentWindow — the nested
+        // browsing context's document and WindowProxy. Backed by a real
+        // same-arena `FrameDocument` (see that class): the near-universal idiom
         // `iframe.contentDocument || iframe.contentWindow.document` (analytics
-        // beacons, sandboxed injectors, the Cloudflare JS-detection script
-        // pixiv embeds) reads them unconditionally — returning undefined made
-        // `contentWindow.document` throw. Hand back a blank same-arena document
-        // facade (the one `document.implementation.createHTMLDocument` already
-        // builds for jQuery); anything written into it is inert (never rendered
-        // or executed), which is the right graceful degrade for a frame we don't
-        // load. Cached on the (identity-stable) wrapper. Non-frame elements
-        // have no such property, so they keep returning undefined.
+        // beacons, sandboxed injectors, code-playground panes, the W3Schools
+        // tryit editor) reads them unconditionally, and now content written via
+        // `document.write`/`srcdoc` actually renders inline. Cached on the
+        // (identity-stable) wrapper. Non-frame elements keep returning undefined.
         get contentDocument() {
             if (this.localName !== "iframe" && this.localName !== "frame") return undefined;
-            return this.__contentDoc || (this.__contentDoc = document.implementation.createHTMLDocument(""));
+            return this.__contentDoc || (this.__contentDoc = new FrameDocument(this));
         }
         get contentWindow() {
             if (this.localName !== "iframe" && this.localName !== "frame") return undefined;
             if (!this.__contentWin) {
+                const frame = this;
                 this.__contentWin = {
-                    document: this.contentDocument,
+                    get document() { return frame.contentDocument; },
                     location: { href: "about:blank", replace() {}, assign() {} },
-                    parent: g, top: g, self: undefined, frameElement: this,
+                    parent: g, top: g, frames: g, frameElement: this,
                     postMessage() {}, focus() {}, blur() {},
                     addEventListener() {}, removeEventListener() {},
                 };
                 this.__contentWin.self = this.__contentWin;
+                this.__contentWin.window = this.__contentWin;
             }
             return this.__contentWin;
         }
@@ -4802,26 +4860,7 @@ const PRELUDE: &str = r##"
             return this.__ds;
         }
         get classList() {
-            if (!this.__cl) {
-                const el = this;
-                const get = () => (el.getAttribute("class") || "").split(/\s+/).filter(Boolean);
-                const set = (l) => el.setAttribute("class", l.join(" "));
-                this.__cl = {
-                    add(...cs) { const l = get(); for (const c of cs) if (!l.includes(String(c))) l.push(String(c)); set(l); },
-                    remove(...cs) { const ss = cs.map(String); set(get().filter((x) => !ss.includes(x))); },
-                    toggle(c, force) {
-                        const has = get().includes(String(c));
-                        const want = force === undefined ? !has : !!force;
-                        if (want && !has) this.add(c);
-                        if (!want && has) this.remove(c);
-                        return want;
-                    },
-                    contains(c) { return get().includes(String(c)); },
-                    item(i) { return get()[i] ?? null; },
-                    get length() { return get().length; },
-                    toString() { return el.getAttribute("class") || ""; },
-                };
-            }
+            if (!this.__cl) this.__cl = new DOMTokenList(this);
             return this.__cl;
         }
         matches(s) { return !!__dom_matches(this.__id, String(s)); }
@@ -5015,6 +5054,72 @@ const PRELUDE: &str = r##"
         write(s) { const host = this.body || this.documentElement; if (host) host.insertAdjacentHTML("beforeend", String(s)); }
         writeln(s) { this.write(s + "\n"); }
         open() {} close() {}
+    }
+
+    // HTMLIFrameElement's nested-browsing-context document — the part of the
+    // iframe spec a terminal can honor: same-origin scripted/`srcdoc` content.
+    // (https://html.spec.whatwg.org/multipage/iframe-embed-object.html). The
+    // nested document is built from REAL arena nodes parented under the
+    // <iframe> element (<html><head><body>), so `document.open/write/close`
+    // and DOM mutations land in the live tree, the CSS cascade sees the frame's
+    // own <style>, and the serializer can flow the body inline (it rewrites the
+    // <iframe>+content into a block so the re-parse doesn't treat it as the
+    // RAWTEXT the HTML parser makes of <iframe> content). A cross-origin `src`
+    // frame we never load keeps an empty body and renders nothing — the same
+    // graceful degrade as before.
+    class FrameDocument {
+        constructor(frameEl) {
+            this.__frame = frameEl;
+            this.nodeType = 9;
+            let html = null;
+            const kids = frameEl.childNodes;
+            for (let i = 0; i < kids.length; i++) {
+                const c = kids[i];
+                if (c.nodeType === 1 && c.localName === "html") { html = c; break; }
+            }
+            if (!html) {
+                html = document.createElement("html");
+                html.appendChild(document.createElement("head"));
+                html.appendChild(document.createElement("body"));
+                frameEl.appendChild(html);
+            }
+            this.documentElement = html;
+            // Declarative content: a `srcdoc` frame parses its attribute as the
+            // document the first time it's realized (scripted frames stay empty
+            // until written).
+            const sd = frameEl.getAttribute("srcdoc");
+            if (sd && !this.body.firstChild) this.write(sd);
+        }
+        get head() { return this.documentElement.querySelector("head") || this.documentElement; }
+        get body() { return this.documentElement.querySelector("body") || this.documentElement; }
+        get defaultView() { return this.__frame.contentWindow; }
+        get readyState() { return "complete"; }
+        get cookie() { return ""; }
+        set cookie(_v) {}
+        get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
+        set title(v) { let t = this.querySelector("title"); if (!t) { t = this.createElement("title"); this.head.appendChild(t); } t.textContent = String(v); }
+        get location() { return this.__frame.contentWindow.location; }
+        get implementation() { return document.implementation; }
+        get [Symbol.toStringTag]() { return "HTMLDocument"; }
+        open() { const b = this.body; while (b.firstChild) b.removeChild(b.firstChild); return this; }
+        write(s) { this.body.insertAdjacentHTML("beforeend", String(s)); }
+        writeln(s) { this.write(s + "\n"); }
+        close() {}
+        createElement(t) { return document.createElement(t); }
+        createElementNS(_n, t) { return document.createElement(t); }
+        createTextNode(s) { return document.createTextNode(s); }
+        createComment(s) { return document.createComment(s); }
+        createDocumentFragment() { return document.createDocumentFragment(); }
+        createEvent(t) { return document.createEvent(t); }
+        createRange() { return new Range(); }
+        getElementById(i) { return this.documentElement.querySelector('[id="' + String(i).replace(/"/g, '\\"') + '"]'); }
+        getElementsByTagName(t) { return this.documentElement.getElementsByTagName(t); }
+        getElementsByClassName(c) { return this.documentElement.querySelectorAll("." + String(c)); }
+        getElementsByName(n) { return this.documentElement.querySelectorAll('[name="' + String(n).replace(/"/g, '\\"') + '"]'); }
+        querySelector(s) { return this.documentElement.querySelector(s); }
+        querySelectorAll(s) { return this.documentElement.querySelectorAll(s); }
+        addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
+        hasFocus() { return true; }
     }
 
     class DocumentFragment extends Node { get [Symbol.toStringTag]() { return "DocumentFragment"; } }
@@ -5756,6 +5861,14 @@ const PRELUDE: &str = r##"
     g.FileReader.EMPTY = 0; g.FileReader.LOADING = 1; g.FileReader.DONE = 2;
 
     g.window = g; g.self = g; g.top = g; g.parent = g;
+    // `window.frames` is the WindowProxy itself in a browser (an array-like of
+    // child browsing contexts). With no child frames it's just `window`, so
+    // `window.frames[name]` is a plain undefined lookup rather than a throw.
+    // Consent-management bootstraps (IAB TCF `__tcfapiLocator` probes —
+    // FastCMP, Quantcast, every CMP stub) read `window.frames[locatorName]`
+    // unguarded; a missing `frames` made that a "convert undefined to object".
+    g.frames = g;
+    g.DOMTokenList = DOMTokenList;
     g.document = wrap(0);
 
     // --- environment ---
@@ -11146,13 +11259,15 @@ mod tests {
     }
 
     #[test]
-    fn iframe_content_document_and_window_are_a_blank_facade() {
+    fn iframe_content_document_and_window_are_a_real_same_arena_document() {
         // `iframe.contentDocument || iframe.contentWindow.document` is the
         // universal frame-access idiom (analytics beacons, the Cloudflare
-        // JS-detection script pixiv embeds). With no nested browsing context we
-        // hand back a blank same-arena document facade so the idiom doesn't
-        // throw; anything written into it is inert. Non-frame elements have no
-        // such property (undefined).
+        // JS-detection script pixiv embeds). We hand back a real same-arena
+        // FrameDocument: the idiom doesn't throw, `contentWindow.document` is
+        // the SAME object, and a fresh frame has the `<html><head><body>`
+        // skeleton. Content written into it renders inline (covered by
+        // `iframe_scripted_document_write_renders_inline`); a non-frame element
+        // has no such property (undefined).
         let (out, outcome) = page(
             r##"<body><div id=o></div><script>
             var f = document.createElement('iframe');
@@ -11172,6 +11287,57 @@ mod tests {
         // a document facade, window.document is the SAME object, head exists,
         // and a plain <div> has no contentDocument.
         assert!(out.contains(">object|true|1|undefined<"), "{out}");
+    }
+
+    #[test]
+    fn iframe_scripted_document_write_renders_inline() {
+        // The W3Schools tryit-editor pattern (and every code-playground result
+        // pane): create an iframe, append it, then `contentWindow.document
+        // .open()/write()/close()` a whole HTML document into it. The nested
+        // body must flow into the page so the written content actually renders
+        // (here, a table) rather than being inert.
+        let (out, outcome) = page(
+            r##"<body><div id=wrap></div><script>
+            var ifr = document.createElement('iframe');
+            document.getElementById('wrap').appendChild(ifr);
+            var w = ifr.contentWindow;
+            w.document.open();
+            w.document.write('<!DOCTYPE html><html><head><style>td{border:1px solid}</style></head><body><h1>A Fancy Table</h1><table><tr><th>Company</th><th>Country</th></tr><tr><td>Alfreds</td><td>Germany</td></tr></table></body></html>');
+            w.document.close();
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("data-trust-frame"),
+            "frame wrapper missing: {out}"
+        );
+        assert!(
+            out.contains("A Fancy Table"),
+            "frame heading missing: {out}"
+        );
+        assert!(
+            out.contains("Alfreds") && out.contains("Germany"),
+            "table cells missing: {out}"
+        );
+        // The frame's own <style> is dropped by the serializer (baked already),
+        // and the content is a normal block (no <iframe> RAWTEXT in the output).
+        assert!(
+            !out.contains("<iframe"),
+            "iframe element should not survive: {out}"
+        );
+    }
+
+    #[test]
+    fn iframe_srcdoc_renders_inline() {
+        // A declarative `srcdoc` frame renders its content even when no script
+        // touches it (`hydrateFrames` realizes it at DOMContentLoaded).
+        let (out, outcome) =
+            page(r##"<body><iframe srcdoc="<p>SANDBOXED CONTENT</p>"></iframe></body>"##);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("SANDBOXED CONTENT"),
+            "srcdoc content missing: {out}"
+        );
     }
 
     #[test]
