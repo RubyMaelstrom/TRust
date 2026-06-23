@@ -2064,6 +2064,74 @@ mod tests {
         server.abort();
     }
 
+    // CDN compile cache (Phase 2): the SAME page (an external IIFE "library"
+    // plus an inline script) is loaded TWICE in one process. The first load
+    // compiles `/lib.js` and caches its detached image; the second is a cache
+    // HIT — the library is rehydrated, not re-parsed/compiled. Both renders must
+    // be byte-identical and error-free: the whole point is that reuse is
+    // observably transparent. (Proof the hit path is wired and faithful; the
+    // js.rs unit tests prove the cache mechanics directly.)
+    #[tokio::test]
+    async fn execute_js_reuses_a_cached_cdn_library_across_two_loads() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).into_owned();
+                let reply: Vec<u8> = if text.starts_with("GET /page ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                      <body><div id=out></div>\
+                      <script src=\"/lib.js\"></script>\
+                      <script>document.getElementById('out').textContent = \
+                      window.__cdnLib('cache');</script></body>"
+                        .to_vec()
+                } else if text.starts_with("GET /lib.js ") {
+                    // A realm-portable IIFE: it installs a global by name only.
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n\
+                      (function(g){ g.__cdnLib = function(s){ return 'lib:' + s; }; })(window);"
+                        .to_vec()
+                } else {
+                    b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                };
+                let _ = sock.write_all(&reply).await;
+            }
+        });
+
+        let load = || async {
+            let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+            let response = fetch(&Request::get(url)).await.unwrap();
+            let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+            let body = String::from_utf8_lossy(&response.body).into_owned();
+            let outcome = response.js.expect("outcome recorded");
+            assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+            assert!(body.contains("lib:cache"), "library output missing: {body}");
+            body
+        };
+
+        // First load compiles + caches `/lib.js`; second is a rehydrate hit.
+        let first = load().await;
+        let second = load().await;
+        assert_eq!(
+            first, second,
+            "a rehydrated CDN library must render identically to its cold compile"
+        );
+        server.abort();
+    }
+
     // A socket.io-style app opens its WebSocket DURING page load (from a
     // top-level script), not from a later click. The `PageWs` host must
     // therefore be registered BEFORE scripts run — it used to be wired up only

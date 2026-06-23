@@ -686,6 +686,62 @@ pub fn run_script(
 static PRELUDE_IMAGE: std::sync::OnceLock<boa_engine::vm::CodeBlockImage> =
     std::sync::OnceLock::new();
 
+/// Run a rehydrated [`CodeBlockImage`] as a script in `ctx`'s realm: install it
+/// into an empty carrier script (`Script::parse("")`, ~free, which binds the
+/// carrier to this realm) and evaluate. The shared execution seam behind both
+/// the prelude cache (Step 4) and the cross-page CDN cache (Phase 2) — see the
+/// JS-engine performance plan.
+///
+/// Sound ONLY for a realm-portable image: one whose source declared no globals,
+/// so its compiled `<main>` block references no realm global-binding slots and
+/// has no global-declaration side effects (the prelude has this by construction;
+/// CDN libraries are admitted only after the realm-portability gate). The empty
+/// carrier is never dereferenced as a dynamic-`import()` referrer because such a
+/// block has no dynamic import. `name` (the script URL or "prelude") becomes the
+/// carrier's source path so a thrown error's backtrace still names the file.
+///
+/// Same budget gate, `catch_unwind`, and error/panic accounting as
+/// [`run_script`], so a (hypothetical) failure degrades the page identically.
+fn run_rehydrated_image(
+    ctx: &mut Context,
+    name: &str,
+    image: &boa_engine::vm::CodeBlockImage,
+    budget: &Budget,
+    outcome: &mut Outcome,
+) {
+    if budget.exhausted() || outcome.elapsed >= COMPUTE_BUDGET {
+        outcome
+            .errors
+            .push(format!("{name}: skipped, page JS budget exhausted"));
+        return;
+    }
+    let started = Instant::now();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let src = Source::from_bytes("".as_bytes()).with_path(std::path::Path::new(name));
+        let t = phase_begin();
+        let shell = boa_engine::Script::parse(src, None, ctx)?;
+        phase_end(Phase::Parse, t);
+        let t = phase_begin();
+        shell.set_codeblock(boa_engine::vm::CodeBlock::from_image(image));
+        phase_end(Phase::Compile, t);
+        let t = phase_begin();
+        let r = shell.evaluate(ctx);
+        phase_end(Phase::Execute, t);
+        r
+    }));
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => outcome.errors.push(format!("{name}: {err}")),
+        Err(_) => {
+            outcome
+                .errors
+                .push(format!("{name}: engine panic (Boa bug) — page JS halted"));
+            outcome.panicked = true;
+        }
+    }
+    outcome.elapsed += started.elapsed();
+}
+
 /// Run the PRELUDE through the process-global compiled-code cache: the first
 /// page parses + compiles it and stores the detached image; every later page
 /// (on its own `trust-js`/`trust-page` thread) rehydrates that image and skips
@@ -703,6 +759,12 @@ fn run_prelude(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
         run_script(ctx, "prelude", PRELUDE.as_bytes(), budget, outcome);
         return;
     }
+    if let Some(image) = PRELUDE_IMAGE.get() {
+        // Cache hit: rehydrate the compiled block into THIS thread's heap and
+        // run it via an empty carrier — no 225 KB parse, no compile.
+        run_rehydrated_image(ctx, "prelude", image, budget, outcome);
+        return;
+    }
     if budget.exhausted() || outcome.elapsed >= COMPUTE_BUDGET {
         outcome
             .errors
@@ -711,40 +773,23 @@ fn run_prelude(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
     }
     let started = Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if let Some(image) = PRELUDE_IMAGE.get() {
-            // Cache hit: rehydrate the compiled block into THIS thread's heap and
-            // install it into an empty carrier script (parsing "" is ~free and
-            // binds the script to this page's realm). No 65 KB parse, no compile.
-            let t = phase_begin();
-            let shell = boa_engine::Script::parse(Source::from_bytes("".as_bytes()), None, ctx)?;
-            phase_end(Phase::Parse, t);
-            let t = phase_begin();
-            shell.set_codeblock(boa_engine::vm::CodeBlock::from_image(image));
-            phase_end(Phase::Compile, t);
-            let t = phase_begin();
-            let r = shell.evaluate(ctx);
-            phase_end(Phase::Execute, t);
-            r
-        } else {
-            // Cold (first page of the process, or a rare concurrent-first race):
-            // parse + compile the real prelude, cache its detached image for
-            // later pages, then run. A lost `set` race is harmless — the winner's
-            // image serves the cache and our own freshly compiled block still
-            // runs this page (`let _ =` discards the rejected value).
-            let src =
-                Source::from_bytes(PRELUDE.as_bytes()).with_path(std::path::Path::new("prelude"));
-            let t = phase_begin();
-            let script = boa_engine::Script::parse(src, None, ctx)?;
-            phase_end(Phase::Parse, t);
-            let t = phase_begin();
-            let cb = script.codeblock(ctx)?;
-            let _ = PRELUDE_IMAGE.set(cb.to_image());
-            phase_end(Phase::Compile, t);
-            let t = phase_begin();
-            let r = script.evaluate(ctx);
-            phase_end(Phase::Execute, t);
-            r
-        }
+        // Cold (first page of the process, or a rare concurrent-first race):
+        // parse + compile the real prelude, cache its detached image for later
+        // pages, then run. A lost `set` race is harmless — the winner's image
+        // serves the cache and our own freshly compiled block still runs this
+        // page (`let _ =` discards the rejected value).
+        let src = Source::from_bytes(PRELUDE.as_bytes()).with_path(std::path::Path::new("prelude"));
+        let t = phase_begin();
+        let script = boa_engine::Script::parse(src, None, ctx)?;
+        phase_end(Phase::Parse, t);
+        let t = phase_begin();
+        let cb = script.codeblock(ctx)?;
+        let _ = PRELUDE_IMAGE.set(cb.to_image());
+        phase_end(Phase::Compile, t);
+        let t = phase_begin();
+        let r = script.evaluate(ctx);
+        phase_end(Phase::Execute, t);
+        r
     }));
     match result {
         Ok(Ok(_)) => {}
@@ -820,6 +865,7 @@ impl ParsePool {
 fn dispatch_parallel_parse(
     scripts: &[(Option<String>, String, Option<String>, usize)],
     externals: &[(String, Option<Vec<u8>>)],
+    cache_hits: &std::collections::HashSet<usize>,
     ctx: &mut Context,
 ) -> Option<ParsePool> {
     // Kill switch: `TRUST_NO_PARALLEL_PARSE` forces the sequential path (parse
@@ -831,6 +877,11 @@ fn dispatch_parallel_parse(
     let mut jobs: Vec<(usize, String, Vec<u8>, u32)> = Vec::new();
     for (i, (src, _inline, type_attr, _node)) in scripts.iter().enumerate() {
         if !is_classic(type_attr) {
+            continue;
+        }
+        // A CDN cache hit is rehydrated, not compiled, so it needs no parse —
+        // keep it out of the pool (parsing it would be pure waste).
+        if cache_hits.contains(&i) {
             continue;
         }
         // Inline scripts stay on the page thread (small, and the body is already
@@ -893,42 +944,253 @@ fn dispatch_parallel_parse(
     })
 }
 
-/// Run a script whose raw parse already happened off the page thread (see
-/// [`ParsePool`]): compile (scope analysis + bytecode, here on the page thread,
-/// in document order) then evaluate. The parse-skipping twin of [`run_script`] —
-/// same budget gate, `catch_unwind`, and error/panic accounting, so a bad script
-/// costs only itself.
-fn run_prepared(
+/// The cross-page CDN compiled-code cache (JS-engine performance plan, Phase 2)
+/// — the keystone `CodeBlockImage`'s second consumer, after the prelude cache.
+///
+/// External classic scripts (jQuery, D3, Vue, Lit, React … served from a CDN)
+/// are byte-identical across the pages of a session, yet Boa re-parses and
+/// re-compiles each one per page. This process-global cache keys a detached,
+/// `Send + Sync` `CodeBlockImage` by the script's source hash so a given library
+/// is parsed + compiled ONCE per process and merely *rehydrated* (re-allocated
+/// into the page thread's GC heap) on every later page. RAM-only and
+/// session-lifetime, the same ethos as the keep-alive `POOL` and the cookie jar.
+///
+/// Only **realm-portable** blocks are admitted (see the gate in
+/// [`run_external_classic`]): a classic script runs in the page's global scope,
+/// and a top-level `let`/`const`/`class` compiles to a binding referenced by
+/// SLOT INDEX into the realm's shared, accumulating global declarative
+/// environment — an index that depends on what ran before it on the page, so its
+/// block is NOT valid on another page. Every real UMD/IIFE bundle (`(function(){
+/// …})()` or `var Lib = (function(){…})()` at top level) is portable; anything
+/// declaring a global lexical falls back cleanly to a normal per-page compile
+/// and is marked [`CdnEntry::NotReusable`] so the gate isn't re-evaluated on
+/// every visit. `TRUST_NO_CDN_CACHE` disables it (the A/B toggle + safety valve,
+/// like `TRUST_NO_PRELUDE_CACHE`).
+enum CdnEntry {
+    /// A realm-portable compiled block, reusable on any page this session.
+    Reusable(std::sync::Arc<boa_engine::vm::CodeBlockImage>),
+    /// This source compiled to a non-portable block — don't cache or re-check it.
+    NotReusable,
+}
+
+/// The result of a [`CDN_CACHE`] probe.
+enum CdnLookup {
+    Reusable(std::sync::Arc<boa_engine::vm::CodeBlockImage>),
+    NotReusable,
+    Absent,
+}
+
+/// Bounded image set (a RAM lid; a session loads a small, fixed set of CDN
+/// libraries). On overflow the oldest insertion is evicted — a hostile-page
+/// guard, not a working constraint.
+const CDN_CACHE_MAX: usize = 64;
+
+/// Discriminates cache entries by engine build: a different binary may compile
+/// the same source to an incompatible image, so its hash space must not overlap.
+/// The cache never persists across processes, so within one run this is
+/// constant; folding it into the key is defensive and documents the keying rule
+/// the plan calls for (source hash + engine build + flags).
+const CDN_CACHE_BUILD_TAG: &str = concat!("trust-cdn-cache-v1/", env!("CARGO_PKG_VERSION"));
+
+struct CdnCache {
+    map: std::collections::HashMap<[u8; 32], CdnEntry>,
+    /// Keys in insertion order, for FIFO eviction past `CDN_CACHE_MAX`.
+    order: VecDeque<[u8; 32]>,
+}
+
+static CDN_CACHE: std::sync::OnceLock<std::sync::Mutex<CdnCache>> = std::sync::OnceLock::new();
+
+fn cdn_cache() -> &'static std::sync::Mutex<CdnCache> {
+    CDN_CACHE.get_or_init(|| {
+        std::sync::Mutex::new(CdnCache {
+            map: std::collections::HashMap::new(),
+            order: VecDeque::new(),
+        })
+    })
+}
+
+/// Whether the CDN cache is active. `TRUST_NO_CDN_CACHE` forces the cold compile
+/// path for every external script.
+fn cdn_cache_enabled() -> bool {
+    std::env::var_os("TRUST_NO_CDN_CACHE").is_none()
+}
+
+/// Cache key for a script body: a strong (collision-free in practice) hash over
+/// the engine-build tag, the length, and the bytes.
+fn cdn_cache_key(body: &[u8]) -> [u8; 32] {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(CDN_CACHE_BUILD_TAG.as_bytes());
+    hasher.update((body.len() as u64).to_le_bytes());
+    hasher.update(body);
+    hasher.finalize().into()
+}
+
+/// Probe the cache, cloning the (cheap, `Arc`) reusable image out under the lock.
+/// A poisoned lock degrades to a miss (the cache simply stops helping).
+fn cdn_cache_lookup(key: &[u8; 32]) -> CdnLookup {
+    let Ok(cache) = cdn_cache().lock() else {
+        return CdnLookup::Absent;
+    };
+    match cache.map.get(key) {
+        Some(CdnEntry::Reusable(image)) => CdnLookup::Reusable(image.clone()),
+        Some(CdnEntry::NotReusable) => CdnLookup::NotReusable,
+        None => CdnLookup::Absent,
+    }
+}
+
+/// Record a cache decision for `key` (the first writer wins a race; a poisoned
+/// lock silently drops the entry). Evicts the oldest insertion past the lid.
+fn cdn_cache_put(key: [u8; 32], entry: CdnEntry) {
+    let Ok(mut cache) = cdn_cache().lock() else {
+        return;
+    };
+    if cache.map.contains_key(&key) {
+        return;
+    }
+    while cache.map.len() >= CDN_CACHE_MAX {
+        match cache.order.pop_front() {
+            Some(oldest) => {
+                cache.map.remove(&oldest);
+            }
+            None => break,
+        }
+    }
+    cache.order.push_back(key);
+    cache.map.insert(key, entry);
+}
+
+/// Indices (into `scripts`) of external classic scripts whose compiled image is
+/// already cached as reusable. They are rehydrated rather than compiled, so they
+/// need no parse and are kept OUT of the parallel-parse pool (a worker parse of
+/// a script we'll never compile would be pure waste).
+fn cdn_cache_hits(
+    scripts: &[(Option<String>, String, Option<String>, usize)],
+    externals: &[(String, Option<Vec<u8>>)],
+) -> std::collections::HashSet<usize> {
+    let mut hits = std::collections::HashSet::new();
+    if !cdn_cache_enabled() {
+        return hits;
+    }
+    for (i, (src, _inline, type_attr, _node)) in scripts.iter().enumerate() {
+        if !is_classic(type_attr) {
+            continue;
+        }
+        let Some(src) = src else { continue };
+        let Some((_, Some(body))) = externals.iter().find(|(k, _)| k == src) else {
+            continue;
+        };
+        if matches!(
+            cdn_cache_lookup(&cdn_cache_key(body)),
+            CdnLookup::Reusable(_)
+        ) {
+            hits.insert(i);
+        }
+    }
+    hits
+}
+
+/// Run one external classic script, going through the CDN compile cache.
+///
+/// - **Hit** (a reusable image is cached): rehydrate + run via the carrier,
+///   skipping parse AND compile. (`prepared` is `None` here — a hit is excluded
+///   from the parallel-parse pool.)
+/// - **Miss** (`Absent`): compile this page's copy — from the worker `prepared`
+///   raw parse when present, else parsed inline — then apply the
+///   realm-portability gate and, if it passes, store the detached image for
+///   later pages. The gate is two cheap fork checks:
+///   [`Script::global_declarations_are_replayable`] (the script declares no
+///   global *lexical* — `let`/`const`/`class` — nor Annex-B block-function
+///   binding, so running its `<main>` recreates all its globals; top-level
+///   `var`/`function` are fine, created by name from the bytecode) AND
+///   [`CodeBlock::is_realm_portable`](boa_engine::vm::CodeBlock::is_realm_portable)
+///   (it reads no prior script's global-declarative slot). Both must hold; a
+///   real UMD/IIFE bundle passes trivially.
+/// - **`NotReusable`** (a prior page proved it non-portable): compile + run, no
+///   re-check, no store.
+///
+/// Same budget gate, `catch_unwind`, and error/panic accounting as
+/// [`run_script`], so a bad script costs only itself.
+fn run_external_classic(
     ctx: &mut Context,
     name: &str,
-    prepared: Result<boa_engine::RawScript, String>,
+    body: &[u8],
+    prepared: Option<Result<boa_engine::RawScript, String>>,
     budget: &Budget,
     outcome: &mut Outcome,
 ) {
+    let key = cdn_cache_enabled().then(|| cdn_cache_key(body));
+    let lookup = key.as_ref().map_or(CdnLookup::Absent, cdn_cache_lookup);
+    if let CdnLookup::Reusable(image) = &lookup {
+        phase(&format!(
+            "cdn cache HIT {name} (rehydrate, no parse/compile)"
+        ));
+        run_rehydrated_image(ctx, name, image, budget, outcome);
+        return;
+    }
+    // Store the freshly compiled image only on a true miss (`Absent`); a
+    // `NotReusable` entry means we already decided this source can't be cached.
+    let store_key = match lookup {
+        CdnLookup::Absent => key,
+        CdnLookup::NotReusable | CdnLookup::Reusable(_) => None,
+    };
+
     if budget.exhausted() || outcome.elapsed >= COMPUTE_BUDGET {
         outcome
             .errors
             .push(format!("{name}: skipped, page JS budget exhausted"));
         return;
     }
-    let raw = match prepared {
-        Ok(raw) => raw,
-        // A raw-parse failure (syntax error, or a worker panic) — same surface
-        // as `Script::parse` returning Err inside `run_script`.
-        Err(err) => {
+    // A raw-parse error from the worker pool surfaces exactly like a
+    // `Script::parse` error inside `run_script`.
+    let prepared = match prepared {
+        Some(Ok(raw)) => Some(raw),
+        Some(Err(err)) => {
             outcome.errors.push(format!("{name}: {err}"));
             return;
         }
+        None => None,
     };
     let started = Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        // Parse is done off-thread; `compile_raw` runs the deferred scope
-        // analysis + bytecode compile (swapping in the worker interner for the
-        // duration), then evaluate. Same compile/execute phase timing as
-        // `run_script`; "parse" for this script was charged to a worker thread.
-        let t = phase_begin();
-        let script = boa_engine::Script::compile_raw(raw, None, ctx)?;
-        phase_end(Phase::Compile, t);
+        // Obtain the compiled script: either compile the worker's raw parse
+        // (parse was off-thread; `compile_raw` does scope-analysis + bytecode,
+        // charged to Compile), or parse + compile inline.
+        let script = match prepared {
+            Some(raw) => {
+                let t = phase_begin();
+                let s = boa_engine::Script::compile_raw(raw, None, ctx)?;
+                phase_end(Phase::Compile, t);
+                s
+            }
+            None => {
+                let src = Source::from_bytes(body).with_path(std::path::Path::new(name));
+                let t = phase_begin();
+                let s = boa_engine::Script::parse(src, None, ctx)?;
+                phase_end(Phase::Parse, t);
+                let t = phase_begin();
+                s.codeblock(ctx)?;
+                phase_end(Phase::Compile, t);
+                s
+            }
+        };
+        // Realm-portability gate: cache the detached image only when the script
+        // neither creates nor reads a global-declarative binding (so its block
+        // runs identically on any page). `codeblock` is memoized — no recompile.
+        if let Some(key) = store_key {
+            let cb = script.codeblock(ctx)?;
+            let reusable = script.global_declarations_are_replayable() && cb.is_realm_portable();
+            phase(&format!(
+                "cdn cache store {name} ({})",
+                if reusable { "reusable" } else { "not reusable" }
+            ));
+            let entry = if reusable {
+                CdnEntry::Reusable(std::sync::Arc::new(cb.to_image()))
+            } else {
+                CdnEntry::NotReusable
+            };
+            cdn_cache_put(key, entry);
+        }
         let t = phase_begin();
         let r = script.evaluate(ctx);
         phase_end(Phase::Execute, t);
@@ -2981,12 +3243,18 @@ fn load_page(
         scripts.len()
     ));
 
+    // CDN compile cache (Phase 2): an external classic library compiled on an
+    // earlier page of this session is already a detached image — these scripts
+    // will be rehydrated, not compiled, so they're excluded from the parse pool
+    // below and rehydrated in the loop.
+    let cache_hits = cdn_cache_hits(&scripts, externals);
+
     // Parallel parse (Step 5a): external classic scripts raw-parse on a worker
     // pool NOW, overlapping the rest of this thread's work (the prelude already
     // ran; earlier scripts' execution and later scripts' parse now overlap). The
     // loop below still compiles + runs each in document order — only the lex/
-    // parse phase moved off this thread.
-    let mut parse_pool = dispatch_parallel_parse(&scripts, externals, &mut ctx);
+    // parse phase moved off this thread. Cache hits are skipped (no parse needed).
+    let mut parse_pool = dispatch_parallel_parse(&scripts, externals, &cache_hits, &mut ctx);
 
     for (i, (src, inline, type_attr, node)) in scripts.iter().enumerate() {
         let script_started = Instant::now();
@@ -3068,16 +3336,15 @@ fn load_page(
         match src {
             Some(src) => match externals.iter().find(|(k, _)| k == src) {
                 Some((_, Some(body))) => {
-                    // If this script was raw-parsed on the pool, compile + run
-                    // the prepared AST; otherwise (pool inactive — <2 externals)
-                    // parse it inline as before.
-                    if let Some(pool) = parse_pool.as_mut().filter(|p| p.was_dispatched(i)) {
-                        let prepared = pool.take(i);
-                        run_prepared(&mut ctx, src, prepared, &budget, &mut outcome);
-                    } else {
-                        let body = String::from_utf8_lossy(body);
-                        run_script(&mut ctx, src, body.as_bytes(), &budget, &mut outcome);
-                    }
+                    // Route through the CDN cache: a reusable image is rehydrated
+                    // (no parse, no compile); otherwise compile this page's copy —
+                    // from the worker pool's raw parse when it took this script,
+                    // else inline — and cache the image if it's realm-portable.
+                    let prepared = parse_pool
+                        .as_mut()
+                        .filter(|p| p.was_dispatched(i))
+                        .map(|pool| pool.take(i));
+                    run_external_classic(&mut ctx, src, body, prepared, &budget, &mut outcome);
                 }
                 _ => {
                     // A deliberately blocked ad/tracker script is expected,
@@ -8459,6 +8726,68 @@ mod tests {
         eprintln!("tiny post-prelude page call:       {tiny_call:?}");
     }
 
+    /// The cross-page CDN compile cache win (Phase 2): for each real classic CDN
+    /// library, the COLD per-page cost (parse + compile, what a non-cached page
+    /// pays) vs the CACHED per-page cost (rehydrate the detached image). The
+    /// saving is what every page after the first in a session avoids. Run:
+    /// `cargo test --release cdn_cache_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual measurement; needs the canary bundles in target/canary/"]
+    fn cdn_cache_cost() {
+        const N: u32 = 30;
+        eprintln!("--- CDN cache cost (avg of {N}, release recommended) ---");
+        for name in [
+            "jquery-3.7.1.min.js",
+            "d3.v7.min.js",
+            "vue.global.prod.js",
+            "react.production.min.js",
+        ] {
+            let Ok(src) = std::fs::read(format!("target/canary/{name}")) else {
+                eprintln!("{name}: SKIP (not present)");
+                continue;
+            };
+            // COLD: parse + compile in a fresh realm each time.
+            let (mut parse_acc, mut compile_acc) = (Duration::ZERO, Duration::ZERO);
+            for _ in 0..N {
+                let mut c = Context::default();
+                let t = Instant::now();
+                let script =
+                    boa_engine::Script::parse(Source::from_bytes(&src), None, &mut c).unwrap();
+                parse_acc += t.elapsed();
+                let t = Instant::now();
+                script.codeblock(&mut c).unwrap();
+                compile_acc += t.elapsed();
+            }
+            let cold = (parse_acc + compile_acc) / N;
+            // The detached image, built once (the per-session one-time cost).
+            let image = {
+                let mut c = Context::default();
+                let script =
+                    boa_engine::Script::parse(Source::from_bytes(&src), None, &mut c).unwrap();
+                script.codeblock(&mut c).unwrap().to_image()
+            };
+            // CACHED: rehydrate into a fresh realm each time (replaces parse+compile).
+            let mut rehydrate_acc = Duration::ZERO;
+            for _ in 0..N {
+                let mut c = Context::default();
+                let t = Instant::now();
+                let shell =
+                    boa_engine::Script::parse(Source::from_bytes("".as_bytes()), None, &mut c)
+                        .unwrap();
+                shell.set_codeblock(boa_engine::vm::CodeBlock::from_image(&image));
+                rehydrate_acc += t.elapsed();
+            }
+            let cached = rehydrate_acc / N;
+            eprintln!(
+                "{name} ({} KB): cold parse {:?} + compile {:?} = {cold:?} | cached {cached:?} | saved {:?}/page",
+                src.len() / 1024,
+                parse_acc / N,
+                compile_acc / N,
+                cold.saturating_sub(cached),
+            );
+        }
+    }
+
     /// What does the MutationObserver path actually COST on this engine?
     /// "Reaction time" has three parts: recording overhead per mutation (with
     /// vs without observers, plus the extra a body-rooted `subtree` observer
@@ -9137,6 +9466,271 @@ mod tests {
             parallel, sequential,
             "parallel parse must match sequential parse exactly"
         );
+    }
+
+    // ---- Phase 2: cross-page CDN compile cache --------------------------
+    //
+    // An external classic library compiled on one page is dehydrated to a
+    // `CodeBlockImage` and rehydrated on later pages (no re-parse, no
+    // re-compile). The realm-portability GATE decides what is safe to reuse: a
+    // classic script runs in the page's global scope, and a top-level
+    // `let`/`const`/`class` binds a SLOT INDEX into the realm's shared,
+    // accumulating global declarative environment — page-position-dependent, so
+    // its block is not reusable elsewhere. The gate admits only blocks that
+    // neither create such a binding (`global_declarations_are_replayable`) nor
+    // read a prior script's (`is_realm_portable`).
+
+    /// The gate's two fork checks classify libraries correctly: a UMD/IIFE bundle
+    /// (incl. one assigned to a top-level `var`) is cacheable; a top-level global
+    /// LEXICAL (`let`/`const`/`class`) is rejected by
+    /// `global_declarations_are_replayable` (it adds a shared-scope slot the
+    /// cache path would skip); and a block that merely READS a prior script's
+    /// global lexical is caught by the defensive `is_realm_portable` scan even
+    /// though it declares nothing of its own.
+    #[test]
+    fn cdn_cache_gate_classifies_realm_portability() {
+        fn gate(ctx: &mut Context, src: &[u8]) -> (bool, bool) {
+            let script = boa_engine::Script::parse(Source::from_bytes(src), None, ctx).unwrap();
+            let cb = script.codeblock(ctx).unwrap();
+            (
+                script.global_declarations_are_replayable(),
+                cb.is_realm_portable(),
+            )
+        }
+        // Cacheable shapes: a bare IIFE, and `var Lib = (function(){…})()` (Vue's
+        // global build) — globals created by name, no lexical slot.
+        for src in [
+            &br#"(function(g){ g.__lib = (typeof someUndeclared); })(globalThis);"#[..],
+            br#"var Lib = (function(){ return { v: 1 }; })();"#,
+            br#"function f(){ return 1; } globalThis.x = f();"#,
+        ] {
+            assert_eq!(
+                gate(&mut Context::default(), src),
+                (true, true),
+                "a by-name-global bundle must be realm-portable: {}",
+                String::from_utf8_lossy(src)
+            );
+        }
+        // Global LEXICAL declarations add a slot to the shared global declarative
+        // scope at analysis time → not replayable from bytecode → rejected.
+        for src in [
+            &b"const X = 1; (function(){})();"[..],
+            b"let Y = 1;",
+            b"class Z {}",
+        ] {
+            assert!(
+                !gate(&mut Context::default(), src).0,
+                "a top-level lexical declaration must be rejected: {}",
+                String::from_utf8_lossy(src)
+            );
+        }
+        // The defensive scan: a library that READS a prior script's global
+        // lexical resolves it by SLOT (scope==1) — it declares nothing itself,
+        // but its block is not realm-portable.
+        let mut shared = Context::default();
+        boa_engine::Script::parse(Source::from_bytes(b"const SHARED = 7;"), None, &mut shared)
+            .unwrap()
+            .evaluate(&mut shared)
+            .unwrap();
+        let (replayable, portable) = gate(&mut shared, br#"(function(){ return SHARED + 1; })();"#);
+        assert!(replayable, "the library itself declares no global lexicals");
+        assert!(
+            !portable,
+            "reading a prior script's global lexical (a slot) is not realm-portable"
+        );
+    }
+
+    /// Top-level `var`/`function` globals are created BY NAME from the bytecode,
+    /// so a rehydrated block recreates them and a LATER script resolves them by
+    /// name — on both the cold page and the cached page. This is what lets Vue's
+    /// `var Vue = …` global build be cached; the test pins the soundness of
+    /// admitting by-name globals (vs. only bare IIFEs).
+    #[test]
+    fn cdn_cache_replays_top_level_var_and_function_globals() {
+        let budget = Budget::new(WALL_BUDGET);
+        let lib = br#"var LibVer = 7; function libDouble(n){ return n*2; }"#;
+        let key = cdn_cache_key(lib);
+        let url = "https://cdn.example/varlib.js";
+
+        // Page A: miss → compile → store (replayable + portable) → run.
+        let mut a = Context::default();
+        let mut oa = Outcome::default();
+        run_external_classic(&mut a, url, lib, None, &budget, &mut oa);
+        assert!(oa.errors.is_empty(), "{:?}", oa.errors);
+        assert!(
+            matches!(cdn_cache_lookup(&key), CdnLookup::Reusable(_)),
+            "a var/function (by-name) library must be cacheable"
+        );
+        // A later script on page A reads the globals by name.
+        assert_eq!(
+            a.eval(Source::from_bytes(b"libDouble(LibVer)"))
+                .unwrap()
+                .as_number(),
+            Some(14.0),
+            "var/function globals must resolve on page A"
+        );
+
+        // Page B (fresh realm): cache HIT → rehydrate. Replaying the block must
+        // recreate the globals, and a later script must resolve them by name.
+        let mut b = Context::default();
+        let mut ob = Outcome::default();
+        run_external_classic(&mut b, url, lib, None, &budget, &mut ob);
+        assert!(ob.errors.is_empty(), "{:?}", ob.errors);
+        assert_eq!(
+            b.eval(Source::from_bytes(b"libDouble(LibVer)"))
+                .unwrap()
+                .as_number(),
+            Some(14.0),
+            "rehydrated var/function globals must resolve by name on page B"
+        );
+    }
+
+    /// End to end through `run_external_classic`: an IIFE library MISSES on page
+    /// A (compile → store the detached image → run), then HITS on page B (a fresh
+    /// realm), where it is rehydrated and runs identically — no re-parse, no
+    /// re-compile. Unique body so the process-global cache can't collide with
+    /// another test.
+    #[test]
+    fn cdn_cache_reuses_a_library_across_pages() {
+        let budget = Budget::new(WALL_BUDGET);
+        let lib =
+            br#"(function(){ globalThis.__cdn_reuse = (globalThis.__cdn_reuse||0) + 41; })();"#;
+        let key = cdn_cache_key(lib);
+        let url = "https://cdn.example/reuse.js";
+
+        // Page A: a true miss → compile + store + run.
+        let mut a = Context::default();
+        let mut oa = Outcome::default();
+        run_external_classic(&mut a, url, lib, None, &budget, &mut oa);
+        assert!(oa.errors.is_empty(), "{:?}", oa.errors);
+        assert_eq!(
+            a.eval(Source::from_bytes(b"globalThis.__cdn_reuse"))
+                .unwrap()
+                .as_number(),
+            Some(41.0),
+            "the library must run on page A"
+        );
+        assert!(
+            matches!(cdn_cache_lookup(&key), CdnLookup::Reusable(_)),
+            "an IIFE library must be cached as reusable after page A"
+        );
+
+        // Page B: a fresh realm, now a cache HIT → rehydrate (carrier path).
+        let mut b = Context::default();
+        let mut ob = Outcome::default();
+        run_external_classic(&mut b, url, lib, None, &budget, &mut ob);
+        assert!(ob.errors.is_empty(), "{:?}", ob.errors);
+        assert_eq!(
+            b.eval(Source::from_bytes(b"globalThis.__cdn_reuse"))
+                .unwrap()
+                .as_number(),
+            Some(41.0),
+            "the rehydrated library must run identically on page B"
+        );
+    }
+
+    /// A non-portable library (a top-level `let`) is run correctly but marked
+    /// `NotReusable`, so it is never rehydrated and the gate isn't re-evaluated
+    /// on later pages.
+    #[test]
+    fn cdn_cache_marks_non_portable_library_not_reusable() {
+        let budget = Budget::new(WALL_BUDGET);
+        let lib = br#"let __cdn_np = 5; globalThis.__cdn_np_marker = __cdn_np + 1;"#;
+        let key = cdn_cache_key(lib);
+        let mut a = Context::default();
+        let mut oa = Outcome::default();
+        run_external_classic(
+            &mut a,
+            "https://cdn.example/np.js",
+            lib,
+            None,
+            &budget,
+            &mut oa,
+        );
+        assert!(oa.errors.is_empty(), "{:?}", oa.errors);
+        assert_eq!(
+            a.eval(Source::from_bytes(b"globalThis.__cdn_np_marker"))
+                .unwrap()
+                .as_number(),
+            Some(6.0),
+            "the library must still run correctly"
+        );
+        assert!(
+            matches!(cdn_cache_lookup(&key), CdnLookup::NotReusable),
+            "a global-lexical library must be marked NotReusable, not cached"
+        );
+    }
+
+    /// `cdn_cache_hits` (which keeps rehydrated scripts OUT of the parse pool)
+    /// flags an external classic only once its image is cached.
+    #[test]
+    fn cdn_cache_hits_flags_only_cached_externals() {
+        let budget = Budget::new(WALL_BUDGET);
+        let lib = br#"(function(){ globalThis.__cdn_hits = 1; })();"#;
+        let url = "https://cdn.example/hits.js";
+        let scripts = vec![(Some(url.to_string()), String::new(), None, 0usize)];
+        let externals = vec![(url.to_string(), Some(lib.to_vec()))];
+
+        // Uncached → not a hit (so it WOULD go to the parse pool).
+        assert!(
+            cdn_cache_hits(&scripts, &externals).is_empty(),
+            "an uncached library must not be flagged as a hit"
+        );
+        // Warm the cache.
+        let mut a = Context::default();
+        let mut oa = Outcome::default();
+        run_external_classic(&mut a, url, lib, None, &budget, &mut oa);
+        assert!(oa.errors.is_empty(), "{:?}", oa.errors);
+        // Cached → flagged (so it's rehydrated, not re-parsed).
+        assert!(
+            cdn_cache_hits(&scripts, &externals).contains(&0),
+            "a cached library must be flagged for rehydration"
+        );
+    }
+
+    /// The real CLASSIC CDN libraries this feature targets must pass the
+    /// realm-portability gate (else the cache does nothing for them). Ignored
+    /// like the canaries — it reads the bundles from `target/canary/`. Run with
+    /// `cargo test --release cdn_cache_admits_real_cdn_bundles -- --ignored
+    /// --nocapture`. (Lit ships only as an ES module — `<script type=module>`,
+    /// out of scope for this classic-script cache — so it can't be parsed as a
+    /// `Script` and is reported as such, not asserted.)
+    #[test]
+    #[ignore = "needs the canary bundles in target/canary/"]
+    fn cdn_cache_admits_real_cdn_bundles() {
+        // The classic (UMD/IIFE) bundles the cache is meant to admit.
+        let classic = ["jquery-3.7.1.min.js", "d3.v7.min.js", "vue.global.prod.js"];
+        for name in classic
+            .iter()
+            .copied()
+            .chain(["lit-core.min.js", "react.production.min.js"])
+        {
+            let Ok(src) = std::fs::read(format!("target/canary/{name}")) else {
+                eprintln!("{name}: SKIP (not present)");
+                continue;
+            };
+            let mut ctx = Context::default();
+            let Ok(script) = boa_engine::Script::parse(Source::from_bytes(&src), None, &mut ctx)
+            else {
+                eprintln!("{name}: not a classic script (ES module?) — out of scope, skipped");
+                assert!(
+                    !classic.contains(&name),
+                    "{name} was expected to be a classic script"
+                );
+                continue;
+            };
+            let cb = script.codeblock(&mut ctx).unwrap();
+            let replayable = script.global_declarations_are_replayable();
+            let portable = cb.is_realm_portable();
+            eprintln!(
+                "{name}: replayable={replayable} is_realm_portable={portable} => cacheable={}",
+                replayable && portable
+            );
+            assert!(
+                replayable && portable,
+                "{name} must be realm-portable for the CDN cache to help it"
+            );
+        }
     }
 
     /// Two scripts with the SAME tag function and SAME template content. Their

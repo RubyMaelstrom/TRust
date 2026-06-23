@@ -313,6 +313,40 @@ impl Script {
         Ok(cb)
     }
 
+    /// Whether re-running this script's compiled `<main>` block in a fresh realm
+    /// reproduces **all** of its global-scope effects — i.e. its
+    /// `GlobalDeclarationInstantiation` is fully *replayable from bytecode*, with
+    /// no compile-time-only or shared-scope side effect that an
+    /// install-the-block-and-evaluate path (the CDN compile cache) would skip.
+    ///
+    /// True iff the script declares:
+    /// - **no global lexical bindings** (`let`/`const`/`class`): each would add a
+    ///   binding by SLOT INDEX to the realm's shared, accumulating global
+    ///   declarative scope *during scope analysis* — an index that depends on
+    ///   what earlier scripts declared, and a mutation the cache path skips; and
+    /// - **no Annex-B block-level function declarations**: those create a global
+    ///   var binding at *compile* time (`GlobalDeclarationInstantiation`'s B.3.2
+    ///   step), another effect the cache path would skip.
+    ///
+    /// Top-level `var` and `function` declarations ARE replayable: they create
+    /// global-object bindings *by name* via `CreateGlobalVar/FunctionBinding`
+    /// opcodes emitted into `<main>`, so simply running the block recreates them
+    /// — and references to them resolve by name (`GlobalObject`), not by slot.
+    ///
+    /// This is the primary half of the cross-page CDN compile cache's
+    /// realm-portability gate (JS-engine performance plan, Phase 2); the
+    /// defensive half is
+    /// [`CodeBlock::is_realm_portable`](crate::vm::CodeBlock::is_realm_portable),
+    /// which additionally rejects a block that *reads* a global declarative slot
+    /// an earlier script created.
+    #[must_use]
+    pub fn global_declarations_are_replayable(&self) -> bool {
+        use boa_ast::operations::{annex_b_function_declarations_names, lexically_declared_names};
+        let source = &self.inner.source;
+        lexically_declared_names(source).is_empty()
+            && annex_b_function_declarations_names(source).is_empty()
+    }
+
     /// Installs a precompiled code block as this script's body, so the next
     /// evaluation runs it instead of compiling the source.
     ///
