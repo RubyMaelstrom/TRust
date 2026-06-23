@@ -385,9 +385,17 @@ mod tests {
         tls::ensure_provider();
 
         // One certificate for the whole test so the TOFU pin stays happy.
-        // Host is 127.0.0.1 to avoid colliding with the telnet TLS test's
-        // "localhost" pin (pins are per server name, process-wide).
-        let signed = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        // Host is the dedicated loopback 127.0.0.2 (all of 127.0.0.0/8 is
+        // loopback): it keeps this test off both the telnet TLS test's
+        // "localhost" pin AND — crucially — off `status_60`'s host. Both
+        // share the process-global TRUST_IDENTITIES dir, and `status_60`
+        // does `create_identity("127.0.0.1")`, which create_new's an EMPTY
+        // <host>.pem before writing it. Were we also on 127.0.0.1, our
+        // per-connection `load_identity("127.0.0.1")` would intermittently
+        // read that file mid-creation ("no CERTIFICATE block") and fail —
+        // a real, load-dependent flake. On 127.0.0.2 we read 127.0.0.2.pem,
+        // which nothing ever writes, so load_identity is always Ok(None).
+        let signed = rcgen::generate_simple_self_signed(vec!["127.0.0.2".into()]).unwrap();
         let key = PrivateKeyDer::try_from(signed.signing_key.serialize_der()).unwrap();
         let config = ServerConfig::builder()
             .with_no_client_auth()
@@ -395,7 +403,7 @@ mod tests {
             .unwrap();
         let acceptor = TlsAcceptor::from(Arc::new(config));
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
         // Each gemini request is its own connection; serve until dropped.
@@ -434,7 +442,7 @@ mod tests {
         });
 
         let url = |path: &str| GeminiUrl {
-            host: String::from("127.0.0.1"),
+            host: String::from("127.0.0.2"),
             port,
             path: path.to_string(),
         };

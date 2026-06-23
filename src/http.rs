@@ -2211,6 +2211,8 @@ mod tests {
     // a serial build.
     #[tokio::test]
     async fn page_fetches_run_concurrently() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         const N: usize = 12;
@@ -2218,6 +2220,16 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+
+        // Overlap is proven by what the SERVER sees, not by wall-clock: the
+        // delayed handler counts how many requests are in flight at once and
+        // records the peak. A serial engine never exceeds 1; a concurrent one
+        // reaches ~N. This is immune to CPU load (the fixed JS parse/compile
+        // overhead used to swamp a wall-clock ratio under a busy test suite
+        // and fail spuriously). `elapsed` is kept only as a diagnostic.
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (srv_inflight, srv_peak) = (inflight.clone(), peak.clone());
 
         let server = tokio::spawn(async move {
             loop {
@@ -2227,6 +2239,7 @@ mod tests {
                 // One task per connection: the server must not serialize
                 // the responses itself, or it would mask client-side
                 // concurrency and the test would prove nothing.
+                let (inflight, peak) = (srv_inflight.clone(), srv_peak.clone());
                 tokio::spawn(async move {
                     let mut req = Vec::new();
                     let mut buf = [0u8; 2048];
@@ -2248,7 +2261,10 @@ mod tests {
                         )
                         .into_bytes()
                     } else if text.starts_with("GET /slow/") {
+                        let cur = inflight.fetch_add(1, Relaxed) + 1;
+                        peak.fetch_max(cur, Relaxed);
                         tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+                        inflight.fetch_sub(1, Relaxed);
                         b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok"
                             .to_vec()
                     } else {
@@ -2264,16 +2280,18 @@ mod tests {
         let started = std::time::Instant::now();
         let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let elapsed = started.elapsed();
-        eprintln!("page_fetches_run_concurrently: {N} fetches @ {DELAY_MS}ms took {elapsed:?}");
+        let peak = peak.load(Relaxed);
+        eprintln!(
+            "page_fetches_run_concurrently: {N} fetches @ {DELAY_MS}ms, peak in-flight {peak}, took {elapsed:?}"
+        );
         let body = String::from_utf8_lossy(&response.body);
         assert!(
             body.contains(&format!("got {N}")),
             "all fetches resolved: {body}"
         );
-        let serial = std::time::Duration::from_millis(DELAY_MS * N as u64);
         assert!(
-            elapsed < serial / 2,
-            "fetches did not overlap: {elapsed:?} (serial would be ~{serial:?})"
+            peak >= N / 2,
+            "fetches did not overlap: peak in-flight {peak} of {N} (serial engine never exceeds 1)"
         );
         server.abort();
     }
@@ -2342,6 +2360,8 @@ mod tests {
     /// `page_fetches_run_concurrently` for the module graph.
     #[tokio::test]
     async fn static_module_graph_prefetches_concurrently() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         const N: usize = 8;
@@ -2349,6 +2369,12 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        // Prove overlap by the server's peak in-flight count, not wall-clock
+        // (the JS overhead swamps a timing ratio under a busy suite — see
+        // `page_fetches_run_concurrently`). Serial never exceeds 1.
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (srv_inflight, srv_peak) = (inflight.clone(), peak.clone());
         let server = tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
@@ -2356,6 +2382,7 @@ mod tests {
                 };
                 // One task per connection so the server never serializes —
                 // otherwise it would mask client concurrency.
+                let (inflight, peak) = (srv_inflight.clone(), srv_peak.clone());
                 tokio::spawn(async move {
                     let mut req = Vec::new();
                     let mut buf = [0u8; 2048];
@@ -2388,7 +2415,10 @@ mod tests {
                         )
                         .into_bytes()
                     } else if text.starts_with("GET /m") {
+                        let cur = inflight.fetch_add(1, Relaxed) + 1;
+                        peak.fetch_max(cur, Relaxed);
                         tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+                        inflight.fetch_sub(1, Relaxed);
                         format!(
                             "HTTP/1.1 200 OK\r\n{js}\r\nConnection: close\r\n\r\n\
                              globalThis.__c=(globalThis.__c||0)+1;"
@@ -2407,16 +2437,18 @@ mod tests {
         let started = std::time::Instant::now();
         let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let elapsed = started.elapsed();
+        let peak = peak.load(Relaxed);
         let body = String::from_utf8_lossy(&response.body);
-        eprintln!("static_module_graph_prefetches_concurrently: {N}@{DELAY_MS}ms took {elapsed:?}");
+        eprintln!(
+            "static_module_graph_prefetches_concurrently: {N}@{DELAY_MS}ms, peak in-flight {peak}, took {elapsed:?}"
+        );
         assert!(
             body.contains(&format!("got {N}")),
             "all modules ran: {body}"
         );
-        let serial = std::time::Duration::from_millis(DELAY_MS * N as u64);
         assert!(
-            elapsed < serial / 2,
-            "module fetches did not overlap: {elapsed:?} (serial would be ~{serial:?})"
+            peak >= N / 2,
+            "module fetches did not overlap: peak in-flight {peak} of {N} (serial engine never exceeds 1)"
         );
         server.abort();
     }
@@ -2432,6 +2464,8 @@ mod tests {
     /// real boot pattern (`Promise.all([import(a), import(b), …])`).
     #[tokio::test]
     async fn dynamic_sibling_imports_load_concurrently() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         const N: usize = 8;
@@ -2439,6 +2473,15 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        // Prove the loader overlapped the imports by the server's peak
+        // in-flight count, not wall-clock — the old timing ratio failed
+        // spuriously under a busy suite because the fixed JS parse/compile
+        // overhead (which dwarfs DELAY_MS) balloons under CPU contention.
+        // The blocking loader these served strictly serial (peak 1); the
+        // awaiting loader fetches them at once (peak ~N).
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (srv_inflight, srv_peak) = (inflight.clone(), peak.clone());
         let server = tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
@@ -2446,6 +2489,7 @@ mod tests {
                 };
                 // One task per connection so the server never serializes —
                 // otherwise it would mask the client concurrency we test.
+                let (inflight, peak) = (srv_inflight.clone(), srv_peak.clone());
                 tokio::spawn(async move {
                     let mut req = Vec::new();
                     let mut buf = [0u8; 2048];
@@ -2480,7 +2524,10 @@ mod tests {
                         )
                         .into_bytes()
                     } else if text.starts_with("GET /m") {
+                        let cur = inflight.fetch_add(1, Relaxed) + 1;
+                        peak.fetch_max(cur, Relaxed);
                         tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+                        inflight.fetch_sub(1, Relaxed);
                         format!(
                             "HTTP/1.1 200 OK\r\n{js}\r\nConnection: close\r\n\r\n\
                              globalThis.__c=(globalThis.__c||0)+1;"
@@ -2499,16 +2546,18 @@ mod tests {
         let started = std::time::Instant::now();
         let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let elapsed = started.elapsed();
+        let peak = peak.load(Relaxed);
         let body = String::from_utf8_lossy(&response.body);
-        eprintln!("dynamic_sibling_imports_load_concurrently: {N}@{DELAY_MS}ms took {elapsed:?}");
+        eprintln!(
+            "dynamic_sibling_imports_load_concurrently: {N}@{DELAY_MS}ms, peak in-flight {peak}, took {elapsed:?}"
+        );
         assert!(
             body.contains(&format!("got {N}")),
             "all modules ran: {body}"
         );
-        let serial = std::time::Duration::from_millis(DELAY_MS * N as u64);
         assert!(
-            elapsed < serial / 2,
-            "dynamic sibling imports did not overlap: {elapsed:?} (serial would be ~{serial:?})"
+            peak >= N / 2,
+            "dynamic sibling imports did not overlap: peak in-flight {peak} of {N} (serial engine never exceeds 1)"
         );
         server.abort();
     }
