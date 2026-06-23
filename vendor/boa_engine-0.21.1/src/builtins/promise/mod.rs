@@ -1913,14 +1913,22 @@ impl Promise {
                 context
                     .job_executor()
                     .enqueue_job(reject_job.into(), context);
-
-                // 12. Set promise.[[PromiseIsHandled]] to true.
-                promise
-                    .downcast_mut::<Self>()
-                    .expect("IsPromise(promise) is false")
-                    .handled = true;
             }
         }
+
+        // 12. Set promise.[[PromiseIsHandled]] to true.
+        //
+        // Spec step 12 runs unconditionally for ALL states, not just rejected.
+        // It was previously set only inside the Rejected arm, so attaching a
+        // reaction to a still-PENDING promise never marked it handled — when
+        // that promise later rejected, RejectPromise saw [[PromiseIsHandled]]
+        // false and falsely fired the "reject" rejection-tracker, reporting a
+        // `p.then().catch()`-handled promise as an unhandled rejection (the
+        // i18next/Vite glob-import-miss shape).
+        promise
+            .downcast_mut::<Self>()
+            .expect("IsPromise(promise) is false")
+            .handled = true;
 
         // 13. If resultCapability is undefined, then
         //   a. Return undefined.

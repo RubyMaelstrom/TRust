@@ -444,6 +444,18 @@ pub fn run_script(
     outcome.elapsed += started.elapsed();
 }
 
+/// Set `document.currentScript` (via the `__trust` bridge, like `readyState`)
+/// to the node id of the classic script about to run — `None` clears it back
+/// to null. A bare property write can't panic the VM, so it skips the
+/// `run_script` budget/error machinery.
+fn set_current_script(ctx: &mut Context, id: Option<usize>) {
+    let src = match id {
+        Some(id) => format!("__trust.currentScript={id};"),
+        None => "__trust.currentScript=null;".to_string(),
+    };
+    let _ = ctx.eval(Source::from_bytes(src.as_bytes()));
+}
+
 // ---- The DOM syscall boundary ----------------------------------------
 //
 // The arena lives in Rust; JS sees nodes as bare integer ids. A thin set
@@ -623,6 +635,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_insert_before", 3, sys_insert_before),
         ("__dom_detach", 1, sys_detach),
         ("__dom_parent", 1, sys_parent),
+        ("__dom_contains", 2, sys_contains),
         ("__dom_children", 1, sys_children),
         ("__dom_next", 1, sys_next),
         ("__dom_prev", 1, sys_prev),
@@ -733,6 +746,31 @@ fn sys_parent(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
     Ok(id_value(
         arg_node(&d, args, 0).and_then(|id| d.node(id).parent),
     ))
+}
+
+/// `__dom_contains(a, b)` → is `a` a STRICT ancestor of `b`? The subtree
+/// match for MutationObserver: walking `b`'s parent chain here (one Rust
+/// pointer walk) replaces a JS `parentNode` loop that would syscall+wrap per
+/// hop — the trap #9 lesson (a body-rooted `subtree:true` observer tests this
+/// on every mutation). Does not cross shadow boundaries (parent is null at a
+/// shadow root), matching the default non-composed observation scope.
+fn sys_contains(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let d = dom.borrow();
+    let found = match (arg_node(&d, args, 0), arg_node(&d, args, 1)) {
+        (Some(anc), Some(node)) => {
+            let mut cur = d.node(node).parent;
+            loop {
+                match cur {
+                    Some(p) if p == anc => break true,
+                    Some(p) => cur = d.node(p).parent,
+                    None => break false,
+                }
+            }
+        }
+        _ => false,
+    };
+    Ok(JsValue::from(found))
 }
 
 fn sys_children(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -2048,6 +2086,32 @@ impl boa_engine::module::ModuleLoader for WebModuleLoader {
         self.modules.borrow_mut().insert(key, module.clone());
         Ok(module)
     }
+
+    /// Populate `import.meta` for a module. We expose `import.meta.url` — the
+    /// module's own absolute URL (the path we attach at parse time) — which
+    /// bundlers rely on to resolve sibling chunks: Vite/SvelteKit's preload
+    /// helper does `new URL("../nodes/x.js", import.meta.url)`, so a missing
+    /// `url` makes every relative resolution throw "Invalid URL" and the app
+    /// never boots.
+    fn init_import_meta(
+        self: Rc<Self>,
+        import_meta: &boa_engine::JsObject,
+        module: &boa_engine::Module,
+        context: &mut Context,
+    ) {
+        let url = module
+            .path()
+            .and_then(|p| p.to_str())
+            .map(str::to_string)
+            .or_else(|| self.page.as_ref().map(url::Url::to_string))
+            .unwrap_or_default();
+        let _ = import_meta.set(
+            boa_engine::js_string!("url"),
+            JsString::from(url),
+            false,
+            context,
+        );
+    }
 }
 
 /// Run one parsed module to completion: load (imports fetch through the
@@ -2238,7 +2302,7 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
         scripts.len()
     ));
 
-    for (i, (src, inline, type_attr)) in scripts.iter().enumerate() {
+    for (i, (src, inline, type_attr, node)) in scripts.iter().enumerate() {
         let script_started = Instant::now();
         if std::env::var_os("TRUST_NET_TRACE").is_some() {
             let label = src.as_deref().unwrap_or("<inline>");
@@ -2310,6 +2374,11 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
             ));
             continue;
         }
+        // `document.currentScript` is the classic script element while its
+        // own code runs (null for modules and between scripts) — SvelteKit's
+        // bootstrap reads `document.currentScript.parentElement` to find its
+        // mount node, so without this the whole app fails to start.
+        set_current_script(&mut ctx, Some(*node));
         match src {
             Some(src) => match externals.iter().find(|(k, _)| k == src) {
                 Some((_, Some(body))) => {
@@ -2335,9 +2404,11 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
             }
         }
         if outcome.panicked {
-            // Engine bug: what the page built so far still renders.
+            // Engine bug: what the page built so far still renders. (Don't
+            // touch the VM further — currentScript is moot once we break.)
             break;
         }
+        set_current_script(&mut ctx, None);
         run_jobs_into(&mut ctx, &budget, &mut outcome);
         phase(&format!(
             "script[{i}] done +{}ms",
@@ -2762,6 +2833,16 @@ fn page_actor(
     // contract; only a page that mutates during settle (archive's tiles)
     // gets a second, filled-in render.
     let _ = page.dom.borrow_mut().take_dirty();
+    // The shell render already delivered the errors accumulated so far — the
+    // app reads them from `response.js` (the first event). `Updated` carries a
+    // DELTA, so drain the reported errors here; otherwise the settle emit below
+    // `take`s the SAME cumulative outcome and the app's `page_js_errors +=`
+    // counts every load error twice (a single load error showed as `· JS:2!`).
+    // Errors that arise DURING settle accumulate fresh and are reported once.
+    // (Console is left cumulative — it's a diagnostic channel, not a count.)
+    if painted_live {
+        page.outcome.errors.clear();
+    }
 
     // Drain the rest of the lifecycle (background network + timers).
     settle_page(&mut page);
@@ -2917,6 +2998,12 @@ fn prepare_dispatch(page: &mut LoadedPage) {
     if let Some(net) = page.ctx.realm().host_defined().get::<PageNet>() {
         net.fetched.set(0);
     }
+    // Give each fresh interaction its own MutationObserver loop budget: a
+    // runaway observer chain in one dispatch disables delivery for the rest of
+    // THAT window, but the next click starts clean.
+    let _ = page.ctx.eval(Source::from_bytes(
+        b"__trust.moResetGuard && __trust.moResetGuard()",
+    ));
     let _ = page.dom.borrow_mut().take_dirty();
 }
 
@@ -3204,8 +3291,8 @@ pub fn external_scripts(html: &str) -> Vec<String> {
     Dom::parse_document(html)
         .scripts()
         .into_iter()
-        .filter(|(_, _, t)| is_classic(t))
-        .filter_map(|(src, _, _)| src)
+        .filter(|(_, _, t, _)| is_classic(t))
+        .filter_map(|(src, _, _, _)| src)
         .collect()
 }
 
@@ -3765,9 +3852,26 @@ const PRELUDE: &str = r##"
         get nextElementSibling() { let s = this.nextSibling; while (s && s.nodeType !== 1) s = s.nextSibling; return s; }
         get previousElementSibling() { let s = this.previousSibling; while (s && s.nodeType !== 1) s = s.previousSibling; return s; }
         get textContent() { return __dom_text(this.__id); }
-        set textContent(v) { __dom_set_text(this.__id, v === null || v === undefined ? "" : String(v)); }
+        set textContent(v) {
+            v = v === null || v === undefined ? "" : String(v);
+            if (!MO.length) { __dom_set_text(this.__id, v); return; }
+            const t = this.nodeType;
+            if (t === 3 || t === 8) { const old = __dom_text(this.__id); __dom_set_text(this.__id, v); moCharData(this, old); return; }
+            // On an element, textContent replaces all children with one text node.
+            const removed = this.childNodes;
+            __dom_set_text(this.__id, v);
+            moChildBulk(this, removed, this.childNodes);
+        }
         get nodeValue() { const t = this.nodeType; return t === 3 || t === 8 ? __dom_text(this.__id) : null; }
-        set nodeValue(v) { const t = this.nodeType; if (t === 3 || t === 8) __dom_set_text(this.__id, String(v)); }
+        set nodeValue(v) {
+            const t = this.nodeType;
+            if (t !== 3 && t !== 8) return;
+            v = String(v);
+            if (!MO.length) { __dom_set_text(this.__id, v); return; }
+            const old = __dom_text(this.__id);
+            __dom_set_text(this.__id, v);
+            moCharData(this, old);
+        }
         get data() { return this.nodeValue ?? ""; }
         set data(v) { this.nodeValue = String(v); }
         get ownerDocument() { return g.document; }
@@ -3785,6 +3889,7 @@ const PRELUDE: &str = r##"
         appendChild(c) {
             if (c && c.nodeType === 11 && !c.__host) { for (const k of c.childNodes) this.appendChild(k); return c; }
             __dom_append(this.__id, c.__id);
+            if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
             return c;
@@ -3792,20 +3897,24 @@ const PRELUDE: &str = r##"
         insertBefore(c, ref) {
             if (c && c.nodeType === 11 && !c.__host) { for (const k of c.childNodes) this.insertBefore(k, ref); return c; }
             __dom_insert_before(this.__id, c.__id, ref ? ref.__id : null);
+            if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
             return c;
         }
-        removeChild(c) { if (CE.defs.size) ceDisconnect(c); __dom_detach(c.__id); return c; }
+        removeChild(c) { if (MO.length) moChildRemove(this, c); if (CE.defs.size) ceDisconnect(c); __dom_detach(c.__id); return c; }
         replaceChild(n, old) {
+            const prev = old.previousSibling, next = old.nextSibling;
             if (CE.defs.size) ceDisconnect(old);
             __dom_insert_before(this.__id, n.__id, old.__id);
             __dom_detach(old.__id);
+            if (MO.length) moNotify({ type: "childList", target: this, addedNodes: [n],
+                removedNodes: [old], previousSibling: prev, nextSibling: next });
             if (CE.defs.size) ceScan(n);
             maybeRunScript(n);
             return old;
         }
-        remove() { if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); }
+        remove() { const p = this.parentNode; if (p && MO.length) moChildRemove(p, this); if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); }
         append(...ns) { for (const n of ns) this.appendChild(n && typeof n === "object" ? n : g.document.createTextNode(String(n))); }
         prepend(...ns) { const f = this.firstChild; for (const n of ns) this.insertBefore(n && typeof n === "object" ? n : g.document.createTextNode(String(n)), f); }
         // The ChildNode mixin: lit's svg templates go through
@@ -3986,16 +4095,18 @@ const PRELUDE: &str = r##"
         getAttribute(n) { return __dom_get_attr(this.__id, String(n)); }
         setAttribute(n, v) {
             n = String(n); v = String(v);
-            const old = this.__ceUpgraded ? this.getAttribute(n) : null;
+            const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             __dom_set_attr(this.__id, n, v);
             ceAttrChanged(this, n.toLowerCase(), old, v);
+            if (MO.length) moAttr(this, n, old);
         }
         setAttributeNS(_, n, v) { this.setAttribute(n, v); }
         removeAttribute(n) {
             n = String(n);
-            const old = this.__ceUpgraded ? this.getAttribute(n) : null;
+            const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             __dom_remove_attr(this.__id, n);
             ceAttrChanged(this, n.toLowerCase(), old, null);
+            if (MO.length) moAttr(this, n, old);
         }
         hasAttribute(n) { return __dom_get_attr(this.__id, String(n)) !== null; }
         getAttributeNames() { return __dom_attr_names(this.__id); }
@@ -4161,7 +4272,10 @@ const PRELUDE: &str = r##"
         set src(v) { this.setAttribute("src", String(v)); }
         get innerHTML() { return __dom_inner_html(this.__id); }
         set innerHTML(v) {
+            if (!MO.length) { __dom_set_inner_html(this.__id, String(v)); if (CE.defs.size) ceScan(this); return; }
+            const removed = this.childNodes;
             __dom_set_inner_html(this.__id, String(v));
+            moChildBulk(this, removed, this.childNodes);
             if (CE.defs.size) ceScan(this);
         }
         get content() {
@@ -4243,7 +4357,17 @@ const PRELUDE: &str = r##"
         get innerText() { return this.textContent; }
         set innerText(v) { this.textContent = v; }
         insertAdjacentHTML(p, h) {
-            __dom_insert_adjacent(this.__id, String(p).toLowerCase(), String(h));
+            p = String(p).toLowerCase();
+            const container = (p === "beforebegin" || p === "afterend") ? this.parentNode : this;
+            if (!MO.length || !container) {
+                __dom_insert_adjacent(this.__id, p, String(h));
+                if (CE.defs.size) { const par = this.parentNode; ceScan(par || this); }
+                return;
+            }
+            const before = new Set(container.childNodes.map((k) => k.__id));
+            __dom_insert_adjacent(this.__id, p, String(h));
+            const added = container.childNodes.filter((k) => !before.has(k.__id));
+            moChildBulk(container, [], added);
             if (CE.defs.size) { const par = this.parentNode; ceScan(par || this); }
         }
         insertAdjacentElement(p, el) {
@@ -4360,7 +4484,17 @@ const PRELUDE: &str = r##"
     // stringifies to "undefined"); `length` is the data's UTF-16 length.
     class CharacterData extends Node {
         get data() { return __dom_text(this.__id) || ""; }
-        set data(v) { __dom_set_text(this.__id, v === null ? "" : String(v)); }
+        // The single choke point for text/comment data changes: `data`,
+        // `nodeValue`, `appendData`/`insertData`/`deleteData`/`replaceData`, and
+        // Node's `textContent` (on a text node) all route here, so the
+        // characterData MutationRecord is emitted from this one setter.
+        set data(v) {
+            v = v === null ? "" : String(v);
+            if (!MO.length) { __dom_set_text(this.__id, v); return; }
+            const old = __dom_text(this.__id) || "";
+            __dom_set_text(this.__id, v);
+            moCharData(this, old);
+        }
         get nodeValue() { return this.data; }
         set nodeValue(v) { this.data = v; }
         get length() { return this.data.length; }
@@ -4411,7 +4545,7 @@ const PRELUDE: &str = r##"
         get defaultView() { return g; }
         get documentURI() { return g.location.href; }
         get URL() { return g.location.href; }
-        get currentScript() { return null; }
+        get currentScript() { return wrap(trust.currentScript); }
         get implementation() {
             const doc = this;
             return {
@@ -5082,6 +5216,22 @@ const PRELUDE: &str = r##"
             g[__cn] = __C;
         }
     }
+    // SVG element interface zoo (all extend SVGElement). SvelteKit's link
+    // handler branches on `e instanceof SVGAElement` to read `href.baseVal`
+    // vs `href` — a bare `SVGAElement` was a ReferenceError that broke its
+    // link interception/preloading; libraries also feature-detect these.
+    for (const __n of ["A", "SVG", "G", "Defs", "Desc", "Title", "Symbol", "Use",
+        "Image", "Switch", "Style", "Script", "Path", "Rect", "Circle", "Ellipse",
+        "Line", "Polyline", "Polygon", "Text", "TSpan", "TextPath", "Marker",
+        "ClipPath", "Mask", "Pattern", "LinearGradient", "RadialGradient", "Stop",
+        "Filter", "ForeignObject", "Graphics", "Geometry", "View", "GradientStop"]) {
+        const __cn = "SVG" + __n + "Element";
+        if (!g[__cn]) {
+            const __C = class extends SVGElement {};
+            try { Object.defineProperty(__C, "name", { value: __cn }); } catch (e) {}
+            g[__cn] = __C;
+        }
+    }
     g.Image = class { constructor() { return g.document.createElement("img"); } };
     // `new Audio(src)` — the legacy HTMLAudioElement constructor (parallel to
     // Image). Returns an <audio> element with no-op media methods: TRust never
@@ -5270,7 +5420,12 @@ const PRELUDE: &str = r##"
     // above are unaffected by the reparent; guard in case the global is frozen.
     try { Object.setPrototypeOf(g, Window.prototype); } catch (e) { /* frozen global */ }
     g.navigator = {
-        userAgent: cfg.ua, language: "en", languages: ["en"],
+        // Real browsers report a region-qualified BCP-47 tag (Chrome/Firefox
+        // default to "en-US"), not a bare "en". Language detectors key off
+        // this: Open WebUI's i18n loads exactly the detected tag, and its
+        // bundle ships "en-US" (no bare "en"), so a bare "en" missed the map
+        // and rejected the translation load.
+        userAgent: cfg.ua, language: "en-US", languages: ["en-US", "en"],
         platform: "Linux", cookieEnabled: true, onLine: true,
         plugins: [], mimeTypes: [], webdriver: false,
     };
@@ -5427,7 +5582,184 @@ const PRELUDE: &str = r##"
     }
     g.Selection = Selection;
     g.getSelection = () => new Selection();
-    g.MutationObserver = class { observe() {} disconnect() {} takeRecords() { return []; } };
+    // --- MutationObserver (real) ---------------------------------------
+    // A pure-JS DOM-mutation observer, delivered as a microtask exactly like
+    // the spec's "mutation observer microtask". It does NOT challenge the
+    // freeze-at-rest invariant: records are emitted ONLY by the mutation
+    // wrappers below (appendChild/setAttribute/…), which run only inside a
+    // compute window (load, settle, a click/form dispatch). At rest nothing
+    // mutates, so nothing fires — no idle CPU, no background ticking. (Timers
+    // remain frozen at rest by design; that is a separate, deliberate choice.)
+    //
+    // Records are recorded against the live observer list `MO`. The hot path
+    // (zero observers) is a single `MO.length` check at each mutation site;
+    // with observers present, an unrelated mutation costs a `target ===` identity
+    // test per registration (no ancestor walk unless that registration is
+    // `subtree`). The subtree match is the one Rust syscall `__dom_contains`
+    // (not a JS parent walk — trap #9).
+    //
+    // MO and each observer's registration list are PLAIN ARRAYS, deliberately
+    // NOT Boa Set/Map: a Map/Set `for…of` holds a `MapLock` whose GC finalizer
+    // re-borrows the backing map, and under the heavy allocation this hot loop
+    // does (a record object per mutation) a GC mid-iteration trips
+    // "Object already borrowed". Arrays have no such finalizer.
+    const MO = [];               // live observers (each with a per-observer record queue)
+    let moQueued = false;        // a delivery microtask is already scheduled
+    let moChain = 0;             // consecutive delivery turns without the queue going quiet
+    let moDisabled = false;      // tripped if an observer-feeds-observer loop runs away
+    const MO_CHAIN_CAP = 1000;   // microtask-checkpoint lid (the spec has none; we need one)
+
+    // Reset the loop guard at the start of each fresh compute window so a
+    // pathological burst in one dispatch can't permanently mute a later one.
+    function moResetGuard() { moChain = 0; moDisabled = false; }
+    g.__trust.moResetGuard = moResetGuard;
+
+    function moEnqueue() {
+        if (moQueued || moDisabled) return;
+        moQueued = true;
+        Promise.resolve().then(moDeliver);
+    }
+    function moDeliver() {
+        moQueued = false;
+        if (moDisabled) return;
+        if (++moChain > MO_CHAIN_CAP) {
+            moDisabled = true;
+            for (let i = 0; i < MO.length; i++) MO[i].__records = [];
+            trust.errors.push("MutationObserver: delivery exceeded " + MO_CHAIN_CAP +
+                " microtask turns (observer loop?) — disabled for this page");
+            return;
+        }
+        // Snapshot the observer list: a callback may observe/disconnect mid-loop.
+        const obs = MO.slice();
+        for (let i = 0; i < obs.length; i++) {
+            const o = obs[i];
+            if (!o.__records.length) continue;
+            const recs = o.__records;
+            o.__records = [];
+            try { o.__cb(recs, o); }
+            catch (e) { trust.errors.push("MutationObserver callback: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+        }
+        // The chain has ended iff no callback re-queued during this turn; only
+        // then is it safe to clear the loop counter.
+        if (!moQueued) moChain = 0;
+    }
+
+    function moIsAncestor(anc, node) {
+        // anc strictly contains node? Direct-target matches are handled by the
+        // `t === target` test; this is only consulted for subtree observers.
+        return !!(node && __dom_contains(anc.__id, node.__id));
+    }
+
+    // Queue `rec` to every interested observer. `rec.type` is one of
+    // "childList" | "attributes" | "characterData"; oldValue is nulled per
+    // observer unless one of its matching registrations asked for it (spec).
+    function moNotify(rec) {
+        for (let i = 0; i < MO.length; i++) {
+            const o = MO[i], regs = o.__targets;
+            let matched = false, wantOld = false;
+            for (let j = 0; j < regs.length; j++) {
+                const opts = regs[j];
+                if (rec.type === "childList" ? !opts.childList
+                    : rec.type === "attributes" ? !opts.attributes
+                    : !opts.characterData) continue;
+                if (!(opts.target === rec.target || (opts.subtree && moIsAncestor(opts.target, rec.target)))) continue;
+                if (rec.type === "attributes" && opts.attributeFilter &&
+                    opts.attributeFilter.indexOf(rec.attributeName) < 0) continue;
+                matched = true;
+                if ((rec.type === "attributes" && opts.attributeOldValue) ||
+                    (rec.type === "characterData" && opts.characterDataOldValue)) { wantOld = true; break; }
+            }
+            if (!matched) continue;
+            o.__records.push({
+                type: rec.type,
+                target: rec.target,
+                addedNodes: rec.addedNodes || [],
+                removedNodes: rec.removedNodes || [],
+                previousSibling: rec.previousSibling || null,
+                nextSibling: rec.nextSibling || null,
+                attributeName: rec.attributeName || null,
+                attributeNamespace: null,
+                oldValue: wantOld ? (rec.oldValue === undefined ? null : rec.oldValue) : null,
+            });
+        }
+        moEnqueue();
+    }
+
+    // Emission helpers used by the mutation wrappers. Each bails on the
+    // zero-observer fast path before touching the DOM for siblings/oldValue.
+    function moChildInsert(parent, node) {        // call AFTER the insert
+        if (!MO.length) return;
+        moNotify({ type: "childList", target: parent, addedNodes: [node],
+            previousSibling: node.previousSibling, nextSibling: node.nextSibling });
+    }
+    function moChildRemove(parent, node) {        // call BEFORE the detach
+        if (!MO.length) return;
+        moNotify({ type: "childList", target: parent, removedNodes: [node],
+            previousSibling: node.previousSibling, nextSibling: node.nextSibling });
+    }
+    function moChildBulk(target, removed, added) { // innerHTML / textContent / insertAdjacentHTML
+        if (!MO.length) return;
+        moNotify({ type: "childList", target, addedNodes: added, removedNodes: removed });
+    }
+    function moAttr(target, name, oldValue) {
+        if (!MO.length) return;
+        moNotify({ type: "attributes", target, attributeName: name, oldValue });
+    }
+    function moCharData(target, oldValue) {
+        if (!MO.length) return;
+        moNotify({ type: "characterData", target, oldValue });
+    }
+
+    g.MutationObserver = class MutationObserver {
+        constructor(cb) {
+            if (typeof cb !== "function")
+                throw new TypeError("Failed to construct 'MutationObserver': parameter 1 is not a function");
+            this.__cb = cb;
+            this.__records = [];
+            this.__targets = []; // array of registrations: { target, childList, … }
+        }
+        observe(target, options) {
+            if (!target || typeof target.__id !== "number")
+                throw new TypeError("Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'");
+            options = options || {};
+            let attributes = options.attributes;
+            let characterData = options.characterData;
+            const childList = !!options.childList;
+            const subtree = !!options.subtree;
+            const attributeOldValue = !!options.attributeOldValue;
+            const characterDataOldValue = !!options.characterDataOldValue;
+            const attributeFilter = options.attributeFilter
+                ? Array.prototype.map.call(options.attributeFilter, String) : null;
+            // Spec defaults: an *OldValue/Filter flag implies its category.
+            if (attributes === undefined) attributes = !!(attributeOldValue || attributeFilter);
+            if (characterData === undefined) characterData = !!characterDataOldValue;
+            if (!childList && !attributes && !characterData)
+                throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+            if (attributeOldValue && !attributes)
+                throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeOldValue' to true when 'attributes' is true or not present.");
+            if (attributeFilter && !attributes)
+                throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'attributeFilter' when 'attributes' is true or not present.");
+            if (characterDataOldValue && !characterData)
+                throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object may only set 'characterDataOldValue' to true when 'characterData' is true or not present.");
+            // Re-observing the same node REPLACES its options (spec). Records
+            // already queued for this observer survive (not the registration).
+            const reg = { target, childList, attributes, characterData, subtree,
+                attributeOldValue, characterDataOldValue, attributeFilter };
+            let replaced = false;
+            for (let i = 0; i < this.__targets.length; i++) {
+                if (this.__targets[i].target === target) { this.__targets[i] = reg; replaced = true; break; }
+            }
+            if (!replaced) this.__targets.push(reg);
+            if (MO.indexOf(this) < 0) MO.push(this);
+        }
+        disconnect() {
+            this.__targets = [];
+            this.__records = [];
+            const i = MO.indexOf(this);
+            if (i >= 0) MO.splice(i, 1);
+        }
+        takeRecords() { const r = this.__records; this.__records = []; return r; }
+    };
     // The terminal has no live scroll and timers freeze at rest, so we REPORT
     // every observed target as FULLY intersecting, once, asynchronously — else
     // below-the-fold lazy/virtualized content (infinite scrollers, lazy tiles)
@@ -5907,6 +6239,295 @@ const PRELUDE: &str = r##"
             return out;
         }
     };
+    // --- WHATWG Streams (in-memory). Real constructors so streaming code
+    // both LOADS and RUNS: Open WebUI's chat/SSE pipeline does
+    // `class X extends TransformStream` at module-eval time and pipes
+    // `body.pipeThrough(new TextDecoderStream()).pipeThrough(parser)` — a
+    // missing `TransformStream` threw a ReferenceError that 500'd the whole
+    // route. Single-consumer, no BYOB/byte-stream/backpressure tuning;
+    // faithful enough for producer→transform→reader pipelines. (A fetch
+    // Response.body is still null — actual network streaming is a separate,
+    // deeper feature — so the streams a page builds itself work, but reading a
+    // response AS a stream doesn't yet.) ---
+    {
+        const deferred = () => {
+            let resolve, reject;
+            const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+            return { promise, resolve, reject };
+        };
+        class ReadableStream {
+            constructor(source, strategy) {
+                source = source || {};
+                this._source = source;
+                this._queue = [];
+                this._pending = []; // waiting read()s: {resolve,reject}
+                this._closed = false;
+                this._error = null;
+                this._reader = null;
+                this._closedDef = deferred();
+                this._closedDef.promise.catch(() => {});
+                const self = this;
+                this._controller = {
+                    enqueue(chunk) {
+                        if (self._closed || self._error) return;
+                        if (self._pending.length) self._pending.shift().resolve({ value: chunk, done: false });
+                        else self._queue.push(chunk);
+                    },
+                    close() {
+                        if (self._closed || self._error) return;
+                        self._closed = true;
+                        while (self._pending.length) self._pending.shift().resolve({ value: undefined, done: true });
+                        self._closedDef.resolve(undefined);
+                    },
+                    error(e) {
+                        if (self._closed || self._error) return;
+                        self._error = e || new TypeError("stream error");
+                        while (self._pending.length) self._pending.shift().reject(self._error);
+                        self._closedDef.reject(self._error);
+                    },
+                    get desiredSize() { return self._closed || self._error ? null : 1; },
+                };
+                try {
+                    const r = source.start ? source.start(this._controller) : undefined;
+                    Promise.resolve(r).then(() => self._pull(), (e) => self._controller.error(e));
+                } catch (e) { this._controller.error(e); }
+            }
+            _pull() {
+                const self = this;
+                if (this._closed || this._error || !this._source.pull) return;
+                if (this._pending.length && this._queue.length === 0) {
+                    try { Promise.resolve(this._source.pull(this._controller)).catch((e) => self._controller.error(e)); }
+                    catch (e) { self._controller.error(e); }
+                }
+            }
+            get locked() { return this._reader !== null; }
+            getReader(opts) {
+                if (this._reader) throw new TypeError("ReadableStream is already locked");
+                const self = this;
+                const reader = {
+                    read() {
+                        if (self._queue.length) return Promise.resolve({ value: self._queue.shift(), done: false });
+                        if (self._error) return Promise.reject(self._error);
+                        if (self._closed) return Promise.resolve({ value: undefined, done: true });
+                        return new Promise((resolve, reject) => { self._pending.push({ resolve, reject }); self._pull(); });
+                    },
+                    cancel(reason) { return self.cancel(reason); },
+                    releaseLock() { self._reader = null; },
+                    get closed() { return self._closedDef.promise; },
+                };
+                this._reader = reader;
+                return reader;
+            }
+            cancel(reason) {
+                if (!this._closed && !this._error) {
+                    this._closed = true;
+                    this._queue = [];
+                    while (this._pending.length) this._pending.shift().resolve({ value: undefined, done: true });
+                    this._closedDef.resolve(undefined);
+                    try { if (this._source.cancel) this._source.cancel(reason); } catch (e) {}
+                }
+                return Promise.resolve(undefined);
+            }
+            pipeTo(dest, opts) {
+                const reader = this.getReader();
+                const writer = dest.getWriter();
+                return new Promise((resolve, reject) => {
+                    const step = () => {
+                        reader.read().then((res) => {
+                            if (res.done) { Promise.resolve(writer.close()).then(resolve, resolve); return; }
+                            Promise.resolve(writer.write(res.value)).then(step, reject);
+                        }, reject);
+                    };
+                    step();
+                });
+            }
+            pipeThrough(pair, opts) {
+                this.pipeTo(pair.writable, opts);
+                return pair.readable;
+            }
+            tee() {
+                const reader = this.getReader();
+                let c1 = null, c2 = null, reading = false;
+                const pump = () => {
+                    if (reading) return;
+                    reading = true;
+                    reader.read().then((res) => {
+                        reading = false;
+                        if (res.done) { if (c1) c1.close(); if (c2) c2.close(); return; }
+                        if (c1) c1.enqueue(res.value);
+                        if (c2) c2.enqueue(res.value);
+                    }, (e) => { if (c1) c1.error(e); if (c2) c2.error(e); });
+                };
+                const b1 = new ReadableStream({ start(c) { c1 = c; }, pull: pump });
+                const b2 = new ReadableStream({ start(c) { c2 = c; }, pull: pump });
+                return [b1, b2];
+            }
+        }
+        ReadableStream.prototype[Symbol.asyncIterator] = function () {
+            const reader = this.getReader();
+            return {
+                next() { return reader.read(); },
+                return() { reader.releaseLock(); return Promise.resolve({ value: undefined, done: true }); },
+            };
+        };
+        class WritableStream {
+            constructor(sink, strategy) {
+                sink = sink || {};
+                this._sink = sink;
+                this._writer = null;
+                this._closed = false;
+                this._error = null;
+                const self = this;
+                this._controller = { error(e) { self._error = e; }, get signal() { return undefined; } };
+                try { this._ready = Promise.resolve(sink.start ? sink.start(this._controller) : undefined); }
+                catch (e) { this._ready = Promise.reject(e); }
+                this._chain = this._ready.catch(() => {});
+            }
+            get locked() { return this._writer !== null; }
+            getWriter() {
+                if (this._writer) throw new TypeError("WritableStream is already locked");
+                const self = this;
+                const writer = {
+                    write(chunk) {
+                        self._chain = self._chain.then(() => {
+                            if (self._error) throw self._error;
+                            return self._sink.write ? self._sink.write(chunk, self._controller) : undefined;
+                        });
+                        return self._chain;
+                    },
+                    close() {
+                        self._chain = self._chain.then(() => {
+                            if (self._closed) return undefined;
+                            self._closed = true;
+                            return self._sink.close ? self._sink.close() : undefined;
+                        });
+                        return self._chain;
+                    },
+                    abort(reason) {
+                        self._error = reason || new TypeError("aborted");
+                        return Promise.resolve(self._sink.abort ? self._sink.abort(reason) : undefined);
+                    },
+                    releaseLock() { self._writer = null; },
+                    get ready() { return self._ready.then(() => undefined); },
+                    get closed() { return self._chain.then(() => undefined); },
+                    get desiredSize() { return self._error ? null : (self._closed ? 0 : 1); },
+                };
+                this._writer = writer;
+                return writer;
+            }
+            abort(reason) { this._error = reason; return Promise.resolve(this._sink.abort ? this._sink.abort(reason) : undefined); }
+            close() { return this.getWriter().close(); }
+        }
+        class TransformStream {
+            constructor(transformer, writableStrategy, readableStrategy) {
+                transformer = transformer || {};
+                let rc;
+                this.readable = new ReadableStream({ start(c) { rc = c; } });
+                const tc = {
+                    enqueue(chunk) { rc.enqueue(chunk); },
+                    terminate() { rc.close(); },
+                    error(e) { rc.error(e); },
+                    get desiredSize() { return rc.desiredSize; },
+                };
+                let started;
+                try { started = transformer.start ? transformer.start(tc) : undefined; }
+                catch (e) { rc.error(e); started = Promise.reject(e); }
+                this.writable = new WritableStream({
+                    start() { return Promise.resolve(started); },
+                    write(chunk) {
+                        if (transformer.transform) return Promise.resolve(transformer.transform(chunk, tc));
+                        tc.enqueue(chunk);
+                        return undefined;
+                    },
+                    close() {
+                        return Promise.resolve(transformer.flush ? transformer.flush(tc) : undefined).then(() => rc.close());
+                    },
+                    abort(e) { rc.error(e); },
+                });
+            }
+        }
+        class TextDecoderStream extends TransformStream {
+            constructor(label, options) {
+                const dec = new g.TextDecoder(label, options);
+                super({
+                    transform(chunk, c) { const s = dec.decode(chunk); if (s) c.enqueue(s); },
+                });
+                this._encoding = dec.encoding;
+            }
+            get encoding() { return this._encoding; }
+        }
+        class TextEncoderStream extends TransformStream {
+            constructor() {
+                const enc = new g.TextEncoder();
+                super({ transform(chunk, c) { c.enqueue(enc.encode(String(chunk))); } });
+            }
+            get encoding() { return "utf-8"; }
+        }
+        g.ReadableStream = ReadableStream;
+        g.WritableStream = WritableStream;
+        g.TransformStream = TransformStream;
+        g.TextDecoderStream = TextDecoderStream;
+        g.TextEncoderStream = TextEncoderStream;
+    }
+    // --- Web Animations API (Element.animate). A terminal has no real
+    // animation, so an Animation settles to "finished" immediately — on a
+    // MACROTASK, so a caller assigning `onfinish` AFTER animate() (Svelte 5's
+    // transition system does exactly this) still sees it fire. Critical, not
+    // cosmetic: `element.animate(...)` being undefined threw inside Svelte 5's
+    // intro-transition effect, and a thrown effect ABORTS the whole effect-
+    // flush batch — so a sibling effect in the same flush (a TipTap/ProseMirror
+    // editor's mount) silently never ran, leaving Open WebUI's chat input
+    // unrendered. `finished` always resolves exactly once (finish/cancel/auto),
+    // so nothing awaiting it hangs or reports an unhandled rejection. ---
+    {
+        class Animation extends EventTarget {
+            constructor(effect, timeline) {
+                super();
+                this.effect = effect || null;
+                this.timeline = timeline || null;
+                this.id = "";
+                this.playbackRate = 1;
+                this.startTime = 0;
+                this.currentTime = 0;
+                this.pending = false;
+                this.playState = "running";
+                this.replaceState = "active";
+                this.onfinish = null;
+                this.oncancel = null;
+                this.onremove = null;
+                this._done = false;
+                let res;
+                this.finished = new Promise((r) => { res = r; });
+                const self = this;
+                this._settle = (kind) => {
+                    if (self._done) return;
+                    self._done = true;
+                    self.playState = kind === "cancel" ? "idle" : "finished";
+                    const ev = new Event(kind === "cancel" ? "cancel" : "finish");
+                    const cb = kind === "cancel" ? self.oncancel : self.onfinish;
+                    if (typeof cb === "function") { try { cb.call(self, ev); } catch (e) {} }
+                    self.dispatchEvent(ev);
+                    res(self);
+                };
+                setTimeout(() => this._settle("finish"), 0);
+            }
+            play() {}
+            pause() { this.playState = "paused"; }
+            reverse() {}
+            finish() { this._settle("finish"); }
+            cancel() { this._settle("cancel"); }
+            updatePlaybackRate(r) { this.playbackRate = r; }
+            persist() {}
+            commitStyles() {}
+        }
+        g.Animation = Animation;
+        Element.prototype.animate = function (keyframes, options) { return new Animation(null, null); };
+        Element.prototype.getAnimations = function () { return []; };
+        if (g.document) {
+            g.document.getAnimations = function () { return []; };
+            try { g.document.timeline = { currentTime: 0 }; } catch (e) {}
+        }
+    }
     // --- Intl: an en-only prelude shim. Measured 2026-06-12: Boa's
     // bundled ICU costs +11MB and its DateTimeFormat/DisplayNames are
     // broken anyway. Honest-enough English output for a terminal;
@@ -6262,6 +6883,49 @@ const PRELUDE: &str = r##"
     }
     g.MessagePort = MessagePort; g.MessageChannel = MessageChannel;
 
+    // BroadcastChannel: same-origin cross-context messaging. A terminal
+    // browser has one page (no other tabs/workers), so the only peers are
+    // other channels of the same name in THIS page — we deliver to them
+    // (excluding the sender, per spec) on a macrotask, and a lone channel
+    // simply never receives, exactly as a single tab would. SvelteKit opens
+    // one at boot for session sync; a missing global was a ReferenceError
+    // that aborted the whole app mount. `BC` maps name→array of live
+    // channels (an array, never iterated as a Boa Map — see the MO trap).
+    const BC = new Map();
+    class BroadcastChannel extends EventTarget {
+        constructor(name) {
+            super();
+            this.name = String(name);
+            this.onmessage = null; this.onmessageerror = null;
+            this.__closed = false;
+            let list = BC.get(this.name);
+            if (!list) { list = []; BC.set(this.name, list); }
+            list.push(this);
+        }
+        postMessage(message) {
+            if (this.__closed) throw new DOMException("channel is closed", "InvalidStateError");
+            const list = BC.get(this.name) || [];
+            for (const ch of list.slice()) {
+                if (ch === this || ch.__closed) continue;
+                g.setTimeout(() => {
+                    if (ch.__closed) return;
+                    const ev = new MessageEvent("message", {
+                        data: message,
+                        origin: (g.location && g.location.origin) || "",
+                    });
+                    if (typeof ch.onmessage === "function") { try { ch.onmessage.call(ch, ev); } catch (e) {} }
+                    ch.dispatchEvent(ev);
+                }, 0);
+            }
+        }
+        close() {
+            this.__closed = true;
+            const list = BC.get(this.name);
+            if (list) { const i = list.indexOf(this); if (i >= 0) list.splice(i, 1); }
+        }
+    }
+    g.BroadcastChannel = BroadcastChannel;
+
     // Flatten a header map ({lowercased-name: value}) into the `k\nv\nk\nv`
     // blob the `__http_fetch` syscalls forward to the request. Lets a page's
     // `setRequestHeader`/`init.headers` (X-Requested-With, Authorization, …)
@@ -6438,6 +7102,104 @@ mod tests {
         eprintln!("  - parse+compile:                 {:?}", parse_acc / N);
         eprintln!("  - evaluate:                      {:?}", eval_acc / N);
         eprintln!("tiny post-prelude page call:       {tiny_call:?}");
+    }
+
+    /// What does the MutationObserver path actually COST on this engine?
+    /// "Reaction time" has three parts: recording overhead per mutation (with
+    /// vs without observers, plus the extra a body-rooted `subtree` observer
+    /// adds via `__dom_contains`); batched delivery cost (the microtask that
+    /// invokes callbacks); and the lone-mutation round trip (one change → its
+    /// callback, NOT amortized — the closest thing to a single interaction's
+    /// reaction latency). Run (release recommended; debug is ~10-20x slower):
+    /// `cargo test --release mutation_observer_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual measurement"]
+    fn mutation_observer_bench() {
+        fn build() -> Context {
+            let html = r#"<html><head></head><body><div id="root"></div></body></html>"#;
+            let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
+            let mut ctx = page_context_with(None).0;
+            {
+                let mut host = ctx.realm().host_defined_mut();
+                host.insert(PageDom(dom.clone()));
+                host.insert(PageStore {
+                    map: Default::default(),
+                    origin: String::from("https://example.com"),
+                });
+            }
+            register_syscalls(&mut ctx).unwrap();
+            let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 640, height: 384 };"#;
+            ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+            ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+            ctx
+        }
+
+        const M: u32 = 5000;
+        eprintln!("--- MutationObserver cost (M={M} appendChild; use --release) ---");
+        // setup script -> ()  (registers the observers under test)
+        let scenarios: &[(&str, &str)] = &[
+            ("no observers (raw appendChild)", ""),
+            (
+                "1 direct observer (childList)",
+                "new MutationObserver(function(){}).observe(root,{childList:true});",
+            ),
+            (
+                "1 subtree observer on <body>",
+                "new MutationObserver(function(){}).observe(document.body,{childList:true,subtree:true});",
+            ),
+            (
+                "8 subtree observers on <body>",
+                "for(var k=0;k<8;k++)new MutationObserver(function(){}).observe(document.body,{childList:true,subtree:true});",
+            ),
+        ];
+        for (label, setup) in scenarios {
+            let mut ctx = build();
+            ctx.eval(Source::from_bytes(
+                format!("var root=document.getElementById('root');{setup}").as_bytes(),
+            ))
+            .unwrap();
+            let loop_src = format!(
+                "for(var i=0;i<{M};i++){{root.appendChild(document.createElement('span'));}}"
+            );
+            let t = Instant::now();
+            ctx.eval(Source::from_bytes(loop_src.as_bytes())).unwrap();
+            let mutate = t.elapsed();
+            let t = Instant::now();
+            ctx.run_jobs().unwrap(); // the batched MutationObserver delivery runs here
+            let deliver = t.elapsed();
+            eprintln!(
+                "{label:34} mutate {mutate:>10.3?} ({:>6.0} ns/op)  deliver {deliver:>10.3?}",
+                mutate.as_nanos() as f64 / M as f64
+            );
+        }
+
+        // Lone mutation -> callback round trip: a single change, then drain its
+        // delivery, repeated. Includes per-turn microtask scheduling that a big
+        // batch amortizes away — the honest single-interaction reaction time.
+        {
+            let mut ctx = build();
+            ctx.eval(Source::from_bytes(
+                b"var root=document.getElementById('root');globalThis.__hits=0;\
+                  new MutationObserver(function(){globalThis.__hits++;}).observe(root,{childList:true});",
+            ))
+            .unwrap();
+            const R: u32 = 2000;
+            let t = Instant::now();
+            for _ in 0..R {
+                ctx.eval(Source::from_bytes(
+                    b"root.appendChild(document.createElement('i'));",
+                ))
+                .unwrap();
+                ctx.run_jobs().unwrap();
+            }
+            let rt = t.elapsed() / R;
+            let hits = ctx
+                .eval(Source::from_bytes(b"globalThis.__hits"))
+                .unwrap()
+                .to_number(&mut ctx)
+                .unwrap();
+            eprintln!("lone mutation -> callback round trip: {rt:?}  (deliveries={hits})");
+        }
     }
 
     /// Engine profiler: load an arbitrary JS bundle into a faithful page
@@ -7453,6 +8215,122 @@ mod tests {
         assert!(
             out.contains("alpha") && out.contains("beta") && out.contains("gamma"),
             "{out}"
+        );
+    }
+
+    /// Stimulus is the purest MutationObserver-driven framework: it connects a
+    /// controller to any element that GAINS `data-controller`, via a
+    /// MutationObserver watching the document. Here the element is injected
+    /// AFTER `Application.start()` is already observing, so ONLY our
+    /// MutationObserver can connect it — `connect()` running proves live MO
+    /// delivery end-to-end through a real framework.
+    ///   cd target/canary && curl -LO https://unpkg.com/@hotwired/stimulus@3/dist/stimulus.umd.js
+    #[test]
+    #[ignore = "manual canary: needs target/canary/stimulus.umd.js"]
+    fn stimulus_mutation_observer_canary() {
+        let Ok(stimulus) = std::fs::read("target/canary/stimulus.umd.js") else {
+            eprintln!("no target/canary/stimulus.umd.js");
+            return;
+        };
+        let html = "<html><head><script src='/stimulus.js'></script></head>\
+            <body><div id='host'></div><script>\
+            var app = Stimulus.Application.start();\
+            app.register('hello', class extends Stimulus.Controller {\
+              connect() { this.element.textContent = 'STIMULUS-CONNECTED'; }\
+            });\
+            setTimeout(function () {\
+              var d = document.createElement('div');\
+              d.setAttribute('data-controller', 'hello');\
+              document.getElementById('host').appendChild(d);\
+            }, 10);\
+            </script></body></html>";
+        let mut env = PageEnv::bare("https://example.com/");
+        env.externals = vec![("/stimulus.js".to_string(), Some(stimulus))];
+        let (out, outcome) = transform(html, &env);
+        eprintln!("stimulus outcome: {outcome:?}");
+        assert!(!outcome.panicked, "Stimulus panicked the engine");
+        assert!(
+            out.contains("STIMULUS-CONNECTED"),
+            "Stimulus's MutationObserver must connect a dynamically-added controller: {out}"
+        );
+    }
+
+    /// Alpine uses a MutationObserver to initialize `x-data` components added
+    /// after start. We inject the component only after `alpine:initialized`
+    /// (observer live), so it is Alpine's MutationObserver — not its initial
+    /// tree walk — that runs the new node's `x-init`.
+    ///   cd target/canary && curl -L -o alpine.min.js https://unpkg.com/alpinejs@3/dist/cdn.min.js
+    #[test]
+    #[ignore = "manual canary: needs target/canary/alpine.min.js"]
+    fn alpine_mutation_observer_canary() {
+        let Ok(alpine) = std::fs::read("target/canary/alpine.min.js") else {
+            eprintln!("no target/canary/alpine.min.js");
+            return;
+        };
+        // Alpine's CDN auto-start uses a readiness helper that doesn't fire in
+        // our load sequence, so start it explicitly (the documented manual
+        // path; Alpine guards against a double start). By `alpine:initialized`
+        // its MutationObserver is live, so the node injected then is initialized
+        // by that observer — exactly what we're proving.
+        let html = "<html><head><script src='/alpine.js'></script></head>\
+            <body><div id='host'></div><script>\
+            document.addEventListener('alpine:initialized', function () {\
+              var d = document.createElement('div');\
+              d.setAttribute('x-data', '{}');\
+              d.setAttribute('x-init', \"$el.textContent = 'ALPINE-INIT'\");\
+              document.getElementById('host').appendChild(d);\
+            });\
+            window.Alpine.start();\
+            </script></body></html>";
+        let mut env = PageEnv::bare("https://example.com/");
+        env.externals = vec![("/alpine.js".to_string(), Some(alpine))];
+        let (out, outcome) = transform(html, &env);
+        eprintln!("alpine outcome: {outcome:?}");
+        assert!(!outcome.panicked, "Alpine panicked the engine");
+        assert!(
+            out.contains("ALPINE-INIT"),
+            "Alpine's MutationObserver must initialize a dynamically-added x-data node: {out}"
+        );
+    }
+
+    /// htmx 2.x uses NO MutationObserver (it processes content via
+    /// `htmx.process()` / swaps), so it was never an MO proof — it was vendored
+    /// alongside the MO canaries as a common-framework boot check. The honest
+    /// finding: htmx is CURRENTLY BLOCKED at module init by a missing
+    /// `XPathEvaluator` global — it does
+    /// `(new XPathEvaluator).createExpression('.//*[@*[starts-with(name(),"hx-")…]]')`
+    /// to find `hx-*` elements (CSS can't match an attribute-name prefix).
+    /// Unblocking htmx needs a real XPath engine — a separate compat task, NOT
+    /// part of MutationObserver. What this canary DOES pin is the robustness
+    /// property that matters here: a missing platform global makes htmx DEGRADE
+    /// GRACEFULLY (the page still renders, the engine does not abort), surfacing
+    /// the gap as an `outcome.error` rather than a crash.
+    ///   cd target/canary && curl -L -o htmx.min.js https://unpkg.com/htmx.org@2/dist/htmx.min.js
+    #[test]
+    #[ignore = "manual canary: needs target/canary/htmx.min.js"]
+    fn htmx_boot_documents_xpath_gap() {
+        let Ok(htmx) = std::fs::read("target/canary/htmx.min.js") else {
+            eprintln!("no target/canary/htmx.min.js");
+            return;
+        };
+        let html = "<html><head><script src='/htmx.js'></script></head>\
+            <body><div id='present' hx-get='/x'>present</div></body></html>";
+        let mut env = PageEnv::bare("https://example.com/");
+        env.externals = vec![("/htmx.js".to_string(), Some(htmx))];
+        let (out, outcome) = transform(html, &env);
+        eprintln!("htmx outcome: {outcome:?}");
+        // Graceful degrade: no engine abort, the page content survives.
+        assert!(
+            !outcome.panicked,
+            "a missing global must not abort the engine"
+        );
+        assert!(out.contains("present"), "the page must still render: {out}");
+        // Document the known blocker (a tripwire: if htmx ever boots clean here,
+        // this flips and we update the note — htmx still wouldn't use MO).
+        assert!(
+            outcome.errors.iter().any(|e| e.contains("XPathEvaluator")),
+            "expected the XPathEvaluator boot gap; htmx errors were: {:?}",
+            outcome.errors
         );
     }
 
@@ -9624,6 +10502,242 @@ mod tests {
         );
     }
 
+    // --- MutationObserver -------------------------------------------------
+
+    #[test]
+    fn mutation_observer_reports_childlist_add_and_remove() {
+        // Two synchronous mutations COALESCE into one microtask delivery with
+        // two records — the spec's compound-microtask batching.
+        let (out, outcome) = page(
+            r##"<body><div id="t"></div><pre id="out"></pre><script>
+            var out = document.getElementById('out'), t = document.getElementById('t');
+            var log = [];
+            new MutationObserver(function (recs) {
+                for (var i = 0; i < recs.length; i++) {
+                    var r = recs[i];
+                    log.push(r.type + ':+' + r.addedNodes.length + '-' + r.removedNodes.length);
+                }
+                out.textContent = log.join(' ');
+            }).observe(t, { childList: true });
+            var span = document.createElement('span');
+            t.appendChild(span);
+            t.removeChild(span);
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("childList:+1-0 childList:+0-1"), "{out}");
+    }
+
+    #[test]
+    fn mutation_observer_reports_attributes_with_old_value_and_filter() {
+        let (out, outcome) = page(
+            r##"<body><div id="t" class="a" data-x="1"></div><pre id="out"></pre><script>
+            var out = document.getElementById('out'), t = document.getElementById('t');
+            var log = [];
+            new MutationObserver(function (recs) {
+                for (var r of recs) log.push(r.attributeName + '=' + r.oldValue);
+                out.textContent = log.join(' ');
+            }).observe(t, { attributes: true, attributeOldValue: true, attributeFilter: ['class'] });
+            t.setAttribute('class', 'b');   // observed (filter includes class)
+            t.setAttribute('data-x', '2');  // filtered out
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // The observer's report is exactly the one filtered-in attribute: the
+        // <pre> holds "class=a" (old value of class) and nothing about data-x.
+        // (The div itself still carries data-x="2" in the serialized markup —
+        // assert on the <pre> content, not the whole document.)
+        assert!(
+            out.contains(">class=a</pre>"),
+            "filtered report should be only class=a: {out}"
+        );
+    }
+
+    #[test]
+    fn mutation_observer_reports_character_data_with_old_value() {
+        let (out, outcome) = page(
+            r##"<body><p id="t">hello</p><pre id="out"></pre><script>
+            var out = document.getElementById('out');
+            var t = document.getElementById('t').firstChild;  // the text node
+            new MutationObserver(function (recs) {
+                out.textContent = recs[0].type + ':' + recs[0].oldValue;
+            }).observe(t, { characterData: true, characterDataOldValue: true });
+            t.data = 'world';
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("characterData:hello"), "{out}");
+    }
+
+    #[test]
+    fn mutation_observer_subtree_matches_deep_but_non_subtree_does_not() {
+        // `subtree:true` sees a mutation on a deep descendant (via the
+        // __dom_contains ancestor syscall); a plain registration on the same
+        // root sees only its direct children.
+        let (out, outcome) = page(
+            r##"<body><div id="root"><div id="mid"><span id="leaf"></span></div></div>
+            <pre id="a"></pre><pre id="b"></pre><script>
+            var root = document.getElementById('root'), leaf = document.getElementById('leaf');
+            var na = 0, nb = 0;
+            new MutationObserver(function (r) { na += r.length; document.getElementById('a').textContent = 'a=' + na; })
+                .observe(root, { childList: true, subtree: true });
+            new MutationObserver(function (r) { nb += r.length; document.getElementById('b').textContent = 'b=' + nb; })
+                .observe(root, { childList: true });   // no subtree
+            leaf.appendChild(document.createElement('b'));  // deep descendant mutation
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("a=1"),
+            "subtree observer must see the deep mutation: {out}"
+        );
+        assert!(
+            !out.contains("b=1"),
+            "non-subtree observer must NOT see a descendant mutation: {out}"
+        );
+    }
+
+    #[test]
+    fn mutation_observer_disconnect_and_take_records() {
+        let (out, outcome) = page(
+            r##"<body><div id="t"></div><pre id="out"></pre><script>
+            var out = document.getElementById('out'), t = document.getElementById('t');
+            var fired = 0;
+            var mo = new MutationObserver(function () { fired++; });
+            mo.observe(t, { childList: true });
+            t.appendChild(document.createElement('a'));   // queues a record
+            var pending = mo.takeRecords().length;        // drains it synchronously
+            mo.disconnect();
+            t.appendChild(document.createElement('b'));   // ignored after disconnect
+            out.textContent = 'pending=' + pending + ' fired=' + fired;
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // takeRecords drained the queued record, so the async callback saw
+        // nothing; the post-disconnect mutation never queued.
+        assert!(out.contains("pending=1 fired=0"), "{out}");
+    }
+
+    #[test]
+    fn mutation_observer_delivers_as_microtask_before_timers() {
+        // Ordering proof: synchronous code first; microtasks (a promise
+        // reaction queued before the mutation, then the MO delivery) run before
+        // the macrotask timer. This is the async-XHR-vs-promise ordering trap's
+        // cousin — getting it wrong reorders observer callbacks against fetch.
+        let (out, outcome) = page(
+            r##"<body><div id="t"></div><pre id="out"></pre><script>
+            var seq = [], t = document.getElementById('t');
+            function finish() { document.getElementById('out').textContent = seq.join(','); }
+            new MutationObserver(function () { seq.push('mo'); finish(); }).observe(t, { childList: true });
+            Promise.resolve().then(function () { seq.push('promise'); finish(); });
+            setTimeout(function () { seq.push('timeout'); finish(); }, 0);
+            t.appendChild(document.createElement('x'));   // queues the MO microtask
+            seq.push('sync');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("sync,promise,mo,timeout"), "ordering: {out}");
+    }
+
+    #[test]
+    fn mutation_observer_callback_mutation_requeues_then_settles() {
+        // A callback that itself mutates the observed tree re-queues a delivery
+        // (legal, spec) and the chain terminates once it stops mutating —
+        // proving the reset-on-quiescence loop guard doesn't false-trip.
+        let (out, outcome) = page(
+            r##"<body><div id="t"></div><pre id="out"></pre><script>
+            var t = document.getElementById('t'), turns = 0;
+            new MutationObserver(function () {
+                turns++;
+                if (turns < 3) t.appendChild(document.createElement('i'));
+                document.getElementById('out').textContent = 'turns=' + turns;
+            }).observe(t, { childList: true });
+            t.appendChild(document.createElement('i'));   // turn 1
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("turns=3"), "{out}");
+    }
+
+    #[test]
+    fn mutation_observer_runaway_loop_is_capped_and_degrades() {
+        // An observer that mutates the observed node on EVERY delivery feeds
+        // itself forever; the microtask-checkpoint lid trips and disables
+        // delivery for the page (degrade, not hang).
+        let (_out, outcome) = page(
+            r##"<body><div id="t"></div><script>
+            var t = document.getElementById('t');
+            new MutationObserver(function () { t.setAttribute('data-n', String(Math.random())); })
+                .observe(t, { attributes: true });
+            t.setAttribute('data-n', '0');   // kick off the self-feeding loop
+            </script></body>"##,
+        );
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("MutationObserver") && e.contains("disabled")),
+            "runaway observer loop should trip the lid: {:?}",
+            outcome.errors
+        );
+    }
+
+    #[test]
+    fn live_click_injection_is_seen_by_a_subtree_observer() {
+        // The dynamic-enhancement pattern (Stimulus / Alpine / htmx): a
+        // body-rooted subtree observer enhances nodes added by a LATER
+        // interaction. The click injects a <span data-enhance>; the observer
+        // rewrites its text. Without a live MutationObserver this never fires.
+        let (handle, mut events) = live(
+            r##"<body><div id="host"></div><button id="go">go</button><script>
+            new MutationObserver(function (recs) {
+                for (var r of recs) for (var i = 0; i < r.addedNodes.length; i++) {
+                    var n = r.addedNodes[i];
+                    if (n.nodeType === 1 && n.hasAttribute && n.hasAttribute('data-enhance')) n.textContent = 'ENHANCED';
+                }
+            }).observe(document.body, { childList: true, subtree: true });
+            document.getElementById('go').addEventListener('click', function () {
+                var s = document.createElement('span');
+                s.setAttribute('data-enhance', '');
+                document.getElementById('host').appendChild(s);
+            });
+            </script></body>"##,
+        );
+        let mut first = String::new();
+        for _ in 0..4 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) | Some(PageEvt::Static { html, .. }) => {
+                    first = html;
+                    if first.contains(">go<") {
+                        break;
+                    }
+                }
+                other => panic!("expected a render, got {other:?}"),
+            }
+        }
+        let go = first
+            .find("id=\"go\"")
+            .and_then(|at| first[..at].rfind("x-trust-js:"))
+            .map(|i| {
+                first[i + "x-trust-js:".len()..]
+                    .split(':')
+                    .next()
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .expect("a clickable marker for the button");
+        handle.cmds.blocking_send(PageCmd::Click(go)).unwrap();
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("expected Updated after the click");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            html.contains("ENHANCED"),
+            "the subtree observer must enhance the click-injected node: {html}"
+        );
+    }
+
     #[test]
     fn spa_router_platform_surface_works() {
         // The router-slot recipe (archive.org's router): an <a> as URL
@@ -9987,6 +11101,180 @@ mod tests {
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("rejected+xhr-error"), "{out}");
         assert_eq!(outcome.fetches, 0);
+    }
+
+    #[test]
+    fn current_script_points_at_the_executing_classic_script() {
+        // `document.currentScript` is the classic script element while its own
+        // code runs (its parent is the element it sits in), and null once that
+        // run is over (here: in the trailing microtask). SvelteKit reads
+        // `document.currentScript.parentElement` to find its mount node.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             var s = document.currentScript;\
+             var rec = (s ? s.tagName : 'null') + ',' + (s ? s.parentNode.tagName : '-');\
+             Promise.resolve().then(function(){\
+               document.getElementById('o').textContent =\
+                 rec + ',after=' + (document.currentScript ? 'set' : 'null');\
+             });\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("SCRIPT,BODY,after=null"),
+            "currentScript during/after: {out}"
+        );
+    }
+
+    #[test]
+    fn import_meta_url_is_the_modules_own_url() {
+        // `import.meta.url` is the module's own absolute URL — bundlers resolve
+        // sibling chunks with `new URL("./x.js", import.meta.url)`, so a
+        // missing url makes every relative resolution throw "Invalid URL".
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script type=module>\
+             document.getElementById('o').textContent =\
+               'meta=' + new URL('./sib.js', import.meta.url).href;\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("meta=https://example.com/a/sib.js"),
+            "import.meta.url resolves siblings: {out}"
+        );
+    }
+
+    #[test]
+    fn broadcast_channel_delivers_to_same_name_peers_not_the_sender() {
+        // Same-name channels in this page receive each other's messages; the
+        // sender does not receive its own. SvelteKit opens one at boot — a
+        // missing global was a ReferenceError that aborted the whole mount.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             var self_got = false, peer = '';\
+             var a = new BroadcastChannel('sync');\
+             var b = new BroadcastChannel('sync');\
+             a.onmessage = function(){ self_got = true; };\
+             b.onmessage = function(e){ peer = e.data; };\
+             a.postMessage('hello');\
+             setTimeout(function(){\
+               document.getElementById('o').textContent =\
+                 'peer=' + peer + ',self=' + self_got;\
+             }, 0);\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("peer=hello,self=false"),
+            "BroadcastChannel delivery: {out}"
+        );
+    }
+
+    #[test]
+    fn streams_transform_pipeline_runs() {
+        // The Open WebUI shape: subclass TransformStream, pipe a readable
+        // THROUGH it, read the transformed output. A missing TransformStream
+        // threw a ReferenceError at module-eval (`class X extends undefined`)
+        // that 500'd the authenticated route.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             class Upper extends TransformStream {\
+               constructor(){ super({ transform(chunk, c){ c.enqueue(String(chunk).toUpperCase()); } }); }\
+             }\
+             const rs = new ReadableStream({ start(c){ c.enqueue('ab'); c.enqueue('cd'); c.close(); } });\
+             (async () => {\
+               const reader = rs.pipeThrough(new Upper()).getReader();\
+               let acc = '';\
+               for (;;) { const r = await reader.read(); if (r.done) break; acc += r.value; }\
+               document.getElementById('o').textContent = 'got=' + acc;\
+             })();\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("got=ABCD"), "transform pipeline: {out}");
+    }
+
+    #[test]
+    fn text_decoder_stream_decodes_piped_bytes() {
+        // TextDecoderStream is a TransformStream that decodes Uint8Array
+        // chunks to text — the SSE pipeline's first stage.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             const rs = new ReadableStream({ start(c){ c.enqueue(new Uint8Array([104,105])); c.close(); } });\
+             (async () => {\
+               const reader = rs.pipeThrough(new TextDecoderStream()).getReader();\
+               let acc = '';\
+               for (;;) { const r = await reader.read(); if (r.done) break; acc += r.value; }\
+               document.getElementById('o').textContent = 'dec=' + acc;\
+             })();\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("dec=hi"), "decoder stream: {out}");
+    }
+
+    #[test]
+    fn element_animate_finishes_so_transition_callbacks_run() {
+        // Web Animations API: a terminal animation completes instantly, firing
+        // onfinish on a MACROTASK so a caller that assigns onfinish AFTER
+        // animate() (Svelte 5's transition system does exactly this) still sees
+        // it. Without it `element.animate` was undefined and threw inside
+        // Svelte's transition effect, aborting the effect-flush batch — so a
+        // sibling effect (a TipTap/ProseMirror editor mount) never ran.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             const el = document.getElementById('o');\
+             const a = el.animate([{opacity:0},{opacity:1}], {duration:200, fill:'forwards'});\
+             a.onfinish = () => { el.textContent = 'finished:' + a.playState; };\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("finished:finished"), "animate onfinish: {out}");
+    }
+
+    #[test]
+    fn svg_element_interfaces_are_defined() {
+        // SvelteKit's link handler branches on `e instanceof SVGAElement` — a
+        // bare SVGAElement reference was a ReferenceError that broke its link
+        // interception. The whole SVG interface zoo is exposed like the HTML one.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             document.getElementById('o').textContent = 'a=' + (typeof SVGAElement)\
+               + ',svg=' + (typeof SVGSVGElement) + ',path=' + (typeof SVGPathElement)\
+               + ',base=' + (SVGAElement.prototype instanceof SVGElement);\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("a=function,svg=function,path=function,base=true"),
+            "SVG interfaces: {out}"
+        );
+    }
+
+    #[test]
+    fn microtask_rejected_promise_with_catch_is_not_unhandled() {
+        // A promise that rejects from inside a queued microtask, with
+        // `.then().catch()` attached synchronously before it rejects, is
+        // HANDLED — the rejection tracker must not report it. This is the
+        // i18next/Vite glob-import-miss shape: the bundler returns
+        // `new Promise((res, rej) => queueMicrotask(rej.bind(null, err)))`
+        // and i18next attaches `.then(...).catch(cb)`. A false "unhandled
+        // rejection" here means we diverge from a real browser.
+        let (out, outcome) = page(
+            "<body><div id=t></div><script>\
+             function boom(){ return new Promise(function(res, rej){ \
+               queueMicrotask(rej.bind(null, new Error('miss'))); }); }\
+             boom().then(function(){}).catch(function(){ \
+               document.getElementById('t').textContent = 'caught'; });\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("caught"), "catch handler ran: {out}");
+        assert!(
+            outcome.console.is_empty(),
+            "no unhandled rejection: {:?}",
+            outcome.console
+        );
     }
 
     #[test]

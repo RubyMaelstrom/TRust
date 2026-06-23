@@ -218,12 +218,19 @@ impl<V> OrderedMap<V> {
 pub(crate) struct MapLock(JsObject);
 impl Finalize for MapLock {
     fn finalize(&self) {
-        // Avoids panicking inside `Finalize`, with the downside of slightly increasing
-        // memory usage if the map could not be borrowed.
-        // TODO: try_downcast_mut
-        self.0
-            .downcast_mut::<OrderedMap<JsValue>>()
-            .expect("MapLock does not point to a map")
-            .unlock();
+        // Avoids panicking inside `Finalize`, with the downside of slightly
+        // increasing memory usage if the map could not be borrowed. Finalizers
+        // must never panic — a panic here aborts the GC (and the whole page,
+        // as a non-unwinding abort). The map this lock guards can still be
+        // borrowed when the lock is finalized (GC finalization order is not
+        // guaranteed: a live `for…of` iterator holds a borrow while a stale
+        // lock pointing at the same map is swept), so use the non-panicking
+        // `try_downcast_mut` rather than `downcast_mut().expect()`, which
+        // panicked with `BorrowMutError` on archive.org's Map-heavy SPA route
+        // transitions and core-dumped the process. This mirrors the identical
+        // fix already applied to `SetLock` (see `set/ordered_set.rs`).
+        if let Some(mut map) = self.0.try_downcast_mut::<OrderedMap<JsValue>>() {
+            map.unlock();
+        }
     }
 }

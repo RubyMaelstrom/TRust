@@ -876,6 +876,8 @@ async fn read_response<R: AsyncRead + Unpin>(
         reusable = false;
         read_to_eof(io).await?
     };
+    // Undo any (unsolicited) Content-Encoding now the body is fully framed.
+    let body = decode_content_encoding(&headers, body);
     Ok((status, headers, body, reusable, set_cookies))
 }
 
@@ -975,6 +977,81 @@ async fn read_to_eof<R: AsyncRead + Unpin>(io: &mut BufReader<R>) -> Result<Vec<
             ));
         }
     }
+}
+
+/// Undo `Content-Encoding` on a fully-read body. We never advertise an
+/// encoding (`Accept-Encoding: identity`), but some servers compress anyway
+/// (archive.org sends `Content-Encoding: gzip` unsolicited); a browser
+/// decodes it regardless, so we do too. Layering: this runs AFTER framing
+/// (Content-Length / dechunking) — `Content-Encoding` is the payload, not
+/// the message framing, so it never affects connection reuse.
+///
+/// `gzip`/`deflate` only (pure-Rust miniz_oxide via flate2). Brotli/zstd are
+/// left as-is — we don't advertise them, so a compliant server won't send
+/// them; if a misbehaving one does, the parser sees the raw bytes (the best
+/// we can do without those decoders). Truncated streams are tolerated like a
+/// missing TLS close_notify: keep whatever decoded.
+fn decode_content_encoding(headers: &Headers, body: Vec<u8>) -> Vec<u8> {
+    let Some(enc) = headers.get("content-encoding") else {
+        return body;
+    };
+    // A response MAY stack codings (applied left-to-right); undo them
+    // right-to-left. In practice it's a single coding.
+    let codings: Vec<String> = enc
+        .split(',')
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    let mut body = body;
+    for coding in codings.iter().rev() {
+        body = match coding.as_str() {
+            "identity" => body,
+            "gzip" | "x-gzip" => inflate_tolerant(flate2::read::GzDecoder::new(body.as_slice())),
+            "deflate" => decode_deflate(&body),
+            // Brotli/zstd/unknown: can't undo it, so stop and hand back what
+            // we have (any remaining leftward codings stay applied).
+            _ => break,
+        };
+    }
+    body
+}
+
+/// `Content-Encoding: deflate` is ambiguous in the wild: the spec means a
+/// zlib stream (RFC 1950), but many servers send a bare DEFLATE stream.
+/// Browsers cope by trying zlib first, then raw — we do the same.
+fn decode_deflate(body: &[u8]) -> Vec<u8> {
+    let zlib = inflate_tolerant(flate2::read::ZlibDecoder::new(body));
+    if !zlib.is_empty() || body.is_empty() {
+        return zlib;
+    }
+    // Zlib decode produced nothing from non-empty input: it's likely a raw
+    // DEFLATE stream mislabelled `deflate`. Retry without the zlib wrapper.
+    inflate_tolerant(flate2::read::DeflateDecoder::new(body))
+}
+
+/// Read a decoder to its end, keeping whatever decoded before an error.
+/// Mirrors our read-to-EOF tolerance — a server that cuts the stream short
+/// (or omits a clean trailer/CRC) still yields the bytes we got. Caps output
+/// at `MAX_BODY` as a decompression-bomb guard (the compressed body is
+/// already capped, but it can inflate far past that).
+fn inflate_tolerant<R: std::io::Read>(mut dec: R) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        match dec.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.len() >= MAX_BODY {
+                    out.truncate(MAX_BODY);
+                    break;
+                }
+            }
+            // Truncated stream / bad trailer / corrupt data: keep what we have.
+            Err(_) => break,
+        }
+    }
+    out
 }
 
 /// Decode the body per the content-type charset: UTF-8 by default,
@@ -2404,6 +2481,87 @@ mod tests {
         server.abort();
     }
 
+    /// Regression: a load-time JS error must be counted ONCE, not once per
+    /// render. The actor paints a shell (errors → `response.js`) then a
+    /// filled settle render. `Updated` is a DELTA, so the settle emit must
+    /// NOT re-carry the load error — else the app's `page_js_errors +=`
+    /// double-counts it and a single error shows as `· JS:2!`.
+    #[tokio::test]
+    async fn a_load_error_is_reported_once_across_shell_and_settle() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let reply: &[u8] = if text.starts_with("GET /page ") {
+                        // A script throws at load (the one error), there's a
+                        // clickable (so a shell paints), and a background fetch
+                        // mutates the DOM during settle (so a second render
+                        // follows on the live channel).
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                          <body><button onclick=\"void 0\">menu</button>\
+                          <div id=tiles>SHELL</div>\
+                          <script>null.boom;</script>\
+                          <script>document.addEventListener('DOMContentLoaded',function(){\
+                          fetch('/data').then(function(r){return r.text();}).then(function(t){\
+                          document.getElementById('tiles').textContent=t;});});</script></body>"
+                    } else if text.starts_with("GET /data ") {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nBACKGROUND-TILE"
+                    } else {
+                        b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    let _ = sock.write_all(reply).await;
+                });
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut live = response.live.take().expect("clickable page stays live");
+        // The shell (response.js) reports the single load error.
+        assert_eq!(
+            response.js.as_ref().map_or(0, |o| o.errors.len()),
+            1,
+            "the load error is reported once via the shell: {:?}",
+            response.js
+        );
+
+        // The filled settle render mutates the DOM but must NOT re-report the
+        // load error — its outcome is a delta with zero new errors.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), live.events.recv()).await {
+            Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                assert!(
+                    html.contains("BACKGROUND-TILE"),
+                    "filled render carries the fetched content: {html}"
+                );
+                assert_eq!(
+                    outcome.errors.len(),
+                    0,
+                    "settle delta must not re-report the load error: {:?}",
+                    outcome.errors
+                );
+            }
+            other => panic!("expected a filled Updated, got {other:?}"),
+        }
+        server.abort();
+    }
+
     /// Regression for the Lever-A first-paint stamp: a live page's `load`
     /// event must STILL fire after the shell paints. `outcome.elapsed` is
     /// the cumulative-COMPUTE accumulator `run_script`'s budget gate reads
@@ -3039,6 +3197,19 @@ mod tests {
                     .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
             })
             .unwrap_or((80, 24));
+        // TRUST_DIAG_COOKIE="name=value[; name2=value2]": seed the process
+        // cookie jar BEFORE the cold fetch, so a cookie-gated SPA serves its
+        // authenticated render instead of the login shell (the live login
+        // handshake seeds the jar via the signin POST; a one-shot diag can't,
+        // so it otherwise only ever sees the logged-out page).
+        if let Ok(cookies) = std::env::var("TRUST_DIAG_COOKIE") {
+            for c in cookies.split(';') {
+                let c = c.trim();
+                if !c.is_empty() {
+                    set_cookie_from_js(&url, c);
+                }
+            }
+        }
         let mut response = fetch(&Request::get(url)).await.unwrap();
         // TRUST_DIAG_INJECT=<file>: splice a probe <script> at the very top of
         // <head> so it runs before the page's own scripts (mirror-harness style).
@@ -4195,6 +4366,89 @@ customElements.define('lit-counter', LitCounter);
         let body = [b'c', b'a', b'f', 0xe9];
         assert_eq!(decode_body("text/html; charset=ISO-8859-1", &body), "café");
         assert_eq!(decode_body("text/html", "café".as_bytes()), "café");
+    }
+
+    #[tokio::test]
+    async fn decompresses_an_unsolicited_gzip_body() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write as _;
+        // A server forces gzip even though we asked for `identity` — decode
+        // it like a browser would, end to end through read_response.
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(b"<html>hello compressed</html>").unwrap();
+        let gz = e.finish().unwrap();
+        let mut raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+             Content-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            gz.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(&gz);
+        let (status, headers, body, reusable, _) =
+            read_response(&mut BufReader::new(&raw[..])).await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(headers["content-encoding"], "gzip");
+        assert_eq!(body, b"<html>hello compressed</html>");
+        // Decoding is a body transform after framing — the conn stays poolable.
+        assert!(reusable, "intact framing ⇒ still reusable after decode");
+    }
+
+    #[test]
+    fn decodes_deflate_as_zlib_or_raw() {
+        use flate2::{
+            Compression,
+            write::{DeflateEncoder, ZlibEncoder},
+        };
+        use std::io::Write as _;
+        let payload = b"deflate me, twice over, for a little entropy".to_vec();
+        let mut h = Headers::new();
+        h.insert("content-encoding".into(), "deflate".into());
+
+        // The spec form: a zlib-wrapped DEFLATE stream.
+        let mut z = ZlibEncoder::new(Vec::new(), Compression::default());
+        z.write_all(&payload).unwrap();
+        assert_eq!(decode_content_encoding(&h, z.finish().unwrap()), payload);
+
+        // The common mislabelled form: a bare DEFLATE stream. The zlib decode
+        // yields nothing, so we fall back to raw.
+        let mut d = DeflateEncoder::new(Vec::new(), Compression::default());
+        d.write_all(&payload).unwrap();
+        assert_eq!(decode_content_encoding(&h, d.finish().unwrap()), payload);
+    }
+
+    #[test]
+    fn tolerates_a_truncated_gzip_stream() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write as _;
+        let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(&payload).unwrap();
+        let mut gz = e.finish().unwrap();
+        // Cut into the DEFLATE stream itself, not just the trailer.
+        gz.truncate(gz.len().saturating_sub(100));
+        let mut h = Headers::new();
+        h.insert("content-encoding".into(), "gzip".into());
+        let out = decode_content_encoding(&h, gz);
+        // Keep whatever decoded before the stream ran out: a non-empty prefix,
+        // never a panic.
+        assert!(!out.is_empty(), "partial stream still yields its prefix");
+        assert!(payload.starts_with(&out), "decoded bytes are a prefix");
+        assert!(out.len() < payload.len(), "and it really is truncated");
+    }
+
+    #[test]
+    fn passes_through_identity_and_undecodable_encodings() {
+        let raw = b"plain bytes, untouched".to_vec();
+        // No Content-Encoding header.
+        assert_eq!(decode_content_encoding(&Headers::new(), raw.clone()), raw);
+        // identity is a no-op.
+        let mut h = Headers::new();
+        h.insert("content-encoding".into(), "identity".into());
+        assert_eq!(decode_content_encoding(&h, raw.clone()), raw);
+        // br/zstd we don't decode (never advertised) — hand the bytes through.
+        let mut h = Headers::new();
+        h.insert("content-encoding".into(), "br".into());
+        assert_eq!(decode_content_encoding(&h, raw.clone()), raw);
     }
 
     #[test]
