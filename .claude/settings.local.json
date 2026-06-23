@@ -85,7 +85,11 @@
       "Bash(TRUST_NET_DIAG='https://store.steampowered.com/' TRUST_DIAG_VP=200x50 TRUST_NET_DIAG_OUT=/tmp/steam_post.html cargo test --release net_diag -- --ignored --nocapture)",
       "Bash(TRUST_NET_DIAG='https://gelbooru.com/index.php?page=post&s=list&tags=all' TRUST_NET_DIAG_OUT=/tmp/gelbooru.html TRUST_DIAG_VP=200x50 cargo test --release net_diag -- --ignored --nocapture)",
       "Bash(TRUST_NET_DIAG=https://www.pixiv.net/ TRUST_DIAG_VP=200x50 TRUST_NET_DIAG_OUT=/tmp/pixiv_postjs.html TRUST_NET_TRACE=1 cargo test --release net_diag -- --ignored --nocapture)",
-      "Bash(TRUST_NET_DIAG='https://accounts.pixiv.net/login?return_to=https%3A%2F%2Fwww.pixiv.net%2F&lang=ja&source=pc&view_type=page' TRUST_NET_DIAG_OUT=/tmp/pixiv_login.html cargo test --release net_diag -- --ignored --nocapture)"
+      "Bash(TRUST_NET_DIAG='https://accounts.pixiv.net/login?return_to=https%3A%2F%2Fwww.pixiv.net%2F&lang=ja&source=pc&view_type=page' TRUST_NET_DIAG_OUT=/tmp/pixiv_login.html cargo test --release net_diag -- --ignored --nocapture)",
+      "Bash(curl -s -o /dev/null -w \"3000: HTTP %{http_code} server=%header{server}\\\\n\" http://localhost:3000/)",
+      "Bash(curl -s -o /dev/null -w \"8080: HTTP %{http_code} server=%header{server}\\\\n\" http://localhost:8080/)",
+      "Bash(curl -s http://localhost:3000/api/config)",
+      "Bash(curl -s http://localhost:8080/api/config)"
     ]
   }
 }

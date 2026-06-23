@@ -2353,7 +2353,11 @@ struct LoadedPage {
 /// Parse, run scripts, fire lifecycle, settle. Err(outcome) means
 /// "render the original HTML with this outcome" (no scripts, or our
 /// own plumbing failed).
-fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
+fn load_page(
+    html: &str,
+    env: &PageEnv,
+    ws_events: Option<tokio::sync::mpsc::Sender<(usize, crate::ws::WsIn)>>,
+) -> Result<LoadedPage, Outcome> {
     phase("load_page start (DOM parse)");
     let page_url = env.url.as_str();
     let viewport = env.viewport;
@@ -2405,6 +2409,25 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
                 fetched: std::cell::Cell::new(0),
                 dispatch: std::cell::Cell::new(false),
                 cache: env.cache.clone(),
+            });
+        }
+        // Register the WebSocket host BEFORE any script runs. socket.io (Open
+        // WebUI and friends) opens its WS during page load / DOMContentLoaded,
+        // so the very first `new WebSocket(...)` must already find a `PageWs`,
+        // or `__ws_open` returns -1 and the socket is never opened — the page
+        // then has no transport for its streamed reply, and socket.io's
+        // reconnect timer is frozen at rest so it never retries. Only the
+        // resident-actor path supplies a `ws_events` sender; the one-shot
+        // `transform` gets None (no actor to forward inbound frames to).
+        if let (Some(ws_tx), Some(handle), Some(page)) =
+            (ws_events, env.net.clone(), parsed_url.clone())
+        {
+            host.insert(PageWs {
+                handle,
+                page,
+                events: ws_tx,
+                sockets: RefCell::new(std::collections::HashMap::new()),
+                next_id: std::cell::Cell::new(1),
             });
         }
         // Geometry backing: a layout pass over this same arena answers the JS
@@ -2848,7 +2871,7 @@ pub fn css_bake(
 }
 
 pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
-    match load_page(html, env) {
+    match load_page(html, env, None) {
         Err(outcome) => (html.to_string(), outcome),
         Ok(mut page) => {
             settle_page(&mut page);
@@ -2960,21 +2983,25 @@ pub fn spawn_page(
     (PageHandle { cmds: cmd_tx }, evt_rx)
 }
 
-/// Wire up page-owned WebSockets: a forwarder relays every socket's inbound
-/// events into the command stream as `PageCmd::Ws` (dispatched like a click),
-/// and a `PageWs` host object lets the `__ws_*` syscalls spawn/address sockets.
-/// No-op for a no-net page (no `PageNet` → no runtime to spawn on).
-fn setup_page_ws(page: &mut LoadedPage, cmd_self: &tokio::sync::mpsc::Sender<PageCmd>) {
-    let Some((handle, page_url)) = page
+/// Spawn the forwarder relaying a page's inbound WebSocket events into the
+/// command stream as `PageCmd::Ws` (dispatched like a click). The `PageWs` host
+/// object itself is registered earlier, in `load_page`, so a socket opened
+/// during page load already has somewhere to deliver; this just connects its
+/// event channel to the actor. No-op for a no-net page (no runtime handle).
+fn setup_page_ws(
+    page: &LoadedPage,
+    mut ws_evt_rx: tokio::sync::mpsc::Receiver<(usize, crate::ws::WsIn)>,
+    cmd_self: &tokio::sync::mpsc::Sender<PageCmd>,
+) {
+    let Some(handle) = page
         .ctx
         .realm()
         .host_defined()
         .get::<PageNet>()
-        .map(|n| (n.handle.clone(), n.page.clone()))
+        .map(|n| n.handle.clone())
     else {
         return;
     };
-    let (ws_evt_tx, mut ws_evt_rx) = tokio::sync::mpsc::channel::<(usize, crate::ws::WsIn)>(64);
     // A WEAK sender: it must NOT keep the command channel open, or the actor's
     // `cmds.recv()` would never see the app drop the handle and the page would
     // never exit (a real deadlock the test suite caught). The forwarder upgrades
@@ -2988,13 +3015,6 @@ fn setup_page_ws(page: &mut LoadedPage, cmd_self: &tokio::sync::mpsc::Sender<Pag
             }
         }
     });
-    page.ctx.realm().host_defined_mut().insert(PageWs {
-        handle,
-        page: page_url,
-        events: ws_evt_tx,
-        sockets: RefCell::new(std::collections::HashMap::new()),
-        next_id: std::cell::Cell::new(1),
-    });
 }
 
 fn page_actor(
@@ -3004,14 +3024,20 @@ fn page_actor(
     evts: tokio::sync::mpsc::Sender<PageEvt>,
     cmd_self: tokio::sync::mpsc::Sender<PageCmd>,
 ) {
-    let mut page = match load_page(&html, &env) {
+    // Create the WS inbound channel up front so `PageWs` can be registered
+    // DURING `load_page` (before any script runs) — a socket.io app opens its
+    // WebSocket at load time and must find a live host immediately. The
+    // forwarder that relays those events into the command stream is spawned
+    // after load returns (it needs the actor's command sender).
+    let (ws_evt_tx, ws_evt_rx) = tokio::sync::mpsc::channel::<(usize, crate::ws::WsIn)>(64);
+    let mut page = match load_page(&html, &env, Some(ws_evt_tx)) {
         Ok(page) => page,
         Err(outcome) => {
             let _ = evts.blocking_send(PageEvt::Static { html, outcome });
             return;
         }
     };
-    setup_page_ws(&mut page, &cmd_self);
+    setup_page_ws(&page, ws_evt_rx, &cmd_self);
     // Drop our own strong command sender now: only the app's handle should keep
     // the channel open, so `cmds.recv()` returns `None` (and the actor exits)
     // the moment the app drops the page. The WS forwarder holds only a weak one.
@@ -4802,6 +4828,14 @@ const PRELUDE: &str = r##"
         webkitMatchesSelector(s) { return this.matches(s); }
         closest(s) { let e = this; while (e && e.nodeType === 1) { if (e.matches(s)) return e; e = e.parentNode; } return null; }
         click() {} focus() {} blur() {} scrollIntoView() {}
+        // Element scrolling (CSSOM View) is a no-op here — the terminal scrolls
+        // the laid-out document, not individual DOM boxes. They MUST exist as
+        // callable methods, though: a chat/feed that auto-scrolls its container
+        // on new content calls `el.scrollTo(...)` inside a framework effect, and
+        // a missing method throws — which in Svelte 5 aborts the whole effect-
+        // flush batch, so a sibling effect (the one rendering the new content)
+        // silently never runs (Open WebUI's streamed reply rendered nothing).
+        scrollTo() {} scrollBy() {} scroll() {}
         // Geometry: a layout pass over the live DOM gives each element its REAL
         // box (CSS pixels, quantized to terminal cells — what we actually
         // paint). `__dom_rect` returns [left, top, width, height] for a laid-out
@@ -6569,8 +6603,23 @@ const PRELUDE: &str = r##"
         return clone(value);
     };
     trust.tick = function (horizon) {
+        // `horizon` is the look-ahead WINDOW from the current virtual time, not
+        // an absolute cap. The old `t.at <= horizon` compared an absolute timer
+        // deadline against a constant 1000, so once `timers.now` passed ~1000ms
+        // (a few rAF frames / a couple of real-delay timers into the page's
+        // life) NO positive-delay timer could ever fire again — its `at` was
+        // always `now + delay > 1000`. That silently froze ALL timer-driven
+        // work for the rest of the page: long interactive sessions and, most
+        // visibly, a socket-streamed reply whose framework defers its leaf
+        // render via `requestAnimationFrame` (Open WebUI's chat markdown
+        // rendered an empty body — the each-block reconciled but the deferred
+        // token render never ran). Anchoring the window to `timers.now` drains
+        // due timers in rolling windows; long-delay timers still stay frozen
+        // (they fall outside `now + horizon`, and `MAX_TICKS`/`DISPATCH_TICKS`
+        // bound a repeating timer per settle), so "frozen at rest" holds.
         let best = null;
-        for (const t of timers.q) if (t.at <= horizon && (!best || t.at < best.at)) best = t;
+        const limit = timers.now + horizon;
+        for (const t of timers.q) if (t.at <= limit && (!best || t.at < best.at)) best = t;
         if (!best) return false;
         timers.q.splice(timers.q.indexOf(best), 1);
         timers.now = Math.max(timers.now, best.at);
@@ -9268,6 +9317,51 @@ mod tests {
         assert!(
             !html.contains("BANNER"),
             "the 500ms click-driven animation must complete and remove the element: {html}"
+        );
+    }
+
+    #[test]
+    fn timers_keep_firing_after_virtual_time_passes_the_tick_window() {
+        // `__trust.tick(1000)` takes a WINDOW from the current virtual time, not
+        // an absolute 1000ms cap. The old code compared each timer's absolute
+        // deadline against a constant 1000, so once virtual time crept past
+        // ~1000ms (a few rAF frames into the page) NO positive-delay timer could
+        // fire again — every new `at` was `now + delay > 1000`. That silently
+        // froze all timer-driven work, most visibly a socket-streamed reply
+        // whose framework defers its render via rAF (Open WebUI rendered an
+        // empty message body). Here a load-time rAF counter must run 120 frames
+        // (~1920ms of virtual time — well past the old 1000ms wall) to set a
+        // marker; with the bug it stalls around frame 62 (now≈1000) and the
+        // marker never appears.
+        let (_handle, mut events) = live(
+            r##"<body><div id="n">0</div><script>
+            var n = 0;
+            (function step() {
+                n++;
+                document.getElementById('n').textContent = String(n);
+                if (n >= 120) { document.body.setAttribute('data-raf-done', 'yes'); return; }
+                requestAnimationFrame(step);
+            })();
+            </script></body>"##,
+        );
+        let mut rendered = String::new();
+        for _ in 0..4 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) | Some(PageEvt::Static { html, .. }) => {
+                    rendered = html;
+                    break;
+                }
+                Some(PageEvt::Settled) => continue,
+                other => panic!("expected a render, got {other:?}"),
+            }
+        }
+        assert!(
+            rendered.contains("data-raf-done=\"yes\""),
+            "the rAF chain must keep firing past 1000ms of virtual time: {rendered}"
+        );
+        assert!(
+            rendered.contains(">120<"),
+            "the counter should have reached 120: {rendered}"
         );
     }
 

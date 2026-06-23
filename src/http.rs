@@ -1993,6 +1993,98 @@ mod tests {
         server.abort();
     }
 
+    // A socket.io-style app opens its WebSocket DURING page load (from a
+    // top-level script), not from a later click. The `PageWs` host must
+    // therefore be registered BEFORE scripts run — it used to be wired up only
+    // after `load_page` returned, so the first `new WebSocket(...)` hit a
+    // missing host, `__ws_open` returned -1, and the socket never opened (the
+    // page then had no transport for its streamed reply, and a framework's
+    // reconnect timer is frozen at rest so it never retried). Here a load-time
+    // script opens a socket; the open + first frame must reach the page.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_websocket_opened_during_page_load_connects_and_delivers() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                // Read request headers (through the blank line).
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).into_owned();
+                if text.contains("Upgrade: websocket") {
+                    // Complete the RFC 6455 handshake (our client doesn't verify
+                    // the accept key — it requires 101 + Upgrade), then push one
+                    // unmasked text frame "hi" and hold the socket open.
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\n\
+                              Upgrade: websocket\r\nConnection: Upgrade\r\n\
+                              Sec-WebSocket-Accept: x\r\n\r\n\x81\x02hi",
+                        )
+                        .await;
+                    // Keep the connection alive so the client doesn't see a drop.
+                    let mut sink = [0u8; 256];
+                    let _ = sock.read(&mut sink).await;
+                } else {
+                    // Serve the page: a load-time script opens a WebSocket and a
+                    // button keeps the page resident so its events dispatch.
+                    let body = format!(
+                        "<body><div id=s>pending</div><button>x</button><script>\
+                         var ws = new WebSocket('ws://127.0.0.1:{port}/ws');\
+                         ws.onopen = function(){{ document.getElementById('s').textContent = 'open'; }};\
+                         ws.onmessage = function(e){{ document.getElementById('s').textContent = 'msg:' + e.data; }};\
+                         </script></body>"
+                    );
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{body}"
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                }
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let live = response
+            .live
+            .as_mut()
+            .expect("page stays live (has a button)");
+        // Drain events: the socket opened during load, so its open + the "hi"
+        // frame dispatch and mutate the DOM shortly after first paint.
+        let mut saw = String::new();
+        for _ in 0..8 {
+            match tokio::time::timeout(Duration::from_secs(5), live.events.recv()).await {
+                Ok(Some(crate::js::PageEvt::Updated { html, .. })) => {
+                    saw = html;
+                    if saw.contains("msg:hi") {
+                        break;
+                    }
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            saw.contains("msg:hi"),
+            "the load-time WebSocket must connect and deliver its frame: {saw:?}"
+        );
+        drop(response.live.take());
+        server.abort();
+    }
+
     // A bare hostname opened without a scheme tries https first and falls
     // back to plain http when the TLS connection fails. The server peeks the
     // first byte: 0x16 = a TLS ClientHello (the https attempt) — drop it so
@@ -3020,26 +3112,46 @@ mod tests {
                 .send(crate::js::PageCmd::Click(node2))
                 .await
                 .unwrap();
-            // Generous: a click that fires an LLM completion can take a while.
+            // Generous: a click that fires an LLM completion streams its reply
+            // back over the WebSocket as many `Updated` events. Keep watching
+            // through `Settled` (the submit's own settle) until the stream goes
+            // quiet for `secs`, so we observe progressive token rendering — not
+            // just the first ack. (Diagnostic only.)
             let secs = std::env::var("TRUST_CLICK_WAIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8);
-            for _ in 0..4 {
+            let mut updates = 0usize;
+            for _ in 0..2000 {
                 match tokio::time::timeout(Duration::from_secs(secs), live.events.recv()).await {
                     Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
-                        eprintln!("EVT2 Updated: errors={:?}", outcome.errors);
-                        eprintln!("   console={:?}", outcome.console);
+                        updates += 1;
+                        if !outcome.errors.is_empty() {
+                            eprintln!("EVT2 Updated #{updates}: errors={:?}", outcome.errors);
+                        }
+                        let console = if outcome.console.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" console={:?}", outcome.console)
+                        };
+                        eprintln!("EVT2 Updated #{updates} ({}B){console}", html.len());
+                        // TRUST_EVT2_DUMP=<dir>: write each streamed snapshot as
+                        // <dir>/evt2-<n>.html so the progressive render can be
+                        // inspected frame by frame.
+                        if let Ok(dir) = std::env::var("TRUST_EVT2_DUMP") {
+                            let _ = std::fs::write(format!("{dir}/evt2-{updates}.html"), &html);
+                        }
                         last_html = Some(html);
                     }
                     Ok(Some(crate::js::PageEvt::Navigate(u))) => eprintln!("EVT2 Navigate -> {u}"),
                     Ok(Some(crate::js::PageEvt::SubmitDefault)) => eprintln!("EVT2 SubmitDefault"),
+                    Ok(Some(crate::js::PageEvt::Settled)) => {} // keep watching the stream
                     Ok(Some(other)) => {
                         eprintln!("EVT2 {other:?}");
                         break;
                     }
                     _ => {
-                        eprintln!("EVT2 <no more within {secs}s>");
+                        eprintln!("EVT2 <stream quiet for {secs}s after {updates} updates>");
                         break;
                     }
                 }
