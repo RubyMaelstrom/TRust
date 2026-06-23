@@ -1645,12 +1645,13 @@ impl App {
     /// Route an open target to the right protocol: gopher:// and
     /// gemini:// URLs (or ports 70/1965) get the browser, everything
     /// else is telnet (TLS for telnets:// / port 992).
-    /// Open a target. An explicit scheme always wins. With no scheme, a
-    /// well-known port keeps its protocol (23→telnet, 992→telnets, 70→gopher,
-    /// 1965→gemini, 79→finger); a bare host with no port — or any other port —
-    /// opens as the WEB (HTTP is the default now, replacing telnet). `port` is
-    /// the explicitly-supplied port, if any; a `host:port` in the target wins
-    /// over it.
+    /// Open a target. An explicit scheme always wins. With no scheme, a bare
+    /// host with NO port opens as the WEB (https→http). An EXPLICIT port picks
+    /// the protocol: 80/443→web, 70→gopher, 79→finger, 1965→gemini,
+    /// 992→telnets, and ANY OTHER port→telnet (the web lives on its standard
+    /// ports; an odd port is a MUD/BBS, so `host:2222` is telnet, not a doomed
+    /// HTTP GET). `port` is the explicitly-supplied port, if any; a `host:port`
+    /// in the target wins over it.
     fn dispatch_open(&mut self, target: &str, port: Option<u16>) {
         if let Some(url) = GopherUrl::parse(target) {
             self.start_fetch(Link::Gopher(url));
@@ -1668,10 +1669,14 @@ impl App {
             self.open(host.to_string(), url_port.or(port).unwrap_or(992), true);
         } else {
             // No scheme: a trailing `:port` on the host wins over the argument.
+            // No port → the web (https→http). An explicit port picks the
+            // protocol by well-known number; ANY OTHER port is telnet, because
+            // the web lives on its standard ports and an odd port is a MUD/BBS.
             let (host, embedded) = split_host_port(target);
             match embedded.or(port) {
-                Some(23) => self.open(host.to_string(), 23, false),
-                Some(992) => self.open(host.to_string(), 992, true),
+                None => self.start_web(host, None),
+                Some(80) => self.start_web(host, Some(80)),
+                Some(443) => self.start_web(host, Some(443)),
                 Some(70) => self.start_fetch(Link::Gopher(GopherUrl {
                     host: host.to_string(),
                     port: 70,
@@ -1690,7 +1695,9 @@ impl App {
                     port: 79,
                     query: String::new(),
                 })),
-                other => self.start_web(host, other),
+                Some(992) => self.open(host.to_string(), 992, true),
+                // Any other explicit port: plain telnet (MUD/BBS).
+                Some(p) => self.open(host.to_string(), p, false),
             }
         }
     }
@@ -2194,6 +2201,25 @@ impl App {
             self.notice = true;
             return;
         }
+        let media = response
+            .content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        // A followed link the server declares as audio/video plays in mpv,
+        // not the page view — we never download media bodies (read_response
+        // skips them, so what's here is empty). This is the general,
+        // content-type-driven catch-all behind the `is_playable_media_url`
+        // extension fast-path: an extensionless or oddly-named media stream
+        // still plays on click. Keep the page we came from rather than
+        // navigating into an empty doc.
+        if media.starts_with("audio/") || media.starts_with("video/") {
+            drop(live);
+            self.launch_mpv(response.url.to_string());
+            return;
+        }
         if response.body.is_empty() {
             self.status = format!(
                 "{}: HTTP {} (empty response)",
@@ -2202,13 +2228,6 @@ impl App {
             self.notice = true;
             return;
         }
-        let media = response
-            .content_type
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
         // Images open the viewer. The sniff fallback covers servers
         // that serve pixels as octet-stream (or with no type at all).
         if media.starts_with("image/")
@@ -3873,7 +3892,8 @@ fn is_playable_media_url(url: &str) -> bool {
         ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".mpg", ".mpeg", ".ogv",
         ".ts", ".m2ts", ".3gp", ".ogm", // adaptive-streaming manifests mpv plays
         ".m3u8", ".mpd", // audio
-        ".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav", ".wma", ".mka", ".weba",
+        ".mp3", ".m4a", ".m4b", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav", ".wma", ".mka",
+        ".weba", ".aiff", ".aif",
     ];
     EXTS.iter().any(|e| path.ends_with(e))
 }
@@ -4993,6 +5013,12 @@ mod tests {
         assert!(m("https://example.com/voice.opus"));
         assert!(m("https://example.com/stream/index.m3u8"));
         assert!(m("https://example.com/manifest.mpd"));
+        // An `.m4b` audiobook — the combined whole-book file archive.org links
+        // — must play on click like any other audio (regression: it was the
+        // one common audio extension missing from the list).
+        assert!(m(
+            "https://archive.org/download/blackcat0604_2605_librivox/BlackCatV6N4January1901_LibriVox.m4b"
+        ));
         // Not media — normal navigation:
         assert!(!m("https://example.com/page.html"));
         assert!(!m("https://example.com/")); // no extension
@@ -5911,10 +5937,18 @@ mod tests {
         assert_eq!(app.host.as_deref(), Some("bbs.example"));
         assert_eq!(app.port, 23);
 
-        // A bare host:port on any other port opens the WEB over http now.
+        // A bare host:port on ANY non-web port opens TELNET — the web lives on
+        // its standard ports, an odd port is a MUD/BBS (the
+        // flexiblesurvival.com:2222 fix; this used to fire an HTTP GET).
         app.execute_command("open shop.example:1701").await;
+        assert_eq!(app.host.as_deref(), Some("shop.example"));
+        assert_eq!(app.port, 1701);
+        assert!(!app.tls, "plain telnet, not telnets");
+
+        // ...but the standard web ports stay web even when given explicitly.
+        app.execute_command("open shop.example:80").await;
         assert!(
-            app.status.starts_with("Fetching http://shop.example:1701/"),
+            app.status.starts_with("Fetching http://shop.example/"),
             "got: {}",
             app.status
         );

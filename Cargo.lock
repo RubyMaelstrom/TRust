@@ -9,6 +9,7 @@ dependencies = [
  "boa_engine",
  "bytes",
  "crossterm",
+ "flate2",
  "futures",
  "html5ever",
  "image",

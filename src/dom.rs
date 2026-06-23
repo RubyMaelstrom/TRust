@@ -1836,7 +1836,10 @@ impl Dom {
 
     /// All `<script>` elements in document order, as (src-attr, inline
     /// source, type-attr) — the execution schedule for js.rs.
-    pub fn scripts(&self) -> Vec<(Option<String>, String, Option<String>)> {
+    /// Every `<script>` in document order: `(src, inline text, type, node)`.
+    /// The node id lets the runner expose `document.currentScript` while a
+    /// classic script executes.
+    pub fn scripts(&self) -> Vec<(Option<String>, String, Option<String>, NodeId)> {
         self.descendants(DOCUMENT)
             .into_iter()
             .filter(|&d| self.tag_name(d) == Some("script"))
@@ -1845,6 +1848,7 @@ impl Dom {
                     self.attr(d, "src").map(str::to_string),
                     self.text_content(d),
                     self.attr(d, "type").map(str::to_string),
+                    d,
                 )
             })
             .collect()

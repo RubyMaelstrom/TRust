@@ -28,8 +28,9 @@ async fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let host = args.next();
     // The port is OPTIONAL: with no port a bare host opens as the web (https,
-    // falling back to http) — HTTP is the default now. A given port keeps its
-    // protocol (23→telnet, 70→gopher, 1965→gemini, ...; see `dispatch_open`).
+    // falling back to http) — HTTP is the default now. A GIVEN port picks the
+    // protocol (80/443→web, 70→gopher, 1965→gemini, ...; ANY OTHER port→telnet,
+    // since odd ports are MUDs/BBSes, not the web; see `dispatch_open`).
     let start_port = match args.next() {
         // Numeric, or a well-known service name ("telnet", "smtp", ...)
         // like GNU telnet's getservbyname.
