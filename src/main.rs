@@ -20,6 +20,7 @@ mod oneshot;
 mod telnet;
 mod tls;
 mod ui;
+mod ws;
 
 use std::process::ExitCode;
 

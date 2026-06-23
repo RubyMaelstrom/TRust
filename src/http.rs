@@ -28,9 +28,15 @@ use crate::tls;
 // headroom while staying bounded (bodies are transient: parsed, then only the
 // post-JS HTML is retained).
 const MAX_BODY: usize = 16 * 1024 * 1024;
-const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+// A single request's wall cap. Generous because a streamed LLM chat completion
+// (Open WebUI → llama.cpp) holds the connection open for the WHOLE generation —
+// a reasoning model can think for a minute or more before the body closes. The
+// real per-context bound is the JS budget (a page LOAD is still capped by
+// `WALL_BUDGET`; an interactive dispatch extends only while a fetch is in
+// flight), so this only needs to be long enough not to sever a working stream.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_REDIRECTS: usize = 10;
-const USER_AGENT: &str = "TRust/0.1";
+pub(crate) const USER_AGENT: &str = "TRust/0.1";
 
 /// An HTTP request as the app sees it: method plus optional body.
 #[derive(Clone, Debug)]
@@ -333,9 +339,21 @@ async fn fetch_redirecting(request: &Request) -> Result<Response, String> {
 
 /// One transport, plain or TLS, behind a single read/write face so the
 /// pool can hold either.
-enum Conn {
+pub(crate) enum Conn {
     Plain(TcpStream),
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+/// The live transport a WebSocket runs over (see `ws.rs`): the same plain/TLS
+/// `Conn` the HTTP path uses, buffered so the upgrade handshake can read the
+/// response head without consuming into the first frame.
+pub(crate) type WsTransport = BufReader<Conn>;
+
+/// Dial + (for `wss`) TLS-connect for a WebSocket upgrade, reusing the HTTP
+/// dial. WebPKI validation, exactly like `https` (a `wss` is an `https` that
+/// upgrades).
+pub(crate) async fn ws_dial(secure: bool, host: &str, port: u16) -> Result<WsTransport, String> {
+    dial(if secure { "https" } else { "http" }, host, port).await
 }
 
 impl AsyncRead for Conn {
@@ -550,7 +568,7 @@ pub(crate) fn set_cookie_from_js(page: &Url, line: &str) {
     store_cookie(page, line, true);
 }
 
-fn cookies_for_request(url: &Url) -> String {
+pub(crate) fn cookies_for_request(url: &Url) -> String {
     if !cookies_enabled() {
         return String::new();
     }
@@ -3002,8 +3020,13 @@ mod tests {
                 .send(crate::js::PageCmd::Click(node2))
                 .await
                 .unwrap();
+            // Generous: a click that fires an LLM completion can take a while.
+            let secs = std::env::var("TRUST_CLICK_WAIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8);
             for _ in 0..4 {
-                match tokio::time::timeout(Duration::from_secs(8), live.events.recv()).await {
+                match tokio::time::timeout(Duration::from_secs(secs), live.events.recv()).await {
                     Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
                         eprintln!("EVT2 Updated: errors={:?}", outcome.errors);
                         eprintln!("   console={:?}", outcome.console);
@@ -3016,7 +3039,7 @@ mod tests {
                         break;
                     }
                     _ => {
-                        eprintln!("EVT2 <no more within 8s>");
+                        eprintln!("EVT2 <no more within {secs}s>");
                         break;
                     }
                 }

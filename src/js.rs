@@ -123,6 +123,17 @@ impl Budget {
     pub fn rearm(&self, wall: Duration) {
         self.deadline.set(Instant::now() + wall);
     }
+
+    /// Push the deadline out to at least `now + dur`, never pulling it in. A
+    /// dispatch-time network request calls this (see `PageNet::dispatch`) so a
+    /// slow wire — an LLM completion — can finish instead of being cancelled at
+    /// the tight compute deadline; a load's already-distant deadline is untouched.
+    pub fn extend_at_least(&self, dur: Duration) {
+        let target = Instant::now() + dur;
+        if target > self.deadline.get() {
+            self.deadline.set(target);
+        }
+    }
 }
 
 /// What a page's scripts did, for the status bar (`· JS:n!`) and
@@ -494,6 +505,12 @@ struct PageNet {
     page: url::Url,
     budget: Rc<Budget>,
     fetched: std::cell::Cell<usize>,
+    /// True once the page is past load, handling interactive dispatches. A
+    /// fetch fired during a dispatch extends the (tight, compute-sized)
+    /// dispatch deadline so the wire can finish — a click that asks an LLM for
+    /// a reply must wait for the reply, not be cancelled at the 1s compute cap.
+    /// Load fetches don't extend (the load already runs on `WALL_BUDGET`).
+    dispatch: std::cell::Cell<bool>,
     /// The shared subresource cache, so the page's own `fetch()` can join
     /// an in-flight/done request for a chunk we already have.
     cache: std::sync::Arc<crate::http::PageCache>,
@@ -502,6 +519,27 @@ struct PageNet {
 impl boa_engine::gc::Finalize for PageNet {}
 // SAFETY: holds no GC-managed objects.
 unsafe impl boa_engine::gc::Trace for PageNet {
+    boa_engine::gc::empty_trace!();
+}
+
+/// Page-owned WebSockets (see `ws.rs`) — the transport socket.io rides. Each
+/// `new WebSocket()` spawns a connection task; this maps the JS-visible id to
+/// that task's outbound sender, and hands every task a clone of `events` so
+/// inbound frames/open/close reach the actor (forwarded as `PageCmd::Ws`,
+/// dispatched like a click). RAM-only, dies with the page, which drops the
+/// senders → the tasks close their sockets and exit.
+#[derive(boa_engine::JsData)]
+struct PageWs {
+    handle: tokio::runtime::Handle,
+    page: url::Url,
+    events: tokio::sync::mpsc::Sender<(usize, crate::ws::WsIn)>,
+    sockets: RefCell<std::collections::HashMap<usize, tokio::sync::mpsc::Sender<crate::ws::WsOut>>>,
+    next_id: std::cell::Cell<usize>,
+}
+
+impl boa_engine::gc::Finalize for PageWs {}
+// SAFETY: holds no GC-managed objects (channels/handle/url/RefCell map).
+unsafe impl boa_engine::gc::Trace for PageWs {
     boa_engine::gc::empty_trace!();
 }
 
@@ -678,6 +716,9 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__storage_clear", 1, sys_storage_clear),
         ("__storage_key", 2, sys_storage_key),
         ("__storage_len", 1, sys_storage_len),
+        ("__ws_open", 2, sys_ws_open),
+        ("__ws_send", 3, sys_ws_send),
+        ("__ws_close", 3, sys_ws_close),
     ];
     for (name, len, f) in table {
         ctx.register_global_callable(JsString::from(*name), *len, NativeFunction::from_fn_ptr(*f))?;
@@ -1256,6 +1297,15 @@ fn page_net_prepare(
         return None;
     }
     net.fetched.set(net.fetched.get() + 1);
+    // A fetch fired during an interactive dispatch extends the tight (1s,
+    // compute-sized) dispatch deadline up to the network-inclusive wall budget,
+    // so a slow wire — an LLM streaming a reply — can finish instead of being
+    // cancelled. The job-drainer re-reads the deadline, so this takes effect
+    // mid-drain. Load fetches don't extend (the load already runs on the wall
+    // budget), so this never loosens a load.
+    if net.dispatch.get() {
+        net.budget.extend_at_least(DISPATCH_NET_GRACE);
+    }
     let mut request = crate::http::Request {
         method,
         url: resolved,
@@ -1430,6 +1480,103 @@ fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
         }
     }
     Ok(promise.into())
+}
+
+/// `__ws_open(url, protocols)` → a socket id (>0), or -1 if WebSockets aren't
+/// available here / the URL is bad / the target is blocked. Spawns the
+/// connection task (`ws::connect`); inbound frames + open/close arrive as
+/// `PageCmd::Ws`. The page's bundled socket.io-client runs the protocol on top.
+fn sys_ws_open(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let url_arg = match args.first() {
+        Some(v) => v.to_string(ctx)?.to_std_string_lossy(),
+        None => return Ok(JsValue::new(-1)),
+    };
+    let host = ctx.realm().host_defined();
+    let Some(wsh) = host.get::<PageWs>() else {
+        return Ok(JsValue::new(-1)); // no-net page / one-shot transform
+    };
+    let Ok(resolved) = wsh.page.join(&url_arg) else {
+        return Ok(JsValue::new(-1));
+    };
+    if !matches!(resolved.scheme(), "ws" | "wss") {
+        return Ok(JsValue::new(-1));
+    }
+    // Same private-address-pivot guard as fetch, with ws(s) mapped to http(s).
+    let mut http_equiv = resolved.clone();
+    let _ = http_equiv.set_scheme(if resolved.scheme() == "wss" {
+        "https"
+    } else {
+        "http"
+    });
+    if !crate::http::subresource_allowed(&wsh.page, &http_equiv) {
+        return Ok(JsValue::new(-1));
+    }
+    let id = wsh.next_id.get();
+    wsh.next_id.set(id + 1);
+    let origin = wsh.page.origin().ascii_serialization();
+    let cookie = {
+        let c = crate::http::cookies_for_request(&http_equiv);
+        (!c.is_empty()).then_some(c)
+    };
+    let out_tx = crate::ws::connect(
+        resolved,
+        origin,
+        cookie,
+        &wsh.handle,
+        id,
+        wsh.events.clone(),
+    );
+    wsh.sockets.borrow_mut().insert(id, out_tx);
+    Ok(JsValue::new(id as i32))
+}
+
+/// `__ws_send(id, data, isBinary)` — queue a message on a socket. `data` is a
+/// string: UTF-8 text, or (isBinary) a latin1 byte string (each char a byte).
+fn sys_ws_send(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let id = args.first().map_or(Ok(-1.0), |v| v.to_number(ctx))? as i64;
+    let data = match args.get(1) {
+        Some(v) => v.to_string(ctx)?.to_std_string_lossy(),
+        None => String::new(),
+    };
+    let is_binary = args.get(2).is_some_and(JsValue::to_boolean);
+    let host = ctx.realm().host_defined();
+    let Some(wsh) = host.get::<PageWs>() else {
+        return Ok(JsValue::new(false));
+    };
+    if id < 0 {
+        return Ok(JsValue::new(false));
+    }
+    if let Some(tx) = wsh.sockets.borrow().get(&(id as usize)) {
+        let msg = if is_binary {
+            crate::ws::WsOut::Binary(data.chars().map(|c| c as u8).collect())
+        } else {
+            crate::ws::WsOut::Text(data)
+        };
+        // Non-blocking: the channel is generous; chat sends are low-rate.
+        let _ = tx.try_send(msg);
+        return Ok(JsValue::new(true));
+    }
+    Ok(JsValue::new(false))
+}
+
+/// `__ws_close(id, code, reason)` — close a socket.
+fn sys_ws_close(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let id = args.first().map_or(Ok(-1.0), |v| v.to_number(ctx))? as i64;
+    let code = args.get(1).map_or(Ok(1000.0), |v| v.to_number(ctx))? as u16;
+    let reason = match args.get(2) {
+        Some(v) if !v.is_null_or_undefined() => v.to_string(ctx)?.to_std_string_lossy(),
+        _ => String::new(),
+    };
+    let host = ctx.realm().host_defined();
+    let Some(wsh) = host.get::<PageWs>() else {
+        return Ok(JsValue::undefined());
+    };
+    if id >= 0
+        && let Some(tx) = wsh.sockets.borrow().get(&(id as usize))
+    {
+        let _ = tx.try_send(crate::ws::WsOut::Close(code, reason));
+    }
+    Ok(JsValue::undefined())
 }
 
 /// `__dom_run_injected_script(nodeId)` — run a `<script>` element that page
@@ -2256,6 +2403,7 @@ fn load_page(html: &str, env: &PageEnv) -> Result<LoadedPage, Outcome> {
                 page,
                 budget: budget.clone(),
                 fetched: std::cell::Cell::new(0),
+                dispatch: std::cell::Cell::new(false),
                 cache: env.cache.clone(),
             });
         }
@@ -2588,15 +2736,28 @@ fn run_jobs_into(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
     let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match (handle, exec) {
             (Some(handle), Some(exec)) => {
-                let remaining = budget.remaining();
-                if remaining.is_zero() {
-                    return Ok(());
-                }
                 let cell = RefCell::new(ctx);
                 handle.block_on(async {
-                    tokio::time::timeout(remaining, exec.run_jobs_async(&cell))
-                        .await
-                        .unwrap_or(Ok(())) // deadline reached: render what we have
+                    let fut = exec.run_jobs_async(&cell);
+                    tokio::pin!(fut);
+                    // Drive the job loop until it finishes (all promises + fetches
+                    // settled) or the budget deadline passes. The deadline is
+                    // RE-READ each slice because a dispatch-time fetch pushes it
+                    // out (wire time): a stale one-shot timeout would cancel an
+                    // in-flight LLM completion at the 1s compute cap. A slice
+                    // timing out doesn't drop `fut`, so the in-flight request
+                    // survives to the next slice; only the final deadline drops it.
+                    loop {
+                        let remaining = budget.remaining();
+                        if remaining.is_zero() {
+                            break Ok(()); // deadline reached: render what we have
+                        }
+                        let slice = remaining.min(Duration::from_millis(200));
+                        match tokio::time::timeout(slice, &mut fut).await {
+                            Ok(r) => break r,   // job loop finished
+                            Err(_) => continue, // re-read the (maybe extended) deadline
+                        }
+                    }
                 })
             }
             _ => ctx.run_jobs(),
@@ -2722,6 +2883,11 @@ pub enum PageCmd {
         form: usize,
         submitter: Option<usize>,
     },
+    /// A WebSocket event from a page-opened socket (the WS task forwards inbound
+    /// frames + open/close here). Dispatched like a click: fire the JS event,
+    /// settle, re-render. This is how a socket.io stream (chat tokens) drives
+    /// the page with no busy-poll — a frame is just another event.
+    Ws { id: usize, event: crate::ws::WsIn },
 }
 
 /// Page → app.
@@ -2755,8 +2921,17 @@ pub struct PageHandle {
     pub cmds: tokio::sync::mpsc::Sender<PageCmd>,
 }
 
-/// Wall budget for a single user-event dispatch (wire time extends it).
+/// Wall budget for a single user-event dispatch's COMPUTE (a fetch fired
+/// during it extends the deadline — see `DISPATCH_NET_GRACE`).
 const DISPATCH_BUDGET: Duration = Duration::from_secs(1);
+
+/// How long a dispatch may wait on in-flight network before giving up. A
+/// page-initiated fetch during a dispatch pushes the deadline out to this, so a
+/// click that asks an LLM for a reply waits for the (possibly slow, reasoning)
+/// reply instead of being cancelled at the 1s compute cap. Generous so it works
+/// with EVERY model; still bounded so a hung server can't hold the page forever
+/// (the user can also Esc). The wait parks on the reactor — no idle CPU.
+const DISPATCH_NET_GRACE: Duration = Duration::from_secs(300);
 /// Settle ticks allowed after a dispatch (load-time settle uses MAX_TICKS).
 const DISPATCH_TICKS: usize = 50;
 /// The page thread owns all parsing/execution: same wide stack as the
@@ -2772,14 +2947,54 @@ pub fn spawn_page(
 ) -> (PageHandle, tokio::sync::mpsc::Receiver<PageEvt>) {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
     let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(16);
+    // The actor keeps a clone of its own command sender so a WebSocket task can
+    // post inbound frames back as `PageCmd::Ws` (see `setup_page_ws`).
+    let cmd_self = cmd_tx.clone();
     let spawned = std::thread::Builder::new()
         .name(String::from("trust-page"))
         .stack_size(PAGE_STACK)
-        .spawn(move || page_actor(html, env, cmd_rx, evt_tx));
+        .spawn(move || page_actor(html, env, cmd_rx, evt_tx, cmd_self));
     if spawned.is_err() {
         // The dropped evt sender tells the caller the page is gone.
     }
     (PageHandle { cmds: cmd_tx }, evt_rx)
+}
+
+/// Wire up page-owned WebSockets: a forwarder relays every socket's inbound
+/// events into the command stream as `PageCmd::Ws` (dispatched like a click),
+/// and a `PageWs` host object lets the `__ws_*` syscalls spawn/address sockets.
+/// No-op for a no-net page (no `PageNet` → no runtime to spawn on).
+fn setup_page_ws(page: &mut LoadedPage, cmd_self: &tokio::sync::mpsc::Sender<PageCmd>) {
+    let Some((handle, page_url)) = page
+        .ctx
+        .realm()
+        .host_defined()
+        .get::<PageNet>()
+        .map(|n| (n.handle.clone(), n.page.clone()))
+    else {
+        return;
+    };
+    let (ws_evt_tx, mut ws_evt_rx) = tokio::sync::mpsc::channel::<(usize, crate::ws::WsIn)>(64);
+    // A WEAK sender: it must NOT keep the command channel open, or the actor's
+    // `cmds.recv()` would never see the app drop the handle and the page would
+    // never exit (a real deadlock the test suite caught). The forwarder upgrades
+    // to send; once the app's (strong) sender is gone, upgrade fails and it stops.
+    let weak = cmd_self.downgrade();
+    handle.spawn(async move {
+        while let Some((id, event)) = ws_evt_rx.recv().await {
+            let Some(tx) = weak.upgrade() else { break };
+            if tx.send(PageCmd::Ws { id, event }).await.is_err() {
+                break; // actor gone
+            }
+        }
+    });
+    page.ctx.realm().host_defined_mut().insert(PageWs {
+        handle,
+        page: page_url,
+        events: ws_evt_tx,
+        sockets: RefCell::new(std::collections::HashMap::new()),
+        next_id: std::cell::Cell::new(1),
+    });
 }
 
 fn page_actor(
@@ -2787,6 +3002,7 @@ fn page_actor(
     env: PageEnv,
     mut cmds: tokio::sync::mpsc::Receiver<PageCmd>,
     evts: tokio::sync::mpsc::Sender<PageEvt>,
+    cmd_self: tokio::sync::mpsc::Sender<PageCmd>,
 ) {
     let mut page = match load_page(&html, &env) {
         Ok(page) => page,
@@ -2795,6 +3011,11 @@ fn page_actor(
             return;
         }
     };
+    setup_page_ws(&mut page, &cmd_self);
+    // Drop our own strong command sender now: only the app's handle should keep
+    // the channel open, so `cmds.recv()` returns `None` (and the actor exits)
+    // the moment the app drops the page. The WS forwarder holds only a weak one.
+    drop(cmd_self);
     // First paint: if the interactive shell is already a live page (has
     // clickables), emit it NOW — before `settle_page` drains background
     // network. A data-driven SPA (e.g. archive.org, which then serially
@@ -2937,8 +3158,88 @@ fn page_actor(
                     return;
                 }
             }
+            PageCmd::Ws { id, event } => {
+                dispatch_ws_in(&mut page, id, event);
+                drain_js_side(&mut page.ctx, &mut page.outcome);
+                if page.outcome.panicked {
+                    let _ = evts
+                        .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+                    return;
+                }
+                if let Some(url) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                // A socket frame that mutated the DOM (a streamed chat token)
+                // re-renders progressively, like any other dispatch.
+                if !finish_dispatch(&mut page, &evts) {
+                    return;
+                }
+            }
         }
     }
+}
+
+/// Deliver a WebSocket event to page JS (fire `open`/`message`/`close` on the
+/// JS `WebSocket`), then settle — same shape as a click/form dispatch. A frame
+/// is just an event; a streamed token mutates the DOM and re-renders.
+fn dispatch_ws_in(page: &mut LoadedPage, id: usize, event: crate::ws::WsIn) {
+    prepare_dispatch(page);
+    let call = match event {
+        crate::ws::WsIn::Open => format!("__trust.wsEvent({id},'open')"),
+        crate::ws::WsIn::Text(s) => {
+            format!("__trust.wsEvent({id},'message',{},false)", js_string(&s))
+        }
+        crate::ws::WsIn::Binary(b) => {
+            // Deliver bytes as a latin1 string the prelude turns into an
+            // ArrayBuffer/Blob per `binaryType`.
+            let latin1: String = b.iter().map(|&x| x as char).collect();
+            format!(
+                "__trust.wsEvent({id},'message',{},true)",
+                js_string(&latin1)
+            )
+        }
+        crate::ws::WsIn::Closed { code, reason } => {
+            // The socket is done: drop it from the registry so a `close`
+            // handler can't resurrect a send, then fire the close event.
+            if let Some(wsh) = page.ctx.realm().host_defined().get::<PageWs>() {
+                wsh.sockets.borrow_mut().remove(&id);
+            }
+            format!(
+                "__trust.wsEvent({id},'close','',false,{code},{})",
+                js_string(&reason)
+            )
+        }
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        page.ctx.eval(Source::from_bytes(call.as_bytes()))
+    })) {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => page.outcome.errors.push(format!("ws event: {err}")),
+        Err(_) => {
+            page.outcome.errors.push(String::from(
+                "ws event: engine panic (Boa bug) — page JS halted",
+            ));
+            page.outcome.panicked = true;
+            return;
+        }
+    }
+    let mut dispatch_outcome = Outcome::default();
+    settle(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
+    settle_image_loads(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
+    page.outcome.errors.extend(dispatch_outcome.errors);
 }
 
 fn finish_dispatch(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
@@ -2997,6 +3298,9 @@ fn prepare_dispatch(page: &mut LoadedPage) {
     page.budget.rearm(DISPATCH_BUDGET);
     if let Some(net) = page.ctx.realm().host_defined().get::<PageNet>() {
         net.fetched.set(0);
+        // We're in interactive dispatch mode now: a fetch fired from here on
+        // extends the tight dispatch deadline so the wire can complete.
+        net.dispatch.set(true);
     }
     // Give each fresh interaction its own MutationObserver loop budget: a
     // runaway observer chain in one dispatch disables delivery for the rest of
@@ -6208,6 +6512,62 @@ const PRELUDE: &str = r##"
     g.requestAnimationFrame = (fn) => g.setTimeout(() => fn(timers.now), 16);
     g.cancelAnimationFrame = g.clearTimeout;
     g.queueMicrotask = (fn) => { Promise.resolve().then(fn).catch((e) => trust.errors.push("microtask: " + ((e && e.message) || e))); };
+    // The HTML structured-clone algorithm: a deep copy that follows the
+    // object graph (handling cycles), supported by every browser as a global.
+    // Apps lean on it to snapshot state before mutating (Open WebUI's chat
+    // submit clones the attachments list before sending — without this it threw
+    // mid-submit, after the input was cleared, so the message silently never
+    // sent). Covers the cloneable types pages actually use; throws DataCloneError
+    // on functions/symbols like a real browser. No transfer support.
+    g.structuredClone = function (value) {
+        const seen = new Map();
+        const clone = (v) => {
+            const t = typeof v;
+            if (v === null || (t !== "object" && t !== "function")) {
+                if (t === "function" || t === "symbol") {
+                    throw new DOMException("value could not be cloned", "DataCloneError");
+                }
+                return v;
+            }
+            if (t === "function") {
+                throw new DOMException("value could not be cloned", "DataCloneError");
+            }
+            if (seen.has(v)) return seen.get(v);
+            if (v instanceof Date) return new Date(v.getTime());
+            if (v instanceof RegExp) return new RegExp(v.source, v.flags);
+            if (typeof ArrayBuffer !== "undefined" && v instanceof ArrayBuffer) return v.slice(0);
+            if (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView && ArrayBuffer.isView(v)) {
+                if (typeof DataView !== "undefined" && v instanceof DataView) {
+                    return new DataView(v.buffer.slice(0), v.byteOffset, v.byteLength);
+                }
+                return new v.constructor(v); // typed array: copies into a fresh buffer
+            }
+            let out;
+            if (Array.isArray(v)) {
+                out = [];
+                seen.set(v, out);
+                for (let i = 0; i < v.length; i++) out[i] = clone(v[i]);
+                return out;
+            }
+            if (v instanceof Map) {
+                out = new Map();
+                seen.set(v, out);
+                v.forEach((val, key) => out.set(clone(key), clone(val)));
+                return out;
+            }
+            if (v instanceof Set) {
+                out = new Set();
+                seen.set(v, out);
+                v.forEach((val) => out.add(clone(val)));
+                return out;
+            }
+            out = {};
+            seen.set(v, out);
+            for (const k of Object.keys(v)) out[k] = clone(v[k]);
+            return out;
+        };
+        return clone(value);
+    };
     trust.tick = function (horizon) {
         let best = null;
         for (const t of timers.q) if (t.at <= horizon && (!best || t.at < best.at)) best = t;
@@ -6881,7 +7241,22 @@ const PRELUDE: &str = r##"
             this.redirected = false;
             this.type = "default";
             this.bodyUsed = false;
-            this.body = null; // no ReadableStream
+            this.__bodyStream = undefined;
+        }
+        // The response body as a ReadableStream (lazy + cached). Streaming
+        // consumers read `response.body.getReader()` — Open WebUI reads chat
+        // completions (SSE) exactly this way; a null body made `getReader()`
+        // throw, so the assistant reply never read back. Our network layer
+        // buffers the whole body, so the stream yields it as one UTF-8 chunk then
+        // closes; an SSE parser splits it identically. null only for empty bodies.
+        get body() {
+            if (this.__bodyStream !== undefined) return this.__bodyStream;
+            if (this.__body === null || this.__body === undefined) { this.__bodyStream = null; return null; }
+            const bytes = new g.TextEncoder().encode(__bodyText(this.__body) || "");
+            this.__bodyStream = new g.ReadableStream({
+                start(c) { if (bytes.length) c.enqueue(bytes); c.close(); },
+            });
+            return this.__bodyStream;
         }
         clone() {
             const r = new Response(this.__body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url });
@@ -6995,6 +7370,94 @@ const PRELUDE: &str = r##"
         }
     }
     g.BroadcastChannel = BroadcastChannel;
+
+    // --- WebSocket (RFC 6455 transport in ws.rs; socket.io rides it) ---
+    // A real connection: `__ws_open` spawns the Rust task, inbound frames arrive
+    // as `__trust.wsEvent` calls (the actor dispatches them like clicks). This is
+    // what lets a websocket-enabled app (Open WebUI) stream chat tokens back —
+    // the page's own socket.io-client runs the protocol over these frames.
+    const WS_REGISTRY = {};
+    class WebSocket extends EventTarget {
+        constructor(url, protocols) {
+            super();
+            this.url = String(url);
+            this.readyState = 0; // CONNECTING
+            this.bufferedAmount = 0;
+            this.extensions = "";
+            this.protocol = "";
+            this.binaryType = "blob";
+            this.onopen = null; this.onmessage = null; this.onclose = null; this.onerror = null;
+            let proto = "";
+            if (Array.isArray(protocols)) proto = protocols.join(",");
+            else if (protocols !== undefined && protocols !== null) proto = String(protocols);
+            this.__id = __ws_open(this.url, proto);
+            if (this.__id < 0) {
+                // Synchronous open failure (bad URL / blocked / no net grant):
+                // a browser still reports it asynchronously as error + close.
+                const self = this;
+                g.setTimeout(() => {
+                    self.readyState = 3;
+                    self.__fire("error", {});
+                    self.__fire("close", { code: 1006, reason: "", wasClean: false });
+                }, 0);
+            } else {
+                WS_REGISTRY[this.__id] = this;
+            }
+        }
+        get CONNECTING() { return 0; } get OPEN() { return 1; }
+        get CLOSING() { return 2; } get CLOSED() { return 3; }
+        send(data) {
+            if (this.readyState === 0) throw new DOMException("WebSocket is still CONNECTING", "InvalidStateError");
+            if (this.readyState !== 1) return;
+            if (typeof data === "string") { __ws_send(this.__id, data, false); return; }
+            let bytes = null;
+            if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+            else if (data && data.buffer instanceof ArrayBuffer) bytes = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+            if (bytes) {
+                let s = ""; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+                __ws_send(this.__id, s, true);
+            } else {
+                __ws_send(this.__id, String(data), false); // Blob/other: best-effort
+            }
+        }
+        close(code, reason) {
+            if (this.readyState >= 2) return;
+            this.readyState = 2; // CLOSING
+            __ws_close(this.__id, (code === undefined || code === null) ? 1000 : (code | 0), reason ? String(reason) : "");
+        }
+        __fire(type, init) {
+            let ev;
+            if (type === "message") ev = new MessageEvent("message", init);
+            else if (type === "close") ev = new CloseEvent("close", init);
+            else ev = new Event(type);
+            const h = this["on" + type];
+            if (typeof h === "function") { try { h.call(this, ev); } catch (e) { trust.errors.push("ws on" + type + ": " + ((e && e.message) || e)); } }
+            this.dispatchEvent(ev);
+        }
+    }
+    WebSocket.CONNECTING = 0; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.CLOSED = 3;
+    g.WebSocket = WebSocket;
+    // The actor calls this for every inbound WebSocket event (open/message/close).
+    trust.wsEvent = function (id, kind, data, isBinary, code, reason) {
+        const ws = WS_REGISTRY[id];
+        if (!ws) return;
+        if (kind === "open") {
+            ws.readyState = 1; // OPEN
+            ws.__fire("open", {});
+        } else if (kind === "message") {
+            let payload = data;
+            if (isBinary) {
+                const len = data.length, buf = new ArrayBuffer(len), view = new Uint8Array(buf);
+                for (let i = 0; i < len; i++) view[i] = data.charCodeAt(i) & 0xFF;
+                payload = (ws.binaryType === "arraybuffer") ? buf : new g.Blob([buf]);
+            }
+            ws.__fire("message", { data: payload, origin: ws.url });
+        } else if (kind === "close") {
+            ws.readyState = 3; // CLOSED
+            delete WS_REGISTRY[id];
+            ws.__fire("close", { code: code, reason: reason || "", wasClean: code === 1000 });
+        }
+    };
 
     // Flatten a header map ({lowercased-name: value}) into the `k\nv\nk\nv`
     // blob the `__http_fetch` syscalls forward to the request. Lets a page's
@@ -11422,6 +11885,52 @@ mod tests {
         assert!(
             out.contains("a=function,svg=function,path=function,base=true"),
             "SVG interfaces: {out}"
+        );
+    }
+
+    #[test]
+    fn structured_clone_deep_copies_with_cycles() {
+        // `structuredClone` deep-copies the object graph (cycles, nested
+        // arrays/objects, Date, Map) — a standard global apps lean on to snapshot
+        // state before mutating (Open WebUI's chat submit clones the attachments
+        // list; a missing `structuredClone` threw mid-submit so nothing sent).
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             const a = { n: 1, arr: [1, 2, { x: 3 }], d: new Date(0), m: new Map([['k', 'v']]) };\
+             a.self = a;\
+             const b = structuredClone(a);\
+             b.arr[2].x = 99;\
+             const ok = (b !== a) && (b.self === b) && (a.arr[2].x === 3)\
+               && (b.d instanceof Date && b.d.getTime() === 0) && (b.m.get('k') === 'v');\
+             document.getElementById('o').textContent = 'ok=' + ok;\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("ok=true"), "structuredClone: {out}");
+    }
+
+    #[test]
+    fn response_body_is_a_readable_stream() {
+        // A fetch `Response.body` is a real ReadableStream: streaming consumers
+        // (SSE/chat completions) read `response.body.getReader()`. It yields the
+        // buffered body as one UTF-8 chunk then closes. A null body made
+        // `getReader()` throw, so a streamed reply was never read back.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             (async () => {\
+               const r = new Response('hello stream', { status: 200 });\
+               const reader = r.body.getReader();\
+               const dec = new TextDecoder();\
+               let acc = '';\
+               for (;;) { const { value, done } = await reader.read(); if (done) break; acc += dec.decode(value); }\
+               document.getElementById('o').textContent = 'got=' + acc;\
+             })();\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("got=hello stream"),
+            "Response.body stream: {out}"
         );
     }
 
