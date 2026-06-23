@@ -220,6 +220,10 @@ impl JobExecutor for PageJobExecutor {
             // Drain every synchronous job that's ready now. These run to
             // completion one at a time (spec: one job at a time) and may
             // enqueue more jobs (a settled fetch enqueues its `.then`s).
+            // The phase profiler times THIS synchronous drain as "execute" —
+            // the `group.next().await` park below (network wait) is left out,
+            // so the bucket is real VM CPU, not wire time.
+            let exec_t = phase_begin();
             let promise = std::mem::take(&mut *self.promise_jobs.borrow_mut());
             let other = std::mem::take(&mut *self.other_jobs.borrow_mut());
             let ran_sync = !promise.is_empty() || !other.is_empty();
@@ -245,6 +249,7 @@ impl JobExecutor for PageJobExecutor {
                     return Err(err);
                 }
             }
+            phase_end(Phase::Execute, exec_t);
             // Everything drained and nothing in flight: quiescent.
             if self.async_jobs.borrow().is_empty() && !ran_sync && group.is_empty() {
                 break;
@@ -417,6 +422,190 @@ mod runtime_limit_in_async {
     }
 }
 
+// ---- Per-phase load profiler (Step 1 decision-gate instrumentation) ----
+//
+// Decompose a LIVE page load into parse / compile / execute wall time,
+// accumulated across every script, module, and job-drain on the page thread.
+// The `engine_profile` test times one bundle in isolation; it CANNOT capture
+// the settle-time execution where a real SPA spends its seconds (Steam's
+// ~15s tail), which only exists in the full page context. This thread-local
+// accumulator runs across the whole live load instead — the tool the JS
+// engine performance plan's Step 1 gate needs to decide whether parse+compile
+// or execution dominates a real rendered page (and thus whether lazy compile
+// is the prize or execution work must be reopened).
+//
+// Thread-local because all of a page's JS runs on its own `trust-page` thread
+// (or the calling thread for the one-shot `transform`). Reset at `load_page`
+// start, reported at `settle_page` end, gated on `TRUST_JS_PHASE` (each thread
+// reads the env var once when its accumulator is first touched, so the
+// `trust-page` thread honors a process-wide `TRUST_JS_PHASE=1`).
+//
+// Zero behaviour change: `run_script` now splits `ctx.eval` into its exact
+// constituent steps — `Script::parse` → `Script::codeblock` → `Script::evaluate`
+// — which is what `ctx.eval` does internally (`eval` == `parse?.evaluate`, and
+// `evaluate`'s `prepare_run` memoizes `codeblock`; see vendored
+// `Context::eval`/`script.rs`). The split is unconditional so what ships is
+// what we measure; the `Instant::now()` calls are gated so the unprofiled path
+// pays only a cached bool check.
+//
+// CAVEATS (read before interpreting numbers): (1) "execute" is the synchronous
+// JS the VM runs — classic-script top level PLUS every synchronous job/microtask
+// drained by the executor — but it EXCLUDES the network parking the executor
+// sleeps on (that wall lands in `load wall − measured CPU`). (2) ES-module
+// compilation happens inside Boa's `load_link_evaluate`/link (not separately
+// exposed), so a module's compile time is attributed to "execute", not
+// "compile"; the decision-gate page (Steam) is classic-script-dominated so this
+// is benign, but a module-dominated page's "compile" is a lower bound. (3) A
+// handful of internal `__trust.*` control evals (tick/scanImageLoads) are
+// negligible and left unmeasured.
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct PhaseProfile {
+    pub parse: Duration,
+    pub parse_n: u32,
+    pub compile: Duration,
+    pub compile_n: u32,
+    pub execute: Duration,
+    pub execute_n: u32,
+}
+
+#[derive(Clone, Copy)]
+enum Phase {
+    Parse,
+    Compile,
+    Execute,
+}
+
+thread_local! {
+    static PHASES: RefCell<PhaseProfile> = const { RefCell::new(PhaseProfile {
+        parse: Duration::ZERO, parse_n: 0,
+        compile: Duration::ZERO, compile_n: 0,
+        execute: Duration::ZERO, execute_n: 0,
+    }) };
+    // Per-thread arm state, seeded from the process-wide env flag (so the
+    // `trust-page` thread honors `TRUST_JS_PHASE`). Seeding reads the global
+    // `OnceLock` — NOT `env::var_os` — so the env (and its global lock) is
+    // scanned exactly once per process, never per thread. A test overrides it
+    // on its own thread via `phases_arm`.
+    static PHASE_ARMED: std::cell::Cell<bool> = std::cell::Cell::new(phase_env_default());
+}
+
+/// The process-wide `TRUST_JS_PHASE` flag, read from the environment exactly
+/// once. Keeping the env scan out of the per-thread seed keeps the hot path a
+/// single thread-local `Cell` read with no env-lock traffic.
+fn phase_env_default() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TRUST_JS_PHASE").is_some())
+}
+
+#[inline]
+fn phases_on() -> bool {
+    PHASE_ARMED.with(std::cell::Cell::get)
+}
+
+/// Begin a `Some(Instant)` if profiling, else `None` — pairs with `phase_end`.
+#[inline]
+fn phase_begin() -> Option<Instant> {
+    phases_on().then(Instant::now)
+}
+
+/// Accumulate `t.elapsed()` into `phase`, if a timer was started.
+#[inline]
+fn phase_end(phase: Phase, t: Option<Instant>) {
+    let Some(t) = t else { return };
+    let d = t.elapsed();
+    PHASES.with(|p| {
+        let mut p = p.borrow_mut();
+        match phase {
+            Phase::Parse => {
+                p.parse += d;
+                p.parse_n += 1;
+            }
+            Phase::Compile => {
+                p.compile += d;
+                p.compile_n += 1;
+            }
+            Phase::Execute => {
+                p.execute += d;
+                p.execute_n += 1;
+            }
+        }
+    });
+}
+
+/// Zero the accumulator — called at the start of every page load.
+fn phases_reset() {
+    PHASES.with(|p| *p.borrow_mut() = PhaseProfile::default());
+}
+
+/// Read the accumulator without clearing it (the next load's `phases_reset`
+/// clears it). Lets the `settle_page` report and a test read the same numbers.
+fn phases_snapshot() -> PhaseProfile {
+    PHASES.with(|p| *p.borrow())
+}
+
+/// Force-arm/disarm profiling on the current thread (tests; production reads
+/// the env var per thread).
+#[cfg(test)]
+fn phases_arm(on: bool) {
+    PHASE_ARMED.with(|c| c.set(on));
+}
+
+/// Print the per-phase decomposition of a finished live load (under
+/// `TRUST_JS_PHASE`). `wall` is the full load+settle wall clock. The gate
+/// reading: parse+compile is the ceiling lazy compilation can remove; if it is
+/// a small share of the measured JS CPU (cross-check against `/usr/bin/time -v`
+/// User CPU, which should be ≈ the CPU line here), execution dominates and the
+/// plan's execution-throughput removal must be reopened.
+fn report_phases(wall: Duration) {
+    if !phases_on() {
+        return;
+    }
+    let p = phases_snapshot();
+    let cpu = p.parse + p.compile + p.execute;
+    let pc = p.parse + p.compile;
+    let pct = |a: Duration, b: Duration| {
+        if b.is_zero() {
+            0.0
+        } else {
+            100.0 * a.as_secs_f64() / b.as_secs_f64()
+        }
+    };
+    let at = crate::http::trace_ms();
+    eprintln!("js : @{at:>6}ms ─── phase profile (whole live load) ───");
+    eprintln!(
+        "       parse   : {:>10.3?}  ({} units, {:>4.1}% of JS CPU)",
+        p.parse,
+        p.parse_n,
+        pct(p.parse, cpu)
+    );
+    eprintln!(
+        "       compile : {:>10.3?}  ({} units, {:>4.1}% of JS CPU)",
+        p.compile,
+        p.compile_n,
+        pct(p.compile, cpu)
+    );
+    eprintln!(
+        "       execute : {:>10.3?}  ({} drains+toplevel, {:>4.1}% of JS CPU; incl. module compile)",
+        p.execute,
+        p.execute_n,
+        pct(p.execute, cpu)
+    );
+    eprintln!(
+        "       ── measured JS CPU (parse+compile+execute): {cpu:.3?}  [≈ /usr/bin/time User]"
+    );
+    eprintln!(
+        "       ── parse+compile = {:.3?} ({:>4.1}% of JS CPU)  ← lazy-compile lever ceiling",
+        pc,
+        pct(pc, cpu)
+    );
+    eprintln!(
+        "       ── load wall: {:.3?}  (wall − JS CPU ≈ network wait + Rust-side: {:.3?})",
+        wall,
+        wall.saturating_sub(cpu)
+    );
+}
+
 /// Run one script, tolerating failure: an exception (including a tripped
 /// runtime limit) lands in `outcome.errors` tagged with `name`, and the
 /// page lives on. Skipped outright when the budget is spent.
@@ -440,7 +629,23 @@ pub fn run_script(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Tag the source with its URL/label so backtraces name the file
         // (classic scripts were anonymous "unknown" — modules already do this).
-        ctx.eval(Source::from_bytes(source).with_path(std::path::Path::new(name)))
+        //
+        // This is `ctx.eval` unrolled into its exact three steps so the phase
+        // profiler can time each: `eval` IS `Script::parse(..)?.evaluate(..)`,
+        // and `evaluate`'s `prepare_run` memoizes `codeblock` — so pre-calling
+        // `codeblock` only lets us time compilation separately; the result is
+        // byte-for-byte identical to `ctx.eval`.
+        let src = Source::from_bytes(source).with_path(std::path::Path::new(name));
+        let t = phase_begin();
+        let script = boa_engine::Script::parse(src, None, ctx)?;
+        phase_end(Phase::Parse, t);
+        let t = phase_begin();
+        script.codeblock(ctx)?;
+        phase_end(Phase::Compile, t);
+        let t = phase_begin();
+        let r = script.evaluate(ctx);
+        phase_end(Phase::Execute, t);
+        r
     }));
     match result {
         Ok(Ok(_)) => {}
@@ -1660,7 +1865,22 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
 /// surviving a Boa VM panic — one bad injected script can't kill the actor.
 fn eval_injected(ctx: &mut Context, name: &str, source: &[u8]) {
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ctx.eval(Source::from_bytes(source).with_path(std::path::Path::new(name)))
+        // Same exact `ctx.eval` unroll as `run_script`, so a dynamically
+        // injected `<script>` (webpack chunk loaders inject many, sometimes
+        // large, ones) lands in the parse/compile/execute split instead of
+        // being invisible — it runs inside an async job future the executor
+        // awaits, which the per-loop drain timer doesn't cover.
+        let src = Source::from_bytes(source).with_path(std::path::Path::new(name));
+        let t = phase_begin();
+        let script = boa_engine::Script::parse(src, None, ctx)?;
+        phase_end(Phase::Parse, t);
+        let t = phase_begin();
+        script.codeblock(ctx)?;
+        phase_end(Phase::Compile, t);
+        let t = phase_begin();
+        let r = script.evaluate(ctx);
+        phase_end(Phase::Execute, t);
+        r
     }));
     if let Ok(Err(err)) = res {
         let msg = format!("{name}: {err}");
@@ -2224,11 +2444,14 @@ impl boa_engine::module::ModuleLoader for WebModuleLoader {
             // module's own imports so they're in flight before the loader
             // asks for each.
             speculate_imports(&mut ctx, &resolved, &cached.body);
-            boa_engine::Module::parse(
+            let t = phase_begin();
+            let m = boa_engine::Module::parse(
                 Source::from_bytes(&cached.body).with_path(std::path::Path::new(&key)),
                 None,
                 &mut ctx,
-            )?
+            )?;
+            phase_end(Phase::Parse, t);
+            m
         };
         self.modules.borrow_mut().insert(key, module.clone());
         Ok(module)
@@ -2274,11 +2497,14 @@ fn run_module(
     register: Option<(&Rc<WebModuleLoader>, &str)>,
 ) {
     let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        boa_engine::Module::parse(
+        let t = phase_begin();
+        let m = boa_engine::Module::parse(
             Source::from_bytes(source).with_path(std::path::Path::new(path)),
             None,
             ctx,
-        )
+        );
+        phase_end(Phase::Parse, t);
+        m
     }));
     let module = match parsed {
         Ok(Ok(m)) => m,
@@ -2359,6 +2585,7 @@ fn load_page(
     ws_events: Option<tokio::sync::mpsc::Sender<(usize, crate::ws::WsIn)>>,
 ) -> Result<LoadedPage, Outcome> {
     phase("load_page start (DOM parse)");
+    phases_reset();
     let page_url = env.url.as_str();
     let viewport = env.viewport;
     let cell_px = env.cell_px;
@@ -2679,6 +2906,16 @@ fn settle_page(page: &mut LoadedPage) {
         .host_defined()
         .get::<PageNet>()
         .map_or(0, |n| n.fetched.get());
+    // Which JS functions burned the settle phase (under TRUST_JS_PROFILE) — the
+    // settle is where a data-driven SPA spends its seconds, and the load_page
+    // dumps only cover up to DOMContentLoaded, so without this the dominant
+    // phase is unsampled. Pairs with the phase split below.
+    dump_vm_profile("settle");
+    // Step 1 decision-gate output: the whole-load parse/compile/execute split
+    // (under TRUST_JS_PHASE). `page.started` was stamped at load start, so this
+    // is the full load+settle wall — including this page's settle execution,
+    // which `engine_profile` (one bundle in isolation) can't see.
+    report_phases(page.started.elapsed());
 }
 
 /// Drain due timers and microtasks until quiet, budget-bounded.
@@ -2695,7 +2932,15 @@ fn settle(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Ou
             ));
             break;
         }
-        match ctx.eval(Source::from_bytes(b"__trust.tick(1000)")) {
+        // `__trust.tick` advances virtual time and FIRES due timer callbacks
+        // (page JS) synchronously, so its execution is real engine work — time
+        // it into the execute bucket. It runs via a direct `ctx.eval` (not
+        // `run_script`/a job), so without this it would be invisible to the
+        // profiler and mis-attributed to "Rust-side" in the gate split.
+        let t = phase_begin();
+        let ticked = ctx.eval(Source::from_bytes(b"__trust.tick(1000)"));
+        phase_end(Phase::Execute, t);
+        match ticked {
             Ok(v) if v.to_boolean() => ticks += 1,
             _ => {
                 phase(&format!("settle: {ticks} ticks, quiescent"));
@@ -2720,10 +2965,14 @@ const IMG_LOAD_PASSES: usize = 3;
 fn settle_image_loads(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Outcome) {
     for _ in 0..IMG_LOAD_PASSES {
         let scheduled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ctx.eval(Source::from_bytes(b"__trust.scanImageLoads()"))
+            let t = phase_begin();
+            let n = ctx
+                .eval(Source::from_bytes(b"__trust.scanImageLoads()"))
                 .ok()
                 .and_then(|v| v.as_number())
-                .unwrap_or(0.0)
+                .unwrap_or(0.0);
+            phase_end(Phase::Execute, t);
+            n
         }))
         .unwrap_or(0.0);
         if scheduled < 1.0 {
@@ -7897,16 +8146,27 @@ mod tests {
         }
     }
 
-    /// Engine profiler: load an arbitrary JS bundle into a faithful page
-    /// context (DOM + syscalls + config + PRELUDE, exactly as `load_page`
-    /// builds it) and split its cost into parse / compile / execute, plus
-    /// GC stats (vendored boa_gc instrumentation). The bundle runs as a
-    /// classic top-level script. Heavy real bundles (the YouTube kevlar
-    /// base) won't fully boot without their page environment, but they
+    /// Engine profiler (Step 0 harness): load an arbitrary JS bundle into a
+    /// faithful page context (DOM + syscalls + config + PRELUDE, exactly as
+    /// `load_page` builds it) and split its cost into parse / compile /
+    /// execute, plus GC stats (vendored boa_gc instrumentation). The bundle
+    /// runs as a classic top-level script. Heavy real bundles (the YouTube
+    /// kevlar base) won't fully boot without their page environment, but they
     /// still exercise parse+compile of the whole file and a large slab of
     /// execution — enough to find where the engine spends its seconds.
-    ///   TRUST_JS_BENCH=/tmp/kevlar.js cargo test --release engine_profile \
-    ///     -- --ignored --nocapture
+    ///
+    /// Hardened for reproducibility: it repeats `TRUST_JS_BENCH_RUNS` times
+    /// (default 5), DISCARDS the first (cold) run, and reports median + min/max
+    /// (dispersion) per phase, plus a metadata header (commit / allocator /
+    /// arch / input hash / peak RSS) so a number is reproducible next session.
+    /// Each run rebuilds a fresh context and force-collects first, so the
+    /// samples are independent. NB: this measures ONE bundle in isolation — it
+    /// CANNOT see a live SPA's settle-time execution; for that, load the real
+    /// page under `TRUST_JS_PHASE=1` (the whole-load phase report). See the JS
+    /// engine performance plan, Step 0/1.
+    ///   TRUST_JS_BENCH=/tmp/kevlar.js [TRUST_JS_BENCH_RUNS=5] \
+    ///     cargo test --release engine_profile -- --ignored --nocapture
+    /// (run under `/usr/bin/time -v` for User CPU / max RSS too).
     #[test]
     #[ignore = "manual measurement, needs TRUST_JS_BENCH=<file>"]
     fn engine_profile() {
@@ -7915,71 +8175,198 @@ mod tests {
             return;
         };
         let src = std::fs::read(&path).unwrap();
-        eprintln!("--- engine profile: {path} ({} bytes) ---", src.len());
+        let runs: usize = std::env::var("TRUST_JS_BENCH_RUNS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5)
+            .max(1);
+        let no_opt = std::env::var_os("TRUST_NO_OPT").is_some();
 
-        // Faithful page context: DOM arena + syscalls + config + PRELUDE.
-        let html = r#"<html><head></head><body><div id="content"></div></body></html>"#;
-        let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
-        let mut ctx = page_context_with(None).0;
-        {
-            let mut host = ctx.realm().host_defined_mut();
-            host.insert(PageDom(dom.clone()));
-            host.insert(PageStore {
-                map: Default::default(),
-                origin: String::from("https://example.com"),
-            });
-        }
-        register_syscalls(&mut ctx).unwrap();
-        let cfg = r#"globalThis.__trust_cfg = { url: "https://www.youtube.com/", ua: "TRust/0.1", width: 1600, height: 800 };"#;
-        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
-        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+        // --- reproducibility metadata header ---
+        use sha2::Digest as _;
+        let hash = sha2::Sha256::digest(&src);
+        let hash_hex: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        let commit = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| String::from("unknown"));
+        let alloc = if cfg!(feature = "mimalloc") {
+            "mimalloc"
+        } else {
+            "system"
+        };
+        eprintln!("=== engine profile ===");
+        eprintln!(
+            "input    : {path}  ({} bytes, sha256:{hash_hex}…)",
+            src.len()
+        );
+        eprintln!(
+            "build    : commit {commit}  arch {}  alloc {alloc}  opt {}",
+            std::env::consts::ARCH,
+            if no_opt { "OFF" } else { "on" },
+        );
+        eprintln!("runs     : {runs} (first discarded as cold)");
 
-        // GC policy comes from page_context_with's apply_gc_policy, honoring
-        // TRUST_GC_FLOOR (MiB) / TRUST_GC_GROWTH (percent).
-        if std::env::var_os("TRUST_NO_OPT").is_some() {
-            ctx.set_optimizer_options(boa_engine::optimizer::OptimizerOptions::empty());
-            eprintln!("AST optimizer DISABLED");
-        }
-
-        // Per-phase GC deltas: (collections, gc time).
-        let g = |a: (usize, Duration, usize), b: (usize, Duration, usize)| (b.0 - a.0, b.1 - a.1);
-
-        let gc0 = boa_engine::gc::gc_profile();
-        let t = Instant::now();
-        let script = boa_engine::Script::parse(Source::from_bytes(&src), None, &mut ctx).unwrap();
-        let parse = t.elapsed();
-        let gc1 = boa_engine::gc::gc_profile();
-
-        let t = Instant::now();
-        script.codeblock(&mut ctx).unwrap();
-        let compile = t.elapsed();
-        let gc2 = boa_engine::gc::gc_profile();
-
-        let t = Instant::now();
-        let res =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| script.evaluate(&mut ctx)));
-        let execute = t.elapsed();
-        let gc3 = boa_engine::gc::gc_profile();
-
-        let (pc, pt) = g(gc0, gc1);
-        let (cc, ct) = g(gc1, gc2);
-        let (ec, et) = g(gc2, gc3);
-        eprintln!("parse:           {parse:?}  (gc: {pc} colls, {pt:?})");
-        eprintln!("compile:         {compile:?}  (gc: {cc} colls, {ct:?})");
-        eprintln!("execute:         {execute:?}  (gc: {ec} colls, {et:?})");
-        eprintln!("TOTAL:           {:?}", parse + compile + execute);
-        match res {
-            Ok(Ok(_)) => eprintln!("result:          ran clean"),
-            Ok(Err(e)) => {
-                let s = e.to_string();
-                eprintln!("result:          threw: {}", &s[..s.len().min(160)]);
+        // One independent measurement: fresh context + clean heap, then time
+        // parse / compile / execute of the bench source (NOT the prelude setup).
+        let run_once = || -> (Duration, Duration, Duration, (usize, Duration, usize), &'static str) {
+            let html = r#"<html><head></head><body><div id="content"></div></body></html>"#;
+            let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
+            let mut ctx = page_context_with(None).0;
+            {
+                let mut host = ctx.realm().host_defined_mut();
+                host.insert(PageDom(dom.clone()));
+                host.insert(PageStore {
+                    map: Default::default(),
+                    origin: String::from("https://example.com"),
+                });
             }
-            Err(_) => eprintln!("result:          PANIC"),
+            register_syscalls(&mut ctx).unwrap();
+            let cfg = r#"globalThis.__trust_cfg = { url: "https://www.youtube.com/", ua: "TRust/0.1", width: 1600, height: 800 };"#;
+            ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+            ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+            if no_opt {
+                ctx.set_optimizer_options(boa_engine::optimizer::OptimizerOptions::empty());
+            }
+            // Start each measured run from a reclaimed heap, so GC growth state
+            // doesn't leak across runs.
+            boa_engine::gc::force_collect();
+
+            let gc0 = boa_engine::gc::gc_profile();
+            let t = Instant::now();
+            let script =
+                boa_engine::Script::parse(Source::from_bytes(&src), None, &mut ctx).unwrap();
+            let parse = t.elapsed();
+            let t = Instant::now();
+            script.codeblock(&mut ctx).unwrap();
+            let compile = t.elapsed();
+            let t = Instant::now();
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                script.evaluate(&mut ctx)
+            }));
+            let execute = t.elapsed();
+            let gc1 = boa_engine::gc::gc_profile();
+            let outcome = match res {
+                Ok(Ok(_)) => "clean",
+                Ok(Err(_)) => "threw",
+                Err(_) => "PANIC",
+            };
+            (parse, compile, execute, (gc1.0 - gc0.0, gc1.1 - gc0.1, gc1.2), outcome)
+        };
+
+        // median + dispersion over a slice of durations.
+        let stats = |xs: &[Duration]| -> (Duration, Duration, Duration) {
+            let mut v = xs.to_vec();
+            v.sort_unstable();
+            (v[v.len() / 2], v[0], v[v.len() - 1]) // median, min, max
+        };
+
+        let mut parses = Vec::new();
+        let mut compiles = Vec::new();
+        let mut executes = Vec::new();
+        let mut last_gc = (0usize, Duration::ZERO, 0usize);
+        let mut last_outcome = "n/a";
+        for i in 0..runs {
+            let (p, c, e, gc, outcome) = run_once();
+            last_gc = gc;
+            last_outcome = outcome;
+            eprintln!(
+                "run {i:>2}{}: parse {p:>9.3?}  compile {c:>9.3?}  execute {e:>9.3?}  [{outcome}]",
+                if i == 0 && runs > 1 { " (cold)" } else { "" }
+            );
+            // Discard the cold run only when we have warm runs to keep.
+            if i > 0 || runs == 1 {
+                parses.push(p);
+                compiles.push(c);
+                executes.push(e);
+            }
         }
-        eprintln!("--- GC totals ---");
-        eprintln!("collections:     {}", gc3.0 - gc0.0);
-        eprintln!("gc time:         {:?}", gc3.1 - gc0.1);
-        eprintln!("bytes live:      {} MiB", gc3.2 / (1024 * 1024));
+
+        let (pm, plo, phi) = stats(&parses);
+        let (cm, clo, chi) = stats(&compiles);
+        let (em, elo, ehi) = stats(&executes);
+        eprintln!(
+            "--- medians over {} warm run(s) (min … max) ---",
+            parses.len()
+        );
+        eprintln!("parse    : {pm:>9.3?}   ({plo:.3?} … {phi:.3?})");
+        eprintln!("compile  : {cm:>9.3?}   ({clo:.3?} … {chi:.3?})");
+        eprintln!("execute  : {em:>9.3?}   ({elo:.3?} … {ehi:.3?})");
+        eprintln!("TOTAL    : {:>9.3?}   (medians summed)", pm + cm + em);
+        eprintln!("--- last run GC / footprint ---");
+        eprintln!("result   : {last_outcome}");
+        eprintln!(
+            "gc       : {} collections, {:?}; live {} MiB",
+            last_gc.0,
+            last_gc.1,
+            last_gc.2 / (1024 * 1024)
+        );
+        if let Some(peak) = proc_peak_rss_mib() {
+            eprintln!("peak RSS : {peak} MiB (VmHWM)");
+        }
+    }
+
+    /// Process peak resident set size (MiB) from `/proc/self/status` VmHWM —
+    /// Linux only; `None` elsewhere. Cheaper and dependency-free vs getrusage
+    /// (the host's `perf` counters are locked; see CLAUDE.md).
+    fn proc_peak_rss_mib() -> Option<u64> {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .and_then(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+            .map(|kib| kib / 1024)
+    }
+
+    /// The phase split inside `run_script` is exactly `ctx.eval` unrolled, so a
+    /// page must run identically; and with profiling armed the whole-load
+    /// parse/compile/execute accumulators populate (the Step 1 decision-gate
+    /// tool). Snapshot BEFORE disarming so a failed assert can't leave the
+    /// thread armed for a sibling test.
+    #[test]
+    fn phase_profiler_splits_a_load_and_preserves_behaviour() {
+        phases_arm(true);
+        let html = r#"<html><body><div id="x"></div>
+            <script>document.getElementById('x').textContent = 'hi' + (1 + 1);</script>
+            </body></html>"#;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        let p = phases_snapshot();
+        phases_arm(false);
+
+        assert!(
+            out.contains("hi2"),
+            "the script effect must survive the phase split: {out}"
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // config + prelude + the page script + DOMContentLoaded + load each run
+        // through the split, so every phase fires several times.
+        assert!(
+            p.parse_n >= 1 && !p.parse.is_zero(),
+            "parse not recorded: {p:?}"
+        );
+        assert!(
+            p.compile_n >= 1 && !p.compile.is_zero(),
+            "compile not recorded: {p:?}"
+        );
+        assert!(p.execute_n >= 1, "execute not recorded: {p:?}");
+    }
+
+    /// Profiling OFF (the default) records nothing — the unprofiled path pays
+    /// only the cached bool check and the accumulators stay zero.
+    #[test]
+    fn phase_profiler_is_inert_when_disarmed() {
+        phases_arm(false);
+        phases_reset();
+        let html = r#"<html><body><script>var x = 1 + 1;</script></body></html>"#;
+        let (_out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        let p = phases_snapshot();
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(p.parse_n, 0, "armed off but parse recorded: {p:?}");
+        assert_eq!(p.compile_n, 0, "armed off but compile recorded: {p:?}");
+        assert_eq!(p.execute_n, 0, "armed off but execute recorded: {p:?}");
     }
 
     /// Quantify the GC policy win, stock vs TRust default, on two
