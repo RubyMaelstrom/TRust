@@ -3735,8 +3735,16 @@ mod tests {
         if std::env::var_os("TRUST_DIAG_SETTLE").is_some()
             && let Some(live) = response.live.as_mut()
         {
-            for _ in 0..6 {
-                match tokio::time::timeout(Duration::from_secs(20), live.events.recv()).await {
+            let __drain: usize = std::env::var("TRUST_DIAG_DRAIN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(6);
+            let __to: u64 = std::env::var("TRUST_DIAG_DRAIN_TO")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(20);
+            for _ in 0..__drain {
+                match tokio::time::timeout(Duration::from_secs(__to), live.events.recv()).await {
                     Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
                         eprintln!(
                             "SETTLE EVT errors={:?} console={:?}",
@@ -4376,8 +4384,16 @@ mod tests {
         if std::env::var_os("TRUST_DIAG_SETTLE").is_some()
             && let Some(live) = response.live.as_mut()
         {
-            for _ in 0..6 {
-                match tokio::time::timeout(Duration::from_secs(20), live.events.recv()).await {
+            let __drain: usize = std::env::var("TRUST_DIAG_DRAIN")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(6);
+            let __to: u64 = std::env::var("TRUST_DIAG_DRAIN_TO")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(20);
+            for _ in 0..__drain {
+                match tokio::time::timeout(Duration::from_secs(__to), live.events.recv()).await {
                     Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
                         eprintln!(
                             "SETTLED EVT errors={:?} console={:?}",

@@ -40,6 +40,16 @@ pub const COMPUTE_BUDGET: Duration = Duration::from_secs(30);
 /// most; ten million leaves headroom while still catching `while(true)`
 /// in well under a second.
 const LOOP_LIMIT: u64 = 10_000_000;
+/// Max JS function-call recursion depth (Boa default is 512). Reactive signal
+/// graphs (YouTube kevlar) nest call frames deep; browsers allow thousands.
+/// Frames are heap-allocated VM CallFrames for JS↔JS recursion, so this is
+/// cheap and stays well within the trust-js thread's 64MB stack.
+const RECURSION_LIMIT: usize = 4000;
+/// Max VM operand-stack slots (Boa default 10240). The operand stack grows
+/// with call depth (args/locals per frame), so it must scale with
+/// RECURSION_LIMIT or a deep-but-finite recursion trips "exceeded maximum call
+/// stack length" before completing. Also a heap Vec, so generous is cheap.
+const STACK_SIZE_LIMIT: usize = 64 * 1024;
 
 /// GC policy for the (vendored) boa_gc mark-sweep collector. Boa's stock
 /// policy — a 1 MiB floor grown only ~1.43× per collection — thrashes
@@ -298,8 +308,15 @@ fn page_context_with(loader: Option<Rc<WebModuleLoader>>) -> (Context, Rc<PageHo
     };
     let limits = ctx.runtime_limits_mut();
     limits.set_loop_iteration_limit(LOOP_LIMIT);
-    // Recursion (512) and stack-size defaults are kept: deep enough for
-    // real bundles, shallow enough to stop runaway recursion fast.
+    limits.set_recursion_limit(RECURSION_LIMIT);
+    limits.set_stack_size_limit(STACK_SIZE_LIMIT);
+    // Recursion limit raised above Boa's 512 default (see RECURSION_LIMIT):
+    // real reactive frameworks (YouTube's kevlar signal graph) legitimately
+    // nest call frames hundreds deep, and a browser's native stack allows
+    // thousands. The frames are heap-allocated VM CallFrames (not native
+    // stack) for pure JS↔JS recursion, so a higher cap is cheap; it still
+    // bounds runaway recursion (just deeper), and the loop-iteration cap +
+    // WALL_BUDGET remain the real DoS lids.
     // Replace Boa's thrashy GC policy (see GC_FLOOR/GC_GROWTH_PERCENT). The
     // policy is thread-local on the GC, so set it every time we build a page
     // context — the trust-js thread is reused across navigations, and each
@@ -5651,8 +5668,16 @@ const PRELUDE: &str = r##"
             __dom_set_text(this.__id, v);
             moCharData(this, old);
         }
-        get data() { return this.nodeValue ?? ""; }
-        set data(v) { this.nodeValue = String(v); }
+        // NOTE: `data` is deliberately NOT here. Per the DOM spec it is a
+        // CharacterData-only IDL attribute (Text/Comment/ProcessingInstruction),
+        // defined on the CharacterData class below. Putting it on Node leaks
+        // `data` onto EVERY element, so `"data" in someDiv` is wrongly true —
+        // which fools `prop in element` feature tests. YouTube's polymer_resin
+        // builds a reference element and does `if ("data" in refEl)` to decide
+        // whether a `data` PROPERTY binding is a known DOM sink (sanitize) or a
+        // safe custom-element property (pass through); the leaked `data` made it
+        // sanitize ytd-* renderers' `.data` object to its innocuous sentinel, so
+        // the whole search-results tree never received its data and stayed empty.
         get ownerDocument() { return g.document; }
         get isConnected() {
             let n = this;
@@ -6383,6 +6408,49 @@ const PRELUDE: &str = r##"
         get scrollLeft() { return 0; }
         set scrollLeft(_v) {}
     }
+
+    // --- type-gated read-only accessors: allow expando writes off-type ------
+    // Several IDL getters belong to a SPECIFIC element interface
+    // (HTMLSelectElement.options/selectedOptions, HTMLMediaElement.error/
+    // duration/readyState/…) but live on the ONE shared Element prototype,
+    // gated to return `undefined` for elements of the wrong type. A real
+    // browser puts each accessor only on its OWNING interface's prototype — so
+    // on every other element the same name is a plain WRITABLE expando, not an
+    // accessor. As getter-only accessors here they instead shadowed the name on
+    // EVERY element, so `el.options = x` / `el.error = x` threw "cannot set
+    // non-writable property" in strict mode (trap #3). This broke YouTube:
+    // Polymer declares an `options` property on its `ytd-*` custom elements and
+    // assigns it during data-binding, so the assignment threw and aborted the
+    // entire search-results render. Fix the primitive generally: give each such
+    // accessor a setter. On the OWNING element type the property stays read-only
+    // (the write is ignored — the spec property is read-only there; a real
+    // browser would throw, we just no-op to never spuriously break a page). On
+    // any OTHER element the setter defines a normal own data property — exactly
+    // the browser's expando. The gate is the getter itself: it returns a
+    // non-undefined sentinel ONLY for the owning type, so a getter that returns
+    // `undefined` for `this` means this element should treat the name as a plain
+    // property. Passing name+getter as parameters keeps the captured bindings
+    // function-scoped (never block-scoped class locals — trap #6 hygiene).
+    function __expandoFallback(name, getter) {
+        Object.defineProperty(Element.prototype, name, {
+            get: getter,
+            set(v) {
+                if (getter.call(this) !== undefined) return; // owning type: read-only
+                Object.defineProperty(this, name, {
+                    value: v, writable: true, configurable: true, enumerable: true,
+                });
+            },
+            configurable: true,
+            enumerable: false,
+        });
+    }
+    ["options", "selectedOptions", "error", "ended", "seeking", "duration",
+        "videoWidth", "videoHeight", "currentSrc", "buffered", "played",
+        "seekable", "textTracks", "audioTracks", "videoTracks", "readyState",
+        "networkState"].forEach(function (name) {
+        const d = Object.getOwnPropertyDescriptor(Element.prototype, name);
+        if (d && d.get && !d.set) __expandoFallback(name, d.get);
+    });
 
     // CharacterData: the shared text-bearing interface for Text and Comment.
     // `data` is [LegacyNullToEmptyString] — null becomes "" (but undefined
@@ -8338,6 +8406,14 @@ const PRELUDE: &str = r##"
     // phases: fast-forwarded during settle, real-time at rest. `Date.now()`
     // keeps a realistic absolute base so timestamps still look real;
     // `performance.now()` is the elapsed virtual time.
+    //
+    // KNOWN LIMITATION (YouTube, deferred to a focused effort): this clock does
+    // NOT advance within a single SYNCHRONOUS block — only between ticks. A
+    // time-budget chunking loop (`while (Date.now() < start + ~13ms) chunk()`,
+    // as YouTube's render scheduler / React's scheduler use) therefore never
+    // sees its deadline and won't yield. Making the LIVE-mode clock real fixes
+    // that but needs careful cross-site verification (load-time code that bails
+    // on a `performance.now()` threshold), so it's a separate task — not landed.
     const __epoch0 = Date.now();
     Date.now = () => __epoch0 + timers.now;
     g.performance.now = () => timers.now;
@@ -14595,6 +14671,87 @@ mod tests {
         // The final selection ("en") carries the `selected` attribute the layout
         // and form-submit path read.
         assert!(out.contains("value=\"en\" selected"), "{out}");
+    }
+
+    #[test]
+    fn type_gated_idl_names_are_writable_expandos_off_type() {
+        // HTMLSelectElement.options / HTMLMediaElement.error etc. are read-only
+        // IDL getters that the prelude gates on the ONE shared Element prototype.
+        // As getter-only accessors they made `el.options = x` throw "cannot set
+        // non-writable property" in strict mode on EVERY element — YouTube's
+        // Polymer declares an `options` property on its `ytd-*` custom elements
+        // and assigns it during data-binding, which aborted the whole render.
+        // On a non-owning element the name must be a plain writable expando
+        // (browser semantics); on the owning element it stays read-only.
+        let (out, outcome) = page(
+            "<body><div id=d></div><pre id=o></pre>\
+             <script>\
+             'use strict';\
+             var r;\
+             try {\
+             class YtThing extends HTMLElement {\
+               setup(){ this.options = {sort:'rel'}; this.error = null; }\
+             }\
+             customElements.define('yt-thing', YtThing);\
+             var t = document.createElement('yt-thing');\
+             t.setup();\
+             var d = document.getElementById('d');\
+             d.options = [1,2,3];\
+             var s = document.createElement('select');\
+             s.innerHTML = '<option value=a></option><option value=b></option>';\
+             var before = s.options.length;\
+             s.options = 'nope';\
+             r = 'opt=' + t.options.sort + ' err=' + (t.error === null)\
+               + ' exp=' + d.options.join(',')\
+               + ' selRO=' + (before === 2 && s.options.length === 2 && s.options !== 'nope');\
+             } catch (e) { r = 'THREW: ' + e; }\
+             document.getElementById('o').textContent = r;\
+             </script></body>",
+        );
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("opt=rel err=true exp=1,2,3 selRO=true"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn data_is_a_characterdata_property_not_a_node_property() {
+        // `data` is a CharacterData-only IDL attribute (Text/Comment) per the DOM
+        // spec — it must NOT exist on Element. When it leaked onto Node (and thus
+        // every element), `"data" in someDiv` was wrongly true, which fools the
+        // `prop in element` feature test libraries use to tell a known DOM
+        // property from an expando. YouTube's polymer_resin does exactly this on a
+        // reference element to decide whether a `.data` PROPERTY binding is a sink
+        // to sanitize; the leak made it replace every ytd-* renderer's `.data`
+        // object with its innocuous sentinel, so the search results never
+        // rendered. Element must have no `data`; Text/Comment keep theirs.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             var div=document.createElement('div');\
+             var t=document.createTextNode('hello');\
+             var c=document.createComment('cmt');\
+             var r='dataInDiv='+('data' in div)\
+               +' divData='+(div.data===undefined)\
+               +' dataInText='+('data' in t)+' textData='+t.data\
+               +' dataInComment='+('data' in c)+' commentData='+c.data;\
+             div.data={kind:'rel'};\
+             r+=' expando='+div.data.kind;\
+             document.getElementById('o').textContent=r;\
+             </script></body>",
+        );
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // Element: no `data` (so `in` is false and a plain read is undefined), but
+        // it stays a normal writable expando. Text/Comment: `data` present + live.
+        assert!(
+            out.contains(
+                "dataInDiv=false divData=true dataInText=true textData=hello \
+                 dataInComment=true commentData=cmt expando=rel"
+            ),
+            "{out}"
+        );
     }
 
     #[test]
