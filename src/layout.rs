@@ -1305,13 +1305,20 @@ impl<'a> Layout<'a> {
         self.modal_root = self.find_modal_overlay();
         if let Some(modal) = self.modal_root {
             self.flow_node(modal, &ctx);
+            self.flush_block();
+            self.finish_floats();
         } else {
             for child in self.dom.children(root) {
                 self.flow_node(child, &ctx);
             }
+            self.flush_block();
+            self.finish_floats();
+            // The initial containing block (the viewport) places out-of-flow
+            // boxes with no positioned ancestor (and `fixed` ones) at their
+            // computed coordinates, after the body's in-flow content.
+            let cb_h = self.rows.len();
+            self.place_positioned_children(None, 0, 0, self.width, cb_h);
         }
-        self.flush_block();
-        self.finish_floats();
     }
 
     fn flow_node(&mut self, id: NodeId, ctx: &Ctx) {
@@ -1383,17 +1390,6 @@ impl<'a> Layout<'a> {
             && let Some(side) = self.float_side(id)
         {
             self.flow_float(id, side, ctx);
-            return;
-        }
-        // A slide deck (a container whose children are ALL absolutely
-        // positioned, so they OVERLAP at one spot) renders one slide at a time,
-        // paged by generated controls — a carousel of stacked slides. Checked
-        // before the tag dispatch so an inline `<a>` wrapping the slides still
-        // routes. A virtual-scroll list ALSO has all-absolute children, but they
-        // TILE at distinct `top`s instead of overlapping; that's a positioned
-        // row stack (flowed as rows below), not a deck.
-        if self.dom.is_slideshow_container(id) && !self.has_positioned_row_stack(id) {
-            self.flow_slideshow(id);
             return;
         }
         // A `contenteditable` host bound to a field (the form walk made it a
@@ -1777,16 +1773,10 @@ impl<'a> Layout<'a> {
             self.place_text(&label, &cctx);
         }
 
-        // Top-right corner overlays (an absolutely-positioned `⋯` menu / badge
-        // pinned to this positioned block's top-right corner) are laid LAST,
-        // right-aligned on the first content row, instead of flowing inline
-        // below the content. Captured before the children so we can both skip
-        // them in the flow below and know the block's first row + right edge.
-        let corner_overlays = if block_like && self.is_positioned(id) {
-            self.corner_overlay_children(id)
-        } else {
-            Vec::new()
-        };
+        // The top-left of this block's content box and its band — the origin
+        // and width that `place_positioned_children` resolves its out-of-flow
+        // descendants' coordinates against (a positioned block is their
+        // containing block). Captured before the content is laid.
         let corner_start_row = self.rows.len();
         let corner_band = (self.line_left, self.line_right);
 
@@ -1806,31 +1796,13 @@ impl<'a> Layout<'a> {
                 Some(FlexMode::Column) => self.stack_flex_items(id, &cctx),
                 None => {
                     for child in self.dom.children(id) {
-                        if corner_overlays.contains(&child) {
-                            continue;
-                        }
                         self.flow_node(child, &cctx);
                     }
                 }
             }
-            // Absolutely-positioned children are NOT flex items (excluded from
-            // `flex_items`), but they still generate boxes painted over the
-            // container. The flex passes above skip them, so flow them here as
-            // overlays (the compact out-of-flow path) — otherwise a flex box
-            // whose only content is an abspos image (a framed foreground, a
-            // `inset:0` media layer) would render nothing. A backdrop among them
-            // is dropped in `place_image`; a framed foreground renders. A corner
-            // overlay is handled separately (right-aligned below), so skip it.
-            if flex.is_some() {
-                for child in self.dom.children(id) {
-                    if matches!(self.dom.node(child).data, NodeData::Element { .. })
-                        && self.is_out_of_flow(child)
-                        && !corner_overlays.contains(&child)
-                    {
-                        self.flow_node(child, &cctx);
-                    }
-                }
-            }
+            // Out-of-flow children are skipped by the in-flow walk above
+            // (`flow_of` → `Flow::None`) and placed by their containing block in
+            // the block-tail `place_positioned_children` below.
         }
 
         // ...and `::after` closes it.
@@ -1866,14 +1838,6 @@ impl<'a> Layout<'a> {
 
         if block_like {
             self.flush_block();
-            // A positioned-row-stack member (a virtual list's row) that produced
-            // no rows — a BLANK line, e.g. an empty line in a code view — must
-            // still occupy ONE row, or the parallel column (the line-number
-            // gutter) slides up under the wrong line. Each positioned row is a
-            // discrete line; an empty one is a blank line, not nothing.
-            if self.rows.len() == corner_start_row && self.in_positioned_row_stack(id) {
-                self.rows.push(Row::default());
-            }
             // Flush this BFC's own floats within it (sizing the box to
             // contain them), then restore the outer float context.
             if let Some(outer) = saved_floats {
@@ -1895,13 +1859,26 @@ impl<'a> Layout<'a> {
                 let gutter = self.indent.saturating_sub(marker_added);
                 self.place_list_marker(&marker, marker_start_row, gutter);
             }
-            if !corner_overlays.is_empty() {
-                self.place_corner_overlays(
-                    &corner_overlays,
-                    corner_start_row,
+            // This block is the containing block for any `position:absolute`
+            // descendant whose nearest positioned ancestor it is (and `fixed`
+            // ones when it is the root). Place them at their computed
+            // coordinates relative to this block's content box, now that its
+            // in-flow content (and so its height) is known.
+            if self.is_positioned(id) {
+                let cb_w = corner_band.1.saturating_sub(corner_band.0);
+                let content_h = self.rows.len().saturating_sub(corner_start_row);
+                let cb_h = self
+                    .dom
+                    .computed_style(id, "height")
+                    .and_then(|v| css_length_rows(&v))
+                    .unwrap_or(content_h)
+                    .max(content_h);
+                self.place_positioned_children(
+                    Some(id),
                     corner_band.0,
-                    corner_band.1,
-                    &cctx,
+                    corner_start_row,
+                    cb_w,
+                    cb_h,
                 );
             }
             if self.gap_after(id, &tag) {
@@ -2091,12 +2068,13 @@ impl<'a> Layout<'a> {
         if self.dom.computed_display(id).as_deref() == Some("none") {
             return Flow::None;
         }
-        // We can't place `position:absolute`/`fixed` boxes at coordinates, so
-        // we render them in normal flow — but as INLINE, not block. An overlay
-        // (slideshow arrows/dots, a badge, a "new" ribbon) then collapses to a
-        // compact run instead of each control claiming its own block line.
-        if self.is_out_of_flow(id) {
-            return Flow::Inline;
+        // An out-of-flow box (`position:absolute`/`fixed`) is removed from
+        // normal flow (CSS 2.1 §9.6): its containing block places it at its
+        // computed coordinates (`place_positioned_children`), so the in-flow
+        // walk skips it. The exception is when WE are laying this very box as
+        // its own sub-box (it is the `subtree_root`) — then flow its content.
+        if self.is_out_of_flow(id) && self.subtree_root != Some(id) {
+            return Flow::None;
         }
         if let Some(d) = self.dom.computed_display(id) {
             return match d.as_str() {
@@ -2243,174 +2221,20 @@ impl<'a> Layout<'a> {
     /// overlays are excluded (they keep their right-aligned first-row path);
     /// when the children don't look like a positioned list this returns empty,
     /// leaving the compact inline-overlay behavior for badges/backdrops intact.
-    /// The direct children of a positioned block that are top-right corner
-    /// overlays — `position:absolute`, anchored to the right edge (`right` set,
-    /// `left` auto) at the TOP (no `bottom` anchor). The web's badge/menu-in-
-    /// the-corner idiom: a comment's options `⋯`, a card's "NEW" ribbon, a count
-    /// badge. We can't position boxes freely, so instead of dropping them to a
-    /// compact inline run BELOW the content, we right-align them on the block's
-    /// FIRST line — where a browser paints them over the top-right corner.
-    fn corner_overlay_children(&self, id: NodeId) -> Vec<NodeId> {
-        self.dom
-            .children(id)
-            .into_iter()
-            .filter(|&c| self.is_top_right_overlay(c))
-            .collect()
-    }
-
-    /// Whether `id` is a top-right corner overlay (see `corner_overlay_children`):
-    /// `position:absolute`, `right` anchored (set, not `auto`), `left` not
-    /// anchored, and not `bottom`-anchored without a matching `top` (a bottom
-    /// corner badge isn't a first-line element). Hidden overlays don't count.
-    /// A transparent single-child wrapper (a link/span) is SEEN THROUGH to the
-    /// overlay it wraps — the live serializer wraps a clickable overlay (the
-    /// search bar's clear/submit buttons over the input) in an `<a>`, which
-    /// would otherwise hide the overlay from this test and let it claim its own
-    /// row below the input (the homepage search field then sat a row above the
-    /// nav).
-    fn is_top_right_overlay(&self, id: NodeId) -> bool {
-        if self.dom.is_hidden(id) {
-            return false;
-        }
-        if self.dom.computed_style(id, "position").as_deref() != Some("absolute") {
-            // See through a transparent wrapper to a sole overlay child.
-            return self
-                .sole_element_child(id)
-                .is_some_and(|c| self.is_top_right_overlay(c));
-        }
-        let off = |p: &str| {
-            self.dom
-                .computed_style(id, p)
-                .map(|v| v.trim().to_ascii_lowercase())
-        };
-        let set = |v: &Option<String>| v.as_deref().is_some_and(|v| v != "auto");
-        let (top, right, bottom, left) = (off("top"), off("right"), off("bottom"), off("left"));
-        // Right-anchored, not left-anchored (else it spans / pins left).
-        if !set(&right) || set(&left) {
-            return false;
-        }
-        // A TOP corner: top-anchored, OR free of a bottom anchor (so it sits at
-        // the box top by default). Both top and bottom anchored → stretched, but
-        // its content still begins at the top, so treat `top` as the anchor.
-        set(&top) || !set(&bottom)
-    }
-
-    /// The sole ELEMENT child of `id` (ignoring whitespace/text nodes), or
-    /// `None` if there are zero or several — used to see through a transparent
-    /// wrapper (an `<a>`/`<span>` the serializer added around one control).
-    fn sole_element_child(&self, id: NodeId) -> Option<NodeId> {
-        let mut found = None;
-        for c in self.dom.children(id) {
-            if matches!(self.dom.node(c).data, NodeData::Element { .. }) {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(c);
-            }
-        }
-        found
-    }
-
     /// Whether an element is taken out of normal flow by `position:absolute`
-    /// or `fixed` — an overlay we render compactly inline, since we can't
-    /// pixel-position it.
-    ///
-    /// EXCEPTION: an absolutely-positioned element that is one of several
-    /// positioned siblings tiling at DISTINCT `top`s is laid IN FLOW as a block
-    /// (`in_positioned_row_stack`). That's a positioned LAYOUT — a virtual
-    /// scroller's rows, a positioned column of items — not a lone overlay; a
-    /// browser places each at its `top`, so collapsing them all onto one inline
-    /// line (the way we treat a badge) is simply wrong. We can't honor the
-    /// pixel `top`, but flowing them as blocks in document order keeps them on
-    /// their own rows in the right sequence (CLAUDE.md: bend compliance only as
-    /// the terminal forces — position by document order, not pixels).
+    /// or `fixed` (CSS 2.1 §9.6) — its containing block places it at its
+    /// computed coordinates (`place_positioned_children`); the in-flow walk
+    /// skips it.
     fn is_out_of_flow(&self, id: NodeId) -> bool {
         // The surfaced modal flows as a normal block (its content IS the page
-        // now), not the compact inline overlay we give other out-of-flow boxes.
+        // now), not an out-of-flow box placed by a containing block.
         if Some(id) == self.modal_root {
             return false;
         }
-        if !matches!(
+        matches!(
             self.dom.computed_style(id, "position").as_deref(),
             Some("absolute" | "fixed")
-        ) {
-            return false;
-        }
-        !self.in_positioned_row_stack(id)
-    }
-
-    /// Whether `id` is one of several absolutely-positioned siblings that tile
-    /// at DISTINCT `top` offsets — a positioned layout (a virtual list's rows),
-    /// as opposed to a lone overlay/badge or a deck of OVERLAPPING slides (same
-    /// `top`). Cheap-gated: only an element that is itself a positioned row with
-    /// a `top` pays the sibling scan.
-    fn in_positioned_row_stack(&self, id: NodeId) -> bool {
-        self.abs_top_px(id).is_some()
-            && self
-                .dom
-                .parent_composed(id)
-                .is_some_and(|p| self.has_positioned_row_stack(p))
-    }
-
-    /// Whether `id`'s children form a positioned row stack: ≥2 absolutely-
-    /// positioned children that tile at DISTINCT `top`s. This is what tells a
-    /// virtual-scroll list (rows at increasing tops) apart from a slide deck
-    /// (slides OVERLAPPING at the same top) or a lone overlay — the former
-    /// flows as rows, the latter two keep their own paths.
-    fn has_positioned_row_stack(&self, id: NodeId) -> bool {
-        let mut first: Option<f32> = None;
-        let mut count = 0u32;
-        let mut distinct = false;
-        for c in self.dom.children(id) {
-            if let Some(t) = self.row_top_px(c) {
-                count += 1;
-                match first {
-                    None => first = Some(t),
-                    Some(f) if (t - f).abs() > f32::EPSILON => distinct = true,
-                    _ => {}
-                }
-            }
-        }
-        count >= 2 && distinct
-    }
-
-    /// A positioned row's `top` in pixels: the element's own absolute `top`, or
-    /// the `top` of an absolute child it wraps (a virtual list wraps each row in
-    /// an inline `<a>` whose absolute inner cell carries the `top`). `None` when
-    /// neither is a positioned-with-`top` box. Reads `position`/`top` directly
-    /// (not `is_out_of_flow`) to avoid recursion.
-    fn row_top_px(&self, id: NodeId) -> Option<f32> {
-        if let Some(t) = self.abs_top_px(id) {
-            return Some(t);
-        }
-        self.dom
-            .children(id)
-            .into_iter()
-            .filter(|&c| matches!(self.dom.node(c).data, NodeData::Element { .. }))
-            .find_map(|c| self.abs_top_px(c))
-    }
-
-    /// An element's explicit `top` as a pixel number when it is `position:
-    /// absolute|fixed`; `None` otherwise or when `top` is unset/`auto`. Only the
-    /// magnitude matters (for distinguishing distinct rows); placement is by
-    /// document order.
-    fn abs_top_px(&self, id: NodeId) -> Option<f32> {
-        if !matches!(
-            self.dom.computed_style(id, "position").as_deref(),
-            Some("absolute" | "fixed")
-        ) {
-            return None;
-        }
-        let v = self.dom.computed_style(id, "top")?;
-        let v = v.trim();
-        if v.is_empty() || v == "auto" {
-            return None;
-        }
-        let num: String = v
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-            .collect();
-        num.parse::<f32>().ok()
+        )
     }
 
     /// Whether `id` is the surfaced modal overlay or sits inside it — so its
@@ -3239,58 +3063,235 @@ impl<'a> Layout<'a> {
         self.pending_space = false;
     }
 
-    /// Lay a slide deck (stacked, absolutely-positioned slides) as a carousel
-    /// showing ONE slide at a time: each slide laid at the full band width,
-    /// side by side, with generated controls to page between them. The opacity
-    /// cascade keeps the inactive slides "in the background" (present but
-    /// off-band, so not rendered) until a control reveals the next — the
-    /// slideshow analogue of the carousel, for JS slideshows whose switching
-    /// we can't drive through the page's own (frozen-timer) script.
-    fn flow_slideshow(&mut self, id: NodeId) {
-        self.flush_block();
-        self.begin_line();
-        let band_left = self.line_left;
-        let band_w = self.line_right.saturating_sub(self.line_left).max(1);
-        // A deck is often the first thing in its box; reserve a row above the
-        // band so the generated prev/next controls have somewhere to sit.
-        if self.rows.is_empty() {
-            self.push_blank();
+    /// Place a containing block's out-of-flow (`position:absolute|fixed`)
+    /// descendants at their CSS-computed coordinates (CSS 2.1 §9.6 / §10.3.7 /
+    /// §10.6.4), relative to the CB's content box whose top-left is
+    /// (`origin_col`, `origin_row`) in cells and whose size is `cb_w`×`cb_h`
+    /// cells. Each box is laid independently (`layout_subtree_inner`) and `blit`
+    /// in document order — CSS paint order, so a later/topmost box wins shared
+    /// cells. Hidden boxes (`opacity:0`/`display:none`/`visibility:hidden`) and
+    /// boxes clipped off-screen by the CB are skipped, exactly as the in-flow
+    /// walk would. A layout wider than the on-screen band is compressed to fit
+    /// (the terminal has no horizontal scroll — her call, mirrors grid tracks).
+    ///
+    /// This single mechanism replaces the former slideshow / positioned-row-
+    /// stack / inline-overlay heuristics: positioned columns land side by side,
+    /// virtual-list rows land at their distinct `top`s, corner badges land in
+    /// their corner — all because we lay each box where its own CSS says.
+    fn place_positioned_children(
+        &mut self,
+        cb: Option<NodeId>,
+        origin_col: usize,
+        origin_row: usize,
+        cb_w: usize,
+        cb_h: usize,
+    ) {
+        let root = cb.unwrap_or_else(|| body_or_document(self.dom));
+        let kids: Vec<NodeId> = self
+            .dom
+            .descendants(root)
+            .into_iter()
+            .filter(|&d| {
+                matches!(self.dom.node(d).data, NodeData::Element { .. })
+                    && self.is_out_of_flow(d)
+                    && !self.dom.is_hidden(d)
+                    && !self.is_clipped_offscreen(d)
+                    && self.positioned_containing_block(d) == cb
+            })
+            .collect();
+        if kids.is_empty() {
+            return;
         }
-        let row_base = self.rows.len();
-        let mut x = 0usize;
-        let mut stops = Vec::new();
-        let mut height = 0usize;
-        for slide in self.dom.children(id) {
-            if self.dom.tag_name(slide).is_none() {
-                continue; // text/comment node between slides
-            }
-            // Each slide fills the band; lay it and place it one band to the
-            // right of the last, so exactly one shows at a time.
-            let b = self.layout_subtree_inner(slide, band_w, Some(slide), false, &Ctx::root());
+        // Lay each box and resolve its used (left, top) in cells.
+        struct Placed {
+            node: NodeId,
+            left: i32,
+            top: i32,
+            used_w: usize,
+            bottom_pinned: bool,
+            b: LaidBox,
+        }
+        let mut placed: Vec<Placed> = Vec::new();
+        let mut union_w = 0i32;
+        for k in kids {
+            // An explicit `width` (or a `left`+`right` stretch) is the used
+            // width; otherwise the box is shrink-to-fit, which we lay at the
+            // full band and read back its content extent — laying it at a
+            // pre-measured narrower width would re-wrap content that already
+            // fit (Steam's nav floats wrapped their last item that way).
+            let explicit_w = self.abs_used_width(k, cb_w);
+            let lay_w = explicit_w.unwrap_or(cb_w).clamp(1, cb_w.max(1));
+            // A positioned descendant still inherits an enclosing `<a>`'s link
+            // (a badge/menu wrapped in an anchor stays clickable), even though
+            // its containing block — not its DOM parent — places it.
+            let inherit = self.ancestor_link_ctx(k);
+            let b = self.layout_subtree_inner(k, lay_w, Some(k), false, &inherit);
             if b.height == 0 {
                 continue;
             }
-            stops.push(x as u16);
-            self.blit(&b, (band_left + x) as u16, row_base);
-            x += band_w; // no gap — one slide per band
-            height = height.max(b.height as usize);
-        }
-        // Two or more slides make a switchable deck; a lone slide just renders.
-        if stops.len() >= 2 {
-            self.emit_scroll_buttons(id, row_base, band_left, band_w, true);
-            self.carousels.push(Carousel {
-                start: row_base,
-                end: row_base + height,
-                left: band_left as u16,
-                right: (band_left + band_w) as u16,
-                width: x as u16,
-                stops,
-                offset: 0,
-                frame_right: None,
+            let used_w = explicit_w.unwrap_or(b.width as usize).max(1);
+            let left = self.abs_used_left(k, cb_w as i32, used_w as i32);
+            // Box height is content-driven: a cell grid has no internal scroll,
+            // so a fixed-height `overflow` panel can't be honored. Per §10.6.4
+            // that makes height auto; `top` is then clamped to the CB so a
+            // bottom-anchored tall panel rides the top instead of off-screen.
+            let top = self.abs_used_top(k, cb_h as i32, b.height as i32).max(0);
+            // A box anchored AT or BELOW the CB's bottom edge (`top:auto` and
+            // `bottom ≤ 0`, e.g. a footer at `bottom:-1.5rem`) follows the
+            // content: in a scroll-free model the CB grows to contain its
+            // positioned children, so this box sits after their extent (fixed
+            // up below). An INSET bottom (`bottom > 0`) keeps the §10.6.4 clamp.
+            let bottom_pinned = self.pos_len(k, "top", cb_h).is_none()
+                && self.pos_len(k, "bottom", cb_h).is_some_and(|b| b <= 0.0);
+            union_w = union_w.max(left.max(0) + used_w as i32);
+            placed.push(Placed {
+                node: k,
+                left,
+                top,
+                used_w,
+                bottom_pinned,
+                b,
             });
+        }
+        if placed.is_empty() {
+            return;
+        }
+        // The CB's used height grows to contain its non-bottom-pinned content;
+        // re-place each bottom-pinned box just past that extent so a footer
+        // lands below the columns instead of riding their top (the CB's own
+        // declared height was indefinite — e.g. `vh` we can't resolve).
+        let extent = placed
+            .iter()
+            .filter(|p| !p.bottom_pinned)
+            .map(|p| p.top + p.b.height as i32)
+            .max()
+            .unwrap_or(cb_h as i32)
+            .max(cb_h as i32);
+        for p in placed.iter_mut().filter(|p| p.bottom_pinned) {
+            p.top = self.abs_used_top(p.node, extent, p.b.height as i32).max(0);
+        }
+        // Compress-to-fit: scale columns down when the layout is wider than the
+        // band actually on screen from `origin_col` (no horizontal scroll).
+        let band = self.width.saturating_sub(origin_col).max(1) as i32;
+        let scale = (band as f32 / union_w as f32).min(1.0);
+        for p in placed {
+            let (col, b) = if scale < 1.0 {
+                // Re-lay at the compressed width so the box's content reflows.
+                let w = ((p.used_w as f32 * scale).round() as usize).max(1);
+                let inherit = self.ancestor_link_ctx(p.node);
+                let b = self.layout_subtree_inner(p.node, w, Some(p.node), false, &inherit);
+                let col = (origin_col as i32 + (p.left as f32 * scale).round() as i32).max(0);
+                (col as u16, b)
+            } else {
+                ((origin_col as i32 + p.left).max(0) as u16, p.b)
+            };
+            self.blit(&b, col, origin_row + p.top as usize);
         }
         self.col = self.indent;
         self.pending_space = false;
+    }
+
+    /// The inline context a positioned box inherits from its DOM ancestors —
+    /// the nearest enclosing `<a href>` (so an anchor-wrapped badge/overlay
+    /// stays clickable). Other inline styling now comes from the cascade
+    /// per-element, so only the link/kind need threading.
+    fn ancestor_link_ctx(&self, id: NodeId) -> Ctx {
+        let mut ctx = Ctx::root();
+        let mut cur = self.dom.parent_composed(id);
+        while let Some(p) = cur {
+            if matches!(self.dom.tag_name(p), Some("body" | "html")) {
+                break;
+            }
+            if self.dom.tag_name(p) == Some("a")
+                && let Some(href) = self.dom.attr(p, "href")
+            {
+                ctx.link = Some(crate::http::resolve(self.base, href));
+                ctx.kind = ItemKind::Link;
+                break;
+            }
+            cur = self.dom.parent_composed(p);
+        }
+        ctx
+    }
+
+    /// The used `width` of a positioned box in cells per CSS 2.1 §10.3.7: an
+    /// explicit `width` (clamped by `min`/`max-width`), or — when `width` is
+    /// `auto` but both `left` and `right` are set — the stretch width
+    /// `cb_w − left − right − margins`. `None` means `width:auto` with a free
+    /// side, i.e. shrink-to-fit (the caller measures content).
+    fn abs_used_width(&self, id: NodeId, cb_w: usize) -> Option<usize> {
+        if let Some(w) = self.pos_len(id, "width", cb_w) {
+            let w = self
+                .pos_len(id, "max-width", cb_w)
+                .map_or(w, |mx| w.min(mx));
+            let w = self
+                .pos_len(id, "min-width", cb_w)
+                .map_or(w, |mn| w.max(mn));
+            return Some(w.round().max(1.0) as usize);
+        }
+        match (
+            self.pos_len(id, "left", cb_w),
+            self.pos_len(id, "right", cb_w),
+        ) {
+            (Some(l), Some(r)) => {
+                let ml = self.pos_len(id, "margin-left", cb_w).unwrap_or(0.0);
+                let mr = self.pos_len(id, "margin-right", cb_w).unwrap_or(0.0);
+                Some((cb_w as f32 - l - r - ml - mr).round().max(1.0) as usize)
+            }
+            _ => None,
+        }
+    }
+
+    /// The used `left` of a positioned box (cells, may be negative) per §10.3.7,
+    /// given its used width. `left` set → `left + margin-left`; `right` set
+    /// (left auto) → `cb_w − right − width − margin-right`; both auto → the
+    /// static position (CB content origin) plus `margin-left`. Over-constrained
+    /// (both set) keeps `left` (ltr).
+    fn abs_used_left(&self, id: NodeId, cb_w: i32, used_w: i32) -> i32 {
+        let left = self.pos_len(id, "left", cb_w as usize);
+        let right = self.pos_len(id, "right", cb_w as usize);
+        let ml = self
+            .pos_len(id, "margin-left", cb_w as usize)
+            .unwrap_or(0.0);
+        let mr = self
+            .pos_len(id, "margin-right", cb_w as usize)
+            .unwrap_or(0.0);
+        match (left, right) {
+            (Some(l), _) => (l + ml).round() as i32,
+            (None, Some(r)) => (cb_w as f32 - r - used_w as f32 - mr).round() as i32,
+            (None, None) => ml.round() as i32,
+        }
+    }
+
+    /// The used `top` of a positioned box (cells, may be negative; caller
+    /// clamps ≥0) per §10.6.4, given its content height. `top` set →
+    /// `top + margin-top`; `bottom` set (top auto) → `cb_h − bottom − height −
+    /// margin-bottom`; both auto → the static position (CB content origin) plus
+    /// `margin-top`.
+    fn abs_used_top(&self, id: NodeId, cb_h: i32, used_h: i32) -> i32 {
+        let top = self.pos_len(id, "top", cb_h as usize);
+        let bottom = self.pos_len(id, "bottom", cb_h as usize);
+        let mt = self.pos_len(id, "margin-top", cb_h as usize).unwrap_or(0.0);
+        let mb = self
+            .pos_len(id, "margin-bottom", cb_h as usize)
+            .unwrap_or(0.0);
+        match (top, bottom) {
+            (Some(t), _) => (t + mt).round() as i32,
+            (None, Some(b)) => (cb_h as f32 - b - used_h as f32 - mb).round() as i32,
+            (None, None) => mt.round() as i32,
+        }
+    }
+
+    /// A positioning length (`left`/`right`/`top`/`bottom`/`width`/margins) in
+    /// cells, resolving `%`/`vw`/`calc()` against `extent`. `None` for unset or
+    /// `auto` (the caller's resolution rules then apply).
+    fn pos_len(&self, id: NodeId, prop: &str, extent: usize) -> Option<f32> {
+        let v = self.dom.computed_style(id, prop)?;
+        let t = v.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("auto") {
+            return None;
+        }
+        resolve_cells_f32(t, extent, self.viewport_w)
     }
 
     /// Generate the carousel's prev/next scroll buttons as glyph items on the
@@ -5054,6 +5055,10 @@ impl<'a> Layout<'a> {
         sub.subtree_root = Some(id);
         sub.table_depth = self.table_depth;
         sub.measuring = measure;
+        // A box laid within a surfaced modal must know it (so its full-bleed
+        // foreground image isn't dropped as a page backdrop, and the modal-root
+        // out-of-flow exemption holds in the sub-pass).
+        sub.modal_root = self.modal_root;
         sub.flow_node(id, inherit);
         sub.flush_block();
         sub.finish_floats();
@@ -5100,39 +5105,6 @@ impl<'a> Layout<'a> {
             c.right += col_off;
             c.frame_right = c.frame_right.map(|fr| fr + col_off);
             self.carousels.push(c);
-        }
-    }
-
-    /// Lay each top-right corner overlay as its own box and place it right-
-    /// aligned on the block's first content row (`row`), packing multiple
-    /// overlays leftward from the right edge (`right`). The overlay's clickable
-    /// content (a `⋯` options menu, a badge link) keeps its node/link so it
-    /// stays selectable. See `corner_overlay_children`.
-    fn place_corner_overlays(
-        &mut self,
-        overlays: &[NodeId],
-        row: usize,
-        left: usize,
-        right: usize,
-        ctx: &Ctx,
-    ) {
-        let mut edge = right;
-        for &ov in overlays {
-            let constraint = edge.saturating_sub(left).max(1);
-            let boxed = self.layout_subtree(ov, constraint, ctx);
-            if boxed.height == 0 || boxed.width == 0 {
-                continue;
-            }
-            let w = (boxed.width as usize).min(constraint);
-            let col = edge.saturating_sub(w).max(left);
-            self.blit(&boxed, col as u16, row);
-            // Keep the target row column-ordered (the overlay merges to the
-            // right of the in-flow content already on the row), so the renderer
-            // and hit-testing read it in column order.
-            if let Some(r) = self.rows.get_mut(row) {
-                r.items.sort_by_key(|it| it.col);
-            }
-            edge = col.saturating_sub(1);
         }
     }
 
@@ -8285,23 +8257,40 @@ mod tests {
     }
 
     #[test]
-    fn a_bottom_or_full_bleed_overlay_is_not_first_lined() {
-        // A bottom-anchored badge, and a full-bleed `inset:0` overlay (both
-        // offsets pinned, so it's a layer not a corner), are NOT corner badges:
-        // they keep the ordinary out-of-flow inline path, below the content.
+    fn positioned_overlays_land_by_coordinate_top_or_bottom() {
+        // A bottom-anchored badge lands at the BOTTOM of its containing block; a
+        // top:0;left:0;right:0 full-bleed layer lands on the FIRST row spanning
+        // the width — each where its own offsets place it (CSS 2.1 §10.6.4),
+        // not collapsed to a compact inline run. The CB has a real height so the
+        // bottom anchor is observable (content alone is one line).
         let rows = lay(
-            r#"<body><div style="position:relative">
+            r#"<body><div style="position:relative;height:6rem">
                  <div>line one</div>
                  <div style="position:absolute;bottom:0;right:0"><a href="/b">BOT</a></div>
                  <div style="position:absolute;top:0;left:0;right:0"><a href="/f">FULL</a></div>
                </div></body>"#,
             40,
         );
-        // Neither sits on the first row (which holds the content).
-        let first = render_row(&rows[0]);
+        let (r_bot, _) = pos_of(&rows, "BOT");
+        let (r_full, c_full) = pos_of(&rows, "FULL");
+        // FULL (top:0) rides the first row at the left edge.
+        assert_eq!(
+            r_full,
+            0,
+            "full-bleed layer on the first row: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(
+            c_full,
+            0,
+            "full-bleed layer at the left edge: {:?}",
+            texts(&rows)
+        );
+        // BOT (bottom:0) sits below it, near the bottom of the 6rem box.
         assert!(
-            !first.contains("BOT") && !first.contains("FULL"),
-            "first row holds content only: {first:?}"
+            r_bot > r_full,
+            "the bottom badge lands below the top layer (BOT@{r_bot} FULL@{r_full}): {:?}",
+            texts(&rows)
         );
     }
 
@@ -10427,30 +10416,24 @@ mod tests {
     }
 
     #[test]
-    fn slideshow_deck_renders_slides_side_by_side_with_paging_controls() {
+    fn slideshow_shows_the_active_slide_and_drops_the_hidden_ones() {
+        // A deck of stacked, absolutely-positioned slides, one revealed by
+        // opacity. Pure standards (her call): a browser paints the VISIBLE slide
+        // and the `opacity:0` ones contribute nothing — so we render the active
+        // slide and drop the rest. No paging carousel (the imminent JS-unfreeze
+        // step lets the page's own timer advance slides). The slides overlap at
+        // the same coordinates, so there is nothing to page between anyway.
         use crate::doc::Link;
-        // A deck of stacked, absolutely-positioned slides (one revealed by
-        // opacity) becomes a one-at-a-time carousel: all slides kept "in the
-        // background" but laid one band apart, with generated prev/next
-        // controls. (An <h2> above gives the controls a row to sit on.)
-        // The deck's own controls (arrows + a dot) follow it in document
-        // order, like a real JS slideshow — they must be suppressed even
-        // though they're laid AFTER the deck.
         let html = r##"<html><head><style>
              .slide { position: absolute; opacity: 0 }
              .slide.active { opacity: 1 }
            </style></head>
            <body>
              <h2>Banner</h2>
-             <div class="show">
-               <div class="deck">
-                 <div class="slide active">ALPHA</div>
-                 <div class="slide">BETA</div>
-                 <div class="slide">GAMMA</div>
-               </div>
-               <a class="prev-slide" href="#">PREVARROW</a>
-               <a class="next-slide" href="#">NEXTARROW</a>
-               <a class="dot" href="#">DOTLINK</a>
+             <div class="show" style="position:relative">
+               <div class="slide active">ALPHA</div>
+               <div class="slide">BETA</div>
+               <div class="slide">GAMMA</div>
              </div>
            </body></html>"##;
         let dom = Dom::parse_document(html);
@@ -10464,43 +10447,96 @@ mod tests {
             &ImageSizes::new(),
             false,
         );
-        assert_eq!(carousels.len(), 1, "the deck is one carousel");
-        assert_eq!(carousels[0].stops.len(), 3, "three slides → three stops");
-        // The page's own controls — arrows AND the dead dot — are all gone.
-        for ctrl in ["PREVARROW", "NEXTARROW", "DOTLINK"] {
-            assert!(
-                !rows
-                    .iter()
-                    .flat_map(|r| &r.items)
-                    .any(|it| it.text.contains(ctrl)),
-                "author control {ctrl} suppressed: {:?}",
-                texts(&rows)
-            );
-        }
-        // All three slides are present (kept in the background), even though
-        // two are opacity:0 — the deck exemption keeps them alive.
-        let col_of = |t: &str| {
-            rows.iter()
-                .flat_map(|r| &r.items)
-                .find(|it| it.text.contains(t))
-                .unwrap_or_else(|| panic!("{t} missing: {:?}", texts(&rows)))
-                .col
-        };
-        assert!(col_of("ALPHA") < col_of("BETA"), "slides laid side by side");
-        assert!(col_of("BETA") < col_of("GAMMA"));
-        // Generated prev/next controls page the deck.
+        // No paging carousel and no generated scroll buttons.
+        assert!(carousels.is_empty(), "no carousel: {:?}", texts(&rows));
         let buttons = rows
             .iter()
             .flat_map(|r| &r.items)
             .filter(|it| matches!(it.link, Some(Link::CarouselScroll(_))))
             .count();
-        assert_eq!(buttons, 2, "prev/next generated: {:?}", texts(&rows));
-        // Only one slide occupies the band at a time (band = one slide wide).
-        let c = &carousels[0];
-        assert_eq!(
-            c.view_width(),
-            c.stops[1],
-            "the band holds exactly one slide"
+        assert_eq!(buttons, 0, "no paging controls: {:?}", texts(&rows));
+        // The active slide renders; the hidden ones do not.
+        assert!(
+            shows(&rows, "ALPHA"),
+            "active slide shows: {:?}",
+            texts(&rows)
+        );
+        assert!(
+            !shows(&rows, "BETA"),
+            "hidden slide dropped: {:?}",
+            texts(&rows)
+        );
+        assert!(
+            !shows(&rows, "GAMMA"),
+            "hidden slide dropped: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn absolute_columns_lay_side_by_side_not_as_a_carousel() {
+        // eggramen's threecol_v2: a `position:relative` container with three
+        // `position:absolute` column boxes — a left sidebar (default left edge),
+        // a middle column (`margin-left`), and a right sidebar (`right:0`). They
+        // tile horizontally, so they lay SIDE BY SIDE at their computed columns
+        // (CSS 2.1 §10.3.7), not as a one-at-a-time carousel.
+        use crate::doc::Link;
+        let rows = lay(
+            r#"<body><div style="position:relative;width:60ch">
+                 <div style="position:absolute;width:20%">LEFT</div>
+                 <div style="position:absolute;width:55%;margin-left:22%">MIDDLE</div>
+                 <div style="position:absolute;width:20%;right:0">RIGHT</div>
+               </div></body>"#,
+            80,
+        );
+        // No carousel paging — they are columns, not slides.
+        let buttons = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|it| matches!(it.link, Some(Link::CarouselScroll(_))))
+            .count();
+        assert_eq!(buttons, 0, "columns are not a carousel: {:?}", texts(&rows));
+        let (lr, lc) = pos_of(&rows, "LEFT");
+        let (mr, mc) = pos_of(&rows, "MIDDLE");
+        let (rr, rc) = pos_of(&rows, "RIGHT");
+        // Ascending columns, all on the same top row.
+        assert!(
+            lc < mc && mc < rc,
+            "left < middle < right cols: {lc} {mc} {rc}"
+        );
+        assert!(
+            lr == mr && mr == rr,
+            "all three share the top row: {lr} {mr} {rr}"
+        );
+        // Left rides the left edge; right is pinned toward the right edge.
+        assert_eq!(lc, 0, "left column at the container's left edge");
+        assert!(
+            (rc as usize) >= 40,
+            "right column anchored toward the right: {rc}"
+        );
+    }
+
+    #[test]
+    fn over_wide_absolute_columns_compress_to_fit() {
+        // No horizontal scroll: a positioned multi-column layout computed wider
+        // than the band is scaled down so every column stays visible (her call,
+        // mirrors grid-track over-wide handling). Two columns declared 60% each
+        // (120% total) still both render, the right one within the band.
+        let rows = lay(
+            r#"<body><div style="position:relative;width:200ch">
+                 <div style="position:absolute;width:60%;left:0">AYE</div>
+                 <div style="position:absolute;width:60%;left:60%">BEE</div>
+               </div></body>"#,
+            40,
+        );
+        let (_, ac) = pos_of(&rows, "AYE");
+        let (_, bc) = pos_of(&rows, "BEE");
+        assert_eq!(ac, 0, "first column at the left");
+        assert!(bc > ac, "second column to its right: {ac} {bc}");
+        assert!(
+            (bc as usize) < 40,
+            "compressed within the 40-col band (col {bc}): {:?}",
+            texts(&rows)
         );
     }
 
@@ -10545,38 +10581,39 @@ mod tests {
     }
 
     #[test]
-    fn out_of_flow_overlay_controls_collapse_to_one_line() {
-        // `position:absolute`/`fixed` overlays (slideshow arrows + dots) can't
-        // be coordinate-positioned, so we render them inline and drop a `<br>`
-        // that only trails an overlay — keeping the controls on one line under
-        // the slide instead of stacking three rows.
+    fn positioned_overlay_controls_land_at_their_offsets() {
+        // A slideshow's prev/next arrows are `position:absolute` pinned to
+        // opposite edges of their containing block; both sit on the same row at
+        // their computed columns — prev at the left, next at the right — over
+        // the slide, exactly where their CSS offsets place them.
         let rows = lay(
-            r#"<html><head><style>
-                 .arrow{position:absolute}
-                 .dots{position:absolute}
+            r##"<html><head><style>
+                 .show{position:relative;height:3rem}
+                 .arrow{position:absolute;top:0}
+                 .prev{left:0}
+                 .next{right:0}
                </style></head>
                <body>
-                 <div class="slide">IMG</div>
-                 <a class="arrow">PREV</a><a class="arrow">NEXT</a>
-                 <br>
-                 <div class="dots">DOTS</div>
-               </body></html>"#,
+                 <div class="show">
+                   <div class="slide">IMG</div>
+                   <a class="arrow prev" href="#p">PREV</a>
+                   <a class="arrow next" href="#n">NEXT</a>
+                 </div>
+               </body></html>"##,
             80,
         );
-        let (r_img, _) = pos_of(&rows, "IMG");
-        let (r_prev, _) = pos_of(&rows, "PREV");
-        let (r_next, _) = pos_of(&rows, "NEXT");
-        let (r_dots, _) = pos_of(&rows, "DOTS");
-        assert!(
-            r_img < r_prev,
-            "the slide stays above its controls: {:?}",
+        let (r_prev, c_prev) = pos_of(&rows, "PREV");
+        let (r_next, c_next) = pos_of(&rows, "NEXT");
+        assert_eq!(r_prev, r_next, "both arrows on one row: {:?}", texts(&rows));
+        assert_eq!(
+            c_prev,
+            0,
+            "prev pinned to the left edge: {:?}",
             texts(&rows)
         );
-        assert_eq!(r_prev, r_next, "arrows share one line: {:?}", texts(&rows));
-        assert_eq!(
-            r_next,
-            r_dots,
-            "dots join the arrows' line (the trailing <br> is dropped): {:?}",
+        assert!(
+            (c_next as usize) >= 80 - 5,
+            "next pinned to the right edge (col {c_next}): {:?}",
             texts(&rows)
         );
     }

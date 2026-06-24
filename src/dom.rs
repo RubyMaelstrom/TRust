@@ -487,20 +487,17 @@ impl Dom {
         }
         // `opacity:0` is invisible — treat it as hidden, like the W3C/Bootstrap
         // slideshow idiom (`.slides{opacity:0}`, the active slide revealed by
-        // an `animation-fill-mode:forwards` fade-in). Gated so a page with no
-        // opacity rules pays nothing on this hot path.
+        // an `animation-fill-mode:forwards` fade-in). A real slideshow hides its
+        // inactive slides this way, so dropping them leaves the active slide —
+        // exactly what a browser paints (CSS 2.1 §9.6 positioning then places
+        // the visible one). Gated so a page with no opacity rules pays nothing
+        // on this hot path.
         let has_inline_opacity = || {
             self.attr(id, "style")
                 .is_some_and(|s| s.contains("opacity"))
         };
         if (self.style_index().has_opacity || has_inline_opacity())
             && self.effective_opacity(id) < OPACITY_HIDDEN
-            // ...but a slide in a deck is kept "in the background" (the layout
-            // renders one at a time and a control reveals the next), so it
-            // must survive serialization rather than being dropped here.
-            && !self
-                .parent_composed(id)
-                .is_some_and(|p| self.is_slideshow_container(p))
         {
             return true;
         }
@@ -522,55 +519,6 @@ impl Dom {
             self.cascaded(id, p)
                 .as_deref()
                 .is_some_and(|v| !css_len_is_zero(v))
-        })
-    }
-
-    /// Whether an element holds a slide deck: ≥2 SLIDE-MATERIAL children, all of
-    /// them absolutely positioned (so they stack/overlap rather than sit in
-    /// flow) — the structural signature of a JS slideshow's slides. The layout
-    /// shows one slide and generates controls to page between them.
-    ///
-    /// "Slide material" excludes inline overlay CHROME — a `position:absolute`
-    /// `<span>` badge/caption/ribbon anchored to a corner (a thumbnail's view
-    /// count, a "NEW" tag, a price). Those sit in a corner ALONGSIDE the
-    /// content, they don't stack over it, so they aren't slides. Without this a
-    /// single image plus two corner badges (the erome.com album card: an `<a>`
-    /// wrapping an `<img>` and two count `<span>`s, all three absolute) was
-    /// misread as a 3-slide carousel, painting spurious dead prev/next arrows
-    /// over every thumbnail. A `<span>`/`<a>` that WRAPS replaced media is still
-    /// a slide (an anchor-wrapped image carousel), and a static slide-material
-    /// child still disqualifies the deck (an ordinary card with one overlay).
-    pub fn is_slideshow_container(&self, id: NodeId) -> bool {
-        let mut count = 0usize;
-        for c in self.children(id) {
-            let Some(tag) = self.tag_name(c) else {
-                continue; // text/comment node — only element children count
-            };
-            if is_inline_overlay_chrome(tag) && !self.contains_replaced_media(c) {
-                continue; // a corner badge/caption, not a slide
-            }
-            if !matches!(
-                self.computed_style(c, "position").as_deref(),
-                Some("absolute" | "fixed")
-            ) {
-                return false; // a static slide → an ordinary card, not a deck
-            }
-            count += 1;
-        }
-        count >= 2
-    }
-
-    /// Whether `id` is, or contains, a replaced media element (`<img>`,
-    /// `<picture>`, `<video>`, `<canvas>`, `<iframe>`, `<object>`, `<embed>`) —
-    /// so an inline wrapper carrying one (an `<a>`/`<span>` slide around an
-    /// image) counts as slide material. `<svg>` is deliberately NOT counted: a
-    /// tiny inline icon glyph inside a badge is chrome, not media.
-    fn contains_replaced_media(&self, id: NodeId) -> bool {
-        std::iter::once(id).chain(self.descendants(id)).any(|n| {
-            matches!(
-                self.tag_name(n),
-                Some("img" | "picture" | "video" | "canvas" | "iframe" | "object" | "embed")
-            )
         })
     }
 
@@ -2879,46 +2827,6 @@ fn css_len_is_zero(v: &str) -> bool {
         .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'))
         .collect();
     !num.is_empty() && num.parse::<f32>().map(|n| n == 0.0).unwrap_or(false)
-}
-
-/// Inline-by-default phrasing elements that, used as a `position:absolute`
-/// overlay, are CHROME on a card — a corner badge (a view/photo count), a
-/// caption, a price tag, a "NEW" ribbon — not a slide of a deck. They sit in a
-/// corner alongside the content rather than stacking over it, so they must not
-/// count toward a slideshow's slides (see `is_slideshow_container`). A real
-/// deck's slides are block containers (`<div>`/`<li>`/`<figure>`) or media.
-fn is_inline_overlay_chrome(tag: &str) -> bool {
-    matches!(
-        tag,
-        "span"
-            | "i"
-            | "b"
-            | "em"
-            | "strong"
-            | "small"
-            | "label"
-            | "sub"
-            | "sup"
-            | "abbr"
-            | "cite"
-            | "code"
-            | "mark"
-            | "s"
-            | "u"
-            | "q"
-            | "samp"
-            | "kbd"
-            | "var"
-            | "time"
-            | "big"
-            | "tt"
-            | "ins"
-            | "del"
-            | "data"
-            | "output"
-            | "bdi"
-            | "bdo"
-    )
 }
 
 /// Below this effective opacity an element is treated as invisible (hidden).
