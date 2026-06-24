@@ -3498,9 +3498,13 @@ fn settle_page(page: &mut LoadedPage) {
     report_phases(page.started.elapsed());
 }
 
-/// Drain due timers and microtasks until quiet, budget-bounded.
-/// Job errors (exceptions escaping microtasks — e.g. an async component
-/// update throwing) are REAL page errors: collect, don't discard.
+/// Drain microtasks + DUE-NOW (0-delay) timers to quiescence at the CURRENT
+/// instant — it does NOT advance virtual time. Real-delay timers (rAF,
+/// intervals, `setTimeout(_, N>0)`) are left pending for the at-rest wake loop
+/// (`settle_to`), so load/dispatch paint the page's real initial state and
+/// time-driven work runs as real time elapses (the browser model). Budget-
+/// bounded. Job errors (exceptions escaping microtasks) are REAL page errors:
+/// collect, don't discard.
 fn settle(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Outcome) {
     let mut ticks = 0;
     loop {
@@ -3512,13 +3516,13 @@ fn settle(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Ou
             ));
             break;
         }
-        // `__trust.tick` advances virtual time and FIRES due timer callbacks
-        // (page JS) synchronously, so its execution is real engine work — time
-        // it into the execute bucket. It runs via a direct `ctx.eval` (not
-        // `run_script`/a job), so without this it would be invisible to the
-        // profiler and mis-attributed to "Rust-side" in the gate split.
+        // `__trust.tick` fires due-now timer callbacks (page JS) synchronously,
+        // so its execution is real engine work — time it into the execute
+        // bucket. It runs via a direct `ctx.eval` (not `run_script`/a job), so
+        // without this it would be invisible to the profiler and mis-attributed
+        // to "Rust-side" in the gate split.
         let t = phase_begin();
-        let ticked = ctx.eval(Source::from_bytes(b"__trust.tick(1000)"));
+        let ticked = ctx.eval(Source::from_bytes(b"__trust.tick()"));
         phase_end(Phase::Execute, t);
         match ticked {
             Ok(v) if v.to_boolean() => ticks += 1,
@@ -3753,6 +3757,11 @@ pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
     match load_page(html, env, None) {
         Err(outcome) => (html.to_string(), outcome),
         Ok(mut page) => {
+            // One-shot snapshot: no resident actor will run deferred timers
+            // later, so the settle FAST-FORWARDS virtual time to the page's
+            // eventual rendered state (rAF-deferred content, delayed timeouts).
+            // The live actor leaves this off and runs that work at real time.
+            let _ = page.ctx.eval(Source::from_bytes(b"__trust.oneShot = true"));
             settle_page(&mut page);
             page.outcome.elapsed = page.started.elapsed();
             let out = page.dom.borrow().serialize(DOCUMENT);
@@ -7894,17 +7903,22 @@ const PRELUDE: &str = r##"
 
     // --- timers on virtual time, driven by the Rust settle loop ---
     const timers = { q: [], now: 0, seq: 1 };
-    g.setTimeout = (fn, d) => {
+    // HTML §8.6: `setTimeout(handler, delay, ...args)` invokes `handler` with
+    // the trailing arguments. Capture them so e.g. `setTimeout(resolve, ms, v)`
+    // and libraries that pass state through the timer work (they got dropped).
+    g.setTimeout = function (fn, d) {
         if (typeof fn !== "function") return 0;
         const id = timers.seq++;
-        timers.q.push({ id, at: timers.now + Math.max(0, Number(d) || 0), fn, every: null });
+        const args = Array.prototype.slice.call(arguments, 2);
+        timers.q.push({ id, at: timers.now + Math.max(0, Number(d) || 0), fn, every: null, args });
         return id;
     };
-    g.setInterval = (fn, d) => {
+    g.setInterval = function (fn, d) {
         if (typeof fn !== "function") return 0;
         const id = timers.seq++;
         const every = Math.max(4, Number(d) || 4);
-        timers.q.push({ id, at: timers.now + every, fn, every });
+        const args = Array.prototype.slice.call(arguments, 2);
+        timers.q.push({ id, at: timers.now + every, fn, every, args });
         return id;
     };
     g.clearTimeout = g.clearInterval = (id) => { timers.q = timers.q.filter((t) => t.id !== id); };
@@ -7967,34 +7981,35 @@ const PRELUDE: &str = r##"
         };
         return clone(value);
     };
-    trust.tick = function (horizon) {
-        // The FAST-FORWARD settle primitive (load + each dispatch): it drains the
-        // "due soon" ONE-SHOT work — deferred-init `setTimeout(0)`, promise-chained
-        // timers, and `requestAnimationFrame` chains (rAF is a one-shot setTimeout,
-        // so a click-driven animation like jQuery `.slideUp` still runs to
-        // completion inside its dispatch, and a framework's rAF-deferred render —
-        // Open WebUI's streamed token — still flushes). `horizon` is a look-ahead
-        // WINDOW from the current virtual time (anchored to `timers.now`, NOT a
-        // constant: a constant cap meant that once `now` passed it no positive-
-        // delay timer could ever fire again, which once froze that rAF render).
+    trust.oneShot = false;
+    trust.tick = function () {
+        // The settle primitive. Two modes, set by `trust.oneShot`:
         //
-        // It deliberately SKIPS repeating `setInterval`s (`every !== null`): an
-        // interval is ongoing REAL-TIME work, not load-time deferred work, so
-        // fast-forwarding it before first paint pre-ran it MAX_TICKS times — a
-        // 300ms counter showed ~400, a JS slideshow jumped to slide N at load.
-        // Intervals fire only at their real cadence AT REST (`tickTo`); here
-        // they're left pending, so an interval-only page settles in ONE pass
-        // instead of burning MAX_TICKS, and the page paints its real initial
-        // state (count 0, slide 0) like a browser.
+        // LIVE (oneShot=false, the actor/production path): fire only ONE-SHOT
+        // timers ALREADY DUE at the current instant (`at <= timers.now`) —
+        // deferred-init `setTimeout(0)` and 0-delay cascades. It does NOT
+        // fast-forward virtual time, so `requestAnimationFrame` (now+16),
+        // `setInterval`, and `setTimeout(_, N>0)` are LEFT PENDING and fire at
+        // their REAL wall-clock time at rest (`tickTo`, driven by the wake
+        // loop). The browser model: paint the initial state, then run
+        // time-driven work as real time elapses — no counter showing ~400, no
+        // rAF pre-running hundreds of frames before first paint.
+        //
+        // ONE-SHOT (oneShot=true, `transform` — diagnostics/canaries/tests):
+        // there is NO at-rest loop to run deferred work later, so fire the
+        // earliest one-shot within a rolling `now+1000` WINDOW and advance
+        // virtual time to it, draining the page to its eventual rendered state
+        // (rAF-deferred content, delayed timeouts). Intervals are still skipped
+        // (`every !== null`) so a snapshot doesn't show a jumped counter.
+        const limit = trust.oneShot ? timers.now + 1000 : timers.now;
         let best = null;
-        const limit = timers.now + horizon;
         for (const t of timers.q) {
             if (t.every === null && t.at <= limit && (!best || t.at < best.at)) best = t;
         }
         if (!best) return false;
         timers.q.splice(timers.q.indexOf(best), 1);
-        timers.now = Math.max(timers.now, best.at);
-        try { best.fn(); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+        timers.now = Math.max(timers.now, best.at); // a no-op in LIVE mode (best.at <= now)
+        try { best.fn.apply(undefined, best.args || []); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         return true;
     };
     // At REST (not the load/dispatch fast-forward settle above), the actor
@@ -8021,8 +8036,8 @@ const PRELUDE: &str = r##"
             if (i < 0) continue; // cleared by an earlier callback in this batch
             timers.q.splice(i, 1);
             timers.now = Math.max(timers.now, t.at);
-            if (t.every !== null) timers.q.push({ id: t.id, at: absMs + t.every, fn: t.fn, every: t.every });
-            try { t.fn(); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+            if (t.every !== null) timers.q.push({ id: t.id, at: absMs + t.every, fn: t.fn, every: t.every, args: t.args });
+            try { t.fn.apply(undefined, t.args || []); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         }
         timers.now = absMs;
         return due.length;
@@ -11634,18 +11649,16 @@ mod tests {
     }
 
     #[test]
-    fn a_click_driven_animation_completes_within_the_dispatch() {
-        // Humble's "Dismiss banner" calls jQuery `.slideUp({duration:500, done:
-        // remove})`: it steps an animation off `Date.now()` and removes the
-        // element only on completion. The dispatch settle advances VIRTUAL time
-        // (1000ms a tick), so the clocks must track it — a wall-clock
-        // `Date.now()` barely moves in that microsecond burst, so the animation
-        // saw ~0 elapsed and the banner never went away. Here a click starts a
-        // `Date.now()`/`requestAnimationFrame` animation that removes the
-        // element after 500ms; it must finish inside the one dispatch.
-        // The handler is DELEGATED on an ancestor and matched by selector (how
-        // Backbone — Humble's framework — binds `click .js-dismiss-button`), so
-        // this also exercises that the synthetic click BUBBLES to the delegate.
+    fn a_click_driven_animation_completes_at_rest() {
+        // Humble's "Dismiss banner" steps a `Date.now()`/`requestAnimationFrame`
+        // animation and removes the element after 500ms. Under the real-time
+        // model the dispatch does NOT fast-forward: clicking starts the
+        // animation (the first `step()` runs synchronously and just schedules a
+        // rAF — no mutation, so the dispatch emits `Settled`), then the rAF
+        // chain fires AT REST over ~500ms of real wall time and removes the
+        // banner — a real animation, like a browser. The handler is DELEGATED on
+        // an ancestor and matched by selector (Backbone's `click .js-dismiss-
+        // button`), so this also exercises that the synthetic click BUBBLES.
         let (handle, mut events) = live(
             r##"<body><div id="banner">BANNER</div><button class="js-dismiss-button">close</button><script>
             document.addEventListener('click', function (e) {
@@ -11680,59 +11693,66 @@ mod tests {
             .parse::<usize>()
             .unwrap();
         handle.cmds.blocking_send(PageCmd::Click(button)).unwrap();
-        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
-            panic!("expected Updated after the click");
-        };
-        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // The animation runs at rest: a Settled (mutation-less dispatch) and a
+        // silent ~500ms of rAF frames, then one Updated when the banner is
+        // removed. Loop until it's gone (each blocking_recv parks on the wake).
+        let mut removed = false;
+        for _ in 0..20 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    if !html.contains("BANNER") {
+                        removed = true;
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled) => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
         assert!(
-            !html.contains("BANNER"),
-            "the 500ms click-driven animation must complete and remove the element: {html}"
+            removed,
+            "the 500ms click-driven animation must remove the banner at rest"
         );
     }
 
     #[test]
-    fn timers_keep_firing_after_virtual_time_passes_the_tick_window() {
-        // `__trust.tick(1000)` takes a WINDOW from the current virtual time, not
-        // an absolute 1000ms cap. The old code compared each timer's absolute
-        // deadline against a constant 1000, so once virtual time crept past
-        // ~1000ms (a few rAF frames into the page) NO positive-delay timer could
-        // fire again — every new `at` was `now + delay > 1000`. That silently
-        // froze all timer-driven work, most visibly a socket-streamed reply
-        // whose framework defers its render via rAF (Open WebUI rendered an
-        // empty message body). Here a load-time rAF counter must run 120 frames
-        // (~1920ms of virtual time — well past the old 1000ms wall) to set a
-        // marker; with the bug it stalls around frame 62 (now≈1000) and the
-        // marker never appears.
+    fn a_raf_chain_runs_to_completion_at_rest() {
+        // A rAF chain runs AT REST under the real-time model — one frame per
+        // real wake, with NO virtual-time ceiling to freeze it (the old
+        // `tick(1000)` window bug, now structurally gone: there is no
+        // fast-forward window in the live path). A framework's rAF-deferred
+        // render (Open WebUI's streamed token once rendered an empty body when
+        // the window bug froze it) now flushes as real time elapses. The first
+        // `step()` runs synchronously at load (counter 1); the rest fire at
+        // rest, and the last sets a marker — which must appear.
         let (_handle, mut events) = live(
             r##"<body><div id="n">0</div><script>
             var n = 0;
             (function step() {
                 n++;
                 document.getElementById('n').textContent = String(n);
-                if (n >= 120) { document.body.setAttribute('data-raf-done', 'yes'); return; }
+                if (n >= 6) { document.body.setAttribute('data-raf-done', 'yes'); return; }
                 requestAnimationFrame(step);
             })();
             </script></body>"##,
         );
-        let mut rendered = String::new();
-        for _ in 0..4 {
+        let mut done = false;
+        for _ in 0..24 {
             match events.blocking_recv() {
-                Some(PageEvt::Updated { html, .. }) | Some(PageEvt::Static { html, .. }) => {
-                    rendered = html;
-                    break;
+                Some(PageEvt::Updated { html, .. }) => {
+                    if html.contains("data-raf-done=\"yes\"") {
+                        assert!(html.contains(">6<"), "counter reached 6: {html}");
+                        done = true;
+                        break;
+                    }
                 }
-                Some(PageEvt::Settled) => continue,
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                Some(PageEvt::Static { .. }) => panic!("a rAF page must stay live"),
                 other => panic!("expected a render, got {other:?}"),
             }
         }
-        assert!(
-            rendered.contains("data-raf-done=\"yes\""),
-            "the rAF chain must keep firing past 1000ms of virtual time: {rendered}"
-        );
-        assert!(
-            rendered.contains(">120<"),
-            "the counter should have reached 120: {rendered}"
-        );
+        assert!(done, "the rAF chain must run to completion at rest");
     }
 
     #[test]
@@ -11837,6 +11857,94 @@ mod tests {
         assert_eq!(
             first, 0,
             "the interval must not fire during the load settle"
+        );
+    }
+
+    #[test]
+    fn timers_pass_extra_arguments_at_rest() {
+        // HTML §8.6: setInterval/setTimeout forward trailing args to the
+        // callback. Exercised at rest (intervals don't fast-forward), so this
+        // also re-confirms the at-rest loop drives a net-less timer.
+        let (_handle, mut events) = live(
+            r##"<body><div id="out">none</div><script>
+            setInterval(function (a, b) {
+                document.getElementById('out').textContent = 'ARGS=' + a + b;
+            }, 50, 'AL', 'PHA');
+            </script></body>"##,
+        );
+        let mut saw = false;
+        for _ in 0..16 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => {
+                    if html.contains("ARGS=ALPHA") {
+                        saw = true;
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                Some(PageEvt::Static { .. }) => panic!("a timer page must stay live"),
+                other => panic!("expected a render, got {other:?}"),
+            }
+        }
+        assert!(saw, "the timer callback received its trailing arguments");
+    }
+
+    #[test]
+    fn request_animation_frame_runs_at_rest() {
+        // A rAF chain (each frame schedules the next) is a one-shot setTimeout
+        // driven by the same wake loop; it must keep firing at rest with a
+        // monotonic timestamp, so the frame counter climbs. (rAF chains DO
+        // fast-forward during the load settle — a documented deviation — so the
+        // first render may already be well above 0; we assert it CLIMBS.)
+        let (_handle, mut events) = live(
+            r##"<body><div id="f">FRAME=0</div><script>
+            var n = 0;
+            function step(ts) {
+                n++;
+                document.getElementById('f').textContent = 'FRAME=' + n;
+                requestAnimationFrame(step);
+            }
+            requestAnimationFrame(step);
+            </script></body>"##,
+        );
+        fn frame(html: &str) -> Option<u64> {
+            let tail = html.split_once("FRAME=")?.1;
+            tail.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        }
+        let first = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => {
+                    if let Some(c) = frame(&html) {
+                        break c;
+                    }
+                }
+                Some(PageEvt::Static { .. }) => panic!("a rAF page must stay live"),
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected a render, got {other:?}"),
+            }
+        };
+        let mut later = first;
+        for _ in 0..16 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => {
+                    if let Some(c) = frame(&html) {
+                        later = c;
+                        if later > first + 1 {
+                            break;
+                        }
+                    }
+                }
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected a render, got {other:?}"),
+            }
+        }
+        assert!(
+            later > first,
+            "requestAnimationFrame must keep firing at rest: first={first} later={later}"
         );
     }
 
