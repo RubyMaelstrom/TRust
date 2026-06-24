@@ -3271,6 +3271,29 @@ fn parse_sheet(
                 rest = tail;
                 continue;
             }
+            // `@supports <condition> { ... }`: a CSS feature query (progressive
+            // enhancement). We DO implement grid/flex/gap/aspect-ratio/etc., so
+            // honor the enhanced block when we support the condition — and DROP
+            // an old-browser `@supports not (display:grid)` fallback. The web's
+            // dominant pattern is a flex fallback under `#x{display:flex}` plus
+            // `@supports (display:grid){#x{display:grid;grid-template-columns:…}}`
+            // (the IA infinite-scroller's uniform tile grid is exactly this);
+            // skipping the query left us on the flex fallback. Mirrors @media.
+            if let Some(rest_c) = lower.strip_prefix("supports")
+                && rest_c
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-')
+                && let Some(brace_off) = after.find('{')
+            {
+                let cond = &after[after.len() - rest_c.len()..brace_off];
+                let (block, tail) = take_block(&after[brace_off..]);
+                if supports_condition(cond) {
+                    parse_sheet(block, order, out, keyframes, viewport);
+                }
+                rest = tail;
+                continue;
+            }
             // Other @-rules (@charset/@import end at ';'; block at-rules at
             // their balanced '}') are skipped whole.
             rest = match (after.find(';'), after.find('{')) {
@@ -3325,18 +3348,21 @@ fn parse_style_rule(
     }
     for (nsel, nblock) in nested {
         // A nested grouping at-rule (CSS Nesting allows `@media`/`@supports`
-        // inside a style rule). Evaluate `@media`; on a match apply its body to
-        // the SAME parent selector. Other nested at-rules are skipped whole —
-        // never leak their declarations onto the parent.
+        // inside a style rule). Evaluate `@media`/`@supports`; on a match apply
+        // its body to the SAME parent selector. Other nested at-rules are
+        // skipped whole — never leak their declarations onto the parent.
         if let Some(at) = nsel.strip_prefix('@') {
             let at = at.trim_start();
             let lower = at.to_ascii_lowercase();
-            if let Some(rest_q) = lower.strip_prefix("media")
-                && rest_q
-                    .chars()
-                    .next()
-                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-')
-                && media_query_matches(&at[5..], viewport)
+            let kw_ok = |kw: &str| {
+                lower.strip_prefix(kw).is_some_and(|r| {
+                    r.chars()
+                        .next()
+                        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-')
+                })
+            };
+            if (kw_ok("media") && media_query_matches(&at[5..], viewport))
+                || (kw_ok("supports") && supports_condition(&at[8..]))
             {
                 parse_style_rule(resolved, nblock, order, out, viewport);
             }
@@ -3461,6 +3487,138 @@ fn expand_nesting(nested: &str, parent: &str) -> String {
         }
     }
     out.join(", ")
+}
+
+/// Evaluate a CSS `@supports` condition — does TRust support it? Feature
+/// queries gate progressively-enhanced CSS (`@supports (display:grid){…}` over a
+/// flex fallback). We honor what we actually implement. Grammar (CSS
+/// Conditional §): `not`, `and`, `or`, parens, `( <declaration> )` feature
+/// tests, and `selector( <complex-selector> )`. An unrecognized function form
+/// (`<general-enclosed>`) is treated as unsupported, so a page falls back.
+fn supports_condition(cond: &str) -> bool {
+    let c = cond.trim();
+    if c.is_empty() {
+        return false;
+    }
+    // `not <in-parens>`
+    if let Some(rest) = c.strip_prefix("not ").or_else(|| c.strip_prefix("not(")) {
+        // Re-attach the `(` we may have eaten so `supports_in_parens` sees it.
+        let rest = if c.starts_with("not(") {
+            &c["not".len()..]
+        } else {
+            rest
+        };
+        return !supports_in_parens(rest.trim());
+    }
+    // `and`/`or` chains (a chain can't mix the two without parens, per spec).
+    let ands = split_supports_kw(c, "and");
+    if ands.len() > 1 {
+        return ands.iter().all(|p| supports_in_parens(p));
+    }
+    let ors = split_supports_kw(c, "or");
+    if ors.len() > 1 {
+        return ors.iter().any(|p| supports_in_parens(p));
+    }
+    supports_in_parens(c)
+}
+
+/// One `<supports-in-parens>`: `( <condition> )`, `( <declaration> )`,
+/// `selector( … )`, or an unknown function form.
+fn supports_in_parens(s: &str) -> bool {
+    let s = s.trim();
+    if let Some(inner) = s
+        .strip_prefix("selector(")
+        .and_then(|x| x.strip_suffix(')'))
+    {
+        // We support the query if our selector engine can parse the selector.
+        return SelectorList::parse(inner.trim()).is_some();
+    }
+    if let Some(inner) = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+        let inner = inner.trim();
+        // `( <condition> )` — a nested condition begins with `(` or `not`/has a
+        // top-level and/or; otherwise it's `( <declaration> )`.
+        if inner.starts_with('(')
+            || inner.starts_with("not ")
+            || inner.starts_with("not(")
+            || split_supports_kw(inner, "and").len() > 1
+            || split_supports_kw(inner, "or").len() > 1
+        {
+            return supports_condition(inner);
+        }
+        if let Some((prop, value)) = inner.split_once(':') {
+            return css_supports(prop.trim(), value.trim());
+        }
+        return false;
+    }
+    false // a bare ident or unknown function form: general-enclosed → unsupported
+}
+
+/// Split a `@supports` condition on a top-level ` and `/` or ` keyword
+/// (paren-depth 0), trimming each part. Returns one element when absent.
+fn split_supports_kw(cond: &str, kw: &str) -> Vec<String> {
+    let bytes = cond.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let pat = format!(" {kw} ");
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && cond[i..].to_ascii_lowercase().starts_with(&pat) {
+            parts.push(cond[start..i].trim().to_string());
+            i += pat.len();
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    parts.push(cond[start..].trim().to_string());
+    parts
+}
+
+/// Does TRust support a CSS `(prop: value)` feature declaration? `display` is
+/// value-checked (the most commonly feature-queried property — we claim the box
+/// types we actually lay out); every other property we TRACK counts as
+/// supported (we understand and apply it), while a property we don't track —
+/// the visual-only ones we deliberately skip (filter/transform/clip-path/…) —
+/// is unsupported, so a page's fallback applies instead.
+fn css_supports(prop: &str, value: &str) -> bool {
+    let prop = prop.to_ascii_lowercase();
+    let value = value.to_ascii_lowercase();
+    if value.is_empty() {
+        return false;
+    }
+    if prop == "display" {
+        return matches!(
+            value.as_str(),
+            "grid"
+                | "inline-grid"
+                | "flex"
+                | "inline-flex"
+                | "block"
+                | "inline"
+                | "inline-block"
+                | "none"
+                | "list-item"
+                | "table"
+                | "inline-table"
+                | "table-row"
+                | "table-cell"
+                | "table-row-group"
+                | "table-header-group"
+                | "table-footer-group"
+                | "table-column"
+                | "table-column-group"
+                | "table-caption"
+                | "contents"
+                | "flow-root"
+        );
+    }
+    is_tracked(&prop)
 }
 
 /// Does a CSS `@media` query list match the viewport (CSS px; `0` = unknown)?
@@ -4631,6 +4789,65 @@ mod tests {
         // (so the rules are dropped, exactly as skipping @media used to).
         assert!(!media_query_matches("(hover: hover)", vp));
         assert!(!media_query_matches("(min-width: 768px)", (0, 0)));
+    }
+
+    #[test]
+    fn supports_conditions_evaluate_what_we_implement() {
+        // Feature tests we implement.
+        assert!(supports_condition("(display: grid)"));
+        assert!(supports_condition("(display:flex)"));
+        assert!(supports_condition("(gap: 1rem)"));
+        assert!(supports_condition("(aspect-ratio: 1 / 1)"));
+        // A box type we don't lay out, and visual-only properties we don't
+        // track, are unsupported → the page's fallback applies.
+        assert!(!supports_condition("(display: ruby)"));
+        assert!(!supports_condition("(filter: blur(1px))"));
+        assert!(!supports_condition("(backdrop-filter: blur(1px))"));
+        // not / and / or / nesting.
+        assert!(!supports_condition("not (display: grid)"));
+        assert!(supports_condition("not (filter: blur(1px))"));
+        assert!(supports_condition("(display: grid) and (gap: 1rem)"));
+        assert!(!supports_condition(
+            "(display: grid) and (filter: blur(1px))"
+        ));
+        assert!(supports_condition("(filter: blur(1px)) or (display: grid)"));
+        assert!(supports_condition("((display: grid))"));
+        assert!(supports_condition("selector(.a)"));
+    }
+
+    #[test]
+    fn supports_feature_queries_gate_their_rules() {
+        // We implement grid, so `@supports (display:grid)` applies (hiding
+        // `.grid-only`); the old-browser `@supports not (display:grid)` fallback
+        // is dropped (`.no-grid` stays); a property we don't implement
+        // (`@supports (filter:…)`) is dropped (`.fancy` stays). This is the
+        // progressive-enhancement pattern (the IA infinite-scroller serves a
+        // flex fallback + `@supports (display:grid)` uniform-track grid).
+        let dom = Dom::parse_document(
+            "<head><style>
+                @supports (display: grid) { .grid-only { display: none } }
+                @supports not (display: grid) { .no-grid { display: none } }
+                @supports (filter: blur(1px)) { .fancy { display: none } }
+                @supports (display: grid) and (gap: 1rem) { .both { display: none } }
+             </style></head>
+             <body>
+               <p class=grid-only>grid gone</p>
+               <p class=no-grid>nogrid kept</p>
+               <p class=fancy>fancy kept</p>
+               <p class=both>both gone</p>
+             </body>",
+        );
+        let html = dom.serialize(DOCUMENT);
+        assert!(
+            !html.contains("grid gone"),
+            "@supports(grid) applies: {html}"
+        );
+        assert!(html.contains("nogrid kept"), "not(grid) dropped: {html}");
+        assert!(
+            html.contains("fancy kept"),
+            "@supports(filter) dropped: {html}"
+        );
+        assert!(!html.contains("both gone"), "grid and gap applies: {html}");
     }
 
     #[test]

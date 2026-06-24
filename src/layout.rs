@@ -1385,20 +1385,27 @@ impl<'a> Layout<'a> {
         // following content wrap beside it (across blocks, until cleared or
         // its bottom is passed). Checked before the tag dispatch so a floated
         // `<img>` floats too; skipped when laying the float's own box. CSS
-        // ignores `float` on a flex item; we drop it only for an INLINE-level
-        // flex item (it then flows inline) — the nav split-button's
-        // `inline-flex;float:left` toggle that otherwise dropped to its own
-        // row. A block-level floated flex child (a latest-post avatar `<div
-        // float:left>`) keeps floating, so its sibling text still wraps beside.
-        // Same INLINE-only rule inside an out-of-flow (absolute/fixed) ancestor:
-        // we render small overlays as a compact inline run, so an inline-level
-        // float there would split it (a search bar's magnifier `<i float:left>`
-        // in an absolutely-positioned icon span) — but a BLOCK-level float inside
-        // an absolutely-positioned CONTAINER must still float (the abspos box is
-        // its formatting context). That's Steam's `.supernav_container`
-        // (`position:absolute`) holding `display:block;float:left` nav items: a
-        // horizontal floated row, not a vertical stack.
-        let drop_float = (self.parent_is_flex_container(id) && self.is_inline_level(id))
+        // ignores `float` on a flex item entirely, so we drop it for ANY item
+        // of a BLOCK-level `display:flex`/`grid` container — those lay their
+        // children as flex columns (`flow_flex_row`/`flow_grid_*`), which
+        // positions them side by side without the float (archive.org's
+        // `.right-side-section` is `display:flex` holding `display:block;
+        // float:right` Sign-up/Upload items — floated, `.upload` shot off-canvas
+        // right). An `inline-flex`/`inline-grid` container is the carve-out: we
+        // lay it by INLINE recursion (not real flex columns), so a BLOCK-level
+        // child there still needs its float to sit beside its siblings (a
+        // latest-post avatar `<div float:left>`); only its INLINE-level children
+        // drop the float (the nav split-button's `inline-flex;float:left` toggle
+        // that otherwise took its own row). Same INLINE-only rule inside an
+        // out-of-flow (absolute/fixed) ancestor: we render small overlays as a
+        // compact inline run, so an inline-level float there would split it (a
+        // search bar's magnifier `<i float:left>` in an absolutely-positioned
+        // icon span) — but a BLOCK-level float inside an absolutely-positioned
+        // CONTAINER must still float (the abspos box is its formatting context).
+        // That's Steam's `.supernav_container` (`position:absolute`) holding
+        // `display:block;float:left` nav items: a horizontal floated row.
+        let drop_float = (self.parent_is_flex_container(id)
+            && (!self.parent_is_inline_flex(id) || self.is_inline_level(id)))
             || (self.parent_out_of_flow(id) && self.is_inline_box(id));
         if self.float_skip != Some(id)
             && !drop_float
@@ -5187,6 +5194,17 @@ impl<'a> Layout<'a> {
     /// base URL, form/control maps, and image sizes with the parent. The
     /// recursion that powers grids and (later) columns and floats.
     fn layout_subtree(&self, id: NodeId, content_width: usize, inherit: &Ctx) -> LaidBox {
+        // Inherit the parent's measuring state: a subtree laid WHILE measuring an
+        // ancestor's intrinsic width (a flex/grid item's box, a stacked column)
+        // must keep measuring, so a nested `width:100%` replaced element resolves
+        // to its INTRINSIC width (CSS Sizing §5.1 — a percentage is indefinite
+        // for a max-content contribution) instead of filling the whole
+        // constraint. Without this, measuring a flex item containing a
+        // `<img width:100%>` reported the full available width as the item's
+        // base size, so every such tile claimed its own shelf at full width
+        // (archive.org's Top-Collections grid collapsed to one column once the
+        // lazy tile images finished loading). Real (non-measuring) layout passes
+        // `false` exactly as before.
         self.layout_subtree_inner(id, content_width, None, false, inherit)
     }
 
@@ -5629,6 +5647,36 @@ impl<'a> Layout<'a> {
         self.place_text(text, &img_ctx);
     }
 
+    /// The text a subtree actually RENDERS — its *visible* label. DOM
+    /// `textContent` includes everything: SVG `<title>`/`<desc>` accessibility
+    /// metadata (non-rendered per the SVG spec), `display:none` "sr-only"
+    /// spans, etc. A visible label must not. We skip the same subtrees the flow
+    /// walker never paints (`SKIP` — which includes the whole `<svg>`) and any
+    /// hidden element. So a `<button>` whose only content is an `<svg>` icon
+    /// has an EMPTY visible label (its accessible name is used instead), not
+    /// "User icon An illustration of a person's head and chest."
+    fn rendered_text(&self, id: NodeId) -> String {
+        let mut out = String::new();
+        self.collect_rendered_text(id, &mut out);
+        out
+    }
+
+    fn collect_rendered_text(&self, id: NodeId, out: &mut String) {
+        match &self.dom.node(id).data {
+            NodeData::Text(t) => out.push_str(t),
+            NodeData::Element { .. } => {
+                let tag = self.dom.tag_name(id).unwrap_or("");
+                if SKIP.contains(&tag) || self.dom.is_hidden(id) {
+                    return;
+                }
+                for c in self.dom.children(id) {
+                    self.collect_rendered_text(c, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The visible handle for an element whose content won't otherwise render
     /// anything (no text, no `<img>`) — an SVG/icon-only link. Prefers the
     /// recognized icon GLYPH (an `<svg>`/sprite Font-Awesome icon — the header
@@ -5636,7 +5684,7 @@ impl<'a> Layout<'a> {
     /// (`aria-label`/`title`/`alt`). `None` when it has real content, a pseudo
     /// glyph already draws it, or it's an unnamed disclosure trigger.
     fn icon_only_label(&self, id: NodeId) -> Option<String> {
-        if !self.dom.text_content(id).trim().is_empty() {
+        if !self.rendered_text(id).trim().is_empty() {
             return None;
         }
         if self
@@ -6183,15 +6231,25 @@ impl<'a> Layout<'a> {
         }
         let stub = match tag {
             "button" => {
-                // An icon-only / empty button renders nothing: a clickable one
-                // is already surfaced by the serializer's glyph/label handle
-                // (see `Dom` serialize) — a `[  ]` stub beside it is noise.
-                let text = self.dom.text_content(id);
+                // The label is the button's VISIBLE text — never the SVG
+                // `<title>`/`<desc>` screen-reader metadata its `textContent`
+                // includes (the archive.org login icon dumped "User icon An
+                // illustration of a person's head and chest.").
+                let text = self.rendered_text(id);
                 let text = text.trim();
                 if text.is_empty() {
-                    return;
+                    // Icon-only button (its content is an `<svg>`/icon we don't
+                    // rasterize): surface its accessible name (`aria-label`/
+                    // `title`) so it stays a short clickable token rather than
+                    // vanishing. None (an unnamed disclosure trigger) → the
+                    // serializer's clickable handle covers it; no stub.
+                    match self.icon_only_label(id) {
+                        Some(name) => format!("[ {name} ]"),
+                        None => return,
+                    }
+                } else {
+                    format!("[ {text} ]")
                 }
-                format!("[ {text} ]")
             }
             "select" => "[ select ▾ ]".to_owned(),
             "textarea" => "[ textarea ]".to_owned(),
@@ -8830,6 +8888,158 @@ mod tests {
         assert!(
             line.contains("X Label"),
             "the icon's right margin separates it from the label: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_grid_of_percentage_image_tiles_lays_uniform_columns() {
+        // archive.org's Top-Collections grid: `display:grid` with
+        // `repeat(auto-fill, minmax(16rem,1fr))` tracks, each cell a `width:100%`
+        // image over a caption. The grid TRACKS size the cells (not the cells'
+        // content), so every `width:100%` image is exactly its track width —
+        // a uniform grid, not content-sized columns. (This is the path
+        // `@supports (display:grid)` selects over the flex fallback.)
+        let mut images = ImageSizes::new();
+        for n in ["a", "b", "c", "d", "e", "f"] {
+            images.insert(format!("https://example.com/img/{n}"), (22, 11));
+        }
+        let tile = |n: &str| {
+            format!(
+                r#"<article>
+                <a href="/x" style="display:block;">
+                  <div style="display:flex;width:100%;flex-direction:column;">
+                    <div style="display:block;">
+                      <img src="/img/{n}" style="width:100%;height:160px;object-fit:cover;">
+                    </div>
+                    <h3>Collection {n}</h3>
+                  </div>
+                </a>
+              </article>"#
+            )
+        };
+        let body = format!(
+            r#"<body><section style="display:grid;grid-template-columns:repeat(auto-fill,minmax(16rem,1fr));column-gap:1.7rem;">{}{}{}{}{}{}</section></body>"#,
+            tile("a"),
+            tile("b"),
+            tile("c"),
+            tile("d"),
+            tile("e"),
+            tile("f")
+        );
+        let rows = lay_with_images(&body, 100, &images);
+        let img_widths: Vec<u16> = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| matches!(i.kind, ItemKind::Image) && i.width > 0)
+            .map(|i| i.width)
+            .collect();
+        assert_eq!(img_widths.len(), 6, "all six tile images laid out");
+        // Every image is the SAME width (uniform tracks), and not the full row.
+        let first = img_widths[0];
+        for w in &img_widths {
+            assert_eq!(*w, first, "uniform track widths: {img_widths:?}");
+        }
+        assert!(first < 60, "a track, not the full 100-cell row: {first}");
+        let top_row_imgs = rows[0]
+            .items
+            .iter()
+            .filter(|i| matches!(i.kind, ItemKind::Image))
+            .count();
+        assert!(
+            top_row_imgs >= 2,
+            "tiles pack into columns ({top_row_imgs} on the first row)"
+        );
+    }
+
+    #[test]
+    fn svg_title_desc_do_not_leak_into_a_button_label() {
+        // SVG `<title>`/`<desc>` are non-rendered accessibility metadata (SVG
+        // spec); a browser never paints them. An icon-only `<button>` must
+        // surface its accessible name (`aria-label`), NOT the screen-reader
+        // description — archive.org's login icon dumped "User icon An
+        // illustration of a person's head and chest." as a 60-cell label.
+        let rows = lay(
+            r#"<body><button aria-label="Toggle login menu"><svg><title>User icon</title><desc>An illustration of a person's head and chest.</desc><path d="m20"/></svg></button></body>"#,
+            60,
+        );
+        let line = texts(&rows).join(" ");
+        assert!(!line.contains("User icon"), "title not rendered: {line:?}");
+        assert!(
+            !line.contains("illustration"),
+            "desc not rendered: {line:?}"
+        );
+        assert!(
+            line.contains("Toggle login menu"),
+            "the accessible name is the visible label: {line:?}"
+        );
+    }
+
+    #[test]
+    fn float_is_dropped_on_a_block_level_flex_item() {
+        // CSS ignores `float` on a flex item. A `display:flex` row holding
+        // `display:block;float:right` items lays them as flex columns (packed,
+        // on-canvas), not floated to the page edge — archive.org's `.upload`
+        // (`display:block;float:right` in a `display:flex` section) shot
+        // off-canvas right. An `inline-flex` parent is the carve-out (next
+        // test) — there a block child still floats.
+        let rows = lay(
+            r#"<body><div style="display:flex"><div style="display:block;float:right">AAA</div><div style="display:block;float:right">BBB</div></div></body>"#,
+            40,
+        );
+        let aaa = rows
+            .iter()
+            .enumerate()
+            .find_map(|(ri, r)| {
+                r.items
+                    .iter()
+                    .find(|i| i.text.contains("AAA"))
+                    .map(|i| (ri, i.col))
+            })
+            .expect("AAA laid out");
+        let bbb = rows
+            .iter()
+            .enumerate()
+            .find_map(|(ri, r)| {
+                r.items
+                    .iter()
+                    .find(|i| i.text.contains("BBB"))
+                    .map(|i| (ri, i.col))
+            })
+            .expect("BBB laid out");
+        assert_eq!(aaa.0, bbb.0, "both items share one row (flex columns)");
+        assert!(
+            aaa.1 < bbb.1 && aaa.1 < 4,
+            "items pack from the left, not floated right (AAA col {}, BBB col {})",
+            aaa.1,
+            bbb.1
+        );
+    }
+
+    #[test]
+    fn a_block_float_in_an_inline_flex_parent_still_floats() {
+        // The carve-out for the block-level float drop above: an `inline-flex`
+        // container is laid by INLINE recursion (not real flex columns), so a
+        // BLOCK-level floated child there still needs its float to sit beside
+        // its siblings — XenForo's latest-post avatar. (Companion to
+        // `a_stacked_column_beside_a_left_float_clears_it`.)
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/av.png".to_owned(), (5, 2));
+        let rows = lay_with_images(
+            r#"<body><div style="display:inline-flex"><div style="float:left"><img src="/av.png" style="display:block"></div><span>beside</span></div></body>"#,
+            40,
+            &images,
+        );
+        let img = image_item(&rows);
+        let beside = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("beside"))
+            .expect("text");
+        assert!(
+            beside.col >= img.col + img.width,
+            "the text clears the still-floated avatar (text col {}, avatar ends {})",
+            beside.col,
+            img.col + img.width
         );
     }
 
