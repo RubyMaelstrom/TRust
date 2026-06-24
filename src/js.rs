@@ -3530,6 +3530,41 @@ fn settle(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Ou
     }
 }
 
+/// Fire every timer due by `abs_ms` (a REAL wall-clock deadline, in `timers.now`
+/// units) and drain the microtasks/fetches their callbacks schedule, to
+/// quiescence. The at-rest analog of `settle`: where `settle` FAST-FORWARDS
+/// virtual time (load/dispatch — drain due work ASAP), this advances to a real
+/// deadline so a 1s interval fires once per real second. Bounded by the per-
+/// wake budget + `max_ticks`; a 0-delay timer a callback schedules (now due by
+/// `abs_ms`) is caught on the next pass.
+fn settle_to(
+    ctx: &mut Context,
+    budget: &Budget,
+    max_ticks: usize,
+    outcome: &mut Outcome,
+    abs_ms: f64,
+) {
+    let mut ticks = 0;
+    loop {
+        // `tickTo` fires due timer callbacks synchronously (page JS), so time it
+        // into the execute bucket like the `tick` call in `settle` does.
+        let t = phase_begin();
+        let fired = ctx
+            .eval(Source::from_bytes(
+                format!("__trust.tickTo({abs_ms})").as_bytes(),
+            ))
+            .ok()
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0);
+        phase_end(Phase::Execute, t);
+        run_jobs_into(ctx, budget, outcome);
+        ticks += 1;
+        if fired < 1.0 || budget.exhausted() || ticks >= max_ticks {
+            break;
+        }
+    }
+}
+
 /// How many scan→settle passes the synthetic-image-load driver makes. One
 /// reveals the current content; a couple more catch images a `load` handler
 /// inserts in turn (lightGallery loads the slide, then preloads its
@@ -3805,6 +3840,31 @@ const DISPATCH_TICKS: usize = 50;
 /// one-shot path (Boa's parser recursion, see CLAUDE.md).
 const PAGE_STACK: usize = 64 * 1024 * 1024;
 
+/// At rest the actor never wakes more often than this, even if a page arms a
+/// 0/16ms timer (a `requestAnimationFrame` chain) — so an animation settles to
+/// ~15fps instead of pegging a core. Sub-floor delays are coalesced to the
+/// frame; a one-shot `setTimeout` with a longer delay still fires near its real
+/// time (the floor only raises sub-frame waits). Her call: 15fps render cadence
+/// (see CLAUDE.md). A page with no pending timers arms NO sleep and parks on
+/// the command channel — zero idle CPU, exactly like the old blocking park.
+const WAKE_FLOOR: Duration = Duration::from_millis(66);
+
+/// What unblocked the at-rest event loop: an app command (`None` = the app
+/// dropped the page handle), or the next-timer-deadline sleep elapsing.
+enum Wake {
+    Cmd(Option<PageCmd>),
+    Timer,
+}
+
+/// Sleep `d`, or never resolve when there's no pending timer — the loop then
+/// parks purely on the command channel (zero idle CPU).
+async fn sleep_or_pending(d: Option<Duration>) {
+    match d {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Spawn a living page. The first event is either `Static` (actor
 /// already gone) or `Updated` (alive, send it `PageCmd`s). Dropping the
 /// handle shuts the actor down.
@@ -3943,8 +4003,13 @@ fn page_actor(
         // Shell already reflects the settled page; nothing new to send.
     } else {
         let (out, has_clickables) = extract_live(&mut page);
+        // A page with pending timers (a JS slideshow, a poller, a rAF chain)
+        // stays LIVE even with no clickables/forms — its own clock drives it at
+        // rest. Only a truly inert page (no interaction AND no scheduled work)
+        // takes the Static fast-exit and drops the engine (articles hold none).
+        let has_timers = js_next_deadline(&mut page).is_some();
         let outcome = std::mem::take(&mut page.outcome);
-        if !has_clickables && !painted_live {
+        if !has_clickables && !painted_live && !has_timers {
             let _ = evts.blocking_send(PageEvt::Static { html: out, outcome });
             return;
         }
@@ -3956,10 +4021,59 @@ fn page_actor(
         }
     }
 
-    // The dispatch loop: blocked (zero CPU) until the app speaks or
-    // drops the handle. Timers are frozen at rest by design — they only
-    // advance inside a dispatch.
-    while let Some(cmd) = cmds.blocking_recv() {
+    // The at-rest event loop. The actor selects between the app's command
+    // stream and a sleep until the next due timer's deadline, so a page's own
+    // setInterval/setTimeout/requestAnimationFrame keep advancing at rest —
+    // WITHOUT busy-waiting. An empty timer queue means no sleep arm, so we park
+    // purely on the command channel (zero idle CPU), exactly like the old
+    // `blocking_recv`. Only a page that schedules ongoing work wakes, and no
+    // more often than `WAKE_FLOOR` (~15fps), so an animation can't peg a core.
+    // Time tracks the REAL monotonic clock here (unlike the load/dispatch
+    // settle, which fast-forwards virtual time): a 1s interval fires once per
+    // real second. A WebSocket frame still arrives as `PageCmd::Ws` and just
+    // composes with the timer wakes.
+    //
+    // The select runs on a small current-thread runtime OWNED by this actor
+    // thread (built here, not the app's runtime) so it drives `recv`/`sleep`
+    // even for a no-net page — which has no app handle — and the actor tests,
+    // which spawn it outside any runtime. Each `block_on` RETURNS before a
+    // dispatch runs, so a dispatch's own `net.handle.block_on` (the app runtime,
+    // for fetches) is never nested under it (the panic that would be).
+    // Only the time driver is needed: the select awaits a `sleep` and an mpsc
+    // `recv` (channels need no reactor). Network dispatches run on the APP
+    // runtime via `net.handle`, not this one.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("trust-page actor runtime");
+    loop {
+        // Re-anchor real time each iteration to the CURRENT virtual clock: a
+        // dispatch may have fast-forwarded `timers.now`, and we measure the next
+        // real-time window forward from wherever it now stands (it's monotonic).
+        let base_ms = js_now(&mut page);
+        let wall = std::time::Instant::now();
+        let sleep_dur = js_next_deadline(&mut page)
+            .map(|at| Duration::from_millis((at - base_ms).max(0.0) as u64).max(WAKE_FLOOR));
+        let wake = rt.block_on(async {
+            tokio::select! {
+                // Bias to commands so a user click is never starved by a busy
+                // animation's frame timer.
+                biased;
+                cmd = cmds.recv() => Wake::Cmd(cmd),
+                () = sleep_or_pending(sleep_dur) => Wake::Timer,
+            }
+        });
+        let cmd = match wake {
+            Wake::Cmd(Some(cmd)) => cmd,
+            Wake::Cmd(None) => break, // app dropped the handle
+            Wake::Timer => {
+                let real_now = base_ms + wall.elapsed().as_millis() as f64;
+                if !timer_wake(&mut page, &evts, real_now) {
+                    break;
+                }
+                continue;
+            }
+        };
         match cmd {
             PageCmd::Click(node) => {
                 let nav = dispatch_click_in(&mut page, node);
@@ -4132,6 +4246,82 @@ fn finish_dispatch(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageE
             .is_ok();
     }
     evts.blocking_send(PageEvt::Settled).is_ok()
+}
+
+/// An at-rest timer deadline elapsed: fire the timers due by `real_now` (ms),
+/// drain, and re-render if the DOM changed — the same shape as a user dispatch,
+/// but a CLEAN tick (no mutation, no error, no navigation) emits NOTHING. A
+/// timer fire isn't an interaction, so there is no app busy-state to clear with
+/// `Settled`; staying silent keeps the run loop from redrawing on every idle
+/// tick of a slow poller. Returns false when the actor should exit (the event
+/// channel is gone, or the engine panicked and is now dead).
+fn timer_wake(
+    page: &mut LoadedPage,
+    evts: &tokio::sync::mpsc::Sender<PageEvt>,
+    real_now: f64,
+) -> bool {
+    prepare_dispatch(page);
+    settle_to(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut page.outcome,
+        real_now,
+    );
+    // A timer may swap in a fresh <img> (a JS slideshow advancing) whose reveal
+    // waits on a `load` event a headless DOM never fires — same as a dispatch.
+    settle_image_loads(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut page.outcome,
+    );
+    drain_js_side(&mut page.ctx, &mut page.outcome);
+    if page.outcome.panicked {
+        let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+        return false;
+    }
+    // A `setTimeout(() => location.href = …)` redirect/refresh fires at rest too.
+    if let Some(url) = take_script_navigation(page) {
+        return evts.blocking_send(PageEvt::Navigate(url)).is_ok();
+    }
+    if page.dom.borrow_mut().take_dirty() {
+        let (out, _) = extract_live(page);
+        let outcome = std::mem::take(&mut page.outcome);
+        return evts
+            .blocking_send(PageEvt::Updated { html: out, outcome })
+            .is_ok();
+    }
+    if !page.outcome.errors.is_empty() {
+        return evts
+            .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)))
+            .is_ok();
+    }
+    true
+}
+
+/// The page's current virtual-time clock (`timers.now`, ms) — the base the
+/// at-rest loop measures real wall time forward from.
+fn js_now(page: &mut LoadedPage) -> f64 {
+    page.ctx
+        .eval(Source::from_bytes(b"__trust.now()"))
+        .ok()
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0)
+}
+
+/// The absolute deadline (ms, in `timers.now` units) of the soonest pending
+/// timer, or `None` when nothing is scheduled (the loop then parks on commands
+/// with zero idle CPU).
+fn js_next_deadline(page: &mut LoadedPage) -> Option<f64> {
+    let v = page
+        .ctx
+        .eval(Source::from_bytes(b"__trust.nextDeadline()"))
+        .ok()?;
+    if v.is_null_or_undefined() {
+        return None;
+    }
+    v.as_number()
 }
 
 fn take_script_navigation(page: &mut LoadedPage) -> Option<String> {
@@ -7778,29 +7968,64 @@ const PRELUDE: &str = r##"
         return clone(value);
     };
     trust.tick = function (horizon) {
-        // `horizon` is the look-ahead WINDOW from the current virtual time, not
-        // an absolute cap. The old `t.at <= horizon` compared an absolute timer
-        // deadline against a constant 1000, so once `timers.now` passed ~1000ms
-        // (a few rAF frames / a couple of real-delay timers into the page's
-        // life) NO positive-delay timer could ever fire again — its `at` was
-        // always `now + delay > 1000`. That silently froze ALL timer-driven
-        // work for the rest of the page: long interactive sessions and, most
-        // visibly, a socket-streamed reply whose framework defers its leaf
-        // render via `requestAnimationFrame` (Open WebUI's chat markdown
-        // rendered an empty body — the each-block reconciled but the deferred
-        // token render never ran). Anchoring the window to `timers.now` drains
-        // due timers in rolling windows; long-delay timers still stay frozen
-        // (they fall outside `now + horizon`, and `MAX_TICKS`/`DISPATCH_TICKS`
-        // bound a repeating timer per settle), so "frozen at rest" holds.
+        // The FAST-FORWARD settle primitive (load + each dispatch): it drains the
+        // "due soon" ONE-SHOT work — deferred-init `setTimeout(0)`, promise-chained
+        // timers, and `requestAnimationFrame` chains (rAF is a one-shot setTimeout,
+        // so a click-driven animation like jQuery `.slideUp` still runs to
+        // completion inside its dispatch, and a framework's rAF-deferred render —
+        // Open WebUI's streamed token — still flushes). `horizon` is a look-ahead
+        // WINDOW from the current virtual time (anchored to `timers.now`, NOT a
+        // constant: a constant cap meant that once `now` passed it no positive-
+        // delay timer could ever fire again, which once froze that rAF render).
+        //
+        // It deliberately SKIPS repeating `setInterval`s (`every !== null`): an
+        // interval is ongoing REAL-TIME work, not load-time deferred work, so
+        // fast-forwarding it before first paint pre-ran it MAX_TICKS times — a
+        // 300ms counter showed ~400, a JS slideshow jumped to slide N at load.
+        // Intervals fire only at their real cadence AT REST (`tickTo`); here
+        // they're left pending, so an interval-only page settles in ONE pass
+        // instead of burning MAX_TICKS, and the page paints its real initial
+        // state (count 0, slide 0) like a browser.
         let best = null;
         const limit = timers.now + horizon;
-        for (const t of timers.q) if (t.at <= limit && (!best || t.at < best.at)) best = t;
+        for (const t of timers.q) {
+            if (t.every === null && t.at <= limit && (!best || t.at < best.at)) best = t;
+        }
         if (!best) return false;
         timers.q.splice(timers.q.indexOf(best), 1);
         timers.now = Math.max(timers.now, best.at);
-        if (best.every !== null) timers.q.push({ id: best.id, at: timers.now + best.every, fn: best.fn, every: best.every });
         try { best.fn(); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         return true;
+    };
+    // At REST (not the load/dispatch fast-forward settle above), the actor
+    // advances time by the REAL wall clock and fires every timer due by `absMs`
+    // ONCE. `nextDeadline` is the absolute deadline the actor sleeps until;
+    // `now` anchors the wall-clock delta it measures forward from. A re-armed
+    // interval re-queues at `absMs + every` (NOT `at + every`), so a long pause
+    // never fires a catch-up burst — one tick per real period, like a browser's
+    // background coalescing. The due set is SNAPSHOTTED up front so a callback
+    // that schedules another already-due timer isn't swept into THIS pass (the
+    // actor's `settle_to` loop catches it next), and a `clearTimeout` mid-batch
+    // is honored (the entry is gone from `q`, so `indexOf` skips it).
+    trust.now = () => timers.now;
+    trust.nextDeadline = function () {
+        let best = null;
+        for (const t of timers.q) if (best === null || t.at < best) best = t.at;
+        return best;
+    };
+    trust.tickTo = function (absMs) {
+        absMs = Math.max(timers.now, absMs);
+        const due = timers.q.filter((t) => t.at <= absMs).sort((a, b) => a.at - b.at || a.id - b.id);
+        for (const t of due) {
+            const i = timers.q.indexOf(t);
+            if (i < 0) continue; // cleared by an earlier callback in this batch
+            timers.q.splice(i, 1);
+            timers.now = Math.max(timers.now, t.at);
+            if (t.every !== null) timers.q.push({ id: t.id, at: absMs + t.every, fn: t.fn, every: t.every });
+            try { t.fn(); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+        }
+        timers.now = absMs;
+        return due.length;
     };
     // The clocks advance with VIRTUAL time, not the wall clock. A click that
     // triggers an animation (jQuery's `.slideUp`/`.fadeOut`, used by Humble's
@@ -11525,6 +11750,149 @@ mod tests {
         }
         // The actor exited: the event channel is closed.
         assert!(events.blocking_recv().is_none());
+    }
+
+    /// Pull a `COUNT=<n>` value out of a render (the at-rest timer tests mark
+    /// their counter this way so it's unambiguous in the serialized HTML).
+    fn marked_count(html: &str) -> Option<u64> {
+        let tail = html.split_once("COUNT=")?.1;
+        let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
+    }
+
+    #[test]
+    fn an_interval_keeps_ticking_at_rest() {
+        // A page whose ONLY behavior is a `setInterval` incrementing a counter —
+        // no clickables, no forms. Before the living-engine loop this went
+        // Static and froze; now its own clock drives it at rest, so the counter
+        // keeps climbing across real-time wakes (the core of step 1).
+        let (_handle, mut events) = live(
+            r##"<body><div id="n">COUNT=0</div><script>
+            var n = 0;
+            setInterval(function () { n++; document.getElementById('n').textContent = 'COUNT=' + n; }, 50);
+            </script></body>"##,
+        );
+        // The first LIVE render (the interval page must NOT go Static).
+        let first = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => {
+                    if let Some(c) = marked_count(&html) {
+                        break c;
+                    }
+                }
+                Some(PageEvt::Static { .. }) => {
+                    panic!("an interval page must stay live, not go Static")
+                }
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected a render, got {other:?}"),
+            }
+        };
+        // Subsequent renders arrive ~one per real frame (WAKE_FLOOR) as the
+        // interval fires at rest; the counter must strictly climb.
+        let mut later = first;
+        for _ in 0..16 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => {
+                    if let Some(c) = marked_count(&html) {
+                        later = c;
+                        if later > first + 2 {
+                            break;
+                        }
+                    }
+                }
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected a render, got {other:?}"),
+            }
+        }
+        assert!(
+            later > first,
+            "the interval must keep ticking at rest: first={first} later={later}"
+        );
+    }
+
+    #[test]
+    fn an_interval_is_not_fast_forwarded_at_load() {
+        // The load settle must NOT pre-run a repeating interval (it's ongoing
+        // real-time work, not deferred init): the page paints its INITIAL state
+        // — COUNT=0 — like a browser, instead of jumping to ~MAX_TICKS. The
+        // at-rest loop then advances it (see `an_interval_keeps_ticking_at_rest`).
+        let (_handle, mut events) = live(
+            r##"<body><div id="n">COUNT=0</div><script>
+            var n = 0;
+            setInterval(function () { n++; document.getElementById('n').textContent = 'COUNT=' + n; }, 50);
+            </script></body>"##,
+        );
+        let first = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => {
+                    if let Some(c) = marked_count(&html) {
+                        break c;
+                    }
+                }
+                Some(PageEvt::Static { .. }) => panic!("an interval page must stay live"),
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected a render, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            first, 0,
+            "the interval must not fire during the load settle"
+        );
+    }
+
+    #[test]
+    fn an_idle_page_parks_without_spurious_renders() {
+        // A clickable page with NO pending timers: after its load render the
+        // actor parks on the command channel (no sleep arm) and emits NOTHING
+        // at rest. A spurious Settled/Updated stream here would mean we wake
+        // when we shouldn't — the zero-idle-CPU invariant the rework must keep.
+        let (_handle, mut events) = live(
+            r##"<body><button id="b">hi</button><script>
+            document.getElementById('b').addEventListener('click', function () {});
+            </script></body>"##,
+        );
+        match events.blocking_recv() {
+            Some(PageEvt::Updated { .. }) => {}
+            other => panic!("expected a live render, got {other:?}"),
+        }
+        // Give the actor real time to (mis)behave, then confirm it stayed quiet.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        match events.try_recv() {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            other => panic!("an idle page must stay silent at rest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_timer_can_navigate_at_rest() {
+        // `setTimeout(() => location.href = …)` — a JS meta-refresh. The 1100ms
+        // delay clears the load settle's 1000ms fast-forward window, so it fires
+        // at REST (proving the timer wake routes script navigation), not at load.
+        let (_handle, mut events) = live(
+            r##"<body><p>redirecting…</p><script>
+            setTimeout(function () { location.href = '/next'; }, 1100);
+            </script></body>"##,
+        );
+        // Drain any load render(s), then expect the at-rest navigation.
+        let mut navigated = None;
+        for _ in 0..8 {
+            match events.blocking_recv() {
+                Some(PageEvt::Navigate(url)) => {
+                    navigated = Some(url);
+                    break;
+                }
+                Some(PageEvt::Updated { .. } | PageEvt::Settled) => continue,
+                Some(PageEvt::Static { .. }) => {
+                    panic!("a page with a pending timer must stay live")
+                }
+                other => panic!("expected Navigate, got {other:?}"),
+            }
+        }
+        let url = navigated.expect("the timer must navigate at rest");
+        assert!(
+            url.ends_with("/next"),
+            "resolved against the page base: {url}"
+        );
     }
 
     /// React synthetic-event system, end-to-end through the page actor:
