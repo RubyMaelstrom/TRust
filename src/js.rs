@@ -1443,6 +1443,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_set_text", 2, sys_set_text),
         ("__dom_inner_html", 1, sys_inner_html),
         ("__dom_set_inner_html", 2, sys_set_inner_html),
+        ("__dom_load_frame", 3, sys_load_frame),
         ("__dom_outer_html", 1, sys_outer_html),
         ("__dom_insert_adjacent", 3, sys_insert_adjacent),
         ("__dom_query", 3, sys_query),
@@ -1789,6 +1790,22 @@ fn sys_set_inner_html(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
         for n in d.parse_fragment_into(&context_tag, &html) {
             d.append(target, n);
         }
+    }
+    Ok(JsValue::undefined())
+}
+
+/// `__dom_load_frame(frameId, html, baseUrl)` — install `html` as the
+/// iframe's nested document (HTML "process the iframe attributes" / "navigate
+/// an iframe"). The prelude calls this for both `src` (after fetching) and
+/// `srcdoc`; the heavy lifting (full document parse, replace the content
+/// navigable, absolutize the frame's relative URLs) is `Dom::install_frame_document`.
+fn sys_load_frame(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let html = arg_str(args, 1, ctx);
+    let base = arg_str(args, 2, ctx);
+    let dom = page_dom(ctx);
+    let mut d = dom.borrow_mut();
+    if let Some(frame) = arg_node(&d, args, 0) {
+        d.install_frame_document(frame, &html, &base);
     }
     Ok(JsValue::undefined())
 }
@@ -3671,11 +3688,26 @@ pub fn css_bake(
     viewport: (u16, u16),
     cell_px: (u16, u16),
 ) -> String {
+    let dom = css_prepare(html, viewport, cell_px);
+    css_finish(dom, sheets)
+}
+
+/// Parse a page into an arena with its viewport set — the front half of the
+/// no-JS `css_bake`, split out so `http::css_only` can load the page's frames
+/// (an async fetch + `Dom::install_frame_document`) between parse and
+/// serialize, the script-less mirror of the JS pipeline's frame loading.
+pub fn css_prepare(html: &str, viewport: (u16, u16), cell_px: (u16, u16)) -> Dom {
     let mut dom = Dom::parse_document(html);
     dom.set_viewport_px(
         u32::from(viewport.0) * u32::from(cell_px.0.max(1)),
         u32::from(viewport.1) * u32::from(cell_px.1.max(1)),
     );
+    dom
+}
+
+/// Attach the page's external sheets and serialize the cascade-baked DOM —
+/// the back half of `css_bake`.
+pub fn css_finish(mut dom: Dom, sheets: &[(String, String)]) -> String {
     if !sheets.is_empty() {
         dom.attach_external_sheets(sheets);
     }
@@ -4553,6 +4585,17 @@ const PRELUDE: &str = r##"
         __dom_run_injected_script(node.__id);
     }
 
+    // A freshly inserted <iframe>/<frame> connected to the document begins
+    // loading (HTML "process the iframe attributes" runs on insertion). A frame
+    // built up inside a detached fragment waits until its root is connected —
+    // the next load/settle sweep (or a contentDocument read) realizes it then.
+    // (Forward-referenced by the Node insert methods; `processIframeAttributes`
+    // is hoisted alongside the other iframe helpers below.)
+    function maybeProcessInsertedFrame(frame, parent) {
+        if (!parent.isConnected) return;
+        try { processIframeAttributes(frame); } catch (e) {}
+    }
+
     // The document base URL: <base href> when present (archive.org sets
     // one; SPA routers resolve '.' against it), the page URL otherwise.
     // CACHED — a full querySelector("base[href]") on every .href/.src read was
@@ -4782,15 +4825,123 @@ const PRELUDE: &str = r##"
         }, 0);
         return pending.length;
     };
-    // Realize the nested document of any same-origin `srcdoc` frame that no
-    // script touched, so its declarative content still flows into the page.
-    // (Scripted frames hydrate the moment their contentDocument is read.)
-    trust.hydrateFrames = function () {
+    // --- iframe processing: HTML "process the iframe attributes" ----------
+    // An <iframe>/<frame> renders its nested document INLINE (the serializer
+    // rewrites the frame + its realized content into a <div data-trust-frame>;
+    // see dom.rs `frame_body`). Standards-faithful within the terminal: the
+    // content navigable's document is fetched (src) or taken from the markup
+    // (srcdoc), parsed as a REAL document, and its relative URLs are resolved
+    // against the frame's own base. Deliberate, medium-forced deviations (her
+    // calls): NO border or scrollbar chrome — the frame flows into the page's
+    // single scroll; and the nested document's OWN scripts do NOT run (TRust
+    // has one Boa realm per page, and a separate realm per nested navigable is
+    // future engine work) — so a frame's HTML+CSS render but its in-frame JS
+    // is inert. Cross-origin frames still RENDER but are not script-accessible
+    // from the parent (`contentDocument` → null, per spec's origin check).
+    function stripFragment(u) { const i = u.indexOf("#"); return i < 0 ? u : u.slice(0, i); }
+    // A frame URL is same-origin with the page (about:blank/about:srcdoc
+    // inherit the parent origin, so they count as same-origin).
+    function frameSameOrigin(url) {
+        if (!url || url === "about:srcdoc" || url === "about:blank") return true;
+        const u = __url_parse(url, g.location.href);
+        return u ? u[8] === g.location.origin : false;
+    }
+    // Shared attribute processing steps, step 3 — circular-navigation guard: a
+    // frame must not load a URL already held by one of its inclusive ancestor
+    // navigables (the infinite self-embed the spec forbids). The nested
+    // document lives in the same arena, so the parentNode chain walks from the
+    // frame up through every ancestor frame element to the top document.
+    function frameAncestorHasUrl(frame, url) {
+        const target = stripFragment(url);
+        if (stripFragment(g.location.href) === target) return true;
+        let n = frame.parentNode;
+        while (n) {
+            const ln = n.localName;
+            if ((ln === "iframe" || ln === "frame") && n.__frameUrl &&
+                stripFragment(n.__frameUrl) === target) return true;
+            n = n.parentNode;
+        }
+        return false;
+    }
+    // "iframe load event steps": fire load at the element once its content
+    // document has loaded. A macrotask so parent onload / addEventListener
+    // handlers attached during the current turn still observe it (same shape
+    // as the synthetic image-load pass).
+    function fireFrameLoad(frame) {
+        setTimeout(function () { try { dispatch(frame, new Event("load"), false); } catch (e) {} }, 0);
+    }
+    // Install markup as the frame's content navigable, then process any frames
+    // nested inside it (bounded by the circular guard + the page fetch cap).
+    function loadFrameMarkup(frame, markup, base, frameUrl) {
+        frame.__frameUrl = frameUrl;
+        __dom_load_frame(frame.__id, String(markup == null ? "" : markup), base);
+        hydrateFramesIn(frame);
+    }
+    // "Process the iframe attributes". The initialInsertion / re-process cases
+    // collapse into one idempotent function: the __loaded* de-dup makes a
+    // repeat call for the SAME state a no-op, so the load sweep, the lazy
+    // contentDocument getter, and src/srcdoc attribute changes all route here.
+    function processIframeAttributes(frame) {
+        if (!frame) return;
+        const ln = frame.localName;
+        if (ln !== "iframe" && ln !== "frame") return;
+        // srcdoc takes priority over src (spec).
+        const srcdoc = frame.getAttribute("srcdoc");
+        if (srcdoc !== null) {
+            if (frame.__loadedSrcdoc === srcdoc) return;
+            frame.__loadedSrcdoc = srcdoc;
+            frame.__loadedSrc = undefined;
+            // about:srcdoc: the markup IS the document; base/origin inherit the
+            // parent document.
+            loadFrameMarkup(frame, srcdoc, g.location.href, "about:srcdoc");
+            fireFrameLoad(frame);
+            return;
+        }
+        frame.__loadedSrcdoc = undefined;
+        // Shared attribute processing steps → a URL, or null (= about:blank).
+        const src = frame.getAttribute("src");
+        if (!src || src.trim() === "") { frame.__loadedSrc = undefined; return; }
+        const parsed = __url_parse(src, baseHref());
+        if (!parsed) return;
+        const url = parsed[0];
+        if (frame.__loadedSrc === url) return; // already navigated to this src
+        // Only http(s) navigables are fetchable here (about:/data:/blob: render
+        // nothing for now — a documented deviation).
+        if (!/^https?:/i.test(url)) { frame.__loadedSrc = undefined; return; }
+        if (frameAncestorHasUrl(frame, url)) return; // circular-navigation guard
+        frame.__loadedSrc = url; // set before fetching so a re-sweep won't double-load
+        let r;
+        try { r = __http_fetch(url, "GET", null, null, null); } catch (e) { r = null; }
+        if (!r) { fireFrameLoad(frame); return; }
+        const status = r[0] | 0;
+        const ctype = String(r[1] || "").toLowerCase();
+        const isHtml = ctype === "" || ctype.indexOf("text/html") >= 0 ||
+            ctype.indexOf("application/xhtml") >= 0;
+        if (status >= 200 && status < 300 && isHtml) {
+            loadFrameMarkup(frame, r[2] || "", url, url);
+        }
+        fireFrameLoad(frame);
+    }
+    // Process every frame within `root` (the document at load, or a freshly
+    // installed frame document for nested frames). Idempotent (the __loaded*
+    // de-dup), so re-sweeping is cheap.
+    function hydrateFramesIn(root) {
         let frames;
-        try { frames = g.document.querySelectorAll("iframe[srcdoc], frame[srcdoc]"); } catch (e) { return 0; }
-        for (let i = 0; i < frames.length; i++) { try { frames[i].contentDocument; } catch (e) {} }
+        try { frames = root.querySelectorAll("iframe, frame"); } catch (e) { return 0; }
+        for (let i = 0; i < frames.length; i++) {
+            try { processIframeAttributes(frames[i]); } catch (e) {}
+        }
         return frames.length;
-    };
+    }
+    // Lazy realization when a script reads a frame's contentDocument before the
+    // load sweep (or for a frame inserted after load). The de-dup guards keep a
+    // repeat call cheap; a frame with neither src nor srcdoc stays about:blank.
+    function ensureFrameProcessed(frame) {
+        if (frame.getAttribute("src") !== null || frame.getAttribute("srcdoc") !== null) {
+            try { processIframeAttributes(frame); } catch (e) {}
+        }
+    }
+    trust.hydrateFrames = function () { return hydrateFramesIn(g.document); };
     // The actor's entry points: dispatch a user click; enumerate nodes
     // with click listeners (delegation hosts included — the actor sorts
     // containers from buttons).
@@ -5077,6 +5228,7 @@ const PRELUDE: &str = r##"
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
             if (c.__ln === "base") baseHrefCache = null; // maybeRunScript already read .localName
+            else if (c.__ln === "iframe" || c.__ln === "frame") maybeProcessInsertedFrame(c, this);
             return c;
         }
         insertBefore(c, ref) {
@@ -5086,6 +5238,7 @@ const PRELUDE: &str = r##"
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
             if (c.__ln === "base") baseHrefCache = null;
+            else if (c.__ln === "iframe" || c.__ln === "frame") maybeProcessInsertedFrame(c, this);
             return c;
         }
         removeChild(c) { if (c.__ln === "base") baseHrefCache = null; if (MO.length) moChildRemove(this, c); if (CE.defs.size) ceDisconnect(c); __dom_detach(c.__id); return c; }
@@ -5099,6 +5252,7 @@ const PRELUDE: &str = r##"
             if (CE.defs.size) ceScan(n);
             maybeRunScript(n);
             if (n.__ln === "base" || old.__ln === "base") baseHrefCache = null;
+            else if (n.__ln === "iframe" || n.__ln === "frame") maybeProcessInsertedFrame(n, this);
             return old;
         }
         remove() { if (this.__ln === "base") baseHrefCache = null; const p = this.parentNode; if (p && MO.length) moChildRemove(p, this); if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); }
@@ -5393,6 +5547,8 @@ const PRELUDE: &str = r##"
             if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, n.toLowerCase(), old, v);
             if (MO.length) moAttr(this, n, old);
+            // Changing src/srcdoc re-runs "process the iframe attributes".
+            if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") processIframeAttributes(this); }
         }
         setAttributeNS(_, n, v) { this.setAttribute(n, v); }
         removeAttribute(n) {
@@ -5403,6 +5559,8 @@ const PRELUDE: &str = r##"
             if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, n.toLowerCase(), old, null);
             if (MO.length) moAttr(this, n, old);
+            // Removing src/srcdoc re-runs "process the iframe attributes".
+            if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") processIframeAttributes(this); }
         }
         hasAttribute(n) { return this.getAttribute(n) !== null; }
         getAttributeNames() { return __dom_attr_names(this.__id); }
@@ -5614,6 +5772,11 @@ const PRELUDE: &str = r##"
         // (identity-stable) wrapper. Non-frame elements keep returning undefined.
         get contentDocument() {
             if (this.localName !== "iframe" && this.localName !== "frame") return undefined;
+            ensureFrameProcessed(this); // load src/srcdoc if a script reads us early
+            // A cross-origin nested document RENDERS but isn't script-accessible
+            // from the parent (spec's origin check) — hand back null, as a real
+            // browser does.
+            if (this.__frameUrl && !frameSameOrigin(this.__frameUrl)) return null;
             return this.__contentDoc || (this.__contentDoc = new FrameDocument(this));
         }
         get contentWindow() {
@@ -5622,7 +5785,12 @@ const PRELUDE: &str = r##"
                 const frame = this;
                 this.__contentWin = {
                     get document() { return frame.contentDocument; },
-                    location: { href: "about:blank", replace() {}, assign() {} },
+                    // The nested document's location reflects the navigated URL
+                    // (about:blank until a src/srcdoc loads).
+                    get location() {
+                        const u = frame.__frameUrl;
+                        return { href: u && u !== "about:srcdoc" ? u : "about:blank", replace() {}, assign() {} };
+                    },
                     parent: g, top: g, frames: g, frameElement: this,
                     postMessage() {}, focus() {}, blur() {},
                     addEventListener() {}, removeEventListener() {},
@@ -5930,24 +6098,23 @@ const PRELUDE: &str = r##"
         constructor(frameEl) {
             this.__frame = frameEl;
             this.nodeType = 9;
-            let html = null;
-            const kids = frameEl.childNodes;
+        }
+        // The content navigable's document element, found live in the arena.
+        // `processIframeAttributes` installs real <html> content for src/srcdoc
+        // frames; an unscripted about:blank frame gets an empty skeleton on
+        // first access so `document.write` has a <body> to write into. (Found,
+        // not cached, so it stays correct after a (re)navigation replaces it.)
+        get documentElement() {
+            const kids = this.__frame.childNodes;
             for (let i = 0; i < kids.length; i++) {
                 const c = kids[i];
-                if (c.nodeType === 1 && c.localName === "html") { html = c; break; }
+                if (c.nodeType === 1 && c.localName === "html") return c;
             }
-            if (!html) {
-                html = document.createElement("html");
-                html.appendChild(document.createElement("head"));
-                html.appendChild(document.createElement("body"));
-                frameEl.appendChild(html);
-            }
-            this.documentElement = html;
-            // Declarative content: a `srcdoc` frame parses its attribute as the
-            // document the first time it's realized (scripted frames stay empty
-            // until written).
-            const sd = frameEl.getAttribute("srcdoc");
-            if (sd && !this.body.firstChild) this.write(sd);
+            const html = document.createElement("html");
+            html.appendChild(document.createElement("head"));
+            html.appendChild(document.createElement("body"));
+            this.__frame.appendChild(html);
+            return html;
         }
         get head() { return this.documentElement.querySelector("head") || this.documentElement; }
         get body() { return this.documentElement.querySelector("body") || this.documentElement; }

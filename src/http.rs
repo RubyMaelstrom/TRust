@@ -1324,9 +1324,243 @@ pub async fn css_only(
     }
     let html = decode_body(&response.content_type, &response.body);
     let sheets = fetch_page_sheets(&html, &response.url).await;
-    response.body = crate::js::css_bake(&html, &sheets, viewport, cell_px).into_bytes();
+    // The frame documents are fetched up front into a url→content map (Dom is
+    // not `Send`, so it must never cross an `.await`), then installed into the
+    // real arena synchronously.
+    let base = base_with_doc_base(&html, &response.url);
+    let frames = prefetch_frame_documents(&html, &base, &response.url).await;
+    let mut dom = crate::js::css_prepare(&html, viewport, cell_px);
+    if !frames.is_empty() {
+        install_page_frames(&mut dom, &response.url, &frames);
+    }
+    response.body = crate::js::css_finish(dom, &sheets).into_bytes();
     response.content_type = String::from("text/html; charset=utf-8");
     response
+}
+
+/// Bounded nesting for the no-JS frame load: a frame whose document holds
+/// more frames is followed this many levels deep, after which deeper frames
+/// render empty (a hostile-page lid; the circular guard already stops a
+/// self-embed at any depth).
+const MAX_FRAME_DEPTH: usize = 8;
+/// Total frame documents loaded per page — the script-less analogue of the
+/// JS pipeline's `MAX_PAGE_FETCHES` ceiling, so a frame bomb can't fan out.
+const MAX_FRAME_LOADS: usize = 32;
+
+fn strip_fragment(u: &str) -> &str {
+    u.split('#').next().unwrap_or(u)
+}
+
+/// The base URL for resolving a document's `src`/`href`: the document URL,
+/// overridden by the first `<base href>` if present (mirrors `baseHref()` in
+/// the JS pipeline). Takes the raw HTML so it works before the real arena
+/// exists (the prefetch phase needs it too).
+fn base_with_doc_base(html: &str, doc_url: &Url) -> Url {
+    let dom = crate::dom::Dom::parse_document(html);
+    for id in dom.descendants(crate::dom::DOCUMENT) {
+        if dom.tag_name(id) == Some("base")
+            && let Some(href) = dom.attr(id, "href")
+            && let Ok(u) = doc_url.join(href.trim())
+        {
+            return u;
+        }
+    }
+    doc_url.clone()
+}
+
+/// Resolve a frame's `src` to the URL it would navigate to, applying the same
+/// gating in the prefetch and install passes: http(s) only (about:/data:/blob:
+/// render nothing — a documented deviation), no private-network pivot, and the
+/// spec circular-navigation guard (a frame may not load a URL already held by
+/// an inclusive ancestor navigable). `None` means "don't load".
+fn resolve_frame_src(src: &str, base: &Url, page_url: &Url, ancestors: &[String]) -> Option<Url> {
+    let url = base.join(src.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if !subresource_allowed(page_url, &url) {
+        return None;
+    }
+    if ancestors.iter().any(|a| a == strip_fragment(url.as_str())) {
+        return None;
+    }
+    Some(url)
+}
+
+/// Scan one document's markup for its frames' `src` URLs to fetch and inline
+/// `srcdoc` contents to recurse into. Synchronous (a throwaway parse, dropped
+/// before the caller's next `.await`), the same parse-don't-pattern-match
+/// approach as `external_stylesheets`. Returns `(src URLs, srcdoc bodies)`.
+fn scan_frame_sources(
+    html: &str,
+    base: &Url,
+    page_url: &Url,
+    ancestors: &[String],
+) -> (Vec<Url>, Vec<String>) {
+    let dom = crate::dom::Dom::parse_document(html);
+    let mut srcs = Vec::new();
+    let mut srcdocs = Vec::new();
+    for id in dom.descendants(crate::dom::DOCUMENT) {
+        match dom.tag_name(id) {
+            Some("iframe") | Some("frame") => {}
+            _ => continue,
+        }
+        // srcdoc wins over src (HTML "process the iframe attributes").
+        if let Some(srcdoc) = dom.attr(id, "srcdoc") {
+            srcdocs.push(srcdoc.to_string());
+            continue;
+        }
+        if let Some(src) = dom.attr(id, "src").map(str::trim).filter(|s| !s.is_empty())
+            && let Some(url) = resolve_frame_src(src, base, page_url, ancestors)
+        {
+            srcs.push(url);
+        }
+    }
+    (srcs, srcdocs)
+}
+
+/// Fetch every frame document a script-less page (and its nested frames) needs,
+/// into a `url → content` map, breadth-first so each level's `src` fetches
+/// overlap. `srcdoc` frames hold no URL but their markup is still scanned for
+/// nested `src` frames. Bounded by depth and a total-frame cap; only 2xx
+/// `text/html` responses are kept.
+async fn prefetch_frame_documents(
+    html: &str,
+    base: &Url,
+    page_url: &Url,
+) -> std::collections::HashMap<String, String> {
+    use std::collections::VecDeque;
+    let mut map: HashMap<String, String> = HashMap::new();
+    // (document markup, its base, fragment-stripped ancestor URLs, depth)
+    let mut queue: VecDeque<(String, Url, Vec<String>, usize)> = VecDeque::new();
+    queue.push_back((
+        html.to_string(),
+        base.clone(),
+        vec![strip_fragment(page_url.as_str()).to_string()],
+        0,
+    ));
+    let mut loaded = 0usize;
+
+    while let Some((markup, base, ancestors, depth)) = queue.pop_front() {
+        if depth >= MAX_FRAME_DEPTH || loaded >= MAX_FRAME_LOADS {
+            continue;
+        }
+        let (srcs, srcdocs) = scan_frame_sources(&markup, &base, page_url, &ancestors);
+
+        // Fetch this level's `src` documents concurrently.
+        let fetched: Vec<Option<(Url, String)>> =
+            futures::stream::iter(srcs.into_iter().map(|url| async move {
+                let resp = fetch(&Request::get(url.clone())).await.ok()?;
+                let media = resp
+                    .content_type
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                let is_html =
+                    media.is_empty() || media == "text/html" || media == "application/xhtml+xml";
+                (resp.status >= 200 && resp.status < 300 && is_html)
+                    .then(|| (url, decode_body(&resp.content_type, &resp.body)))
+            }))
+            .buffered(PREFETCH_CONCURRENCY)
+            .collect()
+            .await;
+
+        for (url, body) in fetched.into_iter().flatten() {
+            if loaded >= MAX_FRAME_LOADS {
+                break;
+            }
+            loaded += 1;
+            let mut child_ancestors = ancestors.clone();
+            child_ancestors.push(strip_fragment(url.as_str()).to_string());
+            // Nested frames in the fetched content resolve against ITS url.
+            queue.push_back((body.clone(), url.clone(), child_ancestors, depth + 1));
+            map.insert(url.to_string(), body);
+        }
+        // srcdoc bodies hold no URL of their own; recurse to load THEIR frames
+        // (base/origin inherit the parent document, per about:srcdoc).
+        for srcdoc in srcdocs {
+            queue.push_back((srcdoc, base.clone(), ancestors.clone(), depth + 1));
+        }
+    }
+    map
+}
+
+/// Install the prefetched frame documents into the real arena, reusing the
+/// same `Dom::install_frame_document` the JS pipeline drives. Walks the live
+/// frames breadth-first; a `src` frame takes its content from `fetched`, a
+/// `srcdoc` frame from its attribute (base = the parent document). Synchronous
+/// — `Dom` never crosses an `.await`. Bounded identically to the prefetch.
+fn install_page_frames(
+    dom: &mut crate::dom::Dom,
+    page_url: &Url,
+    fetched: &HashMap<String, String>,
+) {
+    use crate::dom::{DOCUMENT, NodeId};
+    use std::collections::VecDeque;
+
+    let base = {
+        let mut b = page_url.clone();
+        for id in dom.descendants(DOCUMENT) {
+            if dom.tag_name(id) == Some("base")
+                && let Some(href) = dom.attr(id, "href")
+                && let Ok(u) = page_url.join(href.trim())
+            {
+                b = u;
+                break;
+            }
+        }
+        b
+    };
+    // (subtree root, base for that subtree, fragment-stripped ancestor URLs, depth)
+    let mut queue: VecDeque<(NodeId, Url, Vec<String>, usize)> = VecDeque::new();
+    queue.push_back((
+        DOCUMENT,
+        base,
+        vec![strip_fragment(page_url.as_str()).to_string()],
+        0,
+    ));
+    let mut loaded = 0usize;
+
+    while let Some((root, base, ancestors, depth)) = queue.pop_front() {
+        if depth >= MAX_FRAME_DEPTH || loaded >= MAX_FRAME_LOADS {
+            continue;
+        }
+        // Collect each frame's content first (immutable borrow), then install
+        // (mutable borrow) — can't hold the descendants borrow across install.
+        let mut plans: Vec<(NodeId, String, Url, Option<Url>)> = Vec::new();
+        for id in dom.descendants(root) {
+            match dom.tag_name(id) {
+                Some("iframe") | Some("frame") => {}
+                _ => continue,
+            }
+            if let Some(srcdoc) = dom.attr(id, "srcdoc") {
+                plans.push((id, srcdoc.to_string(), base.clone(), None));
+                continue;
+            }
+            if let Some(src) = dom.attr(id, "src").map(str::trim).filter(|s| !s.is_empty())
+                && let Some(url) = resolve_frame_src(src, &base, page_url, &ancestors)
+                && let Some(content) = fetched.get(url.as_str())
+            {
+                plans.push((id, content.clone(), url.clone(), Some(url)));
+            }
+        }
+
+        for (frame, content, frame_base, frame_url) in plans {
+            if loaded >= MAX_FRAME_LOADS {
+                break;
+            }
+            if let Some(body) = dom.install_frame_document(frame, &content, frame_base.as_str()) {
+                loaded += 1;
+                let mut child_ancestors = ancestors.clone();
+                if let Some(u) = &frame_url {
+                    child_ancestors.push(strip_fragment(u.as_str()).to_string());
+                }
+                queue.push_back((body, frame_base, child_ancestors, depth + 1));
+            }
+        }
+    }
 }
 
 /// Known ad / tracker network domains we neither fetch nor run. A terminal
@@ -1990,6 +2224,141 @@ mod tests {
         assert_eq!(response.content_type, "text/html; charset=utf-8");
         let outcome = response.js.expect("outcome recorded");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        server.abort();
+    }
+
+    // A same-origin <iframe src> is fetched and its nested document flows into
+    // the page inline (HTML "process the iframe attributes" → "navigate an
+    // iframe"). No chrome (no border/scrollbar, no surviving <iframe>); the
+    // frame's relative links resolve against ITS url, not the parent's.
+    #[tokio::test]
+    async fn execute_js_renders_a_same_origin_iframe_src_inline() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).into_owned();
+                let reply: Vec<u8> = if text.starts_with("GET /page ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                      <body><h1>PARENT PAGE</h1><iframe src=\"/inner\"></iframe>\
+                      <script>void 0;</script></body>"
+                        .to_vec()
+                } else if text.starts_with("GET /inner ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                      <!DOCTYPE html><html><head><title>FRAME TITLE</title></head>\
+                      <body><p>INNER FRAME BODY</p><a href=\"deep.html\">go</a></body></html>"
+                        .to_vec()
+                } else {
+                    b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                };
+                let _ = sock.write_all(&reply).await;
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(
+            body.contains("data-trust-frame"),
+            "frame wrapper missing: {body}"
+        );
+        assert!(
+            body.contains("INNER FRAME BODY"),
+            "frame body missing: {body}"
+        );
+        assert!(!body.contains("<iframe"), "iframe element survived: {body}");
+        assert!(
+            body.contains(&format!("http://127.0.0.1:{port}/deep.html")),
+            "relative link not resolved against the frame url: {body}"
+        );
+        assert!(
+            !body.contains("FRAME TITLE"),
+            "frame head leaked into flow: {body}"
+        );
+        let outcome = response.js.expect("outcome recorded");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        server.abort();
+    }
+
+    // A SCRIPT-LESS page (the `css_only` path) loads its frames too: `srcdoc`
+    // inline, a `src` document fetched + flowed inline (relative link resolved
+    // against the frame url), and a frame NESTED inside the fetched document is
+    // followed one level deeper. The whole point is parity with the JS pipeline
+    // without spinning up the engine.
+    #[tokio::test]
+    async fn css_only_loads_iframe_src_srcdoc_and_nested_frames() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).into_owned();
+                let reply: &[u8] = if text.starts_with("GET /page ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                      <body><h1>PARENT PAGE</h1>\
+                      <iframe srcdoc=\"<p>SRCDOC BODY</p>\"></iframe>\
+                      <iframe src=\"/inner\"></iframe></body>"
+                } else if text.starts_with("GET /inner ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                      <body><p>INNER FRAME BODY</p><a href=\"deep.html\">go</a>\
+                      <iframe src=\"/nested\"></iframe></body>"
+                } else if text.starts_with("GET /nested ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                      <body><p>NESTED FRAME BODY</p></body>"
+                } else {
+                    b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n"
+                };
+                let _ = sock.write_all(reply).await;
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        // No <script> in the page → the css_only branch.
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(body.contains("SRCDOC BODY"), "srcdoc frame missing: {body}");
+        assert!(
+            body.contains("INNER FRAME BODY"),
+            "src frame missing: {body}"
+        );
+        assert!(
+            body.contains("NESTED FRAME BODY"),
+            "nested frame missing: {body}"
+        );
+        assert!(!body.contains("<iframe"), "iframe element survived: {body}");
+        assert!(
+            body.contains(&format!("http://127.0.0.1:{port}/deep.html")),
+            "relative link not resolved against the frame url: {body}"
+        );
         server.abort();
     }
 

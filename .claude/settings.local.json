@@ -89,7 +89,8 @@
       "Bash(curl -s -o /dev/null -w \"3000: HTTP %{http_code} server=%header{server}\\\\n\" http://localhost:3000/)",
       "Bash(curl -s -o /dev/null -w \"8080: HTTP %{http_code} server=%header{server}\\\\n\" http://localhost:8080/)",
       "Bash(curl -s http://localhost:3000/api/config)",
-      "Bash(curl -s http://localhost:8080/api/config)"
+      "Bash(curl -s http://localhost:8080/api/config)",
+      "WebFetch(domain:html.spec.whatwg.org)"
     ]
   }
 }
