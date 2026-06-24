@@ -2476,13 +2476,21 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
                             let result = crate::http::fetch(&request).await;
                             let mut guard = cell.borrow_mut();
                             match result {
-                                Ok(resp) => {
+                                // HTML §"fetch a classic script": only an OK (2xx)
+                                // response runs. A non-ok status (a 404'd webpack
+                                // chunk, a 5xx) is a load FAILURE — fire `error`,
+                                // never execute the error-page body as script.
+                                // (Running a 404's HTML body as JS produced a
+                                // spurious `SyntaxError: unexpected token '<'`; the
+                                // loader's own onerror — webpack's ChunkLoadError —
+                                // is the correct, faithful signal instead.)
+                                Ok(resp) if (200..300).contains(&resp.status) => {
                                     let body =
                                         crate::http::decode_body(&resp.content_type, &resp.body);
                                     eval_injected(&mut guard, &name, body.as_bytes());
                                     fire_script_event(&mut guard, node_id, "load");
                                 }
-                                Err(_) => fire_script_event(&mut guard, node_id, "error"),
+                                _ => fire_script_event(&mut guard, node_id, "error"),
                             }
                             Ok(JsValue::undefined())
                         },
@@ -3453,14 +3461,40 @@ fn load_page(
                     run_external_classic(&mut ctx, src, body, prepared, &budget, &mut outcome);
                 }
                 _ => {
-                    // A deliberately blocked ad/tracker script is expected,
-                    // not a page error — don't light the JS-error badge for it.
-                    let blocked = parsed_url
+                    // Not in the parallel prefetch (beyond the prefetch lid, or
+                    // its prefetch failed). A browser fetches a classic script
+                    // wherever it sits in the document, so fetch it on demand
+                    // THROUGH the shared cache — the prefetch cap is only a
+                    // parallelism lid, never a correctness cliff (a code-split
+                    // SPA whose chunk count exceeds the lid still boots). Bounded
+                    // by MAX_PAGE_FETCHES + subresource_allowed via
+                    // `page_net_prepare`. A deliberately blocked ad/tracker host
+                    // stays silent (expected, not a page error); a genuine
+                    // failure (no net / blocked / fetch error) keeps the old
+                    // "not fetched" note.
+                    let resolved = parsed_url
                         .as_ref()
                         .and_then(|b| b.join(src).ok())
-                        .and_then(|u| u.host_str().map(crate::http::is_ad_or_tracker_host))
-                        .unwrap_or(false);
-                    if !blocked {
+                        .filter(|u| matches!(u.scheme(), "http" | "https"));
+                    let blocked = resolved
+                        .as_ref()
+                        .and_then(|u| u.host_str())
+                        .is_some_and(crate::http::is_ad_or_tracker_host);
+                    if blocked {
+                        // expected — ad/tracker block, no badge
+                    } else if let Some(cached) = resolved
+                        .as_ref()
+                        .and_then(|u| load_module_body(&mut ctx, &env.cache, u))
+                    {
+                        run_external_classic(
+                            &mut ctx,
+                            src,
+                            &cached.body,
+                            None,
+                            &budget,
+                            &mut outcome,
+                        );
+                    } else {
                         outcome.errors.push(format!("{src}: not fetched"));
                     }
                 }
@@ -6426,6 +6460,16 @@ const PRELUDE: &str = r##"
         get domain() { return this.__domain !== undefined ? this.__domain : g.location.hostname; }
         set domain(v) { this.__domain = String(v); }
         get defaultView() { return g; }
+        // `document.referrer` (HTML §3.1.5): the address of the page that linked
+        // here, or the EMPTY STRING for a direct navigation / when policy strips
+        // it. The spec contract is that it is ALWAYS a string — never undefined.
+        // TRust navigations don't thread a referrer into page JS, so we report
+        // "" (direct navigation — a valid, common value). Missing it entirely
+        // (undefined) broke connected-react-router: its reducer seeds initial
+        // state from `document.referrer`, so an undefined value made that slice
+        // reducer return undefined on INIT → Redux's "reducer returned undefined
+        // during initialization" (#12), which aborts the whole store + render.
+        get referrer() { return ""; }
         get documentURI() { return g.location.href; }
         get URL() { return g.location.href; }
         get currentScript() { return wrap(trust.currentScript); }
@@ -6476,6 +6520,23 @@ const PRELUDE: &str = r##"
         createRange() { return new Range(); }
         getElementById(i) { return wrap(__dom_get_by_id(String(i))); }
         getElementsByName(n) { return this.querySelectorAll("[name=" + String(n) + "]"); }
+        // `document.elementFromPoint(x, y)` (CSSOM View): the topmost element at
+        // the viewport coordinate, or null when the point is outside the
+        // viewport. A terminal browser does no JS-side pixel hit-testing, so we
+        // can't resolve WHICH element sits under the point — but the method must
+        // EXIST (Microsoft Clarity and other analytics/heatmap/tooltip libraries
+        // call it during boot; missing it is a "not a function" TypeError that
+        // aborts their init). Honest deviation, consistent with our other
+        // geometry shims (getBoundingClientRect returns the viewport box, not 0):
+        // an in-viewport point answers with the body (the element that fills the
+        // viewport in a normal document) rather than null, so callers that gate
+        // on a returned element proceed instead of treating the page as empty.
+        elementFromPoint(x, y) {
+            x = +x; y = +y;
+            if (!(x >= 0 && y >= 0 && x < g.innerWidth && y < g.innerHeight)) return null;
+            return this.body || this.documentElement || null;
+        }
+        elementsFromPoint(x, y) { const el = this.elementFromPoint(x, y); return el ? [el] : []; }
         createEvent(type) { const C = EVENT_INTERFACES[String(type)] || Event; return new C(""); }
         hasFocus() { return true; }
         // A TRust document is always a visible, focused, non-prerendering
@@ -14565,6 +14626,50 @@ mod tests {
              </script></body>",
         );
         assert!(out2.contains(">1<"), "ran once, not twice: {out2}");
+    }
+
+    #[test]
+    fn document_referrer_is_a_string_not_undefined() {
+        // `document.referrer` must always be a STRING (HTML §3.1.5) — "" for a
+        // direct navigation. Returning undefined broke connected-react-router:
+        // its reducer seeds initial state from `document.referrer`, so an
+        // undefined value made the slice reducer return undefined on INIT,
+        // tripping Redux's "reducer returned undefined during initialization"
+        // (#12) and aborting the whole store + render (crunchyroll's blank page).
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             var r = document.referrer;\
+             document.getElementById('o').textContent = (typeof r) + ':' + JSON.stringify(r);\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("string:\"\""),
+            "referrer is the empty string: {out}"
+        );
+    }
+
+    #[test]
+    fn document_element_from_point_exists_and_returns_an_element() {
+        // `document.elementFromPoint` (CSSOM View) must EXIST — analytics/heatmap
+        // libraries (Microsoft Clarity) call it at boot; missing it is a "not a
+        // function" TypeError that aborts their init. We can't hit-test pixels,
+        // so an in-viewport point answers with a real element and an
+        // out-of-viewport point answers null (per spec).
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             var inb = document.elementFromPoint(5, 5);\
+             var oob = document.elementFromPoint(-1, -1);\
+             var es = document.elementsFromPoint(5, 5);\
+             document.getElementById('o').textContent =\
+               (inb && inb.nodeType === 1) + ':' + (oob === null) + ':' + Array.isArray(es) + ':' + es.length;\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("true:true:true:1"),
+            "in-viewport element, null out-of-bounds, array result: {out}"
+        );
     }
 
     #[test]

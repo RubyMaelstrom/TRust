@@ -1085,8 +1085,16 @@ pub(crate) fn decode_body(content_type: &str, body: &[u8]) -> String {
     }
 }
 
-/// Most external scripts fetched for one page.
-const MAX_PAGE_SCRIPTS: usize = 16;
+/// External classic scripts prefetched in parallel for one page. A browser has
+/// no such cap; it's only a parallelism lid (politeness toward one host) and a
+/// hostile-page lid. It must clear a real code-split SPA's chunk count — a
+/// webpack `cr-acquisition`-style app ships ~24 `<script src>` chunks, so at the
+/// old 16 the app's own bundle was truncated (the trailing chunks errored "not
+/// fetched") and the page never mounted. Matches `MAX_PAGE_PRELOADS` in spirit
+/// (both are "app code"). It is NOT a correctness cliff anymore: a classic
+/// script the execution loop reaches that wasn't prefetched is fetched on
+/// demand (see js.rs), bounded by `MAX_PAGE_FETCHES`.
+const MAX_PAGE_SCRIPTS: usize = 96;
 
 /// External stylesheets fetched for the cascade. A browser has no such cap;
 /// it's only a lid on hostile pages. It must clear a real design system's
@@ -2789,6 +2797,118 @@ mod tests {
             response.js.map(|j| j.errors.is_empty()).unwrap_or(true),
             "no JS errors"
         );
+        server.abort();
+    }
+
+    // A dynamically injected `<script src>` whose fetch returns a NON-OK status
+    // (a 404'd webpack chunk, served — as CDNs do — with an HTML error page)
+    // must fire `error`, NOT execute its body. Running the 404 HTML as JS was a
+    // spurious `SyntaxError: unexpected token '<'` (crunchyroll's missing
+    // "Remote Plugin" chunk). The loader's own onerror is the faithful signal.
+    #[tokio::test]
+    async fn an_injected_script_that_404s_fires_error_and_does_not_execute() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let reply: Vec<u8> = if text.starts_with("GET /page ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                          <body><pre id=out>before</pre><script>\
+                          var s=document.createElement('script');\
+                          s.src='/chunk.js';\
+                          s.onload=function(){var o=document.getElementById('out');o.textContent='LOADED';};\
+                          s.onerror=function(){var o=document.getElementById('out');o.textContent='ERRORED';};\
+                          document.body.appendChild(s);\
+                          </script></body>"
+                            .to_vec()
+                    } else if text.starts_with("GET /chunk.js ") {
+                        // A 404 served as an HTML error page (the real CDN shape).
+                        b"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                          <!doctype html><html><body>Not found</body></html>"
+                            .to_vec()
+                    } else {
+                        b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                    };
+                    let _ = sock.write_all(&reply).await;
+                });
+            }
+        });
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(body.contains("ERRORED"), "error event fired: {body}");
+        assert!(
+            !body.contains("LOADED"),
+            "load must not fire on 404: {body}"
+        );
+        // The 404 HTML body was NOT run as JS, so no SyntaxError lands.
+        let errors = response.js.map(|j| j.errors).unwrap_or_default();
+        assert!(
+            !errors.iter().any(|e| e.contains("SyntaxError")),
+            "no SyntaxError from running the 404 page as JS: {errors:?}"
+        );
+        server.abort();
+    }
+
+    // A classic `<script src>` that the parallel prefetch did NOT grab (it sat
+    // beyond MAX_PAGE_SCRIPTS, or its prefetch failed) is fetched ON DEMAND when
+    // the execution loop reaches it — the prefetch cap is a parallelism lid, not
+    // a correctness cliff. A code-split SPA whose chunk count exceeds the lid
+    // (crunchyroll ships ~24) still boots. Driven at the `transform` seam with an
+    // empty `externals` so the script is reached cold and pulled through the cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unprefetched_classic_script_is_fetched_on_demand() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let reply = b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n\
+                          document.getElementById('o').textContent = 'late-ran';"
+                        .to_vec();
+                    let _ = sock.write_all(&reply).await;
+                });
+            }
+        });
+        let page_url = format!("http://127.0.0.1:{port}/page");
+        let html =
+            String::from("<body><pre id=o>before</pre><script src=\"/late.js\"></script></body>");
+        let mut env = crate::js::PageEnv::bare(&page_url);
+        // Deliberately leave `externals` empty: /late.js was never prefetched.
+        env.net = Some(tokio::runtime::Handle::current());
+        // `transform` blocks on the fetch; keep it off the runtime workers.
+        let (out, outcome) = tokio::task::spawn_blocking(move || crate::js::transform(&html, &env))
+            .await
+            .unwrap();
+        assert!(out.contains("late-ran"), "on-demand script ran: {out}");
+        assert!(outcome.errors.is_empty(), "no errors: {:?}", outcome.errors);
         server.abort();
     }
 
