@@ -1339,6 +1339,88 @@ impl Dom {
             .find(|&c| self.tag_name(c) == Some("body"))
     }
 
+    /// Load `html` as an iframe's nested document (the HTML "navigate an
+    /// `iframe` or `frame`" step, for src + srcdoc). The fetched bytes are
+    /// parsed as a FULL HTML document and installed as the frame's content
+    /// navigable, replacing whatever was there (an empty `about:blank`
+    /// document on first load, or a prior navigation). Relative URLs in the
+    /// new content are absolutized against `base` (the frame's own document
+    /// URL): the serializer flattens the frame into the parent document, where
+    /// link/resource resolution would otherwise use the PARENT's base, so we
+    /// bake the frame's base in here. Returns the new `<body>`, or `None` if
+    /// the markup had no parseable `<html>`. (`__dom_load_frame` syscall.)
+    pub fn install_frame_document(
+        &mut self,
+        frame: NodeId,
+        html: &str,
+        base: &str,
+    ) -> Option<NodeId> {
+        let doc = Dom::parse_document(html);
+        let src_html = doc
+            .children(DOCUMENT)
+            .into_iter()
+            .find(|&c| doc.tag_name(c) == Some("html"))?;
+        // Discard the previous content navigable (arenas only grow; the old
+        // subtree is just unlinked).
+        for c in self.children(frame) {
+            self.detach(c);
+        }
+        let new_html = self.transplant(&doc, src_html);
+        self.append(frame, new_html);
+        if let Ok(base_url) = url::Url::parse(base) {
+            self.absolutize_subtree_urls(new_html, &base_url);
+        }
+        self.frame_body(frame)
+    }
+
+    /// Rewrite a subtree's relative URL attributes to absolute, resolved
+    /// against `base`. Absolute URLs and non-relative schemes (`javascript:`,
+    /// `mailto:`, `data:`) pass through `Url::join` unchanged; fragment-only
+    /// hrefs are left alone (they're in-page anchors, not navigations).
+    fn absolutize_subtree_urls(&mut self, root: NodeId, base: &url::Url) {
+        const URL_ATTRS: &[(&str, &str)] = &[
+            ("a", "href"),
+            ("area", "href"),
+            ("link", "href"),
+            ("img", "src"),
+            ("script", "src"),
+            ("source", "src"),
+            ("iframe", "src"),
+            ("frame", "src"),
+            ("embed", "src"),
+            ("audio", "src"),
+            ("video", "src"),
+            ("video", "poster"),
+            ("object", "data"),
+            ("form", "action"),
+            ("input", "formaction"),
+            ("button", "formaction"),
+        ];
+        let mut edits: Vec<(NodeId, &'static str, String)> = Vec::new();
+        for id in self.descendants(root) {
+            let Some(tag) = self.tag_name(id) else {
+                continue;
+            };
+            for &(t, attr) in URL_ATTRS {
+                if t != tag {
+                    continue;
+                }
+                if let Some(v) = self.attr(id, attr) {
+                    let v = v.trim();
+                    if v.is_empty() || v.starts_with('#') {
+                        continue;
+                    }
+                    if let Ok(abs) = base.join(v) {
+                        edits.push((id, attr, abs.to_string()));
+                    }
+                }
+            }
+        }
+        for (id, attr, val) in edits {
+            self.set_attr(id, attr, &val);
+        }
+    }
+
     /// The host's light children assigned to a slot (by name, or the
     /// default slot). Text nodes always belong to the default slot.
     fn slot_assigned(&self, host: NodeId, slot_name: Option<&str>) -> Vec<NodeId> {
@@ -4659,6 +4741,44 @@ mod tests {
         assert_eq!(dom.text_content(host), "onetwo");
         let html = dom.serialize(DOCUMENT);
         assert!(html.contains("<p class=\"x\">one</p>two"), "{html}");
+    }
+
+    #[test]
+    fn install_frame_document_parses_replaces_and_absolutizes() {
+        let mut dom = Dom::parse_document("<body><iframe></iframe></body>");
+        let frame = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&n| dom.tag_name(n) == Some("iframe"))
+            .unwrap();
+        // A FULL document is parsed and installed as the frame's content.
+        dom.install_frame_document(
+            frame,
+            "<!DOCTYPE html><html><head><title>FRAME TITLE</title></head>\
+             <body><p>HELLO FRAME</p><a href=\"deep.html\">go</a></body></html>",
+            "http://h.test/dir/page.html",
+        )
+        .unwrap();
+        // Serializing the iframe node flattens it into a chrome-less block.
+        let html = dom.serialize(frame);
+        assert!(html.contains("data-trust-frame"), "{html}");
+        assert!(html.contains("HELLO FRAME"), "{html}");
+        // The relative link resolved against the FRAME's base, not the parent.
+        assert!(html.contains("http://h.test/dir/deep.html"), "{html}");
+        // Head content (title) stays out of the inline body flow.
+        assert!(
+            !html.contains("FRAME TITLE"),
+            "head leaked into flow: {html}"
+        );
+        // A re-navigation REPLACES the prior content navigable.
+        dom.install_frame_document(frame, "<body><p>SECOND</p></body>", "http://h.test/")
+            .unwrap();
+        let html2 = dom.serialize(frame);
+        assert!(html2.contains("SECOND"), "{html2}");
+        assert!(
+            !html2.contains("HELLO FRAME"),
+            "stale content kept: {html2}"
+        );
     }
 
     #[test]
