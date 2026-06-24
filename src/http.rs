@@ -2505,10 +2505,11 @@ mod tests {
     // top-level script), not from a later click. The `PageWs` host must
     // therefore be registered BEFORE scripts run — it used to be wired up only
     // after `load_page` returned, so the first `new WebSocket(...)` hit a
-    // missing host, `__ws_open` returned -1, and the socket never opened (the
-    // page then had no transport for its streamed reply, and a framework's
-    // reconnect timer is frozen at rest so it never retried). Here a load-time
-    // script opens a socket; the open + first frame must reach the page.
+    // missing host, `__ws_open` returned -1, and the socket never opened on that
+    // attempt (the page then had no transport for its streamed reply until a
+    // framework's reconnect timer fired at rest and retried — an avoidable
+    // delay). Here a load-time script opens a socket; the open + first frame
+    // must reach the page.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_websocket_opened_during_page_load_connects_and_delivers() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -3216,6 +3217,104 @@ mod tests {
             }
             other => panic!("expected a filled Updated, got {other:?}"),
         }
+        server.abort();
+    }
+
+    /// Phase 2 (background fetch): a `fetch()` fired from a CLICK runs OFF the
+    /// dispatch — the dispatch returns IMMEDIATELY with the loading state and the
+    /// actor stays responsive, then the result lands as a SEPARATE render when
+    /// the wire completes. Before this the dispatch BLOCKED on the fetch (up to
+    /// `DISPATCH_NET_GRACE` = 300s), freezing the live engine. We prove the
+    /// no-block contract by delaying `/data` so a "loading" render is forced out
+    /// strictly before the "DATA-OK" render.
+    #[tokio::test]
+    async fn a_click_fetch_runs_in_the_background_not_blocking_the_dispatch() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let reply: &[u8] = if text.starts_with("GET /page ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                          <body><div id=r>none</div>\
+                          <button id=go>go</button>\
+                          <script>document.getElementById('go').addEventListener('click',function(){\
+                          document.getElementById('r').textContent='loading';\
+                          fetch('/data').then(function(x){return x.text();}).then(function(t){\
+                          document.getElementById('r').textContent=t;});});</script></body>"
+                    } else if text.starts_with("GET /data ") {
+                        // Delay so the loading-state render precedes this landing.
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nDATA-OK"
+                    } else {
+                        b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    let _ = sock.write_all(reply).await;
+                });
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut live = response.live.take().expect("clickable page stays live");
+        let body = String::from_utf8_lossy(&response.body).into_owned();
+        let node: usize = body
+            .split("x-trust-js:")
+            .nth(1)
+            .and_then(|r| r.split(':').next())
+            .expect("click marker in body")
+            .parse()
+            .unwrap();
+
+        live.handle
+            .cmds
+            .send(crate::js::PageCmd::Click(node))
+            .await
+            .unwrap();
+
+        // Drain renders: a "loading" one (the dispatch, fetch still in flight)
+        // must arrive STRICTLY BEFORE the "DATA-OK" one (the background result).
+        let mut saw_loading_before_data = false;
+        let mut filled = false;
+        for _ in 0..10 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), live.events.recv()).await
+            {
+                Ok(Some(crate::js::PageEvt::Updated { html, .. })) => {
+                    if html.contains("DATA-OK") {
+                        filled = true;
+                        break;
+                    }
+                    if html.contains("loading") {
+                        saw_loading_before_data = true;
+                    }
+                }
+                Ok(Some(_)) => continue, // Settled etc.
+                other => panic!("expected an Updated, got {other:?}"),
+            }
+        }
+        assert!(
+            saw_loading_before_data,
+            "the click rendered a loading state before the fetch resolved — the dispatch did not block on the wire"
+        );
+        assert!(
+            filled,
+            "the background fetch's result arrived as a later, separate render"
+        );
         server.abort();
     }
 
@@ -4181,6 +4280,63 @@ mod tests {
             eprintln!("full post-JS body ({}B) -> {out}", response.body.len());
         }
         drop(response.live.take());
+    }
+
+    /// Lay out a (post-JS) HTML FILE and dump the rows + carousels, to see
+    /// exactly what reaches the screen. `TRUST_LAYOUT_FILE=<html> [TRUST_DIAG_VP=WxH]
+    /// [TRUST_LAYOUT_GREP=substr] cargo test layout_dump -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "manual diagnostic, needs TRUST_LAYOUT_FILE=<html>"]
+    async fn layout_dump() {
+        let Ok(path) = std::env::var("TRUST_LAYOUT_FILE") else {
+            eprintln!("set TRUST_LAYOUT_FILE to a post-JS html file");
+            return;
+        };
+        let html = std::fs::read(&path).unwrap();
+        let w: usize = std::env::var("TRUST_DIAG_VP")
+            .ok()
+            .and_then(|s| s.split_once('x').and_then(|(w, _)| w.parse().ok()))
+            .unwrap_or(80);
+        let grep = std::env::var("TRUST_LAYOUT_GREP").ok();
+        let url = parse_url("https://store.steampowered.com/").unwrap();
+        let images = crate::layout::ImageSizes::new();
+        let doc = parse_seeded(&url, "text/html", &html, w, None, &images);
+        for (ri, row) in doc.rows.iter().enumerate() {
+            let mut s = String::new();
+            for it in &row.items {
+                let t = it.text.replace('\n', "\\n");
+                let tag = match &it.kind {
+                    crate::layout::ItemKind::Image => "IMG",
+                    crate::layout::ItemKind::Border => "BRD",
+                    _ => "txt",
+                };
+                s.push_str(&format!(
+                    "[c{} w{} h{} {tag} n{} {:?}{}] ",
+                    it.col,
+                    it.width,
+                    it.height,
+                    it.node,
+                    t,
+                    if it.link.is_some() { "*" } else { "" }
+                ));
+            }
+            if s.is_empty() {
+                continue;
+            }
+            if let Some(g) = &grep
+                && !s.to_lowercase().contains(&g.to_lowercase())
+            {
+                continue;
+            }
+            println!("r{ri:>3}: {s}");
+        }
+        println!("--- {} carousels ---", doc.carousels.len());
+        for c in &doc.carousels {
+            println!(
+                "  rows {}..{} band {}..{} width {} stops {:?}",
+                c.start, c.end, c.left, c.right, c.width, c.stops
+            );
+        }
     }
 
     /// Run a web-platform-tests page and report its testharness results.
