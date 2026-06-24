@@ -5015,12 +5015,20 @@ const PRELUDE: &str = r##"
         let w = W.get(id);
         if (w) return w;
         const t = __dom_node_type(id);
-        w = t === 9 ? new Document(id)
-            : t === 1 ? new Element(id)
-            : t === 3 ? new Text(id)
-            : t === 8 ? new Comment(id)
-            : t === 11 ? new DocumentFragment(id)
-            : new Node(id);
+        if (t === 1) {
+            // Dispatch to the element's interface class by tag (HTMLSelectElement,
+            // HTMLVideoElement, …); seed the lazily-cached localName since we
+            // already read it, keeping this ~syscall-neutral vs the old wrap.
+            const tag = __dom_tag(id) || "";
+            w = new (classFor(tag))(id);
+            w.__ln = tag;
+        } else {
+            w = t === 9 ? new Document(id)
+                : t === 3 ? new Text(id)
+                : t === 8 ? new Comment(id)
+                : t === 11 ? new DocumentFragment(id)
+                : new Node(id);
+        }
         W.set(id, w);
         return w;
     }
@@ -5904,90 +5912,16 @@ const PRELUDE: &str = r##"
         get tagName() { let t = this.__tn; if (t === undefined) t = this.__tn = this.localName.toUpperCase(); return t; }
         get nodeName() { return this.tagName; }
         get [Symbol.toStringTag]() { return htmlInterfaceName(this.localName); }
-        // --- HTMLMediaElement surface, on <video>/<audio> ---
-        // TRust presents media via mpv (a followed link), not inline playback.
-        // But a player library (video.js, Plyr, JW Player, …) probes the
-        // element and, finding it reports it can't play, shows "No compatible
-        // source was found for this media" AND strips the <source> — so the
-        // layout never sees the media to represent. Reporting honest support
-        // for the formats mpv plays, plus benign media-element state, keeps the
-        // <source> in the DOM and the error away. Gated to media tags so it
-        // doesn't pollute other elements; general (helps every player lib).
-        get __isMedia() {
-            let m = this.__media;
-            if (m === undefined) { const t = this.tagName; m = this.__media = (t === "VIDEO" || t === "AUDIO"); }
-            return m;
-        }
-        canPlayType(type) {
-            if (!this.__isMedia) return undefined;
-            const t = String(type || "").toLowerCase().split(";")[0].trim();
-            return MEDIA_MIME.test(t) || t === "application/x-mpegurl"
-                || t === "application/vnd.apple.mpegurl" || t === "application/dash+xml"
-                ? "maybe" : "";
-        }
-        load() {}
-        play() { return Promise.resolve(); }
-        pause() {}
-        addTextTrack() { return { mode: "disabled", cues: null, activeCues: null, addCue() {}, removeCue() {}, addEventListener() {}, removeEventListener() {} }; }
-        fastSeek(t) { if (this.__isMedia) this.__ct = +t || 0; }
-        get readyState() { return this.__isMedia ? 0 : undefined; }
-        get networkState() { return this.__isMedia ? 0 : undefined; }
-        get error() { return this.__isMedia ? null : undefined; }
-        get ended() { return this.__isMedia ? false : undefined; }
-        get seeking() { return this.__isMedia ? false : undefined; }
-        get duration() { return this.__isMedia ? NaN : undefined; }
-        get videoWidth() { return this.__isMedia ? 0 : undefined; }
-        get videoHeight() { return this.__isMedia ? 0 : undefined; }
-        get currentSrc() { return this.__isMedia ? (this.getAttribute("src") || "") : undefined; }
-        get buffered() { return this.__isMedia ? emptyTimeRanges() : undefined; }
-        get played() { return this.__isMedia ? emptyTimeRanges() : undefined; }
-        get seekable() { return this.__isMedia ? emptyTimeRanges() : undefined; }
-        get textTracks() { return this.__isMedia ? (this.__tt || (this.__tt = emptyTrackList())) : undefined; }
-        get audioTracks() { return this.__isMedia ? (this.__at || (this.__at = emptyTrackList())) : undefined; }
-        get videoTracks() { return this.__isMedia ? (this.__vt || (this.__vt = emptyTrackList())) : undefined; }
-        get paused() { return this.__isMedia ? (this.__paused !== false) : undefined; }
-        set paused(v) { this.__paused = !!v; }
-        get currentTime() { return this.__isMedia ? (this.__ct || 0) : undefined; }
-        set currentTime(v) { this.__ct = +v || 0; }
-        get volume() { return this.__isMedia ? (this.__vol === undefined ? 1 : this.__vol) : undefined; }
-        set volume(v) { this.__vol = +v; }
-        get muted() { return this.__isMedia ? !!this.__muted : undefined; }
-        set muted(v) { this.__muted = !!v; }
-        get playbackRate() { return this.__isMedia ? (this.__pbr === undefined ? 1 : this.__pbr) : undefined; }
-        set playbackRate(v) { this.__pbr = +v; }
-        get defaultPlaybackRate() { return this.__isMedia ? 1 : undefined; }
-        set defaultPlaybackRate(_v) {}
-        // <canvas> 2d context. We paint no raster, but sites use it to
-        // normalise CSS colours (Web Animations sets `ctx.fillStyle = colour`
-        // and reads it back) and to measure text. A pass-through stub stores/
-        // echoes its properties and no-ops drawing — enough that the code
-        // doesn't throw, without pretending to paint. Canvas-only; other tags
-        // report no context, so `el.getContext && el.getContext('2d')` probes
-        // still fail correctly off-canvas.
-        getContext(kind) {
-            if (this.tagName !== "CANVAS" || String(kind) !== "2d") return null;
-            return this.__ctx2d || (this.__ctx2d = {
-                canvas: this,
-                fillStyle: "#000000", strokeStyle: "#000000",
-                font: "10px sans-serif", globalAlpha: 1, lineWidth: 1,
-                lineCap: "butt", lineJoin: "miter", textAlign: "start", textBaseline: "alphabetic",
-                save() {}, restore() {}, scale() {}, rotate() {}, translate() {},
-                transform() {}, setTransform() {}, resetTransform() {},
-                beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
-                bezierCurveTo() {}, quadraticCurveTo() {}, arc() {}, arcTo() {},
-                rect() {}, ellipse() {}, fill() {}, stroke() {}, clip() {},
-                clearRect() {}, fillRect() {}, strokeRect() {},
-                fillText() {}, strokeText() {}, drawImage() {},
-                measureText(t) { return { width: String(t).length * 6 }; },
-                getImageData() { return { data: new Uint8ClampedArray(0), width: 0, height: 0 }; },
-                putImageData() {}, createImageData() { return { data: new Uint8ClampedArray(0), width: 0, height: 0 }; },
-                createLinearGradient() { return { addColorStop() {} }; },
-                createRadialGradient() { return { addColorStop() {} }; },
-                createPattern() { return null; },
-                setLineDash() {}, getLineDash() { return []; },
-            });
-        }
-        toDataURL() { return this.tagName === "CANVAS" ? "data:," : undefined; }
+        // NOTE: type-SPECIFIC IDL surfaces (HTMLMediaElement media state on
+        // <video>/<audio>, the <canvas> 2d context, HTMLSelectElement options,
+        // HTMLInputElement value/checked/type, anchor URL parts, iframe
+        // contentDocument, <template>/<meta> content, <style>/<link> sheet, and
+        // the reflected value/type/href/src/name/disabled attributes) live on
+        // their OWN interface prototypes below — NOT here. A real browser puts
+        // each accessor only on its owning interface, so on every other element
+        // the same name is a plain writable expando and `"options" in div` is
+        // false. See `class HTMLElement` and the per-interface classes after
+        // Element, plus `defineReflected` for the multi-interface reflectors.
         // getAttribute is hammered by every framework's traversal/normalisation
         // (jQuery's .attr/.hasClass, event delegation, and the value/checked/id/
         // class IDL getters below all route here). A per-element read cache
@@ -6079,82 +6013,8 @@ const PRELUDE: &str = r##"
         set id(v) { this.setAttribute("id", v); }
         get className() { return this.getAttribute("class") || ""; }
         set className(v) { this.setAttribute("class", v); }
-        get name() { return this.getAttribute("name") || ""; }
-        set name(v) { this.setAttribute("name", v); }
-        get value() {
-            const ln = this.localName;
-            // <select>.value is the value of its first selected option (HTML
-            // spec), not a `value` content attribute — selects have none.
-            if (ln === "select") { const o = this.__selectedOption(); return o ? o.value : ""; }
-            // <option>.value falls back to its text when the attribute is absent
-            // (matches the form-submit option logic), so a valueless <option>
-            // still round-trips its label.
-            if (ln === "option") { const v = this.getAttribute("value"); return v === null ? this.textContent : v; }
-            // <textarea> has NO `value` content attribute — its value is its raw
-            // text content (HTML spec), which is also what the form submit path
-            // and `formSet` read/write. Reading the (always-absent) attribute
-            // returned "" and broke every "grab the textarea, do something with
-            // its text" script — the W3Schools tryit editor writes
-            // `textarea.value` into its result iframe, so an empty read rendered
-            // a blank result.
-            if (ln === "textarea") return this.textContent;
-            const v = this.getAttribute("value"); return v === null ? "" : v;
-        }
-        set value(v) {
-            if (this.localName === "select") { this.__selectValue(String(v)); return; }
-            if (this.localName === "textarea") { this.textContent = String(v); return; }
-            this.setAttribute("value", String(v));
-        }
-        // --- HTMLSelectElement surface (options/index/multiple) ---
-        // `options` is the select's <option> descendants (optgroups included, per
-        // spec) as a real Array — `.length`/`[i]` and `.filter`/iteration all
-        // work natively, like every other collection the prelude hands back.
-        __options() { return this.localName === "select" ? this.querySelectorAll("option") : []; }
-        __selectedOption() {
-            const os = this.__options();
-            for (const o of os) if (o.selected) return o;
-            // A single (non-multiple) select with nothing explicitly selected
-            // defaults to its first option (HTML spec).
-            return (!this.multiple && os.length) ? os[0] : null;
-        }
-        __selectValue(val) {
-            const os = this.__options(); let matched = false;
-            for (const o of os) {
-                const m = !matched && o.value === val;
-                o.selected = m;
-                if (m) matched = true;
-            }
-        }
-        get options() { return this.localName === "select" ? this.__options() : undefined; }
-        get selectedOptions() { return this.localName === "select" ? this.__options().filter((o) => o.selected) : undefined; }
-        get selectedIndex() {
-            if (this.localName !== "select") return undefined;
-            const os = this.__options();
-            for (let i = 0; i < os.length; i++) if (os[i].selected) return i;
-            return this.multiple ? -1 : (os.length ? 0 : -1);
-        }
-        set selectedIndex(i) {
-            if (this.localName !== "select") return;
-            const os = this.__options(); i = Number(i);
-            for (let k = 0; k < os.length; k++) os[k].selected = (k === i);
-        }
-        get multiple() { return this.hasAttribute("multiple"); }
-        set multiple(v) { if (v) this.setAttribute("multiple", ""); else this.removeAttribute("multiple"); }
-        get checked() { return this.hasAttribute("checked"); }
-        set checked(v) { if (v) this.setAttribute("checked", ""); else this.removeAttribute("checked"); }
-        get disabled() { return this.hasAttribute("disabled"); }
-        set disabled(v) { if (v) this.setAttribute("disabled", ""); else this.removeAttribute("disabled"); }
-        // HTMLOptionElement.selected / .defaultSelected. A headless DOM has no
-        // separate "dirty selectedness", so both reflect the `selected` content
-        // attribute — which is ALSO what the layout/form code reads to know
-        // which option is current (`option[selected]`). React's <select> commit
-        // (`postMountWrapper`/`updateOptions`) reads+writes both on every option,
-        // so getter-only would throw in strict mode. (`option.disabled` already
-        // works above; it's read in the same loop.)
-        get selected() { return this.hasAttribute("selected"); }
-        set selected(v) { if (v) this.setAttribute("selected", ""); else this.removeAttribute("selected"); }
-        get defaultSelected() { return this.hasAttribute("selected"); }
-        set defaultSelected(v) { if (v) this.setAttribute("selected", ""); else this.removeAttribute("selected"); }
+        // `name`, `value`, `checked`, `selected`, `multiple`, `disabled` and the
+        // <select>/<option> surfaces moved to their owning interfaces (see below).
         get hidden() { return this.hasAttribute("hidden"); }
         set hidden(v) { if (v) this.setAttribute("hidden", ""); else this.removeAttribute("hidden"); }
         // Reflected string IDL attributes (HTML spec): the getter returns the
@@ -6170,38 +6030,8 @@ const PRELUDE: &str = r##"
         set title(v) { this.setAttribute("title", String(v)); }
         get slot() { return this.getAttribute("slot") || ""; }
         set slot(v) { this.setAttribute("slot", String(v)); }
-        // <input>'s type IDL attribute defaults to "text" when the content
-        // attribute is absent (HTML spec: limited to known values, missing →
-        // Text). Code keys off this default constantly — React's change-event
-        // plugin does `supportedInputTypes[input.type]` and treats a "" type
-        // as a non-text input, so controlled inputs never fire onChange. Other
-        // elements keep "" when type is absent.
-        get type() {
-            const t = this.getAttribute("type");
-            if (this.localName === "input") return t === null ? "text" : t.toLowerCase();
-            return t === null ? "" : t;
-        }
-        set type(v) { this.setAttribute("type", String(v)); }
-        get href() { const r = this.getAttribute("href"); if (r === null) return ""; const u = __url_parse(r, baseHref()); return u ? u[0] : r; }
-        set href(v) { this.setAttribute("href", String(v)); }
-        // Anchor URL components (the create-an-<a>-to-parse-URLs trick;
-        // router-slot reads m.pathname). Empty-string fallbacks, no-op
-        // setters (strict mode throws on getter-only assignment).
-        __urlPart(i) {
-            if (this.localName !== "a" && this.localName !== "area") return undefined;
-            const u = __url_parse(this.getAttribute("href") || "", baseHref());
-            return u ? u[i] : "";
-        }
-        get protocol() { return this.__urlPart(1); } set protocol(v) {}
-        get host() { return this.__urlPart(2); } set host(v) {}
-        get hostname() { return this.__urlPart(3); } set hostname(v) {}
-        get port() { return this.__urlPart(4); } set port(v) {}
-        get pathname() { return this.__urlPart(5); } set pathname(v) {}
-        get search() { return this.__urlPart(6); } set search(v) {}
-        get hash() { return this.__urlPart(7); } set hash(v) {}
-        get origin() { return this.__urlPart(8); }
-        get src() { const r = this.getAttribute("src"); if (r === null) return ""; const u = __url_parse(r, baseHref()); return u ? u[0] : r; }
-        set src(v) { this.setAttribute("src", String(v)); }
+        // `type`/`href`/`src` and the anchor URL components moved to their
+        // owning interfaces (HTMLInputElement, HTMLAnchorElement, …) below.
         get innerHTML() { return __dom_inner_html(this.__id); }
         set innerHTML(v) {
             if (!MO.length) { __dom_set_inner_html(this.__id, String(v)); if (CE.defs.size) ceScan(this); return; }
@@ -6210,65 +6040,10 @@ const PRELUDE: &str = r##"
             moChildBulk(this, removed, this.childNodes);
             if (CE.defs.size) ceScan(this);
         }
-        get content() {
-            // <template>.content: the inert fragment its markup parses into.
-            if (this.localName === "template") return wrap(__dom_template_content(this.__id));
-            // HTMLMetaElement.content reflects the `content` attribute (HTML
-            // spec). pixiv stashes its boot config as JSON in
-            // `<meta id="meta-global-data" content='{…}'>` and does
-            // `JSON.parse(meta.content)`; without reflection that was an
-            // expando `undefined` → `JSON.parse(undefined)` → SyntaxError.
-            if (this.localName === "meta") return this.getAttribute("content") || "";
-            return this.__content;
-        }
-        // Non-template, non-meta elements have NO `content` property in the DOM,
-        // so a framework's `.content=${…}` property binding (lit's PropertyPart
-        // does `element[name] = value`) just sets a plain expando — it must NOT
-        // throw the way a getter-without-setter does in strict mode. Templates
-        // keep their read-only fragment; <meta> reflects its attribute.
-        set content(v) {
-            if (this.localName === "template") return;
-            if (this.localName === "meta") { this.setAttribute("content", String(v)); return; }
-            this.__content = v;
-        }
-        // HTMLIFrameElement.contentDocument / .contentWindow — the nested
-        // browsing context's document and WindowProxy. Backed by a real
-        // same-arena `FrameDocument` (see that class): the near-universal idiom
-        // `iframe.contentDocument || iframe.contentWindow.document` (analytics
-        // beacons, sandboxed injectors, code-playground panes, the W3Schools
-        // tryit editor) reads them unconditionally, and now content written via
-        // `document.write`/`srcdoc` actually renders inline. Cached on the
-        // (identity-stable) wrapper. Non-frame elements keep returning undefined.
-        get contentDocument() {
-            if (this.localName !== "iframe" && this.localName !== "frame") return undefined;
-            ensureFrameProcessed(this); // load src/srcdoc if a script reads us early
-            // A cross-origin nested document RENDERS but isn't script-accessible
-            // from the parent (spec's origin check) — hand back null, as a real
-            // browser does.
-            if (this.__frameUrl && !frameSameOrigin(this.__frameUrl)) return null;
-            return this.__contentDoc || (this.__contentDoc = new FrameDocument(this));
-        }
-        get contentWindow() {
-            if (this.localName !== "iframe" && this.localName !== "frame") return undefined;
-            if (!this.__contentWin) {
-                const frame = this;
-                this.__contentWin = {
-                    get document() { return frame.contentDocument; },
-                    // The nested document's location reflects the navigated URL
-                    // (about:blank until a src/srcdoc loads).
-                    get location() {
-                        const u = frame.__frameUrl;
-                        return { href: u && u !== "about:srcdoc" ? u : "about:blank", replace() {}, assign() {} };
-                    },
-                    parent: g, top: g, frames: g, frameElement: this,
-                    postMessage() {}, focus() {}, blur() {},
-                    addEventListener() {}, removeEventListener() {},
-                };
-                this.__contentWin.self = this.__contentWin;
-                this.__contentWin.window = this.__contentWin;
-            }
-            return this.__contentWin;
-        }
+        // `content` (<template>/<meta>) and `contentDocument`/`contentWindow`
+        // (<iframe>/<frame>) moved to their owning interfaces below. A generic
+        // element has no `content` property, so a framework's `.content = …`
+        // property binding (lit's PropertyPart) now sets a plain expando here.
         attachShadow(init) {
             const id = __dom_attach_shadow(this.__id);
             let sr = W.get(id);
@@ -6323,18 +6098,7 @@ const PRELUDE: &str = r##"
             this.insertAdjacentElement(String(p).toLowerCase(), document.createTextNode(String(text)));
         }
         get style() { if (!this.__style) this.__style = styleFor(this); return this.__style; }
-        // <style>.sheet — the parsed CSSOM view of this element's CSS text.
-        // Re-parsed when textContent changes (code sets textContent then
-        // reads .sheet.cssRules). Other elements have no sheet.
-        get sheet() {
-            if (this.tagName !== "STYLE") return null;
-            const text = this.textContent || "";
-            if (!this.__sheet || this.__sheetText !== text) {
-                this.__sheet = makeStyleSheet(text, this);
-                this.__sheetText = text;
-            }
-            return this.__sheet;
-        }
+        // `.sheet` (<style>/<link> CSSOM) moved to HTMLStyleElement/HTMLLinkElement.
         // `el.style = "color:red"` — the [PutForwards=cssText] behaviour: assigning
         // a string to .style sets inline cssText (a getter-only .style throws in
         // strict mode, which silently broke YouTube's renderers in attr callbacks).
@@ -6409,48 +6173,317 @@ const PRELUDE: &str = r##"
         set scrollLeft(_v) {}
     }
 
-    // --- type-gated read-only accessors: allow expando writes off-type ------
-    // Several IDL getters belong to a SPECIFIC element interface
-    // (HTMLSelectElement.options/selectedOptions, HTMLMediaElement.error/
-    // duration/readyState/…) but live on the ONE shared Element prototype,
-    // gated to return `undefined` for elements of the wrong type. A real
-    // browser puts each accessor only on its OWNING interface's prototype — so
-    // on every other element the same name is a plain WRITABLE expando, not an
-    // accessor. As getter-only accessors here they instead shadowed the name on
-    // EVERY element, so `el.options = x` / `el.error = x` threw "cannot set
-    // non-writable property" in strict mode (trap #3). This broke YouTube:
-    // Polymer declares an `options` property on its `ytd-*` custom elements and
-    // assigns it during data-binding, so the assignment threw and aborted the
-    // entire search-results render. Fix the primitive generally: give each such
-    // accessor a setter. On the OWNING element type the property stays read-only
-    // (the write is ignored — the spec property is read-only there; a real
-    // browser would throw, we just no-op to never spuriously break a page). On
-    // any OTHER element the setter defines a normal own data property — exactly
-    // the browser's expando. The gate is the getter itself: it returns a
-    // non-undefined sentinel ONLY for the owning type, so a getter that returns
-    // `undefined` for `this` means this element should treat the name as a plain
-    // property. Passing name+getter as parameters keeps the captured bindings
-    // function-scoped (never block-scoped class locals — trap #6 hygiene).
-    function __expandoFallback(name, getter) {
-        Object.defineProperty(Element.prototype, name, {
-            get: getter,
-            set(v) {
-                if (getter.call(this) !== undefined) return; // owning type: read-only
-                Object.defineProperty(this, name, {
-                    value: v, writable: true, configurable: true, enumerable: true,
-                });
-            },
-            configurable: true,
-            enumerable: false,
-        });
+    // --- per-interface element prototypes (the DOM IDL hierarchy) -------------
+    // Each type-specific IDL accessor (options on <select>, the media state on
+    // <video>/<audio>, the <canvas> context, anchor URL parts, iframe
+    // contentDocument, …) lives ONLY on its OWNING interface's prototype, exactly
+    // as a real browser does — so on every other element the same name is a plain
+    // writable expando and `"options" in div === false`. `wrap()` dispatches each
+    // element to its interface class by tag (classFor). The read-only members are
+    // getter-only, so assigning one on its owning element throws in strict mode
+    // (what a browser does); off-type the name is just an own data property.
+    //
+    // HTMLElement is the base for HTML elements (chain: HTMLDivElement →
+    // HTMLElement → Element → Node). A real browser also splits the HTMLElement
+    // mixin members (lang/dir/title/hidden/dataset/style/click/focus/innerText/
+    // offset*) onto HTMLElement, but TRust keeps those on Element: SVGElement
+    // (also `extends Element`) genuinely shares most of them via the
+    // HTMLOrSVGElement / ElementCSSInlineStyle mixins, and moving them to a
+    // separate HTMLElement would STRIP them from SVG for no real-world gain. The
+    // per-INTERFACE accessors below are the ones that fool `"prop" in el` feature
+    // tests, so those are what we relocate. HTMLElement still exists as its own
+    // constructor: page custom elements `extends HTMLElement`, `div instanceof
+    // HTMLElement` is true, and `svg instanceof HTMLElement` is correctly false.
+    class HTMLElement extends Element {}
+
+    // HTMLMediaElement (<video>/<audio>). TRust presents media via mpv (a
+    // followed link), not inline playback, but a player library (video.js, Plyr,
+    // JW Player, …) probes the element; finding it can't play, it shows "No
+    // compatible source was found" AND strips <source>, so the layout never sees
+    // the media. Reporting honest support for the formats mpv plays, plus benign
+    // media state, keeps the <source> in the DOM and the error away.
+    class HTMLMediaElement extends HTMLElement {
+        canPlayType(type) {
+            const t = String(type || "").toLowerCase().split(";")[0].trim();
+            return MEDIA_MIME.test(t) || t === "application/x-mpegurl"
+                || t === "application/vnd.apple.mpegurl" || t === "application/dash+xml"
+                ? "maybe" : "";
+        }
+        load() {}
+        play() { return Promise.resolve(); }
+        pause() {}
+        addTextTrack() { return { mode: "disabled", cues: null, activeCues: null, addCue() {}, removeCue() {}, addEventListener() {}, removeEventListener() {} }; }
+        fastSeek(t) { this.__ct = +t || 0; }
+        get src() { const r = this.getAttribute("src"); if (r === null) return ""; const u = __url_parse(r, baseHref()); return u ? u[0] : r; }
+        set src(v) { this.setAttribute("src", String(v)); }
+        get currentSrc() { return this.getAttribute("src") || ""; }
+        get readyState() { return 0; }
+        get networkState() { return 0; }
+        get error() { return null; }
+        get ended() { return false; }
+        get seeking() { return false; }
+        get duration() { return NaN; }
+        get buffered() { return emptyTimeRanges(); }
+        get played() { return emptyTimeRanges(); }
+        get seekable() { return emptyTimeRanges(); }
+        get textTracks() { return this.__tt || (this.__tt = emptyTrackList()); }
+        get audioTracks() { return this.__at || (this.__at = emptyTrackList()); }
+        get videoTracks() { return this.__vt || (this.__vt = emptyTrackList()); }
+        get paused() { return this.__paused !== false; }
+        set paused(v) { this.__paused = !!v; }
+        get currentTime() { return this.__ct || 0; }
+        set currentTime(v) { this.__ct = +v || 0; }
+        get volume() { return this.__vol === undefined ? 1 : this.__vol; }
+        set volume(v) { this.__vol = +v; }
+        get muted() { return !!this.__muted; }
+        set muted(v) { this.__muted = !!v; }
+        get playbackRate() { return this.__pbr === undefined ? 1 : this.__pbr; }
+        set playbackRate(v) { this.__pbr = +v; }
+        get defaultPlaybackRate() { return 1; }
+        set defaultPlaybackRate(_v) {}
     }
-    ["options", "selectedOptions", "error", "ended", "seeking", "duration",
-        "videoWidth", "videoHeight", "currentSrc", "buffered", "played",
-        "seekable", "textTracks", "audioTracks", "videoTracks", "readyState",
-        "networkState"].forEach(function (name) {
-        const d = Object.getOwnPropertyDescriptor(Element.prototype, name);
-        if (d && d.get && !d.set) __expandoFallback(name, d.get);
+    // videoWidth/videoHeight are HTMLVideoElement-only (not on <audio>).
+    class HTMLVideoElement extends HTMLMediaElement {
+        get videoWidth() { return 0; }
+        get videoHeight() { return 0; }
+    }
+    class HTMLAudioElement extends HTMLMediaElement {}
+
+    // <canvas> 2d context. We paint no raster, but sites use it to normalise CSS
+    // colours (Web Animations sets ctx.fillStyle and reads it back) and to
+    // measure text. A pass-through stub stores/echoes its properties and no-ops
+    // drawing — enough that the code doesn't throw, without pretending to paint.
+    class HTMLCanvasElement extends HTMLElement {
+        getContext(kind) {
+            if (String(kind) !== "2d") return null;
+            return this.__ctx2d || (this.__ctx2d = {
+                canvas: this,
+                fillStyle: "#000000", strokeStyle: "#000000",
+                font: "10px sans-serif", globalAlpha: 1, lineWidth: 1,
+                lineCap: "butt", lineJoin: "miter", textAlign: "start", textBaseline: "alphabetic",
+                save() {}, restore() {}, scale() {}, rotate() {}, translate() {},
+                transform() {}, setTransform() {}, resetTransform() {},
+                beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
+                bezierCurveTo() {}, quadraticCurveTo() {}, arc() {}, arcTo() {},
+                rect() {}, ellipse() {}, fill() {}, stroke() {}, clip() {},
+                clearRect() {}, fillRect() {}, strokeRect() {},
+                fillText() {}, strokeText() {}, drawImage() {},
+                measureText(t) { return { width: String(t).length * 6 }; },
+                getImageData() { return { data: new Uint8ClampedArray(0), width: 0, height: 0 }; },
+                putImageData() {}, createImageData() { return { data: new Uint8ClampedArray(0), width: 0, height: 0 }; },
+                createLinearGradient() { return { addColorStop() {} }; },
+                createRadialGradient() { return { addColorStop() {} }; },
+                createPattern() { return null; },
+                setLineDash() {}, getLineDash() { return []; },
+            });
+        }
+        toDataURL() { return "data:,"; }
+    }
+
+    // HTMLSelectElement: options is the <option> descendants (optgroups included,
+    // per spec) as a real Array. options/selectedOptions are read-only (getter-
+    // only). value is the first selected option's value; set re-points it.
+    class HTMLSelectElement extends HTMLElement {
+        __options() { return this.querySelectorAll("option"); }
+        __selectedOption() {
+            const os = this.__options();
+            for (const o of os) if (o.selected) return o;
+            // A single (non-multiple) select with nothing explicitly selected
+            // defaults to its first option (HTML spec).
+            return (!this.multiple && os.length) ? os[0] : null;
+        }
+        __selectValue(val) {
+            const os = this.__options(); let matched = false;
+            for (const o of os) {
+                const m = !matched && o.value === val;
+                o.selected = m;
+                if (m) matched = true;
+            }
+        }
+        get options() { return this.__options(); }
+        get selectedOptions() { return this.__options().filter((o) => o.selected); }
+        get selectedIndex() {
+            const os = this.__options();
+            for (let i = 0; i < os.length; i++) if (os[i].selected) return i;
+            return this.multiple ? -1 : (os.length ? 0 : -1);
+        }
+        set selectedIndex(i) {
+            const os = this.__options(); i = Number(i);
+            for (let k = 0; k < os.length; k++) os[k].selected = (k === i);
+        }
+        get multiple() { return this.hasAttribute("multiple"); }
+        set multiple(v) { if (v) this.setAttribute("multiple", ""); else this.removeAttribute("multiple"); }
+        get value() { const o = this.__selectedOption(); return o ? o.value : ""; }
+        set value(v) { this.__selectValue(String(v)); }
+    }
+    // HTMLOptionElement.value falls back to text when the attribute is absent
+    // (round-trips a valueless <option>). selected/defaultSelected both reflect
+    // the `selected` content attribute the layout/form path reads; React's
+    // <select> commit reads+writes both, so they're read-write.
+    class HTMLOptionElement extends HTMLElement {
+        get value() { const v = this.getAttribute("value"); return v === null ? this.textContent : v; }
+        set value(v) { this.setAttribute("value", String(v)); }
+        get selected() { return this.hasAttribute("selected"); }
+        set selected(v) { if (v) this.setAttribute("selected", ""); else this.removeAttribute("selected"); }
+        get defaultSelected() { return this.hasAttribute("selected"); }
+        set defaultSelected(v) { if (v) this.setAttribute("selected", ""); else this.removeAttribute("selected"); }
+    }
+    // HTMLInputElement: value reflects the `value` attribute (no dirty-value
+    // tracking here); checked reflects `checked`; the `type` IDL attribute
+    // defaults to "text" when absent (React's change-event plugin keys off it).
+    class HTMLInputElement extends HTMLElement {
+        get value() { const v = this.getAttribute("value"); return v === null ? "" : v; }
+        set value(v) { this.setAttribute("value", String(v)); }
+        get checked() { return this.hasAttribute("checked"); }
+        set checked(v) { if (v) this.setAttribute("checked", ""); else this.removeAttribute("checked"); }
+        get type() { const t = this.getAttribute("type"); return t === null ? "text" : t.toLowerCase(); }
+        set type(v) { this.setAttribute("type", String(v)); }
+    }
+    // <textarea>.value is its raw text content (no `value` content attribute) —
+    // the form-submit path and formSet read/write the same.
+    class HTMLTextAreaElement extends HTMLElement {
+        get value() { return this.textContent; }
+        set value(v) { this.textContent = String(v); }
+    }
+    // Interfaces with no extra accessors of their own; the reflected attributes
+    // (name/value/type/href/src/disabled) are installed on them below.
+    class HTMLButtonElement extends HTMLElement {}
+    class HTMLScriptElement extends HTMLElement {}
+    class HTMLFormElement extends HTMLElement {}
+    class HTMLImageElement extends HTMLElement {}
+    // HTMLHyperlinkElementUtils (the create-an-<a>-to-parse-URLs trick;
+    // router-slot reads m.pathname) lives on <a> and <area>; href + the URL
+    // components are installed via installUrlParts below.
+    class HTMLAnchorElement extends HTMLElement {}
+    class HTMLAreaElement extends HTMLElement {}
+    // contentDocument/contentWindow (the nested browsing context) on <iframe>/
+    // <frame>; installed below so both share one body.
+    class HTMLIFrameElement extends HTMLElement {}
+    class HTMLFrameElement extends HTMLElement {}
+    // <template>.content is the inert fragment its markup parses into (read-only).
+    class HTMLTemplateElement extends HTMLElement {
+        get content() { return wrap(__dom_template_content(this.__id)); }
+    }
+    // HTMLMetaElement.content reflects the `content` attribute (pixiv stashes
+    // boot config as JSON in <meta content='{…}'> and does JSON.parse(meta.content)).
+    class HTMLMetaElement extends HTMLElement {
+        get content() { return this.getAttribute("content") || ""; }
+        set content(v) { this.setAttribute("content", String(v)); }
+    }
+    // <style>.sheet — the parsed CSSOM view of this element's CSS text, re-parsed
+    // when textContent changes. <link>.sheet stays null (we don't model the
+    // per-link loaded stylesheet; document.styleSheets is the page-level view).
+    class HTMLStyleElement extends HTMLElement {
+        get sheet() {
+            const text = this.textContent || "";
+            if (!this.__sheet || this.__sheetText !== text) {
+                this.__sheet = makeStyleSheet(text, this);
+                this.__sheetText = text;
+            }
+            return this.__sheet;
+        }
+    }
+    class HTMLLinkElement extends HTMLElement {
+        get sheet() { return null; }
+    }
+
+    // wrap() dispatches a node id (type 1) to its interface class by tag. The map
+    // is memoized (localName is immutable, so a class only resolves once); an
+    // interface with no specialized class falls back to the generic HTMLElement.
+    // Reuses htmlInterfaceName + the interface-constructor globals (set below).
+    const ELEM_CLASS = new Map();
+    function classFor(local) {
+        let C = ELEM_CLASS.get(local);
+        if (C !== undefined) return C;
+        C = g[htmlInterfaceName(local)] || HTMLElement;
+        ELEM_CLASS.set(local, C);
+        return C;
+    }
+
+    // The HTML spec reflects name/value/type/href/src/disabled on SEVERAL
+    // interfaces; installing each only on its owners (not the shared Element)
+    // makes `"name" in div === false` while keeping every value-bearing tag
+    // working. `reflectOn` skips an interface that already defines its own
+    // specialized accessor (HTMLSelectElement.value, HTMLInputElement.type).
+    function reflectOn(names, prop, descFactory) {
+        for (let i = 0; i < names.length; i++) {
+            const C = g[names[i]];
+            if (!C || Object.prototype.hasOwnProperty.call(C.prototype, prop)) continue;
+            Object.defineProperty(C.prototype, prop, descFactory(prop));
+        }
+    }
+    const reflectStrDesc = (attr) => ({
+        get() { return this.getAttribute(attr) || ""; },
+        set(v) { this.setAttribute(attr, String(v)); },
+        configurable: true, enumerable: false,
     });
+    const reflectBoolDesc = (attr) => ({
+        get() { return this.hasAttribute(attr); },
+        set(v) { if (v) this.setAttribute(attr, ""); else this.removeAttribute(attr); },
+        configurable: true, enumerable: false,
+    });
+    const reflectUrlDesc = (attr) => ({
+        get() { const r = this.getAttribute(attr); if (r === null) return ""; const u = __url_parse(r, baseHref()); return u ? u[0] : r; },
+        set(v) { this.setAttribute(attr, String(v)); },
+        configurable: true, enumerable: false,
+    });
+    // The HTMLHyperlinkElementUtils URL decomposition (origin is read-only; the
+    // others have no-op setters — we don't rebuild href from a part). `i` is a
+    // function parameter so the getter never captures a block-scoped loop local
+    // (trap #6 hygiene).
+    function urlPartDesc(i, readOnly) {
+        const d = { configurable: true, enumerable: false,
+            get() { const u = __url_parse(this.getAttribute("href") || "", baseHref()); return u ? u[i] : ""; } };
+        if (!readOnly) d.set = function () {};
+        return d;
+    }
+    function installUrlParts(Cls) {
+        Object.defineProperty(Cls.prototype, "protocol", urlPartDesc(1, false));
+        Object.defineProperty(Cls.prototype, "host", urlPartDesc(2, false));
+        Object.defineProperty(Cls.prototype, "hostname", urlPartDesc(3, false));
+        Object.defineProperty(Cls.prototype, "port", urlPartDesc(4, false));
+        Object.defineProperty(Cls.prototype, "pathname", urlPartDesc(5, false));
+        Object.defineProperty(Cls.prototype, "search", urlPartDesc(6, false));
+        Object.defineProperty(Cls.prototype, "hash", urlPartDesc(7, false));
+        Object.defineProperty(Cls.prototype, "origin", urlPartDesc(8, true));
+    }
+    installUrlParts(HTMLAnchorElement);
+    installUrlParts(HTMLAreaElement);
+    // HTMLIFrameElement.contentDocument / .contentWindow — the nested browsing
+    // context's document and WindowProxy. Backed by a real same-arena
+    // FrameDocument: the near-universal idiom `iframe.contentDocument ||
+    // iframe.contentWindow.document` reads them unconditionally, and srcdoc/
+    // document.write content renders inline. A cross-origin nested document
+    // renders but isn't script-accessible (contentDocument → null).
+    function installFrameSurface(Cls) {
+        Object.defineProperty(Cls.prototype, "contentDocument", { configurable: true, enumerable: false,
+            get() {
+                ensureFrameProcessed(this); // load src/srcdoc if a script reads us early
+                if (this.__frameUrl && !frameSameOrigin(this.__frameUrl)) return null;
+                return this.__contentDoc || (this.__contentDoc = new FrameDocument(this));
+            } });
+        Object.defineProperty(Cls.prototype, "contentWindow", { configurable: true, enumerable: false,
+            get() {
+                if (!this.__contentWin) {
+                    const frame = this;
+                    this.__contentWin = {
+                        get document() { return frame.contentDocument; },
+                        get location() {
+                            const u = frame.__frameUrl;
+                            return { href: u && u !== "about:srcdoc" ? u : "about:blank", replace() {}, assign() {} };
+                        },
+                        parent: g, top: g, frames: g, frameElement: this,
+                        postMessage() {}, focus() {}, blur() {},
+                        addEventListener() {}, removeEventListener() {},
+                    };
+                    this.__contentWin.self = this.__contentWin;
+                    this.__contentWin.window = this.__contentWin;
+                }
+                return this.__contentWin;
+            } });
+    }
+    installFrameSurface(HTMLIFrameElement);
+    installFrameSurface(HTMLFrameElement);
 
     // CharacterData: the shared text-bearing interface for Text and Comment.
     // `data` is [LegacyNullToEmptyString] — null becomes "" (but undefined
@@ -7202,14 +7235,8 @@ const PRELUDE: &str = r##"
     // Distinct subclasses so `instanceof` answers honestly (false for
     // our wrappers): Vue picks SVG namespaces by SVGElement checks.
     class SVGElement extends Element { get [Symbol.toStringTag]() { return "SVGElement"; } }
-    class HTMLInputElement extends Element {}
-    class HTMLSelectElement extends Element {}
-    class HTMLTextAreaElement extends Element {}
-    class HTMLFormElement extends Element {}
-    class HTMLAnchorElement extends Element {}
-    class HTMLImageElement extends Element {}
-    class HTMLScriptElement extends Element {}
-    class HTMLButtonElement extends Element {}
+    // (HTMLInputElement/HTMLSelectElement/… are defined with their real per-
+    // interface bodies right after Element, above — not empty stubs anymore.)
 
     // Standard DOM node interfaces real browsers expose as global
     // constructors. Code and polyfills (webcomponentsjs walks
@@ -7236,7 +7263,7 @@ const PRELUDE: &str = r##"
     g.EventTarget = EventTarget; g.Window = Window; g.CharacterData = CharacterData;
     g.CDATASection = CDATASection; g.ProcessingInstruction = ProcessingInstruction;
     g.DocumentType = DocumentType; g.Attr = Attr;
-    g.Node = Node; g.Element = Element; g.HTMLElement = Element;
+    g.Node = Node; g.Element = Element; g.HTMLElement = HTMLElement;
     g.Text = Text; g.Document = Document; g.HTMLDocument = Document;
     g.DocumentFragment = DocumentFragment; g.Comment = Comment;
     g.Event = Event; g.CustomEvent = Event;
@@ -7274,14 +7301,23 @@ const PRELUDE: &str = r##"
     g.HTMLTextAreaElement = HTMLTextAreaElement; g.HTMLFormElement = HTMLFormElement;
     g.HTMLAnchorElement = HTMLAnchorElement; g.HTMLImageElement = HTMLImageElement;
     g.HTMLScriptElement = HTMLScriptElement; g.HTMLButtonElement = HTMLButtonElement;
+    // The per-interface classes with specialized bodies (defined after Element).
+    // These must be registered BEFORE the generic interface-zoo loop below so its
+    // `if (!g[__cn])` guard keeps them (rather than overwriting with empty ones).
+    g.HTMLOptionElement = HTMLOptionElement; g.HTMLCanvasElement = HTMLCanvasElement;
+    g.HTMLMediaElement = HTMLMediaElement; g.HTMLVideoElement = HTMLVideoElement;
+    g.HTMLAudioElement = HTMLAudioElement; g.HTMLAreaElement = HTMLAreaElement;
+    g.HTMLIFrameElement = HTMLIFrameElement; g.HTMLFrameElement = HTMLFrameElement;
+    g.HTMLTemplateElement = HTMLTemplateElement; g.HTMLMetaElement = HTMLMetaElement;
+    g.HTMLStyleElement = HTMLStyleElement; g.HTMLLinkElement = HTMLLinkElement;
     // The rest of the standard HTML element interface zoo. Browsers expose a
     // constructor for every element kind; boot code patches their prototypes
     // and feature-detects them (YouTube's kevlar reads bare `HTMLTemplateElement`,
     // `HTMLDivElement`, … — a ReferenceError on the first missing one). Each is
-    // a distinct Element subclass so prototypes and `instanceof` behave; the
-    // guard skips the explicit ones defined above. (Our createElement still
-    // returns generic Element instances — these exist for the global surface,
-    // not per-tag typing.)
+    // a distinct HTMLElement subclass so prototypes and `instanceof` behave; the
+    // guard skips the interfaces with specialized bodies defined above. wrap()
+    // now dispatches each element to its interface class (classFor), so e.g.
+    // `document.createElement('div') instanceof HTMLDivElement` is true.
     for (const __n of ["Area","Audio","BR","Base","Body","Canvas","Data","DataList",
         "Details","Dialog","Div","DList","Embed","FieldSet","Heading","Head","HR",
         "Html","IFrame","Label","Legend","LI","Link","Map","Media","Menu","Meta",
@@ -7291,11 +7327,38 @@ const PRELUDE: &str = r##"
         "Template","Time","Title","Track","UList","Unknown","Video"]) {
         const __cn = "HTML" + __n + "Element";
         if (!g[__cn]) {
-            const __C = class extends Element {};
+            const __C = class extends HTMLElement {};
             try { Object.defineProperty(__C, "name", { value: __cn }); } catch (e) {}
             g[__cn] = __C;
         }
     }
+    // Now that every HTML interface constructor exists, install the multi-
+    // interface reflected IDL attributes on their owning interfaces only (HTML
+    // spec attribute→element mapping; obsolete reflectors like a.name / frame.src
+    // included so nothing that worked before regresses). reflectOn skips an
+    // interface that defines its own specialized accessor (e.g. select.value,
+    // input.type, media.src). After this, `"name" in div` / `"href" in div` etc.
+    // are false — the names exist only where the spec puts them.
+    reflectOn(["HTMLButtonElement", "HTMLFieldSetElement", "HTMLFormElement",
+        "HTMLInputElement", "HTMLSelectElement", "HTMLTextAreaElement",
+        "HTMLIFrameElement", "HTMLMapElement", "HTMLOutputElement",
+        "HTMLObjectElement", "HTMLMetaElement", "HTMLParamElement", "HTMLSlotElement",
+        "HTMLAnchorElement", "HTMLImageElement", "HTMLEmbedElement",
+        "HTMLFrameElement", "HTMLDetailsElement"], "name", reflectStrDesc);
+    reflectOn(["HTMLButtonElement", "HTMLLIElement", "HTMLDataElement",
+        "HTMLMeterElement", "HTMLProgressElement", "HTMLOutputElement",
+        "HTMLParamElement"], "value", reflectStrDesc);
+    reflectOn(["HTMLAnchorElement", "HTMLButtonElement", "HTMLLinkElement",
+        "HTMLEmbedElement", "HTMLObjectElement", "HTMLOListElement",
+        "HTMLScriptElement", "HTMLSourceElement", "HTMLStyleElement"], "type", reflectStrDesc);
+    reflectOn(["HTMLButtonElement", "HTMLFieldSetElement", "HTMLInputElement",
+        "HTMLOptGroupElement", "HTMLOptionElement", "HTMLSelectElement",
+        "HTMLTextAreaElement", "HTMLLinkElement"], "disabled", reflectBoolDesc);
+    reflectOn(["HTMLAnchorElement", "HTMLAreaElement", "HTMLLinkElement",
+        "HTMLBaseElement"], "href", reflectUrlDesc);
+    reflectOn(["HTMLImageElement", "HTMLScriptElement", "HTMLIFrameElement",
+        "HTMLEmbedElement", "HTMLSourceElement", "HTMLTrackElement",
+        "HTMLInputElement", "HTMLFrameElement"], "src", reflectUrlDesc);
     // SVG element interface zoo (all extend SVGElement). SvelteKit's link
     // handler branches on `e instanceof SVGAElement` to read `href.baseVal`
     // vs `href` — a bare `SVGAElement` was a ReferenceError that broke its
@@ -7322,9 +7385,9 @@ const PRELUDE: &str = r##"
         constructor(src) {
             const el = g.document.createElement("audio");
             if (src !== undefined && src !== null) el.setAttribute("src", String(src));
-            // play/pause/load/canPlayType come from the HTMLMediaElement
-            // surface on the Element prototype (canPlayType now reports honest
-            // support for mpv-playable formats).
+            // createElement('audio') wraps as HTMLAudioElement, so play/pause/
+            // load/canPlayType come from the HTMLMediaElement prototype
+            // (canPlayType reports honest support for mpv-playable formats).
             return el;
         }
     };
@@ -14674,15 +14737,17 @@ mod tests {
     }
 
     #[test]
-    fn type_gated_idl_names_are_writable_expandos_off_type() {
-        // HTMLSelectElement.options / HTMLMediaElement.error etc. are read-only
-        // IDL getters that the prelude gates on the ONE shared Element prototype.
-        // As getter-only accessors they made `el.options = x` throw "cannot set
-        // non-writable property" in strict mode on EVERY element — YouTube's
-        // Polymer declares an `options` property on its `ytd-*` custom elements
-        // and assigns it during data-binding, which aborted the whole render.
-        // On a non-owning element the name must be a plain writable expando
-        // (browser semantics); on the owning element it stays read-only.
+    fn type_specific_idl_accessors_are_writable_expandos_off_their_interface() {
+        // Type-specific IDL accessors (HTMLSelectElement.options,
+        // HTMLMediaElement.error, …) live ONLY on their owning interface's
+        // prototype now, exactly as a browser does. On any OTHER element the
+        // name is therefore a plain writable expando — `el.options = x` no longer
+        // throws "cannot set non-writable property" in strict mode (the trap #3
+        // that aborted YouTube's Polymer, which declares an `options` property on
+        // its `ytd-*` custom elements and assigns it during data-binding). On the
+        // OWNING element the read-only accessor is genuinely getter-only, so
+        // assigning it in strict mode throws a TypeError — what a real browser
+        // does (her call 2026-06-24: spec-compliant over the old silent no-op).
         let (out, outcome) = page(
             "<body><div id=d></div><pre id=o></pre>\
              <script>\
@@ -14700,18 +14765,72 @@ mod tests {
              var s = document.createElement('select');\
              s.innerHTML = '<option value=a></option><option value=b></option>';\
              var before = s.options.length;\
-             s.options = 'nope';\
+             var threw = false;\
+             try { s.options = 'nope'; } catch (e) { threw = true; }\
              r = 'opt=' + t.options.sort + ' err=' + (t.error === null)\
                + ' exp=' + d.options.join(',')\
-               + ' selRO=' + (before === 2 && s.options.length === 2 && s.options !== 'nope');\
+               + ' selRO=' + (threw && before === 2 && s.options.length === 2);\
              } catch (e) { r = 'THREW: ' + e; }\
              document.getElementById('o').textContent = r;\
              </script></body>",
         );
         assert!(!outcome.panicked, "{outcome:?}");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // Off-type writes are writable expandos; the owning-type read-only
+        // write threw (and left the live `options` collection intact).
         assert!(
             out.contains("opt=rel err=true exp=1,2,3 selRO=true"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn dom_interfaces_carry_only_their_own_idl_attributes() {
+        // The standards-compliance payoff of per-interface prototypes: a
+        // type-specific IDL name exists ONLY on its owning interface, so the
+        // `prop in element` feature test (polymer_resin, jQuery, React all use
+        // it) answers correctly — `"options" in div === false`, etc. Also checks
+        // the interface constructors are globals and `instanceof` is honest.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             var r;\
+             try {\
+             var div = document.createElement('div');\
+             var sel = document.createElement('select');\
+             var vid = document.createElement('video');\
+             var a = document.createElement('a');\
+             var leaks = ['options','selectedOptions','error','duration','videoWidth',\
+               'checked','selected','multiple','value','type','name','href','src',\
+               'pathname','content','contentDocument','sheet','getContext'];\
+             var anyLeak = leaks.filter(function (k) { return k in div; });\
+             r = 'leaks=' + anyLeak.join(',')\
+               + ' selOpts=' + ('options' in sel) + ' selVal=' + (sel.value === '')\
+               + ' vidErr=' + ('error' in vid) + ' aHref=' + ('href' in a)\
+               + ' aPath=' + ('pathname' in a) + ' divPath=' + ('pathname' in div)\
+               + ' iSel=' + (sel instanceof HTMLSelectElement)\
+               + ' iVid=' + (vid instanceof HTMLVideoElement)\
+               + ' iVidMedia=' + (vid instanceof HTMLMediaElement)\
+               + ' iDivHtml=' + (div instanceof HTMLElement)\
+               + ' iDivEl=' + (div instanceof Element)\
+               + ' iDivSel=' + (div instanceof HTMLSelectElement)\
+               + ' iDivDiv=' + (div instanceof HTMLDivElement)\
+               + ' ctor=' + (typeof HTMLAnchorElement === 'function');\
+             } catch (e) { r = 'THREW: ' + (e && e.stack || e); }\
+             document.getElementById('o').textContent = r;\
+             </script></body>",
+        );
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // No type-specific name leaks onto <div>; each is present on its owner;
+        // instanceof is honest both ways (div IS HTMLElement/HTMLDivElement, is
+        // NOT HTMLSelectElement).
+        assert!(out.contains("leaks= "), "{out}"); // empty leak list
+        assert!(
+            out.contains(
+                "selOpts=true selVal=true vidErr=true aHref=true aPath=true \
+                 divPath=false iSel=true iVid=true iVidMedia=true iDivHtml=true \
+                 iDivEl=true iDivSel=false iDivDiv=true ctor=true"
+            ),
             "{out}"
         );
     }

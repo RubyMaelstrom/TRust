@@ -7,6 +7,10 @@
 //! half-blocks anywhere else. Both steps are CPU-bound and run on
 //! blocking tasks, never the UI thread.
 
+use std::borrow::Cow;
+use std::io::Read as _;
+use std::sync::{Arc, OnceLock};
+
 use image::DynamicImage;
 use ratatui::layout::Size;
 use ratatui_image::picker::Picker;
@@ -14,20 +18,71 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::{FilterType, Resize};
 
-/// Hard ceiling on decoded dimensions: a 5 MB download can still claim
-/// to be a gigapixel PNG.
+/// Hard ceiling on decoded raster dimensions: a small download can still claim
+/// to be a gigapixel image.
 const MAX_DIMENSION: u32 = 12_000;
+/// SVG and SVGZ are text formats whose compressed representation can be tiny.
+/// Bound the expanded XML before usvg sees it.
+const MAX_SVG_BYTES: usize = 16 * 1024 * 1024;
+/// A resvg pixmap is four bytes per pixel. Sixteen megapixels caps one SVG
+/// rasterization at 64 MiB even if a terminal or document requests a huge box.
+const MAX_SVG_PIXELS: u64 = 16 * 1024 * 1024;
+const SVG_MIME: &str = "image/svg+xml";
 
-/// Sniff the image format from magic bytes; None when it isn't one we
-/// can decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageInfo {
+    pub width: u32,
+    pub height: u32,
+    pub mime: &'static str,
+}
+
+/// Sniff the image format from magic bytes or a bounded SVG/XML prologue.
+/// This remains deliberately cheap because HTTP uses it on the UI thread for
+/// application/octet-stream responses; full XML validation happens off-thread.
 pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
-    image::guess_format(bytes).ok().map(|f| f.to_mime_type())
+    image::guess_format(bytes)
+        .ok()
+        .map(|f| f.to_mime_type())
+        .or_else(|| looks_like_svg(bytes).then_some(SVG_MIME))
+}
+
+/// Return intrinsic image metadata without exposing an SVG renderer tree to the
+/// rest of the app. Raster images retain the existing decode-first behavior;
+/// SVG is parsed in secure static mode and reports its CSS-pixel viewport.
+pub fn info(bytes: &[u8]) -> Result<ImageInfo, String> {
+    if image::guess_format(bytes).is_ok() {
+        let (image, mime) = decode_raster(bytes)?;
+        return Ok(ImageInfo {
+            width: image.width(),
+            height: image.height(),
+            mime,
+        });
+    }
+
+    let svg = parse_svg(bytes)?;
+    Ok(svg.info)
 }
 
 /// Decode raw bytes into pixels, returning the detected MIME type too.
-/// Animated formats decode to their first frame.
+/// Animated raster formats decode to their first frame. SVG uses its intrinsic
+/// viewport, reduced when necessary to stay inside the pixmap allocation cap.
+/// Viewer and inline-image callers should prefer encode_bytes so SVG is
+/// rasterized at the actual terminal box instead of this intrinsic fallback.
+#[cfg(test)]
 pub fn decode(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
-    let mime = sniff(bytes).ok_or("unrecognized image format")?;
+    if image::guess_format(bytes).is_ok() {
+        return decode_raster(bytes);
+    }
+
+    let svg = parse_svg(bytes)?;
+    let image = rasterize_svg(&svg.tree, svg.info.width, svg.info.height, false)?;
+    Ok((image, SVG_MIME))
+}
+
+fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
+    let format =
+        image::guess_format(bytes).map_err(|_| String::from("unrecognized image format"))?;
+    let mime = format.to_mime_type();
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
@@ -37,6 +92,309 @@ pub fn decode(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
     reader.limits(limits);
     let image = reader.decode().map_err(|e| format!("decode: {e}"))?;
     Ok((image, mime))
+}
+
+/// Parse a top-level SVG in the SVG 2 secure static processing mode used for
+/// image resources: scripting/animation are absent in usvg, and our resolver
+/// permits embedded data URLs but rejects every external string reference.
+/// This is also used for the deliberately static standalone image viewer.
+struct SvgImage {
+    tree: resvg::usvg::Tree,
+    info: ImageInfo,
+}
+
+fn parse_svg(bytes: &[u8]) -> Result<SvgImage, String> {
+    let data = bounded_svg_data(bytes)?;
+    let text = std::str::from_utf8(&data).map_err(|_| String::from("SVG is not UTF-8"))?;
+    let xml =
+        resvg::usvg::roxmltree::Document::parse(text).map_err(|e| format!("svg XML parse: {e}"))?;
+    let root = xml.root_element();
+    if root.tag_name().name() != "svg" {
+        return Err(String::from("SVG document root is not <svg>"));
+    }
+
+    // CSS Images default sizing for a replaced image: natural dimensions come
+    // from definite root width/height; a viewBox contributes a natural ratio;
+    // missing dimensions use the 300x150 default object size constrained by
+    // that ratio. Wrapping the original root in that concrete viewport also
+    // prevents usvg's no-viewBox fallback from shrinking to the artwork bbox.
+    let width = root.attribute("width").and_then(svg_length_px);
+    let height = root.attribute("height").and_then(svg_length_px);
+    let ratio = root
+        .attribute("viewBox")
+        .and_then(view_box_ratio)
+        .or_else(|| Some(width? / height?));
+    let (width, height) = concrete_object_size(width, height, ratio)?;
+    let original_root = &text[root.range()];
+    let wrapped = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">{original_root}</svg>"#
+    );
+    let tree = resvg::usvg::Tree::from_str(&wrapped, &secure_svg_options())
+        .map_err(|e| format!("svg parse: {e}"))?;
+    Ok(SvgImage {
+        tree,
+        info: ImageInfo {
+            width: css_pixels(width),
+            height: css_pixels(height),
+            mime: SVG_MIME,
+        },
+    })
+}
+
+fn svg_length_px(value: &str) -> Option<f32> {
+    use svgtypes::LengthUnit as Unit;
+
+    let length: svgtypes::Length = value.trim().parse().ok()?;
+    let number = length.number as f32;
+    let px = match length.unit {
+        Unit::None | Unit::Px => number,
+        Unit::Em => number * 16.0,
+        Unit::Ex => number * 8.0,
+        Unit::In => number * 96.0,
+        Unit::Cm => number * (96.0 / 2.54),
+        Unit::Mm => number * (96.0 / 25.4),
+        Unit::Pt => number * (96.0 / 72.0),
+        Unit::Pc => number * 16.0,
+        Unit::Percent => return None,
+    };
+    (px.is_finite() && px > 0.0).then_some(px)
+}
+
+fn view_box_ratio(value: &str) -> Option<f32> {
+    let values: Vec<f32> = value
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .filter(|v| !v.is_empty())
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if values.len() != 4 || values[2] <= 0.0 || values[3] <= 0.0 {
+        return None;
+    }
+    let ratio = values[2] / values[3];
+    ratio.is_finite().then_some(ratio)
+}
+
+fn concrete_object_size(
+    width: Option<f32>,
+    height: Option<f32>,
+    ratio: Option<f32>,
+) -> Result<(f32, f32), String> {
+    let (width, height) = match (width, height, ratio.filter(|r| *r > 0.0)) {
+        (Some(w), Some(h), _) => (w, h),
+        (Some(w), None, Some(r)) => (w, w / r),
+        (None, Some(h), Some(r)) => (h * r, h),
+        (Some(w), None, None) => (w, 150.0),
+        (None, Some(h), None) => (300.0, h),
+        (None, None, Some(r)) if r >= 2.0 => (300.0, 300.0 / r),
+        (None, None, Some(r)) => (150.0 * r, 150.0),
+        (None, None, None) => (300.0, 150.0),
+    };
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return Err(String::from("invalid SVG intrinsic size"));
+    }
+    Ok((width, height))
+}
+
+fn secure_svg_options() -> resvg::usvg::Options<'static> {
+    let mut options = resvg::usvg::Options::default();
+    // The HTML/SVG default object size when an image has no intrinsic width or
+    // height. usvg's tool-oriented default is 100x100, so set the browser value.
+    options.default_size = resvg::usvg::Size::from_wh(300.0, 150.0).unwrap();
+    options.font_size = 16.0;
+    options.resources_dir = None;
+    options.fontdb = svg_fontdb().clone();
+    options.image_href_resolver = resvg::usvg::ImageHrefResolver {
+        resolve_data: Box::new(|mime, data, options| {
+            if data.len() > MAX_SVG_BYTES {
+                return None;
+            }
+            let nested_svg =
+                mime == SVG_MIME || (mime == "text/plain" && looks_like_svg(data.as_slice()));
+            if nested_svg {
+                // Apply the same SVGZ expansion cap recursively to data: SVGs.
+                let xml = bounded_svg_data(data.as_slice()).ok()?.into_owned();
+                return (resvg::usvg::ImageHrefResolver::default_data_resolver())(
+                    SVG_MIME,
+                    Arc::new(xml),
+                    options,
+                );
+            }
+            (resvg::usvg::ImageHrefResolver::default_data_resolver())(mime, data, options)
+        }),
+        // The usvg default treats arbitrary strings as local paths. Browser
+        // image resources must not read files or fetch external subresources.
+        resolve_string: Box::new(|_, _| None),
+    };
+    options
+}
+
+fn svg_fontdb() -> &'static Arc<resvg::usvg::fontdb::Database> {
+    static FONTS: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
+    FONTS.get_or_init(|| {
+        let mut db = resvg::usvg::fontdb::Database::new();
+        db.load_system_fonts();
+        Arc::new(db)
+    })
+}
+
+fn bounded_svg_data(bytes: &[u8]) -> Result<Cow<'_, [u8]>, String> {
+    bounded_svg_data_with_limit(bytes, MAX_SVG_BYTES)
+}
+
+fn bounded_svg_data_with_limit(bytes: &[u8], limit: usize) -> Result<Cow<'_, [u8]>, String> {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        let decoder = flate2::read::GzDecoder::new(bytes);
+        let mut limited = decoder.take((limit + 1) as u64);
+        let mut out = Vec::new();
+        limited
+            .read_to_end(&mut out)
+            .map_err(|e| format!("svgz decode: {e}"))?;
+        if out.len() > limit {
+            return Err(format!("svgz expands beyond {limit} bytes"));
+        }
+        Ok(Cow::Owned(out))
+    } else if bytes.len() > limit {
+        Err(format!("svg exceeds {limit} bytes"))
+    } else {
+        Ok(Cow::Borrowed(bytes))
+    }
+}
+
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        // Only inflate enough to inspect the XML prologue. Full decoding, when
+        // selected, uses bounded_svg_data and its stricter expanded-size cap.
+        let decoder = flate2::read::GzDecoder::new(bytes);
+        let mut limited = decoder.take(64 * 1024);
+        let mut prefix = Vec::new();
+        return limited.read_to_end(&mut prefix).is_ok() && looks_like_svg_xml(&prefix);
+    }
+    looks_like_svg_xml(bytes)
+}
+
+fn looks_like_svg_xml(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut rest = text.strip_prefix('\u{feff}').unwrap_or(text).trim_start();
+
+    loop {
+        if rest.starts_with("<?") {
+            let Some(end) = rest.find("?>") else {
+                return false;
+            };
+            rest = rest[end + 2..].trim_start();
+        } else if rest.starts_with("<!--") {
+            let Some(end) = rest.find("-->") else {
+                return false;
+            };
+            rest = rest[end + 3..].trim_start();
+        } else if rest.starts_with("<!") {
+            let Some(end) = rest.find('>') else {
+                return false;
+            };
+            rest = rest[end + 1..].trim_start();
+        } else {
+            break;
+        }
+    }
+
+    let Some(after) = rest.strip_prefix('<') else {
+        return false;
+    };
+    let name = after
+        .split(|c: char| c.is_ascii_whitespace() || matches!(c, '/' | '>'))
+        .next()
+        .unwrap_or("");
+    name.rsplit(':').next() == Some("svg")
+}
+
+fn css_pixels(value: f32) -> u32 {
+    value.ceil().max(1.0) as u32
+}
+
+fn bounded_svg_size(width: u32, height: u32) -> (u32, u32) {
+    let (width, height) = (width.max(1) as f64, height.max(1) as f64);
+    let dimension_scale = (MAX_DIMENSION as f64 / width)
+        .min(MAX_DIMENSION as f64 / height)
+        .min(1.0);
+    let pixel_scale = ((MAX_SVG_PIXELS as f64 / (width * height)).sqrt()).min(1.0);
+    let scale = dimension_scale.min(pixel_scale);
+    (
+        (width * scale).round().max(1.0) as u32,
+        (height * scale).round().max(1.0) as u32,
+    )
+}
+
+fn rasterize_svg(
+    tree: &resvg::usvg::Tree,
+    target_width: u32,
+    target_height: u32,
+    crop: bool,
+) -> Result<DynamicImage, String> {
+    let (width, height) = bounded_svg_size(target_width, target_height);
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| String::from("svg target is too large"))?;
+    let source = tree.size();
+    let sx = width as f32 / source.width();
+    let sy = height as f32 / source.height();
+    let scale = if crop { sx.max(sy) } else { sx.min(sy) };
+    let tx = (width as f32 - source.width() * scale) / 2.0;
+    let ty = (height as f32 - source.height() * scale) / 2.0;
+    let transform = tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, tx, ty);
+    resvg::render(tree, transform, &mut pixmap.as_mut());
+
+    let pixels = pixmap.take_demultiplied();
+    let image = image::RgbaImage::from_raw(width, height, pixels)
+        .ok_or_else(|| String::from("invalid SVG raster buffer"))?;
+    Ok(DynamicImage::ImageRgba8(image))
+}
+
+fn decode_for_box(
+    bytes: &[u8],
+    picker: &Picker,
+    size: Size,
+    crop: bool,
+) -> Result<(DynamicImage, ImageInfo, bool), String> {
+    if image::guess_format(bytes).is_ok() {
+        let (image, mime) = decode_raster(bytes)?;
+        let info = ImageInfo {
+            width: image.width(),
+            height: image.height(),
+            mime,
+        };
+        return Ok((image, info, false));
+    }
+
+    let svg = parse_svg(bytes)?;
+    let font = picker.font_size();
+    let width = u32::from(size.width.max(1)) * u32::from(font.width.max(1));
+    let height = u32::from(size.height.max(1)) * u32::from(font.height.max(1));
+    let image = rasterize_svg(&svg.tree, width, height, crop)?;
+    Ok((image, svg.info, true))
+}
+
+/// Decode and encode an image for a fixed terminal-cell box. SVG is rendered
+/// directly into that box, preserving vector quality at every viewer resize.
+pub fn encode_bytes(
+    picker: &Picker,
+    bytes: &[u8],
+    size: Size,
+    crop: bool,
+) -> Result<(Protocol, ImageInfo), String> {
+    let (image, info, svg_fitted) = decode_for_box(bytes, picker, size, crop)?;
+    encode(picker, image, size, crop && !svg_fitted).map(|protocol| (protocol, info))
+}
+
+/// Decode and encode an inline image once for its scroll-independent cell box.
+pub fn encode_sliced_bytes(
+    picker: &Picker,
+    bytes: &[u8],
+    size: Size,
+    crop: bool,
+) -> Result<(SlicedProtocol, ImageInfo), String> {
+    let (image, info, svg_fitted) = decode_for_box(bytes, picker, size, crop)?;
+    encode_sliced(picker, image, size, crop && !svg_fitted).map(|protocol| (protocol, info))
 }
 
 /// Encode an image to fill a panel of `size` cells. `crop` selects the CSS
@@ -120,6 +478,107 @@ pub(crate) fn red_png() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView as _;
+
+    fn sample_svg() -> Vec<u8> {
+        br##"<?xml version="1.0"?>
+            <svg xmlns="http://www.w3.org/2000/svg"
+                 width="80" height="32" viewBox="0 0 80 32"
+                 onload="this.setAttribute('width','1')">
+              <script>document.documentElement.setAttribute('height', '1')</script>
+              <rect width="80" height="32" fill="#ff0000"/>
+            </svg>"##
+            .to_vec()
+    }
+
+    #[test]
+    fn static_svg_is_sniffed_sized_and_rasterized_for_the_terminal_box() {
+        let svg = sample_svg();
+        assert_eq!(sniff(&svg), Some(SVG_MIME));
+        let metadata = info(&svg).unwrap();
+        assert_eq!(
+            metadata,
+            ImageInfo {
+                width: 80,
+                height: 32,
+                mime: SVG_MIME
+            }
+        );
+
+        // Script and event attributes are inert in usvg's static tree: the red
+        // shape renders at the declared viewport rather than either scripted 1px
+        // mutation taking effect.
+        let (intrinsic, mime) = decode(&svg).unwrap();
+        assert_eq!(mime, SVG_MIME);
+        assert_eq!(intrinsic.dimensions(), (80, 32));
+        assert_eq!(intrinsic.to_rgba8().get_pixel(40, 16).0, [255, 0, 0, 255]);
+
+        // Unlike the intrinsic fallback, production renders SVG at the actual
+        // terminal box so a tiny vector remains sharp when CSS/viewer size grows.
+        let picker = Picker::halfblocks();
+        let cells = Size::new(20, 4);
+        let (scaled, scaled_info, svg_fitted) =
+            decode_for_box(&svg, &picker, cells, false).unwrap();
+        let font = picker.font_size();
+        assert!(svg_fitted);
+        assert_eq!(scaled_info, metadata);
+        assert_eq!(
+            scaled.dimensions(),
+            (
+                u32::from(cells.width) * u32::from(font.width),
+                u32::from(cells.height) * u32::from(font.height)
+            )
+        );
+        let (protocol, protocol_info) = encode_bytes(&picker, &svg, cells, false).unwrap();
+        assert_eq!(protocol_info, metadata);
+        assert!(protocol.size().width <= cells.width);
+        assert!(protocol.size().height <= cells.height);
+    }
+
+    #[test]
+    fn secure_static_mode_blocks_external_references_but_keeps_data_images() {
+        let options = secure_svg_options();
+        assert!(
+            (options.image_href_resolver.resolve_string)("Cargo.toml", &options).is_none(),
+            "relative paths must never reach usvg's file resolver"
+        );
+        assert!(
+            (options.image_href_resolver.resolve_string)(
+                "https://example.com/tracker.png",
+                &options
+            )
+            .is_none(),
+            "SVG image rendering must not start its own network fetches"
+        );
+        assert!(
+            (options.image_href_resolver.resolve_data)("image/png", Arc::new(red_png()), &options)
+                .is_some(),
+            "embedded data: images are permitted in secure static mode"
+        );
+    }
+
+    #[test]
+    fn svgz_and_default_object_size_are_supported_with_an_expansion_cap() {
+        use std::io::Write as _;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&sample_svg()).unwrap();
+        let svgz = encoder.finish().unwrap();
+        assert_eq!(sniff(&svgz), Some(SVG_MIME));
+        assert_eq!(info(&svgz).unwrap().width, 80);
+
+        let defaulted =
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>"#;
+        let defaulted = info(defaulted).unwrap();
+        assert_eq!((defaulted.width, defaulted.height), (300, 150));
+
+        let expanded = vec![b'x'; 257];
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&expanded).unwrap();
+        let oversized_svgz = encoder.finish().unwrap();
+        assert!(bounded_svg_data_with_limit(&oversized_svgz, 256).is_err());
+        assert!(bounded_svg_data_with_limit(&expanded, 256).is_err());
+    }
 
     #[test]
     fn decodes_sniffed_images_and_rejects_garbage() {
