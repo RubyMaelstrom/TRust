@@ -1249,6 +1249,15 @@ pub type WebStorage = std::sync::Arc<
     std::sync::Mutex<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
 >;
 
+/// The Send-able result of a BACKGROUND fetch (a dispatch/at-rest `fetch()` or
+/// async XHR), posted back to the actor to settle the JS promise without the
+/// dispatch ever blocking on the wire. `(status, content_type, body)` on
+/// success; `None` on failure (the prelude turns a null resolution into a
+/// rejected fetch / failed XHR, matching the sync syscall's contract).
+type FetchResult = Option<(u16, String, Vec<u8>)>;
+/// Channel a background fetch task posts its `(promise id, result)` back on.
+type FetchSender = tokio::sync::mpsc::Sender<(usize, FetchResult)>;
+
 /// Network access for page JS: requests run on the app's tokio runtime
 /// from the JS thread, metered and capped. No CORS theater — there are
 /// no cookies or ambient credentials to protect; the real boundary is
@@ -1259,12 +1268,21 @@ struct PageNet {
     page: url::Url,
     budget: Rc<Budget>,
     fetched: std::cell::Cell<usize>,
-    /// True once the page is past load, handling interactive dispatches. A
-    /// fetch fired during a dispatch extends the (tight, compute-sized)
-    /// dispatch deadline so the wire can finish — a click that asks an LLM for
-    /// a reply must wait for the reply, not be cancelled at the 1s compute cap.
-    /// Load fetches don't extend (the load already runs on `WALL_BUDGET`).
+    /// True once the page is past load, handling interactive dispatches. While
+    /// false (load) a `fetch()` runs as a Boa async job awaited to quiescence,
+    /// so first paint / the one-shot `transform` snapshot includes the data.
+    /// Once true (dispatch/at-rest) a `fetch()` instead runs as a BACKGROUND
+    /// task that posts its result back via `fetch_events` (see
+    /// `sys_http_fetch_async`) — the dispatch returns immediately and the page
+    /// re-renders when the reply arrives, so a slow request (an LLM reply) can't
+    /// freeze the live engine. (`fetch_events` is only present on the resident
+    /// actor; `transform` leaves it None and always awaits.)
     dispatch: std::cell::Cell<bool>,
+    /// Background-fetch result channel + id counter (resident actor only). A
+    /// dispatch/at-rest `fetch()` spawns a task that sends `(id, result)` here;
+    /// the actor settles promise `id` and re-renders.
+    fetch_events: Option<FetchSender>,
+    next_fetch_id: std::cell::Cell<usize>,
     /// The shared subresource cache, so the page's own `fetch()` can join
     /// an in-flight/done request for a chunk we already have.
     cache: std::sync::Arc<crate::http::PageCache>,
@@ -2184,8 +2202,75 @@ fn sys_http_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
 /// WITHOUT blocking the JS thread, so many in-flight requests overlap
 /// (Boa's job executor polls them concurrently). This is the whole
 /// reason `Promise.all([fetch(a), fetch(b)])` now runs in parallel.
+/// If this `fetch()` should run as a BACKGROUND task — past load, on the
+/// resident actor (`net.dispatch` set AND a `fetch_events` sender present) —
+/// allocate its promise id and hand back the channel + runtime to spawn the
+/// request off the JS thread. `None` ⇒ run it as an awaited Boa job (during
+/// load, or in the one-shot `transform`, where the result must be in hand
+/// before serialize).
+fn bg_fetch_ctx(ctx: &Context) -> Option<(usize, FetchSender, tokio::runtime::Handle)> {
+    let host = ctx.realm().host_defined();
+    let net = host.get::<PageNet>()?;
+    if !net.dispatch.get() {
+        return None;
+    }
+    let tx = net.fetch_events.clone()?;
+    let id = net.next_fetch_id.get();
+    net.next_fetch_id.set(id + 1);
+    Some((id, tx, net.handle.clone()))
+}
+
 fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let (url_arg, method, body, headers) = fetch_args(args, ctx);
+    // BACKGROUND path: past load, on the resident actor, the request runs OFF
+    // the JS thread, so a slow wire (an LLM reply) can't freeze the live engine
+    // — the dispatch returns immediately and the result posts back as
+    // `(id, result)`, which the actor settles + re-renders (see
+    // `dispatch_fetch_done`). The promise is created by `__trust.bgFetch(id)`,
+    // resolved later by `settleFetch`.
+    if let Some((id, tx, handle)) = bg_fetch_ctx(ctx) {
+        // GET dedup: join the cache's single in-flight/done request (no cap spend).
+        if method == "GET"
+            && body.is_none()
+            && let Some(shared) = peek_page_cache(ctx, &url_arg)
+        {
+            phase(&format!("src: PAGE-CACHE-BG {url_arg}"));
+            handle.spawn(async move {
+                let out = shared
+                    .await
+                    .ok()
+                    .map(|c| (c.status, c.content_type.clone(), c.body.clone()));
+                let _ = tx.send((id, out)).await;
+            });
+            return ctx.eval(Source::from_bytes(
+                format!("__trust.bgFetch({id})").as_bytes(),
+            ));
+        }
+        match page_net_prepare(ctx, &url_arg, method, body, headers) {
+            // Blocked/capped/no net: resolve null NOW (a settled promise),
+            // matching the awaited path's contract.
+            None => {
+                let p = ctx.eval(Source::from_bytes(
+                    format!("__trust.bgFetch({id})").as_bytes(),
+                ))?;
+                settle_bg_fetch(ctx, id, JsValue::null());
+                return Ok(p);
+            }
+            Some((_handle, request)) => {
+                phase(&format!("src: PAGE-ASYNC-BG {}", request.url));
+                handle.spawn(async move {
+                    let out = crate::http::fetch(&request)
+                        .await
+                        .ok()
+                        .map(|r| (r.status, r.content_type, r.body));
+                    let _ = tx.send((id, out)).await;
+                });
+                return ctx.eval(Source::from_bytes(
+                    format!("__trust.bgFetch({id})").as_bytes(),
+                ));
+            }
+        }
+    }
     let (promise, resolvers) = JsPromise::new_pending(ctx);
     // GET dedup: a chunk the page re-`fetch()`es (the bundler warms up its
     // own modulepreloads this way) JOINS the cache's single request for
@@ -3149,6 +3234,7 @@ fn load_page(
     html: &str,
     env: &PageEnv,
     ws_events: Option<tokio::sync::mpsc::Sender<(usize, crate::ws::WsIn)>>,
+    fetch_events: Option<FetchSender>,
 ) -> Result<LoadedPage, Outcome> {
     phase("load_page start (DOM parse)");
     phases_reset();
@@ -3201,15 +3287,18 @@ fn load_page(
                 budget: budget.clone(),
                 fetched: std::cell::Cell::new(0),
                 dispatch: std::cell::Cell::new(false),
+                fetch_events: fetch_events.clone(),
+                next_fetch_id: std::cell::Cell::new(1),
                 cache: env.cache.clone(),
             });
         }
         // Register the WebSocket host BEFORE any script runs. socket.io (Open
         // WebUI and friends) opens its WS during page load / DOMContentLoaded,
         // so the very first `new WebSocket(...)` must already find a `PageWs`,
-        // or `__ws_open` returns -1 and the socket is never opened — the page
-        // then has no transport for its streamed reply, and socket.io's
-        // reconnect timer is frozen at rest so it never retries. Only the
+        // or `__ws_open` returns -1 and the socket is never opened on that
+        // attempt — the page then has no transport for its streamed reply until
+        // socket.io's reconnect timer fires at rest and retries, an avoidable
+        // delay (it was the "took a while to hit the model" lag). Only the
         // resident-actor path supplies a `ws_events` sender; the one-shot
         // `transform` gets None (no actor to forward inbound frames to).
         if let (Some(ws_tx), Some(handle), Some(page)) =
@@ -3451,9 +3540,10 @@ fn settle_page(page: &mut LoadedPage) {
         // The load handler can schedule post-load work as a timer — the very
         // common `setTimeout(finish, 0)` pattern (every WPT testharness page
         // completes this way; many SPAs defer init like this). Drain to
-        // quiescence (timers + microtasks), not just the microtask queue, so
-        // that work runs as part of the load settle. Still budget/MAX_TICKS-
-        // bounded, and once quiescent timers stay frozen at rest.
+        // quiescence (DUE-NOW timers + microtasks), not just the microtask
+        // queue, so that 0-delay work runs as part of the load settle. Still
+        // budget/MAX_TICKS-bounded; any real-delay timers left pending fire at
+        // their real time later, in the actor's at-rest wake loop.
         settle(&mut page.ctx, &page.budget, MAX_TICKS, &mut page.outcome);
         // Fire `load` on any image whose reveal a handler is waiting for, so a
         // fade-in-on-load image is shown rather than hidden at `opacity:0`.
@@ -3754,7 +3844,7 @@ pub fn css_finish(mut dom: Dom, sheets: &[(String, String)]) -> String {
 }
 
 pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
-    match load_page(html, env, None) {
+    match load_page(html, env, None, None) {
         Err(outcome) => (html.to_string(), outcome),
         Ok(mut page) => {
             // One-shot snapshot: no resident actor will run deferred timers
@@ -3762,7 +3852,7 @@ pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
             // eventual rendered state (rAF-deferred content, delayed timeouts).
             // The live actor leaves this off and runs that work at real time.
             let _ = page.ctx.eval(Source::from_bytes(b"__trust.oneShot = true"));
-            settle_page(&mut page);
+            settle_page(&mut page); // `load_page(.., None)` ⇒ fetches await in-line
             page.outcome.elapsed = page.started.elapsed();
             let out = page.dom.borrow().serialize(DOCUMENT);
             (out, std::mem::take(&mut page.outcome))
@@ -3859,9 +3949,12 @@ const PAGE_STACK: usize = 64 * 1024 * 1024;
 const WAKE_FLOOR: Duration = Duration::from_millis(66);
 
 /// What unblocked the at-rest event loop: an app command (`None` = the app
-/// dropped the page handle), or the next-timer-deadline sleep elapsing.
+/// dropped the page handle), a background fetch completing (`None` = the
+/// channel closed, i.e. the page is going away), or the next-timer-deadline
+/// sleep elapsing.
 enum Wake {
     Cmd(Option<PageCmd>),
+    Fetch(Option<(usize, FetchResult)>),
     Timer,
 }
 
@@ -3943,7 +4036,20 @@ fn page_actor(
     // forwarder that relays those events into the command stream is spawned
     // after load returns (it needs the actor's command sender).
     let (ws_evt_tx, ws_evt_rx) = tokio::sync::mpsc::channel::<(usize, crate::ws::WsIn)>(64);
-    let mut page = match load_page(&html, &env, Some(ws_evt_tx)) {
+    // Background-fetch result channel: a dispatch/at-rest `fetch()` runs as a
+    // task that posts `(id, result)` here when the wire completes, so the
+    // dispatch never blocks on it. The actor selects on `fetch_rx` (a 3rd arm)
+    // and settles the promise + re-renders. Sized generously — a page can have
+    // many in-flight requests (`Promise.all([...])`).
+    let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::channel::<(usize, FetchResult)>(64);
+    // Keep one sender alive for the actor's whole life. `load_page` only stores
+    // the sender (in `PageNet`) for a NET page; a no-net page drops the clone we
+    // pass in, which would CLOSE `fetch_rx` → `recv()` returns `Ready(None)`
+    // every poll → the select's fetch arm fires forever and STARVES the timer
+    // arm (a CPU spin + frozen timers). This keepalive holds the channel open so
+    // `recv()` stays pending until a real background fetch posts back.
+    let _fetch_keepalive = fetch_tx.clone();
+    let mut page = match load_page(&html, &env, Some(ws_evt_tx), Some(fetch_tx)) {
         Ok(page) => page,
         Err(outcome) => {
             let _ = evts.blocking_send(PageEvt::Static { html, outcome });
@@ -3962,9 +4068,10 @@ fn page_actor(
     // instead of blocking first paint on every background fetch. For a
     // page with no post-interactive work the shell == the settled render,
     // so this is a harmless duplicate; for a static article (no
-    // clickables) we skip it and fall through to the Static path. Timers
-    // stay frozen at rest — `settle_page` advances them once, here, not in
-    // the idle dispatch loop.
+    // clickables) we skip it and fall through to the Static path.
+    // `settle_page` below fires the page's due-now load/init timers for this
+    // first settle; any ongoing timers (a slideshow, a poller, a rAF chain)
+    // keep advancing at their real time in the at-rest wake loop further down.
     let (shell, shell_clickable) = extract_live(&mut page);
     // The shell render reports wall-clock elapsed for the status bar, but
     // we must NOT write that back onto `page.outcome.elapsed`: that field
@@ -4069,12 +4176,23 @@ fn page_actor(
                 // animation's frame timer.
                 biased;
                 cmd = cmds.recv() => Wake::Cmd(cmd),
+                // A background fetch completed — settle its promise and re-render.
+                done = fetch_rx.recv() => Wake::Fetch(done),
                 () = sleep_or_pending(sleep_dur) => Wake::Timer,
             }
         });
         let cmd = match wake {
             Wake::Cmd(Some(cmd)) => cmd,
             Wake::Cmd(None) => break, // app dropped the handle
+            Wake::Fetch(Some((id, result))) => {
+                if !dispatch_fetch_done(&mut page, &evts, id, result) {
+                    break;
+                }
+                continue;
+            }
+            // `fetch_rx` only closes when the page (and its `PageNet` sender) is
+            // gone; nothing more to do.
+            Wake::Fetch(None) => continue,
             Wake::Timer => {
                 let real_now = base_ms + wall.elapsed().as_millis() as f64;
                 if !timer_wake(&mut page, &evts, real_now) {
@@ -4307,6 +4425,99 @@ fn timer_wake(
             .is_ok();
     }
     true
+}
+
+/// A background fetch (a dispatch/at-rest `fetch()` whose request ran OFF the
+/// JS thread so the dispatch didn't block on the wire) completed: settle its JS
+/// promise with the result and drain the `.then` reactions, then re-render if
+/// the DOM changed. Shaped like a dispatch, but a resolution that mutates
+/// nothing emits nothing (it isn't a user interaction). Returns false when the
+/// actor should exit (the event channel is gone or the engine panicked).
+fn dispatch_fetch_done(
+    page: &mut LoadedPage,
+    evts: &tokio::sync::mpsc::Sender<PageEvt>,
+    id: usize,
+    result: FetchResult,
+) -> bool {
+    prepare_dispatch(page);
+    let value = fetch_result_value(&mut page.ctx, result);
+    settle_bg_fetch(&mut page.ctx, id, value);
+    settle(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut page.outcome,
+    );
+    // The `.then` may swap in an image whose reveal waits on a `load` event.
+    settle_image_loads(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut page.outcome,
+    );
+    drain_js_side(&mut page.ctx, &mut page.outcome);
+    if page.outcome.panicked {
+        let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+        return false;
+    }
+    if let Some(url) = take_script_navigation(page) {
+        return evts.blocking_send(PageEvt::Navigate(url)).is_ok();
+    }
+    if page.dom.borrow_mut().take_dirty() {
+        let (out, _) = extract_live(page);
+        let outcome = std::mem::take(&mut page.outcome);
+        return evts
+            .blocking_send(PageEvt::Updated { html: out, outcome })
+            .is_ok();
+    }
+    if !page.outcome.errors.is_empty() {
+        return evts
+            .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)))
+            .is_ok();
+    }
+    true
+}
+
+/// Build the `[status, content_type, body_text]` array (or `null` on failure)
+/// a background fetch resolves its promise with — the same shape as
+/// `response_to_array`, from the Send-able data posted back by the fetch task.
+fn fetch_result_value(ctx: &mut Context, result: FetchResult) -> JsValue {
+    match result {
+        Some((status, content_type, body)) => {
+            let vals = vec![
+                JsValue::from(f64::from(status)),
+                str_value(&content_type),
+                str_value(&String::from_utf8_lossy(&body)),
+            ];
+            JsArray::from_iter(vals, ctx).into()
+        }
+        None => JsValue::null(),
+    }
+}
+
+/// Resolve the pending background-fetch promise `id` with `value` by calling
+/// the JS-side `__trust.settleFetch(id, value)` (the resolver lives in a JS map,
+/// GC-rooted by `trust`, so no GC object is held Rust-side across threads).
+fn settle_bg_fetch(ctx: &mut Context, id: usize, value: JsValue) {
+    let g = ctx.global_object();
+    let Ok(trust) = g.get(boa_engine::js_string!("__trust"), ctx) else {
+        return;
+    };
+    let Some(trust) = trust.as_object() else {
+        return;
+    };
+    let Ok(settle) = trust.get(boa_engine::js_string!("settleFetch"), ctx) else {
+        return;
+    };
+    let Some(settle) = settle.as_callable() else {
+        return;
+    };
+    let settle = settle.clone();
+    let _ = settle.call(
+        &JsValue::undefined(),
+        &[JsValue::from(id as f64), value],
+        ctx,
+    );
 }
 
 /// The page's current virtual-time clock (`timers.now`, ms) — the base the
@@ -7333,12 +7544,13 @@ const PRELUDE: &str = r##"
     g.getSelection = () => new Selection();
     // --- MutationObserver (real) ---------------------------------------
     // A pure-JS DOM-mutation observer, delivered as a microtask exactly like
-    // the spec's "mutation observer microtask". It does NOT challenge the
-    // freeze-at-rest invariant: records are emitted ONLY by the mutation
-    // wrappers below (appendChild/setAttribute/…), which run only inside a
-    // compute window (load, settle, a click/form dispatch). At rest nothing
-    // mutates, so nothing fires — no idle CPU, no background ticking. (Timers
-    // remain frozen at rest by design; that is a separate, deliberate choice.)
+    // the spec's "mutation observer microtask". Records are emitted ONLY by the
+    // mutation wrappers below (appendChild/setAttribute/…), so MO costs nothing
+    // until something actually mutates the DOM — during load/settle, a click or
+    // form dispatch, OR an at-rest timer/animation (the engine now runs at rest,
+    // so a slideshow or poller that mutates the DOM fires its observers in real
+    // time too). A page with no observers AND no scheduled work simply parks
+    // (zero idle CPU): nothing mutates, so nothing fires.
     //
     // Records are recorded against the live observer list `MO`. The hot path
     // (zero observers) is a single `MO.length` check at each mutation site;
@@ -7542,8 +7754,8 @@ const PRELUDE: &str = r##"
         }
         takeRecords() { const r = this.__records; this.__records = []; return r; }
     };
-    // The terminal has no live scroll and timers freeze at rest, so we REPORT
-    // every observed target as FULLY intersecting, once, asynchronously — else
+    // The terminal has no live scroll, so we REPORT every observed
+    // target as FULLY intersecting, once, asynchronously — else
     // below-the-fold lazy/virtualized content (infinite scrollers, lazy tiles)
     // would never materialize, since the scroll that would reveal it can't
     // happen. We render the whole document into the scrollback, so for
@@ -7924,6 +8136,18 @@ const PRELUDE: &str = r##"
     g.clearTimeout = g.clearInterval = (id) => { timers.q = timers.q.filter((t) => t.id !== id); };
     g.requestAnimationFrame = (fn) => g.setTimeout(() => fn(timers.now), 16);
     g.cancelAnimationFrame = g.clearTimeout;
+    // Background fetch (dispatch/at-rest, resident actor): the request runs OFF
+    // the JS thread so the dispatch doesn't block on the wire. `bgFetch(id)`
+    // hands back a promise the actor settles via `settleFetch(id, value)` once
+    // `(id, result)` posts back (see Rust `sys_http_fetch_async`/
+    // `dispatch_fetch_done`). The resolver lives in this JS-side map — GC-rooted
+    // by `trust` — so Rust never holds a GC object across threads.
+    trust.pendingFetches = {};
+    trust.bgFetch = (id) => new Promise((resolve) => { trust.pendingFetches[id] = resolve; });
+    trust.settleFetch = function (id, value) {
+        const resolve = trust.pendingFetches[id];
+        if (resolve) { delete trust.pendingFetches[id]; resolve(value); }
+    };
     g.queueMicrotask = (fn) => { Promise.resolve().then(fn).catch((e) => trust.errors.push("microtask: " + ((e && e.message) || e))); };
     // The HTML structured-clone algorithm: a deep copy that follows the
     // object graph (handling cycles), supported by every browser as a global.
@@ -8042,17 +8266,17 @@ const PRELUDE: &str = r##"
         timers.now = absMs;
         return due.length;
     };
-    // The clocks advance with VIRTUAL time, not the wall clock. A click that
-    // triggers an animation (jQuery's `.slideUp`/`.fadeOut`, used by Humble's
-    // "Dismiss banner") drives its frames off `Date.now()`/`performance.now()`;
-    // our dispatch settle advances `timers.now` 1000ms a tick, but the real
-    // wall clock barely moves in that microsecond burst, so a wall-clock
-    // `Date.now()` made the animation see ~0 elapsed and never finish (the
-    // banner never slid away). Anchoring the clocks to the virtual timer base
-    // lets click-driven animations run to completion within the dispatch —
-    // consistent with timers being frozen at rest and advancing only on
-    // interaction. `Date.now()` keeps a realistic absolute base so timestamps
-    // still look real; `performance.now()` is the elapsed virtual time.
+    // The clocks track `timers.now`, the engine's single virtual clock, not the
+    // host wall clock directly. During the load/dispatch settle `timers.now`
+    // FAST-FORWARDS (firing due one-shots) while the real wall clock barely
+    // moves in that microsecond burst — so a wall-clock `Date.now()` would make
+    // a click-driven animation (jQuery's `.slideUp`/`.fadeOut`, Humble's
+    // "Dismiss banner") see ~0 elapsed and never finish (the banner never slid
+    // away). At REST the actor advances `timers.now` to the real monotonic clock
+    // (see the wake loop), so reading time off `timers.now` is correct in BOTH
+    // phases: fast-forwarded during settle, real-time at rest. `Date.now()`
+    // keeps a realistic absolute base so timestamps still look real;
+    // `performance.now()` is the elapsed virtual time.
     const __epoch0 = Date.now();
     Date.now = () => __epoch0 + timers.now;
     g.performance.now = () => timers.now;

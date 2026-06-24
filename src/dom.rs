@@ -1775,11 +1775,18 @@ impl Dom {
         if wrap {
             out.push_str(&format!("<a href=\"x-trust-js:{id}:\">"));
             // An icon-only clickable would render as an empty (and so
-            // unselectable) link: give it a visible handle. An icon control
-            // (an `<svg>`/`<use>` Font-Awesome-style glyph — the dominant web
-            // icon idiom) shows the icon's GLYPH; a named-but-glyphless one
-            // shows its accessible name; an unnamed one (a CSS-drawn carousel
-            // dot) gets a compact marker rather than the noisy "[button]".
+            // unselectable) link: give it a visible handle WHEN it carries
+            // meaning. An icon control (an `<svg>`/`<use>` Font-Awesome-style
+            // glyph — the dominant web icon idiom) shows the icon's GLYPH; a
+            // named-but-glyphless one shows its accessible name. An element with
+            // NO text, NO icon glyph, and NO accessible name (aria-label/title/
+            // value) conveys nothing to a text reader — its meaning lived only
+            // in CSS (a carousel's pagination dots are click `<div>`s drawn as
+            // background-coloured pills; Steam paints ~12 per carousel). Render
+            // NOTHING rather than a marker per anonymous control: the empty
+            // wrapper yields no layout item, so it neither shows nor steals a
+            // selection stop. (Was a `·` marker — fine for a lone control,
+            // debris in a group.)
             if self.text_content(id).trim().is_empty() {
                 if let Some(glyph) = self.icon_glyph(id) {
                     out.push_str(glyph);
@@ -1791,8 +1798,6 @@ impl Dom {
                     out.push('[');
                     out.push_str(&escape_text(label));
                     out.push(']');
-                } else {
-                    out.push('·');
                 }
             }
         }
@@ -2905,6 +2910,42 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             ];
         }
         return Vec::new();
+    }
+    // `flex: none | auto | <grow> [<shrink>] [<basis>] | <basis>` → the three
+    // longhands, so the CASCADE resolves them by source order (a `flex-grow:0`
+    // BEFORE a `flex:1` must lose to the shorthand's grow:1 — manually merging
+    // shorthand-then-longhand in the layout got this backwards). `flex:<n>`
+    // sets basis 0 (not auto), per the spec.
+    if prop == "flex" {
+        let v = value.trim();
+        let (g, s, b) = match v.to_ascii_lowercase().as_str() {
+            "none" => ("0", "0", "auto".to_string()),
+            "auto" => ("1", "1", "auto".to_string()),
+            "initial" | "" => ("0", "1", "auto".to_string()),
+            _ => {
+                let mut nums = Vec::new();
+                let mut basis = None;
+                for t in v.split_whitespace() {
+                    if t.parse::<f32>().is_ok() {
+                        nums.push(t);
+                    } else {
+                        basis = Some(t.to_string());
+                    }
+                }
+                let g = nums.first().copied().unwrap_or("1");
+                let s = nums.get(1).copied().unwrap_or("1");
+                // A bare number (`flex:1`) means basis 0; a bare basis
+                // (`flex:30%`) keeps grow/shrink 1.
+                let b =
+                    basis.unwrap_or_else(|| if nums.is_empty() { "auto" } else { "0" }.to_string());
+                (g, s, b)
+            }
+        };
+        return vec![
+            ("flex-grow".to_string(), g.to_string()),
+            ("flex-shrink".to_string(), s.to_string()),
+            ("flex-basis".to_string(), b),
+        ];
     }
     // `list-style: <type> || <position> || <image>` — we track the type and
     // position keywords (a bare `none` counts as the type, per the shorthand
@@ -4860,9 +4901,18 @@ mod tests {
         // (An icon-only ANCHOR `<a><svg></a>` is glyphed by the layout instead,
         // see `icon_only_label`, since anchors aren't wrapped.)
         assert!(html.contains('⋯'), "ellipsis icon glyph: {html}");
-        // An unnamed icon-only clickable (a CSS dot) gets a compact marker,
-        // not the noisy "[button]".
-        assert!(html.contains('·') && !html.contains("[button]"), "{html}");
+        // An unnamed icon-only clickable (a CSS-drawn dot — no text, glyph, or
+        // accessible name) gets NO marker: its meaning lived only in CSS, which
+        // a text reader can't convey, so we emit an empty wrapper rather than
+        // litter a `·` per anonymous control (Steam's carousel pagination dots
+        // are ~12 such `<div>`s each). Still wrapped (so it stays a clickable),
+        // just with nothing to show — no debris, no stolen selection stop.
+        assert!(!html.contains('·'), "no anonymous-clickable marker: {html}");
+        assert!(!html.contains("[button]"), "{html}");
+        assert!(
+            html.contains(&format!("x-trust-js:{dot}:")),
+            "anonymous dot stays a clickable wrapper: {html}"
+        );
         // The live anchor's href is rewritten with the original kept;
         // the plain one is untouched (the zero-overhead path).
         assert!(

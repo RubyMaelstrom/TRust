@@ -1343,6 +1343,21 @@ impl<'a> Layout<'a> {
         {
             return;
         }
+        // An out-of-flow box (`position:absolute`/`fixed`, CSS 2.1 §9.6) is
+        // removed from normal flow — its containing block places it at its
+        // computed coordinates (`place_positioned_children`). This guard MUST
+        // precede the early `<img>`/form-control/`<video>` dispatch below:
+        // those tags `return` before the general `flow_of`→`Flow::None` skip
+        // (further down), so without it an absolutely-positioned `<img>` or
+        // control is laid BOTH in normal flow AND at its placed position — the
+        // double-render of Steam's capsule banner images (an abspos `<img>`
+        // filling each positioned capsule) and their overlay badges. Plain
+        // abspos `<div>`s already skip via that later guard; this makes the
+        // replaced/control tags consistent. The exception is when WE are laying
+        // this very box as its own sub-box (`subtree_root`) — then flow it.
+        if self.is_out_of_flow(id) && self.subtree_root != Some(id) {
+            return;
+        }
         // A `<video>`/`<audio>` element renders as a media representation — its
         // poster (when present) plus a labelled link to the playable source —
         // not as an inline player a terminal can't run. Following it auto-opens
@@ -2072,9 +2087,21 @@ impl<'a> Layout<'a> {
         // normal flow (CSS 2.1 §9.6): its containing block places it at its
         // computed coordinates (`place_positioned_children`), so the in-flow
         // walk skips it. The exception is when WE are laying this very box as
-        // its own sub-box (it is the `subtree_root`) — then flow its content.
-        if self.is_out_of_flow(id) && self.subtree_root != Some(id) {
-            return Flow::None;
+        // its own sub-box (it is the `subtree_root`).
+        if self.is_out_of_flow(id) {
+            if self.subtree_root != Some(id) {
+                return Flow::None;
+            }
+            // Laying the out-of-flow box itself: CSS §9.7 BLOCKIFIES an
+            // absolutely-positioned/fixed box (computed `display:inline` /
+            // `inline-*` / `list-item` → block). As a block it runs the
+            // block-tail `place_positioned_children` for its OWN out-of-flow
+            // descendants — e.g. a fill `<img>` inside an abspos overlay `<a>`
+            // (a default-inline anchor): without blockification the anchor laid
+            // inline, never placed the image, and the thumbnail vanished.
+            // `flex_mode` still reads the raw display, so an abspos
+            // `inline-flex`/`inline-grid` lays as a flex/grid container.
+            return Flow::Block;
         }
         if let Some(d) = self.dom.computed_display(id) {
             return match d.as_str() {
@@ -2865,59 +2892,21 @@ impl<'a> Layout<'a> {
             .width as usize
     }
 
-    /// A flex item's `(basis, grow, shrink)`. `basis` resolves `flex-basis`
-    /// (else `width`, `%` against `avail`, capped by `max-width`); `None`
-    /// means auto (size to content). Defaults: grow 0, shrink 1.
+    /// A flex item's `(basis, grow, shrink)`. The `flex` shorthand is expanded
+    /// into `flex-grow`/`flex-shrink`/`flex-basis` in the CASCADE (so source
+    /// order resolves correctly — see `expand_box_shorthand`), so this just
+    /// reads the three longhands. `basis` resolves `flex-basis` (else `width`,
+    /// `%` against `avail`, capped by `max-width`); `None` means auto (size to
+    /// content). Defaults: grow 0, shrink 1, basis auto.
     fn flex_props(&self, id: NodeId, avail: usize) -> (Option<usize>, f32, f32) {
-        let mut grow = 0.0f32;
-        let mut shrink = 1.0f32;
-        let mut basis_css: Option<String> = None;
-        // The `flex` shorthand seeds all three (keywords or `grow [shrink]
-        // [basis]`); the longhands below override.
-        if let Some(f) = self.dom.computed_style(id, "flex") {
-            match f.trim().to_ascii_lowercase().as_str() {
-                "none" => {
-                    grow = 0.0;
-                    shrink = 0.0;
-                    basis_css = Some("auto".into());
-                }
-                "auto" => {
-                    grow = 1.0;
-                    shrink = 1.0;
-                    basis_css = Some("auto".into());
-                }
-                "initial" | "" => {}
-                other => {
-                    let mut nums = Vec::new();
-                    for p in other.split_whitespace() {
-                        match p.parse::<f32>() {
-                            Ok(num) => nums.push(num),
-                            Err(_) => basis_css = Some(p.to_string()),
-                        }
-                    }
-                    if let Some(&g) = nums.first() {
-                        grow = g;
-                    }
-                    if let Some(&s) = nums.get(1) {
-                        shrink = s;
-                    }
-                    // A single number (`flex:1`) means basis 0.
-                    if nums.len() == 1 && basis_css.is_none() {
-                        basis_css = Some("0".into());
-                    }
-                }
-            }
-        }
-        if let Some(g) = self.flex_number(id, "flex-grow") {
-            grow = g;
-        }
-        if let Some(s) = self.flex_number(id, "flex-shrink") {
-            shrink = s;
-        }
-        if let Some(b) = self.dom.computed_style(id, "flex-basis") {
-            basis_css = Some(b);
-        }
-        let basis = match basis_css.as_deref().map(str::trim) {
+        let grow = self.flex_number(id, "flex-grow").unwrap_or(0.0).max(0.0);
+        let shrink = self.flex_number(id, "flex-shrink").unwrap_or(1.0).max(0.0);
+        let basis = match self
+            .dom
+            .computed_style(id, "flex-basis")
+            .as_deref()
+            .map(str::trim)
+        {
             None | Some("auto") => self.len_or_pct(id, "width", avail),
             Some("content" | "max-content" | "min-content" | "fit-content") => None,
             Some(v) => resolve_cells(v, avail, self.viewport_w),
@@ -2928,7 +2917,7 @@ impl<'a> Layout<'a> {
             (Some(b), Some(m)) => Some(b.min(m)),
             (b, _) => b,
         };
-        (basis, grow.max(0.0), shrink.max(0.0))
+        (basis, grow, shrink)
     }
 
     /// A unitless flex number (`flex-grow`/`flex-shrink`), or `None`.
@@ -3174,21 +3163,95 @@ impl<'a> Layout<'a> {
         // band actually on screen from `origin_col` (no horizontal scroll).
         let band = self.width.saturating_sub(origin_col).max(1) as i32;
         let scale = (band as f32 / union_w as f32).min(1.0);
-        for p in placed {
-            let (col, b) = if scale < 1.0 {
-                // Re-lay at the compressed width so the box's content reflows.
-                let w = ((p.used_w as f32 * scale).round() as usize).max(1);
-                let inherit = self.ancestor_link_ctx(p.node);
-                let b = self.layout_subtree_inner(p.node, w, Some(p.node), false, &inherit);
-                let col = (origin_col as i32 + (p.left as f32 * scale).round() as i32).max(0);
-                (col as u16, b)
-            } else {
-                ((origin_col as i32 + p.left).max(0) as u16, p.b)
-            };
-            self.blit(&b, col, origin_row + p.top as usize);
+        // Lay each box to its final (col, box, top); placement happens after so
+        // a lift can shift the boxes below it.
+        let mut blits: Vec<(u16, LaidBox, i32)> = placed
+            .into_iter()
+            .map(|p| {
+                let (col, b) = if scale < 1.0 {
+                    // Re-lay at the compressed width so the box's content reflows.
+                    let w = ((p.used_w as f32 * scale).round() as usize).max(1);
+                    let inherit = self.ancestor_link_ctx(p.node);
+                    let b = self.layout_subtree_inner(p.node, w, Some(p.node), false, &inherit);
+                    let col = (origin_col as i32 + (p.left as f32 * scale).round() as i32).max(0);
+                    (col as u16, b)
+                } else {
+                    ((origin_col as i32 + p.left).max(0) as u16, p.b)
+                };
+                (col, b, p.top)
+            })
+            .collect();
+        // A cell grid has no z-axis, and a decoded image is an atomic blit (a
+        // sixel can't be partially overwritten — see the ratatui image model),
+        // so an overlay positioned ON an image cannot be composited over it.
+        // Rather than garble it (two glyphs fighting for a cell) or shove it off
+        // to the side (the renderer's overlap-append), LIFT the overlay onto its
+        // own row(s) at the same column by inserting blank rows: the image — and
+        // the CB's content below it — shifts down, so the overlay reads just
+        // above the image (a corner deal-badge over a store capsule). Processed
+        // top-down so each insert shifts the boxes below it consistently. The
+        // insert is confined to THIS containing block's row range (each flex
+        // capsule is its own sub-box), so sibling capsules re-align instead of
+        // drifting. Text-on-text overlap is left to the coordinate model
+        // (topmost wins); only an image — which genuinely can't be composited —
+        // forces the lift.
+        blits.sort_by_key(|&(_, _, top)| top);
+        let mut inserted = 0usize;
+        for (col, b, top) in blits {
+            let h = (b.height as usize).max(1);
+            let target = ((origin_row as i32 + top).max(0) as usize) + inserted;
+            if self.overlay_hits_image(target, h, col, b.width) {
+                self.insert_blank_rows(target, h);
+                inserted += h;
+            }
+            self.blit(&b, col, target);
         }
         self.col = self.indent;
         self.pending_space = false;
+    }
+
+    /// Whether placing a box at rows `[at, at+h)` over columns `[col, col+w)`
+    /// would land on a decoded image already laid in those cells. A terminal
+    /// cell has no z-axis and a sixel is an atomic blit, so an overlay can't be
+    /// composited over an image — `place_positioned_children` lifts it onto its
+    /// own row instead.
+    fn overlay_hits_image(&self, at: usize, h: usize, col: u16, w: u16) -> bool {
+        let hi = col.saturating_add(w);
+        (at..(at + h).min(self.rows.len())).any(|r| {
+            self.rows[r].items.iter().any(|it| {
+                matches!(it.kind, ItemKind::Image)
+                    && it.col < hi
+                    && it.col.saturating_add(it.width) > col
+            })
+        })
+    }
+
+    /// Insert `n` blank rows at row `at`, pushing the existing rows — and the
+    /// row references of any carousels/floats at or below `at` — down. Lets a
+    /// lifted overlay (see `place_positioned_children`) take its own row without
+    /// painting over what was there.
+    fn insert_blank_rows(&mut self, at: usize, n: usize) {
+        if n == 0 || at > self.rows.len() {
+            return;
+        }
+        self.rows
+            .splice(at..at, std::iter::repeat_with(Row::default).take(n));
+        for c in &mut self.carousels {
+            if c.start >= at {
+                c.start += n;
+            }
+            if c.end >= at {
+                c.end += n;
+            }
+        }
+        for f in &mut self.floats {
+            if f.start_row >= at {
+                f.start_row += n;
+            }
+            if f.bottom >= at {
+                f.bottom += n;
+            }
+        }
     }
 
     /// The inline context a positioned box inherits from its DOM ancestors —
@@ -3470,16 +3533,27 @@ impl<'a> Layout<'a> {
             .dom
             .children(id)
             .into_iter()
-            .filter(|&c| {
-                matches!(self.dom.node(c).data, NodeData::Element { .. })
-                    && !self.dom.is_hidden(c)
+            .filter(|&c| match &self.dom.node(c).data {
+                // Each contiguous run of text directly inside a flex/grid
+                // container is wrapped in an anonymous flex item (CSS Flexbox
+                // §4) — html5ever coalesces adjacent character data into one
+                // Text node, so a run is one node. A whitespace-only run (HTML
+                // indentation between items) generates no box, so it's skipped;
+                // without this, a `display:flex` element whose only content is
+                // text (`<div style=display:flex>-70%</div>`, a discount badge,
+                // an icon-less label) rendered NOTHING — the text was dropped.
+                NodeData::Text(s) => !s.trim().is_empty(),
+                NodeData::Element { .. } => {
+                    !self.dom.is_hidden(c)
                     // An absolutely-positioned child of a flex container is NOT
                     // a flex item (CSS Flexbox §4) — it's taken out of flow and
                     // positioned over the container. Including it laid decorative
                     // overlays (a blurred `object-fit:cover` backdrop behind a
                     // contained image, a badge) as real columns beside the
                     // content. Out-of-flow children flow via their own path.
-                    && !self.is_out_of_flow(c)
+                        && !self.is_out_of_flow(c)
+                }
+                _ => false,
             })
             .collect();
         // CSS `order`: flex/grid items render in ascending `order` (default 0,
@@ -3767,11 +3841,16 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// Lay a flex-wrap container's children out as a grid: each child is
-    /// laid out as an independent box, then SHELF-PACKED left→right, the
-    /// shelf wrapping to a new band when the next box won't fit. Assumes a
-    /// block boundary (line empty, `col == indent`); appends finished rows
-    /// directly via `blit` and leaves the cursor back at the indent.
+    /// Lay a flex-wrap container's children as real flex lines (CSS Flexbox
+    /// §9.2/§9.3/§9.7): each item is sized to its flex base size (clamped to
+    /// its min/max), lines BREAK on that hypothetical size, then each line's
+    /// free space is handed to `flex-grow` items (or overflow pulled from
+    /// `flex-shrink` items) so the row fills. This is what makes a `flex:1`
+    /// (basis 0) `min-width:40%` `max-width:50%` capsule grid lay TWO per row
+    /// that grow to fill the band — packing by the *content/max-width* (the old
+    /// behaviour) broke every line at ~50% and collapsed it to one column.
+    /// Assumes a block boundary; appends finished rows via `blit` and leaves
+    /// the cursor back at the indent.
     fn flow_flex_wrap(&mut self, id: NodeId, ctx: &Ctx) {
         // Lay within the float-narrowed band (the block boundary already ran
         // `begin_line`), not the raw block box — so a wrapping grid beside a
@@ -3780,67 +3859,152 @@ impl<'a> Layout<'a> {
         let avail = self.line_right.saturating_sub(self.line_left).max(1);
         let gap = self.flex_gap(id, avail, false);
         let row_gap = self.flex_gap(id, avail, true);
-        // Lay every item to a box, keeping its packing width: an explicit
-        // `width` reserves that column even when the content is narrower;
-        // without one the box shrinks to its content (capped to `avail`).
-        let mut boxes: Vec<(LaidBox, usize)> = Vec::new();
+
+        // Per item: the flex inputs and the hypothetical main size used for
+        // line-breaking (the flex base size clamped to [auto-min, max-width]).
+        struct FlexItem {
+            node: NodeId,
+            hypo: usize,
+            grow: f32,
+            shrink: f32,
+            floor: usize,
+            max: usize,
+        }
+        let mut items: Vec<FlexItem> = Vec::new();
         for child in self.flex_items(id) {
-            let explicit = self.css_cells(child, "width").map(|w| w.min(avail).max(1));
-            let min_w = self
-                .css_cells(child, "min-width")
-                .map(|w| w.min(avail).max(1));
-            // Layout constraint: explicit `width`, else `max-width`, else
-            // `min-width`, else the full row. Honoring `min-width` here is what
-            // makes the ubiquitous responsive-grid cell (`min-width: Nrem` plus
-            // grow, often `max-width: 1fr`) lay out to its floor instead of
-            // ballooning to the whole row (its inner `width:100%` content would
-            // otherwise fill `avail`, so it packed one-per-row).
-            let constraint = explicit
-                .or_else(|| self.css_cells(child, "max-width").map(|w| w.min(avail)))
-                .or(min_w)
-                .unwrap_or(avail)
-                .max(1);
-            let b = self.layout_subtree(child, constraint, ctx);
-            if b.height == 0 {
+            let (basis, grow, shrink) = self.flex_props(child, avail);
+            // An empty, auto-sized, non-growing item takes no column.
+            if grow == 0.0 && basis.is_none() && self.is_empty_box(child) {
                 continue;
             }
-            // Packing width: explicit `width` else content width, floored by
-            // `min-width` so a content-narrower-than-floor cell still reserves
-            // its column.
-            let w = explicit
-                .unwrap_or(b.width as usize)
-                .max(min_w.unwrap_or(0))
-                .min(avail)
+            let max = self
+                .css_cells(child, "max-width")
+                .map(|w| w.min(avail))
+                .unwrap_or(avail)
                 .max(1);
-            boxes.push((b, w));
+            // The automatic minimum (§4.5): an explicit `min-width`, else — for
+            // a DEFINITE flex base size (a `flex-basis:0` cell) — the item's
+            // min-content width, so it never collapses below its content. An
+            // auto-basis item is already sized to its content, so it needs no
+            // extra floor (skip the measurement).
+            let floor = match self.css_cells(child, "min-width") {
+                Some(w) => w.min(avail),
+                None if basis.is_some() => self.measure_width(child, 1),
+                None => 1,
+            }
+            .clamp(1, avail);
+            // Flex base size: the definite basis, else the content width.
+            let base = basis.unwrap_or_else(|| self.measure_width(child, max));
+            let hypo = base.min(max).max(floor).clamp(1, avail);
+            items.push(FlexItem {
+                node: child,
+                hypo,
+                grow,
+                shrink,
+                floor,
+                max,
+            });
         }
-        // Shelf-pack: greedily fill each shelf left→right (always at least one
-        // box — an over-wide box takes its own band), then place the shelf
-        // honoring `justify-content` (main-axis distribution of leftover space)
-        // and `align-items` (cross-axis offset of a short box within the
-        // shelf's height). With neither set this packs exactly as before.
+
         let mut shelf_top = self.rows.len();
         let mut i = 0;
-        while i < boxes.len() {
-            let mut used = boxes[i].1;
+        while i < items.len() {
+            // Collect a flex line: as many items as fit at their hypothetical
+            // size (always at least one — an over-wide item takes its own line).
+            let mut used = items[i].hypo;
             let mut end = i + 1;
-            while end < boxes.len() && used + gap + boxes[end].1 <= avail {
-                used += gap + boxes[end].1;
+            while end < items.len() && used + gap + items[end].hypo <= avail {
+                used += gap + items[end].hypo;
                 end += 1;
             }
-            let n = end - i;
-            let shelf_h = boxes[i..end]
-                .iter()
-                .map(|(b, _)| b.height as usize)
-                .max()
-                .unwrap_or(0);
-            let free = avail.saturating_sub(used);
-            let (lead, between) = self.justify_offsets(id, free, n);
+            let line = &items[i..end];
+            let n = line.len();
+            let gaps = (n - 1) * gap;
+            let mut widths: Vec<usize> = line.iter().map(|it| it.hypo).collect();
+            let content: usize = widths.iter().sum();
+            if content + gaps < avail {
+                // Grow: distribute free space to `flex-grow` items, capping each
+                // at its max-width and re-distributing the remainder.
+                let mut free = avail - content - gaps;
+                let mut frozen = vec![false; n];
+                while free > 0 {
+                    let total: f32 = (0..n).filter(|&k| !frozen[k]).map(|k| line[k].grow).sum();
+                    if total <= 0.0 {
+                        break;
+                    }
+                    let mut moved = false;
+                    let free_f = free as f32;
+                    for k in 0..n {
+                        if frozen[k] || line[k].grow <= 0.0 {
+                            continue;
+                        }
+                        let add = (free_f * line[k].grow / total).floor() as usize;
+                        let give = add.min(line[k].max.saturating_sub(widths[k]));
+                        if give > 0 {
+                            widths[k] += give;
+                            free -= give;
+                            moved = true;
+                        }
+                        if widths[k] >= line[k].max {
+                            frozen[k] = true;
+                        }
+                    }
+                    if !moved {
+                        break;
+                    }
+                }
+            } else if content + gaps > avail {
+                // Shrink: pull overflow from `flex-shrink` items (weighted by
+                // shrink × base size), flooring each at its min and re-absorbing.
+                let mut over = content + gaps - avail;
+                let mut frozen = vec![false; n];
+                while over > 0 {
+                    let weight: f32 = (0..n)
+                        .filter(|&k| !frozen[k])
+                        .map(|k| line[k].shrink * line[k].hypo as f32)
+                        .sum();
+                    if weight <= 0.0 {
+                        break;
+                    }
+                    let mut moved = false;
+                    let over_f = over as f32;
+                    for k in 0..n {
+                        if frozen[k] || line[k].shrink <= 0.0 {
+                            continue;
+                        }
+                        let take = (over_f * (line[k].shrink * line[k].hypo as f32) / weight).ceil()
+                            as usize;
+                        let cut = take.min(widths[k].saturating_sub(line[k].floor)).min(over);
+                        if cut > 0 {
+                            widths[k] -= cut;
+                            over -= cut;
+                            moved = true;
+                        }
+                        if widths[k] <= line[k].floor {
+                            frozen[k] = true;
+                        }
+                    }
+                    if !moved {
+                        break;
+                    }
+                }
+            }
+            // Lay each item at its used main size, then place the line honoring
+            // `justify-content` (leftover main-axis space) and `align-items`
+            // (cross-axis offset of a short item within the line's height).
+            let boxes: Vec<LaidBox> = (0..n)
+                .map(|k| self.layout_subtree(line[k].node, widths[k].max(1), ctx))
+                .collect();
+            let shelf_h = boxes.iter().map(|b| b.height as usize).max().unwrap_or(0);
+            let used_w: usize = widths.iter().map(|w| (*w).max(1)).sum::<usize>() + gaps;
+            let (lead, between) = self.justify_offsets(id, avail.saturating_sub(used_w), n);
             let mut x = lead;
-            for (k, (b, w)) in boxes.iter().enumerate().take(end).skip(i) {
-                let dy = self.align_offset(id, b.height as usize, shelf_h);
-                self.blit(b, (self.line_left + x) as u16, shelf_top + dy);
-                x += *w + if k + 1 < end { gap + between } else { 0 };
+            for (k, b) in boxes.iter().enumerate() {
+                if b.height > 0 {
+                    let dy = self.align_offset(id, b.height as usize, shelf_h);
+                    self.blit(b, (self.line_left + x) as u16, shelf_top + dy);
+                }
+                x += widths[k].max(1) + if k + 1 < n { gap + between } else { 0 };
             }
             shelf_top += shelf_h + row_gap;
             i = end;
@@ -9168,6 +9332,62 @@ mod tests {
     }
 
     #[test]
+    fn flex_shorthand_wins_over_a_preceding_longhand_by_source_order() {
+        // `flex-grow:0;flex:1` must resolve to grow:1 — the `flex` shorthand,
+        // declared LATER, wins (it's expanded into the longhands in the cascade,
+        // so source order decides). Steam's capsules carry exactly this. Two such
+        // items (flex base 0, grow 1) SPLIT the row equally, so the second starts
+        // near the half. If the longhand wrongly won (grow 0) both would collapse
+        // to their content and the second would sit right after the first.
+        let rows = lay(
+            r#"<html><head><style>
+                 .row{display:flex}
+                 .a,.b{flex-grow:0;flex:1}
+               </style></head><body><div class="row">
+                 <div class="a">AA</div>
+                 <div class="b">BB</div>
+               </div></body></html>"#,
+            60,
+        );
+        let (ra, ca) = pos_of(&rows, "AA");
+        let (rb, cb) = pos_of(&rows, "BB");
+        assert_eq!(ra, rb, "both on one row: {:?}", texts(&rows));
+        assert_eq!(ca, 0);
+        assert!(
+            cb >= 25,
+            "grow:1 split the row, so the second item starts near the half (col {cb})"
+        );
+    }
+
+    #[test]
+    fn flex_wrap_breaks_lines_by_flex_base_size_not_content() {
+        // Steam's "Featured tag" 2-up capsule grid: `flex:1` (base 0) cells with
+        // `min-width:40%`/`max-width:50%` and content WIDER than 50%. A browser
+        // breaks flex lines by the flex BASE size (0, clamped up to the 40% min),
+        // so 40% + gap + 40% fits TWO per row; the old code packed by the
+        // content/max-width (~50%+), breaking one-per-row and collapsing the grid
+        // to a single column. The third cell still wraps to the next line.
+        let wide = "X".repeat(55); // wider than 50% of the 100-cell row
+        let html = format!(
+            r#"<html><head><style>
+                 .row{{display:flex;flex-wrap:wrap;gap:2px}}
+                 .cap{{flex:1;min-width:40%;max-width:50%;white-space:nowrap}}
+               </style></head><body><div class="row">
+                 <div class="cap">A{wide}</div>
+                 <div class="cap">B{wide}</div>
+                 <div class="cap">C{wide}</div>
+               </div></body></html>"#
+        );
+        let rows = lay(&html, 100);
+        let (ra, _) = pos_of(&rows, "AXXXXX");
+        let (rb, cb) = pos_of(&rows, "BXXXXX");
+        let (rc, _) = pos_of(&rows, "CXXXXX");
+        assert_eq!(ra, rb, "first two capsules share a row: {:?}", texts(&rows));
+        assert!(cb >= 40, "second capsule sits past the 40% first column");
+        assert!(rc > ra, "the third capsule wraps to the next row");
+    }
+
+    #[test]
     fn flex_wrap_min_width_var_cells_pack_into_a_grid() {
         // archive.org's "Top Collections": a flex-wrap container whose cells
         // size via `min-width: var(--x, 8em)` + `max-width: var(--y, 1fr)` and
@@ -9843,6 +10063,30 @@ mod tests {
         assert_eq!(rs, rc, "columns share a row: {:?}", texts(&rows));
         assert_eq!(cs, 0, "sidebar at the left edge");
         assert_eq!(cc, 21, "content past the 20-cell sidebar + 1-cell gap");
+    }
+
+    #[test]
+    fn a_flex_container_renders_its_anonymous_text_item() {
+        // A contiguous text run directly inside a flex container forms an
+        // anonymous flex item (CSS Flexbox §4) and must render. Steam's
+        // `<div class=discount_pct style=display:flex>-70%</div>` discount
+        // badge was dropped entirely because `flex_items` collected only
+        // element children — the "-70%" vanished. Mixed text + element
+        // content keeps BOTH (the text run is its own anonymous item).
+        let rows = lay(
+            r#"<body>
+                 <div style="display:flex">-70%</div>
+                 <div style="display:flex">Save <span>now</span></div>
+               </body>"#,
+            60,
+        );
+        assert_eq!(
+            find(&rows, "-70%").text,
+            "-70%",
+            "pure-text flex item renders"
+        );
+        find(&rows, "Save"); // text run beside an element child still renders
+        find(&rows, "now"); // (panics if either is missing)
     }
 
     #[test]
@@ -10576,6 +10820,48 @@ mod tests {
                 .flat_map(|r| &r.items)
                 .any(|i| i.image.is_some()),
             "the thumbnail image renders: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn an_overlay_on_an_image_is_lifted_above_it() {
+        // A store-capsule corner badge (a "MIDWEEK DEAL" ribbon,
+        // position:absolute top:-12px) sits ON TOP of the capsule's fill image.
+        // A terminal can't composite a glyph over a (sixel) image, so the
+        // overlay is lifted onto its own row ABOVE the image rather than
+        // garbling it or shoving it off to the side. (Steam's Discounts
+        // carousel — the "MI"/"MIDWEEK DEAL" debris.)
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/cap.png".to_owned(), (92, 43));
+        let rows = lay_with_images(
+            r#"<body><div style="position:relative">
+                 <a href="/g" style="position:relative;display:block;width:40ch">
+                   <img src="/cap.png" style="display:block;width:100%;height:auto;position:relative">
+                   <div style="position:absolute;top:-12px;left:0">MIDWEEK DEAL</div>
+                 </a>
+               </div></body>"#,
+            60,
+            &images,
+        );
+        let (badge_row, _) = pos_of(&rows, "MIDWEEK DEAL");
+        let img_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|it| matches!(it.kind, ItemKind::Image)))
+            .expect("the capsule image renders");
+        // The badge reads ABOVE the image, on its own row…
+        assert!(
+            badge_row < img_row,
+            "badge lifted above image (badge r{badge_row}, image r{img_row}): {:?}",
+            texts(&rows)
+        );
+        // …and that row carries no image cells (it didn't paint over the image).
+        assert!(
+            !rows[badge_row]
+                .items
+                .iter()
+                .any(|it| matches!(it.kind, ItemKind::Image)),
+            "badge row is clear of the image: {:?}",
             texts(&rows)
         );
     }

@@ -1,0 +1,72 @@
+<!doctype html>
+<html class="responsive DesktopUI">
+<head><meta charset="utf-8"><style>
+body { width: 1900px; }
+.home_tabs_sections.grid_list_view .tab_content_items { display: grid; grid-template-columns: repeat(3, 1fr); min-height: 850px; }
+html.responsive .home_tabs_sections.grid_list_view .tab_content_items { grid-template-columns: repeat(2, 1fr); }
+.home_tabs_sections .tab_content_items { display: flex; padding: 10px; gap: 10px; }
+.tab_item { display: flex; flex-direction: column; }
+.tab_item_header { display: flex; align-items: center; }
+.discount_block { display:flex; position:relative; justify-content:flex-end; }
+.discount_pct { display:flex; align-items:center; font-weight:bold; color:#000; background:#4c6b22; font-size:14px; padding:0 4px; }
+.discount_prices { display:flex; flex-direction:column; padding:6px 8px; gap:2px; align-items:flex-end; }
+.discount_original_price { position:relative; width:fit-content; color:#738895; font-size:11px; white-space:nowrap; }
+.discount_original_price:before { content:''; left:0px; right:0px; position:absolute; top:43%; border-bottom:1.5px solid #738895; transform:skewY(-8deg); }
+.discount_final_price { color:#BEEE11; font-size:15px; }
+</style></head>
+<body>
+<div class="home_tabs_sections grid_list_view">
+ <div class="home_tabs_row"><div class="home_tabs_section_name">FIRST PERSON SHOOTERS</div></div>
+ <div class="tab_content_items">
+  <div class="tab_item">
+   <div class="tab_item_header"><div class="tab_item_title">Cyberpunk 2077</div></div>
+   <div class="tab_item_purchase">
+    <div class="discount_block discount_block_inline">
+     <div class="discount_pct">-70%</div>
+     <div class="discount_prices">
+      <div class="discount_original_price">59,99€</div>
+      <div class="discount_final_price">17,99€</div>
+     </div>
+    </div>
+   </div>
+  </div>
+  <div class="tab_item">
+   <div class="tab_item_header"><div class="tab_item_title">theHunter</div></div>
+   <div class="tab_item_purchase">
+    <div class="discount_block discount_block_inline">
+     <div class="discount_pct">-90%</div>
+     <div class="discount_prices">
+      <div class="discount_original_price">19,50€</div>
+      <div class="discount_final_price">1,95€</div>
+     </div>
+    </div>
+   </div>
+  </div>
+  <div class="tab_item">
+   <div class="tab_item_header"><div class="tab_item_title">SAND</div></div>
+   <div class="tab_item_purchase">
+    <div class="discount_block discount_block_inline">
+     <div class="discount_pct">-21%</div>
+     <div class="discount_prices">
+      <div class="discount_original_price">19,99€</div>
+      <div class="discount_final_price">15,79€</div>
+     </div>
+    </div>
+   </div>
+  </div>
+  <div class="tab_item">
+   <div class="tab_item_header"><div class="tab_item_title">MOUSE</div></div>
+   <div class="tab_item_purchase">
+    <div class="discount_block discount_block_inline">
+     <div class="discount_pct">-20%</div>
+     <div class="discount_prices">
+      <div class="discount_original_price">29,99€</div>
+      <div class="discount_final_price">23,99€</div>
+     </div>
+    </div>
+   </div>
+  </div>
+ </div>
+</div>
+<script>/* force JS pipeline */ document.title='x';</script>
+</body></html>
