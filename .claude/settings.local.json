@@ -90,7 +90,9 @@
       "Bash(curl -s -o /dev/null -w \"8080: HTTP %{http_code} server=%header{server}\\\\n\" http://localhost:8080/)",
       "Bash(curl -s http://localhost:3000/api/config)",
       "Bash(curl -s http://localhost:8080/api/config)",
-      "WebFetch(domain:html.spec.whatwg.org)"
+      "WebFetch(domain:html.spec.whatwg.org)",
+      "Bash(awk 'NR>=5894 && NR<=6410 && \\(/localName ===|localName !==|tagName ===|tagName !==|__isMedia/\\)' src/js.rs)",
+      "Bash(awk -F: '$1<7239 && $1>5026')"
     ]
   }
 }

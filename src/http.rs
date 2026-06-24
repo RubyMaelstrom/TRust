@@ -4255,7 +4255,6 @@ mod tests {
         for id in dom.descendants(crate::dom::DOCUMENT) {
             if dom.tag_name(id) == Some("img")
                 && let Some(src) = dom.attr(id, "src")
-                && !src.trim_end().ends_with(".svg")
                 && let Link::Http(u) = resolve(&url, src)
             {
                 srcs.push((id, u));

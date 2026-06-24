@@ -1876,11 +1876,14 @@ impl App {
         let picker = self.picker.clone();
         let size = self.last_inner;
         tokio::task::spawn_blocking(move || {
-            let result = img::decode(&raw).and_then(|(image, mime)| {
-                let info = format!("{}×{} {mime}", image.width(), image.height());
-                let panel = ratatui::layout::Size::new(size.0, size.1);
-                // The full-screen image viewer fits (contains) the panel.
-                img::encode(&picker, image, panel, false).map(|protocol| (protocol, info))
+            let panel = ratatui::layout::Size::new(size.0, size.1);
+            // The full-screen viewer fits (contains) the panel. SVG is
+            // rasterized directly at this box, so resize keeps vector quality.
+            let result = img::encode_bytes(&picker, &raw, panel, false).map(|(protocol, image)| {
+                (
+                    protocol,
+                    format!("{}×{} {}", image.width, image.height, image.mime),
+                )
             });
             let _ = tx.blocking_send(ImgMsg {
                 url,
@@ -2068,9 +2071,9 @@ impl App {
             // run-loop thread restores it (see TERMINAL_OWNER).
             let box_size = ratatui::layout::Size::new(key.w, key.h);
             let protocol = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::img::decode(&raw).ok().and_then(|(image, _)| {
-                    crate::img::encode_sliced(&picker, image, box_size, key.crop).ok()
-                })
+                crate::img::encode_sliced_bytes(&picker, &raw, box_size, key.crop)
+                    .ok()
+                    .map(|(protocol, _)| protocol)
             }))
             .ok()
             .flatten();
@@ -4035,9 +4038,9 @@ async fn load_one_image(
         // bad image fails to None, never unwinds the worker. The terminal is
         // safe regardless (only the run loop restores it — TERMINAL_OWNER).
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::img::decode(&for_decode)
+            crate::img::info(&for_decode)
                 .ok()
-                .map(|(image, _mime)| natural_cell_box(&image, font))
+                .map(|image| natural_cell_box_dimensions(image.width, image.height, font))
         }))
         .ok()
         .flatten()
@@ -4050,9 +4053,24 @@ async fn load_one_image(
 /// The cell box an image occupies: its natural size at the terminal font,
 /// scaled down (never up) to fit `IMG_MAX_CELLS` while preserving aspect.
 /// Layout clamps the width further to the content width (rescaling height).
+#[cfg(test)]
 fn natural_cell_box(image: &image::DynamicImage, font: ratatui_image::FontSize) -> (u16, u16) {
-    let nat = ratatui_image::Resize::natural_size(image, font);
-    let (cw, ch) = (nat.width.max(1) as f32, nat.height.max(1) as f32);
+    natural_cell_box_dimensions(image.width(), image.height(), font)
+}
+
+fn natural_cell_box_dimensions(
+    width: u32,
+    height: u32,
+    font: ratatui_image::FontSize,
+) -> (u16, u16) {
+    // Match ratatui-image's natural_size rounding exactly, without forcing SVG
+    // through a throwaway intrinsic-size rasterization just to read dimensions.
+    let cw = (width as f32 / f32::from(font.width.max(1)))
+        .ceil()
+        .max(1.0);
+    let ch = (height as f32 / f32::from(font.height.max(1)))
+        .ceil()
+        .max(1.0);
     let scale = (IMG_MAX_CELLS.0 / cw).min(IMG_MAX_CELLS.1 / ch).min(1.0);
     let w = (cw * scale).round().max(1.0) as u16;
     let h = (ch * scale).round().max(1.0) as u16;
@@ -5772,16 +5790,119 @@ mod tests {
     /// Deliver a decoded+encoded image to the app, the way the
     /// blocking task does (halfblocks picker: deterministic, no tty).
     fn deliver_image(app: &mut super::App, url: Link, raw: Vec<u8>) {
-        let (image, mime) = crate::img::decode(&raw).expect("test image decodes");
-        let info = format!("{}×{} {mime}", image.width(), image.height());
         let size = ratatui::layout::Size::new(app.last_inner.0, app.last_inner.1);
-        let protocol = crate::img::encode(&app.picker, image, size, false).unwrap();
+        let (protocol, image) = crate::img::encode_bytes(&app.picker, &raw, size, false).unwrap();
+        let info = format!("{}×{} {}", image.width, image.height, image.mime);
         app.on_img(super::ImgMsg {
             url,
             raw: raw.into(),
             size: app.last_inner,
             result: Ok((protocol, info)),
         });
+    }
+
+    fn svg_fixture() -> Vec<u8> {
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="32"
+                    viewBox="0 0 80 32">
+                <rect width="80" height="32" fill="#00ff00"/>
+              </svg>"##
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn standalone_http_svg_routes_through_the_image_viewer() {
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (40, 12);
+        let url = url::Url::parse("https://example.com/logo.svg").unwrap();
+        app.on_http_response(
+            crate::http::Response {
+                url: url.clone(),
+                status: 200,
+                content_type: String::from("image/svg+xml"),
+                body: svg_fixture(),
+                js: None,
+                live: None,
+                challenge: None,
+            },
+            40,
+        );
+        let msg = app
+            .img_rx
+            .as_mut()
+            .expect("SVG viewer encode started")
+            .recv()
+            .await
+            .expect("SVG viewer encode completed");
+        app.on_img(msg);
+
+        let viewer = app.viewer.as_ref().expect("SVG viewer opened");
+        assert_eq!(viewer.url, Link::Http(url));
+        assert!(
+            viewer.info.contains("80×32 image/svg+xml"),
+            "{}",
+            viewer.info
+        );
+        assert_eq!(viewer.encoded_for, (40, 12));
+    }
+
+    #[tokio::test]
+    async fn inline_http_svg_fetches_decodes_and_reflows_as_an_image_box() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let svg = svg_fixture();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                svg.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&svg).await.unwrap();
+        });
+
+        let page = url::Url::parse(&format!("http://{address}/page")).unwrap();
+        let image_url = format!("http://{address}/logo.svg");
+        let html =
+            format!(r#"<body><p>before</p><img src="{image_url}" alt="logo"><p>after</p></body>"#);
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (40, 12);
+        let doc = crate::http::parse(
+            &page,
+            "text/html; charset=utf-8",
+            html.as_bytes(),
+            40,
+            &crate::layout::ImageSizes::new(),
+        );
+        app.navigate_to(doc);
+        let expected_cell = super::natural_cell_box_dimensions(80, 32, app.picker.font_size());
+        app.start_image_loads(page, vec![image_url.clone()]);
+        let msg = app
+            .imgs_rx
+            .as_mut()
+            .expect("inline SVG load started")
+            .recv()
+            .await
+            .expect("inline SVG load completed");
+        app.on_img_load(msg);
+        server.await.unwrap();
+
+        let decoded = app.image_cache.get(&image_url).expect("SVG cached");
+        assert_eq!(decoded.cell, expected_cell);
+        let item = app
+            .browser
+            .as_ref()
+            .unwrap()
+            .doc
+            .rows
+            .iter()
+            .flat_map(|row| &row.items)
+            .find(|item| item.image.as_deref() == Some(image_url.as_str()))
+            .expect("reflow produced a real image item");
+        assert_eq!((item.width, item.height), expected_cell);
     }
 
     #[tokio::test]

@@ -7412,12 +7412,8 @@ mod tests {
         // Fake every <img> a small box so image flow exercises.
         let mut images = ImageSizes::new();
         for id in dom.descendants(DOCUMENT) {
-            // Skip SVGs: the real decode pipeline never rasters them, so
-            // they fall through to the alt-text path (where star glyphs etc.
-            // resolve) — faking them here would hide that.
             if dom.tag_name(id) == Some("img")
                 && let Some(src) = dom.attr(id, "src")
-                && !src.trim_end().ends_with(".svg")
                 && let Link::Http(u) = crate::http::resolve(&base, src)
             {
                 let (fw, fh) = std::env::var("TRUST_FAKE_IMG")

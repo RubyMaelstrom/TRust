@@ -36,9 +36,17 @@ libmudtelnet = "2.0.2"
 mimalloc = { version = "0.1", optional = true }
 ratatui = "0.30.2"
 ratatui-image = { version = "11.0.4", default-features = false, features = ["crossterm"] }
+# Static SVG image rendering. `resvg`/`usvg`/tiny-skia are pure Rust; text and
+# embedded data: raster images stay enabled for web compatibility. System-font
+# discovery reads font files through Rust and is initialized once in img.rs.
+# memmap-fonts is deliberately omitted: ordinary reads keep this path free of
+# the font database's mmap unsafe block.
+resvg = { version = "0.47.0", default-features = false, features = ["text", "system-fonts", "raster-images"] }
 rcgen = "0.14.8"
 sha2 = "0.11.0"
 textwrap = "0.16.2"
+tiny-skia = "0.12.0"
+svgtypes = "0.16.1"
 tokio = { version = "1.52.3", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time"] }
 tokio-rustls = "0.26.4"
 tui-term = "0.3.4"
