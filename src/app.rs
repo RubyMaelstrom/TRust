@@ -2467,6 +2467,17 @@ impl App {
         let selected_target = g
             .sel_item
             .and_then(|(r, i)| g.doc.rows.get(r).and_then(|row| row.items.get(i)).cloned());
+        // Was that selection ON-SCREEN before this update? Only then may we
+        // re-center the viewport onto it (the update pushed a visible selection
+        // off-screen). If the user had scrolled it out of view, their scroll
+        // position is sacred: now that the engine runs at rest, an AUTONOMOUS
+        // re-render (a timer/animation tick) arrives here repeatedly, and must
+        // never drag the viewport back to an off-screen selection every frame
+        // while the user reads elsewhere. (`browser_scroll` deliberately leaves
+        // the selection put when the wheel scrolls a laid-out doc.)
+        let sel_was_visible = g
+            .sel_item
+            .is_some_and(|(r, _)| r >= g.scroll && r < g.scroll + height);
         let doc = http::parse_seeded(&url, "text/html; charset=utf-8", &raw, width, None, &images);
         g.doc = doc;
         g.sel_item = selected_target
@@ -2475,8 +2486,9 @@ impl App {
             .or_else(|| Self::http_first_visible_item(g, height));
         let max_scroll = g.doc.rows.len().saturating_sub(height);
         g.scroll = match g.sel_item {
-            // Keep the selection visible if its row moved off-screen.
-            Some((r, _)) if r < g.scroll || r >= g.scroll + height => {
+            // Keep the selection visible if an update pushed it off-screen —
+            // but only if it was visible to begin with (see `sel_was_visible`).
+            Some((r, _)) if sel_was_visible && (r < g.scroll || r >= g.scroll + height) => {
                 r.saturating_sub(height / 2).min(max_scroll)
             }
             _ => g.scroll.min(max_scroll),
@@ -5392,6 +5404,102 @@ mod tests {
         assert!(
             app.imgs_rx.is_some(),
             "the live update kicked off the image pipeline for the new tile"
+        );
+    }
+
+    /// Build a tall laid-out HTTP browser fixture: a `/top` link, then `filler`
+    /// short paragraphs (so the doc far exceeds the 10-row viewport).
+    fn tall_browser_app(filler: usize) -> (super::App, String) {
+        let url = url::Url::parse("https://example.com/p").unwrap();
+        let mut body = String::from(r#"<body><a href="/top">top link</a>"#);
+        for i in 0..filler {
+            body += &format!("<p>line {i}</p>");
+        }
+        body += "</body>";
+        let doc = crate::http::parse(&url, "text/html", body.as_bytes(), 60, &Default::default());
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (60, 10);
+        app.browser = Some(super::BrowserView {
+            doc,
+            selected: None,
+            sel_item: None,
+            scroll: 0,
+            history: Vec::new(),
+        });
+        (app, body)
+    }
+
+    #[tokio::test]
+    async fn an_autonomous_rerender_keeps_a_scrolled_away_view() {
+        // Now that the engine runs at rest, a timer/animation re-renders the
+        // live doc on its own. Such an autonomous update must NOT drag the
+        // viewport back to a selection the user scrolled away from — their
+        // scroll is sacred (else a background timer makes the page unreadable,
+        // snapping to the selection every frame).
+        let (mut app, body) = tall_browser_app(50);
+        let height = 10usize;
+        {
+            let g = app.browser.as_mut().unwrap();
+            g.sel_item = super::App::http_first_visible_item(g, height);
+            assert!(
+                g.sel_item.is_some_and(|(r, _)| r < height),
+                "the top link is selected and on-screen at load"
+            );
+            // The user wheel-scrolls far down; the selection is now off-screen.
+            g.scroll = 30;
+        }
+        // A timer tick re-renders with unchanged content.
+        app.replace_live_doc(body.into_bytes());
+        assert_eq!(
+            app.browser.as_ref().unwrap().scroll,
+            30,
+            "the user's scroll survived the autonomous re-render"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_recenters_a_selection_it_pushed_off_screen() {
+        // The complement: when the selection WAS visible and an update inserts
+        // content above it (shoving it off-screen), the viewport follows so it
+        // stays in view. Proves the narrowed re-center still fires when it should.
+        let (mut app, _) = tall_browser_app(50);
+        let height = 10usize;
+        {
+            let g = app.browser.as_mut().unwrap();
+            g.sel_item = super::App::http_first_visible_item(g, height);
+            // scroll stays 0 — the selected top link is visible.
+        }
+        assert!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .sel_item
+                .is_some_and(|(r, _)| r < height)
+        );
+        // The update prepends 30 lines above the link, pushing it below the fold.
+        let mut updated = String::from("<body>");
+        for i in 0..30 {
+            updated += &format!("<p>before {i}</p>");
+        }
+        updated += r#"<a href="/top">top link</a>"#;
+        for i in 0..50 {
+            updated += &format!("<p>after {i}</p>");
+        }
+        updated += "</body>";
+        app.replace_live_doc(updated.into_bytes());
+        let g = app.browser.as_ref().unwrap();
+        assert!(
+            g.scroll > 0,
+            "the viewport followed the selection the update pushed off-screen (scroll={})",
+            g.scroll
+        );
+        let (r, _) = g.sel_item.expect("selection re-found after the update");
+        assert!(
+            r >= g.scroll && r < g.scroll + height,
+            "the re-found selection {r} is visible in [{}, {})",
+            g.scroll,
+            g.scroll + height
         );
     }
 
