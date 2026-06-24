@@ -2478,12 +2478,23 @@ impl App {
         let sel_was_visible = g
             .sel_item
             .is_some_and(|(r, _)| r >= g.scroll && r < g.scroll + height);
+        // Did the page have a selection at all? In mouse mode with nothing
+        // hovered there's none, and an AUTONOMOUS live update (a timer/anim
+        // tick) must not conjure one — popping a selection onto a link, and
+        // possibly dragging the viewport, while the user just reads. Only a
+        // page that ALREADY had a selection earns the lost-it fallback below.
+        let had_selection = g.sel_item.is_some();
         let doc = http::parse_seeded(&url, "text/html; charset=utf-8", &raw, width, None, &images);
         g.doc = doc;
         g.sel_item = selected_target
             .and_then(|target| Self::find_item_like(&g.doc.rows, &target))
-            // Lost it? Fall back to the first interactive item in view.
-            .or_else(|| Self::http_first_visible_item(g, height));
+            // Lost a selection we HAD? Fall back to the first interactive item
+            // in view. Had none? Keep it None (see `had_selection`).
+            .or_else(|| {
+                had_selection
+                    .then(|| Self::http_first_visible_item(g, height))
+                    .flatten()
+            });
         let max_scroll = g.doc.rows.len().saturating_sub(height);
         g.scroll = match g.sel_item {
             // Keep the selection visible if an update pushed it off-screen —
@@ -5456,6 +5467,32 @@ mod tests {
             30,
             "the user's scroll survived the autonomous re-render"
         );
+    }
+
+    #[tokio::test]
+    async fn an_autonomous_rerender_does_not_pop_a_selection_onto_a_link() {
+        // Mouse mode, nothing hovered: there is NO selection — even though a
+        // link sits in the viewport (`tall_browser_app` puts `/top` at row 0,
+        // scroll 0, so it's on-screen). A live timer/anim re-render must leave
+        // the selection empty: it must NOT pop one onto that visible link (the
+        // bug — `http_first_visible_item` would have found it and grabbed it).
+        let (mut app, body) = tall_browser_app(50);
+        {
+            let g = app.browser.as_ref().unwrap();
+            assert!(g.sel_item.is_none(), "no link is selected to begin with");
+            assert!(
+                super::App::http_first_visible_item(g, 10).is_some(),
+                "a link IS visible in the viewport (so the old fallback would fire)"
+            );
+        }
+        app.replace_live_doc(body.into_bytes());
+        let g = app.browser.as_ref().unwrap();
+        assert!(
+            g.sel_item.is_none(),
+            "the autonomous re-render left the selection empty (got {:?})",
+            g.sel_item
+        );
+        assert_eq!(g.scroll, 0, "the scroll position survived untouched");
     }
 
     #[tokio::test]
