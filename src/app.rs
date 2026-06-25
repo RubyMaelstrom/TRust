@@ -456,8 +456,12 @@ pub struct App {
     /// Static form submit to perform if the live page does not prevent
     /// the submitted form's default action.
     pending_live_submit: Option<(usize, usize)>,
-    /// Cumulative page-JS errors, for the status badge.
-    page_js_errors: usize,
+    /// DISTINCT page-JS error messages seen on the live page, for the status
+    /// badge. A dedup set, not a running count: one error that recurs every
+    /// frame — e.g. a poll whose data is gated behind a bot wall, which the live
+    /// engine re-attempts each tick — reads as `JS:1!`, not a climbing `JS:30!`
+    /// that would overstate the number of distinct problems.
+    page_js_errors: std::collections::HashSet<String>,
     /// The next fetched document replaces the current one instead of
     /// pushing history (`reload`).
     replace_nav: bool,
@@ -586,7 +590,7 @@ impl App {
             last_scroll_sent: None,
             page_busy: false,
             pending_live_submit: None,
-            page_js_errors: 0,
+            page_js_errors: std::collections::HashSet::new(),
             replace_nav: false,
             crlf: false,
             bells_seen: 0,
@@ -2291,7 +2295,13 @@ impl App {
         // JS visibility: a clean run gets a quiet badge; script errors
         // get a count (the page still rendered — no notice).
         let js_note = match &response.js {
-            Some(o) if !o.errors.is_empty() => format!(" · JS:{}!", o.errors.len()),
+            Some(o) if !o.errors.is_empty() => format!(
+                " · JS:{}!",
+                o.errors
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+            ),
             Some(o) if o.modules_skipped > 0 => String::from(" · JS (modules skipped)"),
             Some(_) => String::from(" · JS"),
             None => String::new(),
@@ -2312,7 +2322,11 @@ impl App {
             // Force the next tick to push the current scroll position (0 on a
             // fresh nav; a restored row on revive-on-back) to the new engine.
             self.last_scroll_sent = None;
-            self.page_js_errors = response.js.as_ref().map_or(0, |o| o.errors.len());
+            self.page_js_errors = response
+                .js
+                .as_ref()
+                .map(|o| o.errors.iter().cloned().collect())
+                .unwrap_or_default();
         }
         // Kick off the parallel image pipeline; decoded images re-flow in.
         self.start_image_loads(page, image_urls);
@@ -2528,17 +2542,21 @@ impl App {
         }
 
         if let Some((html, outcome)) = latest_update {
-            self.page_js_errors += outcome.errors.len();
+            self.page_js_errors.extend(outcome.errors.iter().cloned());
             self.replace_live_doc(html.into_bytes());
-            self.status = if self.page_js_errors > 0 {
-                format!("page updated · JS:{}!", self.page_js_errors)
-            } else {
+            self.status = if self.page_js_errors.is_empty() {
                 String::from("page updated · JS")
+            } else {
+                format!("page updated · JS:{}!", self.page_js_errors.len())
             };
         }
         if !trouble.is_empty() {
-            self.page_js_errors += trouble.len();
-            self.status = format!("page JS: {} (JS:{}!)", trouble[0], self.page_js_errors);
+            self.page_js_errors.extend(trouble.iter().cloned());
+            self.status = format!(
+                "page JS: {} (JS:{}!)",
+                trouble[0],
+                self.page_js_errors.len()
+            );
             self.notice = true;
         }
         if submit_default && let Some((form, field)) = pending_submit {
@@ -5554,6 +5572,36 @@ mod tests {
             app.imgs_rx.is_some(),
             "the live update kicked off the image pipeline for the new tile"
         );
+    }
+
+    #[test]
+    fn the_js_error_badge_counts_distinct_errors_not_occurrences() {
+        // The live engine runs at rest, so a page whose data is gated behind a bot
+        // wall re-attempts (and re-throws the same error) every tick. The badge must
+        // count DISTINCT errors, not occurrences — otherwise one recurring problem
+        // reads as a climbing `JS:30!` that overstates how many things are wrong.
+        let mut app = super::App::new(None, 23);
+        for _ in 0..6 {
+            app.on_page_evt(crate::js::PageEvt::Trouble(vec![
+                "timer: unknown value".to_string(),
+            ]));
+        }
+        assert_eq!(
+            app.page_js_errors.len(),
+            1,
+            "the same error six times is one distinct problem"
+        );
+        assert!(
+            app.status.contains("JS:1!"),
+            "badge shows the distinct count: {}",
+            app.status
+        );
+        // A genuinely different error increments the distinct count.
+        app.on_page_evt(crate::js::PageEvt::Trouble(vec![
+            "timer: something else".to_string(),
+        ]));
+        assert_eq!(app.page_js_errors.len(), 2);
+        assert!(app.status.contains("JS:2!"), "{}", app.status);
     }
 
     /// Build a tall laid-out HTTP browser fixture: a `/top` link, then `filler`

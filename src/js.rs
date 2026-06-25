@@ -1275,6 +1275,49 @@ type FetchResult = Option<(u16, String, Vec<u8>)>;
 /// Channel a background fetch task posts its `(promise id, result)` back on.
 type FetchSender = tokio::sync::mpsc::Sender<(usize, FetchResult)>;
 
+/// Web Workers (HTML §"Workers"). A `Worker` is a second JS engine running on
+/// its own dedicated `trust-worker-N` OS thread (Boa's `Context` is `!Send`, so
+/// there is no shared JS heap — and thus no cross-thread GC). The page and the
+/// worker exchange STRUCTURED-CLONE-serialized messages over channels, exactly
+/// like the WebSocket task exchanges frames (`PageWs`/`PageCmd::Ws`).
+///
+/// A message the worker posts back to the page (`self.postMessage`), or an
+/// uncaught error in the worker. Both ride the `(worker id, WorkerOut)` channel
+/// that the page actor's forwarder turns into `PageCmd::Worker`.
+#[derive(Debug)]
+pub enum WorkerOut {
+    /// Structured-clone wire string (the `__sc_serialize` format).
+    Message(String),
+    /// An uncaught error in the worker → fire `error` on the page-side Worker.
+    Error(String),
+}
+
+/// A control message the page sends INTO a worker (page→worker direction).
+enum WorkerCtl {
+    /// A `worker.postMessage(...)` — structured-clone wire string.
+    Message(String),
+    /// `worker.terminate()` — the worker loop breaks and the thread exits.
+    Terminate,
+}
+
+/// Classic vs module worker (`new Worker(url, { type })`). v1 runs classic; a
+/// module worker is recognized but loads its entry as a classic script for now
+/// (module-graph-in-worker is the immediate fast-follow — see the roadmap memo).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorkerKind {
+    Classic,
+    Module,
+}
+
+/// Channel the worker threads post `(worker id, WorkerOut)` back on; the page
+/// actor's forwarder relays each as a `PageCmd::Worker`.
+type WorkerSender = tokio::sync::mpsc::Sender<(usize, WorkerOut)>;
+
+/// Per-page lid on concurrent workers (a hostile page can't spawn threads
+/// without bound). A real browser has no fixed cap, but each worker is a 64MB
+/// thread + engine here, so this is the resource guard, not a spec limit.
+const MAX_WORKERS: usize = 16;
+
 /// Network access for page JS: requests run on the app's tokio runtime
 /// from the JS thread, metered and capped. No CORS theater — there are
 /// no cookies or ambient credentials to protect; the real boundary is
@@ -1329,6 +1372,52 @@ struct PageWs {
 impl boa_engine::gc::Finalize for PageWs {}
 // SAFETY: holds no GC-managed objects (channels/handle/url/RefCell map).
 unsafe impl boa_engine::gc::Trace for PageWs {
+    boa_engine::gc::empty_trace!();
+}
+
+/// The page-side registry of live `Worker`s (host object in the PAGE context).
+/// `__worker_spawn` resolves+guards the script URL, spawns a `trust-worker-N`
+/// thread, and records its control channel here. `__worker_post`/`_terminate`
+/// look the worker up by id. When the page actor exits, the context — and hence
+/// this struct and its `workers` map — drops; dropping a `WorkerHandle` closes
+/// that worker's control channel, so the worker's event loop sees `None` and the
+/// thread exits cleanly (no join needed, no leaked threads).
+#[derive(boa_engine::JsData)]
+struct PageWorkers {
+    handle: tokio::runtime::Handle,
+    page: url::Url,
+    /// Cloned into each worker's `WorkerSelf` so `self.postMessage`/errors reach
+    /// the actor (forwarded as `PageCmd::Worker`).
+    events: WorkerSender,
+    workers: RefCell<std::collections::HashMap<usize, WorkerHandle>>,
+    next_id: std::cell::Cell<usize>,
+}
+
+/// One live worker's page-side handle: the control channel into the worker
+/// thread. Dropping it closes the channel → the worker exits.
+struct WorkerHandle {
+    ctl: tokio::sync::mpsc::Sender<WorkerCtl>,
+}
+
+impl boa_engine::gc::Finalize for PageWorkers {}
+// SAFETY: holds no GC-managed objects (channels/handle/url/RefCell map).
+unsafe impl boa_engine::gc::Trace for PageWorkers {
+    boa_engine::gc::empty_trace!();
+}
+
+/// The worker-side self handle (host object in a WORKER context): how a worker's
+/// own `self.postMessage`/`close` reach back to the page. `closed` is set by
+/// `__worker_self_close` and read by the worker's event loop to exit.
+#[derive(boa_engine::JsData)]
+struct WorkerSelf {
+    id: usize,
+    to_page: WorkerSender,
+    closed: std::cell::Cell<bool>,
+}
+
+impl boa_engine::gc::Finalize for WorkerSelf {}
+// SAFETY: holds no GC-managed objects (id/channel/Cell).
+unsafe impl boa_engine::gc::Trace for WorkerSelf {
     boa_engine::gc::empty_trace!();
 }
 
@@ -1509,6 +1598,11 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__ws_open", 2, sys_ws_open),
         ("__ws_send", 3, sys_ws_send),
         ("__ws_close", 3, sys_ws_close),
+        ("__worker_spawn", 3, sys_worker_spawn),
+        ("__worker_post", 2, sys_worker_post),
+        ("__worker_terminate", 1, sys_worker_terminate),
+        ("__worker_self_post", 1, sys_worker_self_post),
+        ("__worker_self_close", 0, sys_worker_self_close),
     ];
     for (name, len, f) in table {
         ctx.register_global_callable(JsString::from(*name), *len, NativeFunction::from_fn_ptr(*f))?;
@@ -2044,9 +2138,9 @@ fn sys_doc_element(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<Js
 }
 
 /// `__url_parse(href, base|null)` → array of
-/// [href, protocol, host, hostname, port, pathname, search, hash, origin]
-/// or null — the workhorse behind both the URL class and absolutized
-/// href/src getters.
+/// [href, protocol, host, hostname, port, pathname, search, hash, origin,
+/// username, password] or null — the workhorse behind both the URL class and
+/// absolutized href/src getters.
 fn sys_url_parse(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let href = arg_str(args, 0, ctx);
     let base = args
@@ -2075,6 +2169,8 @@ fn sys_url_parse(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
         u.query().map(|q| format!("?{q}")).unwrap_or_default(),
         u.fragment().map(|f| format!("#{f}")).unwrap_or_default(),
         u.origin().ascii_serialization(),
+        u.username().to_string(),
+        u.password().unwrap_or("").to_string(),
     ];
     let vals: Vec<JsValue> = parts.iter().map(|p| str_value(p)).collect();
     Ok(JsArray::from_iter(vals, ctx).into())
@@ -2137,7 +2233,20 @@ fn page_net_fetch(
 ) -> Option<crate::http::Response> {
     let (handle, request) = page_net_prepare(ctx, target, method, body, headers)?;
     phase(&format!("src: PAGE-SYNC {}", request.url));
-    handle.block_on(crate::http::fetch(&request)).ok()
+    // A synchronous fetch must block the page thread, but it can be reached from
+    // INSIDE the job loop — an iframe-hydrate sweep or a sync XHR running as a
+    // microtask — which is itself driven by `handle.block_on`. Nesting a second
+    // `block_on` there aborts ("Cannot start a runtime from within a runtime"),
+    // killing the engine. So drive the request on the runtime via `spawn` and
+    // wait on a plain channel: the same no-nested-`block_on` shape that
+    // `PageCache::block_on_fetch` uses. Outside the job loop (a top-level sync
+    // XHR) this behaves identically — the spawned task runs on the app runtime
+    // and the page thread blocks on the channel until it lands.
+    let (tx, rx) = std::sync::mpsc::channel();
+    handle.spawn(async move {
+        let _ = tx.send(crate::http::fetch(&request).await);
+    });
+    rx.recv().ok().and_then(|r| r.ok())
 }
 
 /// Get a module body for `resolved` THROUGH the shared cache, BLOCKING
@@ -2448,6 +2557,132 @@ fn sys_ws_close(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
         && let Some(tx) = wsh.sockets.borrow().get(&(id as usize))
     {
         let _ = tx.try_send(crate::ws::WsOut::Close(code, reason));
+    }
+    Ok(JsValue::undefined())
+}
+
+// ---- Web Workers ------------------------------------------------------
+//
+// The page side. `new Worker(url)` calls `__worker_spawn`; `postMessage`/
+// `terminate` call `__worker_post`/`__worker_terminate`. A worker's own
+// `self.postMessage`/`close` (running on the worker thread) call
+// `__worker_self_post`/`__worker_self_close` against its `WorkerSelf` host.
+
+/// `__worker_spawn(scriptURL, type, name)` → a worker id (>0), or -1 if workers
+/// aren't available here (no-net / one-shot transform), the URL is bad/blocked,
+/// or the per-page cap is reached. Spawns a dedicated `trust-worker-N` thread.
+fn sys_worker_spawn(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let url_arg = match args.first() {
+        Some(v) => v.to_string(ctx)?.to_std_string_lossy(),
+        None => return Ok(JsValue::new(-1)),
+    };
+    let kind = match args.get(1).map(|v| v.to_string(ctx)) {
+        Some(Ok(s)) if s.to_std_string_lossy() == "module" => WorkerKind::Module,
+        _ => WorkerKind::Classic,
+    };
+    let name = match args.get(2) {
+        Some(v) if !v.is_null_or_undefined() => v.to_string(ctx)?.to_std_string_lossy(),
+        _ => String::new(),
+    };
+    let host = ctx.realm().host_defined();
+    let Some(workers) = host.get::<PageWorkers>() else {
+        return Ok(JsValue::new(-1)); // no-net page / one-shot transform / nested worker
+    };
+    let Ok(resolved) = workers.page.join(&url_arg) else {
+        return Ok(JsValue::new(-1));
+    };
+    if !matches!(resolved.scheme(), "http" | "https") {
+        return Ok(JsValue::new(-1)); // blob:/data: worker scripts not supported in v1
+    }
+    if !crate::http::subresource_allowed(&workers.page, &resolved) {
+        return Ok(JsValue::new(-1)); // SSRF guard, same as fetch
+    }
+    if workers.workers.borrow().len() >= MAX_WORKERS {
+        return Ok(JsValue::new(-1));
+    }
+    let id = workers.next_id.get();
+    workers.next_id.set(id + 1);
+    let (ctl_tx, ctl_rx) = tokio::sync::mpsc::channel::<WorkerCtl>(64);
+    let handle = workers.handle.clone();
+    let to_page = workers.events.clone();
+    // The worker runs on its OWN 64MB-stack OS thread (Boa's parser recurses on
+    // the native stack; same reason the page thread is wide). Named `trust-*` so
+    // the panic hook swallows a Boa VM panic into a graceful per-worker degrade.
+    let spawned = std::thread::Builder::new()
+        .name(format!("trust-worker-{id}"))
+        .stack_size(PAGE_STACK)
+        .spawn(move || run_worker(id, resolved, kind, name, handle, to_page, ctl_rx));
+    if spawned.is_err() {
+        return Ok(JsValue::new(-1));
+    }
+    workers
+        .workers
+        .borrow_mut()
+        .insert(id, WorkerHandle { ctl: ctl_tx });
+    Ok(JsValue::new(id as i32))
+}
+
+/// `__worker_post(id, serialized)` — deliver a structured-clone wire string to a
+/// worker as a `message`. Non-blocking (the channel is generous).
+fn sys_worker_post(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let id = args.first().map_or(Ok(-1.0), |v| v.to_number(ctx))? as i64;
+    let data = match args.get(1) {
+        Some(v) => v.to_string(ctx)?.to_std_string_lossy(),
+        None => String::new(),
+    };
+    let host = ctx.realm().host_defined();
+    let Some(workers) = host.get::<PageWorkers>() else {
+        return Ok(JsValue::new(false));
+    };
+    if id >= 0
+        && let Some(w) = workers.workers.borrow().get(&(id as usize))
+    {
+        let _ = w.ctl.try_send(WorkerCtl::Message(data));
+        return Ok(JsValue::new(true));
+    }
+    Ok(JsValue::new(false))
+}
+
+/// `__worker_terminate(id)` — stop a worker. Removing its handle drops the
+/// control sender, which closes the worker's command channel; the worker's loop
+/// sees `None` and exits (a `Terminate` is also sent so it stops promptly even
+/// mid-park). Idempotent.
+fn sys_worker_terminate(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let id = args.first().map_or(Ok(-1.0), |v| v.to_number(ctx))? as i64;
+    let host = ctx.realm().host_defined();
+    let Some(workers) = host.get::<PageWorkers>() else {
+        return Ok(JsValue::undefined());
+    };
+    if id >= 0
+        && let Some(w) = workers.workers.borrow_mut().remove(&(id as usize))
+    {
+        let _ = w.ctl.try_send(WorkerCtl::Terminate);
+    }
+    Ok(JsValue::undefined())
+}
+
+/// `__worker_self_post(serialized)` — a worker posting a message back to its
+/// page (`self.postMessage`). Runs on the worker thread, against its own
+/// `WorkerSelf` host. No-op on the page context (no `WorkerSelf`).
+fn sys_worker_self_post(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let data = match args.first() {
+        Some(v) => v.to_string(ctx)?.to_std_string_lossy(),
+        None => String::new(),
+    };
+    let host = ctx.realm().host_defined();
+    if let Some(slf) = host.get::<WorkerSelf>() {
+        let _ = slf.to_page.try_send((slf.id, WorkerOut::Message(data)));
+    }
+    Ok(JsValue::undefined())
+}
+
+/// `__worker_self_close()` — a worker requesting its own shutdown (`self.close`).
+/// Sets the `closed` flag; the worker's event loop checks it after the current
+/// turn and exits.
+fn sys_worker_self_close(_: &JsValue, _args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let host = ctx.realm().host_defined();
+    if let Some(slf) = host.get::<WorkerSelf>() {
+        slf.closed.set(true);
     }
     Ok(JsValue::undefined())
 }
@@ -3260,6 +3495,7 @@ fn load_page(
     env: &PageEnv,
     ws_events: Option<tokio::sync::mpsc::Sender<(usize, crate::ws::WsIn)>>,
     fetch_events: Option<FetchSender>,
+    worker_events: Option<WorkerSender>,
 ) -> Result<LoadedPage, Outcome> {
     phase("load_page start (DOM parse)");
     phases_reset();
@@ -3279,7 +3515,20 @@ fn load_page(
     if !env.sheets.is_empty() {
         dom.borrow_mut().attach_external_sheets(&env.sheets);
     }
-    let scripts = dom.borrow().scripts();
+    // Drop classic scripts marked `nomodule`: they target user agents WITHOUT
+    // module support, and we execute module scripts, so a real browser never
+    // runs them (HTML §"prepare the script element": a classic+nomodule script
+    // is not executed when module scripts are supported). Running them loads the
+    // legacy polyfill payload (e.g. core-js) that force-replaces platform globals
+    // like `URL` with its own — exactly the build a modern browser skips. Module
+    // scripts ignore `nomodule`, so this only filters classic ones.
+    let scripts: Vec<_> = {
+        let d = dom.borrow();
+        d.scripts()
+            .into_iter()
+            .filter(|(_, _, ty, node)| !(is_classic(ty) && d.attr(*node, "nomodule").is_some()))
+            .collect()
+    };
     if scripts.is_empty() {
         // No JS ran: the original bytes stand (so <noscript> content
         // still renders, as it should).
@@ -3337,6 +3586,21 @@ fn load_page(
                 next_id: std::cell::Cell::new(1),
             });
         }
+        // Register the Worker host BEFORE any script runs, for the same reason
+        // as PageWs: a page may `new Worker(...)` at load time. Only the
+        // resident-actor path supplies a `worker_events` sender (the one-shot
+        // `transform` gets None → `__worker_spawn` returns -1, no workers).
+        if let (Some(worker_tx), Some(handle), Some(page)) =
+            (worker_events, env.net.clone(), parsed_url.clone())
+        {
+            host.insert(PageWorkers {
+                handle,
+                page,
+                events: worker_tx,
+                workers: RefCell::new(std::collections::HashMap::new()),
+                next_id: std::cell::Cell::new(1),
+            });
+        }
         // Geometry backing: a layout pass over this same arena answers the JS
         // box APIs. Needs an absolute base to resolve hrefs during layout; if
         // the page URL didn't parse, `__dom_rect` is simply absent and the
@@ -3358,10 +3622,15 @@ fn load_page(
     // CSS-pixel viewport from the real terminal: cols/rows times the
     // terminal's cell pixel size (the picker's font size; 8x16 nominal).
     let cfg = format!(
-        "globalThis.__trust_cfg = {{ url: \"{}\", ua: \"TRust/0.1\", width: {}, height: {} }};",
+        "globalThis.__trust_cfg = {{ url: \"{}\", ua: \"TRust/0.1\", width: {}, height: {}, hardwareConcurrency: {} }};",
         esc_js(page_url),
         u32::from(viewport.0) * u32::from(cell_px.0.max(1)),
         u32::from(viewport.1) * u32::from(cell_px.1.max(1)),
+        // navigator.hardwareConcurrency reports the real host logical-processor
+        // count (HTML NavigatorConcurrentHardware) — honest, not a fixed spoof.
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8),
     );
     run_script(&mut ctx, "config", cfg.as_bytes(), &budget, &mut outcome);
     run_prelude(&mut ctx, &budget, &mut outcome);
@@ -3895,7 +4164,7 @@ pub fn css_finish(mut dom: Dom, sheets: &[(String, String)]) -> String {
 }
 
 pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
-    match load_page(html, env, None, None) {
+    match load_page(html, env, None, None, None) {
         Err(outcome) => (html.to_string(), outcome),
         Ok(mut page) => {
             // One-shot snapshot: no resident actor will run deferred timers
@@ -3940,6 +4209,10 @@ pub enum PageCmd {
     /// settle, re-render. This is how a socket.io stream (chat tokens) drives
     /// the page with no busy-poll — a frame is just another event.
     Ws { id: usize, event: crate::ws::WsIn },
+    /// A Web Worker posted a message back (or errored). The worker thread
+    /// forwards `(id, WorkerOut)`; dispatched like a click — fire the JS event,
+    /// settle, re-render. This is how a worker's result drives the page.
+    Worker { id: usize, event: WorkerOut },
     /// The user scrolled the laid-out document; `x`/`y` are the viewport's
     /// top-left in CSS px (document origin). Updates `window.scrollY`, fires the
     /// viewport `scroll` event, and re-runs IntersectionObserver — so a site's
@@ -3992,6 +4265,20 @@ const DISPATCH_BUDGET: Duration = Duration::from_secs(1);
 const DISPATCH_NET_GRACE: Duration = Duration::from_secs(300);
 /// Settle ticks allowed after a dispatch (load-time settle uses MAX_TICKS).
 const DISPATCH_TICKS: usize = 50;
+/// Settle ticks per AT-REST wake (the idle `timer_wake` loop). Unlike a dispatch
+/// — which settles a click's whole cascade to completion (`DISPATCH_TICKS`) — an
+/// at-rest wake fires ONE generation of due timers (one event-loop "task"), drains
+/// the microtask checkpoint, and returns to the sleep. A callback that re-arms a
+/// 0-delay timer (React's scheduler MessageChannel loop; an Apollo poll that never
+/// settles because its data is gated behind a bot wall) therefore advances at the
+/// `WAKE_FLOOR` cadence (~15fps) instead of running 50 generations crammed into a
+/// single virtual instant per wake — which pegged a CPU core on any page that
+/// never reaches a stable state. `setInterval`/`requestAnimationFrame` are
+/// future-dated, so they already fire one generation per wake and are unaffected;
+/// only a due-NOW re-arming chain is rate-limited, and one task per turn is the
+/// faithful event-loop model regardless. A finite deferred chain still completes,
+/// just one step per frame.
+const REST_TICKS: usize = 1;
 /// The page thread owns all parsing/execution: same wide stack as the
 /// one-shot path (Boa's parser recursion, see CLAUDE.md).
 const PAGE_STACK: usize = 64 * 1024 * 1024;
@@ -4044,6 +4331,558 @@ pub fn spawn_page(
         // The dropped evt sender tells the caller the page is gone.
     }
     (PageHandle { cmds: cmd_tx }, evt_rx)
+}
+
+/// The full worker-scope JS: the shared structured-clone codec (extracted from
+/// PRELUDE so it's a single source of truth) followed by the DOM-less worker
+/// global scope. Built once per process.
+fn worker_prelude() -> &'static str {
+    static WP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    WP.get_or_init(|| {
+        let codec = PRELUDE
+            .split_once("/*__SC_CODEC_BEGIN__*/")
+            .and_then(|(_, rest)| rest.split_once("/*__SC_CODEC_END__*/"))
+            .map(|(c, _)| c)
+            .unwrap_or("");
+        format!("{codec}\n{WORKER_SCOPE}")
+    })
+    .as_str()
+}
+
+/// The Web Worker global scope (HTML WorkerGlobalScope + DedicatedWorkerGlobal
+/// Scope), DOM-LESS by design — a worker has no window/document (libraries detect
+/// worker context via `typeof window === 'undefined'`). Built over the same
+/// integer syscalls as the page, plus a self-contained real-time event loop the
+/// Rust `run_worker` loop drives via `__wkr.now()/nextDeadline()/tick()/message()`.
+const WORKER_SCOPE: &str = r##"
+(function () {
+    var g = globalThis;
+    var cfg = g.__worker_cfg || { id: 0, name: "", url: "about:blank", hwc: 8 };
+    function errStr(where, e) { return where + ": " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : ""); }
+
+    // --- the real-time event-loop core (driven by the Rust worker thread) ---
+    var WK = g.__wkr = {
+        timers: [], nextId: 1, nowMs: 0, errors: [],
+        now: function () { return this.nowMs; },
+        nextDeadline: function () {
+            var min = null;
+            for (var i = 0; i < this.timers.length; i++) { var a = this.timers[i].at; if (min === null || a < min) min = a; }
+            return min;
+        },
+        tick: function (realNow) {
+            this.nowMs = realNow;
+            var due = [];
+            for (var i = 0; i < this.timers.length; i++) if (this.timers[i].at <= this.nowMs) due.push(this.timers[i]);
+            due.sort(function (a, b) { return a.at - b.at; });
+            for (var j = 0; j < due.length; j++) {
+                var t = due[j];
+                if (t.interval) t.at = this.nowMs + t.delay; else removeTimer(t.id);
+                try { t.fn.apply(g, t.args); } catch (e) { this.errors.push(errStr("Uncaught", e)); }
+            }
+        },
+        message: function (s) {
+            var data;
+            try { data = g.__sc_deserialize(s); }
+            catch (e) { fireScope("messageerror", new MessageEvent("messageerror", {})); return; }
+            fireScope("message", new MessageEvent("message", { data: data, origin: "" }));
+        },
+        takeErrors: function () { var e = this.errors; this.errors = []; return e.join("\u001e"); }
+    };
+    function addTimer(fn, delay, args, interval) {
+        if (typeof fn !== "function") return 0;
+        delay = +delay; if (!(delay >= 0)) delay = 0;
+        var id = WK.nextId++;
+        WK.timers.push({ id: id, at: WK.nowMs + delay, delay: delay, fn: fn, args: args || [], interval: !!interval });
+        return id;
+    }
+    function removeTimer(id) { for (var i = 0; i < WK.timers.length; i++) if (WK.timers[i].id === id) { WK.timers.splice(i, 1); return; } }
+
+    // --- EventTarget on the worker global ---
+    var LS = new Map();
+    function lsFor(type) { var l = LS.get(type); if (!l) { l = []; LS.set(type, l); } return l; }
+    g.addEventListener = function (type, fn) {
+        if (typeof fn === "function" || (fn && typeof fn.handleEvent === "function")) { var l = lsFor(String(type)); if (l.indexOf(fn) < 0) l.push(fn); }
+    };
+    g.removeEventListener = function (type, fn) { var l = lsFor(String(type)); var i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); };
+    g.dispatchEvent = function (ev) {
+        ev.target = g; ev.currentTarget = g;
+        var l = lsFor(ev.type).slice();
+        for (var i = 0; i < l.length; i++) { try { (typeof l[i] === "function") ? l[i].call(g, ev) : l[i].handleEvent(ev); } catch (e) { WK.errors.push(errStr(ev.type + " handler", e)); } }
+        return !ev.defaultPrevented;
+    };
+    function fireScope(type, ev) {
+        var h = g["on" + type];
+        if (typeof h === "function") { try { h.call(g, ev); } catch (e) { WK.errors.push(errStr("on" + type, e)); } }
+        g.dispatchEvent(ev);
+    }
+
+    // --- Event / MessageEvent / ErrorEvent ---
+    function Event(type, init) { init = init || {}; this.type = String(type); this.bubbles = !!init.bubbles; this.cancelable = !!init.cancelable; this.defaultPrevented = false; this.target = null; this.currentTarget = null; this.timeStamp = Date.now(); }
+    Event.prototype.preventDefault = function () { if (this.cancelable) this.defaultPrevented = true; };
+    Event.prototype.stopPropagation = function () {}; Event.prototype.stopImmediatePropagation = function () {};
+    function MessageEvent(type, init) { Event.call(this, type, init); init = init || {}; this.data = init.data; this.origin = init.origin || ""; this.lastEventId = init.lastEventId || ""; this.source = init.source || null; this.ports = init.ports || []; }
+    MessageEvent.prototype = Object.create(Event.prototype);
+    function ErrorEvent(type, init) { Event.call(this, type, init); init = init || {}; this.message = init.message || ""; this.filename = init.filename || ""; this.lineno = init.lineno || 0; this.colno = init.colno || 0; this.error = init.error || null; }
+    ErrorEvent.prototype = Object.create(Event.prototype);
+    g.Event = Event; g.MessageEvent = MessageEvent; g.ErrorEvent = ErrorEvent;
+    g.CustomEvent = function CustomEvent(type, init) { MessageEvent.call(this, type, init); this.detail = (init && init.detail !== undefined) ? init.detail : null; };
+    g.CustomEvent.prototype = Object.create(MessageEvent.prototype);
+
+    if (!g.DOMException) { g.DOMException = function (message, name) { var e = new Error(message || ""); e.name = name || "Error"; return e; }; }
+
+    // --- self / postMessage / close / on* (DedicatedWorkerGlobalScope) ---
+    g.self = g;
+    g.name = cfg.name || "";
+    g.onmessage = null; g.onmessageerror = null; g.onerror = null;
+    g.postMessage = function (message, transfer) { __worker_self_post(g.__sc_serialize(message)); };
+    g.close = function () { __worker_self_close(); };
+
+    // --- timers / microtasks / performance ---
+    g.setTimeout = function (fn, delay) { return addTimer(fn, delay, Array.prototype.slice.call(arguments, 2), false); };
+    g.setInterval = function (fn, delay) { return addTimer(fn, delay, Array.prototype.slice.call(arguments, 2), true); };
+    g.clearTimeout = function (id) { removeTimer(id); };
+    g.clearInterval = function (id) { removeTimer(id); };
+    g.queueMicrotask = function (fn) { Promise.resolve().then(function () { try { fn(); } catch (e) { WK.errors.push(errStr("queueMicrotask", e)); } }); };
+    var perfOrigin = Date.now();
+    g.performance = { now: function () { return Date.now() - perfOrigin; }, timeOrigin: perfOrigin };
+
+    // --- console: a worker's console isn't surfaced; no-op (never throws) ---
+    var noop = function () {};
+    g.console = { log: noop, info: noop, warn: noop, error: noop, debug: noop, trace: noop, dir: noop, assert: noop, group: noop, groupCollapsed: noop, groupEnd: noop, table: noop, count: noop, time: noop, timeEnd: noop };
+
+    // --- location (WorkerLocation) ---
+    var lp = __url_parse(cfg.url, null) || [cfg.url, "", "", "", "", "/", "", "", "", "", ""];
+    g.location = { href: lp[0], protocol: lp[1], host: lp[2], hostname: lp[3], port: lp[4], pathname: lp[5], search: lp[6], hash: lp[7], origin: lp[8], toString: function () { return lp[0]; } };
+
+    // --- navigator (WorkerNavigator), the same honest values as the page ---
+    g.navigator = {
+        userAgent: "TRust/0.1", appName: "Netscape", appCodeName: "Mozilla", product: "Gecko", productSub: "20100101",
+        platform: "Linux", vendor: "", vendorSub: "", language: "en-US", languages: ["en-US", "en"], onLine: true,
+        hardwareConcurrency: cfg.hwc || 8, maxTouchPoints: 0
+    };
+
+    // --- atob / btoa ---
+    var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    g.btoa = function (s) {
+        s = String(s); var out = "", i = 0;
+        while (i < s.length) {
+            var c1 = s.charCodeAt(i++), c2 = s.charCodeAt(i++), c3 = s.charCodeAt(i++);
+            var e1 = c1 >> 2, e2 = ((c1 & 3) << 4) | (c2 >> 4), e3 = ((c2 & 15) << 2) | (c3 >> 6), e4 = c3 & 63;
+            if (isNaN(c2)) { e3 = 64; e4 = 64; } else if (isNaN(c3)) { e4 = 64; }
+            out += B64.charAt(e1) + B64.charAt(e2) + (e3 === 64 ? "=" : B64.charAt(e3)) + (e4 === 64 ? "=" : B64.charAt(e4));
+        }
+        return out;
+    };
+    g.atob = function (s) {
+        s = String(s).replace(/[^A-Za-z0-9+/]/g, ""); var out = "", i = 0, bits = 0, acc = 0;
+        while (i < s.length) { var idx = B64.indexOf(s.charAt(i++)); if (idx < 0) continue; acc = (acc << 6) | idx; bits += 6; if (bits >= 8) { bits -= 8; out += String.fromCharCode((acc >> bits) & 0xFF); } }
+        return out;
+    };
+
+    // --- TextEncoder / TextDecoder (UTF-8) ---
+    function TextEncoder() {}
+    TextEncoder.prototype.encoding = "utf-8";
+    TextEncoder.prototype.encode = function (s) {
+        s = String(s === undefined ? "" : s); var bytes = [];
+        for (var i = 0; i < s.length; i++) {
+            var c = s.charCodeAt(i);
+            if (c < 0x80) bytes.push(c);
+            else if (c < 0x800) bytes.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
+            else if (c >= 0xD800 && c <= 0xDBFF) { var c2 = s.charCodeAt(++i); var cp = 0x10000 + ((c & 0x3FF) << 10) + (c2 & 0x3FF); bytes.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)); }
+            else bytes.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
+        }
+        return new Uint8Array(bytes);
+    };
+    function TextDecoder(label) { this.encoding = (label || "utf-8").toLowerCase(); this.fatal = false; }
+    TextDecoder.prototype.decode = function (buf) {
+        if (!buf) return "";
+        var bytes = (buf instanceof Uint8Array) ? buf : (buf.buffer ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) : new Uint8Array(buf));
+        var out = "", i = 0;
+        while (i < bytes.length) {
+            var c = bytes[i++];
+            if (c < 0x80) out += String.fromCharCode(c);
+            else if (c < 0xE0) out += String.fromCharCode(((c & 0x1F) << 6) | (bytes[i++] & 0x3F));
+            else if (c < 0xF0) out += String.fromCharCode(((c & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F));
+            else { var cp = ((c & 0x07) << 18) | ((bytes[i++] & 0x3F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F); cp -= 0x10000; out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF)); }
+        }
+        return out;
+    };
+    g.TextEncoder = TextEncoder; g.TextDecoder = TextDecoder;
+
+    // --- crypto ---
+    g.crypto = {
+        getRandomValues: function (a) { for (var i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 4294967296); return a; },
+        randomUUID: function () { var h = ""; for (var i = 0; i < 36; i++) { if (i === 8 || i === 13 || i === 18 || i === 23) h += "-"; else if (i === 14) h += "4"; else if (i === 19) h += (8 + Math.floor(Math.random() * 4)).toString(16); else h += Math.floor(Math.random() * 16).toString(16); } return h; }
+    };
+
+    // --- Blob / File (string-backed, like the page engine's) ---
+    function Blob(parts, opts) {
+        this.__parts = Array.isArray(parts) ? parts.slice() : (parts != null ? [parts] : []);
+        opts = opts || {}; this.type = opts.type || "";
+        var size = 0; for (var i = 0; i < this.__parts.length; i++) { var p = this.__parts[i]; size += (typeof p === "string") ? p.length : ((p && p.byteLength) || 0); }
+        this.size = size;
+    }
+    Blob.prototype.__text = function () { return this.__parts.map(function (p) { return typeof p === "string" ? p : ""; }).join(""); };
+    Blob.prototype.text = function () { return Promise.resolve(this.__text()); };
+    Blob.prototype.slice = function () { return new Blob(this.__parts, { type: this.type }); };
+    Blob.prototype.arrayBuffer = function () { var t = this.__text(), b = new Uint8Array(t.length); for (var i = 0; i < t.length; i++) b[i] = t.charCodeAt(i) & 0xFF; return Promise.resolve(b.buffer); };
+    function File(parts, name, opts) { Blob.call(this, parts, opts); this.name = String(name); this.lastModified = (opts && opts.lastModified) || Date.now(); }
+    File.prototype = Object.create(Blob.prototype);
+    g.Blob = Blob; g.File = File;
+
+    // --- structuredClone (in-realm, via the shared codec) ---
+    g.structuredClone = function (v) { return g.__sc_deserialize(g.__sc_serialize(v)); };
+
+    // --- URLSearchParams / URL (over the __url_parse syscall) ---
+    function URLSearchParams(init) {
+        this.__l = [];
+        if (typeof init === "string") { var s = init.charAt(0) === "?" ? init.slice(1) : init; if (s) s.split("&").forEach(function (pair) { var eq = pair.indexOf("="); var k = eq < 0 ? pair : pair.slice(0, eq); var v = eq < 0 ? "" : pair.slice(eq + 1); this.__l.push([decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))]); }, this); }
+        else if (init && typeof init.forEach === "function") { init.forEach(function (v, k) { this.__l.push([String(k), String(v)]); }, this); }
+        else if (init && typeof init === "object") { for (var key in init) if (Object.prototype.hasOwnProperty.call(init, key)) this.__l.push([key, String(init[key])]); }
+    }
+    URLSearchParams.prototype.get = function (k) { for (var i = 0; i < this.__l.length; i++) if (this.__l[i][0] === k) return this.__l[i][1]; return null; };
+    URLSearchParams.prototype.getAll = function (k) { var r = []; for (var i = 0; i < this.__l.length; i++) if (this.__l[i][0] === k) r.push(this.__l[i][1]); return r; };
+    URLSearchParams.prototype.has = function (k) { return this.get(k) !== null; };
+    URLSearchParams.prototype.set = function (k, v) { var done = false; for (var i = this.__l.length - 1; i >= 0; i--) if (this.__l[i][0] === k) { if (done) this.__l.splice(i, 1); else { this.__l[i][1] = String(v); done = true; } } if (!done) this.__l.push([k, String(v)]); };
+    URLSearchParams.prototype.append = function (k, v) { this.__l.push([String(k), String(v)]); };
+    URLSearchParams.prototype["delete"] = function (k) { for (var i = this.__l.length - 1; i >= 0; i--) if (this.__l[i][0] === k) this.__l.splice(i, 1); };
+    URLSearchParams.prototype.forEach = function (cb, t) { for (var i = 0; i < this.__l.length; i++) cb.call(t, this.__l[i][1], this.__l[i][0], this); };
+    URLSearchParams.prototype.toString = function () { return this.__l.map(function (p) { return encodeURIComponent(p[0]) + "=" + encodeURIComponent(p[1]); }).join("&"); };
+    function URL(url, base) {
+        var p = __url_parse(String(url), base != null ? String(base) : null);
+        if (!p) throw new TypeError("Invalid URL: " + url);
+        this.href = p[0]; this.protocol = p[1]; this.host = p[2]; this.hostname = p[3]; this.port = p[4];
+        this.pathname = p[5]; this.search = p[6]; this.hash = p[7]; this.origin = p[8]; this.username = p[9]; this.password = p[10];
+        this.searchParams = new URLSearchParams(p[6]);
+    }
+    URL.prototype.toString = function () { return this.href; };
+    g.URL = URL; g.URLSearchParams = URLSearchParams;
+
+    // --- importScripts (classic, synchronous fetch + global eval) ---
+    g.importScripts = function () {
+        for (var i = 0; i < arguments.length; i++) {
+            var u = String(arguments[i]);
+            var rp = __url_parse(u, g.location.href); if (rp) u = rp[0];
+            var r = __http_fetch(u, "GET", null, null, "");
+            if (!r || r[0] < 200 || r[0] >= 300) throw new Error("importScripts failed: " + u + " (" + (r ? r[0] : "network error") + ")");
+            (0, eval)(r[2]);
+        }
+    };
+
+    // --- fetch (sync-backed in v1: blocks the worker thread, never the page) ---
+    function makeResponse(status, ctype, text, url) {
+        return {
+            ok: status >= 200 && status < 300, status: status, statusText: "", url: url, redirected: false, type: "basic", bodyUsed: false,
+            headers: { get: function (n) { return String(n).toLowerCase() === "content-type" ? ctype : null; }, has: function (n) { return String(n).toLowerCase() === "content-type"; }, forEach: function () {} },
+            text: function () { return Promise.resolve(text); },
+            json: function () { return Promise.resolve(JSON.parse(text)); },
+            arrayBuffer: function () { var b = new Uint8Array(text.length); for (var i = 0; i < text.length; i++) b[i] = text.charCodeAt(i) & 0xFF; return Promise.resolve(b.buffer); },
+            blob: function () { return Promise.resolve(new Blob([text], { type: ctype || "" })); },
+            clone: function () { return makeResponse(status, ctype, text, url); }
+        };
+    }
+    g.fetch = function (input, init) {
+        init = init || {};
+        var url = (input && input.url) ? input.url : String(input);
+        var rp = __url_parse(url, g.location.href); if (rp) url = rp[0];
+        var method = String(init.method || (input && input.method) || "GET").toUpperCase();
+        var body = (init.body != null) ? String(init.body) : null;
+        var r = __http_fetch(url, method, body, null, "");
+        if (!r) return Promise.reject(new TypeError("Failed to fetch: " + url));
+        return Promise.resolve(makeResponse(r[0], r[1], r[2], url));
+    };
+})();
+"##;
+
+/// What unblocked a worker's at-rest loop: a control message from the page
+/// (`None` = the page dropped the worker → exit), or its next-timer deadline.
+enum WWake {
+    Ctl(Option<WorkerCtl>),
+    Timer,
+}
+
+/// Run one Web Worker on this dedicated `trust-worker-N` thread for its whole
+/// life: build a DOM-less Boa context, run the worker prelude, fetch + run the
+/// worker script, then a real-time timed-park event loop driven by page control
+/// messages and the worker's own timers — the same shape as the page actor's
+/// at-rest loop, minus the DOM. Exits when the page drops the worker (control
+/// channel closes), on `terminate()`/`self.close()`, or when told to stop. Every
+/// eval is `catch_unwind`-guarded and the thread is named `trust-*` so a Boa VM
+/// panic degrades THIS worker (an `error` to the page) instead of the process.
+fn run_worker(
+    id: usize,
+    script_url: url::Url,
+    kind: WorkerKind,
+    name: String,
+    handle: tokio::runtime::Handle,
+    to_page: WorkerSender,
+    mut ctl_rx: tokio::sync::mpsc::Receiver<WorkerCtl>,
+) {
+    let _ = kind; // v1 loads a module worker's entry as a classic script (fast-follow)
+    let (mut ctx, _hooks) = page_context_with(None);
+    if register_syscalls(&mut ctx).is_err() {
+        let _ = to_page.try_send((id, WorkerOut::Error(String::from("worker syscalls failed"))));
+        return;
+    }
+    let budget = Rc::new(Budget::new(WALL_BUDGET));
+    {
+        let mut host = ctx.realm().host_defined_mut();
+        host.insert(WorkerSelf {
+            id,
+            to_page: to_page.clone(),
+            closed: std::cell::Cell::new(false),
+        });
+        // The worker's own network access (script fetch / importScripts / a
+        // sync-backed fetch), metered + SSRF-guarded like the page's, based at
+        // the worker script's URL. Sync only in v1 (`__http_fetch`), so no
+        // background-fetch sender and a private cache it doesn't share.
+        host.insert(PageNet {
+            handle: handle.clone(),
+            page: script_url.clone(),
+            budget: budget.clone(),
+            fetched: std::cell::Cell::new(0),
+            dispatch: std::cell::Cell::new(false),
+            fetch_events: None,
+            next_fetch_id: std::cell::Cell::new(1),
+            cache: std::sync::Arc::new(crate::http::PageCache::default()),
+        });
+    }
+    let mut outcome = Outcome::default();
+    let cfg = format!(
+        "globalThis.__worker_cfg = {{ id: {id}, name: {}, url: {} }};",
+        js_string(&name),
+        js_string(script_url.as_str()),
+    );
+    run_script(
+        &mut ctx,
+        "worker-config",
+        cfg.as_bytes(),
+        &budget,
+        &mut outcome,
+    );
+    run_script(
+        &mut ctx,
+        "worker-prelude",
+        worker_prelude().as_bytes(),
+        &budget,
+        &mut outcome,
+    );
+    if !outcome.errors.is_empty() {
+        let _ = to_page.try_send((id, WorkerOut::Error(outcome.errors.join("; "))));
+        return;
+    }
+    // Fetch the worker's script (HTML "run a worker": fetch the classic script,
+    // then run it). A non-2xx / failed fetch fires `error` on the page-side
+    // Worker and the thread exits — the worker never starts.
+    let script = match page_net_fetch(
+        &mut ctx,
+        script_url.as_str(),
+        String::from("GET"),
+        None,
+        Vec::new(),
+    ) {
+        Some(resp) if (200..300).contains(&resp.status) => {
+            String::from_utf8_lossy(&resp.body).into_owned()
+        }
+        _ => {
+            let _ = to_page.try_send((
+                id,
+                WorkerOut::Error(format!("worker script failed to load: {script_url}")),
+            ));
+            return;
+        }
+    };
+    run_script(
+        &mut ctx,
+        "worker-script",
+        script.as_bytes(),
+        &budget,
+        &mut outcome,
+    );
+    drain_worker_jobs(&mut ctx, &mut outcome);
+    report_worker_errors(&mut ctx, &to_page, id, &mut outcome);
+    if worker_closed(&mut ctx) {
+        return;
+    }
+
+    // The real-time at-rest loop. Each `rt.block_on(select)` RETURNS before the
+    // eval below runs, so the worker's own sync fetch (which drives the app
+    // runtime via spawn + a std channel, not a nested block_on) is never nested
+    // under it — exactly the page actor's discipline.
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return,
+    };
+    loop {
+        let base_ms = worker_now(&mut ctx);
+        let wall = std::time::Instant::now();
+        let sleep_dur = worker_next_deadline(&mut ctx)
+            .map(|at| Duration::from_millis((at - base_ms).max(0.0) as u64).max(WAKE_FLOOR));
+        let wake = rt.block_on(async {
+            tokio::select! {
+                biased;
+                cmd = ctl_rx.recv() => WWake::Ctl(cmd),
+                () = sleep_or_pending(sleep_dur) => WWake::Timer,
+            }
+        });
+        // A fresh per-turn budget, like the page's prepare_dispatch.
+        budget.rearm(DISPATCH_NET_GRACE);
+        match wake {
+            WWake::Ctl(None) | WWake::Ctl(Some(WorkerCtl::Terminate)) => break,
+            WWake::Ctl(Some(WorkerCtl::Message(s))) => {
+                let call = format!("__wkr.message({})", js_string(&s));
+                run_script(&mut ctx, "worker", call.as_bytes(), &budget, &mut outcome);
+            }
+            WWake::Timer => {
+                let real_now = base_ms + wall.elapsed().as_millis() as f64;
+                let call = format!("__wkr.tick({real_now})");
+                run_script(&mut ctx, "worker", call.as_bytes(), &budget, &mut outcome);
+            }
+        }
+        drain_worker_jobs(&mut ctx, &mut outcome);
+        report_worker_errors(&mut ctx, &to_page, id, &mut outcome);
+        if worker_closed(&mut ctx) {
+            break;
+        }
+    }
+}
+
+/// Drain a worker context's microtask/promise jobs (sync — a worker's `fetch`
+/// is sync-backed in v1, so there are no async net jobs to park on). Panic-safe
+/// like `run_jobs_into`.
+fn drain_worker_jobs(ctx: &mut Context, outcome: &mut Outcome) {
+    let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.run_jobs()));
+    match drained {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => outcome.errors.push(format!("worker job: {err}")),
+        Err(_) => {
+            outcome
+                .errors
+                .push(String::from("worker job: engine panic (Boa bug)"));
+            outcome.panicked = true;
+        }
+    }
+}
+
+/// Forward a worker's uncaught errors (top-level script throws collected in
+/// `outcome`, plus handler throws the worker prelude buffered in `__wkr.errors`)
+/// to the page as `error` events on the Worker object.
+fn report_worker_errors(
+    ctx: &mut Context,
+    to_page: &WorkerSender,
+    id: usize,
+    outcome: &mut Outcome,
+) {
+    for e in outcome.errors.drain(..) {
+        let _ = to_page.try_send((id, WorkerOut::Error(e)));
+    }
+    // Handler errors the prelude buffered (joined by RS \x1e).
+    let joined = ctx
+        .eval(Source::from_bytes(b"__wkr.takeErrors()"))
+        .ok()
+        .and_then(|v| v.as_string().map(|s| s.to_std_string_lossy()));
+    if let Some(joined) = joined {
+        for e in joined.split('\u{1e}').filter(|s| !s.is_empty()) {
+            let _ = to_page.try_send((id, WorkerOut::Error(e.to_string())));
+        }
+    }
+}
+
+/// `__wkr.now()` — the worker's current virtual clock (ms), for the next-deadline
+/// math (mirrors `js_now`).
+fn worker_now(ctx: &mut Context) -> f64 {
+    ctx.eval(Source::from_bytes(b"__wkr.now()"))
+        .ok()
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0)
+}
+
+/// `__wkr.nextDeadline()` — ms of the next due worker timer, or null/None when
+/// the queue is empty (then the loop parks purely on the control channel).
+fn worker_next_deadline(ctx: &mut Context) -> Option<f64> {
+    ctx.eval(Source::from_bytes(b"__wkr.nextDeadline()"))
+        .ok()
+        .and_then(|v| v.as_number())
+}
+
+/// Whether the worker called `self.close()`.
+fn worker_closed(ctx: &mut Context) -> bool {
+    ctx.realm()
+        .host_defined()
+        .get::<WorkerSelf>()
+        .is_some_and(|s| s.closed.get())
+}
+
+/// Spawn the forwarder relaying a page's worker→page messages/errors into the
+/// command stream as `PageCmd::Worker` (dispatched like a click). The
+/// `PageWorkers` host is registered earlier in `load_page`, so a worker created
+/// during page load already has somewhere to deliver; this connects its event
+/// channel to the actor. Weak sender, exactly like the WS forwarder, so it can't
+/// keep the actor alive after the app drops the page handle.
+fn setup_page_workers(
+    page: &LoadedPage,
+    mut worker_evt_rx: tokio::sync::mpsc::Receiver<(usize, WorkerOut)>,
+    cmd_self: &tokio::sync::mpsc::Sender<PageCmd>,
+) {
+    let Some(handle) = page
+        .ctx
+        .realm()
+        .host_defined()
+        .get::<PageNet>()
+        .map(|n| n.handle.clone())
+    else {
+        return;
+    };
+    let weak = cmd_self.downgrade();
+    handle.spawn(async move {
+        while let Some((id, event)) = worker_evt_rx.recv().await {
+            let Some(tx) = weak.upgrade() else { break };
+            if tx.send(PageCmd::Worker { id, event }).await.is_err() {
+                break; // actor gone
+            }
+        }
+    });
+}
+
+/// Deliver a worker→page event (a `message` or an `error`) into the page's JS:
+/// `__trust.workerMessage`/`workerError` find the Worker by id, build the event,
+/// and fire it. Same dispatch shape as `dispatch_ws_in`.
+fn dispatch_worker_in(page: &mut LoadedPage, id: usize, event: WorkerOut) {
+    prepare_dispatch(page);
+    let call = match event {
+        WorkerOut::Message(s) => format!("__trust.workerMessage({id},{})", js_string(&s)),
+        WorkerOut::Error(msg) => format!("__trust.workerError({id},{})", js_string(&msg)),
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        page.ctx.eval(Source::from_bytes(call.as_bytes()))
+    })) {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => page.outcome.errors.push(format!("worker event: {err}")),
+        Err(_) => {
+            page.outcome.errors.push(String::from(
+                "worker event: engine panic (Boa bug) — page JS halted",
+            ));
+            page.outcome.panicked = true;
+            return;
+        }
+    }
+    let mut dispatch_outcome = Outcome::default();
+    settle(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
+    settle_image_loads(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
+    page.outcome.errors.extend(dispatch_outcome.errors);
 }
 
 /// Spawn the forwarder relaying a page's inbound WebSocket events into the
@@ -4099,6 +4938,11 @@ fn page_actor(
     // and settles the promise + re-renders. Sized generously — a page can have
     // many in-flight requests (`Promise.all([...])`).
     let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::channel::<(usize, FetchResult)>(64);
+    // Worker→page channel: a worker thread posts `(id, WorkerOut)` here when it
+    // calls `self.postMessage` or errors; the forwarder (spawned after load)
+    // relays each as `PageCmd::Worker`. Registered into the page context DURING
+    // load_page so a worker created at load time has somewhere to deliver.
+    let (worker_evt_tx, worker_evt_rx) = tokio::sync::mpsc::channel::<(usize, WorkerOut)>(64);
     // Keep one sender alive for the actor's whole life. `load_page` only stores
     // the sender (in `PageNet`) for a NET page; a no-net page drops the clone we
     // pass in, which would CLOSE `fetch_rx` → `recv()` returns `Ready(None)`
@@ -4106,7 +4950,13 @@ fn page_actor(
     // arm (a CPU spin + frozen timers). This keepalive holds the channel open so
     // `recv()` stays pending until a real background fetch posts back.
     let _fetch_keepalive = fetch_tx.clone();
-    let mut page = match load_page(&html, &env, Some(ws_evt_tx), Some(fetch_tx)) {
+    let mut page = match load_page(
+        &html,
+        &env,
+        Some(ws_evt_tx),
+        Some(fetch_tx),
+        Some(worker_evt_tx),
+    ) {
         Ok(page) => page,
         Err(outcome) => {
             let _ = evts.blocking_send(PageEvt::Static { html, outcome });
@@ -4114,6 +4964,7 @@ fn page_actor(
         }
     };
     setup_page_ws(&page, ws_evt_rx, &cmd_self);
+    setup_page_workers(&page, worker_evt_rx, &cmd_self);
     // Drop our own strong command sender now: only the app's handle should keep
     // the channel open, so `cmds.recv()` returns `None` (and the actor exits)
     // the moment the app drops the page. The WS forwarder holds only a weak one.
@@ -4184,8 +5035,13 @@ fn page_actor(
         // A page with IO observers / scroll listeners stays live to receive
         // scroll, even with no clickables or timers (see `js_has_scroll_work`).
         let has_scroll_work = js_has_scroll_work(&mut page);
+        // A page that spawned a live Worker stays resident too: the worker runs
+        // on its own thread and can post a message back at any time, which the
+        // actor must be alive to deliver. (The actor owns the worker handles —
+        // exiting here would drop and terminate them.)
+        let has_workers = page_has_workers(&page);
         let outcome = std::mem::take(&mut page.outcome);
-        if !has_clickables && !painted_live && !has_timers && !has_scroll_work {
+        if !has_clickables && !painted_live && !has_timers && !has_scroll_work && !has_workers {
             let _ = evts.blocking_send(PageEvt::Static { html: out, outcome });
             return;
         }
@@ -4345,6 +5201,26 @@ fn page_actor(
                 }
                 // A socket frame that mutated the DOM (a streamed chat token)
                 // re-renders progressively, like any other dispatch.
+                if !finish_dispatch(&mut page, &evts) {
+                    return;
+                }
+            }
+            PageCmd::Worker { id, event } => {
+                dispatch_worker_in(&mut page, id, event);
+                drain_js_side(&mut page.ctx, &mut page.outcome);
+                if page.outcome.panicked {
+                    let _ = evts
+                        .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+                    return;
+                }
+                if let Some(url) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                // A worker message that mutated the DOM (its result rendered into
+                // the page) re-renders like any other dispatch.
                 if !finish_dispatch(&mut page, &evts) {
                     return;
                 }
@@ -4553,7 +5429,7 @@ fn timer_wake(
     settle_to(
         &mut page.ctx,
         &page.budget,
-        DISPATCH_TICKS,
+        REST_TICKS,
         &mut page.outcome,
         real_now,
     );
@@ -4736,6 +5612,17 @@ fn js_has_scroll_work(page: &mut LoadedPage) -> bool {
         .ok()
         .and_then(|v| v.as_boolean())
         .unwrap_or(false)
+}
+
+/// Does this page have at least one live Web Worker? Such a page must stay
+/// resident so the actor can deliver a worker's `postMessage` back (and so it
+/// keeps owning the worker handles — see the actor's stay-alive gate).
+fn page_has_workers(page: &LoadedPage) -> bool {
+    page.ctx
+        .realm()
+        .host_defined()
+        .get::<PageWorkers>()
+        .is_some_and(|w| !w.workers.borrow().is_empty())
 }
 
 fn take_script_navigation(page: &mut LoadedPage) -> Option<String> {
@@ -5066,10 +5953,12 @@ fn dispatch_click_in(page: &mut LoadedPage, node: usize) -> Option<String> {
 /// Collect external script srcs (raw attribute values, document order)
 /// so the fetch pipeline can resolve and download them first.
 pub fn external_scripts(html: &str) -> Vec<String> {
-    Dom::parse_document(html)
-        .scripts()
+    let dom = Dom::parse_document(html);
+    dom.scripts()
         .into_iter()
-        .filter(|(_, _, t, _)| is_classic(t))
+        // Classic, and not `nomodule` (we support modules, so a real browser
+        // skips nomodule classic scripts — don't prefetch what won't run).
+        .filter(|(_, _, t, node)| is_classic(t) && dom.attr(*node, "nomodule").is_none())
         .filter_map(|(src, _, _, _)| src)
         .collect()
 }
@@ -5188,6 +6077,11 @@ const PRELUDE: &str = r##"
         if (!node || node.localName !== "script" || SCRIPTS_STARTED.has(node.__id)) return;
         const ty = (node.getAttribute("type") || "").trim().toLowerCase();
         if (ty && ty !== "text/javascript" && ty !== "application/javascript" && ty !== "text/ecmascript") return;
+        // A classic script carrying `nomodule` is skipped: it exists only for
+        // user agents WITHOUT module support, and we run module scripts (HTML
+        // §"prepare the script element"). Letting it run loads the legacy
+        // polyfill bundle a real browser never executes.
+        if (node.hasAttribute("nomodule")) return;
         // Only a script connected to the document runs (not one built up inside
         // a detached fragment, which executes when ITS root is later inserted).
         let n = node, connected = false;
@@ -6438,7 +7332,10 @@ const PRELUDE: &str = r##"
                 createLinearGradient() { return { addColorStop() {} }; },
                 createRadialGradient() { return { addColorStop() {} }; },
                 createPattern() { return null; },
+                createConicGradient() { return { addColorStop() {} }; },
                 setLineDash() {}, getLineDash() { return []; },
+                isPointInPath() { return false; }, isPointInStroke() { return false; },
+                drawFocusIfNeeded() {},
             });
         }
         toDataURL() { return "data:,"; }
@@ -7545,6 +8442,21 @@ const PRELUDE: &str = r##"
             g[__cn] = __C;
         }
     }
+    // WebGL interface objects. We have no GPU, so canvas.getContext('webgl'|
+    // 'webgl2') returns null (HTMLCanvasElement above) — EXACTLY a browser with
+    // WebGL blocklisted / hardware acceleration off. But the interface objects
+    // themselves still exist on a modern browser regardless of whether a context
+    // can be obtained, and feature-detection reads `'WebGLRenderingContext' in
+    // window`; omitting them reads as "a browser too old to know WebGL" instead
+    // of the truthful "modern browser, WebGL unavailable on this machine". They
+    // are non-constructible interface objects, so call/`new` throws a TypeError
+    // ("Illegal constructor"), matching the platform. We expose NO context and
+    // NO renderer string — that fabricated fingerprint surface stays absent.
+    for (const __n of ["WebGLRenderingContext", "WebGL2RenderingContext"]) {
+        const __C = function () { throw new TypeError("Illegal constructor"); };
+        try { Object.defineProperty(__C, "name", { value: __n }); } catch (e) {}
+        g[__n] = __C;
+    }
     g.Image = class { constructor() { return g.document.createElement("img"); } };
     // `new Audio(src)` — the legacy HTMLAudioElement constructor (parallel to
     // Image). Returns an <audio> element with no-op media methods: TRust never
@@ -7560,6 +8472,18 @@ const PRELUDE: &str = r##"
             // (canPlayType reports honest support for mpv-playable formats).
             return el;
         }
+    };
+    // Path2D — the Canvas geometry container (a declared <canvas> path). We
+    // paint no raster, so it records nothing and no-ops its building methods,
+    // but it MUST exist and be constructable: code that does `new Path2D()` /
+    // `new Path2D(svgPath)` and feeds it to ctx.fill(path)/stroke(path)/clip(path)
+    // (which already ignore the arg) otherwise hits a ReferenceError on the bare
+    // global (Twitch's polyfills reference it unguarded).
+    g.Path2D = class Path2D {
+        constructor(_path) {}
+        addPath() {} closePath() {} moveTo() {} lineTo() {}
+        bezierCurveTo() {} quadraticCurveTo() {} arc() {} arcTo() {}
+        ellipse() {} rect() {} roundRect() {}
     };
     // Blob/File — a standard data container. We don't do real binary I/O, but
     // sites construct Blobs (object URLs, sanitizer/worker plumbing, feature
@@ -7750,6 +8674,43 @@ const PRELUDE: &str = r##"
         userAgent: cfg.ua, language: "en-US", languages: ["en-US", "en"],
         platform: "Linux", cookieEnabled: true, onLine: true,
         plugins: [], mimeTypes: [], webdriver: false,
+        // Spec-mandated Navigator members (HTML §"Client identification" /
+        // NavigatorConcurrentHardware; maxTouchPoints from Pointer Events).
+        // appCodeName/appName/product/vendorSub are FROZEN compatibility
+        // constants every conformant browser returns verbatim regardless of
+        // engine; vendor/productSub take the non-Chrome/non-WebKit (Gecko-mode)
+        // values — the honest residual for a client that is neither. appVersion
+        // is the UA with a leading "Mozilla/" stripped (we carry none → the UA
+        // itself). hardwareConcurrency is the real host core count; we are not a
+        // touch device so maxTouchPoints is 0. These are honest values for our
+        // environment that legit feature-detection reads, NOT browser-spoofing
+        // (returning `undefined` makes us look subtly broken to standard code).
+        appCodeName: "Mozilla", appName: "Netscape", product: "Gecko",
+        productSub: "20100101", vendor: "", vendorSub: "",
+        appVersion: String(cfg.ua).replace(/^Mozilla\//, ""),
+        doNotTrack: null,
+        hardwareConcurrency: cfg.hardwareConcurrency || 8, maxTouchPoints: 0,
+        // Permissions API (navigator.permissions.query) — feature-detected
+        // widely. Returns a Promise<PermissionStatus>. We grant no device/UA
+        // capability, so every query resolves to the neutral pre-decision
+        // "prompt" state (the spec default before any user choice — honest:
+        // we have made no grant, and the state never changes so onchange never
+        // fires). A missing/non-string descriptor name rejects with TypeError
+        // per spec; we accept any other name (permissive over the long tail of
+        // vendor-specific names, rather than the spec's reject-unknown).
+        permissions: {
+            query(desc) {
+                if (desc == null || typeof desc.name !== "string") {
+                    return Promise.reject(new TypeError(
+                        "Failed to execute 'query' on 'Permissions': required member name is undefined."));
+                }
+                return Promise.resolve({
+                    name: desc.name, state: "prompt", onchange: null,
+                    addEventListener() {}, removeEventListener() {},
+                    dispatchEvent() { return false; },
+                });
+            },
+        },
     };
     g.screen = { width: cfg.width, height: cfg.height, availWidth: cfg.width, availHeight: cfg.height, colorDepth: 24, pixelDepth: 24 };
     g.innerWidth = cfg.width; g.innerHeight = cfg.height;
@@ -8682,6 +9643,41 @@ const PRELUDE: &str = r##"
         if (resolve) { delete trust.pendingFetches[id]; resolve(value); }
     };
     g.queueMicrotask = (fn) => { Promise.resolve().then(fn).catch((e) => trust.errors.push("microtask: " + ((e && e.message) || e))); };
+    // FinalizationRegistry (ES2021). Boa ships WeakRef/WeakMap/WeakSet but not
+    // this; libraries that build caches keyed on GC (Apollo's @wry/caches,
+    // emotion, lit's reactive controllers) feature-detect it, and some construct
+    // it unconditionally → a bare ReferenceError without it. The cleanup callback
+    // is NEVER guaranteed to run (spec §FinalizationRegistry — implementations
+    // "may never" call it), and a headless parse-time engine has no JS-visible GC
+    // finalization hook, so we never fire it. We still validate inputs like a real
+    // engine and track the unregister token WEAKLY (a WeakSet — no leak) so
+    // unregister() answers correctly. This is a conformant "never collects"
+    // registry, not a fake.
+    class FinalizationRegistry {
+        constructor(cleanup) {
+            if (typeof cleanup !== "function") throw new TypeError("FinalizationRegistry: cleanup callback must be callable");
+            this.__cleanup = cleanup;
+            this.__tokens = new WeakSet();
+        }
+        get [Symbol.toStringTag]() { return "FinalizationRegistry"; }
+        register(target, heldValue, unregisterToken) {
+            if (target === null || (typeof target !== "object" && typeof target !== "function"))
+                throw new TypeError("FinalizationRegistry.register: target must be an object");
+            if (target === heldValue)
+                throw new TypeError("FinalizationRegistry.register: target and held value must not be the same");
+            if (unregisterToken !== undefined) {
+                if (typeof unregisterToken !== "object" && typeof unregisterToken !== "function")
+                    throw new TypeError("FinalizationRegistry.register: unregister token must be an object");
+                this.__tokens.add(unregisterToken);
+            }
+        }
+        unregister(unregisterToken) {
+            if (unregisterToken === null || (typeof unregisterToken !== "object" && typeof unregisterToken !== "function"))
+                throw new TypeError("FinalizationRegistry.unregister: token must be an object");
+            return this.__tokens.delete(unregisterToken);
+        }
+    }
+    g.FinalizationRegistry = FinalizationRegistry;
     // The HTML structured-clone algorithm: a deep copy that follows the
     // object graph (handling cycles), supported by every browser as a global.
     // Apps lean on it to snapshot state before mutating (Open WebUI's chat
@@ -9328,15 +10324,31 @@ const PRELUDE: &str = r##"
     }
     const dec = (s) => { try { return decodeURIComponent(String(s).replace(/\+/g, " ")); } catch { return String(s); } };
     class URLSearchParams {
+        // WHATWG: init may be a string ("?"-prefixed query), another
+        // URLSearchParams (copy its list), a sequence of [name,value] pairs, or
+        // a record object. Getting all four right matters beyond correctness:
+        // core-js feature-tests `new URLSearchParams(new URLSearchParams("a=b"))`
+        // (and URL.username, live forEach) and REPLACES our whole URL/USP with
+        // its own polyfill if any check fails — and that polyfill then misbehaves
+        // on later pages (Twitch's app threw on it). Passing the battery keeps our
+        // native, url-crate-backed implementation in play.
         constructor(init) {
             this.__p = [];
-            if (typeof init === "string") {
+            if (init === undefined || init === null) return;
+            if (init instanceof URLSearchParams) {
+                for (const p of init.__p) this.__p.push([p[0], p[1]]);
+            } else if (typeof init === "string") {
                 for (const kv of init.replace(/^\?/, "").split("&")) {
                     if (!kv) continue;
                     const i = kv.indexOf("=");
                     this.__p.push(i < 0 ? [dec(kv), ""] : [dec(kv.slice(0, i)), dec(kv.slice(i + 1))]);
                 }
-            } else if (init && typeof init === "object") {
+            } else if (typeof init[Symbol.iterator] === "function") {
+                for (const pair of init) {
+                    const a = Array.from(pair);
+                    this.__p.push([String(a[0]), String(a[1])]);
+                }
+            } else if (typeof init === "object") {
                 for (const k of Object.keys(init)) this.__p.push([String(k), String(init[k])]);
             }
         }
@@ -9346,7 +10358,12 @@ const PRELUDE: &str = r##"
         set(k, v) { this.delete(k); this.__p.push([String(k), String(v)]); }
         append(k, v) { this.__p.push([String(k), String(v)]); }
         delete(k) { this.__p = this.__p.filter((p) => p[0] !== String(k)); }
-        forEach(fn) { for (const [k, v] of this.__p.slice()) fn(v, k, this); }
+        get size() { return this.__p.length; }
+        sort() { this.__p.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); }
+        // Live iteration (WebIDL maplike forEach): re-read length/index each step,
+        // so deleting/appending during the callback affects what's visited — what
+        // core-js's `r.delete("b")`-inside-forEach probe asserts ("a1c3").
+        forEach(fn, thisArg) { for (let i = 0; i < this.__p.length; i++) { const e = this.__p[i]; fn.call(thisArg, e[1], e[0], this); } }
         keys() { return this.__p.map((p) => p[0])[Symbol.iterator](); }
         values() { return this.__p.map((p) => p[1])[Symbol.iterator](); }
         entries() { return this.__p.slice()[Symbol.iterator](); }
@@ -9359,6 +10376,7 @@ const PRELUDE: &str = r##"
             if (!r) throw new TypeError("Invalid URL: " + href);
             this.href = r[0]; this.protocol = r[1]; this.host = r[2]; this.hostname = r[3];
             this.port = r[4]; this.pathname = r[5]; this.search = r[6]; this.hash = r[7]; this.origin = r[8];
+            this.username = r[9] || ""; this.password = r[10] || "";
         }
         get searchParams() { return new URLSearchParams(this.search); }
         toString() { return this.href; }
@@ -9686,6 +10704,182 @@ const PRELUDE: &str = r##"
             delete WS_REGISTRY[id];
             ws.__fire("close", { code: code, reason: reason || "", wasClean: code === 1000 });
         }
+    };
+
+    // ---- Web Workers --------------------------------------------------------
+    // The structured-clone WIRE CODEC (HTML "StructuredSerialize" /
+    // "StructuredDeserialize"): serialize a value to a self-contained JSON string
+    // and back, for cross-thread postMessage. OBJECTS enter a heap array
+    // (referenced by index) so cycles and shared identity round-trip; primitives
+    // encode inline. Symbols, functions, and DOM/platform nodes throw
+    // DataCloneError, per spec. This exact block is SHARED with every worker —
+    // the Rust `worker_prelude()` extracts it between the two markers below, so
+    // edit it ONCE here. (Self-contained IIFE over globalThis → runs identically
+    // in the page realm and a worker realm.)
+    /*__SC_CODEC_BEGIN__*/
+    (function (G) {
+        var TYPED = { Int8Array: 1, Uint8Array: 1, Uint8ClampedArray: 1, Int16Array: 1, Uint16Array: 1, Int32Array: 1, Uint32Array: 1, Float32Array: 1, Float64Array: 1, BigInt64Array: 1, BigUint64Array: 1 };
+        function dce(what) {
+            try { return new (G.DOMException || Error)(what + " could not be cloned.", "DataCloneError"); }
+            catch (e) { var er = new Error(what + " could not be cloned."); er.name = "DataCloneError"; return er; }
+        }
+        function blobBytes(b) {
+            return (b.__parts || []).map(function (p) { return typeof p === "string" ? p : ""; }).join("");
+        }
+        function enc(value, heap, seen) {
+            var t = typeof value;
+            if (value === undefined) return ["u"];
+            if (value === null) return ["z"];
+            if (t === "boolean") return ["b", value];
+            if (t === "string") return ["s", value];
+            if (t === "number") {
+                if (value !== value) return ["fs", "n"];
+                if (value === Infinity) return ["fs", "i"];
+                if (value === -Infinity) return ["fs", "g"];
+                if (value === 0 && 1 / value === -Infinity) return ["fs", "z"];
+                return ["d", value];
+            }
+            if (t === "bigint") return ["bi", value.toString()];
+            if (t === "symbol") throw dce("A Symbol");
+            if (t === "function") throw dce("A function");
+            if (seen.has(value)) return ["r", seen.get(value)];
+            var idx = heap.length;
+            heap.push(0);
+            seen.set(value, idx);
+            heap[idx] = encObj(value, heap, seen);
+            return ["r", idx];
+        }
+        function encObj(v, heap, seen) {
+            if (G.Node && v instanceof G.Node) throw dce("A DOM node");
+            if (v instanceof Date) return ["D", v.getTime()];
+            if (v instanceof RegExp) return ["R", v.source, v.flags];
+            if (typeof Map !== "undefined" && v instanceof Map) {
+                var m = []; v.forEach(function (val, key) { m.push([enc(key, heap, seen), enc(val, heap, seen)]); });
+                return ["M", m];
+            }
+            if (typeof Set !== "undefined" && v instanceof Set) {
+                var s = []; v.forEach(function (val) { s.push(enc(val, heap, seen)); });
+                return ["S", s];
+            }
+            if (v instanceof ArrayBuffer) return ["AB", Array.prototype.slice.call(new Uint8Array(v))];
+            var cn = v.constructor && v.constructor.name;
+            if (cn === "DataView" && v.buffer instanceof ArrayBuffer) return ["DV", enc(v.buffer, heap, seen), v.byteOffset, v.byteLength];
+            if (cn && TYPED[cn] && v.buffer instanceof ArrayBuffer) return ["TA", cn, enc(v.buffer, heap, seen), v.byteOffset, v.length];
+            if (G.File && v instanceof G.File) return ["F", blobBytes(v), v.type || "", v.name || "", v.lastModified || 0];
+            if (G.Blob && v instanceof G.Blob) return ["B", blobBytes(v), v.type || ""];
+            if (v instanceof Error) return ["E", v.name || "Error", v.message || "", v.stack || ""];
+            if (Array.isArray(v)) {
+                var ap = [];
+                for (var k in v) if (Object.prototype.hasOwnProperty.call(v, k)) ap.push([k, enc(v[k], heap, seen)]);
+                return ["A", v.length, ap];
+            }
+            var op = [], keys = Object.keys(v);
+            for (var i = 0; i < keys.length; i++) op.push([keys[i], enc(v[keys[i]], heap, seen)]);
+            return ["O", op];
+        }
+        G.__sc_serialize = function (value) {
+            var heap = [];
+            var root = enc(value, heap, new Map());
+            return JSON.stringify([root, heap]);
+        };
+        // Pass 1: build leaves fully + empty containers (so refs/cycles resolve).
+        function shell(node) {
+            switch (node[0]) {
+                case "D": return new Date(node[1]);
+                case "R": return new RegExp(node[1], node[2]);
+                case "M": return new Map();
+                case "S": return new Set();
+                case "AB": return new Uint8Array(node[1]).buffer;
+                case "F": return G.File ? new G.File([node[1]], node[3], { type: node[2], lastModified: node[4] }) : new G.Blob([node[1]], { type: node[2] });
+                case "B": return G.Blob ? new G.Blob([node[1]], { type: node[2] }) : { __blobText: node[1], type: node[2] };
+                case "E": { var e = new Error(node[2]); e.name = node[1]; if (node[3]) try { e.stack = node[3]; } catch (x) {} return e; }
+                case "A": return new Array(node[1]);
+                case "O": return {};
+            }
+            return null; // TA / DV: built in pass 2 (need the buffer ref resolved)
+        }
+        function decRef(val, built) {
+            switch (val[0]) {
+                case "u": return undefined;
+                case "z": return null;
+                case "b": case "s": case "d": return val[1];
+                case "fs": return val[1] === "n" ? NaN : val[1] === "i" ? Infinity : val[1] === "g" ? -Infinity : -0;
+                case "bi": return BigInt(val[1]);
+                case "r": return built[val[1]];
+            }
+            return undefined;
+        }
+        G.__sc_deserialize = function (str) {
+            var parsed = JSON.parse(str), root = parsed[0], heap = parsed[1];
+            var built = new Array(heap.length), i;
+            for (i = 0; i < heap.length; i++) built[i] = shell(heap[i]);
+            // Pass 2: typed arrays / DataView (their buffer is an AB leaf, now built).
+            for (i = 0; i < heap.length; i++) {
+                var n = heap[i];
+                if (n[0] === "TA") built[i] = new G[n[1]](decRef(n[2], built), n[3], n[4]);
+                else if (n[0] === "DV") built[i] = new DataView(decRef(n[1], built), n[2], n[3]);
+            }
+            // Pass 3: fill containers (all referents now exist → cycles close).
+            for (i = 0; i < heap.length; i++) {
+                var node = heap[i], obj = built[i], j;
+                if (node[0] === "M") { for (j = 0; j < node[1].length; j++) obj.set(decRef(node[1][j][0], built), decRef(node[1][j][1], built)); }
+                else if (node[0] === "S") { for (j = 0; j < node[1].length; j++) obj.add(decRef(node[1][j], built)); }
+                else if (node[0] === "A") { for (j = 0; j < node[2].length; j++) obj[node[2][j][0]] = decRef(node[2][j][1], built); }
+                else if (node[0] === "O") { for (j = 0; j < node[1].length; j++) obj[node[1][j][0]] = decRef(node[1][j][1], built); }
+            }
+            return decRef(root, built);
+        };
+    })(typeof globalThis !== "undefined" ? globalThis : this);
+    /*__SC_CODEC_END__*/
+
+    // The page side of Web Workers. `new Worker(url)` spawns a real second engine
+    // on its own thread (`__worker_spawn`); messages cross as structured-clone
+    // wire strings. Worker→page events arrive via `trust.workerMessage/Error`
+    // (the actor dispatches them like a click). Mirrors the WebSocket class.
+    trust.workers = {};
+    class Worker extends EventTarget {
+        constructor(url, options) {
+            super();
+            options = options || {};
+            const type = options.type === "module" ? "module" : "classic";
+            const name = options.name != null ? String(options.name) : "";
+            this.onmessage = null; this.onmessageerror = null; this.onerror = null;
+            let href = String(url);
+            try { href = new g.URL(href, g.location.href).href; } catch (e) {}
+            this.__id = __worker_spawn(href, type, name);
+            if (this.__id > 0) trust.workers[this.__id] = this;
+        }
+        postMessage(message, _transfer) {
+            if (this.__id <= 0) return;
+            // Structured clone (may throw DataCloneError synchronously, per spec).
+            __worker_post(this.__id, g.__sc_serialize(message));
+        }
+        terminate() {
+            if (this.__id > 0) {
+                __worker_terminate(this.__id);
+                delete trust.workers[this.__id];
+                this.__id = -1;
+            }
+        }
+        __fire(type, ev) {
+            const h = this["on" + type];
+            if (typeof h === "function") { try { h.call(this, ev); } catch (e) { trust.errors.push("worker on" + type + ": " + ((e && e.message) || e)); } }
+            this.dispatchEvent(ev);
+        }
+    }
+    g.Worker = Worker;
+    const __origin = () => (g.location && g.location.origin) || "";
+    trust.workerMessage = function (id, s) {
+        const w = trust.workers[id];
+        if (!w) return;
+        let data;
+        try { data = g.__sc_deserialize(s); }
+        catch (e) { w.__fire("messageerror", new MessageEvent("messageerror", { origin: __origin() })); return; }
+        w.__fire("message", new MessageEvent("message", { data: data, origin: __origin() }));
+    };
+    trust.workerError = function (id, msg) {
+        const w = trust.workers[id];
+        if (w) w.__fire("error", new ErrorEvent("error", { message: String(msg) }));
     };
 
     // Flatten a header map ({lowercased-name: value}) into the `k\nv\nk\nv`
@@ -12546,6 +13740,62 @@ mod tests {
     }
 
     #[test]
+    fn an_at_rest_timeout_chain_fires_one_generation_per_wake() {
+        // A perpetual `setTimeout(0)` re-arm chain — the shape React's scheduler
+        // takes (its MessageChannel posts route through our `setTimeout(0)`), and
+        // the shape a never-settling poll takes when its data is gated behind a
+        // bot wall (Twitch). It fast-forwards during the load settle (to ~MAX_TICKS)
+        // and then continues AT REST. Each at-rest wake must fire ONE generation
+        // (`REST_TICKS`), not drain the re-arming chain dozens of times per wake —
+        // the latter pegged a CPU core on any page that never reaches a fixpoint,
+        // because `settle_to` would re-fire the due-now timer up to `DISPATCH_TICKS`
+        // times in a SINGLE wake. So the counter climbs by a SMALL step between
+        // consecutive at-rest renders, not ~50.
+        let (_handle, mut events) = live(
+            r##"<body><div id="n">COUNT=0</div><script>
+            var n = 0;
+            (function chain() {
+                n++;
+                document.getElementById('n').textContent = 'COUNT=' + n;
+                setTimeout(chain, 0);
+            })();
+            </script></body>"##,
+        );
+        let mut counts = vec![];
+        for _ in 0..80 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => {
+                    if let Some(c) = marked_count(&html) {
+                        counts.push(c);
+                    }
+                    if counts.len() >= 5 {
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                Some(PageEvt::Static { .. }) => panic!("a timer-chain page must stay live"),
+                other => panic!("expected a render, got {other:?}"),
+            }
+        }
+        assert!(
+            counts.len() >= 4,
+            "expected several at-rest renders, got {counts:?}"
+        );
+        // The chain advances (it's alive), but the STEADY at-rest increment per
+        // render is one generation per wake. Skip the first delta — it spans the
+        // load→rest handoff (the load fast-forwarded the chain to ~MAX_TICKS).
+        let deltas: Vec<u64> = counts.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            counts.last().unwrap() > counts.first().unwrap(),
+            "the chain must keep advancing at rest: {counts:?}"
+        );
+        assert!(
+            deltas[1..].iter().all(|&d| d <= 4),
+            "each at-rest wake fires ~one generation (REST_TICKS), not ~DISPATCH_TICKS: deltas {deltas:?}"
+        );
+    }
+
+    #[test]
     fn an_interval_keeps_ticking_at_rest() {
         // A page whose ONLY behavior is a `setInterval` incrementing a counter —
         // no clickables, no forms. Before the living-engine loop this went
@@ -12765,6 +14015,170 @@ mod tests {
         assert!(
             url.ends_with("/next"),
             "resolved against the page base: {url}"
+        );
+    }
+
+    /// Web Worker, end-to-end through the page actor: a page creates a real
+    /// `Worker` (a second engine on its own thread), posts it a structured-clone
+    /// message, and the worker echoes a (mutated) reply back, which fires the
+    /// page's `onmessage` and re-renders. Proves the whole pipeline: spawn +
+    /// script fetch + DOM-less worker scope + bidirectional structured-clone
+    /// messaging + the worker→page forwarder + stay-alive-for-workers.
+    #[test]
+    fn a_worker_round_trips_a_structured_clone_message() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener =
+            rt.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+        let port = listener.local_addr().unwrap().port();
+        rt.spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).into_owned();
+                let reply: Vec<u8> = if text.starts_with("GET /worker.js ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n\
+                      self.onmessage = function (e) {\
+                        self.postMessage({ pong: e.data.ping + 1, who: self.name, items: [e.data.ping, 'x'] });\
+                      };"
+                    .to_vec()
+                } else {
+                    b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                };
+                let _ = sock.write_all(&reply).await;
+            }
+        });
+
+        let html = format!(
+            "<body><pre id=o></pre><script>\
+             var w = new Worker('http://127.0.0.1:{port}/worker.js', {{ name: 'echo' }});\
+             w.onmessage = function (e) {{ document.getElementById('o').textContent = 'GOT pong=' + e.data.pong + ' who=' + e.data.who + ' items=' + e.data.items.join('+'); }};\
+             w.onerror = function (e) {{ document.getElementById('o').textContent = 'ERR ' + e.message; }};\
+             w.postMessage({{ ping: 41 }});\
+             </script></body>"
+        );
+        let mut env = PageEnv::bare(&format!("http://127.0.0.1:{port}/"));
+        env.net = Some(rt.handle().clone());
+        let (handle, mut events) = spawn_page(html, env);
+
+        // Poll (not blocking_recv) so a stuck worker can't hang the suite.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut got = String::new();
+        while std::time::Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(PageEvt::Updated { html, .. }) | Ok(PageEvt::Static { html, .. }) => {
+                    got = html;
+                    if got.contains("GOT pong=") || got.contains("ERR ") {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        drop(handle);
+        assert!(
+            got.contains("GOT pong=42 who=echo items=41+x"),
+            "worker round-trip failed: {got}"
+        );
+    }
+
+    /// The worker scope is DOM-less and spec-shaped, and its own event loop runs
+    /// timers at rest. A worker MUST NOT expose `window`/`document` (libraries
+    /// detect worker context exactly that way); `self === globalThis`;
+    /// `importScripts` is callable; `navigator` is present. The reply is sent
+    /// from a `setTimeout` so it also proves the worker's real-time timer loop
+    /// fires without a message to pump it.
+    #[test]
+    fn a_worker_scope_is_dom_less_and_runs_timers() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener =
+            rt.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+        let port = listener.local_addr().unwrap().port();
+        rt.spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let reply: Vec<u8> = if String::from_utf8_lossy(&req).starts_with("GET /w.js ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n\
+                      self.onmessage = function () {\
+                        setTimeout(function () {\
+                          self.postMessage({ win: typeof window, doc: typeof document,\
+                            sg: (self === globalThis), imp: typeof importScripts,\
+                            hwc: navigator.hardwareConcurrency, t: 'fired' });\
+                        }, 30);\
+                      };"
+                    .to_vec()
+                } else {
+                    b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                };
+                let _ = sock.write_all(&reply).await;
+            }
+        });
+        let html = format!(
+            "<body><pre id=o></pre><script>\
+             var w = new Worker('http://127.0.0.1:{port}/w.js');\
+             w.onmessage = function (e) {{ var d = e.data; document.getElementById('o').textContent = \
+               'SCOPE win=' + d.win + ' doc=' + d.doc + ' sg=' + d.sg + ' imp=' + d.imp + ' hwc=' + (typeof d.hwc) + ' t=' + d.t; }};\
+             w.postMessage('go');\
+             </script></body>"
+        );
+        let mut env = PageEnv::bare(&format!("http://127.0.0.1:{port}/"));
+        env.net = Some(rt.handle().clone());
+        let (handle, mut events) = spawn_page(html, env);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut got = String::new();
+        while std::time::Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(PageEvt::Updated { html, .. }) | Ok(PageEvt::Static { html, .. }) => {
+                    got = html;
+                    if got.contains("SCOPE ") {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        drop(handle);
+        assert!(
+            got.contains(
+                "SCOPE win=undefined doc=undefined sg=true imp=function hwc=number t=fired"
+            ),
+            "worker scope/timer invariants: {got}"
         );
     }
 
@@ -15590,6 +17004,52 @@ mod tests {
     }
 
     #[test]
+    fn nomodule_classic_scripts_are_skipped() {
+        // We execute module scripts, so a classic script carrying `nomodule`
+        // must NOT run (HTML §"prepare the script element": it's the build for
+        // user agents WITHOUT module support). Running it loads the legacy
+        // differential-serving payload — e.g. core-js, which force-replaces
+        // platform globals like `URL`/`URLSearchParams` with its own polyfills.
+        // A plain classic script (no `nomodule`) still runs.
+        let (out, outcome) = page(
+            "<body><pre id=o>start</pre>\
+             <script nomodule>document.getElementById('o').textContent='NOMODULE-RAN';</script>\
+             <script>document.getElementById('o').textContent+='-classic';</script>\
+             </body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("start-classic") && !out.contains("NOMODULE-RAN"),
+            "nomodule skipped, classic ran: {out}"
+        );
+    }
+
+    #[test]
+    fn url_and_searchparams_pass_core_js_native_detection() {
+        // core-js feature-tests the native URL/URLSearchParams and REPLACES them
+        // with its own polyfill if any check fails — a polyfill that then
+        // misbehaves on real pages (Twitch's app threw "Invalid scheme" out of
+        // it). These are the exact checks core-js runs, so passing them keeps our
+        // url-crate-backed implementation in play: `URL.username`, constructing a
+        // URLSearchParams from another, and the live `forEach` (delete-during-
+        // iteration visits "a1c3", not "a1b2c3").
+        let (out, outcome) = page(
+            r#"<body><pre id=o></pre><script>
+            var u = new URL("https://user:pw@host:8/p?x#h");
+            var copy = new URLSearchParams(new URLSearchParams("a=b"));
+            var live = (function(){ var z=new URL("b?a=1&b=2&c=3","http://a"), r=z.searchParams, s="";
+                r.forEach(function(v,k){ r.delete("b"); s+=k+v; }); return s; })();
+            var ok = (u.username==="user") && (u.password==="pw") &&
+                     (copy.get("a")==="b") && (live==="a1c3") &&
+                     (new URLSearchParams("?a=1").size===1);
+            document.getElementById("o").textContent = ok ? "URLOK" : ("BAD u="+u.username+" copy="+copy.get("a")+" live="+live);
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("URLOK"), "URL/USP native detection: {out}");
+    }
+
+    #[test]
     fn document_element_from_point_exists_and_returns_an_element() {
         // `document.elementFromPoint` (CSSOM View) must EXIST — analytics/heatmap
         // libraries (Microsoft Clarity) call it at boot; missing it is a "not a
@@ -15944,6 +17404,179 @@ mod tests {
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("ok=true"), "structuredClone: {out}");
+    }
+
+    #[test]
+    fn finalization_registry_is_available_and_spec_shaped() {
+        // ES2021 `FinalizationRegistry` — Boa ships WeakRef/WeakMap/WeakSet but not
+        // this; caches keyed on GC (Apollo's @wry/caches, emotion, lit) feature-
+        // detect it and some construct it unconditionally, so its absence is a bare
+        // ReferenceError. We never fire the cleanup callback (spec-permitted: it
+        // "may never" run, and a headless engine has no JS GC hook), but the API
+        // shape and input validation must match a real engine, and `unregister`
+        // must answer correctly against the (weakly-held) token.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             const r = [];\
+             r.push(typeof FinalizationRegistry);\
+             const fr = new FinalizationRegistry(() => {});\
+             const tok = {};\
+             fr.register({}, 'held', tok);\
+             r.push(fr.unregister(tok));\
+             r.push(fr.unregister(tok));\
+             let badTok = false;\
+             try { fr.register({}, 'h', 'not-an-object'); } catch (e) { badTok = e instanceof TypeError; }\
+             r.push(badTok);\
+             let same = false; const t = {};\
+             try { fr.register(t, t); } catch (e) { same = e instanceof TypeError; }\
+             r.push(same);\
+             let badCb = false;\
+             try { new FinalizationRegistry(123); } catch (e) { badCb = e instanceof TypeError; }\
+             r.push(badCb);\
+             r.push(Object.prototype.toString.call(fr));\
+             document.getElementById('o').textContent = 'FR=' + r.join('|');\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("FR=function|true|false|true|true|true|[object FinalizationRegistry]"),
+            "FinalizationRegistry shape: {out}"
+        );
+    }
+
+    #[test]
+    fn navigator_exposes_spec_mandated_members() {
+        // The HTML Standard mandates a set of Navigator members every browser
+        // returns. We omitted several entirely (returning `undefined`), which
+        // makes us look subtly broken to standard feature-detection. These are
+        // honest values for our environment (Linux, non-touch, non-Chrome), not
+        // browser-spoofing: the frozen compatibility constants are mandated
+        // verbatim regardless of engine, and the rest are the honest residual.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             const n = navigator; const r = [];\
+             r.push(n.appCodeName);\
+             r.push(n.appName);\
+             r.push(n.product);\
+             r.push(n.productSub);\
+             r.push(JSON.stringify(n.vendor));\
+             r.push(JSON.stringify(n.vendorSub));\
+             r.push(JSON.stringify(n.doNotTrack));\
+             r.push(n.maxTouchPoints);\
+             r.push(typeof n.hardwareConcurrency);\
+             r.push(n.hardwareConcurrency >= 1);\
+             r.push(n.appVersion === n.userAgent.replace(/^Mozilla\\//, ''));\
+             (async () => {\
+               const ps = await n.permissions.query({ name: 'geolocation' });\
+               let rejected = false;\
+               try { await n.permissions.query({}); } catch (e) { rejected = e instanceof TypeError; }\
+               r.push('perm:' + ps.name + ':' + ps.state + ':' + rejected);\
+               document.getElementById('o').textContent = 'NAV=' + r.join('|');\
+             })();\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // appCodeName=Mozilla, appName=Netscape, product=Gecko (frozen
+        // constants); productSub=20100101 + vendor="" + vendorSub="" (Gecko
+        // mode); doNotTrack=null; maxTouchPoints=0; hardwareConcurrency is a
+        // number >=1; appVersion is the UA minus a leading "Mozilla/";
+        // permissions.query resolves to {name, state:"prompt"} and rejects a
+        // nameless descriptor with TypeError.
+        assert!(
+            out.contains(
+                "NAV=Mozilla|Netscape|Gecko|20100101|\"\"|\"\"|null|0|number|true|true|perm:geolocation:prompt:true"
+            ),
+            "navigator members: {out}"
+        );
+    }
+
+    #[test]
+    fn structured_clone_codec_round_trips_the_type_set() {
+        // The cross-thread postMessage wire codec (HTML StructuredSerialize/
+        // Deserialize). It must round-trip the full serializable type set AND
+        // preserve cycles + shared identity, and throw DataCloneError for
+        // functions/symbols. This is the foundation of Worker messaging.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             const S = __sc_serialize, D = __sc_deserialize, rt = (v) => D(S(v));\
+             const r = [];\
+             r.push(rt(42) === 42);\
+             r.push(rt('hi') === 'hi');\
+             r.push(rt(true) === true);\
+             r.push(rt(null) === null);\
+             r.push(rt(undefined) === undefined);\
+             r.push(Number.isNaN(rt(NaN)));\
+             r.push(rt(Infinity) === Infinity);\
+             r.push(1 / rt(-0) === -Infinity);\
+             r.push(rt(123n) === 123n);\
+             r.push(rt(new Date(1000)).getTime() === 1000);\
+             { const re = rt(/ab+c/gi); r.push(re.source === 'ab+c' && re.flags === 'gi'); }\
+             { const a = [1, , 3]; a.x = 'y'; const a2 = rt(a); r.push(a2.length === 3 && a2[0] === 1 && a2[2] === 3 && a2.x === 'y' && !(1 in a2)); }\
+             { const o = rt({ a: 1, b: { c: [2, 3] } }); r.push(o.a === 1 && o.b.c[1] === 3); }\
+             { const m = rt(new Map([['k', { v: 1 }]])); r.push(m.get('k').v === 1); }\
+             { const st = rt(new Set([1, 2, 2, 3])); r.push(st.size === 3 && st.has(2)); }\
+             { const buf = new Uint8Array([10, 20, 30]).buffer; const p = rt([new Uint8Array(buf), new Uint8Array(buf)]); r.push(p[0][1] === 20 && p[1][2] === 30 && p[0].buffer === p[1].buffer); }\
+             { const c = {}; c.self = c; const c2 = rt(c); r.push(c2.self === c2); }\
+             { const e = rt(new TypeError('boom')); r.push(e.name === 'TypeError' && e.message === 'boom'); }\
+             { let t = false; try { S(function () {}); } catch (er) { t = er.name === 'DataCloneError'; } r.push(t); }\
+             { let t = false; try { S(Symbol('x')); } catch (er) { t = er.name === 'DataCloneError'; } r.push(t); }\
+             document.getElementById('o').textContent = 'SC=' + r.join(',') + ';n=' + r.length;\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // Every check must be true (20 of them) and none false.
+        assert!(
+            out.contains("SC=") && out.contains(";n=20"),
+            "codec output: {out}"
+        );
+        let body = out.split("SC=").nth(1).unwrap_or("");
+        assert!(!body.contains("false"), "a codec round-trip failed: {out}");
+    }
+
+    #[test]
+    fn webgl_and_audio_present_the_honest_disabled_state() {
+        // A terminal has no GPU and no audio output. The honest, standards-
+        // compliant way to say so is NOT to fabricate values but to present the
+        // exact state a real browser shows when these are unavailable/disabled:
+        //  - WebGL: the interface objects EXIST (modern browser) but
+        //    getContext('webgl'|'webgl2') returns null (blocklisted/no-GPU).
+        //  - Web Audio DISABLED: window.AudioContext is *undefined* (the global
+        //    is absent), exactly as Firefox reports with dom.webaudio.enabled
+        //    off / privacy browsers that block audio fingerprinting. Not null —
+        //    absent. webkitAudioContext / OfflineAudioContext likewise absent.
+        //  - deviceMemory: Chromium-only; Firefox/Safari leave it absent, so a
+        //    Gecko-mode navigator must report `undefined` and not even have the
+        //    key — `'deviceMemory' in navigator` is false.
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             const r = [];\
+             r.push('WebGLRenderingContext' in window);\
+             r.push(typeof WebGLRenderingContext);\
+             let illegal = false;\
+             try { new WebGLRenderingContext(); } catch (e) { illegal = e instanceof TypeError; }\
+             r.push(illegal);\
+             const c = document.createElement('canvas');\
+             r.push(c.getContext('webgl') === null);\
+             r.push(c.getContext('webgl2') === null);\
+             r.push(typeof window.AudioContext);\
+             r.push('AudioContext' in window);\
+             r.push(typeof window.OfflineAudioContext);\
+             r.push(typeof window.webkitAudioContext);\
+             r.push(navigator.deviceMemory === undefined);\
+             r.push('deviceMemory' in navigator);\
+             document.getElementById('o').textContent = 'GFX=' + r.join('|');\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // WebGL interface objects present + non-constructible; webgl/webgl2
+        // contexts null; AudioContext/OfflineAudioContext/webkitAudioContext all
+        // "undefined" and not in window; deviceMemory undefined and not a key.
+        assert!(
+            out.contains(
+                "GFX=true|function|true|true|true|undefined|false|undefined|undefined|true|false"
+            ),
+            "graphics/audio honest state: {out}"
+        );
     }
 
     #[test]
