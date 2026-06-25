@@ -2751,6 +2751,71 @@ mod tests {
         server.abort();
     }
 
+    // `WebAssembly.instantiateStreaming(fetch(url))` end to end: the wasm is
+    // served as `application/wasm` and its bytes must survive the fetch EXACTLY
+    // (`i32.const 200` encodes a 0xC8 LEB byte ≥ 0x80 — a UTF-8-lossy body would
+    // corrupt it into a CompileError). Proves the byte-exact `arrayBuffer()` path
+    // + the streaming MIME check.
+    #[tokio::test]
+    async fn wasm_instantiate_streaming_fetches_and_runs() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let wasm =
+            wat::parse_str(r#"(module (func (export "f") (result i32) i32.const 200))"#).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let wasm = wasm.clone();
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    if text.starts_with("GET /page ") {
+                        let html = b"<body><pre id=o>pending</pre><script>\
+                            WebAssembly.instantiateStreaming(fetch('/mod.wasm')).then(function(res){\
+                                document.getElementById('o').textContent='r='+res.instance.exports.f();\
+                            });\
+                            </script></body>";
+                        let mut reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            html.len()
+                        )
+                        .into_bytes();
+                        reply.extend_from_slice(html);
+                        let _ = sock.write_all(&reply).await;
+                    } else if text.starts_with("GET /mod.wasm ") {
+                        let mut reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/wasm\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            wasm.len()
+                        )
+                        .into_bytes();
+                        reply.extend_from_slice(&wasm);
+                        let _ = sock.write_all(&reply).await;
+                    } else {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                    }
+                });
+            }
+        });
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(body.contains("r=200"), "instantiateStreaming ran: {body}");
+        server.abort();
+    }
+
     // A <script src> the page INJECTS at runtime (the SDK-loader idiom — how
     // reCAPTCHA/analytics/embeds load) is fetched and executed, and its `load`
     // event fires for code that waits on `script.onload`. Without this an
