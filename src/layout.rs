@@ -2500,13 +2500,27 @@ impl<'a> Layout<'a> {
             up = self.dom.parent_composed(p);
         }
         let root = body_or_document(self.dom);
-        self.dom.descendants(root).into_iter().any(|id| {
+        let order = self.dom.descendants(root);
+        // Document-order index of the overlay, for the equal-z paint-order
+        // tiebreak below (CSS 2.1 Appendix E).
+        let overlay_pos = order.iter().position(|&id| id == overlay);
+        order.iter().enumerate().any(|(pos, &id)| {
             !excluded.contains(&id)
                 && matches!(
                     self.dom.computed_style(id, "position").as_deref(),
                     Some("relative" | "sticky")
                 )
-                && self.z_order(id) > oz
+                // A strictly-higher z-index paints above; equal z-index paints
+                // above when the content comes LATER in document order. Per CSS
+                // 2.1 Appendix E painting order, positioned boxes sharing a
+                // z-index (the common `auto`/`0` case) paint in tree order, so a
+                // full-viewport BACKGROUND layer that sits FIRST in the DOM (the
+                // solar battery meter, a hero slideshow) is painted under the
+                // page's positioned content that follows it — not a modal.
+                && {
+                    let cz = self.z_order(id);
+                    cz > oz || (cz == oz && overlay_pos.is_some_and(|op| pos > op))
+                }
                 && self.overlay_has_content(id)
         })
     }
@@ -8683,6 +8697,35 @@ mod tests {
             "the in-flow signup card is NOT deferred behind the background slide"
         );
         assert!(shows(&rows, "LoginButton"), "the login control renders");
+    }
+
+    #[test]
+    fn a_background_layer_with_equal_z_content_after_it_is_not_a_modal() {
+        // solar.lowtechmagazine.com: a decorative full-viewport battery-meter
+        // BACKGROUND (`position:absolute;width:100%;height:100%;top:0;left:0`,
+        // z-index:auto) sits FIRST in the DOM, with the page's positioned
+        // content (a `position:relative` header, z-index:auto) AFTER it. The
+        // background and the content share z-index, so by CSS 2.1 Appendix E
+        // painting order the LATER content paints on top — it is a background,
+        // not a modal. Treating it as a modal deferred the whole magazine (only
+        // the meter's caption rendered).
+        let rows = lay(
+            r#"<body>
+                 <div style="position:absolute;width:100%;height:100%;top:0;left:0">
+                   <p>BatteryMeter</p>
+                 </div>
+                 <header style="position:relative">
+                   <a href="/">HomeLink</a>
+                 </header>
+                 <div><a href="/article">ArticleLink</a></div>
+               </body>"#,
+            80,
+        );
+        assert!(
+            shows(&rows, "HomeLink"),
+            "the page header is NOT deferred behind the equal-z background layer"
+        );
+        assert!(shows(&rows, "ArticleLink"), "the article list renders");
     }
 
     #[test]
