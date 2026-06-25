@@ -354,6 +354,10 @@ pub(crate) struct EncKey {
     pub(crate) w: u16,
     pub(crate) h: u16,
     pub(crate) crop: bool,
+    /// Recolor for an SVG box: its role (link accent vs. body text) silhouette.
+    /// Ignored when the bytes decode to a raster. Part of the key so a recolor
+    /// re-encodes (and the renderer keys identically).
+    pub(crate) tint: Option<crate::img::SvgTint>,
 }
 
 impl EncKey {
@@ -365,7 +369,27 @@ impl EncKey {
             w: item.width,
             h: item.height,
             crop: item.crop,
+            tint: Some(svg_tint()),
         }
+    }
+}
+
+/// The silhouette recolor for every SVG: a single flat WHITE over the UI
+/// background. We deliberately do NOT vary by role (link vs. body) — one neutral
+/// color keeps inline icons consistent and dodges the context-color mess (her
+/// call). The SVG's own colors are dropped too (same as not honoring HTML/CSS
+/// color); only the shape's coverage is painted, in white.
+pub(crate) fn svg_tint() -> crate::img::SvgTint {
+    crate::img::SvgTint {
+        fg: [0xff, 0xff, 0xff],
+        bg: color_rgb(crate::ui::theme::BG),
+    }
+}
+
+fn color_rgb(c: ratatui::style::Color) -> [u8; 3] {
+    match c {
+        ratatui::style::Color::Rgb(r, g, b) => [r, g, b],
+        _ => [0, 0, 0],
     }
 }
 
@@ -421,6 +445,12 @@ pub struct App {
     /// anything to interact with. ONE live engine, ever.
     live_page: Option<crate::js::PageHandle>,
     page_rx: Option<mpsc::Receiver<crate::js::PageEvt>>,
+    /// The document row last pushed to the live page as its scroll position
+    /// (`PageCmd::Scroll`). Diffed each run-loop tick so a scroll command is
+    /// sent only when the viewport actually moved; `None` = nothing sent yet
+    /// (reset on each new live page). Drives infinite scroll / scroll-based
+    /// lazy loading: the site's own handler reacts to the threaded position.
+    last_scroll_sent: Option<usize>,
     /// A page-script dispatch is in flight (drives the loading heart).
     page_busy: bool,
     /// Static form submit to perform if the live page does not prevent
@@ -553,6 +583,7 @@ impl App {
             web_storage: Default::default(),
             live_page: None,
             page_rx: None,
+            last_scroll_sent: None,
             page_busy: false,
             pending_live_submit: None,
             page_js_errors: 0,
@@ -758,6 +789,10 @@ impl App {
                     Err(_) => break, // Empty (nothing queued) or Disconnected
                 }
             }
+            // After the input burst is coalesced, push the (now settled) scroll
+            // position to the live page so its infinite-scroll / lazy-load logic
+            // reacts. A no-op when the scroll row didn't move (the common case).
+            self.sync_page_scroll();
         }
         Ok(())
     }
@@ -1875,16 +1910,21 @@ impl App {
         self.status = format!("Rendering {url} ...");
         let picker = self.picker.clone();
         let size = self.last_inner;
+        // A directly-opened SVG is recolored neutrally (body-text silhouette);
+        // a raster ignores the tint.
+        let tint = svg_tint();
         tokio::task::spawn_blocking(move || {
             let panel = ratatui::layout::Size::new(size.0, size.1);
             // The full-screen viewer fits (contains) the panel. SVG is
             // rasterized directly at this box, so resize keeps vector quality.
-            let result = img::encode_bytes(&picker, &raw, panel, false).map(|(protocol, image)| {
-                (
-                    protocol,
-                    format!("{}×{} {}", image.width, image.height, image.mime),
-                )
-            });
+            let result = img::encode_bytes(&picker, &raw, panel, false, Some(tint)).map(
+                |(protocol, image)| {
+                    (
+                        protocol,
+                        format!("{}×{} {}", image.width, image.height, image.mime),
+                    )
+                },
+            );
             let _ = tx.blocking_send(ImgMsg {
                 url,
                 raw,
@@ -2071,7 +2111,7 @@ impl App {
             // run-loop thread restores it (see TERMINAL_OWNER).
             let box_size = ratatui::layout::Size::new(key.w, key.h);
             let protocol = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::img::encode_sliced_bytes(&picker, &raw, box_size, key.crop)
+                crate::img::encode_sliced_bytes(&picker, &raw, box_size, key.crop, key.tint)
                     .ok()
                     .map(|(protocol, _)| protocol)
             }))
@@ -2269,6 +2309,9 @@ impl App {
         if let Some(live) = live {
             self.live_page = Some(live.handle);
             self.page_rx = Some(live.events);
+            // Force the next tick to push the current scroll position (0 on a
+            // fresh nav; a restored row on revive-on-back) to the new engine.
+            self.last_scroll_sent = None;
             self.page_js_errors = response.js.as_ref().map_or(0, |o| o.errors.len());
         }
         // Kick off the parallel image pipeline; decoded images re-flow in.
@@ -2278,8 +2321,68 @@ impl App {
     fn drop_live_page(&mut self) {
         self.live_page = None;
         self.page_rx = None;
+        self.last_scroll_sent = None;
         self.page_busy = false;
         self.pending_live_submit = None;
+    }
+
+    /// Push the current browser scroll position to the live page when it moved
+    /// since the last send. The engine updates `window.scrollY`, fires the
+    /// `scroll` event, and re-runs IntersectionObserver, so a site's own
+    /// infinite-scroll / lazy-load logic reacts to the threaded position. Called
+    /// once per run-loop iteration (after input is coalesced) — a single
+    /// chokepoint that catches every path that moves `scroll` (wheel, PageUp/Down,
+    /// Home/End, Ctrl-F jumps, selection). Cheap and idle-safe: a no-op unless a
+    /// live laid-out doc's first visible row actually changed. `y` is in CSS px,
+    /// `row * cell_height` — the SAME quantization `layout::measure_boxes` uses
+    /// for element geometry, so the engine's scroll window and box coordinates
+    /// agree.
+    fn sync_page_scroll(&mut self) {
+        let viewport_rows = self.last_inner.1 as usize;
+        let cell_h = f64::from(self.picker.font_size().height.max(1));
+        let (row, y) = {
+            let Some(g) = self.browser.as_ref() else {
+                return;
+            };
+            // Only HTTP laid-out docs use the 2D row model + a live engine; gopher/
+            // gemini keep the line model and never carry an engine.
+            if !g.doc.laid_out() {
+                return;
+            }
+            let row = g.scroll;
+            if self.last_scroll_sent == Some(row) {
+                return;
+            }
+            let total = g.doc.rows.len();
+            let max_scroll = total.saturating_sub(viewport_rows);
+            // At the app's bottom, anchor to the FULL document height so the
+            // engine's viewport reaches its true bottom (where an infinite-scroll
+            // sentinel lives) — its `setScroll` clamps the over-large value to its
+            // own `scrollHeight − innerHeight`. This is robust to the small
+            // viewport/row-count differences between the app's layout and the
+            // engine's measure pass (e.g. the engine's innerHeight is baked at
+            // fetch time). Below the bottom, the exact row position.
+            let y = if row >= max_scroll {
+                total as f64 * cell_h
+            } else {
+                row as f64 * cell_h
+            };
+            (row, y)
+        };
+        let Some(handle) = self.live_page.as_ref() else {
+            return;
+        };
+        // Clone the (Arc-backed) sender so the borrow of `self.live_page` ends
+        // before we record `last_scroll_sent`.
+        let sender = handle.cmds.clone();
+        if sender
+            .try_send(crate::js::PageCmd::Scroll { x: 0.0, y })
+            .is_ok()
+        {
+            self.last_scroll_sent = Some(row);
+        }
+        // On a full channel we leave `last_scroll_sent` stale: the next tick
+        // retries with the latest position, so the final scroll is never lost.
     }
 
     /// Esc in the browser: stop any in-flight load and kill the page's JS
@@ -4018,6 +4121,13 @@ async fn load_one_image(
     url: &str,
     font: ratatui_image::FontSize,
 ) -> Option<DecodedImage> {
+    // A `data:` image (a rewritten inline SVG, or a page's own data image)
+    // carries its bytes — decode locally, no fetch, no SSRF concern.
+    if url.starts_with("data:") {
+        let raw: std::sync::Arc<[u8]> = crate::img::decode_data_url(url)?.into();
+        let cell = decoded_cell_box(raw.clone(), font).await?;
+        return Some(DecodedImage { raw, cell });
+    }
     let parsed = http::parse_url(url)?;
     if !http::subresource_allowed(page, &parsed) {
         return None;
@@ -4032,22 +4142,32 @@ async fn load_one_image(
         return None;
     }
     let raw: std::sync::Arc<[u8]> = resp.body.into();
-    let for_decode = raw.clone();
-    let cell = tokio::task::spawn_blocking(move || {
-        // Background blocking thread — sandbox the decode like the encode: a
-        // bad image fails to None, never unwinds the worker. The terminal is
-        // safe regardless (only the run loop restores it — TERMINAL_OWNER).
+    let cell = decoded_cell_box(raw.clone(), font).await?;
+    Some(DecodedImage { raw, cell })
+}
+
+/// Decode an image's intrinsic cell box on a blocking thread (sandboxed: a bad
+/// image fails to `None`, never unwinds the worker — the terminal is safe
+/// regardless, only the run loop restores it). The intrinsic box is the
+/// fallback size; an SVG (or any image) whose element carries a CSS/attr
+/// `width`/`height` is sized by that in `image_used_box`, which is why a
+/// rewritten inline `<svg>` keeps the original element's box (see
+/// `Dom::rewrite_inline_svgs`) instead of being clamped here.
+async fn decoded_cell_box(
+    bytes: std::sync::Arc<[u8]>,
+    font: ratatui_image::FontSize,
+) -> Option<(u16, u16)> {
+    tokio::task::spawn_blocking(move || {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::img::info(&for_decode)
+            crate::img::info(&bytes)
                 .ok()
-                .map(|image| natural_cell_box_dimensions(image.width, image.height, font))
+                .map(|info| natural_cell_box_dimensions(info.width, info.height, font))
         }))
         .ok()
         .flatten()
     })
     .await
-    .ok()??;
-    Some(DecodedImage { raw, cell })
+    .ok()?
 }
 
 /// The cell box an image occupies: its natural size at the terminal font,
@@ -5791,7 +5911,9 @@ mod tests {
     /// blocking task does (halfblocks picker: deterministic, no tty).
     fn deliver_image(app: &mut super::App, url: Link, raw: Vec<u8>) {
         let size = ratatui::layout::Size::new(app.last_inner.0, app.last_inner.1);
-        let (protocol, image) = crate::img::encode_bytes(&app.picker, &raw, size, false).unwrap();
+        let (protocol, image) =
+            crate::img::encode_bytes(&app.picker, &raw, size, false, Some(super::svg_tint()))
+                .unwrap();
         let info = format!("{}×{} {}", image.width, image.height, image.mime);
         app.on_img(super::ImgMsg {
             url,
@@ -5843,6 +5965,27 @@ mod tests {
             viewer.info
         );
         assert_eq!(viewer.encoded_for, (40, 12));
+    }
+
+    #[tokio::test]
+    async fn svg_decodes_to_its_intrinsic_box_uncapped() {
+        let font = ratatui_image::picker::Picker::halfblocks().font_size();
+        // An SVG decodes to its INTRINSIC cell box, never an artificial cap: a
+        // 200×40 viewBox (no element CSS size) yields the same box a 200×40
+        // raster would. The element's own CSS/attr `width`/`height` — carried
+        // onto the rewritten <img> in `Dom::rewrite_inline_svgs` — is what
+        // resizes it, applied later in `image_used_box`, not here.
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="40" viewBox="0 0 200 40"><path d="M0 0h200v40H0z"/></svg>"#;
+        let cell = super::decoded_cell_box(std::sync::Arc::from(&svg[..]), font)
+            .await
+            .unwrap();
+        assert_eq!(cell, super::natural_cell_box_dimensions(200, 40, font));
+        // A raster keeps its natural box too — same path, no special-casing.
+        let png = crate::img::red_png();
+        let raster = super::decoded_cell_box(std::sync::Arc::from(&png[..]), font)
+            .await
+            .unwrap();
+        assert_eq!(raster, super::natural_cell_box_dimensions(4, 4, font));
     }
 
     #[tokio::test]

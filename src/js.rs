@@ -3940,6 +3940,12 @@ pub enum PageCmd {
     /// settle, re-render. This is how a socket.io stream (chat tokens) drives
     /// the page with no busy-poll — a frame is just another event.
     Ws { id: usize, event: crate::ws::WsIn },
+    /// The user scrolled the laid-out document; `x`/`y` are the viewport's
+    /// top-left in CSS px (document origin). Updates `window.scrollY`, fires the
+    /// viewport `scroll` event, and re-runs IntersectionObserver — so a site's
+    /// own infinite-scroll logic (a window scroll handler, or an IO sentinel)
+    /// fires its load-more request and the appended content re-renders.
+    Scroll { x: f64, y: f64 },
 }
 
 /// Page → app.
@@ -4175,8 +4181,11 @@ fn page_actor(
         // rest. Only a truly inert page (no interaction AND no scheduled work)
         // takes the Static fast-exit and drops the engine (articles hold none).
         let has_timers = js_next_deadline(&mut page).is_some();
+        // A page with IO observers / scroll listeners stays live to receive
+        // scroll, even with no clickables or timers (see `js_has_scroll_work`).
+        let has_scroll_work = js_has_scroll_work(&mut page);
         let outcome = std::mem::take(&mut page.outcome);
-        if !has_clickables && !painted_live && !has_timers {
+        if !has_clickables && !painted_live && !has_timers && !has_scroll_work {
             let _ = evts.blocking_send(PageEvt::Static { html: out, outcome });
             return;
         }
@@ -4340,6 +4349,29 @@ fn page_actor(
                     return;
                 }
             }
+            PageCmd::Scroll { x, y } => {
+                dispatch_scroll_in(&mut page, x, y);
+                drain_js_side(&mut page.ctx, &mut page.outcome);
+                if page.outcome.panicked {
+                    let _ = evts
+                        .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+                    return;
+                }
+                // A scroll handler may navigate (rare, but e.g. a router) — honour
+                // it the same way a click does.
+                if let Some(url) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                // Scrolling to a sentinel that loaded a batch mutated the DOM —
+                // re-render the appended content. A scroll that revealed nothing
+                // new emits `Settled` (clears the app's busy state, no redraw).
+                if !finish_dispatch(&mut page, &evts) {
+                    return;
+                }
+            }
         }
     }
 }
@@ -4404,9 +4436,88 @@ fn dispatch_ws_in(page: &mut LoadedPage, id: usize, event: crate::ws::WsIn) {
     page.outcome.errors.extend(dispatch_outcome.errors);
 }
 
+/// Apply a viewport scroll (CSS px, document origin) to the live page: update
+/// `window.scrollY`, fire the `scroll` event, and re-run IntersectionObserver
+/// (all inside `__trust.setScroll`), then settle. A site's own scroll handler /
+/// IO sentinel then issues its load-more `fetch()` (which runs off the JS
+/// thread, posting back as a background fetch), and the appended content
+/// re-renders. Same shape as `dispatch_ws_in`.
+fn dispatch_scroll_in(page: &mut LoadedPage, x: f64, y: f64) {
+    prepare_dispatch(page);
+    let x = if x.is_finite() { x } else { 0.0 };
+    let y = if y.is_finite() { y } else { 0.0 };
+    let call = format!("__trust.setScroll({x},{y})");
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        page.ctx.eval(Source::from_bytes(call.as_bytes()))
+    })) {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => page.outcome.errors.push(format!("scroll: {err}")),
+        Err(_) => {
+            page.outcome.errors.push(String::from(
+                "scroll: engine panic (Boa bug) — page JS halted",
+            ));
+            page.outcome.panicked = true;
+            return;
+        }
+    }
+    let mut dispatch_outcome = Outcome::default();
+    settle(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
+    settle_image_loads(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
+    page.outcome.errors.extend(dispatch_outcome.errors);
+}
+
+/// Re-run IntersectionObserver against the current DOM + scroll position after a
+/// dispatch settled. The browser runs IO in every render step, so a mutation that
+/// MOVED a target — an infinite scroller appending a batch above its bottom
+/// sentinel, which pushes the sentinel out of the viewport — is observed and the
+/// target's intersection state re-recorded. Without this the sentinel stays stuck
+/// `isIntersecting:true` after the first load, so the next scroll to the bottom
+/// never re-fires it (no false→true transition) and loading dead-ends.
+/// Edge-triggered + geometry-cached: a no-op (no settle) unless it delivered
+/// entries, so a page with no observers / no geometry change pays one cheap eval.
+fn run_intersections(page: &mut LoadedPage) {
+    let delivered = page
+        .ctx
+        .eval(Source::from_bytes(b"__trust.updateIntersections()"))
+        .ok()
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+    if delivered > 0.0 {
+        // Drain the microtasks/jobs the callbacks scheduled (a fetch's promise
+        // plumbing, a sync mutation's MutationObserver microtask). A load-more
+        // `fetch()` runs OFF the JS thread and posts back as its own fetch-done
+        // dispatch — where this runs again, so the chain advances one batch at a
+        // time until the sentinel clears the viewport.
+        settle(
+            &mut page.ctx,
+            &page.budget,
+            DISPATCH_TICKS,
+            &mut page.outcome,
+        );
+    }
+}
+
 fn finish_dispatch(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
     if page.outcome.panicked {
         // Engine bug: degrade to static, last render stands.
+        let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+        return false;
+    }
+    // A dispatch that moved geometry (a click that revealed content, a scroll)
+    // re-runs IntersectionObserver before we render, so a target now in/out of
+    // view is observed this turn.
+    run_intersections(page);
+    if page.outcome.panicked {
         let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
         return false;
     }
@@ -4459,6 +4570,13 @@ fn timer_wake(
         let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
         return false;
     }
+    // A timer that mutated the DOM (a slideshow/poller) may have moved an observed
+    // target — re-run IntersectionObserver before rendering.
+    run_intersections(page);
+    if page.outcome.panicked {
+        let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+        return false;
+    }
     // A `setTimeout(() => location.href = …)` redirect/refresh fires at rest too.
     if let Some(url) = take_script_navigation(page) {
         return evts.blocking_send(PageEvt::Navigate(url)).is_ok();
@@ -4507,6 +4625,17 @@ fn dispatch_fetch_done(
         &mut page.outcome,
     );
     drain_js_side(&mut page.ctx, &mut page.outcome);
+    if page.outcome.panicked {
+        let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+        return false;
+    }
+    // A completed load-more fetch typically APPENDS its batch here, moving the
+    // bottom sentinel — re-run IntersectionObserver so the sentinel's new state
+    // is recorded (it usually clears the viewport now, arming the next scroll;
+    // if it's still in view a small batch loads the next one, the browser's
+    // "fill the viewport" behaviour). This is the dispatch that was missing the
+    // re-evaluation, dead-ending infinite scroll after the first batch.
+    run_intersections(page);
     if page.outcome.panicked {
         let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
         return false;
@@ -4593,6 +4722,20 @@ fn js_next_deadline(page: &mut LoadedPage) -> Option<f64> {
         return None;
     }
     v.as_number()
+}
+
+/// Does the page have scroll-driven work — an `IntersectionObserver` or a
+/// window/document `scroll` listener? Such a page must stay LIVE (like one with
+/// pending timers) even with no clickables/forms, so it keeps receiving
+/// `PageCmd::Scroll` as the user scrolls; otherwise a lazy-image / infinite-
+/// scroll page that has nothing else interactive would settle `Static`, drop its
+/// engine, and never reveal its below-the-fold content.
+fn js_has_scroll_work(page: &mut LoadedPage) -> bool {
+    page.ctx
+        .eval(Source::from_bytes(b"__trust.hasScrollWork()"))
+        .ok()
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false)
 }
 
 fn take_script_navigation(page: &mut LoadedPage) -> Option<String> {
@@ -6154,22 +6297,43 @@ const PRELUDE: &str = r##"
             return { x: 0, y: 0, left: 0, top: 0, right: g.innerWidth, bottom: g.innerHeight,
                      width: g.innerWidth, height: g.innerHeight, toJSON() { return this; } };
         }
-        getBoundingClientRect() { return this.__rect(); }
-        getClientRects() { return [this.__rect()]; }
+        // getBoundingClientRect/getClientRects are VIEWPORT-relative (CSSOM
+        // View): the document-origin `__rect()` shifted up/left by the page
+        // scroll. At load scroll is 0 so this is `__rect()` unchanged; once the
+        // terminal threads a scroll position (PageCmd::Scroll → setScroll), a
+        // scroll-based lazy-loader reading `getBoundingClientRect().top` sees the
+        // box move through the viewport, exactly as in a browser. `offset*` stays
+        // document/offsetParent-relative (spec) — only the client rect shifts.
+        getBoundingClientRect() {
+            const r = this.__rect();
+            const sx = g.scrollX || 0, sy = g.scrollY || 0;
+            if (!sx && !sy) return r;
+            return { x: r.x - sx, y: r.y - sy, left: r.left - sx, top: r.top - sy,
+                     right: r.right - sx, bottom: r.bottom - sy,
+                     width: r.width, height: r.height, toJSON() { return this; } };
+        }
+        getClientRects() { return [this.getBoundingClientRect()]; }
         get offsetWidth() { return this.__rect().width; }
         get offsetHeight() { return this.__rect().height; }
         get offsetTop() { return this.__rect().top; }
         get offsetLeft() { return this.__rect().left; }
         get offsetParent() { return g.document.body; }
-        get clientWidth() { return this.__rect().width; }
-        get clientHeight() { return this.__rect().height; }
+        // The root element's client area IS the viewport (CSSOM View): a page
+        // reading `document.documentElement.clientHeight` to size against the
+        // window must get the viewport, not the full document height. Every
+        // other element reports its own laid-out box.
+        get clientWidth() { return this.localName === "html" ? g.innerWidth : this.__rect().width; }
+        get clientHeight() { return this.localName === "html" ? g.innerHeight : this.__rect().height; }
         get clientTop() { return 0; }
         get clientLeft() { return 0; }
         get scrollWidth() { return this.__rect().width; }
         get scrollHeight() { return this.__rect().height; }
-        get scrollTop() { return 0; }
+        // The root scroller mirrors the page scroll position (document.scrolling
+        // Element === documentElement); the terminal owns scrolling, so the
+        // setters are no-ops (like scrollTo). Other elements don't scroll here.
+        get scrollTop() { return this.localName === "html" ? (g.scrollY || 0) : 0; }
         set scrollTop(_v) {}
-        get scrollLeft() { return 0; }
+        get scrollLeft() { return this.localName === "html" ? (g.scrollX || 0) : 0; }
         set scrollLeft(_v) {}
     }
 
@@ -6544,6 +6708,12 @@ const PRELUDE: &str = r##"
         // root's prototype to add one — see `ownerDocument` above.
         getSelection() { return g.getSelection(); }
         get documentElement() { return wrap(__dom_doc_element()); }
+        // The element that scrolls the viewport (CSSOM View). Standards mode ⇒
+        // the document element; its scrollTop/scrollHeight/clientHeight mirror
+        // the page scroll, so `document.scrollingElement.scrollTop` reads the
+        // threaded scroll position. The infinite-scroll idiom
+        // `window.pageYOffset || document.scrollingElement.scrollTop` resolves.
+        get scrollingElement() { return this.documentElement; }
         get body() { return this.querySelector("body"); }
         get head() { return this.querySelector("head"); }
         get readyState() { return trust.readyState; }
@@ -7946,38 +8116,209 @@ const PRELUDE: &str = r##"
         }
         takeRecords() { const r = this.__records; this.__records = []; return r; }
     };
-    // The terminal has no live scroll, so we REPORT every observed
-    // target as FULLY intersecting, once, asynchronously — else
-    // below-the-fold lazy/virtualized content (infinite scrollers, lazy tiles)
-    // would never materialize, since the scroll that would reveal it can't
-    // happen. We render the whole document into the scrollback, so for
-    // visibility purposes the WHOLE document is the viewport: every observed
-    // element is fully in view. Hence `isIntersecting:true`, `intersectionRatio:
-    // 1`, and `intersectionRect == boundingClientRect`, ALL consistent — a
-    // lazy-loader that gates on `intersectionRatio > 0` and ignores
-    // `isIntersecting` (vanilla-lazyload does exactly this) then loads its
-    // below-fold images instead of leaving them blank (humblebundle.com bundle
-    // item grids). `boundingClientRect` stays the element's REAL box (a layout
-    // pass backs getBoundingClientRect), so measure-then-render code downstream
-    // still sees true geometry; only the intersection signal is the deliberate
-    // whole-document-is-visible deviation the medium demands.
     g.__viewportRect = () => {
         const vw = g.innerWidth, vh = g.innerHeight;
         return { x: 0, y: 0, left: 0, top: 0, right: vw, bottom: vh, width: vw, height: vh };
     };
+    // IntersectionObserver — HONEST viewport intersection (W3C Intersection
+    // Observer + CSSOM View). The terminal now threads the real scroll position
+    // into the engine (PageCmd::Scroll → trust.setScroll updates scrollY and
+    // re-runs the update step), so a below-the-fold target reports NOT
+    // intersecting until the user scrolls it into the viewport ± the observer's
+    // rootMargin. This is what makes a sentinel-driven infinite scroller
+    // demand-driven (archive.org) instead of trying to reveal the whole document
+    // at load — the old "whole document is the viewport" stub fired every target
+    // fully-visible-once, which made an infinite scroller request endless tiles.
+    // The trade (her call): below-fold lazy images load on scroll, not at load
+    // (browser behaviour; a rootMargin still pre-buffers). Registry `IO` is a
+    // PLAIN ARRAY, never a Boa Set/Map — same MapLock GC trap MO documents.
+    const IO = [];
+    // Parse a rootMargin string into 4 {v, pct} offsets in CSS-margin order
+    // (top, right, bottom, left), each px or %. Percentages resolve per-axis
+    // against the root rect (top/bottom vs height, left/right vs width); the px
+    // form is the overwhelming real-world case (Steam/archive use px or none).
+    function ioParseRootMargin(s) {
+        const parts = String(s == null ? "0px" : s).trim().split(/\s+/);
+        const one = (p) => {
+            const m = /^(-?\d*\.?\d+)(px|%)?$/.exec(p || "");
+            return m ? { v: parseFloat(m[1]), pct: m[2] === "%" } : { v: 0, pct: false };
+        };
+        const t = one(parts[0]);
+        const r = parts.length > 1 ? one(parts[1]) : t;
+        const b = parts.length > 2 ? one(parts[2]) : t;
+        const l = parts.length > 3 ? one(parts[3]) : r;
+        return [t, r, b, l];
+    }
+    function ioNormThresholds(t) {
+        let arr;
+        if (t === undefined || t === null) arr = [0];
+        else if (Array.isArray(t)) arr = t.slice();
+        else arr = [t];
+        arr = arr.map(Number).filter((n) => n >= 0 && n <= 1);
+        if (!arr.length) arr = [0];
+        arr.sort((a, b) => a - b);
+        return arr;
+    }
     g.IntersectionObserver = class {
-        constructor(cb) { this.__cb = cb; this.__dead = false; }
-        observe(el) {
-            g.setTimeout(() => {
-                if (this.__dead) return;
-                const r = (el && el.getBoundingClientRect) ? el.getBoundingClientRect() : g.__viewportRect();
-                try {
-                    this.__cb([{ isIntersecting: true, intersectionRatio: 1, target: el,
-                        time: 0, boundingClientRect: r, intersectionRect: r, rootBounds: g.__viewportRect() }], this);
-                } catch (e) { trust.errors.push("IntersectionObserver: " + ((e && e.message) || e)); }
-            }, 0);
+        constructor(cb, opts) {
+            this.__cb = cb;
+            opts = opts || {};
+            // An element root (scroll container) isn't modelled — the terminal
+            // has one scroll, the document's — so any root is treated as the
+            // viewport. rootMargin/threshold are honoured.
+            this.root = opts.root || null;
+            this.rootMargin = opts.rootMargin == null ? "0px 0px 0px 0px" : String(opts.rootMargin);
+            this.__rm = ioParseRootMargin(opts.rootMargin);
+            this.thresholds = ioNormThresholds(opts.threshold);
+            // Each registration: {el, lastIndex, lastIx}. Start lastIndex at -1
+            // so the FIRST update always queues an entry (the spec's
+            // previousThresholdIndex = -1) — i.e. observe() yields one initial
+            // callback with the current state, isIntersecting possibly false.
+            this.__targets = [];
         }
-        unobserve() {} disconnect() { this.__dead = true; } takeRecords() { return []; }
+        observe(el) {
+            if (!el) return;
+            for (let i = 0; i < this.__targets.length; i++) if (this.__targets[i].el === el) return;
+            this.__targets.push({ el: el, lastIndex: -1, lastIx: false });
+            if (IO.indexOf(this) < 0) IO.push(this);
+            // Report the initial state on a macrotask (the existing settle drain
+            // runs it): a target observed at load still gets one callback.
+            g.setTimeout(() => trust.updateIntersections(), 0);
+        }
+        unobserve(el) {
+            for (let i = 0; i < this.__targets.length; i++) {
+                if (this.__targets[i].el === el) { this.__targets.splice(i, 1); break; }
+            }
+            if (!this.__targets.length) { const k = IO.indexOf(this); if (k >= 0) IO.splice(k, 1); }
+        }
+        disconnect() { this.__targets = []; const k = IO.indexOf(this); if (k >= 0) IO.splice(k, 1); }
+        takeRecords() { return []; }
+    };
+    // Feature-detected by older libraries: `'isIntersecting' in
+    // IntersectionObserverEntry.prototype` gates the isIntersecting code path.
+    // Entries are plain objects (like the records), this is just the brand.
+    g.IntersectionObserverEntry = function () {};
+    Object.defineProperty(g.IntersectionObserverEntry.prototype, "isIntersecting",
+        { get() { return false; }, configurable: true });
+
+    // The spec's "update intersection observations" step: for each observer ×
+    // target, intersect the target's DOCUMENT-space box with the viewport
+    // expanded by rootMargin, then queue an entry ONLY when the threshold index
+    // or isIntersecting changed (edge-triggered, per spec — not a flood). Run at
+    // every settle (an observe() self-schedules it) and on every scroll.
+    trust.updateIntersections = function () {
+        if (!IO.length) return 0;
+        let delivered = 0;
+        const sx = g.scrollX || 0, sy = g.scrollY || 0;
+        const vw = g.innerWidth, vh = g.innerHeight;
+        const observers = IO.slice();
+        for (let oi = 0; oi < observers.length; oi++) {
+            const o = observers[oi];
+            const rm = o.__rm;
+            const mT = rm[0].pct ? (rm[0].v / 100) * vh : rm[0].v;
+            const mR = rm[1].pct ? (rm[1].v / 100) * vw : rm[1].v;
+            const mB = rm[2].pct ? (rm[2].v / 100) * vh : rm[2].v;
+            const mL = rm[3].pct ? (rm[3].v / 100) * vw : rm[3].v;
+            // Root intersection rectangle in DOCUMENT coords (the viewport window
+            // at the current scroll, dilated by rootMargin).
+            const rL = sx - mL, rT = sy - mT, rR = sx + vw + mR, rB = sy + vh + mB;
+            const rootBounds = {
+                x: -mL, y: -mT, left: -mL, top: -mT, right: vw + mR, bottom: vh + mB,
+                width: vw + mR + mL, height: vh + mT + mB,
+            };
+            const ths = o.thresholds;
+            const entries = [];
+            const targets = o.__targets.slice();
+            for (let ti = 0; ti < targets.length; ti++) {
+                const rec = targets[ti];
+                let dr = null;
+                try { dr = __dom_rect(rec.el.__id); } catch (e) { dr = null; }
+                // dr = [left, top, width, height] (document coords), or null only
+                // when the target has NO laid-out box (display:none / detached) ⇒
+                // honestly NOT intersecting. Every real element — including an
+                // empty infinite-scroll sentinel — now gets a real (zero-height)
+                // box from the layout measurement pass, so honest intersection
+                // works for the IntersectionObserver standard without guesswork.
+                const tL = dr ? dr[0] : 0, tT = dr ? dr[1] : 0, tW = dr ? dr[2] : 0, tH = dr ? dr[3] : 0;
+                const tR = tL + tW, tB = tT + tH;
+                const iL = Math.max(tL, rL), iT = Math.max(tT, rT);
+                const iR = Math.min(tR, rR), iB = Math.min(tB, rB);
+                // isIntersecting: rects intersect or are edge-adjacent (zero area
+                // still counts, per spec).
+                const isIx = !!dr && iR >= iL && iB >= iT;
+                const iW = Math.max(0, iR - iL), iH = Math.max(0, iB - iT);
+                const targetArea = tW * tH;
+                let ratio = 0;
+                if (isIx) ratio = targetArea > 0 ? Math.min(1, (iW * iH) / targetArea) : 1;
+                // thresholdIndex = index of first threshold strictly greater than
+                // ratio, else thresholds.length.
+                let idx = ths.length;
+                for (let k = 0; k < ths.length; k++) { if (ths[k] > ratio) { idx = k; break; } }
+                if (idx === rec.lastIndex && isIx === rec.lastIx) continue;
+                rec.lastIndex = idx; rec.lastIx = isIx;
+                const bcr = {
+                    x: tL - sx, y: tT - sy, left: tL - sx, top: tT - sy,
+                    right: tR - sx, bottom: tB - sy, width: tW, height: tH,
+                };
+                const ir = isIx
+                    ? { x: iL - sx, y: iT - sy, left: iL - sx, top: iT - sy, right: iR - sx, bottom: iB - sy, width: iW, height: iH }
+                    : { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+                entries.push({
+                    target: rec.el, isIntersecting: isIx, intersectionRatio: ratio,
+                    boundingClientRect: bcr, intersectionRect: ir, rootBounds: rootBounds, time: g.performance.now(),
+                });
+            }
+            if (entries.length) {
+                delivered += entries.length;
+                try { o.__cb(entries, o); }
+                catch (e) { trust.errors.push("IntersectionObserver: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+            }
+        }
+        return delivered;
+    };
+
+    // Apply a viewport scroll (CSS px, document origin): update the scroll
+    // position properties, fire the viewport `scroll` event, and re-run the
+    // intersection observations. Driven by the actor's PageCmd::Scroll as the
+    // user scrolls the laid-out document. A no-op when the position is unchanged.
+    trust.setScroll = function (x, y) {
+        x = +x || 0; y = +y || 0;
+        if (x < 0) x = 0; if (y < 0) y = 0;
+        // Clamp to the scrollable range using the engine's OWN measured document
+        // height (documentElement.scrollHeight − innerHeight). The app may carry
+        // a slightly different viewport/row count than the measure pass, so it
+        // anchors a "scrolled to the bottom" to the document height; clamping it
+        // here lands the viewport on the true bottom — where an infinite-scroll
+        // sentinel sits — instead of a few rows short of it.
+        const de = g.document.documentElement;
+        if (de) {
+            const maxY = Math.max(0, de.scrollHeight - (g.innerHeight || 0));
+            if (y > maxY) y = maxY;
+            const maxX = Math.max(0, de.scrollWidth - (g.innerWidth || 0));
+            if (x > maxX) x = maxX;
+        }
+        if (x === (g.scrollX || 0) && y === (g.scrollY || 0)) return;
+        g.scrollX = x; g.scrollY = y; g.pageXOffset = x; g.pageYOffset = y;
+        // Fire `scroll` at the document with forceBubble so window scroll
+        // listeners run too (dispatch pushes window onto the path). scroll itself
+        // doesn't bubble, but both document and window listeners must fire — the
+        // classic `window.addEventListener('scroll', ...)` infinite-scroll idiom
+        // (Steam) depends on it.
+        try { dispatch(g.document, new Event("scroll"), true); }
+        catch (e) { trust.errors.push("scroll handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+        trust.updateIntersections();
+    };
+
+    // Does the page have scroll-driven work (so the actor keeps it live at rest
+    // to receive PageCmd::Scroll)? An IntersectionObserver, or a window/document
+    // `scroll` listener. Peeks the listener map without creating entries.
+    trust.hasScrollWork = function () {
+        if (IO.length) return true;
+        const wm = LS.get(g);
+        if (wm) { const l = wm.get("scroll"); if (l && l.length) return true; }
+        const dm = LS.get(g.document);
+        if (dm) { const l = dm.get("scroll"); if (l && l.length) return true; }
+        return typeof g.onscroll === "function";
     };
     g.ResizeObserver = class {
         constructor(cb) { this.__cb = cb; this.__dead = false; }
@@ -14274,10 +14615,11 @@ mod tests {
 
     #[test]
     fn intersection_observer_reports_the_targets_real_box() {
-        // The observer fires for every target (the no-scroll terminal safeguard)
-        // with the element's REAL box for `boundingClientRect` and a FULL
-        // intersection (ratio 1) — we render the whole document, so every
-        // observed element is treated as fully visible.
+        // A target IN the viewport at load (the probe sits at the very top, so
+        // it's inside the 0..384px viewport) reports `isIntersecting:true` with
+        // its REAL box for `boundingClientRect` and a full ratio (1) — honest
+        // viewport intersection. (A below-the-fold target would report false; see
+        // `a_below_fold_lazy_image_loads_when_scrolled_into_view`.)
         let (out, outcome) = page(
             r##"<body><div id=probe>HELLO</div><div id=out></div><script>
             var io = new IntersectionObserver(function (entries) {
@@ -14296,38 +14638,360 @@ mod tests {
     }
 
     #[test]
-    fn intersection_observer_loads_below_fold_lazy_images() {
-        // vanilla-lazyload (and others) gate on `intersectionRatio > 0` and
-        // IGNORE `isIntersecting`. A below-the-fold element's real ratio is 0,
-        // so such a lazy-loader left every below-fold image blank — Humble
-        // Bundle's bundle-item grid loads only the top rows. Since we render the
-        // whole document, an observed element reports ratio 1 regardless of its
-        // box position, so the loader materializes all of them. The probe sits
-        // far below the viewport, yet its ratio is still positive.
-        let (out, outcome) = page(
-            r##"<body><div style="height:5000px"></div>
-            <img id=lazy data-lazy="/x.png"><div id=out></div><script>
-            var io = new IntersectionObserver(function (entries) {
-                entries.forEach(function (e) {
-                    // The vanilla-lazyload condition, verbatim.
-                    if (e.intersectionRatio > 0) {
-                        e.target.src = e.target.getAttribute('data-lazy');
-                        io.unobserve(e.target);
-                    }
-                });
-            });
-            io.observe(document.getElementById('lazy'));
-            window.__after = function () {
+    fn a_below_fold_target_with_a_box_is_not_intersecting_at_load() {
+        // Honest viewport intersection for a target that HAS a laid-out box: a
+        // boxed element far below the fold reports `isIntersecting:false`, ratio 0
+        // at load (scroll is 0). A scroll-based lazy-loader then leaves it for when
+        // the user scrolls to it — browser behaviour, and why an infinite scroller
+        // no longer tries to reveal the whole document at load. The probe (a text
+        // div, so it has a real box) sits below ~50 rows of real content (a
+        // declared CSS height isn't reserved in flow, so the filler must be real
+        // rows). The first observation ALWAYS fires (previousThresholdIndex = -1),
+        // so the callback runs once with the false state.
+        let filler = "filler line\n".repeat(50);
+        let html = format!(
+            r##"<body><pre>{filler}</pre>
+            <div id=probe>probe</div><div id=out></div><script>
+            var io = new IntersectionObserver(function (entries) {{
+                var e = entries[0];
                 document.getElementById('out').textContent =
-                    'src=' + (document.getElementById('lazy').getAttribute('src') || 'NONE');
-            };
-            setTimeout(window.__after, 0);
+                    'isx=' + e.isIntersecting + ' ratio=' + e.intersectionRatio;
+            }});
+            io.observe(document.getElementById('probe'));
+            </script></body>"##
+        );
+        let (out, outcome) = page(&html);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("isx=false ratio=0"),
+            "a below-fold BOXED target must report not-intersecting at load, got: {out}"
+        );
+    }
+
+    #[test]
+    fn an_empty_sentinel_gets_honest_geometry() {
+        // The IntersectionObserver standard for infinite scroll observes an EMPTY
+        // marker <div> (a "sentinel"). The layout now gives every element a real
+        // ZERO-HEIGHT box at its flow position, so honest intersection works for
+        // an empty element with NO guesswork: a sentinel near the TOP is
+        // intersecting; the SAME empty sentinel below the fold is NOT (it's
+        // honestly placed past the viewport, not reported always-visible).
+        let (top, outcome) = page(
+            r##"<body><h1>Top</h1><div id=probe></div><div id=out></div><script>
+            new IntersectionObserver(function (e) {
+                document.getElementById('out').textContent = 'top isx=' + e[0].isIntersecting;
+            }).observe(document.getElementById('probe'));
             </script></body>"##,
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(
-            out.contains("src=/x.png"),
-            "a below-fold lazy image must still load, got: {out}"
+            top.contains("top isx=true"),
+            "an empty sentinel at the top must intersect (it has a real box now): {top}"
+        );
+        let filler = "filler line\n".repeat(50);
+        let html = format!(
+            r##"<body><pre>{filler}</pre><div id=probe></div><div id=out></div><script>
+            new IntersectionObserver(function (e) {{
+                document.getElementById('out').textContent = 'below isx=' + e[0].isIntersecting;
+            }}).observe(document.getElementById('probe'));
+            </script></body>"##
+        );
+        let (below, outcome) = page(&html);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            below.contains("below isx=false"),
+            "an empty sentinel below the fold must be honestly NOT intersecting: {below}"
+        );
+    }
+
+    #[test]
+    fn a_shadow_rooted_abspos_sentinel_gets_honest_geometry() {
+        // archive.org's `<infinite-scroller>` keeps its IntersectionObserver
+        // sentinel as an EMPTY `position:absolute` <div> inside its SHADOW root,
+        // positioned at the bottom of the growing content. Honest geometry must
+        // reach it through BOTH the shadow boundary (the containing block gathers
+        // its positioned descendants through the composed tree) AND the abspos
+        // coordinate model (the sentinel's USED `top`, not its static in-flow DOM
+        // position): a sentinel near the top of a relatively-positioned scroller
+        // intersects; the same empty sentinel placed below the fold is honestly
+        // NOT intersecting.
+        let top = r##"<body><div id=host style="position:relative;height:32px"></div>
+        <div id=out></div><script>
+        var sr = document.getElementById('host').attachShadow({mode:'open'});
+        sr.innerHTML = '<div id=s style="position:absolute;top:0"></div>';
+        new IntersectionObserver(function (e) {
+            document.getElementById('out').textContent = 'top isx=' + e[0].isIntersecting;
+        }).observe(sr.querySelector('#s'));
+        </script></body>"##;
+        let (out, outcome) = page(top);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("top isx=true"),
+            "a shadow-rooted abspos sentinel at the top must intersect: {out}"
+        );
+
+        let below = r##"<body><div id=host style="position:relative;height:1600px"></div>
+        <div id=out></div><script>
+        var sr = document.getElementById('host').attachShadow({mode:'open'});
+        sr.innerHTML = '<div id=s style="position:absolute;top:1500px"></div>';
+        new IntersectionObserver(function (e) {
+            document.getElementById('out').textContent = 'below isx=' + e[0].isIntersecting;
+        }).observe(sr.querySelector('#s'));
+        </script></body>"##;
+        let (out, outcome) = page(below);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("below isx=false"),
+            "a shadow-rooted abspos sentinel below the fold must be honestly NOT intersecting: {out}"
+        );
+    }
+
+    #[test]
+    fn a_below_fold_lazy_image_loads_when_scrolled_into_view() {
+        // The demand-driven half: the same below-fold lazy image stays blank at
+        // load, then loads once the user scrolls it into view — a PageCmd::Scroll
+        // updates scrollY, re-runs the intersection step, and the IO callback
+        // (now isIntersecting) sets src. This is the live-engine path the old
+        // "reveal everything at load" stub replaced; it's how infinite scroll and
+        // scroll-based lazy loading both work.
+        // Observe a text-bearing sentinel (so it has a real layout box) and load
+        // the image when it scrolls into view — the standard sentinel-driven lazy
+        // pattern. (A bare zero-size <img> may have no box, which a real lazy
+        // image avoids by reserving space.)
+        let filler = "filler line\n".repeat(50);
+        let html = format!(
+            r##"<body><pre>{filler}</pre>
+            <img id=lazy data-lazy="/x.png"><div id=sentinel>load-zone</div><div id=out></div><script>
+            var io = new IntersectionObserver(function (entries) {{
+                entries.forEach(function (e) {{
+                    if (e.isIntersecting) {{
+                        var img = document.getElementById('lazy');
+                        img.src = img.getAttribute('data-lazy');
+                        io.unobserve(e.target);
+                    }}
+                }});
+                document.getElementById('out').textContent =
+                    'src=' + (document.getElementById('lazy').getAttribute('src') || 'NONE');
+            }});
+            io.observe(document.getElementById('sentinel'));
+            </script></body>"##
+        );
+        let (handle, mut events) = live(&html);
+        let first = match events.blocking_recv() {
+            Some(PageEvt::Updated { html, outcome }) => {
+                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                html
+            }
+            other => panic!("expected a live first render, got {other:?}"),
+        };
+        assert!(
+            first.contains("src=NONE"),
+            "the lazy image must NOT load at the top of the page, got: {first}"
+        );
+        // Scroll the image (below ~50 rows = 800px) into the 384px viewport.
+        handle
+            .cmds
+            .blocking_send(PageCmd::Scroll { x: 0.0, y: 800.0 })
+            .unwrap();
+        let mut loaded = false;
+        for _ in 0..8 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    if html.contains("src=/x.png") {
+                        loaded = true;
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled) => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(loaded, "the lazy image must load once scrolled into view");
+    }
+
+    #[test]
+    fn a_window_scroll_listener_sees_the_threaded_position() {
+        // Steam's infinite scroll listens on `window` and checks
+        // `scrollY + innerHeight >= scrollHeight`. A PageCmd::Scroll fires the
+        // viewport `scroll` event (reaching window listeners) with the real
+        // scrollY, innerHeight, and documentElement.scrollHeight. A page with a
+        // scroll listener and nothing else stays LIVE to receive the scroll.
+        let filler = "filler line\n".repeat(50);
+        let html = format!(
+            r##"<body><pre>{filler}</pre><div id=out></div><script>
+            window.addEventListener('scroll', function () {{
+                document.getElementById('out').textContent =
+                    'y=' + Math.round(window.scrollY) + ' ih=' + window.innerHeight +
+                    ' atBottom=' + (window.scrollY + window.innerHeight >=
+                                    document.documentElement.scrollHeight);
+            }});
+            </script></body>"##
+        );
+        let (handle, mut events) = live(&html);
+        match events.blocking_recv() {
+            Some(PageEvt::Updated { outcome, .. }) => {
+                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors)
+            }
+            other => panic!("a scroll-listener page must stay live, got {other:?}"),
+        }
+        handle
+            .cmds
+            .blocking_send(PageCmd::Scroll { x: 0.0, y: 320.0 })
+            .unwrap();
+        let mut saw = None;
+        for _ in 0..8 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    if html.contains("y=320 ih=384") {
+                        saw = Some(html);
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled) => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(
+            saw.is_some(),
+            "the window scroll listener must see y=320 ih=384"
+        );
+    }
+
+    #[test]
+    fn a_bottom_sentinel_appends_a_batch_when_scrolled_to() {
+        // The infinite-scroll mechanism end to end (via the actor, append in
+        // place of a network fetch): a sentinel below the fold is NOT intersecting
+        // at load (no batch), then scrolling to it fires the IO callback which
+        // appends the next item. A mid-page scroll that reveals nothing new emits
+        // `Settled` (edge-triggered: no threshold/isIntersecting change ⇒ no
+        // entry ⇒ no mutation).
+        let filler = "filler line\n".repeat(50);
+        let html = format!(
+            r##"<body><div id=list><div class=item>item-1</div></div>
+            <pre>{filler}</pre><div id=sentinel>.</div><script>
+            var n = 1;
+            var io = new IntersectionObserver(function (entries) {{
+                entries.forEach(function (e) {{
+                    if (e.isIntersecting) {{
+                        n++;
+                        var d = document.createElement('div');
+                        d.className = 'item';
+                        d.textContent = 'item-' + n;
+                        document.getElementById('list').appendChild(d);
+                    }}
+                }});
+            }});
+            io.observe(document.getElementById('sentinel'));
+            </script></body>"##
+        );
+        let (handle, mut events) = live(&html);
+        let first = match events.blocking_recv() {
+            Some(PageEvt::Updated { html, outcome }) => {
+                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                html
+            }
+            other => panic!("expected a live first render, got {other:?}"),
+        };
+        assert!(first.contains("item-1"), "{first}");
+        assert!(
+            !first.contains("item-2"),
+            "no batch must load at the top, got: {first}"
+        );
+        // Scroll the sentinel (below ~50 rows = 800px) into view.
+        handle
+            .cmds
+            .blocking_send(PageCmd::Scroll { x: 0.0, y: 800.0 })
+            .unwrap();
+        let mut appended = false;
+        for _ in 0..8 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    if html.contains("item-2") {
+                        appended = true;
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled) => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(
+            appended,
+            "scrolling to the bottom sentinel must append the next batch"
+        );
+    }
+
+    #[test]
+    fn a_bottom_sentinel_re_arms_for_the_next_batch() {
+        // The regression: after a batch loads and pushes the sentinel out of the
+        // viewport, a SECOND scroll to the new bottom must load the next batch.
+        // This only works if intersections are re-evaluated AFTER the batch
+        // mutates the DOM (the sentinel goes isIntersecting:true→false, re-arming
+        // the false→true trigger). Each batch (30 rows) here is taller than the
+        // 24-row viewport, so it clears the sentinel — the well-built infinite
+        // scroller. (Uses a synchronous append; the real fetch path is the live
+        // smoke. `bare` has no network.)
+        let filler = "filler line\n".repeat(50);
+        let html = format!(
+            r##"<body><div id=list></div><pre>{filler}</pre><div id=sentinel>.</div><script>
+            var n = 0;
+            new IntersectionObserver(function (entries) {{
+                entries.forEach(function (e) {{
+                    if (!e.isIntersecting) return;
+                    var list = document.getElementById('list');
+                    for (var i = 0; i < 30; i++) {{
+                        n++;
+                        var d = document.createElement('div');
+                        d.textContent = 'item-' + n;
+                        list.appendChild(d);
+                    }}
+                }});
+            }}).observe(document.getElementById('sentinel'));
+            </script></body>"##
+        );
+        let (handle, mut events) = live(&html);
+        // First render: sentinel below the fold ⇒ no batch.
+        match events.blocking_recv() {
+            Some(PageEvt::Updated { html, .. }) => {
+                assert!(!html.contains("item-1"), "no batch at load: {html}")
+            }
+            other => panic!("expected a live first render, got {other:?}"),
+        }
+        let recv_until = |events: &mut tokio::sync::mpsc::Receiver<PageEvt>, needle: &str| {
+            for _ in 0..8 {
+                match events.blocking_recv() {
+                    Some(PageEvt::Updated { html, outcome }) => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        if html.contains(needle) {
+                            return true;
+                        }
+                    }
+                    Some(PageEvt::Settled) => continue,
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+            false
+        };
+        // Scroll #1: sentinel enters view ⇒ batch 1 (items 1..30) appends and
+        // pushes the sentinel out of the viewport.
+        handle
+            .cmds
+            .blocking_send(PageCmd::Scroll { x: 0.0, y: 800.0 })
+            .unwrap();
+        assert!(recv_until(&mut events, "item-1"), "batch 1 must load");
+        // Scroll #2 to the new bottom: the re-armed sentinel re-enters ⇒ batch 2
+        // (items 31..60). This is what dead-ended before the fetch-done /
+        // post-mutation re-evaluation fix.
+        handle
+            .cmds
+            .blocking_send(PageCmd::Scroll { x: 0.0, y: 1100.0 })
+            .unwrap();
+        assert!(
+            recv_until(&mut events, "item-31"),
+            "scrolling to the new bottom must load the SECOND batch (re-arm)"
         );
     }
 

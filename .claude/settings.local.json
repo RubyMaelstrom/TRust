@@ -92,7 +92,8 @@
       "Bash(curl -s http://localhost:8080/api/config)",
       "WebFetch(domain:html.spec.whatwg.org)",
       "Bash(awk 'NR>=5894 && NR<=6410 && \\(/localName ===|localName !==|tagName ===|tagName !==|__isMedia/\\)' src/js.rs)",
-      "Bash(awk -F: '$1<7239 && $1>5026')"
+      "Bash(awk -F: '$1<7239 && $1>5026')",
+      "Bash(TRUST_NET_DIAG=https://archive.org TRUST_NET_DIAG_OUT=/tmp/claude-1000/-home-ruby-Code-TRust/0d1af1c4-7ca3-4fc4-9db8-c546e7885d47/scratchpad/ao.html TRUST_DIAG_VP=200x50 timeout 180 cargo test --release net_diag -- --ignored --nocapture)"
     ]
   }
 }

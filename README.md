@@ -1,8 +1,8 @@
-# TRust — Telnet in Rust
+# TRust — Terminal browser in Rust
 
-A telnet client written in Rust, that's why it's called TRust. Booooooring!
-Oh wait, did you know it also supports gopher? And gemini? Finger? Whois?
-Oh, and http. With a full rusty JS engine forked from Boa and customized.
+A terminal-based browser written in Rust, that's why it's called TRust.
+Oh wait, did you know it also supports telnet, gopher, gemini, finger, and whois?
+Oh, and HTTP. With a full rusty JS engine forked from Boa and customized.
 Image support? We got it. Live JS rendering? Yup. Full CSS? Yeah.
 
 Browse the web, connect to MUDs, check out your favorite gopher holes and

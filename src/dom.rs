@@ -784,7 +784,41 @@ impl Dom {
                 }
             }
         }
+        // `:host` rules: a shadow root's own stylesheet styles ITS host element
+        // (CSS Scoping §3.3) via `:host`/`:host(<compound>)`. The host lives in
+        // the parent tree, so these aren't in its matched set — pull them from
+        // the host's shadow scope. (`<style>` baked into the serialized HTML is
+        // dropped, so this is the JS-pipeline adoptedStyleSheets path.)
+        if let Some(&sr) = self.shadow_roots.get(&id)
+            && let Some(rules) = index.scopes.get(&sr)
+        {
+            for r in rules {
+                if rule_pseudo(r).is_some() || !self.host_rule_matches(id, r) {
+                    continue;
+                }
+                for (pk, (imp, v)) in &r.decls {
+                    if pk == prop {
+                        consider(&mut winner, (*imp, false, r.specificity, r.order), v);
+                    }
+                }
+            }
+        }
         winner.map(|(_, v)| v)
+    }
+
+    /// Whether a shadow-scope rule is a `:host`/`:host(<compound>)` rule that
+    /// matches its host element. Only a single-compound selector is treated as
+    /// host-matching (`:host`, `:host(.x)`); a `:host(.x) .y` rule targets
+    /// shadow content and is matched against that content in its own scope.
+    fn host_rule_matches(&self, host: NodeId, r: &StyleRule) -> bool {
+        let parts = &r.selector.0;
+        let [(_, c)] = parts.as_slice() else {
+            return false;
+        };
+        c.host
+            && c.host_inner
+                .as_ref()
+                .is_none_or(|inner| self.matches_compound(host, inner, None))
     }
 
     /// An element's computed value for a custom property (`--foo`): its own
@@ -1175,25 +1209,68 @@ impl Dom {
     }
 
     /// Document-order walk of the COMPOSED tree: light children plus
-    /// every shadow tree (interactive content hides in there).
+    /// every shadow tree (interactive content hides in there). Composes the
+    /// shadow root of EVERY node including `root` itself — so a containing
+    /// block that is a shadow host (archive.org's `<infinite-scroller>` keeps
+    /// its positioned sentinel in its own shadow root) reaches its shadow
+    /// descendants, not only its light subtree.
     pub fn composed_descendants(&self, root: NodeId) -> Vec<NodeId> {
         let mut out = Vec::new();
-        let mut stack: Vec<NodeId> = self.children(root);
-        stack.reverse();
+        let mut stack: Vec<NodeId> = Vec::new();
+        self.push_composed_children(root, &mut stack);
         while let Some(id) = stack.pop() {
             out.push(id);
-            let mut kids = self.children(id);
-            if let Some(shadow) = self.shadow_root(id) {
-                kids.extend(self.children(shadow));
-            }
-            kids.reverse();
-            stack.extend(kids);
+            self.push_composed_children(id, &mut stack);
         }
         out
     }
 
     pub fn shadow_root(&self, host: NodeId) -> Option<NodeId> {
         self.shadow_roots.get(&host).copied()
+    }
+
+    /// The composed-tree children of `id`: its light children plus, when it
+    /// hosts a shadow root, that root's children. A slotted light child stays
+    /// a child of its host here (it isn't re-parented under the `<slot>`), so a
+    /// bottom-up walk that unions descendant boxes still reaches it — exactly
+    /// what `measure_boxes` needs so a shadow host's box (and the document's
+    /// scrollable height) counts the content rendered into its shadow tree.
+    pub fn composed_children(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out = self.children(id);
+        if let Some(shadow) = self.shadow_root(id) {
+            out.extend(self.children(shadow));
+        }
+        out
+    }
+
+    /// The light-DOM nodes assigned to a `<slot>` (HTML §4.8.2 slot
+    /// assignment): the slot's shadow HOST's children whose `slot=` attribute
+    /// matches this slot's `name` (the default slot is `name=""`/absent, where
+    /// text nodes and slot-less children land). Returns empty when the slot is
+    /// not inside a shadow tree, or nothing is assigned — the caller then falls
+    /// back to the slot's own children (its fallback content). This is what
+    /// projects a web component's light children into its shadow `<slot>`s so
+    /// the flat (rendered) tree is complete — archive.org's `<router-slot>`
+    /// shadow is just `<slot>`, with the routed `<home-page>` (and the
+    /// `<infinite-scroller>` beneath it) assigned as a light child.
+    pub fn slot_assigned_nodes(&self, slot: NodeId) -> Vec<NodeId> {
+        let mut cur = self.nodes[slot].parent;
+        let host = loop {
+            match cur {
+                Some(p) => {
+                    if let Some(&h) = self.shadow_hosts.get(&p) {
+                        break h;
+                    }
+                    cur = self.nodes[p].parent;
+                }
+                None => return Vec::new(),
+            }
+        };
+        let want = self.attr(slot, "name").unwrap_or("").trim().to_owned();
+        self.children(host)
+            .into_iter()
+            .filter(|&c| self.attr(c, "slot").unwrap_or("").trim() == want)
+            .collect()
     }
 
     /// Composed-tree element ids whose tag is `name`, in document (pre-)order,
@@ -1602,6 +1679,127 @@ impl Dom {
             self.serialize_node(c, None, &mut out);
         }
         out
+    }
+
+    /// Replace each renderable inline `<svg>` with an `<img>` whose `src` is the
+    /// SVG as a `data:` URL, so the existing image pipeline decodes, sizes,
+    /// caches, and silhouette-tints it — a vector icon/logo becomes a rendered
+    /// glyph rather than its accessible-name text. SVG colors are NOT honored
+    /// (same call as dropping HTML/CSS color); the recolor happens at encode.
+    /// Non-renderable SVG (a `<use>`-only sprite instance, or a hidden
+    /// `<symbol>`/`<defs>` container) is left untouched, keeping the existing
+    /// icon-glyph / accessible-name fallback. Runs once per DOM build, before
+    /// image-URL collection and layout. This is the first slice of inline-SVG
+    /// support: a static snapshot of self-contained vector markup.
+    pub fn rewrite_inline_svgs(&mut self) {
+        for id in self.descendants(DOCUMENT) {
+            if self.tag_name(id) != Some("svg")
+                || self.ancestor_is_svg(id)
+                || !self.svg_is_renderable(id)
+            {
+                continue;
+            }
+            let Some(parent) = self.nodes[id].parent else {
+                continue;
+            };
+            let mut svg = self.serialize(id);
+            // resvg needs the namespace; an inline <svg> in HTML may omit it.
+            if !svg.contains("xmlns") {
+                svg = svg.replacen("<svg", r#"<svg xmlns="http://www.w3.org/2000/svg""#, 1);
+            }
+            let name = self.svg_accessible_name(id);
+            // Carry the SVG element's box onto the replacement <img> so layout
+            // sizes the vector the way the page does. A browser sizes a replaced
+            // SVG by its CSS `width`/`height` (here baked into `style` by the JS
+            // cascade — `width:2.7rem`, etc.) over its presentation `width`/
+            // `height` attrs over the viewBox ratio over the 300×150 default.
+            // Without this the <img> carried no size, so `image_used_box` fell
+            // to the SVG's intrinsic (300×150 when the markup has no width/height
+            // attr) and rendered logos page-sized. `style` also carries the
+            // box's margin/display/position so the icon lands where the SVG did.
+            let style = self.attr(id, "style").map(str::to_string);
+            let w_attr = self.attr(id, "width").map(str::to_string);
+            let h_attr = self.attr(id, "height").map(str::to_string);
+            let img = self.create_element("img");
+            self.set_attr(img, "src", &crate::img::svg_data_url(&svg));
+            if !name.is_empty() {
+                self.set_attr(img, "alt", &name);
+            }
+            if let Some(style) = style {
+                self.set_attr(img, "style", &style);
+            }
+            if let Some(w) = w_attr {
+                self.set_attr(img, "width", &w);
+            }
+            if let Some(h) = h_attr {
+                self.set_attr(img, "height", &h);
+            }
+            self.insert_before(parent, img, Some(id));
+            self.detach(id);
+        }
+    }
+
+    /// A paintable inline SVG: not hidden, and carrying real vector geometry
+    /// that resvg can render on its own (not just a `<use>` sprite reference,
+    /// whose target lives in another element we don't serialize with it).
+    fn svg_is_renderable(&self, id: NodeId) -> bool {
+        if self.is_hidden(id) {
+            return false;
+        }
+        self.descendants(id).into_iter().any(|d| {
+            matches!(
+                self.tag_name(d),
+                Some("path" | "rect" | "circle" | "ellipse" | "line" | "polyline" | "polygon")
+            ) && !self.in_svg_non_render(d)
+        })
+    }
+
+    /// Whether a node sits inside a non-rendered SVG container (`<defs>` and
+    /// friends define reusable shapes; they paint nothing on their own).
+    fn in_svg_non_render(&self, id: NodeId) -> bool {
+        let mut cur = self.nodes[id].parent;
+        while let Some(p) = cur {
+            match self.tag_name(p) {
+                Some("defs" | "symbol" | "clipPath" | "mask" | "pattern" | "marker") => {
+                    return true;
+                }
+                Some("svg") => return false,
+                _ => cur = self.nodes[p].parent,
+            }
+        }
+        false
+    }
+
+    fn ancestor_is_svg(&self, id: NodeId) -> bool {
+        let mut cur = self.nodes[id].parent;
+        while let Some(p) = cur {
+            if self.tag_name(p) == Some("svg") {
+                return true;
+            }
+            cur = self.nodes[p].parent;
+        }
+        false
+    }
+
+    /// The SVG's accessible name for `<img alt>` (a fallback shown only if the
+    /// decode fails): `aria-label`, else its `<title>` text, else empty.
+    fn svg_accessible_name(&self, id: NodeId) -> String {
+        if let Some(l) = self
+            .attr(id, "aria-label")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return l.to_string();
+        }
+        for d in self.descendants(id) {
+            if self.tag_name(d) == Some("title") {
+                let t = self.text_content(d).trim().to_string();
+                if !t.is_empty() {
+                    return t;
+                }
+            }
+        }
+        String::new()
     }
 
     fn serialize_node(&self, id: NodeId, host: Option<NodeId>, out: &mut String) {
@@ -2115,6 +2313,12 @@ impl Dom {
         if c.never {
             return false;
         }
+        // `:host` targets the shadow host, which is NOT inside the shadow tree
+        // these rules are scoped to — it's matched specially in `cascaded`
+        // (`host_rule_matches`), never against in-scope elements here.
+        if c.host {
+            return false;
+        }
         // `:scope` matches only the query root (None in the cascade → never).
         if c.scope && scope != Some(id) {
             return false;
@@ -2248,6 +2452,14 @@ struct Compound {
     /// home of custom-property definitions (`:root { --foo: … }`), so matching
     /// it is what lets `var(--foo)` resolve to a root-defined value.
     root: bool,
+    /// `:host` / `:host(<compound>)` (CSS Scoping §3.3): in a shadow root's
+    /// stylesheet, targets the SHADOW HOST (the element the root is attached to),
+    /// which lives in the parent tree — so it's matched specially against the
+    /// host in `cascaded`, never via the normal in-scope path (which would test
+    /// it against shadow-internal elements). `host_inner` is the `(…)` argument
+    /// the host must additionally match (`:host(.theme-dark)`).
+    host: bool,
+    host_inner: Option<Box<Compound>>,
     /// `::before`/`::after`: the rule targets a generated-content box on
     /// the matched element, NOT the element itself. The element-property
     /// cascade skips these; `pseudo_content` consults only these.
@@ -2391,6 +2603,7 @@ impl Compound {
             && !self.never
             && !self.scope
             && !self.root
+            && !self.host
             && self.structural.is_empty()
             && self.pseudo.is_none()
     }
@@ -2406,6 +2619,10 @@ impl Compound {
         for n in &self.nots {
             let ns = n.spec();
             s = (s.0 + ns.0, s.1 + ns.1, s.2 + ns.2);
+        }
+        if let Some(inner) = &self.host_inner {
+            let hs = inner.spec();
+            s = (s.0 + hs.0, s.1 + hs.1, s.2 + hs.2);
         }
         s
     }
@@ -2607,6 +2824,19 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                 } else if name == "root" {
                     compound.root = true;
                     compound.pseudos += 1;
+                } else if name == "host" {
+                    // `:host` / `:host(<compound>)`: styles the shadow host.
+                    // Matched against the host in `cascaded`, not here.
+                    compound.host = true;
+                    compound.pseudos += 1;
+                    if let Some(a) = &arg {
+                        let mut ic = a.trim().chars().peekable();
+                        let inner = parse_compound(&mut ic)?;
+                        if inner.is_empty() || ic.peek().is_some() {
+                            return None;
+                        }
+                        compound.host_inner = Some(Box::new(inner));
+                    }
                 } else if name == "empty" {
                     compound.structural.push(Structural::Empty);
                     compound.pseudos += 1;
@@ -4332,6 +4562,84 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_inline_svg_makes_a_renderable_one_a_data_image() {
+        let mut dom = Dom::parse_document(
+            r##"<body>
+                <a href="/x"><svg viewBox="0 0 40 40" aria-label="Web">
+                    <title>Web</title><path d="M0 0h40v40H0z"/></svg></a>
+                <svg viewBox="0 0 10 10"><use href="#sprite"/></svg>
+                <svg style="display:none"><symbol id="s"><path d="M0 0z"/></symbol></svg>
+               </body>"##,
+        );
+        dom.rewrite_inline_svgs();
+        let imgs: Vec<NodeId> = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .filter(|&d| dom.tag_name(d) == Some("img"))
+            .collect();
+        // The path-bearing SVG became an <img data:…> with its <title> as alt;
+        // the <use>-only and the hidden sprite-def SVG are left as <svg>.
+        assert_eq!(imgs.len(), 1, "only the renderable svg is rewritten");
+        let img = imgs[0];
+        assert!(
+            dom.attr(img, "src")
+                .unwrap()
+                .starts_with("data:image/svg+xml;base64,"),
+            "{:?}",
+            dom.attr(img, "src")
+        );
+        assert_eq!(dom.attr(img, "alt"), Some("Web"));
+        // The data URL decodes back to SVG markup carrying the path + namespace.
+        let bytes = crate::img::decode_data_url(dom.attr(img, "src").unwrap()).unwrap();
+        let svg = String::from_utf8(bytes).unwrap();
+        assert!(
+            svg.contains("<path") && svg.contains("viewBox") && svg.contains("xmlns"),
+            "{svg}"
+        );
+        // It stays inside the anchor, so the icon remains clickable.
+        assert_eq!(dom.tag_name(dom.nodes[img].parent.unwrap()), Some("a"));
+        // The two non-renderable SVGs survive untouched (glyph/text fallback).
+        let svgs = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .filter(|&d| dom.tag_name(d) == Some("svg"))
+            .count();
+        assert_eq!(svgs, 2);
+    }
+
+    #[test]
+    fn rewrite_inline_svg_carries_the_elements_css_and_attr_size() {
+        // The replacement <img> must keep the SVG element's box so layout sizes
+        // the vector the way the page does — the cascaded CSS size (`style`)
+        // over presentation attrs over the intrinsic. archive.org's logo carries
+        // only `style="width:2.7rem;height:3rem"`; its media icons carry both a
+        // `width="40"` attr and a winning `style="width:4rem"`.
+        let mut dom = Dom::parse_document(
+            r##"<body>
+                <svg class="logo" viewBox="0 0 27 30" style="width:2.7rem;height:3rem">
+                    <path d="M0 0h27v30H0z"/></svg>
+                <svg width="40" height="40" viewBox="0 0 40 40" style="width:4rem;height:4rem">
+                    <path d="M0 0h40v40H0z"/></svg>
+               </body>"##,
+        );
+        dom.rewrite_inline_svgs();
+        let imgs: Vec<NodeId> = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .filter(|&d| dom.tag_name(d) == Some("img"))
+            .collect();
+        assert_eq!(imgs.len(), 2);
+        // The style-only logo carries its CSS size (no width/height attr).
+        assert_eq!(dom.attr(imgs[0], "style"), Some("width:2.7rem;height:3rem"));
+        assert_eq!(dom.attr(imgs[0], "width"), None);
+        // The icon carries BOTH; CSS wins in layout, but the attr is preserved
+        // as the presentation-hint fallback.
+        assert_eq!(dom.attr(imgs[1], "style"), Some("width:4rem;height:4rem"));
+        assert_eq!(dom.attr(imgs[1], "width"), Some("40"));
+        assert_eq!(dom.attr(imgs[1], "height"), Some("40"));
+    }
+
+    #[test]
     fn css_cascade_hides_and_reshows() {
         // Stylesheet-class hiding, and the part a one-way hide-list
         // would get wrong: a MORE SPECIFIC rule re-showing.
@@ -4474,6 +4782,47 @@ mod tests {
         assert!(html.contains("light sec stays"), "{html}");
         assert!(!html.contains("doc target"), "{html}");
         assert!(html.contains("shadow shown"), "{html}");
+    }
+
+    #[test]
+    fn host_pseudo_styles_the_shadow_host() {
+        // CSS Scoping §3.3: a shadow root's OWN sheet styles its host element
+        // through `:host` / `:host(<compound>)`. The host lives in the parent
+        // tree, so these are matched specially — not via in-scope selectors.
+        // This is how a Lit component's `:host{display:block}` reaches the
+        // custom element (archive.org's `home-page-hero-block-icon-bar`).
+        let mut dom = Dom::parse_document("<body><my-bar id=host></my-bar><div id=o></div></body>");
+        let host = dom.get_by_id("host").unwrap();
+        let root = dom.attach_shadow(host);
+        let style = dom.create_element("style");
+        let css =
+            dom.create_text(":host{display:block} :host(.wide){max-width:44rem} .in{display:none}");
+        dom.append(style, css);
+        dom.append(root, style);
+        let inner = dom.create_element("span");
+        dom.set_attr(inner, "class", "in");
+        dom.append(root, inner);
+
+        // `:host` styles the host element.
+        assert_eq!(
+            dom.computed_style(host, "display").as_deref(),
+            Some("block")
+        );
+        // `:host(.wide)` applies only when the host matches the argument.
+        assert_eq!(dom.computed_style(host, "max-width"), None);
+        dom.set_attr(host, "class", "wide");
+        assert_eq!(
+            dom.computed_style(host, "max-width").as_deref(),
+            Some("44rem")
+        );
+        // `:host` never leaks onto a sibling in the parent tree...
+        let other = dom.get_by_id("o").unwrap();
+        assert_eq!(dom.computed_style(other, "display"), None);
+        // ...and a normal selector in the shadow sheet still styles shadow content.
+        assert_eq!(
+            dom.computed_style(inner, "display").as_deref(),
+            Some("none")
+        );
     }
 
     #[test]

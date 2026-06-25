@@ -1734,7 +1734,10 @@ pub fn parse_seeded(
         // controls). Forms are extracted from the SAME arena so the
         // control map's node ids line up with the layout pass. HTML no
         // longer uses the line model — `rows` is the whole story.
-        let dom = crate::dom::Dom::parse_document(&html);
+        let mut dom = crate::dom::Dom::parse_document(&html);
+        // Turn renderable inline <svg> into <img data:…> so vectors render
+        // (silhouette-tinted) through the image pipeline instead of as text.
+        dom.rewrite_inline_svgs();
         let (found, controls) = extract_forms_arena(&dom, url, seed);
         forms = found;
         image_urls = collect_image_urls(&dom, url);
@@ -1788,11 +1791,17 @@ fn collect_image_urls(dom: &crate::dom::Dom, base: &Url) -> Vec<String> {
         let Some(src) = src.map(str::trim).filter(|s| !s.is_empty()) else {
             continue;
         };
-        if let Link::Http(u) = resolve(base, src) {
-            let u = u.to_string();
-            if !urls.contains(&u) {
-                urls.push(u);
-            }
+        // A `data:` image (inline SVG rewritten to one, or a page's own data
+        // image) carries its bytes inline — decoded locally, never fetched.
+        let u = if src.starts_with("data:") {
+            src.to_string()
+        } else if let Link::Http(u) = resolve(base, src) {
+            u.to_string()
+        } else {
+            continue;
+        };
+        if !urls.contains(&u) {
+            urls.push(u);
         }
     }
     urls
@@ -4406,6 +4415,35 @@ mod tests {
                     _ => {
                         eprintln!("SETTLED <no more within 20s>");
                         break;
+                    }
+                }
+            }
+        }
+        // TRUST_DIAG_SCROLL=N: drive infinite scroll — send N PageCmd::Scroll
+        // toward the document bottom (huge y, setScroll clamps to the bottom; as
+        // content loads the bottom moves so successive steps make progress),
+        // draining + capturing the render between. Pair with TRUST_NET_TRACE=1 to
+        // see whether the page fetches more on scroll.
+        if let Ok(nstr) = std::env::var("TRUST_DIAG_SCROLL")
+            && let Some(live) = response.live.as_mut()
+        {
+            let n: usize = nstr.parse().unwrap_or(5);
+            for i in 1..=n {
+                let y = (i as f64) * 100_000.0;
+                eprintln!("DIAG_SCROLL step {i}/{n} -> y={y}");
+                let _ = live
+                    .handle
+                    .cmds
+                    .send(crate::js::PageCmd::Scroll { x: 0.0, y })
+                    .await;
+                for _ in 0..8 {
+                    match tokio::time::timeout(Duration::from_secs(4), live.events.recv()).await {
+                        Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                            eprintln!("SCROLL EVT errors={:?}", outcome.errors);
+                            response.body = html.into_bytes();
+                        }
+                        Ok(Some(other)) => eprintln!("SCROLL EVT {other:?}"),
+                        _ => break,
                     }
                 }
             }
