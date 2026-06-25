@@ -36,6 +36,137 @@ pub struct ImageInfo {
     pub mime: &'static str,
 }
 
+/// How an SVG is recolored to match the UI. We deliberately do NOT honor an
+/// SVG's own colors (the same call as not honoring HTML/CSS color — see the
+/// cascade notes): a vector is rendered as a SILHOUETTE — its coverage painted
+/// in `fg` over `bg` — so a black-on-transparent icon designed for a light page
+/// reads cleanly on the cyberpunk canvas instead of vanishing. `fg` is the
+/// element's role color (link accent vs. body text); `bg` is the UI background.
+/// Only SVG is tinted; raster images keep their pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SvgTint {
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+}
+
+/// Replace every pixel's color with the tint, keeping the artwork's coverage:
+/// `out = bg·(1-α) + fg·α`, fully opaque. The anti-aliased edges blend into the
+/// UI background exactly as the on-screen background does, and the result is a
+/// flat duotone (one accent color), never the source art's clashing palette.
+fn apply_silhouette(image: DynamicImage, tint: SvgTint) -> DynamicImage {
+    let mut rgba = image.to_rgba8();
+    for px in rgba.pixels_mut() {
+        let a = px[3] as f32 / 255.0;
+        for c in 0..3 {
+            px[c] = (tint.bg[c] as f32 * (1.0 - a) + tint.fg[c] as f32 * a).round() as u8;
+        }
+        px[3] = 255;
+    }
+    DynamicImage::ImageRgba8(rgba)
+}
+
+/// Wrap serialized SVG markup as a self-contained `data:` URL. Inline `<svg>`
+/// elements are rewritten to `<img src=…>` carrying this so they reuse the
+/// whole `<img>` decode/cache/reflow/tint pipeline (an inline vector has no URL
+/// of its own). base64 keeps the payload safe inside an HTML `src` attribute
+/// (the markup is full of `"`/`<`/`>`).
+pub(crate) fn svg_data_url(svg: &str) -> String {
+    format!(
+        "data:image/svg+xml;base64,{}",
+        base64_encode(svg.as_bytes())
+    )
+}
+
+/// The raw bytes of a `data:` URL — base64 or percent/plain payload. Lets the
+/// image loader render inline SVG (and any `data:image/*`) without a fetch.
+pub(crate) fn decode_data_url(url: &str) -> Option<Vec<u8>> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    if meta.split(';').any(|t| t.eq_ignore_ascii_case("base64")) {
+        base64_decode(payload)
+    } else {
+        Some(percent_decode(payload))
+    }
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64[(n >> 18 & 63) as usize] as char);
+        out.push(B64[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let mut n = 0u32;
+        let mut pad = 0;
+        for i in 0..4 {
+            n <<= 6;
+            match chunk.get(i) {
+                Some(b'=') | None => pad += 1,
+                Some(&c) => n |= val(c)?,
+            }
+        }
+        out.push((n >> 16 & 0xff) as u8);
+        if pad < 2 {
+            out.push((n >> 8 & 0xff) as u8);
+        }
+        if pad < 1 {
+            out.push((n & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    out
+}
+
 /// Sniff the image format from magic bytes or a bounded SVG/XML prologue.
 /// This remains deliberately cheap because HTTP uses it on the UI thread for
 /// application/octet-stream responses; full XML validation happens off-thread.
@@ -355,6 +486,7 @@ fn decode_for_box(
     picker: &Picker,
     size: Size,
     crop: bool,
+    tint: Option<SvgTint>,
 ) -> Result<(DynamicImage, ImageInfo, bool), String> {
     if image::guess_format(bytes).is_ok() {
         let (image, mime) = decode_raster(bytes)?;
@@ -371,6 +503,12 @@ fn decode_for_box(
     let width = u32::from(size.width.max(1)) * u32::from(font.width.max(1));
     let height = u32::from(size.height.max(1)) * u32::from(font.height.max(1));
     let image = rasterize_svg(&svg.tree, width, height, crop)?;
+    // Recolor to the UI palette (silhouette), unless a caller asked for the
+    // raw render. Raster images never reach here with a tint that matters.
+    let image = match tint {
+        Some(t) => apply_silhouette(image, t),
+        None => image,
+    };
     Ok((image, svg.info, true))
 }
 
@@ -381,8 +519,9 @@ pub fn encode_bytes(
     bytes: &[u8],
     size: Size,
     crop: bool,
+    tint: Option<SvgTint>,
 ) -> Result<(Protocol, ImageInfo), String> {
-    let (image, info, svg_fitted) = decode_for_box(bytes, picker, size, crop)?;
+    let (image, info, svg_fitted) = decode_for_box(bytes, picker, size, crop, tint)?;
     encode(picker, image, size, crop && !svg_fitted).map(|protocol| (protocol, info))
 }
 
@@ -392,8 +531,9 @@ pub fn encode_sliced_bytes(
     bytes: &[u8],
     size: Size,
     crop: bool,
+    tint: Option<SvgTint>,
 ) -> Result<(SlicedProtocol, ImageInfo), String> {
-    let (image, info, svg_fitted) = decode_for_box(bytes, picker, size, crop)?;
+    let (image, info, svg_fitted) = decode_for_box(bytes, picker, size, crop, tint)?;
     encode_sliced(picker, image, size, crop && !svg_fitted).map(|protocol| (protocol, info))
 }
 
@@ -518,7 +658,7 @@ mod tests {
         let picker = Picker::halfblocks();
         let cells = Size::new(20, 4);
         let (scaled, scaled_info, svg_fitted) =
-            decode_for_box(&svg, &picker, cells, false).unwrap();
+            decode_for_box(&svg, &picker, cells, false, None).unwrap();
         let font = picker.font_size();
         assert!(svg_fitted);
         assert_eq!(scaled_info, metadata);
@@ -529,10 +669,60 @@ mod tests {
                 u32::from(cells.height) * u32::from(font.height)
             )
         );
-        let (protocol, protocol_info) = encode_bytes(&picker, &svg, cells, false).unwrap();
+        let (protocol, protocol_info) = encode_bytes(&picker, &svg, cells, false, None).unwrap();
         assert_eq!(protocol_info, metadata);
         assert!(protocol.size().width <= cells.width);
         assert!(protocol.size().height <= cells.height);
+    }
+
+    #[test]
+    fn svg_silhouette_recolors_to_the_tint_over_the_background() {
+        // A red rect SVG, tinted with a cyan-on-near-black silhouette: the
+        // covered pixels become the tint fg (NOT the source red), transparent
+        // ones become the bg, and the result is fully opaque.
+        let svg = sample_svg();
+        let picker = Picker::halfblocks();
+        let cells = Size::new(20, 8);
+        let tint = SvgTint {
+            fg: [0x00, 0xff, 0xf9],
+            bg: [0x0b, 0x02, 0x21],
+        };
+        let (image, _, fitted) = decode_for_box(&svg, &picker, cells, false, Some(tint)).unwrap();
+        assert!(fitted);
+        let rgba = image.to_rgba8();
+        // Center is inside the (letterboxed) rect → fully-covered → tint fg.
+        let (cx, cy) = (rgba.width() / 2, rgba.height() / 2);
+        assert_eq!(rgba.get_pixel(cx, cy).0, [0x00, 0xff, 0xf9, 0xff]);
+        // The raw render keeps the source red — proving the recolor is the tint,
+        // not a coincidence.
+        let (raw, _, _) = decode_for_box(&svg, &picker, cells, false, None).unwrap();
+        assert_eq!(raw.to_rgba8().get_pixel(cx, cy).0[0], 0xff); // red channel hot
+        assert_eq!(raw.to_rgba8().get_pixel(cx, cy).0[1], 0x00); // green cold
+    }
+
+    #[test]
+    fn base64_and_data_urls_round_trip() {
+        for sample in [
+            &b""[..],
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"hello, world",
+            &[0u8, 255, 1, 254, 127, 128],
+        ] {
+            assert_eq!(base64_decode(&base64_encode(sample)).unwrap(), sample);
+        }
+        // An inline-SVG data URL decodes back to the exact markup, and a
+        // percent-encoded (non-base64) data URL is handled too.
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0h4v4z"/></svg>"#;
+        let url = svg_data_url(svg);
+        assert!(url.starts_with("data:image/svg+xml;base64,"));
+        assert_eq!(decode_data_url(&url).unwrap(), svg.as_bytes());
+        assert_eq!(
+            decode_data_url("data:image/svg+xml,%3Csvg%3E%3C/svg%3E").unwrap(),
+            b"<svg></svg>"
+        );
     }
 
     #[test]

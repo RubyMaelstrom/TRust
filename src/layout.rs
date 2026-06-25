@@ -64,6 +64,12 @@ pub type ControlMap = HashMap<NodeId, (usize, usize)>;
 /// alt text.
 pub type ImageSizes = HashMap<String, (u16, u16)>;
 
+/// Recorded flow position `(col, row)` in cells of each element entered during
+/// a measurement pass — the geometry an EMPTY element (an infinite-scroll
+/// sentinel) gets when it paints no cells. Carried on `LaidBox` so `blit`
+/// translates it up through nested sub-layouts.
+type ElementTops = HashMap<NodeId, (u16, u16)>;
+
 /// Sentinel `NodeId` for an item that came from no single element
 /// (synthesized text like list markers).
 pub const NO_NODE: NodeId = usize::MAX;
@@ -385,6 +391,13 @@ struct LaidBox {
     /// translates and propagates them so a carousel inside a float/flex
     /// column still reaches the document.
     carousels: Vec<Carousel>,
+    /// Recorded flow positions of EMPTY elements inside this box (measure
+    /// pass only — `tag_all_nodes`), relative to its top-left; `blit`
+    /// translates and propagates them so a boxless element nested in a
+    /// float/flex/grid/abspos sub-layout still gets honest geometry (an
+    /// IntersectionObserver sentinel hidden in a web component's positioned
+    /// shadow subtree). Empty for the render path.
+    element_tops: ElementTops,
 }
 
 /// A cell placed in a table grid (CSS 2.1 §17.5): its element and the
@@ -456,7 +469,8 @@ pub fn lay_out_with_carousels(
 ) -> (Vec<Row>, Vec<Carousel>) {
     let mut layout = Layout::new(dom, base, width.max(10), forms, controls, images, borders);
     layout.flow_all();
-    layout.finish()
+    let (rows, carousels, _element_tops) = layout.finish();
+    (rows, carousels)
 }
 
 /// A node's bounding box in whole terminal cells, accumulated as items and
@@ -516,7 +530,10 @@ pub fn measure_boxes(
     layout.tag_all_nodes = true;
     layout.flow_all();
     let declared = std::mem::take(&mut layout.declared_boxes);
-    let (rows, _carousels) = layout.finish();
+    // `finish` returns `element_tops` already remapped through its blank-row
+    // collapse (and accumulated from every sub-layout via `blit`), so an
+    // empty element's recorded row matches the kept-row grid the cells use.
+    let (rows, _carousels, element_tops) = layout.finish();
 
     // Each laid item contributes a cell rectangle to its source node. An
     // inline image's `height` already counts the rows it reserves.
@@ -540,13 +557,51 @@ pub fn measure_boxes(
         }
     }
 
-    // Union each node's rectangle up into its ancestors. `descendants` is
-    // document (pre-)order, so visiting it in reverse reaches every child
-    // before its parent — one O(n) bottom-up pass. Each child has already
-    // absorbed its own subtree, so unioning the direct children suffices.
-    for &id in dom.descendants(DOCUMENT).iter().rev() {
+    // Honest geometry for EMPTY elements — the IntersectionObserver standard
+    // depends on it. A modern infinite-scroll "sentinel" is typically an empty
+    // marker `<div>` (often inside a web component's shadow root, e.g.
+    // archive.org's `<infinite-scroller>`): it paints no cells, so the cells
+    // pass leaves it with no box and `getBoundingClientRect` would have to lie —
+    // the viewport-fallback that forced the guesswork making an IO scroller
+    // either never fire or loop forever. A browser gives such an element a real
+    // ZERO-HEIGHT box at its position in the flow; do the same, using the
+    // position the flow RECORDED as it entered each element (`element_tops`), so
+    // even an empty element in an otherwise-empty container — where a sibling
+    // guess has nothing to go on — lands at its true flow position. Done BEFORE
+    // the ancestor union so the box also contributes to its ancestors' extent (a
+    // sentinel pinned past the loaded tiles grows the document's scrollable
+    // height, which is what lets the page scroll far enough to reveal the next
+    // batch). Measurement-only (never the render path); `display:none`/
+    // `visibility:hidden` elements are skipped (they stay boxless ⇒ honestly
+    // not-intersecting).
+    for (&id, &(col, row)) in &element_tops {
+        if cells.contains_key(&id) || dom.is_hidden(id) {
+            continue;
+        }
+        cells.insert(
+            id,
+            CellRect {
+                x0: col,
+                y0: row,
+                x1: col,
+                y1: row,
+            },
+        );
+    }
+
+    // Union each node's rectangle up into its ancestors through the COMPOSED
+    // tree, so a shadow host's box (and the document's scrollable height) counts
+    // the content rendered into its shadow root — a slotted/virtualized web
+    // component (archive.org's `<infinite-scroller>` behind a `<router-slot>`)
+    // otherwise reported a box covering only its light children (none), leaving
+    // `documentElement.scrollHeight` too short to scroll the loaded tiles into
+    // view. `composed_descendants` is document (pre-)order, so visiting it in
+    // reverse reaches every child before its parent — one O(n) bottom-up pass.
+    // Each child has already absorbed its own subtree, so unioning the direct
+    // composed children suffices.
+    for &id in dom.composed_descendants(DOCUMENT).iter().rev() {
         let mut acc = cells.get(&id).copied();
-        for child in dom.children(id) {
+        for child in dom.composed_children(id) {
             if let Some(cr) = cells.get(&child) {
                 match acc {
                     Some(ref mut a) => a.union(cr),
@@ -1217,6 +1272,15 @@ struct Layout<'a> {
     /// left out. Populated under `tag_all_nodes`, so the render path never
     /// touches it. See [[js-geometry-real-boxes]] Phase 2.
     declared_boxes: HashMap<NodeId, (usize, usize)>,
+    /// Measurement pass only: every element's flow position `(col, row)` at the
+    /// moment the flow enters it — captured for EVERY element, including empty
+    /// ones that paint no cells. `measure_boxes` uses it to give a boxless
+    /// element (an infinite-scroll sentinel — often empty, often in a web
+    /// component's shadow root) a real ZERO-HEIGHT box at its true position, so
+    /// `getBoundingClientRect`/IntersectionObserver have honest geometry instead
+    /// of a viewport-fallback lie. Populated under `tag_all_nodes`; the render
+    /// path never touches it.
+    element_tops: ElementTops,
 }
 
 impl<'a> Layout<'a> {
@@ -1262,6 +1326,7 @@ impl<'a> Layout<'a> {
             modal_root: None,
             tag_all_nodes: false,
             declared_boxes: HashMap::new(),
+            element_tops: HashMap::new(),
         }
     }
 
@@ -1329,6 +1394,37 @@ impl<'a> Layout<'a> {
             }
             NodeData::Element { .. } => self.flow_element(id, ctx),
             _ => {}
+        }
+    }
+
+    /// The children to flow for `id`: a shadow HOST renders its SHADOW tree (a
+    /// web component renders into its shadow root — archive.org's
+    /// `<infinite-scroller>` puts its cells and its IntersectionObserver sentinel
+    /// there), so we flow the shadow root's children; everyone else flows their
+    /// light children. This composes the shadow DOM in the MEASUREMENT pass so
+    /// getBoundingClientRect / IntersectionObserver see shadow elements at their
+    /// real position. The render path lays out the already-composed serialized
+    /// HTML (which carries no shadow roots), so `shadow_root` is `None` there and
+    /// this is identical. Slots aren't projected (a host's light children aren't
+    /// flowed into its shadow `<slot>`s) — the common virtualized-scroller case
+    /// renders directly into shadow with no slots; slotted geometry is a deferred
+    /// refinement.
+    fn flow_children(&self, id: NodeId) -> Vec<NodeId> {
+        // A `<slot>` is replaced by the host's light children assigned to it
+        // (its fallback content only when nothing is assigned) — the flat-tree
+        // projection that lets a routed component nested behind a shadow
+        // `<slot>` flow at all (archive.org's `<router-slot>`).
+        if self.dom.tag_name(id) == Some("slot") {
+            let assigned = self.dom.slot_assigned_nodes(id);
+            return if assigned.is_empty() {
+                self.dom.children(id)
+            } else {
+                assigned
+            };
+        }
+        match self.dom.shadow_root(id) {
+            Some(shadow) => self.dom.children(shadow),
+            None => self.dom.children(id),
         }
     }
 
@@ -1464,6 +1560,19 @@ impl<'a> Layout<'a> {
         // enclosing element. No effect on rendering (flag is off there).
         if self.tag_all_nodes {
             cctx.node = id;
+            // Record the element's flow position (its top-left in cells) as the
+            // flow ENTERS it — for EVERY element, even an empty one that paints
+            // no cells. `measure_boxes` uses it to give a boxless sentinel a real
+            // zero-height box at its true position (the flow knows where an empty
+            // element sits; a post-hoc sibling guess does not). `rows.len()` is
+            // the current row, `col` the current column.
+            self.element_tops.insert(
+                id,
+                (
+                    u16::try_from(self.col).unwrap_or(u16::MAX),
+                    u16::try_from(self.rows.len()).unwrap_or(u16::MAX),
+                ),
+            );
         }
         match tag.as_str() {
             "a" => {
@@ -1817,8 +1926,16 @@ impl<'a> Layout<'a> {
                 Some(FlexMode::Row) => self.flow_flex_row(id, &cctx),
                 Some(FlexMode::Column) => self.stack_flex_items(id, &cctx),
                 None => {
-                    for child in self.dom.children(id) {
-                        self.flow_node(child, &cctx);
+                    // A block whose children are all atomic inline boxes lays
+                    // them as a wrapping row of sub-boxes (the inline formatting
+                    // context the spec calls for); the line model alone would
+                    // stack each multi-row tile onto its own row.
+                    if block_like && self.is_inline_box_grid(id) {
+                        self.flow_inline_box_grid(id, &cctx);
+                    } else {
+                        for child in self.flow_children(id) {
+                            self.flow_node(child, &cctx);
+                        }
                     }
                 }
             }
@@ -2235,6 +2352,49 @@ impl<'a> Layout<'a> {
                 let tag = self.dom.tag_name(c).unwrap_or("");
                 tag != "li" && !BLOCK.contains(&tag)
             })
+    }
+
+    /// Whether a block establishes an inline formatting context of ATOMIC INLINE
+    /// boxes that the LINE MODEL CANNOT PLACE, so it must be laid by
+    /// `flow_inline_box_grid` (each child a sub-box on wrapping line boxes).
+    /// Three conditions: (1) every in-flow child is an element whose computed
+    /// display is `inline-block`/`inline-flex`/`inline-grid` (CSS Display §2:
+    /// outer `inline`, inner `flow-root`); (2) at least two such children
+    /// (one lays fine inline already); and (3) at least one child carries
+    /// block-level content (`box_has_block_content`) — a multi-row tile (icon
+    /// over caption) that the line model would tower into its own row. A run of
+    /// single-row inline-block text (a nav bar's `<a>`s) stays in the line model,
+    /// which spaces them by their collapsed inter-element whitespace; routing
+    /// those here would drop that whitespace and fuse them ("ABOUTBLOGEVENTS").
+    /// An anonymous text run among the children (`tag_name` is `None`) fails (1).
+    fn is_inline_box_grid(&self, id: NodeId) -> bool {
+        let items = self.flex_items(id);
+        items.len() >= 2
+            && items.iter().all(|&c| {
+                self.dom.tag_name(c).is_some()
+                    && matches!(
+                        self.dom.computed_display(c).as_deref(),
+                        Some("inline-block" | "inline-flex" | "inline-grid")
+                    )
+            })
+            && items.iter().any(|&c| self.box_has_block_content(c))
+    }
+
+    /// Whether an atomic inline box holds block-level content — a child element
+    /// whose effective display is block-level (`block`/`flex`/`grid`/`table`/
+    /// `list-item`). Such a child opens a new line inside the box, so the box is
+    /// multi-row and the line model can't place it (it would break the row). A
+    /// box of only text/inline content (a text link) is single-row and the line
+    /// model handles it. Direct children only — cheap, and the icon-over-caption
+    /// tile pattern this targets puts its blocks at depth one.
+    fn box_has_block_content(&self, id: NodeId) -> bool {
+        self.dom.children(id).into_iter().any(|c| {
+            self.dom.tag_name(c).is_some()
+                && matches!(
+                    self.dom.effective_display(c).as_deref(),
+                    Some("block" | "flex" | "grid" | "table" | "inline-table" | "list-item")
+                )
+        })
     }
 
     /// Whether an element is positioned (so it's the containing block for its
@@ -3083,9 +3243,13 @@ impl<'a> Layout<'a> {
         cb_h: usize,
     ) {
         let root = cb.unwrap_or_else(|| body_or_document(self.dom));
+        // Compose shadow: a positioned box living in a web component's shadow
+        // root (archive.org's `<infinite-scroller>` keeps its sentinel there)
+        // is placed by its composed-tree containing block like any other, so
+        // gather candidates through the shadow boundary, not light-DOM only.
         let kids: Vec<NodeId> = self
             .dom
-            .descendants(root)
+            .composed_descendants(root)
             .into_iter()
             .filter(|&d| {
                 matches!(self.dom.node(d).data, NodeData::Element { .. })
@@ -3122,6 +3286,30 @@ impl<'a> Layout<'a> {
             // its containing block — not its DOM parent — places it.
             let inherit = self.ancestor_link_ctx(k);
             let b = self.layout_subtree_inner(k, lay_w, Some(k), false, &inherit);
+            // Geometry: record this box's COMPUTED top-left (the coordinate its
+            // containing block places it at) so an EMPTY abspos box — an
+            // infinite-scroll sentinel paints no cells — still gets an honest
+            // zero-height `getBoundingClientRect`/IntersectionObserver box.
+            // Recorded at the placed coordinate, never the static in-flow DOM
+            // position: a `bottom:0`/content-tracking sentinel descends as the
+            // scroller's content grows (`cb_h` grows with the laid tiles), so
+            // IO fires on real scroll instead of latching at the top and
+            // looping. A non-empty box is covered by its laid cells, so this
+            // only fills the gap left by the `b.height == 0` skip below.
+            if self.tag_all_nodes {
+                let uw = explicit_w.unwrap_or(b.width as usize).max(1);
+                let gc = (origin_col as i32 + self.abs_used_left(k, cb_w as i32, uw as i32)).max(0);
+                let gr = (origin_row as i32
+                    + self.abs_used_top(k, cb_h as i32, b.height as i32).max(0))
+                .max(0);
+                self.element_tops.insert(
+                    k,
+                    (
+                        u16::try_from(gc).unwrap_or(u16::MAX),
+                        u16::try_from(gr).unwrap_or(u16::MAX),
+                    ),
+                );
+            }
             if b.height == 0 {
                 continue;
             }
@@ -4020,6 +4208,97 @@ impl<'a> Layout<'a> {
         self.pending_space = false;
     }
 
+    /// Lay a block of ATOMIC INLINE boxes (`is_inline_box_grid`) as the inline
+    /// formatting context the spec describes, NOT as flex (no grow/shrink, no
+    /// justify-content). Each box is laid as its own block sub-box
+    /// (`layout_subtree` — inner `flow-root`, CSS Display §2) at its used width,
+    /// then placed left-to-right onto line boxes that break when the next box
+    /// won't fit the remaining width (CSS 2.1 §9.4.2). Each line is aligned by
+    /// the container's `text-align` (CSS 2.1 §16.2). Boxes top-align — we don't
+    /// implement `vertical-align`/baseline (a terminal deviation). Inter-box
+    /// spacing is the boxes' own horizontal margins (CSS 2.1 §8); the collapsed
+    /// source whitespace between inline-blocks is a sub-cell advance that rounds
+    /// to zero at terminal resolution (like a sub-cell `letter-spacing`).
+    fn flow_inline_box_grid(&mut self, id: NodeId, ctx: &Ctx) {
+        let avail = self.line_right.saturating_sub(self.line_left).max(1);
+        // A box's horizontal margin in cells (`auto`/absent → 0). NOT `css_cells`,
+        // which floors to 1 cell and so would invent gaps on zero margins.
+        let margin = |me: &Self, c: NodeId, side: &str| -> usize {
+            me.dom
+                .computed_style(c, side)
+                .filter(|v| v.trim() != "auto")
+                .and_then(|v| resolve_cells(&v, avail, me.viewport_w))
+                .unwrap_or(0)
+        };
+        struct Slot {
+            node: NodeId,
+            ml: usize,
+            w: usize,
+            mr: usize,
+        }
+        let slots: Vec<Slot> = self
+            .flex_items(id)
+            .into_iter()
+            .map(|c| {
+                // Used width (CSS 2.1 §10.3.9 shrink-to-fit): an explicit `width`,
+                // else min(max-content, available); min/max-width clamp.
+                let mut w = self
+                    .css_cells(c, "width")
+                    .unwrap_or_else(|| self.measure_width(c, avail));
+                if let Some(mn) = self.css_cells(c, "min-width") {
+                    w = w.max(mn);
+                }
+                if let Some(mx) = self.css_cells(c, "max-width") {
+                    w = w.min(mx);
+                }
+                Slot {
+                    node: c,
+                    ml: margin(self, c, "margin-left"),
+                    w: w.clamp(1, avail),
+                    mr: margin(self, c, "margin-right"),
+                }
+            })
+            .collect();
+
+        let mut shelf_top = self.rows.len();
+        let mut i = 0;
+        while i < slots.len() {
+            // Greedily fill a line box; always at least one box (an over-wide
+            // box takes its own line, CSS 2.1 §9.4.2).
+            let footprint = |s: &Slot| s.ml + s.w + s.mr;
+            let mut used = footprint(&slots[i]);
+            let mut end = i + 1;
+            while end < slots.len() && used + footprint(&slots[end]) <= avail {
+                used += footprint(&slots[end]);
+                end += 1;
+            }
+            let line = &slots[i..end];
+            let laid: Vec<LaidBox> = line
+                .iter()
+                .map(|s| self.layout_subtree(s.node, s.w, ctx))
+                .collect();
+            let shelf_h = laid.iter().map(|b| b.height as usize).max().unwrap_or(0);
+            // text-align positions the line within the leftover width (CSS §16.2).
+            let lead = match self.align {
+                Align::Center => avail.saturating_sub(used) / 2,
+                Align::Right => avail.saturating_sub(used),
+                Align::Left => 0,
+            };
+            let mut x = lead;
+            for (s, b) in line.iter().zip(&laid) {
+                x += s.ml;
+                if b.height > 0 {
+                    self.blit(b, (self.line_left + x) as u16, shelf_top);
+                }
+                x += s.w + s.mr;
+            }
+            shelf_top += shelf_h;
+            i = end;
+        }
+        self.col = self.line_left;
+        self.pending_space = false;
+    }
+
     /// Lay a `display:grid` container that declares an explicit
     /// `grid-template-columns`, honoring its track sizing and each item's
     /// `grid-column`/`grid-row` placement. This is what lets a page's own grid
@@ -4144,7 +4423,7 @@ impl<'a> Layout<'a> {
         // pathologically deep table tree (some wikis nest navboxes very deep)
         // would otherwise overflow the layout stack.
         if self.table_depth >= MAX_TABLE_DEPTH {
-            for child in self.dom.children(id) {
+            for child in self.flow_children(id) {
                 self.flow_node(child, ctx);
             }
             self.flush_block();
@@ -5021,6 +5300,7 @@ impl<'a> Layout<'a> {
             self.borders,
         );
         sub.viewport_w = self.viewport_w;
+        sub.tag_all_nodes = self.tag_all_nodes;
         sub.inner_border_box = Some(id);
         // The interior pass must NOT re-float this same element: when `id` is
         // both floated and bordered, `flow_float` lays its box (skipping the
@@ -5032,12 +5312,13 @@ impl<'a> Layout<'a> {
         sub.flow_node(id, ctx);
         sub.flush_block();
         sub.finish_floats();
-        let (rows, carousels) = sub.finish();
+        let (rows, carousels, element_tops) = sub.finish();
         let content = LaidBox {
             height: rows.len() as u16,
             width: inner_w as u16,
             rows,
             carousels,
+            element_tops,
         };
         let framed = self.frame_box(content, sides);
         if framed.height > 0 {
@@ -5162,11 +5443,19 @@ impl<'a> Layout<'a> {
                 c.frame_right = Some(new_w as u16 - 1);
             }
         }
+        // The frame shifts the interior in by the present sides, so the
+        // recorded empty-element positions move with it.
+        let element_tops = content
+            .element_tops
+            .into_iter()
+            .map(|(id, (col, row))| (id, (col + col_shift, row + row_shift as u16)))
+            .collect();
         LaidBox {
             rows,
             width: new_w as u16,
             height: new_h as u16,
             carousels,
+            element_tops,
         }
     }
 
@@ -5237,6 +5526,11 @@ impl<'a> Layout<'a> {
         sub.subtree_root = Some(id);
         sub.table_depth = self.table_depth;
         sub.measuring = measure;
+        // Carry the measurement flag so a sub-layout tags its items with their
+        // own nodes and records empty-element flow positions (`element_tops`);
+        // `blit` then propagates that geometry back up. The render path keeps
+        // this off (no tagging), so it's unaffected.
+        sub.tag_all_nodes = self.tag_all_nodes;
         // A box laid within a surfaced modal must know it (so its full-bleed
         // foreground image isn't dropped as a page backdrop, and the modal-root
         // out-of-flow exemption holds in the sub-pass).
@@ -5244,7 +5538,7 @@ impl<'a> Layout<'a> {
         sub.flow_node(id, inherit);
         sub.flush_block();
         sub.finish_floats();
-        let (rows, carousels) = sub.finish();
+        let (rows, carousels, element_tops) = sub.finish();
         let width = rows
             .iter()
             .flat_map(|r| &r.items)
@@ -5257,6 +5551,7 @@ impl<'a> Layout<'a> {
             width,
             height,
             carousels,
+            element_tops,
         }
     }
 
@@ -5287,6 +5582,14 @@ impl<'a> Layout<'a> {
             c.right += col_off;
             c.frame_right = c.frame_right.map(|fr| fr + col_off);
             self.carousels.push(c);
+        }
+        // Empty elements recorded in the box (measure pass only) move with it
+        // too, so a boxless element nested in this sub-layout keeps its honest
+        // flow position in the document's coordinate system.
+        for (&id, &(col, row)) in &b.element_tops {
+            self.element_tops
+                .entry(id)
+                .or_insert((col + col_off, row + row_base as u16));
         }
     }
 
@@ -5734,6 +6037,10 @@ impl<'a> Layout<'a> {
         let src = self.dom.attr(id, "src")?.trim();
         if src.is_empty() {
             return None;
+        }
+        // A `data:` image (e.g. a rewritten inline SVG) keys on the URL itself.
+        if src.starts_with("data:") {
+            return Some(src.to_string());
         }
         match crate::http::resolve(self.base, src) {
             Link::Http(u) => Some(u.to_string()),
@@ -6459,8 +6766,9 @@ impl<'a> Layout<'a> {
     /// stays aligned with its cards no matter how many blank rows above or
     /// inside it were dropped. Without this remap the band drifts off its
     /// cards and the view stops clipping the strip.
-    fn finish(mut self) -> (Vec<Row>, Vec<Carousel>) {
+    fn finish(mut self) -> (Vec<Row>, Vec<Carousel>, ElementTops) {
         let carousels = std::mem::take(&mut self.carousels);
+        let element_tops = std::mem::take(&mut self.element_tops);
         let n = self.rows.len();
         // remap[i] = new index of old row i (for a dropped blank, the index
         // the next kept row takes). remap[n] = total kept rows, for an
@@ -6486,7 +6794,28 @@ impl<'a> Layout<'a> {
                 c
             })
             .collect();
-        (out, carousels)
+        // Remap each recorded element top through the SAME blank-row collapse,
+        // so a measure pass reads the empty element's row in the kept-row grid
+        // (its cell-bearing neighbours live there too). A row at or past the
+        // laid content (an out-of-flow box placed beyond the flow — an
+        // infinite-scroll sentinel pinned below the loaded tiles) has no blank
+        // rows out there to collapse, so keep its overshoot past the last kept
+        // row rather than clamping it onto the content bottom (which would drag
+        // a far-below sentinel up into the viewport and make it falsely
+        // intersect).
+        let element_tops = element_tops
+            .into_iter()
+            .map(|(id, (col, row))| {
+                let r_in = row as usize;
+                let mapped = if r_in >= n {
+                    out.len() + (r_in - n)
+                } else {
+                    remap[r_in]
+                };
+                (id, (col, u16::try_from(mapped).unwrap_or(u16::MAX)))
+            })
+            .collect();
+        (out, carousels, element_tops)
     }
 }
 
@@ -8754,6 +9083,80 @@ mod tests {
         assert!(
             (2..=3).contains(&img_rows),
             "block avatars wrap into a grid, got {img_rows} image rows"
+        );
+    }
+
+    #[test]
+    fn inline_block_tiles_lay_in_a_row_not_a_column() {
+        // archive.org's hero media-count tiles: a block of `inline-block` tiles,
+        // each an icon block over a count block. The line model towers each onto
+        // its own row (a 9-tall column); `flow_inline_box_grid` lays each as a
+        // sub-box and packs them onto one shelf — a row.
+        let mut images = ImageSizes::new();
+        for n in 0..9 {
+            images.insert(format!("https://example.com/i{n}.svg"), (4, 2));
+        }
+        let tiles: String = (0..9)
+            .map(|n| {
+                format!(
+                    r#"<a style="display:inline-block;width:6ch"><div style="display:block"><img src="/i{n}.svg"></div><div>{n}M</div></a>"#
+                )
+            })
+            .collect();
+        let rows = lay_with_images(&format!("<body><div>{tiles}</div></body>"), 100, &images);
+        let imgs: usize = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.is_some())
+            .count();
+        let img_rows = rows
+            .iter()
+            .filter(|r| r.items.iter().any(|i| i.image.is_some()))
+            .count();
+        assert_eq!(imgs, 9, "all nine icons present");
+        assert_eq!(
+            img_rows, 1,
+            "the nine tiles share one shelf, got {img_rows}"
+        );
+    }
+
+    #[test]
+    fn single_row_inline_block_links_stay_inline_and_spaced() {
+        // archive.org's footer nav: a `<ul>` of single-row `<li
+        // display:inline-block>` text links. These must NOT route through the box
+        // grid (it spaces by margins, so padding-spaced links fuse —
+        // "ABOUTBLOGEVENTS"); the line model keeps them on one row, separated.
+        let rows = lay(
+            r#"<body><ul><li style="display:inline-block;padding-left:15px"><a href="/a">ABOUT</a></li><li style="display:inline-block;padding-left:15px"><a href="/b">BLOG</a></li><li style="display:inline-block;padding-left:15px"><a href="/h">HELP</a></li></ul></body>"#,
+            80,
+        );
+        // The three links share ONE row (a row, not a vertical column)...
+        let link_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.items.iter().any(|i| i.link.is_some()))
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(
+            link_rows,
+            vec![0],
+            "nav links share one row, got {link_rows:?}"
+        );
+        // ...and they stay SEPARATED, not fused: reconstructing the row keeps a
+        // space between each (the grid path would butt them: "ABOUTBLOGHELP").
+        let mut line = vec![' '; 80];
+        for it in &rows[0].items {
+            for (k, ch) in it.text.chars().enumerate() {
+                if let Some(slot) = line.get_mut(it.col as usize + k) {
+                    *slot = ch;
+                }
+            }
+        }
+        let text: String = line.into_iter().collect();
+        assert!(
+            text.contains("ABOUT BLOG HELP"),
+            "nav links stay spaced, not fused: {:?}",
+            text.trim()
         );
     }
 
