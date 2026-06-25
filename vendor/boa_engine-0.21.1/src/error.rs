@@ -296,6 +296,13 @@ impl error::Error for JsError {
     }
 }
 
+/// TRust diagnostic gate: whether `TRUST_JS_THROW_LOG` is set, read once.
+fn throw_log_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TRUST_JS_THROW_LOG").is_some())
+}
+
 impl JsError {
     /// Creates a new `JsError` from a native error `err`.
     ///
@@ -384,6 +391,15 @@ impl JsError {
         // debugging pain. Surface it here (the single boundary that `catch`
         // and promise rejections both funnel through), V8-style, reusing the
         // existing formatter and never clobbering an author-set `stack`.
+        // TRust diagnostic: with `TRUST_JS_THROW_LOG=1`, dump every error
+        // materialized at a catch boundary — INCLUDING ones page code swallows
+        // in a try/catch (which never reach our `Outcome.errors`). That's the
+        // only way to see an error a library quietly absorbs; it's how the
+        // core-js/`nomodule` "Invalid scheme" chain was found. Gated behind a
+        // cached flag so it costs one atomic load when off.
+        if throw_log_enabled() {
+            eprintln!("THROW> {self}\n----");
+        }
         if self.backtrace.is_some()
             && let Some(obj) = value.as_object()
             && !obj
