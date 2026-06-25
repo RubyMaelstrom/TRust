@@ -52,7 +52,21 @@ tokio-rustls = "0.26.4"
 tui-term = "0.3.4"
 unicode-width = "0.2"
 url = "2.5.8"
+# WebAssembly engine. wasmi is a pure-Rust interpreter (the Boa-analog — no
+# v8/C++), so it preserves the pure-Rust-engine ethos. Runtime parses BINARY
+# wasm only (the web ships binary), so the default `wat` feature is dropped;
+# `simd` is enabled because the SIMD proposal is finalized and the crate is
+# pure-Rust (v128 still cannot cross the JS boundary — that throws TypeError per
+# the JS-API spec — but a module may use SIMD internally). The real work is the
+# `WebAssembly.*` JS<->wasm bridge in src/js.rs.
+wasmi = { version = "1", default-features = false, features = ["std", "simd"] }
 webpki-roots = "1.0.7"
+
+[dev-dependencies]
+# Compiles readable `.wat` text into wasm bytes for the WebAssembly test
+# fixtures. Pure-Rust (wasmi ecosystem); NEVER a runtime dependency — the
+# runtime accepts only binary wasm from the web.
+wat = "1"
 
 [patch.crates-io]
 crossterm = { path = "vendor/crossterm-0.29.0" }
@@ -87,6 +101,15 @@ boa_gc = { path = "vendor/boa_gc-0.21.1" }
 # `JsString` locators and is not `Send`; the raw one is, which is what lets it
 # cross threads.
 boa_parser = { path = "vendor/boa_parser-0.21.1" }
+# TRust's vendored WebAssembly engine. wasmi is a pure-Rust interpreter (the
+# Boa-analog); we vendor the wasmi-labs crates so we OWN the engine and can
+# fork/patch it the way we do Boa, if a WASM showstopper ever needs it. No
+# patches yet — wasmi is complete — so these are byte-for-byte the 1.1.0 crates.
+# (`wasmparser`/`spin`/`libm` are third-party deps left on crates.io.)
+wasmi = { path = "vendor/wasmi-1.1.0" }
+wasmi_core = { path = "vendor/wasmi_core-1.1.0" }
+wasmi_ir = { path = "vendor/wasmi_ir-1.1.0" }
+wasmi_collections = { path = "vendor/wasmi_collections-1.1.0" }
 
 # Optimized binary: whole-program LTO and a single codegen unit trade
 # compile time for speed and size; symbols stripped (panic messages

@@ -197,12 +197,30 @@ impl BufferObject {
     }
 }
 
+/// An externally-owned backing for an `ArrayBuffer`: a raw, non-owning view over
+/// memory the embedder controls (TRust uses it for `WebAssembly.Memory.buffer`,
+/// a zero-copy live window onto wasm linear memory). The embedder guarantees the
+/// pointer stays valid for `len` bytes until it detaches the buffer — which it
+/// does before the memory can grow or move. This is never freed on drop (the
+/// region isn't owned here).
+#[derive(Debug, Clone, Copy)]
+struct ExternalBacking {
+    ptr: *mut u8,
+    len: usize,
+}
+
 /// The internal representation of an `ArrayBuffer` object.
 #[derive(Debug, Clone, Trace, Finalize, JsData)]
 pub struct ArrayBuffer {
-    /// The `[[ArrayBufferData]]` internal slot.
+    /// The `[[ArrayBufferData]]` internal slot (an owned byte block).
     #[unsafe_ignore_trace]
     data: Option<AlignedVec<u8>>,
+
+    /// An externally-owned live backing, mutually exclusive with `data`. When
+    /// `Some`, the buffer's bytes ARE this region and `data` is `None`; when both
+    /// are `None`, the buffer is detached.
+    #[unsafe_ignore_trace]
+    external: Option<ExternalBacking>,
 
     /// The `[[ArrayBufferMaxByteLength]]` internal slot.
     max_byte_len: Option<u64>,
@@ -215,21 +233,51 @@ impl ArrayBuffer {
     pub(crate) fn from_data(data: AlignedVec<u8>, detach_key: JsValue) -> Self {
         Self {
             data: Some(data),
+            external: None,
+            max_byte_len: None,
+            detach_key,
+        }
+    }
+
+    /// Build an `ArrayBuffer` whose bytes are an externally-owned live region
+    /// (see [`ExternalBacking`]). The caller MUST detach this buffer before the
+    /// region can move or be freed.
+    pub(crate) fn from_external(ptr: *mut u8, len: usize, detach_key: JsValue) -> Self {
+        Self {
+            data: None,
+            external: Some(ExternalBacking { ptr, len }),
             max_byte_len: None,
             detach_key,
         }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.data.as_ref().map_or(0, AlignedVec::len)
+        if let Some(e) = &self.external {
+            e.len
+        } else {
+            self.data.as_ref().map_or(0, AlignedVec::len)
+        }
     }
 
     pub(crate) fn bytes(&self) -> Option<&[u8]> {
-        self.data.as_deref()
+        if let Some(e) = &self.external {
+            // SAFETY: the embedder keeps `ptr` valid for `len` bytes until it
+            // detaches this buffer (which it does before the region can move).
+            // Single-threaded access (Boa's heap is not `Send`).
+            Some(unsafe { std::slice::from_raw_parts(e.ptr, e.len) })
+        } else {
+            self.data.as_deref()
+        }
     }
 
     pub(crate) fn bytes_mut(&mut self) -> Option<&mut [u8]> {
-        self.data.as_deref_mut()
+        if let Some(e) = &self.external {
+            // SAFETY: as in `bytes`; the region is uniquely accessed here (the
+            // embedder pauses wasm execution while host/JS code runs).
+            Some(unsafe { std::slice::from_raw_parts_mut(e.ptr, e.len) })
+        } else {
+            self.data.as_deref_mut()
+        }
     }
 
     pub(crate) fn vec_mut(&mut self) -> Option<&mut AlignedVec<u8>> {
@@ -244,7 +292,10 @@ impl ArrayBuffer {
     /// Gets the inner bytes of the buffer without accessing the current atomic length.
     #[track_caller]
     pub(crate) fn bytes_with_len(&self, len: usize) -> Option<&[u8]> {
-        if let Some(s) = self.data.as_deref() {
+        if let Some(e) = &self.external {
+            // SAFETY: see `bytes`. Clamp to the backing length defensively.
+            Some(unsafe { std::slice::from_raw_parts(e.ptr, len.min(e.len)) })
+        } else if let Some(s) = self.data.as_deref() {
             Some(&s[..len])
         } else {
             None
@@ -254,17 +305,20 @@ impl ArrayBuffer {
     /// Gets the mutable inner bytes of the buffer without accessing the current atomic length.
     #[track_caller]
     pub(crate) fn bytes_with_len_mut(&mut self, len: usize) -> Option<&mut [u8]> {
-        if let Some(s) = self.data.as_deref_mut() {
+        if let Some(e) = &self.external {
+            // SAFETY: see `bytes_mut`. Clamp to the backing length defensively.
+            Some(unsafe { std::slice::from_raw_parts_mut(e.ptr, len.min(e.len)) })
+        } else if let Some(s) = self.data.as_deref_mut() {
             Some(&mut s[..len])
         } else {
             None
         }
     }
 
-    /// Gets the underlying vector for this buffer.
+    /// Gets the underlying bytes for this buffer (owned or external).
     #[must_use]
     pub fn data(&self) -> Option<&[u8]> {
-        self.data.as_deref()
+        self.bytes()
     }
 
     /// Resizes the buffer to the new size, clamped to the maximum byte length if present.
@@ -306,6 +360,8 @@ impl ArrayBuffer {
                 .into());
         }
 
+        // An external backing isn't owned here — just drop the view.
+        self.external = None;
         Ok(self.data.take())
     }
 
@@ -318,7 +374,8 @@ impl ArrayBuffer {
     pub(crate) const fn is_detached(&self) -> bool {
         // 1. If arrayBuffer.[[ArrayBufferData]] is null, return true.
         // 2. Return false.
-        self.data.is_none()
+        // (A live external backing also counts as "not detached".)
+        self.data.is_none() && self.external.is_none()
     }
 
     pub(crate) fn is_fixed_len(&self) -> bool {
@@ -852,6 +909,7 @@ impl ArrayBuffer {
             prototype,
             ArrayBuffer {
                 data: Some(bytes),
+                external: None,
                 max_byte_len: new_max_len,
                 detach_key: JsValue::undefined(),
             },
@@ -905,6 +963,7 @@ impl ArrayBuffer {
                 // 6. Set obj.[[ArrayBufferData]] to block.
                 // 7. Set obj.[[ArrayBufferByteLength]] to byteLength.
                 data: Some(block),
+                external: None,
                 // 8. If allocatingResizableBuffer is true, then
                 //    c. Set obj.[[ArrayBufferMaxByteLength]] to maxByteLength.
                 max_byte_len,

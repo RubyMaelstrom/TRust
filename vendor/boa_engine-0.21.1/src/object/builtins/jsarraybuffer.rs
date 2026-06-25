@@ -132,6 +132,42 @@ impl JsArrayBuffer {
         Ok(Self { inner: obj })
     }
 
+    /// Create a `JsArrayBuffer` whose bytes are an externally-owned live region
+    /// (`ptr`, `len`), rather than an owned byte block. The embedder MUST keep the
+    /// region valid for `len` bytes until it detaches the buffer (with
+    /// `detach_key`), which it must do before the region can move or be freed.
+    /// TRust uses this for a zero-copy `WebAssembly.Memory.buffer`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be valid for reads and writes of `len` bytes for as long as the
+    /// returned buffer is not detached, and must be uniquely accessed (no other
+    /// live `&mut` to the region) whenever JS reads or writes the buffer.
+    pub unsafe fn from_external(
+        ptr: *mut u8,
+        len: usize,
+        detach_key: JsValue,
+        context: &mut Context,
+    ) -> JsResult<Self> {
+        let constructor = context
+            .intrinsics()
+            .constructors()
+            .array_buffer()
+            .constructor()
+            .into();
+        let prototype = get_prototype_from_constructor(
+            &constructor,
+            StandardConstructors::array_buffer,
+            context,
+        )?;
+        let obj = JsObject::new(
+            context.root_shape(),
+            prototype,
+            ArrayBuffer::from_external(ptr, len, detach_key),
+        );
+        Ok(Self { inner: obj })
+    }
+
     /// Set a maximum length for the underlying array buffer.
     #[inline]
     #[must_use]
