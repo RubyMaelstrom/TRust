@@ -14,8 +14,48 @@ pub(crate) struct Backtrace {
 }
 
 impl Backtrace {
-    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &ShadowEntry> {
-        self.stack.iter()
+    /// Append the V8-style `\n    at <frame>` lines (newest first) for this
+    /// backtrace. Shared by `JsError`'s `Display` (a thrown error's `.stack`)
+    /// and the construction-time `.stack` install (TRust fork — `new Error()`
+    /// must carry a `.stack` even without being thrown).
+    pub(crate) fn write_frames(&self, f: &mut impl Write) -> std::fmt::Result {
+        for entry in self.stack.iter().rev() {
+            f.write_str("\n    at ")?;
+            match entry {
+                ShadowEntry::Native {
+                    function_name,
+                    source_info,
+                } => {
+                    if let Some(function_name) = function_name {
+                        write!(f, "{}", function_name.to_std_string_escaped())?;
+                    } else {
+                        f.write_str("<anonymous>")?;
+                    }
+
+                    if let Some(loc) = source_info.as_location() {
+                        write!(f, " (native at {}:{}:{})", loc.file(), loc.line(), loc.column())?;
+                    } else {
+                        f.write_str(" (native)")?;
+                    }
+                }
+                ShadowEntry::Bytecode { pc, source_info } => {
+                    if source_info.function_name().is_empty() {
+                        f.write_str("<anonymous>")?;
+                    } else {
+                        write!(f, "{}", source_info.function_name().to_std_string_escaped())?;
+                    }
+
+                    write!(f, " ({}", source_info.map().path())?;
+                    if let Some(position) = source_info.map().find(*pc) {
+                        write!(f, ":{}:{}", position.line_number(), position.column_number())?;
+                    } else {
+                        f.write_str(":?:?")?;
+                    }
+                    f.write_str(")")?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 

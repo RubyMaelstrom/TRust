@@ -718,56 +718,7 @@ impl fmt::Display for JsError {
         }
 
         if let Some(shadow_stack) = &self.backtrace {
-            for entry in shadow_stack.iter().rev() {
-                write!(f, "\n    at ")?;
-                match entry {
-                    ShadowEntry::Native {
-                        function_name,
-                        source_info,
-                    } => {
-                        if let Some(function_name) = function_name {
-                            write!(f, "{}", function_name.to_std_string_escaped())?;
-                        } else {
-                            f.write_str("<anonymous>")?;
-                        }
-
-                        if let Some(loc) = source_info.as_location() {
-                            write!(
-                                f,
-                                " (native at {}:{}:{})",
-                                loc.file(),
-                                loc.line(),
-                                loc.column()
-                            )?;
-                        } else {
-                            f.write_str(" (native)")?;
-                        }
-                    }
-                    ShadowEntry::Bytecode { pc, source_info } => {
-                        let has_function_name = !source_info.function_name().is_empty();
-                        if has_function_name {
-                            write!(f, "{}", source_info.function_name().to_std_string_escaped(),)?;
-                        } else {
-                            f.write_str("<anonymous>")?;
-                        }
-
-                        f.write_str(" (")?;
-                        source_info.map().path().fmt(f)?;
-
-                        if let Some(position) = source_info.map().find(*pc) {
-                            write!(
-                                f,
-                                ":{}:{}",
-                                position.line_number(),
-                                position.column_number()
-                            )?;
-                        } else {
-                            f.write_str(":?:?")?;
-                        }
-                        f.write_str(")")?;
-                    }
-                }
-            }
+            shadow_stack.write_frames(f)?;
         }
         Ok(())
     }
