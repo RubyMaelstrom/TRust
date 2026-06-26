@@ -5301,6 +5301,16 @@ struct LoadedPage {
     started: Instant,
     page_url: Option<url::Url>,
     hooks: Rc<PageHooks>,
+    /// The render-canonical form (`render_canonical`) of the last `Updated` we
+    /// emitted, for render dedup. The actor re-serializes on every dirty wake but
+    /// must NOT emit an Updated unless what we PAINT changed — else the app
+    /// re-parses + re-lays-out its whole doc (a ~1s UI freeze) for a change that
+    /// paints nothing: a mutation to a dropped element (`<style>`, hidden
+    /// subtree) OR to a non-rendered attribute (`alt`/`class`/`title`/`aria-*` —
+    /// Twitch rotates a co-streamer's name in a loaded avatar's `alt` text every
+    /// second). Serializing + canonicalizing to compare is cheap (~ms); the
+    /// app-side layout this skips is what froze the UI.
+    last_render: Option<String>,
 }
 
 /// Parse, run scripts, fire lifecycle, settle. Err(outcome) means
@@ -5656,6 +5666,7 @@ fn load_page(
         started,
         page_url: parsed_url,
         hooks,
+        last_render: None,
     })
 }
 
@@ -6857,6 +6868,11 @@ fn page_actor(
     // first settle; any ongoing timers (a slideshow, a poller, a rAF chain)
     // keep advancing at their real time in the at-rest wake loop further down.
     let (shell, shell_clickable) = extract_live(&mut page);
+    // Seed the render-dedup baseline from the shell (the settle path below
+    // overwrites it when it re-extracts), so a `painted_live && !changed` page —
+    // which emits ONLY this shell — still has a baseline and the first dispatch
+    // dedups a no-paint change (see `extract_changed`/`last_render`).
+    page.last_render = Some(render_canonical(&shell));
     // The shell render reports wall-clock elapsed for the status bar, but
     // we must NOT write that back onto `page.outcome.elapsed`: that field
     // is the cumulative-COMPUTE accumulator `run_script`'s budget gate
@@ -6903,6 +6919,9 @@ fn page_actor(
         // Shell already reflects the settled page; nothing new to send.
     } else {
         let (out, has_clickables) = extract_live(&mut page);
+        // Seed the render-dedup baseline so the at-rest loop skips re-emitting a
+        // render that paints the same (see `extract_changed`/`last_render`).
+        page.last_render = Some(render_canonical(&out));
         // A page with pending timers (a JS slideshow, a poller, a rAF chain)
         // stays LIVE even with no clickables/forms — its own clock drives it at
         // rest. Only a truly inert page (no interaction AND no scheduled work)
@@ -7274,9 +7293,7 @@ fn finish_dispatch(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageE
         return false;
     }
     let dirty = page.dom.borrow_mut().take_dirty();
-    if dirty {
-        let (out, _) = extract_live(page);
-        let outcome = std::mem::take(&mut page.outcome);
+    if dirty && let Some((out, outcome)) = extract_changed(page) {
         return evts
             .blocking_send(PageEvt::Updated { html: out, outcome })
             .is_ok();
@@ -7333,9 +7350,9 @@ fn timer_wake(
     if let Some(url) = take_script_navigation(page) {
         return evts.blocking_send(PageEvt::Navigate(url)).is_ok();
     }
-    if page.dom.borrow_mut().take_dirty() {
-        let (out, _) = extract_live(page);
-        let outcome = std::mem::take(&mut page.outcome);
+    if page.dom.borrow_mut().take_dirty()
+        && let Some((out, outcome)) = extract_changed(page)
+    {
         return evts
             .blocking_send(PageEvt::Updated { html: out, outcome })
             .is_ok();
@@ -7395,9 +7412,9 @@ fn dispatch_fetch_done(
     if let Some(url) = take_script_navigation(page) {
         return evts.blocking_send(PageEvt::Navigate(url)).is_ok();
     }
-    if page.dom.borrow_mut().take_dirty() {
-        let (out, _) = extract_live(page);
-        let outcome = std::mem::take(&mut page.outcome);
+    if page.dom.borrow_mut().take_dirty()
+        && let Some((out, outcome)) = extract_changed(page)
+    {
         return evts
             .blocking_send(PageEvt::Updated { html: out, outcome })
             .is_ok();
@@ -7754,6 +7771,67 @@ fn extract_live(page: &mut LoadedPage) -> (String, bool) {
     // Extraction itself is not a page mutation.
     let _ = page.dom.borrow_mut().take_dirty();
     (html, has_any)
+}
+
+/// Serialize the live DOM and return the snapshot + drained outcome ONLY when
+/// what we PAINT changed since the last emit (`render_canonical` vs
+/// `page.last_render`). A mutation confined to a non-rendered element (`<style>`,
+/// `<head>`, a `display:none`/hidden subtree) OR a non-rendered attribute
+/// (`alt`/`class`/`title`/`aria-*`) yields the same canonical render — `None`
+/// then, and the caller treats the tick as a no-op (no Updated,
+/// so the app never re-lays-out for a change that paints nothing). Serializing
+/// to compare is cheap; the app-side layout this skips is what froze the UI.
+fn extract_changed(page: &mut LoadedPage) -> Option<(String, Outcome)> {
+    let (out, _) = extract_live(page);
+    let canon = render_canonical(&out);
+    if page.last_render.as_deref() == Some(canon.as_str()) {
+        return None;
+    }
+    page.last_render = Some(canon);
+    Some((out, std::mem::take(&mut page.outcome)))
+}
+
+/// A render-canonical view of a live serialization, for the change-detection in
+/// `extract_changed`: drop attributes the layout NEVER reads, so a mutation that
+/// only touches them doesn't trigger a (full-document) re-render. The baked
+/// `style` attr already captures every layout effect of the cascade, so `class`
+/// is redundant (a transition-class toggle that changes no baked property paints
+/// nothing); `alt`/`title` are fallback/tooltip text we don't paint, `aria-*` is
+/// assistive metadata. This is what stops Twitch — which rotates a co-streamer's
+/// NAME inside a loaded avatar's `alt` text every second — from re-laying-out its
+/// whole ~700KB doc for a change that's invisible. We compare the canonical form
+/// but EMIT the full HTML (the app still wants `alt` for a broken-image fallback).
+fn render_canonical(html: &str) -> String {
+    let b = html.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b' ' {
+            // Read an attribute name (ascii letters/digits/`-`).
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
+                j += 1;
+            }
+            // ` name="…"` whose name is non-rendered → skip the whole attribute.
+            if j > i + 1 && b.get(j) == Some(&b'=') && b.get(j + 1) == Some(&b'"') {
+                let name = &html[i + 1..j];
+                let drop = matches!(name, "class" | "alt" | "title") || name.starts_with("aria-");
+                if drop {
+                    // Values are double-quoted (a literal `"` is `&quot;`).
+                    let mut k = j + 2;
+                    while k < b.len() && b[k] != b'"' {
+                        k += 1;
+                    }
+                    i = (k + 1).min(b.len());
+                    continue;
+                }
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    // Only whole (ASCII-delimited) attributes were removed, so the rest is intact UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| html.to_string())
 }
 
 /// Dispatch a click into the live DOM under a fresh per-dispatch
@@ -10068,6 +10146,29 @@ const PRELUDE: &str = r##"
     function parseCss(text) {
         try { return JSON.parse(__css_parse(String(text || ""))); } catch (e) { return []; }
     }
+    // Split stylesheet text into its top-level rules (string/comment/brace
+    // aware), so a CSSStyleSheet can model insertRule/deleteRule by index and
+    // join them back to text the Rust cascade reads. @media/@supports/@keyframes
+    // count as ONE top-level rule (their inner braces don't split); top-level
+    // `;` at-rules (@import/@charset) are their own rule.
+    function splitCssRules(text) {
+        const s = String(text || "");
+        const out = [];
+        let depth = 0, start = 0, i = 0;
+        const n = s.length;
+        while (i < n) {
+            const c = s[i];
+            if (c === "/" && s[i + 1] === "*") { const e = s.indexOf("*/", i + 2); i = e < 0 ? n : e + 2; continue; }
+            if (c === '"' || c === "'") { const q = c; i++; while (i < n && s[i] !== q) { if (s[i] === "\\") i++; i++; } i++; continue; }
+            if (c === "{") { depth++; i++; continue; }
+            if (c === "}") { i++; if (--depth <= 0) { const r = s.slice(start, i).trim(); if (r) out.push(r); start = i; depth = 0; } continue; }
+            if (c === ";" && depth === 0) { const r = s.slice(start, i + 1).trim(); if (r) out.push(r); i++; start = i; continue; }
+            i++;
+        }
+        const tail = s.slice(start).trim();
+        if (tail) out.push(tail);
+        return out;
+    }
     // A CSSStyleDeclaration over a rule's [name,value] pairs. Read-mostly
     // (rule edits don't flow back into our cascade); covers the surface
     // introspection code reads: length/item/getPropertyValue/cssText and
@@ -10196,19 +10297,47 @@ const PRELUDE: &str = r##"
         return ruleList(out);
     }
 
+    // styled-components & other CSS-in-JS inject ALL their CSS through
+    // sheet.insertRule() in CSSOM "speedy" mode, leaving the owning <style>
+    // element's text node EMPTY (the browser cascades from `cssRules`, not the
+    // text). Our Rust cascade reads `<style>` text, so a <style>-owned sheet
+    // mirrors its joined rules back into the element via __dom_set_text — else
+    // every styled-components flex/grid rule is invisible and the page collapses
+    // to one block column. Rules are kept as an array so insert/delete honour the
+    // CSSOM index (default 0; cascade order is load-bearing). cssRules is lazy.
     class CSSStyleSheet {
-        constructor() { this.__text = ""; this.__rules = null; this.ownerNode = null; this.media = mediaList(""); }
-        get cssRules() { return this.__rules || (this.__rules = ruleList([])); }
+        constructor() { this.__ruleTexts = []; this.__rules = null; this.ownerNode = null; this.media = mediaList(""); }
+        get __text() { return this.__ruleTexts.join("\n"); }
+        get cssRules() { return this.__rules || (this.__rules = buildRules(parseCss(this.__text))); }
         get rules() { return this.cssRules; }
         replace(t) { this.replaceSync(t); return Promise.resolve(this); }
-        replaceSync(t) { this.__text = String(t); this.__rules = buildRules(parseCss(this.__text)); sheetSync(this); }
-        insertRule(r, i) { this.__text += "\n" + String(r); this.__rules = buildRules(parseCss(this.__text)); sheetSync(this); return i || 0; }
-        deleteRule() {}
+        replaceSync(t) { this.__ruleTexts = splitCssRules(t); this.__rules = null; this.__changed(); }
+        insertRule(r, i) {
+            const idx = (i === undefined) ? 0 : (i | 0);
+            if (idx < 0 || idx > this.__ruleTexts.length) throw new DOMException("insertRule index out of range", "IndexSizeError");
+            this.__ruleTexts.splice(idx, 0, String(r));
+            this.__rules = null; this.__changed();
+            return idx;
+        }
+        deleteRule(i) {
+            const idx = i | 0;
+            if (idx < 0 || idx >= this.__ruleTexts.length) throw new DOMException("deleteRule index out of range", "IndexSizeError");
+            this.__ruleTexts.splice(idx, 1);
+            this.__rules = null; this.__changed();
+        }
+        __changed() {
+            const o = this.ownerNode;
+            if (o && o.__id !== undefined && o.localName === "style") {
+                __dom_set_text(o.__id, this.__text);
+                o.__sheetText = this.__text;   // keep <style>.sheet's getter cache coherent
+            } else {
+                sheetSync(this);
+            }
+        }
     }
     function makeStyleSheet(text, owner) {
         const s = new CSSStyleSheet();
-        s.__text = String(text || "");
-        s.__rules = buildRules(parseCss(s.__text));
+        s.__ruleTexts = splitCssRules(text);
         s.ownerNode = owner || null;
         return s;
     }
@@ -17608,6 +17737,32 @@ mod tests {
     }
 
     #[test]
+    fn style_element_insert_rule_reaches_the_cascade() {
+        // styled-components / CSS-in-JS "speedy" mode injects ALL its CSS via
+        // styleEl.sheet.insertRule(), leaving the <style> text node EMPTY. Our
+        // Rust cascade reads <style> text, so a <style>-owned sheet must mirror
+        // its joined rules back into the element — else every flex/grid rule is
+        // invisible and a styled-components page (Twitch) collapses to one block
+        // column. Also pins insert-at-index and delete-at-index (cascade order
+        // is load-bearing): a later `.gone{display:block}` would WIN over the
+        // earlier `display:none`, so a working deleteRule is what keeps it hidden.
+        let (out, outcome) = page(
+            r##"<head><style id=sc></style></head><body>
+            <p class=gone>hide me</p><p class=keep>keep me</p>
+            <script>
+            const sheet = document.getElementById('sc').sheet;
+            sheet.insertRule('.gone { display: none }', 0);
+            sheet.insertRule('.keep { display: block }', 0);   // prepend (mid-insert)
+            sheet.insertRule('.gone { display: block }', 2);   // append: would un-hide
+            sheet.deleteRule(2);                               // remove it: .gone stays hidden
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(!out.contains("hide me"), "{out}");
+        assert!(out.contains("keep me"), "{out}");
+    }
+
+    #[test]
     fn live_click_moves_active_tab_border_via_cascade_rebake() {
         // A tab UI on a living page: clicking the inactive tab moves the
         // `selected` class, and the re-serialization RE-BAKES the cascade so
@@ -17916,6 +18071,55 @@ mod tests {
             panic!("expected Updated from the mutating click");
         };
         assert!(html.contains("changed"), "{html}");
+    }
+
+    #[test]
+    fn render_canonical_strips_non_rendered_attrs() {
+        // Two serializations differing ONLY in non-rendered attributes
+        // (alt/class/title/aria-*) are the same render — the baked `style`
+        // carries every layout effect. (Differing `style`/`src`/text are NOT.)
+        let a = r#"<img src="/a.png" alt="Alpha" class="x tw-transition" title="t" aria-label="A" style="width:10px">x"#;
+        let b = r#"<img src="/a.png" alt="Beta" class="y tw-active" title="u" aria-label="B" style="width:10px">x"#;
+        assert_eq!(render_canonical(a), render_canonical(b));
+        // A real change (style / src / text) still differs.
+        let c = r#"<img src="/a.png" alt="Alpha" class="x" title="t" style="width:20px">x"#;
+        let d = r#"<img src="/b.png" alt="Alpha" class="x" title="t" style="width:10px">y"#;
+        assert_ne!(render_canonical(a), render_canonical(c));
+        assert_ne!(render_canonical(a), render_canonical(d));
+    }
+
+    #[test]
+    fn an_alt_only_mutation_does_not_re_render() {
+        // A click that changes ONLY a non-rendered attribute — an image's `alt`
+        // text, which Twitch rotates a co-streamer's name through every second —
+        // must NOT re-render: `render_canonical` drops `alt`, so what we paint is
+        // unchanged and the actor SETTLES instead of emitting an Updated (which
+        // would re-parse + re-lay-out the whole doc — the CPU spin / 1s freeze).
+        let (handle, mut events) = live(
+            "<body><img id=av src=\"/a.png\" alt=\"Alpha\"><div id=hit></div><script>\
+             document.getElementById('hit').addEventListener('click', function () {\
+               document.getElementById('av').setAttribute('alt', 'Beta');\
+             });</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("expected first Updated");
+        };
+        let at = html.find("id=\"hit\"").expect("hit div present");
+        let hit: usize = html[..at]
+            .rfind("x-trust-js:")
+            .and_then(|i| {
+                html[i + "x-trust-js:".len()..]
+                    .split(':')
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .expect("hit marker");
+        handle.cmds.blocking_send(PageCmd::Click(hit)).unwrap();
+        match events.blocking_recv() {
+            Some(PageEvt::Settled) => {}
+            other => panic!("an alt-only change must only settle, got {other:?}"),
+        }
     }
 
     #[test]

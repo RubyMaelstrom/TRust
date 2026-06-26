@@ -536,6 +536,11 @@ pub struct App {
     image_cache: HashMap<String, DecodedImage>,
     /// In-flight parallel page-image fetch+decode batch.
     imgs_rx: Option<mpsc::Receiver<ImgLoadMsg>>,
+    /// A decoded image landed and the doc needs re-laying-out to reserve its
+    /// real box. Set by `on_img_load`, consumed once per run-loop turn — so a
+    /// burst of decodes (a page load fetches dozens; a churning live page
+    /// streams them) collapses into ONE O(document) re-parse, not one per image.
+    image_relayout_pending: bool,
     /// Encoded inline-image protocols, keyed by `(url, cell_w, cell_h, crop)`.
     /// Each is a `SlicedProtocol` (encoded once for the whole box; the renderer
     /// clips it to any vertical slice), so scroll never re-encodes. Bounded to
@@ -545,6 +550,13 @@ pub struct App {
     /// Non-empty drives the loading pulse (the channel is persistent so it
     /// can't gate the pulse itself).
     image_encoding: HashSet<EncKey>,
+    /// Boxes whose encode FAILED (a malformed image, or a sixel/box edge case).
+    /// Without this, a failed encode is neither in `image_protocols` nor
+    /// `image_encoding`, so `sync_image_encodes` re-requests it EVERY loop tick —
+    /// cloning the decoded bytes and re-spawning forever, a CPU spin that pegs a
+    /// core on an image-heavy page where one image won't encode. Evicted with the
+    /// on-screen set, so scrolling a box back gets exactly one retry.
+    failed_encodes: HashSet<EncKey>,
     /// Persistent channel for finished inline-image encodes.
     enc_tx: mpsc::Sender<EncMsg>,
     enc_rx: mpsc::Receiver<EncMsg>,
@@ -626,8 +638,10 @@ impl App {
             img_rx: None,
             image_cache: HashMap::new(),
             imgs_rx: None,
+            image_relayout_pending: false,
             image_protocols: HashMap::new(),
             image_encoding: HashSet::new(),
+            failed_encodes: HashSet::new(),
             enc_tx,
             enc_rx,
             search_target: None,
@@ -793,6 +807,30 @@ impl App {
                     Err(_) => break, // Empty (nothing queued) or Disconnected
                 }
             }
+            // Coalesce inline-image decodes the same way: the `select!` took ONE
+            // `imgs_rx` message; drain the rest that are already ready, then do a
+            // SINGLE relayout. A page load fetches dozens of images that finish in
+            // a burst, and a churning live page (Twitch's rotating previews) keeps
+            // streaming them — relaying out the whole 396KB doc once PER image
+            // pegged a core. Cache them all, relayout once.
+            if self.imgs_rx.is_some() {
+                let mut drained_imgs = 0;
+                while drained_imgs < 512 {
+                    let recv = self.imgs_rx.as_mut().map(|rx| rx.try_recv());
+                    match recv {
+                        Some(Ok(msg)) => {
+                            self.on_img_load(msg);
+                            drained_imgs += 1;
+                        }
+                        Some(Err(mpsc::error::TryRecvError::Disconnected)) => {
+                            self.imgs_rx = None;
+                            break;
+                        }
+                        _ => break, // Empty, or no receiver
+                    }
+                }
+            }
+            self.apply_pending_image_relayout();
             // After the input burst is coalesced, push the (now settled) scroll
             // position to the live page so its infinite-scroll / lazy-load logic
             // reacts. A no-op when the scroll row didn't move (the common case).
@@ -2018,7 +2056,17 @@ impl App {
             return; // fetch/decode failed: the alt text stands
         };
         self.image_cache.insert(msg.url, decoded);
-        self.relayout_browser();
+        // Defer the (O(document)) re-layout to the run loop's coalesce point so a
+        // burst of decodes triggers one relayout, not one each.
+        self.image_relayout_pending = true;
+    }
+
+    /// Re-lay-out the doc once if any image load since the last turn flagged it
+    /// (the coalesce point for `on_img_load`'s deferred relayouts).
+    fn apply_pending_image_relayout(&mut self) {
+        if std::mem::take(&mut self.image_relayout_pending) {
+            self.relayout_browser();
+        }
     }
 
     /// Re-lay-out the current HTTP doc with the decoded-image sizes,
@@ -2048,8 +2096,14 @@ impl App {
 
     fn on_enc(&mut self, msg: EncMsg) {
         self.image_encoding.remove(&msg.key);
-        if let Some(protocol) = msg.protocol {
-            self.image_protocols.insert(msg.key, protocol);
+        match msg.protocol {
+            Some(protocol) => {
+                self.image_protocols.insert(msg.key, protocol);
+            }
+            // Encode failed: remember it so it isn't re-requested every tick.
+            None => {
+                self.failed_encodes.insert(msg.key);
+            }
         }
     }
 
@@ -2086,11 +2140,17 @@ impl App {
                 live.insert(EncKey::for_item(url, item));
             }
         }
-        // Bound the cache: drop protocols for boxes no longer in range.
+        // Bound the caches: drop protocols/failures for boxes no longer in range
+        // (a re-scrolled box gets one fresh encode attempt).
         self.image_protocols.retain(|k, _| live.contains(k));
+        self.failed_encodes.retain(|k| live.contains(k));
         let wanted: Vec<EncKey> = live
             .into_iter()
-            .filter(|k| !self.image_protocols.contains_key(k) && !self.image_encoding.contains(k))
+            .filter(|k| {
+                !self.image_protocols.contains_key(k)
+                    && !self.image_encoding.contains(k)
+                    && !self.failed_encodes.contains(k)
+            })
             .collect();
         for key in wanted {
             self.request_image_encode(key);
@@ -2543,6 +2603,10 @@ impl App {
 
         if let Some((html, outcome)) = latest_update {
             self.page_js_errors.extend(outcome.errors.iter().cloned());
+            // The actor only emits an Updated when what we PAINT changed
+            // (`extract_changed` dedups non-rendered mutations via
+            // `render_canonical`), so an update reaching here is real work — apply
+            // it at once.
             self.replace_live_doc(html.into_bytes());
             self.status = if self.page_js_errors.is_empty() {
                 String::from("page updated · JS")
@@ -6079,6 +6143,8 @@ mod tests {
             .await
             .expect("inline SVG load completed");
         app.on_img_load(msg);
+        // The run loop coalesces image-load relayouts to one per turn; drive it.
+        app.apply_pending_image_relayout();
         server.await.unwrap();
 
         let decoded = app.image_cache.get(&image_url).expect("SVG cached");
