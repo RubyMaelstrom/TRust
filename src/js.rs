@@ -1002,6 +1002,29 @@ enum CdnLookup {
 /// guard, not a working constraint.
 const CDN_CACHE_MAX: usize = 64;
 
+/// Per-script source-size cap for admission to the compile cache. A script
+/// larger than this is never cached: a huge bundle is almost always FIRST-PARTY
+/// and unique (YouTube's ~10 MB `kevlar_base`), so it is never reused on another
+/// page and its compiled image is pure RAM cost. Every real *shared* CDN library
+/// — jQuery (85 KB), D3 (273 KB), Vue (160 KB), React + react-dom (≤128 KB min,
+/// ~1 MB dev) — sits below the cap, so the speed win is untouched. (2026-06-26:
+/// this + [`CDN_CACHE_MAX_BYTES`] replaced the entries-only lid; a single YouTube
+/// visit was pinning ~2.7 GB of bytecode images, held process-globally across
+/// later navigations — measured peak RSS 3.7 GB → 1.0 GB with the cache off.)
+const CDN_CACHE_MAX_SCRIPT: usize = 2 * 1024 * 1024;
+
+/// Total source-bytes budget for cached reusable images (source length is the
+/// proxy for compiled-image footprint). Past it, the oldest insertions are
+/// evicted by bytes, so the cache's resident cost is bounded regardless of how
+/// many distinct libraries a session touches.
+const CDN_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Whether a script of this source size may be admitted to the compile cache
+/// (the per-script half of the RAM lid — see [`CDN_CACHE_MAX_SCRIPT`]).
+fn cdn_cacheable(body_len: usize) -> bool {
+    body_len <= CDN_CACHE_MAX_SCRIPT
+}
+
 /// Discriminates cache entries by engine build: a different binary may compile
 /// the same source to an incompatible image, so its hash space must not overlap.
 /// The cache never persists across processes, so within one run this is
@@ -1011,8 +1034,11 @@ const CDN_CACHE_BUILD_TAG: &str = concat!("trust-cdn-cache-v1/", env!("CARGO_PKG
 
 struct CdnCache {
     map: std::collections::HashMap<[u8; 32], CdnEntry>,
-    /// Keys in insertion order, for FIFO eviction past `CDN_CACHE_MAX`.
-    order: VecDeque<[u8; 32]>,
+    /// `(key, source-bytes)` in insertion order, for FIFO eviction past either
+    /// the entry lid (`CDN_CACHE_MAX`) or the byte budget (`CDN_CACHE_MAX_BYTES`).
+    order: VecDeque<([u8; 32], usize)>,
+    /// Running sum of `order`'s bytes — the cache's tracked resident footprint.
+    total_bytes: usize,
 }
 
 static CDN_CACHE: std::sync::OnceLock<std::sync::Mutex<CdnCache>> = std::sync::OnceLock::new();
@@ -1022,6 +1048,7 @@ fn cdn_cache() -> &'static std::sync::Mutex<CdnCache> {
         std::sync::Mutex::new(CdnCache {
             map: std::collections::HashMap::new(),
             order: VecDeque::new(),
+            total_bytes: 0,
         })
     })
 }
@@ -1057,23 +1084,39 @@ fn cdn_cache_lookup(key: &[u8; 32]) -> CdnLookup {
 }
 
 /// Record a cache decision for `key` (the first writer wins a race; a poisoned
-/// lock silently drops the entry). Evicts the oldest insertion past the lid.
-fn cdn_cache_put(key: [u8; 32], entry: CdnEntry) {
+/// lock silently drops the entry). `bytes` is the entry's source-length cost
+/// (0 for a `NotReusable` marker). Evicts the oldest insertions past either lid.
+fn cdn_cache_put(key: [u8; 32], entry: CdnEntry, bytes: usize) {
     let Ok(mut cache) = cdn_cache().lock() else {
         return;
     };
+    cdn_cache_insert(&mut cache, key, entry, bytes);
+}
+
+/// The eviction policy (pure, so it's unit-testable off the process-global
+/// cache): keep both the entry-count lid and the byte budget satisfied with the
+/// incoming entry counted, evicting oldest-first. The `!is_empty` guard makes a
+/// lone over-budget entry degrade to "cache just this one" rather than loop
+/// forever — though the per-script cap keeps any single image well under budget.
+fn cdn_cache_insert(cache: &mut CdnCache, key: [u8; 32], entry: CdnEntry, bytes: usize) {
     if cache.map.contains_key(&key) {
         return;
     }
-    while cache.map.len() >= CDN_CACHE_MAX {
+    while !cache.map.is_empty()
+        && (cache.map.len() >= CDN_CACHE_MAX
+            || cache.total_bytes.saturating_add(bytes) > CDN_CACHE_MAX_BYTES)
+    {
         match cache.order.pop_front() {
-            Some(oldest) => {
-                cache.map.remove(&oldest);
+            Some((oldest, oldest_bytes)) => {
+                if cache.map.remove(&oldest).is_some() {
+                    cache.total_bytes = cache.total_bytes.saturating_sub(oldest_bytes);
+                }
             }
             None => break,
         }
     }
-    cache.order.push_back(key);
+    cache.order.push_back((key, bytes));
+    cache.total_bytes = cache.total_bytes.saturating_add(bytes);
     cache.map.insert(key, entry);
 }
 
@@ -1145,11 +1188,13 @@ fn run_external_classic(
         run_rehydrated_image(ctx, name, image, budget, outcome);
         return;
     }
-    // Store the freshly compiled image only on a true miss (`Absent`); a
-    // `NotReusable` entry means we already decided this source can't be cached.
+    // Store the freshly compiled image only on a true miss (`Absent`) AND only
+    // when the source is small enough to be worth keeping (see `cdn_cacheable` —
+    // a monster first-party bundle is excluded). A `NotReusable` entry means we
+    // already decided this source can't be cached.
     let store_key = match lookup {
-        CdnLookup::Absent => key,
-        CdnLookup::NotReusable | CdnLookup::Reusable(_) => None,
+        CdnLookup::Absent if cdn_cacheable(body.len()) => key,
+        _ => None,
     };
 
     if budget.exhausted() || outcome.elapsed >= COMPUTE_BUDGET {
@@ -1201,12 +1246,16 @@ fn run_external_classic(
                 "cdn cache store {name} ({})",
                 if reusable { "reusable" } else { "not reusable" }
             ));
-            let entry = if reusable {
-                CdnEntry::Reusable(std::sync::Arc::new(cb.to_image()))
+            let (entry, bytes) = if reusable {
+                // Source length is the proxy for the image's resident footprint.
+                (
+                    CdnEntry::Reusable(std::sync::Arc::new(cb.to_image())),
+                    body.len(),
+                )
             } else {
-                CdnEntry::NotReusable
+                (CdnEntry::NotReusable, 0)
             };
-            cdn_cache_put(key, entry);
+            cdn_cache_put(key, entry, bytes);
         }
         let t = phase_begin();
         let r = script.evaluate(ctx);
@@ -6173,7 +6222,21 @@ pub fn spawn_page(
     let spawned = std::thread::Builder::new()
         .name(String::from("trust-page"))
         .stack_size(PAGE_STACK)
-        .spawn(move || page_actor(html, env, cmd_rx, evt_tx, cmd_self));
+        .spawn(move || {
+            page_actor(html, env, cmd_rx, evt_tx, cmd_self);
+            // `page_actor` has returned, so the Context + DOM arena have dropped
+            // and this thread's whole JS heap is freed back to its (about-to-be-
+            // abandoned) mimalloc heap. Purge it to the OS NOW — on the owning
+            // thread, the instant it's free. This is the V8 "idle GC on
+            // navigation" analogue, and it fires at exactly the right moment:
+            // navigating away drops the `PageHandle`, this actor exits, the heap
+            // frees, and we return it. Doing it from the app's run loop instead
+            // raced — tearing down a multi-GB heap outlasts a light next page's
+            // load, so the app went idle and purged before the heap was freed.
+            // `mi_collect` is a global purge, so this also reclaims any other
+            // freed high-water. This is what makes RSS fall after a heavy page.
+            crate::release_allocator_memory();
+        });
     if spawned.is_err() {
         // The dropped evt sender tells the caller the page is gone.
     }
@@ -14750,6 +14813,124 @@ mod tests {
                 "{name} must be realm-portable for the CDN cache to help it"
             );
         }
+    }
+
+    /// P1 RAM lid: the per-script size gate admits every real shared library
+    /// (≤ a couple hundred KB) and rejects a monster first-party bundle
+    /// (YouTube's ~10 MB kevlar), whose process-global image was pinning
+    /// gigabytes. A pure check — no engine/network needed.
+    #[test]
+    fn cdn_cacheable_admits_shared_libs_rejects_monster_bundles() {
+        assert!(cdn_cacheable(85 * 1024), "jQuery (85 KB) must be cacheable");
+        assert!(cdn_cacheable(273 * 1024), "D3 (273 KB) must be cacheable");
+        assert!(
+            cdn_cacheable(CDN_CACHE_MAX_SCRIPT),
+            "a script exactly at the cap is admitted"
+        );
+        assert!(
+            !cdn_cacheable(CDN_CACHE_MAX_SCRIPT + 1),
+            "one byte over the cap is rejected"
+        );
+        assert!(
+            !cdn_cacheable(10 * 1024 * 1024),
+            "YouTube's ~10 MB kevlar bundle must NOT be cached"
+        );
+    }
+
+    /// P1 RAM lid: `cdn_cache_insert` keeps the total tracked bytes within
+    /// `CDN_CACHE_MAX_BYTES`, evicting oldest-first, and 0-byte markers don't
+    /// consume the byte budget. Exercised on a LOCAL cache so it never races the
+    /// process-global one other tests populate.
+    #[test]
+    fn cdn_cache_insert_evicts_by_byte_budget() {
+        let mut cache = CdnCache {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            total_bytes: 0,
+        };
+        let key = |n: u8| [n; 32];
+        // Each entry is just over half the budget, so any two together overflow
+        // it — inserting the second must evict the first.
+        let half_plus = CDN_CACHE_MAX_BYTES / 2 + 1;
+        cdn_cache_insert(&mut cache, key(1), CdnEntry::NotReusable, half_plus);
+        cdn_cache_insert(&mut cache, key(2), CdnEntry::NotReusable, half_plus);
+        assert!(
+            !cache.map.contains_key(&key(1)),
+            "the oldest entry is evicted to stay within the byte budget"
+        );
+        assert!(cache.map.contains_key(&key(2)), "the newest entry stays");
+        assert!(
+            cache.total_bytes <= CDN_CACHE_MAX_BYTES,
+            "tracked bytes never exceed the budget"
+        );
+        // Zero-byte markers (a `NotReusable` decision in production) cost no
+        // budget, so many coexist — bounded only by the entry lid.
+        for n in 3..=10u8 {
+            cdn_cache_insert(&mut cache, key(n), CdnEntry::NotReusable, 0);
+        }
+        assert!(
+            cache.map.contains_key(&key(2)),
+            "a 0-byte insert evicts nothing by bytes"
+        );
+        assert!(
+            cache.map.len() <= CDN_CACHE_MAX,
+            "the entry lid still holds"
+        );
+    }
+
+    /// P2 demonstration (manual, like `engine_profile`): after a heavy page's
+    /// engine thread exits and frees, mimalloc HOLDS the freed high-water for
+    /// reuse, so RSS stays elevated; `release_allocator_memory()` (the
+    /// navigation-boundary purge) returns it to the OS. Parses + compiles the
+    /// real YouTube `kevlar` bundle on a dedicated big-stack thread (the engine
+    /// path), joins it (Context drops → GC heap freed → thread heap abandoned),
+    /// then measures resident pages before and after the purge.
+    #[ignore = "manual measurement: RSS before/after the navigation purge; needs /tmp/kevlar.js"]
+    #[test]
+    fn allocator_purge_returns_memory() {
+        let rss_bytes = || -> usize {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+            // field index 1 (0-based) is resident pages
+            statm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|p| p.parse::<usize>().ok())
+                .unwrap_or(0)
+                * 4096
+        };
+        let Ok(body) = std::fs::read("/tmp/kevlar.js") else {
+            eprintln!("SKIP: needs /tmp/kevlar.js (a heavy real bundle)");
+            return;
+        };
+        let base = rss_bytes();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let mut ctx = Context::default();
+                if let Ok(s) = boa_engine::Script::parse(Source::from_bytes(&body), None, &mut ctx)
+                {
+                    let _ = s.codeblock(&mut ctx); // parse + compile = the high-water
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        let held = rss_bytes();
+        crate::release_allocator_memory();
+        let purged = rss_bytes();
+        let mib = |b: usize| b >> 20;
+        eprintln!(
+            "RSS  base={}MiB  after_thread_exit(held)={}MiB  after_purge={}MiB",
+            mib(base),
+            mib(held),
+            mib(purged)
+        );
+        assert!(
+            purged < held,
+            "the navigation purge must return the freed high-water ({}MiB -> {}MiB)",
+            mib(held),
+            mib(purged)
+        );
     }
 
     /// Two scripts with the SAME tag function and SAME template content. Their

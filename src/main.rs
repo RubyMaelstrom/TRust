@@ -6,6 +6,21 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Return freed allocator memory to the OS — a one-shot called at navigation
+/// boundaries (the V8 "idle GC on navigation" analogue). mimalloc retains a
+/// heavy page's freed pages for reuse, so after you leave e.g. YouTube the
+/// resident set never falls on its own; `mi_collect(true)` forces reclamation +
+/// purge of free/abandoned segments back to the OS. No-op on the pure-Rust
+/// (glibc) build, which already trims/`munmap`s on its own.
+pub fn release_allocator_memory() {
+    #[cfg(feature = "mimalloc")]
+    // SAFETY: `mi_collect` is a process-global mimalloc management entry point
+    // with no preconditions; it only reclaims memory that is already unused.
+    unsafe {
+        libmimalloc_sys::mi_collect(true);
+    }
+}
+
 mod app;
 mod cp437;
 mod doc;
