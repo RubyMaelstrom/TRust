@@ -6327,10 +6327,49 @@ const WORKER_SCOPE: &str = r##"
     URL.prototype.toString = function () { return this.href; };
     g.URL = URL; g.URLSearchParams = URLSearchParams;
 
+    // --- Blob URL store (worker realm) — RAM-only, mirrors the page realm ---
+    var __blobURLStore = Object.create(null);
+    function __blobBytes(b) {
+        if (!b || !Array.isArray(b.__parts)) return "";
+        var enc = new g.TextEncoder(), out = "";
+        for (var i = 0; i < b.__parts.length; i++) {
+            var p = b.__parts[i], v, j;
+            if (typeof p === "string") { v = enc.encode(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
+            else if (p instanceof ArrayBuffer) { v = new Uint8Array(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
+            else if (p && typeof p.byteLength === "number" && p.buffer) { v = new Uint8Array(p.buffer, p.byteOffset || 0, p.byteLength); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
+            else if (p && Array.isArray(p.__parts)) out += __blobBytes(p);
+            else if (p != null) { v = enc.encode(String(p)); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
+        }
+        return out;
+    }
+    function __blobText(bytes) { var u = new Uint8Array(bytes.length); for (var i = 0; i < bytes.length; i++) u[i] = bytes.charCodeAt(i) & 0xFF; return new g.TextDecoder().decode(u); }
+    function __resolveBlobURL(u) {
+        var h = u.indexOf("#"), key = h >= 0 ? u.slice(0, h) : u, obj = __blobURLStore[key];
+        if (!obj) return null;
+        if (Array.isArray(obj.__parts)) return { bytes: __blobBytes(obj), type: obj.type || "" };
+        return { bytes: "", type: "" };
+    }
+    URL.createObjectURL = function (obj) {
+        if (obj === null || typeof obj !== "object") throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.");
+        var origin = (g.location && g.location.origin) || "null";
+        var u = "blob:" + (origin || "null") + "/" + g.crypto.randomUUID();
+        __blobURLStore[u] = obj; return u;
+    };
+    URL.revokeObjectURL = function (u) {
+        u = String(u); var h = u.indexOf("#"); if (h >= 0) u = u.slice(0, h);
+        if (u.slice(0, 5) === "blob:") delete __blobURLStore[u];
+    };
+
     // --- importScripts (classic, synchronous fetch + global eval) ---
     g.importScripts = function () {
         for (var i = 0; i < arguments.length; i++) {
             var u = String(arguments[i]);
+            if (u.slice(0, 5) === "blob:") {
+                var be = __resolveBlobURL(u);
+                if (!be) throw new Error("importScripts failed: " + u + " (no blob URL entry)");
+                (0, eval)(__blobText(be.bytes));
+                continue;
+            }
             var rp = __url_parse(u, g.location.href); if (rp) u = rp[0];
             var r = __http_fetch(u, "GET", null, null, "");
             if (!r || r[0] < 200 || r[0] >= 300) throw new Error("importScripts failed: " + u + " (" + (r ? r[0] : "network error") + ")");
@@ -6353,6 +6392,11 @@ const WORKER_SCOPE: &str = r##"
     g.fetch = function (input, init) {
         init = init || {};
         var url = (input && input.url) ? input.url : String(input);
+        if (url.slice(0, 5) === "blob:") {
+            var be = __resolveBlobURL(url);
+            if (!be) return Promise.reject(new TypeError("Failed to fetch: " + url));
+            return Promise.resolve(makeResponse(200, be.type || null, __blobText(be.bytes), url));
+        }
         var rp = __url_parse(url, g.location.href); if (rp) url = rp[0];
         var method = String(init.method || (input && input.method) || "GET").toUpperCase();
         var body = (init.body != null) ? String(init.body) : null;
@@ -12143,6 +12187,44 @@ const PRELUDE: &str = r##"
         [Symbol.iterator]() { return this.entries(); }
         toString() { return this.__p.map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v)).join("&"); }
     }
+    // --- Blob URL store (File API §"Creating and Revoking a blob URL") ---
+    // RAM-only, page-lifetime, per-realm: a map from a minted `blob:` URL string
+    // to its Blob object, kept entirely in this JS realm — zero I/O, like the rest
+    // of TRust's web storage. `createObjectURL` mints a spec-shaped URL + stores
+    // the object; `revokeObjectURL` drops it; `fetch`/XHR below resolve a `blob:`
+    // URL straight from the store WITHOUT touching the network syscall (a blob URL
+    // never hits the wire). A null-proto object (not a Boa Map) keeps it off the
+    // GC-iterator trap and it is only ever keyed by string.
+    const __blobURLStore = Object.create(null);
+    // A latin1 byte string of a Blob's underlying bytes: string parts UTF-8
+    // encoded, BufferSource parts raw, nested Blobs recursed. More faithful than
+    // our string-backed Blob.arrayBuffer() (which leaves binary empty), so a blob
+    // built from a Uint8Array still round-trips through createObjectURL+fetch.
+    function __blobBytes(b) {
+        if (!b || !Array.isArray(b.__parts)) return "";
+        let out = "";
+        for (const p of b.__parts) {
+            if (typeof p === "string") out += utf8Binary(p);
+            else if (p instanceof ArrayBuffer) { const v = new Uint8Array(p); for (let i = 0; i < v.length; i++) out += String.fromCharCode(v[i]); }
+            else if (p && typeof p.byteLength === "number" && p.buffer) { const v = new Uint8Array(p.buffer, p.byteOffset || 0, p.byteLength); for (let i = 0; i < v.length; i++) out += String.fromCharCode(v[i]); }
+            else if (p && Array.isArray(p.__parts)) out += __blobBytes(p);
+            else if (p != null) out += utf8Binary(String(p));
+        }
+        return out;
+    }
+    function __latin1ToBytes(s) { const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i) & 0xff; return u; }
+    // Resolve a `blob:` URL to { bytes (latin1), type } or null (no entry → a
+    // network error at the call site). Keyed without a fragment, per spec.
+    function __resolveBlobURL(u) {
+        const h = u.indexOf("#"); const key = h >= 0 ? u.slice(0, h) : u;
+        const obj = __blobURLStore[key];
+        if (!obj) return null;
+        // Only Blob-shaped entries carry retrievable bytes; an unmodeled MediaSource
+        // still mints a URL but yields no media here (no media pipeline — a
+        // documented terminal deviation: we delegate playback to mpv).
+        if (Array.isArray(obj.__parts)) return { bytes: __blobBytes(obj), type: obj.type || "" };
+        return { bytes: "", type: "" };
+    }
     class URL {
         constructor(href, base) {
             const r = __url_parse(String(href), base === undefined || base === null ? null : String(base));
@@ -12154,6 +12236,21 @@ const PRELUDE: &str = r##"
         get searchParams() { return new URLSearchParams(this.search); }
         toString() { return this.href; }
         toJSON() { return this.href; }
+        // createObjectURL/revokeObjectURL (File API). The minted URL is
+        // `blob:<origin>/<uuid>`; the store is RAM-only (above).
+        static createObjectURL(obj) {
+            if (obj === null || typeof obj !== "object") throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.");
+            const origin = (g.location && g.location.origin) || "null";
+            const u = "blob:" + (origin || "null") + "/" + g.crypto.randomUUID();
+            __blobURLStore[u] = obj;
+            return u;
+        }
+        static revokeObjectURL(u) {
+            u = String(u);
+            const h = u.indexOf("#"); if (h >= 0) u = u.slice(0, h);
+            if (u.slice(0, 5) !== "blob:") return;
+            delete __blobURLStore[u];
+        }
     }
     g.URLSearchParams = URLSearchParams;
     g.URL = URL;
@@ -12676,6 +12773,18 @@ const PRELUDE: &str = r##"
             // a Request, or a URL object).
             const req = new Request(input, init);
             const url = req.url;
+            // A `blob:` URL is served from the in-realm store, never the wire
+            // (File API / Fetch §"scheme fetch" for blob). Missing/revoked entry
+            // → network error (a rejected fetch), exactly like the platform.
+            if (url.slice(0, 5) === "blob:") {
+                const be = __resolveBlobURL(url);
+                if (!be) return Promise.reject(new TypeError("fetch failed: no blob URL entry: " + url));
+                const bh = {}; if (be.type) bh["content-type"] = be.type;
+                const bresp = new Response(new g.TextDecoder().decode(__latin1ToBytes(be.bytes)), { status: 200, statusText: "", headers: bh, url: url });
+                bresp.type = "basic";
+                bresp.__bytes = be.bytes; // byte-exact body for arrayBuffer()/blob()
+                return Promise.resolve(bresp);
+            }
             const body = __bodyText(req.__body);
             const ctype = req.headers.get("content-type")
                 || (body !== null ? "text/plain;charset=UTF-8" : null);
@@ -12732,6 +12841,17 @@ const PRELUDE: &str = r##"
             this.__fire("readystatechange"); this.__fire("load"); this.__fire("loadend");
         }
         send(body) {
+            // A `blob:` URL resolves from the in-realm store, off the wire; a
+            // missing/revoked entry is a network error (__finish(null) → error
+            // event). Async still delivers __finish as a macrotask, like a real GET.
+            if (typeof this.__url === "string" && this.__url.slice(0, 5) === "blob:") {
+                const be = __resolveBlobURL(this.__url);
+                const arr = be ? [200, be.type || null, new g.TextDecoder().decode(__latin1ToBytes(be.bytes))] : null;
+                const xhr = this;
+                if (this.__sync) this.__finish(arr);
+                else g.setTimeout(function () { xhr.__finish(arr); }, 0);
+                return;
+            }
             const b = body === undefined || body === null ? null : String(body);
             const ctype = this.__h["content-type"] || (b !== null ? "text/plain;charset=UTF-8" : null);
             const hdrs = __hdrBlob(this.__h);
@@ -14634,6 +14754,81 @@ mod tests {
         );
     }
 
+    /// `URL.createObjectURL`/`revokeObjectURL` (File API) over a RAM-only,
+    /// per-realm blob URL store. The minted URL is `blob:<origin>/<uuid>`; a
+    /// `blob:` fetch/XHR resolves straight from the store (off the wire, never a
+    /// network syscall) and a revoked entry is a network error. Same faithful
+    /// page context the FileReader test uses (DOM + syscalls + cfg + PRELUDE).
+    #[test]
+    fn object_urls_resolve_from_a_ram_only_store() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "blob.js",
+            br##"
+            globalThis.out = {};
+            // Mint a blob URL: blob:<origin>/<uuid>.
+            const blob = new Blob(['{"k":42}'], { type: "application/json" });
+            const u = URL.createObjectURL(blob);
+            const pre = "blob:" + location.origin + "/";
+            out.url = u;
+            out.shape = u.indexOf(pre) === 0 && u.length === pre.length + 36;
+            // Sync XHR reads it straight back from the store, with its type.
+            const x = new XMLHttpRequest();
+            x.open("GET", u, false);
+            x.send();
+            out.xhrText = x.responseText;
+            out.xhrType = x.getResponseHeader("content-type");
+            // fetch() resolves it: text(), json(), and a byte-exact arrayBuffer
+            // (binary survives the round-trip even though our Blob is string-backed).
+            const ubin = URL.createObjectURL(new Blob([new Uint8Array([1, 2, 3, 254])]));
+            fetch(u).then((r) => { out.fStatus = r.status; out.fType = r.headers.get("content-type"); return r.json(); }).then((j) => { out.fJson = j.k; });
+            fetch(ubin).then((r) => r.arrayBuffer()).then((ab) => { const v = new Uint8Array(ab); out.bin = [v[0], v[1], v[2], v[3]].join(","); });
+            // Revoke -> the next fetch is a network error (rejected promise).
+            URL.revokeObjectURL(u);
+            fetch(u).then(() => { out.revoked = "resolved"; }, () => { out.revoked = "rejected"; });
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"String(out.shape)"), "true");
+        assert_eq!(s(&mut ctx, b"out.xhrText"), r#"{"k":42}"#);
+        assert_eq!(s(&mut ctx, b"out.xhrType"), "application/json");
+        assert_eq!(s(&mut ctx, b"String(out.fStatus)"), "200");
+        assert_eq!(s(&mut ctx, b"out.fType"), "application/json");
+        assert_eq!(s(&mut ctx, b"String(out.fJson)"), "42");
+        assert_eq!(s(&mut ctx, b"out.bin"), "1,2,3,254");
+        assert_eq!(s(&mut ctx, b"out.revoked"), "rejected");
+    }
+
     /// A spec TreeWalker with a NodeFilter callback drives Primer React's
     /// focus zone (`createTreeWalker(root, SHOW_ELEMENT, {acceptNode})` +
     /// `firstChild()`/`nextNode()`). A walker missing those traversal methods
@@ -15514,6 +15709,35 @@ mod tests {
         assert!(!outcome.panicked, "engine panicked: {outcome:?}");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("a,b"), "{out}");
+    }
+
+    #[test]
+    fn array_length_truncation_survives_inline_cache() {
+        // A Boa inline-cache bug surfaced by Apollo Client's `optimism` cache
+        // (and thus every Apollo + React page, e.g. Twitch channel content):
+        // `arr.length = 0` compiles to SetPropertyByName, which inline-caches
+        // the array's `length` storage slot. On a cache hit it wrote the new
+        // length straight into storage and SKIPPED `ArraySetLength`'s element
+        // truncation, so the dense backing vector kept its old elements. A
+        // following `arr[0] = x` then overwrote that in-bounds (stale) slot
+        // without growing `length`, leaving `length === 0` — the impossible
+        // "empty but clean" state optimism reports as "unknown value". The
+        // cache only fired once the `length = 0` site had run twice (a function
+        // called repeatedly on a reused array). Fixed in the vendored boa fork
+        // by marking the array `length` slot NOT_CACHABLE. This pins the exact
+        // pattern without Apollo.
+        let html = r##"<body><div id="t"></div><script>
+            function recomp(o, v) { o.value.length = 0; o.value[0] = v; return o.value.length; }
+            var o = { value: [] };
+            var first = recomp(o, "a");   // fresh array: appends -> length 1
+            var second = recomp(o, "b");  // reused: length=0 then [0]= -> must be 1
+            document.getElementById('t').textContent =
+              "first=" + first + " second=" + second + " v0=" + o.value[0];
+            </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "engine panicked: {outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("first=1 second=1 v0=b"), "{out}");
     }
 
     #[test]

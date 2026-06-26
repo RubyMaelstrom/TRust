@@ -238,9 +238,10 @@ impl Script {
         context: &mut Context,
     ) -> JsResult<Self> {
         let scope = context.realm().scope().clone();
-        code.analyze_scope(&scope, context.interner()).map_err(|reason| {
-            JsNativeError::syntax().with_message(format!("invalid scope analysis: {reason}"))
-        })?;
+        code.analyze_scope(&scope, context.interner())
+            .map_err(|reason| {
+                JsNativeError::syntax().with_message(format!("invalid scope analysis: {reason}"))
+            })?;
         if !context.optimizer_options().is_empty() {
             context.optimize_statement_list(code.statements_mut());
         }

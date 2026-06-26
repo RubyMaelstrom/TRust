@@ -209,10 +209,7 @@ fn date_parse_lenient_fractional_seconds() {
         TestAction::assert_eq("Date.parse('2020-07-08T09:16:15.200128456Z')", expected),
         TestAction::assert_eq("Date.parse('2020-07-08T09:16:15.2001Z')", expected),
         // microseconds with a numeric offset.
-        TestAction::assert_eq(
-            "Date.parse('2020-07-08T09:16:15.200128+00:00')",
-            expected,
-        ),
+        TestAction::assert_eq("Date.parse('2020-07-08T09:16:15.200128+00:00')", expected),
         // three and fewer digits (zero-padded): all 200ms.
         TestAction::assert_eq("Date.parse('2020-07-08T09:16:15.200Z')", expected),
         TestAction::assert_eq("Date.parse('2020-07-08T09:16:15.2Z')", expected),

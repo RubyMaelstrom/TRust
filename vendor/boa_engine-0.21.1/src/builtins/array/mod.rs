@@ -25,6 +25,7 @@ use crate::{
             get_prototype_from_constructor, ordinary_define_own_property,
             ordinary_get_own_property,
         },
+        shape::slot::SlotAttributes,
     },
     property::{Attribute, PropertyDescriptor, PropertyKey, PropertyNameKind},
     realm::Realm,
@@ -3427,8 +3428,20 @@ fn array_exotic_define_own_property(
         // 2. If P is "length", then
         PropertyKey::String(s) if s == &StaticJsStrings::LENGTH => {
             // a. Return ? ArraySetLength(A, Desc).
+            let result = array_set_length(obj, desc, context);
 
-            array_set_length(obj, desc, context)
+            // `length` has exotic [[Set]] semantics — `ArraySetLength` truncates
+            // the array's indexed elements when the length shrinks. The property
+            // still lives in an ordinary, cachable storage slot, so without this
+            // an inline cache would memoize that slot and, on a hit, write the new
+            // length directly into storage while SKIPPING the element truncation.
+            // That leaves the array in an impossible state (e.g. `a.length = 0`
+            // not clearing `a[0]`, so a later `a[0] = x` overwrites the stale slot
+            // and never grows `length`). Marking the slot non-cachable forces
+            // every `arr.length = …` through this real exotic set.
+            context.slot().attributes |= SlotAttributes::NOT_CACHABLE;
+
+            result
         }
         // 3. Else if P is an array index, then
         PropertyKey::Index(index) => {
