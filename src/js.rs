@@ -1973,6 +1973,11 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__http_fetch", 5, sys_http_fetch),
         ("__http_fetch_async", 5, sys_http_fetch_async),
         ("__dom_run_injected_script", 1, sys_run_injected_script),
+        (
+            "__dom_load_injected_stylesheet",
+            1,
+            sys_load_injected_stylesheet,
+        ),
         ("__cookie_get", 0, sys_cookie_get),
         ("__cookie_set", 1, sys_cookie_set),
         ("__storage_get", 2, sys_storage_get),
@@ -4513,6 +4518,60 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
             ctx.enqueue_job(job.into());
         }
         _ => {}
+    }
+    Ok(JsValue::undefined())
+}
+
+/// `__dom_load_injected_stylesheet(nodeId)` — a `<link rel=stylesheet>` that
+/// page JS inserted into the live document. A real browser fetches the sheet
+/// and fires `load` (or `error`) on the element; TRust never did, so a loader
+/// that waits on `link.onload` hung forever. This is exactly how webpack's
+/// mini-css-extract chunk loader resolves a code-split chunk's CSS: it injects
+/// the `<link>` and resolves the chunk promise on the link's `load` event. With
+/// no event, `__webpack_require__.e(chunk)` stays pending → a `Promise.all` of
+/// chunks (every `React.lazy` route — Twitch's whole page body) never resolves →
+/// the route's Suspense shows its spinner forever. We fetch (cap-/SSRF-gated,
+/// like injected scripts) and fire `load` on a 2xx else `error`. The CSS body
+/// isn't yet folded into the live cascade (a separate enhancement); the load
+/// event is what unblocks the loaders.
+fn sys_load_injected_stylesheet(
+    _: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let (node_id, href) = {
+        let dom = page_dom(ctx);
+        let d = dom.borrow();
+        let Some(id) = arg_node(&d, args, 0) else {
+            return Ok(JsValue::undefined());
+        };
+        (id, d.attr(id, "href").map(str::to_string))
+    };
+    let Some(href) = href.filter(|h| !h.trim().is_empty()) else {
+        return Ok(JsValue::undefined());
+    };
+    match page_net_prepare(ctx, &href, String::from("GET"), None, vec![]) {
+        // Blocked/capped/cross-private: a failed load, like a browser.
+        None => fire_script_event(ctx, node_id, "error"),
+        Some((_handle, request)) => {
+            phase(&format!("css: INJECT {}", request.url));
+            let realm = ctx.realm().clone();
+            let job = NativeAsyncJob::with_realm(
+                async move |cell: &RefCell<&mut Context>| {
+                    let result = crate::http::fetch(&request).await;
+                    let mut guard = cell.borrow_mut();
+                    match result {
+                        Ok(resp) if (200..300).contains(&resp.status) => {
+                            fire_script_event(&mut guard, node_id, "load");
+                        }
+                        _ => fire_script_event(&mut guard, node_id, "error"),
+                    }
+                    Ok(JsValue::undefined())
+                },
+                realm,
+            );
+            ctx.enqueue_job(job.into());
+        }
     }
     Ok(JsValue::undefined())
 }
@@ -7907,6 +7966,26 @@ const PRELUDE: &str = r##"
         SCRIPTS_STARTED.add(node.__id);
         __dom_run_injected_script(node.__id);
     }
+    // A `<link rel=stylesheet href>` inserted into the live document is fetched
+    // and fires `load`/`error` (HTML "obtain a resource" for a stylesheet link).
+    // Was a no-op, so a loader waiting on `link.onload` hung — notably webpack's
+    // mini-css-extract chunk loader, which keeps `__webpack_require__.e(chunk)`
+    // pending until the CSS link loads, stalling every `React.lazy` route whose
+    // `Promise.all` of chunks includes a CSS chunk (Twitch's whole page body).
+    function maybeLoadStylesheet(node) {
+        if (!node || node.localName !== "link" || node.__cssStarted) return;
+        // Loaders set `link.rel`/`link.href` as PROPERTIES (webpack's mini-css
+        // loader: `c.rel="stylesheet"; c.href=url`), so read the property first
+        // (the `rel` IDL attribute doesn't always reflect to getAttribute).
+        const rel = (node.rel || node.getAttribute("rel") || "").toLowerCase();
+        if (rel.split(/\s+/).indexOf("stylesheet") < 0) return;
+        if (!(node.href || node.getAttribute("href"))) return;
+        let n = node, connected = false;
+        while (n) { if (n.nodeType === 9) { connected = true; break; } n = n.parentNode; }
+        if (!connected) return;
+        node.__cssStarted = true;
+        __dom_load_injected_stylesheet(node.__id);
+    }
 
     // A freshly inserted <iframe>/<frame> connected to the document begins
     // loading (HTML "process the iframe attributes" runs on insertion). A frame
@@ -8281,9 +8360,16 @@ const PRELUDE: &str = r##"
         }
         return null;
     }
-    trust.click = function (id) {
-        trust.lastClickSubmit = null;
-        const t = wrap(id);
+    // Activate an element as a click does: fire a bubbling, cancelable `click`
+    // event, then (unless prevented) run the submit-control activation. Shared
+    // by the actor's `trust.click` (a real user click, `record` = true so the
+    // app learns whether to run the native form submit) and the scripted
+    // `Element.prototype.click()` (HTML "fire a synthetic pointer event named
+    // click" — `record` = false, it must not clobber the actor's read-once
+    // `lastClickSubmit`). The bubbling click is what reaches React's delegated
+    // root-container listener, so a programmatic `.click()` finally runs onClick.
+    function activateClick(t, record) {
+        if (record) trust.lastClickSubmit = null;
         if (!t) return false;
         const ev = new Event("click", { bubbles: true, cancelable: true });
         dispatch(t, ev, false);
@@ -8302,11 +8388,14 @@ const PRELUDE: &str = r##"
                 const sev = new Event("submit", { bubbles: true, cancelable: true });
                 sev.submitter = btn;
                 dispatch(form, sev, false);
-                trust.lastClickSubmit = { form: form.__id, submitter: btn.__id, prevented: sev.defaultPrevented };
+                if (record) trust.lastClickSubmit = { form: form.__id, submitter: btn.__id, prevented: sev.defaultPrevented };
                 return sev.defaultPrevented;
             }
         }
         return false;
+    }
+    trust.click = function (id) {
+        return activateClick(wrap(id), true);
     };
     // Fire a load/error event on an injected <script> (and its on<type>
     // handler), for loaders that wait on `script.onload` instead of polling.
@@ -8558,6 +8647,7 @@ const PRELUDE: &str = r##"
             if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
+            maybeLoadStylesheet(c);
             if (c.__ln === "base") baseHrefCache = null; // maybeRunScript already read .localName
             else if (c.__ln === "iframe" || c.__ln === "frame") maybeProcessInsertedFrame(c, this);
             return c;
@@ -8568,6 +8658,7 @@ const PRELUDE: &str = r##"
             if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
+            maybeLoadStylesheet(c);
             if (c.__ln === "base") baseHrefCache = null;
             else if (c.__ln === "iframe" || c.__ln === "frame") maybeProcessInsertedFrame(c, this);
             return c;
@@ -8582,6 +8673,7 @@ const PRELUDE: &str = r##"
                 removedNodes: [old], previousSibling: prev, nextSibling: next });
             if (CE.defs.size) ceScan(n);
             maybeRunScript(n);
+            maybeLoadStylesheet(n);
             if (n.__ln === "base" || old.__ln === "base") baseHrefCache = null;
             else if (n.__ln === "iframe" || n.__ln === "frame") maybeProcessInsertedFrame(n, this);
             return old;
@@ -8978,7 +9070,12 @@ const PRELUDE: &str = r##"
         matches(s) { return !!__dom_matches(this.__id, String(s)); }
         webkitMatchesSelector(s) { return this.matches(s); }
         closest(s) { let e = this; while (e && e.nodeType === 1) { if (e.matches(s)) return e; e = e.parentNode; } return null; }
-        click() {} focus() {} blur() {} scrollIntoView() {}
+        // HTML `HTMLElement.click()`: fire a synthetic, non-trusted `click`
+        // event (bubbles to React's delegated root listener) + run activation.
+        // Was a no-op, so any programmatic click (consent "Accept" buttons,
+        // framework-driven toggles, auto-clickers) silently did nothing.
+        click() { try { activateClick(this, false); } catch (e) {} }
+        focus() {} blur() {} scrollIntoView() {}
         // Element scrolling (CSSOM View) is a no-op here — the terminal scrolls
         // the laid-out document, not individual DOM boxes. They MUST exist as
         // callable methods, though: a chat/feed that auto-scrolls its container
@@ -10240,6 +10337,11 @@ const PRELUDE: &str = r##"
         "HTMLTextAreaElement", "HTMLLinkElement"], "disabled", reflectBoolDesc);
     reflectOn(["HTMLAnchorElement", "HTMLAreaElement", "HTMLLinkElement",
         "HTMLBaseElement"], "href", reflectUrlDesc);
+    // `rel` is a reflected DOMString IDL attribute; without it `link.rel =
+    // "stylesheet"` (set as a property, as webpack's mini-css loader does) never
+    // reached `getAttribute("rel")`, so the sheet wasn't recognized.
+    reflectOn(["HTMLAnchorElement", "HTMLAreaElement", "HTMLLinkElement",
+        "HTMLFormElement"], "rel", reflectStrDesc);
     reflectOn(["HTMLImageElement", "HTMLScriptElement", "HTMLIFrameElement",
         "HTMLEmbedElement", "HTMLSourceElement", "HTMLTrackElement",
         "HTMLInputElement", "HTMLFrameElement"], "src", reflectUrlDesc);
@@ -11383,10 +11485,30 @@ const PRELUDE: &str = r##"
     // throws a TypeError its top-level error boundary catches ("Unable to load
     // page"). All no-ops/empty are safe (no entry found -> the caller skips
     // the optimization).
+    // `timeOrigin` and the (deprecated but ubiquitous) `PerformanceTiming`
+    // fields must be REAL epoch-ms timestamps, not 0/undefined: RUM/latency
+    // libraries compute durations off `performance.timing.navigationStart`
+    // (e.g. Twitch's latency tracker: `startTimestamp - navigationStart`), and
+    // an undefined `navigationStart` yields `NaN` durations that stall their
+    // page-load state machine. `now()` is virtual (ms since load); `timeOrigin
+    // + now()` ≈ wall-clock epoch ms, so the origin is the load-start epoch.
+    const __perfOrigin = Date.now();
+    const __perfTiming = {
+        navigationStart: __perfOrigin, fetchStart: __perfOrigin,
+        domainLookupStart: __perfOrigin, domainLookupEnd: __perfOrigin,
+        connectStart: __perfOrigin, connectEnd: __perfOrigin,
+        secureConnectionStart: __perfOrigin, requestStart: __perfOrigin,
+        responseStart: __perfOrigin, responseEnd: __perfOrigin,
+        domLoading: __perfOrigin, domInteractive: __perfOrigin,
+        domContentLoadedEventStart: __perfOrigin, domContentLoadedEventEnd: __perfOrigin,
+        domComplete: __perfOrigin, loadEventStart: __perfOrigin, loadEventEnd: __perfOrigin,
+        unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0,
+        toJSON() { return Object.assign({}, this); },
+    };
     g.performance = {
         now: () => 0,
-        timeOrigin: 0,
-        timing: {}, navigation: {}, memory: {},
+        timeOrigin: __perfOrigin,
+        timing: __perfTiming, navigation: { type: 0, redirectCount: 0 }, memory: {},
         mark() { return undefined; },
         measure() { return undefined; },
         clearMarks() {}, clearMeasures() {}, clearResourceTimings() {},
@@ -14488,6 +14610,90 @@ mod tests {
         assert!(
             out.contains(r#"data-ok="true""#),
             "node type/name getters returned a wrong value: {out}"
+        );
+    }
+
+    /// `HTMLElement.click()` must fire a REAL bubbling, cancelable click — the
+    /// path a framework's delegated root listener (React/Vue attach one click
+    /// listener on the root container) depends on. It was a no-op stub, so any
+    /// programmatic `.click()` — a cookie-consent "Accept" button, an
+    /// auto-clicker, a toggle a script flips — silently did nothing. Asserts the
+    /// event reaches an ANCESTOR listener (delegation) with `target` = the
+    /// clicked element, and that `preventDefault` is observable.
+    #[test]
+    fn a_programmatic_click_bubbles_to_a_delegated_listener() {
+        let html = r##"<body><div id="host"><button id="b">x</button></div><pre id="o"></pre><script>
+            var host = document.getElementById('host');
+            host.addEventListener('click', function (e) {
+                host.setAttribute('data-target', e.target.id);
+                e.preventDefault();
+            });
+            var ev = document.getElementById('b').click();
+            document.getElementById('o').setAttribute('data-done', '1');
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(r#"data-target="b""#),
+            "delegated ancestor listener didn't see the bubbling click: {out}"
+        );
+    }
+
+    /// `new Error().stack` must be a populated string at CONSTRUCTION (V8/
+    /// SpiderMonkey/JSC all do this), not only after the error is thrown. Real
+    /// libraries read it without throwing — Sentry, source-map/debug-id
+    /// registration, and scripts that find their own URL by parsing the stack
+    /// (an empty stack → an empty self-URL → `new URL("")` "Invalid URL"). The
+    /// Boa fork now installs `.stack` in every error constructor.
+    #[test]
+    fn a_constructed_error_has_a_stack_without_being_thrown() {
+        let html = r##"<body><pre id="o"></pre><script>
+            function probe() { return (new Error("boom")).stack; }
+            var s = probe();
+            var te = (new TypeError("t")).stack;
+            var o = document.getElementById('o');
+            o.setAttribute('data-ok', String(
+                typeof s === 'string' && s.length > 0 &&
+                s.indexOf('boom') >= 0 && s.indexOf('probe') >= 0));
+            o.setAttribute('data-te', String(
+                typeof te === 'string' && te.indexOf('TypeError') >= 0));
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(r#"data-ok="true""#),
+            "Error.stack not populated at construction (msg + frame): {out}"
+        );
+        assert!(
+            out.contains(r#"data-te="true""#),
+            "TypeError.stack missing its name header: {out}"
+        );
+    }
+
+    /// A `<link rel=stylesheet>` inserted by page JS must fire `load`/`error`.
+    /// Loaders wait on it — webpack's mini-css chunk loader keeps
+    /// `__webpack_require__.e(chunk)` pending until the link's `load` fires, so
+    /// without it every `React.lazy` route whose `Promise.all` of chunks
+    /// includes a CSS chunk (Twitch's whole page body) stays on its Suspense
+    /// fallback forever. `rel`/`href` are set as PROPERTIES (not `setAttribute`),
+    /// and `rel` doesn't reflect to `getAttribute`, so the handler reads the
+    /// property. Bare env has no net grant, so the resource fetch fails → `error`
+    /// (the point is that AN event fires; pre-fix neither did).
+    #[test]
+    fn an_injected_stylesheet_link_fires_a_load_or_error_event() {
+        let html = r##"<body><pre id="o"></pre><script>
+            var l = document.createElement('link');
+            l.rel = 'stylesheet';
+            l.href = 'http://example.com/x.css';
+            l.onload = function () { document.getElementById('o').setAttribute('data-css', 'load'); };
+            l.onerror = function () { document.getElementById('o').setAttribute('data-css', 'error'); };
+            document.head.appendChild(l);
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("data-css="),
+            "an injected stylesheet link fired no load/error event: {out}"
         );
     }
 

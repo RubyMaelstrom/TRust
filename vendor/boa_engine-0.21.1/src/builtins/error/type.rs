@@ -105,6 +105,9 @@ impl BuiltInConstructor for TypeError {
         // 4. Perform ? InstallErrorCause(O, options).
         Error::install_error_cause(&o, args.get_or_undefined(1), context)?;
 
+        // TRust fork: populate `.stack` now, at construction.
+        Error::install_stack(&o, context);
+
         // 5. Return O.
         Ok(o.into())
     }

@@ -129,6 +129,9 @@ impl BuiltInConstructor for AggregateError {
         )
         .expect("should not fail according to spec");
 
+        // TRust fork: populate `.stack` now, at construction.
+        Error::install_stack(&o, context);
+
         // 5. Return O.
         Ok(o.into())
     }

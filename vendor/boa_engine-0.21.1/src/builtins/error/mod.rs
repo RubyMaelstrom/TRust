@@ -238,12 +238,64 @@ impl BuiltInConstructor for Error {
         // 4. Perform ? InstallErrorCause(O, options).
         Self::install_error_cause(&o, args.get_or_undefined(1), context)?;
 
+        // TRust fork: populate `.stack` now, at construction.
+        Self::install_stack(&o, context);
+
         // 5. Return O.
         Ok(o.into())
     }
 }
 
 impl Error {
+    /// TRust fork: give a freshly-constructed error a `.stack` string, like
+    /// V8/SpiderMonkey/JSC do — NOT only when the error is thrown. Real
+    /// libraries read `new Error().stack` WITHOUT throwing: Sentry, source-map
+    /// /debug-id registration, and scripts that find their own URL by parsing
+    /// the stack. Boa attached `.stack` only at the throw/catch boundary
+    /// (`JsError::to_opaque`), so an unthrown error had none, breaking that code
+    /// silently (an empty self-URL → `new URL("")` → "Invalid URL"). Captures
+    /// the live shadow stack and renders it in the SAME format `to_opaque` uses.
+    /// Called from every error constructor (base + native subclasses).
+    pub(crate) fn install_stack(o: &JsObject, context: &mut Context) {
+        // Don't clobber a `stack` an author already set (e.g. a subclass).
+        if o.has_own_property(js_string!("stack"), context)
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let backtrace = context.vm.shadow_stack.take(
+            context.vm.runtime_limits.backtrace_limit(),
+            context.vm.frame.pc,
+        );
+        // Header = the error's `Name: message` (the first `.stack` line), read
+        // off the just-built object so built-in subclasses get "TypeError" etc.
+        let name = o
+            .get(js_string!("name"), context)
+            .ok()
+            .filter(|v| !v.is_undefined())
+            .and_then(|v| v.to_string(context).ok())
+            .map(|s| s.to_std_string_escaped());
+        let message = o
+            .get(js_string!("message"), context)
+            .ok()
+            .filter(|v| !v.is_undefined())
+            .and_then(|v| v.to_string(context).ok())
+            .map(|s| s.to_std_string_escaped())
+            .filter(|s| !s.is_empty());
+        let mut s = match (name, message) {
+            (Some(n), Some(m)) => format!("{n}: {m}"),
+            (Some(n), None) => n,
+            (None, Some(m)) => m,
+            (None, None) => String::from("Error"),
+        };
+        let _ = backtrace.write_frames(&mut s);
+        o.create_non_enumerable_data_property_or_throw(
+            js_string!("stack"),
+            JsString::from(s),
+            context,
+        );
+    }
+
     pub(crate) fn install_error_cause(
         o: &JsObject,
         options: &JsValue,
