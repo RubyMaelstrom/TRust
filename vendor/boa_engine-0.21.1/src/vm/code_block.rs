@@ -8,6 +8,7 @@ use crate::{
         OrdinaryObject,
         function::{OrdinaryFunction, ThisMode},
     },
+    bytecompiler::LazyFunctionData,
     object::JsObject,
 };
 use bitflags::bitflags;
@@ -50,10 +51,26 @@ bitflags! {
         /// If the function requires a function scope.
         const HAS_FUNCTION_SCOPE = 0b1_0000_0000;
 
+        /// TRust function-execution census (see [`super::fn_census`]): this block
+        /// was compiled while the census was armed. Runtime/diagnostic-only;
+        /// stripped from a [`super::CodeBlockImage`] so cached images stay canonical.
+        const CENSUS_TRACKED = 0b10_0000_0000;
+
+        /// TRust function-execution census: this block has begun executing at
+        /// least once (dedup mark, set on first `push_frame`). Runtime-only.
+        const CENSUS_EXECUTED = 0b100_0000_0000;
+
         /// Trace instruction execution to `stdout`.
         #[cfg(feature = "trace")]
         const TRACEABLE = 0b1000_0000_0000_0000;
     }
+}
+
+impl CodeBlockFlags {
+    /// The TRust function-census marks, which are runtime/diagnostic state and
+    /// must never be persisted into a [`super::CodeBlockImage`].
+    pub(crate) const CENSUS_MASK: Self =
+        Self::from_bits_retain(Self::CENSUS_TRACKED.bits() | Self::CENSUS_EXECUTED.bits());
 }
 
 impl CodeBlockFlags {
@@ -150,6 +167,23 @@ pub struct CodeBlock {
 
     /// Bytecode to source code mapping.
     pub(crate) source_info: SourceInfo,
+
+    /// TRust lazy compilation (see [`crate::vm::lazy`]): when `Some`, this block
+    /// is a *stub* whose body has not been compiled — only its observable
+    /// attributes (name/length/flags/this-mode/source span) are populated, so
+    /// the function object and `Function.prototype.toString` are correct before
+    /// the first call. The call funnels compile the real block from this data on
+    /// first invocation ([`LazyFunctionData::compile`]). `None` for every
+    /// ordinary (eagerly compiled) block.
+    ///
+    /// Holds no `Gc` pointers (AST, `Scope`, `JsString`, source text are all
+    /// reference-counted or owned), so it is soundly ignore-traced, like
+    /// `Constant::Scope`. A stub is never dehydrated into a
+    /// [`CodeBlockImage`](super::CodeBlockImage) — lazy is suppressed on every
+    /// image-cached compile path — so [`to_image`](Self::to_image) asserts this
+    /// is `None`.
+    #[unsafe_ignore_trace]
+    pub(crate) lazy: Option<Box<LazyFunctionData>>,
 }
 
 /// ---- `CodeBlock` public API ----
@@ -176,7 +210,61 @@ impl CodeBlock {
                 name,
                 SpannedSourceText::new_empty(),
             ),
+            lazy: None,
         }
+    }
+
+    /// Creates a lazy *stub* code block (TRust lazy compilation — see
+    /// [`crate::vm::lazy`] and
+    /// [`FunctionCompiler::compile_lazy_stub`](crate::bytecompiler::FunctionCompiler)).
+    ///
+    /// The stub carries every function attribute observable *without* compiling
+    /// the body: `name`, `length`, the `STRICT`/`HAS_PROTOTYPE_PROPERTY` flags,
+    /// the this-mode, and the source span (so `Function.prototype.toString`
+    /// returns the real source before any call). Everything produced by
+    /// compilation — bytecode, constants, bindings, handlers, inline caches — is
+    /// empty until the first call delazifies it.
+    pub(crate) fn new_lazy_stub(
+        name: JsString,
+        length: u32,
+        strict: bool,
+        has_prototype_property: bool,
+        this_mode: ThisMode,
+        source_path: SourcePath,
+        spanned_source_text: SpannedSourceText,
+        lazy: Box<LazyFunctionData>,
+    ) -> Self {
+        let mut flags = CodeBlockFlags::empty();
+        flags.set(CodeBlockFlags::STRICT, strict);
+        flags.set(
+            CodeBlockFlags::HAS_PROTOTYPE_PROPERTY,
+            has_prototype_property,
+        );
+        Self {
+            bytecode: ByteCode::default(),
+            constants: ThinVec::default(),
+            bindings: Box::default(),
+            flags: Cell::new(flags),
+            length,
+            register_count: 0,
+            this_mode,
+            mapped_arguments_binding_indices: ThinVec::new(),
+            parameter_length: 0,
+            handlers: ThinVec::default(),
+            ic: Box::default(),
+            source_info: SourceInfo::new(
+                SourceMap::new(Box::default(), source_path),
+                name,
+                spanned_source_text,
+            ),
+            lazy: Some(lazy),
+        }
+    }
+
+    /// The retained compile inputs of a lazy stub, if this block is one (TRust
+    /// lazy compilation — see [`Self::lazy`]).
+    pub(crate) fn lazy_data(&self) -> Option<&LazyFunctionData> {
+        self.lazy.as_deref()
     }
 
     /// Retrieves the name associated with this code block.

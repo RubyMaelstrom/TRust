@@ -628,6 +628,79 @@ fn report_phases(wall: Duration) {
     );
 }
 
+/// The process-wide `TRUST_FN_CENSUS` flag, read from the environment once. When
+/// set, a live page load arms the function-execution census (`vm::fn_census`)
+/// after the prelude and reports it at settle — the authoritative "real,
+/// fully-booting page: what fraction of the page's own compiled functions are
+/// never called" measurement (the lazy-parse sizing gate), and later the check
+/// that a lazy-parse build actually defers them.
+fn fn_census_on() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TRUST_FN_CENSUS").is_some())
+}
+
+/// The process-wide `TRUST_LAZY_PARSE` flag, read from the environment once.
+/// When set, eligible nested function bodies are compiled lazily — deferred to
+/// their first call instead of eagerly at load (TRust lazy compilation, JS
+/// engine performance plan Step 2 "Phase B"; see [`boa_engine::vm::lazy`]). Off
+/// by default (the A/B + kill switch, like `TRUST_NO_PARALLEL_PARSE` /
+/// `TRUST_NO_CDN_CACHE`, only inverted — opt-in).
+fn lazy_parse_on() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TRUST_LAZY_PARSE").is_some())
+}
+
+/// Optional `TRUST_LAZY_MIN` override (code points) for the lazy-compilation
+/// size threshold — the smallest function source worth deferring. `None` keeps
+/// boa's [`DEFAULT_MIN_SOURCE_LEN`](boa_engine::vm::lazy). Used to A/B the
+/// deferral aggressiveness.
+fn lazy_min() -> Option<usize> {
+    static MIN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var_os("TRUST_LAZY_MIN")
+            .and_then(|v| v.to_str().and_then(|s| s.parse::<usize>().ok()))
+    })
+}
+
+/// Report the live page's function-execution census, if armed (see
+/// [`fn_census_on`]). Counts only the page's own scripts' blocks — the prelude's
+/// are excluded because arming happens after `run_prelude`.
+fn report_fn_census() {
+    if !fn_census_on() {
+        return;
+    }
+    let c = boa_engine::vm::fn_census::snapshot();
+    let never_n = c.compiled_n.saturating_sub(c.executed_n);
+    let never_bytes = c.compiled_bytes.saturating_sub(c.executed_bytes);
+    let pct = |num: u64, den: u64| -> f64 {
+        if den == 0 {
+            0.0
+        } else {
+            100.0 * num as f64 / den as f64
+        }
+    };
+    let at = crate::http::trace_ms();
+    eprintln!("js : @{at:>6}ms ─── function census (page scripts, excl. prelude) ───");
+    eprintln!(
+        "       compiled    : {:>6} fns, {:>9} bytecode bytes",
+        c.compiled_n, c.compiled_bytes
+    );
+    eprintln!(
+        "       executed    : {:>6} fns ({:>5.1}%), {:>9} bytes ({:>5.1}%)",
+        c.executed_n,
+        pct(c.executed_n, c.compiled_n),
+        c.executed_bytes,
+        pct(c.executed_bytes, c.compiled_bytes),
+    );
+    eprintln!(
+        "       NEVER-CALLED: {:>6} fns ({:>5.1}%), {:>9} bytes ({:>5.1}%)  ← lazy-parse prize",
+        never_n,
+        pct(never_n, c.compiled_n),
+        never_bytes,
+        pct(never_bytes, c.compiled_bytes),
+    );
+}
+
 /// Run one script, tolerating failure: an exception (including a tripped
 /// runtime limit) lands in `outcome.errors` tagged with `name`, and the
 /// page lives on. Skipped outright when the budget is spent.
@@ -795,6 +868,11 @@ fn run_prelude(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
         // pages, then run. A lost `set` race is harmless — the winner's image
         // serves the cache and our own freshly compiled block still runs this
         // page (`let _ =` discards the rejected value).
+        //
+        // Suppress TRust lazy compilation for this compile: the result is
+        // dehydrated to a cached image, which cannot carry a lazy stub's AST
+        // (and `to_image` asserts it doesn't). The prelude must compile eagerly.
+        let _no_lazy = boa_engine::vm::lazy::suppress();
         let src = Source::from_bytes(PRELUDE.as_bytes()).with_path(std::path::Path::new("prelude"));
         let t = phase_begin();
         let script = boa_engine::Script::parse(src, None, ctx)?;
@@ -1215,6 +1293,13 @@ fn run_external_classic(
     };
     let started = Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        // Suppress TRust lazy compilation when this compile's result will be
+        // dehydrated into the CDN image cache — a cached image cannot carry a
+        // lazy stub. (The `compile_raw` branch self-suppresses already, since
+        // its worker interner doesn't survive; the inline branch is only unsafe
+        // to defer when it gets imaged, so an uncached inline external still
+        // lazy-compiles against the persistent `Context` interner.)
+        let _no_lazy = store_key.is_some().then(boa_engine::vm::lazy::suppress);
         // Obtain the compiled script: either compile the worker's raw parse
         // (parse was off-thread; `compile_raw` does scope-analysis + bytecode,
         // charged to Compile), or parse + compile inline.
@@ -5527,8 +5612,20 @@ fn load_page(
             .map(|n| n.get())
             .unwrap_or(8),
     );
+    // TRust lazy compilation (`TRUST_LAZY_PARSE`): enable deferral on this page
+    // thread before any of the page's own scripts compile. The prelude (next
+    // line) and the image-cached compiles self-suppress, so they stay eager.
+    boa_engine::vm::lazy::set_enabled(lazy_parse_on());
+    if let Some(n) = lazy_min() {
+        boa_engine::vm::lazy::set_min_source_len(n);
+    }
     run_script(&mut ctx, "config", cfg.as_bytes(), &budget, &mut outcome);
     run_prelude(&mut ctx, &budget, &mut outcome);
+    // Arm the function-execution census AFTER the prelude so it counts only the
+    // page's own scripts (the lazy-parse sizing gate; `TRUST_FN_CENSUS`).
+    if fn_census_on() {
+        boa_engine::vm::fn_census::arm();
+    }
     if !outcome.errors.is_empty() {
         // The prelude is ours: if it broke, render without JS and say so.
         return Err(outcome);
@@ -5802,6 +5899,9 @@ fn settle_page(page: &mut LoadedPage) {
     // is the full load+settle wall — including this page's settle execution,
     // which `engine_profile` (one bundle in isolation) can't see.
     report_phases(page.started.elapsed());
+    // Lazy-parse sizing gate (under TRUST_FN_CENSUS): of this page's own
+    // compiled functions, how many never ran this boot.
+    report_fn_census();
 }
 
 /// Drain microtasks + DUE-NOW (0-delay) timers to quiescence at the CURRENT
@@ -13992,7 +14092,18 @@ mod tests {
 
         // One independent measurement: fresh context + clean heap, then time
         // parse / compile / execute of the bench source (NOT the prelude setup).
-        let run_once = || -> (Duration, Duration, Duration, (usize, Duration, usize), &'static str) {
+        // With `do_census`, the function-execution census (`vm::fn_census`) is
+        // armed across the bundle's compile+execute so we can size the never-
+        // called share — done in a SEPARATE pass so the census hooks don't
+        // perturb the timing medians.
+        let run_once = |do_census: bool| -> (
+            Duration,
+            Duration,
+            Duration,
+            (usize, Duration, usize),
+            &'static str,
+            boa_engine::vm::fn_census::FnCensus,
+        ) {
             let html = r#"<html><head></head><body><div id="content"></div></body></html>"#;
             let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
             let mut ctx = page_context_with(None).0;
@@ -14008,6 +14119,13 @@ mod tests {
             let cfg = r#"globalThis.__trust_cfg = { url: "https://www.youtube.com/", ua: "TRust/0.1", width: 1600, height: 800 };"#;
             ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
             ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+            // TRust lazy compilation A/B: enable it (from `TRUST_LAZY_PARSE`)
+            // only for the BENCH bundle below — the prelude above already ran
+            // eagerly. Reset at the end of the run so it doesn't leak across runs.
+            boa_engine::vm::lazy::set_enabled(lazy_parse_on());
+            if let Some(n) = lazy_min() {
+                boa_engine::vm::lazy::set_min_source_len(n);
+            }
             if no_opt {
                 ctx.set_optimizer_options(boa_engine::optimizer::OptimizerOptions::empty());
             }
@@ -14020,6 +14138,11 @@ mod tests {
             let script =
                 boa_engine::Script::parse(Source::from_bytes(&src), None, &mut ctx).unwrap();
             let parse = t.elapsed();
+            // Arm AFTER parse so only the bundle's own blocks (compiled in
+            // `codeblock`) are tracked, never the prelude's earlier ones.
+            if do_census {
+                boa_engine::vm::fn_census::arm();
+            }
             let t = Instant::now();
             script.codeblock(&mut ctx).unwrap();
             let compile = t.elapsed();
@@ -14028,13 +14151,26 @@ mod tests {
                 script.evaluate(&mut ctx)
             }));
             let execute = t.elapsed();
+            let census = boa_engine::vm::fn_census::snapshot();
+            if do_census {
+                boa_engine::vm::fn_census::disarm();
+            }
+            boa_engine::vm::lazy::set_enabled(false);
+            boa_engine::vm::lazy::reset_min_source_len();
             let gc1 = boa_engine::gc::gc_profile();
             let outcome = match res {
                 Ok(Ok(_)) => "clean",
                 Ok(Err(_)) => "threw",
                 Err(_) => "PANIC",
             };
-            (parse, compile, execute, (gc1.0 - gc0.0, gc1.1 - gc0.1, gc1.2), outcome)
+            (
+                parse,
+                compile,
+                execute,
+                (gc1.0 - gc0.0, gc1.1 - gc0.1, gc1.2),
+                outcome,
+                census,
+            )
         };
 
         // median + dispersion over a slice of durations.
@@ -14050,7 +14186,7 @@ mod tests {
         let mut last_gc = (0usize, Duration::ZERO, 0usize);
         let mut last_outcome = "n/a";
         for i in 0..runs {
-            let (p, c, e, gc, outcome) = run_once();
+            let (p, c, e, gc, outcome, _) = run_once(false);
             last_gc = gc;
             last_outcome = outcome;
             eprintln!(
@@ -14087,6 +14223,600 @@ mod tests {
         if let Some(peak) = proc_peak_rss_mib() {
             eprintln!("peak RSS : {peak} MiB (VmHWM)");
         }
+
+        // --- function-execution census (the lazy-parse sizing gate) ---
+        // A separate, un-timed pass so the census hooks don't perturb the
+        // medians above. Counts how many of the bundle's compiled blocks ever
+        // begin executing; the never-called share is the lazy-parse prize.
+        let (.., census) = run_once(true);
+        let never_n = census.compiled_n.saturating_sub(census.executed_n);
+        let never_bytes = census.compiled_bytes.saturating_sub(census.executed_bytes);
+        let pct = |num: u64, den: u64| -> f64 {
+            if den == 0 {
+                0.0
+            } else {
+                100.0 * num as f64 / den as f64
+            }
+        };
+        eprintln!("--- function census (compiled vs. ever-called this boot) ---");
+        eprintln!(
+            "compiled : {:>7} fns, {:>8} bytecode bytes",
+            census.compiled_n, census.compiled_bytes
+        );
+        eprintln!(
+            "executed : {:>7} fns ({:>5.1}%), {:>8} bytes ({:>5.1}%)",
+            census.executed_n,
+            pct(census.executed_n, census.compiled_n),
+            census.executed_bytes,
+            pct(census.executed_bytes, census.compiled_bytes),
+        );
+        eprintln!(
+            "NEVER-CALLED: {:>4} fns ({:>5.1}%), {:>8} bytes ({:>5.1}%)  <- lazy-parse prize",
+            never_n,
+            pct(never_n, census.compiled_n),
+            never_bytes,
+            pct(never_bytes, census.compiled_bytes),
+        );
+        eprintln!(
+            "note     : '{last_outcome}' boot — a bundle that errors early under-counts execution"
+        );
+    }
+
+    /// The function-execution census (`vm::fn_census`, the lazy-parse sizing
+    /// gate) counts every compiled block and marks the ones that ever run, so
+    /// `compiled − executed` is the never-called set lazy parse targets. Pins
+    /// the count, the byte tally, and that disarming stops tracking. Snapshot +
+    /// disarm BEFORE asserting so a failure can't leave the thread armed for a
+    /// sibling test.
+    #[test]
+    fn fn_census_counts_called_vs_uncalled_functions() {
+        use boa_engine::vm::fn_census;
+        let mut ctx = boa_engine::Context::default();
+        fn_census::arm();
+        let src = r#"
+            function called() { return 1; }
+            function neverCalled() { return 2; }
+            called();
+        "#;
+        let script = boa_engine::Script::parse(Source::from_bytes(src), None, &mut ctx).unwrap();
+        script.codeblock(&mut ctx).unwrap();
+        script.evaluate(&mut ctx).unwrap();
+        let c = fn_census::snapshot();
+        fn_census::disarm();
+
+        // <main> + called + neverCalled are all compiled eagerly; <main> and
+        // called run, neverCalled never does.
+        assert_eq!(c.compiled_n, 3, "main + 2 fns compiled: {c:?}");
+        assert_eq!(
+            c.executed_n, 2,
+            "main + called ran; neverCalled did not: {c:?}"
+        );
+        assert!(
+            c.compiled_bytes > c.executed_bytes && c.executed_bytes > 0,
+            "some bytecode never-called, some executed: {c:?}"
+        );
+
+        // Disarmed: a later compile is NOT tracked (counters frozen at 3).
+        let s2 = boa_engine::Script::parse(Source::from_bytes(b"function f(){}"), None, &mut ctx)
+            .unwrap();
+        s2.codeblock(&mut ctx).unwrap();
+        assert_eq!(
+            fn_census::snapshot().compiled_n,
+            3,
+            "disarmed compile must not be tracked"
+        );
+    }
+
+    // ---- Phase B: lazy function compilation (defer + delazify) -----------
+    //
+    // An eligible nested function's bytecode generation is deferred to its first
+    // call: the byte compiler emits a stub `CodeBlock` carrying the body's
+    // compile inputs, and the call funnels compile the real block ("delazify")
+    // on first invocation. These tests pin the properties that matter:
+    // (1) deferral actually happens (fewer compiles), (2) a delazified function
+    // behaves byte-identically to the eager one (closure capture, named
+    // expression, recursion, defaults, `this`), (3) a never-called function's
+    // observable attributes (name/length/prototype/toString) are still correct,
+    // (4) only ordinary functions defer (not generators/async/arrows), and
+    // (5) suppression keeps the image-cached compile paths eager. All drive the
+    // thread-local `vm::lazy` switch directly; `MIN` is dropped to 0 so even
+    // tiny test functions clear the size gate.
+
+    /// RAII: enable lazy compilation with deferral size threshold `min` on this
+    /// thread, restoring the defaults on drop — so a panic can't leak the state
+    /// to a sibling test sharing the harness thread.
+    struct LazyOn;
+    impl LazyOn {
+        fn with_min(min: usize) -> Self {
+            boa_engine::vm::lazy::set_enabled(true);
+            boa_engine::vm::lazy::set_min_source_len(min);
+            LazyOn
+        }
+    }
+    impl Drop for LazyOn {
+        fn drop(&mut self) {
+            boa_engine::vm::lazy::set_enabled(false);
+            boa_engine::vm::lazy::reset_min_source_len();
+        }
+    }
+
+    /// Deferral happens: with lazy on, a never-called function is never
+    /// compiled (the census `compiled` count drops by exactly that function),
+    /// while a called function delazifies on its call and is counted then.
+    #[test]
+    fn lazy_parse_defers_uncalled_functions() {
+        use boa_engine::vm::fn_census;
+
+        let src = r"
+            function called() { return 1 + 2; }
+            function neverCalled() { return 3 + 4; }
+            called();
+        ";
+
+        let run = |lazy_on: bool| -> fn_census::FnCensus {
+            let mut ctx = boa_engine::Context::default();
+            let _g = lazy_on.then(|| LazyOn::with_min(0));
+            fn_census::arm();
+            let script =
+                boa_engine::Script::parse(Source::from_bytes(src.as_bytes()), None, &mut ctx)
+                    .unwrap();
+            script.codeblock(&mut ctx).unwrap();
+            script.evaluate(&mut ctx).unwrap();
+            let c = fn_census::snapshot();
+            fn_census::disarm();
+            c
+        };
+
+        let eager = run(false);
+        let lazy_c = run(true);
+
+        // Eager compiles <main> + both functions; <main> + called run.
+        assert_eq!(eager.compiled_n, 3, "eager: main + 2 fns: {eager:?}");
+        assert_eq!(eager.executed_n, 2, "eager: main + called run: {eager:?}");
+
+        // Lazy never compiles `neverCalled`; `called` delazifies on its call.
+        assert_eq!(lazy_c.compiled_n, 2, "lazy: main + called only: {lazy_c:?}");
+        assert_eq!(lazy_c.executed_n, 2, "lazy: main + called run: {lazy_c:?}");
+        assert!(
+            lazy_c.compiled_bytes < eager.compiled_bytes,
+            "lazy emits less bytecode: lazy={lazy_c:?} eager={eager:?}"
+        );
+    }
+
+    /// Soundness: a delazified function computes exactly what the eager one
+    /// does, across the paths delazify must reproduce — closure capture, a named
+    /// function expression (binding identifier + recursion), default parameters,
+    /// and `this`.
+    #[test]
+    fn lazy_delazified_functions_behave_identically() {
+        let src = r"
+            function make(base) { return function add(x) { return base + x; }; }
+            var fact = function f(n) { return n <= 1 ? 1 : n * f(n - 1); };
+            function withDefault(a, b = 10) { return a + b; }
+            var obj = { v: 7, peek() { return (function () { return this; }).call(this).v; } };
+            make(5)(3) * 1000 + fact(5) * 10 + withDefault(1) + obj.peek()
+        ";
+        let eval = |lazy_on: bool| -> f64 {
+            let _g = lazy_on.then(|| LazyOn::with_min(0));
+            let mut ctx = boa_engine::Context::default();
+            ctx.eval(Source::from_bytes(src.as_bytes()))
+                .unwrap()
+                .as_number()
+                .unwrap()
+        };
+        // make(5)(3)=8; fact(5)=120; withDefault(1)=11; obj.peek()=7.
+        let eager = eval(false);
+        assert_eq!(
+            eager,
+            8.0 * 1000.0 + 120.0 * 10.0 + 11.0 + 7.0,
+            "fixture sanity"
+        );
+        assert_eq!(eval(true), eager, "delazify must match eager exactly");
+    }
+
+    /// A deferred-but-never-called function still reports correct `name`,
+    /// `length`, prototype, and source text — all read off the stub before any
+    /// delazify (a bit-sum so the comparison stays numeric).
+    #[test]
+    fn lazy_uncalled_function_metadata_is_correct() {
+        let src = r#"
+            function bigFn(a, b, c) { var s = 0; for (var i = 0; i < 3; i++) s += a + b + c + i; return s; }
+            (bigFn.name === "bigFn" ? 1 : 0)
+              + (bigFn.length === 3 ? 2 : 0)
+              + (typeof bigFn === "function" ? 4 : 0)
+              + (typeof bigFn.prototype === "object" ? 8 : 0)
+              + (bigFn.toString().indexOf("return s") >= 0 ? 16 : 0)
+        "#;
+        let eval = |lazy_on: bool| -> f64 {
+            let _g = lazy_on.then(|| LazyOn::with_min(0));
+            let mut ctx = boa_engine::Context::default();
+            ctx.eval(Source::from_bytes(src.as_bytes()))
+                .unwrap()
+                .as_number()
+                .unwrap()
+        };
+        assert_eq!(
+            eval(false),
+            31.0,
+            "fixture sanity: all five checks pass eagerly"
+        );
+        assert_eq!(
+            eval(true),
+            31.0,
+            "uncalled deferred metadata must match eager"
+        );
+    }
+
+    /// Only ordinary functions defer: a never-called generator, async function,
+    /// and arrow are all compiled eagerly (excluded from deferral), while a
+    /// never-called ordinary function is the only one the census loses.
+    #[test]
+    fn lazy_defers_only_ordinary_functions() {
+        use boa_engine::vm::fn_census;
+        let src = r"
+            function ord() { return 1; }
+            function* gen() { return 2; }
+            async function asy() { return 3; }
+            var arr = () => { return 4; };
+        ";
+        let run = |lazy_on: bool| -> fn_census::FnCensus {
+            let mut ctx = boa_engine::Context::default();
+            let _g = lazy_on.then(|| LazyOn::with_min(0));
+            fn_census::arm();
+            let script =
+                boa_engine::Script::parse(Source::from_bytes(src.as_bytes()), None, &mut ctx)
+                    .unwrap();
+            script.codeblock(&mut ctx).unwrap();
+            script.evaluate(&mut ctx).unwrap();
+            let c = fn_census::snapshot();
+            fn_census::disarm();
+            c
+        };
+        // Eager compiles <main> + all 4. Lazy defers ONLY the ordinary `ord`.
+        assert_eq!(run(false).compiled_n, 5, "eager: main + 4 fns");
+        assert_eq!(
+            run(true).compiled_n,
+            4,
+            "lazy defers only the ordinary fn (gen/async/arrow stay eager)"
+        );
+    }
+
+    /// Suppression keeps the image-cached compile paths (prelude / CDN library
+    /// cache) eager: a block compiled under a `SuppressGuard` carries no stub,
+    /// so it dehydrates to a `CodeBlockImage` and rehydrates to identical
+    /// behaviour in another realm. (A deferred stub cannot be imaged — `to_image`
+    /// rejects one — so without suppression this would not round-trip.)
+    #[test]
+    fn lazy_suppression_keeps_image_cached_paths_eager() {
+        use boa_engine::vm::{CodeBlock, lazy};
+        let src = br"
+            function helper(x) { var s = 0; for (var i = 0; i < x; i++) s += i; return s; }
+            helper(5) + helper(3)
+        ";
+        let _g = LazyOn::with_min(0);
+
+        // Realm A: compile under suppression → eager block → detached image.
+        let mut ctx_a = boa_engine::Context::default();
+        let script_a =
+            boa_engine::Script::parse(Source::from_bytes(src), None, &mut ctx_a).unwrap();
+        let image = {
+            let _suppress = lazy::suppress();
+            script_a.codeblock(&mut ctx_a).unwrap().to_image()
+        };
+        let direct = script_a.evaluate(&mut ctx_a).unwrap().as_number().unwrap();
+
+        // Realm B: rehydrate the image and run — identical result.
+        let mut ctx_b = boa_engine::Context::default();
+        let script_b =
+            boa_engine::Script::parse(Source::from_bytes(src), None, &mut ctx_b).unwrap();
+        script_b.set_codeblock(CodeBlock::from_image(&image));
+        let rehydrated = script_b.evaluate(&mut ctx_b).unwrap().as_number().unwrap();
+
+        // helper(5)=0+1+2+3+4=10, helper(3)=0+1+2=3.
+        assert_eq!(direct, 13.0, "fixture sanity");
+        assert_eq!(
+            rehydrated, direct,
+            "a suppressed compile images + rehydrates cleanly (no stub leaked)"
+        );
+    }
+
+    /// Phase C (span + re-parse) stress: a deferred function is recovered by
+    /// RE-PARSING its source and RE-ANALYZING its scopes on first call, instead
+    /// of retaining the body AST. This pins that the re-derived bytecode behaves
+    /// identically to the eager path across the scope-sensitive shapes the
+    /// re-analysis must reproduce — deep nested capture, self-recursion (both a
+    /// declaration binding in the enclosing scope and a named expression binding
+    /// itself), mutual recursion, destructuring + dependent default parameters,
+    /// `var` hoisting vs. block `let`/`const`, `try`/`catch`, `switch`, the
+    /// `arguments` object, tagged templates (the re-parse allocates a fresh call
+    /// site id), strict mode, and closures invoked AFTER their definer returns
+    /// (capture must survive delazify). Each script is evaluated eager and lazy;
+    /// the two must agree, and agree with the hand-computed value (so a bug that
+    /// breaks BOTH identically can't hide).
+    #[test]
+    fn lazy_reparse_matches_eager_across_scope_shapes() {
+        let eval = |src: &str, lazy_on: bool| -> f64 {
+            let _g = lazy_on.then(|| LazyOn::with_min(0));
+            let mut ctx = boa_engine::Context::default();
+            ctx.eval(Source::from_bytes(src.as_bytes()))
+                .unwrap()
+                .as_number()
+                .unwrap()
+        };
+
+        // (source, expected) — `expected` guards against both paths being wrong
+        // in the same way; the eager==lazy assert guards the re-parse itself.
+        let cases: &[(&str, f64)] = &[
+            // Three-level nested capture: each level closes over an outer local,
+            // and the innermost is called long after the outer frames returned.
+            (
+                r"
+                function outer(a) {
+                    function mid(b) {
+                        function inner(c) { return a * 100 + b * 10 + c; }
+                        return inner;
+                    }
+                    return mid;
+                }
+                outer(1)(2)(3)
+                ",
+                123.0,
+            ),
+            // Self-recursion: a function DECLARATION (name binds in the enclosing
+            // scope) and a NAMED function EXPRESSION (name binds to itself).
+            (
+                r"
+                function fdecl(n) { return n <= 1 ? 1 : n * fdecl(n - 1); }
+                var fexpr = function fe(n) { return n <= 1 ? 1 : n * fe(n - 1); };
+                fdecl(5) + fexpr(5)
+                ",
+                240.0,
+            ),
+            // Mutual recursion across two deferred declarations.
+            (
+                r"
+                function isEven(n) { return n === 0 ? 1 : isOdd(n - 1); }
+                function isOdd(n) { return n === 0 ? 0 : isEven(n - 1); }
+                isEven(10) * 10 + isOdd(7)
+                ",
+                11.0,
+            ),
+            // Destructuring parameters + a default that references an earlier
+            // parameter (param-scope ordering must survive re-analysis).
+            (
+                r"
+                function f({ x, y }, [p, q], r = x + p) { return x + y + p + q + r; }
+                f({ x: 1, y: 2 }, [3, 4], undefined)
+                ",
+                14.0,
+            ),
+            // `var` hoisting, block `let`/`const`, a loop with a per-iteration
+            // `let` captured by a closure, `switch`, and `try`/`catch`.
+            (
+                r"
+                function g(n) {
+                    var total = 0;
+                    var fns = [];
+                    for (let i = 0; i < n; i++) { fns.push(function () { return i; }); }
+                    for (const fn of fns) { total += fn(); }
+                    switch (n) { case 3: total += 100; break; default: total += 1; }
+                    try { null.x; } catch (e) { total += 1000; }
+                    return total;
+                }
+                g(3)
+                ",
+                1103.0,
+            ),
+            // The `arguments` object inside a deferred function.
+            (
+                r"
+                function sum() { var t = 0; for (var i = 0; i < arguments.length; i++) t += arguments[i]; return t; }
+                sum(4, 5, 6, 7)
+                ",
+                22.0,
+            ),
+            // A tagged template inside a deferred body (re-parse must allocate a
+            // fresh, valid call-site identifier for it).
+            (
+                r"
+                function tag(strings, ...vals) { return strings.length * 10 + vals.length; }
+                function useTag(a, b) { return tag`x${a}y${b}z`; }
+                useTag(1, 2)
+                ",
+                32.0,
+            ),
+            // Strict-mode deferred function.
+            (
+                r"
+                function s() { 'use strict'; var n = 0; for (var i = 0; i < 5; i++) n += i; return n; }
+                s()
+                ",
+                10.0,
+            ),
+            // Many sibling closures share one constant stub; each must delazify
+            // independently and capture the right per-call binding.
+            (
+                r"
+                function makeAdder(base) { return function (x) { return base + x; }; }
+                var a = makeAdder(10), b = makeAdder(20), c = makeAdder(30);
+                a(1) + b(2) + c(3)
+                ",
+                66.0,
+            ),
+        ];
+
+        for (src, expected) in cases {
+            let eager = eval(src, false);
+            let lazy = eval(src, true);
+            assert_eq!(eager, *expected, "eager fixture sanity failed for: {src}");
+            assert_eq!(lazy, eager, "lazy re-parse diverged from eager for: {src}");
+        }
+    }
+
+    // ---- Phase A: the fallible body-skip scanner, proven against the real
+    // parser. The contract is one-directional: for any real function the
+    // scanner returns EITHER `None` (bail → caller parses eagerly) OR exactly
+    // the span the full parser produced — NEVER a different span. The fuzz
+    // harness over real corpora (the prelude always; canaries/kevlar on demand)
+    // enforces it: zero mismatches, ever.
+
+    /// Collects every braced function-body `Span` (recursively) from `src` via
+    /// the real parser. `None` if the source doesn't parse as a script.
+    fn collect_function_body_spans(
+        src: &str,
+    ) -> Option<Vec<(boa_ast::Position, boa_ast::Position)>> {
+        use boa_ast::visitor::{VisitWith, Visitor};
+        use std::ops::ControlFlow;
+
+        struct BodySpans(Vec<(boa_ast::Position, boa_ast::Position)>);
+        impl<'ast> Visitor<'ast> for BodySpans {
+            type BreakTy = std::convert::Infallible;
+            fn visit_function_body(
+                &mut self,
+                node: &'ast boa_ast::function::FunctionBody,
+            ) -> ControlFlow<Self::BreakTy> {
+                use boa_ast::Spanned;
+                let s = node.span();
+                self.0.push((s.start(), s.end()));
+                node.visit_with(self)
+            }
+        }
+
+        let mut interner = boa_interner::Interner::default();
+        let scope = boa_ast::scope::Scope::new_global();
+        let script = boa_parser::Parser::new(boa_parser::Source::from_bytes(src.as_bytes()))
+            .parse_script(&scope, &mut interner)
+            .ok()?;
+        let mut v = BodySpans(Vec::new());
+        let _: ControlFlow<std::convert::Infallible> = v.visit(&script);
+        Some(v.0)
+    }
+
+    /// Run the scanner against every function body the real parser found in
+    /// `src`. Returns `(matched, bailed, mismatched)`. A mismatch is a bug.
+    fn lazy_scan_check(src: &str) -> (usize, usize, usize) {
+        let cps: Vec<u32> = src.chars().map(u32::from).collect();
+
+        // `line_starts[line]` (1-based) = flat code-point index of that line's
+        // first code point, replicating the lexer's newline rules (`\r\n` is one
+        // break; `\n`/`\r`/U+2028/U+2029 each break a line). Column counts code
+        // points, so `flat(line,col) = line_starts[line] + col − 1`.
+        let mut line_starts = vec![0usize, 0usize]; // [0] unused, [1] = 0
+        {
+            let mut i = 0usize;
+            while i < cps.len() {
+                match cps[i] {
+                    0x0D => {
+                        i += if cps.get(i + 1).copied() == Some(0x0A) {
+                            2
+                        } else {
+                            1
+                        };
+                        line_starts.push(i);
+                    }
+                    0x0A | 0x2028 | 0x2029 => {
+                        i += 1;
+                        line_starts.push(i);
+                    }
+                    _ => i += 1,
+                }
+            }
+        }
+        let flat = |p: boa_ast::Position| -> usize {
+            let line = p.line_number() as usize;
+            let col = p.column_number() as usize;
+            line_starts.get(line).copied().unwrap_or(0) + col - 1
+        };
+
+        let spans = collect_function_body_spans(src).expect("corpus must parse");
+        let (mut matched, mut bailed, mut mismatched) = (0usize, 0usize, 0usize);
+        for (start, end) in spans {
+            let open = flat(start);
+            // Concise (un-braced) arrow bodies have a span that doesn't start at
+            // a `{`; the scanner only handles braced bodies, so skip them.
+            if cps.get(open).copied() != Some(u32::from(b'{')) {
+                continue;
+            }
+            let expected = flat(end);
+            match boa_parser::lazy_scan::scan_function_body(&cps, open) {
+                None => bailed += 1,
+                Some(b) if b.end == expected => matched += 1,
+                Some(b) => {
+                    mismatched += 1;
+                    if mismatched <= 5 {
+                        let ctx: String = cps[open..(open + 40).min(cps.len())]
+                            .iter()
+                            .filter_map(|&c| char::from_u32(c))
+                            .collect();
+                        eprintln!(
+                            "MISMATCH open={open} expected_end={expected} got={} near: {ctx:?}",
+                            b.end
+                        );
+                    }
+                }
+            }
+        }
+        (matched, bailed, mismatched)
+    }
+
+    /// The scanner must NEVER produce a wrong span over the ~225 KB prelude (a
+    /// large real corpus of hand-written JS), and must scan most bodies (a high
+    /// bail rate would gut the win). Runs on every `cargo test`.
+    #[test]
+    fn lazy_scan_matches_parser_on_the_prelude() {
+        let (matched, bailed, mismatched) = lazy_scan_check(PRELUDE);
+        eprintln!("prelude bodies: {matched} matched, {bailed} bailed, {mismatched} mismatched");
+        assert_eq!(mismatched, 0, "scanner produced a WRONG body span (a bug)");
+        assert!(matched > 100, "scanner matched implausibly few bodies");
+        let rate = matched as f64 / (matched + bailed).max(1) as f64;
+        assert!(
+            rate > 0.85,
+            "bail rate too high ({rate:.3}) — coverage regressed"
+        );
+    }
+
+    /// Heavy real-world fuzz: every function in the canary bundles (jQuery, D3,
+    /// Vue, React, …) and, if present, kevlar. Manual (reads files; slow on
+    /// kevlar). Zero mismatches is the hard invariant; the matched/bailed tally
+    /// reports coverage on minified real code (the regex/division stress test).
+    #[test]
+    #[ignore = "manual fuzz over target/canary/* and /tmp/kevlar.js"]
+    fn lazy_scan_fuzz_corpus() {
+        let mut files: Vec<String> = std::fs::read_dir("target/canary")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().to_string_lossy().into_owned())
+            .filter(|p| p.ends_with(".js"))
+            .collect();
+        files.push("/tmp/kevlar.js".to_string());
+        files.sort();
+
+        let (mut tm, mut tb, mut tmm) = (0usize, 0usize, 0usize);
+        for path in files {
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Skip ES modules / non-script sources (parse_script fails → None).
+            let Some(_) = collect_function_body_spans(&src) else {
+                eprintln!("{path}: (not a classic script — skipped)");
+                continue;
+            };
+            let (m, b, mm) = lazy_scan_check(&src);
+            let rate = 100.0 * m as f64 / (m + b).max(1) as f64;
+            eprintln!("{path}: {m} matched, {b} bailed ({rate:.1}% scanned), {mm} MISMATCH");
+            tm += m;
+            tb += b;
+            tmm += mm;
+        }
+        eprintln!(
+            "TOTAL: {tm} matched, {tb} bailed ({:.1}% scanned), {tmm} MISMATCH",
+            100.0 * tm as f64 / (tm + tb).max(1) as f64
+        );
+        assert_eq!(
+            tmm, 0,
+            "scanner produced a WRONG body span somewhere (a bug)"
+        );
     }
 
     /// Process peak resident set size (MiB) from `/proc/self/status` VmHWM —
@@ -15877,6 +16607,23 @@ mod tests {
     /// curl -LO https://d3js.org/d3.v7.min.js
     /// cargo test --release canary -- --ignored --nocapture
     /// ```
+    /// Run `transform` on a dedicated 64MB-stack thread, exactly as production
+    /// does (`spawn_page`). The plain `transform` runs on the caller's thread;
+    /// for big real-world bundles the parser/scope-analyzer recursion needs the
+    /// big stack (CLAUDE.md), and lazy compilation moves that deep recursion into
+    /// EXECUTION (re-analysis at delazify), so a test driving a big bundle with
+    /// `TRUST_LAZY_PARSE=1` must use the same big stack the live page actor does.
+    /// Takes ownership (the engine env is `Send`, as `spawn_page` relies on).
+    fn transform_on_page_stack(html: String, env: PageEnv) -> (String, Outcome) {
+        std::thread::Builder::new()
+            .stack_size(PAGE_STACK)
+            .name("trust-test-transform".into())
+            .spawn(move || transform(&html, &env))
+            .expect("spawn transform thread")
+            .join()
+            .expect("transform thread panicked")
+    }
+
     #[test]
     #[ignore = "manual canary: needs bundles in target/canary/ and --release timings"]
     fn canary_real_world_bundles() {
@@ -15955,7 +16702,9 @@ mod tests {
             let mut env = PageEnv::bare("https://example.com/");
             env.externals = vec![("/bundle.js".to_string(), Some(source))];
             let started = Instant::now();
-            let (out, outcome) = transform(&html, &env);
+            // Big-stack thread, like production — see `transform_on_page_stack`
+            // (lazy delazify re-analyzes on the execution stack).
+            let (out, outcome) = transform_on_page_stack(html, env);
             let booted = out
                 .lines()
                 .find(|l| l.contains("BOOTED:"))

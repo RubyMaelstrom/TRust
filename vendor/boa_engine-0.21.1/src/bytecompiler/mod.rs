@@ -58,7 +58,7 @@ use thin_vec::ThinVec;
 pub(crate) use declarations::{
     eval_declaration_instantiation_context, global_declaration_instantiation_context,
 };
-pub(crate) use function::FunctionCompiler;
+pub(crate) use function::{FunctionCompiler, LazyFunctionData};
 pub(crate) use jump_control::JumpControlInfo;
 pub(crate) use register::*;
 
@@ -507,6 +507,15 @@ pub struct ByteCompiler<'ctx> {
     /// Whether the function is in a `with` statement.
     pub(crate) in_with: bool,
 
+    /// TRust lazy compilation (see [`crate::vm::lazy`]): a one-shot flag, set just
+    /// before compiling the callee of a call when that callee is a function
+    /// expression (an IIFE: `(function () { … })()`). Such a function runs
+    /// immediately, so deferring it would only force an instant re-parse on the
+    /// spot — worse than compiling it eagerly. [`Self::function`] consumes the
+    /// flag (so it applies to that one function only; the IIFE's *inner*
+    /// functions still defer normally) and compiles eagerly when it is set.
+    pub(crate) eager_next_function: bool,
+
     /// Used to determine if a we emited a `CreateUnmappedArgumentsObject` opcode
     pub(crate) emitted_mapped_arguments_object_opcode: bool,
 
@@ -612,6 +621,7 @@ impl<'ctx> ByteCompiler<'ctx> {
             #[cfg(feature = "annex-b")]
             annex_b_function_names: Vec::new(),
             in_with,
+            eager_next_function: false,
             emitted_mapped_arguments_object_opcode: false,
         }
     }
@@ -1771,7 +1781,16 @@ impl<'ctx> ByteCompiler<'ctx> {
 
         let spanned_source_text = SpannedSourceText::new(self.source_text(), linear_span);
 
-        let code = FunctionCompiler::new(spanned_source_text)
+        // TRust lazy compilation: `compile_or_lazy` defers this function's body
+        // to its first call when eligible (see `crate::vm::lazy` and
+        // `FunctionCompiler::is_lazy_eligible`); otherwise it is the exact eager
+        // `compile`. The declaration-instantiation sites route through the same
+        // seam. An immediately-invoked function (the `eager_next_function` flag,
+        // one-shot per `function()` call) skips deferral — it runs at once, so
+        // deferring it would only force an instant re-parse (its inner functions
+        // still defer, the flag having been consumed).
+        let eager_next_function = std::mem::take(&mut self.eager_next_function);
+        let compiler = FunctionCompiler::new(spanned_source_text)
             .name(name)
             .generator(generator)
             .r#async(r#async)
@@ -1779,8 +1798,9 @@ impl<'ctx> ByteCompiler<'ctx> {
             .arrow(arrow)
             .in_with(self.in_with)
             .name_scope(name_scope.cloned())
-            .source_path(self.source_path.clone())
-            .compile(
+            .source_path(self.source_path.clone());
+        let code = if eager_next_function {
+            compiler.compile(
                 parameters,
                 body,
                 self.variable_scope.clone(),
@@ -1788,7 +1808,18 @@ impl<'ctx> ByteCompiler<'ctx> {
                 scopes,
                 function.contains_direct_eval,
                 self.interner,
-            );
+            )
+        } else {
+            compiler.compile_or_lazy(
+                parameters,
+                body,
+                self.variable_scope.clone(),
+                self.lexical_scope.clone(),
+                scopes,
+                function.contains_direct_eval,
+                self.interner,
+            )
+        };
 
         self.push_function_to_constants(code)
     }
@@ -1940,6 +1971,17 @@ impl<'ctx> ByteCompiler<'ctx> {
             Callable::New(new) => (new.call(), CallKind::New),
         };
 
+        // TRust lazy compilation: a call whose callee is a function expression is
+        // an IIFE; such wrappers (the UMD/module pattern
+        // `(function (g, factory) { … })(global, function () { …library… })`)
+        // almost always invoke a function-expression ARGUMENT immediately. So a
+        // function-expression argument of an IIFE compiles eagerly too — deferring
+        // the library factory would force a full re-parse of the whole bundle on
+        // first call. This is narrow: only IIFE arguments (not ordinary callbacks
+        // like `setTimeout(fn, …)`/`arr.map(fn)`, whose callee is not a function
+        // literal, which still defer). See `eager_next_function`.
+        let iife_call = matches!(call.function().flatten(), Expression::FunctionExpression(_));
+
         match call.function().flatten() {
             Expression::PropertyAccess(access) if kind == CallKind::Call => {
                 let this = self.register_allocator.alloc();
@@ -1994,6 +2036,12 @@ impl<'ctx> ByteCompiler<'ctx> {
                 }
 
                 let value = self.register_allocator.alloc();
+                // TRust lazy compilation: an immediately-invoked function
+                // expression (IIFE) should compile eagerly, not defer-then-
+                // instantly-re-parse (see `eager_next_function`).
+                if matches!(expr, Expression::FunctionExpression(_)) {
+                    self.eager_next_function = true;
+                }
                 self.compile_expr(expr, &value);
                 self.push_from_register(&value);
                 self.register_allocator.dealloc(value);
@@ -2024,6 +2072,9 @@ impl<'ctx> ByteCompiler<'ctx> {
             compiler.bytecode.emit_push_new_array(array.variable());
 
             for arg in call.args() {
+                if iife_call && matches!(arg.flatten(), Expression::FunctionExpression(_)) {
+                    compiler.eager_next_function = true;
+                }
                 compiler.compile_expr(arg, &value);
                 if let Expression::Spread(_) = arg {
                     compiler.bytecode.emit_get_iterator(value.variable());
@@ -2043,6 +2094,9 @@ impl<'ctx> ByteCompiler<'ctx> {
             compiler.register_allocator.dealloc(value);
         } else {
             for arg in call.args() {
+                if iife_call && matches!(arg.flatten(), Expression::FunctionExpression(_)) {
+                    compiler.eager_next_function = true;
+                }
                 let value = compiler.register_allocator.alloc();
                 compiler.compile_expr(arg, &value);
                 compiler.push_from_register(&value);
@@ -2090,6 +2144,15 @@ impl<'ctx> ByteCompiler<'ctx> {
 
         let final_bytecode_len = self.next_opcode_location();
 
+        // Function-execution census (TRust diagnostic; see `vm::fn_census`).
+        // Mark every block compiled while armed and tally its bytecode bytes;
+        // the mark rides the flags so it survives the `Gc::new` move and lets
+        // `push_frame` count which of these blocks ever runs.
+        if crate::vm::fn_census::armed() {
+            self.code_block_flags |= CodeBlockFlags::CENSUS_TRACKED;
+            crate::vm::fn_census::note_compiled(u64::from(final_bytecode_len));
+        }
+
         let mapped_arguments_binding_indices = if self.emitted_mapped_arguments_object_opcode {
             MappedArguments::binding_indices(&self.params, &self.parameter_scope, self.interner)
         } else {
@@ -2117,6 +2180,9 @@ impl<'ctx> ByteCompiler<'ctx> {
                 self.function_name,
                 self.spanned_source_text,
             ),
+            // A freshly compiled block is fully eager (this is the delazify
+            // output too — see `LazyFunctionData::compile`).
+            lazy: None,
         }
     }
 

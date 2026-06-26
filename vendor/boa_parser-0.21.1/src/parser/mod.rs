@@ -195,10 +195,7 @@ impl<'a, R: ReadChar> Parser<'a, R> {
     /// bytes being parsed.
     ///
     /// [spec]: https://tc39.es/ecma262/#prod-Script
-    pub fn parse_script_raw(
-        &mut self,
-        interner: &mut Interner,
-    ) -> ParseResult<ScriptParseOutput> {
+    pub fn parse_script_raw(&mut self, interner: &mut Interner) -> ParseResult<ScriptParseOutput> {
         self.cursor.set_goal(InputElement::HashbangOrRegExp);
         ScriptParser::new(false).parse(&mut self.cursor, interner)
     }
@@ -299,6 +296,41 @@ impl<'a, R: ReadChar> Parser<'a, R> {
         allow_await: bool,
     ) -> ParseResult<FormalParameterList> {
         FormalParameters::new(allow_yield, allow_await).parse(&mut self.cursor, interner)
+    }
+
+    /// Parses the input as a single [ECMAScript `FunctionExpression`][spec] into
+    /// the boa AST **with its collected source text**, and **without** running
+    /// scope analysis (the caller runs [`FunctionExpression::analyze_scope`]
+    /// against the enclosing scope itself).
+    ///
+    /// This is the re-parse entry for TRust lazy compilation (`boa_engine`'s
+    /// `crate::vm::lazy`): a deferred ordinary function's retained source span
+    /// (`function name(params) { body }`) is re-parsed on first call to recover
+    /// its body AST without having kept it in memory. The input must be exactly
+    /// one function expression (an ordinary, non-generator/non-async function);
+    /// the result still needs `analyze_scope` before compilation.
+    ///
+    /// The returned [`SourceText`](boa_ast::SourceText) is the freshly lexed
+    /// input. The caller MUST build the function's `SpannedSourceText` from it
+    /// (not from the original document's source), because every span in the
+    /// returned AST — including those of nested functions deferred in turn — is
+    /// relative to THIS input, not the original document.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` on any parsing error, including invalid reads of the
+    /// bytes being parsed.
+    ///
+    /// [spec]: https://tc39.es/ecma262/#prod-FunctionExpression
+    /// [`FunctionExpression::analyze_scope`]: boa_ast::function::FunctionExpression::analyze_scope
+    pub fn parse_function_expression(
+        &mut self,
+        interner: &mut Interner,
+    ) -> ParseResult<(boa_ast::function::FunctionExpression, boa_ast::SourceText)> {
+        self.cursor.set_goal(InputElement::RegExp);
+        let function =
+            expression::FunctionExpressionParser::new().parse(&mut self.cursor, interner)?;
+        Ok((function, self.cursor.take_source()))
     }
 }
 

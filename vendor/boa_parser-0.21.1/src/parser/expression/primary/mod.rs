@@ -57,6 +57,7 @@ use boa_ast::{
 };
 use boa_interner::{Interner, Sym};
 
+pub(in crate::parser) use function_expression::FunctionExpression as FunctionExpressionParser;
 pub(in crate::parser) use object_initializer::Initializer;
 
 /// Parses a primary expression.

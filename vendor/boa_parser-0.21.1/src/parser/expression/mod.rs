@@ -45,6 +45,7 @@ pub(super) use self::{assignment::AssignmentExpression, primary::Initializer};
 pub(in crate::parser) use {
     identifiers::{BindingIdentifier, LabelIdentifier},
     left_hand_side::LeftHandSideExpression,
+    primary::FunctionExpressionParser,
     primary::object_initializer::{
         AsyncGeneratorMethod, AsyncMethod, GeneratorMethod, PropertyName,
     },

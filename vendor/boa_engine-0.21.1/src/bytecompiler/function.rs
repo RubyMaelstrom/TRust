@@ -11,6 +11,7 @@ use boa_ast::{
 };
 use boa_gc::Gc;
 use boa_interner::Interner;
+use boa_parser::{Parser, Source};
 
 /// `FunctionCompiler` is used to compile AST functions to bytecode.
 #[derive(Debug, Clone)]
@@ -232,5 +233,270 @@ impl FunctionCompiler {
         let code = compiler.finish();
 
         Gc::new(code)
+    }
+
+    /// Whether this function may be compiled lazily (TRust lazy compilation —
+    /// see [`crate::vm::lazy`]): lazy is enabled and not suppressed on this
+    /// thread, the function is an ordinary one (not a generator/async/arrow/
+    /// method — those keep the exact eager path this first cut targets), not
+    /// lexically inside a `with`, free of direct `eval`, and its source span is
+    /// real and at least the size threshold (so the stub's source/`toString` is
+    /// correct and the retained AST is worth its cost). Class constructors carry
+    /// a binding-environment shape these inputs don't capture, so they are
+    /// compiled through `class.rs`'s own path, never here.
+    fn is_lazy_eligible(&self, contains_direct_eval: bool) -> bool {
+        crate::vm::lazy::should_defer()
+            && !self.generator
+            && !self.r#async
+            && !self.arrow
+            && !self.method
+            && !self.in_with
+            && !contains_direct_eval
+            && self
+                .spanned_source_text
+                .to_code_points()
+                .is_some_and(|cps| cps.len() >= crate::vm::lazy::min_source_len())
+    }
+
+    /// Compile this function, deferring its body when [eligible](Self::is_lazy_eligible):
+    /// the single seam every deferrable call site (function expressions, all
+    /// function/generator/async **declaration** instantiations) routes through
+    /// to get lazy compilation. An ineligible function (or lazy disabled) takes
+    /// the exact eager [`compile`](Self::compile) path. The delazify path
+    /// (`LazyFunctionData::compile`) calls `compile` directly, so it never
+    /// re-defers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compile_or_lazy(
+        self,
+        parameters: &FormalParameterList,
+        body: &FunctionBody,
+        variable_environment: Scope,
+        lexical_environment: Scope,
+        scopes: &FunctionScopes,
+        contains_direct_eval: bool,
+        interner: &mut Interner,
+    ) -> Gc<CodeBlock> {
+        if self.is_lazy_eligible(contains_direct_eval) {
+            self.compile_lazy_stub(parameters, body, variable_environment, lexical_environment)
+        } else {
+            self.compile(
+                parameters,
+                body,
+                variable_environment,
+                lexical_environment,
+                scopes,
+                contains_direct_eval,
+                interner,
+            )
+        }
+    }
+
+    /// Build a **lazy stub** [`CodeBlock`] for this function instead of compiling
+    /// its body (TRust lazy compilation — see [`crate::vm::lazy`]).
+    ///
+    /// The stub carries every observable function attribute that is available
+    /// without compiling the body — `name`, `length`, strictness, the
+    /// prototype-property and this-mode — so the function *object* created from
+    /// it (`create_function_object_fast`) and `Function.prototype.toString`
+    /// (which reads the retained source span) are correct *before the first
+    /// call*. The body's compile inputs are retained in [`LazyFunctionData`]; the
+    /// call funnels compile the real block on first invocation
+    /// ([`LazyFunctionData::compile`]).
+    ///
+    /// The caller (`ByteCompiler::function`) must only defer functions for which
+    /// these cheap attributes fully determine pre-call observable behaviour —
+    /// ordinary functions (no generator/async/arrow/method/direct-`eval`), with a
+    /// real source span.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compile_lazy_stub(
+        self,
+        parameters: &FormalParameterList,
+        body: &FunctionBody,
+        variable_environment: Scope,
+        lexical_environment: Scope,
+    ) -> Gc<CodeBlock> {
+        // Mirror the early, body-independent part of `compile`: `length` and the
+        // effective strictness (`compile` ORs in `body.strict()`), so the stub's
+        // `.length` own-property and `STRICT` flag match the real block exactly.
+        let length = parameters.length();
+        let strict = self.strict || body.strict();
+        let has_prototype_property =
+            !self.arrow && !self.method && !self.r#async && !self.generator;
+        let this_mode = if self.arrow {
+            ThisMode::Lexical
+        } else {
+            ThisMode::Global
+        };
+
+        // The stub's `source_info` needs the function's name, path and source
+        // span (for `.name` and `Function.prototype.toString` before any call);
+        // clone these cheap handles before the rest moves into `LazyFunctionData`.
+        let name = self.name.clone();
+        let source_path = self.source_path.clone();
+        let spanned_source_text = self.spanned_source_text.clone();
+
+        // Phase C retains NO body AST — only the span and the few facts needed to
+        // re-parse + re-analyze on first call. `parameters`/`body`/`scopes`/
+        // `contains_direct_eval` are recovered by the re-parse, not stored.
+        //
+        // A named function *expression* has a self-name scope; the collector
+        // creates that scope iff the node's `has_binding_identifier` is set, so
+        // `name_scope.is_some()` recovers the original flag (a declaration's name
+        // lives in the enclosing scope, leaving `name_scope` `None`). `scopes` and
+        // `contains_direct_eval` are recovered by the re-parse, not retained.
+        let lazy = LazyFunctionData {
+            name: self.name,
+            has_binding_identifier: self.name_scope.is_some(),
+            // Store the ORIGINAL strictness; delazify re-derives `|| body.strict()`
+            // exactly as `compile` does, so the recompile is identical.
+            strict: self.strict,
+            spanned_source_text: self.spanned_source_text,
+            source_path: self.source_path,
+            variable_environment,
+            lexical_environment,
+        };
+
+        Gc::new(CodeBlock::new_lazy_stub(
+            name,
+            length,
+            strict,
+            has_prototype_property,
+            this_mode,
+            source_path,
+            spanned_source_text,
+            Box::new(lazy),
+        ))
+    }
+}
+
+/// The retained inputs of a function whose bytecode generation was deferred
+/// (TRust lazy compilation — see [`crate::vm::lazy`]). Held by a lazy stub
+/// [`CodeBlock`] and consumed by [`LazyFunctionData::compile`] on first call to
+/// produce the real block.
+///
+/// **Phase C (span + re-parse):** unlike the original clone-retain prototype,
+/// this does NOT keep the body AST. It keeps only the function's source span and
+/// the small set of facts needed to re-derive everything on first call: the
+/// name, whether the function had a self-referential binding (declaration vs.
+/// named expression), the enclosing strictness, the source path, and the
+/// enclosing variable/lexical environments. On first call,
+/// [`compile`](Self::compile) RE-PARSES the function from its span and
+/// RE-ANALYZES it against the retained enclosing scope, then compiles — dropping
+/// the retained AST that made the clone-retain prototype regress peak RSS.
+///
+/// Only ordinary functions are deferred (no generator/async/arrow/method —
+/// [`FunctionCompiler::is_lazy_eligible`]), so those flags are implicitly
+/// `false` here and need not be stored.
+///
+/// It holds no `Gc` pointers (`Scope` is `Rc`-backed, `JsString`/`SourcePath`/
+/// the source span are owned or reference-counted, none GC-managed), so the
+/// field on [`CodeBlock`] is soundly `#[unsafe_ignore_trace]`, like
+/// `Constant::Scope`.
+#[derive(Clone, Debug)]
+pub(crate) struct LazyFunctionData {
+    /// The function's `.name` (used for the compiled block; the re-parsed
+    /// expression's own name handling is overridden by `has_binding_identifier`).
+    name: JsString,
+    /// Whether the original function had a self-referential binding identifier (a
+    /// named function *expression*). A function *declaration* binds its name in
+    /// the enclosing scope, so it must be re-parsed with this `false` or the
+    /// re-analysis would create a spurious self-name scope. Equal to the original
+    /// `name_scope.is_some()` (the collector creates that scope iff
+    /// `has_binding_identifier`).
+    has_binding_identifier: bool,
+    /// The enclosing strictness (before `|| body.strict()`); the re-parse and
+    /// re-analysis use it, and `compile` re-derives the effective strictness from
+    /// the body exactly as the eager path does.
+    strict: bool,
+    /// The function's source span — re-parsed on first call to recover the body
+    /// AST without having retained it.
+    spanned_source_text: SpannedSourceText,
+    source_path: SourcePath,
+    /// The enclosing environments captured at deferral. The re-analysis links the
+    /// function's fresh scopes to `lexical_environment` (the scope the eager
+    /// analysis used as the function's parent); `compile` receives both, exactly
+    /// as the eager `ByteCompiler::function` passed them.
+    variable_environment: Scope,
+    lexical_environment: Scope,
+}
+
+impl LazyFunctionData {
+    /// Compile the deferred function into its real [`CodeBlock`] on first call by
+    /// re-parsing and re-analyzing it (TRust lazy compilation Phase C).
+    ///
+    /// Steps, mirroring the eager path so the output is behaviourally identical:
+    /// 1. Re-parse the retained source span as a function expression. The span
+    ///    was already validated by the eager parse, so this cannot fail.
+    /// 2. Force the original `has_binding_identifier` so a re-parsed *declaration*
+    ///    does not gain a self-name scope.
+    /// 3. Re-analyze against the retained enclosing scope. This rebuilds the
+    ///    function's own scopes AND its nested functions' scopes (which the eager
+    ///    analysis embedded in the now-dropped AST). The enclosing scope's escape
+    ///    flags were already set by the eager analysis, so the re-marking
+    ///    `analyze_scope` performs on it is idempotent.
+    /// 4. Compile with the retained enclosing environments and the freshly
+    ///    analyzed function scopes.
+    ///
+    /// `interner` is the page `Context`'s persistent interner, so re-parsed
+    /// identifiers resolve to the same names the retained scopes were keyed by
+    /// (scopes key bindings by `JsString`). `parser_identifier` makes any
+    /// tagged-template call sites in the body unique within the page.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if re-parsing or re-analyzing source the eager parse already
+    /// accepted fails — a bug in span extraction. On the page thread this is
+    /// caught by the `trust-*` panic hook and degrades the page (`·JS:n!`)
+    /// rather than aborting.
+    pub(crate) fn compile(&self, interner: &mut Interner, parser_identifier: u32) -> Gc<CodeBlock> {
+        let code_points = self
+            .spanned_source_text
+            .to_code_points()
+            .expect("a deferred function always retains a real source span");
+
+        let mut parser = Parser::new(Source::from_utf16(code_points));
+        if self.strict {
+            parser.set_strict();
+        }
+        parser.set_identifier(parser_identifier);
+        let (mut function, reparsed_source) = parser
+            .parse_function_expression(interner)
+            .expect("re-parsing a lazy function whose source the eager parse accepted cannot fail");
+
+        function.set_has_binding_identifier(self.has_binding_identifier);
+
+        function
+            .analyze_scope(self.strict, &self.lexical_environment, interner)
+            .expect("re-analyzing a lazy function the eager pass already analyzed cannot fail");
+
+        // The re-parse's AST spans are relative to the EXTRACTED function source,
+        // so the compiled block (and any nested function it defers in turn) must
+        // carry that extracted text — spanning all of it — as their source base.
+        // Using the retained original-document span here would slice nested
+        // functions' source out of the wrong coordinate system.
+        let spanned_source_text = SpannedSourceText::from_full_source(reparsed_source);
+
+        FunctionCompiler {
+            name: self.name.clone(),
+            generator: false,
+            r#async: false,
+            strict: self.strict,
+            arrow: false,
+            method: false,
+            in_with: false,
+            force_function_scope: false,
+            name_scope: function.name_scope().cloned(),
+            spanned_source_text,
+            source_path: self.source_path.clone(),
+        }
+        .compile(
+            function.parameters(),
+            function.body(),
+            self.variable_environment.clone(),
+            self.lexical_environment.clone(),
+            function.scopes(),
+            function.contains_direct_eval(),
+            interner,
+        )
     }
 }

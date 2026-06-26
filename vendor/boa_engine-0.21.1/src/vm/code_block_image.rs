@@ -121,8 +121,19 @@ impl CodeBlock {
     /// block with [`CodeBlock::from_image`].
     #[must_use]
     pub fn to_image(&self) -> CodeBlockImage {
+        // A lazy stub (TRust lazy compilation) carries an AST + interner-bound
+        // `Sym`s that no image can represent, so lazy is suppressed on every
+        // image-cached compile path (`vm::lazy::SuppressGuard`). This asserts
+        // that invariant holds: a stub must never reach imaging.
+        debug_assert!(
+            self.lazy.is_none(),
+            "a lazy stub must not be dehydrated into a CodeBlockImage"
+        );
         CodeBlockImage {
-            flags: self.flags.get().bits(),
+            // Strip the runtime-only function-census marks (`vm::fn_census`) so a
+            // cached/rehydrated image is identical regardless of whether the
+            // census happened to be armed when this block was compiled/run.
+            flags: (self.flags.get() & !CodeBlockFlags::CENSUS_MASK).bits(),
             length: self.length,
             parameter_length: self.parameter_length,
             register_count: self.register_count,
@@ -187,6 +198,8 @@ impl CodeBlockImage {
                 .map(|n| InlineCache::new(JsString::from(n.as_slice())))
                 .collect(),
             source_info: self.source_info.rehydrate(),
+            // Images only ever hold fully eager blocks (see `to_image`).
+            lazy: None,
         }
     }
 }
