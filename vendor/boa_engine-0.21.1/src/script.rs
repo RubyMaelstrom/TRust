@@ -210,6 +210,12 @@ impl Script {
             mut interner,
             path,
         } = raw;
+        // Suppress TRust lazy deferral for this compile: it runs against the
+        // worker's PRIVATE interner, which is restored away and dropped below, so
+        // a deferred stub's body `Sym`s would not resolve at first call. Compile
+        // eagerly here (held for the whole swapped-interner window). See
+        // `crate::vm::lazy`.
+        let _no_lazy = crate::vm::lazy::SuppressGuard::new();
         // Swap the worker interner in so `analyze_scope` and the byte compiler
         // resolve the AST's `Sym` indices against the interner that produced
         // them. The page interner MUST be restored on every path — including a

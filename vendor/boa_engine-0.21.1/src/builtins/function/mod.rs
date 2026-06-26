@@ -971,6 +971,40 @@ pub(crate) fn set_function_name(
 /// # Panics
 ///
 /// Panics if the object is currently mutably borrowed.
+/// Compile a TRust lazy stub's real block on its first call ("delazify").
+///
+/// If `code` is a lazy stub (TRust lazy compilation — see [`crate::vm::lazy`]),
+/// this compiles its retained body into the real [`CodeBlock`] and swaps that
+/// into `function_object`, so later calls of the same closure run the real
+/// block directly; the real block is returned. A non-stub `code` is returned
+/// unchanged (the common, non-lazy case is a single `Option` check).
+///
+/// The deferred body's identifiers (`Sym`s) resolve against the page
+/// `Context`'s interner, which is persistent and append-only for the page's
+/// lifetime; deferral is suppressed on every compile path whose interner would
+/// not survive to first call (see [`crate::vm::lazy`]), so this is sound.
+fn delazify(
+    function_object: &JsObject,
+    code: Gc<CodeBlock>,
+    context: &mut Context,
+) -> Gc<CodeBlock> {
+    let Some(lazy) = code.lazy_data() else {
+        return code;
+    };
+    // Allocate a fresh parser identifier (tagged-template call-site uniqueness)
+    // before borrowing the interner — Phase C re-parses the body from its span.
+    let parser_identifier = context.next_parser_identifier();
+    let real = lazy.compile(context.interner_mut(), parser_identifier);
+    // Swap the real block into this closure so it is compiled at most once per
+    // closure (a later closure sharing the same constant stub delazifies on its
+    // own first call). The downcast cannot fail — we were reached through this
+    // function object's `[[Call]]`/`[[Construct]]`.
+    if let Some(mut function) = function_object.downcast_mut::<OrdinaryFunction>() {
+        function.code = real.clone();
+    }
+    real
+}
+
 // <https://tc39.es/ecma262/#sec-prepareforordinarycall>
 // <https://tc39.es/ecma262/#sec-ecmascript-function-objects-call-thisargument-argumentslist>
 pub(crate) fn function_call(
@@ -1005,6 +1039,9 @@ pub(crate) fn function_call(
     let script_or_module = function.script_or_module.clone();
 
     drop(function);
+
+    // TRust lazy compilation: compile a deferred function body on first call.
+    let code = delazify(function_object, code, context.context());
 
     let env_fp = environments.len() as u32;
 
@@ -1096,6 +1133,10 @@ fn function_construct(
     let environments = function.environments.clone();
     let script_or_module = function.script_or_module.clone();
     drop(function);
+
+    // TRust lazy compilation: compile a deferred constructor body on first use
+    // (before `code.is_derived_constructor()` is read below).
+    let code = delazify(this_function_object, code, context.context());
 
     let env_fp = environments.len() as u32;
 

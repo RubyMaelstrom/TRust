@@ -26,6 +26,7 @@
 )]
 
 pub mod error;
+pub mod lazy_scan;
 pub mod lexer;
 pub mod parser;
 pub mod source;

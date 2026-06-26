@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use boa_ast::LinearSpan;
+use boa_ast::{LinearPosition, LinearSpan};
 use boa_gc::{Finalize, Trace};
 
 struct Inner {
@@ -63,6 +63,24 @@ impl SpannedSourceText {
         Self {
             source_text: SourceText::new_empty(),
             span: None,
+        }
+    }
+
+    /// Builds a [`SpannedSourceText`] whose span covers the ENTIRE given source.
+    ///
+    /// TRust lazy compilation (Phase C) re-parses a deferred function from its
+    /// own extracted source; that re-parse's AST spans are relative to this
+    /// extracted text, so the compiled block — and any nested function it defers
+    /// in turn — must carry the extracted text as their source base, spanning all
+    /// of it (the extracted text IS the function). See `crate::vm::lazy`.
+    pub(crate) fn from_full_source(source_text: boa_ast::SourceText) -> Self {
+        let len = source_text.as_code_points().len();
+        Self {
+            source_text: SourceText::new(source_text),
+            span: Some(LinearSpan::new(
+                LinearPosition::new(0),
+                LinearPosition::new(len),
+            )),
         }
     }
 

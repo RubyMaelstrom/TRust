@@ -531,6 +531,8 @@ impl ByteCompiler<'_> {
             let func_span = function.linear_span();
             let spanned_source_text = SpannedSourceText::new(self.source_text(), func_span);
 
+            // TRust lazy compilation: defer this global function declaration's
+            // body to first call when eligible (see `FunctionCompiler::compile_or_lazy`).
             let code = FunctionCompiler::new(spanned_source_text)
                 .name(name.sym().to_js_string(self.interner()))
                 .generator(generator)
@@ -538,7 +540,7 @@ impl ByteCompiler<'_> {
                 .strict(self.strict())
                 .in_with(self.in_with)
                 .source_path(self.source_path.clone())
-                .compile(
+                .compile_or_lazy(
                     parameters,
                     body,
                     self.variable_scope.clone(),
@@ -816,6 +818,8 @@ impl ByteCompiler<'_> {
             let func_span = function.linear_span();
             let spanned_source_text = SpannedSourceText::new(self.source_text(), func_span);
 
+            // TRust lazy compilation: defer this function declaration's body to
+            // first call when eligible (see `FunctionCompiler::compile_or_lazy`).
             let code = FunctionCompiler::new(spanned_source_text)
                 .name(name.sym().to_js_string(self.interner()))
                 .generator(generator)
@@ -823,7 +827,7 @@ impl ByteCompiler<'_> {
                 .strict(self.strict())
                 .in_with(self.in_with)
                 .name_scope(None)
-                .compile(
+                .compile_or_lazy(
                     parameters,
                     body,
                     self.variable_scope.clone(),

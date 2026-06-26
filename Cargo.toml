@@ -71,6 +71,14 @@ webpki-roots = "1.0.7"
 # fixtures. Pure-Rust (wasmi ecosystem); NEVER a runtime dependency — the
 # runtime accepts only binary wasm from the web.
 wat = "1"
+# Test-only access to the vendored parser/AST for the lazy-parse (`lazy_scan`)
+# fuzz harness: it walks the real parser's function-body spans and checks the
+# fallible body-skip against them. Redirected to the vendored forks by
+# `[patch.crates-io]` below. NOT runtime deps — the lazy-parse integration
+# lives inside the vendored crates, not in TRust's own source.
+boa_ast = "0.21"
+boa_parser = "0.21"
+boa_interner = "0.21"
 
 [patch.crates-io]
 crossterm = { path = "vendor/crossterm-0.29.0" }

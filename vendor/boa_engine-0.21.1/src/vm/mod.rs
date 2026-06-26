@@ -109,6 +109,218 @@ pub mod profile {
     }
 }
 
+/// Function-execution census (TRust diagnostic — the lazy-parse sizing gate).
+///
+/// Over an *armed* window it counts how many compiled [`CodeBlock`]s ever begin
+/// executing (`push_frame`) versus how many are compiled but never called, plus
+/// each side's bytecode-byte share. A large never-called share is the empirical
+/// justification for lazy parsing: most compile work at boot is for functions
+/// the page never runs. It is also reused to verify a lazy-parse build actually
+/// *defers* the never-called functions (their compile should disappear).
+///
+/// Per-block identity must survive the stack→heap move in `finish` → `Gc::new`,
+/// so the "tracked"/"executed" marks ride two [`CodeBlockFlags`] bits (which
+/// move with the struct) rather than a pointer set. The aggregate counters live
+/// in a thread-local. Diagnostic-only and gated: when disarmed every hook is a
+/// single thread-local bool read.
+pub mod fn_census {
+    use std::cell::Cell;
+
+    /// A snapshot of the census counters.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct FnCensus {
+        /// Blocks (top-level script + every function) compiled while armed.
+        pub compiled_n: u64,
+        /// Total bytecode bytes of those compiled blocks.
+        pub compiled_bytes: u64,
+        /// How many of the compiled blocks ever began executing.
+        pub executed_n: u64,
+        /// Bytecode bytes of the executed blocks.
+        pub executed_bytes: u64,
+    }
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static CENSUS: Cell<FnCensus> = const {
+            Cell::new(FnCensus {
+                compiled_n: 0,
+                compiled_bytes: 0,
+                executed_n: 0,
+                executed_bytes: 0,
+            })
+        };
+    }
+
+    /// Arm the census and zero the counters. Call on the page/bench thread just
+    /// before the bundle compiles so the prelude's earlier blocks aren't counted.
+    pub fn arm() {
+        ARMED.with(|a| a.set(true));
+        CENSUS.with(|c| c.set(FnCensus::default()));
+    }
+
+    /// Disarm; counters are left readable until the next [`arm`].
+    pub fn disarm() {
+        ARMED.with(|a| a.set(false));
+    }
+
+    /// Read the counters without clearing.
+    #[must_use]
+    pub fn snapshot() -> FnCensus {
+        CENSUS.with(Cell::get)
+    }
+
+    #[inline]
+    pub(crate) fn armed() -> bool {
+        ARMED.with(Cell::get)
+    }
+
+    #[inline]
+    pub(crate) fn note_compiled(bytes: u64) {
+        CENSUS.with(|c| {
+            let mut v = c.get();
+            v.compiled_n += 1;
+            v.compiled_bytes += bytes;
+            c.set(v);
+        });
+    }
+
+    #[inline]
+    pub(crate) fn note_executed(bytes: u64) {
+        CENSUS.with(|c| {
+            let mut v = c.get();
+            v.executed_n += 1;
+            v.executed_bytes += bytes;
+            c.set(v);
+        });
+    }
+}
+
+/// TRust lazy-function-compilation control (JS-engine performance plan, Step 2
+/// "Phase B"): defers bytecode generation of an eligible nested function until
+/// it is first called, instead of compiling every function eagerly at load.
+///
+/// The byte compiler (`bytecompiler::function`) consults [`should_defer`] at the
+/// `function()` chokepoint; when it returns `true` for an eligible ordinary
+/// function it emits a lightweight *stub* `CodeBlock` carrying the function's
+/// compile inputs, and the call funnels (`builtins::function::function_call` /
+/// `function_construct`) compile the real block on first invocation
+/// ("delazify").
+///
+/// Two thread-local knobs (both live on the page/compile thread — parse workers
+/// never compile, and delazify runs on the page thread, so thread-local is the
+/// natural scope, exactly like [`fn_census`]):
+///
+/// - **`ENABLED`** — the master switch, set by TRust from `TRUST_LAZY_PARSE`.
+/// - **`SUPPRESS`** — a re-entrant guard ([`SuppressGuard`]) raised around any
+///   compile whose result is **detached from the page's persistent interner**:
+///   the parallel-parse worker path ([`Script::compile_raw`](crate::Script::compile_raw),
+///   whose private interner is dropped after compile) and the image-cached
+///   compiles (prelude / cross-page CDN libraries, dehydrated via
+///   [`CodeBlock::to_image`](crate::vm::CodeBlock::to_image)). A deferred stub
+///   retains the function body's AST, which names identifiers by `Sym` (interner
+///   index); delazify resolves those `Sym`s against the **`Context`'s** interner,
+///   which is persistent and append-only for a page's lifetime — so deferral is
+///   sound exactly when the compile used that interner. The suppressed paths
+///   would either lose the interner (parallel parse) or persist a stub into an
+///   image (which cannot carry an AST/interner), so they compile eagerly.
+pub mod lazy {
+    use std::cell::Cell;
+
+    /// Default minimum function source length (in code points) for deferral to
+    /// be worth it. Tiny functions compile in negligible time and deferring them
+    /// only adds a stub allocation plus a retained AST clone, so they are
+    /// compiled eagerly. The win scales with body size, so the large (often
+    /// never-called) functions that dominate the bytecode bytes are the ones
+    /// that clear it. Overridable per thread via [`set_min_source_len`] (TRust
+    /// tunes it from `TRUST_LAZY_MIN`; tests set `0` to defer every eligible
+    /// function).
+    pub(crate) const DEFAULT_MIN_SOURCE_LEN: usize = 100;
+
+    thread_local! {
+        static ENABLED: Cell<bool> = const { Cell::new(false) };
+        static SUPPRESS: Cell<u32> = const { Cell::new(0) };
+        static MIN_SOURCE_LEN: Cell<usize> = const { Cell::new(DEFAULT_MIN_SOURCE_LEN) };
+    }
+
+    /// Set the minimum function source length (code points) for deferral on the
+    /// current thread. See [`DEFAULT_MIN_SOURCE_LEN`].
+    pub fn set_min_source_len(len: usize) {
+        MIN_SOURCE_LEN.with(|m| m.set(len));
+    }
+
+    /// Reset the deferral size threshold to [`DEFAULT_MIN_SOURCE_LEN`].
+    pub fn reset_min_source_len() {
+        MIN_SOURCE_LEN.with(|m| m.set(DEFAULT_MIN_SOURCE_LEN));
+    }
+
+    /// The deferral size threshold in effect on the current thread.
+    #[inline]
+    #[must_use]
+    pub(crate) fn min_source_len() -> usize {
+        MIN_SOURCE_LEN.with(Cell::get)
+    }
+
+    /// Enable or disable lazy function compilation on the current thread. TRust
+    /// calls this on the page thread from the `TRUST_LAZY_PARSE` flag.
+    pub fn set_enabled(enabled: bool) {
+        ENABLED.with(|e| e.set(enabled));
+    }
+
+    /// Whether lazy compilation is enabled on the current thread.
+    #[must_use]
+    pub fn is_enabled() -> bool {
+        ENABLED.with(Cell::get)
+    }
+
+    /// Whether the byte compiler should defer an *eligible* function right now:
+    /// lazy is enabled and not currently suppressed. Eligibility (ordinary
+    /// function, no direct `eval`, body large enough) is decided at the call
+    /// site; this only gates on the global/suppression state.
+    #[inline]
+    #[must_use]
+    pub(crate) fn should_defer() -> bool {
+        ENABLED.with(Cell::get) && SUPPRESS.with(Cell::get) == 0
+    }
+
+    /// A RAII guard that suppresses deferral for its lifetime (re-entrant, so
+    /// nested guards compose). Raise it around a compile whose result must be
+    /// fully eager — the parallel-parse worker path and the image-cached
+    /// compiles. See the module docs.
+    #[derive(Debug)]
+    #[must_use = "the guard suppresses lazy compilation only while it is alive"]
+    pub struct SuppressGuard {
+        // not `Send`/`Sync`: the thread-local it restores is thread-bound.
+        _private: std::marker::PhantomData<*const ()>,
+    }
+
+    impl SuppressGuard {
+        /// Raise the suppression guard on the current thread.
+        pub fn new() -> Self {
+            SUPPRESS.with(|s| s.set(s.get() + 1));
+            Self {
+                _private: std::marker::PhantomData,
+            }
+        }
+    }
+
+    impl Default for SuppressGuard {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Drop for SuppressGuard {
+        fn drop(&mut self) {
+            SUPPRESS.with(|s| s.set(s.get().saturating_sub(1)));
+        }
+    }
+
+    /// Raise a [`SuppressGuard`] on the current thread (convenience).
+    pub fn suppress() -> SuppressGuard {
+        SuppressGuard::new()
+    }
+}
+
 /// Virtual Machine.
 #[derive(Debug)]
 pub struct Vm {
@@ -511,6 +723,23 @@ impl Vm {
     }
 
     pub(crate) fn push_frame(&mut self, mut frame: CallFrame) {
+        // Function-execution census (TRust diagnostic; see `fn_census`). On the
+        // first frame push of a census-tracked block, mark it executed and tally
+        // its bytecode bytes. The dedup mark rides the flags so re-entry (loops,
+        // recursion, generators re-pushing the same frame) counts a block once.
+        if fn_census::armed() {
+            let flags = frame.code_block.flags.get();
+            if flags.contains(CodeBlockFlags::CENSUS_TRACKED)
+                && !flags.contains(CodeBlockFlags::CENSUS_EXECUTED)
+            {
+                frame
+                    .code_block
+                    .flags
+                    .set(flags | CodeBlockFlags::CENSUS_EXECUTED);
+                fn_census::note_executed(frame.code_block.bytecode.bytes().len() as u64);
+            }
+        }
+
         let current_stack_length = self.stack.stack.len();
         frame.set_register_pointer(current_stack_length as u32);
         std::mem::swap(&mut self.environments, &mut frame.environments);

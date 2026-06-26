@@ -242,6 +242,21 @@ impl FunctionExpression {
         self.has_binding_identifier
     }
 
+    /// Overrides whether the function expression has a (self-referential) binding
+    /// identifier.
+    ///
+    /// TRust lazy compilation re-parses a deferred function's source as a
+    /// function *expression* on first call, but the original may have been a
+    /// function *declaration* (whose name binds in the enclosing scope, not in a
+    /// self-name scope). Forcing this flag to the original value before
+    /// `analyze_scope` makes the re-analyzed scopes — and therefore the compiled
+    /// bytecode — identical to the eager path. See `crate::vm::lazy` in
+    /// `boa_engine`.
+    #[inline]
+    pub fn set_has_binding_identifier(&mut self, has_binding_identifier: bool) {
+        self.has_binding_identifier = has_binding_identifier;
+    }
+
     /// Gets the name scope of the function expression.
     #[inline]
     #[must_use]
