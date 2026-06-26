@@ -103,8 +103,7 @@ pub mod profile {
     #[must_use]
     pub fn take_vm_profile() -> (u64, Vec<(String, u64)>) {
         let total = PROF_TOTAL.with(Cell::take);
-        let mut v: Vec<(String, u64)> =
-            PROF_HIST.with(|h| h.borrow_mut().drain().collect());
+        let mut v: Vec<(String, u64)> = PROF_HIST.with(|h| h.borrow_mut().drain().collect());
         v.sort_by(|a, b| b.1.cmp(&a.1));
         (total, v)
     }
@@ -883,7 +882,12 @@ impl Context {
                     // arrow/anon expression is hot (a bare "path :: " is useless).
                     match cb.source_info().map().find(self.vm.frame.pc) {
                         Some(p) => {
-                            format!("{} :: anon@{}:{}", cb.path(), p.line_number(), p.column_number())
+                            format!(
+                                "{} :: anon@{}:{}",
+                                cb.path(),
+                                p.line_number(),
+                                p.column_number()
+                            )
                         }
                         None => format!("{} :: anon", cb.path()),
                     }
@@ -938,7 +942,12 @@ impl Context {
                     // arrow/anon expression is hot (a bare "path :: " is useless).
                     match cb.source_info().map().find(self.vm.frame.pc) {
                         Some(p) => {
-                            format!("{} :: anon@{}:{}", cb.path(), p.line_number(), p.column_number())
+                            format!(
+                                "{} :: anon@{}:{}",
+                                cb.path(),
+                                p.line_number(),
+                                p.column_number()
+                            )
                         }
                         None => format!("{} :: anon", cb.path()),
                     }

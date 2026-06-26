@@ -407,11 +407,7 @@ impl JsError {
                 .unwrap_or(true)
         {
             let stack = JsString::from(format!("{self}"));
-            obj.create_non_enumerable_data_property_or_throw(
-                js_string!("stack"),
-                stack,
-                context,
-            );
+            obj.create_non_enumerable_data_property_or_throw(js_string!("stack"), stack, context);
         }
         value
     }

@@ -6,6 +6,31 @@ use boa_macros::js_str;
 use indoc::indoc;
 
 #[test]
+fn length_truncation_survives_inline_cache() {
+    // Setting `arr.length` is exotic (`ArraySetLength` truncates the array's
+    // indexed elements when it shrinks), but the property lives in an ordinary
+    // storage slot. The `SetPropertyByName` inline cache must NOT memoize that
+    // slot: on a cache hit it would write the new length straight into storage
+    // and skip the truncation, leaving the dense backing vector populated. A
+    // following `arr[0] = x` then overwrites that stale in-bounds slot without
+    // growing `length`, so `length` stays 0. The cache only fires once the
+    // `length =` site has executed twice, so `recomp` is called repeatedly on
+    // a reused array (the shape Apollo Client's `optimism` cache hits).
+    run_test_actions([
+        TestAction::run(indoc! {r#"
+            function recomp(o, v) { o.value.length = 0; o.value[0] = v; return o.value.length; }
+            let o = { value: [] };
+            let first = recomp(o, "a");
+            let second = recomp(o, "b");
+        "#}),
+        TestAction::assert_eq("first", 1),
+        TestAction::assert_eq("second", 1),
+        TestAction::assert_eq("o.value.length", 1),
+        TestAction::assert("o.value[0] === 'b'"),
+    ]);
+}
+
+#[test]
 fn is_array() {
     run_test_actions([
         TestAction::assert("Array.isArray([])"),

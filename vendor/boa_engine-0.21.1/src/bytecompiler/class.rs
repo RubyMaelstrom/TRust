@@ -127,9 +127,10 @@ impl ByteCompiler<'_> {
             if expr.contains_direct_eval() || !scopes.function_scope().all_bindings_local() {
                 compiler.code_block_flags |= CodeBlockFlags::HAS_FUNCTION_SCOPE;
             } else {
-                compiler
-                    .code_block_flags
-                    .set(CodeBlockFlags::HAS_FUNCTION_SCOPE, scopes.requires_function_scope());
+                compiler.code_block_flags.set(
+                    CodeBlockFlags::HAS_FUNCTION_SCOPE,
+                    scopes.requires_function_scope(),
+                );
             }
             if compiler.code_block_flags.has_function_scope() {
                 let _ = compiler.push_scope(scopes.function_scope());
