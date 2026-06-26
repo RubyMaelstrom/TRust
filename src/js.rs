@@ -2052,23 +2052,38 @@ fn sys_create_comment(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
     Ok(id_value(Some(id)))
 }
 
+/// `__dom_append(parent, child)` → did it mutate? Returns `false` WITHOUT
+/// mutating when `child` is a host-including inclusive ancestor of `parent`
+/// (WHATWG DOM §4.2.3 pre-insertion validity); the prelude turns that into a
+/// `HierarchyRequestError`. Folding the check into the append the prelude
+/// already makes keeps the hot insertion path at ONE syscall — no separate
+/// validity call — and the check itself is O(1) for the dominant case (a
+/// freshly created leaf node, see `is_host_including_inclusive_ancestor`).
 fn sys_append(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let dom = page_dom(ctx);
     let mut d = dom.borrow_mut();
     if let (Some(p), Some(c)) = (arg_node(&d, args, 0), arg_node(&d, args, 1)) {
+        if d.is_host_including_inclusive_ancestor(c, p) {
+            return Ok(JsValue::from(false));
+        }
         d.append(p, c);
     }
-    Ok(JsValue::undefined())
+    Ok(JsValue::from(true))
 }
 
+/// `__dom_insert_before(parent, child, ref)` → did it mutate? Same pre-insertion
+/// validity gate as `sys_append` (returns `false`, unmutated, on a cycle).
 fn sys_insert_before(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let dom = page_dom(ctx);
     let mut d = dom.borrow_mut();
     if let (Some(p), Some(c)) = (arg_node(&d, args, 0), arg_node(&d, args, 1)) {
+        if d.is_host_including_inclusive_ancestor(c, p) {
+            return Ok(JsValue::from(false));
+        }
         let r = arg_node(&d, args, 2);
         d.insert_before(p, c, r);
     }
-    Ok(JsValue::undefined())
+    Ok(JsValue::from(true))
 }
 
 fn sys_detach(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -8721,7 +8736,9 @@ const PRELUDE: &str = r##"
         getRootNode() { let n = this; while (n.parentNode) n = n.parentNode; return n; }
         appendChild(c) {
             if (c && c.nodeType === 11 && !c.__host) { for (const k of c.childNodes) this.appendChild(k); return c; }
-            __dom_append(this.__id, c.__id);
+            // Pre-insertion validity (WHATWG DOM §4.2.3): the syscall refuses
+            // (returns false, unmutated) when `c` is an inclusive ancestor.
+            if (!__dom_append(this.__id, c.__id)) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
             if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
@@ -8732,7 +8749,7 @@ const PRELUDE: &str = r##"
         }
         insertBefore(c, ref) {
             if (c && c.nodeType === 11 && !c.__host) { for (const k of c.childNodes) this.insertBefore(k, ref); return c; }
-            __dom_insert_before(this.__id, c.__id, ref ? ref.__id : null);
+            if (!__dom_insert_before(this.__id, c.__id, ref ? ref.__id : null)) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
             if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
@@ -8744,8 +8761,10 @@ const PRELUDE: &str = r##"
         removeChild(c) { if (c.__ln === "base") baseHrefCache = null; if (MO.length) moChildRemove(this, c); if (CE.defs.size) ceDisconnect(c); __dom_detach(c.__id); return c; }
         replaceChild(n, old) {
             const prev = old.previousSibling, next = old.nextSibling;
+            // Validity (WHATWG DOM §4.2.3) before any side effect: the insert
+            // syscall refuses (unmutated) when `n` is an inclusive ancestor.
+            if (!__dom_insert_before(this.__id, n.__id, old.__id)) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
             if (CE.defs.size) ceDisconnect(old);
-            __dom_insert_before(this.__id, n.__id, old.__id);
             __dom_detach(old.__id);
             if (MO.length) moNotify({ type: "childList", target: this, addedNodes: [n],
                 removedNodes: [old], previousSibling: prev, nextSibling: next });
@@ -14065,6 +14084,48 @@ mod tests {
         assert_eq!(p.parse_n, 0, "armed off but parse recorded: {p:?}");
         assert_eq!(p.compile_n, 0, "armed off but compile recorded: {p:?}");
         assert_eq!(p.execute_n, 0, "armed off but execute recorded: {p:?}");
+    }
+
+    /// WHATWG DOM §4.2.3 pre-insertion validity: inserting a node that is a
+    /// host-including inclusive ancestor of the parent (an ancestor, or the
+    /// node itself) throws `HierarchyRequestError` — like a browser — instead
+    /// of silently splicing a cycle into the arena. The throw is a real,
+    /// catchable `DOMException` (page code can handle it), and a legitimate
+    /// append still works afterward.
+    #[test]
+    fn inserting_an_ancestor_throws_hierarchy_request_error() {
+        let html = r#"<html><body><div id="outer"><div id="inner"></div></div>
+            <script>
+            var outer = document.getElementById('outer');
+            var inner = document.getElementById('inner');
+            var log = [];
+            var rec = function (fn) { try { fn(); log.push('NOTHROW'); }
+                catch (e) { log.push(e.name + (e.code === 3 ? ':3' : '')); } };
+            rec(function () { inner.appendChild(outer); });      // ancestor
+            rec(function () { outer.appendChild(outer); });      // self (inclusive)
+            rec(function () { inner.insertBefore(outer, null); });
+            rec(function () { outer.replaceChild(outer, inner); });
+            // A normal append is unaffected.
+            var ok = document.createElement('span');
+            inner.appendChild(ok);
+            document.body.setAttribute('data-log', log.join(','));
+            document.body.setAttribute('data-ok', inner.contains(ok) ? 'yes' : 'no');
+            </script>
+            </body></html>"#;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        // All four throws were caught by page code, so none surfaced as engine
+        // errors.
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(
+                r#"data-log="HierarchyRequestError:3,HierarchyRequestError:3,HierarchyRequestError:3,HierarchyRequestError:3""#
+            ),
+            "expected four catchable HierarchyRequestErrors (code 3): {out}"
+        );
+        assert!(
+            out.contains(r#"data-ok="yes""#),
+            "a legitimate append must still work: {out}"
+        );
     }
 
     // ---- K1/K2 keystone: detachable compiled-code image ------------------
