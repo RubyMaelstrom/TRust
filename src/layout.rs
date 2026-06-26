@@ -379,6 +379,18 @@ pub fn visual_columns(row: &Row, carousels: &[Carousel], row_idx: usize) -> Vec<
 /// realistic.
 pub const MAX_IMAGE_LOOKBACK: usize = 256;
 
+/// Pass-wide memo for `measure_width`: `(node, constraint, table_depth)` → cells.
+/// `Rc` so every sub-layout in a pass shares the one cache.
+type MeasureCache = std::rc::Rc<std::cell::RefCell<HashMap<(NodeId, usize, usize), usize>>>;
+
+/// Hard ceiling on an ancestor (containing-block) walk. CSS sets no depth limit
+/// — a browser resolves a percentage against its real containing block at any
+/// depth, and the walk terminates because the DOM is acyclic (the spec rejects
+/// inserting an inclusive ancestor). Our arena `append` doesn't enforce that, so
+/// this bounds a pathological cyclic DOM; a well-formed page reaches the document
+/// root in dozens of steps, never this.
+const ANCESTOR_WALK_CAP: usize = 512;
+
 /// An element subtree laid out as an independent box, positioned relative
 /// to its own top-left. `width` is the widest used column and `height` is
 /// `rows.len()`. `blit` places it into a parent at a `(col, row)` offset —
@@ -1281,6 +1293,19 @@ struct Layout<'a> {
     /// of a viewport-fallback lie. Populated under `tag_all_nodes`; the render
     /// path never touches it.
     element_tops: ElementTops,
+    /// Memoizes the intrinsic-width measurement `measure_width(id, constraint)`
+    /// for the WHOLE lay-out pass (SHARED across sub-layouts via the `Rc`). The
+    /// measurement lays out the entire subtree, and a flex/grid container
+    /// measures each item (min- AND max-content) and THEN lays it out for real —
+    /// each pass re-creating a sub-layout — so a nested flex/grid tree re-measures
+    /// the same subtrees EXPONENTIALLY in depth. A styled-components SPA (Twitch)
+    /// is ~all `display:flex`, which made a ~700KB live re-render take ~2s and
+    /// peg a core. The measurement is a pure function of `(id, constraint,
+    /// table_depth)` — `measure_width` always uses `Ctx::root()`, `measure=true`,
+    /// and `subtree_root=id`; the only other input that varies mid-pass is the
+    /// table nesting depth (`flow_table` ±1's it). The DOM is immutable during a
+    /// pass, so caching collapses the blow-up to linear. Fresh per pass.
+    measure_cache: MeasureCache,
 }
 
 impl<'a> Layout<'a> {
@@ -1327,6 +1352,7 @@ impl<'a> Layout<'a> {
             tag_all_nodes: false,
             declared_boxes: HashMap::new(),
             element_tops: HashMap::new(),
+            measure_cache: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
         }
     }
 
@@ -3069,8 +3095,15 @@ impl<'a> Layout<'a> {
     /// The natural width (cells) of an element's subtree laid out at
     /// `constraint` — its content basis (at `avail`) or min-content (at 1).
     fn measure_width(&self, id: NodeId, constraint: usize) -> usize {
-        self.layout_subtree_inner(id, constraint, None, true, &Ctx::root())
-            .width as usize
+        let key = (id, constraint, self.table_depth);
+        if let Some(&w) = self.measure_cache.borrow().get(&key) {
+            return w;
+        }
+        let w = self
+            .layout_subtree_inner(id, constraint, None, true, &Ctx::root())
+            .width as usize;
+        self.measure_cache.borrow_mut().insert(key, w);
+        w
     }
 
     /// A flex item's `(basis, grow, shrink)`. The `flex` shorthand is expanded
@@ -5539,6 +5572,9 @@ impl<'a> Layout<'a> {
         sub.float_skip = skip_float;
         sub.subtree_root = Some(id);
         sub.table_depth = self.table_depth;
+        // Share the pass-wide intrinsic-width memo so a subtree measured by an
+        // ancestor's sizing pass isn't re-measured when this pass measures it.
+        sub.measure_cache = self.measure_cache.clone();
         sub.measuring = measure;
         // Carry the measurement flag so a sub-layout tags its items with their
         // own nodes and records empty-element flow positions (`element_tops`);
@@ -6474,9 +6510,26 @@ impl<'a> Layout<'a> {
     /// image fills the 36px box, not the whole flow column it sits in. `None`
     /// when no ancestor pins a length width — the caller then falls back to the
     /// flow box (the prior behaviour, correct for a genuine full-bleed image).
+    ///
+    /// The intermediate ancestors are `width:auto`/`100%` (they pass the
+    /// percentage straight through), so the FIRST definite-width ancestor is the
+    /// effective containing block — at WHATEVER depth. A styled-components card
+    /// can bury that container deep: Twitch's preview-card width:30rem
+    /// `ScTransitionBase` sits 11 wrappers above its `<img width:100%>` (aspect-
+    /// ratio box, transform/hover wrappers, the `<a>`, shelf-card layers). The
+    /// old 8-level cap stopped short, so the image fell back to the full column
+    /// (~145 cells) and rendered enormous, burying the page.
+    ///
+    /// CSS sets no depth limit on resolving a containing block — a browser walks
+    /// to the actual one — and the walk terminates because the DOM is a tree
+    /// (the spec's pre-insertion validity makes `appendChild` reject inserting an
+    /// inclusive ancestor, so no cycle can form). Our arena `append` doesn't
+    /// enforce that, so the bound below is defense-in-depth against a pathological
+    /// cyclic DOM; on a well-formed page the walk reaches the document root long
+    /// before it (a real page nests dozens of levels, never `ANCESTOR_WALK_CAP`).
     fn definite_ancestor_width(&self, id: NodeId) -> Option<usize> {
         let mut cur = self.dom.parent_composed(id);
-        for _ in 0..8 {
+        for _ in 0..ANCESTOR_WALK_CAP {
             let p = cur?;
             if let Some(em) = self
                 .dom
@@ -6494,9 +6547,10 @@ impl<'a> Layout<'a> {
     /// Height (rows) of the nearest ancestor establishing a definite (length,
     /// non-percentage) `height` — the containing block for a percentage height
     /// on `id` (the avatar wrapper's `height:24px`). `None` when none does.
+    /// Bounded like `definite_ancestor_width` (see its note on the walk depth).
     fn definite_ancestor_height(&self, id: NodeId) -> Option<usize> {
         let mut cur = self.dom.parent_composed(id);
-        for _ in 0..8 {
+        for _ in 0..ANCESTOR_WALK_CAP {
             let p = cur?;
             if let Some(rows) = self
                 .dom
@@ -9016,6 +9070,32 @@ mod tests {
             (img.width, img.height),
             (5, 2),
             "avatar img fills its 36px wrapper, not the flow box"
+        );
+    }
+
+    #[test]
+    fn percentage_image_finds_a_deeply_nested_definite_width_ancestor() {
+        // Twitch's preview card: the `width:30rem` container sits ELEVEN
+        // all-`width:100%` wrappers above its `<img width:100%>` (aspect-ratio
+        // box, transform/hover wrappers, the `<a>`, shelf layers). The image must
+        // size to that 30rem card (≈60 cells), not the full column — the old
+        // 8-level ancestor-walk cap fell short and rendered the preview enormous,
+        // burying the page below it.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/p.png".to_owned(), (40, 22));
+        let html = format!(
+            "<body><div style=\"width:30rem\">{}<img src=\"/p.png\" style=\"width:100%\">{}</div></body>",
+            "<div style=\"width:100%\">".repeat(11),
+            "</div>".repeat(11),
+        );
+        let rows = lay_with_images(&html, 200, &images);
+        let img = image_item(&rows);
+        // 30rem → 60 cells; far below the 200-col flow box. Height by aspect ratio.
+        assert_eq!(img.width, 60, "image fills the 30rem card, not the column");
+        assert!(
+            img.height < 40,
+            "height follows the card width via aspect ratio, got {}",
+            img.height
         );
     }
 
