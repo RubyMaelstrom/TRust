@@ -383,14 +383,6 @@ pub const MAX_IMAGE_LOOKBACK: usize = 256;
 /// `Rc` so every sub-layout in a pass shares the one cache.
 type MeasureCache = std::rc::Rc<std::cell::RefCell<HashMap<(NodeId, usize, usize), usize>>>;
 
-/// Hard ceiling on an ancestor (containing-block) walk. CSS sets no depth limit
-/// — a browser resolves a percentage against its real containing block at any
-/// depth, and the walk terminates because the DOM is acyclic (the spec rejects
-/// inserting an inclusive ancestor). Our arena `append` doesn't enforce that, so
-/// this bounds a pathological cyclic DOM; a well-formed page reaches the document
-/// root in dozens of steps, never this.
-const ANCESTOR_WALK_CAP: usize = 512;
-
 /// An element subtree laid out as an independent box, positioned relative
 /// to its own top-left. `width` is the widest used column and `height` is
 /// `rows.len()`. `blit` places it into a parent at a `(col, row)` offset —
@@ -6521,16 +6513,14 @@ impl<'a> Layout<'a> {
     /// (~145 cells) and rendered enormous, burying the page.
     ///
     /// CSS sets no depth limit on resolving a containing block — a browser walks
-    /// to the actual one — and the walk terminates because the DOM is a tree
-    /// (the spec's pre-insertion validity makes `appendChild` reject inserting an
-    /// inclusive ancestor, so no cycle can form). Our arena `append` doesn't
-    /// enforce that, so the bound below is defense-in-depth against a pathological
-    /// cyclic DOM; on a well-formed page the walk reaches the document root long
-    /// before it (a real page nests dozens of levels, never `ANCESTOR_WALK_CAP`).
+    /// to the actual one — and the walk terminates because the DOM is a tree:
+    /// the JS mutation path enforces pre-insertion validity (`Dom::
+    /// is_host_including_inclusive_ancestor`, throwing `HierarchyRequestError`),
+    /// so no cycle can form in the composed tree this climbs. Unbounded, like a
+    /// browser; a real page reaches the document root in dozens of steps.
     fn definite_ancestor_width(&self, id: NodeId) -> Option<usize> {
         let mut cur = self.dom.parent_composed(id);
-        for _ in 0..ANCESTOR_WALK_CAP {
-            let p = cur?;
+        while let Some(p) = cur {
             if let Some(em) = self
                 .dom
                 .computed_style(p, "width")
@@ -6547,11 +6537,10 @@ impl<'a> Layout<'a> {
     /// Height (rows) of the nearest ancestor establishing a definite (length,
     /// non-percentage) `height` — the containing block for a percentage height
     /// on `id` (the avatar wrapper's `height:24px`). `None` when none does.
-    /// Bounded like `definite_ancestor_width` (see its note on the walk depth).
+    /// Unbounded like `definite_ancestor_width` (see its note on the walk depth).
     fn definite_ancestor_height(&self, id: NodeId) -> Option<usize> {
         let mut cur = self.dom.parent_composed(id);
-        for _ in 0..ANCESTOR_WALK_CAP {
-            let p = cur?;
+        while let Some(p) = cur {
             if let Some(rows) = self
                 .dom
                 .computed_style(p, "height")

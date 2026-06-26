@@ -1208,6 +1208,36 @@ impl Dom {
             .or_else(|| self.shadow_hosts.get(&id).copied())
     }
 
+    /// Pre-insertion validity (WHATWG DOM §4.2.3): is `node` a *host-including
+    /// inclusive ancestor* of `parent`? `appendChild`/`insertBefore`/
+    /// `replaceChild` throw `HierarchyRequestError` when it is — the step that
+    /// keeps the tree acyclic, since a node can never become a descendant of
+    /// itself. "Inclusive" covers `node == parent`; "host-including" climbs
+    /// across shadow boundaries via `parent_composed` (a shadow root hands off
+    /// to its host), so a cycle can't form in the composed tree either — which
+    /// is the tree the layout containing-block walk traverses, so enforcing
+    /// this here is what lets that walk run unbounded like a browser's.
+    pub fn is_host_including_inclusive_ancestor(&self, node: NodeId, parent: NodeId) -> bool {
+        if node == parent {
+            return true; // the "inclusive" case
+        }
+        // A *proper* ancestor must have at least one composed descendant — a
+        // light child or a hosted shadow tree. A node with neither can't be one
+        // (it appears on no ancestor chain), so we skip the walk entirely. This
+        // is the dominant insertion: a freshly created / leaf node, made O(1).
+        if self.nodes[node].first_child.is_none() && !self.shadow_roots.contains_key(&node) {
+            return false;
+        }
+        let mut cur = self.parent_composed(parent);
+        while let Some(p) = cur {
+            if p == node {
+                return true;
+            }
+            cur = self.parent_composed(p);
+        }
+        false
+    }
+
     /// Document-order walk of the COMPOSED tree: light children plus
     /// every shadow tree (interactive content hides in there). Composes the
     /// shadow root of EVERY node including `root` itself — so a containing
@@ -4535,6 +4565,49 @@ mod tests {
         assert!(selector_parses(":scope .tab"));
         assert!(!selector_parses(""));
         assert!(!selector_parses("   "));
+    }
+
+    /// Pre-insertion validity (WHATWG DOM §4.2.3): the host-including inclusive
+    /// ancestor test that `appendChild`/`insertBefore`/`replaceChild` use to
+    /// reject cycle-forming insertions. Inclusive (a node is its own), and
+    /// host-including (it crosses a shadow boundary to the host's ancestors).
+    #[test]
+    fn host_including_inclusive_ancestor_catches_cycles() {
+        let mut dom = Dom::new();
+        let root = dom.create_element("div");
+        let mid = dom.create_element("div");
+        let leaf = dom.create_element("div");
+        dom.append(root, mid);
+        dom.append(mid, leaf);
+
+        // Inclusive: a node is its own host-including inclusive ancestor.
+        assert!(dom.is_host_including_inclusive_ancestor(leaf, leaf));
+        // A real ancestor — appending it under `leaf` would splice a cycle.
+        assert!(dom.is_host_including_inclusive_ancestor(root, leaf));
+        assert!(dom.is_host_including_inclusive_ancestor(mid, leaf));
+        // A descendant is NOT an ancestor of its parent — a legitimate append.
+        assert!(!dom.is_host_including_inclusive_ancestor(leaf, root));
+        let other = dom.create_element("span");
+        assert!(!dom.is_host_including_inclusive_ancestor(other, leaf));
+
+        // Host-including: a node inside `mid`'s shadow tree has `mid` and its
+        // ancestors as host-including inclusive ancestors (the walk crosses the
+        // host), so appending one of them into the shadow tree is also a cycle.
+        let shadow = dom.attach_shadow(mid);
+        let inner = dom.create_element("p");
+        dom.append(shadow, inner);
+        assert!(dom.is_host_including_inclusive_ancestor(mid, inner));
+        assert!(dom.is_host_including_inclusive_ancestor(root, inner));
+        assert!(!dom.is_host_including_inclusive_ancestor(inner, root));
+
+        // A host with NO light children but a shadow tree is still an ancestor
+        // of its shadow content — the O(1) leaf short-circuit must not skip it.
+        let bare = dom.create_element("div");
+        dom.append(root, bare);
+        let bare_shadow = dom.attach_shadow(bare);
+        let deep = dom.create_element("span");
+        dom.append(bare_shadow, deep);
+        assert!(dom.is_host_including_inclusive_ancestor(bare, deep));
     }
 
     #[test]
