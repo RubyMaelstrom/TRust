@@ -50,6 +50,8 @@ pub use self::{
     token::{Token, TokenKind},
 };
 
+pub(crate) use self::cursor::LazyBodyScan;
+
 trait Tokenizer<R> {
     /// Lexes the next token.
     fn lex(
@@ -98,6 +100,16 @@ impl<R> Lexer<R> {
     /// Signals that the goal symbol is a module
     pub(super) fn set_module(&mut self, module: bool) {
         self.cursor.set_module(module);
+    }
+
+    /// Attempt an in-place lazy function-body skip (TRust lazy parsing),
+    /// positioned just after the body's opening `{`. See
+    /// [`Cursor::scan_lazy_function_body`](cursor::Cursor::scan_lazy_function_body).
+    pub(crate) fn scan_lazy_function_body(&mut self, min_len: usize) -> Option<LazyBodyScan>
+    where
+        R: ReadChar,
+    {
+        self.cursor.scan_lazy_function_body(min_len)
     }
 
     /// Creates a new lexer.

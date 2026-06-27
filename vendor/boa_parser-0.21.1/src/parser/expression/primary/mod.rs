@@ -165,6 +165,19 @@ where
                 }
             }
             TokenKind::Punctuator(Punctuator::OpenParen) => {
+                // TRust lazy parsing: a parenthesized function expression is
+                // almost always an IIFE / UMD wrapper that runs immediately, so
+                // mark its body to be parsed eagerly — skipping it would only
+                // force an instant re-parse on the call (its nested module
+                // functions still skip). One-shot; the wrapper's body consumes it.
+                if crate::lazy::enabled()
+                    && matches!(
+                        cursor.peek(1, interner)?.map(Token::kind),
+                        Some(TokenKind::Keyword((Keyword::Function, _)))
+                    )
+                {
+                    crate::lazy::set_eager_next_body();
+                }
                 let expr = CoverParenthesizedExpressionAndArrowParameterList::new(
                     self.allow_yield,
                     self.allow_await,

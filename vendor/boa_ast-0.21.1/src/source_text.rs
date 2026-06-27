@@ -58,6 +58,19 @@ impl SourceText {
         self.source_text.pop();
     }
 
+    /// Truncate the collected source text to `len` UTF-16 code units, discarding
+    /// everything after it.
+    ///
+    /// Used by the lazy-parse body scanner (TRust lazy parsing) to roll back the
+    /// source text it speculatively collected while scanning a function body it
+    /// then decides to parse eagerly. `len` must come from an earlier
+    /// [`cur_linear_position`](Self::cur_linear_position) on the same buffer, so
+    /// it never splits a surrogate pair.
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        self.source_text.truncate(len);
+    }
+
     /// Collect code point.
     ///
     /// # Panics

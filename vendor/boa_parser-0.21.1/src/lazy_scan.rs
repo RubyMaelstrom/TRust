@@ -3,35 +3,66 @@
 //! [`scan_function_body`] takes the source as code points and the index of a
 //! function body's opening `{` and returns the index just past its matching
 //! `}` — WITHOUT building an AST — together with the identifier references in
-//! the body (for closed-over-binding capture). It is the cheap boundary-finder
-//! a lazy parser uses to *defer* a function body it may never need to compile.
+//! the body (for closed-over-binding capture) and whether the body's directive
+//! prologue declares `"use strict"`. It is the cheap boundary-finder a lazy
+//! parser uses to *defer* a function body it may never need to compile.
 //!
 //! It is deliberately FALLIBLE (SpiderMonkey's syntax-parser model): it returns
 //! [`None`] ("bail") on any construct whose tokenization it cannot resolve with
 //! certainty — an ambiguous regex-vs-division after `}`, an unterminated
-//! literal, a bracket mismatch, or EOF before the close. **A bail is never
-//! wrong, only slower**: the caller falls back to a full eager parse. The
-//! contract the fuzz tests enforce is therefore one-directional — for any real
-//! function this returns EITHER `None` OR *exactly* the body span the full
-//! parser produces, NEVER a different span.
+//! literal, a bracket mismatch, EOF before the close — AND on any construct
+//! whose binding semantics it cannot capture by textual reference replay: a
+//! `with` statement or an unqualified `eval` reference anywhere in the body
+//! (both make enclosing bindings reachable in ways the reference superset does
+//! not list, so the caller must parse them eagerly). **A bail is never wrong,
+//! only slower**: the caller falls back to a full eager parse. The contract the
+//! fuzz tests enforce is therefore one-directional — for any real function this
+//! returns EITHER `None` OR *exactly* the body span the full parser produces,
+//! NEVER a different span.
 //!
-//! The scan works in flat code-point indices (the lexer counts columns by code
-//! point, so a caller can map a span `Position` to/from an index with the same
-//! newline rules — see the `lazy_scan` fuzz harness in TRust).
+//! The scan logic lives in one generic core ([`scan_core`]) over a
+//! [`CpCursor`]; the slice entry point below drives it for the fuzz harness, and
+//! `boa_parser`'s lexer cursor drives the same core to skip bodies in place
+//! (so the fuzz proof covers both). The scan works in flat code points (the
+//! lexer counts columns by code point, so a caller can map a span `Position`
+//! to/from an index with the same newline rules — see the `lazy_scan` fuzz
+//! harness in TRust).
+
+/// A forward code-point cursor with one-ahead lookahead, consumed left to
+/// right, driving the lazy body [`scan_core`].
+///
+/// `peek(0)` is the next code point to be consumed, `peek(1)` the one after; the
+/// core never looks further. `bump` consumes one code point and returns it. An
+/// implementation that also tracks source text / position (the lexer cursor) has
+/// those updated by `bump`, so a successful scan leaves the cursor exactly past
+/// the matching `}`.
+pub trait CpCursor {
+    /// The code point `n` ahead (0 = next to consume), or `None` at EOF. `n` is
+    /// always 0 or 1.
+    fn peek(&mut self, n: usize) -> Option<u32>;
+    /// Consume and return the next code point, or `None` at EOF.
+    fn bump(&mut self) -> Option<u32>;
+}
 
 /// The result of a successful body scan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BodyScan {
     /// Index one past the matching `}` — equal to the body span's exclusive end
-    /// (`FunctionBody::span().end()` mapped to a flat code-point index).
+    /// (`FunctionBody::span().end()` mapped to a flat code-point index). Only
+    /// meaningful for the slice entry point; the lexer cursor reads its position
+    /// directly.
     pub end: usize,
-    /// `(start, end)` code-point ranges of identifier references in the body, a
-    /// conservative SUPERSET of its free variables (member-access property
-    /// names after `.`/`?.` are excluded; keywords are excluded; object-literal
-    /// keys and labels are NOT excluded — over-collecting only over-escapes a
-    /// binding, which is safe). Consumed by capturing lazy parse to replay the
-    /// outer scope's escape analysis without re-walking the body.
-    pub idents: Vec<(usize, usize)>,
+    /// The code points of each identifier reference in the body, a conservative
+    /// SUPERSET of its free variables (member-access property names after
+    /// `.`/`?.` and keywords are excluded; object-literal keys, labels, and the
+    /// body's own locals are NOT — over-collecting only over-escapes a binding,
+    /// which is safe). Consumed by capturing lazy parse to replay the outer
+    /// scope's escape analysis without re-walking the body.
+    pub idents: Vec<Box<[u32]>>,
+    /// Whether the body's directive prologue contains an exact `"use strict"`
+    /// directive (no escapes), so the deferred function's effective strictness
+    /// is correct before its body is re-parsed.
+    pub body_strict: bool,
 }
 
 /// What the most recently scanned token implies about a following `/`.
@@ -162,56 +193,104 @@ fn is_keyword(word: &str) -> bool {
     )
 }
 
-/// Scan a function body starting at `open` (which must index a `{`), returning
-/// the matching close and the identifier references, or [`None`] to bail. See
-/// the module docs for the safety contract.
+/// A code-point cursor over a flat slice — the slice entry point's adapter (and
+/// what the fuzz harness exercises).
+struct SliceCursor<'a> {
+    src: &'a [u32],
+    i: usize,
+}
+
+impl CpCursor for SliceCursor<'_> {
+    #[inline]
+    fn peek(&mut self, n: usize) -> Option<u32> {
+        self.src.get(self.i + n).copied()
+    }
+    #[inline]
+    fn bump(&mut self) -> Option<u32> {
+        let c = self.src.get(self.i).copied();
+        if c.is_some() {
+            self.i += 1;
+        }
+        c
+    }
+}
+
+/// Drive the body [`scan_core`] over an arbitrary [`CpCursor`] — the lexer's
+/// own cursor, to skip a body *in place*. `c` must be positioned just after the
+/// body's opening `{`. Pushes each captured identifier's code points into
+/// `idents` and returns the directive-prologue strictness on success (leaving
+/// `c` just past the matching `}`), or [`None`] to bail (having consumed an
+/// arbitrary prefix — the caller restores it). Shares its state machine, and so
+/// the fuzz proof, with [`scan_function_body`].
 #[must_use]
-#[allow(clippy::too_many_lines)]
+pub fn scan_body_after_open<C: CpCursor>(c: &mut C, idents: &mut Vec<Box<[u32]>>) -> Option<bool> {
+    scan_core(c, idents)
+}
+
+/// Scan a function body starting at `open` (which must index a `{`), returning
+/// the matching close, the identifier references, and the directive-prologue
+/// strictness, or [`None`] to bail. See the module docs for the safety
+/// contract. This is the slice entry point used by the fuzz harness; the lexer
+/// cursor drives the same [`scan_core`].
+#[must_use]
 pub fn scan_function_body(src: &[u32], open: usize) -> Option<BodyScan> {
     if src.get(open).copied() != Some(u32::from(b'{')) {
         return None;
     }
+    let mut cur = SliceCursor {
+        src,
+        i: open + 1, // the opening `{` is accounted for by the initial Brace
+    };
+    let mut idents = Vec::new();
+    let body_strict = scan_core(&mut cur, &mut idents)?;
+    Some(BodyScan {
+        end: cur.i,
+        idents,
+        body_strict,
+    })
+}
+
+/// The lazy-body scan state machine, shared by the slice entry point and the
+/// lexer cursor. `c` is positioned just after the body's opening `{` (so the
+/// bracket stack starts with one [`Bracket::Brace`]). On success the function
+/// returns the directive-prologue strictness, pushes each captured identifier's
+/// code points into `idents`, and leaves `c` positioned just past the matching
+/// `}`. On any uncertainty — or a `with`/unqualified-`eval` the reference
+/// superset cannot model — it returns [`None`] (a bail), having consumed an
+/// arbitrary prefix (the caller restores it).
+#[allow(clippy::too_many_lines)]
+fn scan_core<C: CpCursor>(c: &mut C, idents: &mut Vec<Box<[u32]>>) -> Option<bool> {
+    let body_strict = scan_directive_prologue(c)?;
 
     let mut stack: Vec<Bracket> = Vec::with_capacity(16);
     stack.push(Bracket::Brace);
-    let mut idents: Vec<(usize, usize)> = Vec::new();
     let mut slash = Slash::Regex; // after `{`, an expression may begin
     // Whether the previously scanned significant token was `.` or `?.`, so the
     // next identifier is a member-access property name (not a variable ref).
     let mut after_dot = false;
-    let mut i = open + 1;
 
-    while i < src.len() {
-        let c = src[i];
-
+    while let Some(ch) = c.peek(0) {
         // Whitespace and line terminators: skip, leaving `slash`/`after_dot`.
-        if is_ws(c) || is_line_term(c) {
-            i += 1;
+        if is_ws(ch) || is_line_term(ch) {
+            c.bump();
             continue;
         }
 
         // Comments.
-        if c == u32::from(b'/') {
-            match src.get(i + 1).copied() {
+        if ch == u32::from(b'/') {
+            match c.peek(1) {
                 Some(c1) if c1 == u32::from(b'/') => {
-                    i += 2;
-                    while i < src.len() && !is_line_term(src[i]) {
-                        i += 1;
+                    c.bump();
+                    c.bump();
+                    while c.peek(0).is_some_and(|x| !is_line_term(x)) {
+                        c.bump();
                     }
                     continue;
                 }
                 Some(c1) if c1 == u32::from(b'*') => {
-                    i += 2;
-                    let mut closed = false;
-                    while i + 1 < src.len() {
-                        if src[i] == u32::from(b'*') && src[i + 1] == u32::from(b'/') {
-                            i += 2;
-                            closed = true;
-                            break;
-                        }
-                        i += 1;
-                    }
-                    if !closed {
+                    c.bump();
+                    c.bump();
+                    if !skip_block_comment(c) {
                         return None; // unterminated block comment
                     }
                     continue;
@@ -220,18 +299,19 @@ pub fn scan_function_body(src: &[u32], open: usize) -> Option<BodyScan> {
                     // Division vs. regular expression.
                     match slash {
                         Slash::Regex => {
-                            i = scan_regex(src, i)?;
+                            if !scan_regex(c) {
+                                return None;
+                            }
                             slash = Slash::Div;
                             after_dot = false;
                             continue;
                         }
                         Slash::Div => {
                             // `/` or `/=` operator → expression follows.
-                            i += if src.get(i + 1).copied() == Some(u32::from(b'=')) {
-                                2
-                            } else {
-                                1
-                            };
+                            c.bump();
+                            if c.peek(0) == Some(u32::from(b'=')) {
+                                c.bump();
+                            }
                             slash = Slash::Regex;
                             after_dot = false;
                             continue;
@@ -244,61 +324,62 @@ pub fn scan_function_body(src: &[u32], open: usize) -> Option<BodyScan> {
         }
 
         // String literals.
-        if c == u32::from(b'"') || c == u32::from(b'\'') {
-            i = scan_string(src, i, c)?;
+        if ch == u32::from(b'"') || ch == u32::from(b'\'') {
+            if !scan_string(c) {
+                return None;
+            }
             slash = Slash::Div;
             after_dot = false;
             continue;
         }
 
         // Template literals (incl. nested `${ ... }`).
-        if c == u32::from(b'`') {
-            match scan_template(src, i, &mut stack)? {
-                TemplateStep::Complete(next) => {
-                    i = next;
-                    slash = Slash::Div;
-                }
-                TemplateStep::Substitution(next) => {
-                    // Entered a `${` — `stack` got a TemplateSub pushed; resume
-                    // normal scanning of the substitution expression.
-                    i = next;
-                    slash = Slash::Regex;
-                }
+        if ch == u32::from(b'`') {
+            match scan_template(c, &mut stack)? {
+                TemplateStep::Complete => slash = Slash::Div,
+                // Entered a `${` — a TemplateSub was pushed; resume normal
+                // scanning of the substitution expression.
+                TemplateStep::Substitution => slash = Slash::Regex,
             }
             after_dot = false;
             continue;
         }
 
         // Identifiers / keywords.
-        if is_ident_start(c) {
-            let start = i;
-            i += 1;
-            while i < src.len() && is_ident_part(src[i]) {
-                i += 1;
+        if is_ident_start(ch) {
+            let mut run: Vec<u32> = Vec::new();
+            run.push(c.bump().expect("peeked"));
+            while c.peek(0).is_some_and(is_ident_part) {
+                run.push(c.bump().expect("peeked"));
             }
             // A `\uXXXX` escape inside the identifier — be conservative and bail
             // rather than mis-bound it (rare in real code).
-            if i < src.len() && src[i] == u32::from(b'\\') {
+            if c.peek(0) == Some(u32::from(b'\\')) {
                 return None;
             }
-            let word = cp_slice_to_string(&src[start..i]);
+            let word = cp_slice_to_string(&run);
+            // A `with` statement, or any unqualified `eval` reference, makes
+            // enclosing bindings reachable beyond the captured superset — bail.
+            if word == "with" || (!after_dot && word == "eval") {
+                return None;
+            }
             slash = if keyword_allows_regex(&word) {
                 Slash::Regex
             } else {
                 Slash::Div
             };
             if !after_dot && !is_keyword(&word) {
-                idents.push((start, i));
+                idents.push(run.into_boxed_slice());
             }
             after_dot = false;
             continue;
         }
 
         // Numbers (a digit, or `.` immediately before a digit).
-        if is_digit(c) || (c == u32::from(b'.') && src.get(i + 1).copied().is_some_and(is_digit)) {
-            i += 1;
-            while i < src.len() && is_number_part(src[i]) {
-                i += 1;
+        if is_digit(ch) || (ch == u32::from(b'.') && c.peek(1).is_some_and(is_digit)) {
+            c.bump();
+            while c.peek(0).is_some_and(is_number_part) {
+                c.bump();
             }
             slash = Slash::Div;
             after_dot = false;
@@ -306,81 +387,84 @@ pub fn scan_function_body(src: &[u32], open: usize) -> Option<BodyScan> {
         }
 
         // Punctuators.
-        match c {
-            _ if c == u32::from(b'{') => {
+        c.bump();
+        match ch {
+            _ if ch == u32::from(b'{') => {
                 stack.push(Bracket::Brace);
                 slash = Slash::Regex;
                 after_dot = false;
             }
-            _ if c == u32::from(b'}') => match stack.pop() {
+            _ if ch == u32::from(b'}') => match stack.pop() {
                 Some(Bracket::TemplateSub) => {
                     // Resume the enclosing template literal after the `}`.
-                    match scan_template_tail(src, i + 1, &mut stack)? {
-                        TemplateStep::Complete(next) => {
-                            i = next;
-                            slash = Slash::Div;
-                            after_dot = false;
-                            continue;
-                        }
-                        TemplateStep::Substitution(next) => {
-                            i = next;
-                            slash = Slash::Regex;
-                            after_dot = false;
-                            continue;
-                        }
+                    match scan_template_chars(c, &mut stack)? {
+                        TemplateStep::Complete => slash = Slash::Div,
+                        TemplateStep::Substitution => slash = Slash::Regex,
                     }
+                    after_dot = false;
                 }
                 Some(Bracket::Brace) => {
                     if stack.is_empty() {
-                        return Some(BodyScan { end: i + 1, idents });
+                        return Some(body_strict); // matched the body's `}`
                     }
                     slash = Slash::AfterBrace;
                     after_dot = false;
                 }
                 _ => return None, // mismatched `}`
             },
-            _ if c == u32::from(b'(') => {
+            _ if ch == u32::from(b'(') => {
                 stack.push(Bracket::Paren);
                 slash = Slash::Regex;
                 after_dot = false;
             }
-            _ if c == u32::from(b')') => {
+            _ if ch == u32::from(b')') => {
                 if stack.pop() != Some(Bracket::Paren) {
                     return None;
                 }
                 slash = Slash::Div;
                 after_dot = false;
             }
-            _ if c == u32::from(b'[') => {
+            _ if ch == u32::from(b'[') => {
                 stack.push(Bracket::Square);
                 slash = Slash::Regex;
                 after_dot = false;
             }
-            _ if c == u32::from(b']') => {
+            _ if ch == u32::from(b']') => {
                 if stack.pop() != Some(Bracket::Square) {
                     return None;
                 }
                 slash = Slash::Div;
                 after_dot = false;
             }
-            _ if c == u32::from(b'.') => {
-                // `.` or `...`; the next identifier is a property name. (`?.` is
-                // handled at `?`.)
+            _ if ch == u32::from(b'.') => {
+                // `.` member access vs. `...` spread/rest. The first `.` was just
+                // consumed (above); `...` is the only multi-dot token, so two more
+                // dots mean spread/rest. A spread/rest's following identifier is a
+                // real reference (`[...arr]`, `f(...args)`) — or a rest-parameter
+                // *local*, which is only over-collected (safe) — so it must NOT be
+                // treated as a member-access property name, or the capture-replay
+                // superset drops it and the enclosing binding it captures is never
+                // marked escaping. A single `.` is member access: skip the next
+                // identifier. (`?.` is handled at `?`; `.5` numbers above.)
                 slash = Slash::Regex;
-                after_dot = true;
-                i += 1;
-                continue;
+                if c.peek(0) == Some(u32::from(b'.')) && c.peek(1) == Some(u32::from(b'.')) {
+                    c.bump(); // 2nd dot
+                    c.bump(); // 3rd dot
+                    after_dot = false;
+                } else {
+                    after_dot = true;
+                }
             }
-            _ if c == u32::from(b'?') => {
+            _ if ch == u32::from(b'?') => {
                 // `?.` optional chaining → next identifier is a property name.
-                if src.get(i + 1).copied() == Some(u32::from(b'.')) {
-                    i += 2;
+                if c.peek(0) == Some(u32::from(b'.')) {
+                    c.bump();
                     slash = Slash::Regex;
                     after_dot = true;
-                    continue;
+                } else {
+                    slash = Slash::Regex;
+                    after_dot = false;
                 }
-                slash = Slash::Regex;
-                after_dot = false;
             }
             // Any other operator/punctuator: an expression may follow.
             _ => {
@@ -388,10 +472,146 @@ pub fn scan_function_body(src: &[u32], open: usize) -> Option<BodyScan> {
                 after_dot = false;
             }
         }
-        i += 1;
     }
 
     None // EOF before the body closed
+}
+
+/// Scan a leading directive prologue (a run of string-literal statements at the
+/// start of the body), returning whether an exact `"use strict"` directive
+/// (no escapes) is present. Consumes the prologue. Conservative: only `;`- and
+/// `}`-terminated directives count, so exotic ASI/continuation forms are
+/// *under*-detected (the deferred function's effective strictness is recovered
+/// exactly when its body is re-parsed; only the pre-first-call strict flag could
+/// be momentarily sloppy). Never over-detects. Returns [`None`] on an
+/// unterminated comment in the prologue (a bail).
+fn scan_directive_prologue<C: CpCursor>(c: &mut C) -> Option<bool> {
+    let mut strict = false;
+    loop {
+        if !skip_trivia(c)? {
+            return Some(strict);
+        }
+        let Some(q) = c.peek(0) else {
+            return Some(strict);
+        };
+        if q != u32::from(b'"') && q != u32::from(b'\'') {
+            return Some(strict);
+        }
+        // Read the string, capturing its raw content and whether it used any
+        // escape (a `"use strict"` is NOT a use-strict directive).
+        let mut content: Vec<u32> = Vec::new();
+        let mut had_escape = false;
+        c.bump(); // opening quote
+        loop {
+            match c.bump() {
+                None => return None, // unterminated
+                Some(ch) if ch == q => break,
+                Some(ch) if ch == u32::from(b'\\') => {
+                    had_escape = true;
+                    if c.bump().is_none() {
+                        return None;
+                    }
+                }
+                Some(ch) if is_line_term(ch) => return None, // bare newline in string
+                Some(ch) => content.push(ch),
+            }
+        }
+        let is_use_strict = !had_escape && cp_slice_to_string(&content) == "use strict";
+        // Skip non-newline whitespace and comments to find the terminator.
+        skip_inline_trivia(c)?;
+        match c.peek(0) {
+            Some(s) if s == u32::from(b';') => {
+                c.bump();
+                strict |= is_use_strict;
+                // Continue: there may be further directives.
+            }
+            Some(s) if s == u32::from(b'}') => {
+                // Last directive, no trailing `;`. Leave the `}` for the main
+                // loop to match the body close.
+                strict |= is_use_strict;
+                return Some(strict);
+            }
+            _ => {
+                // The string was an expression, not a directive (or the prologue
+                // ended). The main loop continues after it.
+                return Some(strict);
+            }
+        }
+    }
+}
+
+/// Skip whitespace, line terminators, and comments. Returns `Some(true)` if more
+/// input remains, `Some(false)` at EOF, [`None`] on an unterminated block
+/// comment.
+fn skip_trivia<C: CpCursor>(c: &mut C) -> Option<bool> {
+    loop {
+        match c.peek(0) {
+            None => return Some(false),
+            Some(ch) if is_ws(ch) || is_line_term(ch) => {
+                c.bump();
+            }
+            Some(ch) if ch == u32::from(b'/') => match c.peek(1) {
+                Some(c1) if c1 == u32::from(b'/') => {
+                    c.bump();
+                    c.bump();
+                    while c.peek(0).is_some_and(|x| !is_line_term(x)) {
+                        c.bump();
+                    }
+                }
+                Some(c1) if c1 == u32::from(b'*') => {
+                    c.bump();
+                    c.bump();
+                    if !skip_block_comment(c) {
+                        return None;
+                    }
+                }
+                _ => return Some(true),
+            },
+            Some(_) => return Some(true),
+        }
+    }
+}
+
+/// Like [`skip_trivia`] but does not cross line terminators (used to find a
+/// directive's terminator without ASI guesswork).
+fn skip_inline_trivia<C: CpCursor>(c: &mut C) -> Option<()> {
+    loop {
+        match c.peek(0) {
+            Some(ch) if is_ws(ch) => {
+                c.bump();
+            }
+            Some(ch) if ch == u32::from(b'/') => match c.peek(1) {
+                Some(c1) if c1 == u32::from(b'/') => {
+                    c.bump();
+                    c.bump();
+                    while c.peek(0).is_some_and(|x| !is_line_term(x)) {
+                        c.bump();
+                    }
+                }
+                Some(c1) if c1 == u32::from(b'*') => {
+                    c.bump();
+                    c.bump();
+                    if !skip_block_comment(c) {
+                        return None;
+                    }
+                }
+                _ => return Some(()),
+            },
+            _ => return Some(()),
+        }
+    }
+}
+
+/// Consume a block comment body after its opening `/*`. Returns whether it was
+/// terminated (`*/` found).
+fn skip_block_comment<C: CpCursor>(c: &mut C) -> bool {
+    while let Some(ch) = c.bump() {
+        if ch == u32::from(b'*') && c.peek(0) == Some(u32::from(b'/')) {
+            c.bump();
+            return true;
+        }
+    }
+    false
 }
 
 /// Number continuation chars (decimal, hex/bin/oct prefixes & digits, exponent,
@@ -415,101 +635,101 @@ fn is_number_part(c: u32) -> bool {
     )
 }
 
-/// Consume a string literal beginning at `open` (the quote `q`); return the
-/// index just past the closing quote, or [`None`] if unterminated.
-fn scan_string(src: &[u32], open: usize, q: u32) -> Option<usize> {
-    let mut i = open + 1;
-    while i < src.len() {
-        let c = src[i];
-        if c == u32::from(b'\\') {
+/// Consume a string literal whose opening quote `q` is the next code point;
+/// returns whether it was terminated.
+fn scan_string<C: CpCursor>(c: &mut C) -> bool {
+    let q = c.bump().expect("opening quote");
+    while let Some(ch) = c.bump() {
+        if ch == u32::from(b'\\') {
             // Line continuations and all escapes: skip the escaped unit. (A
             // `\<CR><LF>` continuation skips the CR here and the LF next loop —
             // harmless.)
-            i += 2;
+            if c.bump().is_none() {
+                return false;
+            }
             continue;
         }
-        if c == q {
-            return Some(i + 1);
+        if ch == q {
+            return true;
         }
         // A bare line terminator inside a non-template string is a syntax error.
-        if is_line_term(c) {
-            return None;
+        if is_line_term(ch) {
+            return false;
         }
-        i += 1;
     }
-    None
+    false
 }
 
-/// Consume a regular-expression literal beginning at `open` (the `/`); return
-/// the index just past the trailing flags, or [`None`] if malformed.
-fn scan_regex(src: &[u32], open: usize) -> Option<usize> {
-    let mut i = open + 1;
+/// Consume a regular-expression literal whose opening `/` is the next code
+/// point; returns whether it was well-formed (and consumes trailing flags).
+fn scan_regex<C: CpCursor>(c: &mut C) -> bool {
+    c.bump(); // opening `/`
     let mut in_class = false; // inside a `[...]` character class
-    while i < src.len() {
-        let c = src[i];
-        if is_line_term(c) {
-            return None; // a regex literal cannot span lines
+    while let Some(ch) = c.bump() {
+        if is_line_term(ch) {
+            return false; // a regex literal cannot span lines
         }
-        if c == u32::from(b'\\') {
-            i += 2; // escaped char (incl. `\/`, `\]`)
+        if ch == u32::from(b'\\') {
+            if c.bump().is_none() {
+                return false; // escaped char (incl. `\/`, `\]`)
+            }
             continue;
         }
-        if c == u32::from(b'[') {
+        if ch == u32::from(b'[') {
             in_class = true;
-        } else if c == u32::from(b']') {
+        } else if ch == u32::from(b']') {
             in_class = false;
-        } else if c == u32::from(b'/') && !in_class {
+        } else if ch == u32::from(b'/') && !in_class {
             // End of the body; consume identifier-part flags.
-            i += 1;
-            while i < src.len() && is_ident_part(src[i]) {
-                i += 1;
+            while c.peek(0).is_some_and(is_ident_part) {
+                c.bump();
             }
-            return Some(i);
+            return true;
         }
-        i += 1;
     }
-    None
+    false
 }
 
 /// Outcome of scanning a template segment.
 enum TemplateStep {
-    /// The template ended (closing backtick consumed); index just past it.
-    Complete(usize),
-    /// A `${` opened a substitution (a `TemplateSub` was pushed); index just
-    /// past the `${`, scanning resumes in normal mode.
-    Substitution(usize),
+    /// The template ended (closing backtick consumed).
+    Complete,
+    /// A `${` opened a substitution (a `TemplateSub` was pushed); scanning
+    /// resumes in normal mode.
+    Substitution,
 }
 
-/// Scan a template literal beginning at `open` (the backtick).
-fn scan_template(src: &[u32], open: usize, stack: &mut Vec<Bracket>) -> Option<TemplateStep> {
-    scan_template_chars(src, open + 1, stack)
+/// Scan a template literal whose opening backtick is the next code point.
+fn scan_template<C: CpCursor>(c: &mut C, stack: &mut Vec<Bracket>) -> Option<TemplateStep> {
+    c.bump(); // opening backtick
+    scan_template_chars(c, stack)
 }
 
-/// Resume scanning a template's character run after a substitution's closing
-/// `}` (which has already been popped from `stack`). `at` is the index right
-/// after that `}`.
-fn scan_template_tail(src: &[u32], at: usize, stack: &mut Vec<Bracket>) -> Option<TemplateStep> {
-    scan_template_chars(src, at, stack)
-}
-
-/// Scan template characters from `at` until the closing backtick or the next
-/// `${` substitution. Handles `\` escapes; bails on EOF.
-fn scan_template_chars(src: &[u32], at: usize, stack: &mut Vec<Bracket>) -> Option<TemplateStep> {
-    let mut i = at;
-    while i < src.len() {
-        let c = src[i];
-        if c == u32::from(b'\\') {
-            i += 2;
+/// Scan template characters until the closing backtick or the next `${`
+/// substitution. Handles `\` escapes; bails on EOF.
+fn scan_template_chars<C: CpCursor>(
+    c: &mut C,
+    stack: &mut Vec<Bracket>,
+) -> Option<TemplateStep> {
+    while let Some(ch) = c.peek(0) {
+        if ch == u32::from(b'\\') {
+            c.bump();
+            if c.bump().is_none() {
+                return None;
+            }
             continue;
         }
-        if c == u32::from(b'`') {
-            return Some(TemplateStep::Complete(i + 1));
+        if ch == u32::from(b'`') {
+            c.bump();
+            return Some(TemplateStep::Complete);
         }
-        if c == u32::from(b'$') && src.get(i + 1).copied() == Some(u32::from(b'{')) {
+        if ch == u32::from(b'$') && c.peek(1) == Some(u32::from(b'{')) {
+            c.bump();
+            c.bump();
             stack.push(Bracket::TemplateSub);
-            return Some(TemplateStep::Substitution(i + 2));
+            return Some(TemplateStep::Substitution);
         }
-        i += 1;
+        c.bump();
     }
     None // unterminated template
 }
@@ -603,10 +823,46 @@ mod tests {
     }
 
     #[test]
+    fn with_statement_bails() {
+        assert_eq!(scan("{ with (o) { x; } }"), None);
+    }
+
+    #[test]
+    fn unqualified_eval_bails() {
+        assert_eq!(scan("{ return eval(s); }"), None);
+        // A member `.eval` is fine (not a direct eval).
+        assert_eq!(
+            scan("{ return o.eval(s); }"),
+            Some("{ return o.eval(s); }".chars().count())
+        );
+    }
+
+    #[test]
     fn unterminated_bails() {
         assert_eq!(scan("{ var s = 'oops; }"), None);
         assert_eq!(scan("{ return 1; "), None);
         assert_eq!(scan("{ /* nope } "), None);
+    }
+
+    #[test]
+    fn detects_use_strict_directive() {
+        let v = cps(r#"{ "use strict"; return 1; }"#);
+        let open = v.iter().position(|&c| c == u32::from(b'{')).unwrap();
+        assert!(scan_function_body(&v, open).unwrap().body_strict);
+
+        let v = cps(r#"{ 'use strict' }"#);
+        let open = v.iter().position(|&c| c == u32::from(b'{')).unwrap();
+        assert!(scan_function_body(&v, open).unwrap().body_strict);
+
+        // Not a directive: it is the start of an expression.
+        let v = cps(r#"{ "use strict".length; }"#);
+        let open = v.iter().position(|&c| c == u32::from(b'{')).unwrap();
+        assert!(!scan_function_body(&v, open).unwrap().body_strict);
+
+        // Escaped: a directive must be the exact code points with no escapes.
+        let v = cps(r#"{ "use\x20strict"; }"#);
+        let open = v.iter().position(|&c| c == u32::from(b'{')).unwrap();
+        assert!(!scan_function_body(&v, open).unwrap().body_strict);
     }
 
     #[test]
@@ -617,7 +873,7 @@ mod tests {
         let names: Vec<String> = scan
             .idents
             .iter()
-            .map(|&(a, b)| super::cp_slice_to_string(&v[a..b]))
+            .map(|cps| super::cp_slice_to_string(cps))
             .collect();
         // `foo` and `bar` are references; `baz` is a member (after `.`),
         // `return` is a keyword.

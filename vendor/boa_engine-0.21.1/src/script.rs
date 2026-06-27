@@ -74,6 +74,11 @@ pub struct RawScript {
     source: AstSourceText,
     interner: Interner,
     path: Option<PathBuf>,
+    /// Whether TRust lazy *parsing* was enabled on the worker when this was
+    /// parsed, so its `code` may contain skipped (lazy) function bodies. The
+    /// page thread reads this (`was_lazy_parsed`) to keep such a script out of
+    /// the CDN image cache — a lazy stub cannot be dehydrated into an image.
+    lazy: bool,
 }
 
 // SAFETY: a `RawScript` is only ever *moved* between threads (a parse worker to
@@ -87,6 +92,17 @@ pub struct RawScript {
 // thread-affine handle — and `SourceText` is an owned UTF-16 buffer. There is
 // no interior thread-affinity, so the whole value is sound to send.
 unsafe impl Send for RawScript {}
+
+impl RawScript {
+    /// Whether this raw script's bodies may have been skipped at parse time
+    /// (TRust lazy *parsing* was on for the worker that produced it). The page
+    /// thread keeps such a script out of the CDN image cache — a lazy stub can't
+    /// be dehydrated into an image. See [`RawScript`].
+    #[must_use]
+    pub fn was_lazy_parsed(&self) -> bool {
+        self.lazy
+    }
+}
 
 impl Script {
     /// Gets the realm of this script.
@@ -178,6 +194,10 @@ impl Script {
             source,
             interner,
             path,
+            // Capture whether the worker was lazy-parsing (the flag is set
+            // per-job before this call), so the page thread can avoid imaging a
+            // script whose bodies were skipped.
+            lazy: boa_parser::lazy::enabled(),
         })
     }
 
@@ -209,13 +229,21 @@ impl Script {
             source,
             mut interner,
             path,
+            // Read by the page thread (`was_lazy_parsed`) before this consumes
+            // the raw script; the compile itself does not need it.
+            lazy: _,
         } = raw;
-        // Suppress TRust lazy deferral for this compile: it runs against the
-        // worker's PRIVATE interner, which is restored away and dropped below, so
-        // a deferred stub's body `Sym`s would not resolve at first call. Compile
-        // eagerly here (held for the whole swapped-interner window). See
-        // `crate::vm::lazy`.
-        let _no_lazy = crate::vm::lazy::SuppressGuard::new();
+        // TRust lazy deferral is PERMITTED here, and is the caller's policy to
+        // suppress (it does so per-script when the result will be CDN-cached — a
+        // lazy stub can't be dehydrated into an image). A deferred stub re-parses
+        // its body from the retained source span on first call
+        // (`LazyFunctionData::compile`), so it does NOT depend on this worker's
+        // private interner — which is restored away and dropped below. Bodies the
+        // worker already SKIPPED at parse (`body.is_lazy()`) are stubbed here
+        // regardless, since their statements were never built. (Pre-C1 the stub
+        // retained the body AST and resolved its `Sym`s against the page interner
+        // at first call, which the dropped worker interner broke — hence the old
+        // unconditional suppression that lived here.)
         // Swap the worker interner in so `analyze_scope` and the byte compiler
         // resolve the AST's `Sym` indices against the interner that produced
         // them. The page interner MUST be restored on every path — including a

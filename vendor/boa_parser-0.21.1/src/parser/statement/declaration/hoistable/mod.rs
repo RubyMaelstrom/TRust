@@ -139,6 +139,12 @@ trait CallableDeclaration {
     fn parameters_await_is_early_error(&self) -> bool {
         false
     }
+    /// Whether this declaration's body is eligible for TRust lazy parsing
+    /// (skipping it at parse time). Only ordinary function declarations are —
+    /// generators and async functions keep the eager path.
+    fn lazy_eligible_body(&self) -> bool {
+        false
+    }
 }
 
 // This is a helper function to not duplicate code in the individual callable declaration parsers.
@@ -179,6 +185,7 @@ fn parse_callable_declaration<R: ReadChar, C: CallableDeclaration>(
         c.body_allow_await(),
         c.error_context(),
     )
+    .allow_lazy(c.lazy_eligible_body())
     .parse(cursor, interner)?;
 
     // If the source text matched by FormalParameters is strict mode code,

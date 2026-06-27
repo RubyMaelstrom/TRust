@@ -328,8 +328,11 @@ impl<'a, R: ReadChar> Parser<'a, R> {
         interner: &mut Interner,
     ) -> ParseResult<(boa_ast::function::FunctionExpression, boa_ast::SourceText)> {
         self.cursor.set_goal(InputElement::RegExp);
+        // TRust lazy parsing: the function being delazified must have its own
+        // body parsed eagerly (it is being compiled now), while its nested
+        // functions stay skip-eligible.
         let function =
-            expression::FunctionExpressionParser::new().parse(&mut self.cursor, interner)?;
+            expression::FunctionExpressionParser::new_body_eager().parse(&mut self.cursor, interner)?;
         Ok((function, self.cursor.take_source()))
     }
 }

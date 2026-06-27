@@ -1799,7 +1799,12 @@ impl<'ctx> ByteCompiler<'ctx> {
             .in_with(self.in_with)
             .name_scope(name_scope.cloned())
             .source_path(self.source_path.clone());
-        let code = if eager_next_function {
+        // TRust lazy *parsing*: a body skipped at parse time (`body.is_lazy()`)
+        // has no statements to compile, so it can only be stubbed — even under
+        // `eager_next_function` it must route to `compile_or_lazy`. (The parser's
+        // parenthesized-IIFE heuristic keeps such wrappers from being skipped, so
+        // the eager path normally still applies to a real IIFE wrapper.)
+        let code = if eager_next_function && !body.is_lazy() {
             compiler.compile(
                 parameters,
                 body,

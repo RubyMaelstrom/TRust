@@ -25,6 +25,9 @@ mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dependencies]
 boa_engine = { version = "0.21", features = ["annex-b"] }
+# Direct dep for the lazy-parse control surface (`boa_parser::lazy`); the
+# vendored crate is shared with boa_engine via `[patch]` below.
+boa_parser = "0.21"
 bytes = "1.11.1"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 # Default features = the pure-Rust `miniz_oxide` backend. NEVER enable the
@@ -71,13 +74,12 @@ webpki-roots = "1.0.7"
 # fixtures. Pure-Rust (wasmi ecosystem); NEVER a runtime dependency — the
 # runtime accepts only binary wasm from the web.
 wat = "1"
-# Test-only access to the vendored parser/AST for the lazy-parse (`lazy_scan`)
+# Test-only access to the vendored AST/interner for the lazy-parse (`lazy_scan`)
 # fuzz harness: it walks the real parser's function-body spans and checks the
 # fallible body-skip against them. Redirected to the vendored forks by
-# `[patch.crates-io]` below. NOT runtime deps — the lazy-parse integration
-# lives inside the vendored crates, not in TRust's own source.
+# `[patch.crates-io]` below. (`boa_parser` is a runtime dep above for the
+# `boa_parser::lazy` control surface.)
 boa_ast = "0.21"
-boa_parser = "0.21"
 boa_interner = "0.21"
 
 [patch.crates-io]

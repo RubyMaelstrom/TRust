@@ -575,6 +575,20 @@ impl BindingEscapeAnalyzer<'_> {
         scope = scopes.body_scope();
         std::mem::swap(&mut self.scope, &mut scope);
         self.visit_function_body_mut(body)?;
+        // TRust lazy parsing: a body skipped at parse time has no statements to
+        // walk, so its escape effect on the enclosing scopes is replayed from
+        // the captured reference superset. `self.scope` is the body scope here;
+        // each `access_binding` walks outward exactly as a real reference would,
+        // marking an enclosing binding escaping when the access crosses the
+        // function border. A superset only ever OVER-escapes (heap- rather than
+        // stack-allocating a binding), which is safe — never an under-escape.
+        if let Some(lazy) = body.lazy() {
+            let eval_or_with = self.direct_eval || self.with;
+            for &sym in lazy.idents() {
+                let name = sym.to_js_string(self.interner);
+                self.scope.access_binding(&name, eval_or_with);
+            }
+        }
         std::mem::swap(&mut self.scope, &mut scope);
         if scopes.arguments_object_accessed() && scopes.mapped_arguments_object {
             let parameter_names = bound_names(parameters);

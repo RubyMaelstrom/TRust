@@ -212,17 +212,20 @@ pub mod fn_census {
 ///
 /// - **`ENABLED`** — the master switch, set by TRust from `TRUST_LAZY_PARSE`.
 /// - **`SUPPRESS`** — a re-entrant guard ([`SuppressGuard`]) raised around any
-///   compile whose result is **detached from the page's persistent interner**:
-///   the parallel-parse worker path ([`Script::compile_raw`](crate::Script::compile_raw),
-///   whose private interner is dropped after compile) and the image-cached
-///   compiles (prelude / cross-page CDN libraries, dehydrated via
-///   [`CodeBlock::to_image`](crate::vm::CodeBlock::to_image)). A deferred stub
-///   retains the function body's AST, which names identifiers by `Sym` (interner
-///   index); delazify resolves those `Sym`s against the **`Context`'s** interner,
-///   which is persistent and append-only for a page's lifetime — so deferral is
-///   sound exactly when the compile used that interner. The suppressed paths
-///   would either lose the interner (parallel parse) or persist a stub into an
-///   image (which cannot carry an AST/interner), so they compile eagerly.
+///   compile whose result is **dehydrated into a `CodeBlockImage`**: the prelude
+///   and cross-page CDN-library caches (via
+///   [`CodeBlock::to_image`](crate::vm::CodeBlock::to_image)). A lazy stub holds
+///   a live source span and analyzed scopes, not flat image data, so it cannot
+///   be imaged — those paths must compile eagerly. Delazify re-parses a deferred
+///   function from its retained source span (`LazyFunctionData::compile`), so a
+///   stub is **independent of the interner that compiled it** — which is why the
+///   parallel-parse worker path ([`Script::compile_raw`](crate::Script::compile_raw),
+///   whose private interner is dropped after compile) no longer needs engine-level
+///   suppression. (TRust still suppresses *that* path per-script when the result
+///   will be cached, but that is a caller policy for imaging, not an engine
+///   requirement.) Before C1 a stub instead retained the body's AST and resolved
+///   its `Sym`s against the page interner at first call, so the dropped worker
+///   interner forced the now-removed unconditional suppression there.
 pub mod lazy {
     use std::cell::Cell;
 
