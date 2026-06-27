@@ -37,12 +37,25 @@ use boa_interner::{Interner, Sym};
 /// [mdn]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/function
 /// [spec]: https://tc39.es/ecma262/#prod-FunctionExpression
 #[derive(Debug, Clone, Copy)]
-pub(in crate::parser) struct FunctionExpression {}
+pub(in crate::parser) struct FunctionExpression {
+    /// Force this function's own body to be parsed eagerly (not TRust
+    /// lazy-skipped), while its nested functions remain skip-eligible. Set by the
+    /// engine's delazify re-parse (`Parser::parse_function_expression`) so the
+    /// very function being delazified is not skipped again. Nested functions use
+    /// the default (skip-eligible) constructor.
+    body_eager: bool,
+}
 
 impl FunctionExpression {
-    /// Creates a new `FunctionExpression` parser.
+    /// Creates a new `FunctionExpression` parser (body skip-eligible).
     pub(in crate::parser) fn new() -> Self {
-        Self {}
+        Self { body_eager: false }
+    }
+
+    /// Creates a `FunctionExpression` parser whose own body is parsed eagerly
+    /// (TRust lazy parsing; see the field docs).
+    pub(in crate::parser) fn new_body_eager() -> Self {
+        Self { body_eager: true }
     }
 }
 
@@ -82,8 +95,9 @@ where
 
         cursor.expect(Punctuator::CloseParen, "function expression", interner)?;
 
-        let body =
-            FunctionBody::new(false, false, "function expression").parse(cursor, interner)?;
+        let body = FunctionBody::new(false, false, "function expression")
+            .allow_lazy(!self.body_eager)
+            .parse(cursor, interner)?;
 
         // Early Error: If the source code matching FormalParameters is strict mode code,
         // the Early Error rules for UniqueFormalParameters : FormalParameters are applied.

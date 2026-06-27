@@ -639,15 +639,38 @@ fn fn_census_on() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("TRUST_FN_CENSUS").is_some())
 }
 
-/// The process-wide `TRUST_LAZY_PARSE` flag, read from the environment once.
-/// When set, eligible nested function bodies are compiled lazily — deferred to
-/// their first call instead of eagerly at load (TRust lazy compilation, JS
-/// engine performance plan Step 2 "Phase B"; see [`boa_engine::vm::lazy`]). Off
-/// by default (the A/B + kill switch, like `TRUST_NO_PARALLEL_PARSE` /
-/// `TRUST_NO_CDN_CACHE`, only inverted — opt-in).
+/// Whether TRust lazy parsing is active, read from the environment once.
+/// When on, eligible ordinary function bodies are (a) *skipped at parse time*
+/// — their statement AST is never built; only the matching-brace boundary +
+/// free-variable superset are scanned (TRust lazy *parsing*, Phase C2; see
+/// [`boa_parser::lazy`]/[`boa_parser::lazy_scan`]) — and (b) compiled lazily,
+/// deferred to first call (TRust lazy *compilation*, Phase B; see
+/// [`boa_engine::vm::lazy`]). A function reaches the wire only when first called.
+///
+/// **Default ON** (2026-06-27): a parse-heavy multi-chunk page renders in ~0.98 s
+/// at ~390 MB peak RSS instead of ~3.0 s / ~2.2 GB, and lazy now COMPOSES with
+/// parallel parse (the workers skip too). `TRUST_NO_LAZY_PARSE` is the kill
+/// switch / A-B toggle, like `TRUST_NO_PARALLEL_PARSE` / `TRUST_NO_CDN_CACHE`.
+/// KNOWN: the C1 delazify scope-analyzer bug can degrade React/TanStack-heavy
+/// pages (e.g. GitHub code-view) to a `·JS:n!` partial render — its own Boa-fork
+/// session (see the lazy-parse-c1-delazify-bug notes).
 fn lazy_parse_on() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("TRUST_LAZY_PARSE").is_some())
+    *ENABLED.get_or_init(|| std::env::var_os("TRUST_NO_LAZY_PARSE").is_none())
+}
+
+/// Enable (or disable) BOTH halves of TRust lazy parsing — lazy *parsing*
+/// (`boa_parser::lazy`, skip bodies at parse) and lazy *compilation*
+/// (`boa_engine::vm::lazy`, defer bytecode) — on the current thread, honoring
+/// the `TRUST_LAZY_MIN` size override. Called on the page thread before any of
+/// the page's own scripts load.
+fn set_lazy_enabled(enabled: bool) {
+    boa_engine::vm::lazy::set_enabled(enabled);
+    boa_parser::lazy::set_enabled(enabled);
+    if let Some(n) = lazy_min() {
+        boa_engine::vm::lazy::set_min_source_len(n);
+        boa_parser::lazy::set_min_len(n);
+    }
 }
 
 /// Optional `TRUST_LAZY_MIN` override (code points) for the lazy-compilation
@@ -869,10 +892,12 @@ fn run_prelude(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
         // serves the cache and our own freshly compiled block still runs this
         // page (`let _ =` discards the rejected value).
         //
-        // Suppress TRust lazy compilation for this compile: the result is
-        // dehydrated to a cached image, which cannot carry a lazy stub's AST
-        // (and `to_image` asserts it doesn't). The prelude must compile eagerly.
+        // Suppress TRust lazy parsing AND compilation for this compile: the
+        // result is dehydrated to a cached image, which cannot carry a lazy
+        // stub (a skipped/deferred body) — `to_image` asserts it doesn't. The
+        // prelude must parse and compile eagerly.
         let _no_lazy = boa_engine::vm::lazy::suppress();
+        let _no_lazy_parse = boa_parser::lazy::suppress();
         let src = Source::from_bytes(PRELUDE.as_bytes()).with_path(std::path::Path::new("prelude"));
         let t = phase_begin();
         let script = boa_engine::Script::parse(src, None, ctx)?;
@@ -969,7 +994,16 @@ fn dispatch_parallel_parse(
     if std::env::var_os("TRUST_NO_PARALLEL_PARSE").is_some() {
         return None;
     }
-    let mut jobs: Vec<(usize, String, Vec<u8>, u32)> = Vec::new();
+    // Parallel parse now COMPOSES with lazy parse: the workers skip eligible
+    // bodies too (the per-job `lazy` flag below + `boa_parser::lazy` set on each
+    // worker thread, since lazy parsing is thread-local). `compile_raw` on the
+    // page thread stubs those skipped bodies; delazify re-parses from the
+    // retained span, so the dropped worker interner is irrelevant. The one
+    // exception is a CDN-cache candidate — it must stay EAGER so its image can
+    // be dehydrated — so it is excluded from the lazy path per-job.
+    let lazy_on = lazy_parse_on();
+    let lazy_min = lazy_min();
+    let mut jobs: Vec<(usize, String, Vec<u8>, u32, bool)> = Vec::new();
     for (i, (src, _inline, type_attr, _node)) in scripts.iter().enumerate() {
         if !is_classic(type_attr) {
             continue;
@@ -987,7 +1021,12 @@ fn dispatch_parallel_parse(
             continue;
         };
         let id = ctx.next_parser_identifier();
-        jobs.push((i, src.clone(), body.clone(), id));
+        // Lazy-parse this job unless it's a cacheable shared lib: the CDN image
+        // cache (compiled once per session, rehydrated free) beats re-skipping
+        // jQuery/D3/Vue every page, and a lazy stub can't be imaged. Big unique
+        // first-party bundles — the lazy-parse prize — are skipped.
+        let lazy_job = lazy_on && !cdn_cache_candidate(body);
+        jobs.push((i, src.clone(), body.clone(), id, lazy_job));
     }
     if jobs.len() < 2 {
         return None;
@@ -1012,9 +1051,16 @@ fn dispatch_parallel_parse(
             .spawn(move || {
                 loop {
                     let job = queue.lock().expect("parse queue poisoned").pop_front();
-                    let Some((index, name, body, id)) = job else {
+                    let Some((index, name, body, id, lazy)) = job else {
                         break;
                     };
+                    // Lazy parsing is thread-local, so the page thread's setting
+                    // does not reach this worker — apply the per-job decision
+                    // before parsing (matching the page thread's `min_len`).
+                    boa_parser::lazy::set_enabled(lazy);
+                    if let Some(n) = lazy_min {
+                        boa_parser::lazy::set_min_len(n);
+                    }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let src = Source::from_bytes(&body).with_path(std::path::Path::new(&name));
                         boa_engine::Script::raw_parse(src, id)
@@ -1161,6 +1207,21 @@ fn cdn_cache_lookup(key: &[u8; 32]) -> CdnLookup {
     }
 }
 
+/// Whether this external script body is, right now, a candidate for the CDN
+/// compile cache on this page: caching enabled, a true miss (`Absent` — not a
+/// hit, which is excluded earlier, nor an already-decided `NotReusable`), and
+/// small enough to admit. A candidate must compile **eagerly** so its image can
+/// be dehydrated, so parallel parse keeps it off the lazy path (and runs its
+/// page-thread compile un-suppressed). This mirrors the `store_key` decision in
+/// [`run_external_classic`] exactly, so the two never disagree on which scripts
+/// stay eager — the lazy-parse safety net (`RawScript::was_lazy_parsed`) covers
+/// the residual race where a `NotReusable` entry is evicted in between.
+fn cdn_cache_candidate(body: &[u8]) -> bool {
+    cdn_cache_enabled()
+        && cdn_cacheable(body.len())
+        && matches!(cdn_cache_lookup(&cdn_cache_key(body)), CdnLookup::Absent)
+}
+
 /// Record a cache decision for `key` (the first writer wins a race; a poisoned
 /// lock silently drops the entry). `bytes` is the entry's source-length cost
 /// (0 for a `NotReusable` marker). Evicts the oldest insertions past either lid.
@@ -1266,12 +1327,19 @@ fn run_external_classic(
         run_rehydrated_image(ctx, name, image, budget, outcome);
         return;
     }
+    // A worker that lazy-parsed this script may have left skipped (lazy) bodies
+    // in it, which cannot be dehydrated into an image — so such a script is
+    // never cached, regardless of the cache state. The dispatch heuristic
+    // (`cdn_cache_candidate`) already keeps cache candidates EAGER; this is the
+    // safety net for the residual race where that prediction and the cache
+    // disagree (e.g. a `NotReusable` entry evicted between dispatch and here).
+    let prepared_is_lazy = matches!(&prepared, Some(Ok(raw)) if raw.was_lazy_parsed());
     // Store the freshly compiled image only on a true miss (`Absent`) AND only
     // when the source is small enough to be worth keeping (see `cdn_cacheable` —
     // a monster first-party bundle is excluded). A `NotReusable` entry means we
     // already decided this source can't be cached.
     let store_key = match lookup {
-        CdnLookup::Absent if cdn_cacheable(body.len()) => key,
+        CdnLookup::Absent if cdn_cacheable(body.len()) && !prepared_is_lazy => key,
         _ => None,
     };
 
@@ -1293,13 +1361,18 @@ fn run_external_classic(
     };
     let started = Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        // Suppress TRust lazy compilation when this compile's result will be
-        // dehydrated into the CDN image cache — a cached image cannot carry a
-        // lazy stub. (The `compile_raw` branch self-suppresses already, since
-        // its worker interner doesn't survive; the inline branch is only unsafe
-        // to defer when it gets imaged, so an uncached inline external still
-        // lazy-compiles against the persistent `Context` interner.)
+        // Suppress TRust lazy parsing + compilation when this compile's result
+        // will be dehydrated into the CDN image cache — a cached image cannot
+        // carry a lazy stub (a skipped/deferred body). `store_key.is_some()`
+        // already implies the worker (if any) parsed this eagerly
+        // (`cdn_cache_candidate` kept it off the lazy path AND `!prepared_is_lazy`
+        // gates the store), so this guard governs the page-thread compile:
+        // `compile_raw` no longer self-suppresses, so the guard suppresses its
+        // deferral here, and the inline branch parses + compiles eagerly. A
+        // non-candidate (uncached) external still lazily parses/compiles —
+        // delazify re-parses from the retained span, so no interner is needed.
         let _no_lazy = store_key.is_some().then(boa_engine::vm::lazy::suppress);
+        let _no_lazy_parse = store_key.is_some().then(boa_parser::lazy::suppress);
         // Obtain the compiled script: either compile the worker's raw parse
         // (parse was off-thread; `compile_raw` does scope-analysis + bytecode,
         // charged to Compile), or parse + compile inline.
@@ -5612,13 +5685,12 @@ fn load_page(
             .map(|n| n.get())
             .unwrap_or(8),
     );
-    // TRust lazy compilation (`TRUST_LAZY_PARSE`): enable deferral on this page
-    // thread before any of the page's own scripts compile. The prelude (next
-    // line) and the image-cached compiles self-suppress, so they stay eager.
-    boa_engine::vm::lazy::set_enabled(lazy_parse_on());
-    if let Some(n) = lazy_min() {
-        boa_engine::vm::lazy::set_min_source_len(n);
-    }
+    // TRust lazy parsing (default on; `TRUST_NO_LAZY_PARSE` disables): enable
+    // body-skip-at-parse and deferred compilation on this page thread before any
+    // of the page's own scripts load. The prelude (next line) and the
+    // image-cached compiles self-suppress, so they stay eager. The parallel-parse
+    // workers get the same setting per-job (see `dispatch_parallel_parse`).
+    set_lazy_enabled(lazy_parse_on());
     run_script(&mut ctx, "config", cfg.as_bytes(), &budget, &mut outcome);
     run_prelude(&mut ctx, &budget, &mut outcome);
     // Arm the function-execution census AFTER the prelude so it counts only the
@@ -14119,13 +14191,11 @@ mod tests {
             let cfg = r#"globalThis.__trust_cfg = { url: "https://www.youtube.com/", ua: "TRust/0.1", width: 1600, height: 800 };"#;
             ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
             ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
-            // TRust lazy compilation A/B: enable it (from `TRUST_LAZY_PARSE`)
-            // only for the BENCH bundle below — the prelude above already ran
-            // eagerly. Reset at the end of the run so it doesn't leak across runs.
-            boa_engine::vm::lazy::set_enabled(lazy_parse_on());
-            if let Some(n) = lazy_min() {
-                boa_engine::vm::lazy::set_min_source_len(n);
-            }
+            // TRust lazy parsing A/B: enable both halves (skip-at-parse +
+            // deferred compile, from `TRUST_LAZY_PARSE`) only for the BENCH
+            // bundle below — the prelude above already ran eagerly. Reset at the
+            // end of the run so it doesn't leak across runs.
+            set_lazy_enabled(lazy_parse_on());
             if no_opt {
                 ctx.set_optimizer_options(boa_engine::optimizer::OptimizerOptions::empty());
             }
@@ -14157,6 +14227,8 @@ mod tests {
             }
             boa_engine::vm::lazy::set_enabled(false);
             boa_engine::vm::lazy::reset_min_source_len();
+            boa_parser::lazy::set_enabled(false);
+            boa_parser::lazy::set_min_len(boa_parser::lazy::DEFAULT_MIN_LEN);
             let gc1 = boa_engine::gc::gc_profile();
             let outcome = match res {
                 Ok(Ok(_)) => "clean",
@@ -14322,14 +14394,20 @@ mod tests {
     // thread-local `vm::lazy` switch directly; `MIN` is dropped to 0 so even
     // tiny test functions clear the size gate.
 
-    /// RAII: enable lazy compilation with deferral size threshold `min` on this
-    /// thread, restoring the defaults on drop — so a panic can't leak the state
-    /// to a sibling test sharing the harness thread.
+    /// RAII: enable BOTH halves of lazy parsing — lazy *parsing* (skip bodies at
+    /// parse, `boa_parser::lazy`) and lazy *compilation* (defer bytecode,
+    /// `vm::lazy`) — with deferral/skip size threshold `min` on this thread,
+    /// restoring the defaults on drop so a panic can't leak the state to a
+    /// sibling test sharing the harness thread. Enabling both means every
+    /// behavioural test below validates the full pipeline (skip → stub →
+    /// delazify) against the eager path.
     struct LazyOn;
     impl LazyOn {
         fn with_min(min: usize) -> Self {
             boa_engine::vm::lazy::set_enabled(true);
             boa_engine::vm::lazy::set_min_source_len(min);
+            boa_parser::lazy::set_enabled(true);
+            boa_parser::lazy::set_min_len(min);
             LazyOn
         }
     }
@@ -14337,6 +14415,8 @@ mod tests {
         fn drop(&mut self) {
             boa_engine::vm::lazy::set_enabled(false);
             boa_engine::vm::lazy::reset_min_source_len();
+            boa_parser::lazy::set_enabled(false);
+            boa_parser::lazy::set_min_len(boa_parser::lazy::DEFAULT_MIN_LEN);
         }
     }
 
@@ -14495,10 +14575,14 @@ mod tests {
         ";
         let _g = LazyOn::with_min(0);
 
-        // Realm A: compile under suppression → eager block → detached image.
+        // Realm A: parse AND compile under suppression → eager block (no skipped
+        // or deferred body) → detached image. The image-cache paths suppress
+        // both halves, since a stub can be produced at parse *or* compile time.
         let mut ctx_a = boa_engine::Context::default();
-        let script_a =
-            boa_engine::Script::parse(Source::from_bytes(src), None, &mut ctx_a).unwrap();
+        let script_a = {
+            let _suppress_parse = boa_parser::lazy::suppress();
+            boa_engine::Script::parse(Source::from_bytes(src), None, &mut ctx_a).unwrap()
+        };
         let image = {
             let _suppress = lazy::suppress();
             script_a.codeblock(&mut ctx_a).unwrap().to_image()
@@ -14650,6 +14734,191 @@ mod tests {
             let lazy = eval(src, true);
             assert_eq!(eager, *expected, "eager fixture sanity failed for: {src}");
             assert_eq!(lazy, eager, "lazy re-parse diverged from eager for: {src}");
+        }
+    }
+
+    /// Lazy *parsing* (C2) must collect identifiers referenced through a
+    /// spread/rest `...x`, not skip them as member-access property names. A
+    /// deferred function that captures an enclosing binding ONLY via spread
+    /// relies on the scanner's reference superset to mark that binding
+    /// escaping; dropping it left the binding un-escaped, so the delazified
+    /// body read an empty environment and panicked (an env index out of
+    /// bounds). Each case must agree eager == lazy.
+    #[test]
+    fn lazy_scan_collects_spread_references() {
+        let eval = |src: &str, lazy_on: bool| -> f64 {
+            let _g = lazy_on.then(|| LazyOn::with_min(0));
+            let mut ctx = boa_engine::Context::default();
+            ctx.eval(Source::from_bytes(src.as_bytes()))
+                .unwrap()
+                .as_number()
+                .unwrap()
+        };
+        let cases: &[(&str, f64)] = &[
+            // Array spread of a captured param.
+            (
+                r"function host(arr){function inner(){return [...arr].length;}return inner();}host([1,2,3])",
+                3.0,
+            ),
+            // Call spread.
+            (
+                r"function host(arr){function inner(){return Math.max(...arr);}return inner();}host([1,5,2])",
+                5.0,
+            ),
+            // Object spread of a captured binding.
+            (
+                r"function host(o){function inner(){return {...o}.a;}return inner();}host({a:7})",
+                7.0,
+            ),
+            // Two spreads in one expression.
+            (
+                r"function host(a,b){function inner(){return [...a,...b].length;}return inner();}host([1],[2,3])",
+                3.0,
+            ),
+            // Member access still skips the property name; spread does not — the
+            // two must be disambiguated within one body.
+            (
+                r"function host(arr){function inner(){return arr.length + [...arr].length;}return inner();}host([1,2,3])",
+                6.0,
+            ),
+            // Rest parameter (a local, over-collected harmlessly) beside a spread
+            // capture of an enclosing binding.
+            (
+                r"function host(arr){function inner(...rest){return [...arr].length + rest.length;}return inner(9);}host([1,2,3])",
+                4.0,
+            ),
+        ];
+        for (src, expected) in cases {
+            let eager = eval(src, false);
+            assert_eq!(eager, *expected, "eager fixture sanity failed for: {src}");
+            assert_eq!(
+                eval(src, true),
+                eager,
+                "lazy diverged from eager for: {src}"
+            );
+        }
+    }
+
+    /// Phase C2 (skip at PARSE) — the scanner-specific paths the shared
+    /// behavioural fixtures don't exercise: a `with`/unqualified-`eval` body
+    /// (the scanner BAILS, so the body parses eagerly and stays correct), a
+    /// scanner-bail rollback (the cursor restores and the eager parse re-reads
+    /// the consumed prefix), a parenthesized IIFE wrapper (its body parses
+    /// eagerly — not skip-then-re-parse), and a sloppy-context function whose own
+    /// `"use strict"` body directive must still take effect after deferral. Each
+    /// must agree eager == lazy == hand-computed.
+    #[test]
+    fn lazy_parse_scan_specific_paths_stay_correct() {
+        let eval = |src: &str, lazy_on: bool| -> f64 {
+            let _g = lazy_on.then(|| LazyOn::with_min(0));
+            let mut ctx = boa_engine::Context::default();
+            ctx.eval(Source::from_bytes(src.as_bytes()))
+                .unwrap()
+                .as_number()
+                .unwrap()
+        };
+        let cases: &[(&str, f64)] = &[
+            // `with`: the scanner bails (enclosing bindings become dynamically
+            // reachable), so the body is parsed eagerly and resolves correctly.
+            (
+                r"function f(o) { with (o) { return x + y; } } f({ x: 1, y: 20 })",
+                21.0,
+            ),
+            // Unqualified `eval`: the scanner bails (it can reference any
+            // enclosing binding); the body parses eagerly.
+            (
+                r#"function g(s) { var local = 100; return eval(s) + local; } g("1 + 2")"#,
+                103.0,
+            ),
+            // A member `.eval` is NOT a direct eval — this body still skips, and
+            // delazifies correctly.
+            (
+                r#"var o = { eval: function (s) { return 7; } }; function h() { return o.eval("x") + 1; } h()"#,
+                8.0,
+            ),
+            // Scanner-bail rollback: a `}` immediately followed by `/` is the
+            // ambiguous case the scanner refuses; it must restore the cursor and
+            // the eager parse re-read the body (the regex below tests true).
+            (
+                r#"function amb(x) { if (x) {} return /a/.test("a") ? 7 : 0; } amb(1)"#,
+                7.0,
+            ),
+            // Parenthesized IIFE wrapper: runs immediately (its body is parsed
+            // eagerly, not skipped-then-re-parsed); a nested never-called helper
+            // inside still defers.
+            (
+                r"(function (n) { function helper() { return 999; } return n * 2; })(21)",
+                42.0,
+            ),
+            // A sloppy top-level script with a function whose OWN body opts into
+            // strict mode: after deferral, calling it must still see strict `this`
+            // (undefined, not the global object).
+            (
+                r"function strictThis() { 'use strict'; return this === undefined ? 5 : 0; } strictThis()",
+                5.0,
+            ),
+        ];
+        for (src, expected) in cases {
+            let eager = eval(src, false);
+            let lazy = eval(src, true);
+            assert_eq!(eager, *expected, "eager fixture sanity failed for: {src}");
+            assert_eq!(lazy, eager, "lazy diverged from eager for: {src}");
+        }
+    }
+
+    /// Phase C2 rollback: a body BELOW the size threshold (or one the scanner
+    /// bails on) is scanned, then the cursor is restored and the body parsed
+    /// eagerly. The restore must replay the consumed prefix byte-for-byte so the
+    /// eager parse sees identical source. Forced by an absurdly high threshold so
+    /// every function rolls back; must match the eager result across shapes with
+    /// nested braces, operators, and regex.
+    #[test]
+    fn lazy_parse_rollback_reparses_correctly() {
+        let eval = |src: &str, force_rollback: bool| -> f64 {
+            let _g = force_rollback.then(|| LazyOn::with_min(1_000_000));
+            let mut ctx = boa_engine::Context::default();
+            ctx.eval(Source::from_bytes(src.as_bytes()))
+                .unwrap()
+                .as_number()
+                .unwrap()
+        };
+        let cases: &[(&str, f64)] = &[
+            ("function a(){ return 1 + 2; } a()", 3.0),
+            (
+                "function loop(x){ var s=0; for(var i=0;i<x;i++){ s += i; } return s; } loop(4)",
+                6.0,
+            ),
+            (
+                "function nested(x){ if (x) { var o = { a: { b: 2 } }; return o.a.b; } return 0; } nested(1)",
+                2.0,
+            ),
+            (
+                r#"function re(){ return /a{1,2}/.test("aa") ? 9 : 0; } re()"#,
+                9.0,
+            ),
+            (
+                "function ops(a, b){ return a += b, a *= 2, a; } ops(3, 4)",
+                14.0,
+            ),
+            // NESTED rollback: a below-threshold outer function rolls back, and
+            // while its body is being re-read from the pushback the inner
+            // function ALSO rolls back. The inner body (earlier in source) must
+            // replay before the outer remainder still pending in the pushback.
+            (
+                "function makeAdder(base){ return function add(n){ return base + n; }; } makeAdder(5)(37)",
+                42.0,
+            ),
+            // Two-level nesting under rollback.
+            (
+                "function outer(a){ function mid(b){ function inner(c){ return a + b + c; } return inner; } return mid; } outer(1)(2)(3)",
+                6.0,
+            ),
+        ];
+        for (src, expected) in cases {
+            let eager = eval(src, false);
+            assert_eq!(eager, *expected, "eager fixture sanity failed for: {src}");
+            let rolled = eval(src, true);
+            assert_eq!(rolled, eager, "rollback diverged from eager for: {src}");
         }
     }
 
@@ -15679,6 +15948,96 @@ mod tests {
             last_via_parallel_parse(&sources).as_boolean(),
             Some(true),
             "tagged-template sites in separately parsed scripts must stay distinct"
+        );
+    }
+
+    /// Raw-parse `src` on a worker thread WITH lazy parsing on (threshold `min`),
+    /// exactly as `dispatch_parallel_parse` sets it per-job — the worker skips
+    /// eligible bodies, and the returned `RawScript` reports `was_lazy_parsed()`.
+    fn raw_parse_on_lazy_worker(
+        src: &str,
+        id: u32,
+        min: usize,
+    ) -> Result<boa_engine::RawScript, String> {
+        let owned = src.to_string();
+        std::thread::spawn(move || {
+            boa_parser::lazy::set_enabled(true);
+            boa_parser::lazy::set_min_len(min);
+            boa_engine::Script::raw_parse(Source::from_bytes(owned.as_bytes()), id)
+        })
+        .join()
+        .expect("parse worker panicked")
+    }
+
+    /// Parallel parse COMPOSES with lazy parse (the old either/or is gone): each
+    /// script raw-parses on a worker WITH bodies skipped, then `compile_raw`
+    /// stubs them on the page thread (it no longer force-suppresses deferral),
+    /// and delazify re-parses each from the retained span — so the dropped worker
+    /// interner never matters. The evaluated result must equal the eager
+    /// sequential path, AND a never-called function must stay deferred (proving
+    /// the worker skipped it and the page thread did not silently recompile it).
+    #[test]
+    fn parallel_parse_composes_with_lazy_parse() {
+        use boa_engine::vm::fn_census;
+
+        // Cross-script: `bump` is declared in script 1 and CALLED in script 3
+        // (it must delazify correctly across the boundary), `neverRun` is
+        // declared and never called (stays deferred), and the let/var slot
+        // ordering is the one the sequential test pins.
+        let sources = [
+            r#"globalThis.out = "";
+               var v = 10;
+               let lx = 5;
+               function bump(o){ return o.count + 1; }
+               function neverRun(){ return 999 + 1; }"#,
+            r#"var w = v + 20;
+               let ly = lx + 7;
+               const obj = { count: 100 };"#,
+            r#"[v, w, lx, ly, bump(obj)].join(",")"#,
+        ];
+
+        let eager = last_via_sequential_parse(&sources)
+            .as_string()
+            .unwrap()
+            .to_std_string_lossy();
+
+        let _g = LazyOn::with_min(0);
+        let mut ctx = Context::default();
+        fn_census::arm();
+        let mut last = JsValue::undefined();
+        for src in &sources {
+            let id = ctx.next_parser_identifier();
+            let raw = raw_parse_on_lazy_worker(src, id, 0).expect("raw parse");
+            assert!(raw.was_lazy_parsed(), "the worker parsed with lazy on");
+            let script = boa_engine::Script::compile_raw(raw, None, &mut ctx).expect("compile_raw");
+            last = script.evaluate(&mut ctx).expect("evaluate");
+        }
+        let census = fn_census::snapshot();
+        fn_census::disarm();
+        let parallel = last.as_string().unwrap().to_std_string_lossy();
+
+        assert_eq!(parallel, eager, "parallel+lazy must match eager sequential");
+        // 3 `<main>` blocks + `bump` (delazified on its call) compiled; `neverRun`
+        // never did — 4, vs the 5 the eager path compiles.
+        assert_eq!(
+            census.compiled_n, 4,
+            "a never-called worker-parsed fn must stay deferred: {census:?}"
+        );
+    }
+
+    /// The CDN-cache safety net's hinge: a `RawScript` reports whether its worker
+    /// skipped bodies, so `run_external_classic` can keep a lazy-parsed script
+    /// out of the image cache (a lazy stub can't be dehydrated into an image).
+    #[test]
+    fn was_lazy_parsed_reflects_the_worker_setting() {
+        let big = format!("function f(){{ return {}1; }}", "1+".repeat(80));
+        let lazy = raw_parse_on_lazy_worker(&big, 1, 0).unwrap();
+        assert!(lazy.was_lazy_parsed(), "a lazy worker flags its raw script");
+        // The default eager worker leaves its fresh thread-local off.
+        let eager = raw_parse_on_worker(&big, 1).unwrap();
+        assert!(
+            !eager.was_lazy_parsed(),
+            "an eager worker leaves the raw script unflagged"
         );
     }
 

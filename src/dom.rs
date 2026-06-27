@@ -832,14 +832,54 @@ impl Dom {
             .and_then(|p| self.custom_prop(p, name))
     }
 
-    /// Substitute every `var(--name, fallback)` in a CSS value with the
-    /// element's computed custom-property value (cascaded + inherited), falling
-    /// back to the (recursively resolved) fallback, then to empty when neither
-    /// exists. Balanced-paren aware so `var()` inside `calc()` and nested
-    /// `var()` both resolve. A no-op when the value has no `var(`.
+    /// Substitute `var(--name, fallback)` references in a CSS value to a plain
+    /// string — the public entry. Balanced-paren aware so `var()` inside
+    /// `calc()` and nested `var()` both resolve. A value that is *invalid at
+    /// computed-value time* (an undefined reference with no fallback, or one
+    /// that closes a dependency cycle) yields the empty string, which the
+    /// callers treat as unresolvable (skip baking it / expose `""`).
     fn resolve_vars(&self, id: NodeId, value: &str) -> String {
+        self.substitute_vars(id, value, &mut Vec::new())
+            .unwrap_or_default()
+    }
+
+    /// The computed value of custom property `name` on `id`, with its own
+    /// `var()` references substituted (CSS Variables L1). `active` is the set of
+    /// custom properties currently being resolved further up the call chain —
+    /// the resolution stack used to detect dependency cycles ("Resolving
+    /// Dependency Cycles"): a name already on it is a cycle, so we never recurse
+    /// into a property that is its own (in)direct ancestor and the walk always
+    /// terminates (each step either resolves a literal/fallback or pushes a new,
+    /// finite custom-property name).
+    fn resolve_custom_prop(&self, id: NodeId, name: &str, active: &mut Vec<String>) -> VarResult {
+        if active.iter().any(|n| n == name) {
+            return VarResult::Cycle;
+        }
+        let Some(raw) = self.custom_prop(id, name) else {
+            return VarResult::Undefined; // unset up the whole chain
+        };
+        active.push(name.to_owned());
+        let resolved = self.substitute_vars(id, &raw, active);
+        active.pop();
+        // A `None` here means the property's own value failed to substitute (it
+        // hit a cycle or a fallback-less undefined reference): it is invalid at
+        // computed-value time, i.e. the guaranteed-invalid value, which a
+        // referencing `var()` treats like an undefined property — its fallback
+        // applies. (The fallback within *this* property's own value was already
+        // honored or correctly skipped while substituting `raw`.)
+        match resolved {
+            Some(v) => VarResult::Resolved(v),
+            None => VarResult::Undefined,
+        }
+    }
+
+    /// Substitute every `var(--name, fallback)` in `value` against `id`'s
+    /// computed custom properties. Returns `None` when the value is *invalid at
+    /// computed-value time* — a `var()` references a guaranteed-invalid/undefined
+    /// property with no usable fallback, or it closes a dependency cycle.
+    fn substitute_vars(&self, id: NodeId, value: &str, active: &mut Vec<String>) -> Option<String> {
         if !value.contains("var(") {
-            return value.to_owned();
+            return Some(value.to_owned());
         }
         let mut out = String::new();
         let mut rest = value;
@@ -848,7 +888,7 @@ impl Dom {
             guard += 1;
             if guard > 64 {
                 out.push_str(rest);
-                return out;
+                return Some(out);
             }
             out.push_str(&rest[..pos]);
             let after = &rest[pos + 4..];
@@ -870,23 +910,31 @@ impl Dom {
             }
             let Some(end) = end else {
                 out.push_str(&rest[pos..]); // unbalanced: leave as-is
-                return out;
+                return Some(out);
             };
             let inner = &after[..end];
             let (name, fallback) = match inner.split_once(',') {
                 Some((n, f)) => (n.trim(), Some(f.trim())),
                 None => (inner.trim(), None),
             };
-            let resolved = self
-                .custom_prop(id, name)
-                .or_else(|| fallback.map(str::to_owned))
-                .map(|v| self.resolve_vars(id, &v))
-                .unwrap_or_default();
-            out.push_str(&resolved);
+            match self.resolve_custom_prop(id, name, active) {
+                VarResult::Resolved(v) => out.push_str(&v),
+                // A dependency cycle: every property in it is invalid at
+                // computed-value time, and — unlike a plain undefined reference
+                // — its fallback is NOT consulted (CSS Variables L1 §3). The
+                // whole value is invalid.
+                VarResult::Cycle => return None,
+                // Guaranteed-invalid / undefined target: substitute the
+                // fallback if present, else this value is invalid.
+                VarResult::Undefined => match fallback {
+                    Some(f) => out.push_str(&self.substitute_vars(id, f, active)?),
+                    None => return None,
+                },
+            }
             rest = &after[end + 1..];
         }
         out.push_str(rest);
-        out
+        Some(out)
     }
 
     /// The resolved `content` text for an element's `::before`/`::after`
@@ -2435,6 +2483,20 @@ fn escape_attr(s: &str) -> Cow<'_, str> {
 pub struct SelectorList(Vec<Complex>);
 
 struct Complex(Vec<(Combinator, Compound)>);
+
+/// The outcome of resolving a custom property's value during `var()`
+/// substitution (CSS Variables L1 §3). `Resolved` carries its substituted
+/// value; `Undefined` is the guaranteed-invalid value — the property is unset,
+/// or became invalid at computed-value time — for which a referencing `var()`
+/// uses its fallback; `Cycle` means the reference closes a dependency cycle (it
+/// points back at a custom property still being resolved further up the stack),
+/// which makes every property in the cycle invalid at computed-value time
+/// *without* consulting their fallbacks.
+enum VarResult {
+    Resolved(String),
+    Undefined,
+    Cycle,
+}
 
 #[derive(PartialEq)]
 enum Combinator {
@@ -5687,6 +5749,52 @@ mod tests {
         assert!(
             dom.serialize(c).contains("min-width:16rem"),
             "undefined --cell uses the fallback"
+        );
+    }
+
+    #[test]
+    fn cyclic_custom_property_is_invalid_at_computed_value_time() {
+        // CSS Variables L1 §3 "Resolving Dependency Cycles": a custom property
+        // that references itself (Vector-2022 ships
+        // `--font-size-medium: var(--font-size-medium, 1rem)`) is invalid at
+        // computed-value time. WITHOUT cycle detection this recurses until the
+        // 64MB `trust-page` stack aborts (the telewiki.miraheze.org/wiki/Users
+        // crash). Strict spec: the cyclic property is the guaranteed-invalid
+        // value, so a *downstream* reference WITH a fallback uses its own
+        // fallback — and the cyclic property's own fallback is NOT consulted.
+        let dom = Dom::parse_document(
+            "<body><div id=root style=\"--cell: var(--cell, 9rem)\">\
+             <p id=c style=\"min-width: var(--cell, 16rem)\">x</p></div></body>",
+        );
+        let c = dom.get_by_id("c").unwrap();
+        let html = dom.serialize(c); // must terminate, not stack-overflow
+        assert!(
+            html.contains("min-width:16rem"),
+            "self-cyclic --cell is invalid → downstream fallback (16rem), not its own (9rem): {html}"
+        );
+
+        // A mutual cycle (`--a` ⇄ `--b`) is the same: both invalid, so the
+        // reference's own fallback wins.
+        let dom = Dom::parse_document(
+            "<head><style>:root{--a:var(--b);--b:var(--a)}</style></head>\
+             <body><p id=c style=\"min-width: var(--a, 5rem)\">x</p></body>",
+        );
+        let c = dom.get_by_id("c").unwrap();
+        assert!(
+            dom.serialize(c).contains("min-width:5rem"),
+            "mutually cyclic --a/--b are invalid → the reference's fallback (5rem) is used"
+        );
+
+        // A non-cyclic chain still resolves fully (regression guard: the
+        // resolution stack must not flag a legitimate A→B→literal as a cycle).
+        let dom = Dom::parse_document(
+            "<head><style>:root{--a:var(--b);--b:7rem}</style></head>\
+             <body><p id=c style=\"min-width: var(--a, 5rem)\">x</p></body>",
+        );
+        let c = dom.get_by_id("c").unwrap();
+        assert!(
+            dom.serialize(c).contains("min-width:7rem"),
+            "an acyclic --a→--b→7rem chain resolves to 7rem"
         );
     }
 

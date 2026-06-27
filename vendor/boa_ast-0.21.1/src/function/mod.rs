@@ -38,7 +38,7 @@ pub use arrow_function::ArrowFunction;
 pub use async_arrow_function::AsyncArrowFunction;
 pub use async_function::{AsyncFunctionDeclaration, AsyncFunctionExpression};
 pub use async_generator::{AsyncGeneratorDeclaration, AsyncGeneratorExpression};
-use boa_interner::{Interner, ToIndentedString};
+use boa_interner::{Interner, Sym, ToIndentedString};
 pub use class::{
     ClassDeclaration, ClassElement, ClassElementName, ClassExpression, ClassFieldDefinition,
     ClassMethodDefinition, PrivateFieldDefinition, PrivateName, StaticBlockBody,
@@ -67,6 +67,57 @@ use crate::{
 pub struct FunctionBody {
     pub(crate) statements: StatementList,
     span: Span,
+
+    /// Lazy-parse metadata (TRust lazy parsing). `Some` iff this body was
+    /// *skipped* at parse time: its statements were never built (so `statements`
+    /// is empty) and only the body's matching-brace boundary, its free-variable
+    /// reference superset, and its directive-prologue strictness were recorded.
+    /// The owning function is compiled to a lazy stub and re-parsed from its
+    /// source span on first call. `None` for an ordinarily-parsed body.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "arbitrary", arbitrary(value = None))]
+    lazy: Option<Box<LazyBody>>,
+}
+
+/// The metadata recorded for a function body skipped at parse time (TRust lazy
+/// parsing). See [`FunctionBody::lazy`].
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LazyBody {
+    /// A conservative SUPERSET of the identifiers the body references (the lazy
+    /// scanner over-collects: object keys, labels, and the body's own locals may
+    /// appear; member-access names after `.`/`?.` and keywords do not). The
+    /// scope analyzer replays these via the enclosing body scope's
+    /// `access_binding` to mark enclosing bindings escaping without walking the
+    /// (absent) body — over-collection only over-escapes a binding, which is
+    /// safe. Interned against the parser's interner.
+    idents: Box<[Sym]>,
+    /// Whether the body's directive prologue contains an exact `"use strict"`
+    /// directive (so the function's effective strictness is correct before the
+    /// body is re-parsed). The scanner detects it during the skip.
+    strict: bool,
+    /// The linear (UTF-16 code-unit) position just past the body's closing `}`.
+    /// The owning function's `linear_span` unions its start with this, and that
+    /// span is what slices the function's source for the first-call re-parse —
+    /// so it must be the real body end, not the empty statement list's default.
+    linear_end: LinearPosition,
+}
+
+impl LazyBody {
+    /// The captured free-variable reference superset (see the field docs).
+    #[inline]
+    #[must_use]
+    pub fn idents(&self) -> &[Sym] {
+        &self.idents
+    }
+
+    /// Whether the skipped body's directive prologue declared `"use strict"`.
+    #[inline]
+    #[must_use]
+    pub const fn strict(&self) -> bool {
+        self.strict
+    }
 }
 
 impl FunctionBody {
@@ -74,7 +125,51 @@ impl FunctionBody {
     #[inline]
     #[must_use]
     pub fn new(statements: StatementList, span: Span) -> Self {
-        Self { statements, span }
+        Self {
+            statements,
+            span,
+            lazy: None,
+        }
+    }
+
+    /// Creates a `FunctionBody` AST node for a body *skipped* at parse time
+    /// (TRust lazy parsing). The statement list is empty; `idents` is the
+    /// captured reference superset, `strict` the directive-prologue strictness,
+    /// and `linear_end` the linear position past the body's `}` (the empty
+    /// statement list has none, but the owning function's source span needs it).
+    /// See [`FunctionBody::lazy`].
+    #[inline]
+    #[must_use]
+    pub fn new_lazy(
+        idents: Box<[Sym]>,
+        strict: bool,
+        linear_end: LinearPosition,
+        span: Span,
+    ) -> Self {
+        Self {
+            statements: StatementList::default(),
+            span,
+            lazy: Some(Box::new(LazyBody {
+                idents,
+                strict,
+                linear_end,
+            })),
+        }
+    }
+
+    /// The lazy-parse metadata if this body was skipped at parse time, else
+    /// `None`. See [`FunctionBody::lazy`].
+    #[inline]
+    #[must_use]
+    pub fn lazy(&self) -> Option<&LazyBody> {
+        self.lazy.as_deref()
+    }
+
+    /// Whether this body was skipped at parse time (TRust lazy parsing).
+    #[inline]
+    #[must_use]
+    pub const fn is_lazy(&self) -> bool {
+        self.lazy.is_some()
     }
 
     /// Gets the list of statements.
@@ -92,17 +187,33 @@ impl FunctionBody {
     }
 
     /// Get the strict mode.
+    ///
+    /// For a body skipped at parse time (TRust lazy parsing) the statement list
+    /// is empty, so the effective strictness is the directive-prologue
+    /// strictness the scanner recorded; otherwise it is the parsed statement
+    /// list's.
     #[inline]
     #[must_use]
-    pub const fn strict(&self) -> bool {
-        self.statements.strict()
+    pub fn strict(&self) -> bool {
+        match &self.lazy {
+            Some(lazy) => lazy.strict,
+            None => self.statements.strict(),
+        }
     }
 
     /// Get end of linear position in source code.
+    ///
+    /// For a body skipped at parse time (TRust lazy parsing) the statement list
+    /// is empty, so the recorded body-end position is returned instead — the
+    /// owning function's `linear_span` (and thus its re-parse source slice)
+    /// depends on it.
     #[inline]
     #[must_use]
-    pub const fn linear_pos_end(&self) -> LinearPosition {
-        self.statements.linear_pos_end()
+    pub fn linear_pos_end(&self) -> LinearPosition {
+        match &self.lazy {
+            Some(lazy) => lazy.linear_end,
+            None => self.statements.linear_pos_end(),
+        }
     }
 }
 

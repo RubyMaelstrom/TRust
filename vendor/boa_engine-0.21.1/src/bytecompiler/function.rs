@@ -124,6 +124,15 @@ impl FunctionCompiler {
         contains_direct_eval: bool,
         interner: &mut Interner,
     ) -> Gc<CodeBlock> {
+        // A body skipped at parse time (TRust lazy *parsing*) has no statements
+        // and can only be stubbed via `compile_or_lazy`; it must never reach the
+        // eager `compile`. The eager-IIFE path guards on `!body.is_lazy()` and
+        // the delazify re-parse forces its outermost body eager, so this holds.
+        debug_assert!(
+            !body.is_lazy(),
+            "a lazily-skipped function body must be stubbed, never eagerly compiled"
+        );
+
         self.strict = self.strict || body.strict();
 
         let length = parameters.length();
@@ -276,7 +285,12 @@ impl FunctionCompiler {
         contains_direct_eval: bool,
         interner: &mut Interner,
     ) -> Gc<CodeBlock> {
-        if self.is_lazy_eligible(contains_direct_eval) {
+        // A body skipped at parse time (TRust lazy *parsing*) carries no
+        // statements, so it MUST be stubbed regardless of the compile-time
+        // eligibility heuristics — its real body is recovered by re-parsing the
+        // retained span on first call. An ordinarily-parsed body defers only
+        // when `is_lazy_eligible` (TRust lazy *compilation*).
+        if body.is_lazy() || self.is_lazy_eligible(contains_direct_eval) {
             self.compile_lazy_stub(parameters, body, variable_environment, lexical_environment)
         } else {
             self.compile(
@@ -441,14 +455,22 @@ impl LazyFunctionData {
     /// identifiers resolve to the same names the retained scopes were keyed by
     /// (scopes key bindings by `JsString`). `parser_identifier` makes any
     /// tagged-template call sites in the body unique within the page.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if re-parsing or re-analyzing source the eager parse already
-    /// accepted fails — a bug in span extraction. On the page thread this is
-    /// caught by the `trust-*` panic hook and degrades the page (`·JS:n!`)
-    /// rather than aborting.
     pub(crate) fn compile(&self, interner: &mut Interner, parser_identifier: u32) -> Gc<CodeBlock> {
+        self.try_compile(interner, parser_identifier)
+            .unwrap_or_else(|| self.compile_throwing_fallback(interner, parser_identifier))
+    }
+
+    /// Re-parse, re-analyze, and compile the deferred function. Returns `None`
+    /// if the re-parse or re-analysis fails.
+    ///
+    /// With lazy *compilation* (C1) the body was eager-parsed before being
+    /// dropped, so this never fails. With lazy *parsing* (C2) the body was only
+    /// brace-scanned, not validated, so a body the scanner accepted but that is
+    /// not in fact valid JS (which the eager parser would have rejected at load,
+    /// and which never occurs in a page that loaded) fails here; the caller then
+    /// compiles a throwing fallback so the error surfaces at call time rather
+    /// than aborting.
+    fn try_compile(&self, interner: &mut Interner, parser_identifier: u32) -> Option<Gc<CodeBlock>> {
         let code_points = self
             .spanned_source_text
             .to_code_points()
@@ -459,15 +481,13 @@ impl LazyFunctionData {
             parser.set_strict();
         }
         parser.set_identifier(parser_identifier);
-        let (mut function, reparsed_source) = parser
-            .parse_function_expression(interner)
-            .expect("re-parsing a lazy function whose source the eager parse accepted cannot fail");
+        let (mut function, reparsed_source) = parser.parse_function_expression(interner).ok()?;
 
         function.set_has_binding_identifier(self.has_binding_identifier);
 
         function
             .analyze_scope(self.strict, &self.lexical_environment, interner)
-            .expect("re-analyzing a lazy function the eager pass already analyzed cannot fail");
+            .ok()?;
 
         // The re-parse's AST spans are relative to the EXTRACTED function source,
         // so the compiled block (and any nested function it defers in turn) must
@@ -476,11 +496,58 @@ impl LazyFunctionData {
         // functions' source out of the wrong coordinate system.
         let spanned_source_text = SpannedSourceText::from_full_source(reparsed_source);
 
-        FunctionCompiler {
+        let block = FunctionCompiler {
             name: self.name.clone(),
             generator: false,
             r#async: false,
             strict: self.strict,
+            arrow: false,
+            method: false,
+            in_with: false,
+            force_function_scope: false,
+            name_scope: function.name_scope().cloned(),
+            spanned_source_text,
+            source_path: self.source_path.clone(),
+        }
+        .compile(
+            function.parameters(),
+            function.body(),
+            self.variable_environment.clone(),
+            self.lexical_environment.clone(),
+            function.scopes(),
+            function.contains_direct_eval(),
+            interner,
+        );
+        Some(block)
+    }
+
+    /// Compile a stand-in whose body throws a `SyntaxError` on call, for the rare
+    /// case ([`try_compile`](Self::try_compile)) of a lazily-*parsed* body the
+    /// scanner accepted but the parser rejects. Keeps the function's name; its
+    /// synthetic source is always valid, so this cannot itself fail.
+    fn compile_throwing_fallback(
+        &self,
+        interner: &mut Interner,
+        parser_identifier: u32,
+    ) -> Gc<CodeBlock> {
+        const FALLBACK: &str =
+            "function(){throw new SyntaxError('deferred function body failed to parse')}";
+        let code_points: Vec<u16> = FALLBACK.encode_utf16().collect();
+        let mut parser = Parser::new(Source::from_utf16(&code_points));
+        parser.set_identifier(parser_identifier);
+        let (mut function, reparsed_source) = parser
+            .parse_function_expression(interner)
+            .expect("the synthetic fallback source is always valid");
+        function.set_has_binding_identifier(false);
+        function
+            .analyze_scope(false, &self.lexical_environment, interner)
+            .expect("the synthetic fallback source always analyzes");
+        let spanned_source_text = SpannedSourceText::from_full_source(reparsed_source);
+        FunctionCompiler {
+            name: self.name.clone(),
+            generator: false,
+            r#async: false,
+            strict: false,
             arrow: false,
             method: false,
             in_with: false,

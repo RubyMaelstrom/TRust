@@ -267,6 +267,24 @@ where
         Ok(res_token)
     }
 
+    /// Attempt an in-place lazy function-body skip (TRust lazy parsing). Only
+    /// valid when the token peek buffer is empty — the caller has just consumed
+    /// the body's opening `{`, so the underlying char cursor sits exactly at the
+    /// first body code point. Returns `None` (caller parses eagerly) if a token
+    /// is buffered ahead or the scan bails; on success advances `last_linear_pos`
+    /// to the body's end.
+    pub(super) fn scan_lazy_function_body(
+        &mut self,
+        min_len: usize,
+    ) -> Option<crate::lexer::LazyBodyScan> {
+        if self.read_index != self.write_index {
+            return None; // a token is buffered ahead; cannot scan at char level
+        }
+        let scan = self.lexer.scan_lazy_function_body(min_len)?;
+        self.last_linear_pos = scan.end_linear;
+        Some(scan)
+    }
+
     /// Gets current linear position in the source code.
     #[inline]
     pub(super) fn linear_pos(&self) -> LinearPosition {

@@ -309,6 +309,18 @@ where
         self.buffered_lexer.linear_pos()
     }
 
+    /// Attempt an in-place lazy function-body skip (TRust lazy parsing). The
+    /// caller must have just consumed the body's opening `{` (so no token is
+    /// buffered ahead). Returns `None` if the scan bails or is ineligible, in
+    /// which case the cursor is unchanged and the caller parses the body
+    /// eagerly. See [`crate::lazy_scan`].
+    pub(super) fn scan_lazy_function_body(
+        &mut self,
+        min_len: usize,
+    ) -> Option<crate::lexer::LazyBodyScan> {
+        self.buffered_lexer.scan_lazy_function_body(min_len)
+    }
+
     pub(super) fn take_source(&mut self) -> boa_ast::SourceText {
         self.buffered_lexer.take_source()
     }

@@ -435,6 +435,11 @@ pub(in crate::parser) struct FunctionStatementList {
     allow_await: AllowAwait,
     context: &'static str,
     parse_full_input: bool,
+    /// Whether this body is eligible for TRust lazy *parsing* (skipping it at
+    /// parse time; see [`crate::lazy_scan`]). Set only by the ordinary function
+    /// declaration / expression parsers — generators, async functions, arrows,
+    /// methods, getters/setters, and constructors keep the exact eager path.
+    allow_lazy: bool,
 }
 
 impl FunctionStatementList {
@@ -453,12 +458,19 @@ impl FunctionStatementList {
             allow_await: allow_await.into(),
             context,
             parse_full_input: false,
+            allow_lazy: false,
         }
     }
 
     /// Try to consume the whole input, not expecting open/closing parentheses.
     pub(in crate::parser) fn parse_full_input(&mut self, parse_full_input: bool) {
         self.parse_full_input = parse_full_input;
+    }
+
+    /// Mark this body eligible for TRust lazy parsing (ordinary functions only).
+    pub(in crate::parser) const fn allow_lazy(mut self, allow_lazy: bool) -> Self {
+        self.allow_lazy = allow_lazy;
+        self
     }
 }
 
@@ -469,6 +481,11 @@ where
     type Output = AstFunctionBody;
 
     fn parse(self, cursor: &mut Cursor<R>, interner: &mut Interner) -> ParseResult<Self::Output> {
+        // Consume the one-shot eager-next-body flag for THIS body (TRust lazy
+        // parsing). Always taken, even for non-skippable bodies, so a flag set
+        // before a parenthesized generator/method is cleared by it rather than
+        // leaking to an unrelated later function.
+        let force_eager_body = crate::lazy::take_eager_next_body();
         let start = if self.parse_full_input {
             cursor
                 .peek(0, interner)?
@@ -479,6 +496,32 @@ where
                 .span()
                 .start()
         };
+
+        // TRust lazy *parsing*: skip an eligible ordinary function body in place
+        // (find its matching `}` + capture its reference superset without
+        // building the statement AST), to be re-parsed from its source span on
+        // first call. The opening `{` is already consumed, so the cursor sits at
+        // the first body code point. A scanner bail (uncertainty, `with`,
+        // unqualified `eval`, or a body below the size threshold) restores the
+        // cursor and falls through to the eager parse below.
+        if self.allow_lazy
+            && !force_eager_body
+            && !self.parse_full_input
+            && crate::lazy::enabled()
+            && let Some(scan) = cursor.scan_lazy_function_body(crate::lazy::min_len())
+        {
+            let idents: Vec<Sym> = scan
+                .idents
+                .iter()
+                .map(|cps| interner.get_or_intern(&code_points_to_utf16(cps)[..]))
+                .collect();
+            return Ok(AstFunctionBody::new_lazy(
+                idents.into_boxed_slice(),
+                scan.body_strict,
+                scan.end_linear,
+                Span::new(start, scan.end_pos),
+            ));
+        }
 
         let (body, end) = StatementList::new(
             self.allow_yield,
@@ -515,4 +558,20 @@ where
 
         Ok(AstFunctionBody::new(body, Span::new(start, end)))
     }
+}
+
+/// Encode a code-point slice (from the lazy body scanner) as UTF-16 code units
+/// for interning. Mirrors `SourceText::collect_code_point`'s surrogate split.
+fn code_points_to_utf16(cps: &[u32]) -> Vec<u16> {
+    let mut out = Vec::with_capacity(cps.len());
+    for &cp in cps {
+        if let Ok(cu) = u16::try_from(cp) {
+            out.push(cu);
+        } else {
+            let cp = cp - 0x1_0000;
+            out.push((cp / 0x400 + 0xD800) as u16);
+            out.push((cp % 0x400 + 0xDC00) as u16);
+        }
+    }
+    out
 }

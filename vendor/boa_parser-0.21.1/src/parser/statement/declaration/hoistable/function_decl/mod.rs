@@ -68,6 +68,11 @@ impl CallableDeclaration for FunctionDeclaration {
     fn body_allow_await(&self) -> bool {
         false
     }
+    fn lazy_eligible_body(&self) -> bool {
+        // Ordinary function declarations are the one declaration kind eligible
+        // for TRust lazy parsing.
+        true
+    }
 }
 
 impl<R> TokenParser<R> for FunctionDeclaration
