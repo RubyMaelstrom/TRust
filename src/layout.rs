@@ -70,6 +70,27 @@ pub type ImageSizes = HashMap<String, (u16, u16)>;
 /// translates it up through nested sub-layouts.
 type ElementTops = HashMap<NodeId, (u16, u16)>;
 
+/// Incremental-layout boundary capture (INCREMENTAL_LAYOUT_PLAN.md §14), keyed
+/// by the boundary's PARSE `NodeId`: the live actor id (`data-trust-node`), the
+/// outer band it fills (`content_width`, `origin_col`), and its row span
+/// (`start_row..end_row`, this layout's coordinate space — `blit` translates and
+/// `finish` remaps through the blank-row collapse, exactly like `ElementTops`).
+/// Only populated when `capture_boundaries` is set (the live full render).
+#[derive(Clone, Copy)]
+struct BoundaryRec {
+    node: usize,
+    content_width: u16,
+    origin_col: u16,
+    start_row: usize,
+    end_row: usize,
+}
+
+type BoundaryRecs = HashMap<NodeId, BoundaryRec>;
+
+/// The CLIP box `(live_node, client_h_rows, client_w_cells)` of every
+/// definite-height scroll-y box flowed (region or fitting). See `Doc.scroll_clips`.
+type ScrollClips = Vec<(usize, u16, u16)>;
+
 /// Sentinel `NodeId` for an item that came from no single element
 /// (synthesized text like list markers).
 pub const NO_NODE: NodeId = usize::MAX;
@@ -318,6 +339,112 @@ impl Carousel {
     }
 }
 
+/// A VERTICAL inner-scroll viewport (CSS `overflow-y: auto|scroll` on a
+/// definite-height box — a scroll container per CSS Overflow L3). Unlike a
+/// `Carousel` (which scrolls a NON-indexing axis and keeps all its items in
+/// real doc rows), a vertical region scrolls the same axis the document is
+/// indexed by and must show FEWER rows than its content holds. So it cannot
+/// keep its content inline — the layout reserves exactly `height` BLANK doc
+/// rows at the region's flow position (the document stays flat, so the
+/// scroll/selection INDEX MATH is untouched, exactly the property the carousel
+/// relies on) and stashes the full content in `buffer` (its own laid rows).
+/// The renderer draws `buffer[voffset + local]` clipped to the band
+/// `[left, left+width)` for each screen row inside the region's band; scrolling
+/// only changes `voffset` and re-blits the retained buffer — it never re-runs
+/// layout. The scrollport is the box's padding box (CSS Overflow L3 §2); the
+/// scroll origin is the top, so a fresh region's `voffset` is 0 (CSSOM View).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Region {
+    /// The scroll-container element, for re-anchoring `voffset` across the
+    /// chat's per-message re-layout and (Phase 3) `element.scrollTop`.
+    pub node: NodeId,
+    /// First reserved doc row — the top of the scrollport band.
+    pub start_row: usize,
+    /// On-screen left column of the scrollport (cells).
+    pub left: u16,
+    /// Scrollport width (cells) — the band the buffer is clipped to.
+    pub width: u16,
+    /// Reserved doc rows / the scrollport's visible height (`clientHeight`).
+    pub height: u16,
+    /// The full scrollable content, laid at `width`. `buffer.len()` is the
+    /// scrollable overflow height (`scrollHeight`).
+    pub buffer: Vec<Row>,
+    /// Current vertical scroll position in rows (CSSOM `scrollTop`, clamped to
+    /// `[0, max_voffset()]`). Seeded from the page's baked `data-trust-scroll-top`
+    /// signal (Phase 3) when present, else 0 (the top — CSSOM scroll origin).
+    pub voffset: usize,
+    /// The resident page actor's node id for this scroll container (from the
+    /// baked `data-trust-node`), so the app can correlate this re-parsed region
+    /// with the live element for the geometry round-trip + wheel write-back
+    /// (Phase 3). `None` for a static (no-engine) page's region.
+    pub live_node: Option<usize>,
+    /// Whether `voffset` came from the page's own `element.scrollTop` signal this
+    /// layout (the baked `data-trust-scroll-top`). When true, `carry_region_
+    /// offsets` keeps it — the page dictated the position (a chat pinning to the
+    /// bottom); when false, the user's wheel offset is restored across re-layout.
+    pub voffset_from_page: bool,
+    /// Carousels found inside the buffer (buffer-relative). Kept for Phase 4
+    /// carousel-in-region composition; the Phase 1 render doesn't apply them.
+    pub carousels: Vec<Carousel>,
+}
+
+impl Region {
+    /// Whether a doc row index falls inside this region's reserved band.
+    pub fn contains_row(&self, row: usize) -> bool {
+        row >= self.start_row && row < self.start_row + self.height as usize
+    }
+
+    /// Whether on-screen content-column `col` (content-area-relative — the same
+    /// space as `left`) falls inside the scrollport band, i.e. the cursor is
+    /// over this region.
+    pub fn contains_col(&self, col: u16) -> bool {
+        col >= self.left && col < self.left + self.width
+    }
+
+    /// The furthest the content can scroll: `scrollHeight − clientHeight`
+    /// (CSSOM View — the `scrollTop`/`voffset` upper clamp bound).
+    pub fn max_voffset(&self) -> usize {
+        self.buffer.len().saturating_sub(self.height as usize)
+    }
+
+    /// Scroll the window by `delta` rows, clamped to `[0, max_voffset]`.
+    /// Returns whether `voffset` actually moved (`false` = already at that
+    /// boundary). The wheel/page handlers TRAP a scroll inside the hovered
+    /// region regardless, so a boundary scroll is simply absorbed (never chains
+    /// to the page) — her call, `overscroll-behavior: contain`.
+    pub fn scroll_by(&mut self, delta: i64) -> bool {
+        let next = (self.voffset as i64 + delta).clamp(0, self.max_voffset() as i64) as usize;
+        let moved = next != self.voffset;
+        self.voffset = next;
+        moved
+    }
+}
+
+/// An independent-formatting-context boundary that lays its content INLINE in
+/// `Doc.rows` — the cache entry for incremental layout's general subtree splice
+/// (INCREMENTAL_LAYOUT_PLAN.md §14). Captured during a full render so a live
+/// `Patched{node}` whose boundary matches can re-lay ONLY that subtree and
+/// splice it back in place (Tier 1) or splice+shift+scroll-anchor (Tier 2),
+/// leaving the rest of the document identity. v1 captures only BLOCK-FILLING
+/// IFC containers (`display:flow-root`/`flex`/`grid`, not a flex/grid item,
+/// in-flow, not a scroll/clip region) — boxes whose outer width is their
+/// containing block's (width-stable by construction), so the splice never
+/// reflows anything outside the band.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundaryBox {
+    /// The live actor node id (baked as `data-trust-node`) — the app maps a
+    /// `Patched{node}` to this cached box.
+    pub node: usize,
+    /// The rows in `Doc.rows` this boundary's content occupies (`start..end`).
+    pub row_range: std::ops::Range<usize>,
+    /// The left edge (cells) of the band the boundary fills — where the re-laid
+    /// fragment's column 0 maps when spliced back.
+    pub origin_col: u16,
+    /// The outer content band (cells) the boundary fills — the width fed to
+    /// `layout_subtree_inner` so the re-laid fragment wraps identically.
+    pub content_width: u16,
+}
+
 /// The on-screen column for an item in doc row `row`, applying any carousel
 /// scroll offset and clipping. `None` means the item is scrolled out of its
 /// carousel's band (don't draw it). Items left of a carousel's band (a
@@ -373,6 +500,49 @@ pub fn visual_columns(row: &Row, carousels: &[Carousel], row_idx: usize) -> Vec<
     out
 }
 
+/// The effective items for document row `row_idx`, merging any scroll-`Region`
+/// buffer window over the row's reserved band. Returns the BORROWED doc row
+/// when no region covers it (the overwhelming common case — no allocation),
+/// else an OWNED row = the doc row's own items (page content beside the region,
+/// e.g. the video player left of the chat) PLUS the region's windowed buffer
+/// row (`buffer[voffset + local]`), each item clipped to the scrollport `width`
+/// and shifted right into the band by `left`. The renderer and (Phase 2) the
+/// hit-test share this so region content draws — and becomes selectable —
+/// exactly where it lands. The reserved doc rows are blank in the region's
+/// band, so the merge never collides with page content there.
+pub fn effective_row<'a>(
+    rows: &'a [Row],
+    regions: &'a [Region],
+    row_idx: usize,
+) -> std::borrow::Cow<'a, Row> {
+    use std::borrow::Cow;
+    let row = &rows[row_idx];
+    if !regions.iter().any(|rg| rg.contains_row(row_idx)) {
+        return Cow::Borrowed(row);
+    }
+    let mut merged = row.clone();
+    for rg in regions.iter().filter(|rg| rg.contains_row(row_idx)) {
+        let buf_idx = rg.voffset + (row_idx - rg.start_row);
+        let Some(brow) = rg.buffer.get(buf_idx) else {
+            continue; // past the content tail: the band shows blank here
+        };
+        for it in &brow.items {
+            if it.col >= rg.width {
+                continue; // beyond the scrollport's right edge: clipped away
+            }
+            let mut it = it.clone();
+            let max_w = rg.width - it.col;
+            if it.width > max_w {
+                it.width = max_w;
+                it.text = it.text.chars().take(max_w as usize).collect();
+            }
+            it.col += rg.left;
+            merged.items.push(it);
+        }
+    }
+    Cow::Owned(merged)
+}
+
 /// How far above the scroll top to look for an image whose box reaches down
 /// into the viewport (a tall banner scrolled partly off the top). Bounds the
 /// per-frame back-scan; an image taller than this many cells (~5000px) is not
@@ -395,6 +565,11 @@ struct LaidBox {
     /// translates and propagates them so a carousel inside a float/flex
     /// column still reaches the document.
     carousels: Vec<Carousel>,
+    /// Scroll regions found inside this box (`start_row`/`left` relative to its
+    /// top-left; the buffer is position-independent); `blit` translates and
+    /// propagates them so a region inside a float/flex/abspos sub-layout (the
+    /// chat column) still reaches the document.
+    regions: Vec<Region>,
     /// Recorded flow positions of EMPTY elements inside this box (measure
     /// pass only — `tag_all_nodes`), relative to its top-left; `blit`
     /// translates and propagates them so a boxless element nested in a
@@ -402,6 +577,11 @@ struct LaidBox {
     /// IntersectionObserver sentinel hidden in a web component's positioned
     /// shadow subtree). Empty for the render path.
     element_tops: ElementTops,
+    /// Incremental-layout boundaries found inside this box (relative to its
+    /// top-left); `blit` translates and propagates them so a boundary nested in
+    /// a float/flex/grid/abspos sub-layout reaches the document. Empty unless
+    /// `capture_boundaries` is set.
+    boundary_boxes: BoundaryRecs,
 }
 
 /// A cell placed in a table grid (CSS 2.1 §17.5): its element and the
@@ -455,26 +635,198 @@ pub fn lay_out(
     images: &ImageSizes,
     borders: bool,
 ) -> Vec<Row> {
-    lay_out_with_carousels(dom, base, width, forms, controls, images, borders).0
+    // Test helper: viewport height defaults to 0 (unknown ⇒ `vh` unresolved),
+    // so existing width-only tests are unaffected. Tests exercising `vh`/inner
+    // scroll call `lay_out_with_carousels` directly with a real height.
+    lay_out_with_carousels(dom, base, (width, 0), forms, controls, images, borders).0
 }
 
 /// Lay a document out, also returning the horizontally-scrollable strips
-/// (carousels) found so the view can clip/scroll them. The strips' items
-/// are already in the returned rows; the `Carousel`s are the scroll
-/// metadata keyed to those rows.
+/// (carousels), the vertical inner-scroll viewports (regions), the scroll-clip
+/// boxes, and the incremental-layout boundaries found so the view can clip/
+/// scroll them and a live page can patch a boundary's subtree. The carousel
+/// strip items are already in the returned rows; a region instead reserves
+/// blank rows in `rows` and carries its content in its own `buffer` (the view
+/// windows it).
 pub fn lay_out_with_carousels(
     dom: &Dom,
     base: &Url,
-    width: usize,
+    viewport: (usize, usize),
     forms: &[Form],
     controls: &ControlMap,
     images: &ImageSizes,
     borders: bool,
-) -> (Vec<Row>, Vec<Carousel>) {
-    let mut layout = Layout::new(dom, base, width.max(10), forms, controls, images, borders);
+) -> (
+    Vec<Row>,
+    Vec<Carousel>,
+    Vec<Region>,
+    ScrollClips,
+    Vec<BoundaryBox>,
+) {
+    let mut layout = Layout::new(
+        dom,
+        base,
+        viewport.0.max(10),
+        forms,
+        controls,
+        images,
+        borders,
+    );
+    layout.viewport_h = viewport.1;
+    // Capture incremental-layout boundaries (INCREMENTAL_LAYOUT_PLAN.md §14).
+    // Near-free for non-live pages (no `data-trust-node` baked ⇒ the capture
+    // hook short-circuits on the attr gate); bounded for live pages (the cascade
+    // checks run only on the sparse baked boundary set).
+    layout.capture_boundaries = true;
     layout.flow_all();
-    let (rows, carousels, _element_tops) = layout.finish();
-    (rows, carousels)
+    let (rows, carousels, regions, _element_tops, scroll_clips, boundary_recs) = layout.finish();
+    let boundaries = harvest_boundaries(boundary_recs, &regions, &carousels);
+    (rows, carousels, regions, scroll_clips, boundaries)
+}
+
+/// Turn the raw per-pass boundary records into `Doc.boundaries`, dropping any
+/// whose row span overlaps a scroll region's reserved band or a carousel's rows
+/// — those hold content OUTSIDE `Doc.rows` (a region buffer / a scrolled strip),
+/// so the general inline splice (`patch_live_doc`) can't operate on them and
+/// they take the always-correct full path instead. v1 inline boundaries are
+/// pure-`Doc.rows` boxes (INCREMENTAL_LAYOUT_PLAN.md §13b).
+fn harvest_boundaries(
+    recs: BoundaryRecs,
+    regions: &[Region],
+    carousels: &[Carousel],
+) -> Vec<BoundaryBox> {
+    let overlaps = |start: usize, end: usize, a: usize, b: usize| start < b && a < end;
+    recs.into_values()
+        .filter(|rec| rec.end_row > rec.start_row)
+        .filter(|rec| {
+            !regions.iter().any(|rg| {
+                overlaps(
+                    rec.start_row,
+                    rec.end_row,
+                    rg.start_row,
+                    rg.start_row + rg.height as usize,
+                )
+            }) && !carousels
+                .iter()
+                .any(|c| overlaps(rec.start_row, rec.end_row, c.start, c.end))
+        })
+        .map(|rec| BoundaryBox {
+            node: rec.node,
+            row_range: rec.start_row..rec.end_row,
+            origin_col: rec.origin_col,
+            content_width: rec.content_width,
+        })
+        .collect()
+}
+
+/// Lay out a single relayout-boundary subtree (a scroll region) into its buffer
+/// rows, for an incremental layout patch (INCREMENTAL_LAYOUT_PLAN.md). This
+/// mirrors EXACTLY what `flow_region` does to build a `Region.buffer` — lay the
+/// boundary's interior at `width` with the region recursion guard set — so the
+/// result is byte-identical to the same region produced by a full `lay_out`
+/// (the §9 differential guarantee). `boundary` is the scroll-container element
+/// in `dom`. The inherited styling context arrives materialized on the
+/// fragment (so `computed_value` over `dom` resolves it); an anchor-wrapped
+/// boundary is excluded upstream (the actor falls back to full), so the root
+/// `Ctx` carries no link.
+pub fn lay_out_region_fragment(
+    dom: &Dom,
+    base: &Url,
+    content_width: usize,
+    viewport: (usize, usize),
+    controls: &ControlMap,
+    images: &ImageSizes,
+    boundary: NodeId,
+) -> (Vec<Row>, Vec<Carousel>) {
+    let content_width = content_width.max(1);
+    let mut layout = Layout::new(
+        dom,
+        base,
+        content_width,
+        &[],
+        controls,
+        images,
+        borders_enabled(),
+    );
+    // `viewport` is the FULL terminal size (cells) — `vw`/`vh` resolve against
+    // it, NOT the narrowed region width (exactly as `flow_region`'s sub-layout
+    // keeps `self.viewport_w`). `content_width` is the region's scrollport width.
+    layout.viewport_w = viewport.0;
+    layout.viewport_h = viewport.1;
+    // The region recursion guard: laying the boundary's interior must NOT
+    // re-enter `flow_region` on the boundary itself (exactly as `flow_region`
+    // sets `region_inner` before laying its own buffer).
+    layout.region_inner = Some(boundary);
+    let buffer = layout.layout_subtree_inner(boundary, content_width, None, false, &Ctx::root());
+    (buffer.rows, buffer.carousels)
+}
+
+/// The result of laying one INLINE relayout-boundary fragment (a block-filling
+/// IFC box, NOT a scroll region) for the general incremental splice
+/// (INCREMENTAL_LAYOUT_PLAN.md §14). `rows` are in the fragment's own coordinate
+/// space (cols from 0); the app shifts them by the cached `origin_col` and
+/// splices them into `Doc.rows`. `regions`/`carousels` non-empty means the box
+/// now contains content outside pure `Doc.rows` (it grew a scroll viewport /
+/// strip since capture) → the app resyncs to the full path.
+pub struct SubtreeFragment {
+    pub rows: Vec<Row>,
+    pub height: usize,
+    pub width: u16,
+    pub carousels: Vec<Carousel>,
+    pub regions: Vec<Region>,
+    pub scroll_clips: ScrollClips,
+}
+
+/// Lay an INLINE relayout-boundary subtree for the general incremental splice.
+/// Unlike `lay_out_region_fragment` (which mirrors `flow_region`'s sub-layout,
+/// `subtree_root`/constrain SKIPPED to match how a region buffer is built), this
+/// lays the boundary through the NORMAL block path (`flow_node`, NO
+/// `subtree_root`) so its own `block_indent`/`constrain`/`width` are RE-APPLIED
+/// exactly as the full document laid it — the boundary went through `flow_element`
+/// there, not `flow_region`. `content_width` is the OUTER band the box fills
+/// (captured before the box's own indent); the re-applied indent/constrain land
+/// the content at the same place the full pass did (the app then adds
+/// `origin_col`). The §9 differential test guards this equivalence. An IFC box
+/// never overlaps an external float, so no float context is needed.
+pub fn lay_out_subtree_fragment(
+    dom: &Dom,
+    base: &Url,
+    content_width: usize,
+    viewport: (usize, usize),
+    controls: &ControlMap,
+    images: &ImageSizes,
+    boundary: NodeId,
+) -> SubtreeFragment {
+    let content_width = content_width.max(1);
+    let mut layout = Layout::new(
+        dom,
+        base,
+        content_width,
+        &[],
+        controls,
+        images,
+        borders_enabled(),
+    );
+    layout.viewport_w = viewport.0;
+    layout.viewport_h = viewport.1;
+    layout.flow_node(boundary, &Ctx::root());
+    layout.flush_block();
+    layout.finish_floats();
+    let (rows, carousels, regions, _tops, scroll_clips, _bnd) = layout.finish();
+    let width = rows
+        .iter()
+        .flat_map(|r| &r.items)
+        .map(|it| it.col + it.width)
+        .max()
+        .unwrap_or(0);
+    SubtreeFragment {
+        height: rows.len(),
+        width,
+        rows,
+        carousels,
+        regions,
+        scroll_clips,
+    }
 }
 
 /// A node's bounding box in whole terminal cells, accumulated as items and
@@ -523,21 +875,30 @@ impl CellRect {
 pub fn measure_boxes(
     dom: &Dom,
     base: &Url,
-    width: usize,
+    viewport: (usize, usize),
     forms: &[Form],
     controls: &ControlMap,
     cell_px: (u16, u16),
     borders: bool,
 ) -> HashMap<NodeId, PxRect> {
     let images = ImageSizes::new();
-    let mut layout = Layout::new(dom, base, width.max(10), forms, controls, &images, borders);
+    let mut layout = Layout::new(
+        dom,
+        base,
+        viewport.0.max(10),
+        forms,
+        controls,
+        &images,
+        borders,
+    );
+    layout.viewport_h = viewport.1;
     layout.tag_all_nodes = true;
     layout.flow_all();
     let declared = std::mem::take(&mut layout.declared_boxes);
     // `finish` returns `element_tops` already remapped through its blank-row
     // collapse (and accumulated from every sub-layout via `blit`), so an
     // empty element's recorded row matches the kept-row grid the cells use.
-    let (rows, _carousels, element_tops) = layout.finish();
+    let (rows, _carousels, _regions, element_tops, _scroll_clips, _boundaries) = layout.finish();
 
     // Each laid item contributes a cell rectangle to its source node. An
     // inline image's `height` already counts the rows it reserves.
@@ -650,6 +1011,97 @@ pub fn measure_boxes(
         .collect()
 }
 
+/// Inner-scroll GATE diagnostic (gated by `TRUST_DIAG_SCROLL_BOXES` in the
+/// one-shot `js::transform` path): list every vertical scroll-container candidate
+/// (`overflow-y` ∈ {auto, scroll}) on the LIVE post-JS arena, with its
+/// `definite_height` and the height chain that produced it — so we can confirm a
+/// real page's scroll area (Twitch chat) resolves a definite H before building
+/// the Region primitive. MUST run on the live arena (full cascade), NOT the baked
+/// re-parse, which drops `overflow-y`/`min-height`/`max-height` (see dom `PROPS`).
+/// Walks the COMPOSED tree so a scroll area inside a shadow root is found too.
+pub(crate) fn scroll_box_report(dom: &Dom, base: &Url, viewport: (usize, usize)) -> String {
+    let ctrls = ControlMap::new();
+    let imgs = ImageSizes::new();
+    let mut l = Layout::new(dom, base, viewport.0.max(10), &[], &ctrls, &imgs, false);
+    l.viewport_h = viewport.1;
+    let desc = |id: NodeId| -> String {
+        let tag = dom.tag_name(id).unwrap_or("?");
+        let idr = dom
+            .attr(id, "id")
+            .map(|s| format!("#{s}"))
+            .unwrap_or_default();
+        let cls = dom
+            .attr(id, "class")
+            .map(|s| {
+                s.split_whitespace()
+                    .take(2)
+                    .map(|c| format!(".{c}"))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        format!("{tag}{idr}{cls}")
+    };
+    let mut out = String::new();
+    let mut n = 0;
+    for id in dom.composed_descendants(DOCUMENT) {
+        let oy = l.axis_overflow(id, true);
+        if !matches!(oy.as_deref(), Some("auto" | "scroll")) {
+            continue;
+        }
+        n += 1;
+        if n > 50 {
+            out.push_str("\n… (more than 50 scroll boxes; truncated)\n");
+            break;
+        }
+        let dh = l.definite_height(id);
+        out.push_str(&format!(
+            "\n[{n}] {} overflow-y={} height={:?} -> definite_height={:?}  {}\n",
+            desc(id),
+            oy.as_deref().unwrap_or("?"),
+            dom.computed_style(id, "height"),
+            dh,
+            if dh.is_some() {
+                "✓ REGION-CAPABLE"
+            } else {
+                "✗ indefinite"
+            }
+        ));
+        // The height chain up to the viewport — shows WHERE a chain breaks
+        // (an `auto` ancestor that isn't a stretched row-flex item).
+        let mut cur = Some(id);
+        let mut depth = 0;
+        while let Some(c) = cur {
+            if depth > 40 {
+                out.push_str("      … (chain deeper than 40; truncated)\n");
+                break;
+            }
+            // Per-node dump: the height inputs (explicit `height`, flex-grow,
+            // position + `top`/`bottom`) plus the resolved `definite_height`, so
+            // a `dh=None` chain shows exactly which ancestor breaks definiteness.
+            out.push_str(&format!(
+                "    {}{}  h={:?} disp={:?} flex-dir={:?} grow={:?} pos={:?} top={:?} bot={:?} -> dh={:?}\n",
+                "  ".repeat(depth),
+                desc(c),
+                dom.computed_style(c, "height"),
+                dom.computed_display(c),
+                dom.computed_style(c, "flex-direction"),
+                dom.computed_style(c, "flex-grow"),
+                dom.computed_style(c, "position"),
+                dom.computed_style(c, "top"),
+                dom.computed_style(c, "bottom"),
+                l.definite_height(c),
+            ));
+            cur = dom
+                .parent_composed(c)
+                .filter(|&p| dom.tag_name(p).is_some());
+            depth += 1;
+        }
+    }
+    format!(
+        "=== scroll-box report: {n} vertical overflow:auto/scroll element(s) @ viewport {viewport:?} ===\n{out}"
+    )
+}
+
 /// The `<body>` element, or the document node if there isn't one.
 fn body_or_document(dom: &Dom) -> NodeId {
     dom.descendants(DOCUMENT)
@@ -680,6 +1132,14 @@ const MIN_COL: usize = 12;
 /// cell's subtree — from overflowing the layout stack on a pathologically deep
 /// table tree.
 const MAX_TABLE_DEPTH: usize = 8;
+
+/// The containing block a percentage `height` resolves against (`Layout::
+/// height_cb`): a block-level ancestor element, or the viewport (the initial
+/// containing block) at the root.
+enum CbHeight {
+    Element(NodeId),
+    Viewport,
+}
 
 /// How a flex container lays its items out (Phase A/B of the 2D arc).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1149,6 +1609,22 @@ const SPACING: &[&str] = &[
     "ul",
 ];
 
+/// The page's standard preview image (Open Graph `og:image`, else Twitter's
+/// `twitter:image`), resolved to an absolute http(s) URL. This is the
+/// cross-site convention for "a still frame of this page's media" — used to
+/// give an unplayable streaming `<video>` a poster. Host-agnostic: no site
+/// knows it's being read this way.
+pub(crate) fn page_preview_image(dom: &Dom, base: &Url) -> Option<String> {
+    for key in ["og:image", "twitter:image", "og:image:secure_url"] {
+        if let Some(src) = dom.meta_content(key)
+            && let Link::Http(u) = crate::http::resolve(base, src)
+        {
+            return Some(u.to_string());
+        }
+    }
+    None
+}
+
 /// Elements whose subtree never renders as page text. (`<video>`/`<audio>`
 /// are NOT here — they render as a media representation via `flow_media`.)
 const SKIP: &[&str] = &[
@@ -1167,6 +1643,13 @@ struct Layout<'a> {
     /// kept distinct from `width` (which floats/centering narrow as blocks
     /// nest).
     viewport_w: usize,
+    /// The full terminal HEIGHT in cells — the CSS viewport for `vh`/`vmin`/
+    /// `vmax` units and the basis a `height:100%` chain terminates against. `0`
+    /// when a caller didn't thread it (legacy/test paths), which leaves `vh`
+    /// and viewport-relative heights unresolved rather than zero. The
+    /// foundation for inner scroll regions (a definite region height) — see
+    /// INNER_SCROLL_PLAN.md.
+    viewport_h: usize,
     rows: Vec<Row>,
     /// The line currently being built.
     line: Vec<Item>,
@@ -1204,6 +1687,16 @@ struct Layout<'a> {
     list_stack: Vec<u32>,
     /// Horizontally-scrollable strips discovered during the pass.
     carousels: Vec<Carousel>,
+    /// Vertical inner-scroll viewports (`overflow-y:auto|scroll` on a
+    /// definite-height box) discovered during the pass — each reserves `height`
+    /// blank doc rows and holds its content in a separate `buffer`. See `Region`.
+    regions: Vec<Region>,
+    /// The CLIP box `(live_node, client_h_rows, client_w_cells)` of EVERY
+    /// definite-height scroll-y box flowed — region OR currently-fitting — keyed
+    /// by its baked actor node id. The app pushes these as `clientHeight`/
+    /// `clientWidth` so a chat's `atBottom` is right BEFORE its content overflows
+    /// into a region (Phase 3 inner scroll). Only boxes with a `data-trust-node`.
+    scroll_clips: Vec<(usize, u16, u16)>,
     /// Author-supplied carousel/slideshow controls we replace with our own
     /// generated glyphs — skipped when flowed (their markup may come AFTER
     /// the strip, so removing already-laid items isn't enough).
@@ -1235,6 +1728,12 @@ struct Layout<'a> {
     /// this is that element: its own border routing is skipped (no recursion)
     /// and its margin is suppressed (handled outside the frame; padding kept).
     inner_border_box: Option<NodeId>,
+    /// When laying a scroll region's own content into its `buffer`
+    /// (`flow_region`'s sub-pass), this is that element: its region routing is
+    /// skipped so the sub-layout flows its children normally instead of
+    /// re-entering `flow_region` on the same node forever (mirrors
+    /// `inner_border_box`).
+    region_inner: Option<NodeId>,
     /// Whether CSS borders render as box-drawing chrome. Default OFF (her
     /// call: in a terminal, vertical space is at a premium and most page
     /// borders are subtle 1px underlines not worth a whole cell row). The
@@ -1285,6 +1784,14 @@ struct Layout<'a> {
     /// of a viewport-fallback lie. Populated under `tag_all_nodes`; the render
     /// path never touches it.
     element_tops: ElementTops,
+    /// Live full render only (INCREMENTAL_LAYOUT_PLAN.md §14): capture each
+    /// block-filling IFC boundary's outer band + row span into `boundary_boxes`,
+    /// for the general incremental subtree splice. OFF for tests / non-live
+    /// renders / measurement, so they pay nothing.
+    capture_boundaries: bool,
+    /// Incremental-layout boundaries recorded this pass (keyed by parse NodeId);
+    /// `blit` translates them up + `finish` remaps their rows. See `BoundaryRec`.
+    boundary_boxes: BoundaryRecs,
     /// Memoizes the intrinsic-width measurement `measure_width(id, constraint)`
     /// for the WHOLE lay-out pass (SHARED across sub-layouts via the `Rc`). The
     /// measurement lays out the entire subtree, and a flex/grid container
@@ -1318,6 +1825,7 @@ impl<'a> Layout<'a> {
             images,
             width,
             viewport_w: width,
+            viewport_h: 0,
             rows: Vec::new(),
             line: Vec::new(),
             col: 0,
@@ -1332,11 +1840,14 @@ impl<'a> Layout<'a> {
             line_height: 1,
             list_stack: Vec::new(),
             carousels: Vec::new(),
+            regions: Vec::new(),
+            scroll_clips: Vec::new(),
             suppressed_controls: std::collections::HashSet::new(),
             measuring: false,
             table_depth: 0,
             subtree_root: None,
             inner_border_box: None,
+            region_inner: None,
             borders,
             clip_right: None,
             clip_done: false,
@@ -1344,6 +1855,8 @@ impl<'a> Layout<'a> {
             tag_all_nodes: false,
             declared_boxes: HashMap::new(),
             element_tops: HashMap::new(),
+            capture_boundaries: false,
+            boundary_boxes: HashMap::new(),
             measure_cache: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
         }
     }
@@ -1454,6 +1967,7 @@ impl<'a> Layout<'a> {
             || self.dom.is_hidden(id)
             || self.suppressed_controls.contains(&id)
             || self.is_clipped_offscreen(id)
+            || self.is_clip_collapsed(id)
         {
             return;
         }
@@ -1647,7 +2161,7 @@ impl<'a> Layout<'a> {
             .dom
             .computed_value(id, "letter-spacing")
             .as_deref()
-            .and_then(|v| resolve_cells(v, 1, self.viewport_w))
+            .and_then(|v| resolve_cells(v, 1, (self.viewport_w, self.viewport_h)))
             .unwrap_or(0);
 
         // Block vs inline is driven by the cascaded `display` (baked into
@@ -1742,6 +2256,51 @@ impl<'a> Layout<'a> {
         // wider than the viewport — a carousel) lays its content as one wide
         // strip, clipped to the band and scrolled by the view.
         let hscroll = block_like && flex.is_none() && self.is_hscroll(id);
+        // A vertical inner-scroll viewport (`overflow-y:auto|scroll` on a
+        // definite-height box — CSS Overflow L3). Unlike `hscroll` this is NOT
+        // mutually exclusive with flex: a scroll container is commonly
+        // `display:flex; flex-direction:column` (the chat column), and its
+        // buffer sub-layout flows that flex interior itself. So it dispatches
+        // ahead of the flex match, and the flex check here is omitted.
+        let region = block_like && !hscroll && self.scroll_region_height(id).is_some();
+        // Incremental-layout boundary capture (INCREMENTAL_LAYOUT_PLAN.md §14):
+        // a block-filling IFC container (`display:flow-root`/`flex`/`grid`,
+        // in-flow, not a flex/grid item, not a scroll/clip region) lays its
+        // content as pure `Doc.rows` and its outer width IS its containing
+        // block's (width-stable). Record the OUTER band (before this block's own
+        // indent/constrain — the sub-layout re-applies those) so a live patch can
+        // re-lay only this subtree at the same width and splice it back. The band
+        // is `self.width − self.indent`; because an IFC box never overlaps an
+        // external float (CSS 2.1 §9.4.1), its left edge is `self.indent`, not a
+        // float-narrowed `line_left`. `is_out_of_flow`/`parent_is_flex_container`
+        // exclude the content-width-dependent cases; the `data-trust-node` gate
+        // keeps the predicate cheap (most blocks aren't IFC boundaries).
+        let capture_band = if self.capture_boundaries
+            && !self.measuring
+            && block_like
+            && !region
+            && !hscroll
+            // The cheap `data-trust-node` gate FIRST: only IFC boundaries carry
+            // it, so the cascade queries below run on the sparse boundary set,
+            // not every block.
+            && let Some(node) = self
+                .dom
+                .attr(id, "data-trust-node")
+                .and_then(|s| s.parse::<usize>().ok())
+            && !self.is_out_of_flow(id)
+            && !self.parent_is_flex_container(id)
+            && matches!(
+                self.dom.effective_display(id).as_deref(),
+                Some("flex" | "grid" | "flow-root")
+            ) {
+            Some((
+                node,
+                u16::try_from(self.width.saturating_sub(self.indent)).unwrap_or(u16::MAX),
+                u16::try_from(self.indent).unwrap_or(u16::MAX),
+            ))
+        } else {
+            None
+        };
         if block_like {
             self.flush_block();
             // CSS `clear` drops this block below the floats it clears.
@@ -1759,11 +2318,12 @@ impl<'a> Layout<'a> {
         // page's main column) leaks past its wrapper and the footer renders
         // on top of it. (A carousel lays its own contained strip, so it
         // doesn't take this path.)
-        let saved_floats = if block_like && flex.is_none() && !hscroll && self.establishes_bfc(id) {
-            Some(std::mem::take(&mut self.floats))
-        } else {
-            None
-        };
+        let saved_floats =
+            if block_like && flex.is_none() && !hscroll && !region && self.establishes_bfc(id) {
+                Some(std::mem::take(&mut self.floats))
+            } else {
+                None
+            };
 
         // text-align inherits; a block that sets it changes alignment for
         // its own lines and its descendants until they override it. The CSS
@@ -1895,7 +2455,7 @@ impl<'a> Layout<'a> {
             && let Some(cells) = resolve_cells(
                 &v,
                 self.width.saturating_sub(self.indent).max(1),
-                self.viewport_w,
+                (self.viewport_w, self.viewport_h),
             )
         {
             self.col += cells;
@@ -1931,6 +2491,13 @@ impl<'a> Layout<'a> {
 
         if hscroll {
             self.flow_hscroll(id);
+        } else if region {
+            // A vertical inner-scroll viewport: lay the content into a separate
+            // buffer, reserve exactly H blank rows here, and let the view window
+            // it. `flow_region` handles a flex/grid/block interior itself (its
+            // buffer sub-layout re-enters the normal dispatch under the
+            // recursion guard), so it sits ahead of the flex match.
+            self.flow_region(id, &cctx);
         } else {
             match flex {
                 // An explicit `grid-template-columns` lays the page's own
@@ -2016,6 +2583,22 @@ impl<'a> Layout<'a> {
                 let gutter = self.indent.saturating_sub(marker_added);
                 self.place_list_marker(&marker, marker_start_row, gutter);
             }
+            // Incremental-layout boundary capture (INCREMENTAL_LAYOUT_PLAN.md §14):
+            // the in-flow content + contained floats are now laid, so the box's
+            // row span is `[corner_start_row, rows.len())`. Recorded with the
+            // outer band captured before this block's own indent.
+            if let Some((node, content_width, origin_col)) = capture_band {
+                self.boundary_boxes.insert(
+                    id,
+                    BoundaryRec {
+                        node,
+                        content_width,
+                        origin_col,
+                        start_row: corner_start_row,
+                        end_row: self.rows.len(),
+                    },
+                );
+            }
             // This block is the containing block for any `position:absolute`
             // descendant whose nearest positioned ancestor it is (and `fixed`
             // ones when it is the root). Place them at their computed
@@ -2086,7 +2669,7 @@ impl<'a> Layout<'a> {
                 resolve_cells(
                     &v,
                     self.width.saturating_sub(self.indent).max(1),
-                    self.viewport_w,
+                    (self.viewport_w, self.viewport_h),
                 )
             })
             .is_some_and(|c| c > 0)
@@ -2673,6 +3256,34 @@ impl<'a> Layout<'a> {
         (if vertical { y } else { x }).map(|s| s.to_ascii_lowercase())
     }
 
+    /// A box that CLIPS overflow on an axis and is sized to less than one cell
+    /// on that axis paints none of its content: the CSS clip (CSS Overflow §3)
+    /// leaves no room for it at the terminal's cell resolution. This is the
+    /// standard visually-hidden / "sr-only" idiom — `width:1px;height:1px;
+    /// overflow:hidden` (the `clip` accessibility-label pattern); a browser
+    /// renders a ~1px speck, so we faithfully render nothing rather than a stray
+    /// glyph. (Twitch's side-nav cards carry two per card: a clipped "Live" and
+    /// "<n> viewers" sr-only label.) Only a DEFINITE absolute/font length under
+    /// a cell collapses — `%`/`vw`/`auto` don't (`css_length_em` returns `None`)
+    /// — and clipping a box TALLER than a cell to a definite height is the
+    /// inner-scroll feature (deferred), not this.
+    fn is_clip_collapsed(&self, id: NodeId) -> bool {
+        let collapsed = |prop: &str, vertical: bool| {
+            // The axis must actually clip: a 0-size `overflow:visible` box still
+            // paints its overflowing content, so it is NOT collapsed.
+            !matches!(
+                self.axis_overflow(id, vertical).as_deref(),
+                None | Some("visible")
+            ) && self
+                .dom
+                .computed_style(id, prop)
+                .and_then(|v| css_length_em(&v))
+                // `css_length_em` is in em (≈ 2 cells/em); < 1 cell ⇔ < 0.5em.
+                .is_some_and(|em| em * 2.0 < 1.0)
+        };
+        collapsed("width", false) || collapsed("height", true)
+    }
+
     /// Whether an element hard-clips one axis (`overflow:hidden`/`clip`) — the
     /// cases where content positioned outside the box is painted nowhere
     /// (`scroll`/`auto` are excluded: their off-box content is reachable).
@@ -3064,7 +3675,7 @@ impl<'a> Layout<'a> {
     fn flex_gap(&self, id: NodeId, avail: usize, row_axis: bool) -> usize {
         let longhand = if row_axis { "row-gap" } else { "column-gap" };
         if let Some(v) = self.dom.computed_style(id, longhand)
-            && let Some(c) = resolve_cells(&v, avail, self.viewport_w)
+            && let Some(c) = resolve_cells(&v, avail, (self.viewport_w, self.viewport_h))
         {
             return c;
         }
@@ -3076,7 +3687,7 @@ impl<'a> Layout<'a> {
                 toks.get(1).or_else(|| toks.first())
             };
             if let Some(t) = tok
-                && let Some(c) = resolve_cells(t, avail, self.viewport_w)
+                && let Some(c) = resolve_cells(t, avail, (self.viewport_w, self.viewport_h))
             {
                 return c;
             }
@@ -3115,7 +3726,7 @@ impl<'a> Layout<'a> {
         {
             None | Some("auto") => self.len_or_pct(id, "width", avail),
             Some("content" | "max-content" | "min-content" | "fit-content") => None,
-            Some(v) => resolve_cells(v, avail, self.viewport_w),
+            Some(v) => resolve_cells(v, avail, (self.viewport_w, self.viewport_h)),
         };
         // `max-width` caps the basis; if there is no basis yet, an explicit
         // max-width still bounds an auto (content-sized) item via the caller.
@@ -3134,7 +3745,11 @@ impl<'a> Layout<'a> {
     /// A `width`/`max-width`-style property as cells, resolving `%` against
     /// `avail` (the flex row's content width) and `vw` against the viewport.
     fn len_or_pct(&self, id: NodeId, prop: &str, avail: usize) -> Option<usize> {
-        resolve_cells(&self.dom.computed_style(id, prop)?, avail, self.viewport_w)
+        resolve_cells(
+            &self.dom.computed_style(id, prop)?,
+            avail,
+            (self.viewport_w, self.viewport_h),
+        )
     }
 
     /// Whether a block is a horizontal-scroll container (a carousel): it
@@ -3253,6 +3868,183 @@ impl<'a> Layout<'a> {
                 offset: 0,
                 frame_right: None,
             });
+        }
+        self.col = self.indent;
+        self.pending_space = false;
+    }
+
+    /// The definite scroll-viewport height (rows) of `id` IF it is a VERTICAL
+    /// inner-scroll container: `overflow-y: auto|scroll` (CSS Overflow L3 — the
+    /// scrollable values; `hidden`/`clip` stay a pure clip with unreachable
+    /// content, her call, and `visible` isn't a scroll container) on a box with
+    /// a definite height (Phase 0 `definite_height`). `None` otherwise — or for
+    /// the region's own buffer pass (the `region_inner` recursion guard). Reads
+    /// overflow FIRST so the height walk only runs for actual scroll boxes.
+    fn scroll_region_height(&self, id: NodeId) -> Option<usize> {
+        if self.region_inner == Some(id) {
+            return None;
+        }
+        match self.axis_overflow(id, true).as_deref() {
+            Some("auto" | "scroll") => {
+                // The page's PRINCIPAL scroll container is NOT virtualized into an
+                // inner band — it flows into the document so the page scroll (and
+                // the right scrollbar) scrolls it, exactly as a browser scrolls
+                // that panel as "the page". Only genuinely nested scrollers (a
+                // <nav>/<aside> sidebar, a chat feed inside the main flow) become
+                // Regions.
+                if self.is_principal_scroller(id) {
+                    return None;
+                }
+                self.definite_height(id).filter(|&h| h > 0)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `id` is the page's PRINCIPAL scroll container — the one a LOCKED
+    /// viewport delegates document scrolling to (the SPA pattern where
+    /// `html`/`body` are `overflow:hidden` and one inner `overflow:auto` box
+    /// carries the main flow, e.g. Twitch's `root-scrollable` inside `<main>`).
+    /// Such a box is NOT clipped into an inner `Region`; it flows into the
+    /// document so `g.scroll` and the page scrollbar scroll it — matching how a
+    /// browser scrolls that panel as the page. Read purely from the page's own
+    /// declarations: CSS Overflow §3.1 (the root element's overflow propagates
+    /// to the viewport; if the root is `visible` but `<body>` is not, the body's
+    /// propagates) + HTML sectioning landmarks (`<main>` is the dominant
+    /// content, `<nav>`/`<aside>` are complementary) — never the host.
+    ///
+    /// The criterion, in ONE upward walk from `id` to the root: a
+    /// scroll-container ancestor ⇒ `id` is NESTED ⇒ a real inner region; the
+    /// nearest sectioning landmark above `id` decides main-flow (`<main>`) vs a
+    /// complementary sidebar (`<nav>`/`<aside>`, stays a region); and the
+    /// viewport must be LOCKED (an `overflow:hidden`/`clip` on `html`/`body`) or
+    /// the document itself scrolls and an inner `overflow:auto` box is a genuine
+    /// region. Principal ⇔ locked AND (inside `<main>` OR the page declares no
+    /// enclosing landmark at all, i.e. this outermost scroller carries the flow).
+    fn is_principal_scroller(&self, id: NodeId) -> bool {
+        let mut viewport_locked = false;
+        let mut in_main = false;
+        let mut landmark_seen = false;
+        let mut cur = self.dom.parent_composed(id);
+        while let Some(p) = cur {
+            // A scroll-container ancestor ⇒ a nested inner region, never the page.
+            if self.dom.is_scroll_container(p) {
+                return false;
+            }
+            match self.dom.tag_name(p) {
+                Some("main") if !landmark_seen => {
+                    in_main = true;
+                    landmark_seen = true;
+                }
+                Some("nav" | "aside") if !landmark_seen => landmark_seen = true,
+                Some("html" | "body") if self.node_clips_overflow(p) => viewport_locked = true,
+                _ => {}
+            }
+            cur = self.dom.parent_composed(p);
+        }
+        viewport_locked && (in_main || !landmark_seen)
+    }
+
+    /// Whether `id` clips its overflow on EITHER axis (`hidden`/`clip`) — the
+    /// signal (on `html`/`body`) that the viewport can't scroll the document.
+    fn node_clips_overflow(&self, id: NodeId) -> bool {
+        matches!(
+            self.axis_overflow(id, true).as_deref(),
+            Some("hidden" | "clip")
+        ) || matches!(
+            self.axis_overflow(id, false).as_deref(),
+            Some("hidden" | "clip")
+        )
+    }
+
+    /// Lay a vertical inner-scroll viewport (the `flow_element` dispatch). The
+    /// content is laid into a SEPARATE `buffer` at the scrollport width; when it
+    /// overflows the definite height `H` (or `overflow-y:scroll` is explicit),
+    /// the layout reserves exactly `H` blank doc rows here and records a
+    /// `Region` (the view windows the buffer over those rows) — the document
+    /// stays flat, so scroll/selection indices are untouched. When
+    /// `overflow-y:auto` content FITS, there's nothing to scroll, so the buffer
+    /// is blitted inline like an ordinary block (no reservation, no wasted
+    /// rows). The measurement pass (`tag_all_nodes`, the JS geometry backing)
+    /// also flows inline, so region content keeps its honest box geometry.
+    fn flow_region(&mut self, id: NodeId, ctx: &Ctx) {
+        self.flush_block();
+        self.begin_line();
+        let band_left = self.line_left;
+        let avail = self.line_right.saturating_sub(self.line_left).max(1);
+        // The scrollport width: the box's own `width`/`max-width` if set, else
+        // the available band (the common `width:100%`/stretched column).
+        let width = self
+            .css_cells(id, "width")
+            .or_else(|| self.css_cells(id, "max-width"))
+            .map(|w| w.min(avail))
+            .unwrap_or(avail)
+            .max(1);
+        let h = self.scroll_region_height(id).unwrap_or(0);
+        // Lay the content into its own buffer under the recursion guard, so the
+        // sub-layout flows `id`'s interior (flex/grid/block) instead of
+        // re-entering `flow_region` on `id`.
+        let saved = self.region_inner;
+        self.region_inner = Some(id);
+        let buffer = self.layout_subtree_inner(id, width, None, false, ctx);
+        self.region_inner = saved;
+        let content_h = buffer.rows.len();
+        let scroll = matches!(self.axis_overflow(id, true).as_deref(), Some("scroll"));
+        // Reserve the clipped band only on the REAL render pass. The two
+        // measurement passes flow the region's content INLINE instead, so it
+        // contributes its real width/height: `tag_all_nodes` keeps
+        // getBoundingClientRect honest, and `measuring` (intrinsic-width sizing)
+        // keeps a region from measuring as ~0-wide — which would size a flex item
+        // / float / table cell CONTAINING a scroll region down to nothing, then
+        // char-break its content into one cell per row.
+        let clip = h > 0 && !self.tag_all_nodes && !self.measuring && (scroll || content_h > h);
+        let row_base = self.rows.len();
+        // The live actor's node id (baked as `data-trust-node` by the serializer)
+        // for the Phase-3 geometry round-trip + wheel write-back.
+        let live_node: Option<usize> = self
+            .dom
+            .attr(id, "data-trust-node")
+            .and_then(|s| s.parse().ok());
+        // Record the CLIP box of EVERY definite-height scroll-y box (h > 0) —
+        // region OR currently-fitting — so the app can push its clientHeight even
+        // before its content overflows into a region (the chat `atBottom` fix).
+        if h > 0
+            && !self.tag_all_nodes
+            && let Some(node) = live_node
+        {
+            self.scroll_clips.push((node, h as u16, width as u16));
+        }
+        if clip {
+            // A real scroll viewport: reserve exactly H blank doc rows for the
+            // band (the renderer fills them from the buffer, clipped/windowed).
+            for _ in 0..h {
+                self.rows.push(Row::default());
+            }
+            // The page's own `scrollTop` SIGNAL, baked into the re-parsed HTML by
+            // the live serializer. `data-trust-scroll-top` is in ROWS; CSSOM
+            // clamps the position to `[0, scrollHeight − clientHeight]` =
+            // `[0, content_h − h]`.
+            let max_voffset = content_h.saturating_sub(h);
+            let signal = self
+                .dom
+                .attr(id, "data-trust-scroll-top")
+                .and_then(|s| s.parse::<usize>().ok());
+            let voffset = signal.map_or(0, |rows| rows.min(max_voffset));
+            self.regions.push(Region {
+                node: id,
+                start_row: row_base,
+                left: band_left as u16,
+                width: width as u16,
+                height: h as u16,
+                buffer: buffer.rows,
+                voffset,
+                live_node,
+                voffset_from_page: signal.is_some(),
+                carousels: buffer.carousels,
+            });
+        } else {
+            // `auto` content that fits (or the measure pass): place inline.
+            self.blit(&buffer, band_left as u16, row_base);
         }
         self.col = self.indent;
         self.pending_space = false;
@@ -3588,7 +4380,7 @@ impl<'a> Layout<'a> {
         if t.is_empty() || t.eq_ignore_ascii_case("auto") {
             return None;
         }
-        resolve_cells_f32(t, extent, self.viewport_w)
+        resolve_cells_f32(t, extent, (self.viewport_w, self.viewport_h))
     }
 
     /// Generate the carousel's prev/next scroll buttons as glyph items on the
@@ -4266,7 +5058,7 @@ impl<'a> Layout<'a> {
             me.dom
                 .computed_style(c, side)
                 .filter(|v| v.trim() != "auto")
-                .and_then(|v| resolve_cells(&v, avail, me.viewport_w))
+                .and_then(|v| resolve_cells(&v, avail, (me.viewport_w, me.viewport_h)))
                 .unwrap_or(0)
         };
         struct Slot {
@@ -5028,14 +5820,19 @@ impl<'a> Layout<'a> {
             .strip_prefix("fit-content(")
             .and_then(|r| r.strip_suffix(')'))
         {
-            let cap = resolve_cells_f32(inner.trim(), avail as usize, self.viewport_w)?;
+            let cap = resolve_cells_f32(
+                inner.trim(),
+                avail as usize,
+                (self.viewport_w, self.viewport_h),
+            )?;
             return Some(TrackSpec::FitContent(cap.max(0.0)));
         }
         if let Some(num) = t.strip_suffix("fr") {
             let f: f32 = num.trim().parse().ok()?;
             return Some(TrackSpec::Fr(f.max(0.0)));
         }
-        resolve_cells_f32(t, avail as usize, self.viewport_w).map(|c| TrackSpec::Fixed(c.max(0.0)))
+        resolve_cells_f32(t, avail as usize, (self.viewport_w, self.viewport_h))
+            .map(|c| TrackSpec::Fixed(c.max(0.0)))
     }
 
     /// Whether a track sizes to content (so the content-width pass must measure
@@ -5339,8 +6136,10 @@ impl<'a> Layout<'a> {
             self.borders,
         );
         sub.viewport_w = self.viewport_w;
+        sub.viewport_h = self.viewport_h;
         sub.tag_all_nodes = self.tag_all_nodes;
         sub.inner_border_box = Some(id);
+        sub.region_inner = self.region_inner;
         // The interior pass must NOT re-float this same element: when `id` is
         // both floated and bordered, `flow_float` lays its box (skipping the
         // float) and that box's `flow_element(id)` routes here for the frame.
@@ -5351,13 +6150,15 @@ impl<'a> Layout<'a> {
         sub.flow_node(id, ctx);
         sub.flush_block();
         sub.finish_floats();
-        let (rows, carousels, element_tops) = sub.finish();
+        let (rows, carousels, regions, element_tops, _, boundary_boxes) = sub.finish();
         let content = LaidBox {
             height: rows.len() as u16,
             width: inner_w as u16,
             rows,
             carousels,
+            regions,
             element_tops,
+            boundary_boxes,
         };
         let framed = self.frame_box(content, sides);
         if framed.height > 0 {
@@ -5483,18 +6284,41 @@ impl<'a> Layout<'a> {
             }
         }
         // The frame shifts the interior in by the present sides, so the
-        // recorded empty-element positions move with it.
+        // recorded empty-element positions — and any scroll regions inside —
+        // move with it.
+        let mut regions = content.regions;
+        for rg in &mut regions {
+            rg.start_row += row_shift;
+            rg.left += col_shift;
+        }
         let element_tops = content
             .element_tops
             .into_iter()
             .map(|(id, (col, row))| (id, (col + col_shift, row + row_shift as u16)))
+            .collect();
+        let boundary_boxes = content
+            .boundary_boxes
+            .into_iter()
+            .map(|(id, rec)| {
+                (
+                    id,
+                    BoundaryRec {
+                        origin_col: rec.origin_col + col_shift,
+                        start_row: rec.start_row + row_shift,
+                        end_row: rec.end_row + row_shift,
+                        ..rec
+                    },
+                )
+            })
             .collect();
         LaidBox {
             rows,
             width: new_w as u16,
             height: new_h as u16,
             carousels,
+            regions,
             element_tops,
+            boundary_boxes,
         }
     }
 
@@ -5505,7 +6329,8 @@ impl<'a> Layout<'a> {
     fn css_cells(&self, id: NodeId, prop: &str) -> Option<usize> {
         let v = self.dom.computed_style(id, prop)?;
         let avail = self.width.saturating_sub(self.indent).max(1);
-        resolve_cells_f32(&v, avail, self.viewport_w).map(|c| c.round().max(1.0) as usize)
+        resolve_cells_f32(&v, avail, (self.viewport_w, self.viewport_h))
+            .map(|c| c.round().max(1.0) as usize)
     }
 
     /// Like `css_cells`, but FLOORS the result. For a grid column width, `N`
@@ -5514,7 +6339,8 @@ impl<'a> Layout<'a> {
     fn css_cells_floor(&self, id: NodeId, prop: &str) -> Option<usize> {
         let v = self.dom.computed_style(id, prop)?;
         let avail = self.width.saturating_sub(self.indent).max(1);
-        resolve_cells_f32(&v, avail, self.viewport_w).map(|c| c.floor().max(1.0) as usize)
+        resolve_cells_f32(&v, avail, (self.viewport_w, self.viewport_h))
+            .map(|c| c.floor().max(1.0) as usize)
     }
 
     /// Lay an element's subtree out as an independent box at `content_width`,
@@ -5561,6 +6387,7 @@ impl<'a> Layout<'a> {
             self.borders,
         );
         sub.viewport_w = self.viewport_w;
+        sub.viewport_h = self.viewport_h;
         sub.float_skip = skip_float;
         sub.subtree_root = Some(id);
         sub.table_depth = self.table_depth;
@@ -5577,10 +6404,20 @@ impl<'a> Layout<'a> {
         // foreground image isn't dropped as a page backdrop, and the modal-root
         // out-of-flow exemption holds in the sub-pass).
         sub.modal_root = self.modal_root;
+        // Carry the scroll-region recursion guard so a sub-layout laying a
+        // region's own buffer (or a descendant of it) doesn't re-enter
+        // `flow_region` on the SAME node (`flow_region` sets `region_inner` on
+        // self before laying the buffer; the guard is per-node, so a DIFFERENT
+        // nested region still forms).
+        sub.region_inner = self.region_inner;
+        // Capture incremental-layout boundaries inside sub-layouts too (a
+        // chat column lives in an abspos shell's sub-pass), so `blit` propagates
+        // them up. Off when this pass isn't capturing (measure / non-live).
+        sub.capture_boundaries = self.capture_boundaries;
         sub.flow_node(id, inherit);
         sub.flush_block();
         sub.finish_floats();
-        let (rows, carousels, element_tops) = sub.finish();
+        let (rows, carousels, regions, element_tops, _, boundary_boxes) = sub.finish();
         let width = rows
             .iter()
             .flat_map(|r| &r.items)
@@ -5593,7 +6430,9 @@ impl<'a> Layout<'a> {
             width,
             height,
             carousels,
+            regions,
             element_tops,
+            boundary_boxes,
         }
     }
 
@@ -5625,6 +6464,16 @@ impl<'a> Layout<'a> {
             c.frame_right = c.frame_right.map(|fr| fr + col_off);
             self.carousels.push(c);
         }
+        // Scroll regions inside the box move with it too: the reserved band by
+        // `row_base`/`col_off`. The buffer is laid in the region's own
+        // coordinate space (top-left origin), so it's position-independent and
+        // travels unchanged.
+        for rg in &b.regions {
+            let mut rg = rg.clone();
+            rg.start_row += row_base;
+            rg.left += col_off;
+            self.regions.push(rg);
+        }
         // Empty elements recorded in the box (measure pass only) move with it
         // too, so a boxless element nested in this sub-layout keeps its honest
         // flow position in the document's coordinate system.
@@ -5632,6 +6481,18 @@ impl<'a> Layout<'a> {
             self.element_tops
                 .entry(id)
                 .or_insert((col + col_off, row + row_base as u16));
+        }
+        // Incremental-layout boundaries recorded inside the box (capture pass)
+        // move with it: the band left by `col_off`, the row span by `row_base`
+        // (the content band width is position-independent).
+        for (&id, rec) in &b.boundary_boxes {
+            self.boundary_boxes.entry(id).or_insert(BoundaryRec {
+                node: rec.node,
+                content_width: rec.content_width,
+                origin_col: rec.origin_col + col_off,
+                start_row: rec.start_row + row_base,
+                end_row: rec.end_row + row_base,
+            });
         }
     }
 
@@ -5739,6 +6600,23 @@ impl<'a> Layout<'a> {
             }
             self.col += 1;
         }
+        // An unbreakable token wider than the whole band can't fit even on a
+        // fresh line (a poll's concatenated usernames, a long URL/emote name).
+        // Character-break it across rows instead of letting it overflow off the
+        // right edge — the terminal has no horizontal scroll, so the overflow
+        // would be lost. This is CSS `overflow-wrap:break-word`: we break at
+        // RENDER to avoid overflow but DON'T break while measuring intrinsic
+        // width, so the box is still sized to fit its longest word (min-content
+        // stays the word, not 1 char). Breaking during measurement would be
+        // `overflow-wrap:anywhere` — it would collapse a content-sized flex item
+        // / table column to one cell and then char-break its short content.
+        if self.ws.wraps()
+            && !self.measuring
+            && wlen > self.line_right.saturating_sub(self.line_left).max(1)
+        {
+            self.place_oversize(word, ctx.kind, ctx.emph, ctx.node, ctx.link.clone());
+            return;
+        }
         if let Some(last) = self.line.last_mut()
             && same_run(last, ctx)
             && last.col as usize + last.width as usize == self.col
@@ -5756,6 +6634,46 @@ impl<'a> Layout<'a> {
             ctx.node,
             ctx.link.clone(),
         );
+    }
+
+    /// Place a run whose display width exceeds the band by character-breaking it
+    /// across rows — CSS Text L3 §5.4 (`overflow-wrap:anywhere`/`word-break:
+    /// break-all`), applied unconditionally because the terminal has no
+    /// horizontal scroll (a documented deviation): a token wider than the band
+    /// can't be revealed by overflow, so it must wrap or be lost off-screen, and
+    /// breaking it keeps a content-sized ancestor from stretching to its width.
+    /// Flows from the current column, wraps at `line_right`, continues at
+    /// `line_left`; each row is its own item but only the FIRST carries the link
+    /// (one selection stop, like a wrapped link). Display-width aware, so a wide
+    /// glyph (CJK/emoji) never straddles the edge.
+    fn place_oversize(
+        &mut self,
+        text: &str,
+        kind: ItemKind,
+        emph: Emphasis,
+        node: NodeId,
+        link: Option<Link>,
+    ) {
+        let mut link = link;
+        let mut buf = String::new();
+        let mut bw = 0usize;
+        for ch in text.chars() {
+            let gw = display_width(ch.encode_utf8(&mut [0u8; 4]));
+            // Wrap before a glyph that would cross the right edge, but never make
+            // an empty line (only break once the current line holds content).
+            if gw > 0 && self.col + bw + gw > self.line_right && self.col + bw > self.line_left {
+                if bw > 0 {
+                    self.push_item(std::mem::take(&mut buf), bw, kind, emph, node, link.take());
+                    bw = 0;
+                }
+                self.break_line();
+            }
+            buf.push(ch);
+            bw += gw;
+        }
+        if !buf.is_empty() {
+            self.push_item(buf, bw, kind, emph, node, link);
+        }
     }
 
     /// Place a newline-free segment with its spaces preserved. `pre`
@@ -5806,32 +6724,47 @@ impl<'a> Layout<'a> {
     /// decoded video, falls back to the link alone — fully general (not every
     /// embed has a preview frame).
     fn flow_media(&mut self, id: NodeId, tag: &str, ctx: &Ctx) {
-        // The playable URL: the element's own `src`, else the first `<source>`.
-        let Some((media_url, src_node)) = self.media_source(id) else {
-            return; // no playable source — nothing to represent
+        // The URL handed to mpv on follow: the element's own inline source (a
+        // direct file mpv plays), else the PAGE itself. A streaming player
+        // (Twitch/YouTube/Kick/…) feeds its `<video>` from MSE/blob URLs with
+        // no `src`/`<source>`, so there is nothing inline-playable — but yt-dlp
+        // resolves the page URL for ~1800 sites, so a `<video>` ALWAYS yields a
+        // "play in mpv" affordance. (`<audio>` with no source has no fallback —
+        // the page URL isn't an audio stream — so it still represents nothing.)
+        let (play_url, src_node, streaming) = match self.media_source(id) {
+            Some((u, n)) => (url::Url::parse(&u).ok(), n, false),
+            None if tag == "video" => (Some(self.base.clone()), None, true),
+            None => return, // poster-less audio with no source — nothing to show
         };
+        let Some(play_url) = play_url else { return };
         // The representation links to the media; following it launches mpv.
         let mut mctx = ctx.clone();
-        mctx.link = Some(crate::http::resolve(self.base, &media_url));
+        mctx.link = Some(Link::Media(play_url));
         mctx.kind = ItemKind::Link;
         mctx.node = id;
 
         self.flush_block();
         self.begin_line();
 
-        // The video poster (its own preview frame), when present AND decoded,
-        // renders as a clickable thumbnail. Sized by its decoded box (NOT the
-        // `<video>`'s CSS — that carries a `height:0`/`padding-top` 16:9 hack
-        // a poster must not inherit), capped to the content width.
+        // The preview frame, when present AND decoded, renders as a clickable
+        // thumbnail. The element's own `poster` first; failing that (the
+        // streaming case — no poster on the live `<video>`) the page's standard
+        // Open Graph image. Sized by its decoded box (NOT the `<video>`'s CSS —
+        // that carries a `height:0`/`padding-top` 16:9 hack a poster must not
+        // inherit), capped to the content width.
         let poster = (tag == "video")
-            .then(|| self.dom.attr(id, "poster"))
-            .flatten()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .and_then(|p| match crate::http::resolve(self.base, p) {
-                Link::Http(u) => Some(u.to_string()),
-                _ => None,
-            });
+            .then(|| {
+                self.dom
+                    .attr(id, "poster")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|p| match crate::http::resolve(self.base, p) {
+                        Link::Http(u) => Some(u.to_string()),
+                        _ => None,
+                    })
+                    .or_else(|| page_preview_image(self.dom, self.base))
+            })
+            .flatten();
         if let Some(poster) = poster
             && let Some(&(iw, ih)) = self.images.get(&poster)
             && iw > 0
@@ -5858,8 +6791,14 @@ impl<'a> Layout<'a> {
             self.break_line();
         }
 
-        // The caption / fallback link.
-        let label = self.media_label(tag, src_node);
+        // The caption / fallback link. A streaming `<video>` with no inline
+        // source says so plainly (it plays the page via yt-dlp); a direct
+        // source keeps its kind + quality (`▶ Video · 720p HD`).
+        let label = if streaming {
+            String::from("▶ Watch in mpv")
+        } else {
+            self.media_label(tag, src_node)
+        };
         self.place_text(&label, &mctx);
         self.break_line();
     }
@@ -6066,12 +7005,30 @@ impl<'a> Layout<'a> {
         if self.dom.attr(id, "aria-haspopup").is_some() {
             return None;
         }
-        ["aria-label", "title", "alt"]
+        let label = ["aria-label", "title", "alt"]
             .into_iter()
             .filter_map(|a| self.dom.attr(id, a))
             .map(str::trim)
             .find(|v| !v.is_empty())
-            .map(str::to_owned)
+            .map(str::to_owned)?;
+        // A control the author CLIPPED to an icon-sized box never paints its
+        // accessible NAME — a browser shows only what fits the box (the icon).
+        // When the name overflows a definite `width` under `overflow:hidden/clip`
+        // it's assistive-only chrome (an `aria-label`/`title`), not visible
+        // content, so don't surface it. This honors the cascade rather than
+        // policing intent: the box clips, full stop. (Twitch's per-message reply
+        // button is `aria-label="Click to reply to @user"` inside a
+        // `width:3.2rem;overflow:hidden` icon box — surfacing it spammed every
+        // chat line with the screen-reader name.) Bigger boxes that fit their
+        // name (a logo link, a labeled nav button) are unaffected: `css_cells`
+        // is `None` for `auto`, and a wide box's width clears the label.
+        if self.clips_hard(id, false)
+            && let Some(w) = self.css_cells(id, "width")
+            && display_width(&label) > w
+        {
+            return None;
+        }
+        Some(label)
     }
 
     /// The absolute URL of an `<img>`'s `src`, resolved against the base.
@@ -6364,7 +7321,7 @@ impl<'a> Layout<'a> {
             // `aspect-ratio` ancestor; else the intrinsic box.
             if let Some(rows) = self.intrinsic_ratio_container_rows(id, used_w) {
                 (pct * rows as f32).round().max(1.0) as usize
-            } else if let Some(basis) = self.definite_ancestor_height(id) {
+            } else if let Some(basis) = self.containing_block_height(id) {
                 (pct * basis as f32).round().max(1.0) as usize
             } else {
                 self.container_box_rows(id, used_w).unwrap_or(intrinsic_h)
@@ -6534,24 +7491,288 @@ impl<'a> Layout<'a> {
         None
     }
 
-    /// Height (rows) of the nearest ancestor establishing a definite (length,
-    /// non-percentage) `height` — the containing block for a percentage height
-    /// on `id` (the avatar wrapper's `height:24px`). `None` when none does.
-    /// Unbounded like `definite_ancestor_width` (see its note on the walk depth).
-    fn definite_ancestor_height(&self, id: NodeId) -> Option<usize> {
-        let mut cur = self.dom.parent_composed(id);
-        while let Some(p) = cur {
-            if let Some(rows) = self
-                .dom
-                .computed_style(p, "height")
-                .as_deref()
-                .and_then(css_length_rows)
-            {
-                return Some(rows);
+    /// The element's USED height in ROWS **if it is DEFINITE** (CSS 2.1 §10.5),
+    /// else `None` (its height is `auto`/content-driven, i.e. indefinite). The
+    /// single authority for "does this box have a definite height" — used by
+    /// percentage-height resolution and (inner scroll, Phase 1) the scroll-region
+    /// trigger. A pure query: it never changes normal-flow heights, which stay
+    /// content-driven.
+    ///
+    /// A length (px/em/ch/`vh`) is definite. A `%` height is definite ONLY when
+    /// its containing block height is itself definite — the spec rule: "If the
+    /// height of the containing block is not specified explicitly … the value
+    /// computes to 'auto'." The chain walks containing blocks (the parent block,
+    /// per in-flow assumption) multiplying the percentages, and terminates at the
+    /// initial containing block (the viewport, whose height is `viewport_h`). An
+    /// `auto`/absent height anywhere on the chain makes the whole thing
+    /// indefinite. (Absolutely-positioned CBs — the positioned ancestor's padding
+    /// box — are not yet modelled here; in-flow is the common scroll-region case.)
+    fn definite_height(&self, id: NodeId) -> Option<usize> {
+        let mut cur = id;
+        let mut factor = 1.0f32;
+        loop {
+            let raw = self.dom.computed_style(cur, "height");
+            let v = raw.as_deref().map(str::trim).unwrap_or("auto");
+            if v.is_empty() || v.eq_ignore_ascii_case("auto") {
+                // No explicit height ⇒ content-driven/indefinite for a normal
+                // block. TWO bridges make it definite, both off the in-flow
+                // path:
+                //   1. An absolutely/fixed-positioned box with both `top` AND
+                //      `bottom` set has a definite used height (CSS 2.1 §10.6.4)
+                //      = containing-block height − top − bottom. The app-shell
+                //      idiom — a `position:absolute; top:0; bottom:0` panel
+                //      filling a positioned ancestor (Twitch's chat column fills
+                //      `#root`), holding the `height:100%` scroll area.
+                //   2. A flex item stretched/grown to a definite container
+                //      height (CSS Flexbox §9.4/§9.7 — `flex_item_definite_height`).
+                if let Some(h) = self.abs_pos_definite_height(cur) {
+                    return Some((factor * h as f32).round().max(0.0) as usize);
+                }
+                return self
+                    .flex_item_definite_height(cur)
+                    .map(|h| (factor * h as f32).round().max(0.0) as usize);
             }
-            cur = self.dom.parent_composed(p);
+            if let Some(pct) = parse_percent(v) {
+                factor *= pct;
+                match self.height_cb(cur) {
+                    CbHeight::Element(p) => cur = p,
+                    CbHeight::Viewport => {
+                        return (self.viewport_h > 0)
+                            .then(|| (factor * self.viewport_h as f32).round().max(0.0) as usize);
+                    }
+                }
+            } else if let Some(rows) = css_height_rows_f32(v, self.viewport_h) {
+                return Some((factor * rows).round().max(0.0) as usize);
+            } else {
+                return None; // an unresolvable unit (e.g. `vh` with unknown viewport)
+            }
         }
-        None
+    }
+
+    /// The containing block used to resolve a percentage `height` on `id`: the
+    /// nearest block-level ancestor (in-flow assumption), or the viewport (the
+    /// initial containing block) when `id`'s parent is the document root.
+    fn height_cb(&self, id: NodeId) -> CbHeight {
+        match self.dom.parent_composed(id) {
+            Some(p) if self.dom.tag_name(p).is_some() => CbHeight::Element(p),
+            _ => CbHeight::Viewport,
+        }
+    }
+
+    /// The definite height (rows) of `id`'s containing block — what a percentage
+    /// height on `id` resolves against. `None` when that containing block height
+    /// is itself indefinite (so the percentage computes to `auto`). This is the
+    /// containing block for a percentage height on an image (the avatar wrapper's
+    /// `height:36px`, or a `height:100%` chain up to the viewport).
+    fn containing_block_height(&self, id: NodeId) -> Option<usize> {
+        match self.height_cb(id) {
+            CbHeight::Element(p) => self.definite_height(p),
+            CbHeight::Viewport => (self.viewport_h > 0).then_some(self.viewport_h),
+        }
+    }
+
+    /// The DEFINITE used height (rows) of an absolutely/fixed-positioned box
+    /// whose `height` is `auto` but whose `top` AND `bottom` are both definite
+    /// (CSS 2.1 §10.6.4): the containing-block height minus the two offsets and
+    /// vertical margins. `None` when the box isn't out of flow, an offset is
+    /// `auto`/absent, or the containing block height is indefinite. This is the
+    /// app-shell idiom — a `top:0; bottom:0` panel filling a positioned ancestor
+    /// (Twitch's chat column fills `#root`). Borders/padding are approximated
+    /// away (content height ≈ height), as elsewhere in the height model.
+    fn abs_pos_definite_height(&self, id: NodeId) -> Option<usize> {
+        if !self.is_out_of_flow(id) {
+            return None;
+        }
+        let cb_h = self.abs_cb_height(id)?;
+        let top = self.pos_len(id, "top", cb_h)?;
+        let bottom = self.pos_len(id, "bottom", cb_h)?;
+        let mt = self.pos_len(id, "margin-top", cb_h).unwrap_or(0.0);
+        let mb = self.pos_len(id, "margin-bottom", cb_h).unwrap_or(0.0);
+        Some((cb_h as f32 - top - bottom - mt - mb).round().max(0.0) as usize)
+    }
+
+    /// The definite height (rows) of an out-of-flow box's containing block (the
+    /// extent its `top`/`bottom`/`%` resolve against): the viewport for `fixed`,
+    /// else the nearest positioned ancestor's definite height — or the initial
+    /// containing block (the viewport) when there is no positioned ancestor.
+    fn abs_cb_height(&self, id: NodeId) -> Option<usize> {
+        if self.dom.computed_style(id, "position").as_deref() == Some("fixed") {
+            return (self.viewport_h > 0).then_some(self.viewport_h);
+        }
+        match self.positioned_containing_block(id) {
+            Some(cb) => self.definite_height(cb),
+            None => (self.viewport_h > 0).then_some(self.viewport_h),
+        }
+    }
+
+    /// A flex item's DEFINITE cross height when it has no explicit height (CSS
+    /// Flexbox §9.4 "Cross sizing"): a stretched item in a non-wrapping ROW flex
+    /// container with a definite height fills the container's content height. So
+    /// a chat column with `align-items:stretch` (the default) inside a
+    /// viewport-tall horizontal page-flex is itself definite-height, which lets a
+    /// `height:100%` scroll area inside it resolve. `None` when the item isn't
+    /// stretched, its container isn't a definite-height row flex, or it's out of
+    /// flow.
+    ///
+    /// NOT yet modelled (returns `None`): COLUMN-flex MAIN-size distribution —
+    /// splitting the container's definite height across `flex-grow` items
+    /// requires the full main-size resolution; such an item resolves only via an
+    /// explicit `height`/`%`. Padding/border of the container is approximated
+    /// away (its content height ≈ its height) — terminal cell coarseness.
+    fn flex_item_definite_height(&self, id: NodeId) -> Option<usize> {
+        if self.is_out_of_flow(id) {
+            return None;
+        }
+        let parent = self.dom.parent_composed(id)?;
+        match self.flex_mode(parent)? {
+            FlexMode::Row if self.flex_cross_stretches(id, parent) => self.definite_height(parent),
+            FlexMode::Column => self.column_flex_item_main_height(id, parent),
+            _ => None,
+        }
+    }
+
+    /// A `flex-grow` item's DEFINITE main size (height, in rows) inside a
+    /// definite-height COLUMN flex container (CSS Flexbox §9.2/§9.7). The
+    /// container's content height is distributed: free space = `H − Σ base`
+    /// over every item's flex base size, handed to grow items by their grow
+    /// factor — so a stretched chat column inside a viewport-tall
+    /// `flex-direction:column` shell (`#root`) becomes definite, letting an
+    /// inner `height:100%` scroll area resolve.
+    ///
+    /// We resolve ONE item, so we must never measure the item itself — it may
+    /// be mid-layout (self-measurement would recurse). This is exact for a
+    /// SOLE grow item, whose own base size cancels out of the distribution
+    /// (`target = base + 1·(H − Σothers − base) = H − Σothers`), so we only
+    /// measure the OTHER siblings' bases (disjoint subtrees, re-entrancy-safe).
+    /// Multiple grow items would need this item's own base (no cancellation) ⇒
+    /// `None` (deferred; the region simply doesn't trigger — an honest gap).
+    /// Container padding/border is approximated away (content height ≈ height),
+    /// matching the row-stretch bridge — terminal cell coarseness.
+    fn column_flex_item_main_height(&self, id: NodeId, parent: NodeId) -> Option<usize> {
+        // Only a growing item takes a definite main size from the container; a
+        // non-growing auto-height column item is content-sized (indefinite).
+        if self.flex_number(id, "flex-grow").unwrap_or(0.0) <= 0.0 {
+            return None;
+        }
+        let container_h = self.definite_height(parent)?;
+        let cross_w = self.column_cross_width(parent);
+        // Σ flex base sizes of the OTHER (non-grow) items. A second grow item
+        // would require `id`'s own base size (no cancellation) — deferred.
+        let mut others = 0usize;
+        let mut found_self = false;
+        for sib in self.flex_items(parent) {
+            if self.flex_number(sib, "flex-grow").unwrap_or(0.0) > 0.0 {
+                if sib == id {
+                    found_self = true;
+                } else {
+                    return None;
+                }
+            } else {
+                others = others.saturating_add(self.flex_base_height(sib, container_h, cross_w));
+            }
+        }
+        if !found_self {
+            return None;
+        }
+        let mut main = container_h.saturating_sub(others);
+        // Explicit `min-height`/`max-height` clamp the grown main size (resolved
+        // against the container content height). `min-height:auto`'s content
+        // floor (§4.5) is not applied to the grown item — it would require
+        // self-measurement and never binds while an item grows into positive
+        // free space.
+        if let Some(m) = self.len_or_pct_h(id, "max-height", container_h) {
+            main = main.min(m);
+        }
+        if let Some(m) = self.len_or_pct_h(id, "min-height", container_h) {
+            main = main.max(m);
+        }
+        Some(main)
+    }
+
+    /// A column-flex item's flex base size on the MAIN (vertical) axis, in rows
+    /// (CSS Flexbox §9.2): `flex-basis` if a length (`auto` ⇒ the `height`
+    /// property; `content`/`*-content` ⇒ a content size), resolved against the
+    /// container content height `cb_h`; an auto/content size is the item's
+    /// content height laid out at `cross_w` (the container content width).
+    /// Explicit `min-height`/`max-height` clamp it — and the automatic minimum
+    /// (`min-height:auto`, §4.5) is satisfied for a measured item, whose content
+    /// height already exceeds its content-min.
+    fn flex_base_height(&self, id: NodeId, cb_h: usize, cross_w: usize) -> usize {
+        let basis = match self
+            .dom
+            .computed_style(id, "flex-basis")
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("auto") => self.len_or_pct_h(id, "height", cb_h),
+            Some("content" | "max-content" | "min-content" | "fit-content") => None,
+            Some(v) => self.resolve_height_rows(v, cb_h),
+        };
+        let mut base = basis.unwrap_or_else(|| self.measure_height(id, cross_w));
+        if let Some(m) = self.len_or_pct_h(id, "max-height", cb_h) {
+            base = base.min(m);
+        }
+        if let Some(m) = self.len_or_pct_h(id, "min-height", cb_h) {
+            base = base.max(m);
+        }
+        base
+    }
+
+    /// A height-axis analogue of `len_or_pct`: a `height`/`min-height`/
+    /// `max-height`-style property as rows, resolving `%` against the
+    /// containing-block height `cb_h` and `vh` against the viewport.
+    fn len_or_pct_h(&self, id: NodeId, prop: &str, cb_h: usize) -> Option<usize> {
+        self.resolve_height_rows(&self.dom.computed_style(id, prop)?, cb_h)
+    }
+
+    /// Resolve a vertical CSS length to rows: a `%` against the containing-block
+    /// height `cb_h`, else a length/`vh` via `css_height_rows_f32` (NOT the
+    /// width resolver — a cell is ~1 row/em tall but ~2 cells/em wide, so the
+    /// two axes never share `resolve_cells`'s `em·2`). Rounded, never negative.
+    fn resolve_height_rows(&self, value: &str, cb_h: usize) -> Option<usize> {
+        if let Some(pct) = parse_percent(value) {
+            return Some((pct * cb_h as f32).round().max(0.0) as usize);
+        }
+        css_height_rows_f32(value, self.viewport_h).map(|r| r.round().max(0.0) as usize)
+    }
+
+    /// The content height (rows) of `id`'s subtree laid out at `width`. A
+    /// height-axis analogue of `measure_width`; used to size a column-flex
+    /// sibling whose main size is content-driven.
+    fn measure_height(&self, id: NodeId, width: usize) -> usize {
+        self.layout_subtree_inner(id, width.max(1), None, true, &Ctx::root())
+            .height as usize
+    }
+
+    /// The cross-axis (width) basis for measuring a column flex container's
+    /// items: the container's own definite `width` length, else a definite-
+    /// width ancestor, else the viewport width (a full-bleed app shell). An
+    /// approximation — only the fallback content-height measurement of an
+    /// auto-height sibling depends on it.
+    fn column_cross_width(&self, container: NodeId) -> usize {
+        self.dom
+            .computed_style(container, "width")
+            .as_deref()
+            .and_then(css_length_em)
+            .map(|em| (em * 2.0).round().max(1.0) as usize)
+            .or_else(|| self.definite_ancestor_width(container))
+            .unwrap_or_else(|| self.viewport_w.max(1))
+    }
+
+    /// Whether a flex item stretches on the cross axis (CSS Flexbox §9.4): its
+    /// resolved `align-self` (else the container's `align-items`) is `stretch` or
+    /// `normal` — both the initial value, which stretches an auto cross-size to
+    /// fill the line.
+    fn flex_cross_stretches(&self, id: NodeId, parent: NodeId) -> bool {
+        let align = self
+            .dom
+            .computed_style(id, "align-self")
+            .filter(|v| !v.trim().eq_ignore_ascii_case("auto"))
+            .or_else(|| self.dom.computed_style(parent, "align-items"));
+        match align.as_deref().map(str::trim) {
+            None => true, // initial align-items is `normal` ⇒ stretch for flex
+            Some(v) => v.eq_ignore_ascii_case("stretch") || v.eq_ignore_ascii_case("normal"),
+        }
     }
 
     /// Flow a form control. A control known to the form extraction (in
@@ -6654,7 +7875,18 @@ impl<'a> Layout<'a> {
             }
             self.col += 1;
         }
-        self.push_item(text, len, kind, Emphasis::default(), node, link);
+        // A widget LABEL wider than the band (a poll button packed with voter
+        // usernames) char-breaks across rows like text rather than overflowing
+        // off-screen. Render-only (`overflow-wrap:break-word`, like `place_word`)
+        // so measurement still sizes a content-sized box to the full label. Every
+        // `place_atom` caller is a text-bearing form stub, and short widgets
+        // (`[ ]`/`( )`/`[ select ▾ ]`) never exceed the band, so only genuinely
+        // over-wide labels are affected.
+        if !self.measuring && len > self.line_right.saturating_sub(self.line_left).max(1) {
+            self.place_oversize(&text, kind, Emphasis::default(), node, link);
+        } else {
+            self.push_item(text, len, kind, Emphasis::default(), node, link);
+        }
         self.pending_space = true; // a widget gets a trailing gap
     }
 
@@ -6823,25 +8055,59 @@ impl<'a> Layout<'a> {
     /// stays aligned with its cards no matter how many blank rows above or
     /// inside it were dropped. Without this remap the band drifts off its
     /// cards and the view stops clipping the strip.
-    fn finish(mut self) -> (Vec<Row>, Vec<Carousel>, ElementTops) {
+    fn finish(
+        mut self,
+    ) -> (
+        Vec<Row>,
+        Vec<Carousel>,
+        Vec<Region>,
+        ElementTops,
+        ScrollClips,
+        BoundaryRecs,
+    ) {
         let carousels = std::mem::take(&mut self.carousels);
+        let mut regions = std::mem::take(&mut self.regions);
         let element_tops = std::mem::take(&mut self.element_tops);
+        let scroll_clips = std::mem::take(&mut self.scroll_clips);
+        let boundary_boxes = std::mem::take(&mut self.boundary_boxes);
         let n = self.rows.len();
+        // A scroll region reserves exactly `height` BLANK doc rows that the
+        // renderer fills from its buffer — they're intentional placeholders, so
+        // they must survive the blank-row collapse (and the trailing-blank pop)
+        // that would otherwise merge or drop them.
+        let mut reserved = vec![false; n];
+        for rg in &regions {
+            for slot in reserved
+                .iter_mut()
+                .take((rg.start_row + rg.height as usize).min(n))
+                .skip(rg.start_row.min(n))
+            {
+                *slot = true;
+            }
+        }
         // remap[i] = new index of old row i (for a dropped blank, the index
         // the next kept row takes). remap[n] = total kept rows, for an
         // exclusive `end` that points one past the last row.
         let mut remap = vec![0usize; n + 1];
         let mut out: Vec<Row> = Vec::with_capacity(n);
+        let mut out_reserved: Vec<bool> = Vec::with_capacity(n);
         for (i, row) in self.rows.into_iter().enumerate() {
             remap[i] = out.len();
-            if row.items.is_empty() && out.last().is_none_or(|r| r.items.is_empty()) {
+            if !reserved[i] && row.items.is_empty() && out.last().is_none_or(|r| r.items.is_empty())
+            {
                 continue;
             }
+            out_reserved.push(reserved[i]);
             out.push(row);
         }
         remap[n] = out.len();
-        while out.last().is_some_and(|r| r.items.is_empty()) {
+        while out.last().is_some_and(|r| r.items.is_empty()) && out_reserved.last() == Some(&false)
+        {
             out.pop();
+            out_reserved.pop();
+        }
+        for rg in &mut regions {
+            rg.start_row = remap[rg.start_row.min(n)];
         }
         let carousels = carousels
             .into_iter()
@@ -6872,7 +8138,37 @@ impl<'a> Layout<'a> {
                 (id, (col, u16::try_from(mapped).unwrap_or(u16::MAX)))
             })
             .collect();
-        (out, carousels, element_tops)
+        // Remap each incremental-layout boundary's row span through the same
+        // collapse (start inclusive, end exclusive — like a carousel) so its
+        // `row_range` indexes the kept-row grid the splice operates on.
+        let remap_row = |r: usize| -> usize {
+            if r >= n {
+                out.len() + (r - n)
+            } else {
+                remap[r]
+            }
+        };
+        let boundary_boxes = boundary_boxes
+            .into_iter()
+            .map(|(id, rec)| {
+                (
+                    id,
+                    BoundaryRec {
+                        start_row: remap_row(rec.start_row),
+                        end_row: remap_row(rec.end_row),
+                        ..rec
+                    },
+                )
+            })
+            .collect();
+        (
+            out,
+            carousels,
+            regions,
+            element_tops,
+            scroll_clips,
+            boundary_boxes,
+        )
     }
 }
 
@@ -6983,17 +8279,47 @@ fn css_is_italic(value: &str) -> bool {
     )
 }
 
-/// Safety backstop on a CSS-forced image height (rows). Well-built pages
-/// constrain images with a sized box, but a pathological `height: 5000px`
-/// shouldn't reserve hundreds of rows and wreck scroll/selection — this is a
-/// guard, not a layout cap (cf. `IMG_MAX_CELLS` for intrinsic boxes).
-const IMG_CSS_MAX_ROWS: usize = 48;
+/// Defensive backstop on a CSS-forced image height (rows) — only the
+/// `object-fit:cover` path can reach it (that path keeps the author's box
+/// rather than the drawn box). It is NOT a rendering cap: CSS doesn't limit an
+/// image's height, a tall image just scrolls, and partial-sixel drawing handles
+/// images larger than the viewport. The non-cover path already reserves only
+/// what's actually drawn, and the decoder bounds raster dimensions to
+/// `img::MAX_DIMENSION` (12 000px ≈ 750 rows even at a 16px cell), so no real
+/// image reaches this lid. It exists ONLY so a pathological `object-fit:cover;
+/// height: 9999999px` can't reserve a near-infinite blank run and wreck the
+/// scroll/selection index math — the same family of hostile-input lid as
+/// `http::MAX_BODY`. Set far above any decoded image; a tall image renders in
+/// full. (Was 48 — a leftover from before partial sixel, which clipped real
+/// tall images; her call 2026-06-27 to raise it.)
+const IMG_CSS_MAX_ROWS: usize = 12_000;
 
 /// A vertical CSS length as terminal rows. The cell is ~2:1 (col:row), so 1em
 /// ≈ 1 row (vs ≈ 2 cols horizontally) and 1px ≈ 1/16 row. `%`/`auto`/`vh`
 /// return `None` (a `100%`/`%` height resolves against a container instead).
 fn css_length_rows(value: &str) -> Option<usize> {
     css_length_em(value).map(|em| em.round().max(1.0) as usize)
+}
+
+/// A definite CSS height as ROWS (fractional, for chain multiplication): an
+/// absolute length (em/rem/px/pt/ch, 1em ≈ 1 row) or a viewport-height unit
+/// (`vh` against `viewport_h`, already in rows). `%`/`auto` are NOT resolved
+/// here — a `%` height needs its containing block (see `Layout::definite_height`).
+/// `None` for an indefinite/unresolvable value, or `vh` when the viewport height
+/// is unknown (`viewport_h == 0`). Height stays SEPARATE from the width resolver
+/// (`resolve_cells`) on purpose: a terminal cell is ~1 row/em tall but ~2
+/// cells/em wide, so the two axes don't share a unit (`vmin`/`vmax` as a height
+/// would mix the two and are vanishingly rare — deferred). Unlike
+/// `css_length_rows` it does NOT floor at 1 row (the chain rounds once at the end).
+fn css_height_rows_f32(value: &str, viewport_h: usize) -> Option<f32> {
+    let v = value.trim();
+    if let Some(n) = v
+        .strip_suffix("vh")
+        .and_then(|s| s.trim().parse::<f32>().ok())
+    {
+        return (viewport_h > 0).then(|| (n / 100.0) * viewport_h as f32);
+    }
+    css_length_em(v)
 }
 
 /// A CSS percentage (`"75%"`) as a fraction (`0.75`); `None` for any other
@@ -7147,7 +8473,7 @@ fn rows_for_ratio(width_cols: usize, ratio: f32) -> usize {
 /// px; the single place absolute units are understood. Context-dependent
 /// values (`%`/`vw`/`calc()`/`auto`) → `None` here — they go through
 /// `resolve_cells`, which knows the containing block and the viewport.
-fn css_length_em(value: &str) -> Option<f32> {
+pub(crate) fn css_length_em(value: &str) -> Option<f32> {
     let v = value.trim();
     let split = v
         .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
@@ -7164,13 +8490,6 @@ fn css_length_em(value: &str) -> Option<f32> {
     }
 }
 
-/// A CSS horizontal length, percentage, `vw`, or `calc()` as a count of
-/// cells (f32, for `calc` arithmetic). `%` resolves against `avail` (the
-/// containing block's content width), `vw` against `viewport` (the full
-/// terminal width), absolute units via `css_length_em` (≈ 2 cells/em).
-/// `None` for `auto` and units we don't resolve here (`vh`/`vmin`/… need a
-/// viewport height the terminal layout doesn't carry). This is the single
-/// contextual length resolver.
 /// Which CSS math comparison function to fold over its arguments.
 enum Fold {
     Min,
@@ -7277,7 +8596,11 @@ fn grid_mark(
     }
 }
 
-fn resolve_cells_f32(value: &str, avail: usize, viewport: usize) -> Option<f32> {
+/// `viewport` is `(width, height)` in cells — the basis for viewport-percentage
+/// units (`vw` against `.0`, `vh` against `.1`, `vmin`/`vmax` against the
+/// smaller/larger). A height of `0` means this pass wasn't told the viewport
+/// height (a legacy/test caller), so `vh`/`vmin`/`vmax` stay unresolved.
+fn resolve_cells_f32(value: &str, avail: usize, viewport: (usize, usize)) -> Option<f32> {
     let v = value.trim();
     // `var(--name, fallback)`: stylesheets are dropped before layout, so a
     // referenced custom property is (almost always) undefined here — the
@@ -7337,17 +8660,31 @@ fn resolve_cells_f32(value: &str, avail: usize, viewport: usize) -> Option<f32> 
         let pct: f32 = p.trim().parse().ok()?;
         return Some((pct / 100.0) * avail as f32);
     }
-    if let Some(n) = v
-        .strip_suffix("vw")
-        .and_then(|n| n.trim().parse::<f32>().ok())
-    {
-        return Some((n / 100.0) * viewport as f32);
+    // Viewport-percentage units, measured in CELLS (the basis `vw` has always
+    // used), so the result is directly in cells. `vh`/`vmin`/`vmax` need the
+    // viewport height; when it's unknown (`.1 == 0`) they stay `None` rather
+    // than collapsing to 0 — preserving the prior "no viewport height" result.
+    // Longer suffixes (`vmin`/`vmax`) are tested before `vh`/`vw`.
+    let (vw, vh) = (viewport.0 as f32, viewport.1 as f32);
+    let known_h = viewport.1 > 0;
+    for (suffix, basis) in [
+        ("vmin", known_h.then(|| vw.min(vh))),
+        ("vmax", known_h.then(|| vw.max(vh))),
+        ("vh", known_h.then_some(vh)),
+        ("vw", Some(vw)),
+    ] {
+        if let Some(n) = v
+            .strip_suffix(suffix)
+            .and_then(|n| n.trim().parse::<f32>().ok())
+        {
+            return basis.map(|b| (n / 100.0) * b);
+        }
     }
     css_length_em(v).map(|em| em * 2.0)
 }
 
 /// `resolve_cells_f32` rounded to whole cells (never negative).
-fn resolve_cells(value: &str, avail: usize, viewport: usize) -> Option<usize> {
+fn resolve_cells(value: &str, avail: usize, viewport: (usize, usize)) -> Option<usize> {
     resolve_cells_f32(value, avail, viewport).map(|c| c.round().max(0.0) as usize)
 }
 
@@ -7360,7 +8697,7 @@ fn resolve_cells(value: &str, avail: usize, viewport: usize) -> Option<usize> {
 /// 3-column flex/grid item width (Humble Bundle's bundle item grid). Returns
 /// `None` on a parse failure or an unresolvable term, so the caller ignores
 /// the value as it did before `calc` was understood at all.
-fn resolve_calc(body: &str, avail: usize, viewport: usize) -> Option<f32> {
+fn resolve_calc(body: &str, avail: usize, viewport: (usize, usize)) -> Option<f32> {
     let mut p = CalcParser {
         s: body.as_bytes(),
         pos: 0,
@@ -7381,7 +8718,7 @@ struct CalcParser<'a> {
     s: &'a [u8],
     pos: usize,
     avail: usize,
-    viewport: usize,
+    viewport: (usize, usize),
 }
 
 impl CalcParser<'_> {
@@ -7580,7 +8917,15 @@ mod tests {
     fn measure(html: &str, width: usize) -> (Dom, HashMap<NodeId, PxRect>) {
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
-        let boxes = measure_boxes(&dom, &base, width, &[], &ControlMap::new(), (8, 16), false);
+        let boxes = measure_boxes(
+            &dom,
+            &base,
+            (width, 0),
+            &[],
+            &ControlMap::new(),
+            (8, 16),
+            false,
+        );
         (dom, boxes)
     }
 
@@ -7615,6 +8960,52 @@ mod tests {
         assert_eq!(wrap.top, a.top);
         assert_eq!(wrap.width, 32.0);
         assert_eq!(wrap.height, 16.0);
+    }
+
+    #[test]
+    fn viewport_height_resolves_vh_lengths_end_to_end() {
+        // Phase 0a: a `vh` length resolves once the viewport HEIGHT is threaded
+        // through the public entry point — not just in the free-function unit
+        // test. `width:50vh` of a 24-row viewport = 12 cells; cell_px width 8 →
+        // 96px. The same markup with an UNKNOWN height (0) leaves `vh`
+        // unresolved (no width floor → bare content extent), proving the
+        // threaded height is what unlocked it, not a baked constant.
+        let html = r#"<body><div id="box" style="width:50vh">·</div></body>"#;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let id = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&n| dom.attr(n, "id") == Some("box"))
+            .unwrap();
+        let with_h = measure_boxes(
+            &dom,
+            &base,
+            (40, 24),
+            &[],
+            &ControlMap::new(),
+            (8, 16),
+            false,
+        );
+        assert_eq!(
+            with_h.get(&id).unwrap().width,
+            96.0,
+            "50vh = 12 cells = 96px once the viewport height is threaded"
+        );
+        let no_h = measure_boxes(
+            &dom,
+            &base,
+            (40, 0),
+            &[],
+            &ControlMap::new(),
+            (8, 16),
+            false,
+        );
+        assert_eq!(
+            no_h.get(&id).unwrap().width,
+            8.0,
+            "unknown viewport height ⇒ vh unresolved ⇒ no floor, just content"
+        );
     }
 
     #[test]
@@ -7812,8 +9203,8 @@ mod tests {
                 images.insert(u.to_string(), (fw, fh));
             }
         }
-        let (rows, carousels) =
-            lay_out_with_carousels(&dom, &base, w, &[], &ControlMap::new(), &images, true);
+        let (rows, carousels, _regions, ..) =
+            lay_out_with_carousels(&dom, &base, (w, 0), &[], &ControlMap::new(), &images, true);
         for c in &carousels {
             println!(
                 "CAROUSEL rows {}..{} band [{},{}] width {} stops {}",
@@ -8203,35 +9594,79 @@ mod tests {
     fn length_resolver_units_ch_vw_and_calc() {
         // ch is the natural terminal unit (1ch = 1 cell); % is the
         // containing block, vw the viewport; calc folds a +/- term chain.
-        assert_eq!(resolve_cells("10ch", 100, 80), Some(10), "1ch = 1 cell");
-        assert_eq!(resolve_cells("50%", 40, 80), Some(20), "% of avail");
-        assert_eq!(resolve_cells("50vw", 40, 80), Some(40), "vw of viewport");
+        // Viewport is (width, height) in cells; here 80×24.
+        let vp = (80, 24);
+        assert_eq!(resolve_cells("10ch", 100, vp), Some(10), "1ch = 1 cell");
+        assert_eq!(resolve_cells("50%", 40, vp), Some(20), "% of avail");
         assert_eq!(
-            resolve_cells("calc(100% - 4ch)", 40, 80),
+            resolve_cells("50vw", 40, vp),
+            Some(40),
+            "vw of viewport width"
+        );
+        // vh/vmin/vmax now resolve against the viewport height (24 cells).
+        assert_eq!(
+            resolve_cells("50vh", 40, vp),
+            Some(12),
+            "vh of viewport height"
+        );
+        assert_eq!(
+            resolve_cells("100vh", 40, vp),
+            Some(24),
+            "100vh = full height"
+        );
+        assert_eq!(
+            resolve_cells("100vmin", 40, vp),
+            Some(24),
+            "vmin = the smaller axis (height, 24)"
+        );
+        assert_eq!(
+            resolve_cells("100vmax", 40, vp),
+            Some(80),
+            "vmax = the larger axis (width, 80)"
+        );
+        assert_eq!(
+            resolve_cells("calc(100% - 4ch)", 40, vp),
             Some(36),
             "calc subtracts a ch length from a percentage"
         );
         assert_eq!(
-            resolve_cells("calc(50% + 2ch)", 40, 80),
+            resolve_cells("calc(50% + 2ch)", 40, vp),
             Some(22),
             "calc adds across unit kinds"
         );
+        // calc reaches viewport-height units too.
+        assert_eq!(
+            resolve_cells("calc(100vh - 4ch)", 40, vp),
+            Some(20),
+            "calc subtracts from a vh length"
+        );
         // Unsupported values are ignored (None), exactly as before.
-        assert_eq!(resolve_cells("auto", 40, 80), None);
-        assert_eq!(resolve_cells("12vh", 40, 80), None, "no viewport height");
+        assert_eq!(resolve_cells("auto", 40, vp), None);
+        // A 0 height basis means the viewport height wasn't threaded — vh/vmin/
+        // vmax stay unresolved rather than collapsing to 0 (the prior behaviour).
+        assert_eq!(
+            resolve_cells("12vh", 40, (80, 0)),
+            None,
+            "no viewport height ⇒ vh unresolved"
+        );
+        assert_eq!(
+            resolve_cells("50vmin", 40, (80, 0)),
+            None,
+            "vmin needs height"
+        );
         // calc multiplication/division (a unitless number is a scalar).
         assert_eq!(
-            resolve_cells("calc(100% * 2)", 40, 80),
+            resolve_cells("calc(100% * 2)", 40, vp),
             Some(80),
             "calc multiplies a percentage by a scalar"
         );
         assert_eq!(
-            resolve_cells("calc((100% - 4ch) / 3)", 40, 80),
+            resolve_cells("calc((100% - 4ch) / 3)", 40, vp),
             Some(12),
             "calc divides a grouped sub-expression — the 3-column item width"
         );
         assert_eq!(
-            resolve_cells("calc(100% / 3)", 60, 80),
+            resolve_cells("calc(100% / 3)", 60, vp),
             Some(20),
             "calc divides a percentage by a scalar"
         );
@@ -8584,8 +10019,8 @@ mod tests {
             Some("https://example.com/poster.jpg")
         );
         assert!(
-            matches!(&poster.link, Some(Link::Http(u)) if u.as_str().ends_with("clip_720p.mp4")),
-            "poster links to the media source"
+            matches!(&poster.link, Some(Link::Media(u)) if u.as_str().ends_with("clip_720p.mp4")),
+            "poster links to the media source (follows to mpv)"
         );
         assert!(
             shows(&rows, "▶ Video · 720p HD"),
@@ -8598,7 +10033,51 @@ mod tests {
             .flat_map(|r| &r.items)
             .find(|i| i.text.contains("▶ Video"))
             .expect("a caption item");
-        assert!(matches!(&cap.link, Some(Link::Http(u)) if u.as_str().ends_with("clip_720p.mp4")));
+        assert!(matches!(&cap.link, Some(Link::Media(u)) if u.as_str().ends_with("clip_720p.mp4")));
+    }
+
+    #[test]
+    fn a_sourceless_streaming_video_links_to_mpv_with_an_og_image_preview() {
+        // A modern player (Twitch/YouTube/Kick/…) feeds its `<video>` from MSE/
+        // blob URLs: no `src`/`<source>`/`poster`. It must still offer a "play in
+        // mpv" affordance — on the PAGE url (yt-dlp resolves it) — and use the
+        // page's standard Open Graph image as the preview frame.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/preview.jpg".to_owned(), (40, 22));
+        let rows = lay_with_images(
+            r#"<html><head><meta property="og:image" content="/preview.jpg"></head>
+               <body><video aria-label="Live player"></video></body></html>"#,
+            80,
+            &images,
+        );
+        let poster = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .expect("an og:image preview frame");
+        assert_eq!(
+            poster.image.as_deref(),
+            Some("https://example.com/preview.jpg")
+        );
+        assert!(
+            matches!(&poster.link, Some(Link::Media(u)) if u.as_str() == "https://example.com/"),
+            "the preview follows to mpv on the page URL: {:?}",
+            poster.link
+        );
+        assert!(
+            shows(&rows, "▶ Watch in mpv"),
+            "caption: {:?}",
+            texts(&rows)
+        );
+        let cap = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("Watch in mpv"))
+            .expect("a caption item");
+        assert!(
+            matches!(&cap.link, Some(Link::Media(u)) if u.as_str() == "https://example.com/"),
+            "the caption follows to mpv too"
+        );
     }
 
     #[test]
@@ -9062,6 +10541,792 @@ mod tests {
         );
     }
 
+    /// Build a `Layout` with a viewport `(width, height)` for direct unit tests
+    /// of internal sizing queries like `definite_height`.
+    fn layout_vp<'a>(
+        dom: &'a Dom,
+        base: &'a Url,
+        controls: &'a ControlMap,
+        images: &'a ImageSizes,
+        viewport: (usize, usize),
+    ) -> Layout<'a> {
+        let mut l = Layout::new(dom, base, viewport.0, &[], controls, images, false);
+        l.viewport_h = viewport.1;
+        l
+    }
+
+    fn node_by_id(dom: &Dom, id: &str) -> NodeId {
+        dom.descendants(DOCUMENT)
+            .into_iter()
+            .find(|&n| dom.attr(n, "id") == Some(id))
+            .unwrap_or_else(|| panic!("no #{id}"))
+    }
+
+    #[test]
+    fn definite_height_resolves_the_percentage_chain_to_the_viewport() {
+        // Phase 0b — CSS 2.1 §10.5: a `height:100%` chain is definite only when
+        // EVERY containing block up to the viewport is explicitly sized. With
+        // html+body+wrapper all `height:100%` and a 24-row viewport, the wrapper's
+        // used height is the full viewport (24 rows) — this is what lets a scroll
+        // region (Phase 1) know its definite height.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let dom = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%"><div id="box" style="height:100%"></div></body></html>"#,
+        );
+        let l = layout_vp(&dom, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(
+            l.definite_height(node_by_id(&dom, "box")),
+            Some(24),
+            "100% chain resolves to the 24-row viewport"
+        );
+
+        // Break the chain at <html> (auto): CSS 2.1 says the percentage then
+        // computes to `auto` (indefinite) — we must NOT skip to the viewport.
+        let dom2 = Dom::parse_document(
+            r#"<html><body style="height:100%"><div id="box" style="height:100%"></div></body></html>"#,
+        );
+        let l2 = layout_vp(&dom2, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(
+            l2.definite_height(node_by_id(&dom2, "box")),
+            None,
+            "an auto ancestor breaks the chain ⇒ indefinite"
+        );
+
+        // A nested percentage multiplies: 50% of 100%-of-viewport = 12 rows.
+        let dom3 = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%"><div id="box" style="height:50%"></div></body></html>"#,
+        );
+        let l3 = layout_vp(&dom3, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(l3.definite_height(node_by_id(&dom3, "box")), Some(12));
+    }
+
+    #[test]
+    fn definite_height_resolves_lengths_and_vh_but_not_auto() {
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let dom = Dom::parse_document(
+            r#"<body><div id="px" style="height:192px"></div><div id="vh" style="height:50vh"></div><div id="auto"></div></body>"#,
+        );
+        // A length is definite regardless of viewport height (192px = 12em ≈ 12 rows).
+        let l = layout_vp(&dom, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(l.definite_height(node_by_id(&dom, "px")), Some(12));
+        // `vh` is definite once the viewport height is threaded (50% of 24 = 12)…
+        assert_eq!(l.definite_height(node_by_id(&dom, "vh")), Some(12));
+        // …but indefinite when the viewport height is unknown (0).
+        let l0 = layout_vp(&dom, &base, &ctrls, &imgs, (40, 0));
+        assert_eq!(l0.definite_height(node_by_id(&dom, "vh")), None);
+        // A box with no height is auto ⇒ indefinite.
+        assert_eq!(l.definite_height(node_by_id(&dom, "auto")), None);
+    }
+
+    #[test]
+    fn definite_height_bridges_a_stretched_row_flex_item() {
+        // Phase 0b — CSS Flexbox §9.4: a child of a definite-height row flex with
+        // no explicit height STRETCHES (default align-items) to the container's
+        // height, becoming definite. This is the common chat layout: a horizontal
+        // page-flex sized to the viewport, whose chat column stretches to fill it,
+        // holding a `height:100%` scroll area. Without this bridge the height
+        // chain breaks at the auto-height column and the region never triggers.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let dom = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%">
+               <div id="page" style="display:flex;height:100%">
+                 <div id="main">video</div>
+                 <div id="chat"><div id="area" style="height:100%">msgs</div></div>
+               </div></body></html>"#,
+        );
+        let l = layout_vp(&dom, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(
+            l.definite_height(node_by_id(&dom, "chat")),
+            Some(24),
+            "a stretched flex item fills the viewport-tall row"
+        );
+        assert_eq!(
+            l.definite_height(node_by_id(&dom, "area")),
+            Some(24),
+            "height:100% resolves against the now-definite stretched column"
+        );
+
+        // Opting out of stretch (align-self) ⇒ indefinite.
+        let dom2 = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%"><div style="display:flex;height:100%"><div id="chat" style="align-self:flex-start">x</div></div></body></html>"#,
+        );
+        let l2 = layout_vp(&dom2, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(
+            l2.definite_height(node_by_id(&dom2, "chat")),
+            None,
+            "align-self:flex-start ⇒ not stretched ⇒ indefinite"
+        );
+
+        // A non-definite-height container can't make its items definite.
+        let dom3 = Dom::parse_document(
+            r#"<body><div style="display:flex"><div id="chat">x</div></div></body>"#,
+        );
+        let l3 = layout_vp(&dom3, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(
+            l3.definite_height(node_by_id(&dom3, "chat")),
+            None,
+            "stretch only transfers a DEFINITE container height"
+        );
+
+        // Column-flex main-size distribution (§9.2/§9.7): a sole `flex:1`
+        // column item with auto height fills the container's content height.
+        let dom4 = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%"><div style="display:flex;flex-direction:column;height:100%"><div id="grow" style="flex:1">x</div></div></body></html>"#,
+        );
+        let l4 = layout_vp(&dom4, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(
+            l4.definite_height(node_by_id(&dom4, "grow")),
+            Some(24),
+            "the sole grow item fills the viewport-tall column"
+        );
+    }
+
+    #[test]
+    fn definite_height_distributes_column_flex_main_size() {
+        // Phase 0b follow-up — CSS Flexbox §9.2/§9.7: a `flex-grow` item in a
+        // definite-height COLUMN flex gets a definite main (height) = the
+        // container content height minus the other items' base sizes. This is
+        // the Twitch chat shell: `#root` (column, height:100%) holds a fixed
+        // header + the growing app body, whose `height:100%` scroll area then
+        // resolves. The chain breaks here without main-size distribution.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let dom = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%">
+               <div id="root" style="display:flex;flex-direction:column;height:100%">
+                 <div id="hdr" style="height:48px">nav</div>
+                 <div id="body" style="flex:1">
+                   <div id="area" style="height:100%;overflow-y:auto">msgs</div>
+                 </div>
+               </div></body></html>"#,
+        );
+        // 24-row viewport − a fixed 48px (= 3em ≈ 3 rows) header ⇒ the grow body
+        // gets the remaining 21 rows, and the inner scroll area inherits it.
+        let l = layout_vp(&dom, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(
+            l.definite_height(node_by_id(&dom, "body")),
+            Some(21),
+            "the grow body fills the column minus the fixed header"
+        );
+        assert_eq!(
+            l.definite_height(node_by_id(&dom, "area")),
+            Some(21),
+            "height:100% resolves against the now-definite grow body"
+        );
+
+        // A NON-grow auto-height column item stays content-driven (indefinite).
+        let dom2 = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%"><div style="display:flex;flex-direction:column;height:100%"><div id="x">content</div></div></body></html>"#,
+        );
+        let l2 = layout_vp(&dom2, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(
+            l2.definite_height(node_by_id(&dom2, "x")),
+            None,
+            "a non-growing column item is content-sized ⇒ indefinite"
+        );
+
+        // Two grow items need this item's own base size (no cancellation) —
+        // deferred, so it stays indefinite rather than guess.
+        let dom3 = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%"><div style="display:flex;flex-direction:column;height:100%"><div id="a" style="flex:1">a</div><div id="b" style="flex:1">b</div></div></body></html>"#,
+        );
+        let l3 = layout_vp(&dom3, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(
+            l3.definite_height(node_by_id(&dom3, "a")),
+            None,
+            "multiple grow items are deferred (no single-item cancellation)"
+        );
+    }
+
+    #[test]
+    fn definite_height_resolves_an_absolutely_positioned_top_bottom_box() {
+        // CSS 2.1 §10.6.4: an `position:absolute` box with `top` AND `bottom`
+        // set and `height:auto` has a definite used height = containing-block
+        // height − top − bottom. This is Twitch's app shell — a `top:0;bottom:0`
+        // panel filling `#root` (`position:relative`, viewport-tall), which holds
+        // the `height:100%` chat scroll area. Without this the height chain breaks
+        // at the auto-height absolute panel and the region never triggers.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let dom = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%">
+               <div id="root" style="position:relative;height:100%">
+                 <div id="shell" style="position:absolute;top:0;bottom:0">
+                   <div id="area" style="height:100%;overflow-y:auto">msgs</div>
+                 </div>
+               </div></body></html>"#,
+        );
+        let l = layout_vp(&dom, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(
+            l.definite_height(node_by_id(&dom, "shell")),
+            Some(24),
+            "top:0;bottom:0 fills the viewport-tall positioned ancestor"
+        );
+        assert_eq!(
+            l.definite_height(node_by_id(&dom, "area")),
+            Some(24),
+            "height:100% resolves against the now-definite absolute shell"
+        );
+
+        // Non-zero offsets carve in. `top`/`bottom` resolve through `pos_len`
+        // (the shared positioning-length resolver, in cells), exactly as
+        // `abs_used_top`/`place_positioned_children` place the box — so the
+        // definite height stays CONSISTENT with the box's actual placement:
+        // top:32px (4 cells) + bottom:48px (6 cells) ⇒ 24 − 4 − 6 = 14.
+        let dom2 = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%"><div style="position:relative;height:100%"><div id="s" style="position:absolute;top:32px;bottom:48px"></div></div></body></html>"#,
+        );
+        let l2 = layout_vp(&dom2, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(l2.definite_height(node_by_id(&dom2, "s")), Some(14));
+
+        // Only `top` set (bottom auto) ⇒ height is content-driven ⇒ indefinite.
+        let dom3 = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%"><div style="position:relative;height:100%"><div id="s" style="position:absolute;top:0">x</div></div></body></html>"#,
+        );
+        let l3 = layout_vp(&dom3, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(
+            l3.definite_height(node_by_id(&dom3, "s")),
+            None,
+            "only one offset ⇒ height stays auto ⇒ indefinite"
+        );
+
+        // top+bottom but the positioned ancestor is itself indefinite ⇒ None.
+        let dom4 = Dom::parse_document(
+            r#"<body><div style="position:relative"><div id="s" style="position:absolute;top:0;bottom:0">x</div></div></body>"#,
+        );
+        let l4 = layout_vp(&dom4, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(
+            l4.definite_height(node_by_id(&dom4, "s")),
+            None,
+            "an indefinite containing block can't make the offsets definite"
+        );
+
+        // `position:fixed; top:0; bottom:0` fills the viewport directly.
+        let dom5 = Dom::parse_document(
+            r#"<body><div id="s" style="position:fixed;top:0;bottom:0">x</div></body>"#,
+        );
+        let l5 = layout_vp(&dom5, &base, &ctrls, &imgs, (40, 24));
+        assert_eq!(l5.definite_height(node_by_id(&dom5, "s")), Some(24));
+    }
+
+    #[test]
+    fn overflowing_definite_height_box_becomes_a_clipped_region() {
+        // Phase 1 — CSS Overflow L3: a definite-height `overflow-y:auto` box
+        // whose content OVERFLOWS becomes a scroll container. The layout reserves
+        // exactly H blank rows (keeping the document flat) and stashes the full
+        // content in the region's buffer; the view windows it.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let mut body = String::from(r#"<html style="height:100%"><body style="height:100%">"#);
+        body.push_str(r#"<div id="scroller" style="height:100%;overflow-y:auto">"#);
+        for i in 0..20 {
+            body.push_str(&format!("<div>L{i:02}</div>"));
+        }
+        body.push_str(r#"</div><div>FOOT</div></body></html>"#);
+        let dom = Dom::parse_document(&body);
+        // 10-row viewport: H = 10 rows, content = 20 rows ⇒ it clips.
+        let (rows, _car, regions, ..) =
+            lay_out_with_carousels(&dom, &base, (40, 10), &[], &ctrls, &imgs, false);
+
+        assert_eq!(regions.len(), 1, "the overflowing box is one scroll region");
+        let rg = &regions[0];
+        assert_eq!(rg.height, 10, "the region is its definite height (10 rows)");
+        assert_eq!(rg.buffer.len(), 20, "the buffer holds ALL 20 content rows");
+        assert!(
+            rg.voffset == 0,
+            "a fresh region sits at the top (CSSOM origin)"
+        );
+        // The document stayed FLAT: it reserved H (10) rows + the footer row,
+        // NOT the full 20-row content (which would defeat the clip).
+        assert!(
+            rows.len() <= 12,
+            "doc reserved ~H rows, not the content height (got {})",
+            rows.len()
+        );
+        // The footer flows just below the reserved band, at ~row 10 — proof the
+        // region occupies a fixed H rows regardless of its content height.
+        let foot = rows
+            .iter()
+            .position(|r| r.items.iter().any(|it| it.text.contains("FOOT")))
+            .expect("footer present");
+        assert!(
+            (9..=11).contains(&foot),
+            "footer sits just past the H-row band (row {foot})"
+        );
+        // The view window shows the TOP of the content (voffset 0): the band's
+        // first row is L00, its last visible row L09; L10+ are clipped (in the
+        // buffer, not the document).
+        let first = effective_row(&rows, &regions, rg.start_row);
+        assert!(render_row(&first).contains("L00"), "band top shows L00");
+        let last = effective_row(&rows, &regions, rg.start_row + 9);
+        assert!(render_row(&last).contains("L09"), "band bottom shows L09");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.items.iter().any(|it| it.text.contains("L19"))),
+            "the clipped tail (L19) is NOT in the document rows"
+        );
+    }
+
+    #[test]
+    fn the_principal_scroller_under_a_locked_viewport_flows_into_the_document() {
+        // Twitch's front-page pattern: html/body are `overflow:hidden` (the
+        // viewport can't scroll the document), so the page delegates scrolling
+        // to one inner `overflow:auto` box that carries `<main>` — the PRINCIPAL
+        // scroller. That box must NOT be virtualized into an inner Region; its
+        // content flows into the document so the page scroll (and the right
+        // scrollbar) scrolls it, exactly as a browser scrolls that panel as "the
+        // page". A `<nav>` sidebar's own scroller stays a genuine inner Region.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let mut body = String::from(
+            r#"<html style="height:100%;overflow:hidden"><body style="height:100%;overflow:hidden">"#,
+        );
+        body.push_str(r#"<div style="display:flex;height:100%">"#);
+        body.push_str(
+            r#"<nav style="height:100%"><div id="side" style="height:100%;overflow-y:auto">"#,
+        );
+        for i in 0..20 {
+            body.push_str(&format!("<div>S{i:02}</div>"));
+        }
+        body.push_str(r#"</div></nav>"#);
+        body.push_str(r#"<main style="height:100%"><div id="main-scroll" style="height:100%;overflow-y:auto">"#);
+        for i in 0..20 {
+            body.push_str(&format!("<div>M{i:02}</div>"));
+        }
+        body.push_str(r#"</div></main></div></body></html>"#);
+        let dom = Dom::parse_document(&body);
+        let (rows, _car, regions, ..) =
+            lay_out_with_carousels(&dom, &base, (60, 10), &[], &ctrls, &imgs, false);
+
+        // ONLY the <nav> sidebar is a Region; the <main> scroller flowed inline.
+        assert_eq!(
+            regions.len(),
+            1,
+            "only the nav sidebar is a region (the principal main scroller is not)"
+        );
+        let rg = &regions[0];
+        assert_eq!(
+            dom.attr(rg.node, "id"),
+            Some("side"),
+            "the one region is the <nav> sidebar scroller"
+        );
+        // The principal scroller's FULL content flowed into the document — its
+        // clipped tail (M19) is a real document row, not stashed in a buffer.
+        assert!(
+            rows.iter()
+                .any(|r| r.items.iter().any(|it| it.text.contains("M19"))),
+            "the principal scroller's content flows into the document (M19 present)"
+        );
+        // The sidebar's tail (S19) is clipped into its region buffer, NOT the doc.
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.items.iter().any(|it| it.text.contains("S19"))),
+            "the sidebar region clips its tail (S19) out of the document rows"
+        );
+        assert!(
+            rg.buffer
+                .iter()
+                .any(|r| r.items.iter().any(|it| it.text.contains("S19"))),
+            "the sidebar region's buffer holds its full content (S19)"
+        );
+
+        // CONTROL: the SAME structure with an UNLOCKED viewport (no
+        // `overflow:hidden` on html/body) means the document itself scrolls, so
+        // the main scroller is a genuine inner Region again — proving the lock
+        // signal, not the markup shape, is what excludes the principal scroller.
+        let unlocked = body
+            .replace(";overflow:hidden\"", "\"")
+            .replace("overflow:hidden\"", "\"");
+        let dom2 = Dom::parse_document(&unlocked);
+        let (_r2, _c2, regions2, ..) =
+            lay_out_with_carousels(&dom2, &base, (60, 10), &[], &ctrls, &imgs, false);
+        assert_eq!(
+            regions2.len(),
+            2,
+            "with the viewport unlocked, both scrollers are inner regions"
+        );
+    }
+
+    #[test]
+    fn a_region_patch_relayout_matches_a_full_relayout() {
+        // INCREMENTAL_LAYOUT_PLAN.md §9 — the materialization guarantee: the
+        // boundary's buffer laid from a serialized PATCH fragment (re-parsed,
+        // ancestor-less) is byte-for-byte the same as the SAME region produced by
+        // a full `lay_out`. The region inherits `font-weight:bold` +
+        // `text-transform:uppercase` from <body>; if §4a materialization drops
+        // them, the fragment renders non-bold / lowercase and the buffers diverge.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let mut body = String::from(
+            r#"<html style="height:100%"><body style="height:100%;font-weight:bold;text-transform:uppercase">"#,
+        );
+        body.push_str(r#"<div id="chat" style="height:100%;overflow-y:scroll;width:30ch">"#);
+        for i in 0..12 {
+            body.push_str(&format!("<div>msg{i:02}</div>"));
+        }
+        body.push_str(r#"</div></body></html>"#);
+        let dom = Dom::parse_document(&body);
+        let viewport = (40usize, 8usize);
+        // FULL path: the region buffer as the page produces it.
+        let (_rows, _car, regions, ..) =
+            lay_out_with_carousels(&dom, &base, viewport, &[], &ctrls, &imgs, false);
+        assert_eq!(regions.len(), 1, "one scroll region");
+        let full = &regions[0];
+        let boundary = full.node;
+        // PATCH path: serialize the boundary (materialized) → re-parse → re-lay.
+        let frag = dom.serialize_patch(boundary, &std::collections::HashSet::new());
+        let rp = crate::http::lay_region_patch(
+            &base,
+            frag.as_bytes(),
+            full.width as usize,
+            viewport,
+            &imgs,
+            boundary,
+        )
+        .expect("the patch fragment lays out");
+        assert_eq!(rp.rows.len(), full.buffer.len(), "same buffer height");
+        for (a, b) in rp.rows.iter().zip(full.buffer.iter()) {
+            assert_eq!(render_row(a), render_row(b), "same rendered text per row");
+            let bolds_a: Vec<bool> = a.items.iter().map(|it| it.emph.bold).collect();
+            let bolds_b: Vec<bool> = b.items.iter().map(|it| it.emph.bold).collect();
+            assert_eq!(
+                bolds_a, bolds_b,
+                "materialized font-weight matches per item"
+            );
+        }
+        // Guard against both being wrong-but-equal: the inherited styling really
+        // did reach the content (uppercase + bold).
+        assert!(
+            full.buffer
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.emph.bold),
+            "inherited bold reached the region content"
+        );
+        assert!(
+            render_row(&full.buffer[0]).contains("MSG00"),
+            "inherited text-transform:uppercase applied"
+        );
+    }
+
+    #[test]
+    fn an_inline_ifc_boundary_is_captured_with_its_band() {
+        // INCREMENTAL_LAYOUT_PLAN.md §14 step 3: a block-filling IFC box
+        // (`display:flow-root`) carrying a baked `data-trust-node` is captured in
+        // `Doc.boundaries` with its row span + outer band. A plain block is NOT
+        // (only IFC containers are addressable boundaries).
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let html = r#"<html><body><p>header</p><div data-trust-node="42" style="display:flow-root"><div>l0</div><div>l1</div><div>l2</div></div><p>footer</p><div data-trust-node="9" style="display:block">plain</div></body></html>"#;
+        let dom = Dom::parse_document(html);
+        let (rows, _car, _rgn, _clip, boundaries) =
+            lay_out_with_carousels(&dom, &base, (40, 0), &[], &ctrls, &imgs, false);
+        let b = boundaries
+            .iter()
+            .find(|b| b.node == 42)
+            .expect("the flow-root boundary is captured");
+        assert!(
+            !boundaries.iter().any(|b| b.node == 9),
+            "a plain display:block is not an IFC boundary"
+        );
+        assert_eq!(
+            b.origin_col, 0,
+            "a left-aligned block fills from the margin"
+        );
+        assert!(b.content_width >= 4, "the band is the page width");
+        assert!(b.row_range.start >= 1, "header sits above the boundary");
+        assert!(
+            render_row(&rows[b.row_range.start]).contains("l0"),
+            "the captured range starts at the boundary's first content row"
+        );
+        assert!(
+            render_row(&rows[b.row_range.end - 1]).contains("l2"),
+            "the captured range ends at the boundary's last content row"
+        );
+    }
+
+    #[test]
+    fn an_inline_boundary_fragment_lays_like_the_full_document() {
+        // INCREMENTAL_LAYOUT_PLAN.md §9/§14: the boundary laid from a serialized
+        // PATCH fragment (re-parsed, ancestor-less) is byte-for-byte the SAME as
+        // that boundary in the full layout — including `font-weight:bold` +
+        // `text-transform:uppercase` inherited from <body> and materialized onto
+        // the fragment root (§4a). If the band capture or the standalone re-lay
+        // diverged (e.g. a double-applied indent), the rows wouldn't match.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let html = r#"<html><body style="font-weight:bold;text-transform:uppercase"><p>head</p><div data-trust-node="7" style="display:flow-root"><div>msg0</div><div>msg1</div></div></body></html>"#;
+        let dom = Dom::parse_document(html);
+        let vp = (40usize, 0usize);
+        let (rows, _car, _rgn, _clip, boundaries) =
+            lay_out_with_carousels(&dom, &base, vp, &[], &ctrls, &imgs, false);
+        let b = boundaries.iter().find(|b| b.node == 7).unwrap();
+        let frag = {
+            let node = dom
+                .descendants(crate::dom::DOCUMENT)
+                .into_iter()
+                .find(|&id| dom.attr(id, "data-trust-node") == Some("7"))
+                .unwrap();
+            dom.serialize_patch(node, &std::collections::HashSet::new())
+        };
+        let laid = crate::http::lay_subtree_patch(
+            &base,
+            frag.as_bytes(),
+            b.content_width as usize,
+            vp,
+            &imgs,
+            7,
+        )
+        .expect("the patch fragment lays out");
+        assert_eq!(
+            laid.height,
+            b.row_range.len(),
+            "fragment height == the boundary's full-doc row span"
+        );
+        for (i, lr) in laid.rows.iter().enumerate() {
+            // Shift the fragment cols into the box's band (origin_col) and compare
+            // the rendered row to the full document's.
+            let mut shifted = lr.clone();
+            for it in &mut shifted.items {
+                it.col += b.origin_col;
+            }
+            assert_eq!(
+                render_row(&shifted),
+                render_row(&rows[b.row_range.start + i]),
+                "row {i} of the fragment matches the full document"
+            );
+        }
+        assert!(
+            laid.rows
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.emph.bold),
+            "inherited bold was materialized onto the fragment"
+        );
+        assert!(
+            render_row(&laid.rows[0]).contains("MSG0"),
+            "inherited text-transform:uppercase reached the fragment"
+        );
+    }
+
+    #[test]
+    fn an_oversize_token_wraps_instead_of_overflowing_or_stretching() {
+        // A single unbreakable token wider than the band (a poll's concatenated
+        // usernames, a long URL/emote) must character-break across rows: the
+        // terminal has no horizontal scroll, so the overflow would be lost AND a
+        // content-sized ancestor would be stretched to the token's width.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let band_max = |rows: &[Row]| -> usize {
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .map(|it| it.col as usize + it.width as usize)
+                .max()
+                .unwrap_or(0)
+        };
+
+        // (a) a long link label wraps; no row exceeds the band; nothing dropped;
+        // exactly one selection stop (the link rides the first row only).
+        let token =
+            "goldwiser8826matthewmccarter25Amazeran20goldwiser8826matthewmccarter25Amazeran20";
+        let a = format!(
+            r#"<html><body><div style="width:40ch"><a href="/x">{token}</a></div></body></html>"#
+        );
+        let rows = lay_out(
+            &Dom::parse_document(&a),
+            &base,
+            40,
+            &[],
+            &ctrls,
+            &imgs,
+            false,
+        );
+        assert!(band_max(&rows) <= 40, "no row exceeds the 40-cell band");
+        assert!(rows.len() >= 2, "the long token wrapped across rows");
+        let joined: String = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .map(|it| it.text.as_str())
+            .collect();
+        assert!(
+            joined.contains("Amazeran20goldwiser"),
+            "no characters dropped across the wrap"
+        );
+        assert_eq!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .filter(|it| it.link.is_some())
+                .count(),
+            1,
+            "one selection stop for the wrapped link"
+        );
+
+        // (b) inside a DEFINITE-width box (the chat column), the long token wraps
+        // within the box and following content stays inside the band — no
+        // overflow off-screen.
+        let b = r#"<html><body><div style="width:30ch"><div><a href="/x">goldwiser8826matthewmccarter25Amazeran20goldwiser8826matthewmccarter25</a></div><div>SIDE</div></div></body></html>"#;
+        let rows2 = lay_out(
+            &Dom::parse_document(b),
+            &base,
+            80,
+            &[],
+            &ctrls,
+            &imgs,
+            false,
+        );
+        assert!(
+            band_max(&rows2) <= 30,
+            "the token wraps within the 30-cell box, not past it"
+        );
+        assert!(
+            rows2
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.text.contains("SIDE")),
+            "following content survives the wrap"
+        );
+
+        // (b2) REGRESSION GUARD: breaking is `overflow-wrap:break-word` (render-
+        // only), NOT `anywhere` — a content-sized flex column of SHORT words must
+        // NOT collapse to one cell and char-break them. The word stays intact.
+        let g = r#"<html><body><div style="display:flex"><nav><div>S00</div><div>S19</div></nav><main><div>M00</div></main></div></body></html>"#;
+        let rows5 = lay_out(
+            &Dom::parse_document(g),
+            &base,
+            60,
+            &[],
+            &ctrls,
+            &imgs,
+            false,
+        );
+        assert!(
+            rows5
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.text.contains("S19")),
+            "a short word in a content-sized flex item is not char-broken"
+        );
+
+        // (c) an over-wide BUTTON label (the poll voter list) wraps too.
+        let c = r#"<html><body><div style="width:30ch"><button>goldwiser8826matthewmccarter25Amazeran20</button></div></body></html>"#;
+        let rows3 = lay_out(
+            &Dom::parse_document(c),
+            &base,
+            30,
+            &[],
+            &ctrls,
+            &imgs,
+            false,
+        );
+        assert!(
+            band_max(&rows3) <= 30,
+            "the button label wraps within the band"
+        );
+
+        // (d) a SHORT button is untouched — one atom, one row, brackets intact.
+        let d = r#"<html><body><button>Yes 94% (467)</button></body></html>"#;
+        let rows4 = lay_out(
+            &Dom::parse_document(d),
+            &base,
+            40,
+            &[],
+            &ctrls,
+            &imgs,
+            false,
+        );
+        assert_eq!(rows4.len(), 1, "a short widget is not broken");
+        assert!(
+            rows4[0].items.iter().any(|it| it.text.contains("[ Yes")),
+            "the short button keeps its single-atom bracket framing"
+        );
+    }
+
+    #[test]
+    fn auto_overflow_that_fits_is_not_a_region() {
+        // CSS Overflow L3: `overflow:auto` behaves like `visible` when there is
+        // NO scrollable overflow. A short content (3 rows) in a tall (10-row)
+        // box doesn't scroll, so it's laid inline — no region, no wasted rows.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let dom = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%"><div style="height:100%;overflow-y:auto"><div>A</div><div>B</div><div>C</div></div></body></html>"#,
+        );
+        let (rows, _car, regions, ..) =
+            lay_out_with_carousels(&dom, &base, (40, 10), &[], &ctrls, &imgs, false);
+        assert!(regions.is_empty(), "content fits ⇒ not a scroll region");
+        assert!(
+            rows.iter().any(|r| r.items.iter().any(|it| it.text == "C")),
+            "the fitting content is laid inline"
+        );
+    }
+
+    #[test]
+    fn explicit_overflow_scroll_reserves_its_height_even_when_content_fits() {
+        // `overflow-y:scroll` is a scroll container ALWAYS (unlike `auto`), so a
+        // short content still reserves the box's full definite height — a fixed
+        // scroll viewport the author asked for.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let dom = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%"><div id="s" style="height:100%;overflow-y:scroll"><div>ONE</div></div></body></html>"#,
+        );
+        let (rows, _car, regions, ..) =
+            lay_out_with_carousels(&dom, &base, (40, 8), &[], &ctrls, &imgs, false);
+        assert_eq!(regions.len(), 1, "overflow:scroll is always a region");
+        assert_eq!(regions[0].height, 8, "it reserves the full definite height");
+        assert_eq!(regions[0].buffer.len(), 1, "buffer holds the short content");
+        // The reserved band is 8 blank rows; only its first shows ONE.
+        assert!(
+            render_row(&effective_row(&rows, &regions, regions[0].start_row)).contains("ONE"),
+            "the single content row shows at the band top"
+        );
+    }
+
+    #[test]
+    fn an_indefinite_height_overflow_box_does_not_become_a_region() {
+        // Without a definite height the box can't be a fixed scroll viewport
+        // (Phase 0): its content flows normally and nothing is clipped.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let dom = Dom::parse_document(
+            r#"<body><div style="overflow-y:auto"><div>X</div><div>Y</div></div></body>"#,
+        );
+        let (rows, _car, regions, ..) =
+            lay_out_with_carousels(&dom, &base, (40, 10), &[], &ctrls, &imgs, false);
+        assert!(regions.is_empty(), "no definite height ⇒ no region");
+        assert!(rows.iter().any(|r| r.items.iter().any(|it| it.text == "Y")));
+    }
+
+    #[test]
+    fn scroll_box_report_flags_definite_and_indefinite_regions() {
+        // The inner-scroll GATE diagnostic: a chat-like `overflow-y:auto` area in
+        // a viewport-tall stretched flex column is REGION-CAPABLE (definite H)…
+        let base = Url::parse("https://example.com/").unwrap();
+        let dom = Dom::parse_document(
+            r#"<html style="height:100%"><body style="height:100%">
+               <div style="display:flex;height:100%">
+                 <div id="chat"><div id="area" style="height:100%;overflow-y:auto">msgs</div></div>
+               </div></body></html>"#,
+        );
+        let report = scroll_box_report(&dom, &base, (40, 24));
+        assert!(
+            report.contains("REGION-CAPABLE") && report.contains("definite_height=Some(24)"),
+            "chat area should resolve a definite height:\n{report}"
+        );
+        // …while a bare `overflow-y:auto` with no definite-height chain is flagged
+        // indefinite (it would NOT trigger a region today).
+        let dom2 = Dom::parse_document(
+            r#"<body><div id="area" style="overflow-y:auto">msgs</div></body>"#,
+        );
+        let report2 = scroll_box_report(&dom2, &base, (40, 24));
+        assert!(report2.contains("indefinite"), "{report2}");
+    }
+
     #[test]
     fn percentage_image_finds_a_deeply_nested_definite_width_ancestor() {
         // Twitch's preview card: the `width:30rem` container sits ELEVEN
@@ -9321,6 +11586,43 @@ mod tests {
         assert!(
             line.starts_with("Perman"),
             "keeps the leading text: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_visually_hidden_clip_box_renders_nothing() {
+        // The sr-only / `clip` accessibility idiom: a sub-cell `overflow:hidden`
+        // box (`width:0.1rem;height:0.1rem`) clips its label to nothing — a
+        // browser shows a ~1px speck, so we paint NOTHING, not a stray "…". This
+        // is the standard CSS clip (not a special case): Twitch side-nav cards
+        // carry two per card ("Live", "<n> viewers") that were leaking as "…".
+        let rows = lay(
+            r#"<body><div>before<p style="width:0.1rem;height:0.1rem;overflow:hidden">Live</p>after</div></body>"#,
+            40,
+        );
+        let all = texts(&rows).join("\n");
+        assert!(
+            !all.contains('…') && !all.contains("Live"),
+            "the clipped sr-only label paints nothing: {all:?}"
+        );
+        assert!(
+            all.contains("before") && all.contains("after"),
+            "its siblings still render: {all:?}"
+        );
+    }
+
+    #[test]
+    fn a_subcell_box_that_does_not_clip_overflow_still_renders() {
+        // The collapse is gated on a clipping overflow: a sub-cell box with the
+        // default `overflow:visible` lets its content paint outside the box (CSS
+        // Overflow §3), so it is NOT hidden — only the clip makes it vanish.
+        let rows = lay(
+            r#"<body><div><span style="width:0.1rem">kept</span></div></body>"#,
+            40,
+        );
+        assert!(
+            texts(&rows).join("\n").contains("kept"),
+            "a non-clipping sub-cell box still shows its content"
         );
     }
 
@@ -9585,6 +11887,42 @@ mod tests {
         assert!(
             !line.contains("Search"),
             "an empty haspopup trigger's label is suppressed: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_clipped_icon_control_does_not_leak_its_accessible_name() {
+        // An icon-only control the author CLIPPED to an icon-sized box
+        // (a definite `width` under `overflow:hidden`) never paints its
+        // `aria-label` — a browser shows only what fits the box (the icon).
+        // Twitch's per-message reply button (`aria-label="Click to reply to
+        // @user"` in a `width:3.2rem;overflow:hidden` box) spammed every chat
+        // line with the screen-reader name; honoring the clip suppresses it.
+        let rows = lay(
+            r#"<body><a href="/x"><button aria-label="Click to reply to @user" style="width:3.2rem;height:3.2rem;overflow:hidden;white-space:nowrap"></button></a></body>"#,
+            80,
+        );
+        let line = texts(&rows).join(" ");
+        assert!(
+            !line.contains("Click to reply"),
+            "a clipped accessible name is not painted: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_roomy_icon_control_still_surfaces_its_accessible_name() {
+        // The CONTROL case for the clip suppression above: an icon-only control
+        // WITHOUT an icon-sized clip box still surfaces its accessible name (the
+        // archive.org "Sign up" / SL logo behaviour). Here the box is wide
+        // enough to hold the label, so it must show.
+        let rows = lay(
+            r#"<body><a href="/x"><button aria-label="Log In" style="width:20rem;overflow:hidden"></button></a></body>"#,
+            80,
+        );
+        let line = texts(&rows).join(" ");
+        assert!(
+            line.contains("Log In"),
+            "a fitting accessible name is still the visible label: {line:?}"
         );
     }
 
@@ -10312,10 +12650,10 @@ mod tests {
                </div></body>"#,
         );
         let base = Url::parse("https://example.com/").unwrap();
-        let (rows, carousels) = lay_out_with_carousels(
+        let (rows, carousels, _regions, ..) = lay_out_with_carousels(
             &dom,
             &base,
-            50,
+            (50, 0),
             &[],
             &ControlMap::new(),
             &ImageSizes::new(),
@@ -11101,10 +13439,10 @@ mod tests {
            </div></div></body></html>"#;
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
-        let (_, carousels) = lay_out_with_carousels(
+        let (_, carousels, _regions, ..) = lay_out_with_carousels(
             &dom,
             &base,
-            20,
+            (20, 0),
             &[],
             &ControlMap::new(),
             &ImageSizes::new(),
@@ -11119,10 +13457,10 @@ mod tests {
         let plain = r#"<html><head><style>.wrap{overflow:hidden}.col{width:50em}</style></head>
             <body><div class="wrap"><div class="col">just one wide column</div></div></body></html>"#;
         let dom = Dom::parse_document(plain);
-        let (_, none) = lay_out_with_carousels(
+        let (_, none, _regions, ..) = lay_out_with_carousels(
             &dom,
             &base,
-            20,
+            (20, 0),
             &[],
             &ControlMap::new(),
             &ImageSizes::new(),
@@ -11160,10 +13498,10 @@ mod tests {
            </div></div></body></html>"#;
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
-        let (_, carousels) = lay_out_with_carousels(
+        let (_, carousels, _regions, ..) = lay_out_with_carousels(
             &dom,
             &base,
-            60,
+            (60, 0),
             &[],
             &ControlMap::new(),
             &ImageSizes::new(),
@@ -11249,10 +13587,10 @@ mod tests {
            </body></html>"#;
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
-        let (rows, carousels) = lay_out_with_carousels(
+        let (rows, carousels, _regions, ..) = lay_out_with_carousels(
             &dom,
             &base,
-            20,
+            (20, 0),
             &[],
             &ControlMap::new(),
             &ImageSizes::new(),
@@ -11310,10 +13648,10 @@ mod tests {
            </div></body></html>"##;
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
-        let (rows, carousels) = lay_out_with_carousels(
+        let (rows, carousels, _regions, ..) = lay_out_with_carousels(
             &dom,
             &base,
-            20,
+            (20, 0),
             &[],
             &ControlMap::new(),
             &ImageSizes::new(),
@@ -11403,10 +13741,10 @@ mod tests {
            </body></html>"##;
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
-        let (rows, carousels) = lay_out_with_carousels(
+        let (rows, carousels, _regions, ..) = lay_out_with_carousels(
             &dom,
             &base,
-            40,
+            (40, 0),
             &[],
             &ControlMap::new(),
             &ImageSizes::new(),

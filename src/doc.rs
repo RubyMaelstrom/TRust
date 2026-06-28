@@ -30,6 +30,13 @@ pub enum Link {
         node: usize,
         href: String,
     },
+    /// A media representation (a `<video>`/`<audio>` element): following it
+    /// hands this URL to mpv. For an inline-playable element it is the direct
+    /// media file; for an MSE/blob stream with no `src`/`<source>` (Twitch,
+    /// YouTube, any modern player) it is the PAGE URL, which yt-dlp resolves.
+    /// The terminal can't play video, so this representation IS the "play in
+    /// mpv" affordance shown where the video would be.
+    Media(url::Url),
     /// A scheme we don't speak (mailto, irc, ...) — shown, not followed.
     External(String),
     /// A generated carousel scroll control (the CSS `::scroll-button`
@@ -48,6 +55,7 @@ impl fmt::Display for Link {
             Link::Form { .. } => f.write_str("form control"),
             Link::JsClick { href, .. } if !href.is_empty() => f.write_str(href),
             Link::JsClick { .. } => f.write_str("page script"),
+            Link::Media(url) => write!(f, "▶ {url}"),
             Link::External(url) => f.write_str(url),
             Link::CarouselScroll(dir) if *dir < 0 => f.write_str("scroll back"),
             Link::CarouselScroll(_) => f.write_str("scroll forward"),
@@ -269,6 +277,25 @@ pub struct Doc {
     /// Horizontally-scrollable strips (carousels) in `rows`, with their
     /// scroll offset. Empty except for HTML pages that have one.
     pub carousels: Vec<crate::layout::Carousel>,
+    /// Vertical inner-scroll viewports (`overflow-y:auto|scroll` regions) in
+    /// `rows`. Each reserves blank rows in `rows` and holds its content in its
+    /// own buffer (the view windows it). Empty except for HTML pages with one.
+    pub regions: Vec<crate::layout::Region>,
+    /// The CLIP box `(live_node, client_h_rows, client_w_cells)` of EVERY
+    /// definite-height `overflow-y:auto|scroll` box — whether it overflowed into
+    /// a `Region` or its content currently fits (no region). The app pushes these
+    /// to the live engine as each element's `clientHeight`/`clientWidth` (Phase 3
+    /// inner scroll) so a chat's `atBottom` is correct from the first message,
+    /// before its content overflows into a region. Empty except for HTML pages.
+    pub scroll_clips: Vec<(usize, u16, u16)>,
+    /// Independent-formatting-context boundaries that lay their content INLINE in
+    /// `rows` (NOT in a region/carousel buffer) — the cache for incremental
+    /// layout's general subtree splice (INCREMENTAL_LAYOUT_PLAN.md §14). A live
+    /// `Patched{node}` whose boundary is here re-lays ONLY that subtree and
+    /// splices it back into `rows` (Tier 1 in-place / Tier 2 shift), leaving the
+    /// rest of the document untouched. Captured on every full HTTP render of a
+    /// live page; empty otherwise.
+    pub boundaries: Vec<crate::layout::BoundaryBox>,
 }
 
 impl Doc {

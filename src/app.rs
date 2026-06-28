@@ -451,6 +451,25 @@ pub struct App {
     /// (reset on each new live page). Drives infinite scroll / scroll-based
     /// lazy loading: the site's own handler reacts to the threaded position.
     last_scroll_sent: Option<usize>,
+    /// Per-region CLIP box last pushed to the live page (`PageCmd::RegionGeom`),
+    /// keyed by the actor node id; value is the px `(clientHeight, clientWidth)`
+    /// quantized to ints, so a geometry command is sent only when the box changed
+    /// (rarely — it's viewport-tied). Cleared with the live page. (Phase 3.)
+    region_geom_sent: std::collections::HashMap<usize, (i64, i64)>,
+    /// Per-region `scrollTop` (rows) last written BACK to the live page on a
+    /// wheel/page scroll (`PageCmd::SetScroll`), keyed by the actor node id — so
+    /// the same offset isn't re-sent and the page's `scroll` handler fires only
+    /// on a real move. Cleared with the live page. (Phase 3 inner scroll.)
+    region_scroll_sent: std::collections::HashMap<usize, usize>,
+    /// The set of live clipped-region actor nodes last sent to the page actor
+    /// (`PageCmd::LiveRegions`), so it patches a mutation ONLY when confined to a
+    /// real region (INCREMENTAL_LAYOUT_PLAN.md §4b). Re-sent only when it changes.
+    live_regions_sent: std::collections::HashSet<usize>,
+    /// The set of cached inline IFC-boundary actor nodes last sent to the page
+    /// actor (`PageCmd::LiveBoundaries`, the `Doc.boundaries` node set), so it
+    /// proposes a general inline patch ONLY when the app has the box cached
+    /// (INCREMENTAL_LAYOUT_PLAN.md §14). Re-sent only when it changes.
+    live_boundaries_sent: std::collections::HashSet<usize>,
     /// A page-script dispatch is in flight (drives the loading heart).
     page_busy: bool,
     /// Static form submit to perform if the live page does not prevent
@@ -507,6 +526,11 @@ pub struct App {
     pub status: String,
     /// Inner size of the session widget as of the last draw (cols, rows).
     pub last_inner: (u16, u16),
+    /// Last mouse cell `(col, row)` seen, in absolute terminal coordinates —
+    /// so a keyboard PgUp/PgDn can target the scroll region under the cursor
+    /// ("scroll the hovered region", CSS Overscroll target). `None` until the
+    /// first mouse event.
+    last_mouse: Option<(u16, u16)>,
     /// `mode character` / `mode line` override; None means follow ECHO.
     mode_override: Option<InputMode>,
     /// Up/Down recall for lines sent to the remote host.
@@ -600,6 +624,10 @@ impl App {
             live_page: None,
             page_rx: None,
             last_scroll_sent: None,
+            region_geom_sent: std::collections::HashMap::new(),
+            live_boundaries_sent: std::collections::HashSet::new(),
+            region_scroll_sent: std::collections::HashMap::new(),
+            live_regions_sent: std::collections::HashSet::new(),
             page_busy: false,
             pending_live_submit: None,
             page_js_errors: std::collections::HashSet::new(),
@@ -623,6 +651,7 @@ impl App {
             tls: false,
             status: String::from("No connection. Ctrl-] for commands."),
             last_inner: (80, 24),
+            last_mouse: None,
             mode_override: None,
             session_history: History::default(),
             command_history: History::default(),
@@ -835,6 +864,18 @@ impl App {
             // position to the live page so its infinite-scroll / lazy-load logic
             // reacts. A no-op when the scroll row didn't move (the common case).
             self.sync_page_scroll();
+            // Push each inner-scroll region's measured geometry back to the page
+            // so its `scrollHeight`/`clientHeight` getters read TRUE values (the
+            // conditional chat-pin reads them). Diffed — a no-op when unchanged.
+            self.sync_region_state();
+            // Tell the actor which scroll boxes are CURRENTLY clipped regions, so
+            // it patches a mutation only when confined to one (and a non-region
+            // scroll box takes the full path, never a failed patch). Diffed.
+            self.sync_live_regions();
+            // Tell the actor which inline IFC boundaries the app has cached, so
+            // it proposes a general inline patch only when the box is splice-able
+            // (INCREMENTAL_LAYOUT_PLAN.md §14). Diffed.
+            self.sync_live_boundaries();
         }
         Ok(())
     }
@@ -856,6 +897,9 @@ impl App {
     }
 
     fn on_mouse_event(&mut self, mouse: MouseEvent) {
+        // Remember the cursor cell so a later keyboard PgUp/PgDn can scroll the
+        // region under it.
+        self.last_mouse = Some((mouse.column, mouse.row));
         // A left-click on the top address bar or the bottom status line opens
         // the command console — a discoverable alternative to Tab/Ctrl-], in
         // EVERY mode and view (handled before the viewer/dropdown/browser
@@ -877,8 +921,8 @@ impl App {
         match (mouse.kind, self.browser.is_some()) {
             (MouseEventKind::ScrollUp, false) => self.scroll_by(3),
             (MouseEventKind::ScrollDown, false) => self.scroll_by(-3),
-            (MouseEventKind::ScrollUp, true) => self.browser_scroll(-3, true),
-            (MouseEventKind::ScrollDown, true) => self.browser_scroll(3, true),
+            (MouseEventKind::ScrollUp, true) => self.browser_wheel(-3, mouse.column, mouse.row),
+            (MouseEventKind::ScrollDown, true) => self.browser_wheel(3, mouse.column, mouse.row),
             (MouseEventKind::Down(MouseButton::Mouse4), true) if self.mode == Mode::Session => {
                 self.browser_back();
             }
@@ -1893,6 +1937,7 @@ impl App {
                 Link::CarouselScroll(_) => Err(String::from(
                     "carousel controls scroll in place, not fetched",
                 )),
+                Link::Media(_) => Err(String::from("media plays in mpv, not fetched")),
             };
             let _ = tx.send(FetchMsg { target, result }).await;
         });
@@ -2082,14 +2127,21 @@ impl App {
         if g.doc.raw.is_empty() {
             return;
         }
-        let item_target = g
-            .sel_item
-            .and_then(|(r, i)| g.doc.rows.get(r).and_then(|row| row.items.get(i)).cloned());
+        let item_target = g.sel_item.and_then(|(r, i)| {
+            crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                .items
+                .get(i)
+                .cloned()
+        });
+        let old_offsets: Vec<_> = g.doc.regions.iter().map(|r| (r.node, r.voffset)).collect();
         let meta = g.doc.meta.clone().unwrap_or_default();
         let forms = std::mem::take(&mut g.doc.forms);
         let raw = std::mem::take(&mut g.doc.raw);
-        g.doc = http::parse_seeded(&url, &meta, &raw, width, Some(&forms), &images);
-        g.sel_item = item_target.and_then(|t| Self::find_item_like(&g.doc.rows, &t));
+        g.doc = http::parse_seeded(&url, &meta, &raw, width, height, Some(&forms), &images);
+        // A re-wrap of the SAME HTML (image relayout): the baked scroll signal is
+        // stale, so the on-screen offset wins (prefer_signal = false).
+        Self::carry_region_offsets(&old_offsets, &mut g.doc.regions, false);
+        g.sel_item = item_target.and_then(|t| Self::find_item_like(&g.doc, &t));
         let max_scroll = g.doc.rows.len().saturating_sub(height);
         g.scroll = g.scroll.min(max_scroll);
     }
@@ -2138,6 +2190,31 @@ impl App {
                     continue;
                 }
                 live.insert(EncKey::for_item(url, item));
+            }
+        }
+        // Region buffer images: a vertical scroll region holds its content — text
+        // AND images — in its own buffer, not in `doc.rows`, so the loop above
+        // never sees them. Scan each on-screen region's windowed buffer (plus the
+        // lookback, for a tall image whose top scrolled off the band's top) and
+        // mark those boxes live too, else they'd never encode (or get evicted).
+        for rg in &g.doc.regions {
+            // Skip a region whose band is entirely outside the viewport window.
+            if rg.start_row >= end || rg.start_row + rg.height as usize <= start {
+                continue;
+            }
+            let top = rg.voffset.saturating_sub(crate::layout::MAX_IMAGE_LOOKBACK);
+            let bot = rg.voffset + rg.height as usize;
+            for br in top..bot {
+                let Some(brow) = rg.buffer.get(br) else {
+                    continue;
+                };
+                for item in &brow.items {
+                    let Some(url) = &item.image else { continue };
+                    if item.col >= rg.width {
+                        continue; // past the scrollport's right edge — never shown
+                    }
+                    live.insert(EncKey::for_item(url, item));
+                }
             }
         }
         // Bound the caches: drop protocols/failures for boxes no longer in range
@@ -2348,6 +2425,7 @@ impl App {
             &response.content_type,
             &response.body,
             width,
+            self.last_inner.1 as usize,
             &self.image_sizes(),
         );
         let image_urls = doc.image_urls.clone();
@@ -2396,6 +2474,10 @@ impl App {
         self.live_page = None;
         self.page_rx = None;
         self.last_scroll_sent = None;
+        self.region_geom_sent.clear();
+        self.region_scroll_sent.clear();
+        self.live_regions_sent.clear();
+        self.live_boundaries_sent.clear();
         self.page_busy = false;
         self.pending_live_submit = None;
     }
@@ -2457,6 +2539,178 @@ impl App {
         }
         // On a full channel we leave `last_scroll_sent` stale: the next tick
         // retries with the latest position, so the final scroll is never lost.
+    }
+
+    /// Push each inner-scroll region's app-measured box geometry (CSSOM View, px)
+    /// to the live page, so the element's `scrollHeight`/`scrollWidth`/
+    /// `clientHeight`/`clientWidth` getters read TRUE values — required for the
+    /// conditional pin idiom (`if scrollTop + clientHeight >= scrollHeight`). The
+    /// app is the only party that lays the region out (clips it to its definite
+    /// height + retains the full buffer), so it owns the geometry; the actor's
+    /// in-process measure pass flows region content inline and can't distinguish
+    /// the clip box from the content extent. Diffed per node (quantized to ints)
+    /// so a `RegionGeom` command goes out only when a box changed. Mirrors
+    /// `sync_page_scroll`: only mark a node sent on a successful enqueue.
+    fn sync_region_state(&mut self) {
+        if self.live_page.is_none() {
+            return;
+        }
+        let cell_w = f64::from(self.picker.font_size().width.max(1));
+        let cell_h = f64::from(self.picker.font_size().height.max(1));
+        let measured: Vec<(usize, f64, f64)> = {
+            let Some(g) = self.browser.as_ref() else {
+                return;
+            };
+            // `scroll_clips` covers EVERY definite-height scroll-y box — the
+            // overflowing regions AND the ones whose content currently fits (no
+            // region) — so the page's `clientHeight` is right from the first
+            // message, before content overflows. The CLIP box only: clientHeight =
+            // the band, clientWidth = the scrollport (no horizontal inner scroll).
+            // scrollHeight is NOT pushed — the actor reads it fresh from `__dom_rect`.
+            g.doc
+                .scroll_clips
+                .iter()
+                .map(|&(node, h_rows, w_cells)| {
+                    (
+                        node,
+                        f64::from(h_rows) * cell_h,
+                        f64::from(w_cells) * cell_w,
+                    )
+                })
+                .collect()
+        };
+        // Drop entries for regions that vanished, so a re-appearing node re-sends.
+        self.region_geom_sent
+            .retain(|node, _| measured.iter().any(|&(n, ..)| n == *node));
+        let mut to_send: Vec<(usize, f64, f64)> = Vec::new();
+        let mut keys: Vec<(usize, (i64, i64))> = Vec::new();
+        for &(node, ch, cw) in &measured {
+            let key = (ch as i64, cw as i64);
+            if self.region_geom_sent.get(&node) != Some(&key) {
+                to_send.push((node, ch, cw));
+                keys.push((node, key));
+            }
+        }
+        if to_send.is_empty() {
+            return;
+        }
+        if let Some(handle) = self.live_page.as_ref()
+            && handle
+                .cmds
+                .try_send(crate::js::PageCmd::RegionGeom { items: to_send })
+                .is_ok()
+        {
+            for (node, key) in keys {
+                self.region_geom_sent.insert(node, key);
+            }
+        }
+    }
+
+    /// Tell the page actor which scroll boxes are CURRENTLY clipped regions (the
+    /// live nodes of `Doc.regions`), so it patches a mutation ONLY when confined
+    /// to a real region (INCREMENTAL_LAYOUT_PLAN.md §4b). A box whose content
+    /// fits (no `Region`) is NOT included, so a mutation inside it takes the full
+    /// path — never a failed patch + resync. Re-sent only when the set changes.
+    fn sync_live_regions(&mut self) {
+        if self.live_page.is_none() {
+            return;
+        }
+        let current: std::collections::HashSet<usize> = self
+            .browser
+            .as_ref()
+            .map(|g| g.doc.regions.iter().filter_map(|r| r.live_node).collect())
+            .unwrap_or_default();
+        if current == self.live_regions_sent {
+            return;
+        }
+        if let Some(handle) = self.live_page.as_ref()
+            && handle
+                .cmds
+                .try_send(crate::js::PageCmd::LiveRegions(
+                    current.iter().copied().collect(),
+                ))
+                .is_ok()
+        {
+            self.live_regions_sent = current;
+        }
+    }
+
+    /// Tell the page actor which inline IFC boundaries the app has cached as
+    /// splice-able boxes (the `Doc.boundaries` node set), so it proposes a
+    /// general inline `Patched` ONLY when the box is in this set
+    /// (INCREMENTAL_LAYOUT_PLAN.md §14). A boundary the app hasn't cached (it
+    /// overlapped a region/carousel, or hasn't been captured yet) takes the full
+    /// path — never a failed patch + resync. Re-sent only when the set changes.
+    fn sync_live_boundaries(&mut self) {
+        if self.live_page.is_none() {
+            return;
+        }
+        let current: std::collections::HashSet<usize> = self
+            .browser
+            .as_ref()
+            .map(|g| g.doc.boundaries.iter().map(|b| b.node).collect())
+            .unwrap_or_default();
+        if current == self.live_boundaries_sent {
+            return;
+        }
+        if let Some(handle) = self.live_page.as_ref()
+            && handle
+                .cmds
+                .try_send(crate::js::PageCmd::LiveBoundaries(
+                    current.iter().copied().collect(),
+                ))
+                .is_ok()
+        {
+            self.live_boundaries_sent = current;
+        }
+    }
+
+    /// Write an inner-scroll region's new `scrollTop` (rows → px) BACK into the
+    /// live element (CSSOM View — the region→page write-back) so the page's
+    /// `scroll` handler fires and a conditional pin-to-bottom learns the user
+    /// scrolled up. A static region (`live_node == None`, no engine) needs no
+    /// write-back — the app's own offset persistence carries it. Deduped per node
+    /// so an unchanged offset (a boundary scroll) isn't re-sent.
+    fn region_writeback(&mut self, node: Option<usize>, voffset: usize) {
+        let Some(node) = node else { return };
+        if self.region_scroll_sent.get(&node) == Some(&voffset) {
+            return;
+        }
+        let cell_h = f64::from(self.picker.font_size().height.max(1));
+        let top = voffset as f64 * cell_h;
+        if let Some(handle) = self.live_page.as_ref()
+            && handle
+                .cmds
+                .try_send(crate::js::PageCmd::SetScroll {
+                    node,
+                    top,
+                    left: 0.0,
+                })
+                .is_ok()
+        {
+            self.region_scroll_sent.insert(node, voffset);
+        }
+    }
+
+    /// Apply a page-initiated inner-scroll write (`PageEvt::Scrolled`): move the
+    /// region whose live node matches to the page's `scrollTop` (px → rows,
+    /// clamped) — a cheap re-blit, no re-parse. The page dictated this offset, so
+    /// mark it `voffset_from_page` (a subsequent re-layout keeps it).
+    fn apply_region_scroll(&mut self, node: usize, top: f64) {
+        let cell_h = f64::from(self.picker.font_size().height.max(1));
+        let rows = (top / cell_h).round().max(0.0) as usize;
+        let Some(g) = self.browser.as_mut() else {
+            return;
+        };
+        for rg in g.doc.regions.iter_mut() {
+            if rg.live_node == Some(node) {
+                rg.voffset = rows.min(rg.max_voffset());
+                rg.voffset_from_page = true;
+                // Keep the write-back dedup in sync so a wheel right after a
+                // page pin still re-sends (the page owns this value now).
+                self.region_scroll_sent.insert(node, rg.voffset);
+            }
+        }
     }
 
     /// Esc in the browser: stop any in-flight load and kill the page's JS
@@ -2576,21 +2830,41 @@ impl App {
         use crate::js::PageEvt;
         self.page_busy = false;
         let mut latest_update: Option<(String, crate::js::Outcome)> = None;
+        // Incremental-layout patches accumulated this batch (newest per boundary
+        // wins; a full Updated supersedes them all). INCREMENTAL_LAYOUT_PLAN.md.
+        let mut patches: Vec<crate::js::SubtreePatch> = Vec::new();
         let mut trouble: Vec<String> = Vec::new();
         let mut navigate: Option<String> = None;
         let mut submit_default = false;
         // A click-triggered native submit carries its form/submitter arena
         // nodes (the app didn't pre-record them the way the Submit path does).
         let mut submit_nodes: Option<(usize, usize)> = None;
+        // Page-initiated inner-scroll writes (CSSOM View) without a DOM mutation:
+        // applied AFTER any content update so they land on the new regions.
+        let mut scrolled: Vec<(usize, f64)> = Vec::new();
         let pending_submit = self.pending_live_submit.take();
         let mut pending = Some(evt);
         loop {
             match pending {
                 Some(PageEvt::Updated { html, outcome } | PageEvt::Static { html, outcome }) => {
                     latest_update = Some((html, outcome));
+                    // A full render supersedes any patches queued before it.
+                    patches.clear();
+                }
+                Some(PageEvt::Patched {
+                    patches: ps,
+                    outcome,
+                }) => {
+                    self.page_js_errors.extend(outcome.errors.iter().cloned());
+                    for p in ps {
+                        // Coalesce: only the newest patch per boundary matters.
+                        patches.retain(|q| q.node != p.node);
+                        patches.push(p);
+                    }
                 }
                 Some(PageEvt::Trouble(errors)) => trouble.extend(errors),
                 Some(PageEvt::Settled) => {}
+                Some(PageEvt::Scrolled { node, top, .. }) => scrolled.push((node, top)),
                 Some(PageEvt::SubmitDefault) => submit_default = true,
                 Some(PageEvt::SubmitForm { form, submitter }) => {
                     submit_nodes = Some((form, submitter));
@@ -2601,6 +2875,7 @@ impl App {
             pending = self.page_rx.as_mut().and_then(|rx| rx.try_recv().ok());
         }
 
+        let mut rendered = false;
         if let Some((html, outcome)) = latest_update {
             self.page_js_errors.extend(outcome.errors.iter().cloned());
             // The actor only emits an Updated when what we PAINT changed
@@ -2608,11 +2883,33 @@ impl App {
             // `render_canonical`), so an update reaching here is real work — apply
             // it at once.
             self.replace_live_doc(html.into_bytes());
+            rendered = true;
+        }
+        // Incremental-layout patches (INCREMENTAL_LAYOUT_PLAN.md): re-lay ONLY the
+        // changed scroll region(s), leaving the rest of the document untouched.
+        // A patch that can't apply (the boundary isn't a live region) asks the
+        // actor to resync with a full render, then we stop (the resync supersedes
+        // any remaining stale patches in this batch).
+        for p in &patches {
+            if self.patch_live_doc(p) {
+                rendered = true;
+            } else {
+                self.request_resync();
+                break;
+            }
+        }
+        if rendered {
             self.status = if self.page_js_errors.is_empty() {
                 String::from("page updated · JS")
             } else {
                 format!("page updated · JS:{}!", self.page_js_errors.len())
             };
+        }
+        // Page-initiated scroll writes (a chat pinning to bottom) re-window the
+        // region cheaply — after any content update, so they target the new
+        // regions. Latest write per node wins (the loop preserves order).
+        for (node, top) in scrolled {
+            self.apply_region_scroll(node, top);
         }
         if !trouble.is_empty() {
             self.page_js_errors.extend(trouble.iter().cloned());
@@ -2652,9 +2949,12 @@ impl App {
         };
         // Remember the selected item by its arena node (and link) so the
         // selection survives the DOM mutating under it.
-        let selected_target = g
-            .sel_item
-            .and_then(|(r, i)| g.doc.rows.get(r).and_then(|row| row.items.get(i)).cloned());
+        let selected_target = g.sel_item.and_then(|(r, i)| {
+            crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                .items
+                .get(i)
+                .cloned()
+        });
         // Was that selection ON-SCREEN before this update? Only then may we
         // re-center the viewport onto it (the update pushed a visible selection
         // off-screen). If the user had scrolled it out of view, their scroll
@@ -2672,10 +2972,25 @@ impl App {
         // possibly dragging the viewport, while the user just reads. Only a
         // page that ALREADY had a selection earns the lost-it fallback below.
         let had_selection = g.sel_item.is_some();
-        let doc = http::parse_seeded(&url, "text/html; charset=utf-8", &raw, width, None, &images);
+        let doc = http::parse_seeded(
+            &url,
+            "text/html; charset=utf-8",
+            &raw,
+            width,
+            height,
+            None,
+            &images,
+        );
+        // Carry scroll-region scroll positions across the re-layout (restored
+        // below, before the selection re-anchor reads the windowed rows).
+        let old_offsets: Vec<_> = g.doc.regions.iter().map(|r| (r.node, r.voffset)).collect();
         g.doc = doc;
+        // A live re-render carries a FRESH baked scroll signal, so a page-pinned
+        // region keeps the page's position (prefer_signal = true); only an
+        // un-signalled region restores the user's wheel offset.
+        Self::carry_region_offsets(&old_offsets, &mut g.doc.regions, true);
         g.sel_item = selected_target
-            .and_then(|target| Self::find_item_like(&g.doc.rows, &target))
+            .and_then(|target| Self::find_item_like(&g.doc, &target))
             // Lost a selection we HAD? Fall back to the first interactive item
             // in view. Had none? Keep it None (see `had_selection`).
             .or_else(|| {
@@ -2705,13 +3020,282 @@ impl App {
         self.start_image_loads(url, image_urls);
     }
 
+    /// Apply one incremental-layout patch (INCREMENTAL_LAYOUT_PLAN.md): re-lay
+    /// ONLY the boundary's subtree and splice it back, leaving the rest of the
+    /// document untouched. Two arms: a live scroll `Region` swaps its buffer
+    /// (Tier 1, structurally row-count-invariant); a general inline IFC boundary
+    /// splices its rows into `Doc.rows` (Tier 1 in-place / Tier 2 shift). Returns
+    /// false when neither applies (the cache is out of sync, the box reshaped, or
+    /// it grew a sub-frame) and the caller resyncs to the full path.
+    fn patch_live_doc(&mut self, patch: &crate::js::SubtreePatch) -> bool {
+        // A region boundary (its content lives in a side buffer) takes the
+        // buffer-swap arm; everything else is an inline boundary spliced into
+        // `Doc.rows`.
+        let is_region = self.browser.as_ref().is_some_and(|g| {
+            g.doc
+                .regions
+                .iter()
+                .any(|r| r.live_node == Some(patch.node))
+        });
+        if is_region {
+            self.patch_live_region(patch)
+        } else {
+            self.patch_live_boundary(patch)
+        }
+    }
+
+    /// The region arm of `patch_live_doc`: swap a live scroll `Region`'s buffer
+    /// with the boundary's freshly laid content. The band reserves a fixed
+    /// `Region.height` rows regardless of the buffer's length, so the outer
+    /// layout is invariant by construction — `Doc.rows`, the page scroll, and
+    /// every other region stay untouched.
+    fn patch_live_region(&mut self, patch: &crate::js::SubtreePatch) -> bool {
+        let viewport = (
+            (self.last_inner.0 as usize).max(10),
+            self.last_inner.1.max(1) as usize,
+        );
+        let images = self.image_sizes();
+        let url = match self.browser.as_ref().map(|g| g.doc.url.clone()) {
+            Some(Link::Http(u)) => u,
+            _ => return false,
+        };
+        // Locate the live region this patch targets (by the actor node id baked
+        // as `data-trust-node`).
+        let Some(ri) = self.browser.as_ref().and_then(|g| {
+            g.doc
+                .regions
+                .iter()
+                .position(|r| r.live_node == Some(patch.node))
+        }) else {
+            return false;
+        };
+        let region_width = self.browser.as_ref().unwrap().doc.regions[ri].width as usize;
+        let Some(rp) = http::lay_region_patch(
+            &url,
+            patch.html.as_bytes(),
+            region_width,
+            viewport,
+            &images,
+            patch.node,
+        ) else {
+            return false;
+        };
+        let g = self.browser.as_mut().unwrap();
+        // Capture a selection sitting INSIDE this region's band, to re-anchor it
+        // after the swap. A selection elsewhere keeps its row/item indices — the
+        // band's row COUNT is invariant, so nothing outside the region moves.
+        let rg = &g.doc.regions[ri];
+        let band = rg.start_row..rg.start_row + rg.height as usize;
+        let selected_target = g
+            .sel_item
+            .filter(|&(r, _)| band.contains(&r))
+            .and_then(|(r, i)| {
+                crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                    .items
+                    .get(i)
+                    .cloned()
+            });
+        // Carry the scroll position: prefer the page's fresh `scrollTop` signal (a
+        // chat pinning to bottom), else the reader's offset — clamped to the new
+        // content height (mirrors `flow_region`/`carry_region_offsets`).
+        let new_max = rp.rows.len().saturating_sub(rg.height as usize);
+        let (voffset, from_page) = match rp.scroll_top {
+            Some(s) => (s.min(new_max), true),
+            None => (rg.voffset.min(new_max), rg.voffset_from_page),
+        };
+        let rg = &mut g.doc.regions[ri];
+        rg.buffer = rp.rows;
+        rg.carousels = rp.carousels;
+        rg.voffset = voffset;
+        rg.voffset_from_page = from_page;
+        // Re-anchor an in-region selection by target in the new windowed content.
+        if let Some(t) = selected_target {
+            g.sel_item = Self::find_item_like(&g.doc, &t).or(g.sel_item);
+        }
+        // New images the patch introduced (chat avatars): merge into the doc +
+        // kick decodes (deduped; `start_image_loads` skips anything cached).
+        let mut new_urls = Vec::new();
+        for u in rp.image_urls {
+            if !g.doc.image_urls.contains(&u) {
+                g.doc.image_urls.push(u.clone());
+                new_urls.push(u);
+            }
+        }
+        if !new_urls.is_empty() {
+            self.start_image_loads(url, new_urls);
+        }
+        true
+    }
+
+    /// The general inline arm of `patch_live_doc` (INCREMENTAL_LAYOUT_PLAN.md §14):
+    /// re-lay a block-filling IFC boundary's subtree and splice its rows into
+    /// `Doc.rows` at the cached box. The boundary fills its containing block, so
+    /// its width is stable; only its HEIGHT can change. Tier 1 (height unchanged)
+    /// splices in place — nothing outside moves. Tier 2 (height changed) splices
+    /// then SHIFTS every following `Doc.rows`-anchored index by the row delta and
+    /// scroll-anchors (CSS Scroll Anchoring) — no relayout of anything outside the
+    /// box. Returns false (→ resync) when the cache is out of sync, the box grew a
+    /// sub-frame (region/carousel), or the splice would fall outside the doc.
+    fn patch_live_boundary(&mut self, patch: &crate::js::SubtreePatch) -> bool {
+        let viewport = (
+            (self.last_inner.0 as usize).max(10),
+            self.last_inner.1.max(1) as usize,
+        );
+        let images = self.image_sizes();
+        let url = match self.browser.as_ref().map(|g| g.doc.url.clone()) {
+            Some(Link::Http(u)) => u,
+            _ => return false,
+        };
+        // Look up the cached box for this boundary (by the actor node id baked as
+        // `data-trust-node`). A miss = the cache is out of sync (a full render
+        // hasn't captured it yet, or it was dropped) → resync.
+        let (old_range, origin_col, content_width) = {
+            let Some(g) = self.browser.as_ref() else {
+                return false;
+            };
+            let Some(b) = g.doc.boundaries.iter().find(|b| b.node == patch.node) else {
+                return false;
+            };
+            (b.row_range.clone(), b.origin_col, b.content_width as usize)
+        };
+        let Some(laid) = http::lay_subtree_patch(
+            &url,
+            patch.html.as_bytes(),
+            content_width,
+            viewport,
+            &images,
+            patch.node,
+        ) else {
+            return false;
+        };
+        // The box grew a scroll region / carousel since capture — it's no longer a
+        // pure-`Doc.rows` inline boundary, so the full path must re-capture it.
+        if laid.has_subframes {
+            return false;
+        }
+        // Width sanity (INCREMENTAL_LAYOUT_PLAN.md §14 step 4.3): a block-filling
+        // box's content never exceeds its band. If it does the box reshaped (the
+        // actor mis-proved, or a wide unbreakable token appeared) → resync so the
+        // full path lays it against the real document.
+        if laid.width as usize > content_width {
+            return false;
+        }
+        let g = self.browser.as_mut().unwrap();
+        // The cached range must still be valid against the current doc (a prior
+        // patch in the same batch could have shifted it; the actor coalesces to
+        // one patch per boundary, but guard anyway).
+        if old_range.end > g.doc.rows.len() {
+            return false;
+        }
+        let splice_at = old_range.start;
+        let old_len = old_range.len();
+        let new_len = laid.height;
+        let delta = new_len as isize - old_len as isize;
+        // Capture a selection sitting INSIDE the patched box, to re-anchor by
+        // target after the splice. A selection outside keeps its item index and
+        // only its row shifts (below).
+        let selected_target = g
+            .sel_item
+            .filter(|&(r, _)| old_range.contains(&r))
+            .and_then(|(r, i)| {
+                crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                    .items
+                    .get(i)
+                    .cloned()
+            });
+        // Shift the fragment's cols into the box's absolute band, then splice it
+        // in place of the old rows (the Vec splice shifts following rows for us).
+        let mut new_rows = laid.rows;
+        if origin_col > 0 {
+            for row in &mut new_rows {
+                for it in &mut row.items {
+                    it.col += origin_col;
+                }
+            }
+        }
+        g.doc.rows.splice(old_range.clone(), new_rows);
+        // Tier 2: reposition every OTHER `Doc.rows`-anchored index. A box was
+        // excluded at capture if it overlapped a region/carousel, so those sit
+        // wholly before or wholly after the splice — shift the after ones. A
+        // cached boundary INSIDE the patched box (nested) is invalidated: drop it
+        // (re-captured on the next full render); the patched box itself is
+        // repositioned to its new span.
+        let after = old_range.end;
+        let shift = |r: usize| -> usize {
+            if r >= after {
+                (r as isize + delta).max(0) as usize
+            } else {
+                r
+            }
+        };
+        if delta != 0 {
+            for rg in &mut g.doc.regions {
+                rg.start_row = shift(rg.start_row);
+            }
+            for c in &mut g.doc.carousels {
+                c.start = shift(c.start);
+                c.end = shift(c.end);
+            }
+        }
+        g.doc.boundaries.retain(|b| {
+            b.node == patch.node || b.row_range.start < splice_at || b.row_range.start >= after
+        });
+        for b in &mut g.doc.boundaries {
+            if b.node == patch.node {
+                b.row_range = splice_at..splice_at + new_len;
+            } else if delta != 0 {
+                b.row_range = shift(b.row_range.start)..shift(b.row_range.end);
+            }
+        }
+        // Selection: re-anchor an in-box selection by target; shift an after-box
+        // one by delta; leave a before-box one. Scroll-anchor the viewport so a
+        // splice ABOVE the visible top doesn't make the content jump (CSS Scroll
+        // Anchoring L1, specialized to the vertical-row model).
+        let height = viewport.1;
+        if let Some(target) = selected_target {
+            g.sel_item = Self::find_item_like(&g.doc, &target).or(g.sel_item);
+        } else if delta != 0
+            && let Some((r, i)) = g.sel_item
+        {
+            g.sel_item = Some((shift(r), i));
+        }
+        if delta != 0 && splice_at < g.scroll {
+            g.scroll = (g.scroll as isize + delta).max(0) as usize;
+        }
+        let max_scroll = g.doc.rows.len().saturating_sub(height);
+        g.scroll = g.scroll.min(max_scroll);
+        // New images the patch introduced: merge + kick decodes (deduped).
+        let mut new_urls = Vec::new();
+        for u in laid.image_urls {
+            if !g.doc.image_urls.contains(&u) {
+                g.doc.image_urls.push(u.clone());
+                new_urls.push(u);
+            }
+        }
+        if !new_urls.is_empty() {
+            self.start_image_loads(url, new_urls);
+        }
+        true
+    }
+
+    /// Ask the resident page actor to re-emit the whole document (a full
+    /// `Updated`) because an incremental patch couldn't be applied
+    /// (INCREMENTAL_LAYOUT_PLAN.md §7). Unreachable when the predicate is correct.
+    fn request_resync(&mut self) {
+        if let Some(handle) = self.live_page.as_ref() {
+            let _ = handle.cmds.try_send(crate::js::PageCmd::Resync);
+        }
+    }
+
     /// Find the `(row, item)` matching `target` in fresh rows: same arena
     /// node wins (a control that moved), else same link target.
-    fn find_item_like(
-        rows: &[crate::layout::Row],
-        target: &crate::layout::Item,
-    ) -> Option<(usize, usize)> {
-        for (r, row) in rows.iter().enumerate() {
+    fn find_item_like(doc: &Doc, target: &crate::layout::Item) -> Option<(usize, usize)> {
+        // Search the EFFECTIVE rows (region buffer windows merged in) so a
+        // selection on scroll-region content re-anchors after a re-layout — the
+        // returned `(r, i)` indexes the effective row, consistent with how the
+        // selection is later read (`selected_link`/render through `effective_row`).
+        for r in 0..doc.rows.len() {
+            let row = crate::layout::effective_row(&doc.rows, &doc.regions, r);
             for (i, it) in row.items.iter().enumerate() {
                 if !it.is_interactive() {
                     continue;
@@ -2724,6 +3308,43 @@ impl App {
             }
         }
         None
+    }
+
+    /// Carry scroll-region offsets across a re-layout: match each new region to
+    /// an old one by node id and restore its `voffset` (clamped to the new
+    /// content). So a re-parse (the chat's per-message update) or a re-wrap
+    /// (resize) doesn't reset the reader's scroll position — the region-level
+    /// analogue of `find_item_like`'s selection stability.
+    ///
+    /// `prefer_signal` distinguishes the two re-layout kinds (Phase 3):
+    /// - A live re-render (`replace_live_doc`) re-bakes a FRESH
+    ///   `data-trust-scroll-top` signal, so a region whose `voffset_from_page` is
+    ///   set keeps the page's signalled position (a chat re-pinning to bottom);
+    ///   only an un-signalled region restores the user's wheel offset.
+    /// - A re-wrap of the SAME HTML (resize / image relayout) carries a STALE
+    ///   signal (the page may have scrolled since), so the on-screen offset (the
+    ///   old `voffset`) always wins — the user's position is preserved.
+    ///
+    /// NO heuristic about where a GROWING region should scroll — whether new
+    /// content pins to the bottom (a chat) or stays put (a log you're reading) is
+    /// the PAGE's call, via its own `element.scrollTop` writes; we never guess it.
+    fn carry_region_offsets(
+        old: &[(crate::dom::NodeId, usize)],
+        regions: &mut [crate::layout::Region],
+        prefer_signal: bool,
+    ) {
+        for rg in regions.iter_mut() {
+            if rg.node == crate::layout::NO_NODE {
+                continue;
+            }
+            // Keep the page's fresh signal on a live re-render.
+            if prefer_signal && rg.voffset_from_page {
+                continue;
+            }
+            if let Some(&(_, voff)) = old.iter().find(|&&(n, _)| n == rg.node) {
+                rg.voffset = voff.min(rg.max_voffset());
+            }
+        }
     }
 
     /// Show a fetched document, pushing the current one onto the back
@@ -2840,12 +3461,17 @@ impl App {
         let local_col = col.saturating_sub(self.last_content_area.x);
         (g.scroll..=doc_row).rev().find_map(|r| {
             let row_offset = doc_row.saturating_sub(r);
-            let row = g.doc.rows.get(r)?;
+            if r >= g.doc.rows.len() {
+                return None;
+            }
+            // The effective row merges any scroll-region buffer window over the
+            // reserved band, so a click inside a region lands on its content.
+            let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r);
             // Use the SAME on-screen placement the renderer draws (carousel
             // clip + gap-fill + overlap-append), so a click lands on the item
             // actually under the cursor — not the raw `item.col`, which diverges
             // when items overlap (an overlay drawn after the content it covers).
-            crate::layout::visual_columns(row, &g.doc.carousels, r)
+            crate::layout::visual_columns(&row, &g.doc.carousels, r)
                 .into_iter()
                 .find_map(|(i, start)| {
                     let item = &row.items[i];
@@ -2874,6 +3500,10 @@ impl App {
             KeyCode::Right if self.scroll_selected_carousel(1) => {}
             KeyCode::Left => self.http_move(-1, true),
             KeyCode::Right => self.http_move(1, true),
+            // PgUp/PgDn scroll the region under the cursor, if any (chaining to
+            // the document at its boundary); otherwise they page the document.
+            KeyCode::PageUp if self.region_page_scroll(-1) => {}
+            KeyCode::PageDown if self.region_page_scroll(1) => {}
             KeyCode::PageUp => self.http_scroll(-page),
             KeyCode::PageDown => self.http_scroll(page),
             KeyCode::Home => self.http_scroll(i64::MIN / 2),
@@ -3182,6 +3812,90 @@ impl App {
         }
     }
 
+    /// Route a wheel scroll. A wheel with the cursor over a scroll region
+    /// scrolls ONLY that region — and TRAPS the scroll there: even at the
+    /// region's boundary the wheel never leaks to the page (her call — a region
+    /// must never scroll the whole canvas while the cursor is inside it; this is
+    /// `overscroll-behavior: contain`, NOT the chaining `auto`). Off any region,
+    /// the document scrolls as before. `delta` rows, positive = down.
+    fn browser_wheel(&mut self, delta: i64, col: u16, row: u16) {
+        if let Some(idx) = self.region_under(col, row) {
+            let moved = self.scroll_region_by(idx, delta);
+            // A user wheel overrides the page's pin: write the new scrollTop back
+            // so a conditional chat learns we scrolled and stops following.
+            if moved {
+                let (node, voff) = {
+                    let g = self.browser.as_ref().unwrap();
+                    (g.doc.regions[idx].live_node, g.doc.regions[idx].voffset)
+                };
+                self.region_writeback(node, voff);
+            }
+            return; // trapped in the region — never chains to the document
+        }
+        self.browser_scroll(delta, true);
+    }
+
+    /// Scroll region `idx` by `delta` rows (clamped); returns whether it moved.
+    /// A user-driven scroll, so it clears `voffset_from_page` — a later re-wrap of
+    /// the same HTML (resize) preserves THIS offset, not the stale page signal.
+    fn scroll_region_by(&mut self, idx: usize, delta: i64) -> bool {
+        let Some(g) = &mut self.browser else {
+            return false;
+        };
+        let rg = &mut g.doc.regions[idx];
+        let moved = rg.scroll_by(delta);
+        if moved {
+            rg.voffset_from_page = false;
+        }
+        moved
+    }
+
+    /// The index of the scroll region whose scrollport is under the cursor
+    /// `(col, row)` (absolute terminal cells), if any.
+    fn region_under(&self, col: u16, row: u16) -> Option<usize> {
+        if !self.mouse_in_content_area(col, row) {
+            return None;
+        }
+        let g = self.browser.as_ref()?;
+        if !g.doc.laid_out() {
+            return None;
+        }
+        let doc_row = g.scroll + row.saturating_sub(self.last_content_area.y) as usize;
+        let local_col = col.saturating_sub(self.last_content_area.x);
+        g.doc
+            .regions
+            .iter()
+            .position(|rg| rg.contains_row(doc_row) && rg.contains_col(local_col))
+    }
+
+    /// PgUp/PgDn over a scroll region scrolls THAT region by a page (its own
+    /// height), using the last hovered cell ("scroll the hovered region").
+    /// Returns whether the cursor was over a region (which then TRAPS the
+    /// page key — never pages the document — to match the wheel); otherwise
+    /// `false` and the document pages as usual.
+    fn region_page_scroll(&mut self, dir: i64) -> bool {
+        let Some((col, row)) = self.last_mouse else {
+            return false;
+        };
+        let Some(idx) = self.region_under(col, row) else {
+            return false;
+        };
+        // A page is the scrollport height less one row of overlap (mirrors the
+        // document's `last_inner.1 - 1` page step).
+        let page = {
+            let g = self.browser.as_ref().unwrap();
+            (i64::from(g.doc.regions[idx].height) - 1).max(1)
+        };
+        if self.scroll_region_by(idx, dir * page) {
+            let (node, voff) = {
+                let g = self.browser.as_ref().unwrap();
+                (g.doc.regions[idx].live_node, g.doc.regions[idx].voffset)
+            };
+            self.region_writeback(node, voff);
+        }
+        true // over a region ⇒ trap the key (don't fall through to the document)
+    }
+
     fn pending_browser_wrap_target(&self) -> Option<(usize, bool)> {
         let width = (self.last_inner.0 as usize).max(10);
         let cp437 = self.encoding == Encoding::Cp437;
@@ -3211,10 +3925,15 @@ impl App {
                 .filter(|l| l.link.is_some())
                 .count()
         });
-        // For laid-out docs, carry the selection over by its item identity.
-        let item_target = g
-            .sel_item
-            .and_then(|(r, i)| g.doc.rows.get(r).and_then(|row| row.items.get(i)).cloned());
+        // For laid-out docs, carry the selection over by its item identity, and
+        // the scroll-region offsets so a resize keeps each region's scroll spot.
+        let item_target = g.sel_item.and_then(|(r, i)| {
+            crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                .items
+                .get(i)
+                .cloned()
+        });
+        let old_offsets: Vec<_> = g.doc.regions.iter().map(|r| (r.node, r.voffset)).collect();
         let raw = std::mem::take(&mut g.doc.raw);
         g.doc = match g.doc.url.clone() {
             Link::Gopher(url) => gopher::parse(&url, raw, cp437, width),
@@ -3226,16 +3945,19 @@ impl App {
                 let meta = g.doc.meta.clone().unwrap_or_default();
                 // Seed so typed-in form values survive the re-parse.
                 let forms = std::mem::take(&mut g.doc.forms);
-                http::parse_seeded(&url, &meta, &raw, width, Some(&forms), &images)
+                http::parse_seeded(&url, &meta, &raw, width, height, Some(&forms), &images)
             }
             Link::OneShot(url) => oneshot::parse(&url, raw, width),
             Link::Form { .. } | Link::JsClick { .. } | Link::External(_) => return,
-            Link::CarouselScroll(_) => return,
+            Link::CarouselScroll(_) | Link::Media(_) => return,
         };
         if g.doc.laid_out() {
             // Re-flow at the new width re-laid the rows; re-anchor the
-            // selected item by identity.
-            g.sel_item = item_target.and_then(|t| Self::find_item_like(&g.doc.rows, &t));
+            // selected item by identity and restore region scroll positions. A
+            // resize re-wraps the SAME HTML, so the baked scroll signal is stale —
+            // the on-screen offset wins (prefer_signal = false).
+            Self::carry_region_offsets(&old_offsets, &mut g.doc.regions, false);
+            g.sel_item = item_target.and_then(|t| Self::find_item_like(&g.doc, &t));
             let max_scroll = g.doc.rows.len().saturating_sub(height);
             g.scroll = match g.sel_item {
                 Some((r, _)) => r.saturating_sub(height / 2).min(max_scroll),
@@ -3388,6 +4110,10 @@ impl App {
                 self.start_fetch_opts(Link::Http(url), false, referrer);
             }
             Link::OneShot(url) => self.start_fetch(Link::OneShot(url)),
+            // A `<video>`/`<audio>` representation: hand its URL to mpv (a direct
+            // file, or — for a streaming player — the page URL that yt-dlp
+            // resolves). The terminal can't play it inline.
+            Link::Media(url) => self.launch_mpv(url.to_string()),
             Link::Form { form, field } => self.form_interact(form, field),
             Link::JsClick { node, .. } => self.dispatch_click(node),
             Link::External(target) => {
@@ -3448,7 +4174,14 @@ impl App {
         let g = self.browser.as_ref()?;
         if g.doc.laid_out() {
             let (r, i) = g.sel_item?;
-            g.doc.rows.get(r)?.items.get(i)?.link.clone()
+            // Through `effective_row` so a selection that landed on scroll-region
+            // content (whose items live in the region buffer, not the blank
+            // reserved doc row) resolves to its link.
+            crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                .items
+                .get(i)?
+                .link
+                .clone()
         } else {
             g.selected
                 .and_then(|i| g.doc.lines.get(i))
@@ -3464,6 +4197,7 @@ impl App {
         let link = self.selected_link()?;
         let raw: String = match &link {
             Link::Http(url) => url.to_string(),
+            Link::Media(url) => url.to_string(),
             Link::JsClick { href, .. } if !href.is_empty() => href.clone(),
             Link::External(s) => s.clone(),
             _ => return None,
@@ -4485,6 +5219,9 @@ mod tests {
             rows: Vec::new(),
             image_urls: Vec::new(),
             carousels: Vec::new(),
+            regions: Vec::new(),
+            scroll_clips: Vec::new(),
+            boundaries: Vec::new(),
         }
     }
 
@@ -4615,6 +5352,7 @@ mod tests {
             "text/html",
             html,
             80,
+            0,
             &Default::default(),
         ));
 
@@ -4646,6 +5384,7 @@ mod tests {
             "text/html",
             html.as_bytes(),
             80,
+            0,
             &Default::default(),
         ));
         assert!(app.browser.as_ref().unwrap().doc.laid_out());
@@ -4713,6 +5452,7 @@ mod tests {
             "text/html",
             html,
             80,
+            0,
             &Default::default(),
         ));
         app.browser.as_mut().unwrap().sel_item = None;
@@ -4736,6 +5476,7 @@ mod tests {
             "text/html",
             html,
             80,
+            0,
             &Default::default(),
         ));
         // A sticky message is up (the mpv-launch confirmation / a fetch error),
@@ -4764,6 +5505,7 @@ mod tests {
             "text/html",
             html,
             80,
+            0,
             &Default::default(),
         ));
         let (x, y, target) = item_point(&app, |it| matches!(it.link, Some(Link::External(_))));
@@ -4778,6 +5520,511 @@ mod tests {
         assert_eq!(app.status, "external link: mailto:x@y.z");
     }
 
+    /// An app showing a page with a fixed-height (96px ≈ 6 rows)
+    /// `overflow-y:auto` scroll region holding 40 link rows, followed by a tall
+    /// footer (so the document itself is ALSO scrollable — for chain tests). The
+    /// content area starts at row 1 (row 0 is the title chrome).
+    fn region_app() -> super::App {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(0, 1, 80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let mut links = String::new();
+        for i in 0..40 {
+            links.push_str(&format!("<div><a href='/L{i:02}'>L{i:02}</a></div>"));
+        }
+        let foot: String = (0..20).map(|i| format!("<p>F{i:02}</p>")).collect();
+        let html = format!(
+            "<html><body><div id='s' style='height:96px;overflow-y:auto'>{links}</div>{foot}</body></html>"
+        );
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html.as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        ));
+        app
+    }
+
+    /// The absolute screen `(col, row)` of the first link in the region's
+    /// current top visible row (the same placement the renderer draws).
+    fn region_top_link_point(app: &super::App) -> (u16, u16) {
+        let g = app.browser.as_ref().unwrap();
+        let rg = &g.doc.regions[0];
+        let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, rg.start_row);
+        let start = crate::layout::visual_columns(&row, &g.doc.carousels, rg.start_row)
+            .into_iter()
+            .find(|&(i, _)| row.items[i].is_interactive())
+            .map(|(_, c)| c)
+            .expect("a link in the region top row");
+        (
+            app.last_content_area.x + start,
+            app.last_content_area.y + (rg.start_row - g.scroll) as u16,
+        )
+    }
+
+    #[test]
+    fn wheel_over_a_region_scrolls_it_not_the_document() {
+        let mut app = region_app();
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.doc.regions.len(), 1, "the overflow box is a region");
+        assert_eq!(g.scroll, 0);
+        assert_eq!(g.doc.regions[0].voffset, 0);
+        let start_row = g.doc.regions[0].start_row;
+        let rg_row = app.last_content_area.y + start_row as u16 + 1;
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::ScrollDown,
+            3,
+            rg_row,
+        ));
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.doc.regions[0].voffset, 3, "the wheel scrolled the region");
+        assert_eq!(g.scroll, 0, "the document did NOT scroll");
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::ScrollUp, 3, rg_row));
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.regions[0].voffset,
+            0,
+            "and back up"
+        );
+    }
+
+    #[test]
+    fn a_region_at_its_bottom_traps_the_wheel_does_not_scroll_the_page() {
+        // Her call: a wheel with the cursor inside a region scrolls ONLY the
+        // region — even at its boundary it never leaks to the page (NOT the
+        // chaining `auto`; this is `overscroll-behavior: contain`).
+        let mut app = region_app();
+        let (start_row, max) = {
+            let g = app.browser.as_mut().unwrap();
+            let max = g.doc.regions[0].max_voffset();
+            assert!(max > 0, "the region overflows");
+            g.doc.regions[0].voffset = max; // pin to the bottom
+            (g.doc.regions[0].start_row, max)
+        };
+        let rg_row = app.last_content_area.y + start_row as u16 + 1;
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::ScrollDown,
+            3,
+            rg_row,
+        ));
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(
+            g.doc.regions[0].voffset, max,
+            "the region stayed at its bottom"
+        );
+        assert_eq!(
+            g.scroll, 0,
+            "the page did NOT scroll — the wheel was trapped"
+        );
+    }
+
+    #[test]
+    fn a_link_inside_a_region_is_hoverable_and_resolves() {
+        let mut app = region_app();
+        let (x, y) = region_top_link_point(&app);
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, x, y));
+        assert!(
+            app.browser.as_ref().unwrap().sel_item.is_some(),
+            "hover selected the region's content"
+        );
+        assert_eq!(
+            app.selected_link(),
+            Some(crate::doc::Link::Http(
+                url::Url::parse("https://example.com/L00").unwrap()
+            )),
+            "the selected link resolves through the region buffer"
+        );
+    }
+
+    #[test]
+    fn pgup_pgdn_scroll_the_hovered_region() {
+        let mut app = region_app();
+        let start_row = app.browser.as_ref().unwrap().doc.regions[0].start_row;
+        app.last_mouse = Some((3, app.last_content_area.y + start_row as u16 + 1));
+        // PgDn pages the hovered region (height 6 → a 5-row step).
+        assert!(
+            app.region_page_scroll(1),
+            "the hovered region consumed PgDn"
+        );
+        assert_eq!(app.browser.as_ref().unwrap().doc.regions[0].voffset, 5);
+        assert!(app.region_page_scroll(-1), "PgUp pages it back");
+        assert_eq!(app.browser.as_ref().unwrap().doc.regions[0].voffset, 0);
+        // At the top, PgUp is still TRAPPED (consumed) — it must not page the
+        // document while the cursor is inside the region — but the offset stays.
+        assert!(
+            app.region_page_scroll(-1),
+            "the key stays trapped in the region at its boundary"
+        );
+        assert_eq!(app.browser.as_ref().unwrap().doc.regions[0].voffset, 0);
+        // With nothing under the cursor it falls through to the document.
+        app.last_mouse = Some((3, app.last_content_area.y + 200));
+        assert!(!app.region_page_scroll(1));
+    }
+
+    #[test]
+    fn region_scroll_offset_persists_across_relayout() {
+        let mut app = region_app();
+        app.browser.as_mut().unwrap().doc.regions[0].voffset = 5;
+        // A relayout (image decode / resize) re-parses from raw — the region's
+        // scroll position is carried over by node id.
+        app.relayout_browser();
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.doc.regions.len(), 1);
+        assert_eq!(
+            g.doc.regions[0].voffset, 5,
+            "the region kept its scroll position across the re-layout"
+        );
+    }
+
+    /// A region app whose scroll container carries the live serializer's
+    /// `data-trust-node` (so the app can correlate it with the resident actor),
+    /// and optionally a baked `data-trust-scroll-top` signal (rows).
+    fn region_app_with_node(scroll_top: Option<u32>) -> super::App {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(0, 1, 80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let mut links = String::new();
+        for i in 0..40 {
+            links.push_str(&format!("<div><a href='/L{i:02}'>L{i:02}</a></div>"));
+        }
+        let sig = scroll_top
+            .map(|t| format!(" data-trust-scroll-top='{t}'"))
+            .unwrap_or_default();
+        let html = format!(
+            "<html><body><div id='s' data-trust-node='99'{sig} style='height:96px;overflow-y:auto'>{links}</div></body></html>"
+        );
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html.as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        ));
+        app
+    }
+
+    #[test]
+    fn a_baked_scroll_top_signal_seeds_the_region_voffset() {
+        // The page set `element.scrollTop`; the live serializer baked it (rows)
+        // + the actor node id, and `flow_region` opens the region there (CSSOM
+        // View — obey the page, no top-vs-bottom heuristic).
+        let app = region_app_with_node(Some(7));
+        let rg = &app.browser.as_ref().unwrap().doc.regions[0];
+        assert_eq!(
+            rg.voffset, 7,
+            "the region opened at the page's signalled scrollTop"
+        );
+        assert_eq!(rg.live_node, Some(99), "the actor node id round-tripped");
+        assert!(rg.voffset_from_page, "the offset came from the page signal");
+    }
+
+    #[test]
+    fn a_baked_scroll_top_signal_clamps_to_the_content() {
+        // A signal past the bottom (e.g. `scrollTop = scrollHeight` before the
+        // app re-measured) clamps to `scrollHeight − clientHeight` = the bottom.
+        let app = region_app_with_node(Some(9999));
+        let rg = &app.browser.as_ref().unwrap().doc.regions[0];
+        assert_eq!(rg.voffset, rg.max_voffset(), "clamped to the bottom");
+    }
+
+    #[test]
+    fn carry_region_offsets_respects_the_page_signal_only_on_a_live_render() {
+        use crate::layout::Region;
+        let mk = |voffset: usize, from_page: bool| Region {
+            node: 5,
+            start_row: 0,
+            left: 0,
+            width: 10,
+            height: 4,
+            buffer: vec![crate::layout::Row::default(); 20], // max_voffset = 16
+            voffset,
+            live_node: Some(99),
+            voffset_from_page: from_page,
+            carousels: Vec::new(),
+        };
+        let old = [(5usize, 9usize)];
+        // Live render + the page dictated the offset → keep the fresh signal (3).
+        let mut regions = [mk(3, true)];
+        super::App::carry_region_offsets(&old, &mut regions, true);
+        assert_eq!(regions[0].voffset, 3, "the page's signal is kept");
+        // Live render, no page signal → restore the user's wheel offset (9).
+        let mut regions = [mk(3, false)];
+        super::App::carry_region_offsets(&old, &mut regions, true);
+        assert_eq!(
+            regions[0].voffset, 9,
+            "un-signalled region restores the wheel offset"
+        );
+        // A resize (same HTML, stale signal) → the on-screen offset always wins.
+        let mut regions = [mk(3, true)];
+        super::App::carry_region_offsets(&old, &mut regions, false);
+        assert_eq!(
+            regions[0].voffset, 9,
+            "resize preserves the on-screen position"
+        );
+    }
+
+    #[test]
+    fn a_user_wheel_writes_the_scroll_back_to_the_live_page() {
+        // The region→page write-back (CSSOM View): a wheel over a live region
+        // sends its new scrollTop back so a conditional pin learns we scrolled.
+        let mut app = region_app_with_node(None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        app.live_page = Some(crate::js::PageHandle { cmds: tx });
+        let start_row = app.browser.as_ref().unwrap().doc.regions[0].start_row;
+        let rg_row = app.last_content_area.y + start_row as u16 + 1;
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::ScrollDown,
+            3,
+            rg_row,
+        ));
+        assert_eq!(app.browser.as_ref().unwrap().doc.regions[0].voffset, 3);
+        match rx.try_recv().expect("a SetScroll write-back") {
+            crate::js::PageCmd::SetScroll { node, top, .. } => {
+                assert_eq!(node, 99);
+                let cell_h = f64::from(app.picker.font_size().height);
+                assert_eq!(top, 3.0 * cell_h, "scrollTop in px = voffset × cell height");
+            }
+            other => panic!("expected SetScroll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_region_state_pushes_geometry_then_dedups() {
+        let mut app = region_app_with_node(None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        app.live_page = Some(crate::js::PageHandle { cmds: tx });
+        app.sync_region_state();
+        match rx.try_recv().expect("a RegionGeom push") {
+            crate::js::PageCmd::RegionGeom { items } => {
+                let (node, ch, _cw) = items[0];
+                assert_eq!(node, 99);
+                let cell_h = f64::from(app.picker.font_size().height);
+                assert_eq!(ch, 6.0 * cell_h, "clientHeight = the 6-row viewport");
+            }
+            other => panic!("expected RegionGeom, got {other:?}"),
+        }
+        // Unchanged geometry isn't re-sent.
+        app.sync_region_state();
+        assert!(rx.try_recv().is_err(), "geometry deduped when unchanged");
+    }
+
+    #[test]
+    fn apply_region_scroll_windows_the_region_from_the_page_signal() {
+        let mut app = region_app_with_node(None);
+        let cell_h = f64::from(app.picker.font_size().height);
+        app.apply_region_scroll(99, 5.0 * cell_h);
+        let rg = &app.browser.as_ref().unwrap().doc.regions[0];
+        assert_eq!(rg.voffset, 5);
+        assert!(rg.voffset_from_page);
+        // A pin past the bottom clamps (CSSOM View).
+        app.apply_region_scroll(99, 9999.0 * cell_h);
+        let rg = &app.browser.as_ref().unwrap().doc.regions[0];
+        assert_eq!(rg.voffset, rg.max_voffset(), "clamped to the bottom");
+    }
+
+    #[test]
+    fn a_region_patch_swaps_only_the_buffer_leaving_doc_rows_untouched() {
+        // INCREMENTAL_LAYOUT_PLAN.md Tier 1: a patch re-lays ONLY the region's
+        // buffer; the document rows (the fixed band + everything outside) are
+        // untouched, so nothing on the page moves.
+        let mut app = region_app_with_node(None);
+        let (rows_before, buf_before, region_w) = {
+            let g = app.browser.as_ref().unwrap();
+            let rg = &g.doc.regions[0];
+            assert_eq!(rg.live_node, Some(99), "the region carries its actor node");
+            (g.doc.rows.len(), rg.buffer.len(), rg.width)
+        };
+        // A patch replacing the region's 40 links with 2 new ones.
+        let frag = r#"<div data-trust-frag=""><div data-trust-node="99" style="height:96px;overflow-y:auto"><div><a href="/N00">N00</a></div><div><a href="/N01">N01</a></div></div></div>"#;
+        let patch = crate::js::SubtreePatch {
+            node: 99,
+            html: frag.to_string(),
+            tier: crate::js::BoundaryTier::Size,
+        };
+        assert!(app.patch_live_doc(&patch), "the region patch applies");
+        let g = app.browser.as_ref().unwrap();
+        // The document row COUNT is unchanged — the band is invariant.
+        assert_eq!(g.doc.rows.len(), rows_before, "doc rows untouched");
+        let rg = &g.doc.regions[0];
+        assert_eq!(rg.width, region_w, "band width unchanged");
+        assert_ne!(rg.buffer.len(), buf_before, "the buffer was replaced");
+        assert!(
+            rg.buffer
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.text.contains("N00")),
+            "the patched content is in the new buffer"
+        );
+        assert!(
+            !rg.buffer
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.text.contains("L00")),
+            "the old content is gone"
+        );
+        // A patch for a node that ISN'T a live region or cached boundary asks for
+        // a resync (false).
+        let bogus = crate::js::SubtreePatch {
+            node: 12345,
+            html: frag.to_string(),
+            tier: crate::js::BoundaryTier::Size,
+        };
+        assert!(
+            !app.patch_live_doc(&bogus),
+            "an uncached boundary can't be patched"
+        );
+    }
+
+    #[test]
+    fn an_inline_boundary_patch_splices_like_a_full_relayout() {
+        // INCREMENTAL_LAYOUT_PLAN.md §9/§14 (the splice-level differential): a
+        // grown inline IFC boundary patched into Doc.rows is byte-for-byte the
+        // same as a FULL re-layout of the mutated page — the patched box's rows
+        // replace the old ones, and content OUTSIDE (HEADER above, FOOTER below)
+        // is identity-shifted, never re-laid.
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let page = |lines: usize| -> String {
+            let mut s = String::from(
+                r#"<html><body><p>HEADER</p><div data-trust-node="42" style="display:flow-root">"#,
+            );
+            for i in 0..lines {
+                s.push_str(&format!("<div>line{i}</div>"));
+            }
+            s.push_str("</div><p>FOOTER</p></body></html>");
+            s
+        };
+        // Initial render (3 lines) captures Doc.boundaries[42].
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            page(3).as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        ));
+        assert!(
+            app.browser
+                .as_ref()
+                .unwrap()
+                .doc
+                .boundaries
+                .iter()
+                .any(|b| b.node == 42),
+            "the flow-root boundary was captured at load"
+        );
+        let rows_before = app.browser.as_ref().unwrap().doc.rows.len();
+        // Patch: the boundary grew to 5 lines (Tier 2 — height changed).
+        let frag = r#"<div data-trust-frag=""><div data-trust-node="42" style="display:flow-root"><div>line0</div><div>line1</div><div>line2</div><div>line3</div><div>line4</div></div></div>"#;
+        let patch = crate::js::SubtreePatch {
+            node: 42,
+            html: frag.to_string(),
+            tier: crate::js::BoundaryTier::WidthStable,
+        };
+        assert!(
+            app.patch_live_doc(&patch),
+            "the inline boundary patch applies"
+        );
+        // The mutated page laid the full way is the oracle.
+        let full = crate::http::parse(
+            &url,
+            "text/html",
+            page(5).as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        );
+        let got = &app.browser.as_ref().unwrap().doc;
+        assert_eq!(
+            got.rows.len(),
+            full.rows.len(),
+            "row count matches a full relayout (Tier-2 shift added 2 rows)"
+        );
+        assert_eq!(got.rows.len(), rows_before + 2, "two lines were added");
+        for (i, (g, f)) in got.rows.iter().zip(full.rows.iter()).enumerate() {
+            assert_eq!(
+                crate::layout::render_row(g),
+                crate::layout::render_row(f),
+                "spliced row {i} matches the full relayout"
+            );
+        }
+        // The cached boundary box was repositioned to its new span.
+        let b = got.boundaries.iter().find(|b| b.node == 42).unwrap();
+        assert_eq!(b.row_range.len(), 5, "the boundary now spans 5 rows");
+    }
+
+    #[test]
+    fn an_inline_boundary_tier1_patch_leaves_outside_rows_identical() {
+        // INCREMENTAL_LAYOUT_PLAN.md §14 Tier 1: a content change that keeps the
+        // box's HEIGHT splices in place — every row OUTSIDE the boundary is
+        // byte-identical (nothing shifts).
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let html = r#"<html><body><p>HEADER</p><div data-trust-node="42" style="display:flow-root"><div>old0</div><div>old1</div></div><p>FOOTER</p></body></html>"#;
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html.as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        ));
+        let before: Vec<String> = app
+            .browser
+            .as_ref()
+            .unwrap()
+            .doc
+            .rows
+            .iter()
+            .map(crate::layout::render_row)
+            .collect();
+        let footer_row = before
+            .iter()
+            .position(|r| r.contains("FOOTER"))
+            .expect("footer present");
+        // Same line COUNT, different text → Tier 1 (delta 0), no shift.
+        let frag = r#"<div data-trust-frag=""><div data-trust-node="42" style="display:flow-root"><div>new0</div><div>new1</div></div></div>"#;
+        let patch = crate::js::SubtreePatch {
+            node: 42,
+            html: frag.to_string(),
+            tier: crate::js::BoundaryTier::WidthStable,
+        };
+        assert!(app.patch_live_doc(&patch), "the Tier-1 patch applies");
+        let after: Vec<String> = app
+            .browser
+            .as_ref()
+            .unwrap()
+            .doc
+            .rows
+            .iter()
+            .map(crate::layout::render_row)
+            .collect();
+        assert_eq!(after.len(), before.len(), "row count unchanged (delta 0)");
+        assert_eq!(
+            after[footer_row], before[footer_row],
+            "FOOTER row is byte-identical (nothing outside moved)"
+        );
+        assert_eq!(after[0], before[0], "HEADER row is byte-identical");
+        assert!(
+            after.iter().any(|r| r.contains("new0")),
+            "the new content was spliced in"
+        );
+        assert!(
+            !after.iter().any(|r| r.contains("old0")),
+            "the old content is gone"
+        );
+    }
+
     #[test]
     fn http_mouse_left_click_activates_linked_image_on_bottom_row() {
         let mut app = super::App::new(None, 23);
@@ -4788,7 +6035,7 @@ mod tests {
         let mut images = crate::layout::ImageSizes::new();
         images.insert("https://example.com/cat.png".to_owned(), (10, 4));
         let html = b"<body><a href='mailto:x@y.z'><img src='/cat.png' alt='cat'></a></body>";
-        app.navigate_to(crate::http::parse(&url, "text/html", html, 80, &images));
+        app.navigate_to(crate::http::parse(&url, "text/html", html, 80, 0, &images));
 
         let g = app.browser.as_ref().unwrap();
         let (img_row, img_item) = g
@@ -4835,6 +6082,7 @@ mod tests {
             "text/html",
             html,
             80,
+            0,
             &Default::default(),
         ));
         let (x, y, target) = item_point(&app, |it| matches!(it.link, Some(Link::Form { .. })));
@@ -4915,6 +6163,7 @@ mod tests {
             "text/html",
             b"<body><p>hi</p></body>",
             80,
+            0,
             &Default::default(),
         )
     }
@@ -4933,7 +6182,7 @@ mod tests {
             &url,
             "text/html",
             br#"<body><span style="display:inline-flex"><img src="/logo.png" style="display:block"></span><a href="/f">Forums</a></body>"#,
-            80,
+            80, 0,
             &images,
         );
         let g = super::BrowserView {
@@ -4975,7 +6224,7 @@ mod tests {
     fn app_browsing(mime: &str, body: &str) -> super::App {
         let images = crate::layout::ImageSizes::new();
         let url = url::Url::parse("https://example.com/").unwrap();
-        let doc = crate::http::parse(&url, mime, body.as_bytes(), 80, &images);
+        let doc = crate::http::parse(&url, mime, body.as_bytes(), 80, 0, &images);
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
         app.browser = Some(super::BrowserView {
@@ -5362,6 +6611,7 @@ mod tests {
             "text/html",
             html.as_bytes(),
             60,
+            0,
             &Default::default(),
         ));
         app
@@ -5677,7 +6927,14 @@ mod tests {
             body += &format!("<p>line {i}</p>");
         }
         body += "</body>";
-        let doc = crate::http::parse(&url, "text/html", body.as_bytes(), 60, &Default::default());
+        let doc = crate::http::parse(
+            &url,
+            "text/html",
+            body.as_bytes(),
+            60,
+            0,
+            &Default::default(),
+        );
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
         app.last_inner = (60, 10);
@@ -5867,6 +7124,7 @@ mod tests {
                 "text/html; charset=utf-8",
                 html.as_bytes(),
                 app.last_inner.0 as usize,
+                0,
                 &images,
             );
             app.navigate_to(doc);
@@ -5930,6 +7188,7 @@ mod tests {
             "text/html; charset=utf-8",
             body.as_bytes(),
             40,
+            0,
             &images,
         );
         app.navigate_to(doc);
@@ -5985,6 +7244,67 @@ mod tests {
         assert!(
             !app.image_protocols.contains_key(&key),
             "an off-screen image's encode should be evicted (#3)"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_region_buffer_image_is_marked_live_for_encoding() {
+        // A vertical scroll region holds its content (incl. images) in its own
+        // buffer, NOT in `doc.rows`. The encode pass must scan that buffer, else a
+        // region image would never encode — or, once encoded, get evicted because
+        // the doc-rows scan never marks it live. (Phase 4 images-in-regions.)
+        use ratatui::layout::Size;
+        let png = crate::img::red_png();
+        let (decoded, _) = crate::img::decode(&png).unwrap();
+        let cell = super::natural_cell_box(&decoded, (8u16, 16u16).into());
+        let base = url::Url::parse("https://ex.com/").unwrap();
+        let mut images = crate::layout::ImageSizes::new();
+        images.insert("https://ex.com/av.png".to_string(), cell);
+        // A definite-height `overflow-y:auto` region whose content includes an
+        // image plus enough rows to overflow (so it becomes a Region + buffer).
+        let mut content = String::from(r#"<img src="/av.png">"#);
+        for i in 0..40 {
+            content.push_str(&format!("<div>L{i}</div>"));
+        }
+        let body = format!("<body><div style='height:96px;overflow-y:auto'>{content}</div></body>");
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (40, 50); // tall enough that the region band is on-screen
+        let doc = crate::http::parse(
+            &base,
+            "text/html; charset=utf-8",
+            body.as_bytes(),
+            40,
+            50,
+            &images,
+        );
+        app.navigate_to(doc);
+        let key = {
+            let g = app.browser.as_ref().unwrap();
+            assert_eq!(g.doc.regions.len(), 1, "the overflow box is a region");
+            g.doc.regions[0]
+                .buffer
+                .iter()
+                .flat_map(|r| &r.items)
+                .find_map(|it| it.image.as_deref().map(|u| super::EncKey::for_item(u, it)))
+                .expect("the region buffer holds the image item")
+        };
+        // Seed the decoded cache + a box-keyed encode, as the pipeline would.
+        app.image_cache.insert(
+            "https://ex.com/av.png".to_string(),
+            super::DecodedImage {
+                raw: png.clone().into(),
+                cell,
+            },
+        );
+        let proto =
+            crate::img::encode_sliced(&app.picker, decoded, Size::new(key.w, key.h), key.crop)
+                .unwrap();
+        app.image_protocols.insert(key.clone(), proto);
+        // The encode pass scans the region buffer ⇒ the image is LIVE ⇒ kept.
+        app.sync_image_encodes();
+        assert!(
+            app.image_protocols.contains_key(&key),
+            "the region image's encode is kept (the region scan marks it live)"
         );
     }
 
@@ -6130,6 +7450,7 @@ mod tests {
             "text/html; charset=utf-8",
             html.as_bytes(),
             40,
+            0,
             &crate::layout::ImageSizes::new(),
         );
         app.navigate_to(doc);
@@ -6610,6 +7931,7 @@ mod tests {
             "text/html",
             html.as_bytes(),
             60,
+            0,
             &Default::default(),
         ));
 
