@@ -95,6 +95,59 @@ pub struct Dom {
     /// (width/height queries then conservatively don't match, as if skipped).
     /// Set by `execute_js` from `PageEnv`.
     viewport_px: (u32, u32),
+    /// Per-element inner-scroll state (CSSOM View `element.scrollTop`, Phase 3).
+    /// Keyed by node; absent = never scrolled / not a measured scroll box.
+    scroll_state: std::collections::HashMap<NodeId, ScrollBox>,
+    /// Page-initiated scroll writes `(node, top, left)` (px) since the last
+    /// drain — delivered to the app as `PageEvt::Scrolled` so a pure scroll (no
+    /// DOM mutation) re-windows a region WITHOUT a full re-parse/relayout.
+    scroll_changes: Vec<(NodeId, f64, f64)>,
+    /// Terminal cell size in px (`PageEnv.cell_px`), for the px↔row conversion
+    /// when baking `data-trust-scroll-top`. Default 8×16 (the nominal).
+    cell_px: (u16, u16),
+    /// Incremental layout (INCREMENTAL_LAYOUT_PLAN.md): the element nodes mutated
+    /// since the last `take_dirty_targets`, with the kind of change. A mutation
+    /// confined to a relayout boundary's subtree lets the app re-lay ONLY that
+    /// boundary instead of the whole document. Content = childList/text (the
+    /// boundary may be the recorded node itself); Attr = an attribute change (the
+    /// node's OWN box may move, so the boundary must strictly enclose it).
+    dirty_nodes: Vec<(NodeId, DirtyKind)>,
+    /// False once any *un*attributed mutation occurred this cycle (a global
+    /// style/viewport change, or a mutator that can't name its node) — then the
+    /// app must do a full relayout, never a patch. Reset to true on take.
+    dirty_attributed: bool,
+}
+
+/// The kind of DOM mutation, for incremental-layout boundary mapping. See
+/// `Dom::relayout_boundary`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DirtyKind {
+    /// A childList or text-content change: the content INSIDE a node changed.
+    Content,
+    /// An attribute change: the element's own styling/box may have changed.
+    Attr,
+}
+
+/// Per-element inner-scroll state (CSSOM View). The scroll POSITION
+/// (`scrollTop`/`scrollLeft`, px) is owned by the page (its `scrollTop=` /
+/// `scrollTo`) and the terminal wheel write-back; `top` is the single source of
+/// truth the `scrollTop` getter, the live serializer (baked as
+/// `data-trust-scroll-top`), and the wheel write-back read.
+///
+/// `scrollHeight` is NOT stored: it must reflect the CURRENT content (CSSOM
+/// View), so the getter reads the actor's own fresh measure pass (`__dom_rect`,
+/// re-measured per DOM epoch) — pushing it from the app would lag one render and
+/// break the conditional pin (`if scrollTop + clientHeight >= scrollHeight`).
+/// Only `clientHeight`/`clientWidth` (the CLIP box) round-trip from the app: an
+/// `absolute; top:0; bottom:0` chat needs layout to know its viewport height,
+/// which the actor can't compute. `None` until the first push ⇒ the getter falls
+/// back to the rect (the pre-Phase-3 behaviour, used only at cold load).
+#[derive(Clone, Copy, Default)]
+struct ScrollBox {
+    top: f64,
+    left: f64,
+    client_h: Option<f64>,
+    client_w: Option<f64>,
 }
 
 /// Per-epoch memo for `computed_value`: the epoch the entries are valid for,
@@ -135,6 +188,11 @@ impl Dom {
             computed_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
             matched_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
             viewport_px: (0, 0),
+            scroll_state: std::collections::HashMap::new(),
+            scroll_changes: Vec::new(),
+            cell_px: (8, 16),
+            dirty_nodes: Vec::new(),
+            dirty_attributed: true,
         };
         dom.new_node(NodeData::Document);
         dom
@@ -152,9 +210,9 @@ impl Dom {
         self.epoch
     }
 
-    /// Every mutation comes through here: the dirty bit for the living
-    /// page, the epoch for the cached visibility cascade.
-    fn touch(&mut self) {
+    /// The common core of every mutation: the dirty bit for the living page +
+    /// the epoch for the cached visibility cascade.
+    fn mark(&mut self) {
         self.dirty = true;
         self.epoch = self.epoch.wrapping_add(1);
         // Diagnostic: record WHEN the DOM last changed, so we can size the
@@ -165,6 +223,232 @@ impl Dom {
         }
     }
 
+    /// An UNATTRIBUTED mutation — one we can't pin to a single element (a global
+    /// stylesheet/viewport change). Forces the next render to a full relayout
+    /// (no incremental patch), since it may have changed anything.
+    fn touch(&mut self) {
+        self.mark();
+        self.dirty_attributed = false;
+    }
+
+    /// An attribute change on `id` (its own styling/box may have changed).
+    fn touch_attr(&mut self, id: NodeId) {
+        self.mark();
+        self.dirty_nodes.push((id, DirtyKind::Attr));
+    }
+
+    /// A childList/text change whose content lives under `id` (the parent whose
+    /// children changed, or a text node's parent element). `None` = a structural
+    /// no-op for the rendered tree (detaching an already-orphan node) — still
+    /// dirties the epoch but records no target and does NOT force a full relayout.
+    fn touch_content(&mut self, id: Option<NodeId>) {
+        self.mark();
+        if let Some(i) = id {
+            self.dirty_nodes.push((i, DirtyKind::Content));
+        }
+    }
+
+    /// Take the element nodes mutated since the last call, for incremental
+    /// layout. `None` = an unattributed mutation occurred this cycle ⇒ the caller
+    /// MUST do a full relayout. `Some(targets)` = every mutation named a node
+    /// (possibly empty, meaning only no-op detaches happened).
+    pub fn take_dirty_targets(&mut self) -> Option<Vec<(NodeId, DirtyKind)>> {
+        let attributed = std::mem::replace(&mut self.dirty_attributed, true);
+        let nodes = std::mem::take(&mut self.dirty_nodes);
+        attributed.then_some(nodes)
+    }
+
+    /// The nearest LIVE scroll-region ancestor (the Tier-1 relayout boundary,
+    /// INCREMENTAL_LAYOUT_PLAN.md §4b) a mutation at `node` is confined to —
+    /// `None` when none encloses it (the change reaches non-region content ⇒ full
+    /// relayout, OR Tier 2). `live_regions` is the set the APP confirmed are
+    /// currently CLIPPED scroll viewports (a fixed band → content changes can't
+    /// alter their outer box; CSS Containment L2). It is NOT just "has
+    /// overflow:auto" — a fitting (non-overflowing) box renders inline and is
+    /// height-elastic (Tier 2), so patching it as a region would fail; gating on
+    /// the app's live set avoids that failed-patch→resync churn. For a `Content`
+    /// change the boundary may be `node` itself (appending INTO a region is
+    /// contained); for an `Attr` change the node's own box may move, so the
+    /// boundary must STRICTLY enclose it.
+    pub fn relayout_boundary(
+        &self,
+        node: NodeId,
+        kind: DirtyKind,
+        live_regions: &std::collections::HashSet<NodeId>,
+    ) -> Option<NodeId> {
+        let mut cur = match kind {
+            DirtyKind::Content => Some(node),
+            DirtyKind::Attr => self.parent_composed(node),
+        };
+        while let Some(c) = cur {
+            if live_regions.contains(&c) {
+                return Some(c);
+            }
+            cur = self.parent_composed(c);
+        }
+        None
+    }
+
+    /// Whether `id` establishes an **independent formatting context** — a box
+    /// whose inside cannot change the layout of anything outside it (and into
+    /// which outside floats cannot intrude). This is the spec-exact form of "the
+    /// mutation can't affect anything outside its container"
+    /// (INCREMENTAL_LAYOUT_PLAN.md §13a): CSS2 §9.4.1 block-formatting-context
+    /// triggers (`overflow ≠ visible`, `float`, out-of-flow, `display:flow-root`/
+    /// table-cell/inline-block), CSS Flexbox/Grid §3 (a flex/grid container AND a
+    /// flex/grid item each establish one for their contents), and CSS Containment
+    /// L2 (`contain: layout|paint|size|content|strict`). A plain in-flow block
+    /// does NOT qualify (its margins collapse through, its floats can escape), so
+    /// it is never a relayout boundary. This set is deliberately SPARSE — it is
+    /// what makes baking `data-trust-node` on boundaries cheap (§3). The actor
+    /// proposes the nearest such ancestor; the app proves the box is also
+    /// width-stable geometrically (§13a). Cascade-only (no layout).
+    pub fn establishes_independent_formatting_context(&self, id: NodeId) -> bool {
+        if self.tag_name(id).is_none() {
+            return false; // text/comment/document — not an element box
+        }
+        // overflow ≠ visible on EITHER axis → BFC (a scroll/clip viewport).
+        for prop in ["overflow", "overflow-x", "overflow-y"] {
+            if let Some(v) = self.computed_style(id, prop)
+                && v.split_whitespace().any(|t| {
+                    matches!(
+                        t.to_ascii_lowercase().as_str(),
+                        "hidden" | "clip" | "scroll" | "auto"
+                    )
+                })
+            {
+                return true;
+            }
+        }
+        // display values that establish an independent context for their
+        // contents (`effective_display` = cascade ELSE the tag's UA default, so a
+        // bare `<td>`/`<table>` is caught too).
+        if let Some(d) = self.effective_display(id)
+            && matches!(
+                d.trim().to_ascii_lowercase().as_str(),
+                "flow-root"
+                    | "inline-block"
+                    | "table-cell"
+                    | "table-caption"
+                    | "table"
+                    | "inline-table"
+                    | "flex"
+                    | "inline-flex"
+                    | "grid"
+                    | "inline-grid"
+            )
+        {
+            return true;
+        }
+        // A flex/grid ITEM establishes a new formatting context for its contents
+        // (CSS Flexbox §3) — detected via the parent's effective display.
+        if let Some(p) = self.parent_composed(id)
+            && let Some(pd) = self.effective_display(p)
+            && matches!(
+                pd.trim().to_ascii_lowercase().as_str(),
+                "flex" | "inline-flex" | "grid" | "inline-grid"
+            )
+        {
+            return true;
+        }
+        // Out-of-flow (absolute/fixed) and floats establish a BFC.
+        if let Some(pos) = self.computed_style(id, "position")
+            && matches!(
+                pos.trim().to_ascii_lowercase().as_str(),
+                "absolute" | "fixed"
+            )
+        {
+            return true;
+        }
+        if let Some(f) = self.computed_style(id, "float")
+            && matches!(
+                f.trim().to_ascii_lowercase().as_str(),
+                "left" | "right" | "inline-start" | "inline-end"
+            )
+        {
+            return true;
+        }
+        // Layout containment (CSS Containment L2) establishes one explicitly.
+        if let Some(c) = self.computed_style(id, "contain")
+            && c.split_whitespace().any(|t| {
+                matches!(
+                    t.to_ascii_lowercase().as_str(),
+                    "layout" | "paint" | "size" | "content" | "strict"
+                )
+            })
+        {
+            return true;
+        }
+        false
+    }
+
+    /// The nearest ancestor (or `self`, for a `Content` change) of a mutation at
+    /// `node` that establishes an independent formatting context — the GENERAL
+    /// relayout boundary (INCREMENTAL_LAYOUT_PLAN.md §13a). Unlike
+    /// `relayout_boundary` (which only finds an app-confirmed live scroll
+    /// region), this returns ANY independent-formatting-context ancestor, the
+    /// boundary whose interior the app will re-lay and splice once the general
+    /// `Doc.rows` splice lands (plan §13c step 4). Until then it drives only the
+    /// diagnostic (`confined_boundaries`) so a live page reveals which boundaries
+    /// the splice must handle. An `Attr` change may move the node's OWN box, so we
+    /// start the walk at its parent; a `Content` change is contained, so `node`
+    /// itself may be the boundary.
+    pub fn relayout_boundary_general(&self, node: NodeId, kind: DirtyKind) -> Option<NodeId> {
+        let mut cur = match kind {
+            DirtyKind::Content => Some(node),
+            DirtyKind::Attr => self.parent_composed(node),
+        };
+        while let Some(c) = cur {
+            if self.establishes_independent_formatting_context(c) {
+                return Some(c);
+            }
+            cur = self.parent_composed(c);
+        }
+        None
+    }
+
+    /// Serialize a relayout boundary's subtree as a self-contained fragment for
+    /// an incremental patch (INCREMENTAL_LAYOUT_PLAN.md §4a). The boundary is
+    /// wrapped in a context `<div>` carrying the inherited computed values from
+    /// ABOVE it, so the app's `computed_value`/`text_decoration` over the
+    /// re-parsed fragment — which has no real ancestors — resolve EXACTLY as in
+    /// the full document. The boundary keeps its own baked style (its own cascade
+    /// wins over the wrapper); the wrapper only supplies what it inherits.
+    pub fn serialize_patch(
+        &self,
+        boundary: NodeId,
+        clickable: &std::collections::HashSet<NodeId>,
+    ) -> String {
+        let from = self.parent_composed(boundary).unwrap_or(DOCUMENT);
+        let mut style = String::new();
+        for &p in INHERITED_LAYOUT_PROPS {
+            if let Some(v) = self.computed_value(from, p) {
+                style.push_str(p);
+                style.push(':');
+                style.push_str(&v);
+                style.push(';');
+            }
+        }
+        // text-decoration PROPAGATES (it doesn't inherit), so carry the
+        // accumulated lines entering the boundary explicitly.
+        let (underline, strike) = self.text_decoration(from);
+        if underline || strike {
+            style.push_str("text-decoration:");
+            if underline {
+                style.push_str("underline ");
+            }
+            if strike {
+                style.push_str("line-through");
+            }
+            style.push(';');
+        }
+        format!(
+            "<div data-trust-frag=\"\" style=\"{}\">{}</div>",
+            escape_attr(&style),
+            self.serialize_live(boundary, clickable)
+        )
+    }
+
     /// Set the CSS-pixel viewport (`cols*cell_px`, `rows*cell_px`) that
     /// `@media` queries evaluate against. Invalidates the cascade cache when
     /// it changes so breakpoint-gated rules re-resolve.
@@ -173,6 +457,84 @@ impl Dom {
             self.viewport_px = (width, height);
             self.touch();
         }
+    }
+
+    /// Set the terminal cell pixel size (`PageEnv.cell_px`) — used to convert the
+    /// px `scrollTop` to rows when the live serializer bakes
+    /// `data-trust-scroll-top`. No `touch()`: it only affects the next bake.
+    pub fn set_cell_px(&mut self, w: u16, h: u16) {
+        self.cell_px = (w.max(1), h.max(1));
+    }
+
+    /// Read a scroll metric (CSSOM View, px). `which`: 0=scrollTop, 1=scrollLeft,
+    /// 4=clientHeight, 5=clientWidth. Position (0/1) defaults to 0; the clip box
+    /// (4/5) is `None` until the app has pushed it (`set_scroll_geom`), so the
+    /// getter falls back to the element's rect. `scrollHeight`/`scrollWidth`
+    /// (2/3) are deliberately ALWAYS `None` here — they read the actor's fresh
+    /// `__dom_rect` (current content) instead, never a lagging pushed value.
+    pub fn scroll_metric(&self, id: NodeId, which: u8) -> Option<f64> {
+        let sb = self.scroll_state.get(&id);
+        match which {
+            0 => Some(sb.map_or(0.0, |s| s.top)),
+            1 => Some(sb.map_or(0.0, |s| s.left)),
+            4 => sb.and_then(|s| s.client_h),
+            5 => sb.and_then(|s| s.client_w),
+            _ => None,
+        }
+    }
+
+    /// Set a scroll position (px). The caller (the `scrollTop` setter) has
+    /// already clamped to `[0, scrollHeight − clientHeight]` per CSSOM View.
+    /// `record` (a page-JS write) queues a `Scrolled` delivery so the app
+    /// re-windows the region cheaply; the wheel write-back passes `record=false`
+    /// (the app already moved its own voffset). NEVER sets the dirty bit — a
+    /// scroll paints no content of its own; the position rides the next serialize
+    /// (baked) and the `Scrolled` channel.
+    pub fn set_scroll_pos(&mut self, id: NodeId, top: f64, left: f64, record: bool) {
+        let sb = self.scroll_state.entry(id).or_default();
+        let changed = sb.top != top || sb.left != left;
+        sb.top = top;
+        sb.left = left;
+        // Only an element the app has MEASURED as a scroll region (geometry
+        // present) can move a window — record just those for the cheap path.
+        if record && changed && sb.client_h.is_some() {
+            self.scroll_changes.push((id, top, left));
+        }
+    }
+
+    /// Store the app-measured CLIP box (px) for a scroll region — the viewport
+    /// height/width the `clientHeight`/`clientWidth` getters report. (Pure
+    /// measurement backing: no dirty, no scroll record. `scrollHeight` is NOT
+    /// stored — it reads the fresh `__dom_rect`; see `ScrollBox`.)
+    pub fn set_scroll_geom(&mut self, id: NodeId, client_h: f64, client_w: f64) {
+        let sb = self.scroll_state.entry(id).or_default();
+        sb.client_h = Some(client_h);
+        sb.client_w = Some(client_w);
+    }
+
+    /// Drain the page-initiated scroll writes for `PageEvt::Scrolled` delivery.
+    pub fn take_scroll_changes(&mut self) -> Vec<(NodeId, f64, f64)> {
+        std::mem::take(&mut self.scroll_changes)
+    }
+
+    /// A vertical scroll container (CSS Overflow L3 `overflow-y: auto|scroll`).
+    /// The live serializer marks these with `data-trust-node` + a baked
+    /// `data-trust-scroll-top` so the app's `flow_region` can re-seed the
+    /// region's scroll offset across the per-message re-parse.
+    pub fn is_scroll_container(&self, id: NodeId) -> bool {
+        let v = match self.computed_style(id, "overflow-y") {
+            Some(v) => v,
+            None => match self.computed_style(id, "overflow") {
+                // shorthand `overflow: x [y]` — the y component defaults to x.
+                Some(sh) => {
+                    let mut toks = sh.split_whitespace();
+                    let x = toks.next().unwrap_or("");
+                    toks.next().unwrap_or(x).to_string()
+                }
+                None => return false,
+            },
+        };
+        matches!(v.trim().to_ascii_lowercase().as_str(), "auto" | "scroll")
     }
 
     /// Parse a full HTML document into a fresh arena.
@@ -232,11 +594,14 @@ impl Dom {
     /// subtree stay in the arena; arenas only ever grow — page-lifetime
     /// memory is the deal).
     pub fn detach(&mut self, id: NodeId) {
-        self.touch();
         let (parent, prev, next) = {
             let n = &self.nodes[id];
             (n.parent, n.prev_sibling, n.next_sibling)
         };
+        // The PARENT's child list is what changed; `None` (an already-orphan
+        // node, e.g. a fresh child about to be appended) is a no-op for the
+        // rendered tree — dirties the epoch but records no relayout target.
+        self.touch_content(parent);
         if let Some(prev) = prev {
             self.nodes[prev].next_sibling = next;
         }
@@ -258,7 +623,6 @@ impl Dom {
     }
 
     pub fn append(&mut self, parent: NodeId, child: NodeId) {
-        self.touch();
         self.detach(child);
         let old_last = self.nodes[parent].last_child;
         self.nodes[child].parent = Some(parent);
@@ -269,6 +633,7 @@ impl Dom {
             self.nodes[parent].first_child = Some(child);
         }
         self.nodes[parent].last_child = Some(child);
+        self.touch_content(Some(parent));
     }
 
     /// Insert `child` under `parent` immediately before `reference`;
@@ -283,7 +648,6 @@ impl Dom {
             self.append(parent, child);
             return;
         }
-        self.touch();
         self.detach(child);
         let prev = self.nodes[reference].prev_sibling;
         self.nodes[child].parent = Some(parent);
@@ -294,6 +658,7 @@ impl Dom {
             Some(prev) => self.nodes[prev].next_sibling = Some(child),
             None => self.nodes[parent].first_child = Some(child),
         }
+        self.touch_content(Some(parent));
     }
 
     /// Append text, merging into a trailing text node like a parser would.
@@ -302,7 +667,7 @@ impl Dom {
             && let NodeData::Text(existing) = &mut self.nodes[last].data
         {
             existing.push_str(text);
-            self.touch();
+            self.touch_content(Some(parent));
             return;
         }
         let t = self.create_text(text);
@@ -350,6 +715,25 @@ impl Dom {
         }
     }
 
+    /// The `content` of the first `<meta>` whose `property`/`name` matches
+    /// `key` (case-insensitive) — the Open Graph / page-metadata channel
+    /// (`og:image`, `twitter:image`, `og:type`, …). Empty content is treated
+    /// as absent. Host-agnostic: this is the standard cross-site preview/typing
+    /// surface, used to give an unplayable `<video>` a preview thumbnail.
+    pub fn meta_content(&self, key: &str) -> Option<&str> {
+        self.descendants(DOCUMENT)
+            .into_iter()
+            .filter(|&id| self.tag_name(id) == Some("meta"))
+            .find(|&id| {
+                self.attr(id, "property")
+                    .or_else(|| self.attr(id, "name"))
+                    .is_some_and(|k| k.eq_ignore_ascii_case(key))
+            })
+            .and_then(|id| self.attr(id, "content"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
         if let NodeData::Element { attrs, .. } = &mut self.nodes[id].data {
             let name = name.to_ascii_lowercase();
@@ -365,15 +749,15 @@ impl Dom {
                     value: StrTendril::from(value),
                 });
             }
-            self.touch();
+            self.touch_attr(id);
         }
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: &str) {
-        self.touch();
         if let NodeData::Element { attrs, .. } = &mut self.nodes[id].data {
             attrs.retain(|a| !str::eq_ignore_ascii_case(&a.name.local, name));
         }
+        self.touch_attr(id);
     }
 
     pub fn attr_names(&self, id: NodeId) -> Vec<String> {
@@ -602,6 +986,40 @@ impl Dom {
     /// value the serializer bakes.
     pub fn computed_style(&self, id: NodeId, prop: &str) -> Option<String> {
         self.cascaded(id, prop)
+    }
+
+    /// Whether `id` CLIPS `label` out of view: a definite `width` under
+    /// horizontal `overflow:hidden/clip` narrower than the label's display
+    /// width. The accessible-name fallback in `serialize_live_node` uses this to
+    /// honor an author's icon-sized clip box — a control clipped to its icon
+    /// never paints its `aria-label` (CSS Overflow §overflow). `width:auto`/`%`
+    /// (`css_length_em` → `None`) is not a clip box, so the name shows.
+    fn name_is_clipped_out(&self, id: NodeId, label: &str) -> bool {
+        // Resolve `var()` — the live (pre-bake) cascade stores raw values, and a
+        // styled-components control sizes its icon box with a custom property
+        // (`width:var(--button-size-default)`). `computed_value_resolved`
+        // substitutes it (`→ 3.2rem`); the raw `computed_style` would not, so the
+        // clip would never be detected. Horizontal clip: the `overflow-x`
+        // longhand else the `overflow` shorthand's first token (mirrors
+        // `layout::axis_overflow`).
+        let overflow_x = self.computed_value_resolved(id, "overflow-x").or_else(|| {
+            self.computed_value_resolved(id, "overflow")
+                .and_then(|s| s.split_whitespace().next().map(str::to_owned))
+        });
+        if !matches!(
+            overflow_x.as_deref().map(str::trim),
+            Some("hidden") | Some("clip")
+        ) {
+            return false;
+        }
+        let Some(width_em) = self
+            .computed_value_resolved(id, "width")
+            .and_then(|v| crate::layout::css_length_em(&v))
+        else {
+            return false;
+        };
+        // One em ≈ 2 terminal cells; a cell ≈ one unit of display width.
+        crate::layout::display_width(label) as f32 > width_em * 2.0
     }
 
     /// The computed value of a property — the single inheritance authority.
@@ -1256,6 +1674,22 @@ impl Dom {
             .or_else(|| self.shadow_hosts.get(&id).copied())
     }
 
+    /// Whether `id` is connected to the document (a render-affecting node). A
+    /// mutation on a DETACHED subtree — the `createElement` + set-content that
+    /// precedes `appendChild` — is invisible until the node is inserted, so
+    /// incremental layout IGNORES it (INCREMENTAL_LAYOUT_PLAN.md): the insertion
+    /// records the container, whose patch re-serializes the now-attached content.
+    pub fn is_connected(&self, id: NodeId) -> bool {
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            if c == DOCUMENT {
+                return true;
+            }
+            cur = self.parent_composed(c);
+        }
+        false
+    }
+
     /// Pre-insertion validity (WHATWG DOM §4.2.3): is `node` a *host-including
     /// inclusive ancestor* of `parent`? `appendChild`/`insertBefore`/
     /// `replaceChild` throw `HierarchyRequestError` when it is — the step that
@@ -1551,7 +1985,10 @@ impl Dom {
             && t != text
         {
             *t = text.to_string();
-            self.touch();
+            // Comments never render; record the parent so this can't strand an
+            // unattributed mutation, and let the per-boundary render-dedup drop it.
+            let parent = self.nodes[id].parent;
+            self.touch_content(parent);
         }
     }
 
@@ -1598,7 +2035,10 @@ impl Dom {
             NodeData::Text(t) if *t == text => (),
             NodeData::Text(t) => {
                 *t = text.to_string();
-                self.touch();
+                // A text node's content changed — its PARENT element is the
+                // relayout target (text styling/flow is an element concern).
+                let parent = self.nodes[id].parent;
+                self.touch_content(parent);
             }
             _ => {
                 // A single-text-child rewrite to the same value is the
@@ -1610,7 +2050,7 @@ impl Dom {
                 {
                     return;
                 }
-                self.touch();
+                self.touch_content(Some(id));
                 for c in kids {
                     self.detach(c);
                 }
@@ -2070,6 +2510,15 @@ impl Dom {
                     .attr(id, "aria-label")
                     .or_else(|| self.attr(id, "title"))
                     .or_else(|| self.attr(id, "value"))
+                    // A control the author CLIPPED to an icon-sized box never
+                    // paints its accessible NAME — a browser shows only the icon.
+                    // Honoring that clip (don't surface a name wider than its
+                    // definite `width` under `overflow:hidden/clip`) is what stops
+                    // Twitch's per-message reply button — `aria-label="Click to
+                    // reply to @user"` in a `width:3.2rem;overflow:hidden` box —
+                    // from spamming every chat line. The empty wrapper then yields
+                    // no layout item (same as an anonymous control).
+                    .filter(|l| !self.name_is_clipped_out(id, l))
                 {
                     out.push('[');
                     out.push_str(&escape_text(label));
@@ -2092,13 +2541,37 @@ impl Dom {
         if is_click && is_anchor && self.attr(id, "href").is_none() {
             out.push_str(&format!(" href=\"x-trust-js:{id}:\""));
         }
-        // The app re-parses this serialized HTML into a fresh layout DOM,
-        // so form controls need an explicit pointer back to the resident
-        // page actor's original node ids.
+        // The app re-parses this serialized HTML into a fresh layout DOM, so
+        // form controls AND vertical scroll containers need an explicit pointer
+        // back to the resident page actor's original node ids (form values /
+        // the region's scroll position round-trip by it).
+        let is_scroll = self.is_scroll_container(id);
+        // Bake the actor node id on every element the app re-correlates after a
+        // re-parse: form controls + vertical scroll containers (values / region
+        // scroll round-trip by it) AND every independent-formatting-context
+        // boundary (INCREMENTAL_LAYOUT_PLAN.md §14 step 3). An IFC boundary is a
+        // box whose interior can't reflow anything outside it, so the app can
+        // re-lay ONLY that subtree and splice it back — but only if it can map the
+        // patched fragment to the cached box by this id. IFC roots are SPARSE (not
+        // every block), so the HTML/parse bloat stays bounded (§3).
         if matches!(tag, "form" | "input" | "button" | "select" | "textarea")
             || self.is_contenteditable_host(id)
+            || is_scroll
+            || self.establishes_independent_formatting_context(id)
         {
             out.push_str(&format!(" data-trust-node=\"{id}\""));
+        }
+        // A scroll container's current `scrollTop` SIGNAL (CSSOM View) rides the
+        // HTML in ROWS so `flow_region` can re-seed the region's voffset — the
+        // page's own `element.scrollTop` write (a chat pinning to the bottom)
+        // survives the re-parse, exactly like a baked form value. (The box
+        // GEOMETRY round-trips separately via a `PageCmd`; only the position is
+        // baked, since the app already measures the geometry.)
+        if is_scroll && let Some(sb) = self.scroll_state.get(&id) {
+            let rows = (sb.top / f64::from(self.cell_px.1.max(1))).round();
+            if rows >= 1.0 {
+                out.push_str(&format!(" data-trust-scroll-top=\"{}\"", rows as i64));
+            }
         }
         out.push('>');
         if !VOID_ELEMENTS.contains(&tag) {
@@ -3022,77 +3495,100 @@ const fn prop(name: &'static str, inherited: bool, baked: bool) -> PropDef {
 }
 
 #[rustfmt::skip]
+/// The inherited layout properties (the `inherited=true` rows of `PROPS`) — the
+/// styling context that flows INTO a relayout boundary. `serialize_patch`
+/// materializes these onto the fragment wrapper so an ancestor-less re-parse
+/// resolves them identically (INCREMENTAL_LAYOUT_PLAN.md §4a). Keep in sync with
+/// the `inherited=true` rows below. (`visibility` is inherited but a rendered
+/// boundary is by definition visible, so it's a near-no-op; included for rigor.)
+const INHERITED_LAYOUT_PROPS: &[&str] = &[
+    "text-align",
+    "font-weight",
+    "font-style",
+    "white-space",
+    "text-transform",
+    "letter-spacing",
+    "list-style-type",
+    "list-style-position",
+    "text-indent",
+    "visibility",
+];
+
 const PROPS: &[PropDef] = &[
     //    name                    inherited  baked
-    prop("display",              false,     true),
-    prop("visibility",           true,      false),
-    prop("opacity",              false,     false),
-    prop("animation-name",       false,     false),
-    prop("animation-fill-mode",  false,     false),
-    prop("animation",            false,     false),
-    prop("margin-top",           false,     true),
-    prop("margin-bottom",        false,     true),
-    prop("margin-left",          false,     true),
-    prop("margin-right",         false,     true),
-    prop("padding-top",          false,     true),
-    prop("padding-bottom",       false,     true),
-    prop("padding-left",         false,     true),
-    prop("text-align",           true,      true),
-    prop("font-weight",          true,      true),
-    prop("font-style",           true,      true),
-    prop("white-space",          true,      true),
-    prop("text-transform",       true,      true),
-    prop("letter-spacing",       true,      true),
-    prop("list-style-type",      true,      true),
-    prop("list-style-position",  true,      true),
-    prop("text-indent",          true,      true),
-    prop("text-decoration",      false,     true),
-    prop("text-decoration-line", false,     true),
-    prop("content",              false,     false),
-    prop("width",                false,     true),
-    prop("max-width",            false,     true),
-    prop("min-width",            false,     true),
-    prop("height",               false,     true),
-    prop("aspect-ratio",         false,     true),
-    prop("object-fit",           false,     true),
-    prop("flex-wrap",            false,     true),
-    prop("flex-flow",            false,     true),
-    prop("flex-direction",       false,     true),
-    prop("float",                false,     true),
-    prop("clear",                false,     true),
-    prop("overflow",             false,     true),
-    prop("cursor",               false,     false),
-    prop("position",             false,     true),
-    prop("z-index",              false,     true),
-    prop("top",                  false,     true),
-    prop("right",                false,     true),
-    prop("bottom",               false,     true),
-    prop("left",                 false,     true),
-    prop("flex-grow",            false,     true),
-    prop("flex-shrink",          false,     true),
-    prop("flex-basis",           false,     true),
-    prop("flex",                 false,     true),
-    prop("gap",                  false,     true),
-    prop("column-gap",           false,     true),
-    prop("row-gap",              false,     true),
-    prop("grid-template-columns", false,    true),
-    prop("grid-template-rows",   false,     true),
-    prop("grid-auto-flow",       false,     true),
-    prop("grid-auto-columns",    false,     true),
-    prop("grid-auto-rows",       false,     true),
-    prop("grid-column",          false,     true),
-    prop("grid-row",             false,     true),
-    prop("justify-content",      false,     true),
-    prop("align-items",          false,     true),
-    prop("order",                false,     true),
-    prop("border-top-width",     false,     true),
-    prop("border-right-width",   false,     true),
-    prop("border-bottom-width",  false,     true),
-    prop("border-left-width",    false,     true),
-    prop("border-top-style",     false,     true),
-    prop("border-right-style",   false,     true),
-    prop("border-bottom-style",  false,     true),
-    prop("border-left-style",    false,     true),
+    prop("display", false, true),
+    prop("visibility", true, false),
+    prop("opacity", false, false),
+    prop("animation-name", false, false),
+    prop("animation-fill-mode", false, false),
+    prop("animation", false, false),
+    prop("margin-top", false, true),
+    prop("margin-bottom", false, true),
+    prop("margin-left", false, true),
+    prop("margin-right", false, true),
+    prop("padding-top", false, true),
+    prop("padding-bottom", false, true),
+    prop("padding-left", false, true),
+    prop("text-align", true, true),
+    prop("font-weight", true, true),
+    prop("font-style", true, true),
+    prop("white-space", true, true),
+    prop("text-transform", true, true),
+    prop("letter-spacing", true, true),
+    prop("list-style-type", true, true),
+    prop("list-style-position", true, true),
+    prop("text-indent", true, true),
+    prop("text-decoration", false, true),
+    prop("text-decoration-line", false, true),
+    prop("content", false, false),
+    prop("width", false, true),
+    prop("max-width", false, true),
+    prop("min-width", false, true),
+    prop("height", false, true),
+    prop("min-height", false, true),
+    prop("max-height", false, true),
+    prop("aspect-ratio", false, true),
+    prop("object-fit", false, true),
+    prop("flex-wrap", false, true),
+    prop("flex-flow", false, true),
+    prop("flex-direction", false, true),
+    prop("float", false, true),
+    prop("clear", false, true),
+    prop("overflow", false, true),
+    prop("overflow-x", false, true),
+    prop("overflow-y", false, true),
+    prop("cursor", false, false),
+    prop("position", false, true),
+    prop("z-index", false, true),
+    prop("top", false, true),
+    prop("right", false, true),
+    prop("bottom", false, true),
+    prop("left", false, true),
+    prop("flex-grow", false, true),
+    prop("flex-shrink", false, true),
+    prop("flex-basis", false, true),
+    prop("flex", false, true),
+    prop("gap", false, true),
+    prop("column-gap", false, true),
+    prop("row-gap", false, true),
+    prop("grid-template-columns", false, true),
+    prop("grid-template-rows", false, true),
+    prop("grid-auto-flow", false, true),
+    prop("grid-auto-columns", false, true),
+    prop("grid-auto-rows", false, true),
+    prop("grid-column", false, true),
+    prop("grid-row", false, true),
+    prop("justify-content", false, true),
+    prop("align-items", false, true),
+    prop("order", false, true),
+    prop("border-top-width", false, true),
+    prop("border-right-width", false, true),
+    prop("border-bottom-width", false, true),
+    prop("border-left-width", false, true),
+    prop("border-top-style", false, true),
+    prop("border-right-style", false, true),
+    prop("border-bottom-style", false, true),
+    prop("border-left-style", false, true),
 ];
 
 fn is_tracked(name: &str) -> bool {
@@ -5170,6 +5666,145 @@ mod tests {
     }
 
     #[test]
+    fn relayout_boundary_finds_the_enclosing_scroll_container() {
+        // INCREMENTAL_LAYOUT_PLAN.md §4b: a mutation maps to the nearest scroll
+        // container (the size-contained relayout boundary).
+        let dom = Dom::parse_document(
+            r#"<body><div id=chrome>x</div>
+               <div id=chat style="overflow-y:scroll;height:100px"><div id=msg>hi</div></div></body>"#,
+        );
+        let chat = dom.get_by_id("chat").unwrap();
+        let msg = dom.get_by_id("msg").unwrap();
+        let chrome = dom.get_by_id("chrome").unwrap();
+        // The app confirmed #chat is a live clipped region.
+        let live: std::collections::HashSet<NodeId> = [chat].into_iter().collect();
+        let none: std::collections::HashSet<NodeId> = Default::default();
+        // Content mutation inside the region → the region.
+        assert_eq!(
+            dom.relayout_boundary(msg, DirtyKind::Content, &live),
+            Some(chat)
+        );
+        // Content mutation ON the region (appending into it) is contained → itself.
+        assert_eq!(
+            dom.relayout_boundary(chat, DirtyKind::Content, &live),
+            Some(chat)
+        );
+        // An ATTRIBUTE change on the region itself may move its box → look
+        // STRICTLY above it (none here → full relayout).
+        assert_eq!(dom.relayout_boundary(chat, DirtyKind::Attr, &live), None);
+        // Page chrome (no region ancestor) → no boundary.
+        assert_eq!(
+            dom.relayout_boundary(chrome, DirtyKind::Content, &live),
+            None
+        );
+        // Not a CONFIRMED live region (content fits / no app signal yet) → no
+        // patch boundary; the change takes the full path, never a failed patch.
+        assert_eq!(dom.relayout_boundary(msg, DirtyKind::Content, &none), None);
+    }
+
+    #[test]
+    fn independent_formatting_context_matches_the_spec_triggers() {
+        // INCREMENTAL_LAYOUT_PLAN.md §13a: the boundary set is exactly the boxes
+        // that establish an independent formatting context (CSS2 §9.4.1 BFC + CSS
+        // Display + Flexbox/Grid §3 + Containment L2). A plain in-flow block is
+        // NOT one (its inside can affect its outside), so it is never a boundary.
+        let dom = Dom::parse_document(
+            r#"<body>
+              <div id=plain>x</div>
+              <div id=scroll style="overflow-y:auto">x</div>
+              <div id=hidden style="overflow:hidden">x</div>
+              <div id=flowroot style="display:flow-root">x</div>
+              <span id=ib style="display:inline-block">x</span>
+              <div id=flex style="display:flex"><div id=item>x</div></div>
+              <div id=grid style="display:grid"><div id=gitem>x</div></div>
+              <div id=abs style="position:absolute">x</div>
+              <div id=flt style="float:left">x</div>
+              <div id=contain style="contain:layout">x</div>
+              <table><tr><td id=cell>x</td></tr></table>
+            </body>"#,
+        );
+        let ifc =
+            |id: &str| dom.establishes_independent_formatting_context(dom.get_by_id(id).unwrap());
+        // A normal in-flow block is NOT an independent formatting context.
+        assert!(!ifc("plain"), "a plain block is not a boundary");
+        // The spec triggers all are.
+        for id in [
+            "scroll", "hidden", "flowroot", "ib", "flex", "grid", "abs", "flt", "contain",
+        ] {
+            assert!(
+                ifc(id),
+                "{id} establishes an independent formatting context"
+            );
+        }
+        // A flex/grid ITEM establishes one for its contents (Flexbox §3).
+        assert!(ifc("item"), "a flex item is a boundary");
+        assert!(ifc("gitem"), "a grid item is a boundary");
+        // A bare table cell (UA default display:table-cell) is one too.
+        assert!(ifc("cell"), "a table cell is a boundary");
+    }
+
+    #[test]
+    fn general_boundary_walks_to_the_nearest_formatting_context_root() {
+        // The general relayout boundary (plan §13c step 4 target) is the nearest
+        // independent-formatting-context ancestor — NOT keyed on an app-confirmed
+        // region. Here a mutation deep inside a plain wrapper resolves up to the
+        // enclosing `overflow:auto` card, skipping the in-flow `<p>` wrapper.
+        let dom = Dom::parse_document(
+            r#"<body>
+              <div id=page>
+                <div id=card style="overflow-y:auto;height:80px">
+                  <p id=wrap><span id=leaf>hi</span></p>
+                </div>
+              </div>
+            </body>"#,
+        );
+        let card = dom.get_by_id("card").unwrap();
+        let leaf = dom.get_by_id("leaf").unwrap();
+        let page = dom.get_by_id("page").unwrap();
+        // A content change at the leaf maps up to the card (the nearest BFC).
+        assert_eq!(
+            dom.relayout_boundary_general(leaf, DirtyKind::Content),
+            Some(card)
+        );
+        // A content change ON the card is contained → the card itself.
+        assert_eq!(
+            dom.relayout_boundary_general(card, DirtyKind::Content),
+            Some(card)
+        );
+        // An ATTRIBUTE change on the card may move ITS box → look strictly above;
+        // the only formatting-context ancestor here is none (plain `#page`/body)
+        // → no general boundary (the page reflows).
+        assert_eq!(dom.relayout_boundary_general(card, DirtyKind::Attr), None);
+        // A plain wrapper with no formatting-context ancestor → no boundary.
+        assert_eq!(
+            dom.relayout_boundary_general(page, DirtyKind::Content),
+            None
+        );
+    }
+
+    #[test]
+    fn dirty_targets_record_node_and_kind_then_force_full_on_a_global_change() {
+        let mut dom = Dom::parse_document(r#"<body><div id=box><span id=s>a</span></div></body>"#);
+        let box_id = dom.get_by_id("box").unwrap();
+        let s = dom.get_by_id("s").unwrap();
+        let _ = dom.take_dirty_targets(); // drain parse-time mutations
+        // An attribute change records (element, Attr).
+        dom.set_attr(s, "class", "hot");
+        assert_eq!(dom.take_dirty_targets(), Some(vec![(s, DirtyKind::Attr)]));
+        // Appending a child records the PARENT as Content (the fresh child's own
+        // orphan-detach records nothing).
+        let p = dom.create_element("p");
+        dom.append(box_id, p);
+        assert_eq!(
+            dom.take_dirty_targets(),
+            Some(vec![(box_id, DirtyKind::Content)])
+        );
+        // A global (unattributed) stylesheet change forces a full relayout.
+        dom.set_adopted_styles(DOCUMENT, "div{font-weight:bold}");
+        assert_eq!(dom.take_dirty_targets(), None);
+    }
+
+    #[test]
     fn computed_value_memo_follows_mutations() {
         // The memo is epoch-keyed: changing an ancestor's class re-resolves an
         // inherited value rather than serving a stale cache hit.
@@ -5540,6 +6175,77 @@ mod tests {
     }
 
     #[test]
+    fn a_scroll_container_bakes_its_node_id_and_scroll_top_in_rows() {
+        // The live serializer marks a vertical scroll container with a stable
+        // node id AND the page's current scrollTop SIGNAL in rows, so the app's
+        // `flow_region` can re-seed the region's voffset across the re-parse.
+        let mut dom = Dom::parse_document(
+            "<body><div id=s style='overflow-y:auto;height:96px'><p>x</p></div></body>",
+        );
+        dom.set_cell_px(8, 16);
+        let s = dom.get_by_id("s").unwrap();
+        assert!(
+            dom.is_scroll_container(s),
+            "overflow-y:auto is a scroll container"
+        );
+        // The app pushed the clip box; the page's setter clamped + stored the
+        // position (here we drive the syscalls directly).
+        dom.set_scroll_geom(s, 160.0, 100.0);
+        dom.set_scroll_pos(s, 320.0, 0.0, true); // 320px / 16px = 20 rows
+        let html = dom.serialize_live(DOCUMENT, &std::collections::HashSet::new());
+        assert!(
+            html.contains("data-trust-node="),
+            "the scroll container carries an actor node id: {html}"
+        );
+        assert!(
+            html.contains("data-trust-scroll-top=\"20\""),
+            "the scrollTop signal is baked in rows: {html}"
+        );
+    }
+
+    #[test]
+    fn a_plain_block_bakes_no_scroll_signal() {
+        let dom = Dom::parse_document("<body><div id=p><p>x</p></div></body>");
+        let p = dom.get_by_id("p").unwrap();
+        assert!(!dom.is_scroll_container(p), "a plain div is not a scroller");
+        let html = dom.serialize_live(DOCUMENT, &std::collections::HashSet::new());
+        assert!(
+            !html.contains("data-trust-scroll-top"),
+            "no scroll signal on a non-scroll-container: {html}"
+        );
+    }
+
+    #[test]
+    fn set_scroll_geom_stores_the_clip_box_and_gates_scroll_records() {
+        // The app pushes the CLIP box; a page scrollTop write is recorded for the
+        // cheap `Scrolled` channel only once geometry is known (the app has
+        // measured this as a region). scrollHeight (`which=2`) is deliberately NOT
+        // stored — it reads the fresh `__dom_rect`.
+        let mut dom = Dom::parse_document("<body><div id=s style='overflow-y:auto'></div></body>");
+        let s = dom.get_by_id("s").unwrap();
+        // No geometry yet ⇒ a scroll write isn't recorded.
+        dom.set_scroll_pos(s, 50.0, 0.0, true);
+        assert!(
+            dom.take_scroll_changes().is_empty(),
+            "no record before the app measured the region"
+        );
+        dom.set_scroll_geom(s, 100.0, 80.0);
+        assert_eq!(dom.scroll_metric(s, 4), Some(100.0), "clientHeight stored");
+        assert_eq!(dom.scroll_metric(s, 5), Some(80.0), "clientWidth stored");
+        assert_eq!(
+            dom.scroll_metric(s, 2),
+            None,
+            "scrollHeight is read from the rect, never stored"
+        );
+        dom.set_scroll_pos(s, 70.0, 0.0, true);
+        assert_eq!(
+            dom.take_scroll_changes(),
+            vec![(s, 70.0, 0.0)],
+            "a scroll write records once the region is measured"
+        );
+    }
+
+    #[test]
     fn scripts_are_collected_in_document_order() {
         let dom = Dom::parse_document(
             "<head><script src='/a.js'></script></head>\
@@ -5621,6 +6327,35 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("href=\"/normal\""), "{html}");
+    }
+
+    #[test]
+    fn serialize_live_drops_a_clipped_icon_controls_accessible_name() {
+        // A control the author CLIPPED to an icon-sized box (`width` under
+        // `overflow:hidden`) never paints its accessible name — only the icon.
+        // The live serializer must not bracket the `aria-label` of such a
+        // control: Twitch's per-message reply button (`width:3.2rem;
+        // overflow:hidden`) spammed every chat line with "[Click to reply to
+        // @user]". An UN-clipped icon control still surfaces its name.
+        let dom = Dom::parse_document(
+            "<body>\
+             <button id=reply aria-label='Click to reply to @user' style='width:3.2rem;height:3.2rem;overflow:hidden'></button>\
+             <button id=menu aria-label='Open menu'></button></body>",
+        );
+        let reply = dom.get_by_id("reply").unwrap();
+        let menu = dom.get_by_id("menu").unwrap();
+        let clickable = std::collections::HashSet::from([reply, menu]);
+        let html = dom.serialize_live(DOCUMENT, &clickable);
+        // The PAINTED form is the bracketed handle; the raw name still appears in
+        // the preserved `aria-label` attribute, so assert on the bracket.
+        assert!(
+            !html.contains("[Click to reply"),
+            "a clipped accessible name is not surfaced as a label: {html}"
+        );
+        assert!(
+            html.contains("[Open menu]"),
+            "an un-clipped icon control keeps its accessible name: {html}"
+        );
     }
 
     #[test]

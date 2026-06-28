@@ -1659,6 +1659,7 @@ type GeomCache = (
 struct PageGeom {
     base: url::Url,
     width_cells: u16,
+    height_cells: u16,
     cell_px: (u16, u16),
     borders: bool,
     cache: Rc<RefCell<GeomCache>>,
@@ -2153,6 +2154,8 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_get_attr", 2, sys_get_attr),
         ("__dom_computed", 2, sys_computed_style),
         ("__dom_rect", 1, sys_rect),
+        ("__dom_scroll_get", 2, sys_scroll_get),
+        ("__dom_scroll_set", 3, sys_scroll_set),
         ("__dom_set_attr", 3, sys_set_attr),
         ("__dom_remove_attr", 2, sys_remove_attr),
         ("__dom_attr_names", 1, sys_attr_names),
@@ -2432,12 +2435,13 @@ fn sys_computed_style(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
 /// the live arena (`layout::measure_boxes`) and reused until the next mutation
 /// — lazy, so a page that never measures pays nothing.
 fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let Some((base, width_cells, cell_px, borders, cache)) = ({
+    let Some((base, width_cells, height_cells, cell_px, borders, cache)) = ({
         let host = ctx.realm().host_defined();
         host.get::<PageGeom>().map(|g| {
             (
                 g.base.clone(),
                 g.width_cells,
+                g.height_cells,
                 g.cell_px,
                 g.borders,
                 g.cache.clone(),
@@ -2459,7 +2463,7 @@ fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
             c.1 = crate::layout::measure_boxes(
                 &d,
                 &base,
-                width_cells as usize,
+                (width_cells as usize, height_cells as usize),
                 &forms,
                 &controls,
                 cell_px,
@@ -2482,6 +2486,40 @@ fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
         .into(),
         None => JsValue::null(),
     })
+}
+
+/// `__dom_scroll_get(id, which)` → an inner-scroll metric in px (CSSOM View,
+/// Phase 3). `which`: 0=scrollTop, 1=scrollLeft, 2=scrollHeight, 3=scrollWidth,
+/// 4=clientHeight, 5=clientWidth. `null` for an unknown geometry metric (the
+/// prelude getter then falls back to the element's measured rect); an unset
+/// position reads `0` (CSSOM scroll origin is the top).
+fn sys_scroll_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let d = dom.borrow();
+    let Some(id) = arg_node(&d, args, 0) else {
+        return Ok(JsValue::null());
+    };
+    let which = arg_id(args, 1).unwrap_or(0) as u8;
+    Ok(match d.scroll_metric(id, which) {
+        Some(v) => JsValue::from(v),
+        None => JsValue::null(),
+    })
+}
+
+/// `__dom_scroll_set(id, top, left)` — store a scroll position (px); the
+/// `scrollTop`/`scrollLeft` setter has already clamped it to
+/// `[0, scrollHeight − clientHeight]`. Records the write so the app re-windows
+/// the region (`PageEvt::Scrolled`); see `Dom::set_scroll_pos`.
+fn sys_scroll_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let mut d = dom.borrow_mut();
+    let Some(id) = arg_node(&d, args, 0) else {
+        return Ok(JsValue::undefined());
+    };
+    let top = args.get(1).and_then(JsValue::as_number).unwrap_or(0.0);
+    let left = args.get(2).and_then(JsValue::as_number).unwrap_or(0.0);
+    d.set_scroll_pos(id, top, left, true);
+    Ok(JsValue::undefined())
 }
 
 fn sys_remove_attr(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -5533,6 +5571,27 @@ struct LoadedPage {
     /// second). Serializing + canonicalizing to compare is cheap (~ms); the
     /// app-side layout this skips is what froze the UI.
     last_render: Option<String>,
+    /// The clipped scroll-region nodes the app confirmed it laid out
+    /// (`PageCmd::LiveRegions`). A mutation is patched only when confined to one
+    /// of these (INCREMENTAL_LAYOUT_PLAN.md §4b) — everything else takes the full
+    /// path, so a non-region scroll box can't trigger a failed-patch→resync.
+    live_regions: std::collections::HashSet<usize>,
+    /// The cached inline IFC-boundary nodes the app can splice (`Doc.boundaries`,
+    /// via `PageCmd::LiveBoundaries`). A mutation whose nearest IFC boundary is
+    /// here is patched as a general inline `Patched` (Tier 2); everything else
+    /// takes the full path (INCREMENTAL_LAYOUT_PLAN.md §14).
+    live_boundaries: std::collections::HashSet<usize>,
+    /// Per-boundary render-dedup baselines (INCREMENTAL_LAYOUT_PLAN.md §12c, W1):
+    /// the `render_canonical` form of the last patch we emitted for each relayout
+    /// boundary, keyed by its `data-trust-node`. The patch path serializes ONLY a
+    /// dirty boundary's subtree (never the whole document) and drops the patch
+    /// when its canonical render is unchanged — the per-boundary analogue of
+    /// `last_render`, so an invisible mutation inside a boundary (an `alt`/`aria`
+    /// rotation) still emits nothing. Populated lazily on the first patch per
+    /// boundary; cleared whenever a full `Updated` resyncs the whole document
+    /// (the app re-laid everything, so every baseline is moot) and pruned of
+    /// boundaries that left the tree.
+    boundary_render: std::collections::HashMap<usize, String>,
 }
 
 /// Parse, run scripts, fire lifecycle, settle. Err(outcome) means
@@ -5560,6 +5619,8 @@ fn load_page(
         u32::from(viewport.0) * u32::from(cell_px.0.max(1)),
         u32::from(viewport.1) * u32::from(cell_px.1.max(1)),
     );
+    // The terminal cell size, for the live serializer's px→row `scrollTop` bake.
+    dom.borrow_mut().set_cell_px(cell_px.0, cell_px.1);
     if !env.sheets.is_empty() {
         dom.borrow_mut().attach_external_sheets(&env.sheets);
     }
@@ -5662,6 +5723,7 @@ fn load_page(
             host.insert(PageGeom {
                 base,
                 width_cells: viewport.0,
+                height_cells: viewport.1,
                 cell_px,
                 borders: crate::layout::borders_enabled(),
                 cache: Rc::new(RefCell::new((u64::MAX, std::collections::HashMap::new()))),
@@ -5900,6 +5962,9 @@ fn load_page(
         page_url: parsed_url,
         hooks,
         last_render: None,
+        live_regions: std::collections::HashSet::new(),
+        live_boundaries: std::collections::HashSet::new(),
+        boundary_render: std::collections::HashMap::new(),
     })
 }
 
@@ -6219,6 +6284,7 @@ pub fn css_prepare(html: &str, viewport: (u16, u16), cell_px: (u16, u16)) -> Dom
         u32::from(viewport.0) * u32::from(cell_px.0.max(1)),
         u32::from(viewport.1) * u32::from(cell_px.1.max(1)),
     );
+    dom.set_cell_px(cell_px.0, cell_px.1);
     dom
 }
 
@@ -6242,6 +6308,23 @@ pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
             let _ = page.ctx.eval(Source::from_bytes(b"__trust.oneShot = true"));
             settle_page(&mut page); // `load_page(.., None)` ⇒ fetches await in-line
             page.outcome.elapsed = page.started.elapsed();
+            // Inner-scroll GATE diagnostic: report definite_height for every
+            // vertical scroll container on the live (full-cascade) arena before it
+            // is serialized (which drops overflow-y/min-height). See
+            // `layout::scroll_box_report`.
+            if std::env::var("TRUST_DIAG_SCROLL_BOXES").is_ok()
+                && let Ok(base) = url::Url::parse(&env.url)
+            {
+                let d = page.dom.borrow();
+                eprintln!(
+                    "{}",
+                    crate::layout::scroll_box_report(
+                        &d,
+                        &base,
+                        (env.viewport.0 as usize, env.viewport.1 as usize),
+                    )
+                );
+            }
             let out = page.dom.borrow().serialize(DOCUMENT);
             (out, std::mem::take(&mut page.outcome))
         }
@@ -6287,6 +6370,62 @@ pub enum PageCmd {
     /// own infinite-scroll logic (a window scroll handler, or an IO sentinel)
     /// fires its load-more request and the appended content re-renders.
     Scroll { x: f64, y: f64 },
+    /// Per-region CLIP box the app measured (CSSOM View, Phase 3): `(node,
+    /// clientHeight, clientWidth)` px. Stored on the live DOM so `clientHeight`/
+    /// `clientWidth` read TRUE values (the conditional pin reads them). Only the
+    /// clip box round-trips — `scrollHeight` reads the actor's own fresh
+    /// `__dom_rect` (current content, no render lag). No event/re-render — pure
+    /// measurement backing, like the geometry box map behind `__dom_rect`.
+    RegionGeom { items: Vec<(usize, f64, f64)> },
+    /// The user wheeled/paged an inner-scroll region: write its new `scrollTop`
+    /// (px) back into the live element and fire its `scroll` event, so a page
+    /// that conditionally pins to the bottom learns the user scrolled up and
+    /// stops following (CSSOM View — the region→page write-back).
+    SetScroll { node: usize, top: f64, left: f64 },
+    /// The app couldn't apply an incremental `Patched` (the boundary wasn't a
+    /// live region, or a verify failed) — re-emit the WHOLE document as a full
+    /// `Updated` so the app resyncs. The downgrade path
+    /// (INCREMENTAL_LAYOUT_PLAN.md §7); unreachable when the boundary predicate
+    /// is correct.
+    Resync,
+    /// The current set of CLIPPED scroll-region nodes (by `data-trust-node`) the
+    /// app has laid out. The actor patches a mutation ONLY when it's confined to
+    /// one of these (INCREMENTAL_LAYOUT_PLAN.md §4b) — a non-region scroll box
+    /// (content fits / height-elastic) takes the full path instead of a failed
+    /// patch. The app sends the full set whenever it changes (deduped).
+    LiveRegions(Vec<usize>),
+    /// The current set of cached INLINE IFC-boundary nodes (the `Doc.boundaries`
+    /// node set) the app can splice into `Doc.rows` (INCREMENTAL_LAYOUT_PLAN.md
+    /// §14). The actor proposes a general inline `Patched` ONLY for a boundary in
+    /// this set; one the app hasn't cached takes the full path (no failed-patch
+    /// resync). Sent whenever it changes (deduped).
+    LiveBoundaries(Vec<usize>),
+}
+
+/// Which kind of relayout boundary a patch targets (INCREMENTAL_LAYOUT_PLAN.md
+/// §2). v1 emits only `Size` (scroll regions — content-independent outer box,
+/// in-place swap); `WidthStable` (Tier 2: relayout + shift) is reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryTier {
+    /// Size-contained: the boundary's outer box (incl. height) is unchanged, so
+    /// the splice touches only its buffer/range — nothing outside moves.
+    Size,
+    /// Width-stable, height-elastic (Tier 2): relayout the subtree, then shift
+    /// the following content. Reserved; not emitted in v1.
+    WidthStable,
+}
+
+/// One targeted incremental-layout patch: a relayout boundary's freshly
+/// serialized subtree (with its inherited context materialized,
+/// INCREMENTAL_LAYOUT_PLAN.md §4a). The app re-lays ONLY this subtree.
+#[derive(Debug)]
+pub struct SubtreePatch {
+    /// The boundary's arena node id (baked as `data-trust-node`) — the app maps
+    /// it to the live `Region` to swap.
+    pub node: usize,
+    /// `Dom::serialize_patch` output: the boundary inside a context wrapper.
+    pub html: String,
+    pub tier: BoundaryTier,
 }
 
 /// Page → app.
@@ -6294,6 +6433,14 @@ pub enum PageCmd {
 pub enum PageEvt {
     /// A render of a page that stays alive for interaction.
     Updated { html: String, outcome: Outcome },
+    /// Targeted incremental re-render: re-lay ONLY these relayout boundaries,
+    /// leaving the rest of the document untouched (INCREMENTAL_LAYOUT_PLAN.md).
+    /// The app applies each via `patch_live_doc`, falling back to a `Resync`
+    /// request if any can't be applied.
+    Patched {
+        patches: Vec<SubtreePatch>,
+        outcome: Outcome,
+    },
     /// Final render: nothing to interact with, the actor has exited.
     /// (Free efficiency: text articles never hold an engine.)
     Static { html: String, outcome: Outcome },
@@ -6304,6 +6451,13 @@ pub enum PageEvt {
     Trouble(Vec<String>),
     /// A dispatch settled without a renderable mutation.
     Settled,
+    /// A page-initiated inner-scroll write (CSSOM View, Phase 3): the page set
+    /// `element.scrollTop` (a chat pinning to bottom) on a scroll-region element
+    /// without otherwise mutating the DOM. The app re-windows that region (by
+    /// `node`, the actor node id baked as `data-trust-node`) — a cheap re-blit,
+    /// no re-parse. `top`/`left` are px. When the same dispatch ALSO mutated the
+    /// DOM, the `Updated`'s baked `data-trust-scroll-top` carries it instead.
+    Scrolled { node: usize, top: f64, left: f64 },
     /// The page did not prevent a form submit; the app should perform
     /// the normal HTTP form submission it already prepared.
     SubmitDefault,
@@ -7117,7 +7271,7 @@ fn page_actor(
     // `settle_page` below fires the page's due-now load/init timers for this
     // first settle; any ongoing timers (a slideshow, a poller, a rAF chain)
     // keep advancing at their real time in the at-rest wake loop further down.
-    let (shell, shell_clickable) = extract_live(&mut page);
+    let (shell, _, shell_clickable) = extract_live(&mut page);
     // Seed the render-dedup baseline from the shell (the settle path below
     // overwrites it when it re-extracts), so a `painted_live && !changed` page —
     // which emits ONLY this shell — still has a baseline and the first dispatch
@@ -7168,7 +7322,7 @@ fn page_actor(
     if painted_live && !changed {
         // Shell already reflects the settled page; nothing new to send.
     } else {
-        let (out, has_clickables) = extract_live(&mut page);
+        let (out, _, has_clickables) = extract_live(&mut page);
         // Seed the render-dedup baseline so the at-rest loop skips re-emitting a
         // render that paints the same (see `extract_changed`/`last_render`).
         page.last_render = Some(render_canonical(&out));
@@ -7393,6 +7547,49 @@ fn page_actor(
                     return;
                 }
             }
+            PageCmd::RegionGeom { items } => {
+                // Pure measurement backing for the `clientHeight`/`clientWidth`
+                // getters. No settle, no event — like the geometry box map behind
+                // `__dom_rect`.
+                let mut d = page.dom.borrow_mut();
+                for (node, client_h, client_w) in items {
+                    if d.is_valid(node) {
+                        d.set_scroll_geom(node, client_h, client_w);
+                    }
+                }
+            }
+            PageCmd::SetScroll { node, top, left } => {
+                if !dispatch_set_scroll_in(&mut page, &evts, node, top, left) {
+                    return;
+                }
+            }
+            PageCmd::Resync => {
+                // The app couldn't apply a patch — re-emit the WHOLE document so
+                // it resyncs (INCREMENTAL_LAYOUT_PLAN.md §7). Force the render
+                // (bypass the dedup): the app explicitly asked for full state.
+                let (out, _, _) = extract_live(&mut page);
+                page.last_render = Some(render_canonical(&out));
+                // A full resync re-lays everything; drop the per-boundary
+                // patch baselines (repopulated lazily on the next patch).
+                page.boundary_render.clear();
+                let outcome = std::mem::take(&mut page.outcome);
+                if evts
+                    .blocking_send(PageEvt::Updated { html: out, outcome })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            PageCmd::LiveRegions(nodes) => {
+                // Pure bookkeeping (no render): the actor patches a mutation only
+                // when confined to one of these confirmed clipped regions.
+                page.live_regions = nodes.into_iter().collect();
+            }
+            PageCmd::LiveBoundaries(nodes) => {
+                // Pure bookkeeping (no render): the actor proposes a general
+                // inline patch only for a boundary the app has cached.
+                page.live_boundaries = nodes.into_iter().collect();
+            }
         }
     }
 }
@@ -7497,6 +7694,60 @@ fn dispatch_scroll_in(page: &mut LoadedPage, x: f64, y: f64) {
     page.outcome.errors.extend(dispatch_outcome.errors);
 }
 
+/// The terminal wheel/page scrolled an inner-scroll region: write its new
+/// `scrollTop`/`scrollLeft` (px) back into the live element (CSSOM View — the
+/// region→page write-back) and fire the element's `scroll` event, then settle.
+/// A page that conditionally pins to the bottom runs its scroll handler here and
+/// learns the user scrolled up, so it stops following. Shaped like a dispatch: a
+/// handler that mutates re-renders (`Updated`), else it settles silently. The
+/// app already moved its own region `voffset`, so this write does NOT record a
+/// `Scrolled` echo (`set_scroll_pos(.., false)`).
+fn dispatch_set_scroll_in(
+    page: &mut LoadedPage,
+    evts: &tokio::sync::mpsc::Sender<PageEvt>,
+    node: usize,
+    top: f64,
+    left: f64,
+) -> bool {
+    prepare_dispatch(page);
+    let valid = {
+        let mut d = page.dom.borrow_mut();
+        let valid = d.is_valid(node);
+        if valid {
+            d.set_scroll_pos(node, top, left, false);
+        }
+        valid
+    };
+    if !valid {
+        return finish_dispatch(page, evts);
+    }
+    let call = format!("__trust.fireElementScroll({node})");
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        page.ctx.eval(Source::from_bytes(call.as_bytes()))
+    })) {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => page.outcome.errors.push(format!("scroll: {err}")),
+        Err(_) => {
+            page.outcome.errors.push(String::from(
+                "scroll: engine panic (Boa bug) — page JS halted",
+            ));
+            page.outcome.panicked = true;
+        }
+    }
+    if !page.outcome.panicked {
+        let mut dispatch_outcome = Outcome::default();
+        settle(
+            &mut page.ctx,
+            &page.budget,
+            DISPATCH_TICKS,
+            &mut dispatch_outcome,
+        );
+        page.outcome.errors.extend(dispatch_outcome.errors);
+        drain_js_side(&mut page.ctx, &mut page.outcome);
+    }
+    finish_dispatch(page, evts)
+}
+
 /// Re-run IntersectionObserver against the current DOM + scroll position after a
 /// dispatch settled. The browser runs IO in every render step, so a mutation that
 /// MOVED a target — an infinite scroller appending a batch above its bottom
@@ -7542,18 +7793,45 @@ fn finish_dispatch(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageE
         let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
         return false;
     }
+    let scrolls = page.dom.borrow_mut().take_scroll_changes();
     let dirty = page.dom.borrow_mut().take_dirty();
-    if dirty && let Some((out, outcome)) = extract_changed(page) {
-        return evts
-            .blocking_send(PageEvt::Updated { html: out, outcome })
-            .is_ok();
+    if dirty && let Some(ok) = emit_dirty_render(page, evts) {
+        // The Updated/Patched's baked `data-trust-scroll-top` carries every
+        // region's scroll position, so the cheap `Scrolled` events are redundant.
+        return ok;
+    }
+    // No visible content change: deliver any pure-scroll writes cheaply (the app
+    // re-windows the region without a re-parse). This is the chat-pin path when a
+    // rAF/effect sets `scrollTop` in a turn that mutated nothing else.
+    if !send_scroll_events(&scrolls, evts) {
+        return false;
     }
     if !page.outcome.errors.is_empty() {
         return evts
             .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)))
             .is_ok();
     }
+    if !scrolls.is_empty() {
+        return true; // the Scrolled events stood in for Settled
+    }
     evts.blocking_send(PageEvt::Settled).is_ok()
+}
+
+/// Send a `PageEvt::Scrolled` for each page-initiated scroll write; returns
+/// false if the event channel closed (the actor should exit).
+fn send_scroll_events(
+    scrolls: &[(usize, f64, f64)],
+    evts: &tokio::sync::mpsc::Sender<PageEvt>,
+) -> bool {
+    for &(node, top, left) in scrolls {
+        if evts
+            .blocking_send(PageEvt::Scrolled { node, top, left })
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// An at-rest timer deadline elapsed: fire the timers due by `real_now` (ms),
@@ -7600,12 +7878,17 @@ fn timer_wake(
     if let Some(url) = take_script_navigation(page) {
         return evts.blocking_send(PageEvt::Navigate(url)).is_ok();
     }
+    let scrolls = page.dom.borrow_mut().take_scroll_changes();
     if page.dom.borrow_mut().take_dirty()
-        && let Some((out, outcome)) = extract_changed(page)
+        && let Some(ok) = emit_dirty_render(page, evts)
     {
-        return evts
-            .blocking_send(PageEvt::Updated { html: out, outcome })
-            .is_ok();
+        // The baked scroll position rides the Updated/Patched (see finish_dispatch).
+        return ok;
+    }
+    // A rAF/effect that pinned a region (set `scrollTop`) without mutating the
+    // DOM re-windows it cheaply via Scrolled — the chat auto-scroll at rest.
+    if !send_scroll_events(&scrolls, evts) {
+        return false;
     }
     if !page.outcome.errors.is_empty() {
         return evts
@@ -7663,11 +7946,9 @@ fn dispatch_fetch_done(
         return evts.blocking_send(PageEvt::Navigate(url)).is_ok();
     }
     if page.dom.borrow_mut().take_dirty()
-        && let Some((out, outcome)) = extract_changed(page)
+        && let Some(ok) = emit_dirty_render(page, evts)
     {
-        return evts
-            .blocking_send(PageEvt::Updated { html: out, outcome })
-            .is_ok();
+        return ok;
     }
     if !page.outcome.errors.is_empty() {
         return evts
@@ -7912,11 +8193,15 @@ fn dispatch_submit_in(page: &mut LoadedPage, form: usize, submitter: Option<usiz
     prevented
 }
 
-/// Serialize for interaction: gather clickables (inherent tags + the
-/// prelude's listener registry), mark live anchors, and skip wrapping
-/// delegation containers (an element whose subtree holds other
-/// interactives is a listener host, not a button).
-fn extract_live(page: &mut LoadedPage) -> (String, bool) {
+/// Compute the clickable set for interaction marking: inherent tags + the
+/// prelude's listener registry, with delegation containers removed (an element
+/// whose subtree holds other interactives is a listener host, not a button) and
+/// live anchors included. Returns the set + whether the page has ANY interaction
+/// (clickables or forms) — the Static-vs-live signal. This is the part of
+/// `extract_live` that does NOT serialize the whole document, so the incremental
+/// patch path (INCREMENTAL_LAYOUT_PLAN.md §12c W1) can mark clickables for a
+/// per-boundary serialize without paying the whole-doc serialize.
+fn clickable_set(page: &mut LoadedPage) -> (std::collections::HashSet<usize>, bool) {
     use std::collections::HashSet;
 
     // Listener-bearing nodes, straight from the registry we own.
@@ -8011,6 +8296,15 @@ fn extract_live(page: &mut LoadedPage) -> (String, bool) {
         ) || dom.is_contenteditable_host(d)
     });
     let has_any = !clickable.is_empty() || has_forms;
+    (clickable, has_any)
+}
+
+/// Serialize the WHOLE live document for interaction (the full-path / fallback
+/// render), marking clickables computed by `clickable_set`. Returns the HTML +
+/// the clickable set + whether the page has any interaction.
+fn extract_live(page: &mut LoadedPage) -> (String, std::collections::HashSet<usize>, bool) {
+    let (clickable, has_any) = clickable_set(page);
+    let dom = page.dom.borrow();
     let ser_t = Instant::now();
     let html = dom.serialize_live(crate::dom::DOCUMENT, &clickable);
     phase(&format!(
@@ -8018,9 +8312,15 @@ fn extract_live(page: &mut LoadedPage) -> (String, bool) {
         ser_t.elapsed().as_millis()
     ));
     drop(dom);
-    // Extraction itself is not a page mutation.
-    let _ = page.dom.borrow_mut().take_dirty();
-    (html, has_any)
+    // Extraction itself is not a page mutation; also drain the incremental
+    // dirty-target set so this full serialize CONSUMES it and the next dispatch's
+    // patch decision starts from a clean slate (INCREMENTAL_LAYOUT_PLAN.md §5).
+    {
+        let mut d = page.dom.borrow_mut();
+        let _ = d.take_dirty();
+        let _ = d.take_dirty_targets();
+    }
+    (html, clickable, has_any)
 }
 
 /// Serialize the live DOM and return the snapshot + drained outcome ONLY when
@@ -8031,14 +8331,270 @@ fn extract_live(page: &mut LoadedPage) -> (String, bool) {
 /// then, and the caller treats the tick as a no-op (no Updated,
 /// so the app never re-lays-out for a change that paints nothing). Serializing
 /// to compare is cheap; the app-side layout this skips is what froze the UI.
-fn extract_changed(page: &mut LoadedPage) -> Option<(String, Outcome)> {
-    let (out, _) = extract_live(page);
+fn extract_changed(
+    page: &mut LoadedPage,
+) -> Option<(String, std::collections::HashSet<usize>, Outcome)> {
+    let (out, clickable, _) = extract_live(page);
     let canon = render_canonical(&out);
     if page.last_render.as_deref() == Some(canon.as_str()) {
         return None;
     }
     page.last_render = Some(canon);
-    Some((out, std::mem::take(&mut page.outcome)))
+    Some((out, clickable, std::mem::take(&mut page.outcome)))
+}
+
+/// Deliver a real (visible) DOM change and send the event: a targeted `Patched`
+/// when every mutation this cycle is confined to a relayout boundary, else the
+/// full `Updated` (the always-correct fallback). Returns `Some(send_ok)` when an
+/// event was sent, `None` when nothing visible changed (the caller continues to
+/// its scroll/trouble/settled tail). Drains the dirty-target set regardless.
+/// (INCREMENTAL_LAYOUT_PLAN.md — Tier 1.)
+fn emit_dirty_render(
+    page: &mut LoadedPage,
+    evts: &tokio::sync::mpsc::Sender<PageEvt>,
+) -> Option<bool> {
+    let targets = page.dom.borrow_mut().take_dirty_targets();
+    let n_targets = targets.as_ref().map(|t| t.len());
+    // Decide patch-vs-full from the dirty TARGETS — BEFORE any serialize
+    // (INCREMENTAL_LAYOUT_PLAN.md §12c W1). When every mutation this cycle is
+    // confined to a patchable boundary, the patch path serializes ONLY those
+    // subtrees; the whole document is never serialized. The old order did a
+    // whole-doc serialize (~13.7ms on a 462KB chat, growing) on EVERY dirty
+    // cycle, patch path or not — half the live-page CPU peg. Now that cost is
+    // paid only on the genuine full path.
+    if !no_incremental() {
+        let boundaries = {
+            let dom = page.dom.borrow();
+            confined_boundaries(
+                &dom,
+                &page.live_regions,
+                &page.live_boundaries,
+                targets.as_deref(),
+            )
+        };
+        if let Some(boundaries) = boundaries {
+            return emit_boundary_patches(page, evts, boundaries, n_targets);
+        }
+    }
+    // FULL PATH: whole-doc serialize + canonical dedup (the no-op detection that
+    // drops an `alt`/`class` rotation on a NON-boundary node) → `Updated`. Keeps
+    // `last_render` coherent (its only consumer is the next full-path dedup).
+    let t_extract = std::time::Instant::now();
+    let changed = extract_changed(page);
+    if diag_patch() {
+        eprintln!(
+            "DIAGPATCH UPDATE whole-doc-serialize={}us changed={} targets={:?}",
+            t_extract.elapsed().as_micros(),
+            changed.is_some(),
+            n_targets
+        );
+    }
+    let (out, _clickable, outcome) = changed?;
+    // A full render resyncs every boundary (the app re-laid the whole document),
+    // so the per-boundary baselines are moot — clear them; the next patch
+    // repopulates lazily.
+    page.boundary_render.clear();
+    Some(
+        evts.blocking_send(PageEvt::Updated { html: out, outcome })
+            .is_ok(),
+    )
+}
+
+/// The patch path (INCREMENTAL_LAYOUT_PLAN.md §12c W1): serialize ONLY each dirty
+/// boundary's subtree (never the whole document), canonical-dedup against the
+/// per-boundary baseline (`boundary_render`), and emit a `Patched` for the
+/// boundaries that actually changed. A cycle whose every boundary is canonically
+/// unchanged (an invisible in-boundary mutation — an `alt`/`aria` rotation)
+/// emits nothing (`None`), exactly as the whole-doc dedup did on the old path.
+/// The clickable set is computed cheaply (no whole-doc serialize) for the
+/// subtree markers.
+fn emit_boundary_patches(
+    page: &mut LoadedPage,
+    evts: &tokio::sync::mpsc::Sender<PageEvt>,
+    boundaries: Vec<(crate::dom::NodeId, BoundaryTier)>,
+    n_targets: Option<usize>,
+) -> Option<bool> {
+    let (clickable, _) = clickable_set(page);
+    let t = std::time::Instant::now();
+    let mut total_bytes = 0usize;
+    let mut patches: Vec<SubtreePatch> = Vec::new();
+    {
+        let dom = page.dom.borrow();
+        for (node, tier) in boundaries {
+            let html = dom.serialize_patch(node, &clickable);
+            total_bytes += html.len();
+            let canon = render_canonical(&html);
+            // Lazy baseline: an absent entry counts as changed (one redundant
+            // patch after a full render, never a wrong one) and populates it.
+            if page.boundary_render.get(&node).map(String::as_str) == Some(canon.as_str()) {
+                continue; // invisible in-boundary mutation — emit nothing
+            }
+            page.boundary_render.insert(node, canon);
+            patches.push(SubtreePatch { html, node, tier });
+        }
+        // Prune baselines for boundaries that left the tree (the map is bounded
+        // by the live boundary count — tiny — but a removed chat region would
+        // otherwise linger until the next full render).
+        page.boundary_render.retain(|&n, _| dom.is_connected(n));
+    }
+    // Reads (clickable eval + serialize) don't mutate the arena, but drain
+    // defensively so a getter that lazily marked dirty can't leak into the next
+    // cycle's patch decision (the old patch path drained via `extract_changed`).
+    {
+        let mut d = page.dom.borrow_mut();
+        let _ = d.take_dirty();
+        let _ = d.take_dirty_targets();
+    }
+    if diag_patch() {
+        eprintln!(
+            "DIAGPATCH PATCH per-boundary-serialize={}us bytes={} patches={} targets={:?}",
+            t.elapsed().as_micros(),
+            total_bytes,
+            patches.len(),
+            n_targets
+        );
+    }
+    if patches.is_empty() {
+        return None; // nothing painted — caller continues to scroll/errors/settled
+    }
+    let outcome = std::mem::take(&mut page.outcome);
+    Some(
+        evts.blocking_send(PageEvt::Patched { patches, outcome })
+            .is_ok(),
+    )
+}
+
+fn diag_patch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TRUST_DIAG_PATCH").is_some())
+}
+
+/// The relayout boundaries a cycle's mutations are confined to (each with its
+/// tier), or `None` if the change can't be delivered as patches (an unattributed
+/// mutation, a target with no enclosing patchable boundary, or one v1 doesn't
+/// patch). A `Some` result is non-empty: EVERY target maps to a patchable
+/// boundary — a confirmed clipped scroll REGION (`Size`, buffer swap) or a cached
+/// inline IFC boundary (`WidthStable`, `Doc.rows` splice). The region path is
+/// tried first (a mutation inside a region must rebuild the region buffer, not
+/// patch an inner card whose rows live in that buffer).
+fn confined_boundaries(
+    dom: &crate::dom::Dom,
+    live_regions: &std::collections::HashSet<usize>,
+    live_boundaries: &std::collections::HashSet<usize>,
+    targets: Option<&[(crate::dom::NodeId, crate::dom::DirtyKind)]>,
+) -> Option<Vec<(crate::dom::NodeId, BoundaryTier)>> {
+    let targets = match targets {
+        Some(t) => t,
+        None => {
+            if diag_patch() {
+                eprintln!("DIAGPATCH bail=unattributed (global mutation)");
+            }
+            return None;
+        }
+    };
+    if targets.is_empty() {
+        return None;
+    }
+    let mut set: Vec<(crate::dom::NodeId, BoundaryTier)> = Vec::new();
+    for &(node, kind) in targets {
+        // A mutation on a DETACHED subtree (createElement + set content, before
+        // appendChild) is invisible until inserted — skip it. The insertion that
+        // connects it records the container, whose patch captures the content.
+        if !dom.is_connected(node) {
+            continue;
+        }
+        // A live scroll region wins first (its content lives in a side buffer):
+        // Tier 1 / `Size`, buffer swap. Otherwise the nearest INLINE IFC boundary
+        // the app has cached: Tier 2 / `WidthStable`, `Doc.rows` splice.
+        let boundary = if let Some(b) = dom.relayout_boundary(node, kind, live_regions) {
+            Some((b, BoundaryTier::Size))
+        } else {
+            dom.relayout_boundary_general(node, kind)
+                .filter(|g| live_boundaries.contains(g))
+                .map(|g| (g, BoundaryTier::WidthStable))
+        };
+        let (b, tier) = match boundary {
+            Some(bt) => bt,
+            None => {
+                if diag_patch() {
+                    let tag = dom.tag_name(node).unwrap_or("?");
+                    let cls = dom.attr(node, "class").unwrap_or("");
+                    let ptag = dom
+                        .parent_composed(node)
+                        .and_then(|p| dom.tag_name(p))
+                        .unwrap_or("?");
+                    let general = dom.relayout_boundary_general(node, kind).map_or_else(
+                        || "<none/root>".to_string(),
+                        |g| {
+                            format!(
+                                "<{} class=\"{}\"> cached={}",
+                                dom.tag_name(g).unwrap_or("?"),
+                                dom.attr(g, "class")
+                                    .unwrap_or("")
+                                    .chars()
+                                    .take(30)
+                                    .collect::<String>(),
+                                live_boundaries.contains(&g),
+                            )
+                        },
+                    );
+                    eprintln!(
+                        "DIAGPATCH bail=no_boundary <{tag} class=\"{}\"> parent=<{ptag}> kind={kind:?} live_regions={} live_boundaries={} general={general}",
+                        cls.chars().take(40).collect::<String>(),
+                        live_regions.len(),
+                        live_boundaries.len()
+                    );
+                }
+                return None;
+            }
+        };
+        if !patchable_boundary(dom, b) {
+            if diag_patch() {
+                eprintln!("DIAGPATCH bail=not_patchable boundary={b:?}");
+            }
+            return None;
+        }
+        if !set.iter().any(|&(n, _)| n == b) {
+            set.push((b, tier));
+        }
+    }
+    // All targets were detached (no visible change to attribute) — fall back to
+    // the full path (this is unreachable when extract_changed reported a change).
+    (!set.is_empty()).then_some(set)
+}
+
+/// Whether a relayout boundary is one v1 patches: NOT anchor-wrapped (the
+/// fragment doesn't thread an enclosing `<a>`'s link context) and holding no
+/// STATEFUL form control. The exclusion is scoped to controls whose live state
+/// (`<input>`/`<select>`/`<textarea>` value/checked/selection, a contenteditable
+/// host) the full path round-trips but the region-patch path does NOT yet
+/// reconcile into `Doc.forms` — so patching one could clobber an in-progress
+/// edit. A `<button>`/`<form>` carries no such state: a button serializes as a
+/// `JsClick` marker and activates by node id (`dispatch_click`) regardless of
+/// patch-vs-full, and a `<form>` is a bare container — so neither blocks a
+/// patch. (This is what lets a Twitch chat region, whose every message holds a
+/// reply `<button>`, patch instead of full-reparsing the ~1.4MB document per
+/// message.) Otherwise the caller falls back to a full relayout (always
+/// correct).
+fn patchable_boundary(dom: &crate::dom::Dom, b: crate::dom::NodeId) -> bool {
+    let mut cur = dom.parent_composed(b);
+    while let Some(c) = cur {
+        if dom.tag_name(c) == Some("a") && dom.attr(c, "href").is_some() {
+            return false;
+        }
+        cur = dom.parent_composed(c);
+    }
+    !dom.composed_descendants(b).iter().any(|&d| {
+        matches!(dom.tag_name(d), Some("input" | "select" | "textarea"))
+            || dom.is_contenteditable_host(d)
+    })
+}
+
+/// The incremental-layout kill switch (INCREMENTAL_LAYOUT_PLAN.md §9):
+/// `TRUST_NO_INCREMENTAL_LAYOUT` forces the full path (A/B + escape hatch).
+fn no_incremental() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("TRUST_NO_INCREMENTAL_LAYOUT").is_some())
 }
 
 /// A render-canonical view of a live serialization, for the change-detection in
@@ -8875,8 +9431,14 @@ const PRELUDE: &str = r##"
             // Functions AND `{ handleEvent }` objects (Lit's EventParts register
             // themselves as listeners).
             if (typeof fn === "function" || (fn && typeof fn.handleEvent === "function")) {
-                const l = lsFor(this, String(type));
+                const t = String(type);
+                const l = lsFor(this, t);
                 if (!l.includes(fn)) l.push(fn);
+                // A per-element `scroll` listener (an inner-scroll region's un-pin
+                // handler) keeps the page resident so the wheel write-back can
+                // fire it (see `trust.hasScrollWork`). Window/document scroll is
+                // tracked separately via the listener map.
+                if (t === "scroll" && this !== g.document) g.__elScroll = true;
             }
         }
         removeEventListener(type, fn) { const l = lsFor(this, String(type)); const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); }
@@ -9407,15 +9969,51 @@ const PRELUDE: &str = r##"
         // Was a no-op, so any programmatic click (consent "Accept" buttons,
         // framework-driven toggles, auto-clickers) silently did nothing.
         click() { try { activateClick(this, false); } catch (e) {} }
-        focus() {} blur() {} scrollIntoView() {}
-        // Element scrolling (CSSOM View) is a no-op here — the terminal scrolls
-        // the laid-out document, not individual DOM boxes. They MUST exist as
-        // callable methods, though: a chat/feed that auto-scrolls its container
-        // on new content calls `el.scrollTo(...)` inside a framework effect, and
-        // a missing method throws — which in Svelte 5 aborts the whole effect-
-        // flush batch, so a sibling effect (the one rendering the new content)
-        // silently never runs (Open WebUI's streamed reply rendered nothing).
-        scrollTo() {} scrollBy() {} scroll() {}
+        focus() {} blur() {}
+        // Element scrolling (CSSOM View, Phase 3 inner-scroll regions). A
+        // definite-height `overflow-y:auto|scroll` box is a real scroll viewport
+        // (the app reserves H rows and windows a retained buffer over them). The
+        // page OWNS the scroll position via these members; the app measures the
+        // box GEOMETRY and pushes it back, so the conditional pin idiom
+        // (`if scrollTop + clientHeight >= scrollHeight`) reads TRUE values and a
+        // chat that sets `scrollTop = scrollHeight` actually pins to the bottom.
+        // `scroll()`/`scrollTo()` set an absolute position; `scrollBy()` a
+        // relative one; each takes either `(x, y)` or a `{left, top}` options
+        // dict. `scrollIntoView()` scrolls each ancestor scroll container so this
+        // element is visible (the recursive CSSOM scroll). The root element /
+        // scrollingElement still mirrors the page scroll (the terminal owns it).
+        scrollTo(x, y) {
+            const o = (x && typeof x === "object") ? x : { left: x, top: y };
+            if (o.left !== undefined && o.left !== null) this.scrollLeft = +o.left || 0;
+            if (o.top !== undefined && o.top !== null) this.scrollTop = +o.top || 0;
+        }
+        scroll(x, y) { this.scrollTo(x, y); }
+        scrollBy(x, y) {
+            const o = (x && typeof x === "object") ? x : { left: x, top: y };
+            this.scrollLeft = this.scrollLeft + (+o.left || 0);
+            this.scrollTop = this.scrollTop + (+o.top || 0);
+        }
+        scrollIntoView(arg) {
+            // Boolean legacy: true ⇒ align top ("start"), false ⇒ bottom ("end").
+            const block = (arg && typeof arg === "object" && arg.block) ? String(arg.block)
+                : (arg === false ? "end" : "start");
+            const top = this.__rect().top, bottom = this.__rect().bottom;
+            let a = this.parentNode;
+            while (a && a.nodeType === 1) {
+                // A real scroll container (content taller than its viewport): the
+                // element's offset within it is its rect minus the container's
+                // (both measured at scroll 0 in the inline flow), so that offset
+                // IS the scrollTop that brings it to the container's top.
+                if (a.scrollHeight > a.clientHeight + 1) {
+                    const ar = a.__rect(), ch = a.clientHeight;
+                    const offTop = top - ar.top, offBottom = bottom - ar.top;
+                    if (block === "end") a.scrollTop = offBottom - ch;
+                    else if (block === "center") a.scrollTop = (offTop + offBottom) / 2 - ch / 2;
+                    else a.scrollTop = offTop; // "start"/"nearest" default
+                }
+                a = a.parentNode;
+            }
+        }
         // Geometry: a layout pass over the live DOM gives each element its REAL
         // box (CSS pixels, quantized to terminal cells — what we actually
         // paint). `__dom_rect` returns [left, top, width, height] for a laid-out
@@ -9462,19 +10060,59 @@ const PRELUDE: &str = r##"
         // reading `document.documentElement.clientHeight` to size against the
         // window must get the viewport, not the full document height. Every
         // other element reports its own laid-out box.
-        get clientWidth() { return this.localName === "html" ? g.innerWidth : this.__rect().width; }
-        get clientHeight() { return this.localName === "html" ? g.innerHeight : this.__rect().height; }
+        // client*/scroll* read the app-measured box geometry (px) when present
+        // (the region geometry round-trip), else fall back to the element rect —
+        // the pre-Phase-3 behaviour, so a non-region element is unchanged. The
+        // root element's client box IS the viewport (CSSOM View); its
+        // scrollHeight is the full document height (its rect, via the fallback).
+        get clientWidth() {
+            if (this.localName === "html") return g.innerWidth;
+            const v = __dom_scroll_get(this.__id, 5);
+            return v !== null ? v : this.__rect().width;
+        }
+        get clientHeight() {
+            if (this.localName === "html") return g.innerHeight;
+            const v = __dom_scroll_get(this.__id, 4);
+            return v !== null ? v : this.__rect().height;
+        }
         get clientTop() { return 0; }
         get clientLeft() { return 0; }
-        get scrollWidth() { return this.__rect().width; }
-        get scrollHeight() { return this.__rect().height; }
+        get scrollWidth() {
+            const v = __dom_scroll_get(this.__id, 3);
+            return v !== null ? v : this.__rect().width;
+        }
+        get scrollHeight() {
+            const v = __dom_scroll_get(this.__id, 2);
+            return v !== null ? v : this.__rect().height;
+        }
         // The root scroller mirrors the page scroll position (document.scrolling
-        // Element === documentElement); the terminal owns scrolling, so the
-        // setters are no-ops (like scrollTo). Other elements don't scroll here.
-        get scrollTop() { return this.localName === "html" ? (g.scrollY || 0) : 0; }
-        set scrollTop(_v) {}
-        get scrollLeft() { return this.localName === "html" ? (g.scrollX || 0) : 0; }
-        set scrollLeft(_v) {}
+        // Element === documentElement). Every other element owns a real scroll
+        // position (CSSOM View): the getter reads the stored value and the setter
+        // clamps to `[0, scrollHeight − clientHeight]` and records the write
+        // (`__dom_scroll_set` → the app re-windows the region). The root's setter
+        // routes to the window scroll (terminal-owned, so currently inert).
+        get scrollTop() {
+            if (this.localName === "html") return g.scrollY || 0;
+            return __dom_scroll_get(this.__id, 0) || 0;
+        }
+        set scrollTop(v) {
+            v = +v; if (!isFinite(v)) v = 0;
+            if (this.localName === "html") { g.scrollTo(g.scrollX || 0, v); return; }
+            const max = Math.max(0, this.scrollHeight - this.clientHeight);
+            if (v < 0) v = 0; else if (v > max) v = max;
+            __dom_scroll_set(this.__id, v, this.scrollLeft);
+        }
+        get scrollLeft() {
+            if (this.localName === "html") return g.scrollX || 0;
+            return __dom_scroll_get(this.__id, 1) || 0;
+        }
+        set scrollLeft(v) {
+            v = +v; if (!isFinite(v)) v = 0;
+            if (this.localName === "html") { g.scrollTo(v, g.scrollY || 0); return; }
+            const max = Math.max(0, this.scrollWidth - this.clientWidth);
+            if (v < 0) v = 0; else if (v > max) v = max;
+            __dom_scroll_set(this.__id, this.scrollTop, v);
+        }
     }
 
     // --- per-interface element prototypes (the DOM IDL hierarchy) -------------
@@ -11572,11 +12210,26 @@ const PRELUDE: &str = r##"
         trust.updateIntersections();
     };
 
+    // The terminal wheel scrolled an inner-scroll region: the actor has already
+    // written the element's new scrollTop (PageCmd::SetScroll → set_scroll_pos),
+    // so fire the element's `scroll` event (CSSOM View — it does NOT bubble) and
+    // re-run intersections. A page that conditionally pins to the bottom learns
+    // here that the user scrolled up and stops following.
+    trust.fireElementScroll = function (node) {
+        const el = wrap(node);
+        if (!el) return;
+        try { dispatch(el, new Event("scroll"), false); }
+        catch (e) { trust.errors.push("element scroll handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+        trust.updateIntersections();
+    };
+
     // Does the page have scroll-driven work (so the actor keeps it live at rest
-    // to receive PageCmd::Scroll)? An IntersectionObserver, or a window/document
-    // `scroll` listener. Peeks the listener map without creating entries.
+    // to receive PageCmd::Scroll / SetScroll)? An IntersectionObserver, a
+    // window/document `scroll` listener, or a per-element `scroll` listener (an
+    // inner-scroll region's un-pin handler). Peeks without creating entries.
     trust.hasScrollWork = function () {
         if (IO.length) return true;
+        if (g.__elScroll) return true;
         const wm = LS.get(g);
         if (wm) { const l = wm.get("scroll"); if (l && l.length) return true; }
         const dm = LS.get(g.document);
@@ -17806,6 +18459,341 @@ mod tests {
     }
 
     #[test]
+    fn confined_boundaries_routes_a_cached_inline_boundary_to_a_width_stable_patch() {
+        // INCREMENTAL_LAYOUT_PLAN.md §14: a content mutation inside a block-filling
+        // IFC boundary the app has CACHED is proposed as a `WidthStable` patch (the
+        // Doc.rows splice); the SAME boundary uncached takes the full path.
+        use crate::dom::DirtyKind;
+        use std::collections::HashSet;
+        let dom = Dom::parse_document(
+            r#"<html><body><div data-trust-node="5" style="display:flow-root"><span id="t">x</span></div></body></html>"#,
+        );
+        let boundary = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&id| dom.attr(id, "data-trust-node") == Some("5"))
+            .unwrap();
+        let child = dom.get_by_id("t").unwrap();
+        let regions: HashSet<usize> = HashSet::new();
+        let targets = [(child, DirtyKind::Content)];
+        // Cached → a targeted WidthStable patch on the boundary.
+        let cached: HashSet<usize> = [boundary].into_iter().collect();
+        assert_eq!(
+            confined_boundaries(&dom, &regions, &cached, Some(&targets)),
+            Some(vec![(boundary, BoundaryTier::WidthStable)]),
+        );
+        // Uncached → no inline patch proposed (the full path is always correct).
+        let empty: HashSet<usize> = HashSet::new();
+        assert_eq!(
+            confined_boundaries(&dom, &regions, &empty, Some(&targets)),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_chat_append_emits_a_targeted_patch_not_a_full_render() {
+        // INCREMENTAL_LAYOUT_PLAN.md Tier 1 — the headline behaviour: a click that
+        // appends a message INTO a scroll region emits a TARGETED `Patched` for
+        // that region (so the app re-lays only it), NOT a whole-document
+        // `Updated`. The build-then-append (`createElement`+`textContent`+
+        // `appendChild`) is exactly the common pattern the `is_connected` skip
+        // keeps on the patch path.
+        let mut seed = String::new();
+        for i in 0..30 {
+            seed.push_str(&format!("<div>seed{i:02}</div>"));
+        }
+        // The clickable is a plain <div> (not a <button>) so the ONLY baked
+        // `data-trust-node` is the scroll region's — the test reads it to send
+        // `LiveRegions` (the app's job: it confirms which boxes are live regions).
+        let (handle, mut events) = live(&format!(
+            r##"<body><div id="add">add</div>
+            <div id="chat" style="height:96px;overflow-y:scroll">{seed}</div>
+            <script>
+            document.getElementById('add').addEventListener('click', function () {{
+                var d = document.createElement('div');
+                d.textContent = 'NEWMSG';
+                document.getElementById('chat').appendChild(d);
+            }});
+            </script></body>"##
+        ));
+        let mut rendered = String::new();
+        for _ in 0..4 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) | Some(PageEvt::Static { html, .. }) => {
+                    rendered = html;
+                    if rendered.contains("seed00") {
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected a render, got {other:?}"),
+            }
+        }
+        let button = rendered
+            .split("x-trust-js:")
+            .nth(1)
+            .and_then(|r| r.split(':').next())
+            .expect("a clickable marker for the button")
+            .parse::<usize>()
+            .unwrap();
+        // The app confirms #chat is a live clipped region (the layout decides
+        // this; the actor only patches confirmed regions).
+        let chat_node = rendered
+            .split("data-trust-node=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .expect("the region's baked node id")
+            .parse::<usize>()
+            .unwrap();
+        handle
+            .cmds
+            .blocking_send(PageCmd::LiveRegions(vec![chat_node]))
+            .unwrap();
+        handle.cmds.blocking_send(PageCmd::Click(button)).unwrap();
+        let mut saw_patch = false;
+        for _ in 0..6 {
+            match events.blocking_recv() {
+                Some(PageEvt::Patched { patches, .. }) => {
+                    assert_eq!(patches.len(), 1, "exactly one region patched");
+                    assert!(
+                        patches[0].html.contains("NEWMSG"),
+                        "patch carries the new message"
+                    );
+                    assert!(
+                        patches[0].html.contains("seed00"),
+                        "patch is the WHOLE region subtree (so the app re-lays it)"
+                    );
+                    assert_eq!(patches[0].tier, BoundaryTier::Size);
+                    saw_patch = true;
+                    break;
+                }
+                Some(PageEvt::Updated { .. }) => {
+                    panic!("a contained chat append must NOT trigger a full Updated")
+                }
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(
+            saw_patch,
+            "the chat append produced a targeted region patch"
+        );
+    }
+
+    #[test]
+    fn a_chat_append_with_a_reply_button_still_patches() {
+        // The real-chat shape: every message holds a reply `<button>` (Twitch).
+        // A `<button>` carries no editable state and activates by node id, so a
+        // region full of them must STILL patch — not fall back to a full
+        // ~1.4MB-document `Updated` per message (the old over-broad exclusion
+        // lumped `button` with stateful `<input>`/`<select>`/`<textarea>`).
+        let mut seed = String::new();
+        for i in 0..30 {
+            seed.push_str(&format!("<div>seed{i:02}</div>"));
+        }
+        let (handle, mut events) = live(&format!(
+            r##"<body><div id="add">add</div>
+            <div id="chat" style="height:96px;overflow-y:scroll">{seed}</div>
+            <script>
+            document.getElementById('add').addEventListener('click', function () {{
+                var d = document.createElement('div');
+                d.innerHTML = 'NEWMSG <button aria-label="Click to reply">reply</button>';
+                document.getElementById('chat').appendChild(d);
+            }});
+            </script></body>"##
+        ));
+        let mut rendered = String::new();
+        for _ in 0..4 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) | Some(PageEvt::Static { html, .. }) => {
+                    rendered = html;
+                    if rendered.contains("seed00") {
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected a render, got {other:?}"),
+            }
+        }
+        // The "add" trigger is the FIRST clickable (it precedes #chat in document
+        // order; the seed divs are plain), so its marker parses cleanly.
+        let button = rendered
+            .split("x-trust-js:")
+            .nth(1)
+            .and_then(|r| r.split(':').next())
+            .expect("a clickable marker for the add trigger")
+            .parse::<usize>()
+            .unwrap();
+        let chat_node = rendered
+            .split("data-trust-node=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .expect("the region's baked node id")
+            .parse::<usize>()
+            .unwrap();
+        handle
+            .cmds
+            .blocking_send(PageCmd::LiveRegions(vec![chat_node]))
+            .unwrap();
+        handle.cmds.blocking_send(PageCmd::Click(button)).unwrap();
+        let mut saw_patch = false;
+        for _ in 0..6 {
+            match events.blocking_recv() {
+                Some(PageEvt::Patched { patches, .. }) => {
+                    assert_eq!(patches.len(), 1, "exactly one region patched");
+                    assert!(
+                        patches[0].html.contains("NEWMSG"),
+                        "patch carries the new message + its reply button"
+                    );
+                    saw_patch = true;
+                    break;
+                }
+                Some(PageEvt::Updated { .. }) => {
+                    panic!("a chat append whose message holds a <button> must STILL patch")
+                }
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(saw_patch, "a region containing a <button> still patches");
+    }
+
+    #[test]
+    fn an_invisible_in_region_mutation_dedups_and_the_full_path_carries_prior_patches() {
+        // INCREMENTAL_LAYOUT_PLAN.md §12c W1 (scoped change-detection). Three
+        // properties in one flow:
+        //  (a) a VISIBLE append inside a live region emits a targeted `Patched`
+        //      (the patch path — no whole-document serialize);
+        //  (b) an INVISIBLE mutation inside that SAME region (an `aria-label`
+        //      rotation, which `render_canonical` drops) dedups per-boundary and
+        //      emits NOTHING (a `Settled`, not a `Patched`/`Updated`);
+        //  (c) a later NON-confined mutation (header text, outside any region)
+        //      takes the FULL path and its `Updated` STILL carries the earlier
+        //      region append — the actor DOM is the truth, so `last_render`
+        //      staleness on the patch path costs only a redundant full render,
+        //      never a wrong one (§12c step 5).
+        let mut seed = String::new();
+        for i in 0..30 {
+            seed.push_str(&format!("<div>seed{i:02}</div>"));
+        }
+        let (handle, mut events) = live(&format!(
+            r##"<body><div id="hdr">HDR0</div>
+            <div id="add">add</div><div id="aria">aria</div><div id="hchg">hchg</div>
+            <div id="chat" style="height:96px;overflow-y:scroll">{seed}</div>
+            <script>
+            document.getElementById('add').addEventListener('click', function () {{
+                var d = document.createElement('div');
+                d.textContent = 'NEWMSG';
+                document.getElementById('chat').appendChild(d);
+            }});
+            document.getElementById('aria').addEventListener('click', function () {{
+                // Invisible: an aria rotation on a child INSIDE the region.
+                document.getElementById('chat').firstElementChild
+                    .setAttribute('aria-label', 'tick');
+            }});
+            document.getElementById('hchg').addEventListener('click', function () {{
+                document.getElementById('hdr').textContent = 'HDR1';
+            }});
+            </script></body>"##
+        ));
+        let mut rendered = String::new();
+        for _ in 0..4 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) | Some(PageEvt::Static { html, .. }) => {
+                    rendered = html;
+                    if rendered.contains("seed00") {
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected a render, got {other:?}"),
+            }
+        }
+        // The clickables serialize in document order: add, aria, hchg (the seed
+        // divs are plain). Collect their node ids in that order.
+        let ids: Vec<usize> = rendered
+            .split("x-trust-js:")
+            .skip(1)
+            .map(|r| r.split(':').next().unwrap().parse::<usize>().unwrap())
+            .collect();
+        assert!(ids.len() >= 3, "add/aria/hchg markers: {ids:?}");
+        let (add, aria, hchg) = (ids[0], ids[1], ids[2]);
+        let chat_node = rendered
+            .split("data-trust-node=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .expect("the region's baked node id")
+            .parse::<usize>()
+            .unwrap();
+        handle
+            .cmds
+            .blocking_send(PageCmd::LiveRegions(vec![chat_node]))
+            .unwrap();
+
+        // (a) Append → a targeted Patched carrying the new message.
+        handle.cmds.blocking_send(PageCmd::Click(add)).unwrap();
+        let mut saw_patch = false;
+        for _ in 0..6 {
+            match events.blocking_recv() {
+                Some(PageEvt::Patched { patches, .. }) => {
+                    assert!(patches[0].html.contains("NEWMSG"), "patch carries append");
+                    saw_patch = true;
+                    break;
+                }
+                Some(PageEvt::Updated { .. }) => panic!("append must patch, not full-render"),
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(saw_patch, "the append patched the region");
+
+        // (b) Invisible aria rotation inside the region → per-boundary dedup →
+        // NOTHING painted (a Settled, never a Patched/Updated).
+        handle.cmds.blocking_send(PageCmd::Click(aria)).unwrap();
+        // The invisible mutation emits exactly one event (a silent Settled) —
+        // anything else is a failure, so a single recv suffices.
+        match events.blocking_recv() {
+            Some(PageEvt::Settled) => {}
+            Some(PageEvt::Patched { .. }) => {
+                panic!("an invisible in-region mutation must NOT emit a patch")
+            }
+            Some(PageEvt::Updated { .. }) => {
+                panic!("an invisible in-region mutation must NOT full-render")
+            }
+            Some(PageEvt::Trouble(e)) => panic!("unexpected trouble: {e:?}"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        // (c) A non-confined mutation (header, outside any region) → FULL path,
+        // whose Updated carries BOTH the header change AND the earlier append
+        // (the patch path left `last_render` stale; the full serialize is truth).
+        handle.cmds.blocking_send(PageCmd::Click(hchg)).unwrap();
+        let mut saw_full = false;
+        for _ in 0..6 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => {
+                    assert!(html.contains("HDR1"), "full render shows the header change");
+                    assert!(
+                        html.contains("NEWMSG"),
+                        "full render still carries the patched append (coherence)"
+                    );
+                    saw_full = true;
+                    break;
+                }
+                Some(PageEvt::Patched { .. }) => {
+                    panic!("an out-of-region change takes the full path")
+                }
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(
+            saw_full,
+            "the out-of-region mutation full-rendered coherently"
+        );
+    }
+
+    #[test]
     fn a_raf_chain_runs_to_completion_at_rest() {
         // A rAF chain runs AT REST under the real-time model — one frame per
         // real wake, with NO virtual-time ceiling to freeze it (the old
@@ -18226,6 +19214,103 @@ mod tests {
         assert!(
             got.contains("GOT pong=42 who=echo items=41+x"),
             "worker round-trip failed: {got}"
+        );
+    }
+
+    /// Phase 3 inner scroll, end-to-end: the app pushes a region's box geometry
+    /// (`RegionGeom`), the page reads the TRUE `clientHeight`/`scrollHeight` and
+    /// pins (`scrollTop = scrollHeight`), and the next render bakes
+    /// `data-trust-scroll-top` (rows) — the signal `flow_region` re-seeds the
+    /// region's voffset from. Proves the geometry round-trip + the `scrollTop`
+    /// setter (clamp to `scrollHeight − clientHeight`) + the baked signal
+    /// together, which is exactly the chat pin-to-bottom path.
+    #[test]
+    fn a_region_pins_using_pushed_geometry_and_bakes_the_signal() {
+        fn id_after(html: &str, marker: &str) -> usize {
+            let start = html
+                .find(marker)
+                .unwrap_or_else(|| panic!("marker {marker} not in {html}"))
+                + marker.len();
+            html[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap()
+        }
+        fn next_updated(events: &mut tokio::sync::mpsc::Receiver<PageEvt>) -> String {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match events.try_recv() {
+                    Ok(PageEvt::Updated { html, .. }) | Ok(PageEvt::Static { html, .. }) => {
+                        return html;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+            panic!("no render received");
+        }
+
+        // The scroll container gets a `data-trust-node`; the anchor (the trigger)
+        // gets a JsClick `x-trust-js:<id>:` marker, NOT a node id — so each marker
+        // is unambiguous. The onclick reads the geometry, then pins. 40 rows of
+        // content overflow the 64px (4-row) clip the app pushes.
+        let mut lines = String::new();
+        for i in 0..40 {
+            lines.push_str(&format!("<p>line {i}</p>"));
+        }
+        let html = format!(
+            "<body>\
+             <div id=s style='overflow-y:auto;height:64px'>{lines}</div>\
+             <pre id=o>idle</pre>\
+             <a href='#' onclick=\"var s=document.getElementById('s');\
+               document.getElementById('o').textContent='ch='+s.clientHeight+' sh='+s.scrollHeight;\
+               s.scrollTop=s.scrollHeight; return false;\">pin</a>\
+             <script>window.__ready = 1;</script>\
+             </body>"
+        );
+        let env = PageEnv::bare("https://example.com/");
+        let (handle, mut events) = spawn_page(html, env);
+
+        let first = next_updated(&mut events);
+        let region_node = id_after(&first, "data-trust-node=\"");
+        let click_id = id_after(&first, "x-trust-js:");
+        assert!(
+            !first.contains("data-trust-scroll-top"),
+            "a fresh region has no scroll signal yet: {first}"
+        );
+
+        // The app measured the region's CLIP box (a 64px viewport). Push it, then
+        // click the pin — the page reads clientHeight=64 (pushed) and scrollHeight
+        // from the actor's fresh measure (the 40-row content, ≫ 64).
+        handle
+            .cmds
+            .blocking_send(PageCmd::RegionGeom {
+                items: vec![(region_node, 64.0, 100.0)],
+            })
+            .unwrap();
+        handle.cmds.blocking_send(PageCmd::Click(click_id)).unwrap();
+
+        let got = next_updated(&mut events);
+        drop(handle);
+        assert!(
+            got.contains("ch=64"),
+            "the page read the pushed clientHeight: {got}"
+        );
+        let sh = id_after(&got, "sh=");
+        assert!(
+            sh > 64,
+            "scrollHeight read the fresh content extent (> the 64px clip): sh={sh} in {got}"
+        );
+        // scrollTop pins to scrollHeight − clientHeight > 0 ⇒ a non-zero signal.
+        let signal = id_after(&got, "data-trust-scroll-top=\"");
+        assert!(
+            signal > 0,
+            "the pin baked a non-zero scrollTop signal (rows): {got}"
         );
     }
 

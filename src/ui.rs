@@ -340,22 +340,27 @@ pub(crate) fn browser_rows<'a>(
 ) -> Vec<Line<'a>> {
     use crate::layout::{ItemKind, NO_NODE};
     // The selected link's source node: every item sharing it (a link that
-    // wrapped across rows) highlights as one unit.
-    let sel_node = g
-        .sel_item
-        .and_then(|(r, i)| g.doc.rows.get(r).and_then(|row| row.items.get(i)))
-        .map(|it| it.node);
+    // wrapped across rows) highlights as one unit. Read through `effective_row`
+    // so a selection on scroll-region content resolves to its buffer item.
+    let sel_node = g.sel_item.and_then(|(r, i)| {
+        crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+            .items
+            .get(i)
+            .map(|it| it.node)
+    });
     let carousels = &g.doc.carousels;
     let end = (g.scroll + height).min(g.doc.rows.len());
-    g.doc.rows[g.scroll..end]
-        .iter()
-        .enumerate()
-        .map(|(off, row)| {
-            let row_idx = g.scroll + off;
+    (g.scroll..end)
+        .map(|row_idx| {
+            // Merge any scroll-region buffer window over this row's reserved
+            // band (a vertical inner-scroll viewport draws `buffer[voffset+…]`
+            // here, clipped to its band) before placement, so region content
+            // styles/highlights through the same path as page content.
+            let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, row_idx);
             // Each item's on-screen start column (carousel clip + gap-fill +
             // overlap-append), shared with the hit-test so the drawn position
             // and the clickable position always agree.
-            let placed = crate::layout::visual_columns(row, carousels, row_idx);
+            let placed = crate::layout::visual_columns(&row, carousels, row_idx);
             let mut spans: Vec<Span> = Vec::with_capacity(placed.len() * 2);
             let mut col = 0u16;
             for (i, scol) in placed {
@@ -418,7 +423,10 @@ pub(crate) fn browser_rows<'a>(
                 }
                 let ranges = find_ranges(find, row_idx, Some(i));
                 if ranges.is_empty() {
-                    spans.push(Span::styled(item.text.as_str(), style));
+                    // Owned (not `as_str`): a scroll-region row's items live in a
+                    // freshly merged row (`effective_row`'s `Cow::Owned`), so the
+                    // span can't borrow from it. `match_spans` already owns.
+                    spans.push(Span::styled(item.text.clone(), style));
                 } else {
                     spans.extend(match_spans(&item.text, style, &ranges));
                 }
@@ -485,6 +493,79 @@ fn render_inline_images(
             frame.render_widget(SlicedImage::new(proto, position), inner);
         }
     }
+    render_region_images(frame, g, inner, protocols);
+}
+
+/// Draw the images held in each vertical scroll region's buffer (the reserved
+/// doc rows are blank, so the pass above never sees them). Each region's
+/// windowed buffer images are rendered into the region's on-screen BAND `Rect`
+/// — not the full content area — so the sliced widget clips them to the band:
+/// its top edge when an image is scrolled partly off the region's top, its
+/// bottom edge, and the scrollport width. That clipping is what keeps a region
+/// image (a chat avatar, a thumbnail in a scroll panel) from bleeding into the
+/// page content above/below or past the region's right edge.
+fn render_region_images(
+    frame: &mut Frame,
+    g: &BrowserView,
+    inner: ratatui::layout::Rect,
+    protocols: &std::collections::HashMap<
+        crate::app::EncKey,
+        ratatui_image::sliced::SlicedProtocol,
+    >,
+) {
+    use ratatui::layout::Rect;
+    use ratatui_image::sliced::{SignedPosition, SlicedImage};
+    let inner_top = i32::from(inner.y);
+    let inner_bot = i32::from(inner.y) + i32::from(inner.height);
+    let inner_right = i32::from(inner.x) + i32::from(inner.width);
+    for rg in &g.doc.regions {
+        // The band's on-screen rows (the reserved doc rows move with the page
+        // scroll), clamped to the content area.
+        let band_top = inner_top + rg.start_row as i32 - g.scroll as i32;
+        let band_bot = band_top + i32::from(rg.height);
+        let vis_top = band_top.max(inner_top);
+        let vis_bot = band_bot.min(inner_bot);
+        if vis_bot <= vis_top {
+            continue; // band scrolled entirely off-screen
+        }
+        let band_x = i32::from(inner.x) + i32::from(rg.left);
+        if band_x >= inner_right {
+            continue; // band off the right edge
+        }
+        let band_w = i32::from(rg.width).min(inner_right - band_x) as u16;
+        let band = Rect {
+            x: band_x as u16,
+            y: vis_top as u16,
+            width: band_w,
+            height: (vis_bot - vis_top) as u16,
+        };
+        // Window the buffer: the visible rows plus the lookback (a tall image
+        // whose top scrolled above the band still reaches down into it — a
+        // negative `y` clips its top, exactly like the document pass).
+        let top = rg.voffset.saturating_sub(crate::layout::MAX_IMAGE_LOOKBACK);
+        let bot = rg.voffset + rg.height as usize;
+        for br in top..bot {
+            let Some(brow) = rg.buffer.get(br) else {
+                continue;
+            };
+            for item in &brow.items {
+                let Some(url) = &item.image else { continue };
+                if u32::from(item.col) >= u32::from(band_w) {
+                    continue; // past the scrollport's right edge
+                }
+                let key = crate::app::EncKey::for_item(url, item);
+                let Some(proto) = protocols.get(&key) else {
+                    continue;
+                };
+                // Position relative to the visible band's top-left; the
+                // `band_top - vis_top` term is the negative offset when the
+                // band's top is clipped, so rows shift up correctly.
+                let pos_y = (band_top - vis_top) + (br as i32 - rg.voffset as i32);
+                let position = SignedPosition::from((item.col as i16, pos_y as i16));
+                frame.render_widget(SlicedImage::new(proto, position), band);
+            }
+        }
+    }
 }
 
 /// Draw a scroll-position indicator on the panel's right border when the
@@ -535,9 +616,9 @@ fn protocol_badge(g: &BrowserView) -> &'static str {
             crate::oneshot::Scheme::Dict => " DICT ",
         },
         Link::JsClick { .. } => " WWW ",
-        // Form controls and carousel buttons never appear as a document's
-        // own URL.
-        Link::Form { .. } | Link::CarouselScroll(_) => " WWW ",
+        // Form controls, carousel buttons, and media representations never
+        // appear as a document's own URL.
+        Link::Form { .. } | Link::CarouselScroll(_) | Link::Media(_) => " WWW ",
         Link::External(_) => " NET ",
     }
 }

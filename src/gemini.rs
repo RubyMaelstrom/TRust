@@ -297,6 +297,9 @@ pub fn parse(url: &GeminiUrl, meta: &str, body: &[u8], width: usize) -> Doc {
         rows: Vec::new(),
         image_urls: Vec::new(),
         carousels: Vec::new(),
+        regions: Vec::new(),
+        scroll_clips: Vec::new(),
+        boundaries: Vec::new(),
     }
 }
 

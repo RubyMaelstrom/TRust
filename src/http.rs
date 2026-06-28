@@ -1252,6 +1252,20 @@ pub async fn execute_js(
     if std::env::var_os("TRUST_NET_TRACE").is_some() {
         eprintln!("js : @{:>6}ms prefetch done; spawning page", trace_ms());
     }
+    // Inner-scroll GATE diagnostic: run the ONE-SHOT `transform` (which prints
+    // the scroll-box report off the live, full-cascade arena — see
+    // `layout::scroll_box_report`) instead of the resident actor. Only when
+    // `TRUST_DIAG_SCROLL_BOXES` is set, so production is unaffected.
+    if std::env::var_os("TRUST_DIAG_SCROLL_BOXES").is_some() {
+        let (out, outcome) = tokio::task::spawn_blocking(move || crate::js::transform(&html, &env))
+            .await
+            .unwrap();
+        response.body = out.into_bytes();
+        response.content_type = String::from("text/html; charset=utf-8");
+        response.js = Some(outcome);
+        response.live = None;
+        return response;
+    }
     let (handle, mut events) = crate::js::spawn_page(html, env);
     let first = tokio::time::timeout(Duration::from_secs(60), events.recv()).await;
     if std::env::var_os("TRUST_NET_TRACE").is_some() {
@@ -1701,18 +1715,22 @@ pub fn parse(
     content_type: &str,
     body: &[u8],
     width: usize,
+    viewport_h: usize,
     images: &crate::layout::ImageSizes,
 ) -> Doc {
-    parse_seeded(url, content_type, body, width, None, images)
+    parse_seeded(url, content_type, body, width, viewport_h, None, images)
 }
 
 /// Like `parse`, seeding form field values from a previous parse of the
 /// same page (resize re-wraps and edits must not lose what was typed).
+/// `viewport_h` is the terminal inner height in cells — the basis for `vh`/
+/// `vmin`/`vmax` and definite region heights (0 ⇒ unknown, `vh` unresolved).
 pub fn parse_seeded(
     url: &Url,
     content_type: &str,
     body: &[u8],
     width: usize,
+    viewport_h: usize,
     seed: Option<&[Form]>,
     images: &crate::layout::ImageSizes,
 ) -> Doc {
@@ -1726,6 +1744,9 @@ pub fn parse_seeded(
     let mut forms = Vec::new();
     let mut rows = Vec::new();
     let mut carousels = Vec::new();
+    let mut regions = Vec::new();
+    let mut scroll_clips = Vec::new();
+    let mut boundaries = Vec::new();
     let mut image_urls = Vec::new();
     let lines = if media.is_empty() || media == "text/html" || media == "application/xhtml+xml" {
         let html = decode_body(content_type, body);
@@ -1741,17 +1762,21 @@ pub fn parse_seeded(
         let (found, controls) = extract_forms_arena(&dom, url, seed);
         forms = found;
         image_urls = collect_image_urls(&dom, url);
-        let (laid, found_carousels) = crate::layout::lay_out_with_carousels(
-            &dom,
-            url,
-            width,
-            &forms,
-            &controls,
-            images,
-            crate::layout::borders_enabled(),
-        );
+        let (laid, found_carousels, found_regions, found_clips, found_boundaries) =
+            crate::layout::lay_out_with_carousels(
+                &dom,
+                url,
+                (width, viewport_h),
+                &forms,
+                &controls,
+                images,
+                crate::layout::borders_enabled(),
+            );
         rows = laid;
         carousels = found_carousels;
+        regions = found_regions;
+        scroll_clips = found_clips;
+        boundaries = found_boundaries;
         Vec::new()
     } else if media.starts_with("text/") {
         crate::doc::wrap_plain(&decode_body(content_type, body), width)
@@ -1773,7 +1798,135 @@ pub fn parse_seeded(
         rows,
         image_urls,
         carousels,
+        regions,
+        scroll_clips,
+        boundaries,
     }
+}
+
+/// The result of laying out one incremental-layout region patch
+/// (INCREMENTAL_LAYOUT_PLAN.md): the boundary's freshly laid buffer + the
+/// metadata the app needs to swap it into the live `Region`.
+pub struct RegionPatch {
+    /// The region's new scrollable content buffer (replaces `Region.buffer`).
+    pub rows: Vec<crate::layout::Row>,
+    /// Carousels found inside the new buffer (buffer-relative).
+    pub carousels: Vec<crate::layout::Carousel>,
+    /// Absolute http(s) image URLs in the new buffer, to feed the decode pipe.
+    pub image_urls: Vec<String>,
+    /// The page's `scrollTop` SIGNAL baked on the boundary (rows), if it pinned
+    /// the scroll this update (a chat re-pinning to bottom); else the app keeps
+    /// the reader's offset. Mirrors `flow_region`'s `data-trust-scroll-top` read.
+    pub scroll_top: Option<usize>,
+}
+
+/// Parse and lay out a single relayout-boundary fragment (a scroll region) for
+/// an incremental patch — WITHOUT re-parsing or re-laying the whole document.
+/// `fragment_html` is `Dom::serialize_patch`'s output (the boundary inside a
+/// context wrapper carrying its inherited style). Returns `None` when the
+/// boundary can't be found in the fragment (treat as a resync). Mirrors the
+/// HTML arm of `parse_seeded`, scoped to the one subtree.
+pub fn lay_region_patch(
+    url: &Url,
+    fragment_html: &[u8],
+    content_width: usize,
+    viewport: (usize, usize),
+    images: &crate::layout::ImageSizes,
+    boundary_node: usize,
+) -> Option<RegionPatch> {
+    let html = decode_body("text/html; charset=utf-8", fragment_html);
+    let mut dom = crate::dom::Dom::parse_document(&html);
+    dom.rewrite_inline_svgs();
+    let key = boundary_node.to_string();
+    let boundary = dom
+        .descendants(crate::dom::DOCUMENT)
+        .into_iter()
+        .find(|&id| dom.attr(id, "data-trust-node") == Some(key.as_str()))?;
+    let (_forms, controls) = extract_forms_arena(&dom, url, None);
+    let image_urls = collect_image_urls(&dom, url);
+    let scroll_top = dom
+        .attr(boundary, "data-trust-scroll-top")
+        .and_then(|s| s.parse::<usize>().ok());
+    let (rows, carousels) = crate::layout::lay_out_region_fragment(
+        &dom,
+        url,
+        content_width,
+        viewport,
+        &controls,
+        images,
+        boundary,
+    );
+    Some(RegionPatch {
+        rows,
+        carousels,
+        image_urls,
+        scroll_top,
+    })
+}
+
+/// The result of laying one INLINE incremental-layout boundary patch
+/// (INCREMENTAL_LAYOUT_PLAN.md §14): the boundary's freshly laid rows (fragment-
+/// relative cols) + the metadata the app needs to splice them into `Doc.rows`.
+/// (Distinct from `js::SubtreePatch`, the actor→app protocol message — this is
+/// the laid-out geometry the app derives from it.)
+pub struct SubtreeLaid {
+    /// The boundary's new content rows (cols from 0 — the app shifts by the
+    /// cached `origin_col`).
+    pub rows: Vec<crate::layout::Row>,
+    /// New content height (rows). `delta = height − old row span` drives the
+    /// Tier-2 shift of following content.
+    pub height: usize,
+    /// Painted content extent (cells). A sanity bound (≤ `content_width`).
+    pub width: u16,
+    /// Absolute http(s) image URLs the patch introduced, to feed the decode pipe.
+    pub image_urls: Vec<String>,
+    /// Non-empty iff the box grew a scroll region / carousel since capture — the
+    /// app then resyncs (the box is no longer a pure-`Doc.rows` inline boundary).
+    pub has_subframes: bool,
+}
+
+/// Parse and lay out a single INLINE relayout-boundary fragment for the general
+/// incremental splice — WITHOUT re-parsing or re-laying the whole document.
+/// `fragment_html` is `Dom::serialize_patch`'s output (the boundary inside a
+/// context wrapper carrying its inherited style). `content_width` is the cached
+/// outer band the box fills. Returns `None` when the boundary can't be found
+/// (treat as a resync). Sibling of `lay_region_patch`, scoped to one inline box.
+pub fn lay_subtree_patch(
+    url: &Url,
+    fragment_html: &[u8],
+    content_width: usize,
+    viewport: (usize, usize),
+    images: &crate::layout::ImageSizes,
+    boundary_node: usize,
+) -> Option<SubtreeLaid> {
+    let html = decode_body("text/html; charset=utf-8", fragment_html);
+    let mut dom = crate::dom::Dom::parse_document(&html);
+    dom.rewrite_inline_svgs();
+    let key = boundary_node.to_string();
+    let boundary = dom
+        .descendants(crate::dom::DOCUMENT)
+        .into_iter()
+        .find(|&id| dom.attr(id, "data-trust-node") == Some(key.as_str()))?;
+    let (_forms, controls) = extract_forms_arena(&dom, url, None);
+    let image_urls = collect_image_urls(&dom, url);
+    let frag = crate::layout::lay_out_subtree_fragment(
+        &dom,
+        url,
+        content_width,
+        viewport,
+        &controls,
+        images,
+        boundary,
+    );
+    Some(SubtreeLaid {
+        height: frag.height,
+        width: frag.width,
+        rows: frag.rows,
+        has_subframes: !frag.regions.is_empty()
+            || !frag.carousels.is_empty()
+            || !frag.scroll_clips.is_empty(),
+        image_urls,
+    })
 }
 
 /// The absolute http(s) URLs of every `<img src>` in document order,
@@ -1803,6 +1956,20 @@ fn collect_image_urls(dom: &crate::dom::Dom, base: &Url) -> Vec<String> {
         if !urls.contains(&u) {
             urls.push(u);
         }
+    }
+    // A `<video>` whose source is MSE/blob (no `src`/`<source>`/`poster` — every
+    // modern streaming player) renders as a "play in mpv" representation; give
+    // it a preview frame from the page's standard Open Graph image so the
+    // representation has a thumbnail. Decode it only when such a video exists.
+    let has_video = dom
+        .descendants(crate::dom::DOCUMENT)
+        .into_iter()
+        .any(|id| dom.tag_name(id) == Some("video"));
+    if has_video
+        && let Some(preview) = crate::layout::page_preview_image(dom, base)
+        && !urls.contains(&preview)
+    {
+        urls.push(preview);
     }
     urls
 }
@@ -4354,10 +4521,10 @@ mod tests {
             }
         }
         eprintln!("decoded {} images", images.len());
-        let (rows, _car) = crate::layout::lay_out_with_carousels(
+        let (rows, _car, _rgn, _clip, _bnd) = crate::layout::lay_out_with_carousels(
             &dom,
             &url,
-            vp.0 as usize,
+            (vp.0 as usize, vp.1 as usize),
             &[],
             &crate::layout::ControlMap::new(),
             &images,
@@ -4538,7 +4705,7 @@ mod tests {
         let grep = std::env::var("TRUST_LAYOUT_GREP").ok();
         let url = parse_url("https://store.steampowered.com/").unwrap();
         let images = crate::layout::ImageSizes::new();
-        let doc = parse_seeded(&url, "text/html", &html, w, None, &images);
+        let doc = parse_seeded(&url, "text/html", &html, w, 0, None, &images);
         for (ri, row) in doc.rows.iter().enumerate() {
             let mut s = String::new();
             for it in &row.items {
@@ -5268,6 +5435,7 @@ customElements.define('lit-counter', LitCounter);
             &response.content_type,
             &response.body,
             60,
+            0,
             &Default::default(),
         );
         assert_eq!(
@@ -5767,7 +5935,14 @@ customElements.define('lit-counter', LitCounter);
             <pre>preformatted   text</pre>
             <p><img src="/cat.png" alt="a cat"></p>
             </body></html>"#;
-        let doc = parse(&base, "text/html", html.as_bytes(), 60, &Default::default());
+        let doc = parse(
+            &base,
+            "text/html",
+            html.as_bytes(),
+            60,
+            0,
+            &Default::default(),
+        );
 
         assert_eq!(item(&doc, "Big Title").kind, ItemKind::Heading(1));
         assert!(item(&doc, "Plain paragraph").link.is_none());
@@ -5811,6 +5986,7 @@ customElements.define('lit-counter', LitCounter);
             "text/html",
             CHAT_PAGE.as_bytes(),
             60,
+            0,
             &Default::default(),
         );
 
@@ -5849,6 +6025,7 @@ customElements.define('lit-counter', LitCounter);
             "text/html",
             b"<body><div contenteditable=\"true\" data-placeholder=\"Type here\">\n</div></body>",
             60,
+            0,
             &Default::default(),
         );
         assert_eq!(doc.forms.len(), 1);
@@ -5869,6 +6046,7 @@ customElements.define('lit-counter', LitCounter);
             "text/html",
             b"<body><div contenteditable=\"false\">x</div></body>",
             60,
+            0,
             &Default::default(),
         );
         assert!(
@@ -5885,6 +6063,7 @@ customElements.define('lit-counter', LitCounter);
             "text/html",
             CHAT_PAGE.as_bytes(),
             60,
+            0,
             &Default::default(),
         );
         doc.forms[0].fields[1].value = String::from("hello there");
@@ -5895,6 +6074,7 @@ customElements.define('lit-counter', LitCounter);
             "text/html",
             CHAT_PAGE.as_bytes(),
             40,
+            0,
             Some(&doc.forms),
             &Default::default(),
         );
@@ -5918,7 +6098,14 @@ customElements.define('lit-counter', LitCounter);
               <input type="checkbox" name="safe" checked>
               <input type="submit" value="Search">
             </form>"#;
-        let doc = parse(&base, "text/html", html.as_bytes(), 60, &Default::default());
+        let doc = parse(
+            &base,
+            "text/html",
+            html.as_bytes(),
+            60,
+            0,
+            &Default::default(),
+        );
         let form = &doc.forms[0];
         assert_eq!(form.method, FormMethod::Get);
         assert_eq!(form.action.as_str(), "http://search.example/lite/search");
@@ -5941,7 +6128,14 @@ customElements.define('lit-counter', LitCounter);
     fn forms_without_submit_get_a_synthetic_one() {
         let base = Url::parse("http://example.com/").unwrap();
         let html = r#"<form action="/go"><input type="text" name="q"></form>"#;
-        let doc = parse(&base, "text/html", html.as_bytes(), 60, &Default::default());
+        let doc = parse(
+            &base,
+            "text/html",
+            html.as_bytes(),
+            60,
+            0,
+            &Default::default(),
+        );
         assert_eq!(doc.forms[0].fields.last().unwrap().kind, FieldKind::Submit);
         assert!(has_item(&doc, "[ Submit ]"));
     }
