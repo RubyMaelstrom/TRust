@@ -1184,6 +1184,106 @@ impl Dom {
         self.cascaded(id, prop)
     }
 
+    /// True when an ATTRIBUTE mutation on `node` cannot change a single painted
+    /// cell, so it need not be serialized or re-rendered. The case: `node` lies
+    /// within an out-of-flow (`position:absolute`/`fixed`) subtree that PAINTS
+    /// NOTHING — no text, no replaced element, no generated content, no drawn
+    /// border. Out-of-flow ⇒ the change can't reflow in-flow painted content;
+    /// paints-nothing ⇒ the box contributes no cells of its own (we render no
+    /// color/background — the cyberpunk-monochrome deviation). The exact shape of
+    /// Twitch's decorative `highlight__progress-bar` (an absolute, `z-index:-1`,
+    /// textless bar whose width animates every frame, repainting nothing). Only
+    /// an ATTR mutation qualifies — a childList/text change could add or remove
+    /// painted text — so the caller gates on `DirtyKind::Attr`. CONSERVATIVE:
+    /// an in-flow box (no positioned ancestor) or ANY painting descendant ⇒ NOT
+    /// inert (we process the mutation). A wrong "inert" would leave a stale frame
+    /// until the next real change; the checks below admit no false "inert".
+    pub fn inert_positioned_attr(&self, node: NodeId) -> bool {
+        let Some(oof) = self.nearest_out_of_flow(node) else {
+            return false;
+        };
+        !self.subtree_paints(oof)
+    }
+
+    /// Nearest self-or-ancestor out of normal flow (`position:absolute`/`fixed`);
+    /// `None` if the node is in flow to the root.
+    fn nearest_out_of_flow(&self, node: NodeId) -> Option<NodeId> {
+        let mut cur = Some(node);
+        while let Some(id) = cur {
+            if matches!(
+                self.computed_style(id, "position").as_deref(),
+                Some("absolute" | "fixed")
+            ) {
+                return Some(id);
+            }
+            cur = self.nodes[id].parent;
+        }
+        None
+    }
+
+    /// Whether the subtree rooted at `root` (inclusive) paints any cell in our
+    /// renderer: any non-whitespace text, any replaced/control/marker element,
+    /// any `::before`/`::after` generated content, or (borders on) a drawn
+    /// border. We render no color/background, so a plain container with none of
+    /// those paints nothing. Early-exits on the first painting node. Generic
+    /// containers (`div`/`span`/headings/…) paint only via their text children,
+    /// which are checked; only the POSITIVE painting tags below count as
+    /// self-painting, so an unlisted generic tag is correctly non-painting and an
+    /// unlisted MEDIA tag would conservatively need adding (none known missing).
+    fn subtree_paints(&self, root: NodeId) -> bool {
+        // Replaced / form-control / marker-bearing tags that produce cells with
+        // NO text of their own. Generic containers are deliberately absent.
+        const PAINTS: &[&str] = &[
+            "img", "svg", "canvas", "video", "iframe", "object", "embed", "picture", "input",
+            "textarea", "select", "button", "progress", "meter", "hr", "li", "summary", "details",
+            "audio", "math", "source", "track", "marquee",
+        ];
+        let borders = crate::layout::borders_enabled();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            match &self.nodes[id].data {
+                NodeData::Text(t) if !t.chars().all(char::is_whitespace) => return true,
+                NodeData::Element { .. } => {
+                    if self.tag_name(id).is_some_and(|t| PAINTS.contains(&t)) {
+                        return true;
+                    }
+                    if self.pseudo_content(id, PseudoEl::Before).is_some()
+                        || self.pseudo_content(id, PseudoEl::After).is_some()
+                    {
+                        return true;
+                    }
+                    if borders && self.has_drawn_border(id) {
+                        return true;
+                    }
+                    let mut c = self.nodes[id].first_child;
+                    while let Some(k) = c {
+                        stack.push(k);
+                        c = self.nodes[k].next_sibling;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Any side has a non-zero border width (only consulted when borders render).
+    fn has_drawn_border(&self, id: NodeId) -> bool {
+        [
+            "border-top-width",
+            "border-right-width",
+            "border-bottom-width",
+            "border-left-width",
+        ]
+        .iter()
+        .any(|p| {
+            self.computed_style(id, p)
+                .as_deref()
+                .and_then(crate::layout::css_length_em)
+                .is_some_and(|em| em > 0.0)
+        })
+    }
+
     /// Whether `id` CLIPS `label` out of view: a definite `width` under
     /// horizontal `overflow:hidden/clip` narrower than the label's display
     /// width. The accessible-name fallback in `serialize_live_node` uses this to
@@ -5342,6 +5442,37 @@ impl TreeSink for Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_out_of_flow_textless_attr_mutation_paints_nothing() {
+        // The decorative-progress-bar case (Twitch's `highlight__progress-bar`):
+        // an ATTR mutation inside an absolutely-positioned, textless subtree
+        // cannot change a painted cell, so `inert_positioned_attr` is true. Any
+        // painting descendant (text, <img>), or an in-flow box (no positioned
+        // ancestor, so a size change reflows siblings), is NOT inert.
+        let dom = Dom::parse_document(
+            r#"<body>
+                <div id="bar" style="position:absolute"><div id="fill" style="width:50%"></div></div>
+                <p id="text">hello</p>
+                <div id="abstext" style="position:absolute"><span id="lbl">x</span></div>
+                <div id="inflow"><span id="empty"></span></div>
+                <div id="absimg" style="position:fixed"><img id="im" src="a.png"></div>
+            </body>"#,
+        );
+        let f = |id| dom.get_by_id(id).unwrap();
+        // Absolute + entirely textless/imageless → inert (the bar itself and the
+        // animated fill inside it).
+        assert!(dom.inert_positioned_attr(f("bar")), "abs textless box is inert");
+        assert!(dom.inert_positioned_attr(f("fill")), "the animated fill is inert");
+        // In-flow text box: no positioned ancestor → never inert.
+        assert!(!dom.inert_positioned_attr(f("text")), "in-flow box is not inert");
+        // Absolute but contains text → it paints the text → not inert.
+        assert!(!dom.inert_positioned_attr(f("lbl")), "abs box WITH text paints");
+        // In-flow textless box → a size change reflows siblings → not inert.
+        assert!(!dom.inert_positioned_attr(f("empty")), "in-flow textless is not inert");
+        // Fixed but contains an <img> → the image paints → not inert.
+        assert!(!dom.inert_positioned_attr(f("im")), "abs box with img paints");
+    }
 
     #[test]
     fn parse_cssom_json_preserves_rule_structure() {

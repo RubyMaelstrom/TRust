@@ -7377,14 +7377,24 @@ fn page_actor(
         .enable_time()
         .build()
         .expect("trust-page actor runtime");
+    // The at-rest virtual clock tracks REAL wall time from a FIXED origin
+    // (`clock_wall`); `clock_virt` is the offset mapping wall→virtual. Measuring
+    // against a fixed origin (not re-capturing `Instant::now()` each iteration)
+    // counts a wake's WORK time, not just its sleep: a heavy `settle` (a React
+    // re-render the 1s timer triggered can take 1–3s on a big page) otherwise
+    // vanished from the clock, so `timers.now` — and the page's `Date.now()`/
+    // `setInterval` — fell behind real time and the on-page uptime timer lurched
+    // (33→37→41 instead of ticking each second). `clock_virt` re-anchors UP to
+    // `js_now()` each iteration so a dispatch that fast-forwards `timers.now` is
+    // still honored, and the clock stays monotonic.
+    let clock_wall = std::time::Instant::now();
+    let mut clock_virt = js_now(&mut page);
     loop {
-        // Re-anchor real time each iteration to the CURRENT virtual clock: a
-        // dispatch may have fast-forwarded `timers.now`, and we measure the next
-        // real-time window forward from wherever it now stands (it's monotonic).
-        let base_ms = js_now(&mut page);
-        let wall = std::time::Instant::now();
+        let elapsed = clock_wall.elapsed().as_millis() as f64;
+        let now_virt = (clock_virt + elapsed).max(js_now(&mut page));
+        clock_virt = now_virt - elapsed;
         let sleep_dur = js_next_deadline(&mut page)
-            .map(|at| Duration::from_millis((at - base_ms).max(0.0) as u64).max(WAKE_FLOOR));
+            .map(|at| Duration::from_millis((at - now_virt).max(0.0) as u64).max(WAKE_FLOOR));
         let wake = rt.block_on(async {
             tokio::select! {
                 // Bias to commands so a user click is never starved by a busy
@@ -7409,7 +7419,7 @@ fn page_actor(
             // gone; nothing more to do.
             Wake::Fetch(None) => continue,
             Wake::Timer => {
-                let real_now = base_ms + wall.elapsed().as_millis() as f64;
+                let real_now = clock_virt + clock_wall.elapsed().as_millis() as f64;
                 if !timer_wake(&mut page, &evts, real_now) {
                     break;
                 }
@@ -7841,12 +7851,26 @@ fn send_scroll_events(
 /// `Settled`; staying silent keeps the run loop from redrawing on every idle
 /// tick of a slow poller. Returns false when the actor should exit (the event
 /// channel is gone, or the engine panicked and is now dead).
+/// Whether the per-wake `DIAGWAKE` trace is on (`TRUST_DIAG_FRAME`), cached so
+/// the at-rest wake loop pays no per-wake env lookup in production.
+fn frame_diag_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TRUST_DIAG_FRAME").is_some())
+}
+
 fn timer_wake(
     page: &mut LoadedPage,
     evts: &tokio::sync::mpsc::Sender<PageEvt>,
     real_now: f64,
 ) -> bool {
+    // Per-wake phase timing (TRUST_DIAG_FRAME): the at-rest timer-tick cadence is
+    // the cost under study, so split a wake into settle / image-load / drain /
+    // intersect / emit to find what stretches the cycle past the timer interval.
+    let diag = frame_diag_on();
+    let mark = || diag.then(std::time::Instant::now);
+    let t_wake = mark();
     prepare_dispatch(page);
+    let t = mark();
     settle_to(
         &mut page.ctx,
         &page.budget,
@@ -7854,22 +7878,29 @@ fn timer_wake(
         &mut page.outcome,
         real_now,
     );
+    let d_settle = t.map(|t| t.elapsed().as_millis());
     // A timer may swap in a fresh <img> (a JS slideshow advancing) whose reveal
     // waits on a `load` event a headless DOM never fires — same as a dispatch.
+    let t = mark();
     settle_image_loads(
         &mut page.ctx,
         &page.budget,
         DISPATCH_TICKS,
         &mut page.outcome,
     );
+    let d_imgload = t.map(|t| t.elapsed().as_millis());
+    let t = mark();
     drain_js_side(&mut page.ctx, &mut page.outcome);
+    let d_drain = t.map(|t| t.elapsed().as_millis());
     if page.outcome.panicked {
         let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
         return false;
     }
     // A timer that mutated the DOM (a slideshow/poller) may have moved an observed
     // target — re-run IntersectionObserver before rendering.
+    let t = mark();
     run_intersections(page);
+    let d_intersect = t.map(|t| t.elapsed().as_millis());
     if page.outcome.panicked {
         let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
         return false;
@@ -7879,9 +7910,26 @@ fn timer_wake(
         return evts.blocking_send(PageEvt::Navigate(url)).is_ok();
     }
     let scrolls = page.dom.borrow_mut().take_scroll_changes();
-    if page.dom.borrow_mut().take_dirty()
-        && let Some(ok) = emit_dirty_render(page, evts)
-    {
+    let dirty = page.dom.borrow_mut().take_dirty();
+    let t = mark();
+    let emit = dirty.then(|| emit_dirty_render(page, evts));
+    if let (Some(t0), Some(w0)) = (t, t_wake) {
+        let wall_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() % 100_000)
+            .unwrap_or(0);
+        let clock_now = js_now(page);
+        eprintln!(
+            "DIAGWAKE wall={wall_ms} real_now={real_now:.0} clock={clock_now:.0} cycle_work={}ms settle={}ms imgload={}ms drain={}ms intersect={}ms emit={}ms dirty={dirty}",
+            w0.elapsed().as_millis(),
+            d_settle.unwrap_or(0),
+            d_imgload.unwrap_or(0),
+            d_drain.unwrap_or(0),
+            d_intersect.unwrap_or(0),
+            t0.elapsed().as_millis(),
+        );
+    }
+    if let Some(Some(ok)) = emit {
         // The baked scroll position rides the Updated/Patched (see finish_dispatch).
         return ok;
     }
@@ -8353,7 +8401,31 @@ fn emit_dirty_render(
     page: &mut LoadedPage,
     evts: &tokio::sync::mpsc::Sender<PageEvt>,
 ) -> Option<bool> {
-    let targets = page.dom.borrow_mut().take_dirty_targets();
+    let mut targets = page.dom.borrow_mut().take_dirty_targets();
+    // Paint-relevance filter (INCREMENTAL_LAYOUT_PLAN.md): drop ATTR mutations
+    // that cannot change a single painted cell — an out-of-flow subtree that
+    // paints nothing (Twitch's decorative `highlight__progress-bar` animates its
+    // width EVERY frame, repainting nothing, and was ~88% of the whole-doc
+    // bails). If every dirty target this cycle is inert, nothing visible changed,
+    // so we emit nothing and skip the entire serialize/reparse pipeline; a frame
+    // mixing the inert bar with a real change keeps only the real target, which
+    // can then confine to a patch. `take_dirty_targets` returns `None` for an
+    // UNATTRIBUTED (force-full) mutation — left untouched. Only `Attr` qualifies
+    // (a childList/text change could add/remove painted text). See
+    // `Dom::inert_positioned_attr`.
+    if let Some(ts) = targets.as_mut() {
+        let dom = page.dom.borrow();
+        ts.retain(|(node, kind)| {
+            *kind != crate::dom::DirtyKind::Attr || !dom.inert_positioned_attr(*node)
+        });
+        if ts.is_empty() {
+            drop(dom);
+            if diag_patch() {
+                eprintln!("DIAGPATCH INERT all targets non-painting (out-of-flow attr)");
+            }
+            return None;
+        }
+    }
     let n_targets = targets.as_ref().map(|t| t.len());
     // Decide patch-vs-full from the dirty TARGETS — BEFORE any serialize
     // (INCREMENTAL_LAYOUT_PLAN.md §12c W1). When every mutation this cycle is
