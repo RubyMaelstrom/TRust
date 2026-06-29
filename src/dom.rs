@@ -51,6 +51,78 @@ thread_local! {
     /// Diagnostic only (`TRUST_NET_TRACE`): `trace_ms()` of the most recent
     /// DOM mutation, for sizing the DOM-stable→load-finish tail.
     static LAST_MUTATION_MS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
+    /// Diagnostic only (`TRUST_DIAG_FRAME`): per-layout cascade cost breakdown,
+    /// to split the live-reparse peg into CSS-parse vs selector-match vs flow.
+    /// Counting is a cheap increment (always on); the one-shot CSS-parse time is
+    /// the only Instant. Read+reset with `take_casc_diag()` after each layout.
+    static CASC_DIAG: std::cell::Cell<CascDiag> = const { std::cell::Cell::new(CascDiag::ZERO) };
+}
+
+/// Cascade-cost counters accumulated during one layout pass (diagnostic).
+#[derive(Clone, Copy, Default)]
+pub struct CascDiag {
+    /// `build_style_index` (parse every `<style>`/`<link>` CSS + bucket) time.
+    pub style_index_us: u64,
+    /// Times the rule index was (re)built — once per cold-cache layout.
+    pub style_index_builds: u64,
+    /// Total author rules parsed into the index.
+    pub rules: u64,
+    /// `computed_value` invocations (inheritance/UA-default resolution).
+    pub computed_value_calls: u64,
+    /// `flow_element` entries — total element-flow visits this layout (a value
+    /// far above the node count means subtrees are re-flowed, e.g. measurement).
+    pub flow_visits: u64,
+    /// `measure_width` entries — intrinsic-sizing passes that re-descend subtrees.
+    pub measure_calls: u64,
+    /// `cascaded` invocations (each re-parses the element's inline `style`).
+    pub cascaded_calls: u64,
+    /// Cumulative time inside `cascaded` (the inline-style re-parse cost).
+    pub cascaded_us: u64,
+}
+
+impl CascDiag {
+    const ZERO: Self = CascDiag {
+        style_index_us: 0,
+        style_index_builds: 0,
+        rules: 0,
+        computed_value_calls: 0,
+        flow_visits: 0,
+        measure_calls: 0,
+        cascaded_calls: 0,
+        cascaded_us: 0,
+    };
+}
+
+/// Layout-side counters (called from `layout.rs`); no-op when diag is off.
+pub fn casc_note_flow_visit() {
+    casc_bump(|d| d.flow_visits += 1);
+}
+pub fn casc_note_measure() {
+    casc_bump(|d| d.measure_calls += 1);
+}
+
+/// Cached once: are the cascade counters active? Off in production (no env) so
+/// the hot selector-match path pays only a single relaxed atomic load + branch.
+fn casc_diag_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TRUST_DIAG_FRAME").is_some())
+}
+
+#[inline]
+fn casc_bump(f: impl FnOnce(&mut CascDiag)) {
+    if !casc_diag_on() {
+        return;
+    }
+    CASC_DIAG.with(|c| {
+        let mut d = c.get();
+        f(&mut d);
+        c.set(d);
+    });
+}
+
+/// Read and reset the per-layout cascade counters (diagnostic).
+pub fn take_casc_diag() -> CascDiag {
+    CASC_DIAG.with(|c| c.replace(CascDiag::ZERO))
 }
 
 /// The `trace_ms()` of the last DOM mutation on this thread (diagnostic).
@@ -90,6 +162,19 @@ pub struct Dom {
     /// rules × props)). With it, each element is matched ONCE per epoch (via the
     /// rightmost-key buckets), then every property/pseudo read reuses the list.
     matched_cache: RefCell<MatchedCache>,
+    /// Memoized `cascaded` results for the current epoch, keyed (node, property).
+    /// The layout reads each element's properties hundreds of times — across the
+    /// flow AND the intrinsic-measurement re-descents (which re-flow subtrees
+    /// against a shared `&Dom`) — and every `cascaded` call otherwise re-parses
+    /// the element's inline `style` from scratch. This caches the author-cascade
+    /// winner per property; cleared when the epoch advances. Pure memoization
+    /// (identical results), so it never affects the cascade outcome.
+    cascaded_cache: RefCell<CascadedCache>,
+    /// Memoized `is_hidden` results for the current epoch. `is_hidden` reads ~15
+    /// cascaded properties and runs once per `flow_element` visit (and the same
+    /// node is re-visited by every measurement pass that re-descends through it),
+    /// so without this the visibility test is the layout's most-repeated work.
+    hidden_cache: RefCell<(u64, std::collections::HashMap<NodeId, bool>)>,
     /// The CSS-pixel viewport (`cols*cell_px`, `rows*cell_px`) used to
     /// evaluate `@media` queries when the cascade is built; `(0, 0)` = unknown
     /// (width/height queries then conservatively don't match, as if skipped).
@@ -165,6 +250,15 @@ type MatchedCache = (
     std::collections::HashMap<NodeId, std::rc::Rc<Vec<u32>>>,
 );
 
+/// Per-epoch memo for `cascaded`: nested (node → property → winner) so a
+/// property lookup borrows the `&str` key without allocating. The inner
+/// `Option<String>` is the cascade winner (`None` = no author value), distinct
+/// from the OUTER `Option` of the lookup (absent = not yet computed).
+type CascadedCache = (
+    u64,
+    std::collections::HashMap<NodeId, std::collections::HashMap<String, Option<String>>>,
+);
+
 /// The document node is always index 0.
 pub const DOCUMENT: NodeId = 0;
 
@@ -187,6 +281,8 @@ impl Dom {
             style_cache: RefCell::new(None),
             computed_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
             matched_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
+            cascaded_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
+            hidden_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
             viewport_px: (0, 0),
             scroll_state: std::collections::HashMap::new(),
             scroll_changes: Vec::new(),
@@ -201,6 +297,11 @@ impl Dom {
     /// True when anything mutated since the last call; resets the flag.
     pub fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
+    }
+
+    /// Total arena slots (diagnostic): the tree size the layout walks.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
     }
 
     /// The monotonic mutation counter. Anything memoized against the DOM's
@@ -869,6 +970,28 @@ impl Dom {
     }
 
     pub fn is_hidden(&self, id: NodeId) -> bool {
+        // Per-epoch memo: `is_hidden` reads ~15 cascaded properties and runs once
+        // per `flow_element` visit, with the same node re-tested by every
+        // measurement re-descent through it — the layout's most-repeated check.
+        {
+            let cache = self.hidden_cache.borrow();
+            if cache.0 == self.epoch
+                && let Some(&hit) = cache.1.get(&id)
+            {
+                return hit;
+            }
+        }
+        let hidden = self.is_hidden_inner(id);
+        let mut cache = self.hidden_cache.borrow_mut();
+        if cache.0 != self.epoch {
+            cache.0 = self.epoch;
+            cache.1.clear();
+        }
+        cache.1.insert(id, hidden);
+        hidden
+    }
+
+    fn is_hidden_inner(&self, id: NodeId) -> bool {
         if self.attr(id, "hidden").is_some() {
             return true;
         }
@@ -1103,7 +1226,8 @@ impl Dom {
     /// the layout's inherited-text reads both go through here, so a property
     /// inherits everywhere by being marked `inherited` once.
     pub fn computed_value(&self, id: NodeId, name: &str) -> Option<String> {
-        let Some(idx) = PROPS.iter().position(|p| p.name == name) else {
+        casc_bump(|d| d.computed_value_calls += 1);
+        let Some(idx) = prop_index(name) else {
             // Untracked: no UA default, no inheritance — author cascade.
             return self.cascaded(id, name);
         };
@@ -1246,6 +1370,40 @@ impl Dom {
     /// tree rules by specificity/order, `!important` and source order
     /// resolved by `CascadeKey`.
     fn cascaded(&self, id: NodeId, prop: &str) -> Option<String> {
+        casc_bump(|d| d.cascaded_calls += 1);
+        // Per-epoch memo: the same (node, property) is read many times over one
+        // layout (flow + measurement re-descents), each call otherwise re-parsing
+        // the element's inline `style`. Borrow-only fast path; on a miss compute
+        // once and store. Pure memoization — the cascade result is unchanged.
+        {
+            let cache = self.cascaded_cache.borrow();
+            if cache.0 == self.epoch
+                && let Some(inner) = cache.1.get(&id)
+                && let Some(hit) = inner.get(prop)
+            {
+                return hit.clone();
+            }
+        }
+        let _t = casc_diag_on().then(std::time::Instant::now);
+        let r = self.cascaded_inner(id, prop);
+        if let Some(t) = _t {
+            let us = t.elapsed().as_micros() as u64;
+            casc_bump(|d| d.cascaded_us += us);
+        }
+        let mut cache = self.cascaded_cache.borrow_mut();
+        if cache.0 != self.epoch {
+            cache.0 = self.epoch;
+            cache.1.clear();
+        }
+        cache
+            .1
+            .entry(id)
+            .or_default()
+            .insert(prop.to_string(), r.clone());
+        r
+    }
+
+    fn cascaded_inner(&self, id: NodeId, prop: &str) -> Option<String> {
         let mut winner: Option<(CascadeKey, String)> = None;
         if let Some(style) = self.attr(id, "style") {
             for decl in style.split(';') {
@@ -1540,7 +1698,16 @@ impl Dom {
         {
             return idx.clone();
         }
-        let idx = std::rc::Rc::new(self.build_style_index());
+        let t = std::time::Instant::now();
+        let built = self.build_style_index();
+        let rules = built.scopes.values().map(|v| v.len() as u64).sum::<u64>();
+        let us = t.elapsed().as_micros() as u64;
+        casc_bump(|d| {
+            d.style_index_us += us;
+            d.style_index_builds += 1;
+            d.rules += rules;
+        });
+        let idx = std::rc::Rc::new(built);
         *cache = Some((self.epoch, idx.clone()));
         idx
     }
@@ -3565,6 +3732,18 @@ const fn prop(name: &'static str, inherited: bool, baked: bool) -> PropDef {
         inherited,
         baked,
     }
+}
+
+/// `PROPS` index for a property name, via a one-time name→index map. Replaces a
+/// per-call `PROPS.iter().position()` linear scan — `computed_value` runs this
+/// ~100k times in one heavy-page layout, so the scan was pure waste.
+fn prop_index(name: &str) -> Option<usize> {
+    static INDEX: std::sync::OnceLock<std::collections::HashMap<&'static str, usize>> =
+        std::sync::OnceLock::new();
+    INDEX
+        .get_or_init(|| PROPS.iter().enumerate().map(|(i, p)| (p.name, i)).collect())
+        .get(name)
+        .copied()
 }
 
 #[rustfmt::skip]
