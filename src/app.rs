@@ -849,11 +849,20 @@ impl App {
                             )
                         });
                         let imgr = IMG_RENDERS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                        // Per-image sixel sequence cache (vendored ratatui-image):
+                        // at rest with on-screen sixels, hits≈img_renders and
+                        // builds≈0 — that's the per-image-redraw cost being killed.
+                        let seq_builds = ratatui_image::sliced::SIXEL_SEQ_BUILDS
+                            .swap(0, std::sync::atomic::Ordering::Relaxed);
+                        let seq_hits = ratatui_image::sliced::SIXEL_SEQ_HITS
+                            .swap(0, std::sync::atomic::Ordering::Relaxed);
+                        let seq_prewarms = ratatui_image::sliced::SIXEL_SEQ_PREWARMS
+                            .swap(0, std::sync::atomic::Ordering::Relaxed);
                         let ev = EVT_TALLY.with(|t| t.replace([0; 5]));
                         let redun = REDUNDANT_DRAWS.with(|c| c.replace(0));
                         let _ = writeln!(
                             std::io::stderr(),
-                            "DIAGFRAME draws/s={n} (redundant={redun}) draw={}ms | page_evt: {pn} calls {}ms (full_replaces={pfull} drains={pdr}) | img_relayout: {icount}x {}ms | raw={raw_kb}KB doc_rows={doc_rows} reg_rows={reg_rows} | img_renders/s={imgr} evts[upd={} pat={} scr={} set={}]",
+                            "DIAGFRAME draws/s={n} (redundant={redun}) draw={}ms | page_evt: {pn} calls {}ms (full_replaces={pfull} drains={pdr}) | img_relayout: {icount}x {}ms | raw={raw_kb}KB doc_rows={doc_rows} reg_rows={reg_rows} | img_renders/s={imgr} sixel_seq[build={seq_builds} hit={seq_hits} prewarm={seq_prewarms}] evts[upd={} pat={} scr={} set={}]",
                             us / 1000,
                             pus / 1000,
                             ius / 1000,
@@ -2517,9 +2526,17 @@ impl App {
             // run-loop thread restores it (see TERMINAL_OWNER).
             let box_size = ratatui::layout::Size::new(key.w, key.h);
             let protocol = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::img::encode_sliced_bytes(&picker, &raw, box_size, key.crop, key.tint)
-                    .ok()
-                    .map(|(protocol, _)| protocol)
+                let protocol =
+                    crate::img::encode_sliced_bytes(&picker, &raw, box_size, key.crop, key.tint)
+                        .ok()
+                        .map(|(protocol, _)| protocol)?;
+                // Build the at-rest slice HERE, on the encode thread, so the
+                // first on-screen draw of this image is a cache hit instead of a
+                // render-thread `to_sequence` build — matters for a streaming
+                // chat's steady flow of newly-appearing emotes (see
+                // SlicedProtocol::prewarm_sixel_cache).
+                protocol.prewarm_sixel_cache();
+                Some(protocol)
             }))
             .ok()
             .flatten();
