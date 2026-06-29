@@ -802,6 +802,120 @@ mod tests {
         assert!(size.height > 0 && size.height <= 10);
     }
 
+    /// The per-image sixel sequence cache (vendored ratatui-image): redrawing an
+    /// unchanged on-screen image reuses its built byte-string instead of
+    /// rebuilding it (`bands().join()` — the dominant at-rest sixel cost). This
+    /// exercises the real `SlicedProtocol::Sixel` render path: at rest a redraw is
+    /// a cache HIT, a scroll changes the slice key and rebuilds, the cached bytes
+    /// are byte-identical to a fresh build, and an encode-thread `prewarm` makes a
+    /// newly-appearing image's first draw a hit (the build moved off the render
+    /// thread).
+    ///
+    /// The counters are process-global atomics, but this is the only non-ignored
+    /// test that renders a Sixel `SlicedImage`, so keeping every assertion in one
+    /// test keeps the deltas deterministic under the parallel test runner.
+    #[test]
+    fn sixel_sequence_cache_hits_rebuilds_on_scroll_and_prewarms() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+        use ratatui_image::picker::ProtocolType;
+        use ratatui_image::sliced::{
+            SIXEL_SEQ_BUILDS, SIXEL_SEQ_HITS, SIXEL_SEQ_PREWARMS, SignedPosition, SlicedImage,
+        };
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Sixel);
+        let f = picker.font_size();
+        // A box taller than the viewport so a scroll yields a different slice.
+        let cols: u16 = 20;
+        let rows: u16 = 30;
+        let vh: u16 = 10;
+        let (iw, ih) = (
+            u32::from(cols) * u32::from(f.width),
+            u32::from(rows) * u32::from(f.height),
+        );
+        let (image, _) = decode(&tall_png(iw, ih)).unwrap();
+        let sliced = encode_sliced(&picker, image, Size::new(cols, rows), false).unwrap();
+        let area = Rect::new(0, 0, cols, vh);
+        let render = |pos_y: i16, buf: &mut Buffer| {
+            SlicedImage::new(&sliced, SignedPosition::from((0, pos_y))).render(area, buf);
+        };
+
+        // Cold draw at rest: a miss builds the sequence once.
+        SIXEL_SEQ_BUILDS.store(0, Relaxed);
+        SIXEL_SEQ_HITS.store(0, Relaxed);
+        let mut buf0 = Buffer::empty(area);
+        render(0, &mut buf0);
+        assert_eq!(SIXEL_SEQ_BUILDS.load(Relaxed), 1, "cold draw builds once");
+        assert_eq!(SIXEL_SEQ_HITS.load(Relaxed), 0, "no hit on the cold draw");
+
+        // Redraw, same slice: a hit, no rebuild — and identical output.
+        let mut buf1 = Buffer::empty(area);
+        render(0, &mut buf1);
+        assert_eq!(
+            SIXEL_SEQ_BUILDS.load(Relaxed),
+            1,
+            "at-rest redraw does not rebuild"
+        );
+        assert_eq!(
+            SIXEL_SEQ_HITS.load(Relaxed),
+            1,
+            "at-rest redraw is a cache hit"
+        );
+        assert_eq!(buf0, buf1, "the cached sequence renders identical bytes");
+
+        // Scrolling changes skip/drop -> the 1-entry memo misses and rebuilds.
+        let mut buf2 = Buffer::empty(area);
+        render(-5, &mut buf2);
+        assert_eq!(
+            SIXEL_SEQ_BUILDS.load(Relaxed),
+            2,
+            "a scroll rebuilds (new slice key)"
+        );
+        assert_eq!(
+            SIXEL_SEQ_HITS.load(Relaxed),
+            1,
+            "the scrolled draw is not a hit"
+        );
+
+        // Holding at the scrolled position hits again (no rebuild).
+        let mut buf3 = Buffer::empty(area);
+        render(-5, &mut buf3);
+        assert_eq!(
+            SIXEL_SEQ_BUILDS.load(Relaxed),
+            2,
+            "holding the scroll does not rebuild"
+        );
+        assert_eq!(SIXEL_SEQ_HITS.load(Relaxed), 2, "holding the scroll hits");
+
+        // Prewarm: building the at-rest slice off-thread (on the encode thread)
+        // makes a freshly-appearing image's FIRST on-screen draw a hit, not a
+        // render-thread build. A fresh protocol, prewarmed, then drawn fully
+        // visible (an area that fits the whole image, so skip = drop = 0):
+        let (image2, _) = decode(&tall_png(iw, ih)).unwrap();
+        let warm = encode_sliced(&picker, image2, Size::new(cols, rows), false).unwrap();
+        warm.prewarm_sixel_cache();
+        let wsize = warm.size();
+        let warea = Rect::new(0, 0, wsize.width, wsize.height);
+        SIXEL_SEQ_BUILDS.store(0, Relaxed);
+        SIXEL_SEQ_HITS.store(0, Relaxed);
+        SIXEL_SEQ_PREWARMS.store(0, Relaxed);
+        let mut wbuf = Buffer::empty(warea);
+        SlicedImage::new(&warm, SignedPosition::from((0, 0))).render(warea, &mut wbuf);
+        assert_eq!(
+            SIXEL_SEQ_BUILDS.load(Relaxed),
+            0,
+            "a prewarmed first draw does not build on the render thread"
+        );
+        assert_eq!(
+            SIXEL_SEQ_HITS.load(Relaxed),
+            1,
+            "a prewarmed first draw is a hit"
+        );
+    }
+
     /// Tall photographic-ish test image: a gradient plus per-pixel variation so
     /// the sixel payload is dense (a flat fill compresses to almost nothing and
     /// would understate the cost).

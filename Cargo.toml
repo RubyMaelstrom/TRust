@@ -42,7 +42,7 @@ libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 libmudtelnet = "2.0.2"
 mimalloc = { version = "0.1", optional = true }
 ratatui = "0.30.2"
-ratatui-image = { version = "11.0.4", default-features = false, features = ["crossterm"] }
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 # Static SVG image rendering. `resvg`/`usvg`/tiny-skia are pure Rust; text and
 # embedded data: raster images stay enabled for web compatibility. System-font
 # discovery reads font files through Rust and is initialized once in img.rs.
@@ -124,6 +124,15 @@ wasmi = { path = "vendor/wasmi-1.1.0" }
 wasmi_core = { path = "vendor/wasmi_core-1.1.0" }
 wasmi_ir = { path = "vendor/wasmi_ir-1.1.0" }
 wasmi_collections = { path = "vendor/wasmi_collections-1.1.0" }
+# TRust's vendored ratatui-image fork (updated 11.0.4 -> 11.0.6 before vendoring:
+# the 11.0.5 large-image multiply-overflow fix + the 11.0.6 chafa '\0' control-
+# char filter; the sixel/sliced path is otherwise byte-identical to 11.0.4). We
+# own it to memoize the per-image sixel byte-string: `SlicedSixelData::to_sequence`
+# (`bands().join()`) rebuilt every visible image's whole sixel string on every
+# full-frame redraw — the dominant at-rest main-thread cost on sixel terminals. The
+# `SlicedProtocol::Sixel` variant now carries a 1-entry `SixelSeqCache` so an
+# unchanged on-screen image is reused instead of rebuilt. See src/sliced.rs.
+ratatui-image = { path = "vendor/ratatui-image-11.0.6" }
 
 # Optimized binary: whole-program LTO and a single codegen unit trade
 # compile time for speed and size; symbols stripped (panic messages
