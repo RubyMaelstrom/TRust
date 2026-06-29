@@ -8509,8 +8509,11 @@ fn confined_boundaries(
         let boundary = if let Some(b) = dom.relayout_boundary(node, kind, live_regions) {
             Some((b, BoundaryTier::Size))
         } else {
-            dom.relayout_boundary_general(node, kind)
-                .filter(|g| live_boundaries.contains(g))
+            // The nearest CACHED inline boundary, walking up past any IFC the app
+            // couldn't cache (a row-sharing flex item like the viewer counter) to
+            // its enclosing cached section — so a deep mutation patches that
+            // section instead of forcing a whole-document render.
+            dom.nearest_cached_boundary(node, kind, live_boundaries)
                 .map(|g| (g, BoundaryTier::WidthStable))
         };
         let (b, tier) = match boundary {
@@ -8550,7 +8553,33 @@ fn confined_boundaries(
         };
         if !patchable_boundary(dom, b) {
             if diag_patch() {
-                eprintln!("DIAGPATCH bail=not_patchable boundary={b:?}");
+                let off = dom.composed_descendants(b).into_iter().find(|&d| {
+                    matches!(dom.tag_name(d), Some("input" | "select" | "textarea"))
+                        || dom.is_contenteditable_host(d)
+                });
+                let offdesc = off.map_or_else(
+                    || "anchor-wrapped".to_string(),
+                    |d| {
+                        format!(
+                            "<{} class=\"{}\">",
+                            dom.tag_name(d).unwrap_or("?"),
+                            dom.attr(d, "class")
+                                .unwrap_or("")
+                                .chars()
+                                .take(30)
+                                .collect::<String>(),
+                        )
+                    },
+                );
+                eprintln!(
+                    "DIAGPATCH bail=not_patchable boundary={b:?} <{} class=\"{}\"> tier={tier:?} offender={offdesc}",
+                    dom.tag_name(b).unwrap_or("?"),
+                    dom.attr(b, "class")
+                        .unwrap_or("")
+                        .chars()
+                        .take(40)
+                        .collect::<String>(),
+                );
             }
             return None;
         }
@@ -18455,6 +18484,40 @@ mod tests {
         assert!(
             removed,
             "the 500ms click-driven animation must remove the banner at rest"
+        );
+    }
+
+    #[test]
+    fn confined_boundaries_walks_up_to_the_nearest_cached_boundary() {
+        // INCREMENTAL_LAYOUT_PLAN.md §14 (the walk-up): a deep mutation whose
+        // NEAREST IFC boundary (a row-sharing flex item — the viewer counter
+        // pattern) the app couldn't cache routes to its enclosing CACHED section
+        // and patches it, instead of forcing a whole-document render.
+        use crate::dom::DirtyKind;
+        use std::collections::HashSet;
+        let dom = Dom::parse_document(
+            r#"<html><body><div data-trust-node="9" style="display:flow-root"><div style="display:flex"><div data-trust-node="5">x<span id="t">N</span></div></div></div></body></html>"#,
+        );
+        let find = |n: &str| {
+            dom.descendants(DOCUMENT)
+                .into_iter()
+                .find(|&id| dom.attr(id, "data-trust-node") == Some(n))
+                .unwrap()
+        };
+        let section = find("9");
+        let target = dom.get_by_id("t").unwrap();
+        let regions: HashSet<usize> = HashSet::new();
+        // Only the OUTER section (9) is cached — the inner flex item (5) is not.
+        let cached: HashSet<usize> = [section].into_iter().collect();
+        assert_eq!(
+            confined_boundaries(
+                &dom,
+                &regions,
+                &cached,
+                Some(&[(target, DirtyKind::Content)])
+            ),
+            Some(vec![(section, BoundaryTier::WidthStable)]),
+            "the mutation walks up past the uncached flex item to the cached section"
         );
     }
 

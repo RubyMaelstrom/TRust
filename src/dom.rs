@@ -407,6 +407,79 @@ impl Dom {
         None
     }
 
+    /// The nearest independent-formatting-context ancestor (or `self`, for a
+    /// `Content` change) that the app has CACHED as a splice-able boundary —
+    /// walking UP past any IFC boundary the app couldn't cache
+    /// (INCREMENTAL_LAYOUT_PLAN.md §14). A mutation is contained by EVERY IFC
+    /// ancestor, so the nearest cached one is a valid (if larger) patch target.
+    /// This is what lets a deep mutation — an animated viewer counter that's a
+    /// flex-ROW item sharing its row (so its own box can't be a `Doc.rows`
+    /// boundary) — patch its enclosing cached SECTION instead of forcing a
+    /// whole-document render. `cached` is the app's `Doc.boundaries` node set
+    /// (`live_boundaries`), keyed by the same arena ids walked here.
+    pub fn nearest_cached_boundary(
+        &self,
+        node: NodeId,
+        kind: DirtyKind,
+        cached: &std::collections::HashSet<usize>,
+    ) -> Option<NodeId> {
+        let mut cur = match kind {
+            DirtyKind::Content => Some(node),
+            DirtyKind::Attr => self.parent_composed(node),
+        };
+        while let Some(c) = cur {
+            if cached.contains(&c) && self.establishes_independent_formatting_context(c) {
+                return Some(c);
+            }
+            cur = self.parent_composed(c);
+        }
+        None
+    }
+
+    /// A content hash of `id`'s subtree (tag names, attributes, and text, in
+    /// document order) — the cache key for incremental region layout
+    /// (INCREMENTAL_LAYOUT_PLAN.md §14, per-child memoization). Two subtrees that
+    /// serialize identically hash identically, so an UNCHANGED chat message reuses
+    /// its laid rows across the per-message re-parse while a new/edited one is a
+    /// cache miss and re-laid. Over-conservative on purpose: it covers EVERY
+    /// attribute (one the layout ignores still busts the key), so a hit can never
+    /// reuse rows for layout-different content — a miss only costs a re-lay. Walks
+    /// the same `first_child`/`next_sibling` order the block flow lays children.
+    pub fn subtree_layout_hash(&self, id: NodeId) -> u64 {
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.hash_subtree(id, &mut h);
+        h.finish()
+    }
+
+    fn hash_subtree(&self, id: NodeId, h: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        match &self.nodes[id].data {
+            NodeData::Text(t) => {
+                h.write_u8(0);
+                t.hash(h);
+            }
+            NodeData::Element { name, attrs, .. } => {
+                h.write_u8(1);
+                (*name.local).hash(h);
+                for a in attrs {
+                    (*a.name.local).hash(h);
+                    (*a.value).hash(h);
+                }
+                h.write_u8(2); // open-children delimiter
+                let mut c = self.nodes[id].first_child;
+                while let Some(cid) = c {
+                    self.hash_subtree(cid, h);
+                    c = self.nodes[cid].next_sibling;
+                }
+                h.write_u8(3); // close-children delimiter
+            }
+            // Comment/doctype/fragment/document: structural marker only (they
+            // contribute no laid content).
+            _ => h.write_u8(4),
+        }
+    }
+
     /// Serialize a relayout boundary's subtree as a self-contained fragment for
     /// an incremental patch (INCREMENTAL_LAYOUT_PLAN.md §4a). The boundary is
     /// wrapped in a context `<div>` carrying the inherited computed values from

@@ -490,6 +490,7 @@ fn render_inline_images(
             // at the same scale as a fully-visible one (no resize-on-scroll).
             let position =
                 SignedPosition::from((scol as i16, (doc_row as isize - g.scroll as isize) as i16));
+            crate::app::IMG_RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             frame.render_widget(SlicedImage::new(proto, position), inner);
         }
     }
@@ -562,6 +563,7 @@ fn render_region_images(
                 // band's top is clipped, so rows shift up correctly.
                 let pos_y = (band_top - vis_top) + (br as i32 - rg.voffset as i32);
                 let position = SignedPosition::from((item.col as i16, pos_y as i16));
+                crate::app::IMG_RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 frame.render_widget(SlicedImage::new(proto, position), band);
             }
         }
