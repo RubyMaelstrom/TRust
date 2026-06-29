@@ -1755,13 +1755,21 @@ pub fn parse_seeded(
         // controls). Forms are extracted from the SAME arena so the
         // control map's node ids line up with the layout pass. HTML no
         // longer uses the line model — `rows` is the whole story.
+        // Gated phase timing (TRUST_DIAG_FRAME): the live-reparse peg is here,
+        // so split the cost into DOM parse vs cascade+layout to aim the fix.
+        let diag = std::env::var_os("TRUST_DIAG_FRAME").is_some();
+        let t0 = std::time::Instant::now();
         let mut dom = crate::dom::Dom::parse_document(&html);
         // Turn renderable inline <svg> into <img data:…> so vectors render
         // (silhouette-tinted) through the image pipeline instead of as text.
         dom.rewrite_inline_svgs();
+        let t_dom = t0.elapsed();
+        let t1 = std::time::Instant::now();
         let (found, controls) = extract_forms_arena(&dom, url, seed);
         forms = found;
         image_urls = collect_image_urls(&dom, url);
+        let t_forms = t1.elapsed();
+        let t2 = std::time::Instant::now();
         let (laid, found_carousels, found_regions, found_clips, found_boundaries) =
             crate::layout::lay_out_with_carousels(
                 &dom,
@@ -1772,6 +1780,25 @@ pub fn parse_seeded(
                 images,
                 crate::layout::borders_enabled(),
             );
+        if diag {
+            let c = crate::dom::take_casc_diag();
+            eprintln!(
+                "DIAGPARSE html={}KB nodes={} dom={}ms forms={}ms layout={}ms total={}ms | flow_visits={} measure_calls={} computed_value={} cascaded={}calls/{}ms css_parse={}ms rules={}",
+                html.len() / 1024,
+                dom.node_count(),
+                t_dom.as_millis(),
+                t_forms.as_millis(),
+                t2.elapsed().as_millis(),
+                t0.elapsed().as_millis(),
+                c.flow_visits,
+                c.measure_calls,
+                c.computed_value_calls,
+                c.cascaded_calls,
+                c.cascaded_us / 1000,
+                c.style_index_us / 1000,
+                c.rules,
+            );
+        }
         rows = laid;
         carousels = found_carousels;
         regions = found_regions;

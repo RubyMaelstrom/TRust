@@ -105,7 +105,9 @@
       "Bash(awk 'NR<=1740 && /^[[:space:]]*\\(pub \\)?\\(async \\)?fn /{ln=NR; sig=$0} END{}' src/http.rs)",
       "Bash(awk -F: '$1<1740')",
       "WebFetch(domain:www.w3.org)",
-      "Bash(grep -aoE '[A-Za-z][A-Za-z .,:/&-]{6,}')"
+      "Bash(grep -aoE '[A-Za-z][A-Za-z .,:/&-]{6,}')",
+      "Bash(ps -o pid,ppid,pcpu,pmem,etime,nlwp,comm -p 3159846)",
+      "Bash(ps -eo pid,pcpu,pmem,etime,comm)"
     ]
   }
 }

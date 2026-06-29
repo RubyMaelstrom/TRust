@@ -2094,6 +2094,7 @@ impl<'a> Layout<'a> {
     }
 
     fn flow_element(&mut self, id: NodeId, ctx: &Ctx) {
+        crate::dom::casc_note_flow_visit();
         let Some(tag) = self.dom.tag_name(id).map(str::to_owned) else {
             return;
         };
@@ -3873,6 +3874,7 @@ impl<'a> Layout<'a> {
     /// The natural width (cells) of an element's subtree laid out at
     /// `constraint` — its content basis (at `avail`) or min-content (at 1).
     fn measure_width(&self, id: NodeId, constraint: usize) -> usize {
+        crate::dom::casc_note_measure();
         let key = (id, constraint, self.table_depth);
         if let Some(&w) = self.measure_cache.borrow().get(&key) {
             return w;
