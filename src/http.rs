@@ -1818,6 +1818,10 @@ pub struct RegionPatch {
     /// the scroll this update (a chat re-pinning to bottom); else the app keeps
     /// the reader's offset. Mirrors `flow_region`'s `data-trust-scroll-top` read.
     pub scroll_top: Option<usize>,
+    /// The refreshed per-child row cache (INCREMENTAL_LAYOUT_PLAN.md §14) to
+    /// store back on the region and feed the NEXT patch, so an unchanged message
+    /// is reused instead of re-laid. Empty when the region wasn't cacheable.
+    pub row_cache: crate::layout::RegionRowCache,
 }
 
 /// Parse and lay out a single relayout-boundary fragment (a scroll region) for
@@ -1833,7 +1837,10 @@ pub fn lay_region_patch(
     viewport: (usize, usize),
     images: &crate::layout::ImageSizes,
     boundary_node: usize,
+    cache: &crate::layout::RegionRowCache,
 ) -> Option<RegionPatch> {
+    let diag = std::env::var_os("TRUST_DIAG_PATCH").is_some();
+    let t0 = std::time::Instant::now();
     let html = decode_body("text/html; charset=utf-8", fragment_html);
     let mut dom = crate::dom::Dom::parse_document(&html);
     dom.rewrite_inline_svgs();
@@ -1847,7 +1854,12 @@ pub fn lay_region_patch(
     let scroll_top = dom
         .attr(boundary, "data-trust-scroll-top")
         .and_then(|s| s.parse::<usize>().ok());
-    let (rows, carousels) = crate::layout::lay_out_region_fragment(
+    let t_parse = t0.elapsed();
+    let t1 = std::time::Instant::now();
+    // Memoize the scroll container's block children: only a NEW/changed message
+    // is laid; unchanged ones reuse their cached rows (INCREMENTAL_LAYOUT_PLAN.md
+    // §14 — the inner-scroll de-lag). Row-identical to the uncached layout.
+    let (rows, carousels, row_cache) = crate::layout::lay_out_region_fragment_cached(
         &dom,
         url,
         content_width,
@@ -1855,12 +1867,25 @@ pub fn lay_region_patch(
         &controls,
         images,
         boundary,
+        cache,
     );
+    if diag {
+        let n_nodes = dom.descendants(crate::dom::DOCUMENT).len();
+        eprintln!(
+            "DIAGPATCH region-split parse={}us layout={}us nodes={} rows={} reused={}",
+            t_parse.as_micros(),
+            t1.elapsed().as_micros(),
+            n_nodes,
+            rows.len(),
+            row_cache.children.len(),
+        );
+    }
     Some(RegionPatch {
         rows,
         carousels,
         image_urls,
         scroll_top,
+        row_cache,
     })
 }
 
@@ -1898,6 +1923,7 @@ pub fn lay_subtree_patch(
     viewport: (usize, usize),
     images: &crate::layout::ImageSizes,
     boundary_node: usize,
+    sub_box: bool,
 ) -> Option<SubtreeLaid> {
     let html = decode_body("text/html; charset=utf-8", fragment_html);
     let mut dom = crate::dom::Dom::parse_document(&html);
@@ -1917,6 +1943,7 @@ pub fn lay_subtree_patch(
         &controls,
         images,
         boundary,
+        sub_box,
     );
     Some(SubtreeLaid {
         height: frag.height,

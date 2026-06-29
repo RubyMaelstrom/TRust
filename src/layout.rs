@@ -79,10 +79,24 @@ type ElementTops = HashMap<NodeId, (u16, u16)>;
 #[derive(Clone, Copy)]
 struct BoundaryRec {
     node: usize,
+    /// The width to re-lay the boundary's content at (the band it fills, for a
+    /// block-filling box; the track width it was given, for a sub-box).
     content_width: u16,
+    /// The boundary's painted extent (cells). For a block-filling box this is the
+    /// band; for a sub-box (flex/grid item, inline-block) it is the content's
+    /// actual width — the column span the owns-rows check + width verify use.
+    width: u16,
     origin_col: u16,
     start_row: usize,
     end_row: usize,
+    /// Laid as a SUB-BOX (`layout_subtree_inner`+`blit`: a flex/grid item, float,
+    /// inline-box-grid cell) rather than in-flow. A sub-box re-lays with
+    /// `subtree_root` set (its own `constrain`/width was applied by the parent,
+    /// not itself) and is verified for STRICT width-stability (its width is
+    /// content-dependent, so a width change reflows its siblings → resync). A
+    /// block-filling box (in-flow) re-lays without `subtree_root` and fills its
+    /// band regardless of content, so it needs no width verify.
+    sub_box: bool,
 }
 
 type BoundaryRecs = HashMap<NodeId, BoundaryRec>;
@@ -386,6 +400,17 @@ pub struct Region {
     /// Carousels found inside the buffer (buffer-relative). Kept for Phase 4
     /// carousel-in-region composition; the Phase 1 render doesn't apply them.
     pub carousels: Vec<Carousel>,
+    /// Absolute http(s)/`data:` URLs of EVERY `<img>` in this region's subtree —
+    /// decoded or not — collected from the DOM at layout time (an undecoded image
+    /// is alt text, absent from the laid `buffer`, so this is read off the
+    /// CONTENT, not the rendered items). This is what lets an image-decode reflow
+    /// be ROUTED: a URL here means the image's box is contained by this scroll
+    /// region's independent formatting context, so its intrinsic-size reflow
+    /// re-lays only this region — never the whole document (the inner-scroll
+    /// de-lag, INCREMENTAL_LAYOUT_PLAN.md §14). Populated on every full render; a
+    /// region patch refreshes it from the patch fragment, so it survives the
+    /// per-message re-parse and stays current as chat grows.
+    pub image_urls: Vec<String>,
 }
 
 impl Region {
@@ -425,11 +450,12 @@ impl Region {
 /// (INCREMENTAL_LAYOUT_PLAN.md §14). Captured during a full render so a live
 /// `Patched{node}` whose boundary matches can re-lay ONLY that subtree and
 /// splice it back in place (Tier 1) or splice+shift+scroll-anchor (Tier 2),
-/// leaving the rest of the document identity. v1 captures only BLOCK-FILLING
-/// IFC containers (`display:flow-root`/`flex`/`grid`, not a flex/grid item,
-/// in-flow, not a scroll/clip region) — boxes whose outer width is their
-/// containing block's (width-stable by construction), so the splice never
-/// reflows anything outside the band.
+/// leaving the rest of the document identity. Two kinds qualify: BLOCK-FILLING
+/// IFC containers (`display:flow-root`/`flex`/`grid`, in-flow) whose outer width
+/// is their containing block's; and SUB-BOXES (a flex/grid item, inline-block
+/// cell) that OWN their rows (no sibling shares a row — proven geometrically at
+/// harvest) and are width-stable (verified on patch). A box that shares its rows
+/// with siblings is excluded → full path (always correct).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundaryBox {
     /// The live actor node id (baked as `data-trust-node`) — the app maps a
@@ -437,12 +463,19 @@ pub struct BoundaryBox {
     pub node: usize,
     /// The rows in `Doc.rows` this boundary's content occupies (`start..end`).
     pub row_range: std::ops::Range<usize>,
-    /// The left edge (cells) of the band the boundary fills — where the re-laid
-    /// fragment's column 0 maps when spliced back.
+    /// The left edge (cells) where the re-laid fragment's column 0 maps when
+    /// spliced back.
     pub origin_col: u16,
-    /// The outer content band (cells) the boundary fills — the width fed to
-    /// `layout_subtree_inner` so the re-laid fragment wraps identically.
+    /// The width fed to the fragment re-lay (the band, for a block-filling box;
+    /// the track width, for a sub-box) so it wraps identically.
     pub content_width: u16,
+    /// The boundary's painted extent (cells) — the column span the splice
+    /// occupies and (for a sub-box) the width the patch verifies stays stable.
+    pub width: u16,
+    /// Laid as a SUB-BOX (flex/grid item, inline-block) — re-laid with
+    /// `subtree_root` set and verified for strict width-stability. `false` = a
+    /// block-filling in-flow box (fills its band, no width verify).
+    pub sub_box: bool,
 }
 
 /// The on-screen column for an item in doc row `row`, applying any carousel
@@ -553,6 +586,34 @@ pub const MAX_IMAGE_LOOKBACK: usize = 256;
 /// `Rc` so every sub-layout in a pass shares the one cache.
 type MeasureCache = std::rc::Rc<std::cell::RefCell<HashMap<(NodeId, usize, usize), usize>>>;
 
+/// Per-region memoization of the laid rows of a scroll container's block
+/// children, keyed by `Dom::subtree_layout_hash` (INCREMENTAL_LAYOUT_PLAN.md
+/// §14 — region child caching). The whole point of the inner-scroll de-lag:
+/// re-laying a 150-message chat boundary from scratch on every appended message
+/// is O(N) per message = O(N²) over a session (measured: 25→157ms and growing).
+/// With this, an unchanged message reuses its cached rows and only a NEW message
+/// is laid — O(1 message). `container` is the BFC whose block children are the
+/// cacheable units; `old` is last pass's cache (read), `new` is built this pass
+/// (every child, hit or laid) to become next pass's `old`. Shared across the
+/// sub-layouts a region fragment spins up (like `MeasureCache`), so the children
+/// flowed inside `layout_subtree_inner` see it.
+struct RegionChildCache {
+    container: NodeId,
+    old: HashMap<u64, std::rc::Rc<Vec<Row>>>,
+    new: HashMap<u64, std::rc::Rc<Vec<Row>>>,
+}
+type RegionCache = std::rc::Rc<std::cell::RefCell<RegionChildCache>>;
+
+/// The serializable, cross-pass form of a region's child-row cache: the laid
+/// rows keyed by content hash, plus the band `width` they were laid at (a width
+/// change invalidates them). Held app-side per region (`live_node`) so it
+/// survives the per-message re-parse AND the occasional full re-render.
+#[derive(Default, Clone)]
+pub struct RegionRowCache {
+    pub width: usize,
+    pub children: HashMap<u64, std::rc::Rc<Vec<Row>>>,
+}
+
 /// An element subtree laid out as an independent box, positioned relative
 /// to its own top-left. `width` is the widest used column and `height` is
 /// `rows.len()`. `blit` places it into a parent at a `(col, row)` offset —
@@ -582,6 +643,12 @@ struct LaidBox {
     /// a float/flex/grid/abspos sub-layout reaches the document. Empty unless
     /// `capture_boundaries` is set.
     boundary_boxes: BoundaryRecs,
+    /// The element this box was laid for (`layout_subtree_inner`'s root) and the
+    /// width it was laid at — so `blit` can record this box itself as an
+    /// incremental-layout SUB-BOX boundary (a flex/grid item, inline-block cell)
+    /// when capturing. `None` for boxes not rooted on an element.
+    root: Option<NodeId>,
+    lay_width: u16,
 }
 
 /// A cell placed in a table grid (CSS 2.1 §17.5): its element and the
@@ -680,22 +747,40 @@ pub fn lay_out_with_carousels(
     layout.capture_boundaries = true;
     layout.flow_all();
     let (rows, carousels, regions, _element_tops, scroll_clips, boundary_recs) = layout.finish();
-    let boundaries = harvest_boundaries(boundary_recs, &regions, &carousels);
+    let boundaries = harvest_boundaries(boundary_recs, &rows, &regions, &carousels);
     (rows, carousels, regions, scroll_clips, boundaries)
 }
 
-/// Turn the raw per-pass boundary records into `Doc.boundaries`, dropping any
-/// whose row span overlaps a scroll region's reserved band or a carousel's rows
-/// — those hold content OUTSIDE `Doc.rows` (a region buffer / a scrolled strip),
-/// so the general inline splice (`patch_live_doc`) can't operate on them and
-/// they take the always-correct full path instead. v1 inline boundaries are
-/// pure-`Doc.rows` boxes (INCREMENTAL_LAYOUT_PLAN.md §13b).
+/// Turn the raw per-pass boundary records into `Doc.boundaries`, keeping only the
+/// ones the inline splice can apply correctly (INCREMENTAL_LAYOUT_PLAN.md §14).
+/// Dropped:
+/// - boxes whose row span overlaps a scroll region / carousel — those hold
+///   content OUTSIDE `Doc.rows` (a region buffer / a scrolled strip), so the
+///   `Doc.rows` splice can't operate on them;
+/// - a SUB-BOX (flex/grid item, inline-block) that SHARES a row with a sibling —
+///   replacing its rows would drop the sibling. A box OWNS its rows when no item
+///   on any of its rows falls outside its `[origin_col, origin_col+width)` span;
+///   only then is the row splice safe. A block-filling box owns its (full-width)
+///   rows by construction, so the check is skipped for it.
+///
+/// Anything dropped takes the always-correct full path.
 fn harvest_boundaries(
     recs: BoundaryRecs,
+    rows: &[Row],
     regions: &[Region],
     carousels: &[Carousel],
 ) -> Vec<BoundaryBox> {
     let overlaps = |start: usize, end: usize, a: usize, b: usize| start < b && a < end;
+    let owns_rows = |rec: &BoundaryRec| -> bool {
+        if !rec.sub_box {
+            return true; // a block-filling box fills its rows
+        }
+        let (lo, hi) = (rec.origin_col, rec.origin_col.saturating_add(rec.width));
+        !rows[rec.start_row.min(rows.len())..rec.end_row.min(rows.len())]
+            .iter()
+            .flat_map(|r| &r.items)
+            .any(|it| it.col < lo || it.col >= hi)
+    };
     recs.into_values()
         .filter(|rec| rec.end_row > rec.start_row)
         .filter(|rec| {
@@ -710,26 +795,38 @@ fn harvest_boundaries(
                 .iter()
                 .any(|c| overlaps(rec.start_row, rec.end_row, c.start, c.end))
         })
+        .filter(owns_rows)
         .map(|rec| BoundaryBox {
             node: rec.node,
             row_range: rec.start_row..rec.end_row,
             origin_col: rec.origin_col,
             content_width: rec.content_width,
+            width: rec.width,
+            sub_box: rec.sub_box,
         })
         .collect()
 }
 
 /// Lay out a single relayout-boundary subtree (a scroll region) into its buffer
-/// rows, for an incremental layout patch (INCREMENTAL_LAYOUT_PLAN.md). This
-/// mirrors EXACTLY what `flow_region` does to build a `Region.buffer` — lay the
-/// boundary's interior at `width` with the region recursion guard set — so the
-/// result is byte-identical to the same region produced by a full `lay_out`
-/// (the §9 differential guarantee). `boundary` is the scroll-container element
-/// in `dom`. The inherited styling context arrives materialized on the
-/// fragment (so `computed_value` over `dom` resolves it); an anchor-wrapped
-/// boundary is excluded upstream (the actor falls back to full), so the root
-/// `Ctx` carries no link.
-pub fn lay_out_region_fragment(
+/// rows, for an incremental layout patch (INCREMENTAL_LAYOUT_PLAN.md), MEMOIZING
+/// the laid rows of the scroll container's block children (§14 — the inner-scroll
+/// de-lag). This mirrors EXACTLY what `flow_region` does to build a
+/// `Region.buffer` — lay the boundary's interior at `width` with the region
+/// recursion guard set — so the result is byte-identical to the same region
+/// produced by a full `lay_out` (the §9 differential guarantee), but reuses
+/// `cache.children` for every child whose content hash is unchanged and lays only
+/// the new/changed ones: an appended chat message is O(1 message) instead of
+/// O(all messages). `boundary` is the scroll-container element in `dom`; the
+/// inherited styling context arrives materialized on the fragment (so
+/// `computed_value` over `dom` resolves it); an anchor-wrapped boundary is
+/// excluded upstream (the actor falls back to full), so the root `Ctx` carries no
+/// link. Returns the laid buffer/carousels plus the refreshed cache (every child
+/// this pass, to seed the next). When the region's structure doesn't fit the
+/// cacheable shape (a single-child-descended block BFC with ≥2 block children),
+/// it transparently lays the region in full — always correct. Guarded by
+/// `region_incremental_layout_matches_full`.
+#[allow(clippy::too_many_arguments)]
+pub fn lay_out_region_fragment_cached(
     dom: &Dom,
     base: &Url,
     content_width: usize,
@@ -737,7 +834,8 @@ pub fn lay_out_region_fragment(
     controls: &ControlMap,
     images: &ImageSizes,
     boundary: NodeId,
-) -> (Vec<Row>, Vec<Carousel>) {
+    cache: &RegionRowCache,
+) -> (Vec<Row>, Vec<Carousel>, RegionRowCache) {
     let content_width = content_width.max(1);
     let mut layout = Layout::new(
         dom,
@@ -748,17 +846,34 @@ pub fn lay_out_region_fragment(
         images,
         borders_enabled(),
     );
-    // `viewport` is the FULL terminal size (cells) — `vw`/`vh` resolve against
-    // it, NOT the narrowed region width (exactly as `flow_region`'s sub-layout
-    // keeps `self.viewport_w`). `content_width` is the region's scrollport width.
     layout.viewport_w = viewport.0;
     layout.viewport_h = viewport.1;
-    // The region recursion guard: laying the boundary's interior must NOT
-    // re-enter `flow_region` on the boundary itself (exactly as `flow_region`
-    // sets `region_inner` before laying its own buffer).
     layout.region_inner = Some(boundary);
+    // The cacheable container (a block BFC with ≥2 block children); `None` ⇒ no
+    // memoization, a plain full layout.
+    let rc = layout.region_cache_container(boundary).map(|container| {
+        // Reuse last pass's rows only if they were laid at this same width.
+        let old = if cache.width == content_width {
+            cache.children.clone()
+        } else {
+            HashMap::new()
+        };
+        std::rc::Rc::new(std::cell::RefCell::new(RegionChildCache {
+            container,
+            old,
+            new: HashMap::new(),
+        }))
+    });
+    layout.region_child_cache = rc.clone();
     let buffer = layout.layout_subtree_inner(boundary, content_width, None, false, &Ctx::root());
-    (buffer.rows, buffer.carousels)
+    let new_cache = match rc {
+        Some(rc) => RegionRowCache {
+            width: content_width,
+            children: std::mem::take(&mut rc.borrow_mut().new),
+        },
+        None => RegionRowCache::default(),
+    };
+    (buffer.rows, buffer.carousels, new_cache)
 }
 
 /// The result of laying one INLINE relayout-boundary fragment (a block-filling
@@ -778,16 +893,21 @@ pub struct SubtreeFragment {
 }
 
 /// Lay an INLINE relayout-boundary subtree for the general incremental splice.
-/// Unlike `lay_out_region_fragment` (which mirrors `flow_region`'s sub-layout,
-/// `subtree_root`/constrain SKIPPED to match how a region buffer is built), this
-/// lays the boundary through the NORMAL block path (`flow_node`, NO
-/// `subtree_root`) so its own `block_indent`/`constrain`/`width` are RE-APPLIED
-/// exactly as the full document laid it — the boundary went through `flow_element`
-/// there, not `flow_region`. `content_width` is the OUTER band the box fills
-/// (captured before the box's own indent); the re-applied indent/constrain land
-/// the content at the same place the full pass did (the app then adds
-/// `origin_col`). The §9 differential test guards this equivalence. An IFC box
-/// never overlaps an external float, so no float context is needed.
+/// Two re-lay modes, matching how the full document laid the box:
+/// - A BLOCK-FILLING box (`sub_box == false`) went through `flow_element` in
+///   flow, so it re-lays through the NORMAL block path (NO `subtree_root`) and
+///   re-applies its own `block_indent`/`constrain`/`width`. `content_width` is
+///   the OUTER band it fills (captured before its own indent); the re-applied
+///   indent/constrain land the content where the full pass did.
+/// - A SUB-BOX (`sub_box == true`: a flex/grid item) was laid by the parent's
+///   formatting pass via `layout_subtree_inner` with `subtree_root` SET (its own
+///   `constrain`/width already applied by the parent), so it re-lays the same way
+///   — `subtree_root` set, constrain skipped — at `content_width` = the track
+///   width it was given. (Unlike `lay_out_region_fragment`, no region guard.)
+///
+/// The §9 differential test guards both. An IFC box never overlaps an external
+/// float, so no float context is needed; the app adds `origin_col` after.
+#[allow(clippy::too_many_arguments)] // a layout entry point with genuinely many inputs
 pub fn lay_out_subtree_fragment(
     dom: &Dom,
     base: &Url,
@@ -796,6 +916,7 @@ pub fn lay_out_subtree_fragment(
     controls: &ControlMap,
     images: &ImageSizes,
     boundary: NodeId,
+    sub_box: bool,
 ) -> SubtreeFragment {
     let content_width = content_width.max(1);
     let mut layout = Layout::new(
@@ -809,6 +930,12 @@ pub fn lay_out_subtree_fragment(
     );
     layout.viewport_w = viewport.0;
     layout.viewport_h = viewport.1;
+    if sub_box {
+        // A flex/grid item: the parent already sized it, so skip its own
+        // `constrain` (`subtree_root`) — exactly as the full layout's
+        // `layout_subtree_inner` did when the parent laid this item.
+        layout.subtree_root = Some(boundary);
+    }
     layout.flow_node(boundary, &Ctx::root());
     layout.flush_block();
     layout.finish_floats();
@@ -1805,6 +1932,12 @@ struct Layout<'a> {
     /// table nesting depth (`flow_table` ±1's it). The DOM is immutable during a
     /// pass, so caching collapses the blow-up to linear. Fresh per pass.
     measure_cache: MeasureCache,
+    /// Region child-row memoization (INCREMENTAL_LAYOUT_PLAN.md §14). `Some`
+    /// only on the region-patch path (`lay_out_region_fragment_cached`): when the
+    /// block flow reaches `container`, each child is reused from `old` (by content
+    /// hash) instead of re-laid, and every child is recorded into `new`. `None`
+    /// everywhere else (the full document layout, measurement, tests) — zero cost.
+    region_child_cache: Option<RegionCache>,
 }
 
 impl<'a> Layout<'a> {
@@ -1858,6 +1991,7 @@ impl<'a> Layout<'a> {
             capture_boundaries: false,
             boundary_boxes: HashMap::new(),
             measure_cache: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+            region_child_cache: None,
         }
     }
 
@@ -2280,6 +2414,10 @@ impl<'a> Layout<'a> {
             && block_like
             && !region
             && !hscroll
+            // Not the root of this sub-layout: a box laid as a SUB-BOX (a flex/
+            // grid item) is captured by `blit` instead (with `subtree_root` set),
+            // so capturing it here too would double-record it.
+            && self.subtree_root != Some(id)
             // The cheap `data-trust-node` gate FIRST: only IFC boundaries carry
             // it, so the cascade queries below run on the sparse boundary set,
             // not every block.
@@ -2517,6 +2655,11 @@ impl<'a> Layout<'a> {
                     // stack each multi-row tile onto its own row.
                     if block_like && self.is_inline_box_grid(id) {
                         self.flow_inline_box_grid(id, &cctx);
+                    } else if self.is_region_cache_container(id) {
+                        // Region de-lag (INCREMENTAL_LAYOUT_PLAN.md §14): reuse the
+                        // cached rows of every unchanged block child, lay only the
+                        // new/changed ones.
+                        self.flow_cached_children(id, &cctx);
                     } else {
                         for child in self.flow_children(id) {
                             self.flow_node(child, &cctx);
@@ -2593,9 +2736,13 @@ impl<'a> Layout<'a> {
                     BoundaryRec {
                         node,
                         content_width,
+                        // A block-filling box fills its band, so its width IS the
+                        // band — the owns-rows check is skipped for it.
+                        width: content_width,
                         origin_col,
                         start_row: corner_start_row,
                         end_row: self.rows.len(),
+                        sub_box: false,
                     },
                 );
             }
@@ -2901,6 +3048,34 @@ impl<'a> Layout<'a> {
         self.dom
             .parent_composed(id)
             .is_some_and(|p| self.is_flex_or_grid(p))
+    }
+
+    /// Whether `id` is an incremental-layout SUB-BOX boundary candidate — a flex/
+    /// grid ITEM, or an atomic inline box (`inline-block`/`-flex`/`-grid`) — laid
+    /// as its own box via `layout_subtree_inner`+`blit` (INCREMENTAL_LAYOUT_PLAN.md
+    /// §14, the widening for styled-components items / animated counters).
+    /// Excludes out-of-flow (abspos/fixed) and floated boxes — they position
+    /// specially, aren't the high-churn targets, and a wrong splice would be
+    /// worse than a full render. The harvest's owns-rows check + the patch's
+    /// width verify are the real safety, so this is only a cheap pre-filter.
+    fn is_sub_box_boundary(&self, id: NodeId) -> bool {
+        if self.is_out_of_flow(id) {
+            return false;
+        }
+        if matches!(
+            self.dom
+                .computed_style(id, "float")
+                .as_deref()
+                .map(str::trim),
+            Some("left" | "right" | "inline-start" | "inline-end")
+        ) {
+            return false;
+        }
+        self.parent_is_flex_container(id)
+            || matches!(
+                self.dom.effective_display(id).as_deref(),
+                Some("inline-block" | "inline-flex" | "inline-grid")
+            )
     }
 
     /// Whether `id`'s parent is an INLINE-level flex/grid container
@@ -3958,15 +4133,20 @@ impl<'a> Layout<'a> {
     }
 
     /// Lay a vertical inner-scroll viewport (the `flow_element` dispatch). The
-    /// content is laid into a SEPARATE `buffer` at the scrollport width; when it
-    /// overflows the definite height `H` (or `overflow-y:scroll` is explicit),
-    /// the layout reserves exactly `H` blank doc rows here and records a
-    /// `Region` (the view windows the buffer over those rows) — the document
-    /// stays flat, so scroll/selection indices are untouched. When
-    /// `overflow-y:auto` content FITS, there's nothing to scroll, so the buffer
-    /// is blitted inline like an ordinary block (no reservation, no wasted
-    /// rows). The measurement pass (`tag_all_nodes`, the JS geometry backing)
-    /// also flows inline, so region content keeps its honest box geometry.
+    /// content is laid into a SEPARATE `buffer` at the scrollport width; the
+    /// layout reserves exactly the box's DEFINITE height `H` in blank doc rows
+    /// here and records a `Region` (the view windows the buffer over those rows)
+    /// — the document stays flat, so scroll/selection indices are untouched. A
+    /// definite-height `overflow-y:auto|scroll` box IS `H` tall whether its
+    /// content overflows or fits (CSS: the `height` property fixes the box; the
+    /// `auto`/`scroll` distinction is only scrollbar presence, not box size) —
+    /// so a short chat list reserves its full band and shows empty space below
+    /// the messages, exactly as a browser paints it, instead of growing inline
+    /// from empty to full as messages arrive (her call 2026-06-29: follow what
+    /// the page declares; don't render a fixed-height box as flexible). The two
+    /// measurement passes (`tag_all_nodes`, the JS geometry backing; `measuring`,
+    /// intrinsic-width sizing) flow the content INLINE instead, so region content
+    /// keeps its honest box geometry.
     fn flow_region(&mut self, id: NodeId, ctx: &Ctx) {
         self.flush_block();
         self.begin_line();
@@ -3989,15 +4169,16 @@ impl<'a> Layout<'a> {
         let buffer = self.layout_subtree_inner(id, width, None, false, ctx);
         self.region_inner = saved;
         let content_h = buffer.rows.len();
-        let scroll = matches!(self.axis_overflow(id, true).as_deref(), Some("scroll"));
-        // Reserve the clipped band only on the REAL render pass. The two
-        // measurement passes flow the region's content INLINE instead, so it
-        // contributes its real width/height: `tag_all_nodes` keeps
-        // getBoundingClientRect honest, and `measuring` (intrinsic-width sizing)
-        // keeps a region from measuring as ~0-wide — which would size a flex item
-        // / float / table cell CONTAINING a scroll region down to nothing, then
-        // char-break its content into one cell per row.
-        let clip = h > 0 && !self.tag_all_nodes && !self.measuring && (scroll || content_h > h);
+        // Reserve the clipped band on the REAL render pass for EVERY definite-
+        // height (h > 0) scroll-y box — overflowing or fitting alike, since the
+        // box is `h` tall either way (see the doc comment). The two measurement
+        // passes flow the region's content INLINE instead, so it contributes its
+        // real width/height: `tag_all_nodes` keeps getBoundingClientRect honest,
+        // and `measuring` (intrinsic-width sizing) keeps a region from measuring
+        // as ~0-wide — which would size a flex item / float / table cell
+        // CONTAINING a scroll region down to nothing, then char-break its content
+        // into one cell per row.
+        let clip = h > 0 && !self.tag_all_nodes && !self.measuring;
         let row_base = self.rows.len();
         // The live actor's node id (baked as `data-trust-node` by the serializer)
         // for the Phase-3 geometry round-trip + wheel write-back.
@@ -4030,6 +4211,18 @@ impl<'a> Layout<'a> {
                 .attr(id, "data-trust-scroll-top")
                 .and_then(|s| s.parse::<usize>().ok());
             let voffset = signal.map_or(0, |rows| rows.min(max_voffset));
+            // Collect every `<img>` URL in the region's subtree (decoded or not —
+            // an undecoded one is alt text, not a laid item) so an image-decode
+            // reflow can be routed to THIS region instead of the whole document.
+            let mut image_urls = Vec::new();
+            for d in self.dom.descendants(id) {
+                if self.dom.tag_name(d) == Some("img")
+                    && let Some(u) = self.image_src(d)
+                    && !image_urls.contains(&u)
+                {
+                    image_urls.push(u);
+                }
+            }
             self.regions.push(Region {
                 node: id,
                 start_row: row_base,
@@ -4041,6 +4234,7 @@ impl<'a> Layout<'a> {
                 live_node,
                 voffset_from_page: signal.is_some(),
                 carousels: buffer.carousels,
+                image_urls,
             });
         } else {
             // `auto` content that fits (or the measure pass): place inline.
@@ -4048,6 +4242,120 @@ impl<'a> Layout<'a> {
         }
         self.col = self.indent;
         self.pending_space = false;
+    }
+
+    /// The scroll-container child whose block children are memoized for the
+    /// region de-lag (INCREMENTAL_LAYOUT_PLAN.md §14). Descend from `boundary`
+    /// through single-element-child wrappers (a chat region is
+    /// `scrollable-area > message-container > messages`); stop at the first node
+    /// with ≠1 element children. Cache there ONLY when it has ≥2 block-level,
+    /// in-flow children laid by the plain block path — the seam
+    /// `flow_cached_children` hooks. Anything else (a flex/grid list, mixed
+    /// inline content, a 0/1-item list) returns `None` ⇒ the caller lays the
+    /// region in full, always correct. Cascade/structure only, no layout.
+    fn region_cache_container(&self, boundary: NodeId) -> Option<NodeId> {
+        let mut cur = boundary;
+        loop {
+            let kids: Vec<NodeId> = self
+                .dom
+                .children(cur)
+                .into_iter()
+                .filter(|&c| self.dom.tag_name(c).is_some())
+                .collect();
+            if kids.len() == 1 {
+                cur = kids[0];
+                continue;
+            }
+            if kids.len() < 2 {
+                return None; // nothing to memoize
+            }
+            // The seam is the block-children loop, so the container must flow its
+            // children there (not flex/grid) and every child must be a block-level
+            // in-flow box that owns whole rows (so capturing `rows[snap..]` is
+            // exactly that child's content).
+            if self.flex_mode(cur).is_some() {
+                return None;
+            }
+            let all_block = kids.iter().all(|&c| {
+                matches!(
+                    self.flow_of(c, self.dom.tag_name(c).unwrap_or("")),
+                    Flow::Block | Flow::ListItem
+                )
+            });
+            return all_block.then_some(cur);
+        }
+    }
+
+    /// Whether `id` is this pass's region cache container (region-patch path only).
+    fn is_region_cache_container(&self, id: NodeId) -> bool {
+        self.region_child_cache
+            .as_ref()
+            .is_some_and(|c| c.borrow().container == id)
+    }
+
+    /// The cache key for a region child: its subtree content hash
+    /// (`subtree_layout_hash`) folded with each descendant `<img>`'s DECODE
+    /// READINESS (whether its intrinsic size is known). A chat emote/avatar/badge
+    /// carries no explicit dimensions (verified on Twitch), so its used box is its
+    /// intrinsic size (CSS Images §5.1) — laid as alt/placeholder until decoded,
+    /// then as the real W×H box. Folding readiness makes a decode invalidate ONLY
+    /// the message that image sits in (a cache miss → re-laid with the real box),
+    /// leaving every other message reused — so an emote decoding inside the region
+    /// re-lays one message, not the whole page. Without it the content hash is
+    /// unchanged on decode (same HTML) and the stale placeholder rows reuse.
+    fn region_child_key(&self, child: NodeId) -> u64 {
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write_u64(self.dom.subtree_layout_hash(child));
+        for d in self.dom.descendants(child) {
+            if self.dom.tag_name(d) == Some("img")
+                && let Some(url) = self.image_src(d)
+            {
+                let ready = self
+                    .images
+                    .get(&url)
+                    .is_some_and(|&(w, ht)| w > 0 && ht > 0);
+                h.write_u8(ready as u8);
+            }
+        }
+        h.finish()
+    }
+
+    /// Lay the block children of the region cache container, reusing the cached
+    /// rows of every UNCHANGED child (by `subtree_layout_hash`) and laying only
+    /// new/changed ones. Each child is captured/reused at a clean row boundary
+    /// (`flush_block` before + after) — block children own whole rows, so the
+    /// reassembled buffer is row-identical to a full in-flow layout (the §9
+    /// differential guard `region_incremental_layout_matches_full` pins this).
+    /// This is what turns an appended chat message from an O(all-messages)
+    /// re-layout into an O(one-message) one.
+    fn flow_cached_children(&mut self, id: NodeId, ctx: &Ctx) {
+        let cache = self
+            .region_child_cache
+            .clone()
+            .expect("a cache container implies a cache");
+        for child in self.flow_children(id) {
+            let key = self.region_child_key(child);
+            // Close any open inline line so the child's rows start clean.
+            self.flush_block();
+            let hit = cache.borrow().old.get(&key).cloned();
+            let rows = match hit {
+                Some(rows) => {
+                    // Reuse: append the cached rows verbatim (same width/indent).
+                    self.rows.extend(rows.iter().cloned());
+                    rows
+                }
+                None => {
+                    // Miss: lay the child in flow, capture exactly its rows.
+                    let snap = self.rows.len();
+                    self.flow_node(child, ctx);
+                    self.flush_block();
+                    std::rc::Rc::new(self.rows[snap..].to_vec())
+                }
+            };
+            cache.borrow_mut().new.insert(key, rows);
+        }
+        self.col = self.indent;
     }
 
     /// Place a containing block's out-of-flow (`position:absolute|fixed`)
@@ -6159,6 +6467,8 @@ impl<'a> Layout<'a> {
             regions,
             element_tops,
             boundary_boxes,
+            root: Some(id),
+            lay_width: inner_w as u16,
         };
         let framed = self.frame_box(content, sides);
         if framed.height > 0 {
@@ -6319,6 +6629,10 @@ impl<'a> Layout<'a> {
             regions,
             element_tops,
             boundary_boxes,
+            // The frame wraps the SAME element — keep its root, but the framed
+            // box's used width is `new_w` (interior + borders).
+            root: content.root,
+            lay_width: new_w as u16,
         }
     }
 
@@ -6394,6 +6708,9 @@ impl<'a> Layout<'a> {
         // Share the pass-wide intrinsic-width memo so a subtree measured by an
         // ancestor's sizing pass isn't re-measured when this pass measures it.
         sub.measure_cache = self.measure_cache.clone();
+        // Share the region child-row cache so the children flowed deep inside a
+        // region fragment's sub-layout reuse/record against the same map.
+        sub.region_child_cache = self.region_child_cache.clone();
         sub.measuring = measure;
         // Carry the measurement flag so a sub-layout tags its items with their
         // own nodes and records empty-element flow positions (`element_tops`);
@@ -6433,6 +6750,8 @@ impl<'a> Layout<'a> {
             regions,
             element_tops,
             boundary_boxes,
+            root: Some(id),
+            lay_width: content_width.min(u16::MAX as usize) as u16,
         }
     }
 
@@ -6487,11 +6806,35 @@ impl<'a> Layout<'a> {
         // (the content band width is position-independent).
         for (&id, rec) in &b.boundary_boxes {
             self.boundary_boxes.entry(id).or_insert(BoundaryRec {
-                node: rec.node,
-                content_width: rec.content_width,
                 origin_col: rec.origin_col + col_off,
                 start_row: rec.start_row + row_base,
                 end_row: rec.end_row + row_base,
+                ..*rec
+            });
+        }
+        // The box ITSELF is an incremental-layout SUB-BOX boundary when it's a
+        // flex/grid item or inline-block cell carrying a baked `data-trust-node`
+        // (INCREMENTAL_LAYOUT_PLAN.md §14 — the widening that lets a styled-
+        // components flex item / animated counter patch instead of forcing a full
+        // render). Recorded at its blit position; the harvest's owns-rows check +
+        // the patch's width verify keep only the safe ones.
+        if self.capture_boundaries
+            && b.height > 0
+            && let Some(root) = b.root
+            && self.is_sub_box_boundary(root)
+            && let Some(node) = self
+                .dom
+                .attr(root, "data-trust-node")
+                .and_then(|s| s.parse::<usize>().ok())
+        {
+            self.boundary_boxes.entry(root).or_insert(BoundaryRec {
+                node,
+                content_width: b.lay_width,
+                width: b.width,
+                origin_col: col_off,
+                start_row: row_base,
+                end_row: row_base + b.height as usize,
+                sub_box: true,
             });
         }
     }
@@ -10987,6 +11330,7 @@ mod tests {
             viewport,
             &imgs,
             boundary,
+            &RegionRowCache::default(),
         )
         .expect("the patch fragment lays out");
         assert_eq!(rp.rows.len(), full.buffer.len(), "same buffer height");
@@ -11011,6 +11355,128 @@ mod tests {
         assert!(
             render_row(&full.buffer[0]).contains("MSG00"),
             "inherited text-transform:uppercase applied"
+        );
+    }
+
+    #[test]
+    fn region_incremental_layout_matches_full() {
+        // INCREMENTAL_LAYOUT_PLAN.md §14 / §9 differential guard for the inner-
+        // scroll DE-LAG: reusing the cached rows of unchanged messages and laying
+        // only the NEW one must produce a buffer BYTE-IDENTICAL to re-laying the
+        // whole region from scratch. This is the correctness bar that lets us not
+        // re-walk off-screen messages on every append.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let viewport = (40usize, 8usize);
+        // Build a chat-like region: a scroll container > message-container > N
+        // block messages (each unique content → unique cache key), mirroring the
+        // real `scrollable-area > __message-container > chat-line` nesting.
+        let region_html = |msgs: &[&str]| {
+            let mut s = String::from(
+                r#"<html style="height:100%"><body style="height:100%"><div id="chat" data-trust-node="980" style="height:100%;overflow-y:scroll;width:30ch"><div class="msgs">"#,
+            );
+            for m in msgs {
+                s.push_str(&format!("<div class=\"line\"><span>{m}</span></div>"));
+            }
+            s.push_str("</div></div></body></html>");
+            s
+        };
+        let lay_region = |html: &str, cache: &RegionRowCache| {
+            let dom = Dom::parse_document(html);
+            let boundary = dom
+                .descendants(DOCUMENT)
+                .into_iter()
+                .find(|&id| dom.attr(id, "data-trust-node") == Some("980"))
+                .expect("the chat boundary");
+            lay_out_region_fragment_cached(
+                &dom, &base, 30, viewport, &ctrls, &imgs, boundary, cache,
+            )
+        };
+        // Patch 1 (cold): 5 messages. Populates the cache.
+        let five = ["alpha", "bravo", "charlie", "delta", "echo"];
+        let (_rows1, _c1, cache1) = lay_region(&region_html(&five), &RegionRowCache::default());
+        assert_eq!(cache1.children.len(), 5, "five message rows cached");
+        // Patch 2 (warm): append a 6th message — only it should be laid, the first
+        // five reused from `cache1`.
+        let six = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+        let (rows_inc, _c2, cache2) = lay_region(&region_html(&six), &cache1);
+        assert_eq!(cache2.children.len(), 6, "six rows cached after the append");
+        // The FULL (uncached) layout of the same six messages.
+        let (rows_full, ..) = lay_region(&region_html(&six), &RegionRowCache::default());
+        assert_eq!(
+            rows_inc.len(),
+            rows_full.len(),
+            "incremental buffer has the same height as a full relayout"
+        );
+        for (a, b) in rows_inc.iter().zip(rows_full.iter()) {
+            assert_eq!(
+                render_row(a),
+                render_row(b),
+                "incremental row matches the full relayout row"
+            );
+        }
+        assert!(
+            rows_full.iter().any(|r| render_row(r).contains("foxtrot")),
+            "the appended message is present"
+        );
+        // Top-trim (the chat buffer cap): drop the oldest, keep appending. Still
+        // matches a full relayout, and the evicted key is gone from the cache.
+        let shifted = ["bravo", "charlie", "delta", "echo", "foxtrot", "golf"];
+        let (rows_shift, _c3, cache3) = lay_region(&region_html(&shifted), &cache2);
+        assert_eq!(cache3.children.len(), 6, "still six after a shift");
+        let (rows_shift_full, ..) = lay_region(&region_html(&shifted), &RegionRowCache::default());
+        for (a, b) in rows_shift.iter().zip(rows_shift_full.iter()) {
+            assert_eq!(render_row(a), render_row(b), "shift matches full relayout");
+        }
+        assert!(
+            !rows_shift.iter().any(|r| render_row(r).contains("alpha")),
+            "the trimmed-off oldest message is gone"
+        );
+    }
+
+    #[test]
+    fn a_flex_column_item_is_captured_but_a_shared_row_item_is_not() {
+        // INCREMENTAL_LAYOUT_PLAN.md §14 (the widening): a flex/grid ITEM that
+        // OWNS its rows (a flex-column item) is captured as a SUB-BOX boundary —
+        // so a styled-components item / animated counter patches instead of
+        // forcing a full render. But a flex-ROW item that SHARES a row with a
+        // sibling is EXCLUDED (the owns-rows safety valve), because a row splice
+        // would drop the sibling — it takes the full path.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+
+        // A flex COLUMN: each item stacks on its own rows → owns them.
+        let col = r#"<html><body><div style="display:flex;flex-direction:column"><div data-trust-node="5"><div>aaa</div><div>aaa</div></div><div data-trust-node="6"><div>bbb</div></div></div></body></html>"#;
+        let (_r, _c, _rg, _cl, b1) = lay_out_with_carousels(
+            &Dom::parse_document(col),
+            &base,
+            (40, 0),
+            &[],
+            &ctrls,
+            &imgs,
+            false,
+        );
+        let item = b1
+            .iter()
+            .find(|b| b.node == 5)
+            .expect("the flex-column item is captured as a sub-box boundary");
+        assert!(item.sub_box, "it is a sub-box (re-lays with subtree_root)");
+        assert_eq!(item.row_range.len(), 2, "it spans its two content rows");
+
+        // A flex ROW: the two items sit side by side, sharing a row.
+        let row = r#"<html><body><div style="display:flex"><div data-trust-node="5">AAA</div><div data-trust-node="6">BBB</div></div></body></html>"#;
+        let (_r2, _c2, _rg2, _cl2, b2) = lay_out_with_carousels(
+            &Dom::parse_document(row),
+            &base,
+            (40, 0),
+            &[],
+            &ctrls,
+            &imgs,
+            false,
+        );
+        assert!(
+            !b2.iter().any(|b| b.node == 5),
+            "a row-sharing flex item is excluded (a row splice would drop its sibling)"
         );
     }
 
@@ -11081,6 +11547,7 @@ mod tests {
             vp,
             &imgs,
             7,
+            b.sub_box,
         )
         .expect("the patch fragment lays out");
         assert_eq!(
@@ -11247,10 +11714,15 @@ mod tests {
     }
 
     #[test]
-    fn auto_overflow_that_fits_is_not_a_region() {
-        // CSS Overflow L3: `overflow:auto` behaves like `visible` when there is
-        // NO scrollable overflow. A short content (3 rows) in a tall (10-row)
-        // box doesn't scroll, so it's laid inline — no region, no wasted rows.
+    fn auto_overflow_with_a_definite_height_reserves_its_full_band_even_when_content_fits() {
+        // A definite-height `overflow-y:auto` box IS its `height` tall whether
+        // content overflows or fits — `auto` only governs scrollbar presence, not
+        // box size (CSS Overflow L3). So a short content (3 rows) in a tall
+        // (10-row) box reserves the full 10-row band and shows empty space below,
+        // exactly as a browser paints it — NOT laid inline at content height (her
+        // call 2026-06-29: follow the declared box, don't render fixed as
+        // flexible). This is the fix for a chat list growing inline from empty to
+        // full as messages arrive instead of being full-height from the start.
         let base = Url::parse("https://example.com/").unwrap();
         let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
         let dom = Dom::parse_document(
@@ -11258,10 +11730,20 @@ mod tests {
         );
         let (rows, _car, regions, ..) =
             lay_out_with_carousels(&dom, &base, (40, 10), &[], &ctrls, &imgs, false);
-        assert!(regions.is_empty(), "content fits ⇒ not a scroll region");
+        assert_eq!(regions.len(), 1, "a definite-height auto box is a region");
+        assert_eq!(
+            regions[0].height, 10,
+            "it reserves its full definite height"
+        );
+        assert_eq!(
+            regions[0].buffer.len(),
+            3,
+            "the buffer holds the short content"
+        );
+        // The content shows at the band top; the rest of the band is blank.
         assert!(
-            rows.iter().any(|r| r.items.iter().any(|it| it.text == "C")),
-            "the fitting content is laid inline"
+            render_row(&effective_row(&rows, &regions, regions[0].start_row)).contains("A"),
+            "the fitting content shows at the band top"
         );
     }
 

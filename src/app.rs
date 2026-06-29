@@ -427,6 +427,39 @@ thread_local! {
     /// spawned tasks (verified). So the owner flag set at run-loop entry
     /// stays valid for every draw.
     pub(crate) static TERMINAL_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Diagnostic (`TRUST_DIAG_FRAME`): redraws this second + their summed draw
+    /// time (µs), to size the main-thread render/encode cost.
+    static FRAME_DIAG: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    static FRAME_DIAG_LAST: std::cell::Cell<std::time::Instant> = std::cell::Cell::new(std::time::Instant::now());
+    /// (on_page_evt µs, #calls, #full-replaces, #event-drains) this second.
+    static PAGE_WORK: std::cell::Cell<(u64, u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+    /// (image-relayout µs, #relayouts) this second.
+    static IMG_RELAYOUT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// (Updated, Patched, Scrolled, Settled, other) page events this second —
+    /// to see what wakes the redraw at rest (the sixel-cost trigger).
+    static EVT_TALLY: std::cell::Cell<[u64; 5]> = const { std::cell::Cell::new([0; 5]) };
+    /// Draws this second whose VISIBLE browser frame was byte-identical to the
+    /// prior draw — wasted redraws (the sixel re-render cost with nothing on
+    /// screen changing). The `TRUST_DIAG_FRAME` lever for the at-rest peg.
+    static REDUNDANT_DRAWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Diagnostic (`TRUST_DIAG_FRAME`): count of `SlicedImage` widget renders during
+/// the current draw — the main-thread sixel cost is ~linear in this. `ui::draw`
+/// increments it per image; the run loop reads+resets it after each draw.
+pub(crate) static IMG_RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A live scroll region's retained state (INCREMENTAL_LAYOUT_PLAN.md §14): the
+/// last patch fragment HTML (so the region can be re-laid in place — on an image
+/// decode, or to refresh it from current content after a full re-render) plus the
+/// per-child row cache that makes that re-lay O(changed messages). The region's
+/// image-URL set (for decode routing) lives on the layout `Region` itself, not
+/// here — it's populated on every full render so routing works before a region
+/// ever patches (`Region::image_urls`).
+#[derive(Default)]
+struct RegionLive {
+    html: Vec<u8>,
+    cache: crate::layout::RegionRowCache,
 }
 
 pub struct App {
@@ -461,6 +494,21 @@ pub struct App {
     /// the same offset isn't re-sent and the page's `scroll` handler fires only
     /// on a real move. Cleared with the live page. (Phase 3 inner scroll.)
     region_scroll_sent: std::collections::HashMap<usize, usize>,
+    /// Per-region live state (INCREMENTAL_LAYOUT_PLAN.md §14 — the inner-scroll
+    /// de-lag), keyed by the actor node id so it survives the per-message re-parse
+    /// AND a full re-render: the last patch FRAGMENT HTML + the memoized child-row
+    /// cache. The cache lets a region patch reuse the laid rows of every unchanged
+    /// chat message and lay only the new one (O(one message) instead of O(all)).
+    /// The retained HTML lets an IMAGE DECODE inside the region re-lay ONLY that
+    /// region (an emote's box is contained by the region's formatting context),
+    /// instead of re-laying the whole page — and is the CURRENT content, so it
+    /// also keeps a region's chat messages from reverting to the stale `doc.raw`
+    /// content on a full re-render. Cleared with the live page.
+    region_live: std::collections::HashMap<usize, RegionLive>,
+    /// Image URLs that finished decoding since the last run-loop coalesce point,
+    /// to drive a SCOPED re-lay (region-only when the image is region-confined;
+    /// see `apply_pending_image_decodes`) instead of a blanket full-page relayout.
+    pending_decoded_urls: Vec<String>,
     /// The set of live clipped-region actor nodes last sent to the page actor
     /// (`PageCmd::LiveRegions`), so it patches a mutation ONLY when confined to a
     /// real region (INCREMENTAL_LAYOUT_PLAN.md §4b). Re-sent only when it changes.
@@ -560,11 +608,6 @@ pub struct App {
     image_cache: HashMap<String, DecodedImage>,
     /// In-flight parallel page-image fetch+decode batch.
     imgs_rx: Option<mpsc::Receiver<ImgLoadMsg>>,
-    /// A decoded image landed and the doc needs re-laying-out to reserve its
-    /// real box. Set by `on_img_load`, consumed once per run-loop turn — so a
-    /// burst of decodes (a page load fetches dozens; a churning live page
-    /// streams them) collapses into ONE O(document) re-parse, not one per image.
-    image_relayout_pending: bool,
     /// Encoded inline-image protocols, keyed by `(url, cell_w, cell_h, crop)`.
     /// Each is a `SlicedProtocol` (encoded once for the whole box; the renderer
     /// clips it to any vertical slice), so scroll never re-encodes. Bounded to
@@ -627,6 +670,8 @@ impl App {
             region_geom_sent: std::collections::HashMap::new(),
             live_boundaries_sent: std::collections::HashSet::new(),
             region_scroll_sent: std::collections::HashMap::new(),
+            region_live: std::collections::HashMap::new(),
+            pending_decoded_urls: Vec::new(),
             live_regions_sent: std::collections::HashSet::new(),
             page_busy: false,
             pending_live_submit: None,
@@ -667,7 +712,6 @@ impl App {
             img_rx: None,
             image_cache: HashMap::new(),
             imgs_rx: None,
-            image_relayout_pending: false,
             image_protocols: HashMap::new(),
             image_encoding: HashSet::new(),
             failed_encodes: HashSet::new(),
@@ -729,6 +773,12 @@ impl App {
             .expect("spawn terminal input reader");
         let mut pending_wrap_target: Option<(usize, bool)> = None;
         let mut wrap_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        // Redraw economy: the last drawn visible-frame signature + terminal size,
+        // so a wake that paints an identical browser frame skips the draw (and its
+        // sixel re-render). `TRUST_NO_FRAME_SKIP` forces the old always-draw path.
+        let mut last_frame_sig: Option<u64> = None;
+        let mut last_term_size: Option<ratatui::layout::Size> = None;
+        let frame_skip_off = std::env::var_os("TRUST_NO_FRAME_SKIP").is_some();
         // Tracks the `<select>` dropdown across frames. A sixel image is one
         // escape sequence anchored at its top-left cell; a popup covering the
         // middle of an image leaves that anchor cell unchanged, so ratatui's
@@ -755,7 +805,67 @@ impl App {
                 terminal.clear()?;
             }
             menu_was_open = menu_open;
-            terminal.draw(|frame| ui::draw(frame, &mut self))?;
+            // Redraw economy: skip the draw entirely when it would paint a
+            // byte-identical visible browser frame (same signature AND same
+            // terminal size). On an immediate-mode TUI every draw re-renders all
+            // on-screen images from scratch — cheap for halfblocks, but each sixel
+            // image rebuilds its full byte string per draw, so a background timer
+            // ticking an off-screen node every second otherwise pegs a core
+            // re-emitting unchanged emotes. A `None` signature (image viewer,
+            // menus, prompts, loading) always draws. Kill switch:
+            // `TRUST_NO_FRAME_SKIP`.
+            let term_size = terminal.size().ok();
+            let sig = self.browser_frame_sig();
+            let skip = !frame_skip_off
+                && sig.is_some()
+                && sig == last_frame_sig
+                && term_size == last_term_size;
+            if std::env::var_os("TRUST_DIAG_FRAME").is_some() && skip {
+                REDUNDANT_DRAWS.with(|c| c.set(c.get() + 1));
+            }
+            last_frame_sig = sig;
+            last_term_size = term_size;
+            let _t_draw = std::time::Instant::now();
+            if !skip {
+                terminal.draw(|frame| ui::draw(frame, &mut self))?;
+            }
+            if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+                use std::io::Write;
+                FRAME_DIAG.with(|d| {
+                    let (mut n, mut us) = d.get();
+                    if !skip {
+                        n += 1;
+                        us += _t_draw.elapsed().as_micros() as u64;
+                    }
+                    let now = std::time::Instant::now();
+                    if FRAME_DIAG_LAST.with(|l| now.duration_since(l.get()).as_secs_f64()) >= 1.0 {
+                        let (pus, pn, pfull, pdr) = PAGE_WORK.with(|w| w.replace((0, 0, 0, 0)));
+                        let (ius, icount) = IMG_RELAYOUT.with(|c| c.replace((0, 0)));
+                        let (raw_kb, doc_rows, reg_rows) = self.browser.as_ref().map_or((0, 0, 0), |g| {
+                            (
+                                g.doc.raw.len() / 1024,
+                                g.doc.rows.len(),
+                                g.doc.regions.iter().map(|r| r.buffer.len()).sum::<usize>(),
+                            )
+                        });
+                        let imgr = IMG_RENDERS.swap(0, std::sync::atomic::Ordering::Relaxed);
+                        let ev = EVT_TALLY.with(|t| t.replace([0; 5]));
+                        let redun = REDUNDANT_DRAWS.with(|c| c.replace(0));
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "DIAGFRAME draws/s={n} (redundant={redun}) draw={}ms | page_evt: {pn} calls {}ms (full_replaces={pfull} drains={pdr}) | img_relayout: {icount}x {}ms | raw={raw_kb}KB doc_rows={doc_rows} reg_rows={reg_rows} | img_renders/s={imgr} evts[upd={} pat={} scr={} set={}]",
+                            us / 1000,
+                            pus / 1000,
+                            ius / 1000,
+                            ev[0], ev[1], ev[2], ev[3],
+                        );
+                        FRAME_DIAG_LAST.with(|l| l.set(now));
+                        n = 0;
+                        us = 0;
+                    }
+                    d.set((n, us));
+                });
+            }
             self.sync_vt_size().await;
             match self.pending_browser_wrap_target() {
                 Some(target) if pending_wrap_target != Some(target) => {
@@ -859,7 +969,7 @@ impl App {
                     }
                 }
             }
-            self.apply_pending_image_relayout();
+            self.apply_pending_image_decodes();
             // After the input burst is coalesced, push the (now settled) scroll
             // position to the live page so its infinite-scroll / lazy-load logic
             // reacts. A no-op when the scroll row didn't move (the common case).
@@ -2094,24 +2204,118 @@ impl App {
         });
     }
 
-    /// One image finished decoding: cache it and re-flow the page so its
-    /// box (and the rows beneath it) appear in place of the alt text.
+    /// One image finished decoding: cache it and record its URL so the run loop's
+    /// coalesce point re-flows the box. A burst of decodes (a page load fetches
+    /// dozens; a churning live page streams chat emotes) collapses into ONE scoped
+    /// re-lay, not one per image.
     fn on_img_load(&mut self, msg: ImgLoadMsg) {
         let Some(decoded) = msg.decoded else {
             return; // fetch/decode failed: the alt text stands
         };
+        self.pending_decoded_urls.push(msg.url.clone());
         self.image_cache.insert(msg.url, decoded);
-        // Defer the (O(document)) re-layout to the run loop's coalesce point so a
-        // burst of decodes triggers one relayout, not one each.
-        self.image_relayout_pending = true;
     }
 
-    /// Re-lay-out the doc once if any image load since the last turn flagged it
-    /// (the coalesce point for `on_img_load`'s deferred relayouts).
-    fn apply_pending_image_relayout(&mut self) {
-        if std::mem::take(&mut self.image_relayout_pending) {
-            self.relayout_browser();
+    /// Re-flow for the images decoded since the last run-loop turn — SCOPED to
+    /// where they sit (the coalesce point for `on_img_load`). An image whose box
+    /// lives only inside a scroll region (a chat emote/avatar/badge) re-lays JUST
+    /// that region: its formatting context is independent (CSS Containment / a
+    /// BFC), so its intrinsic-size reflow can't change anything outside it, and
+    /// the region re-lay is O(the messages whose image decoded) via the row cache
+    /// — NOT the whole page. Only an image in the main document flow triggers the
+    /// (O(document)) full relayout, which then refreshes every region from its
+    /// current retained HTML (so chat content + emote boxes stay right). This is
+    /// what stopped Twitch's 135 streaming chat images from pegging a core with a
+    /// full-page relayout per decode.
+    fn apply_pending_image_decodes(&mut self) {
+        let urls = std::mem::take(&mut self.pending_decoded_urls);
+        if urls.is_empty() {
+            return;
         }
+        let t = std::time::Instant::now();
+        // Route each decoded URL by WHERE its `<img>` lives, off the LAYOUT
+        // region's image-URL set (`Region::image_urls`, populated on every full
+        // render by walking the region's subtree — so routing works before the
+        // region ever patches, and for EVERY region, not only the chat). A URL
+        // inside a LIVE region (one we can re-lay in place) re-lays just that
+        // region; a URL in no live region is in the main document flow (or a
+        // static region we can't re-lay) and takes the full relayout, as before.
+        let Some(g) = self.browser.as_ref() else {
+            return;
+        };
+        let confined = |u: &String| {
+            g.doc
+                .regions
+                .iter()
+                .any(|r| r.live_node.is_some() && r.image_urls.contains(u))
+        };
+        let regions_hit: Vec<usize> = g
+            .doc
+            .regions
+            .iter()
+            .filter(|r| r.live_node.is_some() && urls.iter().any(|u| r.image_urls.contains(u)))
+            .filter_map(|r| r.live_node)
+            .collect();
+        let main_flow = urls.iter().any(|u| !confined(u));
+        if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+            let sample = urls
+                .iter()
+                .find(|u| !confined(u))
+                .cloned()
+                .unwrap_or_default();
+            eprintln!(
+                "DIAGDECODE urls={} main_flow={main_flow} regions_hit={} live_regions={} region_url_sets={} sample={}",
+                urls.len(),
+                regions_hit.len(),
+                g.doc
+                    .regions
+                    .iter()
+                    .filter(|r| r.live_node.is_some())
+                    .count(),
+                g.doc
+                    .regions
+                    .iter()
+                    .map(|r| r.image_urls.len())
+                    .sum::<usize>(),
+                sample.chars().take(60).collect::<String>(),
+            );
+        }
+        if main_flow {
+            // A main-flow image changes document flow → full relayout, then refresh
+            // every region from its CURRENT retained HTML (the full relayout rebuilt
+            // them from possibly-stale doc.raw).
+            self.relayout_browser();
+            let live: Vec<usize> = self.region_live.keys().copied().collect();
+            for ln in live {
+                self.relay_region(ln);
+            }
+        } else {
+            for ln in regions_hit {
+                self.relay_region(ln);
+            }
+        }
+        if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+            IMG_RELAYOUT.with(|c| {
+                let (us, n) = c.get();
+                c.set((us + t.elapsed().as_micros() as u64, n + 1));
+            });
+        }
+    }
+
+    /// Re-lay a live region in place from its RETAINED patch HTML (the current
+    /// content) + row cache, keeping its scroll position — used to refresh a
+    /// region after an image inside it decoded, or after a full re-render rebuilt
+    /// it from stale `doc.raw`. A no-op if the region has no retained HTML yet.
+    fn relay_region(&mut self, node: usize) -> bool {
+        let Some(html) = self
+            .region_live
+            .get(&node)
+            .map(|r| r.html.clone())
+            .filter(|h| !h.is_empty())
+        else {
+            return false;
+        };
+        self.relay_region_from_html(node, &html, true)
     }
 
     /// Re-lay-out the current HTTP doc with the decoded-image sizes,
@@ -2144,6 +2348,67 @@ impl App {
         g.sel_item = item_target.and_then(|t| Self::find_item_like(&g.doc, &t));
         let max_scroll = g.doc.rows.len().saturating_sub(height);
         g.scroll = g.scroll.min(max_scroll);
+    }
+
+    /// A hash of everything `ui::draw` paints for the VISIBLE browser frame —
+    /// scroll, selection, status/notice/input, the find overlay, each on-screen
+    /// row's content (col + height + text + image, AND whether that image's
+    /// encoded protocol is ready so an alt-text→image reveal redraws), every
+    /// region's visible window, and carousel offsets. Two equal signatures ⇒ a
+    /// redraw would paint a byte-identical frame, so it (and its per-image sixel
+    /// rebuild) is wasted — the at-rest peg when a background timer ticks an
+    /// off-screen node every second.
+    ///
+    /// `None` (⇒ always draw, never skip) unless we're in the plain browser
+    /// display state: a browser doc showing, no image viewer, Session mode (not
+    /// the Search/Find input line), no `<select>` dropdown, and not loading (the
+    /// loading heart animates). The caller additionally guards terminal SIZE, so
+    /// this need not hash it. Computed without touching the terminal — far cheaper
+    /// than the draw it elides.
+    fn browser_frame_sig(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        if self.viewer.is_some()
+            || self.mode != Mode::Session
+            || self.select_menu.is_some()
+            || self.loading()
+        {
+            return None;
+        }
+        let g = self.browser.as_ref()?;
+        let vh = self.last_inner.1 as usize;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        g.scroll.hash(&mut h);
+        g.sel_item.hash(&mut h);
+        self.status.hash(&mut h);
+        self.notice.hash(&mut h);
+        self.input.hash(&mut h);
+        let end = (g.scroll + vh).min(g.doc.rows.len());
+        for r in g.scroll..end {
+            let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r);
+            for it in &row.items {
+                it.col.hash(&mut h);
+                it.height.hash(&mut h);
+                it.text.hash(&mut h);
+                it.image.hash(&mut h);
+                // A decoded image reveals when its protocol lands — the row text
+                // is unchanged across that transition, so hash readiness too.
+                if let Some(url) = &it.image {
+                    self.image_protocols
+                        .contains_key(&EncKey::for_item(url, it))
+                        .hash(&mut h);
+                }
+            }
+        }
+        // A region's window can scroll, and a carousel can shift, without the
+        // page scroll moving.
+        for rg in &g.doc.regions {
+            rg.start_row.hash(&mut h);
+            rg.voffset.hash(&mut h);
+        }
+        for c in &g.doc.carousels {
+            c.offset.hash(&mut h);
+        }
+        Some(h.finish())
     }
 
     fn on_enc(&mut self, msg: EncMsg) {
@@ -2476,6 +2741,8 @@ impl App {
         self.last_scroll_sent = None;
         self.region_geom_sent.clear();
         self.region_scroll_sent.clear();
+        self.region_live.clear();
+        self.pending_decoded_urls.clear();
         self.live_regions_sent.clear();
         self.live_boundaries_sent.clear();
         self.page_busy = false;
@@ -2827,6 +3094,24 @@ impl App {
     /// queued up, only the newest is parsed (parsing is the cost, not
     /// drawing) — the redraw-economy requirement.
     fn on_page_evt(&mut self, evt: crate::js::PageEvt) {
+        let _t_evt = std::time::Instant::now();
+        let r = self.on_page_evt_inner(evt);
+        if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+            PAGE_WORK.with(|w| {
+                let (us, n, full, drains) = w.get();
+                w.set((
+                    us + _t_evt.elapsed().as_micros() as u64,
+                    n + 1,
+                    full + r.0 as u64,
+                    drains + r.1 as u64,
+                ));
+            });
+        }
+    }
+
+    /// (did a full replace_live_doc, events drained this call) — for the frame
+    /// diagnostic.
+    fn on_page_evt_inner(&mut self, evt: crate::js::PageEvt) -> (bool, u32) {
         use crate::js::PageEvt;
         self.page_busy = false;
         let mut latest_update: Option<(String, crate::js::Outcome)> = None;
@@ -2844,9 +3129,16 @@ impl App {
         let mut scrolled: Vec<(usize, f64)> = Vec::new();
         let pending_submit = self.pending_live_submit.take();
         let mut pending = Some(evt);
+        let mut drains = 0u32;
         loop {
+            drains += 1;
             match pending {
                 Some(PageEvt::Updated { html, outcome } | PageEvt::Static { html, outcome }) => {
+                    EVT_TALLY.with(|t| {
+                        let mut a = t.get();
+                        a[0] += 1;
+                        t.set(a);
+                    });
                     latest_update = Some((html, outcome));
                     // A full render supersedes any patches queued before it.
                     patches.clear();
@@ -2855,6 +3147,11 @@ impl App {
                     patches: ps,
                     outcome,
                 }) => {
+                    EVT_TALLY.with(|t| {
+                        let mut a = t.get();
+                        a[1] += 1;
+                        t.set(a);
+                    });
                     self.page_js_errors.extend(outcome.errors.iter().cloned());
                     for p in ps {
                         // Coalesce: only the newest patch per boundary matters.
@@ -2863,8 +3160,19 @@ impl App {
                     }
                 }
                 Some(PageEvt::Trouble(errors)) => trouble.extend(errors),
-                Some(PageEvt::Settled) => {}
-                Some(PageEvt::Scrolled { node, top, .. }) => scrolled.push((node, top)),
+                Some(PageEvt::Settled) => EVT_TALLY.with(|t| {
+                    let mut a = t.get();
+                    a[3] += 1;
+                    t.set(a);
+                }),
+                Some(PageEvt::Scrolled { node, top, .. }) => {
+                    EVT_TALLY.with(|t| {
+                        let mut a = t.get();
+                        a[2] += 1;
+                        t.set(a);
+                    });
+                    scrolled.push((node, top));
+                }
                 Some(PageEvt::SubmitDefault) => submit_default = true,
                 Some(PageEvt::SubmitForm { form, submitter }) => {
                     submit_nodes = Some((form, submitter));
@@ -2876,6 +3184,7 @@ impl App {
         }
 
         let mut rendered = false;
+        let full_replace = latest_update.is_some();
         if let Some((html, outcome)) = latest_update {
             self.page_js_errors.extend(outcome.errors.iter().cloned());
             // The actor only emits an Updated when what we PAINT changed
@@ -2933,6 +3242,7 @@ impl App {
             // carries the page's Referer like any followed link.
             self.navigate_from_page(&url);
         }
+        (full_replace, drains)
     }
 
     /// Swap the living page's fresh render into the browser doc:
@@ -3037,6 +3347,22 @@ impl App {
                 .iter()
                 .any(|r| r.live_node == Some(patch.node))
         });
+        if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+            let (nreg, live) = self.browser.as_ref().map_or((0, 0), |g| {
+                (
+                    g.doc.regions.len(),
+                    g.doc
+                        .regions
+                        .iter()
+                        .filter(|r| r.live_node.is_some())
+                        .count(),
+                )
+            });
+            eprintln!(
+                "DIAGROUTE patch.node={} is_region={is_region} tier={:?} doc.regions={nreg} with_live_node={live}",
+                patch.node, patch.tier
+            );
+        }
         if is_region {
             self.patch_live_region(patch)
         } else {
@@ -3050,6 +3376,19 @@ impl App {
     /// layout is invariant by construction — `Doc.rows`, the page scroll, and
     /// every other region stay untouched.
     fn patch_live_region(&mut self, patch: &crate::js::SubtreePatch) -> bool {
+        self.relay_region_from_html(patch.node, patch.html.as_bytes(), false)
+    }
+
+    /// Lay a live scroll `Region`'s buffer from a fragment HTML — shared by the
+    /// actor's patch (`patch_live_region`, `keep_scroll=false`: honor the page's
+    /// fresh `scrollTop` pin) and an in-place region refresh (`relay_region`,
+    /// `keep_scroll=true`: an image decode / post-full-render refresh keeps the
+    /// reader's offset). The band reserves a fixed `Region.height` rows regardless
+    /// of the buffer's length, so the outer layout is invariant by construction —
+    /// `Doc.rows`, the page scroll, and every other region stay untouched. Retains
+    /// the fragment HTML + refreshed row cache in `region_live` for the next
+    /// re-lay.
+    fn relay_region_from_html(&mut self, node: usize, html: &[u8], keep_scroll: bool) -> bool {
         let viewport = (
             (self.last_inner.0 as usize).max(10),
             self.last_inner.1.max(1) as usize,
@@ -3059,27 +3398,47 @@ impl App {
             Some(Link::Http(u)) => u,
             _ => return false,
         };
-        // Locate the live region this patch targets (by the actor node id baked
-        // as `data-trust-node`).
-        let Some(ri) = self.browser.as_ref().and_then(|g| {
-            g.doc
-                .regions
-                .iter()
-                .position(|r| r.live_node == Some(patch.node))
-        }) else {
+        // Locate the live region this targets (by the actor node id baked as
+        // `data-trust-node`).
+        let Some(ri) = self
+            .browser
+            .as_ref()
+            .and_then(|g| g.doc.regions.iter().position(|r| r.live_node == Some(node)))
+        else {
             return false;
         };
         let region_width = self.browser.as_ref().unwrap().doc.regions[ri].width as usize;
+        // The memoized child-row cache from the previous re-lay (or an empty one),
+        // so unchanged messages are reused and only the new/decoded one is laid.
+        let old = self.region_live.remove(&node).unwrap_or_default();
         let Some(rp) = http::lay_region_patch(
             &url,
-            patch.html.as_bytes(),
+            html,
             region_width,
             viewport,
             &images,
-            patch.node,
+            node,
+            &old.cache,
         ) else {
+            // Re-insert so a transient miss (boundary not found) doesn't discard
+            // the retained HTML/memo for the next attempt.
+            self.region_live.insert(node, old);
             return false;
         };
+        self.region_live.insert(
+            node,
+            RegionLive {
+                html: html.to_vec(),
+                cache: rp.row_cache.clone(),
+            },
+        );
+        if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+            eprintln!(
+                "DIAGRELAY stored node={node} keep_scroll={keep_scroll} region_img_urls={} region_live={}",
+                rp.image_urls.len(),
+                self.region_live.len(),
+            );
+        }
         let g = self.browser.as_mut().unwrap();
         // Capture a selection sitting INSIDE this region's band, to re-anchor it
         // after the swap. A selection elsewhere keeps its row/item indices — the
@@ -3095,19 +3454,25 @@ impl App {
                     .get(i)
                     .cloned()
             });
-        // Carry the scroll position: prefer the page's fresh `scrollTop` signal (a
-        // chat pinning to bottom), else the reader's offset — clamped to the new
-        // content height (mirrors `flow_region`/`carry_region_offsets`).
+        // Carry the scroll position. An actor patch (`keep_scroll=false`) prefers
+        // the page's fresh `scrollTop` signal (a chat pinning to bottom); an
+        // in-place refresh (`keep_scroll=true` — an image decode or post-render
+        // refresh, no fresh signal) keeps the reader's current offset. Both clamp
+        // to the new content height (mirrors `flow_region`/`carry_region_offsets`).
         let new_max = rp.rows.len().saturating_sub(rg.height as usize);
-        let (voffset, from_page) = match rp.scroll_top {
-            Some(s) => (s.min(new_max), true),
-            None => (rg.voffset.min(new_max), rg.voffset_from_page),
+        let (voffset, from_page) = match (keep_scroll, rp.scroll_top) {
+            (false, Some(s)) => (s.min(new_max), true),
+            _ => (rg.voffset.min(new_max), rg.voffset_from_page),
         };
         let rg = &mut g.doc.regions[ri];
         rg.buffer = rp.rows;
         rg.carousels = rp.carousels;
         rg.voffset = voffset;
         rg.voffset_from_page = from_page;
+        // Refresh the region's decode-routing set from the patch fragment, so a
+        // newly-arrived chat emote routes to this region (not the full document)
+        // even though the last full render predates it.
+        rg.image_urls = rp.image_urls.clone();
         // Re-anchor an in-region selection by target in the new windowed content.
         if let Some(t) = selected_target {
             g.sel_item = Self::find_item_like(&g.doc, &t).or(g.sel_item);
@@ -3149,14 +3514,20 @@ impl App {
         // Look up the cached box for this boundary (by the actor node id baked as
         // `data-trust-node`). A miss = the cache is out of sync (a full render
         // hasn't captured it yet, or it was dropped) → resync.
-        let (old_range, origin_col, content_width) = {
+        let (old_range, origin_col, content_width, old_width, sub_box) = {
             let Some(g) = self.browser.as_ref() else {
                 return false;
             };
             let Some(b) = g.doc.boundaries.iter().find(|b| b.node == patch.node) else {
                 return false;
             };
-            (b.row_range.clone(), b.origin_col, b.content_width as usize)
+            (
+                b.row_range.clone(),
+                b.origin_col,
+                b.content_width as usize,
+                b.width,
+                b.sub_box,
+            )
         };
         let Some(laid) = http::lay_subtree_patch(
             &url,
@@ -3165,6 +3536,7 @@ impl App {
             viewport,
             &images,
             patch.node,
+            sub_box,
         ) else {
             return false;
         };
@@ -3173,11 +3545,18 @@ impl App {
         if laid.has_subframes {
             return false;
         }
-        // Width sanity (INCREMENTAL_LAYOUT_PLAN.md §14 step 4.3): a block-filling
-        // box's content never exceeds its band. If it does the box reshaped (the
-        // actor mis-proved, or a wide unbreakable token appeared) → resync so the
-        // full path lays it against the real document.
-        if laid.width as usize > content_width {
+        // Width verify (INCREMENTAL_LAYOUT_PLAN.md §14 step 4.3). A SUB-BOX (flex/
+        // grid item, inline-block) is content-sized: if its width CHANGED it
+        // reshaped its siblings, so the in-place row splice is no longer valid →
+        // resync (strict). A block-filling box fills its band regardless of
+        // content, so only an over-band content extent (a wide unbreakable token)
+        // is a reshape; a narrower extent is fine.
+        let width_ok = if sub_box {
+            laid.width == old_width
+        } else {
+            laid.width as usize <= content_width
+        };
+        if !width_ok {
             return false;
         }
         let g = self.browser.as_mut().unwrap();
@@ -5747,6 +6126,7 @@ mod tests {
             live_node: Some(99),
             voffset_from_page: from_page,
             carousels: Vec::new(),
+            image_urls: Vec::new(),
         };
         let old = [(5usize, 9usize)];
         // Live render + the page dictated the offset → keep the fresh signal (3).
@@ -6023,6 +6403,78 @@ mod tests {
             !after.iter().any(|r| r.contains("old0")),
             "the old content is gone"
         );
+    }
+
+    #[test]
+    fn a_sub_box_boundary_patch_splices_like_a_full_relayout() {
+        // INCREMENTAL_LAYOUT_PLAN.md §14 (the widening): a flex-COLUMN ITEM (a
+        // sub-box, re-laid with subtree_root) that grows is patched into Doc.rows
+        // byte-for-byte the same as a full re-layout — the sibling flex item below
+        // it ("after") and the FOOTER are identity-shifted, never re-laid.
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let page = |rows: usize| -> String {
+            let mut s = String::from(
+                r#"<html><body><p>HEADER</p><div style="display:flex;flex-direction:column"><div>before</div><div data-trust-node="42">"#,
+            );
+            for i in 0..rows {
+                s.push_str(&format!("<div>row{i}</div>"));
+            }
+            s.push_str(r#"</div><div>after</div></div><p>FOOTER</p></body></html>"#);
+            s
+        };
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            page(2).as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        ));
+        let cached = app
+            .browser
+            .as_ref()
+            .unwrap()
+            .doc
+            .boundaries
+            .iter()
+            .find(|b| b.node == 42)
+            .cloned();
+        assert!(
+            cached.as_ref().is_some_and(|b| b.sub_box),
+            "the flex-column item was captured as a sub-box boundary"
+        );
+        // Patch: the item grew from 2 to 4 rows (same width → Tier-2 shift).
+        let frag = r#"<div data-trust-frag=""><div data-trust-node="42"><div>row0</div><div>row1</div><div>row2</div><div>row3</div></div></div>"#;
+        let patch = crate::js::SubtreePatch {
+            node: 42,
+            html: frag.to_string(),
+            tier: crate::js::BoundaryTier::WidthStable,
+        };
+        assert!(app.patch_live_doc(&patch), "the sub-box patch applies");
+        let full = crate::http::parse(
+            &url,
+            "text/html",
+            page(4).as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        );
+        let got = &app.browser.as_ref().unwrap().doc.rows;
+        assert_eq!(
+            got.len(),
+            full.rows.len(),
+            "row count matches a full relayout"
+        );
+        for (i, (g, f)) in got.iter().zip(full.rows.iter()).enumerate() {
+            assert_eq!(
+                crate::layout::render_row(g),
+                crate::layout::render_row(f),
+                "spliced row {i} matches the full relayout"
+            );
+        }
     }
 
     #[test]
@@ -7465,7 +7917,7 @@ mod tests {
             .expect("inline SVG load completed");
         app.on_img_load(msg);
         // The run loop coalesces image-load relayouts to one per turn; drive it.
-        app.apply_pending_image_relayout();
+        app.apply_pending_image_decodes();
         server.await.unwrap();
 
         let decoded = app.image_cache.get(&image_url).expect("SVG cached");
