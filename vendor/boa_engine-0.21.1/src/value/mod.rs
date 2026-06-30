@@ -417,7 +417,10 @@ impl JsValue {
     #[must_use]
     pub fn to_boolean(&self) -> bool {
         match self.variant() {
-            JsVariant::Symbol(_) | JsVariant::Object(_) => true,
+            JsVariant::Symbol(_) => true,
+            // An ordinary object is truthy; the `[[IsHTMLDDA]]` exotic object
+            // (`document.all`, Annex B.3.6) is the one object that is falsy.
+            JsVariant::Object(o) => !o.is_html_dda(),
             JsVariant::String(s) if !s.is_empty() => true,
             JsVariant::Float64(n) if n != 0.0 && !n.is_nan() => true,
             JsVariant::Integer32(n) if n != 0 => true,

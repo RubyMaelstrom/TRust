@@ -71,7 +71,9 @@ impl JsVariant {
             JsVariant::Undefined => "undefined",
             JsVariant::BigInt(_) => "bigint",
             JsVariant::Object(object) => {
-                if object.is_callable() {
+                if object.is_html_dda() {
+                    "undefined"
+                } else if object.is_callable() {
                     "function"
                 } else {
                     "object"
@@ -92,7 +94,9 @@ impl JsVariant {
             JsVariant::Undefined => js_string!("undefined"),
             JsVariant::BigInt(_) => js_string!("bigint"),
             JsVariant::Object(object) => {
-                if object.is_callable() {
+                if object.is_html_dda() {
+                    js_string!("undefined")
+                } else if object.is_callable() {
                     js_string!("function")
                 } else {
                     js_string!("object")

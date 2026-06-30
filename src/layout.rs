@@ -2374,11 +2374,16 @@ impl<'a> Layout<'a> {
         // instead of stacking every `<td>` as its own block. Routed before the
         // border/flex/block dispatch so the whole table subtree is laid by the
         // table algorithm. `flow_table` does its own block framing.
+        //
+        // `establishes_anonymous_table` catches the §17.2.1 "generate missing
+        // parents" case: a `<table>` whose `display` was overridden to `block`
+        // (GitHub/markdown CSS does this for horizontal scroll) still wraps its
+        // row-group children in an anonymous table, so it lays as a table too.
         if block_like
-            && matches!(
+            && (matches!(
                 self.dom.effective_display(id).as_deref(),
                 Some("table" | "inline-table")
-            )
+            ) || self.dom.establishes_anonymous_table(id))
         {
             self.flow_table(id, ctx);
             return;
@@ -10393,6 +10398,46 @@ mod tests {
         // Same column for cells stacked in a column.
         assert_eq!(find(&rows, "r1a").col, find(&rows, "r2a").col);
         assert_eq!(find(&rows, "r1b").col, find(&rows, "r2b").col);
+    }
+
+    #[test]
+    fn a_display_block_table_still_lays_as_a_table() {
+        // GitHub/markdown CSS forces `display:block;width:max-content;
+        // overflow:auto` onto a `<table>` so a wide table scrolls horizontally.
+        // The `<thead>`/`<tbody>` keep their table displays, so per CSS 2.1
+        // §17.2.1 the row groups generate an anonymous table around them and the
+        // cells STILL lay side by side — they must not block-stack.
+        let rows = lay(
+            "<body><table style=\"display:block;width:max-content;overflow:auto\">\
+             <thead><tr><th>Command</th><th>Effect</th></tr></thead>\
+             <tbody>\
+             <tr><td>website.com</td><td>opens it</td></tr>\
+             <tr><td>back</td><td>history pop</td></tr>\
+             </tbody></table></body>",
+            60,
+        );
+        // Header cells share a row, side by side.
+        assert_eq!(
+            row_index_of(&rows, "Command"),
+            row_index_of(&rows, "Effect"),
+            "header cells lay on the same row"
+        );
+        assert!(find(&rows, "Effect").col > find(&rows, "Command").col);
+        // Body cells align into the header's columns and rows stack.
+        assert_eq!(
+            row_index_of(&rows, "website.com"),
+            row_index_of(&rows, "opens it"),
+            "body cells lay on the same row"
+        );
+        assert_eq!(
+            find(&rows, "Command").col,
+            find(&rows, "website.com").col,
+            "first column aligns header to body"
+        );
+        assert!(
+            row_index_of(&rows, "website.com") > row_index_of(&rows, "Command"),
+            "the body row is below the header row"
+        );
     }
 
     #[test]

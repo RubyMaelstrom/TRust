@@ -5,7 +5,8 @@
 use super::{
     JsPrototype, NativeObject, Object, ObjectData, PrivateName, PropertyMap,
     internal_methods::{
-        InternalMethodPropertyContext, InternalObjectMethods, ORDINARY_INTERNAL_METHODS,
+        HTML_DDA_INTERNAL_METHODS, InternalMethodPropertyContext, InternalObjectMethods,
+        ORDINARY_INTERNAL_METHODS,
     },
     shape::RootShape,
 };
@@ -203,6 +204,29 @@ impl JsObject {
                 private_elements: ThinVec::new(),
             }),
             vtable: internal_methods,
+        });
+
+        JsObject { inner }.upcast()
+    }
+
+    /// Creates the `[[IsHTMLDDA]]` exotic object (ECMAScript Annex B.3.6), which
+    /// the web platform exposes as `document.all`. It is an ordinary object with
+    /// `%Object.prototype%`, but its vtable carries the `is_html_dda` marker, so
+    /// the engine treats it as falsy in `ToBoolean`, reports `typeof "undefined"`,
+    /// and compares `== null`/`== undefined`, while keeping ordinary `===`
+    /// identity and property access.
+    #[must_use]
+    pub fn html_dda(intrinsics: &Intrinsics) -> Self {
+        let inner = Gc::new(VTableObject {
+            object: GcRefCell::new(Object {
+                data: ObjectData::new(OrdinaryObject),
+                properties: PropertyMap::from_prototype_unique_shape(Some(
+                    intrinsics.constructors().object().prototype(),
+                )),
+                extensible: true,
+                private_elements: ThinVec::new(),
+            }),
+            vtable: &HTML_DDA_INTERNAL_METHODS,
         });
 
         JsObject { inner }.upcast()
@@ -804,6 +828,16 @@ impl<T: NativeObject> JsObject<T> {
             self.inner.vtable.__call__,
             ORDINARY_INTERNAL_METHODS.__call__,
         )
+    }
+
+    /// Returns `true` if this is the `[[IsHTMLDDA]]` exotic object (`document.all`,
+    /// ECMAScript Annex B.3.6). The marker lives on the (borrow-free) vtable, so
+    /// the hot `ToBoolean`/`typeof` paths can consult it without borrowing the
+    /// object.
+    #[inline]
+    #[must_use]
+    pub fn is_html_dda(&self) -> bool {
+        self.inner.vtable.is_html_dda
     }
 
     /// It determines if Object is a function object with a `[[Construct]]` internal method.

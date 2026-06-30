@@ -389,6 +389,17 @@ pub(crate) const ORDINARY_INTERNAL_METHODS: InternalObjectMethods = InternalObje
     __own_property_keys__: ordinary_own_property_keys,
     __call__: non_existant_call,
     __construct__: non_existant_construct,
+    is_html_dda: false,
+};
+
+/// Internal methods for the `[[IsHTMLDDA]]` exotic object — the one returned by
+/// `document.all` (ECMAScript Annex B.3.6 "The `[[IsHTMLDDA]]` Internal Slot").
+/// Identical to the ordinary methods except for the `is_html_dda` marker, so the
+/// object behaves like a normal object for property access / `===` identity, but
+/// is falsy, reports `typeof "undefined"`, and is `== null`/`== undefined`.
+pub(crate) static HTML_DDA_INTERNAL_METHODS: InternalObjectMethods = InternalObjectMethods {
+    is_html_dda: true,
+    ..ORDINARY_INTERNAL_METHODS
 };
 
 /// The internal representation of the internal methods of a `JsObject`.
@@ -451,6 +462,14 @@ pub struct InternalObjectMethods {
         argument_count: usize,
         context: &mut InternalMethodCallContext<'_>,
     ) -> JsResult<CallValue>,
+    /// `true` only for the `[[IsHTMLDDA]]` exotic object (`document.all`, Annex
+    /// B.3.6). Every ordinary and exotic methods table spreads
+    /// `ORDINARY_INTERNAL_METHODS` (which sets this `false`); only
+    /// `HTML_DDA_INTERNAL_METHODS` sets it `true`. The slot makes the object
+    /// falsy in `ToBoolean`, `typeof "undefined"`, and `== null`/`== undefined`,
+    /// while keeping ordinary `===` identity. Stored on the (borrow-free) vtable
+    /// like the call/construct pointers so `ToBoolean`/`typeof` stay cheap.
+    pub(crate) is_html_dda: bool,
 }
 
 /// The return value of an internal method (`[[Call]]` or `[[Construct]]`).
