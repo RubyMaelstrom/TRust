@@ -2174,6 +2174,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_ce_candidates", 1, sys_ce_candidates),
         ("__dom_clone", 2, sys_clone),
         ("__dom_doc_element", 0, sys_doc_element),
+        ("__html_dda", 0, sys_html_dda),
         ("__url_parse", 2, sys_url_parse),
         ("__dom_attach_shadow", 1, sys_attach_shadow),
         ("__dom_shadow_root", 1, sys_shadow_root),
@@ -2822,6 +2823,20 @@ fn sys_doc_element(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<Js
             .into_iter()
             .find(|&c| d.tag_name(c) == Some("html")),
     ))
+}
+
+/// The `[[IsHTMLDDA]]` exotic object behind `document.all` (ECMAScript Annex
+/// B.3.6). The web platform relies on its special semantics — falsy, `typeof
+/// "undefined"`, and `== null`/`== undefined`, but a distinct object for `===`.
+/// YouTube's `polymer_resin` XSS sanitizer is the case that needs it: its
+/// pass-through guard is `if (value || value === document.all) return value`, so
+/// without a real `document.all` an `undefined` binding value (e.g. a Polymer
+/// `hidden="[[…]]"` whose source is undefined) matched the guard and got
+/// replaced with the sentinel string `"zClosurez"` — silently hiding whole
+/// subtrees (the YouTube search-results container). Only the engine can mint
+/// this object; the prelude caches it on `document.all`.
+fn sys_html_dda(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(boa_engine::JsObject::html_dda(ctx.intrinsics()).into())
 }
 
 /// `__url_parse(href, base|null)` → array of
@@ -9017,7 +9032,7 @@ const PRELUDE: &str = r##"
             // already read it, keeping this ~syscall-neutral vs the old wrap.
             const tag = __dom_tag(id) || "";
             w = new (classFor(tag))(id);
-            w.__ln = tag;
+            w.__trustLN = tag;
         } else {
             w = t === 9 ? new Document(id)
                 : t === 3 ? new Text(id)
@@ -9097,6 +9112,10 @@ const PRELUDE: &str = r##"
     // NOT tracked (self-heals on the next navigation, both vanishingly rare): a
     // `<base>` injected via innerHTML, or a case-variant setAttribute("HREF").
     let baseHrefCache = null;
+    // Lazily-minted, then cached `document.all` (`[[IsHTMLDDA]]`) — see the
+    // `Document` class `get all()`. Per-page (fresh per realm), so its identity is
+    // stable within a page but never shared across pages.
+    let documentAllValue = null;
     function baseHref() {
         if (baseHrefCache !== null) return baseHrefCache;
         const b = g.document.querySelector("base[href]");
@@ -9695,6 +9714,7 @@ const PRELUDE: &str = r##"
         get lastChild() { const c = __dom_children(this.__id); return c.length ? wrap(c[c.length - 1]) : null; }
         get firstElementChild() { return this.children[0] || null; }
         get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
+        get childElementCount() { return this.children.length; }
         get nextSibling() { return wrap(__dom_next(this.__id)); }
         get previousSibling() { return wrap(__dom_prev(this.__id)); }
         get nextElementSibling() { let s = this.nextSibling; while (s && s.nodeType !== 1) s = s.nextSibling; return s; }
@@ -9751,8 +9771,8 @@ const PRELUDE: &str = r##"
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
             maybeLoadStylesheet(c);
-            if (c.__ln === "base") baseHrefCache = null; // maybeRunScript already read .localName
-            else if (c.__ln === "iframe" || c.__ln === "frame") maybeProcessInsertedFrame(c, this);
+            if (c.__trustLN === "base") baseHrefCache = null; // maybeRunScript already read .localName
+            else if (c.__trustLN === "iframe" || c.__trustLN === "frame") maybeProcessInsertedFrame(c, this);
             return c;
         }
         insertBefore(c, ref) {
@@ -9762,11 +9782,11 @@ const PRELUDE: &str = r##"
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
             maybeLoadStylesheet(c);
-            if (c.__ln === "base") baseHrefCache = null;
-            else if (c.__ln === "iframe" || c.__ln === "frame") maybeProcessInsertedFrame(c, this);
+            if (c.__trustLN === "base") baseHrefCache = null;
+            else if (c.__trustLN === "iframe" || c.__trustLN === "frame") maybeProcessInsertedFrame(c, this);
             return c;
         }
-        removeChild(c) { if (c.__ln === "base") baseHrefCache = null; if (MO.length) moChildRemove(this, c); if (CE.defs.size) ceDisconnect(c); __dom_detach(c.__id); return c; }
+        removeChild(c) { if (c.__trustLN === "base") baseHrefCache = null; if (MO.length) moChildRemove(this, c); if (CE.defs.size) ceDisconnect(c); __dom_detach(c.__id); return c; }
         replaceChild(n, old) {
             const prev = old.previousSibling, next = old.nextSibling;
             // Validity (WHATWG DOM §4.2.3) before any side effect: the insert
@@ -9779,11 +9799,11 @@ const PRELUDE: &str = r##"
             if (CE.defs.size) ceScan(n);
             maybeRunScript(n);
             maybeLoadStylesheet(n);
-            if (n.__ln === "base" || old.__ln === "base") baseHrefCache = null;
-            else if (n.__ln === "iframe" || n.__ln === "frame") maybeProcessInsertedFrame(n, this);
+            if (n.__trustLN === "base" || old.__trustLN === "base") baseHrefCache = null;
+            else if (n.__trustLN === "iframe" || n.__trustLN === "frame") maybeProcessInsertedFrame(n, this);
             return old;
         }
-        remove() { if (this.__ln === "base") baseHrefCache = null; const p = this.parentNode; if (p && MO.length) moChildRemove(p, this); if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); }
+        remove() { if (this.__trustLN === "base") baseHrefCache = null; const p = this.parentNode; if (p && MO.length) moChildRemove(p, this); if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); }
         append(...ns) { for (const n of ns) this.appendChild(n && typeof n === "object" ? n : g.document.createTextNode(String(n))); }
         prepend(...ns) { const f = this.firstChild; for (const n of ns) this.insertBefore(n && typeof n === "object" ? n : g.document.createTextNode(String(n)), f); }
         // The ChildNode mixin: lit's svg templates go through
@@ -9969,7 +9989,14 @@ const PRELUDE: &str = r##"
         // `nodeName`/`tagName` getters were ~8% of Steam's settle phase; a
         // getter-hammering micro-bench runs ~25% faster).
         get nodeType() { return 1; }
-        get localName() { let t = this.__ln; if (t === undefined) t = this.__ln = __dom_tag(this.__id) || ""; return t; }
+        // Cached localName. NAMESPACED `__trustLN` (not the obvious `__ln`)
+        // because page code writes its OWN expandos onto our node wrappers and a
+        // 2-char name collides: YouTube/Polymer stores a MutationObserver
+        // linked-list node in `node.__ln` (`kgv`: `k.__ln = {value,previous,next}`)
+        // — sharing `__ln` clobbered our cached tag AND made YT read our string
+        // where it expected its object (`"div".next = …` → "cannot set
+        // non-writable property"). Keep every per-node internal field `__trust*`.
+        get localName() { let t = this.__trustLN; if (t === undefined) t = this.__trustLN = __dom_tag(this.__id) || ""; return t; }
         get tagName() { let t = this.__tn; if (t === undefined) t = this.__tn = this.localName.toUpperCase(); return t; }
         get nodeName() { return this.tagName; }
         // `Element.namespaceURI` — immutable, so cache it (undefined = uncached,
@@ -10567,7 +10594,20 @@ const PRELUDE: &str = r##"
     function classFor(local) {
         let C = ELEM_CLASS.get(local);
         if (C !== undefined) return C;
-        C = g[htmlInterfaceName(local)] || HTMLElement;
+        // The interface class comes from the GLOBAL (so a page that subclasses,
+        // say, HTMLElement keeps inheriting our methods). BUT a page may REPLACE
+        // `window.HTMLElement` with a custom-element ES5 shim — YouTube/Polymer
+        // installs `HTMLElement = function(){ return Reflect.construct(real, [],
+        // newTarget) }` so ES5 transpiled classes can `extend` it. That shim
+        // constructs with an EMPTY argument list, so `new (g.HTMLElement)(id)`
+        // DROPS the node id we pass — every wrapper it builds gets `__id ===
+        // undefined`, and the element then reads as detached (`isConnected`
+        // false, `parentNode` null), so Polymer never connects/stamps it. Always
+        // use our OWN lexical base classes for construction (they faithfully
+        // forward the id to the Node constructor); the global is only consulted
+        // for the genuinely-specialized interfaces it still owns.
+        const name = htmlInterfaceName(local);
+        C = name === "HTMLElement" ? HTMLElement : g[name] || HTMLElement;
         ELEM_CLASS.set(local, C);
         return C;
     }
@@ -10705,6 +10745,17 @@ const PRELUDE: &str = r##"
         get nodeType() { return 9; }
         get nodeName() { return "#document"; }
         get [Symbol.toStringTag]() { return "HTMLDocument"; }
+        // `document.all` — the legacy `HTMLAllCollection`, the web's one
+        // `[[IsHTMLDDA]]` object (Annex B.3.6): falsy, `typeof "undefined"`, and
+        // `== null`/`== undefined`, but a stable distinct object for `===`. Minted
+        // by the engine (`__html_dda`) and cached so its identity is stable across
+        // reads (polymer_resin and others compare `value === document.all`). We do
+        // not implement its named/indexed element access — identity + the falsy
+        // semantics are what the platform actually depends on here.
+        // NB: cache-test is `=== null`, NOT `||` — the cached value is the falsy
+        // `[[IsHTMLDDA]]` object, so a truthiness test would re-mint it every read
+        // and break `document.all === document.all` identity.
+        get all() { if (documentAllValue === null) documentAllValue = __html_dda(); return documentAllValue; }
         // A document has NO owner document (DOM §`Document` overrides Node's
         // `ownerDocument` to null). Inheriting Node's "return the document" here
         // made `document.ownerDocument === document`, which sent ProseMirror's
@@ -12705,18 +12756,21 @@ const PRELUDE: &str = r##"
     // and without it falls back to a legacy keyup/selectionchange polyfill
     // that never sees our input dispatch → controlled inputs go dead); (2)
     // `el.onclick = fn` assignment works as a real listener.
+    // `on<event>` storage is NAMESPACED `__trustOn` (not `__on`): D3's
+    // `selection.on()` stores its listener descriptors in `node.__on` (and YT
+    // bundles D3), so a shared `__on` would cross our handler map with D3's.
     function installHandlerProps(proto, types) {
         for (const type of types) {
             Object.defineProperty(proto, "on" + type, {
                 configurable: true,
                 enumerable: false,
-                get() { return (this.__on && this.__on[type]) || null; },
+                get() { return (this.__trustOn && this.__trustOn[type]) || null; },
                 set(v) {
-                    if (!this.__on) this.__on = {};
-                    const prev = this.__on[type];
+                    if (!this.__trustOn) this.__trustOn = {};
+                    const prev = this.__trustOn[type];
                     if (prev) this.removeEventListener(type, prev);
                     const fn = typeof v === "function" ? v : null;
-                    this.__on[type] = fn;
+                    this.__trustOn[type] = fn;
                     if (fn) this.addEventListener(type, fn);
                 },
             });
@@ -17318,6 +17372,73 @@ mod tests {
                 .unwrap()
                 .to_boolean()
         );
+    }
+
+    #[test]
+    fn document_all_is_the_html_dda_exotic() {
+        // `document.all` must be the `[[IsHTMLDDA]]` exotic object (Annex B.3.6):
+        // falsy, `typeof "undefined"`, `== null`/`== undefined`, but a distinct
+        // stable object for `===` (and `!== undefined`). Without these semantics,
+        // a guard like polymer_resin's `value || value === document.all` treats an
+        // `undefined` value as `document.all` and sanitizes it (the YouTube
+        // search-results-hidden bug). The getter is in the PRELUDE, so this needs
+        // a faithful page context (DOM + syscalls + config + PRELUDE).
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        // typeof is "undefined"; the value is falsy.
+        assert_eq!(s(&mut ctx, b"typeof document.all"), "undefined");
+        assert_eq!(s(&mut ctx, b"String(!!document.all)"), "false");
+        assert_eq!(s(&mut ctx, b"document.all ? 'truthy' : 'falsy'"), "falsy");
+        // Loose equality to null/undefined is true (both directions).
+        assert_eq!(s(&mut ctx, b"String(document.all == undefined)"), "true");
+        assert_eq!(s(&mut ctx, b"String(document.all == null)"), "true");
+        assert_eq!(s(&mut ctx, b"String(undefined == document.all)"), "true");
+        // Strict equality to undefined/null is false — it IS a distinct object.
+        assert_eq!(s(&mut ctx, b"String(document.all === undefined)"), "false");
+        assert_eq!(s(&mut ctx, b"String(document.all === null)"), "false");
+        assert_eq!(s(&mut ctx, b"String(document.all !== undefined)"), "true");
+        // Stable identity across reads (polymer_resin compares `=== document.all`).
+        assert_eq!(
+            s(&mut ctx, b"String(document.all === document.all)"),
+            "true"
+        );
+        assert_eq!(s(&mut ctx, b"String(undefined === document.all)"), "false");
+        // The exact polymer_resin guard shape: a falsy/undefined value must flow
+        // through `value || value === document.all` WITHOUT matching document.all.
+        assert_eq!(
+            s(
+                &mut ctx,
+                b"(function(v){return (v || v === document.all) ? 'sanitized' : 'passthrough';})(undefined)"
+            ),
+            "passthrough"
+        );
+        // An ordinary object stays truthy and `typeof "object"` — the marker is
+        // specific to the one exotic object.
+        assert_eq!(s(&mut ctx, b"typeof {}"), "object");
+        assert_eq!(s(&mut ctx, b"String(!!{})"), "true");
+        assert_eq!(s(&mut ctx, b"String({} == undefined)"), "false");
     }
 
     /// `URL.createObjectURL`/`revokeObjectURL` (File API) over a RAM-only,

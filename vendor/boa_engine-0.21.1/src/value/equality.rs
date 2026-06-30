@@ -75,6 +75,15 @@ impl JsValue {
                 true
             }
 
+            // ECMAScript Annex B.3.6: `undefined`/`null` is `==` to the
+            // `[[IsHTMLDDA]]` exotic object (`document.all`), in both directions.
+            (JsVariant::Null | JsVariant::Undefined, JsVariant::Object(o)) if o.is_html_dda() => {
+                true
+            }
+            (JsVariant::Object(o), JsVariant::Null | JsVariant::Undefined) if o.is_html_dda() => {
+                true
+            }
+
             // 3. If Type(x) is Number and Type(y) is String, return the result of the comparison x == ! ToNumber(y).
             // 4. If Type(x) is String and Type(y) is Number, return the result of the comparison ! ToNumber(x) == y.
             //

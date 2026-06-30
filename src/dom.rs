@@ -1191,6 +1191,37 @@ impl Dom {
         Some(ua_display(self.tag_name(id)?).to_string())
     }
 
+    /// True when `id` must establish a table formatting context for its
+    /// children EVEN THOUGH its own `display` is not `table`/`inline-table` —
+    /// i.e. it holds misparented "proper table children" (table rows /
+    /// row-groups) that, per CSS 2.1 §17.2.1 "generate missing parents", are
+    /// wrapped in an anonymous `table` box ("a row group box is misparented
+    /// when its parent is neither a 'table' box nor an 'inline-table' box").
+    /// The common real-world trigger is markdown CSS (GitHub, many doc themes)
+    /// forcing `display:block;width:max-content;overflow:auto` onto a `<table>`
+    /// so a wide table scrolls horizontally: the `<thead>`/`<tbody>` keep their
+    /// table displays, so the table still lays as a table. Without this the
+    /// cells block-stack (every `<td>` on its own line). The layout routes such
+    /// an element through `flow_table`, which collects rows from the children
+    /// regardless of the element's own display — the element acts as the
+    /// generated anonymous table.
+    pub fn establishes_anonymous_table(&self, id: NodeId) -> bool {
+        // An element already displayed as a table is handled by its own
+        // display; a table-internal box (row/cell/group) is owned by its
+        // ancestor table — neither needs an anonymous wrapper here.
+        if let Some(d) = self.effective_display(id)
+            && (d == "table" || d == "inline-table" || d.starts_with("table-"))
+        {
+            return false;
+        }
+        self.children(id).iter().any(|&c| {
+            matches!(
+                self.effective_display(c).as_deref(),
+                Some("table-row" | "table-row-group" | "table-header-group" | "table-footer-group")
+            )
+        })
+    }
+
     /// The cascaded value of any tracked property (the layout reads
     /// margin/padding/text-align through this), or `None` when unset.
     /// Author cascade only (no UA defaults, no inheritance) — the
