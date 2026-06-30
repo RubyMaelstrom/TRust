@@ -2151,6 +2151,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_prev", 1, sys_prev),
         ("__dom_node_type", 1, sys_node_type),
         ("__dom_tag", 1, sys_tag),
+        ("__dom_namespace", 1, sys_namespace),
         ("__dom_get_attr", 2, sys_get_attr),
         ("__dom_computed", 2, sys_computed_style),
         ("__dom_rect", 1, sys_rect),
@@ -2388,6 +2389,17 @@ fn sys_tag(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue
         Some(t) => str_value(t),
         None => JsValue::null(),
     })
+}
+
+fn sys_namespace(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let d = dom.borrow();
+    Ok(
+        match arg_node(&d, args, 0).and_then(|id| d.namespace_uri(id)) {
+            Some(ns) => str_value(ns),
+            None => JsValue::null(),
+        },
+    )
 }
 
 fn sys_get_attr(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -5355,6 +5367,36 @@ impl boa_engine::module::ModuleLoader for WebModuleLoader {
         context: &RefCell<&mut Context>,
     ) -> JsResult<boa_engine::Module> {
         let spec = specifier.to_std_string_lossy();
+        // `data:` URL modules (RFC 2397): decode the body inline — no network,
+        // no shared cache. Vite's modern-browser probe STATICALLY imports
+        // `data:text/javascript,if(!import.meta.resolve)throw…` to feature-test;
+        // failing to load it makes Vite fall back to its legacy SystemJS/core-js
+        // build (joinpeertube.org). Registered under the data: URL itself so a
+        // re-import returns the one record (Boa's per-specifier identity rule).
+        if spec.starts_with("data:") {
+            if let Some(cached) = self.modules.borrow().get(&spec) {
+                return Ok(cached.clone());
+            }
+            let body = crate::img::decode_data_url(&spec).ok_or_else(|| {
+                boa_engine::JsNativeError::typ()
+                    .with_message(format!("cannot decode data: module '{spec}'"))
+            })?;
+            let module = {
+                let mut ctx = context.borrow_mut();
+                let t = phase_begin();
+                let m = boa_engine::Module::parse(
+                    Source::from_bytes(&body).with_path(std::path::Path::new(&spec)),
+                    None,
+                    &mut ctx,
+                )?;
+                phase_end(Phase::Parse, t);
+                m
+            };
+            self.modules
+                .borrow_mut()
+                .insert(spec.clone(), module.clone());
+            return Ok(module);
+        }
         // The HTML spec's rule: only absolute URLs and /-, ./-, ../-
         // prefixed paths resolve. Bare specifiers ("lit") need an
         // import map we don't have — reject, don't guess.
@@ -5464,10 +5506,33 @@ impl boa_engine::module::ModuleLoader for WebModuleLoader {
             .unwrap_or_default();
         let _ = import_meta.set(
             boa_engine::js_string!("url"),
-            JsString::from(url),
+            JsString::from(url.clone()),
             false,
             context,
         );
+        // `import.meta.resolve(spec)` → spec resolved against this module's URL
+        // (HTML "HostGetImportMetaProperties"). Vite's modern-browser probe
+        // imports a data: module that throws `if(!import.meta.resolve)`, so
+        // without this the page detects a "legacy" browser and loads its
+        // SystemJS/core-js fallback. The module's own URL is captured.
+        let resolve = NativeFunction::from_copy_closure_with_captures(
+            |_this, args, base: &JsString, ctx| {
+                let spec = args.first().cloned().unwrap_or_default().to_string(ctx)?;
+                let base = base.to_std_string_lossy();
+                match url::Url::parse(&base)
+                    .ok()
+                    .and_then(|b| b.join(&spec.to_std_string_lossy()).ok())
+                {
+                    Some(u) => Ok(JsString::from(u.to_string()).into()),
+                    None => Err(boa_engine::JsNativeError::typ()
+                        .with_message("Failed to resolve module specifier")
+                        .into()),
+                }
+            },
+            JsString::from(url),
+        )
+        .to_js_function(context.realm());
+        let _ = import_meta.set(boa_engine::js_string!("resolve"), resolve, false, context);
     }
 }
 
@@ -5646,8 +5711,29 @@ fn load_page(
 
     let started = Instant::now();
     let parsed_url = url::Url::parse(page_url).ok();
+    // The document base URL (HTML §4.2.3): the page URL, overridden by the
+    // first `<base href>`. Relative entry-script/module `src`s resolve against
+    // it, not the page URL — peer.tube sets `<base href="/client/en-US/">` and
+    // references its scripts relatively, so resolving against the page URL hits
+    // the SPA catch-all (every unknown path returns index.html). Mirrors the
+    // prefetch's `base_with_doc_base`, so the engine's module URLs agree with
+    // the seeded cache keys.
+    let base_url = {
+        let d = dom.borrow();
+        let mut b = parsed_url.clone();
+        for id in d.descendants(crate::dom::DOCUMENT) {
+            if d.tag_name(id) == Some("base")
+                && let Some(href) = d.attr(id, "href")
+                && let Some(j) = parsed_url.as_ref().and_then(|u| u.join(href.trim()).ok())
+            {
+                b = Some(j);
+                break;
+            }
+        }
+        b
+    };
     let loader = Rc::new(WebModuleLoader {
-        page: parsed_url.clone(),
+        page: base_url.clone(),
         modules: RefCell::new(std::collections::HashMap::new()),
         body: env.cache.clone(),
     });
@@ -5806,7 +5892,7 @@ fn load_page(
                         // was seeded as a classic <script>), and we
                         // speculatively prefetch its imports so the first
                         // wave is already in flight.
-                        let resolved = parsed_url
+                        let resolved = base_url
                             .as_ref()
                             .and_then(|b| b.join(src).ok())
                             .filter(|u| matches!(u.scheme(), "http" | "https"));
@@ -5832,11 +5918,14 @@ fn load_page(
                     }
                     None => {
                         let name = format!("inline-module#{}", i + 1);
+                        // An inline module's base URL is the document base URL,
+                        // so its relative imports resolve like the page's.
+                        let base = base_url.as_ref().map(|u| u.as_str()).unwrap_or(page_url);
                         run_module(
                             &mut ctx,
                             &name,
                             inline.as_bytes(),
-                            page_url,
+                            base,
                             &budget,
                             &mut outcome,
                             None,
@@ -5860,6 +5949,20 @@ fn load_page(
         // mount node, so without this the whole app fails to start.
         set_current_script(&mut ctx, Some(*node));
         match src {
+            // `data:` URL classic script (RFC 2397): decode the body inline — no
+            // network, no shared cache. Instagram/Facebook inline their entire
+            // bootloader as `data:` scripts (the requireLazy/Env bootstrap), so
+            // without this the page never starts. Mirrors the `data:` module path
+            // in `load_imported_module`.
+            Some(src) if src.starts_with("data:") => {
+                let name = format!("data#{}", i + 1);
+                match crate::img::decode_data_url(src) {
+                    Some(body) => run_script(&mut ctx, &name, &body, &budget, &mut outcome),
+                    None => outcome
+                        .errors
+                        .push(format!("{name}: cannot decode data: URL")),
+                }
+            }
             Some(src) => match externals.iter().find(|(k, _)| k == src) {
                 Some((_, Some(body))) => {
                     // Route through the CDN cache: a reusable image is rehydrated
@@ -5884,7 +5987,7 @@ fn load_page(
                     // stays silent (expected, not a page error); a genuine
                     // failure (no net / blocked / fetch error) keeps the old
                     // "not fetched" note.
-                    let resolved = parsed_url
+                    let resolved = base_url
                         .as_ref()
                         .and_then(|b| b.join(src).ok())
                         .filter(|u| matches!(u.scheme(), "http" | "https"));
@@ -9001,6 +9104,13 @@ const PRELUDE: &str = r##"
         const u = __url_parse(b.getAttribute("href") || "", g.location.href);
         return (baseHrefCache = u ? u[0] : g.location.href);
     }
+    // Resolve a (possibly relative) request URL against the document base URL —
+    // the base for fetch()/XHR per Fetch §"Request" and XHR `open()` (the API
+    // base URL of the relevant settings object IS the document base URL, i.e.
+    // <base href>, not the document URL). An already-absolute URL — incl.
+    // blob:/data:/about: — ignores the base. Falls back to the raw string on a
+    // parse miss (the Rust syscall then joins against the page URL as before).
+    function resolveURL(u) { const p = __url_parse(u, baseHref()); return p ? p[0] : u; }
 
     // --- events: listener registry + synchronous bubble dispatch ---
     const LS = new Map();
@@ -9840,6 +9950,16 @@ const PRELUDE: &str = r##"
         [Symbol.iterator]() { return this.__get()[Symbol.iterator](); }
     }
 
+    // `element.dataset` is a DOMStringMap (https://html.spec.whatwg.org/#domstringmap).
+    // The interface object MUST exist on the global AND `el.dataset instanceof
+    // DOMStringMap` MUST be true: Facebook/Instagram's async-CSS bootloader does
+    // `e.dataset instanceof window.DOMStringMap ? e.dataset : null`, so a missing
+    // global makes the `instanceof` RHS `undefined` → a TypeError that aborts the
+    // bootstrap. Direct construction throws like the platform ("Illegal
+    // constructor"); the live map is the proxy in the `dataset` getter, whose
+    // target inherits this prototype so the `instanceof` check holds.
+    const DOMStringMap = function () { throw new TypeError("Illegal constructor"); };
+
     class Element extends Node {
         // nodeType and the tag are IMMUTABLE for a node: `wrap()` already
         // dispatched this class BY node type, and an element's local name never
@@ -9852,6 +9972,12 @@ const PRELUDE: &str = r##"
         get localName() { let t = this.__ln; if (t === undefined) t = this.__ln = __dom_tag(this.__id) || ""; return t; }
         get tagName() { let t = this.__tn; if (t === undefined) t = this.__tn = this.localName.toUpperCase(); return t; }
         get nodeName() { return this.tagName; }
+        // `Element.namespaceURI` — immutable, so cache it (undefined = uncached,
+        // null = the null namespace). HTML elements report the XHTML namespace;
+        // inline SVG/MathML their own. Vue 3 hydration reads
+        // `el.namespaceURI.includes("svg")`, so a missing value threw on every
+        // SSR Vue/Nuxt page (joinpeertube).
+        get namespaceURI() { let n = this.__ns; if (n === undefined) n = this.__ns = __dom_namespace(this.__id); return n; }
         get [Symbol.toStringTag]() { return htmlInterfaceName(this.localName); }
         // NOTE: type-SPECIFIC IDL surfaces (HTMLMediaElement media state on
         // <video>/<audio>, the <canvas> 2d context, HTMLSelectElement options,
@@ -10050,7 +10176,7 @@ const PRELUDE: &str = r##"
         get dataset() {
             if (!this.__ds) {
                 const el = this;
-                this.__ds = new Proxy({}, {
+                this.__ds = new Proxy(Object.create(DOMStringMap.prototype), {
                     get(_, p) { return typeof p === "string" ? (el.getAttribute("data-" + kebab(p)) ?? undefined) : undefined; },
                     set(_, p, v) { if (typeof p === "string") el.setAttribute("data-" + kebab(p), String(v)); return true; },
                     has(_, p) { return typeof p === "string" && el.getAttribute("data-" + kebab(p)) !== null; },
@@ -11634,6 +11760,7 @@ const PRELUDE: &str = r##"
     // unguarded; a missing `frames` made that a "convert undefined to object".
     g.frames = g;
     g.DOMTokenList = DOMTokenList;
+    g.DOMStringMap = DOMStringMap;
     g.document = wrap(0);
 
     // --- environment ---
@@ -13538,8 +13665,9 @@ const PRELUDE: &str = r##"
     g.Headers = Headers;
     // The wire body for a request/response: the platform accepts strings,
     // URLSearchParams, Blob/File, and ArrayBuffer views; our syscall takes a
-    // string, so flatten to one. Unknown objects stringify (no multipart —
-    // FormData is deliberately unsupported), null stays null.
+    // string, so flatten to one. Unknown objects stringify (no multipart and no
+    // FormData yet — the encoder just isn't built; the urlencoded path covers
+    // ~every form), null stays null.
     const __bodyText = (body) => {
         if (body === null || body === undefined) return null;
         if (typeof body === "string") return body;
@@ -13585,8 +13713,11 @@ const PRELUDE: &str = r##"
         constructor(input, init) {
             init = init || {};
             const fromReq = input instanceof Request;
+            // A Request copies its already-resolved url; a string/URL input is
+            // resolved against the document base URL (Fetch §"Request": parse
+            // input with the base URL = the settings object's API base URL).
             this.url = fromReq ? input.url
-                : String((input && input.url !== undefined) ? input.url : input);
+                : resolveURL(String((input && input.url !== undefined) ? input.url : input));
             this.method = String(init.method || (fromReq ? input.method : null) || "GET").toUpperCase();
             this.headers = new Headers(init.headers !== undefined ? init.headers : (fromReq ? input.headers : undefined));
             this.__body = init.body !== undefined ? init.body : (fromReq ? input.__body : null);
@@ -14059,16 +14190,28 @@ const PRELUDE: &str = r##"
         } catch (e) { return Promise.reject(e); }
     };
 
-    class XMLHttpRequest {
+    // XMLHttpRequest IS an EventTarget (spec: XMLHttpRequest : XMLHttpRequest-
+    // EventTarget : EventTarget). It MUST sit in the real `EventTarget.prototype`
+    // chain so its events flow through the shared `addEventListener`/`dispatch`
+    // machinery — Zone.js (Angular) patches `EventTarget.prototype.addEventListener`
+    // and, when scheduling an XHR macrotask, reads the stashed original back as
+    // `XMLHttpRequest.prototype[__zone_symbol__addEventListener]` to register its
+    // own `readystatechange` listener. A standalone XHR (own `__ls`, not in the
+    // chain) left that stash undefined → `undefined.call` aborted every Angular
+    // HttpClient request (the tilvids/PeerTube "Cannot load more videos").
+    class XMLHttpRequest extends EventTarget {
         constructor() {
+            super();
             this.readyState = 0; this.status = 0; this.statusText = "";
             this.responseText = ""; this.response = ""; this.responseType = "";
             this.responseURL = ""; this.timeout = 0; this.withCredentials = false;
-            this.__h = {}; this.__ls = {};
+            this.__h = {};
         }
         open(method, url, isAsync) {
             this.__method = String(method).toUpperCase();
-            this.__url = String(url);
+            // Resolve against the document base URL (XHR `open()`: parse url with
+            // the API base URL of the relevant settings object). blob: stays as-is.
+            this.__url = resolveURL(String(url));
             this.__sync = isAsync === false;
             this.readyState = 1;
             this.__fire("readystatechange");
@@ -14078,13 +14221,16 @@ const PRELUDE: &str = r##"
         getAllResponseHeaders() { return this.__ctype ? "content-type: " + this.__ctype + "\r\n" : ""; }
         overrideMimeType() {}
         abort() {}
-        addEventListener(t, f) { (this.__ls[t] = this.__ls[t] || []).push(f); }
-        removeEventListener(t, f) { const l = this.__ls[t] || []; const i = l.indexOf(f); if (i >= 0) l.splice(i, 1); }
+        // addEventListener/removeEventListener are inherited from EventTarget so
+        // listeners land in the shared `lsFor` store (and Zone's patched wrapper
+        // sees them). The `on<type>` JS properties stay plain instance props.
         __fire(t) {
             const ev = new Event(t); ev.target = this;
             const on = this["on" + t];
             if (typeof on === "function") { try { on.call(this, ev); } catch (e) { trust.errors.push("xhr on" + t + ": " + ((e && e.message) || e)); } }
-            for (const f of (this.__ls[t] || []).slice()) { try { f.call(this, ev); } catch (e) { trust.errors.push("xhr " + t + ": " + ((e && e.message) || e)); } }
+            // Fire addEventListener listeners (app's + Zone's internal
+            // readystatechange handler) through the shared EventTarget dispatch.
+            dispatch(this, ev, false);
         }
         __finish(r) {
             if (!r) {
@@ -20282,6 +20428,42 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_import_of_a_statically_imported_module_does_not_halt() {
+        // Boa-fork regression (vm/opcode/call/mod.rs `load_dyn_import`): the
+        // `Referrer::Module` arm shadowed the loaded `module` with the REFERRER
+        // module, so a dynamic `import()` of a specifier ALSO statically imported
+        // recorded/asserted the wrong module — tripping a `debug_assert_eq!` that
+        // halted ALL page JS (archive.org's `import('…/app-services-*.js')`). The
+        // fork renames the binding so the LOADED module is used, like the
+        // Realm/Script arms. `cargo test` is a debug build, so the assert is live
+        // here: before the fix this page reported an "engine panic" error.
+        let env = PageEnv::bare("https://example.com/");
+        env.cache.seed(
+            String::from("https://example.com/dep.js"),
+            200,
+            String::from("text/javascript"),
+            b"export const v = 42;".to_vec(),
+        );
+        env.cache.seed(
+            String::from("https://example.com/main.js"),
+            200,
+            String::from("text/javascript"),
+            b"import { v } from './dep.js';\n\
+              import('./dep.js').then(m => {\n\
+                document.getElementById('t').textContent = 'static=' + v + ' dynamic=' + m.v;\n\
+              });"
+            .to_vec(),
+        );
+        let (out, outcome) = transform(
+            "<body><div id=t></div>\
+             <script type=module src='/main.js'></script></body>",
+            &env,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("static=42 dynamic=42"), "{out}");
+    }
+
+    #[test]
     fn adopted_stylesheets_hide_through_the_cascade() {
         // Both adoption orders: replaceSync-then-adopt (Lit's shape)
         // and adopt-then-replaceSync (needs the sheet→scope re-sync).
@@ -23320,6 +23502,41 @@ mod tests {
     }
 
     #[test]
+    fn a_data_url_classic_script_runs_inline() {
+        // A `<script src="data:...">` is decoded inline (RFC 2397) and run — no
+        // network. Instagram/Facebook inline their whole bootloader this way; a
+        // missing data: branch reported every one as "not fetched". Cover both
+        // payload encodings: base64 (the FB form) and percent/plain.
+        let b64 = "ZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ3QnKS50ZXh0Q29udGVudD0nZGF0YS1yYW4nOw==";
+        let html = format!(
+            "<body><div id=t></div>\
+             <script src=\"data:text/javascript;base64,{b64}\"></script>\
+             <script src=\"data:text/javascript,document.getElementById('t').textContent+='+plain';\"></script>\
+             </body>"
+        );
+        let (out, outcome) = page(&html);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("data-ran+plain"), "{out}");
+    }
+
+    #[test]
+    fn dataset_is_a_domstringmap_instance() {
+        // `element.dataset` is a DOMStringMap and the interface object is a
+        // global, so `el.dataset instanceof window.DOMStringMap` is true.
+        // Instagram's async-CSS bootloader does exactly that test; a missing
+        // global made the `instanceof` RHS undefined → a TypeError.
+        let (out, outcome) = page(
+            "<body><div id=t data-x=hi></div><script>\
+             var d = document.getElementById('t');\
+             d.textContent = (typeof window.DOMStringMap) + ' '\
+               + (d.dataset instanceof window.DOMStringMap) + ' ' + d.dataset.x;\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("function true hi"), "{out}");
+    }
+
+    #[test]
     fn missing_external_is_an_error_not_a_crash() {
         let (out, outcome) = page("<body><p>still here</p><script src='/gone.js'></script></body>");
         assert_eq!(outcome.errors.len(), 1);
@@ -23404,6 +23621,71 @@ mod tests {
         assert!(
             out.contains("meta=https://example.com/a/sib.js"),
             "import.meta.url resolves siblings: {out}"
+        );
+    }
+
+    #[test]
+    fn data_url_module_import_runs_with_import_meta_resolve() {
+        // Vite's modern-browser probe: a module statically imports a `data:` URL
+        // module that throws `if(!import.meta.resolve)`. Both pieces must work —
+        // `data:` URL module loading AND `import.meta.resolve` — or the import
+        // throws, `__vite_is_modern_browser` stays unset, and the page loads its
+        // legacy SystemJS/core-js build (joinpeertube.org).
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script type=module>\
+             import 'data:text/javascript,if(!import.meta.resolve)throw Error(\"no resolve\")';\
+             window.__vite_is_modern_browser = true;\
+             document.getElementById('o').textContent =\
+               'modern=' + (window.__vite_is_modern_browser === true) +\
+               ',resolve=' + import.meta.resolve('./x.js');\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("modern=true,resolve=https://example.com/a/x.js"),
+            "data: module + import.meta.resolve: {out}"
+        );
+    }
+
+    #[test]
+    fn fetch_resolves_relative_urls_against_the_base_href() {
+        // A relative `fetch()`/XHR URL resolves against the document BASE URL —
+        // the API base URL of the relevant settings object (Fetch §"Request",
+        // XHR `open()`), i.e. `<base href>` — not the document URL. An absolute
+        // URL ignores the base. (Both go through `new Request(...).url`.)
+        let (out, outcome) = page(
+            "<head><base href=\"/client/en-US/\"></head>\
+             <body><pre id=o></pre><script>\
+             document.getElementById('o').textContent =\
+               'rel=' + new Request('data.json').url +\
+               ',abs=' + new Request('https://other.example/x').url;\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(
+                "rel=https://example.com/client/en-US/data.json,abs=https://other.example/x"
+            ),
+            "fetch resolves against <base href>, leaves absolute URLs alone: {out}"
+        );
+    }
+
+    #[test]
+    fn element_namespace_uri_is_the_html_namespace() {
+        // `Element.namespaceURI` is the XHTML namespace for HTML elements (never
+        // null/undefined). Vue 3 hydration reads `el.namespaceURI.includes("svg")`,
+        // so an undefined value threw on every SSR Vue/Nuxt page (joinpeertube).
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script>\
+             document.getElementById('o').textContent =\
+               'ns=' + document.body.namespaceURI +\
+               ',svg=' + document.body.namespaceURI.includes('svg');\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("ns=http://www.w3.org/1999/xhtml,svg=false"),
+            "Element.namespaceURI is the HTML namespace: {out}"
         );
     }
 

@@ -1174,14 +1174,23 @@ pub async fn execute_js(
             jobs.len()
         );
     }
+    // Relative subresource URLs resolve against the document BASE URL — the
+    // first `<base href>` (HTML §4.2.3) — not the document URL. peer.tube
+    // serves `<base href="/client/en-US/">` and references its scripts/sheets
+    // relatively; resolving against the document URL hits the Angular SPA
+    // catch-all (every unknown path returns index.html → the scripts parse as
+    // "unexpected token '<'" and the app never boots). The SSRF gate still
+    // keys off the real page URL.
+    let doc_base = base_with_doc_base(&html, &response.url);
     let results = futures::stream::iter(jobs.into_iter().map(|(kind, raw)| {
-        let base = response.url.clone();
+        let doc_base = doc_base.clone();
+        let page_url = response.url.clone();
         async move {
-            let resolved = base
+            let resolved = doc_base
                 .join(&raw)
                 .ok()
                 .filter(|u| matches!(u.scheme(), "http" | "https"))
-                .filter(|u| subresource_allowed(&base, u));
+                .filter(|u| subresource_allowed(&page_url, u));
             let resp = match &resolved {
                 Some(u) => {
                     if std::env::var_os("TRUST_NET_TRACE").is_some() {
@@ -2462,6 +2471,61 @@ mod tests {
         assert_eq!(response.content_type, "text/html; charset=utf-8");
         let outcome = response.js.expect("outcome recorded");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        server.abort();
+    }
+
+    // A relative subresource resolves against the document BASE URL (the first
+    // `<base href>`, HTML §4.2.3), NOT the document URL. peer.tube serves
+    // `<base href="/client/en-US/">` with a relative `<script src=app.js>`; the
+    // real asset lives under the base path, while the document URL's path is an
+    // Angular SPA catch-all that answers HTML for any unknown route. Resolving
+    // against the document URL fetches HTML and the script dies with
+    // "unexpected token '<'"; resolving against the base href runs it.
+    #[tokio::test]
+    async fn execute_js_resolves_subresources_against_base_href() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).into_owned();
+                let reply: Vec<u8> = if text.starts_with("GET /assets/app.js ") {
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n\
+                      document.getElementById('out').textContent = 'external ran';"
+                        .to_vec()
+                } else {
+                    // The SPA catch-all: ANY other path (including the wrong
+                    // /client/app.js a document-URL resolution would request)
+                    // answers the index HTML, exactly like peer.tube.
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                      <html><head><base href=\"/assets/\"></head>\
+                      <body><div id=out></div><script src=\"app.js\"></script></body></html>"
+                        .to_vec()
+                };
+                let _ = sock.write_all(&reply).await;
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/client/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body);
+        let outcome = response.js.expect("outcome recorded");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(body.contains("external ran"), "{body}");
         server.abort();
     }
 
