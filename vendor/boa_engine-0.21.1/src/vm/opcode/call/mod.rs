@@ -309,9 +309,20 @@ async fn load_dyn_import(
     };
 
     // 1. If result is a normal completion, then
+    //
+    // NOTE (TRust fork): the `Referrer::Module` arm must NOT name its binding
+    // `module` — that would shadow the loaded `module` (result.[[Value]]) above,
+    // so `result.[[Value]]` below would resolve to the REFERRER module instead.
+    // The record we append (and assert) is keyed on the LOADED module, exactly
+    // as the `Realm`/`Script` arms do. Upstream shadowed it, which made a
+    // dynamic `import()` of an already-statically-loaded specifier compare the
+    // referrer against the (correctly) recorded module and trip the
+    // `debug_assert_eq!` — halting all page JS in debug builds (and recording
+    // the wrong module for a never-before-loaded specifier in any build).
+    // Repro: archive.org's `import('…/app-services-*.js')`.
     match referrer {
-        Referrer::Module(module) => {
-            let ModuleKind::SourceText(src) = module.kind() else {
+        Referrer::Module(referrer_module) => {
+            let ModuleKind::SourceText(src) = referrer_module.kind() else {
                 panic!("referrer cannot be a synthetic module");
             };
 

@@ -879,6 +879,22 @@ impl Dom {
         }
     }
 
+    /// The element's namespace URI (DOM `Element.namespaceURI`): the full URI
+    /// string carried in its `QualName` — `http://www.w3.org/1999/xhtml` for
+    /// HTML, `…/2000/svg` for SVG, `…/1998/Math/MathML` for MathML. `None`
+    /// (→ `null` in JS) for non-elements or the null namespace. Vue 3's
+    /// hydration reads `el.namespaceURI.includes("svg")`, so a missing value
+    /// throws on every SSR Vue/Nuxt page.
+    pub fn namespace_uri(&self, id: NodeId) -> Option<&str> {
+        match &self.nodes[id].data {
+            NodeData::Element { name, .. } => {
+                let ns = &*name.ns;
+                (!ns.is_empty()).then_some(ns)
+            }
+            _ => None,
+        }
+    }
+
     pub fn attr(&self, id: NodeId, name: &str) -> Option<&str> {
         match &self.nodes[id].data {
             NodeData::Element { attrs, .. } => attrs
@@ -1316,6 +1332,28 @@ impl Dom {
         };
         // One em ≈ 2 terminal cells; a cell ≈ one unit of display width.
         crate::layout::display_width(label) as f32 > width_em * 2.0
+    }
+
+    /// Whether `id` is a content-less full-area POSITIONED OVERLAY — a click
+    /// SCRIM (a click-to-play / click-to-dismiss hit target) that fills its
+    /// containing block. A browser paints nothing for it, so its accessible name
+    /// must not be surfaced as a clickable HANDLE (the live serializer) or a
+    /// LABEL (`layout::icon_only_label`): either would float phantom body text
+    /// over the content the scrim covers. (Twitch's player carries a full-bleed
+    /// `<button aria-label="Play" style="position:absolute;width:100%;
+    /// height:100%">`.) Emptiness is the caller's precondition — both callers
+    /// only reach here for a control with no text and no icon glyph. `var()` is
+    /// resolved so a styled-components size still reads as `100%`.
+    pub(crate) fn is_overlay_scrim(&self, id: NodeId) -> bool {
+        let pos = self.computed_value_resolved(id, "position");
+        if !matches!(pos.as_deref().map(str::trim), Some("absolute" | "fixed")) {
+            return false;
+        }
+        let fills = |prop: &str, full: &[&str]| {
+            self.computed_value_resolved(id, prop)
+                .is_some_and(|v| full.contains(&v.trim()))
+        };
+        fills("width", &["100%", "100vw"]) && fills("height", &["100%", "100vh"])
     }
 
     /// The computed value of a property — the single inheritance authority.
@@ -2859,6 +2897,9 @@ impl Dom {
                     // from spamming every chat line. The empty wrapper then yields
                     // no layout item (same as an anonymous control).
                     .filter(|l| !self.name_is_clipped_out(id, l))
+                    // A full-bleed positioned scrim (a click-to-play overlay)
+                    // paints nothing in a browser — don't surface its name.
+                    .filter(|_| !self.is_overlay_scrim(id))
                 {
                     out.push('[');
                     out.push_str(&escape_text(label));
@@ -5462,16 +5503,34 @@ mod tests {
         let f = |id| dom.get_by_id(id).unwrap();
         // Absolute + entirely textless/imageless → inert (the bar itself and the
         // animated fill inside it).
-        assert!(dom.inert_positioned_attr(f("bar")), "abs textless box is inert");
-        assert!(dom.inert_positioned_attr(f("fill")), "the animated fill is inert");
+        assert!(
+            dom.inert_positioned_attr(f("bar")),
+            "abs textless box is inert"
+        );
+        assert!(
+            dom.inert_positioned_attr(f("fill")),
+            "the animated fill is inert"
+        );
         // In-flow text box: no positioned ancestor → never inert.
-        assert!(!dom.inert_positioned_attr(f("text")), "in-flow box is not inert");
+        assert!(
+            !dom.inert_positioned_attr(f("text")),
+            "in-flow box is not inert"
+        );
         // Absolute but contains text → it paints the text → not inert.
-        assert!(!dom.inert_positioned_attr(f("lbl")), "abs box WITH text paints");
+        assert!(
+            !dom.inert_positioned_attr(f("lbl")),
+            "abs box WITH text paints"
+        );
         // In-flow textless box → a size change reflows siblings → not inert.
-        assert!(!dom.inert_positioned_attr(f("empty")), "in-flow textless is not inert");
+        assert!(
+            !dom.inert_positioned_attr(f("empty")),
+            "in-flow textless is not inert"
+        );
         // Fixed but contains an <img> → the image paints → not inert.
-        assert!(!dom.inert_positioned_attr(f("im")), "abs box with img paints");
+        assert!(
+            !dom.inert_positioned_attr(f("im")),
+            "abs box with img paints"
+        );
     }
 
     #[test]
@@ -6738,6 +6797,32 @@ mod tests {
         assert!(
             html.contains("[Open menu]"),
             "an un-clipped icon control keeps its accessible name: {html}"
+        );
+    }
+
+    #[test]
+    fn serialize_live_drops_a_full_bleed_overlay_scrims_handle() {
+        // A content-less full-area positioned overlay (Twitch's `<button
+        // aria-label="Play" style="position:absolute;width:100%;height:100%">`
+        // click-to-play scrim) paints nothing in a browser — the live serializer
+        // must not give it a bracketed handle, which floated "[Play]" over the
+        // player. A normal icon control keeps its name.
+        let dom = Dom::parse_document(
+            "<body>\
+             <button id=scrim aria-label='Play' style='position:absolute;width:100%;height:100%'></button>\
+             <button id=menu aria-label='Open menu'></button></body>",
+        );
+        let scrim = dom.get_by_id("scrim").unwrap();
+        let menu = dom.get_by_id("menu").unwrap();
+        let clickable = std::collections::HashSet::from([scrim, menu]);
+        let html = dom.serialize_live(DOCUMENT, &clickable);
+        assert!(
+            !html.contains("[Play]"),
+            "a full-bleed scrim is not given a handle label: {html}"
+        );
+        assert!(
+            html.contains("[Open menu]"),
+            "an ordinary icon control keeps its handle: {html}"
         );
     }
 

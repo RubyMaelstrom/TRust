@@ -161,7 +161,12 @@ fn percent_decode(s: &str) -> Vec<u8> {
                 continue;
             }
         }
-        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        // A `data:` URL body is percent-decoded only (RFC 2397 / WHATWG URL
+        // "data: URL processing"); `+` is a literal plus, NOT a space. The
+        // `+`→space rule belongs to application/x-www-form-urlencoded query
+        // strings, not here — converting it corrupts JS (`+=`, `'+x'`) and any
+        // SVG markup with a literal `+`.
+        out.push(bytes[i]);
         i += 1;
     }
     out

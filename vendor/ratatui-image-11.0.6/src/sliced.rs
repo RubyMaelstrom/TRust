@@ -428,9 +428,19 @@ mod sixel_slice {
             let skip_bands = (skip_line_count * self.font_height as usize).div_ceil(6);
 
             let bands: Vec<&str> = self.bands.to_vec();
-            let take_bands = (((self.size.height.saturating_sub(drop_line_count as u16))
+            // The band index of the visible region's BOTTOM edge, counted from
+            // band 0. The number of bands to EMIT is the count from `skip_bands`
+            // to there — i.e. `bottom_band - skip_bands`. Taking `bottom_band`
+            // bands *after* skipping (the old code) over-emits by `skip_bands`:
+            // a sixel clipped on BOTH ends (a tall image scrolled into the
+            // MIDDLE of the viewport, so `skip > 0` and `drop > 0`) then painted
+            // `skip_bands * 6` pixels PAST the bottom of its cell box — over the
+            // status bar and off the screen bottom, which scrolls the terminal
+            // and leaves the title row + scrollbar corrupted until a full redraw.
+            let bottom_band = (((self.size.height.saturating_sub(drop_line_count as u16))
                 * self.font_height)
                 / 6) as usize;
+            let take_bands = bottom_band.saturating_sub(skip_bands);
 
             let sliced_bands: Vec<&str> = bands
                 .iter()
@@ -587,6 +597,37 @@ mod sixel_slice {
             let sliced = sliced.borrow_dependent();
             // band1 should be skipped, band2 should be present
             assert_eq!(sliced.bands, vec!["#0band1", "band2", "band3"]);
+        }
+
+        #[test]
+        fn test_bands_clipped_both_ends_stays_within_box() {
+            // A tall image scrolled into the MIDDLE of the viewport: clipped on
+            // BOTH the top (`skip`) and bottom (`drop`). The emitted band count
+            // must equal the VISIBLE region, never overshoot by `skip` — the
+            // old bug took the full bottom-edge band index *after* skipping, so
+            // a both-ends-clipped sixel painted `skip` rows past its cell box
+            // (into the status bar / off the screen bottom).
+            //
+            // font-height 6 ⇒ one band per row; 10 rows ⇒ 10 bands.
+            let data = String::from(
+                "\x1bPq\"1;1;8;60#0b0-b1-b2-b3-b4-b5-b6-b7-b8-b9-\x1b\\",
+            );
+            let sixel = Sixel {
+                data,
+                size: Size::new(8, 10),
+                is_tmux: false,
+            };
+            let sliced = SlicedSixel::from_sixel(sixel, 6, false);
+            let sliced = sliced.borrow_dependent();
+            assert_eq!(sliced.bands(0, 0).len(), 10, "the full image is 10 bands");
+            // Scroll 2 rows off the top, 3 off the bottom ⇒ 5 rows visible.
+            let visible = sliced.bands(2, 3);
+            assert_eq!(
+                visible.len(),
+                5,
+                "5 visible rows ⇒ 5 bands, not the old overshoot of 7"
+            );
+            assert_eq!(visible, vec!["b2", "b3", "b4", "b5", "b6"]);
         }
 
         #[test]

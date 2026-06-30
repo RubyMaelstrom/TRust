@@ -484,6 +484,19 @@ pub struct App {
     /// (reset on each new live page). Drives infinite scroll / scroll-based
     /// lazy loading: the site's own handler reacts to the threaded position.
     last_scroll_sent: Option<usize>,
+    /// The scroll row the user INTENDS to be at on the HTTP laid-out doc, kept
+    /// independent of the rendered `scroll`. A living page re-renders on its own
+    /// (a timer, a fetch, an infinite-scroll load), and such a re-layout can
+    /// momentarily SHRINK the document — an archive.org collection load blanks
+    /// the grid to a "Searching…" placeholder, then refills it. Clamping the
+    /// rendered scroll to the shrunken `max_scroll` (and never restoring it when
+    /// the doc grows back) is what made scrolling "pop up" then settle higher
+    /// than before. `scroll_intent` is the position to RESTORE toward on every
+    /// live re-render (clamped only for display), so a transient shrink no longer
+    /// destroys the reader's place. Synced to `scroll` after any user-driven
+    /// scroll/resize/navigation (run-loop tail + `navigate_to`); a live
+    /// re-render's "keep" path reads it but does NOT overwrite it.
+    scroll_intent: usize,
     /// Per-region CLIP box last pushed to the live page (`PageCmd::RegionGeom`),
     /// keyed by the actor node id; value is the px `(clientHeight, clientWidth)`
     /// quantized to ints, so a geometry command is sent only when the box changed
@@ -667,6 +680,7 @@ impl App {
             live_page: None,
             page_rx: None,
             last_scroll_sent: None,
+            scroll_intent: 0,
             region_geom_sent: std::collections::HashMap::new(),
             live_boundaries_sent: std::collections::HashSet::new(),
             region_scroll_sent: std::collections::HashMap::new(),
@@ -860,9 +874,13 @@ impl App {
                             .swap(0, std::sync::atomic::Ordering::Relaxed);
                         let ev = EVT_TALLY.with(|t| t.replace([0; 5]));
                         let redun = REDUNDANT_DRAWS.with(|c| c.replace(0));
+                        let cur_scroll = self.browser.as_ref().map_or(0, |g| g.scroll);
+                        let cur_max = doc_rows.saturating_sub(self.last_inner.1 as usize);
+                        let lss = self.last_scroll_sent;
+                        let sint = self.scroll_intent;
                         let _ = writeln!(
                             std::io::stderr(),
-                            "DIAGFRAME draws/s={n} (redundant={redun}) draw={}ms | page_evt: {pn} calls {}ms (full_replaces={pfull} drains={pdr}) | img_relayout: {icount}x {}ms | raw={raw_kb}KB doc_rows={doc_rows} reg_rows={reg_rows} | img_renders/s={imgr} sixel_seq[build={seq_builds} hit={seq_hits} prewarm={seq_prewarms}] evts[upd={} pat={} scr={} set={}]",
+                            "DIAGFRAME draws/s={n} (redundant={redun}) draw={}ms | page_evt: {pn} calls {}ms (full_replaces={pfull} drains={pdr}) | img_relayout: {icount}x {}ms | raw={raw_kb}KB doc_rows={doc_rows} reg_rows={reg_rows} | SCROLL[pos={cur_scroll} max={cur_max} intent={sint} last_sent={lss:?}] | img_renders/s={imgr} sixel_seq[build={seq_builds} hit={seq_hits} prewarm={seq_prewarms}] evts[upd={} pat={} scr={} set={}]",
                             us / 1000,
                             pus / 1000,
                             ius / 1000,
@@ -890,6 +908,12 @@ impl App {
             self.sync_viewer_size();
             self.sync_image_encodes();
 
+            // Did THIS iteration come from the live page (a self-driven
+            // re-render)? Such a render restores `scroll` toward `scroll_intent`
+            // and must NOT then overwrite the intent with the (transiently
+            // shrink-clamped) display scroll — that's what the tail-sync below
+            // skips, so a placeholder frame can't destroy the reader's place.
+            let mut from_page = false;
             tokio::select! {
                 event = input_rx.recv() => match event {
                     Some(event) => self.on_terminal_event(event).await,
@@ -913,7 +937,10 @@ impl App {
                 },
                 Some(msg) = self.enc_rx.recv() => self.on_enc(msg),
                 evt = recv_opt(&mut self.page_rx) => match evt {
-                    Some(evt) => self.on_page_evt(evt),
+                    Some(evt) => {
+                        from_page = true;
+                        self.on_page_evt(evt);
+                    }
                     None => {
                         // The actor is gone; the last render stands.
                         self.drop_live_page();
@@ -979,6 +1006,18 @@ impl App {
                 }
             }
             self.apply_pending_image_decodes();
+            // Record the user's intended scroll, the value a self-driven live
+            // re-render restores toward (so a transient document shrink can't pop
+            // the view permanently — see `scroll_intent`). Sync after any user/
+            // resize/fetch-driven iteration, but NOT after a pure live re-render
+            // (which manages the intent itself); a re-render that also coincided
+            // with drained user input (`drained > 0`) still syncs, so a scroll
+            // during a render frame isn't lost.
+            if (!from_page || drained > 0)
+                && let Some(s) = self.browser.as_ref().map(|g| g.scroll)
+            {
+                self.scroll_intent = s;
+            }
             // After the input burst is coalesced, push the (now settled) scroll
             // position to the live page so its infinite-scroll / lazy-load logic
             // reacts. A no-op when the scroll row didn't move (the common case).
@@ -2795,14 +2834,20 @@ impl App {
             }
             let total = g.doc.rows.len();
             let max_scroll = total.saturating_sub(viewport_rows);
-            // At the app's bottom, anchor to the FULL document height so the
-            // engine's viewport reaches its true bottom (where an infinite-scroll
-            // sentinel lives) — its `setScroll` clamps the over-large value to its
-            // own `scrollHeight − innerHeight`. This is robust to the small
-            // viewport/row-count differences between the app's layout and the
-            // engine's measure pass (e.g. the engine's innerHeight is baked at
-            // fetch time). Below the bottom, the exact row position.
-            let y = if row >= max_scroll {
+            // Within a viewport of the app's bottom, anchor to the FULL document
+            // height so the engine's viewport reaches (and STAYS at) its true
+            // bottom — its `setScroll` clamps the over-large value to its own
+            // `scrollHeight − innerHeight`. Two reasons it's a BAND, not just the
+            // exact last row: (1) it's robust to the small viewport/row-count
+            // differences between the app's layout and the engine's measure pass
+            // (the engine's innerHeight is baked at fetch time) — where an
+            // infinite-scroll sentinel lives; (2) a virtualized scroller
+            // (archive.org) UN-RENDERS its bottom section the moment the engine's
+            // scrollY steps off the bottom, shrinking the doc and bouncing the
+            // view — keeping the engine pinned to the bottom across the last
+            // viewport holds that section rendered, so the reader can scroll into
+            // it. Further up, the exact row position.
+            let y = if row >= max_scroll.saturating_sub(viewport_rows) {
                 total as f64 * cell_h
             } else {
                 row as f64 * cell_h
@@ -3270,6 +3315,7 @@ impl App {
         let width = (self.last_inner.0 as usize).max(10);
         let height = self.last_inner.1.max(1) as usize;
         let images = self.image_sizes();
+        let scroll_intent = self.scroll_intent;
         let Some(g) = &mut self.browser else { return };
         let Link::Http(url) = g.doc.url.clone() else {
             return;
@@ -3282,6 +3328,22 @@ impl App {
                 .get(i)
                 .cloned()
         });
+        // CSS Scroll Anchoring: the topmost followable item the reader currently
+        // sees (its row + link), and how far below the viewport top it sits. If it
+        // survives the re-render we re-pin it to that same screen offset (below),
+        // so a transient height change (archive's "Searching…" placeholder, an
+        // image-driven reflow) or content inserted above can't bounce the view.
+        // Captured from the OLD doc, before the re-parse; matched by LINK (a fresh
+        // re-parse reassigns layout node ids, so they can't anchor across it).
+        let view_anchor: Option<(usize, crate::doc::Link)> = {
+            let bot = (g.scroll + height).min(g.doc.rows.len());
+            (g.scroll..bot).find_map(|r| {
+                crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                    .items
+                    .iter()
+                    .find_map(|it| it.link.clone().map(|l| (r, l)))
+            })
+        };
         // Was that selection ON-SCREEN before this update? Only then may we
         // re-center the viewport onto it (the update pushed a visible selection
         // off-screen). If the user had scrolled it out of view, their scroll
@@ -3326,13 +3388,38 @@ impl App {
                     .flatten()
             });
         let max_scroll = g.doc.rows.len().saturating_sub(height);
-        g.scroll = match g.sel_item {
-            // Keep the selection visible if an update pushed it off-screen —
-            // but only if it was visible to begin with (see `sel_was_visible`).
+        // The position to restore toward. We RESTORE from `scroll_intent`, not
+        // the (possibly already shrink-clamped) live `scroll`, so a transient
+        // shrink — a placeholder frame the page paints before it refills (e.g.
+        // archive.org's "Searching…") — no longer permanently pops the view up:
+        // when the doc grows back, `intent.min(max_scroll)` lands where the
+        // reader was. The display value is still clamped to the current content.
+        let new_intent: Option<usize> = match g.sel_item {
+            // The update pushed a SELECTION that was visible off-screen: follow
+            // it (a deliberate reposition, so it becomes the new intent).
             Some((r, _)) if sel_was_visible && (r < g.scroll || r >= g.scroll + height) => {
-                r.saturating_sub(height / 2).min(max_scroll)
+                g.scroll = r.saturating_sub(height / 2).min(max_scroll);
+                Some(g.scroll)
             }
-            _ => g.scroll.min(max_scroll),
+            // Keep the reader's place. Prefer to pin the viewport-top anchor to
+            // its old screen offset (CSS Scroll Anchoring — content the reader
+            // sees stays put across the re-render); fall back to restoring toward
+            // the user's intent, clamped, when the anchor didn't survive (the
+            // transient-shrink safety net). Either way DON'T touch intent (so the
+            // regrow recovers it).
+            _ => {
+                g.scroll = match &view_anchor {
+                    Some((old_r, link)) => match Self::find_row_by_link(&g.doc, link, *old_r) {
+                        Some(new_r) => {
+                            let offset = old_r.saturating_sub(g.scroll);
+                            new_r.saturating_sub(offset).min(max_scroll)
+                        }
+                        None => scroll_intent.min(max_scroll),
+                    },
+                    None => scroll_intent.min(max_scroll),
+                };
+                None
+            }
         };
         // A live update can introduce images that weren't in the prior
         // render: archive.org's collection tiles (and any SPA's lazily
@@ -3344,6 +3431,12 @@ impl App {
         // yet cached) is merely re-fetched by the new batch, never lost,
         // and the per-batch channel still closes when done (idle-CPU gate).
         let image_urls = g.doc.image_urls.clone();
+        // A deliberate reposition (following an off-screen selection) adopts its
+        // new scroll as the intent; the "keep" path left it None to preserve the
+        // reader's intended place across a transient shrink.
+        if let Some(v) = new_intent {
+            self.scroll_intent = v;
+        }
         self.start_image_loads(url, image_urls);
     }
 
@@ -3523,6 +3616,7 @@ impl App {
             (self.last_inner.0 as usize).max(10),
             self.last_inner.1.max(1) as usize,
         );
+        let scroll_intent = self.scroll_intent;
         let images = self.image_sizes();
         let url = match self.browser.as_ref().map(|g| g.doc.url.clone()) {
             Some(Link::Http(u)) => u,
@@ -3599,6 +3693,26 @@ impl App {
                     .get(i)
                     .cloned()
             });
+        // CSS Scroll Anchoring L1 (specialized to the vertical-row model): when
+        // the patched box SPANS the viewport top, capture the topmost interactive
+        // item the reader actually sees as the scroll anchor — BEFORE the splice,
+        // from the old rows. After the splice we re-find it and shift `scroll` by
+        // how far it moved, so content appended BELOW the anchor (an infinite-
+        // scroll grid loading more rows) leaves the viewport put, while content
+        // inserted ABOVE it shifts to compensate. (A box wholly above the viewport
+        // is handled by the simpler whole-delta shift below; one at/below the
+        // viewport top never moves the reader.)
+        let scroll_anchor: Option<(usize, crate::doc::Link)> =
+            if delta != 0 && splice_at < g.scroll && g.scroll < old_range.end {
+                (g.scroll..old_range.end).find_map(|r| {
+                    crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                        .items
+                        .iter()
+                        .find_map(|it| it.link.clone().map(|l| (r, l)))
+                })
+            } else {
+                None
+            };
         // Shift the fragment's cols into the box's absolute band, then splice it
         // in place of the old rows (the Vec splice shifts following rows for us).
         let mut new_rows = laid.rows;
@@ -3644,9 +3758,8 @@ impl App {
             }
         }
         // Selection: re-anchor an in-box selection by target; shift an after-box
-        // one by delta; leave a before-box one. Scroll-anchor the viewport so a
-        // splice ABOVE the visible top doesn't make the content jump (CSS Scroll
-        // Anchoring L1, specialized to the vertical-row model).
+        // one by delta; leave a before-box one. (The viewport itself is scroll-
+        // anchored just below.)
         let height = viewport.1;
         if let Some(target) = selected_target {
             g.sel_item = Self::find_item_like(&g.doc, &target).or(g.sel_item);
@@ -3655,11 +3768,39 @@ impl App {
         {
             g.sel_item = Some((shift(r), i));
         }
-        if delta != 0 && splice_at < g.scroll {
-            g.scroll = (g.scroll as isize + delta).max(0) as usize;
-        }
+        // How far the content at the viewport top moved (CSS Scroll Anchoring):
+        //  - box wholly ABOVE the viewport ⇒ everything below it (the viewport
+        //    included) moved by the full `delta`;
+        //  - box SPANS the viewport top ⇒ measure the captured anchor's real
+        //    movement (0 for an append below it, `delta`-ish for an insert above);
+        //    a lost anchor falls back to 0 (never the runaway whole-`delta` drag);
+        //  - box at/below the viewport top ⇒ the reader doesn't move.
+        let shift_by: isize = if delta == 0 {
+            0
+        } else if old_range.end <= g.scroll {
+            delta
+        } else if let Some((old_r, link)) = &scroll_anchor {
+            Self::find_row_by_link(&g.doc, link, *old_r)
+                .map_or(0, |new_r| new_r as isize - *old_r as isize)
+        } else {
+            0
+        };
         let max_scroll = g.doc.rows.len().saturating_sub(height);
-        g.scroll = g.scroll.min(max_scroll);
+        if shift_by != 0 {
+            // Content moved ABOVE the viewport: shift `scroll` to keep the
+            // reader's content visually fixed.
+            g.scroll = ((g.scroll as isize + shift_by).max(0) as usize).min(max_scroll);
+        } else {
+            // The viewport-top content didn't move (an append/change BELOW the
+            // viewport, or a transient virtualization shrink — archive.org
+            // un-renders an off-screen section, shrinking the doc): restore toward
+            // the reader's INTENT, clamped. So a section shrinking below the
+            // viewport can't permanently yank the view up (the "snaps up a
+            // section" bug) — it clamps for display, then the regrow restores
+            // intent. Identical to an append below for the no-shrink case
+            // (intent == the reader's row ⇒ no drag, preserving the tilvids fix).
+            g.scroll = scroll_intent.min(max_scroll);
+        }
         // New images the patch introduced: merge + kick decodes (deduped).
         let mut new_urls = Vec::new();
         for u in laid.image_urls {
@@ -3667,6 +3808,13 @@ impl App {
                 g.doc.image_urls.push(u.clone());
                 new_urls.push(u);
             }
+        }
+        // Keep the scroll intent tracking the same content: when the viewport was
+        // scroll-anchored, shift the intent by the same amount. Like the full
+        // path, the intent is NOT clamped here — it's the value a later re-render
+        // restores toward, so a transient shrink can't lose it.
+        if shift_by != 0 {
+            self.scroll_intent = (self.scroll_intent as isize + shift_by).max(0) as usize;
         }
         if !new_urls.is_empty() {
             self.start_image_loads(url, new_urls);
@@ -3681,6 +3829,28 @@ impl App {
         if let Some(handle) = self.live_page.as_ref() {
             let _ = handle.cmds.try_send(crate::js::PageCmd::Resync);
         }
+    }
+
+    /// Row of the item following `link` that is CLOSEST to `near` (the anchor's
+    /// old row) — the scroll-anchor re-find that keeps the content the reader sees
+    /// fixed across a re-layout. Matched by LINK (a fresh re-parse reassigns
+    /// layout node ids, so a node match would catch a renumbered DIFFERENT
+    /// element) and disambiguated by PROXIMITY, because a link can REPEAT in the
+    /// document — archive.org lists the same collection in a featured row AND the
+    /// main grid, so taking the first occurrence pops the viewport to an
+    /// unrelated copy (the "snaps up a section, never reaches the bottom" bug).
+    fn find_row_by_link(doc: &Doc, link: &crate::doc::Link, near: usize) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for r in 0..doc.rows.len() {
+            let here = crate::layout::effective_row(&doc.rows, &doc.regions, r)
+                .items
+                .iter()
+                .any(|it| it.link.as_ref() == Some(link));
+            if here && best.is_none_or(|b| r.abs_diff(near) < b.abs_diff(near)) {
+                best = Some(r);
+            }
+        }
+        best
     }
 
     /// Find the `(row, item)` matching `target` in fresh rows: same arena
@@ -3795,6 +3965,11 @@ impl App {
                 g.selected = Self::browser_visible_links(g, height).first().copied();
             }
         }
+        // A navigation resets the scroll intent to the new page's position
+        // (0, or the clamped reload scroll). The JS-driven navigate path runs
+        // inside a live-page event, where the run-loop tail skips the sync, so
+        // set it here too rather than relying on the tail.
+        self.scroll_intent = self.browser.as_ref().map_or(0, |g| g.scroll);
     }
 
     /// gopherus keys: Up/Down scroll the page (the highlight rides the
@@ -6494,6 +6669,277 @@ mod tests {
         }
     }
 
+    /// A list-boundary fixture spanning far past the viewport: HEADER, an IFC
+    /// boundary (node 42) of `n` one-row link items, then FOOTER.
+    fn infinite_list_app(n: usize) -> (super::App, url::Url) {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let mut s = String::from(
+            r#"<html><body><p>HEADER</p><div data-trust-node="42" style="display:flow-root">"#,
+        );
+        for i in 0..n {
+            s.push_str(&format!(r#"<div><a href="/v/{i}">item{i}</a></div>"#));
+        }
+        s.push_str("</div><p>FOOTER</p></body></html>");
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            s.as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        ));
+        (app, url)
+    }
+
+    fn list_patch(n: usize) -> crate::js::SubtreePatch {
+        let mut frag = String::from(
+            r#"<div data-trust-frag=""><div data-trust-node="42" style="display:flow-root">"#,
+        );
+        for i in 0..n {
+            frag.push_str(&format!(r#"<div><a href="/v/{i}">item{i}</a></div>"#));
+        }
+        frag.push_str("</div></div>");
+        crate::js::SubtreePatch {
+            node: 42,
+            html: frag,
+            tier: crate::js::BoundaryTier::WidthStable,
+        }
+    }
+
+    #[test]
+    fn infinite_scroll_append_below_does_not_drag_the_viewport() {
+        // THE suck-down regression (tilvids/peertube, archive grids): an
+        // infinite-scroll list is an IFC boundary that STARTS above the viewport
+        // and EXTENDS below it. Appending a batch at its BOTTOM must leave the
+        // reader's viewport exactly where it is. The old anchor heuristic shifted
+        // `scroll` by the boundary's WHOLE growth whenever it merely started above
+        // the viewport — pinning the reader to the new bottom every load, which
+        // re-fired the at-bottom infinite-scroll anchor into a runaway "suck
+        // down". CSS Scroll Anchoring keys on the CONTENT the reader sees, and an
+        // append below it doesn't move that content.
+        let (mut app, _url) = infinite_list_app(40);
+        let b = app
+            .browser
+            .as_ref()
+            .unwrap()
+            .doc
+            .boundaries
+            .iter()
+            .find(|b| b.node == 42)
+            .cloned()
+            .expect("the list boundary was captured at load");
+        // Park the viewport wholly inside the list (top inside the boundary).
+        let scroll = b.row_range.start + 18;
+        assert!(
+            scroll > b.row_range.start && scroll + 10 < b.row_range.end,
+            "the 10-row viewport sits wholly inside the list ({:?})",
+            b.row_range
+        );
+        app.browser.as_mut().unwrap().scroll = scroll;
+        app.scroll_intent = scroll;
+        let top_before = crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
+        // The list appends a batch at the bottom (40 → 60).
+        assert!(
+            app.patch_live_doc(&list_patch(60)),
+            "the append patch applies"
+        );
+        assert_eq!(
+            app.browser.as_ref().unwrap().scroll,
+            scroll,
+            "the viewport did NOT drift when content appended below it"
+        );
+        assert_eq!(
+            app.scroll_intent, scroll,
+            "the scroll intent held too (no runaway re-anchor to the new bottom)"
+        );
+        assert_eq!(
+            crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]),
+            top_before,
+            "the reader still sees the same item at the viewport top"
+        );
+    }
+
+    #[test]
+    fn content_growth_above_the_viewport_shifts_scroll_to_keep_it_pinned() {
+        // The complement (the legitimate scroll-anchoring case the old heuristic
+        // existed for, preserved): when a boundary ENTIRELY ABOVE the viewport
+        // grows, the content below it (what the reader sees) moves down, so
+        // `scroll` shifts by the same amount to keep it visually fixed.
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let page = |n: usize| -> String {
+            let mut s =
+                String::from(r#"<html><body><div data-trust-node="42" style="display:flow-root">"#);
+            for i in 0..n {
+                s.push_str(&format!("<div>top{i}</div>"));
+            }
+            s.push_str("</div>");
+            for i in 0..40 {
+                s.push_str(&format!("<div>filler{i}</div>"));
+            }
+            s.push_str("</body></html>");
+            s
+        };
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            page(3).as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        ));
+        let b = app
+            .browser
+            .as_ref()
+            .unwrap()
+            .doc
+            .boundaries
+            .iter()
+            .find(|b| b.node == 42)
+            .cloned()
+            .expect("the top boundary was captured");
+        // Park the viewport in the filler, wholly BELOW the boundary.
+        let scroll = b.row_range.end + 8;
+        app.browser.as_mut().unwrap().scroll = scroll;
+        app.scroll_intent = scroll;
+        let top_before = crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
+        // The top boundary grows 3 → 6 (three rows inserted above the viewport).
+        let mut frag = String::from(
+            r#"<div data-trust-frag=""><div data-trust-node="42" style="display:flow-root">"#,
+        );
+        for i in 0..6 {
+            frag.push_str(&format!("<div>top{i}</div>"));
+        }
+        frag.push_str("</div></div>");
+        let patch = crate::js::SubtreePatch {
+            node: 42,
+            html: frag,
+            tier: crate::js::BoundaryTier::WidthStable,
+        };
+        assert!(app.patch_live_doc(&patch), "the growth patch applies");
+        let new_scroll = app.browser.as_ref().unwrap().scroll;
+        assert_eq!(
+            new_scroll,
+            scroll + 3,
+            "scroll shifted down by the growth so the reader's content stays put"
+        );
+        assert_eq!(
+            crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[new_scroll]),
+            top_before,
+            "the same filler line is still at the viewport top"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_rerender_pins_the_viewport_to_what_the_reader_sees() {
+        // CSS Scroll Anchoring through the FULL-replace path (the archive.org
+        // "bounce up at the end" family): a live re-render that inserts content
+        // ABOVE the viewport keeps the content the reader sees visually fixed (it
+        // does NOT keep the raw scroll number, which would shove the page up under
+        // them). Same mechanism re-pins the viewport-top item across a transient
+        // shrink/regrow instead of bouncing it.
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let body = |extra: usize| -> String {
+            let mut s = String::from("<body>");
+            for i in 0..extra {
+                s.push_str(&format!(r#"<div><a href="/x/{i}">x{i}</a></div>"#));
+            }
+            for i in 0..40 {
+                s.push_str(&format!(r#"<div><a href="/v/{i}">item{i}</a></div>"#));
+            }
+            s.push_str("</body>");
+            s
+        };
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            body(0).as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        ));
+        let scroll = 20usize;
+        app.browser.as_mut().unwrap().scroll = scroll;
+        app.scroll_intent = scroll;
+        let top_before = crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
+        // A re-render inserts 5 items above the viewport.
+        app.replace_live_doc(body(5).into_bytes());
+        let new_scroll = app.browser.as_ref().unwrap().scroll;
+        assert_eq!(
+            new_scroll,
+            scroll + 5,
+            "scroll shifted by the inserted-above count to keep the reader's content"
+        );
+        assert_eq!(
+            crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[new_scroll]),
+            top_before,
+            "the same item is still at the viewport top after the re-render"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scroll_anchor_picks_the_nearest_duplicate_link_not_the_first() {
+        // archive.org's "snaps up a section, never reaches the bottom" bug: it
+        // lists the same collection in a featured row AND the main grid, so the
+        // viewport-top tile's link is NOT unique. The scroll anchor must re-find
+        // the occurrence CLOSEST to where the reader was; taking the FIRST
+        // (higher) copy yanked the whole page up to an unrelated tile every
+        // re-render, so the reader could never reach the bottom (and the
+        // infinite-scroll sentinel there never fired).
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let body = || {
+            let mut s = String::from("<body>");
+            // an earlier copy of the duplicated link (a "featured" row)
+            s.push_str(r#"<div><a href="/dup">dup-featured</a></div>"#);
+            for i in 1..25 {
+                s.push_str(&format!(r#"<div><a href="/b{i}">b{i}</a></div>"#));
+            }
+            // the same link again, deep in the doc (the main grid) — row 25
+            s.push_str(r#"<div><a href="/dup">dup-grid</a></div>"#);
+            for i in 26..60 {
+                s.push_str(&format!(r#"<div><a href="/b{i}">b{i}</a></div>"#));
+            }
+            s.push_str("</body>");
+            s
+        };
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            body().as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        ));
+        let scroll = 25usize; // the viewport top sits on the SECOND `/dup`
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.rows[scroll].items[0]
+                .text
+                .as_str(),
+            "dup-grid",
+            "fixture: the reader is parked on the grid copy of the duplicated link"
+        );
+        app.browser.as_mut().unwrap().scroll = scroll;
+        app.scroll_intent = scroll;
+        // A re-render with identical content (an image-decode reflow on archive).
+        app.replace_live_doc(body().into_bytes());
+        assert_eq!(
+            app.browser.as_ref().unwrap().scroll,
+            scroll,
+            "the viewport stayed on the NEAR duplicate, not snapped up to the first copy"
+        );
+    }
+
     #[test]
     fn http_mouse_left_click_activates_linked_image_on_bottom_row() {
         let mut app = super::App::new(None, 23);
@@ -7436,6 +7882,9 @@ mod tests {
             // The user wheel-scrolls far down; the selection is now off-screen.
             g.scroll = 30;
         }
+        // A real user scroll records its intent (the run-loop tail does this);
+        // mirror it here since the test pokes `scroll` directly.
+        app.scroll_intent = 30;
         // A timer tick re-renders with unchanged content.
         app.replace_live_doc(body.into_bytes());
         assert_eq!(
@@ -7513,6 +7962,46 @@ mod tests {
             "the re-found selection {r} is visible in [{}, {})",
             g.scroll,
             g.scroll + height
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_shrink_restores_scroll_when_the_doc_grows_back() {
+        // The infinite-scroll judder (archive.org "every time"): a living page
+        // momentarily SHRINKS — it paints a short "Searching…" placeholder — and
+        // then refills. The reader's scroll must not pop PERMANENTLY: it can only
+        // clamp for the placeholder frame (the doc is genuinely shorter then) and
+        // must be RESTORED when the content grows back. The old code kept the
+        // shrink-clamped row index, so the view settled at the top forever.
+        let (mut app, body) = tall_browser_app(50); // ~51 rows, viewport 10
+        let height = 10usize;
+        {
+            let g = app.browser.as_mut().unwrap();
+            g.sel_item = None; // a pure wheel scroll, no selection
+            g.scroll = 30; // the user scrolled well down
+        }
+        // A real wheel scroll records the intent (the run-loop tail does this);
+        // the test pokes `scroll` directly, so mirror it.
+        app.scroll_intent = 30;
+
+        // The page blanks to a tiny placeholder, shorter than the viewport.
+        app.replace_live_doc(b"<body><p>loading</p></body>".to_vec());
+        {
+            let g = app.browser.as_ref().unwrap();
+            let max = g.doc.rows.len().saturating_sub(height);
+            assert!(
+                g.scroll <= max,
+                "the display scroll is clamped to the shrunken content (scroll={}, max={max})",
+                g.scroll
+            );
+        }
+
+        // The page refills with the original content; the reader returns to place.
+        app.replace_live_doc(body.into_bytes());
+        assert_eq!(
+            app.browser.as_ref().unwrap().scroll,
+            30,
+            "scroll was restored to the reader's intent after the regrow"
         );
     }
 

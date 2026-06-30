@@ -1938,6 +1938,21 @@ struct Layout<'a> {
     /// hash) instead of re-laid, and every child is recorded into `new`. `None`
     /// everywhere else (the full document layout, measurement, tests) — zero cost.
     region_child_cache: Option<RegionCache>,
+    /// `<video>`/`<audio>` nodes this Layout has emitted as a media
+    /// representation (`flow_media`). Per-Layout (NOT shared with sub-layouts):
+    /// an abspos media element's in-flow wrapper dispatch and the coordinate
+    /// model (`place_positioned_children`) both run inside the Layout of the
+    /// media's nearest positioned ancestor, so a local set connects them — and,
+    /// unlike a shared set, it can't dedupe across the redundant subtree re-lays
+    /// nested positioning spawns (which landed the lone render in a discarded
+    /// re-lay). See `flow_media` and `place_positioned_children`.
+    media_emitted: std::collections::HashSet<NodeId>,
+    /// Set while laying a SHRINK-TO-FIT box (an abspos `width:auto` card sizing
+    /// to content). Makes a `width:%` replaced child with no definite-width
+    /// ancestor contribute its intrinsic width rather than stretching to the
+    /// flow box, so the box wraps to its content. Propagated to sub-layouts (the
+    /// image can be nested). See `image_used_box` and `place_positioned_children`.
+    shrink_wrap: bool,
 }
 
 impl<'a> Layout<'a> {
@@ -1992,6 +2007,8 @@ impl<'a> Layout<'a> {
             boundary_boxes: HashMap::new(),
             measure_cache: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             region_child_cache: None,
+            media_emitted: std::collections::HashSet::new(),
+            shrink_wrap: false,
         }
     }
 
@@ -4398,6 +4415,12 @@ impl<'a> Layout<'a> {
                     && !self.dom.is_hidden(d)
                     && !self.is_clipped_offscreen(d)
                     && self.positioned_containing_block(d) == cb
+                    // An abspos `<video>`/`<audio>` whose in-flow wrapper dispatch
+                    // already rendered a media representation in THIS Layout
+                    // (`flow_media` marked it) must not be placed again — that was
+                    // the doubled Twitch player preview. A media element with no
+                    // such wrapper (not yet marked) is still placed here.
+                    && !self.media_emitted.contains(&d)
             })
             .collect();
         if kids.is_empty() {
@@ -4410,23 +4433,31 @@ impl<'a> Layout<'a> {
             top: i32,
             used_w: usize,
             bottom_pinned: bool,
+            z: i32,
             b: LaidBox,
         }
         let mut placed: Vec<Placed> = Vec::new();
-        let mut union_w = 0i32;
         for k in kids {
-            // An explicit `width` (or a `left`+`right` stretch) is the used
-            // width; otherwise the box is shrink-to-fit, which we lay at the
-            // full band and read back its content extent — laying it at a
-            // pre-measured narrower width would re-wrap content that already
-            // fit (Steam's nav floats wrapped their last item that way).
-            let explicit_w = self.abs_used_width(k, cb_w);
-            let lay_w = explicit_w.unwrap_or(cb_w).clamp(1, cb_w.max(1));
             // A positioned descendant still inherits an enclosing `<a>`'s link
             // (a badge/menu wrapped in an anchor stays clickable), even though
             // its containing block — not its DOM parent — places it.
             let inherit = self.ancestor_link_ctx(k);
+            // Used width (CSS 2.1 §10.3.7): an explicit `width` (or a `left`+
+            // `right` stretch), else SHRINK-TO-FIT. We still lay shrink-to-fit at
+            // the full band and read back its content extent (laying at a measured
+            // width re-wraps floated content — Steam's nav stacked that way), but
+            // set `shrink_wrap` so a `width:%` REPLACED child with no sized
+            // ancestor contributes its INTRINSIC width instead of stretching to
+            // the band (CSS Sizing §5.1). Without it, Twitch's featured carousel
+            // player — a `width:100%` streaming thumbnail in a `width:auto` card —
+            // filled the whole content area instead of its card-sized box. Floats
+            // and text are untouched (still laid at the band), so they don't wrap.
+            let explicit_w = self.abs_used_width(k, cb_w);
+            let lay_w = explicit_w.unwrap_or(cb_w).clamp(1, cb_w.max(1));
+            let prev_sw = self.shrink_wrap;
+            self.shrink_wrap = explicit_w.is_none();
             let b = self.layout_subtree_inner(k, lay_w, Some(k), false, &inherit);
+            self.shrink_wrap = prev_sw;
             // Geometry: record this box's COMPUTED top-left (the coordinate its
             // containing block places it at) so an EMPTY abspos box — an
             // infinite-scroll sentinel paints no cells — still gets an honest
@@ -4468,18 +4499,68 @@ impl<'a> Layout<'a> {
             // up below). An INSET bottom (`bottom > 0`) keeps the §10.6.4 clamp.
             let bottom_pinned = self.pos_len(k, "top", cb_h).is_none()
                 && self.pos_len(k, "bottom", cb_h).is_some_and(|b| b <= 0.0);
-            union_w = union_w.max(left.max(0) + used_w as i32);
             placed.push(Placed {
                 node: k,
                 left,
                 top,
                 used_w,
                 bottom_pinned,
+                z: self.z_index(k),
                 b,
             });
         }
         if placed.is_empty() {
             return;
+        }
+        // Occlusion collapse: a terminal cell has no z-axis and an image is an
+        // atomic, opaque blit (see the ratatui image model), so when two
+        // positioned siblings nearly COINCIDE — alternative layers of one region,
+        // differentiated only by `z-index` and/or a `transform` we don't apply —
+        // the page would composite them by z-order and the lower layers would be
+        // occluded. We can't composite, so we paint only the TOP layer and drop
+        // the rest (CSS 2.1 Appendix E painting order: higher `z-index`, then
+        // later in document order, wins the shared cells; her call: "overlap =
+        // topmost wins, no paging carousel"). This is what collapses Twitch's
+        // front-page peek-carousel — 5 cards all at `left:calc(50%-375px);top:0`,
+        // separated only by `transform: translateX(…) scale(…)` and z 1/2/3/2/1 —
+        // to its focused (center, z 3) card instead of stacking 5 full-panel
+        // images. A box `i` is occluded (dropped) when some box `j` paints ON TOP
+        // of it AND they overlap by a large fraction of BOTH areas. The
+        // both-areas test is what spares a small overlay (a corner deal-badge over
+        // a store capsule): the badge covers ~all of itself but only a sliver of
+        // the image, so it is NOT occluded — it still rides its own row via the
+        // image-lift below.
+        if placed.len() > 1 {
+            let on_top =
+                |a: &Placed, b: &Placed, ai: usize, bi: usize| a.z > b.z || (a.z == b.z && ai > bi);
+            let mostly_covers = |a: &Placed, b: &Placed| {
+                let ax1 = a.left + a.used_w as i32;
+                let ay1 = a.top + a.b.height as i32;
+                let bx1 = b.left + b.used_w as i32;
+                let by1 = b.top + b.b.height as i32;
+                let ow = (ax1.min(bx1) - a.left.max(b.left)).max(0);
+                let oh = (ay1.min(by1) - a.top.max(b.top)).max(0);
+                let overlap = (ow as i64) * (oh as i64);
+                let area_a = (a.used_w as i64) * (a.b.height as i64);
+                let area_b = (b.used_w as i64) * (b.b.height as i64);
+                let frac = |area: i64| area > 0 && overlap * 5 >= area * 3; // ≥60%
+                frac(area_a) && frac(area_b)
+            };
+            let occluded: Vec<bool> = (0..placed.len())
+                .map(|i| {
+                    (0..placed.len()).any(|j| {
+                        j != i
+                            && on_top(&placed[j], &placed[i], j, i)
+                            && mostly_covers(&placed[i], &placed[j])
+                    })
+                })
+                .collect();
+            let mut iter = occluded.into_iter();
+            placed.retain(|_| !iter.next().unwrap_or(false));
+        }
+        let mut union_w = 0i32;
+        for p in &placed {
+            union_w = union_w.max(p.left.max(0) + p.used_w as i32);
         }
         // The CB's used height grows to contain its non-bottom-pinned content;
         // re-place each bottom-pinned box just past that extent so a footer
@@ -4679,6 +4760,17 @@ impl<'a> Layout<'a> {
             (None, Some(b)) => (cb_h as f32 - b - used_h as f32 - mb).round() as i32,
             (None, None) => mt.round() as i32,
         }
+    }
+
+    /// The used `z-index` of a positioned box for painting order — the integer
+    /// value, or `0` for `auto`/unset/non-integer. Only the relative order among
+    /// the siblings of one containing block matters here (the occlusion collapse
+    /// in `place_positioned_children`), not stacking-context nesting.
+    fn z_index(&self, id: NodeId) -> i32 {
+        self.dom
+            .computed_style(id, "z-index")
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(0)
     }
 
     /// A positioning length (`left`/`right`/`top`/`bottom`/`width`/margins) in
@@ -6713,6 +6805,9 @@ impl<'a> Layout<'a> {
         // Share the region child-row cache so the children flowed deep inside a
         // region fragment's sub-layout reuse/record against the same map.
         sub.region_child_cache = self.region_child_cache.clone();
+        // A shrink-to-fit box's replaced descendants (the image can be nested in
+        // flex/grid sub-layouts) must see the shrink-wrap context too.
+        sub.shrink_wrap = self.shrink_wrap;
         sub.measuring = measure;
         // Carry the measurement flag so a sub-layout tags its items with their
         // own nodes and records empty-element flow positions (`element_tops`);
@@ -7069,6 +7164,22 @@ impl<'a> Layout<'a> {
     /// decoded video, falls back to the link alone — fully general (not every
     /// embed has a preview frame).
     fn flow_media(&mut self, id: NodeId, tag: &str, ctx: &Ctx) {
+        // Record that this Layout has represented `id`, so the coordinate model
+        // (`place_positioned_children`) won't ALSO place it. An abspos `<video>`
+        // is reachable two ways: the in-flow media-player-wrapper dispatch in
+        // `flow_element` (here) renders it where its wrapper sits, and the
+        // coordinate model places it at its computed box. They coincide only when
+        // the wrapper IS the video's containing block (video.js — the wrapper
+        // returns before its own block-tail, so the coordinate model never runs
+        // for it); when the containing block is a HIGHER ancestor (Twitch's
+        // `<div class="video-ref"><video abspos>`), both fire → a doubled preview
+        // + "Watch in mpv". Everything between the media and its nearest positioned
+        // ancestor is in-flow, so this dispatch and that ancestor's
+        // `place_positioned_children` both run in the SAME Layout — this local
+        // mark connects them (`place_positioned_children` skips a media node found
+        // here). It is laid in-flow first (before the block-tail), so the in-flow
+        // position wins.
+        self.media_emitted.insert(id);
         // The URL handed to mpv on follow: the element's own inline source (a
         // direct file mpv plays), else the PAGE itself. A streaming player
         // (Twitch/YouTube/Kick/…) feeds its `<video>` from MSE/blob URLs with
@@ -7350,6 +7461,17 @@ impl<'a> Layout<'a> {
         if self.dom.attr(id, "aria-haspopup").is_some() {
             return None;
         }
+        // A content-less control that FILLS its containing block as a positioned
+        // overlay is a click-SCRIM (click-to-play / click-to-dismiss hit target),
+        // not a labeled icon button — it has nothing the browser paints (no text,
+        // no icon, no glyph above), so surfacing its accessible name invents body
+        // text floating over the content the scrim covers. (Twitch's player has a
+        // full-bleed `<button aria-label="Play" style="position:absolute;
+        // width:100%;height:100%">` over the video.) An ordinary icon button is
+        // icon-SIZED, so it isn't caught and keeps its name.
+        if self.dom.is_overlay_scrim(id) {
+            return None;
+        }
         let label = ["aria-label", "title", "alt"]
             .into_iter()
             .filter_map(|a| self.dom.attr(id, a))
@@ -7627,10 +7749,18 @@ impl<'a> Layout<'a> {
             // two-price capsule got a wider column → wider image). Using the
             // intrinsic width makes those columns equal.
             Some(_) if self.measuring => iw,
-            Some(pct) => {
-                let basis = self.definite_ancestor_width(id).unwrap_or(avail);
-                (pct * basis as f32).round().max(1.0) as usize
-            }
+            Some(pct) => match self.definite_ancestor_width(id) {
+                Some(basis) => (pct * basis as f32).round().max(1.0) as usize,
+                // No definite-width ancestor: normally a percentage falls back to
+                // the flow box, so a full-bleed image fills its column. But inside
+                // a SHRINK-WRAP box (an abspos `width:auto` card sizing to content)
+                // the containing block width is indefinite, so the percentage is
+                // treated as the intrinsic width (CSS Sizing §5.1) — else the image
+                // would stretch the card out to the whole band (Twitch's featured
+                // player). Capped to the band so it can never exceed it.
+                None if self.shrink_wrap => iw.min(avail),
+                None => avail,
+            },
             None => self
                 .css_cells(id, "width")
                 .or_else(|| {
@@ -10462,6 +10592,41 @@ mod tests {
     }
 
     #[test]
+    fn an_abspos_video_under_a_higher_containing_block_renders_once() {
+        // Twitch's shape: the `<video>` is `position:absolute` but its DIRECT
+        // parent (`video-ref`) is in-flow, so its containing block is a HIGHER
+        // positioned ancestor. The in-flow wrapper dispatch renders the media
+        // representation, and the coordinate model (`place_positioned_children`,
+        // run at the ancestor's block-tail) used to place the SAME video again —
+        // a doubled preview + "Watch in mpv". It must render exactly once.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/preview.jpg".to_owned(), (40, 22));
+        let rows = lay_with_images(
+            r#"<html><head><meta property="og:image" content="/preview.jpg"></head>
+               <body><div style="position:relative;width:100%;height:100%">
+                 <div class="video-ref">
+                   <video aria-label="Twitch video player"
+                          style="position:absolute;width:100%;height:100%;top:0;left:0"></video>
+                 </div>
+               </div></body></html>"#,
+            120,
+            &images,
+        );
+        let captions = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.text.contains("Watch in mpv"))
+            .count();
+        assert_eq!(captions, 1, "exactly one caption: {:?}", texts(&rows));
+        let posters = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.as_deref() == Some("https://example.com/preview.jpg"))
+            .count();
+        assert_eq!(posters, 1, "exactly one preview frame, not doubled");
+    }
+
+    #[test]
     fn an_svg_icon_link_renders_its_glyph_not_its_label() {
         // The logged-in header idiom: `<a><svg class="...fa-bell"></svg></a>`.
         // An icon-only anchor renders the icon GLYPH (the web's dominant icon
@@ -12390,6 +12555,24 @@ mod tests {
         assert!(
             !line.contains("Click to reply"),
             "a clipped accessible name is not painted: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_full_bleed_overlay_button_does_not_leak_a_phantom_label() {
+        // A content-less full-area positioned overlay (Twitch's player carries a
+        // `<button aria-label="Play" style="position:absolute;width:100%;
+        // height:100%">` click-to-play scrim) paints NOTHING in a browser — its
+        // accessible name must not be surfaced as a label over the content it
+        // covers. A normal small icon button (next test, the roomy case) keeps it.
+        let rows = lay(
+            r#"<body><div style="position:relative;width:100%;height:100%"><a href="/p"><button aria-label="Play" style="position:absolute;width:100%;height:100%"></button></a></div></body>"#,
+            80,
+        );
+        let line = texts(&rows).join(" ");
+        assert!(
+            !line.contains("Play"),
+            "a full-bleed overlay scrim does not paint its name: {line:?}"
         );
     }
 
@@ -14364,6 +14547,71 @@ mod tests {
                 .any(|i| i.image.is_some()),
             "the thumbnail image renders: {:?}",
             texts(&rows)
+        );
+    }
+
+    #[test]
+    fn a_peek_carousel_of_coincident_cards_collapses_to_the_top_z_card() {
+        // Twitch's front-page featured carousel: 5 cards all `position:absolute`
+        // at the SAME spot (`top:0; left:calc(50%-375px)`), separated ONLY by a
+        // `transform: translateX(…) scale(…)` we don't apply and `z-index`
+        // 1/2/3/2/1 (center highest). A terminal can't composite the z-layers, so
+        // instead of stacking 5 full-panel images we paint only the focused
+        // (top-z, center) card and drop the occluded peeks.
+        let mut images = ImageSizes::new();
+        for n in 1..=5 {
+            images.insert(format!("https://example.com/c{n}.png"), (60, 18));
+        }
+        let rows = lay_with_images(
+            r#"<body><div style="position:relative;width:100%;height:100%">
+                 <div style="position:absolute;top:0;left:0;width:600px;z-index:1"><img src="/c1.png"></div>
+                 <div style="position:absolute;top:0;left:0;width:600px;z-index:2"><img src="/c2.png"></div>
+                 <div style="position:absolute;top:0;left:0;width:600px;z-index:3"><img src="/c3.png"></div>
+                 <div style="position:absolute;top:0;left:0;width:600px;z-index:2"><img src="/c4.png"></div>
+                 <div style="position:absolute;top:0;left:0;width:600px;z-index:1"><img src="/c5.png"></div>
+               </div></body>"#,
+            200,
+            &images,
+        );
+        let imgs: Vec<&str> = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter_map(|i| i.image.as_deref())
+            .collect();
+        assert_eq!(
+            imgs,
+            vec!["https://example.com/c3.png"],
+            "only the focused (z-index 3, center) card paints, not a stack of all 5"
+        );
+    }
+
+    #[test]
+    fn a_shrink_to_fit_card_sizes_to_its_image_not_the_band() {
+        // Twitch's featured carousel: a `position:absolute; width:auto` card
+        // (shrink-to-fit) holding a `width:100%` streaming thumbnail with no
+        // definite-width ancestor. The card must size to the image's INTRINSIC
+        // width — not stretch the image out to the whole content band (the
+        // full-page player the user flagged). The image's decoded box is 30×17.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/thumb.jpg".to_owned(), (30, 17));
+        let rows = lay_with_images(
+            r#"<body><div style="position:relative;width:100%;height:100%">
+                 <div style="position:absolute;top:0;left:0">
+                   <img src="/thumb.jpg" style="width:100%;max-width:100%;height:100%">
+                 </div>
+               </div></body>"#,
+            200,
+            &images,
+        );
+        let img = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .expect("the thumbnail renders");
+        assert!(
+            img.width <= 30,
+            "the image sizes to its 30-cell intrinsic width, not the 200-cell band (got {})",
+            img.width
         );
     }
 
