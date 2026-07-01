@@ -141,13 +141,21 @@ fn keyword_allows_regex(word: &str) -> bool {
     )
 }
 
-/// Whether `word` is a reserved word / keyword (so it is not collected as a
-/// captured identifier reference).
+/// Whether `word` is an ALWAYS-reserved word (so it can never be a captured
+/// identifier reference and is not collected).
+///
+/// Only unconditional reserved words belong here. CONTEXTUAL keywords —
+/// `get`/`set`/`of`/`as`/`from`/`async`, and the strict/generator/module-only
+/// reserved `let`/`static`/`yield`/`await` — are all legal identifiers in some
+/// context (minifiers really do emit `function of(e){…}`), so they MUST be
+/// collected: not collecting an identifier that IS a reference under-escapes the
+/// enclosing binding, which resolves the wrong slot at delazify (react-core's
+/// `of` "not a callable" bug). Collecting a word that turns out to be a keyword
+/// only ever OVER-escapes a (non-existent) binding — the safe direction.
 fn is_keyword(word: &str) -> bool {
     matches!(
         word,
-        "await"
-            | "break"
+        "break"
             | "case"
             | "catch"
             | "class"
@@ -183,13 +191,6 @@ fn is_keyword(word: &str) -> bool {
             | "void"
             | "while"
             | "with"
-            | "yield"
-            | "let"
-            | "static"
-            | "async"
-            | "get"
-            | "set"
-            | "of"
     )
 }
 
@@ -377,9 +378,35 @@ fn scan_core<C: CpCursor>(c: &mut C, idents: &mut Vec<Box<[u32]>>) -> Option<boo
 
         // Numbers (a digit, or `.` immediately before a digit).
         if is_digit(ch) || (ch == u32::from(b'.') && c.peek(1).is_some_and(is_digit)) {
-            c.bump();
-            while c.peek(0).is_some_and(is_number_part) {
-                c.bump();
+            let first = c.bump().expect("peeked");
+            // A radix literal (`0x`/`0b`/`0o`) has no exponent, so a following
+            // sign is never part of it; only a DECIMAL exponent takes a sign.
+            let is_radix = first == u32::from(b'0')
+                && matches!(c.peek(0), Some(0x78 | 0x58 | 0x62 | 0x42 | 0x6F | 0x4F));
+            let mut prev = first;
+            while let Some(p) = c.peek(0) {
+                if p == u32::from(b'+') || p == u32::from(b'-') {
+                    // A `+`/`-` continues the number ONLY as a decimal exponent
+                    // sign — i.e. immediately after `e`/`E` in a non-radix
+                    // literal. Otherwise it is a subtraction/addition operator:
+                    // stop, so `31-eg` scans as `31`, `-`, `eg` and the free
+                    // reference `eg` is still captured. (Swallowing it — `e` is a
+                    // hex digit, so `31-e` looked like a number — dropped `eg`
+                    // from a deferred function's captured set, leaving the
+                    // enclosing binding un-escaped: the react-lib `sX` delazify
+                    // "not a callable" bug. An under-collected reference is the
+                    // one unsafe direction — cf. the spread-scan fix.)
+                    if !is_radix && matches!(prev, 0x65 | 0x45) {
+                        prev = c.bump().expect("peeked");
+                        continue;
+                    }
+                    break;
+                }
+                if is_number_part(p) {
+                    prev = c.bump().expect("peeked");
+                    continue;
+                }
+                break;
             }
             slash = Slash::Div;
             after_dot = false;
@@ -618,6 +645,12 @@ fn skip_block_comment<C: CpCursor>(c: &mut C) -> bool {
 /// `_` separators, BigInt `n`, and the decimal point). Over-consuming an
 /// attached `.member` chain is brace- and capture-safe (numbers hold no
 /// brackets, and a member name is not a captured variable).
+///
+/// NOTE: the exponent SIGN (`+`/`-`) is deliberately NOT here — it is consumed
+/// contextually by the number loop (only right after `e`/`E` in a decimal
+/// literal). Listing it unconditionally swallowed the operator in `31-eg`
+/// (`e` is a hex digit, so `31-e` looked numeric), dropping the reference `eg`
+/// and UNDER-escaping its enclosing binding — the react-lib `sX` delazify bug.
 fn is_number_part(c: u32) -> bool {
     // `A-F`/`a-f` already cover the `B`/`b`/`E`/`e` of binary prefixes and
     // exponents; only the radix letters outside that range are listed.
@@ -631,7 +664,6 @@ fn is_number_part(c: u32) -> bool {
             | 0x6E           // n (BigInt suffix)
             | 0x2E           // .
             | 0x5F           // _ (numeric separator)
-            | 0x2B | 0x2D    // + - (exponent sign; harmless mid-run for valid src)
     )
 }
 
@@ -878,5 +910,48 @@ mod tests {
         // `foo` and `bar` are references; `baz` is a member (after `.`),
         // `return` is a keyword.
         assert_eq!(names, vec!["foo", "bar"]);
+    }
+
+    fn names_of(s: &str) -> Vec<String> {
+        let v = cps(s);
+        let open = v.iter().position(|&c| c == u32::from(b'{')).unwrap();
+        scan_function_body(&v, open)
+            .unwrap()
+            .idents
+            .iter()
+            .map(|cps| super::cp_slice_to_string(cps))
+            .collect()
+    }
+
+    #[test]
+    fn subtraction_of_identifier_after_number_is_captured() {
+        // `31-eg` is `31`, `-`, `eg` — NOT a number. `e` is a hex digit, so a
+        // sign-swallowing number scan consumed `31-e` and dropped the reference
+        // `eg`, under-escaping it (the react-lib fiber-lane `sX` delazify bug).
+        assert_eq!(names_of("{ return 31-eg(l); }"), vec!["eg", "l"]);
+        // A genuine decimal exponent DOES take a sign and holds no identifier.
+        assert_eq!(names_of("{ return 1e-5 + x; }"), vec!["x"]);
+        assert_eq!(names_of("{ return 1.5e+10 * y; }"), vec!["y"]);
+        // A hex literal ending in `e`/`E` has no exponent: `0x1e-foo` is a
+        // subtraction, so `foo` must survive.
+        assert_eq!(names_of("{ return 0x1e-foo; }"), vec!["foo"]);
+        // Addition of an identifier after a number, likewise.
+        assert_eq!(names_of("{ return 3+ab; }"), vec!["ab"]);
+    }
+
+    #[test]
+    fn contextual_keywords_used_as_identifiers_are_captured() {
+        // `of`/`get`/`set`/`async`/`let`/`static`/`yield`/`await` are legal
+        // identifiers in some context (minifiers emit `function of(e){…}`), so a
+        // reference to one must be collected — dropping it under-escapes the
+        // enclosing binding (react-core's `of` delazify bug). True reserved
+        // words (`return`, `new`, `typeof`, …) stay uncollected.
+        assert_eq!(names_of("{ return of(x); }"), vec!["of", "x"]);
+        assert_eq!(names_of("{ return get + set; }"), vec!["get", "set"]);
+        assert_eq!(
+            names_of("{ return async(let, static); }"),
+            vec!["async", "let", "static"]
+        );
+        assert_eq!(names_of("{ return typeof of; }"), vec!["of"]);
     }
 }
