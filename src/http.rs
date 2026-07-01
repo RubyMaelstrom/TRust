@@ -4822,7 +4822,32 @@ mod tests {
             .unwrap_or(80);
         let grep = std::env::var("TRUST_LAYOUT_GREP").ok();
         let url = parse_url("https://store.steampowered.com/").unwrap();
-        let images = crate::layout::ImageSizes::new();
+        // TRUST_LAYOUT_IMG_CELL=WxH: seed EVERY <img>'s src with a decoded cell
+        // box, so a layout that only shows the real box once decoded (an
+        // `object-fit`/`width:100%` product tile) can be reproduced offline.
+        let mut images = crate::layout::ImageSizes::new();
+        if let Ok(spec) = std::env::var("TRUST_LAYOUT_IMG_CELL")
+            && let Some((cw, ch)) = spec
+                .split_once('x')
+                .and_then(|(a, b)| Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?)))
+        {
+            let mut probe = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
+            probe.rewrite_inline_svgs();
+            for id in 0..probe.node_count() {
+                if probe.tag_name(id) == Some("img")
+                    && let Some(src) = probe.attr(id, "src")
+                {
+                    let key = if src.trim().starts_with("data:") {
+                        src.trim().to_string()
+                    } else if let Link::Http(u) = resolve(&url, src.trim()) {
+                        u.to_string()
+                    } else {
+                        continue;
+                    };
+                    images.insert(key, (cw, ch));
+                }
+            }
+        }
         let doc = parse_seeded(&url, "text/html", &html, w, 0, None, &images);
         // Legend: reproduce the layout DOM (same NodeIds) so we can map an
         // item's `node` back to its element (tag/id/class + box/flex props).

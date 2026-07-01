@@ -4010,23 +4010,58 @@ impl<'a> Layout<'a> {
         scrolls && self.hscroll_track(id).is_some()
     }
 
-    /// The over-wide "track" inside a scroll container `id`: a child wider
-    /// than the viewport whose own element children are the cards (≥3, so a
-    /// real carousel rail — NOT a clearfix wrapping a single wide layout
-    /// column, whose one float child isn't a rail of cards).
+    /// The over-wide "track" inside a scroll container `id`: a child holding a
+    /// rail of ≥3 cards whose combined width overflows the band. Two shapes:
+    ///   - a child with a DECLARED width wider than the band (a slick/JS carousel
+    ///     that sizes its strip explicitly), OR
+    ///   - a non-wrapping FLEX rail whose fixed-width items overflow the band —
+    ///     the modern flexbox / scroll-snap carousel, where the track is
+    ///     `width:100%` (so the declared-width test misses it) but its `slide`s
+    ///     each take `calc((100% − gaps)/N)` and together exceed the band
+    ///     (redbubble's featured-collection `carouselInner`). Without this the
+    ///     track fell to `flow_flex_row`, which — seeing the track itself doesn't
+    ///     clip-x (its scroll-container PARENT does) — stacked the slides
+    ///     vertically at full width, so each `width:100%` product image filled
+    ///     the band.
+    ///
+    /// Either shape must be a real rail (≥3 cards), NOT a clearfix wrapping a
+    /// single wide layout column.
     fn hscroll_track(&self, id: NodeId) -> Option<NodeId> {
         let avail = self.width.saturating_sub(self.indent).max(1);
         self.dom.children(id).into_iter().find(|&c| {
-            matches!(self.dom.node(c).data, NodeData::Element { .. })
-                && self.css_cells(c, "width").is_some_and(|w| w > avail)
+            if !matches!(self.dom.node(c).data, NodeData::Element { .. }) {
+                return false;
+            }
+            let declared_wide = self.css_cells(c, "width").is_some_and(|w| w > avail)
                 && self
                     .dom
                     .children(c)
                     .iter()
                     .filter(|&&g| matches!(self.dom.node(g).data, NodeData::Element { .. }))
                     .count()
-                    >= 3
+                    >= 3;
+            declared_wide || self.is_overflowing_flex_rail(c, avail)
         })
+    }
+
+    /// Whether `id` is a non-wrapping flex ROW whose ≥3 items have a combined
+    /// main-axis size (bases + gaps) exceeding the band — an over-wide carousel
+    /// rail. The flexbox/scroll-snap carousel signal `hscroll_track` needs when
+    /// the rail's own width is `100%` but its fixed-width cards overflow it.
+    fn is_overflowing_flex_rail(&self, id: NodeId, avail: usize) -> bool {
+        if self.flex_mode(id) != Some(FlexMode::Row) {
+            return false;
+        }
+        let items = self.flex_items(id);
+        if items.len() < 3 {
+            return false;
+        }
+        let mut total = self.flex_gap(id, avail, false) * (items.len() - 1);
+        for &it in &items {
+            let (basis, ..) = self.flex_props(it, avail);
+            total += basis.unwrap_or_else(|| self.measure_width(it, avail));
+        }
+        total > avail
     }
 
     /// Lay a carousel: a row of card boxes side by side at their full strip
@@ -8036,17 +8071,41 @@ impl<'a> Layout<'a> {
     fn definite_ancestor_width(&self, id: NodeId) -> Option<usize> {
         let mut cur = self.dom.parent_composed(id);
         while let Some(p) = cur {
-            if let Some(em) = self
-                .dom
-                .computed_style(p, "width")
-                .as_deref()
-                .and_then(css_length_em)
-            {
-                return Some((em * 2.0).round().max(1.0) as usize);
+            if let Some(w) = self.definite_len_cells(p, "width") {
+                return Some(w);
             }
             cur = self.dom.parent_composed(p);
         }
         None
+    }
+
+    /// A property's DEFINITE width in cells — a value that fixes the box's width
+    /// regardless of its containing block, so it BREAKS a percentage-width chain
+    /// (the containing block for a descendant's `width:%`). A context-free length
+    /// (px/em/pt/ch), OR a `calc()`/`min|max|clamp()` that reduces to a fixed
+    /// length with NO percentage/viewport term (`width:calc(4px*20)` — the 80px
+    /// avatar wrapper redbubble sizes its round `width:100%` image against).
+    /// `None` for `%`/`auto`/viewport-relative or a calc that DEPENDS on the
+    /// containing block: those pass the percentage through rather than anchoring
+    /// it (`css_length_em` already returns `None` for them; the calc guard keeps
+    /// that contract so a `min(100%, 40rem)` cap isn't mistaken for a fixed box).
+    fn definite_len_cells(&self, id: NodeId, prop: &str) -> Option<usize> {
+        let raw = self.dom.computed_style(id, prop)?;
+        let v = raw.trim();
+        if let Some(em) = css_length_em(v) {
+            return Some((em * 2.0).round().max(1.0) as usize);
+        }
+        let lower = v.to_ascii_lowercase();
+        let is_math = ["calc(", "min(", "max(", "clamp("]
+            .iter()
+            .any(|f| lower.starts_with(f));
+        let ctx_dependent = lower.contains('%')
+            || ["vw", "vh", "vmin", "vmax"]
+                .iter()
+                .any(|u| lower.contains(u));
+        (is_math && !ctx_dependent)
+            .then(|| self.css_cells(id, prop))
+            .flatten()
     }
 
     /// The basis a percentage **width** resolves against, in cells: the nearest
@@ -8068,19 +8127,11 @@ impl<'a> Layout<'a> {
     /// Unbounded like `definite_ancestor_width` (the composed tree is acyclic, so
     /// the walk terminates at the document root).
     fn pct_width_basis(&self, id: NodeId) -> Option<usize> {
-        let cells = |em: f32| (em * 2.0).round().max(1.0) as usize;
-        let len = |p: NodeId, prop: &str| {
-            self.dom
-                .computed_style(p, prop)
-                .as_deref()
-                .and_then(css_length_em)
-                .map(cells)
-        };
         let mut cur = self.dom.parent_composed(id);
         let mut cap: Option<usize> = None; // tightest max-width between `id` and `cur`
         while let Some(p) = cur {
-            let mw = len(p, "max-width");
-            if let Some(w) = len(p, "width") {
+            let mw = self.definite_len_cells(p, "max-width");
+            if let Some(w) = self.definite_len_cells(p, "width") {
                 // A definite width breaks the chain. Clamp it by this element's
                 // own max-width and by any tighter cap nearer the descendant.
                 let w = mw.map_or(w, |m| w.min(m));
@@ -14006,6 +14057,83 @@ mod tests {
         let img = image_item(&rows);
         assert_eq!(img.width, 8, "64px width attr → 8 cells");
         assert_eq!(img.height, 4, "height scales with the decoded box: 11·8/22");
+    }
+
+    #[test]
+    fn calc_width_ancestor_bounds_a_percent_image() {
+        // A `width:100%` image inside a `width:calc(4px*20)` (80px = 10 cells)
+        // wrapper fills the WRAPPER, not the flow band. `pct_width_basis` must
+        // resolve the ancestor's `calc()` length — the context-free
+        // `css_length_em` returns None for it, so the old walk skipped the
+        // wrapper and the avatar fell back to the full band. redbubble sizes its
+        // round artist avatar exactly this way (a `padding-bottom:100%` square
+        // inside the calc box), and without this it filled the whole page width.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/a.png".to_owned(), (47, 24));
+        let rows = lay_with_images(
+            r#"<body><div style="display:inline-block;width:calc(4px*20)">
+                 <div style="position:relative;padding-bottom:100%;overflow:hidden">
+                   <div style="position:absolute;top:0;right:0;bottom:0;left:0">
+                     <img src="/a.png" style="display:block;width:100%;height:100%;object-fit:cover">
+                   </div></div></div></body>"#,
+            80,
+            &images,
+        );
+        let img = image_item(&rows);
+        assert_eq!(
+            img.width, 10,
+            "image fills the 80px (10-cell) box, not the band"
+        );
+        assert_eq!(
+            img.height, 5,
+            "square via padding-bottom:100%: 10 cells → 5 rows"
+        );
+    }
+
+    #[test]
+    fn overflow_x_flex_rail_is_a_carousel_not_a_vertical_stack() {
+        // A horizontal-scroll container (`overflow-x`) whose flex TRACK is
+        // `width:100%` but holds ≥3 fixed-width cards that overflow the band is a
+        // carousel: the cards lay side by side (a scrollable strip), NOT stacked
+        // vertically at full width. The track itself doesn't clip-x (its scroll
+        // PARENT does), so `flow_flex_row` used to stack the slides — making each
+        // `width:100%` product image fill the band (redbubble's featured rail).
+        let mut images = ImageSizes::new();
+        for s in ["a", "b", "c", "d"] {
+            images.insert(format!("https://example.com/{s}.png"), (30, 15));
+        }
+        let rows = lay_with_images(
+            r#"<body><div style="overflow-x:scroll"><div style="display:flex;width:100%">
+                 <div style="width:20em"><img src="/a.png" style="width:100%"></div>
+                 <div style="width:20em"><img src="/b.png" style="width:100%"></div>
+                 <div style="width:20em"><img src="/c.png" style="width:100%"></div>
+                 <div style="width:20em"><img src="/d.png" style="width:100%"></div>
+               </div></div></body>"#,
+            60,
+            &images,
+        );
+        let img_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.items.iter().any(|i| i.image.is_some()))
+            .map(|(ri, _)| ri)
+            .collect();
+        assert_eq!(
+            img_rows.len(),
+            1,
+            "all card images share the strip's top row, not stacked: {img_rows:?}"
+        );
+        for it in rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.is_some())
+        {
+            assert!(
+                it.width <= 40,
+                "card image sized to its 20em (40-cell) card, not the 60-cell band: {}",
+                it.width
+            );
+        }
     }
 
     #[test]

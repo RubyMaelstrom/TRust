@@ -9969,6 +9969,37 @@ const PRELUDE: &str = r##"
         replaceChildren(...ns) { let c; while ((c = this.firstChild)) this.removeChild(c); this.append(...ns); }
         cloneNode(deep) { return wrap(__dom_clone(this.__id, !!deep)); }
         contains(o) { while (o) { if (o === this) return true; o = o.parentNode; } return false; }
+        isSameNode(o) { return o === this; }
+        // WHATWG DOM §4.4 "equals": same interface (nodeType), the type's own
+        // fields equal (element: namespace/local-name/attributes; text/comment:
+        // data; doctype: name), and children equal pairwise in order. Attribute
+        // order does NOT matter (equal counts + each A-attr present-and-equal in
+        // B ⇒ sets match, names being unique). react-helmet dedupes head tags
+        // with `newTag.isEqualNode(oldTag)`, from a timer — a missing method
+        // aborted that reconciliation on every React-Helmet page.
+        isEqualNode(o) {
+            if (!o) return false;
+            if (o === this) return true;
+            const t = this.nodeType;
+            if (t !== o.nodeType) return false;
+            if (t === 1) {
+                if (this.localName !== o.localName) return false;
+                if (this.namespaceURI !== o.namespaceURI) return false;
+                const an = this.getAttributeNames();
+                if (an.length !== o.getAttributeNames().length) return false;
+                for (let i = 0; i < an.length; i++)
+                    if (this.getAttribute(an[i]) !== o.getAttribute(an[i])) return false;
+            } else if (t === 3 || t === 8) {
+                if (this.nodeValue !== o.nodeValue) return false;
+            } else if (t === 10) {
+                if (this.nodeName !== o.nodeName) return false;
+            }
+            const ac = this.childNodes, bc = o.childNodes;
+            if (ac.length !== bc.length) return false;
+            for (let i = 0; i < ac.length; i++)
+                if (!ac[i].isEqualNode(bc[i])) return false;
+            return true;
+        }
         hasChildNodes() { return __dom_children(this.__id).length > 0; }
         compareDocumentPosition() { return 0; }
         normalize() {}
@@ -15962,6 +15993,37 @@ mod tests {
                 ",
                 66.0,
             ),
+            // A deferred function captures an enclosing binding referenced ONLY
+            // as `31-eg` (a subtraction the scanner must not read as a number —
+            // `e` is a hex digit). Dropping `eg` from the capture set left it
+            // un-escaped, so the delazified body resolved the wrong slot: the
+            // real react-lib fiber-lane `sX` "not a callable" bug.
+            (
+                r"
+                function outer(x) {
+                    var eg = function (v) { return v * 2; };
+                    function inner(l) { return 31 - eg(l); }
+                    return inner(x);
+                }
+                outer(10)
+                ",
+                11.0,
+            ),
+            // A deferred function captures an enclosing binding whose name is a
+            // CONTEXTUAL keyword (`of`) used as an ordinary identifier. Treating
+            // it as reserved dropped the reference, un-escaping the binding — the
+            // real react-core `of` "not a callable" bug.
+            (
+                r"
+                function wrap() {
+                    function of(v) { return v + 5; }
+                    function useOf(x) { return of(x); }
+                    return useOf(10);
+                }
+                wrap()
+                ",
+                15.0,
+            ),
         ];
 
         for (src, expected) in cases {
@@ -15970,6 +16032,143 @@ mod tests {
             assert_eq!(eager, *expected, "eager fixture sanity failed for: {src}");
             assert_eq!(lazy, eager, "lazy re-parse diverged from eager for: {src}");
         }
+    }
+
+    /// The lazy body-scanner must collect a SUPERSET of every identifier a
+    /// function body references — an UNDER-collection leaves an enclosing
+    /// binding un-escaped, so a deferred function that captures it resolves the
+    /// wrong slot at delazify (the react-lib `31-eg` "not a callable" bug). This
+    /// checks, over a real bundle, that for each function body every identifier
+    /// the real parser sees is in the scanner's captured set. Point it at a
+    /// classic-script bundle: `TRUST_SCAN_AUDIT=<file> cargo test --release
+    /// scan_ident_audit -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual audit, needs TRUST_SCAN_AUDIT=<classic-script bundle>"]
+    fn scan_ident_audit() {
+        use boa_ast::visitor::{VisitWith, Visitor};
+        use std::ops::ControlFlow;
+
+        let Ok(path) = std::env::var("TRUST_SCAN_AUDIT") else {
+            eprintln!("set TRUST_SCAN_AUDIT to a classic-script JS file");
+            return;
+        };
+        let src = std::fs::read_to_string(&path).unwrap();
+        let cps: Vec<u32> = src.chars().map(u32::from).collect();
+
+        // Flat code-point index of each 1-based line's start (lexer newline rules).
+        let mut line_starts = vec![0usize, 0usize];
+        {
+            let mut i = 0usize;
+            while i < cps.len() {
+                match cps[i] {
+                    0x0D => {
+                        i += usize::from(cps.get(i + 1).copied() == Some(0x0A)) + 1;
+                        line_starts.push(i);
+                    }
+                    0x0A | 0x2028 | 0x2029 => {
+                        i += 1;
+                        line_starts.push(i);
+                    }
+                    _ => i += 1,
+                }
+            }
+        }
+        let flat = |p: boa_ast::Position| -> usize {
+            line_starts
+                .get(p.line_number() as usize)
+                .copied()
+                .unwrap_or(0)
+                + p.column_number() as usize
+                - 1
+        };
+
+        // Every identifier reference the real parser sees, with its flat pos.
+        let mut interner = boa_interner::Interner::default();
+        let scope = boa_ast::scope::Scope::new_global();
+        let script = boa_parser::Parser::new(boa_parser::Source::from_bytes(src.as_bytes()))
+            .parse_script(&scope, &mut interner)
+            .expect("bundle must parse as a classic script");
+        // Collect after parse so we can resolve syms against the interner.
+        struct Collect<'a> {
+            out: Vec<(String, usize)>,
+            interner: &'a boa_interner::Interner,
+            line_starts: &'a [usize],
+        }
+        impl<'ast> Visitor<'ast> for Collect<'_> {
+            type BreakTy = std::convert::Infallible;
+            // Record only EXPRESSION-position identifiers (genuine variable
+            // reads/references) — the set the scanner must capture. Object /
+            // class property keys, labels, and binding patterns are NOT
+            // `Expression::Identifier`, so they're excluded (they aren't
+            // captured references, and counting them produced false positives:
+            // quoted keys like `"catch"`/`"enter-end"`).
+            fn visit_expression(
+                &mut self,
+                node: &'ast boa_ast::expression::Expression,
+            ) -> ControlFlow<Self::BreakTy> {
+                use boa_ast::Spanned;
+                if let boa_ast::expression::Expression::Identifier(id) = node {
+                    let p = id.span().start();
+                    let pos = self
+                        .line_starts
+                        .get(p.line_number() as usize)
+                        .copied()
+                        .unwrap_or(0)
+                        + p.column_number() as usize
+                        - 1;
+                    self.out
+                        .push((self.interner.resolve_expect(id.sym()).to_string(), pos));
+                }
+                node.visit_with(self)
+            }
+        }
+        let mut c = Collect {
+            out: Vec::new(),
+            interner: &interner,
+            line_starts: &line_starts,
+        };
+        let _: ControlFlow<std::convert::Infallible> = c.visit(&script);
+        let refs = c.out;
+
+        let spans = collect_function_body_spans(&src).expect("must parse");
+        let mut drops: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for (start, end) in spans {
+            let open = flat(start);
+            if cps.get(open).copied() != Some(u32::from(b'{')) {
+                continue;
+            }
+            let Some(scan) = boa_parser::lazy_scan::scan_function_body(&cps, open) else {
+                continue; // scanner bailed → caller parses eagerly, safe
+            };
+            let end_flat = scan.end;
+            let collected: std::collections::HashSet<String> = scan
+                .idents
+                .iter()
+                .map(|ident| ident.iter().filter_map(|&c| char::from_u32(c)).collect())
+                .collect();
+            for (name, pos) in &refs {
+                if *pos > open && *pos < end_flat && !collected.contains(name) {
+                    drops.entry(name.clone()).or_insert_with(|| {
+                        let s = pos.saturating_sub(20);
+                        let e = (*pos + 15).min(cps.len());
+                        cps[s..e]
+                            .iter()
+                            .filter_map(|&c| char::from_u32(c))
+                            .collect()
+                    });
+                }
+            }
+        }
+        eprintln!("=== UNDER-COLLECTED identifiers ({}): ===", drops.len());
+        for (name, ctx) in &drops {
+            eprintln!("  {name:?}  near: {ctx:?}");
+        }
+        assert!(
+            drops.is_empty(),
+            "scanner under-collected {} identifier(s)",
+            drops.len()
+        );
     }
 
     /// Lazy *parsing* (C2) must collect identifiers referenced through a
@@ -17305,6 +17504,44 @@ mod tests {
         assert!(
             out.contains(r#"data-ok="true""#),
             "node type/name getters returned a wrong value: {out}"
+        );
+    }
+
+    /// `Node.isEqualNode` (WHATWG DOM §4.4 "equals") + `isSameNode`. Both were
+    /// entirely absent, so react-helmet — which dedupes `<head>` tags with
+    /// `newTag.isEqualNode(oldTag)` from a `requestAnimationFrame` — threw
+    /// "undefined is not a callable function" on every page it drives
+    /// (redbubble). Structural equality: same tag + attributes (order-independent)
+    /// + equal children; text nodes compare data; identity is separate.
+    #[test]
+    fn is_equal_node_compares_structure_not_identity() {
+        let html = r##"<body><div id="o"></div><script>
+            const mk = (html) => { const t = document.createElement('template'); t.innerHTML = html; return t.content.firstChild; };
+            const a = mk('<meta name="x" content="1">');
+            const b = mk('<meta name="x" content="1">');
+            const c = mk('<meta content="1" name="x">');   // same attrs, different order
+            const d = mk('<meta name="x" content="2">');   // different value
+            const e = mk('<link name="x" content="1">');   // different tag
+            const p = mk('<p>hi</p>');
+            const q = mk('<p>hi</p>');
+            const r = mk('<p>bye</p>');
+            const ok =
+                a.isEqualNode(b) === true &&
+                a.isEqualNode(c) === true &&      // attribute order is irrelevant
+                a.isEqualNode(d) === false &&
+                a.isEqualNode(e) === false &&
+                a.isEqualNode(null) === false &&
+                p.isEqualNode(q) === true &&      // equal element + equal text child
+                p.isEqualNode(r) === false &&     // differing text data
+                a.isSameNode(a) === true &&
+                a.isSameNode(b) === false;
+            document.getElementById('o').setAttribute('data-ok', String(ok));
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(r#"data-ok="true""#),
+            "isEqualNode/isSameNode returned a wrong result: {out}"
         );
     }
 
