@@ -1047,6 +1047,26 @@ impl Dom {
         {
             return true;
         }
+        // The OTHER visually-hidden idiom: shove an absolutely/fixed-positioned
+        // box far off the top-left corner (`left:-9999px`, `top:-1000px`).
+        // YouTube's "Skip navigation" button hides this way; without honoring it
+        // we clamp the negative offset to row/col 0 in `place_positioned_children`
+        // and the hidden text paints at the very top-left. `position` is checked
+        // first so the hot path short-circuits for non-positioned nodes.
+        if matches!(
+            self.cascaded(id, "position").as_deref(),
+            Some("absolute" | "fixed")
+        ) && (self
+            .cascaded(id, "left")
+            .as_deref()
+            .is_some_and(css_len_offscreen_neg)
+            || self
+                .cascaded(id, "top")
+                .as_deref()
+                .is_some_and(css_len_offscreen_neg))
+        {
+            return true;
+        }
         // A box collapsed to ZERO on an axis, with `overflow:hidden`/`clip` on
         // that axis, clips ALL its content to nothing — the standard "keep it
         // in the DOM but show nothing" idiom (a preloaded hero copy, a closed
@@ -2596,14 +2616,29 @@ impl Dom {
     /// the re-parsed layout arena flows it the way the engine computed.
     pub fn serialize(&self, root: NodeId) -> String {
         let mut out = String::new();
-        self.serialize_node(root, None, &mut out);
+        self.serialize_node_inner(root, None, false, &mut out);
         out
     }
 
+    /// Serialize for JS consumption (`outerHTML`). Identical to `serialize`
+    /// except `<template>` elements serialize WITH their content fragment as
+    /// children — the HTML serialization standard ("if the node is a template
+    /// element, serialize its template contents"). Frameworks that recover
+    /// in-DOM template/slot markup by reading `outerHTML` (Vue 2's DOM-template
+    /// compiler reads `el.outerHTML`) need the template content present; the
+    /// layout/`Doc.raw` `serialize` keeps dropping it (inert, not laid out).
+    pub fn serialize_js(&self, root: NodeId) -> String {
+        let mut out = String::new();
+        self.serialize_node_inner(root, None, true, &mut out);
+        out
+    }
+
+    /// JS-facing `innerHTML`: preserves `<template>` content (single caller is
+    /// `sys_inner_html`). See `serialize_js`.
     pub fn inner_html(&self, id: NodeId) -> String {
         let mut out = String::new();
         for c in self.children(self.content_target(id)) {
-            self.serialize_node(c, None, &mut out);
+            self.serialize_node_inner(c, None, true, &mut out);
         }
         out
     }
@@ -2729,11 +2764,21 @@ impl Dom {
         String::new()
     }
 
-    fn serialize_node(&self, id: NodeId, host: Option<NodeId>, out: &mut String) {
+    /// `keep_template`: when true, `<template>` elements serialize WITH their
+    /// content fragment as children (the JS/`outerHTML` path — see
+    /// `serialize_js`); when false they are dropped entirely (the layout/
+    /// `Doc.raw` path, where template content is inert and must not be flowed).
+    fn serialize_node_inner(
+        &self,
+        id: NodeId,
+        host: Option<NodeId>,
+        keep_template: bool,
+        out: &mut String,
+    ) {
         match &self.nodes[id].data {
             NodeData::Document | NodeData::Fragment => {
                 for c in self.children(id) {
-                    self.serialize_node(c, host, out);
+                    self.serialize_node_inner(c, host, keep_template, out);
                 }
             }
             NodeData::Doctype => {}
@@ -2747,8 +2792,27 @@ impl Dom {
             NodeData::Text(t) => out.push_str(&escape_text(t)),
             NodeData::Element { name, attrs, .. } => {
                 let tag: &str = &name.local;
-                if matches!(tag, "script" | "noscript" | "template" | "style") || self.is_hidden(id)
-                {
+                // A `<template>` is dropped from the layout serializer (inert),
+                // but the JS path serializes it WITH its content fragment as
+                // children — handled before the is_hidden gate because a
+                // template is UA `display:none` yet a browser always serializes
+                // its contents.
+                if tag == "template" {
+                    if keep_template {
+                        out.push('<');
+                        out.push_str(tag);
+                        self.write_attrs(id, attrs, &mut |_, _| None, out);
+                        out.push('>');
+                        for c in self.children(self.content_target(id)) {
+                            self.serialize_node_inner(c, host, true, out);
+                        }
+                        out.push_str("</");
+                        out.push_str(tag);
+                        out.push('>');
+                    }
+                    return;
+                }
+                if matches!(tag, "script" | "noscript" | "style") || self.is_hidden(id) {
                     return;
                 }
                 // An iframe/frame with realized same-origin content: flow the
@@ -2762,7 +2826,7 @@ impl Dom {
                         if !kids.is_empty() {
                             out.push_str("<div data-trust-frame=\"\">");
                             for c in kids {
-                                self.serialize_node(c, host, out);
+                                self.serialize_node_inner(c, host, keep_template, out);
                             }
                             out.push_str("</div>");
                         }
@@ -2777,11 +2841,11 @@ impl Dom {
                     let assigned = self.slot_assigned(h, self.attr(id, "name"));
                     if assigned.is_empty() {
                         for c in self.children(id) {
-                            self.serialize_node(c, host, out);
+                            self.serialize_node_inner(c, host, keep_template, out);
                         }
                     } else {
                         for c in assigned {
-                            self.serialize_node(c, None, out);
+                            self.serialize_node_inner(c, None, keep_template, out);
                         }
                     }
                     return;
@@ -2798,11 +2862,11 @@ impl Dom {
                 // composition fidelity).
                 if let Some(root) = self.shadow_root(id) {
                     for c in self.children(root) {
-                        self.serialize_node(c, Some(id), out);
+                        self.serialize_node_inner(c, Some(id), keep_template, out);
                     }
                 } else {
                     for c in self.children(id) {
-                        self.serialize_node(c, host, out);
+                        self.serialize_node_inner(c, host, keep_template, out);
                     }
                 }
                 out.push_str("</");
@@ -4062,6 +4126,26 @@ fn css_len_at_most_1px(v: &str) -> bool {
     let v = v.trim();
     let n = v.strip_suffix("px").unwrap_or(v).trim();
     n.parse::<f32>().is_ok_and(|x| x <= 1.0)
+}
+
+/// Whether an absolute length pushes a box FAR off-screen — the "shove it past
+/// the corner" visually-hidden idiom (`left:-9999px`, `top:-1000px`, WordPress
+/// `.screen-reader-text`, YouTube's skip-nav). Only absolute units (px/em/rem)
+/// and only past a generous threshold, so legitimate small negative offsets (an
+/// `-1.5rem` footer, a `-1px` overlap) and viewport-relative `%`/`vw` are never
+/// caught.
+fn css_len_offscreen_neg(v: &str) -> bool {
+    let v = v.trim();
+    let (num, mult) = if let Some(n) = v.strip_suffix("px") {
+        (n, 1.0)
+    } else if let Some(n) = v.strip_suffix("rem") {
+        (n, 16.0)
+    } else if let Some(n) = v.strip_suffix("em") {
+        (n, 16.0)
+    } else {
+        (v, 1.0)
+    };
+    num.trim().parse::<f32>().is_ok_and(|x| x * mult <= -999.0)
 }
 
 /// Whether a CSS length/percentage is exactly zero (`0`, `0px`, `0%`, `0em`,
@@ -5663,6 +5747,52 @@ mod tests {
         assert!(!html.contains("inert"), "{html}");
         assert!(!html.contains("color:red"), "{html}");
         assert!(html.contains("keep"), "{html}");
+    }
+
+    #[test]
+    fn js_serializer_preserves_template_content_but_layout_drops_it() {
+        // Wiki.js (Vue 2) delivers its article inside `<template slot=contents>`
+        // and recovers it by reading `#root.outerHTML`. The JS path must keep
+        // the template + its content fragment as children (HTML serialization
+        // standard); the layout/`Doc.raw` path keeps dropping it (inert).
+        let dom = Dom::parse_document(
+            r#"<body><div id="r"><template slot="contents"><p>article body</p></template></div></body>"#,
+        );
+        let r = dom.query(DOCUMENT, &SelectorList::parse("#r").unwrap(), true)[0];
+
+        // JS-facing (outerHTML / serialize_js): template + content survive.
+        let js = dom.serialize_js(r);
+        assert!(js.contains("<template"), "outerHTML missing template: {js}");
+        assert!(
+            js.contains(r#"slot="contents""#),
+            "outerHTML missing slot attr: {js}"
+        );
+        assert!(
+            js.contains("article body"),
+            "outerHTML missing template content: {js}"
+        );
+
+        // JS-facing innerHTML of the wrapper preserves it too.
+        let inner = dom.inner_html(r);
+        assert!(
+            inner.contains("<template"),
+            "innerHTML missing template: {inner}"
+        );
+        assert!(
+            inner.contains("article body"),
+            "innerHTML missing template content: {inner}"
+        );
+
+        // Layout path still drops the inert template content.
+        let layout = dom.serialize(DOCUMENT);
+        assert!(
+            !layout.contains("article body"),
+            "layout serializer leaked template content: {layout}"
+        );
+        assert!(
+            !layout.contains("<template"),
+            "layout serializer leaked template tag: {layout}"
+        );
     }
 
     #[test]

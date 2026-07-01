@@ -2224,7 +2224,21 @@ impl<'a> Layout<'a> {
                 self.place_image(id, ctx);
                 return;
             }
-            "input" | "textarea" | "select" | "button" => {
+            "input" | "textarea" | "select" => {
+                self.flow_form_control(id, &tag, ctx.link.clone());
+                return;
+            }
+            // A `<button>` is normally an atomic widget stub (`[ label ]`). But an
+            // ICON-ONLY button (no visible text, an `<svg>`→`<img>` icon inside)
+            // renders its ICON like an `<a>`/`<div>` does — the document made it an
+            // icon, so we draw the icon (the stub path threw it away and fell back
+            // to the `aria-label`, which is how YouTube's masthead chrome came out
+            // as long German smears). Such a button is NOT matched here: it falls
+            // through to normal inline flow (its `<img>` renders). This holds even
+            // for a form-bound icon button (a magnifier submit) — its submit link
+            // is threaded onto the icon below, so it stays clickable. Text/labeled
+            // buttons keep the readable stub.
+            "button" if !self.button_is_icon_only(id) => {
                 self.flow_form_control(id, &tag, ctx.link.clone());
                 return;
             }
@@ -2238,6 +2252,16 @@ impl<'a> Layout<'a> {
         // inherits and applies the UA tag defaults (`<b>` bold, `<i>` italic),
         // and `text_decoration` propagates `<u>`/`<s>` + author rules.
         let mut cctx = ctx.clone();
+        // An icon-only `<button>` that fell through the match above keeps its
+        // click semantics: if it's a form control with no ambient (live-page)
+        // link of its own, its icon carries the form's submit `Link` so a click
+        // still submits — the stub path's behaviour, minus the stub.
+        if tag == "button"
+            && cctx.link.is_none()
+            && let Some(&(form, field)) = self.controls.get(&id)
+        {
+            cctx.link = Some(Link::Form { form, field });
+        }
         // Geometry measurement: attribute every item to its nearest element so
         // `measure_boxes` can recover per-element boxes. A descendant element
         // overrides this with its own id, so each item carries the closest
@@ -3669,7 +3693,21 @@ impl<'a> Layout<'a> {
         for k in self.flex_items(id) {
             let (b_css, g, s) = self.flex_props(k, avail);
             let b = match b_css {
-                Some(w) => w.min(avail),
+                Some(w) => {
+                    let base = w.min(avail);
+                    if self.measuring {
+                        // Intrinsic sizing (CSS Flexbox §9.9.1): an item's
+                        // max-content contribution is its content max-content —
+                        // flex-grow does NOT expand it (no free space exists
+                        // yet), and a flex-basis BELOW the content (the common
+                        // `flex-basis:0` grow item — every Material/Polymer
+                        // button) must still contribute its content. Floor the
+                        // declared basis by the measured content.
+                        base.max(self.measure_width(k, avail))
+                    } else {
+                        base
+                    }
+                }
                 None => {
                     // `flex-basis:auto`/`width:auto`: size to content. An empty,
                     // non-growing item takes no column.
@@ -3692,10 +3730,16 @@ impl<'a> Layout<'a> {
         let total_basis: usize = basis.iter().sum();
         let mut widths = basis.clone();
         if total_basis + gaps <= avail {
-            // Free space is distributed to the grow items by their flex-grow.
+            // Free space is distributed to the grow items by their flex-grow —
+            // but ONLY during real layout. While measuring intrinsic width there
+            // is no free space to hand out (CSS Flexbox §9.9.1): flex-grow must
+            // not inflate an item past its content, or every measured flex
+            // container holding a grow child reports ~the whole constraint
+            // (which froze YouTube's `flex-shrink:0` masthead end-cap at ~the
+            // viewport width and starved the search box to one column).
             let free = avail - total_basis - gaps;
             let total_grow: f32 = grow.iter().sum();
-            if total_grow > 0.0 && free > 0 {
+            if !self.measuring && total_grow > 0.0 && free > 0 {
                 for i in 0..n {
                     widths[i] += (free as f32 * grow[i] / total_grow).round() as usize;
                 }
@@ -7158,7 +7202,19 @@ impl<'a> Layout<'a> {
     /// Push one preserved-whitespace run, inheriting the context's kind
     /// and emphasis.
     fn push_preserved_item(&mut self, text: &str, len: usize, ctx: &Ctx) {
-        self.push_item(text.to_owned(), len, ctx.kind, ctx.emph, ctx.node, None);
+        // Carry the link: a link inside `white-space:pre/nowrap/pre-wrap` (a
+        // directory-listing cell, a `<pre>` full of anchors) is still followable.
+        // Dropping it here left such anchors styled like links (kind=Link → cyan)
+        // but inert — not selectable, not clickable. The collapsing path
+        // (`place_word`) already threads `ctx.link`; match it.
+        self.push_item(
+            text.to_owned(),
+            len,
+            ctx.kind,
+            ctx.emph,
+            ctx.node,
+            ctx.link.clone(),
+        );
     }
 
     /// Render a `<video>`/`<audio>` element as a media representation: the
@@ -7420,6 +7476,20 @@ impl<'a> Layout<'a> {
             }
             _ => {}
         }
+    }
+
+    /// An icon-only `<button>`: no visible text, but a renderable `<img>` icon
+    /// inside (the inline `<svg>` rewritten by `rewrite_inline_svgs`, or a real
+    /// icon image). Such a button flows its icon like an `<a>`/`<div>` rather
+    /// than collapsing to the `[ aria-label ]` form stub that discards it.
+    fn button_is_icon_only(&self, id: NodeId) -> bool {
+        if !self.rendered_text(id).trim().is_empty() {
+            return false;
+        }
+        self.dom
+            .descendants(id)
+            .into_iter()
+            .any(|d| self.dom.tag_name(d) == Some("img") && !self.dom.is_hidden(d))
     }
 
     /// The visible handle for an element whose content won't otherwise render
@@ -7754,9 +7824,17 @@ impl<'a> Layout<'a> {
             // two-price capsule got a wider column → wider image). Using the
             // intrinsic width makes those columns equal.
             Some(_) if self.measuring => iw,
-            Some(pct) => match self.definite_ancestor_width(id) {
+            // A percentage resolves against the nearest ancestor that BREAKS the
+            // percentage chain (`pct_width_basis`): a definite `width`, OR — for a
+            // run of `width:100%` boxes — a nearer capping `max-width`. The cap
+            // must win over a definite-width ancestor sitting ABOVE it: YouTube's
+            // brand-icon SVG is `width:100%` through `yt-icon-shape`/
+            // `ytIconWrapperHost` (the latter `width:undefinedpx`, invalid) up to a
+            // `max-width:36px` leading-image box; resolving against the wide column
+            // ABOVE that cap rendered the Shorts logo full-screen.
+            Some(pct) => match self.pct_width_basis(id) {
                 Some(basis) => (pct * basis as f32).round().max(1.0) as usize,
-                // No definite-width ancestor: normally a percentage falls back to
+                // No constraint up the chain: normally a percentage falls back to
                 // the flow box, so a full-bleed image fills its column. But inside
                 // a SHRINK-WRAP box (an abspos `width:auto` card sizing to content)
                 // the containing block width is indefinite, so the percentage is
@@ -7969,6 +8047,51 @@ impl<'a> Layout<'a> {
             cur = self.dom.parent_composed(p);
         }
         None
+    }
+
+    /// The basis a percentage **width** resolves against, in cells: the nearest
+    /// ancestor that breaks the percentage chain. Walks the composed chain and
+    /// returns the FIRST binding constraint, nearest first:
+    ///   - a definite `width` length (px/em) — the containing block width, itself
+    ///     clamped by that element's own `max-width` and by any tighter
+    ///     `max-width` seen NEARER the descendant;
+    ///   - else, if only `max-width`s were seen, the tightest of them — a run of
+    ///     `width:100%` boxes can be no wider than its nearest capped ancestor.
+    ///
+    /// `None` when nothing up the chain constrains the width (a genuine full-bleed
+    /// image, which then falls back to the flow box). This is what fixes
+    /// YouTube's brand icons: the `max-width:36px` leading-image box is NEARER
+    /// than any definite-width column above it, so the cap must win — the old
+    /// "nearest definite width, else nearest max-width" split preferred the far
+    /// definite width and rendered the Shorts logo full-screen.
+    ///
+    /// Unbounded like `definite_ancestor_width` (the composed tree is acyclic, so
+    /// the walk terminates at the document root).
+    fn pct_width_basis(&self, id: NodeId) -> Option<usize> {
+        let cells = |em: f32| (em * 2.0).round().max(1.0) as usize;
+        let len = |p: NodeId, prop: &str| {
+            self.dom
+                .computed_style(p, prop)
+                .as_deref()
+                .and_then(css_length_em)
+                .map(cells)
+        };
+        let mut cur = self.dom.parent_composed(id);
+        let mut cap: Option<usize> = None; // tightest max-width between `id` and `cur`
+        while let Some(p) = cur {
+            let mw = len(p, "max-width");
+            if let Some(w) = len(p, "width") {
+                // A definite width breaks the chain. Clamp it by this element's
+                // own max-width and by any tighter cap nearer the descendant.
+                let w = mw.map_or(w, |m| w.min(m));
+                return Some(cap.map_or(w, |c| w.min(c)));
+            }
+            if let Some(mw) = mw {
+                cap = Some(cap.map_or(mw, |c| c.min(mw)));
+            }
+            cur = self.dom.parent_composed(p);
+        }
+        cap
     }
 
     /// The element's USED height in ROWS **if it is DEFINITE** (CSS 2.1 §10.5),
@@ -9784,6 +9907,50 @@ mod tests {
         // Word-wrapped at 14 columns, no row exceeds the width.
         assert!(lines.iter().all(|l| l.chars().count() <= 14), "{lines:?}");
         assert_eq!(lines.join(" ").split_whitespace().count(), 6);
+    }
+
+    #[test]
+    fn preserved_whitespace_link_stays_interactive() {
+        // A link inside a `white-space:nowrap` (or pre/pre-wrap) context flows
+        // through `place_preserved`, not the collapsing `place_word` path. That
+        // path used to drop the link (`push_preserved_item` passed `None`), so
+        // such anchors rendered styled like links (kind=Link → cyan) but were
+        // inert — not selectable, not clickable. archive.org's directory-listing
+        // tables mark the file-name cells `white-space:nowrap` (names have
+        // spaces and must not wrap), so every file link was dead. Cover all three
+        // preserved modes plus a `<pre>` block.
+        for ws in ["nowrap", "pre", "pre-wrap"] {
+            let rows = lay(
+                &format!(
+                    r#"<body><div style="white-space:{ws};"><a href="/file%20name.jpg">file name.jpg</a></div></body>"#
+                ),
+                60,
+            );
+            let link = rows
+                .iter()
+                .flat_map(|r| &r.items)
+                .find(|i| i.text.contains("file name"))
+                .unwrap_or_else(|| panic!("{ws}: link item present"));
+            assert_eq!(link.kind, ItemKind::Link, "{ws}: styled as a link");
+            assert!(
+                matches!(&link.link, Some(Link::Http(u)) if u.as_str().ends_with("/file%20name.jpg")),
+                "{ws}: still followable, got {:?}",
+                link.link
+            );
+            assert!(link.is_interactive(), "{ws}: selectable");
+        }
+        // A `<pre>` (white-space:pre by UA default) full of anchors, too.
+        let rows = lay(
+            r#"<body><pre><a href="/a.txt">a.txt</a>
+<a href="/b.txt">b.txt</a></pre></body>"#,
+            60,
+        );
+        let links: Vec<&Item> = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.link.is_some())
+            .collect();
+        assert_eq!(links.len(), 2, "both <pre> anchors interactive: {links:?}");
     }
 
     #[test]
@@ -12482,6 +12649,118 @@ mod tests {
     }
 
     #[test]
+    fn an_icon_only_button_renders_its_icon_not_its_aria_label() {
+        // A `<button>` is normally an atomic widget stub. But an icon-only button
+        // (no visible text, an `<img>` icon inside — the inline `<svg>` rewritten
+        // by `rewrite_inline_svgs`) must render its ICON like an `<a>`/`<div>`
+        // does. YouTube's masthead chrome is `<button aria-label="Einstellungen">
+        // <yt-icon><svg/></yt-icon></button>`; the stub path threw the icon away
+        // and dumped the long aria-label as a vertical smear.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/i.svg".to_owned(), (3, 2));
+        let rows = lay_with_images(
+            r#"<body><button aria-label="Einstellungen"><img src="/i.svg"></button></body>"#,
+            40,
+            &images,
+        );
+        let line = texts(&rows).join(" ");
+        assert!(
+            !line.contains("Einstellungen"),
+            "the aria-label is not dumped as a label: {line:?}"
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .any(|i| matches!(i.kind, ItemKind::Image)),
+            "the icon image renders instead"
+        );
+    }
+
+    #[test]
+    fn a_text_button_still_renders_a_widget_stub() {
+        // The carve-out: a button WITH visible text stays a readable `[ text ]`
+        // stub — only icon-only buttons flow their icon.
+        let rows = lay(r#"<body><button>Subscribe</button></body>"#, 40);
+        let line = texts(&rows).join(" ");
+        assert!(
+            line.contains("Subscribe"),
+            "a text button keeps its widget stub: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_form_bound_icon_button_renders_its_icon_and_stays_clickable() {
+        // No special case for form controls: a form button written as an icon (a
+        // magnifier submit) renders its icon like any other icon button — the
+        // document made it an icon. Its submit `Link` is threaded onto the icon so
+        // a click still submits (functional, just not a `[ Search ]` stub).
+        let html = r#"<body><form><button type="submit" aria-label="Search"><img src="/i.svg"></button></form></body>"#;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let button = dom
+            .descendants(crate::dom::DOCUMENT)
+            .into_iter()
+            .find(|&n| dom.tag_name(n) == Some("button"))
+            .expect("button node");
+        let mut controls = ControlMap::new();
+        controls.insert(button, (0, 0)); // what the form walk binds at parse time
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/i.svg".to_owned(), (3, 2));
+        let rows = lay_out(&dom, &base, 40, &[], &controls, &images, false);
+        let line = texts(&rows).join(" ");
+        assert!(
+            !line.contains("Search"),
+            "the icon renders, not the aria-label stub: {line:?}"
+        );
+        let img = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| matches!(i.kind, ItemKind::Image))
+            .expect("the icon image renders");
+        assert!(
+            matches!(img.link, Some(Link::Form { form: 0, field: 0 })),
+            "the icon carries the form submit link so it stays clickable: {:?}",
+            img.link
+        );
+    }
+
+    #[test]
+    fn an_offscreen_positioned_box_is_hidden() {
+        // The "shove it past the corner" visually-hidden idiom (`left:-9999px`,
+        // `top:-1000px` — YouTube's Skip-navigation button). We must not paint
+        // it; before, the negative offset was clamped to row/col 0 in
+        // `place_positioned_children` so the hidden text landed at the top-left.
+        // A small negative offset (an `-1.5rem` overlap) is NOT the idiom and
+        // stays visible.
+        let rows = lay(
+            r#"<body>
+               <div style="position:absolute;top:-1000px"><a href="/m">Skip navigation</a></div>
+               <div style="position:absolute;left:-9999px">Offscreen left</div>
+               <div style="position:absolute;top:-1.5rem">Small negative stays</div>
+               <p>Real content</p>
+            </body>"#,
+            60,
+        );
+        let line = texts(&rows).join(" ");
+        assert!(
+            !line.contains("Skip navigation"),
+            "top:-1000px is hidden: {line:?}"
+        );
+        assert!(
+            !line.contains("Offscreen left"),
+            "left:-9999px is hidden: {line:?}"
+        );
+        assert!(
+            line.contains("Real content"),
+            "real content renders: {line:?}"
+        );
+        assert!(
+            line.contains("Small negative stays"),
+            "a small -1.5rem offset is not hidden: {line:?}"
+        );
+    }
+
+    #[test]
     fn float_is_dropped_on_a_block_level_flex_item() {
         // CSS ignores `float` on a flex item. A `display:flex` row holding
         // `display:block;float:right` items lays them as flex columns (packed,
@@ -12749,6 +13028,55 @@ mod tests {
     }
 
     #[test]
+    fn a_shrink0_flex_endcap_measures_its_content_not_the_whole_row() {
+        // YouTube's masthead `#container`: a flex row of
+        // [#start, #center(search, flex:0 1 <wide>, min-width:0),
+        //  #end(flex:0 0 auto — shrink 0)]. #end's content is a grow button
+        // whose label is centred (`justify-content:center`, like every Material/
+        // Polymer button). While MEASURING #end's intrinsic width (flex-basis
+        // auto), flex-grow must NOT expand that button to fill the measuring
+        // constraint (CSS Flexbox §9.9.1 — there is no free space to distribute
+        // during intrinsic sizing). The bug: grow ran while measuring, so the
+        // button box widened to the constraint, then its content was re-laid
+        // (non-measuring) and `justify-content:center` pushed the label to the
+        // box's middle — a column near the constraint, which the box's extent
+        // (`max(col+width)`) reported back as the intrinsic width. #end then
+        // froze there (shrink:0) and starved #center, wrapping the search query.
+        let rows = lay(
+            r#"<body><div style="display:flex;width:100%">
+                 <div style="flex:0 0 auto">Menu</div>
+                 <div style="flex:0 1 80ch;min-width:0">search query that should stay on one line</div>
+                 <div style="flex:0 0 auto;display:flex">
+                   <div style="display:flex;flex:1 1 0;justify-content:center;white-space:nowrap">Sign in</div>
+                 </div>
+               </div></body>"#,
+            100,
+        );
+        // The end-cap holds only "Sign in" (~7 cells), so it sits at the far
+        // right edge and #center keeps the rest of the row.
+        let signin = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("Sign in"))
+            .expect("sign-in label laid");
+        assert!(
+            signin.col >= 80,
+            "shrink:0 end-cap stays narrow at the right edge (col {}), not inflated by grow+centre during measure",
+            signin.col
+        );
+        // …and the search text keeps a wide box: it lays on a single row, not
+        // fragmented down a starved #center.
+        let center_rows = rows
+            .iter()
+            .filter(|r| r.items.iter().any(|i| i.text.contains("search query")))
+            .count();
+        assert_eq!(
+            center_rows, 1,
+            "search text fits on one row in the un-starved #center"
+        );
+    }
+
+    #[test]
     fn percentage_image_without_a_definite_ancestor_still_fills_the_flow_box() {
         // A genuine full-bleed image (`width:100%` with no sized ancestor)
         // must keep filling the content width — the fallback when no ancestor
@@ -12762,6 +13090,53 @@ mod tests {
         );
         let img = image_item(&rows);
         assert_eq!(img.width, 40, "width:100% still fills the flow box");
+    }
+
+    #[test]
+    fn an_image_is_capped_by_an_ancestor_max_width() {
+        // The icon idiom: `<span style="max-width:36px"><img style="width:100%">`.
+        // The 36px max-width wrapper (no explicit `width`) is the containing
+        // block, so the `width:100%` image must resolve against the CAPPED box,
+        // not fall through to the full flow box.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/i.png".into(), (100, 100));
+        let rows = lay_with_images(
+            r#"<body><div style="width:100%"><span style="max-width:36px"><img src="/i.png" style="width:100%"></span></div></body>"#,
+            120,
+            &images,
+        );
+        let img = image_item(&rows);
+        assert!(
+            img.width <= 6,
+            "icon capped by its ancestor's max-width (36px ~= 5 cells), got {}",
+            img.width
+        );
+    }
+
+    #[test]
+    fn a_nearer_max_width_caps_a_percentage_image_over_a_far_definite_width() {
+        // YouTube's brand icons (the Shorts logo) rendered FULL-SCREEN. The real
+        // structure: a `width:100%` SVG sits in a run of `width:100%` boxes
+        // (`yt-icon-shape`, the `ytIconWrapperHost` whose own width is the invalid
+        // `undefinedpx`) capped by a `max-width:36px` leading-image box — which
+        // itself sits inside a WIDE definite-width results column. The percentage
+        // must resolve against the NEARER 36px cap, not the far column. The old
+        // code preferred the nearest definite WIDTH (the 600px column) and only
+        // consulted `max-width` when no definite width existed anywhere up-chain,
+        // so the cap lost and the logo filled the screen.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/shorts.svg".into(), (3, 3));
+        let rows = lay_with_images(
+            r#"<body><div style="width:600px"><div style="max-width:36px"><div style="width:100%"><img src="/shorts.svg" style="width:100%"></div></div></div></body>"#,
+            200,
+            &images,
+        );
+        let img = image_item(&rows);
+        assert!(
+            img.width <= 6,
+            "icon caps at the nearer 36px max-width (~5 cells), not the 600px column, got {}",
+            img.width
+        );
     }
 
     #[test]

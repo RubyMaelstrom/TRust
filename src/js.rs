@@ -103,6 +103,20 @@ fn apply_gc_policy() {
     );
 }
 
+/// GC permanent generation (default on; `TRUST_NO_GC_PERMGEN` disables). After
+/// the immortal platform graph (realm intrinsics + our JS prelude) is built,
+/// `retenure_permanent` tenures it so it stops being re-ref-counted in the
+/// `trace_non_roots` pass of every later collection during the page's life —
+/// a ~2x cut to that phase on allocation-heavy pages (the phase is ~28% of GC
+/// time; see JS_ENGINE_REVIEW.md / GC_PLAN.md). The first no-write-barrier
+/// brick of the generational GC track. Safe by construction: tenuring only
+/// ever *retains* (it can never free a live object), and the retenure is
+/// self-cleaning across navigations on the reused page thread.
+fn gc_permgen_on() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TRUST_NO_GC_PERMGEN").is_none())
+}
+
 /// A page-wide execution deadline, shared by every script on the page.
 /// Page-initiated network time extends it: the wall budget meters JS,
 /// not the wire.
@@ -2095,6 +2109,20 @@ fn arg_str(args: &[JsValue], i: usize, ctx: &mut Context) -> String {
         .unwrap_or_default()
 }
 
+/// Decode a JS string the prelude built as a LATIN1 byte-string (one code unit
+/// per byte) back into the exact bytes. A request body must travel byte-exact:
+/// the prelude flattens it to such a string (`__bodyWire` — text UTF-8-encoded,
+/// binary `Uint8Array`/`ArrayBuffer`/`Blob` already one-byte-per-unit), so we
+/// take the low byte of each UTF-16 code unit instead of `to_std_string_lossy`'s
+/// UTF-8 re-encode, which would expand every byte >= 0x80 into two and corrupt a
+/// gzipped/protobuf/binary body (YouTube gzips its `youtubei` POSTs in-page, so
+/// the UTF-8 mangling made the server reject the search continuation with 400).
+fn arg_bytes_latin1(v: &JsValue, ctx: &mut Context) -> Vec<u8> {
+    v.to_string(ctx)
+        .map(|s| s.iter().map(|u| u as u8).collect())
+        .unwrap_or_default()
+}
+
 fn id_value(id: Option<usize>) -> JsValue {
     match id {
         Some(id) => JsValue::from(id as f64),
@@ -2176,6 +2204,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_doc_element", 0, sys_doc_element),
         ("__html_dda", 0, sys_html_dda),
         ("__url_parse", 2, sys_url_parse),
+        ("__url_set", 3, sys_url_set),
         ("__dom_attach_shadow", 1, sys_attach_shadow),
         ("__dom_shadow_root", 1, sys_shadow_root),
         ("__dom_adopt_styles", 2, sys_adopt_styles),
@@ -2631,7 +2660,7 @@ fn sys_outer_html(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
     let dom = page_dom(ctx);
     let d = dom.borrow();
     let h = arg_node(&d, args, 0)
-        .map(|id| d.serialize(id))
+        .map(|id| d.serialize_js(id))
         .unwrap_or_default();
     Ok(str_value(&h))
 }
@@ -2856,6 +2885,15 @@ fn sys_url_parse(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
     let Ok(u) = parsed else {
         return Ok(JsValue::null());
     };
+    Ok(url_parts_array(&u, ctx).into())
+}
+
+/// Serialize a parsed URL into the 11-part array the prelude `URL` class reads:
+/// `[href, protocol, host, hostname, port, pathname, search, hash, origin,
+/// username, password]`. The single source of truth for both `__url_parse` and
+/// `__url_set`, so a URL built by the constructor and one mutated by a setter
+/// serialize identically.
+fn url_parts_array(u: &url::Url, ctx: &mut Context) -> JsArray {
     let host = match (u.host_str(), u.port()) {
         (Some(h), Some(p)) => format!("{h}:{p}"),
         (Some(h), None) => h.to_string(),
@@ -2875,7 +2913,87 @@ fn sys_url_parse(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
         u.password().unwrap_or("").to_string(),
     ];
     let vals: Vec<JsValue> = parts.iter().map(|p| str_value(p)).collect();
-    Ok(JsArray::from_iter(vals, ctx).into())
+    JsArray::from_iter(vals, ctx)
+}
+
+/// `__url_set(href, which, value)` — apply a WHATWG URL component setter to
+/// `href` and return the re-serialized 11-part array (same shape as
+/// `__url_parse`), so a live `URL` object reflows `href`/all components when any
+/// one is assigned. Delegates to the `url` crate's setters (which implement the
+/// WHATWG "URL setter" algorithms), so `u.pathname = "c%20d"` re-serializes
+/// `href` to `http://a/c%20d` exactly as a browser does — the check the
+/// webcomponents/core-js URL polyfills gate on before force-replacing native
+/// URL. A setter whose basic-parse fails is a spec no-op (the URL is left
+/// unchanged); we still return the parts so the JS setter is a silent no-op too.
+/// Returns null only when `href` itself doesn't parse (can't happen from a live
+/// URL) or `which` is unknown.
+fn sys_url_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let href = arg_str(args, 0, ctx);
+    let which = arg_str(args, 1, ctx);
+    let value = arg_str(args, 2, ctx);
+    let Ok(mut u) = url::Url::parse(&href) else {
+        return Ok(JsValue::null());
+    };
+    match which.as_str() {
+        // The scheme setter's value may or may not carry the trailing ':'.
+        "protocol" => {
+            let s = value.strip_suffix(':').unwrap_or(&value);
+            let _ = u.set_scheme(s);
+        }
+        "username" => {
+            let _ = u.set_username(&value);
+        }
+        "password" => {
+            let _ = u.set_password(if value.is_empty() { None } else { Some(&value) });
+        }
+        // `.host` carries an optional `:port`; `.hostname` never does. `set_host`
+        // parses the "host[:port]" form, so route hostname through it after
+        // stripping any port the caller wrongly included (keeping the existing
+        // port), and host directly.
+        "host" => {
+            let _ = u.set_host(if value.is_empty() { None } else { Some(&value) });
+        }
+        "hostname" => {
+            let bare = host_without_port(&value);
+            let _ = u.set_host(if bare.is_empty() { None } else { Some(bare) });
+        }
+        "port" => {
+            if value.is_empty() {
+                let _ = u.set_port(None);
+            } else if let Ok(p) = value.parse::<u16>() {
+                let _ = u.set_port(Some(p));
+            }
+        }
+        "pathname" => u.set_path(&value),
+        // `.search`/`.hash` accept the value with or without the leading `?`/`#`;
+        // an empty value clears the component.
+        "search" => {
+            let q = value.strip_prefix('?').unwrap_or(&value);
+            u.set_query(if q.is_empty() { None } else { Some(q) });
+        }
+        "hash" => {
+            let f = value.strip_prefix('#').unwrap_or(&value);
+            u.set_fragment(if f.is_empty() { None } else { Some(f) });
+        }
+        _ => return Ok(JsValue::null()),
+    }
+    Ok(url_parts_array(&u, ctx).into())
+}
+
+/// The host portion of a `host[:port]` string, respecting IPv6 `[..]` brackets
+/// (a `:` inside brackets is part of the address, not a port separator).
+fn host_without_port(s: &str) -> &str {
+    if let Some(rest) = s.strip_prefix('[') {
+        // IPv6 literal: the host ends at the closing bracket.
+        return match rest.find(']') {
+            Some(i) => &s[..i + 2],
+            None => s,
+        };
+    }
+    match s.rfind(':') {
+        Some(i) => &s[..i],
+        None => s,
+    }
 }
 
 /// Run the synchronous half of a page fetch: resolve against the page
@@ -4958,15 +5076,15 @@ fn fetch_args(
     let body = args
         .get(2)
         .filter(|v| !v.is_null_or_undefined())
-        .map(|_| arg_str(args, 2, ctx));
+        .map(|v| arg_bytes_latin1(v, ctx));
     let content_type = args
         .get(3)
         .filter(|v| !v.is_null_or_undefined())
         .map(|_| arg_str(args, 3, ctx));
-    let body = body.map(|b| {
+    let body = body.map(|bytes| {
         (
             content_type.unwrap_or_else(|| String::from("text/plain;charset=UTF-8")),
-            b.into_bytes(),
+            bytes,
         )
     });
     let headers = args
@@ -5864,6 +5982,15 @@ fn load_page(
     if !outcome.errors.is_empty() {
         // The prelude is ours: if it broke, render without JS and say so.
         return Err(outcome);
+    }
+    // Tenure the immortal platform graph (intrinsics + prelude) as the GC's
+    // permanent generation, now that it's fully built and before any page
+    // script allocates. This runs one collection (reclaiming prelude setup
+    // garbage — and, on a reused thread, the previous page's platform) and then
+    // flags the survivors so they stop being re-ref-counted every later
+    // collection. See `gc_permgen_on`.
+    if gc_permgen_on() {
+        let _tenured = boa_engine::gc::retenure_permanent();
     }
     phase(&format!(
         "prelude done; {} top-level scripts",
@@ -6904,19 +7031,47 @@ const WORKER_SCOPE: &str = r##"
     URLSearchParams.prototype.get = function (k) { for (var i = 0; i < this.__l.length; i++) if (this.__l[i][0] === k) return this.__l[i][1]; return null; };
     URLSearchParams.prototype.getAll = function (k) { var r = []; for (var i = 0; i < this.__l.length; i++) if (this.__l[i][0] === k) r.push(this.__l[i][1]); return r; };
     URLSearchParams.prototype.has = function (k) { return this.get(k) !== null; };
-    URLSearchParams.prototype.set = function (k, v) { var done = false; for (var i = this.__l.length - 1; i >= 0; i--) if (this.__l[i][0] === k) { if (done) this.__l.splice(i, 1); else { this.__l[i][1] = String(v); done = true; } } if (!done) this.__l.push([k, String(v)]); };
-    URLSearchParams.prototype.append = function (k, v) { this.__l.push([String(k), String(v)]); };
-    URLSearchParams.prototype["delete"] = function (k) { for (var i = this.__l.length - 1; i >= 0; i--) if (this.__l[i][0] === k) this.__l.splice(i, 1); };
+    URLSearchParams.prototype.set = function (k, v) { var done = false; for (var i = this.__l.length - 1; i >= 0; i--) if (this.__l[i][0] === k) { if (done) this.__l.splice(i, 1); else { this.__l[i][1] = String(v); done = true; } } if (!done) this.__l.push([k, String(v)]); this.__notify(); };
+    URLSearchParams.prototype.append = function (k, v) { this.__l.push([String(k), String(v)]); this.__notify(); };
+    URLSearchParams.prototype["delete"] = function (k) { for (var i = this.__l.length - 1; i >= 0; i--) if (this.__l[i][0] === k) this.__l.splice(i, 1); this.__notify(); };
     URLSearchParams.prototype.forEach = function (cb, t) { for (var i = 0; i < this.__l.length; i++) cb.call(t, this.__l[i][1], this.__l[i][0], this); };
-    URLSearchParams.prototype.toString = function () { return this.__l.map(function (p) { return encodeURIComponent(p[0]) + "=" + encodeURIComponent(p[1]); }).join("&"); };
+    // application/x-www-form-urlencoded byte serializer (URL Standard): space→"+",
+    // percent-encode `! ' ( ) ~` that encodeURIComponent leaves bare. Mirrors the
+    // page realm's `fenc`.
+    function __fenc(s) { return encodeURIComponent(String(s)).replace(/[!'()~]/g, function (c) { return "%" + c.charCodeAt(0).toString(16).toUpperCase(); }).replace(/%20/g, "+"); }
+    URLSearchParams.prototype.toString = function () { return this.__l.map(function (p) { return __fenc(p[0]) + "=" + __fenc(p[1]); }).join("&"); };
+    // Live binding to an owning URL, mirroring the page realm (see its URL/USP).
+    URLSearchParams.prototype.__notify = function () { if (this.__url) this.__url.__setSearchFromParams(this.toString()); };
+    URLSearchParams.prototype.__setList = function (query) { this.__l = []; var s = String(query).charAt(0) === "?" ? String(query).slice(1) : String(query); if (s) s.split("&").forEach(function (pair) { var eq = pair.indexOf("="); var k = eq < 0 ? pair : pair.slice(0, eq); var v = eq < 0 ? "" : pair.slice(eq + 1); this.__l.push([decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))]); }, this); };
+    // A live URL: assigning a component re-serializes href via __url_set (the
+    // url crate's WHATWG setters), exactly like the page realm's class version.
     function URL(url, base) {
         var p = __url_parse(String(url), base != null ? String(base) : null);
         if (!p) throw new TypeError("Invalid URL: " + url);
-        this.href = p[0]; this.protocol = p[1]; this.host = p[2]; this.hostname = p[3]; this.port = p[4];
-        this.pathname = p[5]; this.search = p[6]; this.hash = p[7]; this.origin = p[8]; this.username = p[9]; this.password = p[10];
-        this.searchParams = new URLSearchParams(p[6]);
+        this.__p = p; this.__sp = null;
     }
-    URL.prototype.toString = function () { return this.href; };
+    function urlAccessor(i, which) {
+        return which
+            ? { get: function () { return this.__p[i]; }, set: function (v) { var r = __url_set(this.__p[0], which, String(v)); if (r) this.__p = r; } }
+            : { get: function () { return this.__p[i]; } };
+    }
+    Object.defineProperties(URL.prototype, {
+        href: { get: function () { return this.__p[0]; }, set: function (v) { var r = __url_parse(String(v), null); if (!r) throw new TypeError("Invalid URL: " + v); this.__p = r; if (this.__sp) this.__sp.__setList(this.__p[6]); } },
+        protocol: urlAccessor(1, "protocol"),
+        host: urlAccessor(2, "host"),
+        hostname: urlAccessor(3, "hostname"),
+        port: urlAccessor(4, "port"),
+        pathname: urlAccessor(5, "pathname"),
+        search: { get: function () { return this.__p[6]; }, set: function (v) { var r = __url_set(this.__p[0], "search", String(v)); if (r) this.__p = r; if (this.__sp) this.__sp.__setList(this.__p[6]); } },
+        hash: urlAccessor(7, "hash"),
+        origin: urlAccessor(8),
+        username: urlAccessor(9, "username"),
+        password: urlAccessor(10, "password"),
+        searchParams: { get: function () { if (!this.__sp) { this.__sp = new URLSearchParams(this.__p[6]); this.__sp.__url = this; } return this.__sp; } },
+    });
+    URL.prototype.__setSearchFromParams = function (qs) { var r = __url_set(this.__p[0], "search", qs); if (r) this.__p = r; };
+    URL.prototype.toString = function () { return this.__p[0]; };
+    URL.prototype.toJSON = function () { return this.__p[0]; };
     g.URL = URL; g.URLSearchParams = URLSearchParams;
 
     // --- Blob URL store (worker realm) — RAM-only, mirrors the page realm ---
@@ -11532,6 +11687,33 @@ const PRELUDE: &str = r##"
     class ProcessingInstruction extends CharacterData {}
     class DocumentType extends Node {}
     class Attr extends Node {}
+    // WHATWG DOM puts the element-traversal accessors on the ParentNode mixin
+    // (Document/DocumentFragment/Element/ShadowRoot) and NonDocumentTypeChildNode
+    // (Element/CharacterData) — NOT on Node. We author them once on `class Node`
+    // above for brevity, then relocate to the spec interfaces here. This is not
+    // cosmetic: libraries feature-detect and CAPTURE the native accessors as OWN
+    // properties of those exact prototypes. ShadyDOM (loaded by YouTube/Polymer
+    // in shady mode) wires `__shady_native_firstElementChild` via
+    // `Object.getOwnPropertyDescriptor(Element.prototype, "firstElementChild")`;
+    // with the getter only on Node.prototype that descriptor is undefined, the
+    // capture silently no-ops, and a non-shadow element's shady `firstElementChild`
+    // returns undefined. YouTube's renderer-stamper reuses existing children by
+    // scanning `firstElementChild`, so it then re-creates instead of reusing and
+    // the masthead end buttons (any stamped list) render doubled. Relocating to
+    // the spec interfaces restores the capture, hence the reuse path.
+    {
+        const PARENT_NODE = ["children", "firstElementChild", "lastElementChild", "childElementCount"];
+        const CHILD_NODE = ["nextElementSibling", "previousElementSibling"];
+        const move = (proto, names) => {
+            for (const n of names) {
+                const d = Object.getOwnPropertyDescriptor(Node.prototype, n);
+                if (d) Object.defineProperty(proto, n, d);
+            }
+        };
+        for (const p of [Element.prototype, Document.prototype, DocumentFragment.prototype, ShadowRoot.prototype]) move(p, PARENT_NODE);
+        for (const p of [Element.prototype, CharacterData.prototype]) move(p, CHILD_NODE);
+        for (const n of [...PARENT_NODE, ...CHILD_NODE]) delete Node.prototype[n];
+    }
     // querySelectorAll/getElementsBy* return real Arrays (so .map/.forEach/
     // spread all work); these constructors exist for the `'NodeList' in window`
     // / `instanceof` feature checks code performs. NamedNodeMap is the type of
@@ -13580,6 +13762,11 @@ const PRELUDE: &str = r##"
         Date.prototype.toLocaleString = function () { return new DateTimeFormat(0, { year: "numeric", hour: "numeric", second: "numeric" }).format(this); };
     }
     const dec = (s) => { try { return decodeURIComponent(String(s).replace(/\+/g, " ")); } catch { return String(s); } };
+    // The application/x-www-form-urlencoded byte serializer (URL Standard §"urlencoded
+    // serializing"): 0x20→"+", keep only `* - . _ 0-9 A-Z a-z`, percent-encode
+    // (UTF-8) everything else. NOT encodeURIComponent, which emits "%20" for space
+    // and leaves `! ' ( ) ~` unescaped — both wrong for a query string.
+    const fenc = (s) => encodeURIComponent(String(s)).replace(/[!'()~]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase()).replace(/%20/g, "+");
     class URLSearchParams {
         // WHATWG: init may be a string ("?"-prefixed query), another
         // URLSearchParams (copy its list), a sequence of [name,value] pairs, or
@@ -13612,11 +13799,25 @@ const PRELUDE: &str = r##"
         get(k) { const e = this.__p.find((p) => p[0] === String(k)); return e ? e[1] : null; }
         getAll(k) { return this.__p.filter((p) => p[0] === String(k)).map((p) => p[1]); }
         has(k) { return this.__p.some((p) => p[0] === String(k)); }
-        set(k, v) { this.delete(k); this.__p.push([String(k), String(v)]); }
-        append(k, v) { this.__p.push([String(k), String(v)]); }
-        delete(k) { this.__p = this.__p.filter((p) => p[0] !== String(k)); }
+        set(k, v) { this.__p = this.__p.filter((p) => p[0] !== String(k)); this.__p.push([String(k), String(v)]); this.__notify(); }
+        append(k, v) { this.__p.push([String(k), String(v)]); this.__notify(); }
+        delete(k) { this.__p = this.__p.filter((p) => p[0] !== String(k)); this.__notify(); }
         get size() { return this.__p.length; }
-        sort() { this.__p.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); }
+        sort() { this.__p.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); this.__notify(); }
+        // Live binding to an owning URL (set by URL.searchParams). WHATWG makes
+        // url.searchParams the URL's "query object": mutating it reflows the
+        // URL's query. Undefined for a standalone URLSearchParams (no-op).
+        __notify() { if (this.__url) this.__url.__setSearchFromParams(this.toString()); }
+        // Rebuild the list from a query string (called by the owning URL when its
+        // .search/.href is set, so the shared object stays in sync both ways).
+        __setList(query) {
+            this.__p = [];
+            for (const kv of String(query).replace(/^\?/, "").split("&")) {
+                if (!kv) continue;
+                const i = kv.indexOf("=");
+                this.__p.push(i < 0 ? [dec(kv), ""] : [dec(kv.slice(0, i)), dec(kv.slice(i + 1))]);
+            }
+        }
         // Live iteration (WebIDL maplike forEach): re-read length/index each step,
         // so deleting/appending during the callback affects what's visited — what
         // core-js's `r.delete("b")`-inside-forEach probe asserts ("a1c3").
@@ -13625,7 +13826,7 @@ const PRELUDE: &str = r##"
         values() { return this.__p.map((p) => p[1])[Symbol.iterator](); }
         entries() { return this.__p.slice()[Symbol.iterator](); }
         [Symbol.iterator]() { return this.entries(); }
-        toString() { return this.__p.map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v)).join("&"); }
+        toString() { return this.__p.map(([k, v]) => fenc(k) + "=" + fenc(v)).join("&"); }
     }
     // --- Blob URL store (File API §"Creating and Revoking a blob URL") ---
     // RAM-only, page-lifetime, per-realm: a map from a minted `blob:` URL string
@@ -13666,16 +13867,46 @@ const PRELUDE: &str = r##"
         return { bytes: "", type: "" };
     }
     class URL {
+        // A WHATWG URL is a LIVE object: assigning any component re-serializes
+        // href (and every other component). We keep the parsed parts in `__p`
+        // (the 11-tuple __url_parse returns) and expose each field as an
+        // accessor; a component setter runs the `__url_set` syscall (the url
+        // crate's WHATWG setter algorithms) and swaps in the new parts. This is
+        // load-bearing beyond correctness: the webcomponents/core-js URL
+        // polyfills feature-test `u.pathname="c%20d"; u.href==="…/c%20d"` and, if
+        // the native URL doesn't reflow, force-replace it with a searchParams-less
+        // polyfill — which then throws "cannot convert undefined to object" the
+        // moment a page reads `new URL(x).searchParams` (archive.org's item pages).
         constructor(href, base) {
             const r = __url_parse(String(href), base === undefined || base === null ? null : String(base));
             if (!r) throw new TypeError("Invalid URL: " + href);
-            this.href = r[0]; this.protocol = r[1]; this.host = r[2]; this.hostname = r[3];
-            this.port = r[4]; this.pathname = r[5]; this.search = r[6]; this.hash = r[7]; this.origin = r[8];
-            this.username = r[9] || ""; this.password = r[10] || "";
+            this.__p = r;      // [href, protocol, host, hostname, port, pathname, search, hash, origin, username, password]
+            this.__sp = null;  // lazily-created bound URLSearchParams (the "query object")
         }
-        get searchParams() { return new URLSearchParams(this.search); }
-        toString() { return this.href; }
-        toJSON() { return this.href; }
+        get href() { return this.__p[0]; }
+        // The href setter re-parses from scratch (no base) and throws on failure.
+        set href(v) { const r = __url_parse(String(v), null); if (!r) throw new TypeError("Invalid URL: " + v); this.__p = r; this.__syncSP(); }
+        get protocol() { return this.__p[1]; } set protocol(v) { this.__set("protocol", v); }
+        get host() { return this.__p[2]; } set host(v) { this.__set("host", v); }
+        get hostname() { return this.__p[3]; } set hostname(v) { this.__set("hostname", v); }
+        get port() { return this.__p[4]; } set port(v) { this.__set("port", v); }
+        get pathname() { return this.__p[5]; } set pathname(v) { this.__set("pathname", v); }
+        get search() { return this.__p[6]; } set search(v) { this.__set("search", v); this.__syncSP(); }
+        get hash() { return this.__p[7]; } set hash(v) { this.__set("hash", v); }
+        get origin() { return this.__p[8]; }
+        get username() { return this.__p[9]; } set username(v) { this.__set("username", v); }
+        get password() { return this.__p[10]; } set password(v) { this.__set("password", v); }
+        // Apply a component setter; a spec no-op (invalid value) returns the
+        // unchanged parts, so href only moves when the assignment is valid.
+        __set(which, v) { const r = __url_set(this.__p[0], which, String(v)); if (r) this.__p = r; }
+        // Refresh the bound query object after .search/.href changes (one-way,
+        // URL→params; the reverse, params→URL, is __setSearchFromParams).
+        __syncSP() { if (this.__sp) this.__sp.__setList(this.__p[6]); }
+        // Called BY the bound searchParams when it is mutated: reflow the query.
+        __setSearchFromParams(qs) { const r = __url_set(this.__p[0], "search", qs); if (r) this.__p = r; }
+        get searchParams() { if (!this.__sp) { this.__sp = new URLSearchParams(this.__p[6]); this.__sp.__url = this; } return this.__sp; }
+        toString() { return this.__p[0]; }
+        toJSON() { return this.__p[0]; }
         // createObjectURL/revokeObjectURL (File API). The minted URL is
         // `blob:<origin>/<uuid>`; the store is RAM-only (above).
         static createObjectURL(obj) {
@@ -13736,6 +13967,29 @@ const PRELUDE: &str = r##"
             } catch (e) { return ""; }
         }
         return String(body);
+    };
+    // The WIRE encoding of a request body: the exact bytes to put on the socket,
+    // as a LATIN1 byte-string (one code unit per byte) the Rust syscall reads
+    // byte-exact (`arg_bytes_latin1`). A text string is UTF-8-encoded (Fetch
+    // §"Body" — a string body is UTF-8); URLSearchParams is UTF-8 of its
+    // serialization; a Blob/File and an ArrayBuffer(view) are already raw bytes,
+    // so they map straight to latin1. Without this a binary body (e.g. a page
+    // that gzips its own POST — YouTube's `youtubei` continuation) was sent as
+    // UTF-8 text, doubling every byte >= 0x80 and getting rejected.
+    const __bodyWire = (body) => {
+        if (body === null || body === undefined) return null;
+        if (typeof body === "string") return utf8Binary(body);
+        if (body instanceof URLSearchParams) return utf8Binary(body.toString());
+        if (Array.isArray(body.__parts)) return utf8Binary(blobText(body)); // Blob/File
+        if (typeof body.byteLength === "number") {
+            try {
+                const v = body instanceof ArrayBuffer ? new Uint8Array(body)
+                    : new Uint8Array(body.buffer || body);
+                let s = ""; for (let i = 0; i < v.length; i++) s += String.fromCharCode(v[i]);
+                return s;
+            } catch (e) { return ""; }
+        }
+        return utf8Binary(String(body));
     };
     // Body mixin shared by Request and Response: the consumption methods read
     // the captured body once (lenient — we don't throw on re-read, unlike the
@@ -14229,7 +14483,7 @@ const PRELUDE: &str = r##"
                 bresp.__bytes = be.bytes; // byte-exact body for arrayBuffer()/blob()
                 return Promise.resolve(bresp);
             }
-            const body = __bodyText(req.__body);
+            const body = __bodyWire(req.__body);
             const ctype = req.headers.get("content-type")
                 || (body !== null ? "text/plain;charset=UTF-8" : null);
             return __http_fetch_async(url, req.method, body, ctype, __hdrBlob(req.headers.__h)).then(function (r) {
@@ -14311,7 +14565,7 @@ const PRELUDE: &str = r##"
                 else g.setTimeout(function () { xhr.__finish(arr); }, 0);
                 return;
             }
-            const b = body === undefined || body === null ? null : String(body);
+            const b = __bodyWire(body);
             const ctype = this.__h["content-type"] || (b !== null ? "text/plain;charset=UTF-8" : null);
             const hdrs = __hdrBlob(this.__h);
             if (this.__sync) {
@@ -15156,6 +15410,16 @@ mod tests {
             // Start each measured run from a reclaimed heap, so GC growth state
             // doesn't leak across runs.
             boa_engine::gc::force_collect();
+            // A/B knob (TRUST_GC_PERM): tenure the immortal platform graph
+            // (intrinsics + prelude) so it stops being re-ref-counted on every
+            // subsequent collection during the bench. Measures the permanent-
+            // generation win in isolation before it's wired into the real load.
+            // `retenure_permanent` self-cleans (clear+collect+set), so a per-run
+            // context can't leak its predecessor's frozen set into this number.
+            if std::env::var_os("TRUST_GC_PERM").is_some() {
+                let n = boa_engine::gc::retenure_permanent();
+                eprintln!("(tenured {n} platform objects permanent)");
+            }
 
             let gc0 = boa_engine::gc::gc_profile();
             let t = Instant::now();
@@ -15248,6 +15512,23 @@ mod tests {
         );
         if let Some(peak) = proc_peak_rss_mib() {
             eprintln!("peak RSS : {peak} MiB (VmHWM)");
+        }
+        {
+            // Per-phase GC breakdown (cumulative over all runs; the bench
+            // dominates the prelude's few collections, so the ratio is the
+            // signal). Tells the GC roadmap which phase to attack.
+            let (tnr, mk, sw) = boa_engine::gc::gc_phase_profile();
+            let tot = (tnr + mk + sw).as_secs_f64().max(1e-9);
+            let pct = |d: Duration| d.as_secs_f64() / tot * 100.0;
+            eprintln!(
+                "gc phases: trace_non_roots {:.0}%  mark {:.0}%  sweep {:.0}%  ({:?}/{:?}/{:?} cumulative)",
+                pct(tnr),
+                pct(mk),
+                pct(sw),
+                tnr,
+                mk,
+                sw
+            );
         }
 
         // --- function-execution census (the lazy-parse sizing gate) ---
@@ -19619,6 +19900,84 @@ mod tests {
         );
     }
 
+    /// A binary request body — a `Uint8Array` carrying bytes >= 0x80, e.g. a page
+    /// that gzips its own POST (YouTube's `youtubei` search continuation) — must
+    /// reach the wire BYTE-EXACT. The prelude flattens it to a latin1 byte-string
+    /// (`__bodyWire`) and the syscall decodes it byte-for-byte
+    /// (`arg_bytes_latin1`). The old path round-tripped it through a UTF-8 Rust
+    /// `String` (`into_bytes`), doubling every byte >= 0x80 (`8b` -> `c2 8b`), so
+    /// the server saw a corrupt gzip stream and rejected it with 400.
+    #[test]
+    fn a_binary_request_body_reaches_the_wire_byte_exact() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener =
+            rt.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+        let port = listener.local_addr().unwrap().port();
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        rt.spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&req[..pos]).to_lowercase();
+                    let clen = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let start = pos + 4;
+                    while req.len() < start + clen {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    *cap.lock().unwrap() = req[start..(start + clen).min(req.len())].to_vec();
+                    break;
+                }
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        });
+
+        let html = format!(
+            "<body><script>\
+             fetch('http://127.0.0.1:{port}/echo', {{ method: 'POST', \
+             body: new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0xff, 0x80, 0xc2, 0xa5]) }});\
+             </script></body>"
+        );
+        let mut env = PageEnv::bare(&format!("http://127.0.0.1:{port}/"));
+        env.net = Some(rt.handle().clone());
+        let (handle, _events) = spawn_page(html, env);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while captured.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(handle);
+        let body = captured.lock().unwrap().clone();
+        assert_eq!(
+            body,
+            vec![0x1f, 0x8b, 0x08, 0x00, 0xff, 0x80, 0xc2, 0xa5],
+            "binary POST body must reach the wire byte-exact, got {body:02x?}"
+        );
+    }
+
     /// Phase 3 inner scroll, end-to-end: the app pushes a region's box geometry
     /// (`RegionGeom`), the page reads the TRUE `clientHeight`/`scrollHeight` and
     /// pins (`scrollTop = scrollHeight`), and the next render bakes
@@ -22815,6 +23174,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn element_traversal_accessors_live_on_the_spec_interfaces() {
+        // The ParentNode (children/firstElementChild/lastElementChild/
+        // childElementCount) and NonDocumentTypeChildNode (next/previous
+        // ElementSibling) accessors must be OWN properties of the spec
+        // interfaces — Document/DocumentFragment/Element/ShadowRoot and
+        // Element/CharacterData — NOT Node. ShadyDOM (YouTube/Polymer shady
+        // mode) wires its native shim by capturing
+        // `Object.getOwnPropertyDescriptor(Element.prototype,"firstElementChild")`;
+        // with the getter only on Node.prototype that capture silently no-ops,
+        // a non-shadow element's shady `firstElementChild` returns undefined,
+        // and the renderer-stamper re-creates instead of reusing → doubled
+        // masthead buttons. The final `captured=span` line exercises the exact
+        // capture-then-call pattern ShadyDOM uses.
+        let html = r#"<body><pre id=o></pre><script>
+            function own(p,n){ return !!Object.getOwnPropertyDescriptor(p,n); }
+            var host=document.createElement('div');
+            host.appendChild(document.createTextNode('t'));
+            var span=document.createElement('span'); host.appendChild(span);
+            var d=Object.getOwnPropertyDescriptor(Element.prototype,'firstElementChild');
+            document.getElementById('o').textContent = [
+                'E.fec='+own(Element.prototype,'firstElementChild'),
+                'E.children='+own(Element.prototype,'children'),
+                'E.nes='+own(Element.prototype,'nextElementSibling'),
+                'Doc.fec='+own(Document.prototype,'firstElementChild'),
+                'DF.fec='+own(DocumentFragment.prototype,'firstElementChild'),
+                'SR.fec='+own(ShadowRoot.prototype,'firstElementChild'),
+                'CD.nes='+own(CharacterData.prototype,'nextElementSibling'),
+                'Node.fec='+own(Node.prototype,'firstElementChild'),
+                'captured='+(d&&d.get? d.get.call(host).localName : 'NONE')
+            ].join(' ');
+            </script></body>"#;
+        let (out, outcome) = page(html);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        for expect in [
+            "E.fec=true",
+            "E.children=true",
+            "E.nes=true",
+            "Doc.fec=true",
+            "DF.fec=true",
+            "SR.fec=true",
+            "CD.nes=true",
+            "Node.fec=false",
+            "captured=span",
+        ] {
+            assert!(out.contains(expect), "missing {expect:?} in: {out}");
+        }
+    }
+
     // ---- WebAssembly (js-api): Stage 1 — Module / validate / compile ----
 
     /// Compile WAT text into a `new Uint8Array([...])` JS literal, so a wasm
@@ -23479,6 +23887,89 @@ mod tests {
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("URLOK"), "URL/USP native detection: {out}");
+    }
+
+    #[test]
+    fn url_is_a_live_object_reflowing_href() {
+        // A WHATWG URL re-serializes href (and every component) when ANY
+        // component is assigned. The webcomponents URL polyfill (bundled in
+        // archive.org's webcomponents-bundle.js) gates on exactly this — it does
+        // `k = new URL("b","http://a"); k.pathname = "c%20d"; keep native iff
+        // k.href === "http://a/c%20d"` — and REPLACES native URL with a
+        // searchParams-less polyfill if it fails, which then throws the moment a
+        // page reads `new URL(x).searchParams` (archive.org item pages). A dumb
+        // data-property URL (our old one) left href stale and failed this.
+        let (out, outcome) = page(
+            r##"<body><pre id=o></pre><script>
+            var results = [];
+            // The exact webcomponents/core-js reflow probe.
+            var k = new URL("b","http://a"); k.pathname = "c%20d";
+            results.push("reflow=" + (k.href === "http://a/c%20d"));
+            // Each component setter reflows href.
+            var u = new URL("https://user:pw@host:80/p?x=1#h");
+            u.hash = "frag"; results.push("hash=" + (u.href.indexOf("#frag") >= 0 && u.hash === "#frag"));
+            u.search = "y=2"; results.push("search=" + (u.href.indexOf("?y=2") >= 0 && u.search === "?y=2"));
+            u.pathname = "/q"; results.push("path=" + (u.href.indexOf("/q?y=2") >= 0));
+            u.protocol = "http:"; results.push("proto=" + (u.protocol === "http:" && u.href.indexOf("http://") === 0));
+            u.hostname = "other"; results.push("host=" + (u.hostname === "other" && u.href.indexOf("other") >= 0));
+            // searchParams is LIVE both ways: mutating it reflows the URL, and
+            // setting .search updates the shared params object.
+            var w = new URL("http://a/p?a=1");
+            var sp = w.searchParams;
+            sp.set("b", "2");
+            results.push("sp2url=" + (w.search === "?a=1&b=2"));
+            w.search = "?c=3";
+            results.push("url2sp=" + (sp.get("c") === "3" && sp.get("a") === null));
+            results.push("same=" + (w.searchParams === sp));
+            document.getElementById("o").textContent = results.join(" ");
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(
+                "reflow=true hash=true search=true path=true proto=true host=true \
+                 sp2url=true url2sp=true same=true"
+            ),
+            "live URL behavior: {out}"
+        );
+    }
+
+    #[test]
+    fn urlsearchparams_tostring_is_form_urlencoded() {
+        // URLSearchParams.toString() is the application/x-www-form-urlencoded
+        // serializer, NOT encodeURIComponent: space is "+" (not "%20"), and
+        // `! ' ( ) ~` — which encodeURIComponent leaves bare — are percent-encoded.
+        // The unreserved set `* - . _` and alphanumerics stay literal; non-ASCII
+        // is UTF-8 percent-encoded; and it round-trips back through the parser.
+        let (out, outcome) = page(
+            r#"<body><pre id=o></pre><script>
+            var r = [];
+            var s = new URLSearchParams();
+            s.set("a b", "c d");         r.push("space=" + (s.toString() === "a+b=c+d"));
+            s = new URLSearchParams();
+            s.set("k", "!'()~");         r.push("special=" + (s.toString() === "k=%21%27%28%29%7E"));
+            s = new URLSearchParams();
+            s.set("x", "a*b-c.d_e");     r.push("unreserved=" + (s.toString() === "x=a*b-c.d_e"));
+            s = new URLSearchParams();
+            s.set("q", "café");     r.push("utf8=" + (s.toString() === "q=caf%C3%A9"));
+            // Round-trips: a serialized "+" parses back to a space.
+            var back = new URLSearchParams("a+b=c+d");
+            r.push("roundtrip=" + (back.get("a b") === "c d"));
+            // The serializer also drives URL.search reflow through the live binding.
+            var u = new URL("http://h/p");
+            u.searchParams.set("n m", "v w");
+            r.push("urlreflow=" + (u.search === "?n+m=v+w"));
+            document.getElementById("o").textContent = r.join(" ");
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(
+                "space=true special=true unreserved=true utf8=true \
+                 roundtrip=true urlreflow=true"
+            ),
+            "form-urlencoded toString: {out}"
+        );
     }
 
     #[test]

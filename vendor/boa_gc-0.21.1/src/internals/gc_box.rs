@@ -34,6 +34,21 @@ impl<T: Trace + ?Sized> GcBox<T> {
         self.header.is_marked()
     }
 
+    /// Returns `true` if this object is flagged permanent (immortal).
+    pub(crate) fn is_permanent(&self) -> bool {
+        self.header.is_permanent()
+    }
+
+    /// Flags this object permanent (immortal). See [`GcHeader::set_permanent`].
+    pub(crate) fn set_permanent(&self) {
+        self.header.set_permanent();
+    }
+
+    /// Clears the permanent flag. See [`GcHeader::clear_permanent`].
+    pub(crate) fn clear_permanent(&self) {
+        self.header.clear_permanent();
+    }
+
     #[inline]
     pub(crate) fn inc_ref_count(&self) {
         self.header.inc_ref_count();
