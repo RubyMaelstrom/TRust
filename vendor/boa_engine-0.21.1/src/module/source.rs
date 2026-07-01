@@ -1508,6 +1508,9 @@ impl SourceTextModule {
             self.code.path.clone().into(),
         );
 
+        // TRust lazy parsing: this is Module code, so any function deferred
+        // within it must re-parse in the Module goal (permits `import.meta`).
+        compiler.in_module = true;
         compiler.async_handler = Some(compiler.push_handler());
 
         let mut imports = Vec::new();

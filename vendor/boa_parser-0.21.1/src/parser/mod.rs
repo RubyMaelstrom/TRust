@@ -346,6 +346,22 @@ impl<R> Parser<'_, R> {
         self.cursor.set_strict(true);
     }
 
+    /// Set the parser goal symbol to Module.
+    ///
+    /// TRust lazy parsing: a deferred function body re-parsed on first call
+    /// (`parse_function_expression`) must use the SAME goal symbol as the
+    /// original parse. Module code permits `import.meta` (and reserves `await`);
+    /// script code does neither. Without this, a function deferred from a
+    /// `<script type=module>` that references `import.meta` (e.g. Vite's dynamic
+    /// import helper) re-parses in the default script goal and is rejected as
+    /// "invalid `import.meta` expression outside a module".
+    pub fn set_module(&mut self)
+    where
+        R: ReadChar,
+    {
+        self.cursor.set_module();
+    }
+
     /// Set the parser JSON mode to true.
     pub fn set_json_parse(&mut self)
     where

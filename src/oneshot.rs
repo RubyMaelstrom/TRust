@@ -201,21 +201,7 @@ pub fn parse(url: &OneShotUrl, raw: Vec<u8>, width: usize) -> Doc {
         }
         Scheme::Dict => dict_lines(&String::from_utf8_lossy(&raw), width),
     };
-    Doc {
-        url: Link::OneShot(url.clone()),
-        lines,
-        raw,
-        wrapped_to: width,
-        cp437: false,
-        meta: None,
-        forms: Vec::new(),
-        rows: Vec::new(),
-        image_urls: Vec::new(),
-        carousels: Vec::new(),
-        regions: Vec::new(),
-        scroll_clips: Vec::new(),
-        boundaries: Vec::new(),
-    }
+    Doc::from_lines(Link::OneShot(url.clone()), lines, raw, width, false, None)
 }
 
 /// Convert a DICT session transcript into document lines: each `151`

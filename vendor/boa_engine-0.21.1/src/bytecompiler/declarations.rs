@@ -539,6 +539,7 @@ impl ByteCompiler<'_> {
                 .r#async(r#async)
                 .strict(self.strict())
                 .in_with(self.in_with)
+                .in_module(self.in_module)
                 .source_path(self.source_path.clone())
                 .compile_or_lazy(
                     parameters,
@@ -826,6 +827,7 @@ impl ByteCompiler<'_> {
                 .r#async(r#async)
                 .strict(self.strict())
                 .in_with(self.in_with)
+                .in_module(self.in_module)
                 .name_scope(None)
                 .compile_or_lazy(
                     parameters,
