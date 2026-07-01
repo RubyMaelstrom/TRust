@@ -1,7 +1,11 @@
 use std::{cell::Cell, fmt};
 
 const MARK_MASK: u32 = 1 << (u32::BITS - 1);
-const NON_ROOTS_MASK: u32 = !MARK_MASK;
+/// `PERMANENT` marks an immortal object (see `GcHeader::set_permanent`). Stored
+/// in the second-from-top bit of `non_root_count`, so the mark bit and the
+/// (now 30-bit) non-roots counter are unaffected.
+const PERMANENT_MASK: u32 = 1 << (u32::BITS - 2);
+const NON_ROOTS_MASK: u32 = !(MARK_MASK | PERMANENT_MASK);
 const NON_ROOTS_MAX: u32 = NON_ROOTS_MASK;
 
 /// The `Gcheader` contains the `GcBox`'s and `EphemeronBox`'s current state for the `Collector`'s
@@ -90,6 +94,30 @@ impl GcHeader {
     pub(crate) fn unmark(&self) {
         self.non_root_count
             .set(self.non_root_count.get() & !MARK_MASK);
+    }
+
+    /// Returns `true` if this object is flagged permanent (immortal). A
+    /// permanent object is an implicit root: it is force-traced in the mark
+    /// phase (so nothing it reaches can be freed) and skipped as a source in
+    /// the `trace_non_roots` ref-counting pass (counting its out-edges is
+    /// wasted work). The bit survives `unmark`/`reset_non_root_count`.
+    pub(crate) fn is_permanent(&self) -> bool {
+        self.non_root_count.get() & PERMANENT_MASK != 0
+    }
+
+    /// Flags this object permanent (immortal). See [`GcHeader::is_permanent`].
+    pub(crate) fn set_permanent(&self) {
+        self.non_root_count
+            .set(self.non_root_count.get() | PERMANENT_MASK);
+    }
+
+    /// Clears the permanent flag, so the object is collected normally again.
+    /// Used to un-immortalize a prior generation's frozen set before a new one
+    /// is established (see `boa_gc::retenure_permanent`), which is what keeps a
+    /// long-lived, context-reused thread from leaking old platform graphs.
+    pub(crate) fn clear_permanent(&self) {
+        self.non_root_count
+            .set(self.non_root_count.get() & !PERMANENT_MASK);
     }
 }
 

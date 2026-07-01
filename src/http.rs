@@ -4824,6 +4824,11 @@ mod tests {
         let url = parse_url("https://store.steampowered.com/").unwrap();
         let images = crate::layout::ImageSizes::new();
         let doc = parse_seeded(&url, "text/html", &html, w, 0, None, &images);
+        // Legend: reproduce the layout DOM (same NodeIds) so we can map an
+        // item's `node` back to its element (tag/id/class + box/flex props).
+        let mut legend_dom = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
+        legend_dom.rewrite_inline_svgs();
+        let mut seen_nodes: std::collections::BTreeSet<usize> = Default::default();
         for (ri, row) in doc.rows.iter().enumerate() {
             let mut s = String::new();
             for it in &row.items {
@@ -4833,6 +4838,7 @@ mod tests {
                     crate::layout::ItemKind::Border => "BRD",
                     _ => "txt",
                 };
+                seen_nodes.insert(it.node);
                 s.push_str(&format!(
                     "[c{} w{} h{} {tag} n{} {:?}{}] ",
                     it.col,
@@ -4858,6 +4864,67 @@ mod tests {
             println!(
                 "  rows {}..{} band {}..{} width {} stops {:?}",
                 c.start, c.end, c.left, c.right, c.width, c.stops
+            );
+        }
+        // TRUST_LAYOUT_NODES=n1,n2,…: also print the legend for ancestors of
+        // these nodes (parent chain), to see the flex containers above an item.
+        let extra: std::collections::BTreeSet<usize> = std::env::var("TRUST_LAYOUT_NODES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|t| t.trim().trim_start_matches('n').parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for &nid in &extra {
+            let mut cur = nid;
+            loop {
+                seen_nodes.insert(cur);
+                match legend_dom.node(cur).parent {
+                    Some(p) if p != cur => cur = p,
+                    _ => break,
+                }
+            }
+        }
+        // The synthetic node id (usize::MAX) marks generated items (pseudo
+        // content, tooltips) with no backing arena node — skip it.
+        seen_nodes.retain(|&n| n < legend_dom.node_count());
+        println!("--- legend ({} nodes) ---", seen_nodes.len());
+        for &nid in &seen_nodes {
+            let tag = legend_dom.tag_name(nid).unwrap_or("·").to_string();
+            let id = legend_dom
+                .attr(nid, "id")
+                .map(|s| format!("#{s}"))
+                .unwrap_or_default();
+            let cls = legend_dom
+                .attr(nid, "class")
+                .map(|s| {
+                    let c: String = s.split_whitespace().take(3).collect::<Vec<_>>().join(".");
+                    if c.is_empty() {
+                        String::new()
+                    } else {
+                        format!(".{c}")
+                    }
+                })
+                .unwrap_or_default();
+            let dtn = legend_dom
+                .attr(nid, "data-trust-node")
+                .map(|s| format!(" dtn={s}"))
+                .unwrap_or_default();
+            let g = |p: &str| legend_dom.computed_style(nid, p).unwrap_or_default();
+            let disp = legend_dom.computed_display(nid).unwrap_or_default();
+            println!(
+                "  n{nid}: <{tag}>{id}{cls}{dtn} disp={disp} flex=({}/{}/{}) w={} minw={} maxw={} pos={} ws={} overflow={}/{}",
+                g("flex-grow"),
+                g("flex-shrink"),
+                g("flex-basis"),
+                g("width"),
+                g("min-width"),
+                g("max-width"),
+                g("position"),
+                g("white-space"),
+                g("overflow"),
+                g("overflow-x"),
             );
         }
     }

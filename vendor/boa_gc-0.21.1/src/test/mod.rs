@@ -3,6 +3,7 @@ use crate::BOA_GC;
 mod allocation;
 mod cell;
 mod erased;
+mod permanent;
 mod weak;
 mod weak_map;
 

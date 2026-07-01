@@ -107,6 +107,12 @@ struct GcRuntimeData {
     /// for TRust's engine profiler; the two `Instant::now()` calls per
     /// collection are negligible next to a full-heap mark-sweep).
     total_collect_time: Duration,
+    /// Per-phase breakdown of `total_collect_time`, so the GC roadmap can see
+    /// which phase to attack: `trace_non_roots` (the derived-root ref-count
+    /// pass), mark (incl. finalize + resurrection re-mark), and sweep.
+    trace_non_roots_time: Duration,
+    mark_time: Duration,
+    sweep_time: Duration,
 }
 
 /// Snapshot of GC activity for profiling: (collections, cumulative collect
@@ -120,6 +126,22 @@ pub fn gc_profile() -> (usize, Duration, usize) {
             gc.runtime.collections,
             gc.runtime.total_collect_time,
             gc.runtime.bytes_allocated,
+        )
+    })
+}
+
+/// Per-phase cumulative collection time: `(trace_non_roots, mark, sweep)`.
+/// `mark` includes finalize + the resurrection re-mark. Sums to roughly the
+/// `total_collect_time` of [`gc_profile`] (minus the small weak-map cleanup /
+/// bookkeeping tail). Used by the GC roadmap to target the right phase.
+#[must_use]
+pub fn gc_phase_profile() -> (Duration, Duration, Duration) {
+    BOA_GC.with(|st| {
+        let gc = st.borrow();
+        (
+            gc.runtime.trace_non_roots_time,
+            gc.runtime.mark_time,
+            gc.runtime.sweep_time,
         )
     })
 }
@@ -318,7 +340,9 @@ impl Collector {
         gc.runtime.collections += 1;
 
         Self::trace_non_roots(gc);
+        gc.runtime.trace_non_roots_time += __collect_start.elapsed();
 
+        let __mark_start = Instant::now();
         let mut tracer = Tracer::new();
 
         let unreachables = Self::mark_heap(&mut tracer, &gc.strongs, &gc.weaks, &gc.weak_maps);
@@ -335,8 +359,10 @@ impl Collector {
             let _final_unreachables =
                 Self::mark_heap(&mut tracer, &gc.strongs, &gc.weaks, &gc.weak_maps);
         }
+        gc.runtime.mark_time += __mark_start.elapsed();
 
         // SAFETY: The head of our linked list is always valid per the invariants of our GC.
+        let __sweep_start = Instant::now();
         unsafe {
             Self::sweep(
                 &mut gc.strongs,
@@ -344,6 +370,7 @@ impl Collector {
                 &mut gc.runtime.bytes_allocated,
             );
         }
+        gc.runtime.sweep_time += __sweep_start.elapsed();
 
         // Weak maps have to be cleared after the sweep, since the process dereferences GcBoxes.
         gc.weak_maps.retain(|w| {
@@ -376,7 +403,17 @@ impl Collector {
         // Then, we can find whether there is a reference from other places, and they are the roots.
         for node in &gc.strongs {
             // SAFETY: node must be valid as this phase cannot drop any node.
-            let trace_non_roots_fn = unsafe { node.as_ref() }.trace_non_roots_fn();
+            let node_ref = unsafe { node.as_ref() };
+            // Permanent (immortal) objects are implicit roots: they are
+            // force-traced in `mark_heap`, so their out-edges never need to be
+            // ref-counted here. Skipping them makes the derived-root pass cost
+            // scale with the churning (young) heap instead of the whole heap.
+            // SAFE: under-counting an object's non-root refs can only make it
+            // look *more* rooted (retain it), never free a live object.
+            if node_ref.is_permanent() {
+                continue;
+            }
+            let trace_non_roots_fn = node_ref.trace_non_roots_fn();
 
             // SAFETY: The function pointer is appropriate for this node type because we extract it from it's VTable.
             unsafe {
@@ -408,6 +445,14 @@ impl Collector {
         for node in strongs {
             // SAFETY: node must be valid as this phase cannot drop any node.
             let node_ref = unsafe { node.as_ref() };
+            // NB: marking is ordinary reachability — permanents are NOT force-
+            // enqueued here. Skipping a permanent as a *source* in
+            // `trace_non_roots` already leaves any object reachable only via
+            // permanents with `non_root_count == 0`, so `is_rooted()` enqueues
+            // it anyway; and a permanent that has genuinely become unreachable
+            // (e.g. a prior context's platform after navigation) is then swept
+            // normally instead of being immortalized — no forced retention, no
+            // cross-context leak. See `retenure_permanent`.
             if node_ref.is_rooted() {
                 tracer.enqueue(*node);
 
@@ -633,6 +678,65 @@ pub fn force_collect() {
             Collector::collect(&mut gc);
         }
     });
+}
+
+/// (Re-)establish the **permanent generation** as exactly the objects live
+/// *now*, and return how many were flagged.
+///
+/// The permanent flag affects ONE thing: a permanent object is skipped as a
+/// *source* in the `trace_non_roots` ref-counting pass (counting the out-edges
+/// of a known-live root is wasted work). It does NOT force retention — marking
+/// and sweeping stay ordinary reachability, so a permanent object that later
+/// becomes unreachable (a prior context's platform after a navigation on this
+/// reused thread) is swept normally. The intended use is to tenure the immortal
+/// platform graph — the realm intrinsics plus a host's bootstrap / prelude —
+/// right after it is built, so that graph stops being re-ref-counted on every
+/// subsequent collection.
+///
+/// Three steps, so it is safe to call repeatedly on a **reused thread** (whose
+/// thread-local heap outlives individual contexts) with clean generational
+/// hygiene:
+/// 1. Clear every existing permanent flag — a prior generation's platform is no
+///    longer skipped in `trace_non_roots`.
+/// 2. Collect — reclaim that now-dead prior graph plus bootstrap garbage,
+///    leaving exactly the current live set (also avoids a dead permanent briefly
+///    skewing an orphaned child's rootedness).
+/// 3. Flag the survivors permanent.
+///
+/// Correctness: skipping a source in `trace_non_roots` can only *under*-count an
+/// object's in-heap references, which can only make it look MORE rooted — i.e.
+/// retain it — never free a live object. So tenuring is safe regardless of what
+/// is flagged; steps 1–2 exist purely for prompt reclamation, not correctness.
+///
+/// Returns the number of objects tenured (for diagnostics/tests; ignore it when
+/// calling for effect).
+#[must_use]
+pub fn retenure_permanent() -> usize {
+    BOA_GC.with(|current| {
+        // 1. Un-immortalize the previous generation.
+        {
+            let gc = current.borrow();
+            for node in &gc.strongs {
+                // SAFETY: node is valid; the single-threaded heap is quiescent
+                // here (no collection running), so touching the header is safe.
+                unsafe { node.as_ref() }.clear_permanent();
+            }
+        }
+        // 2. Collect the now-collectable dead (incl. a prior context's graph).
+        {
+            let mut gc = current.borrow_mut();
+            if gc.runtime.bytes_allocated > 0 {
+                Collector::collect(&mut gc);
+            }
+        }
+        // 3. Tenure the survivors — the current live platform graph.
+        let gc = current.borrow();
+        for node in &gc.strongs {
+            // SAFETY: as above.
+            unsafe { node.as_ref() }.set_permanent();
+        }
+        gc.strongs.len()
+    })
 }
 
 #[cfg(test)]
