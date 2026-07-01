@@ -1753,6 +1753,7 @@ pub fn parse_seeded(
     let mut forms = Vec::new();
     let mut rows = Vec::new();
     let mut carousels = Vec::new();
+    let mut fixed = Vec::new();
     let mut regions = Vec::new();
     let mut scroll_clips = Vec::new();
     let mut boundaries = Vec::new();
@@ -1779,7 +1780,7 @@ pub fn parse_seeded(
         image_urls = collect_image_urls(&dom, url);
         let t_forms = t1.elapsed();
         let t2 = std::time::Instant::now();
-        let (laid, found_carousels, found_regions, found_clips, found_boundaries) =
+        let (laid, found_carousels, found_regions, found_clips, found_boundaries, found_fixed) =
             crate::layout::lay_out_with_carousels(
                 &dom,
                 url,
@@ -1810,6 +1811,7 @@ pub fn parse_seeded(
         }
         rows = laid;
         carousels = found_carousels;
+        fixed = found_fixed;
         regions = found_regions;
         scroll_clips = found_clips;
         boundaries = found_boundaries;
@@ -1834,6 +1836,7 @@ pub fn parse_seeded(
         rows,
         image_urls,
         carousels,
+        fixed,
         regions,
         scroll_clips,
         boundaries,
@@ -4639,7 +4642,7 @@ mod tests {
             }
         }
         eprintln!("decoded {} images", images.len());
-        let (rows, _car, _rgn, _clip, _bnd) = crate::layout::lay_out_with_carousels(
+        let (rows, _car, _rgn, _clip, _bnd, _fix) = crate::layout::lay_out_with_carousels(
             &dom,
             &url,
             (vp.0 as usize, vp.1 as usize),

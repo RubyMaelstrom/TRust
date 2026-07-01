@@ -224,6 +224,11 @@ pub struct BrowserView {
     /// HTTP path uses this instead of `selected`; the two are never both
     /// active (a doc is either laid out or not).
     pub sel_item: Option<(usize, usize)>,
+    /// The selected item in the PINNED fixed layer, as `(fixed, row, item)`
+    /// (`doc.fixed[fixed].rows[row].items[item]`). Mutually exclusive with
+    /// `sel_item` — a hover/click is on either the scrolling doc or a pinned
+    /// rail. `selected_link` reads it; the renderer highlights it.
+    pub sel_fixed: Option<(usize, usize, usize)>,
     /// First visible line/row.
     pub scroll: usize,
     history: Vec<(Doc, ViewPos, usize)>,
@@ -2427,6 +2432,20 @@ impl App {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         g.scroll.hash(&mut h);
         g.sel_item.hash(&mut h);
+        // The PINNED fixed layer draws every frame independent of scroll, so its
+        // selection (hover highlight + status link preview) and content must be
+        // in the signature — else hovering a pinned rail link changes `sel_fixed`
+        // but the draw is skipped, so no highlight/preview shows until a click
+        // changes the page and forces a redraw.
+        g.sel_fixed.hash(&mut h);
+        for f in &g.doc.fixed {
+            (f.col, f.row).hash(&mut h);
+            for row in &f.rows {
+                for it in &row.items {
+                    (it.col, &it.text).hash(&mut h);
+                }
+            }
+        }
         self.status.hash(&mut h);
         self.notice.hash(&mut h);
         self.input.hash(&mut h);
@@ -3951,6 +3970,7 @@ impl App {
                     doc,
                     selected: None,
                     sel_item: None,
+                    sel_fixed: None,
                     scroll: 0,
                     history: Vec::new(),
                 });
@@ -3993,6 +4013,18 @@ impl App {
     }
 
     fn http_mouse_hover(&mut self, col: u16, row: u16) -> bool {
+        // The PINNED fixed layer is drawn ON TOP of the scrolling document, so a
+        // hover/click over it wins — hit-test it first (viewport coords).
+        if let Some(target) = self.fixed_hit_test(col, row) {
+            if let Some(g) = &mut self.browser {
+                g.sel_fixed = Some(target);
+                g.sel_item = None;
+            }
+            return true;
+        }
+        if let Some(g) = &mut self.browser {
+            g.sel_fixed = None;
+        }
         let Some(target) = self.http_hit_test(col, row) else {
             if self.mouse_in_content_area(col, row)
                 && self.browser.as_ref().is_some_and(|g| g.doc.laid_out())
@@ -4006,6 +4038,34 @@ impl App {
             g.sel_item = Some(target);
         }
         true
+    }
+
+    /// Hit-test the PINNED fixed layer at screen `(col, row)`: returns the
+    /// `(fixed, row, item)` index of an INTERACTIVE item under the cursor, or
+    /// `None`. Fixed items pin to the viewport, so they map by SCREEN position
+    /// (content-area origin + the item's `col`/`row`), NOT the scroll offset.
+    /// Later items draw on top, so scan in reverse.
+    fn fixed_hit_test(&self, col: u16, row: u16) -> Option<(usize, usize, usize)> {
+        if !self.mouse_in_content_area(col, row) {
+            return None;
+        }
+        let g = self.browser.as_ref()?;
+        let (ox, oy) = (self.last_content_area.x, self.last_content_area.y);
+        for (fi, f) in g.doc.fixed.iter().enumerate().rev() {
+            for (r, frow) in f.rows.iter().enumerate() {
+                if oy as usize + f.row as usize + r != row as usize {
+                    continue;
+                }
+                for (i, item) in frow.items.iter().enumerate() {
+                    let start = ox as usize + f.col as usize + item.col as usize;
+                    let end = start + item.width.max(1) as usize;
+                    if item.is_interactive() && (col as usize) >= start && (col as usize) < end {
+                        return Some((fi, r, i));
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn mouse_in_content_area(&self, col: u16, row: u16) -> bool {
@@ -4189,16 +4249,56 @@ impl App {
     /// Move the item selection. `horizontal` steps within/between rows in
     /// document order; otherwise it jumps to the column-nearest item in an
     /// adjacent row. The page scrolls to keep the new selection visible.
+    /// Every INTERACTIVE item in the pinned fixed layer, as `(fixed, row, item)`
+    /// addresses in reading order — the keyboard-navigable rail links.
+    fn fixed_interactives(g: &BrowserView) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        for (fi, f) in g.doc.fixed.iter().enumerate() {
+            for (r, row) in f.rows.iter().enumerate() {
+                for (i, it) in row.items.iter().enumerate() {
+                    if it.is_interactive() {
+                        out.push((fi, r, i));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn http_move(&mut self, dir: i64, horizontal: bool) {
         let height = self.last_inner.1.max(1) as usize;
         let Some(g) = &mut self.browser else { return };
-        let rows = &g.doc.rows;
-        if rows.is_empty() {
+        // The pinned rail links are keyboard-navigable like any other link — no
+        // special-casing beyond WHERE they draw. The selection cycles: document
+        // items → (boundary) → rail links → (boundary) → document items.
+        let fixed = Self::fixed_interactives(g);
+
+        // Selection is in a pinned rail: step through the rail links; past the
+        // end, drop back into the document.
+        if let Some(cur) = g.sel_fixed {
+            let next = fixed
+                .iter()
+                .position(|&t| t == cur)
+                .map(|p| p as i64 + dir)
+                .filter(|&n| n >= 0 && (n as usize) < fixed.len());
+            match next {
+                Some(n) => g.sel_fixed = Some(fixed[n as usize]),
+                None => {
+                    g.sel_fixed = None;
+                    g.sel_item = Self::http_first_visible_item(g, height);
+                }
+            }
+            self.http_keep_visible();
             return;
         }
-        // No selection yet: take the first/last interactive item on screen.
+
+        let rows = &g.doc.rows;
+        // No selection yet: the first document item, else the first rail link.
         let Some((cr, ci)) = g.sel_item else {
             g.sel_item = Self::http_first_visible_item(g, height);
+            if g.sel_item.is_none() && !fixed.is_empty() {
+                g.sel_fixed = Some(fixed[0]);
+            }
             self.http_keep_visible();
             return;
         };
@@ -4210,6 +4310,14 @@ impl App {
         };
         if let Some(next) = target {
             g.sel_item = Some(next);
+        } else if !fixed.is_empty() {
+            // No further document item this way → enter the pinned rails.
+            g.sel_item = None;
+            g.sel_fixed = Some(if dir > 0 {
+                fixed[0]
+            } else {
+                fixed[fixed.len() - 1]
+            });
         }
         self.http_keep_visible();
     }
@@ -4743,6 +4851,10 @@ impl App {
     /// item selection or the gopher/gemini line selection).
     pub(crate) fn selected_link(&self) -> Option<Link> {
         let g = self.browser.as_ref()?;
+        // A selection in the PINNED fixed layer resolves to that item's link.
+        if let Some((fi, r, i)) = g.sel_fixed {
+            return g.doc.fixed.get(fi)?.rows.get(r)?.items.get(i)?.link.clone();
+        }
         if g.doc.laid_out() {
             let (r, i) = g.sel_item?;
             // Through `effective_row` so a selection that landed on scroll-region
@@ -5779,21 +5891,8 @@ mod tests {
                 }),
             })
             .collect();
-        Doc {
-            url: Link::Gopher(url),
-            lines,
-            raw: Vec::new(), // synthetic docs are never re-wrapped
-            wrapped_to: 80,
-            cp437: false,
-            meta: None,
-            forms: Vec::new(),
-            rows: Vec::new(),
-            image_urls: Vec::new(),
-            carousels: Vec::new(),
-            regions: Vec::new(),
-            scroll_clips: Vec::new(),
-            boundaries: Vec::new(),
-        }
+        // synthetic docs are never re-wrapped (empty `raw`)
+        Doc::from_lines(Link::Gopher(url), lines, Vec::new(), 80, false, None)
     }
 
     fn selected(app: &super::App) -> Option<usize> {
@@ -6985,6 +7084,67 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_fixed_rail_link_hovers_and_resolves_at_its_viewport_position() {
+        // A `position:fixed` rail (Mastodon's side nav) is captured into the
+        // pinned overlay; a hover over it (SCREEN position, not scroll-offset)
+        // selects the rail link so a click activates it.
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 20);
+        app.last_content_area = ratatui::layout::Rect::new(0, 1, 80, 20);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let images = crate::layout::ImageSizes::new();
+        let html = b"<body><div style='display:flex;justify-content:center'>\
+            <div style='min-width:120px'>\
+              <div style='position:fixed;width:120px'><a href='/dest'>RAILLINK</a></div>\
+            </div>\
+            <main style='width:100px'>FEED</main>\
+          </div></body>";
+        app.navigate_to(crate::http::parse(&url, "text/html", html, 80, 20, &images));
+
+        let g = app.browser.as_ref().unwrap();
+        assert!(!g.doc.fixed.is_empty(), "a fixed rail was captured");
+        // Locate the RAILLINK item + its screen position in the fixed layer.
+        let mut hit = None;
+        for (fi, f) in g.doc.fixed.iter().enumerate() {
+            for (r, row) in f.rows.iter().enumerate() {
+                for (i, it) in row.items.iter().enumerate() {
+                    if it.text.contains("RAILLINK") && it.link.is_some() {
+                        hit = Some((fi, r, i, f.col + it.col, f.row + r as u16));
+                    }
+                }
+            }
+        }
+        let (fi, r, i, col_in_box, row_in_box) = hit.expect("RAILLINK captured with a link");
+        let sx = app.last_content_area.x + col_in_box;
+        let sy = app.last_content_area.y + row_in_box;
+
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, sx, sy));
+        assert_eq!(
+            app.browser.as_ref().unwrap().sel_fixed,
+            Some((fi, r, i)),
+            "hover selects the pinned rail link at its screen position"
+        );
+        assert_eq!(app.browser.as_ref().unwrap().sel_item, None);
+        // The click path (browser_follow) resolves through selected_link.
+        assert!(
+            matches!(app.selected_link(), Some(crate::doc::Link::Http(u)) if u.as_str() == "https://example.com/dest"),
+            "the rail link resolves to its href: {:?}",
+            app.selected_link()
+        );
+
+        // KEYBOARD reaches the rail too: with no document link to take, an arrow
+        // step enters the pinned rail (same link, same activation path).
+        app.browser.as_mut().unwrap().sel_fixed = None;
+        app.http_move(1, false);
+        assert_eq!(
+            app.browser.as_ref().unwrap().sel_fixed,
+            Some((fi, r, i)),
+            "an arrow key selects the pinned rail link"
+        );
+    }
+
+    #[test]
     fn http_mouse_left_click_activates_form_text_box() {
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
@@ -7104,6 +7264,7 @@ mod tests {
             doc,
             selected: None,
             sel_item: None,
+            sel_fixed: None,
             scroll: 0,
             history: vec![],
         };
@@ -7146,6 +7307,7 @@ mod tests {
             doc,
             selected: None,
             sel_item: None,
+            sel_fixed: None,
             scroll: 0,
             history: vec![],
         });
@@ -7288,6 +7450,7 @@ mod tests {
             doc: http_doc("/b"),
             selected: None,
             sel_item: None,
+            sel_fixed: None,
             scroll: 0,
             history: vec![(
                 http_doc("/a"),
@@ -7324,6 +7487,7 @@ mod tests {
             doc: http_doc("/b"),
             selected: None,
             sel_item: None,
+            sel_fixed: None,
             scroll: 0,
             history: vec![(
                 http_doc("/a"),
@@ -7356,6 +7520,7 @@ mod tests {
             doc: http_doc("/b"),
             selected: None,
             sel_item: None,
+            sel_fixed: None,
             scroll: 0,
             history: vec![(
                 http_doc("/a"),
@@ -7857,6 +8022,7 @@ mod tests {
             doc,
             selected: None,
             sel_item: None,
+            sel_fixed: None,
             scroll: 0,
             history: Vec::new(),
         });

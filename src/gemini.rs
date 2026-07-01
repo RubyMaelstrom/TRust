@@ -286,21 +286,14 @@ pub fn parse(url: &GeminiUrl, meta: &str, body: &[u8], width: usize) -> Doc {
             link: None,
         }]
     };
-    Doc {
-        url: Link::Gemini(url.clone()),
+    Doc::from_lines(
+        Link::Gemini(url.clone()),
         lines,
-        raw: body.to_vec(),
-        wrapped_to: width,
-        cp437: false,
-        meta: Some(meta.to_string()),
-        forms: Vec::new(),
-        rows: Vec::new(),
-        image_urls: Vec::new(),
-        carousels: Vec::new(),
-        regions: Vec::new(),
-        scroll_clips: Vec::new(),
-        boundaries: Vec::new(),
-    }
+        body.to_vec(),
+        width,
+        false,
+        Some(meta.to_string()),
+    )
 }
 
 /// Parse gemtext into document lines. The resolver maps `=>` targets to

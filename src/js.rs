@@ -2182,6 +2182,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_namespace", 1, sys_namespace),
         ("__dom_get_attr", 2, sys_get_attr),
         ("__dom_computed", 2, sys_computed_style),
+        ("__match_media", 1, sys_match_media),
         ("__dom_rect", 1, sys_rect),
         ("__dom_scroll_get", 2, sys_scroll_get),
         ("__dom_scroll_set", 3, sys_scroll_set),
@@ -2468,6 +2469,18 @@ fn sys_computed_style(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
             None => JsValue::null(),
         },
     )
+}
+
+/// `window.matchMedia(query).matches` — evaluate a CSS media query against the
+/// page viewport through the SAME evaluator the `@media` cascade uses (so JS and
+/// stylesheet media queries agree). Was a stub that always returned `false`,
+/// which made `(min-width: …)` tests read false at any width → responsive apps
+/// (Mastodon's `layoutFromWindow`) fell to their narrowest/mobile layout.
+fn sys_match_media(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let query = arg_str(args, 0, ctx);
+    let dom = page_dom(ctx);
+    let matches = dom.borrow().media_matches(&query);
+    Ok(JsValue::from(matches))
 }
 
 /// Geometry backing for `getBoundingClientRect`/`offset*`/`client*` and the
@@ -12182,7 +12195,22 @@ const PRELUDE: &str = r##"
         });
     }
     g.getComputedStyle = (el) => (el instanceof Element ? computedStyleFor(el) : makeStyle());
-    g.matchMedia = (m) => ({ matches: false, media: String(m), addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} });
+    // matchMedia evaluates the query against the real viewport through the same
+    // Rust `@media` evaluator the cascade uses (width/height/orientation etc.);
+    // `.matches` is a live getter so a later read reflects the current viewport.
+    // Listener plumbing stays inert — TRust re-evaluates media only on reload
+    // (a breakpoint-crossing resize reloads), so there is no change event to fire.
+    g.matchMedia = (m) => {
+        const q = String(m);
+        return {
+            media: q,
+            get matches() { return !!__match_media(q); },
+            onchange: null,
+            addListener() {}, removeListener() {},
+            addEventListener() {}, removeEventListener() {},
+            dispatchEvent() { return false; },
+        };
+    };
     // window.CSS — feature detection (used across the web, not just
     // css3test). `supports("selector(…)")` runs the real selector engine
     // (honest); the property/value form leans on the style declaration's
@@ -16133,7 +16161,7 @@ mod tests {
         let spans = collect_function_body_spans(&src).expect("must parse");
         let mut drops: std::collections::BTreeMap<String, String> =
             std::collections::BTreeMap::new();
-        for (start, end) in spans {
+        for (start, _end) in spans {
             let open = flat(start);
             if cps.get(open).copied() != Some(u32::from(b'{')) {
                 continue;
@@ -21827,6 +21855,39 @@ mod tests {
         assert!(out.contains("module ran"), "{out}");
     }
 
+    /// A function DEFERRED from Module code that references `import.meta`
+    /// delazifies on first call without a parse error. Regression for
+    /// fosstodon.org (Mastodon): Vite emits a lazy-import helper
+    /// `function $(e){return()=>s(()=>import(`…`)…,import.meta.url)}` inside a
+    /// `<script type=module>`. Lazy parsing skipped its body, and the first-call
+    /// re-parse ran in the default Script goal — where `import.meta` is a
+    /// SyntaxError ("invalid `import.meta` expression outside a module") — so the
+    /// function became a throwing stub ("deferred function body failed to
+    /// parse") and the whole app bundle died. The delazify re-parse must use the
+    /// SAME goal symbol (Module) as the original parse. The body is padded past
+    /// the lazy size gate (100 code points) so it is actually deferred; `meta()`
+    /// is called to force the delazify.
+    #[test]
+    fn deferred_module_function_using_import_meta_delazifies() {
+        let (out, outcome) = page(
+            "<body><div id=t></div><script type=module>\
+             function meta() {\
+               /* padding to clear the lazy-parse size gate so this body defers */\
+               var parts = [];\
+               parts.push('meta');\
+               parts.push(String(typeof import.meta));\
+               parts.push(String(typeof import.meta.url));\
+               return parts.join(':');\
+             }\
+             document.getElementById('t').textContent = meta();\
+             export const x = 1;\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // `import.meta` is an object; delazify ran the real body, not the stub.
+        assert!(out.contains("meta:object:"), "{out}");
+    }
+
     #[test]
     fn bare_specifier_imports_reject_without_recursive_formatting() {
         let (out, outcome) = page(
@@ -23156,6 +23217,35 @@ mod tests {
             out.contains("KEEP_AT_NARROW"),
             "min-width:1000px not matched at 640px → kept: {out}"
         );
+    }
+
+    /// `window.matchMedia(q).matches` evaluates the query against the real
+    /// viewport through the same evaluator as CSS `@media` — it was a stub that
+    /// always returned `false`, so `(min-width: …)` tests read false at any
+    /// width and responsive apps (Mastodon's `layoutFromWindow`) fell to their
+    /// narrowest/mobile layout. bare() viewport = 80 cols × 8px = 640px.
+    #[test]
+    fn match_media_evaluates_against_the_viewport() {
+        let (out, outcome) = page(
+            "<body><div id=o></div><script>\
+             var o = document.getElementById('o');\
+             o.setAttribute('data-min500', String(matchMedia('(min-width: 500px)').matches));\
+             o.setAttribute('data-min1000', String(matchMedia('(min-width: 1000px)').matches));\
+             o.setAttribute('data-max768', String(matchMedia('(max-width: 768px)').matches));\
+             o.setAttribute('data-land', String(matchMedia('(orientation: landscape)').matches));\
+             o.setAttribute('data-and', String(matchMedia('screen and (min-width: 600px)').matches));\
+             o.setAttribute('data-unknown', String(matchMedia('(prefers-color-scheme: dark)').matches));\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // 640px: >=500 true, >=1000 false, <=768 true, landscape (640x384) true.
+        assert!(out.contains("data-min500=\"true\""), "{out}");
+        assert!(out.contains("data-min1000=\"false\""), "{out}");
+        assert!(out.contains("data-max768=\"true\""), "{out}");
+        assert!(out.contains("data-land=\"true\""), "{out}");
+        assert!(out.contains("data-and=\"true\""), "{out}");
+        // Unrecognized features stay false (the old conservative default).
+        assert!(out.contains("data-unknown=\"false\""), "{out}");
     }
 
     #[test]

@@ -156,21 +156,7 @@ pub fn parse(url: &GopherUrl, raw: Vec<u8>, cp437: bool, width: usize) -> Doc {
         }
         _ => parse_text(&raw, cp437, width),
     };
-    Doc {
-        url: Link::Gopher(url.clone()),
-        lines,
-        raw,
-        wrapped_to: width,
-        cp437,
-        meta: None,
-        forms: Vec::new(),
-        rows: Vec::new(),
-        image_urls: Vec::new(),
-        carousels: Vec::new(),
-        regions: Vec::new(),
-        scroll_clips: Vec::new(),
-        boundaries: Vec::new(),
-    }
+    Doc::from_lines(Link::Gopher(url.clone()), lines, raw, width, cp437, None)
 }
 
 fn decode(bytes: &[u8], cp437: bool) -> String {

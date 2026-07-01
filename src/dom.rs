@@ -633,6 +633,16 @@ impl Dom {
         }
     }
 
+    /// Evaluate a CSS media-query text (as `window.matchMedia(query).matches`)
+    /// against the current viewport — the SAME evaluator the `@media` cascade
+    /// uses, so JS `matchMedia` and stylesheet `@media` agree. Covers
+    /// width/height/orientation + `screen`/`all`/`not`/`only`/`and`/comma;
+    /// unrecognized features (e.g. `prefers-*`, `hover`, `pointer`) don't match
+    /// (the conservative default the old stub had for every query).
+    pub fn media_matches(&self, query: &str) -> bool {
+        media_query_matches(query, self.viewport_px)
+    }
+
     /// Set the terminal cell pixel size (`PageEnv.cell_px`) — used to convert the
     /// px `scrollTop` to rows when the live serializer bakes
     /// `data-trust-scroll-top`. No `touch()`: it only affects the next bake.
@@ -1101,6 +1111,25 @@ impl Dom {
         {
             return true;
         }
+        // A REPLACED element (img/svg/video/canvas/…) sized to a definite zero on
+        // EITHER axis paints nothing: its raster scales into a zero content box,
+        // so — unlike a normal block, whose overflow can still show — there is
+        // nothing to overflow, and `overflow` is irrelevant (hence no `ox`/`oy`
+        // gate here). This is the OTHER half of the copyable-but-unseen idiom:
+        // `font-size:0` hides sibling TEXT (which never affects a replaced box),
+        // while images are collapsed by a separate zero-size rule (Mastodon's
+        // `.invisible img{width:0!important;height:0!important}`). Without this
+        // our image box clamps to a 1-cell sliver instead of vanishing.
+        if (w_zero || h_zero)
+            && matches!(
+                self.tag_name(id),
+                Some(
+                    "img" | "svg" | "video" | "canvas" | "picture" | "iframe" | "embed" | "object"
+                )
+            )
+        {
+            return true;
+        }
         // `opacity:0` is invisible — treat it as hidden, like the W3C/Bootstrap
         // slideshow idiom (`.slides{opacity:0}`, the active slide revealed by
         // an `animation-fill-mode:forwards` fade-in). A real slideshow hides its
@@ -1443,6 +1472,17 @@ impl Dom {
     pub fn computed_value_resolved(&self, id: NodeId, name: &str) -> Option<String> {
         self.computed_value(id, name)
             .map(|v| self.resolve_vars(id, &v))
+    }
+
+    /// Whether text placed DIRECTLY in this element renders at zero font size —
+    /// `Some(true)`/`Some(false)` when the element's own `font-size` is
+    /// definitive, `None` to defer to the inherited value (so the layout, which
+    /// threads inheritance down its formatting context, keeps the parent's
+    /// answer). See [`classify_font_size_zero`].
+    pub fn font_size_zero(&self, id: NodeId) -> Option<bool> {
+        self.cascaded(id, "font-size")
+            .as_deref()
+            .and_then(classify_font_size_zero)
     }
 
     fn computed_cache_get(&self, id: NodeId, idx: usize) -> Option<Option<String>> {
@@ -3991,6 +4031,7 @@ fn prop_index(name: &str) -> Option<usize> {
 /// boundary is by definition visible, so it's a near-no-op; included for rigor.)
 const INHERITED_LAYOUT_PROPS: &[&str] = &[
     "text-align",
+    "font-size",
     "font-weight",
     "font-style",
     "white-space",
@@ -4018,6 +4059,7 @@ const PROPS: &[PropDef] = &[
     prop("padding-bottom", false, true),
     prop("padding-left", false, true),
     prop("text-align", true, true),
+    prop("font-size", true, true),
     prop("font-weight", true, true),
     prop("font-style", true, true),
     prop("white-space", true, true),
@@ -4158,6 +4200,42 @@ fn css_len_is_zero(v: &str) -> bool {
         .take_while(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'))
         .collect();
     !num.is_empty() && num.parse::<f32>().map(|n| n == 0.0).unwrap_or(false)
+}
+
+/// Classify an element's OWN `font-size` declaration for the zero-size
+/// (invisible-text) check. `Some(true)` = collapses text to nothing
+/// (`font-size:0` in any unit); `Some(false)` = a definite non-zero size
+/// (absolute px/pt/rem/vw, an absolute keyword, `calc()`, …); `None` = defer to
+/// the inherited size (no declaration, a relative `em`/`%`/`ex`/`ch`/`lh` size
+/// that merely scales the parent, or `inherit`/`unset`). We render every visible
+/// glyph at one cell regardless of point size, so the ONE font-size that changes
+/// layout is zero: `font-size:0` is the standard idiom for keeping copyable-but-
+/// unseen text (Mastodon's `.invisible` spans hide a URL's scheme and tail this
+/// way). A relative unit is left to the caller's inheritance so the
+/// inline-block-whitespace-killer idiom (`ul{font-size:0} li{font-size:1rem}`)
+/// re-shows an absolutely-reset descendant.
+fn classify_font_size_zero(v: &str) -> Option<bool> {
+    let v = v.trim();
+    let first = *v.as_bytes().first()?;
+    if !(first.is_ascii_digit() || matches!(first, b'.' | b'-' | b'+')) {
+        // Keyword / function value.
+        return match v.to_ascii_lowercase().as_str() {
+            "inherit" | "unset" => None,
+            _ => Some(false),
+        };
+    }
+    let split = v
+        .find(|c: char| c.is_ascii_alphabetic() || c == '%')
+        .unwrap_or(v.len());
+    let (num, unit) = v.split_at(split);
+    let n = num.parse::<f32>().ok()?;
+    if n == 0.0 {
+        return Some(true);
+    }
+    match unit.trim().to_ascii_lowercase().as_str() {
+        "em" | "ex" | "ch" | "lh" | "%" => None,
+        _ => Some(false),
+    }
 }
 
 /// Below this effective opacity an element is treated as invisible (hidden).
@@ -5792,6 +5870,66 @@ mod tests {
         assert!(
             !layout.contains("<template"),
             "layout serializer leaked template tag: {layout}"
+        );
+    }
+
+    #[test]
+    fn font_size_zero_is_baked_and_classified() {
+        // The JS render path re-parses the serialized HTML with the sheets gone,
+        // so a `<style>`-declared `font-size:0` must be BAKED onto the element or
+        // the invisible-text hide is lost (Mastodon's `.invisible` URL spans).
+        let dom = Dom::parse_document(
+            "<head><style>.invisible{font-size:0}</style></head>\
+             <body><span id=x class=invisible>hidden</span></body>",
+        );
+        let html = dom.serialize(DOCUMENT);
+        assert!(
+            html.contains("font-size:0"),
+            "font-size not baked into render HTML: {html}"
+        );
+        // The classifier the layout consults resolves the same declaration.
+        let x = dom.get_by_id("x").unwrap();
+        assert_eq!(dom.font_size_zero(x), Some(true));
+        // Unit coverage of the relative/absolute distinction.
+        assert_eq!(classify_font_size_zero("0"), Some(true));
+        assert_eq!(classify_font_size_zero("0px"), Some(true));
+        assert_eq!(classify_font_size_zero("0%"), Some(true));
+        assert_eq!(classify_font_size_zero("14px"), Some(false));
+        assert_eq!(classify_font_size_zero("1rem"), Some(false));
+        assert_eq!(classify_font_size_zero("medium"), Some(false));
+        assert_eq!(classify_font_size_zero("calc(1em + 2px)"), Some(false));
+        // Relative to the parent (scales the inherited size) / explicit inherit
+        // ⇒ defer to inheritance.
+        assert_eq!(classify_font_size_zero("2em"), None);
+        assert_eq!(classify_font_size_zero("120%"), None);
+        assert_eq!(classify_font_size_zero("inherit"), None);
+    }
+
+    #[test]
+    fn zero_size_replaced_element_hidden_via_rule_and_baked() {
+        // Mastodon collapses images inside `.invisible` with a RULE (a descendant
+        // combinator + !important), not inline — `.invisible img{width:0!important;
+        // height:0!important}`. The cascade must resolve it, is_hidden must hide the
+        // img, and the JS render path must bake the zero so the re-parse hides it too.
+        let dom = Dom::parse_document(
+            "<head><style>.invisible img,.invisible svg\
+             {width:0 !important;height:0 !important}</style></head>\
+             <body><span class=invisible><img id=i src=x></span></body>",
+        );
+        let i = dom.get_by_id("i").unwrap();
+        assert_eq!(dom.cascaded(i, "width").as_deref(), Some("0"), "rule width");
+        assert_eq!(
+            dom.cascaded(i, "height").as_deref(),
+            Some("0"),
+            "rule height"
+        );
+        assert!(dom.is_hidden(i), "zero-sized img not hidden");
+        // The render path drops a hidden node entirely, so the re-parsed layout
+        // arena never sees the collapsed img (no baked sliver to clamp to 1 cell).
+        let html = dom.serialize(DOCUMENT);
+        assert!(
+            !html.contains("<img"),
+            "zero-sized img leaked into render HTML: {html}"
         );
     }
 

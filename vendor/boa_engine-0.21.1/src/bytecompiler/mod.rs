@@ -507,6 +507,12 @@ pub struct ByteCompiler<'ctx> {
     /// Whether the function is in a `with` statement.
     pub(crate) in_with: bool,
 
+    /// TRust lazy parsing: whether this code is being compiled as an ECMAScript
+    /// Module (vs a Script). Propagated to every deferred function's
+    /// [`LazyFunctionData`](function::LazyFunctionData) so its first-call
+    /// re-parse uses the same goal symbol (module code permits `import.meta`).
+    pub(crate) in_module: bool,
+
     /// TRust lazy compilation (see [`crate::vm::lazy`]): a one-shot flag, set just
     /// before compiling the callee of a call when that callee is a function
     /// expression (an IIFE: `(function () { … })()`). Such a function runs
@@ -621,6 +627,10 @@ impl<'ctx> ByteCompiler<'ctx> {
             #[cfg(feature = "annex-b")]
             annex_b_function_names: Vec::new(),
             in_with,
+            // Default to Script goal; the module compile entry
+            // (`SourceTextModule::code_block`) sets this, and every child
+            // `ByteCompiler`/`FunctionCompiler` inherits it.
+            in_module: false,
             eager_next_function: false,
             emitted_mapped_arguments_object_opcode: false,
         }
@@ -1797,6 +1807,7 @@ impl<'ctx> ByteCompiler<'ctx> {
             .strict(self.strict())
             .arrow(arrow)
             .in_with(self.in_with)
+            .in_module(self.in_module)
             .name_scope(name_scope.cloned())
             .source_path(self.source_path.clone());
         // TRust lazy *parsing*: a body skipped at parse time (`body.is_lazy()`)
@@ -1895,6 +1906,7 @@ impl<'ctx> ByteCompiler<'ctx> {
             .arrow(arrow)
             .method(true)
             .in_with(self.in_with)
+            .in_module(self.in_module)
             .name_scope(name_scope.cloned())
             .source_path(self.source_path.clone())
             .compile(
@@ -1945,6 +1957,7 @@ impl<'ctx> ByteCompiler<'ctx> {
             .arrow(arrow)
             .method(true)
             .in_with(self.in_with)
+            .in_module(self.in_module)
             .name_scope(function.name_scope.cloned())
             .source_path(self.source_path.clone())
             .compile(

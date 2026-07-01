@@ -225,6 +225,24 @@ pub struct Row {
     pub items: Vec<Item>,
 }
 
+/// A `position:fixed` element captured into the PINNED overlay layer: its laid
+/// content, plus the viewport position it pins at. The document scrolls
+/// underneath; the renderer draws this on top at a fixed screen position — the
+/// one place a terminal composites (see the CSS-cascade fixed-layer deviation).
+/// Only all-insets-`auto` (static-position), non-viewport-covering fixed boxes
+/// are captured here (Mastodon's side rails); covering ones stay modals.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FixedItem {
+    /// Column of the box's top-left in the pinned viewport (0-based cells).
+    pub col: u16,
+    /// Row of the box's top-left in the pinned viewport (clamped into view).
+    pub row: u16,
+    /// The laid content rows (position-independent, like a scroll-region buffer).
+    pub rows: Vec<Row>,
+    /// Paint order — higher draws last (over lower). From `z-index`.
+    pub z: i32,
+}
+
 /// A horizontally-scrollable strip (an `overflow-x` container whose content
 /// is wider than the viewport — a carousel). Its items live in `Doc.rows`
 /// spanning rows `[start, end)`, laid at their full strip columns offset by
@@ -626,6 +644,11 @@ struct LaidBox {
     /// translates and propagates them so a carousel inside a float/flex
     /// column still reaches the document.
     carousels: Vec<Carousel>,
+    /// `position:fixed` boxes captured inside this box (`col`/`row` relative to
+    /// its top-left); `blit` translates and propagates them up so a fixed rail
+    /// nested in a flex column reaches the document with its true static
+    /// position. See `FixedItem`.
+    fixed: Vec<FixedItem>,
     /// Scroll regions found inside this box (`start_row`/`left` relative to its
     /// top-left; the buffer is position-independent); `blit` translates and
     /// propagates them so a region inside a float/flex/abspos sub-layout (the
@@ -715,6 +738,7 @@ pub fn lay_out(
 /// strip items are already in the returned rows; a region instead reserves
 /// blank rows in `rows` and carries its content in its own `buffer` (the view
 /// windows it).
+#[allow(clippy::type_complexity)]
 pub fn lay_out_with_carousels(
     dom: &Dom,
     base: &Url,
@@ -729,6 +753,7 @@ pub fn lay_out_with_carousels(
     Vec<Region>,
     ScrollClips,
     Vec<BoundaryBox>,
+    Vec<FixedItem>,
 ) {
     let mut layout = Layout::new(
         dom,
@@ -746,9 +771,10 @@ pub fn lay_out_with_carousels(
     // checks run only on the sparse baked boundary set).
     layout.capture_boundaries = true;
     layout.flow_all();
-    let (rows, carousels, regions, _element_tops, scroll_clips, boundary_recs) = layout.finish();
+    let (rows, carousels, fixed, regions, _element_tops, scroll_clips, boundary_recs) =
+        layout.finish();
     let boundaries = harvest_boundaries(boundary_recs, &rows, &regions, &carousels);
-    (rows, carousels, regions, scroll_clips, boundaries)
+    (rows, carousels, regions, scroll_clips, boundaries, fixed)
 }
 
 /// Turn the raw per-pass boundary records into `Doc.boundaries`, keeping only the
@@ -939,7 +965,7 @@ pub fn lay_out_subtree_fragment(
     layout.flow_node(boundary, &Ctx::root());
     layout.flush_block();
     layout.finish_floats();
-    let (rows, carousels, regions, _tops, scroll_clips, _bnd) = layout.finish();
+    let (rows, carousels, _fixed, regions, _tops, scroll_clips, _bnd) = layout.finish();
     let width = rows
         .iter()
         .flat_map(|r| &r.items)
@@ -1025,7 +1051,8 @@ pub fn measure_boxes(
     // `finish` returns `element_tops` already remapped through its blank-row
     // collapse (and accumulated from every sub-layout via `blit`), so an
     // empty element's recorded row matches the kept-row grid the cells use.
-    let (rows, _carousels, _regions, element_tops, _scroll_clips, _boundaries) = layout.finish();
+    let (rows, _carousels, _fixed, _regions, element_tops, _scroll_clips, _boundaries) =
+        layout.finish();
 
     // Each laid item contributes a cell rectangle to its source node. An
     // inline image's `height` already counts the rows it reserves.
@@ -1632,6 +1659,10 @@ struct Ctx {
     /// adjacent characters (inherits; 0 = none). Sub-cell values round to 0,
     /// so the common subtle tracking is a faithful no-op in a cell grid.
     letter_spacing: usize,
+    /// CSS `font-size:0` collapses text to zero cells (the copyable-but-unseen
+    /// idiom — Mastodon's `.invisible` URL scheme/tail). Inherits down the
+    /// formatting context; an absolute font-size reset re-shows a descendant.
+    font_zero: bool,
     node: NodeId,
     link: Option<Link>,
 }
@@ -1643,6 +1674,7 @@ impl Ctx {
             emph: Emphasis::default(),
             transform: TextTransform::None,
             letter_spacing: 0,
+            font_zero: false,
             node: NO_NODE,
             link: None,
         }
@@ -1814,6 +1846,9 @@ struct Layout<'a> {
     list_stack: Vec<u32>,
     /// Horizontally-scrollable strips discovered during the pass.
     carousels: Vec<Carousel>,
+    /// `position:fixed` boxes captured into the pinned overlay layer during the
+    /// pass (viewport-relative once translated up by `blit`). See `FixedItem`.
+    fixed: Vec<FixedItem>,
     /// Vertical inner-scroll viewports (`overflow-y:auto|scroll` on a
     /// definite-height box) discovered during the pass — each reserves `height`
     /// blank doc rows and holds its content in a separate `buffer`. See `Region`.
@@ -1988,6 +2023,7 @@ impl<'a> Layout<'a> {
             line_height: 1,
             list_stack: Vec::new(),
             carousels: Vec::new(),
+            fixed: Vec::new(),
             regions: Vec::new(),
             scroll_clips: Vec::new(),
             suppressed_controls: std::collections::HashSet::new(),
@@ -2138,6 +2174,13 @@ impl<'a> Layout<'a> {
         if self.is_out_of_flow(id) && self.subtree_root != Some(id) {
             return;
         }
+        // Capture this element's pinned `position:fixed` children into the
+        // overlay layer at the parent's content origin (their STATIC position —
+        // the reserved flex column for Mastodon's side rails); `blit` carries
+        // them up to the document. Done here — after the out-of-flow guard, so a
+        // skipped fixed box can't re-enter — because a fixed child of a FLEX
+        // container is not a flex item and the flex layout never visits it.
+        self.capture_fixed_children(id);
         // A `<video>`/`<audio>` element renders as a media representation — its
         // poster (when present) plus a labelled link to the playable source —
         // not as an inline player a terminal can't run. Following it auto-opens
@@ -2339,6 +2382,10 @@ impl<'a> Layout<'a> {
             .as_deref()
             .and_then(|v| resolve_cells(v, 1, (self.viewport_w, self.viewport_h)))
             .unwrap_or(0);
+        // `font-size:0` collapses this element's text to nothing. Definitive on
+        // the element wins; otherwise inherit the parent's answer (relative
+        // sizes scale zero to zero, an absolute reset re-shows a descendant).
+        cctx.font_zero = self.dom.font_size_zero(id).unwrap_or(ctx.font_zero);
 
         // Block vs inline is driven by the cascaded `display` (baked into
         // the serialized HTML by the engine, which has the sheets), with
@@ -3254,6 +3301,68 @@ impl<'a> Layout<'a> {
         )
     }
 
+    /// Whether `id` is a `position:fixed` box we PIN into the overlay layer: it
+    /// has NO box insets (so it paints at its static position — the reserved
+    /// flex column, for a sidebar/header) and does not cover the viewport (a
+    /// full-bleed fixed overlay stays a modal). A terminal has no compositing
+    /// layer, so such a box draws pinned over the scrolling document at its
+    /// static viewport position (see the fixed-layer deviation). Offset-
+    /// positioned fixed boxes and `absolute` boxes keep the normal out-of-flow
+    /// placement.
+    fn is_fixed_pinned(&self, id: NodeId) -> bool {
+        self.subtree_root != Some(id)
+            && Some(id) != self.modal_root
+            && self.dom.computed_style(id, "position").as_deref() == Some("fixed")
+            && self.all_insets_auto(id)
+            && !self.covers_viewport(id)
+    }
+
+    /// Whether every box inset (`top`/`right`/`bottom`/`left`) on `id` is `auto`
+    /// or absent — so a positioned box uses its static position on both axes.
+    fn all_insets_auto(&self, id: NodeId) -> bool {
+        ["top", "right", "bottom", "left"].iter().all(|&side| {
+            self.dom
+                .computed_style(id, side)
+                .is_none_or(|v| v.trim().eq_ignore_ascii_case("auto"))
+        })
+    }
+
+    /// Capture `id`'s pinned `position:fixed` children (`is_fixed_pinned`) into
+    /// the overlay layer at the parent's current content origin — their static
+    /// position, which `blit` translates up to the document coordinate space.
+    /// A no-op while measuring (the overlay is a render-pass product) and for a
+    /// parent with no such children. Each child's subtree is laid at its used
+    /// width (CB = viewport: explicit `width`, else shrink-to-fit).
+    fn capture_fixed_children(&mut self, id: NodeId) {
+        if self.measuring {
+            return;
+        }
+        let col = self.indent as u16;
+        let row = self.rows.len() as u16;
+        for child in self.flow_children(id) {
+            if !self.is_fixed_pinned(child) {
+                continue;
+            }
+            let cb_w = self.viewport_w.max(1);
+            let explicit_w = self.abs_used_width(child, cb_w);
+            let lay_w = explicit_w.unwrap_or(cb_w).clamp(1, cb_w);
+            let inherit = self.ancestor_link_ctx(child);
+            let prev_sw = self.shrink_wrap;
+            self.shrink_wrap = explicit_w.is_none();
+            let b = self.layout_subtree_inner(child, lay_w, Some(child), false, &inherit);
+            self.shrink_wrap = prev_sw;
+            if b.height == 0 {
+                continue;
+            }
+            self.fixed.push(FixedItem {
+                col,
+                row,
+                rows: b.rows,
+                z: self.z_index(child),
+            });
+        }
+    }
+
     /// Whether `id` is the surfaced modal overlay or sits inside it — so its
     /// images count as the modal's foreground content (the page-backdrop drops
     /// must spare them). When a modal is surfaced the layout only flows that
@@ -3710,11 +3819,34 @@ impl<'a> Layout<'a> {
                 }
                 None => {
                     // `flex-basis:auto`/`width:auto`: size to content. An empty,
-                    // non-growing item takes no column.
-                    if g == 0.0 && self.is_empty_box(k) {
+                    // non-growing item takes no column — UNLESS it reserves space
+                    // via `min-width` (it's a width-reserving spacer, not empty:
+                    // Mastodon's side panes, whose only child is a `position:fixed`
+                    // rail captured into the overlay — laying the pane is also what
+                    // runs `capture_fixed_children`).
+                    if g == 0.0 && self.is_empty_box(k) && self.css_cells(k, "min-width").is_none()
+                    {
                         continue;
                     }
                     self.measure_width(k, avail)
+                }
+            };
+            // `min-width` is a HARD floor on a flex item's used main size — even
+            // when the row has room (CSS Flexbox §4.5/§9.7: the hypothetical
+            // main size clamps the flex base size to `min-width`). Without this
+            // a `min-width:285px` item whose content measures narrower collapses
+            // to that content (or to 0) once the row "fits", instead of holding
+            // its floor: Mastodon's centered 3-column layout has two side panes
+            // at `min-width:285px` flanking a `max-width:600px` main; they were
+            // basis=0 so only main laid out, centered alone. (`max-width` already
+            // caps an explicit basis in `flex_props`.) Skipped while measuring so
+            // intrinsic width still reflects content, not the declared floor.
+            let b = if self.measuring {
+                b
+            } else {
+                match self.css_cells(k, "min-width") {
+                    Some(mw) => b.max(mw.min(avail)),
+                    None => b,
                 }
             };
             nodes.push(k);
@@ -3850,7 +3982,11 @@ impl<'a> Layout<'a> {
         let mut x = lead;
         for i in 0..n {
             let cw = widths[i].max(1);
-            if boxes[i].height > 0 {
+            // Blit a 0-height item too when it carries a pinned fixed rail (a
+            // `min-width` spacer pane whose only child is `position:fixed`): the
+            // blit draws no rows but propagates the fixed overlay at this item's
+            // column, so the rail lands at its reserved (centered) column.
+            if boxes[i].height > 0 || !boxes[i].fixed.is_empty() {
                 let dy = self.align_offset(id, boxes[i].height as usize, line_h);
                 self.blit(&boxes[i], (self.line_left + x) as u16, row_base + dy);
             }
@@ -4498,6 +4634,10 @@ impl<'a> Layout<'a> {
                     && self.is_out_of_flow(d)
                     && !self.dom.is_hidden(d)
                     && !self.is_clipped_offscreen(d)
+                    // A pinned `position:fixed` box is captured into the overlay
+                    // layer at its static position (`capture_fixed_children`),
+                    // not placed in the scrolling document — don't double-place.
+                    && !self.is_fixed_pinned(d)
                     && self.positioned_containing_block(d) == cb
                     // An abspos `<video>`/`<audio>` whose in-flow wrapper dispatch
                     // already rendered a media representation in THIS Layout
@@ -6636,12 +6776,13 @@ impl<'a> Layout<'a> {
         sub.flow_node(id, ctx);
         sub.flush_block();
         sub.finish_floats();
-        let (rows, carousels, regions, element_tops, _, boundary_boxes) = sub.finish();
+        let (rows, carousels, fixed, regions, element_tops, _, boundary_boxes) = sub.finish();
         let content = LaidBox {
             height: rows.len() as u16,
             width: inner_w as u16,
             rows,
             carousels,
+            fixed,
             regions,
             element_tops,
             boundary_boxes,
@@ -6779,6 +6920,11 @@ impl<'a> Layout<'a> {
             rg.start_row += row_shift;
             rg.left += col_shift;
         }
+        let mut fixed = content.fixed;
+        for f in &mut fixed {
+            f.col += col_shift;
+            f.row += row_shift as u16;
+        }
         let element_tops = content
             .element_tops
             .into_iter()
@@ -6804,6 +6950,7 @@ impl<'a> Layout<'a> {
             width: new_w as u16,
             height: new_h as u16,
             carousels,
+            fixed,
             regions,
             element_tops,
             boundary_boxes,
@@ -6915,7 +7062,7 @@ impl<'a> Layout<'a> {
         sub.flow_node(id, inherit);
         sub.flush_block();
         sub.finish_floats();
-        let (rows, carousels, regions, element_tops, _, boundary_boxes) = sub.finish();
+        let (rows, carousels, fixed, regions, element_tops, _, boundary_boxes) = sub.finish();
         let width = rows
             .iter()
             .flat_map(|r| &r.items)
@@ -6928,6 +7075,7 @@ impl<'a> Layout<'a> {
             width,
             height,
             carousels,
+            fixed,
             regions,
             element_tops,
             boundary_boxes,
@@ -6973,6 +7121,16 @@ impl<'a> Layout<'a> {
             rg.start_row += row_base;
             rg.left += col_off;
             self.regions.push(rg);
+        }
+        // Pinned `position:fixed` boxes captured inside travel with the box: their
+        // captured position is the box-relative flow position (their static
+        // origin), so it shifts by `col_off`/`row_base` up toward the document's
+        // coordinate space, exactly like a scroll region's reserved band.
+        for f in &b.fixed {
+            let mut f = f.clone();
+            f.col += col_off;
+            f.row += row_base as u16;
+            self.fixed.push(f);
         }
         // Empty elements recorded in the box (measure pass only) move with it
         // too, so a boxless element nested in this sub-layout keeps its honest
@@ -7022,7 +7180,10 @@ impl<'a> Layout<'a> {
 
     /// Flow a run of inline text under the active `white-space` mode.
     fn place_text(&mut self, text: &str, ctx: &Ctx) {
-        if text.is_empty() {
+        if text.is_empty() || ctx.font_zero {
+            // `font-size:0` renders zero-width glyphs — the text is present in
+            // the DOM (copyable) but paints nothing, and its whitespace
+            // collapses too, so emit no items and owe no space.
             return;
         }
         if self.ws.preserves_newlines() {
@@ -7477,6 +7638,7 @@ impl<'a> Layout<'a> {
             emph: ctx.emph,
             transform: ctx.transform,
             letter_spacing: ctx.letter_spacing,
+            font_zero: ctx.font_zero,
             node: id,
             link: ctx.link.clone(),
         };
@@ -8207,6 +8369,22 @@ impl<'a> Layout<'a> {
     /// nearest block-level ancestor (in-flow assumption), or the viewport (the
     /// initial containing block) when `id`'s parent is the document root.
     fn height_cb(&self, id: NodeId) -> CbHeight {
+        // An out-of-flow box resolves its percentage height against its
+        // POSITIONING containing block, not its DOM parent (CSS 2.1 §10.1/
+        // §10.6.4): the viewport for `fixed`, else the nearest positioned
+        // ancestor (or the viewport when there is none) — mirroring
+        // `abs_cb_height`. This is what makes `pane__inner{position:fixed;
+        // height:100%}` (Mastodon's fixed rails) resolve to the viewport height
+        // instead of walking a parent chain that dead-ends at a `height:auto`.
+        if self.is_out_of_flow(id) {
+            if self.dom.computed_style(id, "position").as_deref() == Some("fixed") {
+                return CbHeight::Viewport;
+            }
+            return match self.positioned_containing_block(id) {
+                Some(cb) => CbHeight::Element(cb),
+                None => CbHeight::Viewport,
+            };
+        }
         match self.dom.parent_composed(id) {
             Some(p) if self.dom.tag_name(p).is_some() => CbHeight::Element(p),
             _ => CbHeight::Viewport,
@@ -8709,17 +8887,20 @@ impl<'a> Layout<'a> {
     /// stays aligned with its cards no matter how many blank rows above or
     /// inside it were dropped. Without this remap the band drifts off its
     /// cards and the view stops clipping the strip.
+    #[allow(clippy::type_complexity)]
     fn finish(
         mut self,
     ) -> (
         Vec<Row>,
         Vec<Carousel>,
+        Vec<FixedItem>,
         Vec<Region>,
         ElementTops,
         ScrollClips,
         BoundaryRecs,
     ) {
         let carousels = std::mem::take(&mut self.carousels);
+        let mut fixed = std::mem::take(&mut self.fixed);
         let mut regions = std::mem::take(&mut self.regions);
         let element_tops = std::mem::take(&mut self.element_tops);
         let scroll_clips = std::mem::take(&mut self.scroll_clips);
@@ -8815,9 +8996,15 @@ impl<'a> Layout<'a> {
                 )
             })
             .collect();
+        // Pinned fixed boxes move through the same blank-row collapse (their
+        // captured row is a flow position in this box's coordinate space).
+        for f in &mut fixed {
+            f.row = u16::try_from(remap_row(f.row as usize)).unwrap_or(u16::MAX);
+        }
         (
             out,
             carousels,
+            fixed,
             regions,
             element_tops,
             scroll_clips,
@@ -8967,11 +9154,14 @@ fn css_length_rows(value: &str) -> Option<usize> {
 /// `css_length_rows` it does NOT floor at 1 row (the chain rounds once at the end).
 fn css_height_rows_f32(value: &str, viewport_h: usize) -> Option<f32> {
     let v = value.trim();
-    if let Some(n) = v
-        .strip_suffix("vh")
-        .and_then(|s| s.trim().parse::<f32>().ok())
-    {
-        return (viewport_h > 0).then(|| (n / 100.0) * viewport_h as f32);
+    // Viewport-height units. A terminal has no dynamic browser chrome, so the
+    // small/large/dynamic-viewport keywords (`svh`/`lvh`/`dvh`) all equal `vh`:
+    // strip the `vh` suffix, then an optional `d`/`s`/`l` qualifier.
+    if let Some(rest) = v.strip_suffix("vh") {
+        let rest = rest.strip_suffix(['d', 's', 'l']).unwrap_or(rest);
+        if let Ok(n) = rest.trim().parse::<f32>() {
+            return (viewport_h > 0).then(|| (n / 100.0) * viewport_h as f32);
+        }
     }
     css_length_em(v)
 }
@@ -9327,11 +9517,14 @@ fn resolve_cells_f32(value: &str, avail: usize, viewport: (usize, usize)) -> Opt
         ("vh", known_h.then_some(vh)),
         ("vw", Some(vw)),
     ] {
-        if let Some(n) = v
-            .strip_suffix(suffix)
-            .and_then(|n| n.trim().parse::<f32>().ok())
-        {
-            return basis.map(|b| (n / 100.0) * b);
+        // A terminal has no dynamic browser chrome, so a small/large/dynamic-
+        // viewport qualifier (`dvw`/`svh`/`lvmin`, …) equals the classic unit:
+        // strip the base unit, then an optional trailing `d`/`s`/`l`.
+        if let Some(rest) = v.strip_suffix(suffix) {
+            let rest = rest.strip_suffix(['d', 's', 'l']).unwrap_or(rest);
+            if let Ok(n) = rest.trim().parse::<f32>() {
+                return basis.map(|b| (n / 100.0) * b);
+            }
         }
     }
     css_length_em(v).map(|em| em * 2.0)
@@ -9566,6 +9759,171 @@ mod tests {
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
         lay_out(&dom, &base, width, &[], &ControlMap::new(), images, false)
+    }
+
+    #[test]
+    fn font_size_zero_text_renders_nothing_not_one_char_per_line() {
+        // The fosstodon glitch: Mastodon hides a link's URL scheme and tail with
+        // `.invisible{font-size:0}` and shows only the middle. Without honoring
+        // font-size:0 the zero-width invisible text wrapped ONE CHARACTER PER
+        // LINE. font-size:0 text must paint nothing; the visible middle stays.
+        let html = "<style>.invisible{font-size:0}</style>\
+            <p>See: <a href='https://example.com/en/miniFantasyTeater/059.html'>\
+            <span class='invisible'>https://</span>\
+            <span>example.com/en/miniFantas</span>\
+            <span class='invisible'>yTeater/059.html</span></a></p>";
+        let rows = lay(html, 80);
+        let text = all_text(&rows);
+        assert!(
+            text.contains("example.com/en/miniFantas"),
+            "visible middle missing: {text:?}"
+        );
+        assert!(!text.contains("https"), "invisible scheme leaked: {text:?}");
+        assert!(!text.contains("059"), "invisible tail leaked: {text:?}");
+        assert!(!text.contains("Teater"), "invisible tail leaked: {text:?}");
+    }
+
+    #[test]
+    fn absolute_font_size_reset_reshows_text_under_a_zero_parent() {
+        // The inline-block-whitespace-killer idiom: `font-size:0` on a parent to
+        // remove gaps, with an absolute reset on children. font-size:0 hides only
+        // an element's OWN text — an absolutely-reset descendant re-shows.
+        let html = "<style>.z{font-size:0}.r{font-size:1rem}</style>\
+            <div class='z'>GONE<span class='r'>SHOWN</span></div>";
+        let text = all_text(&lay(html, 80));
+        assert!(text.contains("SHOWN"), "reset text hidden: {text:?}");
+        assert!(!text.contains("GONE"), "zero-size text leaked: {text:?}");
+    }
+
+    #[test]
+    fn a_zero_sized_replaced_image_renders_nothing() {
+        // The image half of the `.invisible` idiom: Mastodon collapses images with
+        // `img{width:0;height:0}` (no overflow rule). A zero-sized replaced element
+        // paints nothing — not the 1-cell sliver our box would otherwise clamp to.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/cat.png".to_owned(), (10, 4));
+        let rows = lay_with_images(
+            r#"<body>A<img src="/cat.png" alt="cat" style="width:0;height:0">B</body>"#,
+            40,
+            &images,
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .all(|i| i.image.is_none()),
+            "zero-sized image leaked a box: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn font_size_zero_leaves_a_real_image_visible() {
+        // `font-size:0` hides TEXT, never a replaced element — a browser still
+        // paints an image inside a font-size:0 span. (Mastodon pairs it with an
+        // explicit width:0 to hide the image; absent that, the image shows.)
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/cat.png".to_owned(), (10, 4));
+        let rows = lay_with_images(
+            r#"<body><span style="font-size:0"><img src="/cat.png" alt="cat"></span></body>"#,
+            40,
+            &images,
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .any(|i| i.image.is_some()),
+            "font-size:0 wrongly hid the image: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn viewport_height_units_including_dynamic_resolve_like_vh() {
+        // A terminal has no dynamic browser chrome, so the small/large/dynamic-
+        // viewport keywords all equal `vh` (Mastodon's `height:100dvh`).
+        for u in ["vh", "dvh", "svh", "lvh"] {
+            assert_eq!(
+                css_height_rows_f32(&format!("100{u}"), 40),
+                Some(40.0),
+                "{u}"
+            );
+            assert_eq!(
+                css_height_rows_f32(&format!("50{u}"), 40),
+                Some(20.0),
+                "{u}"
+            );
+        }
+        // Unknown viewport height ⇒ None (unchanged), non-viewport length still ok.
+        assert_eq!(css_height_rows_f32("100dvh", 0), None);
+        assert!(css_height_rows_f32("2em", 40).is_some());
+    }
+
+    #[test]
+    fn a_fixed_rail_is_captured_into_the_pinned_layer_at_its_flex_column() {
+        // Mastodon's pattern: a centered flex row with a `min-width` spacer pane
+        // whose only child is `position:fixed` (all insets auto). The fixed rail
+        // must be captured into the PINNED overlay layer at the pane's reserved
+        // (centered) column — NOT laid into the scrolling document.
+        let html = "<div style='display:flex;justify-content:center'>\
+            <div style='min-width:100px'>\
+              <div style='position:fixed;width:100px'>PINNED_RAIL</div>\
+            </div>\
+            <main style='width:100px'>CENTER_FEED</main>\
+          </div>";
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (rows, _c, _rg, _cl, _b, fixed) = lay_out_with_carousels(
+            &dom,
+            &base,
+            (80, 20),
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
+        let doc_text: String = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .map(|i| i.text.as_str())
+            .collect();
+        // The center feed scrolls in the document; the rail is NOT in it.
+        assert!(
+            doc_text.contains("CENTER_FEED"),
+            "center in doc: {doc_text:?}"
+        );
+        assert!(
+            !doc_text.contains("PINNED_RAIL"),
+            "rail must be pinned, not in the scrolling doc: {doc_text:?}"
+        );
+        // The pinned layer holds exactly the rail, at a non-zero column (the
+        // centered flex column — proving the static-position translation).
+        assert_eq!(fixed.len(), 1, "one fixed rail captured");
+        let rail_text: String = fixed[0]
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .map(|i| i.text.as_str())
+            .collect();
+        assert!(
+            rail_text.contains("PINNED_RAIL"),
+            "rail text: {rail_text:?}"
+        );
+        assert!(
+            fixed[0].col > 5,
+            "rail pinned at its centered column, not 0: col={}",
+            fixed[0].col
+        );
+    }
+
+    #[test]
+    fn viewport_width_units_including_dynamic_resolve_in_cells() {
+        let vp = (100usize, 40usize);
+        for u in ["vw", "dvw", "svw", "lvw"] {
+            assert_eq!(resolve_cells(&format!("100{u}"), 0, vp), Some(100), "{u}");
+        }
+        for u in ["vh", "dvh", "svh", "lvh"] {
+            assert_eq!(resolve_cells(&format!("100{u}"), 0, vp), Some(40), "{u}");
+        }
+        assert_eq!(resolve_cells("100dvmin", 0, vp), Some(40)); // min(100,40)
+        assert_eq!(resolve_cells("100lvmax", 0, vp), Some(100)); // max(100,40)
     }
 
     fn measure(html: &str, width: usize) -> (Dom, HashMap<NodeId, PxRect>) {
@@ -11877,7 +12235,7 @@ mod tests {
 
         // A flex COLUMN: each item stacks on its own rows → owns them.
         let col = r#"<html><body><div style="display:flex;flex-direction:column"><div data-trust-node="5"><div>aaa</div><div>aaa</div></div><div data-trust-node="6"><div>bbb</div></div></div></body></html>"#;
-        let (_r, _c, _rg, _cl, b1) = lay_out_with_carousels(
+        let (_r, _c, _rg, _cl, b1, _f1) = lay_out_with_carousels(
             &Dom::parse_document(col),
             &base,
             (40, 0),
@@ -11895,7 +12253,7 @@ mod tests {
 
         // A flex ROW: the two items sit side by side, sharing a row.
         let row = r#"<html><body><div style="display:flex"><div data-trust-node="5">AAA</div><div data-trust-node="6">BBB</div></div></body></html>"#;
-        let (_r2, _c2, _rg2, _cl2, b2) = lay_out_with_carousels(
+        let (_r2, _c2, _rg2, _cl2, b2, _f2) = lay_out_with_carousels(
             &Dom::parse_document(row),
             &base,
             (40, 0),
@@ -11920,7 +12278,7 @@ mod tests {
         let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
         let html = r#"<html><body><p>header</p><div data-trust-node="42" style="display:flow-root"><div>l0</div><div>l1</div><div>l2</div></div><p>footer</p><div data-trust-node="9" style="display:block">plain</div></body></html>"#;
         let dom = Dom::parse_document(html);
-        let (rows, _car, _rgn, _clip, boundaries) =
+        let (rows, _car, _rgn, _clip, boundaries, _fixed) =
             lay_out_with_carousels(&dom, &base, (40, 0), &[], &ctrls, &imgs, false);
         let b = boundaries
             .iter()
@@ -11959,7 +12317,7 @@ mod tests {
         let html = r#"<html><body style="font-weight:bold;text-transform:uppercase"><p>head</p><div data-trust-node="7" style="display:flow-root"><div>msg0</div><div>msg1</div></div></body></html>"#;
         let dom = Dom::parse_document(html);
         let vp = (40usize, 0usize);
-        let (rows, _car, _rgn, _clip, boundaries) =
+        let (rows, _car, _rgn, _clip, boundaries, _fixed) =
             lay_out_with_carousels(&dom, &base, vp, &[], &ctrls, &imgs, false);
         let b = boundaries.iter().find(|b| b.node == 7).unwrap();
         let frag = {

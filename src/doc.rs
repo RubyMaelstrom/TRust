@@ -277,6 +277,12 @@ pub struct Doc {
     /// Horizontally-scrollable strips (carousels) in `rows`, with their
     /// scroll offset. Empty except for HTML pages that have one.
     pub carousels: Vec<crate::layout::Carousel>,
+    /// `position:fixed` boxes captured into the PINNED overlay layer, in
+    /// viewport coordinates. The renderer draws these on top of the scrolling
+    /// `rows` window at a fixed screen position (the document scrolls beneath
+    /// them). Empty except for HTML pages with a pinned fixed box (a sidebar/
+    /// header rail — Mastodon). See `crate::layout::FixedItem`.
+    pub fixed: Vec<crate::layout::FixedItem>,
     /// Vertical inner-scroll viewports (`overflow-y:auto|scroll` regions) in
     /// `rows`. Each reserves blank rows in `rows` and holds its content in its
     /// own buffer (the view windows it). Empty except for HTML pages with one.
@@ -299,6 +305,38 @@ pub struct Doc {
 }
 
 impl Doc {
+    /// A line-model document (gopher / gemini / oneshot / plain text): only
+    /// `lines` is populated; the 2D-layout artifacts (`rows`, `image_urls`,
+    /// `carousels`, `fixed`, `regions`, `scroll_clips`, `boundaries`) and
+    /// `forms` all start empty. Protocol parsers build through this so a new
+    /// HTTP/layout field defaults HERE, never in them — those parsers are meant
+    /// to stay simple and never change for an HTTP-only feature.
+    pub fn from_lines(
+        url: Link,
+        lines: Vec<DocLine>,
+        raw: Vec<u8>,
+        wrapped_to: usize,
+        cp437: bool,
+        meta: Option<String>,
+    ) -> Doc {
+        Doc {
+            url,
+            lines,
+            raw,
+            wrapped_to,
+            cp437,
+            meta,
+            forms: Vec::new(),
+            rows: Vec::new(),
+            image_urls: Vec::new(),
+            carousels: Vec::new(),
+            fixed: Vec::new(),
+            regions: Vec::new(),
+            scroll_clips: Vec::new(),
+            boundaries: Vec::new(),
+        }
+    }
+
     /// Whether this document uses the HTTP 2D layout (rows of items)
     /// rather than the gopher/gemini line model.
     pub fn laid_out(&self) -> bool {

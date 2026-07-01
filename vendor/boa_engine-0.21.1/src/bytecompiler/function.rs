@@ -25,6 +25,9 @@ pub(crate) struct FunctionCompiler {
     method: bool,
     in_with: bool,
     force_function_scope: bool,
+    /// TRust lazy parsing: whether this function is compiled as Module code, so a
+    /// deferred body re-parses in the Module goal (permits `import.meta`).
+    in_module: bool,
     name_scope: Option<Scope>,
     spanned_source_text: SpannedSourceText,
     source_path: SourcePath,
@@ -42,6 +45,7 @@ impl FunctionCompiler {
             method: false,
             in_with: false,
             force_function_scope: false,
+            in_module: false,
             name_scope: None,
             spanned_source_text,
             source_path: SourcePath::None,
@@ -100,6 +104,13 @@ impl FunctionCompiler {
         self
     }
 
+    /// Indicate if the function is compiled as Module code (TRust lazy parsing:
+    /// a deferred body re-parses in the Module goal, permitting `import.meta`).
+    pub(crate) const fn in_module(mut self, in_module: bool) -> Self {
+        self.in_module = in_module;
+        self
+    }
+
     /// Indicate if the function is in a `with` statement.
     pub(crate) const fn force_function_scope(mut self, force_function_scope: bool) -> Self {
         self.force_function_scope = force_function_scope;
@@ -151,6 +162,9 @@ impl FunctionCompiler {
             self.source_path,
         );
 
+        // TRust lazy parsing: the child inherits the Module goal, so functions
+        // deferred within this body also re-parse as Module code.
+        compiler.in_module = self.in_module;
         compiler.length = length;
         compiler.code_block_flags.set(
             CodeBlockFlags::HAS_PROTOTYPE_PROPERTY,
@@ -364,6 +378,8 @@ impl FunctionCompiler {
             // Store the ORIGINAL strictness; delazify re-derives `|| body.strict()`
             // exactly as `compile` does, so the recompile is identical.
             strict: self.strict,
+            // Store the goal symbol so the first-call re-parse matches it.
+            module: self.in_module,
             spanned_source_text: self.spanned_source_text,
             source_path: self.source_path,
             variable_environment,
@@ -422,6 +438,14 @@ pub(crate) struct LazyFunctionData {
     /// re-analysis use it, and `compile` re-derives the effective strictness from
     /// the body exactly as the eager path does.
     strict: bool,
+    /// Whether the function was compiled as Module code. The first-call re-parse
+    /// must use the same goal symbol as the original parse: Module code permits
+    /// `import.meta` (which a deferred Vite dynamic-import helper references),
+    /// while Script code does not. Without it such a body re-parses in the Script
+    /// goal and is rejected as "invalid `import.meta` expression outside a
+    /// module", surfacing as the throwing fallback ("deferred function body
+    /// failed to parse").
+    module: bool,
     /// The function's source span — re-parsed on first call to recover the body
     /// AST without having retained it.
     spanned_source_text: SpannedSourceText,
@@ -480,6 +504,12 @@ impl LazyFunctionData {
         if self.strict {
             parser.set_strict();
         }
+        // The re-parse must use the SAME goal symbol as the original parse: a
+        // body deferred from Module code may reference `import.meta`, which the
+        // default Script goal rejects (Vite's dynamic-import helper does this).
+        if self.module {
+            parser.set_module();
+        }
         parser.set_identifier(parser_identifier);
         let (mut function, reparsed_source) = parser.parse_function_expression(interner).ok()?;
 
@@ -505,6 +535,9 @@ impl LazyFunctionData {
             method: false,
             in_with: false,
             force_function_scope: false,
+            // Nested functions deferred within this delazified body inherit the
+            // Module goal, so they too re-parse permitting `import.meta`.
+            in_module: self.module,
             name_scope: function.name_scope().cloned(),
             spanned_source_text,
             source_path: self.source_path.clone(),
@@ -552,6 +585,8 @@ impl LazyFunctionData {
             method: false,
             in_with: false,
             force_function_scope: false,
+            // The synthetic fallback body holds no nested functions; goal is moot.
+            in_module: self.module,
             name_scope: function.name_scope().cloned(),
             spanned_source_text,
             source_path: self.source_path.clone(),

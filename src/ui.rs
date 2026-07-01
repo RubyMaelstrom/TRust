@@ -105,6 +105,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             if g.doc.laid_out() {
                 render_inline_images(frame, g, inner, &app.image_protocols);
             }
+            // Third pass: the PINNED fixed layer (sidebar/header rails captured
+            // from `position:fixed`) draws over the scrolling document at a fixed
+            // screen position, so it stays put while the center scrolls.
+            if !g.doc.fixed.is_empty() {
+                render_fixed_layer(frame, g, inner);
+            }
             // Scroll-position indicator on the right border, when the document
             // overflows the panel.
             render_browser_scrollbar(frame, g, session_area, inner);
@@ -330,6 +336,29 @@ fn browser_lines<'a>(g: &'a BrowserView, height: usize, find: Option<&FindState>
 
 use crate::layout::visible_col;
 
+/// The base cyberpunk colour for an item's `kind` (before emphasis, selection,
+/// carousel-disabled, and find highlighting are layered on). Shared by the
+/// scrolling document rows and the pinned fixed layer.
+fn item_kind_style(kind: crate::layout::ItemKind) -> Style {
+    use crate::layout::ItemKind;
+    match kind {
+        ItemKind::Link => Style::new().fg(theme::NEON_CYAN),
+        ItemKind::Heading(1) => Style::new()
+            .fg(theme::NEON_PINK)
+            .add_modifier(Modifier::BOLD),
+        ItemKind::Heading(2) => Style::new()
+            .fg(theme::NEON_CYAN)
+            .add_modifier(Modifier::BOLD),
+        ItemKind::Heading(_) => Style::new().fg(theme::NEON_CYAN),
+        ItemKind::Quote => Style::new().fg(theme::DIM),
+        ItemKind::Pre => Style::new().fg(theme::NEON_GREEN),
+        ItemKind::Form => Style::new().fg(theme::PASTEL_GREEN),
+        ItemKind::Image => Style::new().fg(theme::DIM).add_modifier(Modifier::ITALIC),
+        ItemKind::Border => Style::new().fg(theme::DIM),
+        ItemKind::Text => Style::new().fg(theme::TEXT),
+    }
+}
+
 /// Render an HTTP laid-out doc: each visible row is a sequence of
 /// positioned item spans, padded to each item's start column. The
 /// selected `(row, item)` is highlighted.
@@ -338,7 +367,7 @@ pub(crate) fn browser_rows<'a>(
     height: usize,
     find: Option<&FindState>,
 ) -> Vec<Line<'a>> {
-    use crate::layout::{ItemKind, NO_NODE};
+    use crate::layout::NO_NODE;
     // The selected link's source node: every item sharing it (a link that
     // wrapped across rows) highlights as one unit. Read through `effective_row`
     // so a selection on scroll-region content resolves to its buffer item.
@@ -368,22 +397,7 @@ pub(crate) fn browser_rows<'a>(
                 if scol > col {
                     spans.push(Span::raw(" ".repeat((scol - col) as usize)));
                 }
-                let mut style = match item.kind {
-                    ItemKind::Link => Style::new().fg(theme::NEON_CYAN),
-                    ItemKind::Heading(1) => Style::new()
-                        .fg(theme::NEON_PINK)
-                        .add_modifier(Modifier::BOLD),
-                    ItemKind::Heading(2) => Style::new()
-                        .fg(theme::NEON_CYAN)
-                        .add_modifier(Modifier::BOLD),
-                    ItemKind::Heading(_) => Style::new().fg(theme::NEON_CYAN),
-                    ItemKind::Quote => Style::new().fg(theme::DIM),
-                    ItemKind::Pre => Style::new().fg(theme::NEON_GREEN),
-                    ItemKind::Form => Style::new().fg(theme::PASTEL_GREEN),
-                    ItemKind::Image => Style::new().fg(theme::DIM).add_modifier(Modifier::ITALIC),
-                    ItemKind::Border => Style::new().fg(theme::DIM),
-                    ItemKind::Text => Style::new().fg(theme::TEXT),
-                };
+                let mut style = item_kind_style(item.kind);
                 // A generated carousel scroll control greys out when it can't
                 // page that way (the spec's `:disabled` end state).
                 if let Some(crate::doc::Link::CarouselScroll(dir)) = &item.link {
@@ -446,6 +460,76 @@ pub(crate) fn browser_rows<'a>(
             Line::from(spans)
         })
         .collect()
+}
+
+/// Draw the PINNED fixed layer over the scrolling document: each captured
+/// `position:fixed` box (a sidebar/header rail) paints at a FIXED screen
+/// position — NOT offset by scroll — so the document scrolls beneath it. Rows
+/// are placed at their box-relative columns; the box is clipped to the panel.
+/// (Text only for now — images inside a fixed rail are a follow-up.)
+fn render_fixed_layer(frame: &mut Frame, g: &BrowserView, inner: Rect) {
+    for (fi, item) in g.doc.fixed.iter().enumerate() {
+        let sx = inner.x.saturating_add(item.col);
+        if sx >= inner.right() {
+            continue;
+        }
+        let w = inner.right() - sx;
+        for (r, row) in item.rows.iter().enumerate() {
+            let sy = inner.y as usize + item.row as usize + r;
+            if sy >= inner.bottom() as usize {
+                break; // rows past the panel bottom are clipped
+            }
+            // The hovered/selected fixed item (this fixed box + row) highlights.
+            let sel = match g.sel_fixed {
+                Some((sfi, sr, si)) if sfi == fi && sr == r => Some(si),
+                _ => None,
+            };
+            frame.render_widget(
+                Paragraph::new(fixed_row_line(row, sel)),
+                Rect::new(sx, sy as u16, w, 1),
+            );
+        }
+    }
+}
+
+/// A pinned fixed-layer row as a styled `Line`: items placed at their
+/// box-relative columns (gap-filled), coloured by kind + emphasis. `sel` is the
+/// hovered/selected item's index in `row.items` (highlighted reversed+bold).
+fn fixed_row_line(row: &crate::layout::Row, sel: Option<usize>) -> Line<'static> {
+    // Keep the original index (the hit-test / `sel` addresses `row.items[i]`)
+    // while placing left-to-right by column.
+    let mut items: Vec<(usize, &crate::layout::Item)> = row.items.iter().enumerate().collect();
+    items.sort_by_key(|(_, it)| it.col);
+    let mut spans: Vec<Span> = Vec::new();
+    let mut col = 0u16;
+    for (idx, it) in items {
+        if it.col > col {
+            spans.push(Span::raw(" ".repeat((it.col - col) as usize)));
+        }
+        let mut style = item_kind_style(it.kind);
+        if it.emph.bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if it.emph.italic {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        if it.emph.underline {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        if it.emph.strike {
+            style = style.add_modifier(Modifier::CROSSED_OUT);
+        }
+        if sel == Some(idx) {
+            style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+        }
+        spans.push(Span::styled(it.text.clone(), style));
+        let text_w = crate::layout::display_width(&it.text) as u16;
+        if it.width > text_w {
+            spans.push(Span::raw(" ".repeat((it.width - text_w) as usize)));
+        }
+        col = it.col + it.width;
+    }
+    Line::from(spans)
 }
 
 /// Overlay encoded inline images onto their reserved boxes within the
