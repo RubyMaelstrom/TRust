@@ -194,6 +194,16 @@ pub struct Item {
     /// aspect different from the image's intrinsic one. Always `false` for
     /// non-image items.
     pub crop: bool,
+    /// Paint suppression (`opacity:0` — CSS Color/Compositing): the item is
+    /// fully laid out (its `col`/`width`/`height` reserve its real box, so
+    /// `measure_boxes`/`getBoundingClientRect` are unaffected) but the renderer
+    /// writes BLANK cells for it (spaces for text, no pixels for an image) —
+    /// exactly like a browser painting the element transparent. Set from the
+    /// inline formatting context (`Ctx.invisible`), so a whole `opacity:0`
+    /// subtree paints blank while still occupying space. This is what makes
+    /// React virtualized-list placeholders (`opacity:0` + cached height) report
+    /// their real height instead of collapsing.
+    pub invisible: bool,
 }
 
 /// Inline text emphasis, set by tags (`<b>`/`<i>`/`<u>`/`<s>`) and by CSS
@@ -1048,6 +1058,7 @@ pub fn measure_boxes(
     layout.tag_all_nodes = true;
     layout.flow_all();
     let declared = std::mem::take(&mut layout.declared_boxes);
+    let clip_heights = std::mem::take(&mut layout.clip_heights);
     // `finish` returns `element_tops` already remapped through its blank-row
     // collapse (and accumulated from every sub-layout via `blit`), so an
     // empty element's recorded row matches the kept-row grid the cells use.
@@ -1142,6 +1153,17 @@ pub fn measure_boxes(
             let fh = u16::try_from(fh).unwrap_or(u16::MAX);
             a.x1 = a.x1.max(a.x0.saturating_add(fw));
             a.y1 = a.y1.max(a.y0.saturating_add(fh));
+        }
+        // The counterpart to the floor: `overflow:hidden|clip` + a definite
+        // `height` CLIPS the content, so the box is EXACTLY that height. Applied
+        // AFTER the floor (so a shorter content is raised to it and a taller one
+        // is capped to it → exactly the declared height) and BEFORE the parent
+        // unions it (so the parent sees the clipped extent, not the unclipped
+        // content). This is what makes a React virtualized-list placeholder
+        // (`height:320px;overflow:hidden;opacity:0`) report 320px.
+        if let (Some(a), Some(&clip_h)) = (acc.as_mut(), clip_heights.get(&id)) {
+            let clip_h = u16::try_from(clip_h).unwrap_or(u16::MAX);
+            a.y1 = a.y0.saturating_add(clip_h);
         }
         if let Some(acc) = acc {
             cells.insert(id, acc);
@@ -1663,6 +1685,25 @@ struct Ctx {
     /// idiom — Mastodon's `.invisible` URL scheme/tail). Inherits down the
     /// formatting context; an absolute font-size reset re-shows a descendant.
     font_zero: bool,
+    /// Paint suppression for TEXT/emission in this formatting context: items are
+    /// laid out normally but tagged `invisible` so the renderer writes blank
+    /// cells (see `Item.invisible`). Unlike `font_zero`, the box is RESERVED,
+    /// not collapsed. This is the element's FULL suppression — the sticky opacity
+    /// chain (`opacity_hidden`) OR its own `visibility:hidden` — so a text child,
+    /// which inherits its parent's visibility, paints blank correctly. The
+    /// authority for the CURRENT layer's emission is the `Layout.invisible` field
+    /// (set from this on entering each element); `Ctx.invisible` carries it
+    /// across sub-layout boundaries (where a fresh `Layout` re-derives it).
+    invisible: bool,
+    /// The STICKY `opacity:0` (`paint_suppressed`) chain ONLY — accumulated down
+    /// the tree because opacity applies to a subtree as a group (a descendant
+    /// cannot re-reveal it). Kept SEPARATE from `invisible` because `visibility`
+    /// is re-clearable: an element child derives its own suppression from THIS
+    /// (opacity, sticky) plus its own computed `visibility` — never from the
+    /// parent's `visibility`, which would wrongly stick. (`invisible` folds in
+    /// the current element's visibility for its text; element children ignore
+    /// that part and re-read `visibility` via the cascade.)
+    opacity_hidden: bool,
     node: NodeId,
     link: Option<Link>,
 }
@@ -1675,6 +1716,8 @@ impl Ctx {
             transform: TextTransform::None,
             letter_spacing: 0,
             font_zero: false,
+            invisible: false,
+            opacity_hidden: false,
             node: NO_NODE,
             link: None,
         }
@@ -1988,6 +2031,24 @@ struct Layout<'a> {
     /// flow box, so the box wraps to its content. Propagated to sub-layouts (the
     /// image can be nested). See `image_used_box` and `place_positioned_children`.
     shrink_wrap: bool,
+    /// Paint suppression for the item currently being emitted: `true` while the
+    /// flow is inside an `opacity:0` (`paint_suppressed`) element. Every emitted
+    /// `Item` copies this into `Item.invisible` so the renderer writes blank
+    /// cells while the box still reserves its space/geometry. It's the CURRENT
+    /// layer's authority (set from `ctx.invisible || paint_suppressed(id)` at
+    /// each element and refreshed before the block-tail emitters, since the
+    /// child recursion overwrites it); `Ctx.invisible` carries it across
+    /// sub-layout boundaries, where a fresh `Layout` re-derives its own value.
+    invisible: bool,
+    /// Measurement pass only (`measure_boxes`): the definite CONTENT height (in
+    /// rows) of each block that clips its vertical overflow (`overflow`/
+    /// `overflow-y` ∈ {hidden, clip} + a definite `height`). `measure_boxes`
+    /// CAPS the block's measured box to exactly this — the counterpart to the
+    /// `declared_boxes` floor — so a `height:N;overflow:hidden` placeholder
+    /// reports exactly N (its cached height), not the taller unclipped content
+    /// (React virtualized lists cache the measured height then clip). Populated
+    /// under `tag_all_nodes`; the render path never touches it.
+    clip_heights: HashMap<NodeId, usize>,
 }
 
 impl<'a> Layout<'a> {
@@ -2045,6 +2106,8 @@ impl<'a> Layout<'a> {
             region_child_cache: None,
             media_emitted: std::collections::HashSet::new(),
             shrink_wrap: false,
+            invisible: false,
+            clip_heights: HashMap::new(),
         }
     }
 
@@ -2055,6 +2118,25 @@ impl<'a> Layout<'a> {
             v.split_whitespace()
                 .any(|t| matches!(t, "hidden" | "clip" | "auto" | "scroll"))
         })
+    }
+
+    /// Whether an element clips its VERTICAL overflow with `hidden`/`clip`
+    /// (NOT `auto`/`scroll` — those establish a scroll region, sized elsewhere).
+    /// A definite `height` + this ⇒ the box is exactly that height, so
+    /// `measure_boxes` caps the measured geometry to it (a React virtualized-list
+    /// placeholder's `height:N;overflow:hidden`). Every space-separated token
+    /// must be a clip keyword, so `overflow:hidden` / `hidden clip` count but
+    /// `auto hidden` (a scroll axis) does not — mirrors `is_hidden`'s zero-axis
+    /// clip test.
+    fn clips_overflow_y(&self, id: NodeId) -> bool {
+        let clips_all = |v: Option<String>| {
+            v.as_deref().is_some_and(|s| {
+                let mut toks = s.split_whitespace().peekable();
+                toks.peek().is_some() && toks.all(|t| matches!(t, "hidden" | "clip"))
+            })
+        };
+        clips_all(self.dom.computed_style(id, "overflow-y"))
+            || clips_all(self.dom.computed_style(id, "overflow"))
     }
 
     /// Whether an element clips/scrolls its horizontal (flex main) axis —
@@ -2174,6 +2256,26 @@ impl<'a> Layout<'a> {
         if self.is_out_of_flow(id) && self.subtree_root != Some(id) {
             return;
         }
+        // Paint suppression rides the formatting context (like `font_zero`): a
+        // suppressed element and its subtree are laid out normally but painted
+        // BLANK. Two CSS mechanisms, combined here:
+        //   - `opacity:0` (Phase 1) — STICKY: opacity applies to the subtree as a
+        //     group, so a descendant can't re-reveal it. Accumulated in the
+        //     `opacity_hidden` chain.
+        //   - `visibility:hidden` (Phase 2) — INHERITED but RE-CLEARABLE: a
+        //     `visibility:visible` descendant of a hidden ancestor IS painted.
+        //     The cascade (`computed_value`, via `visibility_hidden`) resolves
+        //     the inheritance/override PER ELEMENT, so it's read fresh here and
+        //     never propagated as sticky.
+        // Set here (before every emission path — media/float/`<img>`/form
+        // controls/`<hr>`, and the block dispatch below) and copied onto `cctx`
+        // so it flows to children and across sub-layout boundaries. NOT
+        // save/restored across the whole function: the block-tail emitters
+        // refresh it from `cctx` (the child recursion overwrites `self.invisible`),
+        // and after this element returns the caller re-sets it before its own
+        // next emission — so a stale value is never read.
+        let opacity_hidden = ctx.opacity_hidden || self.dom.paint_suppressed(id);
+        self.invisible = opacity_hidden || self.dom.visibility_hidden(id);
         // Capture this element's pinned `position:fixed` children into the
         // overlay layer at the parent's content origin (their STATIC position —
         // the reserved flex column for Mastodon's side rails); `blit` carries
@@ -2386,6 +2488,13 @@ impl<'a> Layout<'a> {
         // the element wins; otherwise inherit the parent's answer (relative
         // sizes scale zero to zero, an absolute reset re-shows a descendant).
         cctx.font_zero = self.dom.font_size_zero(id).unwrap_or(ctx.font_zero);
+        // Paint suppression flows to children/sub-layouts through the context:
+        // `invisible` (the element's FULL state) is what a text child inherits;
+        // `opacity_hidden` (the sticky opacity chain) is what an element child
+        // accumulates — it re-derives its own `visibility` from the cascade, so
+        // the parent's visibility must NOT ride along as sticky.
+        cctx.invisible = self.invisible;
+        cctx.opacity_hidden = opacity_hidden;
 
         // Block vs inline is driven by the cascaded `display` (baked into
         // the serialized HTML by the engine, which has the sheets), with
@@ -2438,6 +2547,22 @@ impl<'a> Layout<'a> {
             if floor_w.is_some() || floor_h.is_some() {
                 self.declared_boxes
                     .insert(id, (floor_w.unwrap_or(0), floor_h.unwrap_or(0)));
+            }
+            // The COUNTERPART cap: a definite `height` with `overflow`/
+            // `overflow-y` ∈ {hidden, clip} clips its content vertically, so the
+            // box is EXACTLY that height even when its (unclipped) content is
+            // taller. Record it so `measure_boxes` caps the measured box — a
+            // React virtualized-list placeholder (`height:320px;overflow:hidden;
+            // opacity:0` holding a full clipped article) then reports 320px, its
+            // cached height, not the article's real extent. Only a DEFINITE
+            // `height` clips to a known box; `min-height`/`auto` don't cap.
+            if self.clips_overflow_y(id)
+                && let Some(h) = self
+                    .dom
+                    .computed_style(id, "height")
+                    .and_then(|v| css_length_rows(&v))
+            {
+                self.clip_heights.insert(id, h);
             }
         }
         // A `display:table` element establishes a table formatting context: its
@@ -2765,6 +2890,12 @@ impl<'a> Layout<'a> {
             // (`flow_of` → `Flow::None`) and placed by their containing block in
             // the block-tail `place_positioned_children` below.
         }
+        // The child recursion above overwrote `self.invisible` with the last
+        // child's value; restore this element's own so the block-tail emitters
+        // (`::after`, the form-submit stub, the list marker) tag their items
+        // with THIS element's paint-suppression. `place_positioned_children`
+        // re-derives it per placed box, so it needs no refresh.
+        self.invisible = cctx.invisible;
 
         // ...and `::after` closes it.
         if let Some(t) = self.pseudo_text(id, crate::dom::PseudoEl::After) {
@@ -3466,6 +3597,15 @@ impl<'a> Layout<'a> {
     fn is_modal_overlay(&self, id: NodeId) -> bool {
         self.is_out_of_flow(id)
             && !self.dom.is_hidden(id)
+            // A PAINT-SUPPRESSED (`opacity:0`/`visibility:hidden`) overlay paints
+            // blank, so the page behind it shows through — it is NOT covering
+            // anything. Surfacing it would defer the whole page behind a blank
+            // screen (a fade-in dialog/lightbox that hasn't animated in yet, or a
+            // `visibility:hidden` menu until a class toggles). Since neither is
+            // folded into `is_hidden` anymore (both keep their box), these guards
+            // are what stop that.
+            && !self.dom.paint_suppressed(id)
+            && !self.dom.visibility_hidden(id)
             && (self.covers_viewport(id) || self.is_semantic_dialog(id))
             && self.overlay_has_content(id)
     }
@@ -4633,6 +4773,22 @@ impl<'a> Layout<'a> {
                 matches!(self.dom.node(d).data, NodeData::Element { .. })
                     && self.is_out_of_flow(d)
                     && !self.dom.is_hidden(d)
+                    // A PAINT-SUPPRESSED (`opacity:0`/`visibility:hidden`)
+                    // out-of-flow box paints BLANK, and being out of flow it can
+                    // never reserve in-flow space — so in the RENDER it must not
+                    // be placed at all: our deliberate "grow the containing block
+                    // to contain its positioned children" deviation (so overlays
+                    // aren't clipped) would otherwise STACK invisible boxes and
+                    // push the visible content down. Steam's featured carousels
+                    // pre-render ~13 hidden `.next` pages (`position:absolute`,
+                    // opacity:0) of game tiles; placing them buried the real grid
+                    // ~7 viewports down behind blank rows. (An IN-FLOW suppressed
+                    // box still reserves space + paints blank — Mastodon's
+                    // virtualized placeholders — that path never reaches here.)
+                    // The MEASUREMENT pass (`tag_all_nodes`) still places them so
+                    // `getBoundingClientRect` stays honest; only the render skips.
+                    && (self.tag_all_nodes
+                        || !(self.dom.paint_suppressed(d) || self.dom.visibility_hidden(d)))
                     && !self.is_clipped_offscreen(d)
                     // A pinned `position:fixed` box is captured into the overlay
                     // layer at its static position (`capture_fixed_children`),
@@ -4770,10 +4926,21 @@ impl<'a> Layout<'a> {
                 let frac = |area: i64| area > 0 && overlap * 5 >= area * 3; // ≥60%
                 frac(area_a) && frac(area_b)
             };
+            // A PAINT-SUPPRESSED box (`opacity:0` or `visibility:hidden`) can't
+            // occlude anything — it writes only blank cells (`Item.invisible`),
+            // so the box beneath still shows through. This is the slideshow
+            // guard: a deck of stacked suppressed slides with one visible active
+            // slide would otherwise collapse to the topmost (a blank inactive
+            // slide) by painting order. Excluding suppressed occluders leaves the
+            // active slide visible while the inactive ones still lay out + paint
+            // blank — the same outcome the old `is_hidden` shortcut produced, via
+            // the correct paint-suppression model.
             let occluded: Vec<bool> = (0..placed.len())
                 .map(|i| {
                     (0..placed.len()).any(|j| {
                         j != i
+                            && !self.dom.paint_suppressed(placed[j].node)
+                            && !self.dom.visibility_hidden(placed[j].node)
                             && on_top(&placed[j], &placed[i], j, i)
                             && mostly_covers(&placed[i], &placed[j])
                     })
@@ -5056,6 +5223,8 @@ impl<'a> Layout<'a> {
                 emph: Emphasis::default(),
                 node: NO_NODE,
                 link: Some(Link::CarouselScroll(dir)),
+                // Generated scroll control — always painted.
+                invisible: false,
             });
         }
         self.rows[row].items.sort_by_key(|it| it.col);
@@ -6868,6 +7037,8 @@ impl<'a> Layout<'a> {
             emph: Emphasis::default(),
             node: NO_NODE,
             link: None,
+            // Structural box-drawing chrome (borders default-off); painted.
+            invisible: false,
         };
         if tp {
             let s = edge_string(
@@ -7180,6 +7351,11 @@ impl<'a> Layout<'a> {
 
     /// Flow a run of inline text under the active `white-space` mode.
     fn place_text(&mut self, text: &str, ctx: &Ctx) {
+        // Paint suppression rides the context: this text's items are tagged
+        // `invisible` (painted blank, space reserved) when it flows under an
+        // `opacity:0` subtree. Set from the context so pseudo/child/alt text all
+        // pick up the right value at their own call site.
+        self.invisible = ctx.invisible;
         if text.is_empty() || ctx.font_zero {
             // `font-size:0` renders zero-width glyphs — the text is present in
             // the DOM (copyable) but paints nothing, and its whitespace
@@ -7450,11 +7626,19 @@ impl<'a> Layout<'a> {
             None => return, // poster-less audio with no source — nothing to show
         };
         let Some(play_url) = play_url else { return };
+        // Paint suppression: a media representation inside an `opacity:0`/
+        // `visibility:hidden` subtree reserves its box but paints blank.
+        // `self.invisible` was set by `flow_element` for the wrapper before this
+        // dispatch; OR-in the media element's own opacity + computed visibility,
+        // then carry it onto `mctx` (the caption flows through `place_text`) and
+        // onto the poster item below.
+        self.invisible |= self.dom.paint_suppressed(id) || self.dom.visibility_hidden(id);
         // The representation links to the media; following it launches mpv.
         let mut mctx = ctx.clone();
         mctx.link = Some(Link::Media(play_url));
         mctx.kind = ItemKind::Link;
         mctx.node = id;
+        mctx.invisible = self.invisible;
 
         self.flush_block();
         self.begin_line();
@@ -7498,6 +7682,7 @@ impl<'a> Layout<'a> {
                 emph: Emphasis::default(),
                 node: id,
                 link: mctx.link.clone(),
+                invisible: self.invisible,
             });
             self.col += w as usize;
             self.line_height = self.line_height.max(h);
@@ -7575,6 +7760,13 @@ impl<'a> Layout<'a> {
     }
 
     fn place_image(&mut self, id: NodeId, ctx: &Ctx) {
+        // Paint suppression: an image in an `opacity:0`/`visibility:hidden`
+        // subtree reserves its box (so geometry is unaffected) but the renderer
+        // skips its pixels. The image's full state = the inherited sticky opacity
+        // chain, its own opacity, and its own computed visibility (which inherits
+        // the ancestor's `visibility:hidden` but is re-clearable).
+        self.invisible =
+            ctx.opacity_hidden || self.dom.paint_suppressed(id) || self.dom.visibility_hidden(id);
         // A decoded image (size known) lays out as a real W×H box; an
         // undecoded or failed one falls back to its alt text.
         if let Some(url) = self.image_src(id)
@@ -7639,6 +7831,8 @@ impl<'a> Layout<'a> {
             transform: ctx.transform,
             letter_spacing: ctx.letter_spacing,
             font_zero: ctx.font_zero,
+            invisible: self.invisible,
+            opacity_hidden: ctx.opacity_hidden,
             node: id,
             link: ctx.link.clone(),
         };
@@ -7660,15 +7854,41 @@ impl<'a> Layout<'a> {
     }
 
     fn collect_rendered_text(&self, id: NodeId, out: &mut String) {
+        self.collect_rendered_text_inner(id, false, out);
+    }
+
+    /// `opacity_hidden` is the STICKY `opacity:0` chain (an ancestor suppressed
+    /// it → the subtree stays suppressed). `visibility` is checked PER ELEMENT
+    /// (it inherits but is re-clearable), so a `visibility:visible` descendant of
+    /// a hidden ancestor DOES contribute to the visible label — matching how the
+    /// flow paints it. A paint-suppressed run isn't part of a button's
+    /// visible/accessible name (an `opacity:0`/`visibility:hidden` helper span
+    /// must not leak into it).
+    fn collect_rendered_text_inner(&self, id: NodeId, opacity_hidden: bool, out: &mut String) {
         match &self.dom.node(id).data {
+            // Only reachable when `rendered_text` is called directly on a text
+            // node (entry `opacity_hidden` is always false); a text CHILD of an
+            // element is gated inline in the element arm below.
             NodeData::Text(t) => out.push_str(t),
             NodeData::Element { .. } => {
                 let tag = self.dom.tag_name(id).unwrap_or("");
                 if SKIP.contains(&tag) || self.dom.is_hidden(id) {
                     return;
                 }
+                let oh = opacity_hidden || self.dom.paint_suppressed(id);
+                // This element's OWN paint state gates its DIRECT text; element
+                // children re-derive their own visibility from the cascade (so a
+                // visible child of a `visibility:hidden` element still counts).
+                let hidden = oh || self.dom.visibility_hidden(id);
                 for c in self.dom.children(id) {
-                    self.collect_rendered_text(c, out);
+                    match &self.dom.node(c).data {
+                        NodeData::Text(t) => {
+                            if !hidden {
+                                out.push_str(t);
+                            }
+                        }
+                        _ => self.collect_rendered_text_inner(c, oh, out),
+                    }
                 }
             }
             _ => {}
@@ -7837,6 +8057,7 @@ impl<'a> Layout<'a> {
             node: id,
             // A linked image follows its anchor on Enter/click.
             link: ctx.link.clone(),
+            invisible: self.invisible,
         });
         self.col += w as usize;
         self.line_height = self.line_height.max(h);
@@ -8768,6 +8989,9 @@ impl<'a> Layout<'a> {
             emph: Emphasis::default(),
             node: NO_NODE,
             link: None,
+            // A list marker follows its `<li>`'s paint-suppression (set by
+            // `flow_element` before the block-tail marker placement).
+            invisible: self.invisible,
         };
         let items = &mut self.rows[row].items;
         items.push(item);
@@ -8808,6 +9032,7 @@ impl<'a> Layout<'a> {
             emph,
             node,
             link,
+            invisible: self.invisible,
         });
         self.col += width;
     }
@@ -9031,12 +9256,21 @@ fn image_spacer_row(indent: usize) -> Row {
             emph: Emphasis::default(),
             node: NO_NODE,
             link: None,
+            // A zero-width image-box spacer paints nothing regardless.
+            invisible: false,
         }],
     }
 }
 
 fn same_run(item: &Item, ctx: &Ctx) -> bool {
-    item.kind == ctx.kind && item.emph == ctx.emph && item.node == ctx.node && item.link == ctx.link
+    item.kind == ctx.kind
+        && item.emph == ctx.emph
+        && item.node == ctx.node
+        && item.link == ctx.link
+        // Never coalesce a painted word into a paint-suppressed run (or vice
+        // versa): they render differently even at the same node (an `opacity:0`
+        // reveal on part of a run).
+        && item.invisible == ctx.invisible
 }
 
 /// Pad a flex-grown text/search input's `[…]` widget to fill its allocated
@@ -10136,6 +10370,229 @@ mod tests {
         let (dom, m) = measure(r#"<body><div id="p" style="height:50%">x</div></body>"#, 80);
         let p = box_by_id(&dom, &m, "p");
         assert_eq!(p.height, 16.0, "percent height is indefinite → no floor");
+    }
+
+    #[test]
+    fn opacity_zero_block_keeps_its_measured_box() {
+        // Phase 1 (VIRTUALIZED_LIST_LAYOUT_PLAN.md): `opacity:0` suppresses PAINT,
+        // not box generation, so a paint-suppressed placeholder reports the SAME
+        // measured box as its visible twin — the fix for the React virtualized-
+        // list bug where an off-screen `opacity:0` placeholder collapsed (no box)
+        // and `getBoundingClientRect` fell back to the whole viewport height. The
+        // Mastodon shape: `height:128px;overflow:hidden` on both, one `opacity:0`.
+        let (dom, m) = measure(
+            r#"<body>
+                <article id="vis" style="height:128px;overflow:hidden">real post content that is quite long</article>
+                <article id="inv" style="height:128px;overflow:hidden;opacity:0">real post content that is quite long</article>
+            </body>"#,
+            80,
+        );
+        let vis = box_by_id(&dom, &m, "vis");
+        let inv = box_by_id(&dom, &m, "inv");
+        assert_eq!(
+            inv.height, vis.height,
+            "opacity:0 placeholder reports the same box as its visible twin"
+        );
+        assert_eq!(
+            inv.height, 128.0,
+            "the box is its real 128px, not the viewport"
+        );
+        // The suppressed article sits BELOW the visible one — proving it takes
+        // part in normal flow rather than collapsing. (Declared height is
+        // geometry-only, not reserved on screen — the documented deviation — so
+        // this compares flow position, not the 128px geometry box.)
+        assert!(
+            inv.top > vis.top,
+            "in-flow opacity:0 reserves flow space (inv.top {} below vis.top {})",
+            inv.top,
+            vis.top
+        );
+    }
+
+    #[test]
+    fn overflow_hidden_definite_height_caps_the_measured_box() {
+        // Phase 1 step 4: `overflow:hidden` + a definite `height` clips the
+        // content, so the measured box is EXACTLY the height even when the
+        // (unclipped) content is much taller — a virtualized placeholder caches
+        // its measured height then clips a full article into it. Ten lines of
+        // content in a 3-row (48px) clipped box report 48px; the same content
+        // with visible overflow extends past the declared height.
+        let tall = "l1<br>l2<br>l3<br>l4<br>l5<br>l6<br>l7<br>l8<br>l9<br>l10";
+        let (dom, m) = measure(
+            &format!(
+                r#"<body><div id="clip" style="height:48px;overflow:hidden">{tall}</div></body>"#
+            ),
+            80,
+        );
+        assert_eq!(
+            box_by_id(&dom, &m, "clip").height,
+            48.0,
+            "overflow:hidden + height:48 caps the box to 48px (3 rows)"
+        );
+        let (dom2, m2) = measure(
+            &format!(r#"<body><div id="noclip" style="height:48px">{tall}</div></body>"#),
+            80,
+        );
+        assert!(
+            box_by_id(&dom2, &m2, "noclip").height > 48.0,
+            "overflow:visible content extends past the declared height (no cap)"
+        );
+    }
+
+    #[test]
+    fn opacity_zero_content_is_laid_out_but_painted_blank() {
+        // Render side: an in-flow `opacity:0` block is laid into the row grid
+        // (its text present as items, so the box reserves space) but every item
+        // is flagged `invisible` — the renderer writes blank cells. Its visible
+        // sibling is untouched.
+        let rows = lay(
+            r#"<body><div style="opacity:0">SECRET</div><div>SHOWN</div></body>"#,
+            80,
+        );
+        let secret: Vec<&Item> = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.text.contains("SECRET"))
+            .collect();
+        assert!(
+            !secret.is_empty(),
+            "opacity:0 content is laid out (reserves space): {:?}",
+            texts(&rows)
+        );
+        assert!(
+            secret.iter().all(|i| i.invisible),
+            "every opacity:0 item is painted blank"
+        );
+        assert!(shows(&rows, "SHOWN"), "the visible sibling renders");
+        assert!(
+            !shows(&rows, "SECRET"),
+            "the opacity:0 block does not visibly show"
+        );
+    }
+
+    #[test]
+    fn opacity_zero_subtree_paints_blank_but_a_reset_is_not_re_revealed() {
+        // Opacity applies to the subtree as a GROUP: a nested element cannot
+        // re-reveal itself (unlike visibility — that's Phase 2). So a
+        // `opacity:1` child of an `opacity:0` parent still paints blank.
+        let rows = lay(
+            r#"<body><div style="opacity:0"><span style="opacity:1">CHILD</span></div></body>"#,
+            80,
+        );
+        assert!(
+            !shows(&rows, "CHILD"),
+            "opacity:1 child of an opacity:0 parent stays suppressed (group)"
+        );
+    }
+
+    #[test]
+    fn visibility_hidden_is_laid_out_but_painted_blank() {
+        // Phase 2: `visibility:hidden` (CSS2 §11.2) is paint suppression, not box
+        // removal — laid out (reserves space), painted blank. Its visible sibling
+        // renders normally. Mirrors the opacity:0 case but via `visibility`.
+        let rows = lay(
+            r#"<body><div style="visibility:hidden">HIDDENTEXT</div><div>SHOWNTEXT</div></body>"#,
+            80,
+        );
+        let hidden: Vec<&Item> = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.text.contains("HIDDENTEXT"))
+            .collect();
+        assert!(
+            !hidden.is_empty(),
+            "visibility:hidden content is laid out (reserves space): {:?}",
+            texts(&rows)
+        );
+        assert!(
+            hidden.iter().all(|i| i.invisible),
+            "visibility:hidden items are painted blank"
+        );
+        assert!(shows(&rows, "SHOWNTEXT"), "the visible sibling renders");
+        assert!(!shows(&rows, "HIDDENTEXT"), "hidden text does not show");
+    }
+
+    #[test]
+    fn visibility_visible_descendant_of_a_hidden_ancestor_is_painted() {
+        // The KEY difference from opacity: `visibility` inherits but is
+        // RE-CLEARABLE. A `visibility:visible` descendant of a
+        // `visibility:hidden` ancestor IS painted (a plain nested child stays
+        // hidden — inheritance). This is why visibility is a per-element cascade
+        // read, not the sticky opacity chain.
+        let rows = lay(
+            r#"<body><div style="visibility:hidden">
+                 PARENTHIDDEN
+                 <span>STILLHIDDEN</span>
+                 <span style="visibility:visible">RESHOWN</span>
+               </div></body>"#,
+            80,
+        );
+        assert!(
+            !shows(&rows, "PARENTHIDDEN"),
+            "the hidden element's own text is blank: {:?}",
+            texts(&rows)
+        );
+        assert!(
+            !shows(&rows, "STILLHIDDEN"),
+            "a plain child inherits visibility:hidden"
+        );
+        assert!(
+            shows(&rows, "RESHOWN"),
+            "a visibility:visible descendant is re-painted: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn visibility_hidden_keeps_its_measured_box() {
+        // Like opacity:0, a `visibility:hidden` block keeps its real box for
+        // geometry (`getBoundingClientRect`) — CSS2 §11.2 lays it out fully.
+        let (dom, m) = measure(
+            r#"<body>
+                <div id="vis" style="height:64px">visible</div>
+                <div id="inv" style="height:64px;visibility:hidden">hidden</div>
+            </body>"#,
+            80,
+        );
+        let vis = box_by_id(&dom, &m, "vis");
+        let inv = box_by_id(&dom, &m, "inv");
+        assert_eq!(inv.height, vis.height, "visibility:hidden keeps its box");
+        assert!(inv.top > vis.top, "and reserves its flow space");
+    }
+
+    #[test]
+    fn visibility_hidden_survives_serialize_and_reparse_as_blank() {
+        // The JS pipeline serializes post-cascade HTML (no `<style>`) then
+        // re-parses it for layout, so `visibility:hidden` must be BAKED. Round-
+        // trip through the serializer and confirm the re-parsed layout still
+        // paints the subtree blank (the fix for the no-JS / js-off / css_bake
+        // paths, where the layout reads only baked inline styles).
+        let dom = Dom::parse_document(
+            r#"<head><style>.gone{visibility:hidden}</style></head>
+               <body><p class="gone">BAKEDHIDDEN</p><p>BAKEDSHOWN</p></body>"#,
+        );
+        let html = dom.serialize(DOCUMENT);
+        assert!(
+            html.contains("visibility:hidden"),
+            "suppression baked into the serialized HTML: {html}"
+        );
+        let reparsed = Dom::parse_document(&html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (rows, ..) = lay_out_with_carousels(
+            &reparsed,
+            &base,
+            (80, 0),
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
+        assert!(shows(&rows, "BAKEDSHOWN"), "the visible sibling re-parses");
+        assert!(
+            !shows(&rows, "BAKEDHIDDEN"),
+            "the baked visibility:hidden re-parses as blank: {:?}",
+            texts(&rows)
+        );
     }
 
     #[test]
@@ -11277,9 +11734,13 @@ mod tests {
 
     /// Whether any laid item's text contains `needle`.
     fn shows(rows: &[Row], needle: &str) -> bool {
+        // "Visibly rendered": a paint-suppressed (`opacity:0`) item is laid out
+        // and carries its text, but the renderer paints it blank — so it does
+        // NOT show. (Matches how the slideshow's inactive slides are present in
+        // the row grid yet invisible.)
         rows.iter()
             .flat_map(|r| &r.items)
-            .any(|i| i.text.contains(needle))
+            .any(|i| !i.invisible && i.text.contains(needle))
     }
 
     #[test]
@@ -11302,6 +11763,33 @@ mod tests {
         assert!(
             !shows(&rows, "LoginLink"),
             "the page behind the overlay is deferred"
+        );
+    }
+
+    #[test]
+    fn an_opacity_zero_fade_in_modal_does_not_surface() {
+        // Phase 1 regression: a fade-in dialog/lightbox is `opacity:0` until a
+        // class animates it in. It covers the viewport geometrically, but paints
+        // BLANK — the page behind shows through. Surfacing it would defer the
+        // whole page behind a blank screen (the trap opened by opacity:0 keeping
+        // its box). The page must render; the blank overlay must not surface.
+        let rows = lay(
+            r#"<body>
+                 <div id="page"><a href="/in">LoginLink</a></div>
+                 <div style="position:fixed;width:100%;height:100%;opacity:0">
+                   <p>HiddenGate</p><a href="/enter">HiddenButton</a>
+                 </div>
+               </body>"#,
+            80,
+        );
+        assert!(
+            shows(&rows, "LoginLink"),
+            "the page renders — a blank (opacity:0) overlay is not a modal: {:?}",
+            texts(&rows)
+        );
+        assert!(
+            !shows(&rows, "HiddenGate"),
+            "the opacity:0 overlay content is painted blank, not surfaced"
         );
     }
 
@@ -15118,6 +15606,7 @@ mod tests {
             node: NO_NODE,
             link,
             crop: false,
+            invisible: false,
         };
         let row = Row {
             items: vec![
@@ -15346,6 +15835,62 @@ mod tests {
             !shows(&rows, "GAMMA"),
             "hidden slide dropped: {:?}",
             texts(&rows)
+        );
+    }
+
+    #[test]
+    fn a_hidden_out_of_flow_page_does_not_push_content_down() {
+        // Regression (Steam featured carousels): a `position:absolute` box that
+        // is `opacity:0`/`visibility:hidden` (a pre-rendered, not-yet-shown
+        // carousel `.next` page of tiles) paints BLANK and — being out of flow —
+        // reserves NO in-flow space. It must NOT be placed in the render, else
+        // the "grow the containing block to contain its positioned children"
+        // deviation STACKS the invisible pages and buries the visible content
+        // (Steam's real game grid ended up ~7 viewports down behind blank rows).
+        // The active page shows and the following content stays near the top.
+        let row_of = |rows: &[Row], needle: &str| {
+            rows.iter()
+                .position(|r| r.items.iter().any(|i| i.text.contains(needle)))
+        };
+        for hide in ["opacity:0", "visibility:hidden"] {
+            let html = format!(
+                r#"<body>
+                     <div style="position:relative">
+                       <div style="position:absolute;{hide}">
+                         <p>P1</p><p>P2</p><p>P3</p><p>P4</p>
+                         <p>P5</p><p>P6</p><p>P7</p><p>P8</p>
+                       </div>
+                       <p>ACTIVEPAGE</p>
+                     </div>
+                     <p>AFTERCAROUSEL</p>
+                   </body>"#
+            );
+            let rows = lay(&html, 80);
+            assert!(shows(&rows, "ACTIVEPAGE"), "the active page shows ({hide})");
+            assert!(
+                !shows(&rows, "P1"),
+                "the hidden abspos page is not rendered ({hide}): {:?}",
+                texts(&rows)
+            );
+            let after = row_of(&rows, "AFTERCAROUSEL").expect("AFTER present");
+            assert!(
+                after < 6,
+                "following content must not be pushed down by the hidden abspos \
+                 page ({hide}): landed at row {after}"
+            );
+        }
+        // The MEASUREMENT pass still places it, so `getBoundingClientRect` on a
+        // hidden abspos box stays honest (only the RENDER skips it).
+        let (dom, m) = measure(
+            r#"<body><div style="position:relative;height:100px">
+                 <div id="h" style="position:absolute;opacity:0;width:80px;height:64px">x</div>
+               </div></body>"#,
+            80,
+        );
+        let h = box_by_id(&dom, &m, "h");
+        assert!(
+            h.width > 0.0 && h.height > 0.0,
+            "hidden abspos box keeps its measured box: {h:?}"
         );
     }
 

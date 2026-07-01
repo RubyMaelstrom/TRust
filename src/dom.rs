@@ -1031,12 +1031,13 @@ impl Dom {
         {
             return true;
         }
-        if self.cascaded(id, "display").as_deref() == Some("none")
-            || matches!(
-                self.cascaded(id, "visibility").as_deref(),
-                Some("hidden" | "collapse")
-            )
-        {
+        // `display:none` generates NO box (the element and subtree occupy no
+        // space). `visibility:hidden` is NOT here — like `opacity:0` it is
+        // paint suppression (laid out, painted blank), routed through
+        // `visibility_hidden`/`Ctx.invisible`, so a `visibility:hidden` element
+        // keeps its box (CSS2 §11.2) and a `visibility:visible` descendant of it
+        // is still painted.
+        if self.cascaded(id, "display").as_deref() == Some("none") {
             return true;
         }
         // Visually-hidden / "sr-only" accessibility text: the universal idiom
@@ -1130,23 +1131,54 @@ impl Dom {
         {
             return true;
         }
-        // `opacity:0` is invisible — treat it as hidden, like the W3C/Bootstrap
-        // slideshow idiom (`.slides{opacity:0}`, the active slide revealed by
-        // an `animation-fill-mode:forwards` fade-in). A real slideshow hides its
-        // inactive slides this way, so dropping them leaves the active slide —
-        // exactly what a browser paints (CSS 2.1 §9.6 positioning then places
-        // the visible one). Gated so a page with no opacity rules pays nothing
-        // on this hot path.
+        // `opacity:0` is NOT hidden — CSS separates box generation (`display`)
+        // from painting. `opacity` (like `visibility`) suppresses only the
+        // PAINT: an `opacity:0` element is fully laid out and occupies its
+        // normal space (`getBoundingClientRect`/`scrollHeight` report its real
+        // box), it is merely painted fully transparent. Collapsing it here (no
+        // box) is what broke React virtualized lists — Mastodon's off-screen
+        // placeholders are `opacity:0` PRECISELY so they keep their measured
+        // height. Paint suppression rides `paint_suppressed`/`Ctx.invisible`
+        // instead (laid out, painted blank); the slideshow that used to lean on
+        // this branch still resolves to its active slide (an inactive slide is
+        // out-of-flow → reserves no space, and paints blank → can't cover the
+        // active one). See `paint_suppressed`.
+        false
+    }
+
+    /// Whether the element's own PAINT is suppressed by `opacity:0` (effective
+    /// opacity below `OPACITY_HIDDEN`). Unlike `is_hidden` (box generation),
+    /// this does NOT remove the element from layout: CSS Color/Compositing lays
+    /// out and measures an `opacity:0` element exactly as if visible, then
+    /// paints it (and its subtree, as a group) fully transparent. The layout
+    /// threads this down the inline formatting context (`Ctx.invisible`, like
+    /// `font_zero`) so the whole subtree reserves its real box but writes blank
+    /// cells — opacity is a group property a descendant cannot re-reveal, and
+    /// `effective_opacity` already honors the `animation-fill-mode:forwards`
+    /// slideshow reveal. Gated so a page with no `opacity` rules pays nothing.
+    pub fn paint_suppressed(&self, id: NodeId) -> bool {
         let has_inline_opacity = || {
             self.attr(id, "style")
                 .is_some_and(|s| s.contains("opacity"))
         };
-        if (self.style_index().has_opacity || has_inline_opacity())
+        (self.style_index().has_opacity || has_inline_opacity())
             && self.effective_opacity(id) < OPACITY_HIDDEN
-        {
-            return true;
-        }
-        false
+    }
+
+    /// Whether the element's own PAINT is suppressed by `visibility:hidden`
+    /// (or `collapse`) — CSS2 §11.2. Like `opacity:0` this keeps the box (the
+    /// element is fully laid out and occupies its normal space; only its cells
+    /// paint blank), but UNLIKE opacity `visibility` INHERITS and is
+    /// RE-CLEARABLE: a `visibility:visible` descendant of a hidden ancestor IS
+    /// painted. So this reads the *computed* value (`computed_value` resolves the
+    /// inheritance/override per element) rather than an accumulated flag — the
+    /// layout never threads it as sticky (that's `Ctx.invisible`'s opacity
+    /// chain); each element re-derives it here.
+    pub fn visibility_hidden(&self, id: NodeId) -> bool {
+        matches!(
+            self.computed_value(id, "visibility").as_deref(),
+            Some("hidden" | "collapse")
+        )
     }
 
     /// Whether an element reserves height (`vertical`) or width via positive
@@ -1835,12 +1867,22 @@ impl Dom {
             }
         }
         let raw = winner.map(|(_, v)| v)?;
-        // A hidden pseudo-element generates no rendered content. The common
-        // width-reservation idiom `[data-content]::before { content:
-        // attr(data-content); visibility:hidden }` (Primer's UnderlineNav tabs,
-        // many tab/button components) paints a hidden bold copy of the label
-        // purely to reserve its selected width — rendering it doubles the label
-        // ("CodeCode IssuesIssues"). Honor the pseudo's own visibility/display.
+        // A hidden pseudo-element generates NO rendered content here — a
+        // deliberate TERMINAL DEVIATION, distinct from Phase 2's element-level
+        // `visibility:hidden` (which reserves a blank box). The width-reservation
+        // idiom `[data-content]::before{content:attr(data-content);
+        // font-weight:bold;visibility:hidden}` (Primer's UnderlineNav tabs, many
+        // tab/button components) paints a hidden BOLD copy of the label ONLY to
+        // reserve the selected (bold) pixel width, so switching a tab to bold
+        // doesn't reflow. In a cell grid BOLD IS THE SAME WIDTH as normal, so the
+        // reservation is vacuous: reserving its blank width would just append a
+        // blank copy after the real label (bloating every tab), and rendering it
+        // gives the doubled "CodeCode". Dropping it yields the correct terminal
+        // result ("Code Issues PullRequests") with no reflow to prevent. (A
+        // `visibility:hidden` ELEMENT still reserves its box — see
+        // `visibility_hidden`; only the pseudo SIZER idiom drops, since its whole
+        // purpose is pixel-width reflow-avoidance a cell grid doesn't have.)
+        // `display:none` on a pseudo generates no box at all, likewise dropped.
         if matches!(
             self.pseudo_style(id, which, "visibility").as_deref(),
             Some("hidden" | "collapse")
@@ -3122,8 +3164,9 @@ impl Dom {
     ) {
         // Bake the cascaded box/layout properties (the engine has the
         // sheets; the re-parsed layout arena doesn't) into the element's
-        // inline style. `display:none`/`visibility:hidden` are already
-        // dropped, so they never need baking.
+        // inline style. `display:none` is dropped outright (never baked, see the
+        // skip below); `visibility:hidden` IS kept + baked now (paint
+        // suppression, Phase 2) so the re-parse paints it blank.
         let mut bake = String::new();
         for prop in PROPS.iter().filter(|p| p.baked).map(|p| p.name) {
             if let Some(v) = self.cascaded(id, prop) {
@@ -3144,6 +3187,20 @@ impl Dom {
                 bake.push_str(&escape_attr(&v));
                 bake.push(';');
             }
+        }
+        // `opacity` is not a normally-baked property — a terminal has no alpha
+        // compositing, so a merely-faded element (`opacity:0.5`) renders solid
+        // and its raw value is irrelevant. But a PAINT-SUPPRESSED element
+        // (effective opacity ~0) must survive the re-parse AS suppressed: the JS
+        // pipeline re-parses this HTML with no `<style>`, so bake the resolved
+        // suppression as `opacity:0`. The animation reveal is already folded into
+        // `paint_suppressed` (an `animation-fill-mode:forwards` slide ending
+        // opacity:1 bakes nothing and stays painted), so this can't misfire on
+        // the active slide. The layout reads it back through
+        // `paint_suppressed`/`Ctx.invisible` to paint the box blank while still
+        // reserving its geometry (React virtualized-list placeholders).
+        if self.paint_suppressed(id) {
+            bake.push_str("opacity:0;");
         }
         let mut style_done = false;
         for a in attrs {
@@ -3994,11 +4051,15 @@ struct PropDef {
     inherited: bool,
     /// Baked into the element's inline `style` on serialization, so the
     /// re-parsed layout arena (which has no `<style>`) flows the property
-    /// the way the engine computed it. `false` for properties consumed only
-    /// inside the engine and never re-read from serialized HTML: `visibility`
-    /// (hidden nodes are dropped outright), `opacity`/`animation*` (folded
-    /// into `is_hidden`'s slideshow logic), and `content` (baked separately
-    /// as `data-trust-before`/`data-trust-after` attributes).
+    /// the way the engine computed it. `visibility` IS baked (Phase 2 — a
+    /// `visibility:hidden` element is kept + painted blank, so the re-parse must
+    /// see it; the DIRECT cascaded value is baked and re-parse inheritance
+    /// reconstructs the rest, so a `visibility:visible` descendant re-clears it).
+    /// `false` for properties consumed only inside the engine and never re-read
+    /// verbatim: `opacity`/`animation*` (opacity is baked SPECIALLY — the
+    /// resolved paint-suppression as `opacity:0`, see `write_attrs` — not its raw
+    /// cascaded value; the animation longhands feed that resolution) and
+    /// `content` (baked separately as `data-trust-before`/`data-trust-after`).
     baked: bool,
 }
 
@@ -4046,7 +4107,7 @@ const INHERITED_LAYOUT_PROPS: &[&str] = &[
 const PROPS: &[PropDef] = &[
     //    name                    inherited  baked
     prop("display", false, true),
-    prop("visibility", true, false),
+    prop("visibility", true, true),
     prop("opacity", false, false),
     prop("animation-name", false, false),
     prop("animation-fill-mode", false, false),
@@ -4238,8 +4299,9 @@ fn classify_font_size_zero(v: &str) -> Option<bool> {
     }
 }
 
-/// Below this effective opacity an element is treated as invisible (hidden).
-/// Keeps merely-faded content (e.g. `opacity:0.5`) visible.
+/// Below this effective opacity an element's paint is suppressed (laid out but
+/// painted blank — `paint_suppressed`). Keeps merely-faded content (e.g.
+/// `opacity:0.5`) painted normally.
 const OPACITY_HIDDEN: f32 = 0.05;
 
 /// Expand a `margin`/`padding`/`border*`/`list-style` shorthand into the
@@ -4489,8 +4551,8 @@ struct StyleIndex {
     /// keyframe), for honoring an `animation-fill-mode:forwards` reveal/hide.
     /// Only opacity is extracted (the one keyframe property visibility needs).
     keyframes: std::collections::HashMap<String, f32>,
-    /// Whether any rule sets `opacity` at all — lets `is_hidden` skip the
-    /// opacity cascade entirely on the overwhelming majority of pages.
+    /// Whether any rule sets `opacity` at all — lets `paint_suppressed` skip
+    /// the opacity cascade entirely on the overwhelming majority of pages.
     has_opacity: bool,
 }
 
@@ -6032,11 +6094,14 @@ mod tests {
     }
 
     #[test]
-    fn css_opacity_hides_and_animation_reveals_one_slide() {
-        // The W3C/Bootstrap slideshow idiom: every slide is opacity:0, and
-        // the active one is revealed by a fade-in whose end state (fill-mode
-        // forwards) is opacity:1. Honoring opacity (and the animation's end
-        // opacity) shows exactly the active slide — no slideshow-specific code.
+    fn css_opacity_suppresses_paint_but_keeps_the_box() {
+        // The W3C/Bootstrap slideshow idiom: every slide is opacity:0, and the
+        // active one is revealed by a fade-in whose end state (fill-mode
+        // forwards) is opacity:1. `opacity:0` does NOT collapse the box (CSS
+        // separates box generation from painting) — it is `paint_suppressed`
+        // (laid out, painted blank), never `is_hidden`. The animation reveal and
+        // the merely-faded (0.5) case are honored, so `paint_suppressed` marks
+        // exactly the inactive slides — no slideshow-specific code.
         let dom = Dom::parse_document(
             "<head><style>
                 @keyframes fade-in { from { opacity: 0 } to { opacity: 1 } }
@@ -6047,25 +6112,103 @@ mod tests {
                 .faded { opacity: 0.5 }
              </style></head>
              <body>
-               <div class='slide active'>shown slide</div>
-               <div class='slide'>hidden slide</div>
-               <div class='slide leaving'>leaving slide</div>
-               <div class='faded'>still visible</div>
+               <div id=active class='slide active'>shown slide</div>
+               <div id=hidden class='slide'>hidden slide</div>
+               <div id=leaving class='slide leaving'>leaving slide</div>
+               <div id=faded class='faded'>still visible</div>
              </body>",
         );
+        let g = |i| dom.get_by_id(i).unwrap();
+        // Never `is_hidden` — opacity generates a box.
+        for id in ["active", "hidden", "leaving", "faded"] {
+            assert!(!dom.is_hidden(g(id)), "opacity never hides: {id}");
+        }
+        // Paint suppressed = effectively invisible: the plain opacity:0 slide
+        // and the fade-out (ends opacity:0); NOT the fade-in (ends opacity:1)
+        // nor the merely-faded 0.5.
+        assert!(
+            !dom.paint_suppressed(g("active")),
+            "fade-in ends opacity:1 → painted"
+        );
+        assert!(
+            dom.paint_suppressed(g("hidden")),
+            "opacity:0 slide painted blank"
+        );
+        assert!(
+            dom.paint_suppressed(g("leaving")),
+            "fade-out ends opacity:0 → painted blank"
+        );
+        assert!(
+            !dom.paint_suppressed(g("faded")),
+            "merely-faded (0.5) painted normally"
+        );
+        // All four survive serialization — a paint-suppressed box is still laid
+        // out (its subtree reserves space and reports its measured geometry).
         let html = dom.serialize(DOCUMENT);
-        assert!(html.contains("shown slide"), "active slide visible: {html}");
+        for t in [
+            "shown slide",
+            "hidden slide",
+            "leaving slide",
+            "still visible",
+        ] {
+            assert!(
+                html.contains(t),
+                "opacity:0 content kept for layout: {html}"
+            );
+        }
+    }
+
+    #[test]
+    fn css_visibility_is_paint_suppression_inherited_and_re_clearable() {
+        // Phase 2: `visibility:hidden` is NOT `is_hidden` (it keeps its box) — it
+        // is `visibility_hidden` (painted blank). It INHERITS (a plain child of a
+        // hidden element is hidden) but is RE-CLEARABLE (`visibility:visible` on a
+        // descendant re-shows it). All are KEPT by the serializer, with the
+        // suppression baked so the re-parsed layout sees it.
+        let dom = Dom::parse_document(
+            "<head><style>
+                .hide { visibility: hidden }
+                .show { visibility: visible }
+             </style></head>
+             <body>
+               <div id=root class=hide>ROOTHIDDEN
+                 <span id=child>CHILDINHERITS</span>
+                 <span id=reshow class=show>RESHOWN</span>
+               </div>
+               <p id=normal>NORMALVIS</p>
+             </body>",
+        );
+        let g = |i| dom.get_by_id(i).unwrap();
+        // Never `is_hidden` — visibility generates a box.
+        for id in ["root", "child", "reshow"] {
+            assert!(
+                !dom.is_hidden(g(id)),
+                "visibility never removes the box: {id}"
+            );
+        }
+        assert!(dom.visibility_hidden(g("root")), "the hidden element");
         assert!(
-            !html.contains("hidden slide"),
-            "opacity:0 slide hidden: {html}"
+            dom.visibility_hidden(g("child")),
+            "a plain child INHERITS visibility:hidden"
         );
         assert!(
-            !html.contains("leaving slide"),
-            "fade-out ends opacity:0 → hidden: {html}"
+            !dom.visibility_hidden(g("reshow")),
+            "visibility:visible RE-CLEARS on a descendant"
         );
         assert!(
-            html.contains("still visible"),
-            "merely-faded (0.5) stays visible: {html}"
+            !dom.visibility_hidden(g("normal")),
+            "unrelated content visible"
+        );
+        // Kept + baked so the JS-pipeline re-parse paints it blank.
+        let html = dom.serialize(DOCUMENT);
+        assert!(html.contains("ROOTHIDDEN"), "hidden content kept: {html}");
+        assert!(
+            html.contains("visibility:hidden"),
+            "suppression baked: {html}"
+        );
+        assert!(
+            html.contains("visibility:visible"),
+            "the re-clear baked: {html}"
         );
     }
 
@@ -6119,8 +6262,23 @@ mod tests {
         );
         let html = dom.serialize(DOCUMENT);
         assert!(html.contains("kept"), "{html}");
-        assert!(!html.contains("dropped"), "{html}");
-        assert!(!html.contains("shut"), "{html}");
+        assert!(!html.contains("dropped"), "display:none is dropped: {html}");
+        // `visibility:hidden` is paint suppression (Phase 2): the matched box is
+        // KEPT for layout (painted blank) and carries the baked suppression, so
+        // the `[data-state^=clos]` selector match shows up as a baked visibility.
+        let shut = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&n| dom.attr(n, "data-state") == Some("closed"))
+            .unwrap();
+        assert!(
+            dom.visibility_hidden(shut),
+            "the `^=` attr selector matched → visibility:hidden: {html}"
+        );
+        assert!(
+            html.contains("visibility:hidden"),
+            "suppression baked: {html}"
+        );
         assert!(html.contains("still open"), "{html}");
     }
 

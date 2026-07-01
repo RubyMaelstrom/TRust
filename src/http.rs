@@ -4868,13 +4868,14 @@ mod tests {
                 };
                 seen_nodes.insert(it.node);
                 s.push_str(&format!(
-                    "[c{} w{} h{} {tag} n{} {:?}{}] ",
+                    "[c{} w{} h{} {tag} n{} {:?}{}{}] ",
                     it.col,
                     it.width,
                     it.height,
                     it.node,
                     t,
-                    if it.link.is_some() { "*" } else { "" }
+                    if it.link.is_some() { "*" } else { "" },
+                    if it.invisible { " INVIS" } else { "" }
                 ));
             }
             if s.is_empty() {

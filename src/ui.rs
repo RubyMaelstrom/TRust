@@ -397,6 +397,17 @@ pub(crate) fn browser_rows<'a>(
                 if scol > col {
                     spans.push(Span::raw(" ".repeat((scol - col) as usize)));
                 }
+                // Paint suppression (`opacity:0`): the item is fully laid out
+                // but painted BLANK — reserve its width with spaces and skip all
+                // styling/selection/text (its image, if any, is skipped in the
+                // image pass too). Geometry is untouched (the item still carries
+                // its real `col`/`width`/`height`), so measurement APIs report
+                // the true box while the cells render empty.
+                if item.invisible {
+                    spans.push(Span::raw(" ".repeat(item.width as usize)));
+                    col = scol + item.width;
+                    continue;
+                }
                 let mut style = item_kind_style(item.kind);
                 // A generated carousel scroll control greys out when it can't
                 // page that way (the spec's `:disabled` end state).
@@ -559,6 +570,11 @@ fn render_inline_images(
         let doc_row = start + off;
         for item in &row.items {
             let Some(url) = &item.image else { continue };
+            // Paint suppression (`opacity:0`): the image box is reserved (its
+            // rows still spacer-pad the flow) but no pixels are drawn.
+            if item.invisible {
+                continue;
+            }
             // Carousel offset/clip: a strip image scrolled out of its band
             // doesn't draw — snapping keeps whole cards, so it's never cut.
             let Some(scol) = visible_col(carousels, doc_row, item) else {
@@ -635,6 +651,10 @@ fn render_region_images(
             };
             for item in &brow.items {
                 let Some(url) = &item.image else { continue };
+                // Paint suppression (`opacity:0`): reserve the box, draw nothing.
+                if item.invisible {
+                    continue;
+                }
                 if u32::from(item.col) >= u32::from(band_w) {
                     continue; // past the scrollport's right edge
                 }
