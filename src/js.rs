@@ -10470,12 +10470,9 @@ const PRELUDE: &str = r##"
         // Geometry: a layout pass over the live DOM gives each element its REAL
         // box (CSS pixels, quantized to terminal cells — what we actually
         // paint). `__dom_rect` returns [left, top, width, height] for a laid-out
-        // element, or null when it has none (un-rendered / detached /
-        // display:none), in which case we keep the generous viewport-box
-        // fallback so measurement gates ("render once I have a non-zero size")
-        // still fire. Coordinates are document-origin (page scroll is not
-        // threaded in yet, so they read viewport-relative at the top of the
-        // page, where load-time measurement happens).
+        // element, or null when it has none. Coordinates are document-origin
+        // (page scroll is not threaded in yet, so they read viewport-relative at
+        // the top of the page, where load-time measurement happens).
         __rect() {
             let r = null;
             try { r = __dom_rect(this.__id); } catch (e) { r = null; }
@@ -10485,8 +10482,30 @@ const PRELUDE: &str = r##"
                          right: left + width, bottom: top + height,
                          toJSON() { return this; } };
             }
-            return { x: 0, y: 0, left: 0, top: 0, right: g.innerWidth, bottom: g.innerHeight,
-                     width: g.innerWidth, height: g.innerHeight, toJSON() { return this; } };
+            // Phase 3 (CSSOM View §"the getBoundingClientRect() method"): an
+            // element with NO associated CSS layout box returns an ALL-ZERO
+            // rect. After the opacity:0/visibility:hidden paint-suppression work,
+            // every RENDERED element (even an empty infinite-scroll sentinel)
+            // gets a real box from the measurement pass, so a null here means the
+            // element genuinely has no box — `display:none` (self/ancestor),
+            // detached, or hidden — and `getBoundingClientRect`/`offset*`/
+            // `client*` must report 0, exactly as a browser does (the old
+            // viewport-sized fallback lied: a display:none element measured as
+            // the whole window). EXCEPTION: an embedded/replaced element the
+            // measurement pass deliberately SKIPs (`<svg>`/`<canvas>`/`<iframe>`/
+            // `<object>`/`<math>`/`<embed>`) DOES have a real box in a browser —
+            // our layout just can't compute it — so a chart/embed library
+            // measuring one must still see a non-zero size; keep the viewport-box
+            // hedge for those (only when connected — a detached one is still 0).
+            const t = this.localName;
+            if (this.isConnected &&
+                (t === "svg" || t === "canvas" || t === "iframe" ||
+                 t === "object" || t === "math" || t === "embed")) {
+                return { x: 0, y: 0, left: 0, top: 0, right: g.innerWidth, bottom: g.innerHeight,
+                         width: g.innerWidth, height: g.innerHeight, toJSON() { return this; } };
+            }
+            return { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0,
+                     width: 0, height: 0, toJSON() { return this; } };
         }
         // getBoundingClientRect/getClientRects are VIEWPORT-relative (CSSOM
         // View): the document-origin `__rect()` shifted up/left by the page
@@ -18070,8 +18089,9 @@ mod tests {
     /// `css_bake` applies a page's CSS with no JS at all — the path for
     /// no-`<script>` pages, `set js off`, and the JS-load-timeout fallback
     /// (a big GitHub code file). It must bake cascaded properties (so the
-    /// layout flexes/grids per the page) and drop hidden subtrees (so a
-    /// `visibility:hidden` nav menu collapses instead of rendering expanded).
+    /// layout flexes/grids per the page), dropping `display:none` subtrees and
+    /// baking `visibility:hidden` as paint suppression (so a hidden nav menu
+    /// renders as blank cells instead of expanded — Phase 2).
     #[test]
     fn css_bake_applies_the_cascade_without_js() {
         let html = r#"<html><head><style>
@@ -18087,9 +18107,17 @@ mod tests {
             out.contains("display:flex"),
             "flex should be baked onto .row: {out}"
         );
+        // `visibility:hidden` is paint suppression (Phase 2): the menu is KEPT
+        // for layout (which paints it blank), carrying the baked suppression —
+        // NOT dropped from the HTML. Baking `visibility:hidden` is what tells the
+        // re-parsed layout to render the collapsed menu as blank cells.
         assert!(
-            !out.contains("SECRET-MENU-ITEM"),
-            "a visibility:hidden subtree must be dropped (menu collapses): {out}"
+            out.contains("SECRET-MENU-ITEM"),
+            "the menu content is kept for layout (painted blank): {out}"
+        );
+        assert!(
+            out.contains("visibility:hidden"),
+            "the suppression is baked so the layout paints it blank: {out}"
         );
     }
 
@@ -22341,6 +22369,87 @@ mod tests {
         assert!(
             out.contains("0 40 16 40 16"),
             "geometry should be the real cell box, got: {out}"
+        );
+    }
+
+    #[test]
+    fn opacity_zero_placeholder_reports_its_real_clipped_height() {
+        // Phase 1 (VIRTUALIZED_LIST_LAYOUT_PLAN.md): a React virtualized-list
+        // placeholder is `opacity:0` + a cached height + `overflow:hidden`
+        // (Mastodon's off-screen articles). `opacity:0` suppresses PAINT not box
+        // generation, so getBoundingClientRect must report the real 128px box —
+        // NOT the collapsed/viewport-fallback height that made the list mis-size
+        // its scroll extent and stop windowing. The 8-row (128px) box also CLIPS
+        // the taller content, so the reported height is exactly 128, never the
+        // unclipped article's extent. cell_px 8x16 ⇒ 128px = 8 rows.
+        let (out, outcome) = page(
+            r##"<body>
+            <div id=ph style="height:128px;overflow:hidden;opacity:0">l1<br>l2<br>l3<br>l4<br>l5<br>l6<br>l7<br>l8<br>l9<br>l10<br>l11<br>l12</div>
+            <div id=out></div><script>
+            var r = document.getElementById('ph').getBoundingClientRect();
+            document.getElementById('out').textContent =
+                r.height + '|' + document.getElementById('ph').offsetHeight;
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(">128|128<"),
+            "opacity:0 placeholder reports its real (clipped) 128px box, got: {out}"
+        );
+    }
+
+    #[test]
+    fn visibility_hidden_element_reports_its_real_box() {
+        // Phase 2: `visibility:hidden` is paint suppression (CSS2 §11.2), not box
+        // removal — the element is fully laid out, so getBoundingClientRect
+        // reports its real box (not 0, not the viewport). "HELLO" = 5 cells;
+        // cell_px 8x16 → 40x16. Exercises the visibility bake through the JS
+        // serialize→re-parse→measure pipeline.
+        let (out, outcome) = page(
+            r##"<body><div id=probe style="visibility:hidden">HELLO</div><div id=out></div><script>
+            var r = document.getElementById('probe').getBoundingClientRect();
+            document.getElementById('out').textContent = [r.width, r.height].join(' ');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(">40 16<"),
+            "visibility:hidden keeps its real 40x16 box, got: {out}"
+        );
+    }
+
+    #[test]
+    fn boxless_elements_report_a_zero_rect_not_the_viewport() {
+        // Phase 3 (CSSOM View): an element with NO CSS layout box —
+        // `display:none` or detached — returns an ALL-ZERO rect (and
+        // offsetWidth/Height 0), NOT the whole viewport. A connected replaced
+        // element the measurement pass SKIPs (`<svg>`) keeps a non-zero hedge
+        // (it has a real box in a browser; our layout just can't compute it). A
+        // visible element still reports its real box.
+        let (out, outcome) = page(
+            r##"<body>
+            <div id=vis>shown</div>
+            <div id=none style="display:none">hidden</div>
+            <div id=out></div><script>
+            var none = document.getElementById('none').getBoundingClientRect();
+            var noneW = document.getElementById('none').offsetWidth;
+            var noneH = document.getElementById('none').offsetHeight;
+            var det = document.createElement('div').getBoundingClientRect();  // detached
+            var svg = document.createElement('svg'); document.body.appendChild(svg);
+            var svgr = svg.getBoundingClientRect();
+            var vis = document.getElementById('vis').getBoundingClientRect();
+            document.getElementById('out').textContent = [
+              none.width, none.height, noneW, noneH,   // display:none -> 0 0 0 0
+              det.width, det.height,                   // detached -> 0 0
+              svgr.width > 0,                          // connected <svg> hedge -> true
+              vis.width > 0 && vis.height > 0          // visible -> true
+            ].join('|');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(">0|0|0|0|0|0|true|true<"),
+            "boxless elements report a zero rect; svg keeps a hedge; visible has a box: {out}"
         );
     }
 
