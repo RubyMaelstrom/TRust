@@ -69,9 +69,19 @@ pub struct Response {
     pub url: Url,
     pub status: u16,
     pub content_type: String,
+    /// Response headers (names lowercased, sorted; the dedup'ing wire map is
+    /// unordered), minus `Set-Cookie` — that's a forbidden response-header
+    /// name for scripts (Fetch spec), and exposing it would leak HttpOnly
+    /// cookies the jar deliberately hides. Pages read real APIs' out-of-band
+    /// results from here (Steam's WebAPI puts the EResult in `x-eresult`).
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     /// What the page's JavaScript did, when `execute_js` ran it.
     pub js: Option<crate::js::Outcome>,
+    /// The page's `blob:` URL byte mirror, when JS ran (see `js::BlobMap`).
+    /// The app hangs it on the `Doc` so the image pipeline can decode an
+    /// `<img src="blob:…">` (a client-generated image — Steam's login QR).
+    pub blobs: Option<crate::js::BlobMap>,
     /// The living page behind this response, when its JS left
     /// something to interact with.
     pub live: Option<LivePage>,
@@ -96,6 +106,9 @@ pub struct LivePage {
 pub struct CachedResp {
     pub status: u16,
     pub content_type: String,
+    /// Same filtered/sorted pairs as `Response.headers` (a `seed`ed entry
+    /// synthesizes just its content-type).
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
@@ -142,6 +155,7 @@ impl PageCache {
                 Ok(r) => Ok(std::sync::Arc::new(CachedResp {
                     status: r.status,
                     content_type: r.content_type,
+                    headers: r.headers,
                     body: r.body,
                 })),
                 Err(_) => Err(()),
@@ -210,6 +224,7 @@ impl PageCache {
         use futures::future::FutureExt as _;
         let resp = std::sync::Arc::new(CachedResp {
             status,
+            headers: vec![(String::from("content-type"), content_type.clone())],
             content_type,
             body,
         });
@@ -680,8 +695,10 @@ fn finish_response(
             url: url.clone(),
             status,
             content_type: location,
+            headers: Vec::new(),
             body: Vec::new(),
             js: None,
+            blobs: None,
             live: None,
             challenge: None,
         });
@@ -690,12 +707,20 @@ fn finish_response(
         .get("content-type")
         .cloned()
         .unwrap_or_else(|| String::from("text/html"));
+    let mut header_pairs: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(k, _)| *k != "set-cookie")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    header_pairs.sort();
     Ok(Response {
         url: url.clone(),
         status,
         content_type,
+        headers: header_pairs,
         body,
         js: None,
+        blobs: None,
         live: None,
         challenge: detect_challenge(&headers),
     })
@@ -1244,6 +1269,10 @@ pub async fn execute_js(
             }
         }
     }
+    // Created HERE so it outlives the engine: the app hangs it on the Doc
+    // and decodes blob: image srcs from it even after the page froze.
+    let blobs = crate::js::BlobMap::default();
+    response.blobs = Some(blobs.clone());
     let env = crate::js::PageEnv {
         url: response.url.to_string(),
         viewport,
@@ -1253,6 +1282,7 @@ pub async fn execute_js(
         cache,
         net: Some(tokio::runtime::Handle::current()),
         storage: Some(storage),
+        blobs,
     };
     // The page actor owns the engine on its own wide-stack thread (Boa's
     // parser recursion — see CLAUDE.md). Its first event is `Static`
@@ -1758,6 +1788,8 @@ pub fn parse_seeded(
     let mut scroll_clips = Vec::new();
     let mut boundaries = Vec::new();
     let mut image_urls = Vec::new();
+    let mut hover_ids = std::collections::HashMap::new();
+    let mut anchor_rows = std::collections::HashMap::new();
     let lines = if media.is_empty() || media == "text/html" || media == "application/xhtml+xml" {
         let html = decode_body(content_type, body);
         // The HTTP renderer: our own arena DOM laid out into rows of
@@ -1780,16 +1812,23 @@ pub fn parse_seeded(
         image_urls = collect_image_urls(&dom, url);
         let t_forms = t1.elapsed();
         let t2 = std::time::Instant::now();
-        let (laid, found_carousels, found_regions, found_clips, found_boundaries, found_fixed) =
-            crate::layout::lay_out_with_carousels(
-                &dom,
-                url,
-                (width, viewport_h),
-                &forms,
-                &controls,
-                images,
-                crate::layout::borders_enabled(),
-            );
+        let (
+            laid,
+            found_carousels,
+            found_regions,
+            found_clips,
+            found_boundaries,
+            found_fixed,
+            found_anchors,
+        ) = crate::layout::lay_out_with_carousels(
+            &dom,
+            url,
+            (width, viewport_h),
+            &forms,
+            &controls,
+            images,
+            crate::layout::borders_enabled(),
+        );
         if diag {
             let c = crate::dom::take_casc_diag();
             eprintln!(
@@ -1815,6 +1854,8 @@ pub fn parse_seeded(
         regions = found_regions;
         scroll_clips = found_clips;
         boundaries = found_boundaries;
+        hover_ids = collect_hover_ids(&dom);
+        anchor_rows = found_anchors;
         Vec::new()
     } else if media.starts_with("text/") {
         crate::doc::wrap_plain(&decode_body(content_type, body), width)
@@ -1835,12 +1876,56 @@ pub fn parse_seeded(
         forms,
         rows,
         image_urls,
+        blobs: None,
         carousels,
         fixed,
         regions,
         scroll_clips,
         boundaries,
+        hover_ids,
+        anchor_rows,
     }
+}
+
+/// Resolve every layout-DOM element under an actor marker to its NEAREST
+/// marker's actor node id, while the parsed DOM is still alive (it doesn't
+/// survive into `Doc`, so the hover hit-test can't walk ancestors later).
+/// Markers: `data-trust-hover` (a hover-listener host) AND `x-trust-js`
+/// anchors (clickables) — folding both into one top-down walk makes
+/// "deepest marker wins" structural, which is the correct hover target
+/// either way around: a Steam row anchor INSIDE a delegating container
+/// resolves to the row (so `e.target.closest('.row')` works), and a
+/// hover-only div INSIDE a clickable card resolves to the div (bubbling
+/// still reaches the card). Non-live pages have no markers → empty map.
+fn collect_hover_ids(
+    dom: &crate::dom::Dom,
+) -> std::collections::HashMap<crate::dom::NodeId, usize> {
+    let mut map = std::collections::HashMap::new();
+    let mut stack: Vec<(crate::dom::NodeId, Option<usize>)> = vec![(crate::dom::DOCUMENT, None)];
+    while let Some((id, mut cur)) = stack.pop() {
+        let marker = dom
+            .attr(id, "data-trust-hover")
+            .and_then(|v| v.parse().ok())
+            .or_else(|| {
+                dom.attr(id, "href")
+                    .filter(|_| dom.tag_name(id) == Some("a"))
+                    .and_then(|h| h.strip_prefix("x-trust-js:"))
+                    .and_then(|rest| rest.split_once(':'))
+                    .and_then(|(n, _)| n.parse().ok())
+            });
+        if let Some(actor) = marker {
+            cur = Some(actor);
+        }
+        if let Some(actor) = cur
+            && dom.tag_name(id).is_some()
+        {
+            map.insert(id, actor);
+        }
+        for c in dom.children(id) {
+            stack.push((c, cur));
+        }
+    }
+    map
 }
 
 /// The result of laying out one incremental-layout region patch
@@ -2012,7 +2097,9 @@ fn collect_image_urls(dom: &crate::dom::Dom, base: &Url) -> Vec<String> {
         };
         // A `data:` image (inline SVG rewritten to one, or a page's own data
         // image) carries its bytes inline — decoded locally, never fetched.
-        let u = if src.starts_with("data:") {
+        // A `blob:` image resolves from the page's blob byte mirror
+        // (`Doc.blobs`) the same local way (Steam's client-generated QR).
+        let u = if src.starts_with("data:") || src.starts_with("blob:") {
             src.to_string()
         } else if let Link::Http(u) = resolve(base, src) {
             u.to_string()
@@ -2396,6 +2483,35 @@ mod tests {
             .iter()
             .flat_map(|r| &r.items)
             .any(|it| it.text.contains(needle))
+    }
+
+    #[test]
+    fn anchor_rows_maps_id_and_name_to_first_row() {
+        let url = parse_url("http://example.com/").unwrap();
+        let html = b"<body><h1 id=top>Top</h1>\
+            <p>a</p><p>b</p><p>c</p>\
+            <section id=mid><p>middle content</p></section>\
+            <a name=named></a><p>after named</p>\
+            <h2 id=bottom>Bottom</h2><p>tail</p></body>";
+        let doc = parse(
+            &url,
+            "text/html",
+            html,
+            80,
+            24,
+            &crate::layout::ImageSizes::new(),
+        );
+        let a = &doc.anchor_rows;
+        eprintln!("anchor_rows = {a:?}, rows = {}", doc.rows.len());
+        // Every named anchor resolved to a row, in ascending document order.
+        let top = a.get("top").copied().expect("id=top");
+        let mid = a.get("mid").copied().expect("id=mid");
+        let named = a.get("named").copied().expect("a name=named");
+        let bottom = a.get("bottom").copied().expect("id=bottom");
+        assert!(top <= mid, "{top} <= {mid}");
+        assert!(mid <= named, "{mid} <= {named}");
+        assert!(named <= bottom, "{named} <= {bottom}");
+        assert!(bottom < doc.rows.len(), "bottom row in range");
     }
 
     #[test]
@@ -3035,6 +3151,229 @@ mod tests {
         assert!(
             peak >= N / 2,
             "fetches did not overlap: peak in-flight {peak} of {N} (serial engine never exceeds 1)"
+        );
+        server.abort();
+    }
+
+    // Response headers reach page JS, and binary bodies stay byte-exact,
+    // through BOTH fetch paths — the load-time one (`response_to_array`) and
+    // the live-actor background one (`fetch_result_value`) — plus the XHR
+    // `responseType='arraybuffer'` reader. Steam's QR login needs all of it:
+    // its WebAPI transport reads the EResult from the `x-eresult` response
+    // header and protobuf-decodes the body from `arrayBuffer()`. The
+    // background path used to drop the byte-exact element ("Failed to read
+    // varint" → no auth session) and only content-type was ever visible.
+    // Set-Cookie must stay hidden (a forbidden response-header name — it
+    // would leak HttpOnly cookies past the jar). Server on 127.0.0.3: the
+    // cookie jar is process-global, so the Set-Cookie this test emits must
+    // not share a host with other cookie tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn response_headers_and_binary_bodies_reach_page_js() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const SCRIPT: &str = r##"
+            function readAll(tag, cb) {
+              fetch('/api').then(function (r) {
+                var h = 'h:' + r.headers.get('x-eresult') + ' sc:' + String(r.headers.get('set-cookie'));
+                return r.arrayBuffer().then(function (ab) {
+                  var x = new XMLHttpRequest();
+                  x.open('GET', '/api');
+                  x.responseType = 'arraybuffer';
+                  x.onload = function () {
+                    cb(tag + ' ' + h + ' f:' + Array.from(new Uint8Array(ab)).join(',') +
+                       ' xh:' + x.getResponseHeader('x-eresult') +
+                       ' x:' + Array.from(new Uint8Array(x.response)).join(','));
+                  };
+                  x.send();
+                });
+              });
+            }
+            readAll('ld', function (s) { document.getElementById('out').textContent = s; });
+            document.getElementById('go').addEventListener('click', function () {
+              readAll('bg', function (s) { document.getElementById('out').textContent = s; });
+            });
+        "##;
+        let listener = tokio::net::TcpListener::bind("127.0.0.3:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let reply: Vec<u8> = if text.starts_with("GET /page ") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                             <body><div id=out></div><button id=go>go</button><script>{SCRIPT}</script></body>"
+                        )
+                        .into_bytes()
+                    } else if text.starts_with("GET /api ") {
+                        // A protobuf-ish binary body: 0x96/0xFF are not valid
+                        // UTF-8 here, so only the byte-exact path preserves
+                        // them. X-EResult is the out-of-band API result;
+                        // Set-Cookie must NOT surface to JS.
+                        let mut r =
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                                      X-EResult: 1\r\nSet-Cookie: secret=1; HttpOnly\r\n\
+                                      Content-Length: 4\r\nConnection: close\r\n\r\n"
+                                .to_vec();
+                        r.extend_from_slice(&[0x08, 0x96, 0x01, 0xFF]);
+                        r
+                    } else {
+                        b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                    };
+                    let _ = sock.write_all(&reply).await;
+                });
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.3:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body).into_owned();
+        let mut live = response
+            .live
+            .take()
+            .expect("a live page (it has a listener)");
+        // The XHR's deferred `__finish` (a setTimeout(0) scheduled mid-settle)
+        // can land after the load settle's last tick; the actor fires it AT
+        // REST. Drain until the load-path result text shows up.
+        let mut latest = body.clone();
+        async fn wait_for(live: &mut LivePage, latest: &mut String, needle: &str) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !latest.contains(needle) && std::time::Instant::now() < deadline {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(left, live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        *latest = html;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        wait_for(&mut live, &mut latest, "ld h:").await;
+        assert!(
+            latest.contains("ld h:1 sc:null f:8,150,1,255 xh:1 x:8,150,1,255"),
+            "load-time fetch/XHR results: {latest}"
+        );
+        // The live phase: a click dispatch runs the same reads through the
+        // BACKGROUND fetch path (the one that dropped the bytes).
+        let button = body
+            .split("x-trust-js:")
+            .nth(1)
+            .and_then(|r| r.split(':').next())
+            .expect("a clickable marker for the button")
+            .parse::<usize>()
+            .unwrap();
+        live.handle
+            .cmds
+            .send(crate::js::PageCmd::Click(button))
+            .await
+            .unwrap();
+        wait_for(&mut live, &mut latest, "bg h:").await;
+        assert!(
+            latest.contains("bg h:1 sc:null f:8,150,1,255 xh:1 x:8,150,1,255"),
+            "background fetch/XHR results: {latest}"
+        );
+        drop(live);
+        server.abort();
+    }
+
+    // A `<link rel=stylesheet>` INJECTED by page JS (webpack's mini-css chunk
+    // loader: rel/href set as properties, appended to <head>) is fetched, fires
+    // `load`, and its CSS body JOINS THE LIVE CASCADE (HTML §4.2.4: obtaining
+    // the resource adds the sheet to the document's style sheets). A code-split
+    // app ships its layout in these chunks — Steam's login QR frame width and
+    // checkbox cap live there; dropping the body left late-loaded routes
+    // unstyled (giant check-mark SVG, intrinsic-tiny QR).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn injected_stylesheet_joins_the_live_cascade() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const SCRIPT: &str = r##"
+            var l = document.createElement('link');
+            l.rel = 'stylesheet';
+            l.href = '/chunk.css';
+            l.onload = function () {
+                document.getElementById('out').textContent = 'css loaded';
+            };
+            document.head.appendChild(l);
+        "##;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    let reply: Vec<u8> = if text.starts_with("GET /page ") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                             <html><head></head><body><div id=out></div>\
+                             <div class=wide>styled</div><script>{SCRIPT}</script></body></html>"
+                        )
+                        .into_bytes()
+                    } else if text.starts_with("GET /chunk.css ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nConnection: close\r\n\r\n\
+                          .wide{width:160px;text-transform:uppercase}"
+                            .to_vec()
+                    } else {
+                        b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                    };
+                    let _ = sock.write_all(&reply).await;
+                });
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut latest = String::from_utf8_lossy(&response.body).into_owned();
+        // The fetch lands via an async job; drain live renders until the chunk
+        // CSS is visible in the serialized (baked) output.
+        if let Some(mut live) = response.live.take() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while !(latest.contains("css loaded") && latest.contains("width:160px"))
+                && std::time::Instant::now() < deadline
+            {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(left, live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        latest = html;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        assert!(latest.contains("css loaded"), "link onload fired: {latest}");
+        assert!(
+            latest.contains("width:160px"),
+            "chunk CSS baked into the cascade output: {latest}"
+        );
+        assert!(
+            latest.contains("text-transform:uppercase"),
+            "all chunk declarations joined: {latest}"
         );
         server.abort();
     }
@@ -4554,6 +4893,17 @@ mod tests {
                 }
             }
         }
+        if let Some(blobs) = &resp.blobs {
+            for (u, (b, t)) in blobs.lock().unwrap().iter() {
+                eprintln!(
+                    "BLOB {} type={:?} len={} head={:?}",
+                    u,
+                    t,
+                    b.len(),
+                    String::from_utf8_lossy(&b[..b.len().min(60)])
+                );
+            }
+        }
         eprintln!("=== {} UNIQUE ERRORS ===", errs.len());
         for (i, e) in errs.iter().enumerate() {
             eprintln!("\n[{i}] {e}");
@@ -4642,7 +4992,7 @@ mod tests {
             }
         }
         eprintln!("decoded {} images", images.len());
-        let (rows, _car, _rgn, _clip, _bnd, _fix) = crate::layout::lay_out_with_carousels(
+        let (rows, _car, _rgn, _clip, _bnd, _fix, _anchors) = crate::layout::lay_out_with_carousels(
             &dom,
             &url,
             (vp.0 as usize, vp.1 as usize),
@@ -4767,6 +5117,34 @@ mod tests {
                     }
                     _ => {
                         eprintln!("SETTLED <no more within 20s>");
+                        break;
+                    }
+                }
+            }
+        }
+        // TRUST_DIAG_CLICK=<nodeid>: dispatch a click to that live node and drain
+        // events, to see whether it navigates / re-renders / errors (temporary).
+        if let Ok(nstr) = std::env::var("TRUST_DIAG_CLICK")
+            && let Some(live) = response.live.as_mut()
+        {
+            let node: usize = nstr.parse().unwrap();
+            eprintln!("DIAG_CLICK -> node {node}");
+            let _ = live.handle.cmds.send(crate::js::PageCmd::Click(node)).await;
+            for _ in 0..10 {
+                match tokio::time::timeout(Duration::from_secs(20), live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Navigate(u))) => {
+                        eprintln!("CLICK EVT Navigate({u})");
+                    }
+                    Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                        eprintln!(
+                            "CLICK EVT Updated errors={:?} console={:?}",
+                            outcome.errors, outcome.console
+                        );
+                        response.body = html.into_bytes();
+                    }
+                    Ok(Some(other)) => eprintln!("CLICK EVT {other:?}"),
+                    _ => {
+                        eprintln!("CLICK <no more within 20s>");
                         break;
                     }
                 }

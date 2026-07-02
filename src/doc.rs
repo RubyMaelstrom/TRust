@@ -249,6 +249,19 @@ pub struct DocLine {
 
 /// A parsed, wrapped document plus everything needed to re-parse it
 /// (terminal resize re-wraps; encoding switches re-decode).
+/// Doc-carried handle to the page's blob byte mirror (`js::BlobMap`).
+/// Equality is Arc IDENTITY — re-parses of the same live page share one map,
+/// which is all the Doc's derived `PartialEq` needs.
+#[derive(Clone, Debug)]
+pub struct BlobsHandle(pub crate::js::BlobMap);
+
+impl PartialEq for BlobsHandle {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for BlobsHandle {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Doc {
     /// The URL this document was fetched from.
@@ -274,6 +287,11 @@ pub struct Doc {
     /// document order. The app's decode pipeline fetches these; once
     /// decoded, a re-layout turns the alt-text placeholders into pixels.
     pub image_urls: Vec<String>,
+    /// The page's `blob:` URL byte mirror (see `js::BlobMap`), set by the app
+    /// from the JS response. The image pipeline decodes `<img src="blob:…">`
+    /// from it (a client-generated image — Steam's login QR); it rides the Doc
+    /// into history so a frozen page's blob images still render on back.
+    pub blobs: Option<BlobsHandle>,
     /// Horizontally-scrollable strips (carousels) in `rows`, with their
     /// scroll offset. Empty except for HTML pages that have one.
     pub carousels: Vec<crate::layout::Carousel>,
@@ -302,6 +320,19 @@ pub struct Doc {
     /// rest of the document untouched. Captured on every full HTTP render of a
     /// live page; empty otherwise.
     pub boundaries: Vec<crate::layout::BoundaryBox>,
+    /// Layout-DOM node → live actor node of its nearest enclosing hover host
+    /// (the serializer's `data-trust-hover` markers, resolved at parse time —
+    /// the parsed DOM doesn't survive layout, so hover targets must be mapped
+    /// while it's alive). The app's hover hit-test reads an item's `node`
+    /// here to learn which actor node should hear the pointer. Empty except
+    /// for live HTML pages with hover listeners.
+    pub hover_ids: std::collections::HashMap<crate::dom::NodeId, usize>,
+    /// Fragment scroll targets: element `id` (and `<a name>`) → the FIRST
+    /// `rows` index that element's box occupies, captured at parse time (the
+    /// layout DOM doesn't survive into `Doc`). The app scrolls here when a
+    /// `#fragment` link / URL / live hash-change targets that anchor — HTML's
+    /// "scroll to the fragment". Empty for line-model docs (gopher/gemini/text).
+    pub anchor_rows: std::collections::HashMap<String, usize>,
 }
 
 impl Doc {
@@ -329,11 +360,14 @@ impl Doc {
             forms: Vec::new(),
             rows: Vec::new(),
             image_urls: Vec::new(),
+            blobs: None,
             carousels: Vec::new(),
             fixed: Vec::new(),
             regions: Vec::new(),
             scroll_clips: Vec::new(),
             boundaries: Vec::new(),
+            hover_ids: std::collections::HashMap::new(),
+            anchor_rows: std::collections::HashMap::new(),
         }
     }
 

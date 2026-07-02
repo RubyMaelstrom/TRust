@@ -1,15 +1,10 @@
-//! Ring-fenced Boa glue: the ONLY module allowed to import `boa_engine`.
-//! If the engine ever has to change (rquickjs is the named fallback),
-//! this file is the whole blast radius.
-//!
-//! Phase 0: engine plumbing — a budgeted context, script execution with
-//! per-script error tolerance, and the canary benchmark that gates the
-//! Phase 1 DOM work. Real DOM bindings replace the canary's permissive
-//! stubs in Phase 1.
-
-// Phase 0: nothing outside the tests calls this module yet; the app
-// wiring (`set js on|off`, the fetch pipeline hook) lands in Phase 1.
-#![allow(dead_code)]
+//! The JS engine seam: the ONLY module allowed to import `boa_engine` (Boa IS
+//! the engine — a showstopper means fixing the vendored fork, never swapping;
+//! see CLAUDE.md). Owns the budgeted page context, the `__dom_*`/`__http_*`
+//! integer-syscall boundary over the Rust arena, the PRELUDE (the web platform,
+//! self-hosted in JS on those syscalls), the compiled-code caches (prelude
+//! image + cross-page CDN image), parallel/lazy parse, and the living-page
+//! actor that keeps a displayed page's engine + DOM resident for dispatches.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -167,7 +162,8 @@ impl Budget {
 pub struct Outcome {
     pub errors: Vec<String>,
     pub elapsed: Duration,
-    /// `type="module"` scripts skipped (ES modules are a later phase).
+    /// `type="module"` scripts that could not run (an entry whose URL didn't
+    /// resolve / whose body never arrived). Modules otherwise execute for real.
     pub modules_skipped: usize,
     /// A script tripped an engine bug; remaining page JS was abandoned.
     pub panicked: bool,
@@ -179,6 +175,8 @@ pub struct Outcome {
 
 impl Outcome {
     /// The headline failure for `app.notice`, if anything went wrong.
+    /// (Test/diagnostic surface — the app currently formats its own notice.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn notice(&self) -> Option<String> {
         let first = self.errors.first()?;
         match self.errors.len() {
@@ -298,6 +296,7 @@ impl JobExecutor for PageJobExecutor {
 
 /// A fresh, isolated engine for one page, with the hostile-input limits
 /// applied. Dropped with the page — nothing survives navigation.
+#[cfg_attr(not(test), allow(dead_code))] // test/diagnostic surface
 pub fn page_context() -> Context {
     page_context_with(None).0
 }
@@ -1492,7 +1491,7 @@ pub type WebStorage = std::sync::Arc<
 /// dispatch ever blocking on the wire. `(status, content_type, body)` on
 /// success; `None` on failure (the prelude turns a null resolution into a
 /// rejected fetch / failed XHR, matching the sync syscall's contract).
-type FetchResult = Option<(u16, String, Vec<u8>)>;
+type FetchResult = Option<(u16, String, Vec<u8>, String)>;
 /// Channel a background fetch task posts its `(promise id, result)` back on.
 type FetchSender = tokio::sync::mpsc::Sender<(usize, FetchResult)>;
 
@@ -1652,6 +1651,28 @@ struct PageStore {
 impl boa_engine::gc::Finalize for PageStore {}
 // SAFETY: holds no GC-managed objects.
 unsafe impl boa_engine::gc::Trace for PageStore {
+    boa_engine::gc::empty_trace!();
+}
+
+/// Rust-side mirror of the page's minted `blob:` URLs → `(bytes, MIME type)`.
+/// The JS realm owns the AUTHORITATIVE store (`__blobURLStore`, File API);
+/// this mirror exists so the APP — outside the JS thread — can decode an
+/// `<img src="blob:…">` (Steam's login QR is a client-generated blob image).
+/// Entries are never removed on revoke: revocation only blocks NEW page-side
+/// fetches (File API: a load already started keeps its resource), and the
+/// renderer may re-decode a displayed blob image long after the page revoked
+/// its URL (resize, scroll back). Page-lifetime, RAM-only — the map dies with
+/// the `Doc`/history entry that carries it.
+pub type BlobMap =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (Vec<u8>, String)>>>;
+
+/// Host-defined carrier for the blob mirror (`__blob_mirror` writes to it).
+#[derive(boa_engine::JsData)]
+struct PageBlobs(BlobMap);
+
+impl boa_engine::gc::Finalize for PageBlobs {}
+// SAFETY: holds no GC-managed objects.
+unsafe impl boa_engine::gc::Trace for PageBlobs {
     boa_engine::gc::empty_trace!();
 }
 
@@ -2022,16 +2043,6 @@ fn wasm_to_js(v: &wasmi::Val) -> JsResult<JsValue> {
     })
 }
 
-/// js-api: calling an Exported Function whose type's params or results contain
-/// v128 throws a TypeError before executing. (exnref cannot occur — wasmi has no
-/// exception-handling support, so it never decodes one.)
-fn functype_rejects_at_js_boundary(ty: &wasmi::FuncType) -> bool {
-    ty.params()
-        .iter()
-        .chain(ty.results())
-        .any(|t| matches!(t, wasmi::ValType::V128))
-}
-
 /// Classify a wasmi instantiate/call error for the prelude error envelope: a
 /// trap → `RuntimeError`, anything else (a link/type failure) → `LinkError`.
 fn wasm_error_kind(e: &wasmi::Error) -> &'static str {
@@ -2168,12 +2179,14 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_create_element", 1, sys_create_element),
         ("__dom_create_text", 1, sys_create_text),
         ("__dom_create_fragment", 0, sys_create_fragment),
+        ("__dom_parse_document", 1, sys_parse_document),
         ("__dom_create_comment", 0, sys_create_comment),
         ("__dom_append", 2, sys_append),
         ("__dom_insert_before", 3, sys_insert_before),
         ("__dom_detach", 1, sys_detach),
         ("__dom_parent", 1, sys_parent),
         ("__dom_contains", 2, sys_contains),
+        ("__dom_set_hover", 1, sys_set_hover),
         ("__dom_children", 1, sys_children),
         ("__dom_next", 1, sys_next),
         ("__dom_prev", 1, sys_prev),
@@ -2228,6 +2241,8 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__storage_clear", 1, sys_storage_clear),
         ("__storage_key", 2, sys_storage_key),
         ("__storage_len", 1, sys_storage_len),
+        ("__blob_mirror", 3, sys_blob_mirror),
+        ("__dom_popover", 2, sys_dom_popover),
         ("__ws_open", 2, sys_ws_open),
         ("__ws_send", 3, sys_ws_send),
         ("__ws_close", 3, sys_ws_close),
@@ -2284,6 +2299,16 @@ fn sys_create_text(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
 fn sys_create_fragment(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let dom = page_dom(ctx);
     let id = dom.borrow_mut().create_fragment();
+    Ok(id_value(Some(id)))
+}
+
+/// `__dom_parse_document(str)` → detached `Document` node (nodeType 9), with a
+/// real `<html>`/`<head>`/`<body>` split. Backs `DOMParser.parseFromString` for
+/// `text/html`.
+fn sys_parse_document(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let html = arg_str(args, 0, ctx);
+    let dom = page_dom(ctx);
+    let id = dom.borrow_mut().parse_document_into(&html);
     Ok(id_value(Some(id)))
 }
 
@@ -2368,6 +2393,23 @@ fn sys_contains(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
         _ => false,
     };
     Ok(JsValue::from(found))
+}
+
+/// `__dom_set_hover(id | -1)` → move the cascade's live `:hover` chain to the
+/// element (+ its composed ancestors), or clear it (-1 / stale id). Returns
+/// whether the move can change the RENDER (`Dom::set_hover_chain` — the
+/// affected-check), in which case it already marked the page dirty, so the
+/// dispatch's normal dirty-check re-renders. Called by `trust.hover` after
+/// the pointer/mouse event sequence: ONE hover command drives both halves.
+fn sys_set_hover(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let target = args
+        .first()
+        .and_then(boa_engine::JsValue::as_number)
+        .filter(|n| *n >= 0.0)
+        .map(|n| n as usize);
+    let affected = dom.borrow_mut().set_hover_chain(target);
+    Ok(JsValue::from(affected))
 }
 
 fn sys_children(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -3195,10 +3237,14 @@ fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
         {
             phase(&format!("src: PAGE-CACHE-BG {url_arg}"));
             handle.spawn(async move {
-                let out = shared
-                    .await
-                    .ok()
-                    .map(|c| (c.status, c.content_type.clone(), c.body.clone()));
+                let out = shared.await.ok().map(|c| {
+                    (
+                        c.status,
+                        c.content_type.clone(),
+                        c.body.clone(),
+                        headers_to_blob(&c.headers),
+                    )
+                });
                 let _ = tx.send((id, out)).await;
             });
             return ctx.eval(Source::from_bytes(
@@ -3218,10 +3264,14 @@ fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
             Some((_handle, request)) => {
                 phase(&format!("src: PAGE-ASYNC-BG {}", request.url));
                 handle.spawn(async move {
-                    let out = crate::http::fetch(&request)
-                        .await
-                        .ok()
-                        .map(|r| (r.status, r.content_type, r.body));
+                    let out = crate::http::fetch(&request).await.ok().map(|r| {
+                        (
+                            r.status,
+                            r.content_type,
+                            r.body,
+                            headers_to_blob(&r.headers),
+                        )
+                    });
                     let _ = tx.send((id, out)).await;
                 });
                 return ctx.eval(Source::from_bytes(
@@ -3295,6 +3345,41 @@ fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
         }
     }
     Ok(promise.into())
+}
+
+/// `__dom_popover(nodeId, open)` — set/clear an element's popover SHOWING
+/// state (HTML §the popover attribute). The prelude's `showPopover`/
+/// `hidePopover` call it after the (cancelable) `beforetoggle` fires; the
+/// arena's UA hide rule and `:popover-open` matching read it, so an open
+/// popover renders and a closed one drops from layout.
+fn sys_dom_popover(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let open = args.get(1).is_some_and(JsValue::to_boolean);
+    let dom = page_dom(ctx);
+    let mut d = dom.borrow_mut();
+    if let Some(id) = arg_node(&d, args, 0) {
+        d.set_popover_open(id, open);
+    }
+    Ok(JsValue::undefined())
+}
+
+/// `__blob_mirror(url, bytes, type)` — mirror a freshly minted `blob:` URL's
+/// bytes into the Rust-side `BlobMap` so the app's image pipeline can decode
+/// an `<img src="blob:…">` (the authoritative store stays in the JS realm —
+/// see `PageBlobs`). `bytes` is a latin1 byte string, like every binary
+/// syscall argument. No-op without a `PageBlobs` host (workers).
+fn sys_blob_mirror(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let url = arg_str(args, 0, ctx);
+    let bytes = args
+        .get(1)
+        .map(|v| arg_bytes_latin1(v, ctx))
+        .unwrap_or_default();
+    let mime = arg_str(args, 2, ctx);
+    if !url.is_empty()
+        && let Some(blobs) = ctx.realm().host_defined().get::<PageBlobs>()
+    {
+        blobs.0.lock().unwrap().insert(url, (bytes, mime));
+    }
+    Ok(JsValue::undefined())
 }
 
 /// `__ws_open(url, protocols)` → a socket id (>0), or -1 if WebSockets aren't
@@ -4949,9 +5034,14 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
 /// no event, `__webpack_require__.e(chunk)` stays pending → a `Promise.all` of
 /// chunks (every `React.lazy` route — Twitch's whole page body) never resolves →
 /// the route's Suspense shows its spinner forever. We fetch (cap-/SSRF-gated,
-/// like injected scripts) and fire `load` on a 2xx else `error`. The CSS body
-/// isn't yet folded into the live cascade (a separate enhancement); the load
-/// event is what unblocks the loaders.
+/// like injected scripts) and fire `load` on a 2xx else `error`. On success the
+/// CSS body is FOLDED INTO THE LIVE CASCADE at the link's document position
+/// (HTML §4.2.4: obtaining the resource creates the sheet and adds it to the
+/// document's style sheets) — a code-split app ships its LAYOUT in these
+/// chunks, and dropping them left every late-loaded route unstyled (Steam's
+/// login: the QR frame's width and the 14px checkbox cap live in chunk CSS;
+/// without them the QR rendered intrinsic-tiny and the 256px check-mark SVG
+/// rendered giant).
 fn sys_load_injected_stylesheet(
     _: &JsValue,
     args: &[JsValue],
@@ -4980,6 +5070,10 @@ fn sys_load_injected_stylesheet(
                     let mut guard = cell.borrow_mut();
                     match result {
                         Ok(resp) if (200..300).contains(&resp.status) => {
+                            let css = crate::http::decode_body(&resp.content_type, &resp.body);
+                            page_dom(&mut guard)
+                                .borrow_mut()
+                                .attach_sheet_to_link(node_id, css);
                             fire_script_event(&mut guard, node_id, "load");
                         }
                         _ => fire_script_event(&mut guard, node_id, "error"),
@@ -5132,26 +5226,50 @@ fn body_latin1(body: &[u8]) -> JsValue {
     str_value(&body.iter().map(|&b| b as char).collect::<String>())
 }
 
-/// A fetched response as the `[status, content_type, body_text, body_bytes]`
-/// array the prelude expects (`body_bytes` is byte-exact for `arrayBuffer`).
+/// Response headers as the same `name\nvalue\n…` blob the request side uses
+/// (`parse_header_blob` is its inverse); the prelude splits it back into the
+/// fetch `Response.headers` / XHR `getResponseHeader` map. Values never hold
+/// newlines (read_line strips them), but strip defensively anyway.
+fn headers_to_blob(headers: &[(String, String)]) -> String {
+    let mut s = String::new();
+    for (k, v) in headers {
+        if k.is_empty() {
+            continue;
+        }
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(k);
+        s.push('\n');
+        s.push_str(&v.replace('\n', " "));
+    }
+    s
+}
+
+/// A fetched response as the `[status, content_type, body_text, body_bytes,
+/// header_blob]` array the prelude expects (`body_bytes` is byte-exact for
+/// `arrayBuffer`; `header_blob` carries ALL response headers — pages read
+/// API results out of band, e.g. Steam's `x-eresult`).
 fn response_to_array(resp: &crate::http::Response, ctx: &mut Context) -> JsValue {
     let vals = vec![
         JsValue::from(f64::from(resp.status)),
         str_value(&resp.content_type),
         str_value(&String::from_utf8_lossy(&resp.body)),
         body_latin1(&resp.body),
+        str_value(&headers_to_blob(&resp.headers)),
     ];
     JsArray::from_iter(vals, ctx).into()
 }
 
-/// Same `[status, content_type, body_text, body_bytes]` shape from a cached
-/// response.
+/// Same `[status, content_type, body_text, body_bytes, header_blob]` shape
+/// from a cached response.
 fn cached_to_array(c: &crate::http::CachedResp, ctx: &mut Context) -> JsValue {
     let vals = vec![
         JsValue::from(f64::from(c.status)),
         str_value(&c.content_type),
         str_value(&String::from_utf8_lossy(&c.body)),
         body_latin1(&c.body),
+        str_value(&headers_to_blob(&c.headers)),
     ];
     JsArray::from_iter(vals, ctx).into()
 }
@@ -5297,10 +5415,16 @@ pub struct PageEnv {
     pub net: Option<tokio::runtime::Handle>,
     /// Shared session storage; None gets a fresh page-lifetime map.
     pub storage: Option<WebStorage>,
+    /// The page's `blob:` URL byte mirror (see `BlobMap`). Created by the
+    /// caller so it survives the engine: `execute_js` keeps a clone on the
+    /// `Response`, the app hangs it on the `Doc`, and the image pipeline
+    /// resolves `blob:` `<img>` srcs from it — even after the page froze.
+    pub blobs: BlobMap,
 }
 
 impl PageEnv {
     /// No network, no shared storage: the test/diagnostic default.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn bare(url: &str) -> Self {
         Self {
             url: url.to_string(),
@@ -5311,6 +5435,7 @@ impl PageEnv {
             cache: std::sync::Arc::new(crate::http::PageCache::default()),
             net: None,
             storage: None,
+            blobs: BlobMap::default(),
         }
     }
 }
@@ -5900,6 +6025,10 @@ fn load_page(
                 .map(|u| u.origin().ascii_serialization())
                 .unwrap_or_else(|| String::from("null")),
         });
+        // The blob byte mirror (the caller keeps the other clone — see
+        // `PageEnv.blobs`); unconditional, like PageStore: pages mint blob
+        // image URLs with or without net.
+        host.insert(PageBlobs(env.blobs.clone()));
         if let (Some(handle), Some(page)) = (env.net.clone(), parsed_url.clone()) {
             host.insert(PageNet {
                 handle,
@@ -6299,6 +6428,39 @@ fn settle_page(page: &mut LoadedPage) {
     report_fn_census();
 }
 
+/// Evaluate a `__trust.*` entry point that RUNS PAGE CALLBACKS (timer ticks,
+/// IntersectionObserver delivery, image-load scans) with the same panic
+/// containment as `run_script`/`run_jobs_into`. These used to be bare
+/// `ctx.eval`s — the one remaining place a Boa VM panic inside page code could
+/// unwind the resident actor thread, silently killing the live page (and
+/// skipping the thread's allocator purge on the way out) instead of degrading
+/// to the `· JS:n!` badge. `None` = the eval failed or panicked; on panic
+/// `outcome.panicked` is set so the caller's normal Trouble path runs.
+fn guarded_eval(
+    ctx: &mut Context,
+    src: &[u8],
+    what: &str,
+    outcome: &mut Outcome,
+) -> Option<JsValue> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.eval(Source::from_bytes(src))
+    }));
+    match result {
+        Ok(Ok(v)) => Some(v),
+        Ok(Err(err)) => {
+            outcome.errors.push(format!("{what}: {err}"));
+            None
+        }
+        Err(_) => {
+            outcome
+                .errors
+                .push(format!("{what}: engine panic (Boa bug) — page JS halted"));
+            outcome.panicked = true;
+            None
+        }
+    }
+}
+
 /// Drain microtasks + DUE-NOW (0-delay) timers to quiescence at the CURRENT
 /// instant — it does NOT advance virtual time. Real-delay timers (rAF,
 /// intervals, `setTimeout(_, N>0)`) are left pending for the at-rest wake loop
@@ -6310,7 +6472,7 @@ fn settle(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Ou
     let mut ticks = 0;
     loop {
         run_jobs_into(ctx, budget, outcome);
-        if budget.exhausted() || ticks >= max_ticks {
+        if budget.exhausted() || ticks >= max_ticks || outcome.panicked {
             phase(&format!(
                 "settle: {ticks} ticks, exhausted={}",
                 budget.exhausted()
@@ -6319,14 +6481,14 @@ fn settle(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Ou
         }
         // `__trust.tick` fires due-now timer callbacks (page JS) synchronously,
         // so its execution is real engine work — time it into the execute
-        // bucket. It runs via a direct `ctx.eval` (not `run_script`/a job), so
-        // without this it would be invisible to the profiler and mis-attributed
-        // to "Rust-side" in the gate split.
+        // bucket. It runs via `guarded_eval` (not `run_script`/a job): a VM
+        // panic inside a timer callback must cost the page, not the actor
+        // thread. Timed so the profiler doesn't mis-attribute it to Rust-side.
         let t = phase_begin();
-        let ticked = ctx.eval(Source::from_bytes(b"__trust.tick()"));
+        let ticked = guarded_eval(ctx, b"__trust.tick()", "timer tick", outcome);
         phase_end(Phase::Execute, t);
         match ticked {
-            Ok(v) if v.to_boolean() => ticks += 1,
+            Some(v) if v.to_boolean() => ticks += 1,
             _ => {
                 phase(&format!("settle: {ticks} ticks, quiescent"));
                 break;
@@ -6352,19 +6514,22 @@ fn settle_to(
     let mut ticks = 0;
     loop {
         // `tickTo` fires due timer callbacks synchronously (page JS), so time it
-        // into the execute bucket like the `tick` call in `settle` does.
+        // into the execute bucket like the `tick` call in `settle` does — and
+        // guard it identically (a VM panic in an at-rest timer callback must
+        // degrade the page, not unwind the actor).
         let t = phase_begin();
-        let fired = ctx
-            .eval(Source::from_bytes(
-                format!("__trust.tickTo({abs_ms})").as_bytes(),
-            ))
-            .ok()
-            .and_then(|v| v.as_number())
-            .unwrap_or(0.0);
+        let fired = guarded_eval(
+            ctx,
+            format!("__trust.tickTo({abs_ms})").as_bytes(),
+            "timer tick",
+            outcome,
+        )
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
         phase_end(Phase::Execute, t);
         run_jobs_into(ctx, budget, outcome);
         ticks += 1;
-        if fired < 1.0 || budget.exhausted() || ticks >= max_ticks {
+        if fired < 1.0 || budget.exhausted() || ticks >= max_ticks || outcome.panicked {
             break;
         }
     }
@@ -6384,18 +6549,12 @@ const IMG_LOAD_PASSES: usize = 3;
 /// where nothing listens for `load`.
 fn settle_image_loads(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Outcome) {
     for _ in 0..IMG_LOAD_PASSES {
-        let scheduled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let t = phase_begin();
-            let n = ctx
-                .eval(Source::from_bytes(b"__trust.scanImageLoads()"))
-                .ok()
-                .and_then(|v| v.as_number())
-                .unwrap_or(0.0);
-            phase_end(Phase::Execute, t);
-            n
-        }))
-        .unwrap_or(0.0);
-        if scheduled < 1.0 {
+        let t = phase_begin();
+        let scheduled = guarded_eval(ctx, b"__trust.scanImageLoads()", "image load scan", outcome)
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0);
+        phase_end(Phase::Execute, t);
+        if scheduled < 1.0 || outcome.panicked {
             break;
         }
         settle(ctx, budget, max_ticks, outcome);
@@ -6522,6 +6681,7 @@ fn drain_js_side(ctx: &mut Context, outcome: &mut Outcome) {
 /// UA defaults. Without this, e.g. GitHub's code view (when its heavy JS times
 /// out) renders line numbers stacked above the code and nav menus expanded,
 /// because `display:flex`/`visibility:hidden` from its sheets never apply.
+#[cfg_attr(not(test), allow(dead_code))] // one-call form; production uses css_prepare + css_finish
 pub fn css_bake(
     html: &str,
     sheets: &[(String, String)],
@@ -6628,6 +6788,15 @@ pub enum PageCmd {
     /// own infinite-scroll logic (a window scroll handler, or an IO sentinel)
     /// fires its load-more request and the appended content re-renders.
     Scroll { x: f64, y: f64 },
+    /// The terminal's pointer (mouse cursor OR the gopherus selection — her
+    /// call: the selection IS the pointer) came to rest on a new element, or on
+    /// none (`node: None` — chrome rows / selection cleared). Dispatches the
+    /// Pointer Events transition sequence (pointer/mouse out→leave→over→enter→
+    /// move with relatedTarget) from the old target to this one, and moves the
+    /// cascade's `:hover` chain. `x`/`y` are viewport-relative CSS px of the
+    /// hovered cell's center. The app sends only COMMITTED targets (diff +
+    /// dwell-at-rest), so this is target-change-rate bounded, not motion-rate.
+    Hover { node: Option<usize>, x: f64, y: f64 },
     /// Per-region CLIP box the app measured (CSSOM View, Phase 3): `(node,
     /// clientHeight, clientWidth)` px. Stored on the live DOM so `clientHeight`/
     /// `clientWidth` read TRUE values (the conditional pin reads them). Only the
@@ -6705,6 +6874,12 @@ pub enum PageEvt {
     /// An un-prevented click on a live anchor: the app navigates
     /// (absolute URL, already resolved against the page).
     Navigate(String),
+    /// A same-document fragment scroll the page requested (`location.href = "#x"`
+    /// / `location.hash = …`): the app scrolls the view to the element with this
+    /// `id`/`<a name>` (empty = the top). The live engine has no scroll model, so
+    /// the app resolves it against `Doc.anchor_rows`. Emitted AFTER the dispatch's
+    /// render, so the app scrolls in the freshly-rendered doc.
+    ScrollToFragment(String),
     /// A dispatch produced errors but no content change.
     Trouble(Vec<String>),
     /// A dispatch settled without a renderable mutation.
@@ -6715,7 +6890,15 @@ pub enum PageEvt {
     /// `node`, the actor node id baked as `data-trust-node`) — a cheap re-blit,
     /// no re-parse. `top`/`left` are px. When the same dispatch ALSO mutated the
     /// DOM, the `Updated`'s baked `data-trust-scroll-top` carries it instead.
-    Scrolled { node: usize, top: f64, left: f64 },
+    Scrolled {
+        node: usize,
+        top: f64,
+        /// Horizontal position — carried for protocol symmetry with
+        /// `scrollLeft` writes; the app re-windows vertically only (terminal
+        /// regions have no h-scroll), so nothing reads it yet.
+        #[allow(dead_code)]
+        left: f64,
+    },
     /// The page did not prevent a form submit; the app should perform
     /// the normal HTTP form submission it already prepared.
     SubmitDefault,
@@ -7460,6 +7643,10 @@ fn dispatch_worker_in(page: &mut LoadedPage, id: usize, event: WorkerOut) {
         &mut dispatch_outcome,
     );
     page.outcome.errors.extend(dispatch_outcome.errors);
+    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
+    // scheduled) must reach the caller's Trouble/exit path, not vanish with
+    // the scratch outcome.
+    page.outcome.panicked |= dispatch_outcome.panicked;
 }
 
 /// Spawn the forwarder relaying a page's inbound WebSocket events into the
@@ -7625,8 +7812,20 @@ fn page_actor(
         // actor must be alive to deliver. (The actor owns the worker handles —
         // exiting here would drop and terminate them.)
         let has_workers = page_has_workers(&page);
+        // A page listening for the pointer (hover-type listeners) or styling by
+        // it (`:hover` rules that can change the RENDER — tracked properties)
+        // stays live to receive `PageCmd::Hover`; dropping the engine here
+        // would kill hover on exactly the pages the feature targets.
+        let has_hover_work = !page.dom.borrow().hover_hosts_is_empty()
+            || page.dom.borrow().hover_css_affects_rendering();
         let outcome = std::mem::take(&mut page.outcome);
-        if !has_clickables && !painted_live && !has_timers && !has_scroll_work && !has_workers {
+        if !has_clickables
+            && !painted_live
+            && !has_timers
+            && !has_scroll_work
+            && !has_workers
+            && !has_hover_work
+        {
             let _ = evts.blocking_send(PageEvt::Static { html: out, outcome });
             return;
         }
@@ -7843,6 +8042,29 @@ fn page_actor(
                     return;
                 }
             }
+            PageCmd::Hover { node, x, y } => {
+                dispatch_hover_in(&mut page, node, x, y);
+                drain_js_side(&mut page.ctx, &mut page.outcome);
+                if page.outcome.panicked {
+                    let _ = evts
+                        .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+                    return;
+                }
+                // A hover handler may navigate (a hover-triggered router
+                // prefetch that commits) — honour it like a click does.
+                if let Some(url) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                // A handler that mutated (Steam's preview pane swap) or an
+                // affected :hover chain re-renders; an inert hover emits
+                // `Settled` (no redraw).
+                if !finish_dispatch(&mut page, &evts) {
+                    return;
+                }
+            }
             PageCmd::RegionGeom { items } => {
                 // Pure measurement backing for the `clientHeight`/`clientWidth`
                 // getters. No settle, no event — like the geometry box map behind
@@ -7948,6 +8170,10 @@ fn dispatch_ws_in(page: &mut LoadedPage, id: usize, event: crate::ws::WsIn) {
         &mut dispatch_outcome,
     );
     page.outcome.errors.extend(dispatch_outcome.errors);
+    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
+    // scheduled) must reach the caller's Trouble/exit path, not vanish with
+    // the scratch outcome.
+    page.outcome.panicked |= dispatch_outcome.panicked;
 }
 
 /// Apply a viewport scroll (CSS px, document origin) to the live page: update
@@ -7988,6 +8214,56 @@ fn dispatch_scroll_in(page: &mut LoadedPage, x: f64, y: f64) {
         &mut dispatch_outcome,
     );
     page.outcome.errors.extend(dispatch_outcome.errors);
+    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
+    // scheduled) must reach the caller's Trouble/exit path, not vanish with
+    // the scratch outcome.
+    page.outcome.panicked |= dispatch_outcome.panicked;
+}
+
+/// The terminal's pointer came to rest on a new element (or none): dispatch the
+/// Pointer Events transition sequence from the old hover target to `node` and
+/// move the cascade's `:hover` chain (both inside `__trust.hover`), then
+/// settle. A stale `node` (detached since the snapshot the app hit-test ran
+/// against — routine on re-rendering pages) degrades to a hover-clear, never an
+/// error. Same shape as `dispatch_scroll_in`.
+fn dispatch_hover_in(page: &mut LoadedPage, node: Option<usize>, x: f64, y: f64) {
+    prepare_dispatch(page);
+    let node = node.filter(|&n| page.dom.borrow().is_valid(n));
+    let x = if x.is_finite() { x } else { 0.0 };
+    let y = if y.is_finite() { y } else { 0.0 };
+    let arg = node.map_or_else(|| String::from("null"), |n| n.to_string());
+    let call = format!("__trust.hover({arg},{x},{y})");
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        page.ctx.eval(Source::from_bytes(call.as_bytes()))
+    })) {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => page.outcome.errors.push(format!("hover: {err}")),
+        Err(_) => {
+            page.outcome.errors.push(String::from(
+                "hover: engine panic (Boa bug) — page JS halted",
+            ));
+            page.outcome.panicked = true;
+            return;
+        }
+    }
+    let mut dispatch_outcome = Outcome::default();
+    settle(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
+    settle_image_loads(
+        &mut page.ctx,
+        &page.budget,
+        DISPATCH_TICKS,
+        &mut dispatch_outcome,
+    );
+    page.outcome.errors.extend(dispatch_outcome.errors);
+    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
+    // scheduled) must reach the caller's Trouble/exit path, not vanish with
+    // the scratch outcome.
+    page.outcome.panicked |= dispatch_outcome.panicked;
 }
 
 /// The terminal wheel/page scrolled an inner-scroll region: write its new
@@ -8039,6 +8315,10 @@ fn dispatch_set_scroll_in(
             &mut dispatch_outcome,
         );
         page.outcome.errors.extend(dispatch_outcome.errors);
+        // A panic during the settle (a Boa bug in a timer/microtask the dispatch
+        // scheduled) must reach the caller's Trouble/exit path, not vanish with
+        // the scratch outcome.
+        page.outcome.panicked |= dispatch_outcome.panicked;
         drain_js_side(&mut page.ctx, &mut page.outcome);
     }
     finish_dispatch(page, evts)
@@ -8054,12 +8334,17 @@ fn dispatch_set_scroll_in(
 /// Edge-triggered + geometry-cached: a no-op (no settle) unless it delivered
 /// entries, so a page with no observers / no geometry change pays one cheap eval.
 fn run_intersections(page: &mut LoadedPage) {
-    let delivered = page
-        .ctx
-        .eval(Source::from_bytes(b"__trust.updateIntersections()"))
-        .ok()
-        .and_then(|v| v.as_number())
-        .unwrap_or(0.0);
+    let delivered = guarded_eval(
+        &mut page.ctx,
+        b"__trust.updateIntersections()",
+        "intersection observer",
+        &mut page.outcome,
+    )
+    .and_then(|v| v.as_number())
+    .unwrap_or(0.0);
+    if page.outcome.panicked {
+        return;
+    }
     if delivered > 0.0 {
         // Drain the microtasks/jobs the callbacks scheduled (a fetch's promise
         // plumbing, a sync mutation's MutationObserver microtask). A load-more
@@ -8076,6 +8361,24 @@ fn run_intersections(page: &mut LoadedPage) {
 }
 
 fn finish_dispatch(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
+    // A same-document fragment scroll (`location.href = "#x"`) requested during
+    // the dispatch: emitted AFTER the render below, so the app scrolls in the
+    // freshly-rendered doc (its `anchor_rows` are current). Captured before the
+    // render — the click handler that set it has already run.
+    let frag = take_scroll_fragment(page);
+    if !finish_dispatch_render(page, evts) {
+        return false;
+    }
+    if let Some(frag) = frag {
+        return evts.blocking_send(PageEvt::ScrollToFragment(frag)).is_ok();
+    }
+    true
+}
+
+fn finish_dispatch_render(
+    page: &mut LoadedPage,
+    evts: &tokio::sync::mpsc::Sender<PageEvt>,
+) -> bool {
     if page.outcome.panicked {
         // Engine bug: degrade to static, last render stands.
         let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
@@ -8292,16 +8595,22 @@ fn dispatch_fetch_done(
     true
 }
 
-/// Build the `[status, content_type, body_text]` array (or `null` on failure)
-/// a background fetch resolves its promise with — the same shape as
-/// `response_to_array`, from the Send-able data posted back by the fetch task.
+/// Build the `[status, content_type, body_text, body_bytes, header_blob]`
+/// array (or `null` on failure) a background fetch resolves its promise with
+/// — the same shape as `response_to_array`, from the Send-able data posted
+/// back by the fetch task. The byte-exact 4th element MUST be included:
+/// dropping it made a live-page `arrayBuffer()` fall back to the UTF-8-lossy
+/// text, corrupting every binary response (Steam's protobuf auth call → no
+/// QR login).
 fn fetch_result_value(ctx: &mut Context, result: FetchResult) -> JsValue {
     match result {
-        Some((status, content_type, body)) => {
+        Some((status, content_type, body, header_blob)) => {
             let vals = vec![
                 JsValue::from(f64::from(status)),
                 str_value(&content_type),
                 str_value(&String::from_utf8_lossy(&body)),
+                body_latin1(&body),
+                str_value(&header_blob),
             ];
             JsArray::from_iter(vals, ctx).into()
         }
@@ -8381,6 +8690,23 @@ fn page_has_workers(page: &LoadedPage) -> bool {
         .host_defined()
         .get::<PageWorkers>()
         .is_some_and(|w| !w.workers.borrow().is_empty())
+}
+
+/// The pending same-document fragment scroll a dispatch produced (a live
+/// `location.href = "#x"` / `location.hash = …`), or None. `Some("")` means
+/// scroll to the top (a bare-URL / `#top` navigation). Cleared on read.
+fn take_scroll_fragment(page: &mut LoadedPage) -> Option<String> {
+    if page.outcome.panicked {
+        return None;
+    }
+    let v = page
+        .ctx
+        .eval(Source::from_bytes(b"__trust.takeScrollFragment()"))
+        .ok()?;
+    if v.is_null_or_undefined() {
+        return None;
+    }
+    Some(v.to_string(&mut page.ctx).ok()?.to_std_string_lossy())
 }
 
 fn take_script_navigation(page: &mut LoadedPage) -> Option<String> {
@@ -8483,6 +8809,10 @@ fn dispatch_form_set_in(page: &mut LoadedPage, node: usize, value: &str, checked
         &mut dispatch_outcome,
     );
     page.outcome.errors.extend(dispatch_outcome.errors);
+    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
+    // scheduled) must reach the caller's Trouble/exit path, not vanish with
+    // the scratch outcome.
+    page.outcome.panicked |= dispatch_outcome.panicked;
 }
 
 fn dispatch_submit_in(page: &mut LoadedPage, form: usize, submitter: Option<usize>) -> bool {
@@ -8524,6 +8854,10 @@ fn dispatch_submit_in(page: &mut LoadedPage, form: usize, submitter: Option<usiz
         &mut dispatch_outcome,
     );
     page.outcome.errors.extend(dispatch_outcome.errors);
+    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
+    // scheduled) must reach the caller's Trouble/exit path, not vanish with
+    // the scratch outcome.
+    page.outcome.panicked |= dispatch_outcome.panicked;
     prevented
 }
 
@@ -8535,22 +8869,27 @@ fn dispatch_submit_in(page: &mut LoadedPage, form: usize, submitter: Option<usiz
 /// `extract_live` that does NOT serialize the whole document, so the incremental
 /// patch path (INCREMENTAL_LAYOUT_PLAN.md §12c W1) can mark clickables for a
 /// per-boundary serialize without paying the whole-doc serialize.
-fn clickable_set(page: &mut LoadedPage) -> (std::collections::HashSet<usize>, bool) {
-    use std::collections::HashSet;
-
-    // Listener-bearing nodes, straight from the registry we own.
-    let mut listeners: HashSet<usize> = HashSet::new();
-    if let Ok(v) = page
-        .ctx
-        .eval(Source::from_bytes(b"__trust.clickables().join(\",\")"))
+/// Evaluate a prelude id-list entry point (`__trust.clickables()` /
+/// `hoverables()`) into a set — the listener-registry half of the marker sets.
+fn listener_ids(page: &mut LoadedPage, src: &[u8]) -> std::collections::HashSet<usize> {
+    let mut out = std::collections::HashSet::new();
+    if let Ok(v) = page.ctx.eval(Source::from_bytes(src))
         && let Ok(s) = v.to_string(&mut page.ctx)
     {
         for part in s.to_std_string_lossy().split(',') {
             if let Ok(id) = part.parse::<usize>() {
-                listeners.insert(id);
+                out.insert(id);
             }
         }
     }
+    out
+}
+
+fn clickable_set(page: &mut LoadedPage) -> (std::collections::HashSet<usize>, bool) {
+    use std::collections::HashSet;
+
+    // Listener-bearing nodes, straight from the registry we own.
+    let listeners = listener_ids(page, b"__trust.clickables().join(\",\")");
 
     let dom = page.dom.borrow();
     // The COMPOSED tree: shadow content is where component UIs live.
@@ -8633,11 +8972,187 @@ fn clickable_set(page: &mut LoadedPage) -> (std::collections::HashSet<usize>, bo
     (clickable, has_any)
 }
 
+/// The `on*` content attributes that make an element a hover host even with no
+/// registered listener (mirrors `onclick` in `clickable_set`'s inherent test).
+const HOVER_ATTRS: &[&str] = &[
+    "onmouseover",
+    "onmouseout",
+    "onmouseenter",
+    "onmouseleave",
+    "onmousemove",
+    "onpointerover",
+    "onpointerout",
+    "onpointerenter",
+    "onpointerleave",
+    "onpointermove",
+];
+
+/// The hover-target set the serializer marks (`data-trust-hover`), from three
+/// sources:
+///  1. Elements holding any hover-type listener (the prelude registry, via
+///     `__trust.hoverables()`) or bearing a hover `on*` attribute — PLUS
+///     their whole composed subtrees: a delegation container's descendants
+///     are its real targets (`e.target.closest('.row')` must see the ROW,
+///     not the container the listener sits on — the live smoke caught
+///     delegated rows resolving to the container without this).
+///  2. Elements a render-affecting `:hover` RULE could match (the style
+///     index's hover probes): a pure-CSS dropdown (`.menu:hover .drop`) has
+///     no listener at all, but `.menu` must still be a nameable hover target
+///     or the cascade's chain can never reach it. (Any-element probes —
+///     `:hover` nested in `:is()`/`:not()` — are skipped here: marking the
+///     whole document isn't a marker. Such rules still restyle when the
+///     chain moves via targets named by other means.)
+///
+/// NO cursor heuristics; html/body excluded (document-level delegation is
+/// reached by bubbling from whatever target the app resolves). Stored on the
+/// Dom so `serialize_live` bakes the marker — refreshed wherever the
+/// clickable set is.
+fn hover_set(page: &mut LoadedPage) -> std::collections::HashSet<usize> {
+    let mut hosts = listener_ids(page, b"__trust.hoverables().join(\",\")");
+    let dom = page.dom.borrow();
+    for d in dom.composed_descendants(crate::dom::DOCUMENT) {
+        if HOVER_ATTRS.iter().any(|a| dom.attr(d, a).is_some()) {
+            hosts.insert(d);
+        }
+    }
+    let mut marked = hosts.clone();
+    for &h in &hosts {
+        marked.extend(dom.composed_descendants(h));
+    }
+    marked.extend(dom.hover_css_candidates());
+    marked.retain(|&h| !matches!(dom.tag_name(h), None | Some("html" | "body")));
+    marked
+}
+
+/// `clickable_set` RESTRICTED to the given subtrees — the incremental patch
+/// path's marker input. A patch serializes ONLY its dirty boundaries, so only
+/// their nodes need click markers; the whole-document walk (every composed
+/// node × a `cursor` cascade probe × an ancestor scan) was the last per-patch
+/// whole-doc cost after the serialize itself was scoped
+/// (INCREMENTAL_LAYOUT_PLAN.md §12c). Same semantics as the full set for every
+/// in-scope node: ancestor `listens()` walks still climb past the boundary
+/// (a delegated row inside a listening container stays live), and a container
+/// holding an interactive is still demoted — an out-of-scope interactive can't
+/// affect an in-scope node, because ancestors of anything outside the boundary
+/// subtree never pass through it.
+fn clickable_set_scoped(
+    page: &mut LoadedPage,
+    roots: &[usize],
+) -> std::collections::HashSet<usize> {
+    use std::collections::HashSet;
+    let listeners = listener_ids(page, b"__trust.clickables().join(\",\")");
+    let dom = page.dom.borrow();
+    let mut everyone: Vec<usize> = Vec::new();
+    for &r in roots {
+        everyone.push(r);
+        everyone.extend(dom.composed_descendants(r));
+    }
+    let scope: HashSet<usize> = everyone.iter().copied().collect();
+    let listens = |id: usize| -> bool {
+        let mut cur = Some(id);
+        while let Some(c) = cur {
+            if listeners.contains(&c) || dom.attr(c, "onclick").is_some() {
+                return true;
+            }
+            cur = dom.parent_composed(c);
+        }
+        false
+    };
+    let mut candidates: HashSet<usize> = everyone
+        .iter()
+        .copied()
+        .filter(|&d| {
+            matches!(dom.tag_name(d), Some("button" | "summary"))
+                || dom.attr(d, "onclick").is_some()
+                || dom.attr(d, "role") == Some("button")
+        })
+        .collect();
+    candidates.extend(listeners.iter().copied().filter(|l| scope.contains(l)));
+    let mut anchors: Vec<usize> = Vec::new();
+    for &d in &everyone {
+        if dom.tag_name(d) == Some("a") && listens(d) {
+            anchors.push(d);
+        }
+    }
+    for &d in &everyone {
+        if dom.computed_style(d, "cursor").as_deref() == Some("pointer") && listens(d) {
+            candidates.insert(d);
+        }
+    }
+    candidates.retain(|&c| !matches!(dom.tag_name(c), None | Some("html" | "body")));
+    let mut containers: HashSet<usize> = HashSet::new();
+    for &i in candidates.iter().chain(anchors.iter()) {
+        let mut cur = dom.parent_composed(i);
+        while let Some(p) = cur {
+            containers.insert(p);
+            cur = dom.parent_composed(p);
+        }
+    }
+    let mut clickable: HashSet<usize> = candidates.difference(&containers).copied().collect();
+    clickable.extend(anchors);
+    clickable
+}
+
+/// Memoized "this node, or a composed ancestor of it, is a hover host" — the
+/// upward half of the scoped hover set. Each parent-chain segment is resolved
+/// once (the memo), so a subtree scan stays ~linear.
+fn self_or_ancestor_hover_host(
+    dom: &crate::dom::Dom,
+    reg: &std::collections::HashSet<usize>,
+    memo: &mut std::collections::HashMap<usize, bool>,
+    start: usize,
+) -> bool {
+    let mut chain: Vec<usize> = Vec::new();
+    let mut cur = Some(start);
+    let mut result = false;
+    while let Some(c) = cur {
+        if let Some(&v) = memo.get(&c) {
+            result = v;
+            break;
+        }
+        if reg.contains(&c) || HOVER_ATTRS.iter().any(|a| dom.attr(c, a).is_some()) {
+            memo.insert(c, true);
+            result = true;
+            break;
+        }
+        chain.push(c);
+        cur = dom.parent_composed(c);
+    }
+    for c in chain {
+        memo.insert(c, result);
+    }
+    result
+}
+
+/// `hover_set` RESTRICTED to the given subtrees (the patch path's marker
+/// input; see `clickable_set_scoped`). Marks the same nodes the full set
+/// would inside the boundaries: hover hosts and everything under one (the
+/// host may sit ABOVE the boundary — the memoized ancestor walk finds it),
+/// plus the CSS hover-probe candidates, scoped in dom.rs.
+fn hover_set_scoped(page: &mut LoadedPage, roots: &[usize]) -> std::collections::HashSet<usize> {
+    let reg = listener_ids(page, b"__trust.hoverables().join(\",\")");
+    let dom = page.dom.borrow();
+    let mut marked: std::collections::HashSet<usize> =
+        dom.hover_css_candidates_in(roots).into_iter().collect();
+    let mut memo: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
+    for &r in roots {
+        for d in std::iter::once(r).chain(dom.composed_descendants(r)) {
+            if self_or_ancestor_hover_host(&dom, &reg, &mut memo, d) {
+                marked.insert(d);
+            }
+        }
+    }
+    marked.retain(|&h| !matches!(dom.tag_name(h), None | Some("html" | "body")));
+    marked
+}
+
 /// Serialize the WHOLE live document for interaction (the full-path / fallback
 /// render), marking clickables computed by `clickable_set`. Returns the HTML +
 /// the clickable set + whether the page has any interaction.
 fn extract_live(page: &mut LoadedPage) -> (String, std::collections::HashSet<usize>, bool) {
     let (clickable, has_any) = clickable_set(page);
+    let hover = hover_set(page);
+    page.dom.borrow_mut().set_hover_hosts(hover);
     let dom = page.dom.borrow();
     let ser_t = Instant::now();
     let html = dom.serialize_live(crate::dom::DOCUMENT, &clickable);
@@ -8772,7 +9287,15 @@ fn emit_boundary_patches(
     boundaries: Vec<(crate::dom::NodeId, BoundaryTier)>,
     n_targets: Option<usize>,
 ) -> Option<bool> {
-    let (clickable, _) = clickable_set(page);
+    // Marker sets SCOPED to the dirty boundaries: a patch serializes nothing
+    // else, so nothing else needs marking, and the per-patch cost stays
+    // proportional to the patch — not the document (the full-path
+    // `extract_live` recomputes the document-wide sets before any full
+    // serialize, so the scoped hover set stored here can never leak into one).
+    let boundary_nodes: Vec<usize> = boundaries.iter().map(|&(n, _)| n).collect();
+    let clickable = clickable_set_scoped(page, &boundary_nodes);
+    let hover = hover_set_scoped(page, &boundary_nodes);
+    page.dom.borrow_mut().set_hover_hosts(hover);
     let t = std::time::Instant::now();
     let mut total_bytes = 0usize;
     let mut patches: Vec<SubtreePatch> = Vec::new();
@@ -9067,6 +9590,10 @@ fn dispatch_click_in(page: &mut LoadedPage, node: usize) -> Option<String> {
         &mut dispatch_outcome,
     );
     page.outcome.errors.extend(dispatch_outcome.errors);
+    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
+    // scheduled) must reach the caller's Trouble/exit path, not vanish with
+    // the scratch outcome.
+    page.outcome.panicked |= dispatch_outcome.panicked;
 
     if prevented {
         return None;
@@ -9108,11 +9635,6 @@ pub fn external_scripts(html: &str) -> Vec<String> {
         .filter(|(_, _, t, node)| is_classic(t) && dom.attr(*node, "nomodule").is_none())
         .filter_map(|(src, _, _, _)| src)
         .collect()
-}
-
-/// Does this page have scripts worth running at all?
-pub fn has_scripts(html: &str) -> bool {
-    !Dom::parse_document(html).scripts().is_empty()
 }
 
 /// Collect external stylesheet hrefs (raw attribute values, document
@@ -9173,12 +9695,15 @@ fn esc_js(s: &str) -> String {
         .collect()
 }
 
-/// The web platform, self-hosted: built on the `__dom_*` syscalls. This
-/// is plain portable JavaScript — an engine swap reuses it verbatim.
-/// Phase 1 surface: DOM core, events (bubble phase), timers (virtual
-/// time), classList/dataset/style, URL/URLSearchParams, atob/btoa, and
-/// RAM-only page-lifetime storage. Deliberately absent: fetch/XHR (the
-/// Phase 1 security envelope is zero I/O), ES modules, MutationObserver.
+/// The web platform, self-hosted: plain JavaScript built on the `__dom_*`
+/// integer syscalls (see the syscall-boundary comment above for WHY it's JS).
+/// The surface has grown to ~the working web: DOM core + per-interface
+/// prototypes, events (capture/target/bubble, once/signal options), timers on
+/// virtual time driven by the actor, fetch/XHR/Headers/AbortSignal, WebSocket,
+/// Web Workers, WebAssembly, MutationObserver/IntersectionObserver/
+/// ResizeObserver, custom elements + shadow DOM, CSSOM, URL/URLSearchParams,
+/// Blob/File/FileReader + blob: URLs, structured clone, Streams, storage,
+/// crypto.digest, and the Intl shim. Everything RAM-only, session-lifetime.
 const PRELUDE: &str = r##"
 (function () {
     "use strict";
@@ -9249,13 +9774,29 @@ const PRELUDE: &str = r##"
         // loader: `c.rel="stylesheet"; c.href=url`), so read the property first
         // (the `rel` IDL attribute doesn't always reflect to getAttribute).
         const rel = (node.rel || node.getAttribute("rel") || "").toLowerCase();
-        if (rel.split(/\s+/).indexOf("stylesheet") < 0) return;
-        if (!(node.href || node.getAttribute("href"))) return;
+        const rels = rel.split(/\s+/);
         let n = node, connected = false;
         while (n) { if (n.nodeType === 9) { connected = true; break; } n = n.parentNode; }
         if (!connected) return;
-        node.__cssStarted = true;
-        __dom_load_injected_stylesheet(node.__id);
+        if (rels.indexOf("stylesheet") >= 0) {
+            if (!(node.href || node.getAttribute("href"))) return;
+            node.__cssStarted = true;
+            __dom_load_injected_stylesheet(node.__id);
+            return;
+        }
+        // Resource-hint links (`preload`/`prefetch`/`modulepreload`/`preconnect`/
+        // `dns-prefetch`): we don't speculatively fetch (hints are optional), but
+        // the element MUST still fire `load` — a loader that `await`s the hint
+        // otherwise hangs forever. Astro's ClientRouter preloads the destination
+        // page's stylesheets as `<link rel="preload" as="style">` and awaits
+        // `Promise.all` of their load/error events BEFORE the view-transition
+        // swap; without this the swap never runs and every routed link goes dead.
+        if (rels.some((r) => r === "preload" || r === "prefetch" || r === "modulepreload"
+                || r === "preconnect" || r === "dns-prefetch")) {
+            node.__cssStarted = true;
+            // Async, like a real hint resolving — settles inside the same job drain.
+            Promise.resolve().then(() => { try { node.dispatchEvent(new Event("load")); } catch (e) {} });
+        }
     }
 
     // A freshly inserted <iframe>/<frame> connected to the document begins
@@ -9299,14 +9840,60 @@ const PRELUDE: &str = r##"
     // parse miss (the Rust syscall then joins against the page URL as before).
     function resolveURL(u) { const p = __url_parse(u, baseHref()); return p ? p[0] : u; }
 
-    // --- events: listener registry + synchronous bubble dispatch ---
+    // --- events: listener registry + synchronous capture/target/bubble dispatch ---
+    // Each list entry is { fn, capture, once, removed } (DOM §"event listener").
+    // `removed` is the spec's removed flag: a listener removed mid-dispatch (or
+    // consumed by `once`) is skipped by the in-flight snapshot. `captureCount`
+    // tracks whether ANY capture listener exists, so the common no-capture page
+    // pays nothing for the capture phase (no ancestor walk on non-bubbling
+    // events, no extra pass).
     const LS = new Map();
+    let captureCount = 0;
     function lsFor(target, type) {
         let m = LS.get(target);
         if (!m) { m = new Map(); LS.set(target, m); }
         let l = m.get(type);
         if (!l) { l = []; m.set(type, l); }
         return l;
+    }
+    // Flatten the WebIDL options argument (boolean useCapture, or the
+    // AddEventListenerOptions dict) — capture/once/signal honored, `passive`
+    // accepted and ignored (nothing here has a scroll-blocking default).
+    function lsOpts(options) {
+        if (options === true) return { capture: true, once: false, signal: null };
+        if (!options || typeof options !== "object") return { capture: false, once: false, signal: null };
+        return { capture: !!options.capture, once: !!options.once, signal: options.signal || null };
+    }
+    // The one "add an event listener" implementation (DOM §2.7), shared by
+    // EventTarget.prototype and the window's bound wrappers. Dedup is by
+    // (callback, capture) — a re-add with different once/passive is ignored,
+    // per spec. An already-aborted signal means never add; a live signal
+    // removes the listener when it aborts.
+    function addL(target, type, fn, options) {
+        if (!(typeof fn === "function" || (fn && typeof fn.handleEvent === "function"))) return;
+        const o = lsOpts(options);
+        if (o.signal && o.signal.aborted) return;
+        const t = String(type);
+        const l = lsFor(target, t);
+        for (let i = 0; i < l.length; i++) if (l[i].fn === fn && l[i].capture === o.capture) return;
+        const entry = { fn: fn, capture: o.capture, once: o.once, removed: false };
+        l.push(entry);
+        if (o.capture) captureCount++;
+        if (o.signal && typeof o.signal.addEventListener === "function") {
+            o.signal.addEventListener("abort", function () { removeL(target, t, fn, { capture: o.capture }); }, { once: true });
+        }
+    }
+    function removeL(target, type, fn, options) {
+        const capture = lsOpts(options).capture;
+        const l = lsFor(target, String(type));
+        for (let i = 0; i < l.length; i++) {
+            if (l[i].fn === fn && l[i].capture === capture) {
+                l[i].removed = true; // in-flight dispatch snapshots skip it (spec)
+                if (l[i].capture) captureCount--;
+                l.splice(i, 1);
+                return;
+            }
+        }
     }
     class Event {
         constructor(type, opts) {
@@ -9317,6 +9904,7 @@ const PRELUDE: &str = r##"
             this.defaultPrevented = false;
             this.target = null;
             this.currentTarget = null;
+            this.eventPhase = 0; // NONE; dispatch sets 1/2/3 per phase
             this.isTrusted = false;
             // CustomEvent.detail (and UIEvent.detail) default to null, not
             // undefined, when not supplied.
@@ -9386,6 +9974,11 @@ const PRELUDE: &str = r##"
             this.view = view; this.key = key;
         }
     }
+    // Event-phase constants (DOM §2.2), on the interface object AND the
+    // prototype per WebIDL — code compares `ev.eventPhase === Event.AT_TARGET`.
+    Event.NONE = 0; Event.CAPTURING_PHASE = 1; Event.AT_TARGET = 2; Event.BUBBLING_PHASE = 3;
+    Event.prototype.NONE = 0; Event.prototype.CAPTURING_PHASE = 1;
+    Event.prototype.AT_TARGET = 2; Event.prototype.BUBBLING_PHASE = 3;
     // The standard Event-interface hierarchy. Real browsers expose all of
     // these as constructable globals with distinct prototypes; code (and
     // polyfills like webcomponentsjs) reference `window.MouseEvent`, do
@@ -9415,6 +10008,15 @@ const PRELUDE: &str = r##"
     class ClipboardEvent extends Event {}
     class PageTransitionEvent extends Event {}
     class CloseEvent extends Event {}
+    // ToggleEvent (HTML §ToggleEvent): `beforetoggle`/`toggle` for popovers
+    // (and <details>/<dialog>). oldState/newState ride the init dict.
+    class ToggleEvent extends Event {
+        constructor(type, init) {
+            super(type, init);
+            this.oldState = (init && init.oldState) || "";
+            this.newState = (init && init.newState) || "";
+        }
+    }
     // createEvent("MouseEvent") must yield a MouseEvent, etc. (legacy path).
     const EVENT_INTERFACES = {
         Event, CustomEvent: Event, Events: Event, HTMLEvents: Event,
@@ -9443,31 +10045,78 @@ const PRELUDE: &str = r##"
         }
         return slot.fn;
     }
-    function dispatch(target, ev, forceBubble) {
-        ev.target = target;
-        const path = [target];
-        if (forceBubble || ev.bubbles) {
-            let p = target instanceof Node ? (target.parentNode || target.__host) : null;
-            while (p) { path.push(p); p = p.parentNode || p.__host; }
-            if (target !== g) path.push(g);
-        }
-        for (const cur of path) {
-            ev.currentTarget = cur;
+    // "Inner invoke" (DOM §2.9): run `cur`'s listeners for the event's current
+    // phase. phase 1 = capturing (capture listeners only), 2 = at-target (all,
+    // in registration order), 3 = bubbling (non-capture only). The legacy
+    // `on<type>` content-attribute handler is a non-capture listener, so it
+    // never runs in the capture phase. A `once` listener is removed BEFORE its
+    // callback runs (spec), so a re-dispatch from inside it can't re-fire it.
+    function invokeListeners(cur, ev, phase) {
+        if (phase !== 1) {
             const af = attrHandler(cur, ev.type);
             if (af) {
                 try { if (af.call(cur, ev) === false) ev.preventDefault(); }
                 catch (e) { trust.errors.push("on" + ev.type + ": " + ((e && e.message) || e)); }
+                if (ev.__stopNow) return;
             }
-            for (const fn of lsFor(cur, ev.type).slice()) {
-                try {
-                    if (typeof fn === "function") fn.call(cur, ev);
-                    else fn.handleEvent(ev);
-                }
-                catch (e) { trust.errors.push(ev.type + " handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
-                if (ev.__stopNow) break;
-            }
-            if (ev.__stop) break;
         }
+        const list = lsFor(cur, ev.type);
+        if (!list.length) return;
+        for (const entry of list.slice()) {
+            if (entry.removed) continue;
+            if (phase === 1 && !entry.capture) continue;
+            if (phase === 3 && entry.capture) continue;
+            if (entry.once) removeL(cur, ev.type, entry.fn, { capture: entry.capture });
+            try {
+                if (typeof entry.fn === "function") entry.fn.call(cur, ev);
+                else entry.fn.handleEvent(ev);
+            }
+            catch (e) { trust.errors.push(ev.type + " handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+            if (ev.__stopNow) break;
+        }
+    }
+    // "Dispatch" (DOM §2.9): capture down the composed path, at-target, then
+    // bubble back up when the event bubbles (or the caller forces it — the
+    // platform events we fire on the document that window listeners must see).
+    // The path is built whenever it can matter: a bubbling event, a forced
+    // one, or ANY event while capture listeners exist (the spec runs the
+    // capture phase even for non-bubbling events — capture-delegated focus
+    // handling depends on it). A non-bubbling event on a page with no capture
+    // listeners keeps the old one-element fast path.
+    function dispatch(target, ev, forceBubble) {
+        ev.target = target;
+        let path = null;
+        if (forceBubble || ev.bubbles || captureCount > 0) {
+            path = [target];
+            let p = target instanceof Node ? (target.parentNode || target.__host) : null;
+            while (p) { path.push(p); p = p.parentNode || p.__host; }
+            if (target !== g) path.push(g);
+        }
+        let stopped = false;
+        if (path && captureCount > 0) {
+            ev.eventPhase = 1; // CAPTURING_PHASE
+            for (let i = path.length - 1; i >= 1; i--) {
+                ev.currentTarget = path[i];
+                invokeListeners(path[i], ev, 1);
+                if (ev.__stop) { stopped = true; break; }
+            }
+        }
+        if (!stopped) {
+            ev.eventPhase = 2; // AT_TARGET
+            ev.currentTarget = target;
+            invokeListeners(target, ev, 2);
+            if (ev.__stop) stopped = true;
+        }
+        if (!stopped && path && (forceBubble || ev.bubbles)) {
+            ev.eventPhase = 3; // BUBBLING_PHASE
+            for (let i = 1; i < path.length; i++) {
+                ev.currentTarget = path[i];
+                invokeListeners(path[i], ev, 3);
+                if (ev.__stop) break;
+            }
+        }
+        ev.eventPhase = 0;
+        ev.currentTarget = null;
         return !ev.defaultPrevented;
     }
     trust.fire = function (target, type, bubble) {
@@ -9650,12 +10299,34 @@ const PRELUDE: &str = r##"
     // click" — `record` = false, it must not clobber the actor's read-once
     // `lastClickSubmit`). The bubbling click is what reaches React's delegated
     // root-container listener, so a programmatic `.click()` finally runs onClick.
+    // Popovers currently SHOWING, keyed by node id (the arena set is the
+    // render truth; this mirror drives the API logic + auto-closing).
+    const POPOVER_OPEN = Object.create(null);
     function activateClick(t, record) {
         if (record) trust.lastClickSubmit = null;
         if (!t) return false;
         const ev = new Event("click", { bubbles: true, cancelable: true });
         dispatch(t, ev, false);
         if (ev.defaultPrevented) return true;
+        // Popover invoker (HTML §popover target attributes): activating a
+        // button with `popovertarget` toggles/shows/hides the target popover
+        // — the no-JS popover idiom works in live pages.
+        const invoker = (t.localName === "button" || t.localName === "input") ? t
+            : (t.closest ? t.closest("button[popovertarget],input[popovertarget]") : null);
+        const pt = invoker && invoker.getAttribute && invoker.getAttribute("popovertarget");
+        if (pt) {
+            const target = document.getElementById(pt);
+            if (target && target.popover !== null) {
+                const action = String(invoker.getAttribute("popovertargetaction") || "toggle").toLowerCase();
+                const open = !!POPOVER_OPEN[target.__id];
+                try {
+                    if (action === "show") { if (!open) target.showPopover(); }
+                    else if (action === "hide") { if (open) target.hidePopover(); }
+                    else target.togglePopover();
+                } catch (e) {}
+                return true;
+            }
+        }
         // The default action of activating a submit control is to submit its
         // form (HTML). A live <button>/<input type=submit> reaches the app as a
         // JsClick, so without this a click fired only a `click` event and the
@@ -9696,6 +10367,91 @@ const PRELUDE: &str = r##"
             if (target instanceof Node && typeof target.__id === "number") {
                 const l = m.get("click");
                 if (l && l.length) out.push(target.__id);
+            }
+        }
+        return out;
+    };
+    // ---- hover (Pointer Events spec, which absorbed UI Events' mouse order) ----
+    // The terminal's pointer (mouse cursor or the gopherus selection) rests on
+    // ONE element at a time; the actor delivers committed target changes via
+    // trust.hover. Transition sequence on old→new: pointerout/mouseout on old
+    // (bubbling), pointerleave/mouseleave per element bottom-up from old to the
+    // exclusive common ancestor (NON-bubbling, non-cancelable), pointerover/
+    // mouseover on new (bubbling), pointerenter/mouseenter top-down from below
+    // the common ancestor to new, then pointermove/mousemove on new.
+    // relatedTarget = the other element of the pair. Every event object is
+    // FRESH — dispatch mutates ev.target, and __stop/defaultPrevented persist
+    // on the object, so reuse across a chain would corrupt the sequence.
+    let hoverTarget = null;
+    // The composed ancestor path (target-first), the same parentNode/__host
+    // walk dispatch() bubbles along, so shadow boundaries hop identically.
+    function hoverPath(t) {
+        const path = [];
+        let n = t;
+        while (n && n !== g) { path.push(n); n = n.parentNode || n.__host; }
+        return path;
+    }
+    // One pointer/mouse compat pair. over/out/move bubble and are cancelable;
+    // enter/leave are neither (Pointer Events event tables).
+    function fireHoverPair(name, target, related, bubbling, x, y) {
+        const init = {
+            bubbles: bubbling, cancelable: bubbling, composed: bubbling,
+            clientX: x, clientY: y,
+            pageX: x + (g.scrollX || 0), pageY: y + (g.scrollY || 0),
+            screenX: x, screenY: y, button: 0, buttons: 0,
+            relatedTarget: related, view: g, detail: 0,
+        };
+        const pinit = Object.assign({ pointerId: 1, pointerType: "mouse", isPrimary: true }, init);
+        dispatch(target, new PointerEvent("pointer" + name, pinit), false);
+        dispatch(target, new MouseEvent("mouse" + name, init), false);
+    }
+    trust.hover = function (id, x, y) {
+        // A stale id (the node was detached since the snapshot the app hit-test
+        // ran against) wraps to null — degrade to hover-clear, never an error.
+        const t = id === null || id === undefined ? null : wrap(id);
+        x = +x || 0; y = +y || 0;
+        if (t !== hoverTarget) {
+            const old = hoverTarget;
+            hoverTarget = t;
+            const oldPath = old ? hoverPath(old) : [];
+            const newPath = t ? hoverPath(t) : [];
+            // Trim the shared root suffix: what remains on each side is the
+            // chain strictly BELOW the nearest common ancestor.
+            let oi = oldPath.length - 1;
+            let ni = newPath.length - 1;
+            while (oi >= 0 && ni >= 0 && oldPath[oi] === newPath[ni]) { oi--; ni--; }
+            if (old) {
+                fireHoverPair("out", old, t, true, x, y);
+                for (let i = 0; i <= oi; i++) fireHoverPair("leave", oldPath[i], t, false, x, y);
+            }
+            if (t) {
+                fireHoverPair("over", t, old, true, x, y);
+                for (let i = ni; i >= 0; i--) fireHoverPair("enter", newPath[i], old, false, x, y);
+                fireHoverPair("move", t, null, true, x, y);
+            }
+        }
+        // The CSS half: the cascade's :hover chain follows the same committed
+        // target (Phase B syscall; guarded so the JS half stands alone).
+        if (typeof __dom_set_hover === "function") __dom_set_hover(t ? t.__id : -1);
+        return true;
+    };
+    // The nodes holding any hover-type listener — the serializer marks them
+    // (data-trust-hover) so the app can resolve a hover target back to this
+    // arena. Delegation needs no descendant marks: the bubbling over/out pair
+    // reaches ancestor listeners from whatever target the app resolves.
+    const HOVER_TYPES = [
+        "mouseover", "mouseout", "mouseenter", "mouseleave", "mousemove",
+        "pointerover", "pointerout", "pointerenter", "pointerleave", "pointermove",
+    ];
+    trust.hoverables = function () {
+        const out = [];
+        for (const entry of LS) {
+            const target = entry[0], m = entry[1];
+            if (target instanceof Node && typeof target.__id === "number") {
+                for (let i = 0; i < HOVER_TYPES.length; i++) {
+                    const l = m.get(HOVER_TYPES[i]);
+                    if (l && l.length) { out.push(target.__id); break; }
+                }
             }
         }
         return out;
@@ -9825,21 +10581,20 @@ const PRELUDE: &str = r##"
     // and installs `__shady_*` accessors here — so nodes inherit those too.
     // (`lsFor`/`dispatch` are hoisted function declarations, defined above.)
     class EventTarget {
-        addEventListener(type, fn) {
+        addEventListener(type, fn, options) {
             // Functions AND `{ handleEvent }` objects (Lit's EventParts register
-            // themselves as listeners).
+            // themselves as listeners). `addL` validates + honors the options
+            // dict (capture/once/signal — see lsOpts).
             if (typeof fn === "function" || (fn && typeof fn.handleEvent === "function")) {
-                const t = String(type);
-                const l = lsFor(this, t);
-                if (!l.includes(fn)) l.push(fn);
+                addL(this, type, fn, options);
                 // A per-element `scroll` listener (an inner-scroll region's un-pin
                 // handler) keeps the page resident so the wheel write-back can
                 // fire it (see `trust.hasScrollWork`). Window/document scroll is
                 // tracked separately via the listener map.
-                if (t === "scroll" && this !== g.document) g.__elScroll = true;
+                if (String(type) === "scroll" && this !== g.document) g.__elScroll = true;
             }
         }
-        removeEventListener(type, fn) { const l = lsFor(this, String(type)); const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); }
+        removeEventListener(type, fn, options) { removeL(this, type, fn, options); }
         dispatchEvent(ev) { return dispatch(this, ev, false); }
     }
     class Node extends EventTarget {
@@ -10423,6 +11178,68 @@ const PRELUDE: &str = r##"
         // framework-driven toggles, auto-clickers) silently did nothing.
         click() { try { activateClick(this, false); } catch (e) {} }
         focus() {} blur() {}
+        // --- The Popover API (HTML §the popover attribute) ---------------
+        // State truth lives in the ARENA (`__dom_popover` → the UA hide rule
+        // + `:popover-open`); POPOVER_OPEN mirrors it for the API logic.
+        // Light dismiss (click-outside closes auto popovers) is DEFERRED —
+        // the terminal's click dispatch has no pointerdown/up pair to track.
+        // `popover` reflects as the enumerated keyword state: missing → null,
+        // ""/"auto" → "auto", "hint" → "hint", anything else → "manual".
+        get popover() {
+            const v = this.getAttribute("popover");
+            if (v === null) return null;
+            const s = String(v).toLowerCase();
+            return (s === "" || s === "auto") ? "auto" : s === "hint" ? "hint" : "manual";
+        }
+        set popover(v) {
+            if (v === null || v === undefined) this.removeAttribute("popover");
+            else this.setAttribute("popover", String(v));
+        }
+        showPopover() {
+            const state = this.popover;
+            if (state === null) throw new DOMException("Element has no popover attribute", "NotSupportedError");
+            // Already showing: "check popover validity" RETURNS FALSE on a
+            // state mismatch — show popover then just returns (HTML; only a
+            // no-popover attribute or a disconnected element throws). Steam's
+            // tooltip re-calls showPopover on every hover tick and a throw
+            // here fed its error boundary.
+            if (POPOVER_OPEN[this.__id]) return;
+            if (!this.isConnected) throw new DOMException("Popover is not connected", "InvalidStateError");
+            const bev = new g.ToggleEvent("beforetoggle", { oldState: "closed", newState: "open", cancelable: true });
+            dispatch(this, bev, false);
+            if (bev.defaultPrevented) return;
+            // An auto/hint popover closes the other showing auto/hint
+            // popovers (the spec's stack, flattened: last one wins).
+            if (state !== "manual") {
+                for (const k in POPOVER_OPEN) {
+                    const other = POPOVER_OPEN[k];
+                    if (other && other !== this && other.popover !== "manual") {
+                        try { other.hidePopover(); } catch (e) {}
+                    }
+                }
+            }
+            POPOVER_OPEN[this.__id] = this;
+            __dom_popover(this.__id, true);
+            const self = this;
+            g.setTimeout(function () { dispatch(self, new g.ToggleEvent("toggle", { oldState: "closed", newState: "open" }), false); }, 0);
+        }
+        hidePopover() {
+            if (this.popover === null) throw new DOMException("Element has no popover attribute", "NotSupportedError");
+            // Already hidden: silent return, same validity rule as show.
+            if (!POPOVER_OPEN[this.__id]) return;
+            // beforetoggle open→closed is NOT cancelable (spec).
+            dispatch(this, new g.ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }), false);
+            delete POPOVER_OPEN[this.__id];
+            __dom_popover(this.__id, false);
+            const self = this;
+            g.setTimeout(function () { dispatch(self, new g.ToggleEvent("toggle", { oldState: "open", newState: "closed" }), false); }, 0);
+        }
+        togglePopover(force) {
+            const open = !!POPOVER_OPEN[this.__id];
+            if (open && (force === undefined || !force)) { this.hidePopover(); return false; }
+            if (!open && (force === undefined || !!force)) { this.showPopover(); return true; }
+            return open;
+        }
         // Element scrolling (CSSOM View, Phase 3 inner-scroll regions). A
         // definite-height `overflow-y:auto|scroll` box is a real scroll viewport
         // (the app reserves H rows and windows a retained buffer over them). The
@@ -10624,7 +11441,27 @@ const PRELUDE: &str = r##"
                 ? "maybe" : "";
         }
         load() {}
-        play() { return Promise.resolve(); }
+        // HTMLMediaElement §"playing the media resource": an element that is
+        // "not allowed to play" returns a promise rejected with
+        // NotAllowedError — the exact signal a real browser gives for blocked
+        // autoplay. We NEVER play inline (media routes to mpv via the follow
+        // affordance), so report that honestly instead of a lying resolve:
+        // hover-preview sites (Steam's sale-capsule microtrailers, every
+        // autoplay-guarded player since Chrome's policy) handle precisely
+        // this rejection and fall back to their poster/image UI — which keeps
+        // the capsule IMAGE instead of swapping to a video we can't paint.
+        // (The lying resolve left Steam's `with_microtrailer` class on
+        // forever: image hidden, unpaintable video shown, capsule destroyed.)
+        // The rejection is pre-observed so a page that never .catch()es
+        // doesn't count as a page error — browsers only console-warn there.
+        play() {
+            const p = Promise.reject(new DOMException(
+                "play() failed: no inline media playback in this rendering",
+                "NotAllowedError"
+            ));
+            p.catch(function () {});
+            return p;
+        }
         pause() {}
         addTextTrack() { return { mode: "disabled", cues: null, activeCues: null, addCue() {}, removeCue() {}, addEventListener() {}, removeEventListener() {} }; }
         fastSeek(t) { this.__ct = +t || 0; }
@@ -10984,7 +11821,11 @@ const PRELUDE: &str = r##"
         // `window.getSelection()`. Without it ProseMirror monkey-patches the
         // root's prototype to add one — see `ownerDocument` above.
         getSelection() { return g.getSelection(); }
-        get documentElement() { return wrap(__dom_doc_element()); }
+        // The main document (node 0) reads its root element by direct syscall
+        // (hot path). A DETACHED document (a `DOMParser` result, `__id !== 0`)
+        // scopes to its OWN subtree instead — `__dom_doc_element` only knows the
+        // live tree's root.
+        get documentElement() { return this.__id === 0 ? wrap(__dom_doc_element()) : (this.querySelector("html") || this.firstElementChild); }
         // The element that scrolls the viewport (CSSOM View). Standards mode ⇒
         // the document element; its scrollTop/scrollHeight/clientHeight mirror
         // the page scroll, so `document.scrollingElement.scrollTop` reads the
@@ -11066,7 +11907,15 @@ const PRELUDE: &str = r##"
         createNodeIterator(root, whatToShow) { return new NodeIterator(root, whatToShow); }
         createDocumentFragment() { return wrap(__dom_create_fragment()); }
         createRange() { return new Range(); }
-        getElementById(i) { return wrap(__dom_get_by_id(String(i))); }
+        getElementById(i) {
+            // `__dom_get_by_id` scans the LIVE tree; a detached parsed document
+            // (`__id !== 0`) must scan its own subtree instead.
+            if (this.__id !== 0) {
+                for (const e of this.querySelectorAll("[id]")) if (e.id === String(i)) return e;
+                return null;
+            }
+            return wrap(__dom_get_by_id(String(i)));
+        }
         getElementsByName(n) { return this.querySelectorAll("[name=" + String(n) + "]"); }
         // `document.elementFromPoint(x, y)` (CSSOM View): the topmost element at
         // the viewport coordinate, or null when the point is outside the
@@ -11335,49 +12184,25 @@ const PRELUDE: &str = r##"
         detach() {}
     }
     // DOMParser: parse a markup string into a detached document. `text/html`
-    // parses into a fresh <body> (the common case — DOMPurify, jQuery, and
-    // template libraries feed body-level fragments / whole documents alike).
-    // The parsed nodes live in the same arena, so their `ownerDocument`
-    // (the real document) carries createNodeIterator/importNode — which is
-    // exactly what a sanitizer reaches for through them.
+    // yields a REAL `Document` (nodeType 9) backed by a detached arena node with
+    // the parser's genuine `<html>`/`<head>`/`<body>` split — so it inherits the
+    // full Document read surface (`scripts`/`forms`/`links`/`images`/`title`/
+    // `querySelector*`/`getElementById*`…). This matters for a view-transitions
+    // swap (Astro's ClientRouter) that reads `newDocument.scripts` and swaps
+    // `newDocument.head`/`.body` separately: the old body-fragment parse crammed
+    // the whole document into one `<body>` and had no `.scripts`, so the swap
+    // threw and every client-routed link went dead. DOMPurify/jQuery.parseHTML
+    // (body-level fragments) still work — the document parser wraps a stray
+    // fragment into `<html><head></head><body>…`.
     class DOMParser {
-        parseFromString(str, _type) {
-            const docEl = g.document.createElement("html");
-            const head = g.document.createElement("head");
-            const body = g.document.createElement("body");
-            docEl.appendChild(head);
-            docEl.appendChild(body);
-            body.innerHTML = String(str === undefined ? "" : str);
-            return {
-                nodeType: 9,
-                documentElement: docEl,
-                head: head,
-                body: body,
-                createElement: (t) => g.document.createElement(t),
-                createTextNode: (s) => g.document.createTextNode(s),
-                createComment: (s) => g.document.createComment(s),
-                createDocumentFragment: () => g.document.createDocumentFragment(),
-                createNodeIterator: (r, w) => new NodeIterator(r, w),
-                createTreeWalker: (r, w, f) => new TreeWalker(r, w, f),
-                createRange: () => new Range(),
-                importNode: (n, deep) => n.cloneNode(!!deep),
-                getElementsByTagName: (t) => {
-                    const want = String(t).toLowerCase();
-                    const list = Array.from(docEl.getElementsByTagName(t));
-                    // getElementsByTagName matches descendants only; the root
-                    // <html> answers `'html'` itself (DOMPurify's whole-doc path).
-                    if (docEl.localName === want || want === "*") list.unshift(docEl);
-                    return list;
-                },
-                getElementById: (i) => {
-                    for (const e of docEl.querySelectorAll("[id]")) {
-                        if (e.id === String(i)) return e;
-                    }
-                    return null;
-                },
-                querySelector: (s) => docEl.querySelector(s),
-                querySelectorAll: (s) => docEl.querySelectorAll(s),
-            };
+        parseFromString(str, type) {
+            const s = String(str === undefined ? "" : str);
+            const t = String(type || "text/html").toLowerCase();
+            // We have no XML parser; treat anything non-XML as HTML (the common
+            // case). An XML mediaType falls back to the HTML document parser too
+            // — best-effort, same as before, but now a well-formed document.
+            void t;
+            return wrap(__dom_parse_document(s));
         }
     }
     // `new XMLSerializer().serializeToString(node)` — the inverse of DOMParser.
@@ -11802,6 +12627,7 @@ const PRELUDE: &str = r##"
     g.StorageEvent = StorageEvent; g.AnimationEvent = AnimationEvent;
     g.TransitionEvent = TransitionEvent; g.ClipboardEvent = ClipboardEvent;
     g.PageTransitionEvent = PageTransitionEvent; g.CloseEvent = CloseEvent;
+    g.ToggleEvent = ToggleEvent;
     g.ShadowRoot = ShadowRoot;
     g.TreeWalker = TreeWalker;
     g.NodeIterator = NodeIterator;
@@ -11989,6 +12815,116 @@ const PRELUDE: &str = r##"
         for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
         return out;
     };
+    // FormData (XHR standard §5, https://xhr.spec.whatwg.org/#interface-formdata):
+    // an ordered list of (name, value) entries where a value is a string or a
+    // File. `new FormData(form)` collects the form's submittable fields (HTML
+    // §"constructing the entry list" — the common cases). Used as a fetch/XHR
+    // body it encodes as multipart/form-data (`__formDataWire` below). Steam's
+    // store main.js news-up a FormData in a timer — a ReferenceError without it.
+    g.FormData = class FormData {
+        constructor(form) {
+            this.__entries = [];
+            if (form === undefined || form === null) return;
+            if (typeof form.querySelectorAll !== "function" || form.localName !== "form") {
+                throw new TypeError("FormData constructor: argument 1 is not a form element");
+            }
+            const els = form.querySelectorAll("input, select, textarea");
+            for (let i = 0; i < els.length; i++) {
+                const el = els[i];
+                const name = el.getAttribute("name");
+                if (!name) continue;
+                if (el.disabled || el.hasAttribute("disabled")) continue;
+                const tag = el.localName;
+                if (tag === "select") {
+                    const opts = el.querySelectorAll("option");
+                    for (let j = 0; j < opts.length; j++) {
+                        if (opts[j].selected && !opts[j].disabled) {
+                            this.__entries.push({ name: name, value: String(opts[j].value) });
+                        }
+                    }
+                } else if (tag === "textarea") {
+                    this.__entries.push({ name: name, value: String(el.value == null ? "" : el.value) });
+                } else {
+                    const type = (el.getAttribute("type") || "text").toLowerCase();
+                    if (type === "checkbox" || type === "radio") {
+                        if (!el.checked) continue;
+                        this.__entries.push({ name: name, value: el.hasAttribute("value") ? String(el.getAttribute("value")) : "on" });
+                    } else if (type === "file") {
+                        // No real file selection in this engine — the spec's
+                        // "no files selected" entry: a single empty File.
+                        this.__entries.push({ name: name, value: new g.File([], "", { type: "application/octet-stream" }) });
+                    } else if (type === "submit" || type === "button" || type === "reset" || type === "image") {
+                        continue; // buttons enter only as the submitter (we pass none)
+                    } else if (type === "hidden" && name === "_charset_") {
+                        this.__entries.push({ name: name, value: "UTF-8" });
+                    } else {
+                        this.__entries.push({ name: name, value: String(el.value == null ? "" : el.value) });
+                    }
+                }
+            }
+        }
+        // Blob → File conversion on append/set (spec: a Blob value becomes a
+        // File named "blob"; an explicit filename renames either).
+        __val(value, filename) {
+            if (value && Array.isArray(value.__parts)) {
+                if (!(value instanceof g.File)) {
+                    return new g.File(value.__parts.slice(), filename === undefined ? "blob" : String(filename), { type: value.type });
+                }
+                if (filename !== undefined) {
+                    return new g.File(value.__parts.slice(), String(filename), { type: value.type, lastModified: value.lastModified });
+                }
+                return value;
+            }
+            return String(value);
+        }
+        append(name, value, filename) { this.__entries.push({ name: String(name), value: this.__val(value, filename) }); }
+        set(name, value, filename) {
+            const n = String(name);
+            const v = this.__val(value, filename);
+            const es = this.__entries;
+            let placed = false;
+            for (let i = 0; i < es.length; i++) {
+                if (es[i].name !== n) continue;
+                if (placed) { es.splice(i, 1); i--; continue; }
+                es[i] = { name: n, value: v };
+                placed = true;
+            }
+            if (!placed) es.push({ name: n, value: v });
+        }
+        delete(name) {
+            const n = String(name);
+            const es = this.__entries;
+            for (let i = 0; i < es.length; i++) {
+                if (es[i].name === n) { es.splice(i, 1); i--; }
+            }
+        }
+        get(name) {
+            const n = String(name);
+            for (let i = 0; i < this.__entries.length; i++) if (this.__entries[i].name === n) return this.__entries[i].value;
+            return null;
+        }
+        getAll(name) {
+            const n = String(name);
+            const out = [];
+            for (let i = 0; i < this.__entries.length; i++) if (this.__entries[i].name === n) out.push(this.__entries[i].value);
+            return out;
+        }
+        has(name) {
+            const n = String(name);
+            for (let i = 0; i < this.__entries.length; i++) if (this.__entries[i].name === n) return true;
+            return false;
+        }
+        entries() { return this.__entries.map((e) => [e.name, e.value])[Symbol.iterator](); }
+        keys() { return this.__entries.map((e) => e.name)[Symbol.iterator](); }
+        values() { return this.__entries.map((e) => e.value)[Symbol.iterator](); }
+        forEach(fn, thisArg) {
+            const es = this.__entries.slice();
+            for (let i = 0; i < es.length; i++) fn.call(thisArg, es[i].value, es[i].name, this);
+        }
+        get [Symbol.toStringTag]() { return "FormData"; }
+    };
+    g.FormData.prototype[Symbol.iterator] = g.FormData.prototype.entries;
+
     // FileReader: async reads off a Blob/File. We already hold the blob's
     // bytes in JS, so the read is local; we still settle on a macrotask
     // (setTimeout 0) like the platform, firing loadstart -> load -> loadend
@@ -12088,6 +13024,13 @@ const PRELUDE: &str = r##"
         setLocParts(p);
         if (withoutHash(old) === withoutHash(p[0])) {
             if (old !== p[0]) fireHashChange(old, p[0]);
+            // Same document, only the fragment moved (or was re-set): HTML's
+            // "navigate to a fragment" scrolls the indicated element into view.
+            // Signal the app the new target (`""` = the top, for a bare URL /
+            // `#top`); the live engine has no scroll model of its own. This is
+            // how Astro's ClientRouter #anchor links (`location.href = "#x"`)
+            // reach the app to scroll — see PageEvt::ScrollToFragment.
+            trust.scrollFragment = locState.hash ? locState.hash.slice(1) : "";
         } else if (!hashOnly) {
             trust.navigation = p[0];
         }
@@ -12118,6 +13061,9 @@ const PRELUDE: &str = r##"
         set(v) { navigateLoc(v, false); },
     });
     trust.takeNavigation = function () { const n = trust.navigation || null; trust.navigation = null; return n; };
+    // The pending same-document fragment scroll (see `navigateLoc`). `undefined`
+    // (no signal) → null; a string (possibly `""` for the top) → that target.
+    trust.takeScrollFragment = function () { const f = trust.scrollFragment; trust.scrollFragment = undefined; return f === undefined ? null : f; };
     // Host objects must NOT look like plain objects. Real browsers tag
     // them, so `Object.prototype.toString.call(window)` is "[object
     // Window]". Without this they read as "[object Object]", and a
@@ -12952,13 +13898,10 @@ const PRELUDE: &str = r##"
         g.MediaError = MediaError;
     }
 
-    g.addEventListener = (t, f) => {
-        if (typeof f === "function" || (f && typeof f.handleEvent === "function")) {
-            const l = lsFor(g, String(t));
-            if (!l.includes(f)) l.push(f);
-        }
-    };
-    g.removeEventListener = (t, f) => { const l = lsFor(g, String(t)); const i = l.indexOf(f); if (i >= 0) l.splice(i, 1); };
+    // Bound wrappers (installEventHandlers calls them unbound), routing
+    // through the shared options-aware registry.
+    g.addEventListener = (t, f, o) => { addL(g, t, f, o); };
+    g.removeEventListener = (t, f, o) => { removeL(g, t, f, o); };
     g.dispatchEvent = (ev) => dispatch(g, ev, false);
     // `window.postMessage(message[, targetOrigin][, transfer])` (HTML web
     // messaging). With no foreign frames the only valid target is ourselves, so
@@ -13054,7 +13997,7 @@ const PRELUDE: &str = r##"
         "copy", "cut", "paste", "compositionstart", "compositionupdate", "compositionend",
         "play", "pause", "ended", "canplay", "canplaythrough", "durationchange",
         "timeupdate", "volumechange", "waiting", "seeked", "seeking",
-        "toggle", "cancel", "close",
+        "toggle", "beforetoggle", "cancel", "close",
     ]);
     // Performance + the Performance Timeline API. We keep no real timing
     // buffer, so the getEntries* trio returns empty arrays — but they MUST
@@ -13992,6 +14935,13 @@ const PRELUDE: &str = r##"
             const origin = (g.location && g.location.origin) || "null";
             const u = "blob:" + (origin || "null") + "/" + g.crypto.randomUUID();
             __blobURLStore[u] = obj;
+            // Mirror the bytes Rust-side so the APP can decode an
+            // `<img src="blob:…">` (Steam's client-generated QR code); only
+            // Blob-shaped objects carry bytes (a MediaSource mints a URL but
+            // has no retrievable data here).
+            if (Array.isArray(obj.__parts) && typeof __blob_mirror === "function") {
+                try { __blob_mirror(u, __blobBytes(obj), obj.type || ""); } catch (e) {}
+            }
             return u;
         }
         static revokeObjectURL(u) {
@@ -14011,19 +14961,44 @@ const PRELUDE: &str = r##"
     // synchronous XHR still blocks (via the __http_fetch syscall).
     class Headers {
         constructor(init) {
-            this.__h = {};
+            // Null-proto: header names are arbitrary strings, and a plain {}
+            // leaks Object.prototype ("constructor" in {} is true, so
+            // has("constructor") lied and get() returned a function).
+            this.__h = Object.create(null);
             if (init) {
-                if (Array.isArray(init)) { for (const kv of init) this.__h[String(kv[0]).toLowerCase()] = String(kv[1]); }
+                // A sequence init APPENDS each pair (Fetch §Headers: "fill" runs
+                // append), so `[["accept","a"],["accept","b"]]` combines to
+                // "a, b" instead of the last one clobbering.
+                if (Array.isArray(init)) { for (const kv of init) this.append(kv[0], kv[1]); }
                 else if (init.__h) { Object.assign(this.__h, init.__h); }
-                else if (typeof init === "object") { for (const k of Object.keys(init)) this.__h[String(k).toLowerCase()] = String(init[k]); }
+                else if (typeof init === "object") { for (const k of Object.keys(init)) this.append(k, init[k]); }
             }
         }
         get(k) { const v = this.__h[String(k).toLowerCase()]; return v === undefined ? null : v; }
         set(k, v) { this.__h[String(k).toLowerCase()] = String(v); }
-        append(k, v) { this.set(k, v); }
+        // append COMBINES with an existing value (Fetch §"header list append":
+        // `", "`-joined) — it is not set. Pages building multi-value headers
+        // (Accept variants, custom lists) get the spec wire form.
+        append(k, v) {
+            const key = String(k).toLowerCase();
+            const cur = this.__h[key];
+            this.__h[key] = cur === undefined ? String(v) : cur + ", " + String(v);
+        }
         has(k) { return String(k).toLowerCase() in this.__h; }
         delete(k) { delete this.__h[String(k).toLowerCase()]; }
-        forEach(fn) { for (const k of Object.keys(this.__h)) fn(this.__h[k], k, this); }
+        // Set-Cookie never reaches page JS (the Rust side strips it — a
+        // forbidden response-header name), so the list is honestly empty.
+        getSetCookie() { return []; }
+        // Iteration is SORTED by (lowercased) name with combined values —
+        // the Fetch spec's "sort and combine" — and Headers is iterable
+        // (`for (const [k, v] of resp.headers)`).
+        __sorted() { return Object.keys(this.__h).sort(); }
+        forEach(fn, thisArg) { for (const k of this.__sorted()) fn.call(thisArg, this.__h[k], k, this); }
+        keys() { return this.__sorted()[Symbol.iterator](); }
+        values() { const out = []; for (const k of this.__sorted()) out.push(this.__h[k]); return out[Symbol.iterator](); }
+        entries() { const out = []; for (const k of this.__sorted()) out.push([k, this.__h[k]]); return out[Symbol.iterator](); }
+        [Symbol.iterator]() { return this.entries(); }
+        get [Symbol.toStringTag]() { return "Headers"; }
     }
     g.Headers = Headers;
     // The wire body for a request/response: the platform accepts strings,
@@ -14068,6 +15043,45 @@ const PRELUDE: &str = r##"
             } catch (e) { return ""; }
         }
         return utf8Binary(String(body));
+    };
+    // The multipart/form-data wire encoding of a FormData body (RFC 7578 +
+    // HTML §"multipart/form-data encoding algorithm"): each entry is one part;
+    // `"`/CR/LF in names and filenames percent-escape (%22/%0D/%0A), newlines
+    // in string values normalize to CRLF, File parts carry their content type.
+    // Returns the latin1 wire body plus the content type with its boundary.
+    const __formDataWire = (fd) => {
+        let boundary = "----TRustFormBoundary";
+        for (let i = 0; i < 16; i++) boundary += "0123456789abcdef"[(Math.random() * 16) | 0];
+        const escName = (s) => String(s).replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22");
+        let out = "";
+        const es = fd.__entries;
+        for (let i = 0; i < es.length; i++) {
+            const e = es[i];
+            out += "--" + boundary + "\r\n";
+            if (e.value && Array.isArray(e.value.__parts)) { // File
+                out += utf8Binary('Content-Disposition: form-data; name="' + escName(e.name) + '"; filename="' + escName(e.value.name == null ? "blob" : e.value.name) + '"') + "\r\n";
+                out += "Content-Type: " + (e.value.type || "application/octet-stream") + "\r\n\r\n";
+                out += utf8Binary(blobText(e.value)) + "\r\n";
+            } else {
+                out += utf8Binary('Content-Disposition: form-data; name="' + escName(e.name) + '"') + "\r\n\r\n";
+                out += utf8Binary(String(e.value).replace(/\r\n|\r|\n/g, "\r\n")) + "\r\n";
+            }
+        }
+        out += "--" + boundary + "--\r\n";
+        return { wire: out, type: "multipart/form-data; boundary=" + boundary };
+    };
+    // The DEFAULT content type a body implies when the request sets none
+    // (Fetch §"BodyInit extract"): a string is text/plain, URLSearchParams is
+    // its form-urlencoded serialization, a Blob carries its own type, and raw
+    // buffers advertise nothing. (FormData is handled at the call sites — its
+    // type must carry the boundary of the encoded body.)
+    const __bodyType = (body) => {
+        if (body === null || body === undefined) return null;
+        if (typeof body === "string") return "text/plain;charset=UTF-8";
+        if (body instanceof URLSearchParams) return "application/x-www-form-urlencoded;charset=UTF-8";
+        if (Array.isArray(body.__parts)) return body.type || null; // Blob/File
+        if (typeof body.byteLength === "number") return null;
+        return "text/plain;charset=UTF-8";
     };
     // Body mixin shared by Request and Response: the consumption methods read
     // the captured body once (lenient — we don't throw on re-read, unlike the
@@ -14148,7 +15162,14 @@ const PRELUDE: &str = r##"
         get body() {
             if (this.__bodyStream !== undefined) return this.__bodyStream;
             if (this.__body === null || this.__body === undefined) { this.__bodyStream = null; return null; }
-            const bytes = new g.TextEncoder().encode(__bodyText(this.__body) || "");
+            // A fetched response streams its byte-EXACT body (`__bytes`, latin1)
+            // — encoding the UTF-8-lossy text corrupted every binary payload
+            // read through `.body` (the arrayBuffer()/`r[3]` bug, one path
+            // over). Only a Response constructed in JS from a text body falls
+            // back to UTF-8 bytes of that text.
+            const bytes = this.__bytes != null
+                ? __latin1ToBytes(this.__bytes)
+                : new g.TextEncoder().encode(__bodyText(this.__body) || "");
             this.__bodyStream = new g.ReadableStream({
                 start(c) { if (bytes.length) c.enqueue(bytes); c.close(); },
             });
@@ -14543,12 +15564,46 @@ const PRELUDE: &str = r##"
         }
         return s;
     }
+    // The inverse, for RESPONSE headers: the syscalls return all response
+    // headers as the same `name\nvalue\n…` blob (r[4]); split it back into a
+    // lowercased name→value map for `Response.headers` / XHR header getters.
+    function __parseHdrBlob(s) {
+        const out = {};
+        if (!s) return out;
+        const parts = String(s).split("\n");
+        for (let i = 0; i + 1 < parts.length; i += 2) {
+            if (parts[i]) out[parts[i].toLowerCase()] = parts[i + 1];
+        }
+        return out;
+    }
     g.fetch = function (input, init) {
         try {
             // Normalize input+init into a Request (input may be a URL string,
             // a Request, or a URL object).
             const req = new Request(input, init);
             const url = req.url;
+            // AbortSignal (Fetch §"abort fetch"): an already-aborted signal
+            // rejects immediately with its reason; an abort while in flight
+            // wins the race below. The wire request itself isn't torn down —
+            // it completes into a dropped promise — but the OBSERVABLE
+            // contract (the rejection, and stale responses never reaching
+            // .then) is the part pages depend on (abort-and-retype search).
+            const sig = req.signal;
+            const abortReason = () => (sig && sig.reason !== undefined && sig.reason !== null)
+                ? sig.reason : new DOMException("The operation was aborted.", "AbortError");
+            if (sig && sig.aborted) return Promise.reject(abortReason());
+            const raceAbort = (p) => {
+                if (!sig || typeof sig.addEventListener !== "function") return p;
+                return new Promise((resolve, reject) => {
+                    let done = false;
+                    const onAbort = () => { if (!done) { done = true; reject(abortReason()); } };
+                    sig.addEventListener("abort", onAbort, { once: true });
+                    p.then(
+                        (v) => { if (!done) { done = true; sig.removeEventListener("abort", onAbort); resolve(v); } },
+                        (e) => { if (!done) { done = true; sig.removeEventListener("abort", onAbort); reject(e); } }
+                    );
+                });
+            };
             // A `blob:` URL is served from the in-realm store, never the wire
             // (File API / Fetch §"scheme fetch" for blob). Missing/revoked entry
             // → network error (a rejected fetch), exactly like the platform.
@@ -14561,18 +15616,24 @@ const PRELUDE: &str = r##"
                 bresp.__bytes = be.bytes; // byte-exact body for arrayBuffer()/blob()
                 return Promise.resolve(bresp);
             }
-            const body = __bodyWire(req.__body);
+            const isFD = req.__body instanceof g.FormData && Array.isArray(req.__body.__entries);
+            const enc = isFD ? __formDataWire(req.__body) : null;
+            const body = isFD ? enc.wire : __bodyWire(req.__body);
             const ctype = req.headers.get("content-type")
-                || (body !== null ? "text/plain;charset=UTF-8" : null);
-            return __http_fetch_async(url, req.method, body, ctype, __hdrBlob(req.headers.__h)).then(function (r) {
+                || (isFD ? enc.type : __bodyType(req.__body));
+            return raceAbort(__http_fetch_async(url, req.method, body, ctype, __hdrBlob(req.headers.__h)).then(function (r) {
                 if (!r) throw new TypeError("fetch failed or blocked: " + url);
                 const status = r[0], respCType = r[1], text = r[2];
-                const hdrs = {}; if (respCType) hdrs["content-type"] = respCType;
+                // All response headers (pages read out-of-band API results —
+                // Steam's `x-eresult`); older 3/4-element shapes degrade to
+                // content-type only.
+                const hdrs = __parseHdrBlob(r[4]);
+                if (respCType && hdrs["content-type"] === undefined) hdrs["content-type"] = respCType;
                 const resp = new Response(text, { status: status, statusText: "", headers: hdrs, url: url });
                 resp.type = "basic";
                 resp.__bytes = r[3]; // byte-exact body (latin1) for arrayBuffer()
                 return resp;
-            });
+            }));
         } catch (e) { return Promise.reject(e); }
     };
 
@@ -14589,9 +15650,48 @@ const PRELUDE: &str = r##"
         constructor() {
             super();
             this.readyState = 0; this.status = 0; this.statusText = "";
-            this.responseText = ""; this.response = ""; this.responseType = "";
+            this.__text = ""; this.__bytes = null; this.__respType = ""; this.__respObj = undefined;
             this.responseURL = ""; this.timeout = 0; this.withCredentials = false;
-            this.__h = {};
+            this.__h = {}; this.__aborted = false; this.__inFlight = false;
+        }
+        // `responseType` is a WebIDL enum: an invalid assignment is silently
+        // ignored; changing it once loading, or on a sync request, throws
+        // InvalidStateError (XHR spec §the responseType attribute).
+        get responseType() { return this.__respType; }
+        set responseType(v) {
+            v = String(v);
+            if (v !== "" && v !== "text" && v !== "arraybuffer" && v !== "blob" && v !== "document" && v !== "json") return;
+            if (this.readyState >= 3) throw new DOMException("responseType cannot be set once loading", "InvalidStateError");
+            if (this.__sync) throw new DOMException("responseType is unsupported on a synchronous request", "InvalidStateError");
+            this.__respType = v;
+        }
+        // `responseText` is only readable in text mode (spec: throw unless
+        // responseType is "" or "text"). Binary consumers must use `response`,
+        // which is built from the byte-EXACT body (`r[3]`) — the UTF-8-lossy
+        // text corrupts binary payloads (Steam's protobuf WebAPI responses).
+        get responseText() {
+            if (this.__respType !== "" && this.__respType !== "text") throw new DOMException("responseText is only available for '' or 'text' responseType", "InvalidStateError");
+            return this.__text;
+        }
+        get response() {
+            const rt = this.__respType;
+            if (rt === "" || rt === "text") return this.__text;
+            if (this.readyState !== 4) return null;
+            if (this.__respObj !== undefined) return this.__respObj;
+            let out = null;
+            if (rt === "arraybuffer" || rt === "blob") {
+                const bin = this.__bytes != null ? this.__bytes : utf8Binary(this.__text);
+                const buf = new ArrayBuffer(bin.length), view = new Uint8Array(buf);
+                for (let i = 0; i < bin.length; i++) view[i] = bin.charCodeAt(i) & 0xff;
+                out = rt === "blob" ? new g.Blob([buf], { type: this.__ctype || "" }) : buf;
+            } else if (rt === "json") {
+                try { out = JSON.parse(this.__text); } catch (e) { out = null; }
+            } else if (rt === "document") {
+                const xml = /xml/i.test(this.__ctype || "") && !/html/i.test(this.__ctype || "");
+                try { out = new g.DOMParser().parseFromString(this.__text, xml ? "text/xml" : "text/html"); } catch (e) { out = null; }
+            }
+            this.__respObj = out;
+            return out;
         }
         open(method, url, isAsync) {
             this.__method = String(method).toUpperCase();
@@ -14603,10 +15703,37 @@ const PRELUDE: &str = r##"
             this.__fire("readystatechange");
         }
         setRequestHeader(k, v) { this.__h[String(k).toLowerCase()] = String(v); }
-        getResponseHeader(k) { return String(k).toLowerCase() === "content-type" ? (this.__ctype || null) : null; }
-        getAllResponseHeaders() { return this.__ctype ? "content-type: " + this.__ctype + "\r\n" : ""; }
+        getResponseHeader(k) {
+            k = String(k).toLowerCase();
+            if (this.__hdrs) return Object.prototype.hasOwnProperty.call(this.__hdrs, k) ? this.__hdrs[k] : null;
+            return k === "content-type" ? (this.__ctype || null) : null;
+        }
+        getAllResponseHeaders() {
+            if (this.__hdrs) {
+                let s = "";
+                for (const k of Object.keys(this.__hdrs).sort()) s += k + ": " + this.__hdrs[k] + "\r\n";
+                return s;
+            }
+            return this.__ctype ? "content-type: " + this.__ctype + "\r\n" : "";
+        }
         overrideMimeType() {}
-        abort() {}
+        // XHR §the abort() method: an in-flight request runs the "request error
+        // steps" for abort (state DONE, readystatechange, abort, loadend), then
+        // state resets to UNSENT. The wire request isn't torn down — its late
+        // result is discarded by the `__aborted` guard in `__finish` — but the
+        // page-observable contract (events fire, the response never lands) holds.
+        abort() {
+            this.__aborted = true;
+            if (this.__inFlight) {
+                this.__inFlight = false;
+                this.status = 0; this.__text = ""; this.__bytes = null; this.__respObj = undefined;
+                this.readyState = 4;
+                this.__fire("readystatechange");
+                this.__fire("abort");
+                this.__fire("loadend");
+            }
+            if (this.readyState === 4) this.readyState = 0; // DONE → UNSENT, silently
+        }
         // addEventListener/removeEventListener are inherited from EventTarget so
         // listeners land in the shared `lsFor` store (and Zone's patched wrapper
         // sees them). The `on<type>` JS properties stay plain instance props.
@@ -14619,32 +15746,61 @@ const PRELUDE: &str = r##"
             dispatch(this, ev, false);
         }
         __finish(r) {
+            // A late result for an aborted/timed-out request is discarded —
+            // its events already fired from abort()/the timeout timer.
+            if (this.__aborted || !this.__inFlight) return;
+            this.__inFlight = false;
             if (!r) {
                 this.readyState = 4; this.status = 0;
                 this.__fire("readystatechange"); this.__fire("error"); this.__fire("loadend");
                 return;
             }
             this.status = r[0]; this.__ctype = r[1];
-            this.responseText = r[2]; this.responseURL = this.__url;
-            if (this.responseType === "json") { try { this.response = JSON.parse(r[2]); } catch (e) { this.response = null; } }
-            else { this.response = r[2]; }
+            this.__text = r[2]; this.__bytes = r[3] != null ? r[3] : null;
+            this.__hdrs = r.length > 4 ? __parseHdrBlob(r[4]) : null;
+            if (this.__hdrs && this.__ctype && this.__hdrs["content-type"] === undefined) this.__hdrs["content-type"] = this.__ctype;
+            this.__respObj = undefined;
+            this.responseURL = this.__url;
             this.readyState = 4;
             this.__fire("readystatechange"); this.__fire("load"); this.__fire("loadend");
         }
         send(body) {
+            this.__aborted = false;
+            this.__inFlight = true;
+            // Async requests fire `loadstart` synchronously from send() (XHR
+            // §the send() method; a SYNC request deliberately doesn't), and an
+            // armed `timeout` runs the timeout request-error steps if the
+            // response hasn't landed by then (the late result is then dropped).
+            if (!this.__sync) {
+                this.__fire("loadstart");
+                if (this.timeout > 0) {
+                    const xhr = this;
+                    g.setTimeout(function () {
+                        if (!xhr.__inFlight || xhr.__aborted) return;
+                        xhr.__inFlight = false; xhr.__aborted = true;
+                        xhr.status = 0; xhr.__text = ""; xhr.__bytes = null; xhr.__respObj = undefined;
+                        xhr.readyState = 4;
+                        xhr.__fire("readystatechange");
+                        xhr.__fire("timeout");
+                        xhr.__fire("loadend");
+                    }, this.timeout);
+                }
+            }
             // A `blob:` URL resolves from the in-realm store, off the wire; a
             // missing/revoked entry is a network error (__finish(null) → error
             // event). Async still delivers __finish as a macrotask, like a real GET.
             if (typeof this.__url === "string" && this.__url.slice(0, 5) === "blob:") {
                 const be = __resolveBlobURL(this.__url);
-                const arr = be ? [200, be.type || null, new g.TextDecoder().decode(__latin1ToBytes(be.bytes))] : null;
+                const arr = be ? [200, be.type || null, new g.TextDecoder().decode(__latin1ToBytes(be.bytes)), be.bytes] : null;
                 const xhr = this;
                 if (this.__sync) this.__finish(arr);
                 else g.setTimeout(function () { xhr.__finish(arr); }, 0);
                 return;
             }
-            const b = __bodyWire(body);
-            const ctype = this.__h["content-type"] || (b !== null ? "text/plain;charset=UTF-8" : null);
+            const isFD = body instanceof g.FormData && Array.isArray(body.__entries);
+            const enc = isFD ? __formDataWire(body) : null;
+            const b = isFD ? enc.wire : __bodyWire(body);
+            const ctype = this.__h["content-type"] || (isFD ? enc.type : __bodyType(body));
             const hdrs = __hdrBlob(this.__h);
             if (this.__sync) {
                 this.__finish(__http_fetch(this.__url, this.__method || "GET", b, ctype, hdrs));
@@ -17677,6 +18833,32 @@ mod tests {
     }
 
     #[test]
+    fn an_injected_preload_link_fires_load() {
+        // A resource-hint `<link rel="preload">` must fire `load` when connected,
+        // even though we don't speculatively fetch it — a loader that `await`s the
+        // hint otherwise hangs forever. Astro's ClientRouter preloads the next
+        // page's stylesheets this way and awaits `Promise.all` of their load
+        // events BEFORE the view-transition swap; without this the swap never
+        // runs and every routed link goes dead.
+        let html = r##"<body><pre id="o"></pre><script>
+            const done = ['preload','prefetch','modulepreload'].map(rel => {
+                const l = document.createElement('link');
+                l.rel = rel; l.setAttribute('as', 'style'); l.href = '/x-' + rel + '.css';
+                const p = new Promise(res => { ['load','error'].forEach(e => l.addEventListener(e, res)); });
+                document.head.appendChild(l);
+                return p;
+            });
+            Promise.all(done).then(() => { document.getElementById('o').textContent = 'ALL-HINTS-SETTLED'; });
+        </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("ALL-HINTS-SETTLED"),
+            "preload/prefetch/modulepreload links must fire load so awaiters resolve: {out}"
+        );
+    }
+
+    #[test]
     fn getattribute_cache_reflects_writes() {
         // The per-element read cache (`__ac`) must never go stale: every
         // attribute write nukes it, so a read after a set/remove — through ANY
@@ -18017,6 +19199,9 @@ mod tests {
             r#"<html><head></head><body></body></html>"#,
         )));
         let mut ctx = page_context_with(None).0;
+        // The Rust-side blob byte mirror the app's image pipeline reads
+        // (`__blob_mirror` fills it on every createObjectURL).
+        let blob_mirror = BlobMap::default();
         {
             let mut host = ctx.realm().host_defined_mut();
             host.insert(PageDom(dom.clone()));
@@ -18024,6 +19209,7 @@ mod tests {
                 map: Default::default(),
                 origin: String::from("https://example.com"),
             });
+            host.insert(PageBlobs(blob_mirror.clone()));
         }
         register_syscalls(&mut ctx).unwrap();
         let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
@@ -18079,6 +19265,244 @@ mod tests {
         assert_eq!(s(&mut ctx, b"String(out.fJson)"), "42");
         assert_eq!(s(&mut ctx, b"out.bin"), "1,2,3,254");
         assert_eq!(s(&mut ctx, b"out.revoked"), "rejected");
+        // Every mint mirrored bytes Rust-side for the app's image pipeline
+        // (the binary blob byte-exact, high bytes intact), and revocation
+        // deliberately does NOT unmirror (a rendered <img> keeps its
+        // resource; the map dies with the page/Doc).
+        {
+            let m = blob_mirror.lock().unwrap();
+            assert_eq!(m.len(), 2, "both minted URLs mirrored");
+            let json_url = s(&mut ctx, b"out.url");
+            let (bytes, mime) = m.get(&json_url).expect("revoked URL still mirrored");
+            assert_eq!(bytes.as_slice(), br#"{"k":42}"#);
+            assert_eq!(mime, "application/json");
+            assert!(
+                m.values().any(|(b, _)| b.as_slice() == [1, 2, 3, 254]),
+                "binary blob mirrored byte-exact"
+            );
+        }
+    }
+
+    /// The Popover API (HTML §the popover attribute): reflection, the
+    /// show/hide/toggle methods with their spec throws, the (cancelable)
+    /// `beforetoggle` + async `toggle` events, `:popover-open` matching, the
+    /// UA hide rule (a closed popover serializes to nothing; an open one
+    /// renders), auto-vs-manual close-others, and the `popovertarget` button
+    /// invoker. Steam's login tooltips call `showPopover()` on hover — a
+    /// missing API threw and its React error boundary replaced the section.
+    #[test]
+    fn popover_api_shows_hides_and_matches() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head><style>#tip:popover-open{text-transform:uppercase}</style></head><body>
+            <button id="btn" popovertarget="tip">help</button>
+            <div id="tip" popover>tooltip text</div>
+            <div id="man" popover="manual">manual pop</div>
+            <div id="veto" popover>veto pop</div>
+            </body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+
+        // At rest every popover is hidden (UA `[popover]:not(:popover-open)`).
+        let at_rest = dom.borrow().serialize(DOCUMENT);
+        assert!(
+            !at_rest.contains("tooltip text"),
+            "closed popover hidden: {at_rest}"
+        );
+
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "popover.js",
+            br##"
+            globalThis.out = {};
+            const tip = document.getElementById('tip');
+            const man = document.getElementById('man');
+            // Enumerated reflection: ""->"auto", "manual"->"manual", missing->null.
+            out.reflectAuto = tip.popover;
+            out.reflectMan = man.popover;
+            out.reflectNull = document.body.popover === null;
+            const events = [];
+            tip.addEventListener('beforetoggle', (e) => events.push('before:' + e.oldState + '>' + e.newState));
+            tip.addEventListener('toggle', (e) => events.push('toggle:' + e.oldState + '>' + e.newState));
+            globalThis.events = events;
+            // No popover attribute -> NotSupportedError.
+            try { document.body.showPopover(); out.noAttr = 'no'; } catch (e) { out.noAttr = e.name; }
+            out.initialMatch = tip.matches(':popover-open');
+            tip.showPopover();
+            out.openMatch = tip.matches(':popover-open');
+            // Double-show is a silent no-op ("check popover validity"
+            // returns false on a state mismatch -- it does NOT throw).
+            try { tip.showPopover(); out.reshow = 'silent'; } catch (e) { out.reshow = e.name; }
+            // Double-hide likewise.
+            try { man.hidePopover(); out.rehide = 'silent'; } catch (e) { out.rehide = e.name; }
+            // A cancelable beforetoggle veto blocks the show.
+            const veto = document.getElementById('veto');
+            veto.addEventListener('beforetoggle', (e) => e.preventDefault());
+            veto.showPopover();
+            out.vetoed = !veto.matches(':popover-open');
+            // A MANUAL popover opening leaves the auto one alone...
+            man.showPopover();
+            out.autoSurvivesManual = tip.matches(':popover-open');
+            // ...but another AUTO popover opening closes it (close-others).
+            man.hidePopover();
+            man.setAttribute('popover', '');
+            man.showPopover();
+            out.autoClosedByAuto = !tip.matches(':popover-open') && man.matches(':popover-open');
+            man.hidePopover();
+            // togglePopover returns the resulting state.
+            out.t1 = tip.togglePopover();  // shows -> true
+            out.t2 = tip.togglePopover();  // hides -> false
+            // The popovertarget button invoker toggles it back open.
+            document.getElementById('btn').click();
+            out.viaButton = tip.matches(':popover-open');
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.reflectAuto"), "auto");
+        assert_eq!(s(&mut ctx, b"out.reflectMan"), "manual");
+        assert_eq!(s(&mut ctx, b"String(out.reflectNull)"), "true");
+        assert_eq!(s(&mut ctx, b"out.noAttr"), "NotSupportedError");
+        assert_eq!(s(&mut ctx, b"String(out.initialMatch)"), "false");
+        assert_eq!(s(&mut ctx, b"String(out.openMatch)"), "true");
+        assert_eq!(s(&mut ctx, b"out.reshow"), "silent");
+        assert_eq!(s(&mut ctx, b"out.rehide"), "silent");
+        assert_eq!(s(&mut ctx, b"String(out.vetoed)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.autoSurvivesManual)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.autoClosedByAuto)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.t1)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.t2)"), "false");
+        assert_eq!(s(&mut ctx, b"String(out.viaButton)"), "true");
+        // The event log: every transition fired beforetoggle immediately and
+        // toggle as a task (drained by the settle above).
+        let events = s(&mut ctx, b"events.join(' ')");
+        assert!(
+            events.starts_with("before:closed>open"),
+            "beforetoggle order: {events}"
+        );
+        assert!(
+            events.contains("toggle:closed>open"),
+            "async toggle: {events}"
+        );
+        assert!(
+            events.contains("before:open>closed"),
+            "hide beforetoggle: {events}"
+        );
+        // The FINAL open popover renders; a closed sibling doesn't.
+        let shown = dom.borrow().serialize(DOCUMENT);
+        assert!(
+            shown.contains("tooltip text"),
+            "open popover renders: {shown}"
+        );
+        assert!(
+            !shown.contains("manual pop"),
+            "closed popover hidden: {shown}"
+        );
+    }
+
+    /// XHR `responseType` (XHR spec §the response attribute): `"arraybuffer"`
+    /// must deliver the byte-EXACT body — Steam's WebAPI transport reads
+    /// binary protobuf via `xhr.response` and the old text-only `response`
+    /// (UTF-8-lossy) corrupted every high byte ("Failed to read varint" →
+    /// no QR login session). Also pins the spec guards: `responseText`
+    /// throws in binary modes, invalid enum values are ignored, and a sync
+    /// request refuses a responseType.
+    #[test]
+    fn xhr_response_type_arraybuffer_is_byte_exact() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "xhr_ab.js",
+            br##"
+            globalThis.out = {};
+            // High bytes + NULs survive only if `response` is built from the
+            // byte-exact body, not the lossy text.
+            const bytes = [8, 150, 1, 255, 0, 128, 254];
+            const u = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: "application/octet-stream" }));
+            const x = new XMLHttpRequest();
+            x.open("GET", u);
+            x.responseType = "arraybuffer";
+            out.rtEcho = x.responseType;
+            x.onload = function () {
+                out.isAB = x.response instanceof ArrayBuffer;
+                out.bin = Array.from(new Uint8Array(x.response)).join(",");
+                out.stable = x.response === x.response; // cached, not rebuilt
+                try { x.responseText; out.rtThrew = "no"; } catch (e) { out.rtThrew = e.name; }
+            };
+            x.send();
+            // An invalid enum value is silently ignored (WebIDL enum attribute).
+            const y = new XMLHttpRequest();
+            y.responseType = "bogus";
+            out.enumIgnored = y.responseType === "";
+            // A sync request refuses a responseType (spec: InvalidStateError).
+            const z = new XMLHttpRequest();
+            z.open("GET", u, false);
+            try { z.responseType = "arraybuffer"; out.syncThrew = "no"; } catch (e) { out.syncThrew = e.name; }
+            // "json" parses lazily from the text.
+            const j = new XMLHttpRequest();
+            j.open("GET", URL.createObjectURL(new Blob(['{"a":7}'], { type: "application/json" })));
+            j.responseType = "json";
+            j.onload = function () { out.json = j.response && j.response.a; };
+            j.send();
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.rtEcho"), "arraybuffer");
+        assert_eq!(s(&mut ctx, b"String(out.isAB)"), "true");
+        assert_eq!(s(&mut ctx, b"out.bin"), "8,150,1,255,0,128,254");
+        assert_eq!(s(&mut ctx, b"String(out.stable)"), "true");
+        assert_eq!(s(&mut ctx, b"out.rtThrew"), "InvalidStateError");
+        assert_eq!(s(&mut ctx, b"String(out.enumIgnored)"), "true");
+        assert_eq!(s(&mut ctx, b"out.syncThrew"), "InvalidStateError");
+        assert_eq!(s(&mut ctx, b"String(out.json)"), "7");
     }
 
     /// A spec TreeWalker with a NodeFilter callback drives Primer React's
@@ -18299,6 +19723,251 @@ mod tests {
         assert_eq!(s(&mut ctx, b"out.rjType"), "application/json");
         assert_eq!(s(&mut ctx, b"out.loc"), "https://example.com/x");
         assert_eq!(s(&mut ctx, b"String(out.rrStatus)"), "301");
+    }
+
+    /// A faithful platform context (DOM + syscalls + config + PRELUDE) for the
+    /// event/fetch spec tests below — the same shape the neighbouring tests
+    /// build inline. No net grant: `fetch`/XHR degrade exactly as a no-net page.
+    fn platform_ctx() -> Context {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body><div id="outer"><button id="b">hi</button></div></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+        ctx
+    }
+
+    #[test]
+    fn listener_options_once_capture_and_signal_follow_the_spec() {
+        // DOM §2.7 addEventListener options: `capture` listeners run in the
+        // capture phase (ancestors top-down, BEFORE the target), `once`
+        // self-removes before its first invoke, `signal` unregisters on abort
+        // (and an already-aborted signal never registers), and
+        // removeEventListener matches on the capture flag. All four were
+        // silently ignored before — `once` handlers double-fired.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "opts.js",
+            br##"
+            globalThis.out = { order: [], onceCount: 0, sigCount: 0, stopped: [] };
+            const outer = document.getElementById("outer");
+            const b = document.getElementById("b");
+            outer.addEventListener("ping", () => out.order.push("capture"), true);
+            b.addEventListener("ping", () => out.order.push("target"));
+            outer.addEventListener("ping", () => out.order.push("bubble"));
+            b.dispatchEvent(new Event("ping", { bubbles: true }));
+            out.phases = [Event.NONE, Event.CAPTURING_PHASE, Event.AT_TARGET, Event.BUBBLING_PHASE].join(",");
+            b.addEventListener("once-ev", () => out.onceCount++, { once: true });
+            b.dispatchEvent(new Event("once-ev"));
+            b.dispatchEvent(new Event("once-ev"));
+            const ac = new AbortController();
+            b.addEventListener("sig-ev", () => out.sigCount++, { signal: ac.signal });
+            b.dispatchEvent(new Event("sig-ev"));
+            ac.abort();
+            b.dispatchEvent(new Event("sig-ev"));
+            b.addEventListener("sig2", () => out.sigCount++, { signal: AbortSignal.abort() });
+            b.dispatchEvent(new Event("sig2"));
+            outer.addEventListener("halt", (e) => { out.stopped.push("cap"); e.stopPropagation(); }, { capture: true });
+            b.addEventListener("halt", () => out.stopped.push("target"));
+            b.dispatchEvent(new Event("halt", { bubbles: true }));
+            var n = 0; const f = () => n++;
+            b.addEventListener("rm", f, true);
+            b.removeEventListener("rm", f, false); // wrong flag: still registered
+            b.dispatchEvent(new Event("rm"));      // at-target runs capture listeners too
+            b.removeEventListener("rm", f, true);  // right flag: removed
+            b.dispatchEvent(new Event("rm"));
+            out.rm = n;
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.order.join(',')"), "capture,target,bubble");
+        assert_eq!(s(&mut ctx, b"out.phases"), "0,1,2,3");
+        assert_eq!(s(&mut ctx, b"String(out.onceCount)"), "1");
+        assert_eq!(s(&mut ctx, b"String(out.sigCount)"), "1");
+        assert_eq!(s(&mut ctx, b"out.stopped.join(',')"), "cap");
+        assert_eq!(s(&mut ctx, b"String(out.rm)"), "1");
+    }
+
+    #[test]
+    fn fetch_with_an_aborted_signal_rejects_with_abort_error() {
+        // Fetch §"abort fetch": an already-aborted signal rejects immediately
+        // with an AbortError (before any request fires); an abort while in
+        // flight rejects the pending promise. The no-net context proves the
+        // pre-check runs before the syscall (which would reject differently).
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "abort.js",
+            br##"
+            globalThis.out = {};
+            fetch("https://example.com/x", { signal: AbortSignal.abort() })
+                .then(() => { out.pre = "resolved"; }, (e) => { out.pre = e.name; });
+            const ac = new AbortController();
+            const p = fetch("https://example.com/y", { signal: ac.signal })
+                .then(() => { out.mid = "resolved"; }, (e) => { out.mid = e.name; });
+            ac.abort();
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.pre"), "AbortError");
+        assert_eq!(s(&mut ctx, b"out.mid"), "AbortError");
+    }
+
+    #[test]
+    fn headers_append_combines_and_iterates_sorted() {
+        // Fetch §Headers: append COMBINES with ", " (it is not set), a sequence
+        // init fills via append, iteration is sorted-by-name and the class is
+        // iterable, and the null-proto backing map can't leak Object.prototype
+        // names (`has("constructor")` lied before).
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "headers.js",
+            br##"
+            globalThis.out = {};
+            const h = new Headers([["b", "2"], ["Accept", "text/html"]]);
+            h.append("accept", "text/plain");
+            out.accept = h.get("Accept");
+            h.set("a", "1");
+            const seen = [];
+            for (const kv of h) seen.push(kv[0] + "=" + kv[1]);
+            out.iter = seen.join(";");
+            out.keys = Array.from(h.keys()).join(",");
+            out.sc = h.getSetCookie().length;
+            out.hasCtor = h.has("constructor");
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.accept"), "text/html, text/plain");
+        assert_eq!(
+            s(&mut ctx, b"out.iter"),
+            "a=1;accept=text/html, text/plain;b=2"
+        );
+        assert_eq!(s(&mut ctx, b"out.keys"), "a,accept,b");
+        assert_eq!(s(&mut ctx, b"String(out.sc)"), "0");
+        assert_eq!(s(&mut ctx, b"String(out.hasCtor)"), "false");
+    }
+
+    #[test]
+    fn response_body_stream_yields_the_byte_exact_body() {
+        // Reading a fetched response THROUGH `.body` must see the byte-exact
+        // bytes (`__bytes`), not a UTF-8 re-encode of the lossy text — the
+        // same corruption class as the arrayBuffer()/r[3] bug, one path over.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "stream.js",
+            br##"
+            globalThis.out = {};
+            const r = new Response("text-form");
+            r.__bytes = "\u00ff\u0000\u0041"; // 3 latin1 bytes: 255, 0, 65
+            r.body.getReader().read().then((res) => {
+                out.bytes = Array.from(res.value).join(",");
+            });
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.bytes"), "255,0,65");
+    }
+
+    #[test]
+    fn xhr_abort_fires_abort_and_discards_the_late_result() {
+        // XHR §abort(): an in-flight request fires readystatechange → abort →
+        // loadend and resets to UNSENT; the request's late result is DISCARDED
+        // (no error/load events after an abort). Also pins the new `loadstart`.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "xhr-abort.js",
+            br##"
+            globalThis.out = { events: [] };
+            const x = new XMLHttpRequest();
+            x.open("GET", "/x");
+            for (const t of ["loadstart", "abort", "error", "load", "loadend", "timeout"])
+                x.addEventListener(t, function () { out.events.push(t); });
+            x.send();
+            x.abort();
+            out.state = x.readyState;
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // Drain the deferred __finish (the no-net null result) — it must be
+        // swallowed by the abort, not fire `error` after the fact.
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(
+            s(&mut ctx, b"out.events.join(',')"),
+            "loadstart,abort,loadend"
+        );
+        assert_eq!(s(&mut ctx, b"String(out.state)"), "0");
     }
 
     #[test]
@@ -19018,6 +20687,46 @@ mod tests {
         assert!(!outcome.panicked, "engine panicked: {outcome:?}");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("first=1 second=1 v0=b"), "{out}");
+    }
+
+    #[test]
+    fn dom_parser_document_backs_a_view_transitions_swap() {
+        // Astro's ClientRouter (view transitions) fetches the destination page,
+        // parses it with `new DOMParser().parseFromString(html, "text/html")`,
+        // then swaps: iterates `newDoc.scripts`, reads `newDoc.documentElement`
+        // attributes + `newDoc.head`, and `document.body.replaceWith(newDoc.body)`.
+        // The old body-fragment DOMParser lacked `.scripts` (crash) and had no
+        // head/body split; a real detached Document fixes both.
+        let html = r##"<html data-old><head><title>Old</title></head>
+            <body><p id="here">grid</p><div id="log"></div><script>
+            const src = '<html data-new><head><title>New</title></head>'
+                + '<body><h1>Entry</h1><article>hello world</article></body></html>';
+            const nd = new DOMParser().parseFromString(src, 'text/html');
+            const parts = [];
+            parts.push('type=' + nd.nodeType);
+            parts.push('scripts=' + (typeof nd.scripts) + ':' + Array.from(nd.scripts).length);
+            let sc = 0; for (const s of nd.scripts) sc++; parts.push('iter=' + sc);
+            parts.push('docEl=' + (nd.documentElement ? nd.documentElement.tagName : 'null'));
+            parts.push('head=' + (nd.head ? nd.head.children.length : -1));
+            parts.push('title=' + nd.title);
+            parts.push('body=' + (nd.body ? nd.body.tagName : 'null'));
+            // The actual swap: replace the live body with the parsed one.
+            document.body.replaceWith(nd.body);
+            document.getElementById('log') && 0; // (log is inside the old body, now detached)
+            // Prove the live document now shows the entry.
+            window.__result = parts.join('|') + ' :: body=' + document.body.innerHTML;
+            </script></body></html>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // The swapped-in entry content reaches the serialized output.
+        assert!(
+            out.contains("Entry"),
+            "swapped body should render the entry: {out}"
+        );
+        assert!(out.contains("hello world"), "{out}");
+        // And the old grid paragraph is gone (body was replaced, not appended).
+        assert!(!out.contains(">grid<"), "old body should be gone: {out}");
     }
 
     #[test]
@@ -20268,6 +21977,149 @@ mod tests {
             body,
             vec![0x1f, 0x8b, 0x08, 0x00, 0xff, 0x80, 0xc2, 0xa5],
             "binary POST body must reach the wire byte-exact, got {body:02x?}"
+        );
+    }
+
+    #[test]
+    fn formdata_collects_form_fields_and_supports_the_entry_api() {
+        // FormData (XHR standard §5): the entry API (append/set/get/getAll/
+        // delete/has, iteration, Blob→File conversion) and `new FormData(form)`
+        // collecting submittable fields per HTML §"constructing the entry
+        // list" — named enabled fields, checked-only checkboxes/radios,
+        // selected options, no buttons. Steam's store main.js news one up in a
+        // timer; a ReferenceError there degraded the page badge to ·JS:n!.
+        let (out, outcome) = page(
+            r##"<body>
+            <form id=f>
+              <input name=user value=ruby>
+              <input type=checkbox name=on1 checked>
+              <input type=checkbox name=off1>
+              <input type=radio name=pick value=b checked>
+              <input type=radio name=pick value=c>
+              <select name=sel><option value=x>x</option><option value=y selected>y</option></select>
+              <textarea name=note>hello</textarea>
+              <input name=nope disabled value=no>
+              <input type=submit name=go value=Go>
+            </form>
+            <div id=out></div><script>
+            var ok = [];
+            var fd = new FormData();
+            fd.append('a', '1'); fd.append('a', '2'); fd.append('b', 3);
+            ok.push(fd.get('a') === '1');
+            ok.push(fd.getAll('a').join(',') === '1,2');
+            ok.push(fd.has('b') && fd.get('b') === '3');
+            fd.set('a', '9');
+            ok.push(fd.getAll('a').join(',') === '9');
+            fd.delete('b');
+            ok.push(!fd.has('b'));
+            var names = [];
+            for (var e of fd) names.push(e[0] + '=' + e[1]);
+            ok.push(names.join('&') === 'a=9');
+            fd.append('file', new Blob(['bytes'], { type: 'text/x-thing' }), 'thing.txt');
+            ok.push(fd.get('file') instanceof File && fd.get('file').name === 'thing.txt');
+            var got = [];
+            new FormData(document.getElementById('f')).forEach(function (v, k) { got.push(k + '=' + v); });
+            ok.push(got.join('&') === 'user=ruby&on1=on&pick=b&sel=y&note=hello');
+            document.getElementById('out').textContent = ok.join(' ');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("true true true true true true true true"),
+            "FormData probes failed: {out}"
+        );
+    }
+
+    /// A `fetch(url, {body: FormData})` goes on the wire as multipart/form-data
+    /// (RFC 7578): the Content-Type header advertises the boundary, each entry
+    /// is a Content-Disposition part, a File part carries filename + its own
+    /// type, and the body closes with the terminal boundary.
+    #[test]
+    fn a_formdata_body_posts_multipart_with_a_boundary() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener =
+            rt.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+        let port = listener.local_addr().unwrap().port();
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        rt.spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&req[..pos]).to_lowercase();
+                    let clen = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let start = pos + 4;
+                    while req.len() < start + clen {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    *cap.lock().unwrap() = req;
+                    break;
+                }
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        });
+
+        let html = format!(
+            "<body><script>\
+             var fd = new FormData();\
+             fd.append('kind', 'story');\
+             fd.append('data', new Blob(['payload'], {{ type: 'text/x-data' }}), 'p.bin');\
+             fetch('http://127.0.0.1:{port}/up', {{ method: 'POST', body: fd }});\
+             </script></body>"
+        );
+        let mut env = PageEnv::bare(&format!("http://127.0.0.1:{port}/"));
+        env.net = Some(rt.handle().clone());
+        let (handle, _events) = spawn_page(html, env);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while captured.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(handle);
+        let req = String::from_utf8_lossy(&captured.lock().unwrap().clone()).to_string();
+        let boundary = req
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-type: multipart/form-data; boundary=")
+                    .map(|b| l[l.len() - b.len()..].to_string())
+            })
+            .unwrap_or_else(|| panic!("no multipart content-type header in: {req}"));
+        let expect_field = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"kind\"\r\n\r\nstory\r\n"
+        );
+        assert!(req.contains(&expect_field), "field part missing: {req}");
+        let expect_file = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"data\"; filename=\"p.bin\"\r\n\
+             Content-Type: text/x-data\r\n\r\npayload\r\n"
+        );
+        assert!(req.contains(&expect_file), "file part missing: {req}");
+        assert!(
+            req.ends_with(&format!("--{boundary}--\r\n")),
+            "terminal boundary missing: {req}"
         );
     }
 
@@ -21599,6 +23451,274 @@ mod tests {
     }
 
     #[test]
+    fn hover_dispatches_the_pointer_events_sequence() {
+        // The Pointer Events transition order on old→new (which absorbed the
+        // UI Events mouse section): out (bubbling) → leave (per element,
+        // bottom-up to the exclusive common ancestor, NON-bubbling) → over
+        // (bubbling) → enter (top-down, non-bubbling) → move; each pointer
+        // event paired with its mouse compat twin; relatedTarget = the other
+        // element of the pair. Bubbling types log at the document (they must
+        // reach it); enter/leave log per element (they must NOT bubble).
+        let (out, outcome) = page(
+            r##"<body><div id=a><span id=b>b</span><span id=c>c</span></div>
+            <div id=out></div><script>
+            var log = [];
+            function tag(el) { return el === null || el === undefined ? "0" : (el.id || el.localName || "win"); }
+            function rec(e) { log.push(e.type + ":" + tag(e.target) + "~" + tag(e.relatedTarget)); }
+            var bubbling = ["pointerover", "pointerout", "pointermove", "mouseover", "mouseout", "mousemove"];
+            for (var i = 0; i < bubbling.length; i++) document.addEventListener(bubbling[i], rec);
+            var edge = ["pointerenter", "pointerleave", "mouseenter", "mouseleave"];
+            var els = ["a", "b", "c"];
+            for (var j = 0; j < edge.length; j++) {
+                for (var k = 0; k < els.length; k++) {
+                    document.getElementById(els[k]).addEventListener(edge[j], rec);
+                }
+            }
+            document.addEventListener("mousemove", function (e) { log.push("x" + e.clientX + "y" + e.clientY); });
+            __trust.hover(document.getElementById("b").__id, 5, 7);
+            __trust.hover(document.getElementById("c").__id, 6, 7);
+            __trust.hover(null, 0, 0);
+            document.getElementById("out").textContent = log.join(" ");
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let expected = [
+            // null → b: over(b), enter a then b (top-down), move(b).
+            "pointerover:b~0",
+            "mouseover:b~0",
+            "pointerenter:a~0",
+            "mouseenter:a~0",
+            "pointerenter:b~0",
+            "mouseenter:b~0",
+            "pointermove:b~0",
+            "mousemove:b~0",
+            "x5y7",
+            // b → c (common ancestor a): out(b), leave b ONLY, over(c),
+            // enter c ONLY, move(c).
+            "pointerout:b~c",
+            "mouseout:b~c",
+            "pointerleave:b~c",
+            "mouseleave:b~c",
+            "pointerover:c~b",
+            "mouseover:c~b",
+            "pointerenter:c~b",
+            "mouseenter:c~b",
+            "pointermove:c~0",
+            "mousemove:c~0",
+            "x6y7",
+            // c → nothing: out(c), leave bottom-up (c then a; body/html/doc
+            // have no listeners registered here).
+            "pointerout:c~0",
+            "mouseout:c~0",
+            "pointerleave:c~0",
+            "mouseleave:c~0",
+            "pointerleave:a~0",
+            "mouseleave:a~0",
+        ]
+        .join(" ");
+        assert!(
+            out.contains(&expected),
+            "hover sequence mismatch:\n want …{expected}…\n got {out}"
+        );
+    }
+
+    #[test]
+    fn a_hover_only_page_stays_live_and_hover_dispatch_rerenders() {
+        // A page whose ONLY listener is a hover type must keep its engine
+        // (the auto-Static gate counts hover work), be marked with the
+        // DEDICATED data-trust-hover attribute (never data-trust-node — that
+        // one gates incremental-layout boundaries), and re-render when a
+        // hover handler mutates. A clear and a stale id settle silently.
+        let (handle, mut events) = live(
+            "<body><h1 id=t>idle</h1><div id=hot>hover me</div><script>\
+             document.getElementById('hot').addEventListener('mouseover', function () {\
+               document.getElementById('t').textContent = 'hovered';\
+             });</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("hover-only page must stay live (Updated, not Static)");
+        };
+        let at = html
+            .find("data-trust-hover=\"")
+            .expect("hover host marked with data-trust-hover");
+        let hot: usize = html[at + "data-trust-hover=\"".len()..]
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let hot_tag = {
+            let tag_start = html[..at].rfind('<').unwrap();
+            &html[tag_start..html[tag_start..].find('>').unwrap() + tag_start]
+        };
+        assert!(
+            !hot_tag.contains("data-trust-node"),
+            "hover host must not carry data-trust-node: {hot_tag}"
+        );
+
+        handle
+            .cmds
+            .blocking_send(PageCmd::Hover {
+                node: Some(hot),
+                x: 4.0,
+                y: 8.0,
+            })
+            .unwrap();
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("mutating hover handler should re-render");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(html.contains("hovered"), "{html}");
+
+        // Clearing hover fires out/leave on the old chain — no listener, no
+        // mutation, just a settle.
+        handle
+            .cmds
+            .blocking_send(PageCmd::Hover {
+                node: None,
+                x: 0.0,
+                y: 0.0,
+            })
+            .unwrap();
+        match events.blocking_recv() {
+            Some(PageEvt::Settled) => {}
+            other => panic!("hover clear should settle, got {other:?}"),
+        }
+        // A stale node id (detached since the app's snapshot — routine on
+        // re-rendering pages) degrades to a hover-clear, never a Trouble.
+        handle
+            .cmds
+            .blocking_send(PageCmd::Hover {
+                node: Some(99_999_999),
+                x: 0.0,
+                y: 0.0,
+            })
+            .unwrap();
+        match events.blocking_recv() {
+            Some(PageEvt::Settled) => {}
+            other => panic!("stale hover id should settle silently, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delegated_hover_reaches_an_ancestor_listener_by_bubbling() {
+        // jQuery-delegation shape: the listener sits on a CONTAINER; the
+        // committed target is a child. The bubbling mouseover pair (with
+        // relatedTarget) is exactly what jQuery's mouseenter shim consumes.
+        let (handle, mut events) = live(
+            "<body><h1 id=t>idle</h1>\
+             <div id=list><span id=kid>row</span></div><script>\
+             var kid = document.getElementById('kid');\
+             kid.setAttribute('data-kid-id', kid.__id);\
+             document.getElementById('list').addEventListener('mouseover', function (e) {\
+               document.getElementById('t').textContent = 'saw:' + (e.target.id || '?');\
+             });</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("expected first Updated");
+        };
+        let at = html.find("data-kid-id=\"").expect("kid id baked");
+        let kid: usize = html[at + "data-kid-id=\"".len()..]
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        handle
+            .cmds
+            .blocking_send(PageCmd::Hover {
+                node: Some(kid),
+                x: 1.0,
+                y: 1.0,
+            })
+            .unwrap();
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("delegated hover should re-render");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            html.contains("saw:kid"),
+            "delegated listener saw the child target: {html}"
+        );
+    }
+
+    #[test]
+    fn media_play_rejects_not_allowed_without_erroring_the_page() {
+        // HTMLMediaElement: we never play inline, so play() reports the
+        // spec's "not allowed to play" — a NotAllowedError rejection, the
+        // same signal a real browser's blocked autoplay gives. The element
+        // stays paused, and an UNCAUGHT play() must not count as a page
+        // error (browsers only console-warn) — the rejection is pre-observed.
+        let (out, outcome) = page(
+            r##"<body><video id=v></video><div id=out></div><script>
+            var v = document.getElementById('v');
+            v.play().catch(function (e) {
+                document.getElementById('out').textContent = 'name:' + e.name + ' paused:' + v.paused;
+            });
+            document.createElement('video').play(); // uncaught: no page error
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("name:NotAllowedError paused:true"),
+            "play() must reject NotAllowedError: {out}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_play_lets_a_sites_hover_fallback_keep_the_image() {
+        // Steam's sale-capsule microtrailer shape: first mouseenter mounts a
+        // <video>, adds the image-hiding class, and calls play(); the site's
+        // OWN rejection handler removes the class (the autoplay-blocked
+        // fallback every hover-preview site carries since Chrome's policy).
+        // With the old lying `Promise.resolve()` the class stayed on forever:
+        // image hidden, unpaintable video shown, capsule destroyed — and the
+        // teardown never ran, so hovering away didn't restore it either.
+        let (handle, mut events) = live(
+            "<body><div id=cap class=plain><img id=i src=/cap.jpg alt=capsule></div><script>\
+             var cap = document.getElementById('cap');\
+             cap.addEventListener('mouseenter', function () {\
+               cap.className = 'with_microtrailer';\
+               var v = document.createElement('video');\
+               cap.appendChild(v);\
+               v.play().catch(function () { cap.className = 'plain restored'; });\
+             });</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("hover-listener page stays live");
+        };
+        let at = html
+            .find("data-trust-hover=\"")
+            .expect("capsule marked as hover host");
+        let cap: usize = html[at + "data-trust-hover=\"".len()..]
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        handle
+            .cmds
+            .blocking_send(PageCmd::Hover {
+                node: Some(cap),
+                x: 2.0,
+                y: 2.0,
+            })
+            .unwrap();
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("the mount + fallback should re-render");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            html.contains("plain restored"),
+            "the site's rejection fallback must run and restore the class: {html}"
+        );
+        assert!(
+            !html.contains("with_microtrailer"),
+            "the image-hiding class must not survive the rejected play: {html}"
+        );
+    }
+
+    #[test]
     fn render_canonical_strips_non_rendered_attrs() {
         // Two serializations differing ONLY in non-rendered attributes
         // (alt/class/title/aria-*) are the same render — the baked `style`
@@ -21781,6 +23901,48 @@ mod tests {
             }
             other => panic!("hash route should update in place, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_live_hash_change_emits_scroll_to_fragment() {
+        // A same-document hash navigation (`location.hash = 'sec'`) the page runs
+        // during a click must reach the app as a ScrollToFragment, AFTER the
+        // dispatch's render — the live engine has no scroll model, so the app
+        // scrolls the named element into view. This is how Astro's ClientRouter
+        // #anchor links move the terminal view.
+        let (handle, mut events) = live(
+            r##"<body><button id=go onclick="location.hash = 'sec'">go</button>
+             <div id=sec>section</div><script>void 0;</script></body>"##,
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("expected first Updated");
+        };
+        let id = html
+            .split("x-trust-js:")
+            .nth(1)
+            .and_then(|r| r.split(':').next())
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        handle.cmds.blocking_send(PageCmd::Click(id)).unwrap();
+        // The dispatch emits its render (Settled — no DOM change) first, then the
+        // fragment scroll request.
+        let mut saw = None;
+        for _ in 0..4 {
+            match events.blocking_recv() {
+                Some(PageEvt::ScrollToFragment(f)) => {
+                    saw = Some(f);
+                    break;
+                }
+                Some(PageEvt::Updated { .. } | PageEvt::Settled) => continue,
+                other => panic!("unexpected event before ScrollToFragment: {other:?}"),
+            }
+        }
+        assert_eq!(
+            saw.as_deref(),
+            Some("sec"),
+            "expected ScrollToFragment(sec)"
+        );
     }
 
     #[test]

@@ -536,10 +536,12 @@ pub fn encode_sliced_bytes(
     bytes: &[u8],
     size: Size,
     crop: bool,
+    pixelated: bool,
     tint: Option<SvgTint>,
 ) -> Result<(SlicedProtocol, ImageInfo), String> {
     let (image, info, svg_fitted) = decode_for_box(bytes, picker, size, crop, tint)?;
-    encode_sliced(picker, image, size, crop && !svg_fitted).map(|protocol| (protocol, info))
+    encode_sliced(picker, image, size, crop && !svg_fitted, pixelated)
+        .map(|protocol| (protocol, info))
 }
 
 /// Encode an image to fill a panel of `size` cells. `crop` selects the CSS
@@ -571,15 +573,30 @@ pub fn encode(
 /// the viewport edge never re-encodes it (the old per-slice `encode_slice` did,
 /// which both re-decoded per line and made a partly-visible image render at a
 /// different scale than a fully-visible one). `crop` selects the CSS
-/// `object-fit`: `false` → contain (fit preserving aspect, never upscaling,
-/// transparent letterbox); `true` → cover (fill the box preserving aspect,
-/// cropping the overflow). Re-encode only when the cell box or crop mode changes.
+/// `object-fit`: `false` → contain (scale to the box preserving aspect,
+/// UPSCALING included, transparent letterbox); `true` → cover (fill the box
+/// preserving aspect, cropping the overflow). Re-encode only when the cell box
+/// or crop mode changes. Unlike the standalone VIEWER (which deliberately
+/// never upscales past natural size — `encode` above), an inline image's box
+/// is its CSS USED size: a page that sizes a small image up (Steam's 41px QR
+/// GIF at `width:100%` of a 160px frame, `image-rendering:pixelated`) gets the
+/// scaled render a browser gives it, not a natural-size thumbnail lost in a
+/// big reserved box.
 pub fn encode_sliced(
     picker: &Picker,
     image: DynamicImage,
     size: Size,
     crop: bool,
+    pixelated: bool,
 ) -> Result<SlicedProtocol, String> {
+    // CSS Images 3 §5.4 `image-rendering: pixelated`: scale with
+    // nearest-neighbor so upscaled blocks stay hard-edged (Steam's 41px QR
+    // GIF must stay machine-scannable); default stays the smooth Lanczos.
+    let filter = if pixelated {
+        FilterType::Nearest
+    } else {
+        FilterType::Lanczos3
+    };
     if crop {
         // object-fit: cover — scale to fill the box preserving aspect and crop
         // the overflow, then slice 1:1 (the image already matches the box, so
@@ -589,19 +606,15 @@ pub fn encode_sliced(
             u32::from(size.width).max(1) * u32::from(f.width).max(1),
             u32::from(size.height).max(1) * u32::from(f.height).max(1),
         );
-        let filled = image.resize_to_fill(fw, fh, FilterType::Lanczos3);
+        let filled = image.resize_to_fill(fw, fh, filter);
         SlicedProtocol::new_with_resize(picker, filled, size, Resize::Fit(None))
             .map_err(|e| e.to_string())
     } else {
-        // object-fit: contain — the library fits (preserving aspect, never
-        // upscaling) and pads the slack transparently.
-        SlicedProtocol::new_with_resize(
-            picker,
-            image,
-            size,
-            Resize::Fit(Some(FilterType::Lanczos3)),
-        )
-        .map_err(|e| e.to_string())
+        // object-fit: contain — scale to the box preserving aspect (UP or
+        // down: `Resize::Scale`, vs `Fit` which never upscales), slack padded
+        // transparently.
+        SlicedProtocol::new_with_resize(picker, image, size, Resize::Scale(Some(filter)))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -801,7 +814,7 @@ mod tests {
         // it at draw time (so partial visibility never re-encodes or rescales).
         let (image, _) = decode(&red_png()).unwrap();
         let picker = Picker::halfblocks();
-        let proto = encode_sliced(&picker, image, Size::new(20, 10), false).unwrap();
+        let proto = encode_sliced(&picker, image, Size::new(20, 10), false, false).unwrap();
         let size = proto.size();
         assert!(size.width > 0 && size.width <= 20);
         assert!(size.height > 0 && size.height <= 10);
@@ -842,7 +855,7 @@ mod tests {
             u32::from(rows) * u32::from(f.height),
         );
         let (image, _) = decode(&tall_png(iw, ih)).unwrap();
-        let sliced = encode_sliced(&picker, image, Size::new(cols, rows), false).unwrap();
+        let sliced = encode_sliced(&picker, image, Size::new(cols, rows), false, false).unwrap();
         let area = Rect::new(0, 0, cols, vh);
         let render = |pos_y: i16, buf: &mut Buffer| {
             SlicedImage::new(&sliced, SignedPosition::from((0, pos_y))).render(area, buf);
@@ -900,7 +913,7 @@ mod tests {
         // render-thread build. A fresh protocol, prewarmed, then drawn fully
         // visible (an area that fits the whole image, so skip = drop = 0):
         let (image2, _) = decode(&tall_png(iw, ih)).unwrap();
-        let warm = encode_sliced(&picker, image2, Size::new(cols, rows), false).unwrap();
+        let warm = encode_sliced(&picker, image2, Size::new(cols, rows), false, false).unwrap();
         warm.prewarm_sixel_cache();
         let wsize = warm.size();
         let warea = Rect::new(0, 0, wsize.width, wsize.height);
@@ -985,7 +998,7 @@ mod tests {
 
         // --- one-time encode costs ---
         let t = Instant::now();
-        let sliced = encode_sliced(&picker, image.clone(), box_size, false).unwrap();
+        let sliced = encode_sliced(&picker, image.clone(), box_size, false, false).unwrap();
         eprintln!("A encode_sliced (once): {:?}", t.elapsed());
 
         let t = Instant::now();
