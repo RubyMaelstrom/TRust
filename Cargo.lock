@@ -23,6 +23,7 @@ dependencies = [
  "ratatui-image",
  "rcgen",
  "resvg",
+ "rustc-hash",
  "sha2 0.11.0",
  "svgtypes",
  "textwrap",

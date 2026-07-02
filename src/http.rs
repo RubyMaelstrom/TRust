@@ -1909,7 +1909,7 @@ pub fn lay_region_patch(
         cache,
     );
     if diag {
-        let n_nodes = dom.descendants(crate::dom::DOCUMENT).len();
+        let n_nodes = dom.descendants(crate::dom::DOCUMENT).count();
         eprintln!(
             "DIAGPATCH region-split parse={}us layout={}us nodes={} rows={} reused={}",
             t_parse.as_micros(),

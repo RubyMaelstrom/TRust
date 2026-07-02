@@ -11,6 +11,8 @@
 use std::borrow::Cow;
 use std::cell::{Ref, RefCell};
 
+use rustc_hash::FxHashMap;
+
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::{Attribute, ParseOpts, QualName, ns};
@@ -134,9 +136,9 @@ pub fn last_mutation_ms() -> u128 {
 pub struct Dom {
     nodes: Vec<Node>,
     /// host element → shadow root fragment (attachShadow).
-    shadow_roots: std::collections::HashMap<NodeId, NodeId>,
+    shadow_roots: FxHashMap<NodeId, NodeId>,
     /// and the reverse: shadow root fragment → host element.
-    shadow_hosts: std::collections::HashMap<NodeId, NodeId>,
+    shadow_hosts: FxHashMap<NodeId, NodeId>,
     /// Set by every tree/attribute mutation; the living page takes it
     /// to decide whether a dispatch warrants re-extraction at all.
     dirty: bool,
@@ -160,9 +162,9 @@ pub struct Dom {
     style_epoch: u64,
     /// adoptedStyleSheets text per scope (DOCUMENT or a shadow root
     /// fragment), pushed by the prelude on adoption/replaceSync.
-    adopted_styles: std::collections::HashMap<NodeId, String>,
+    adopted_styles: FxHashMap<NodeId, String>,
     /// Fetched `<link rel=stylesheet>` text, keyed by the link element.
-    external_sheets: std::collections::HashMap<NodeId, String>,
+    external_sheets: FxHashMap<NodeId, String>,
     /// Lazily built visibility cascade, valid for one STYLE epoch.
     style_cache: RefCell<Option<(u64, std::rc::Rc<StyleIndex>)>>,
     /// Memoized inherited `computed_value` results for the current epoch,
@@ -177,21 +179,21 @@ pub struct Dom {
     /// element — without this each read re-matched every rule (O(elements ×
     /// rules × props)). With it, each element is matched ONCE per epoch (via the
     /// rightmost-key buckets), then every property/pseudo read reuses the list.
-    matched_cache: RefCell<MatchedCache>,
+    matched_cache: RefCell<NodeCache<std::rc::Rc<Vec<u32>>>>,
     /// Memoized per-element cascade WINNER MAPS for the current epoch (see
-    /// `CascadedCache`/`cascaded_maps`): the layout/serializer read 30+
+    /// `cascaded_maps`): the layout/serializer read 30+
     /// properties per element (across the flow AND the intrinsic-measurement
     /// re-descents), so the winners for EVERY declared property — element
     /// box plus `::before`/`::after` — are resolved in ONE pass on the first
-    /// read, then each read is a hash lookup. Cleared when the epoch
-    /// advances. Pure memoization (identical results), so it never affects
-    /// the cascade outcome.
-    cascaded_cache: RefCell<CascadedCache>,
+    /// read, then each read is a slot lookup (epoch-stamp invalidated).
+    /// Pure memoization (identical results), so it never affects the
+    /// cascade outcome.
+    cascaded_cache: RefCell<NodeCache<std::rc::Rc<CascadedMaps>>>,
     /// Memoized `is_hidden` results for the current epoch. `is_hidden` reads ~15
     /// cascaded properties and runs once per `flow_element` visit (and the same
     /// node is re-visited by every measurement pass that re-descends through it),
     /// so without this the visibility test is the layout's most-repeated work.
-    hidden_cache: RefCell<(u64, std::collections::HashMap<NodeId, bool>)>,
+    hidden_cache: RefCell<NodeCache<bool>>,
     /// The CSS-pixel viewport (`cols*cell_px`, `rows*cell_px`) used to
     /// evaluate `@media` queries when the cascade is built; `(0, 0)` = unknown
     /// (width/height queries then conservatively don't match, as if skipped).
@@ -199,7 +201,7 @@ pub struct Dom {
     viewport_px: (u32, u32),
     /// Per-element inner-scroll state (CSSOM View `element.scrollTop`, Phase 3).
     /// Keyed by node; absent = never scrolled / not a measured scroll box.
-    scroll_state: std::collections::HashMap<NodeId, ScrollBox>,
+    scroll_state: FxHashMap<NodeId, ScrollBox>,
     /// Page-initiated scroll writes `(node, top, left)` (px) since the last
     /// drain — delivered to the app as `PageEvt::Scrolled` so a pure scroll (no
     /// DOM mutation) re-windows a region WITHOUT a full re-parse/relayout.
@@ -253,31 +255,44 @@ struct ScrollBox {
 }
 
 /// Per-epoch memo for `computed_value`: the epoch the entries are valid for,
-/// and inherited results keyed `(node, property index)`.
-type ComputedCache = (
-    u64,
-    std::collections::HashMap<(NodeId, usize), Option<String>>,
-);
+/// and inherited results keyed `(node, property index)`. FxHash: the keys
+/// are arena-internal, so SipHash's DoS resistance buys nothing.
+type ComputedCache = (u64, FxHashMap<(NodeId, usize), Option<String>>);
 
-/// Per-epoch memo for `matched_rules`: the epoch the entries are valid for, and
-/// the matching author-rule indices (into the element's tree-scope rule vec)
-/// per element, shared via `Rc` so every property read clones cheaply.
-type MatchedCache = (
-    u64,
-    std::collections::HashMap<NodeId, std::rc::Rc<Vec<u32>>>,
-);
+/// A node-indexed, epoch-STAMPED slot cache for the per-epoch memos keyed
+/// by bare `NodeId`. NodeIds are dense arena indices, so a Vec slot
+/// replaces hashing entirely, and the stamp compare replaces the per-epoch
+/// clear: advancing the epoch invalidates every slot at once, for free.
+/// A stale value lingers in its slot until overwritten — bounded by the
+/// arena, the same steady-state the old cleared-and-refilled maps had.
+struct NodeCache<T> {
+    slots: Vec<(u64, Option<T>)>,
+}
 
-/// Per-epoch memo for `cascaded_maps`: the epoch the entries are valid for,
-/// and each element's full author-cascade WINNER MAPS, shared via `Rc`.
-/// The serializer/layout read 30+ properties per element; before this map,
-/// EVERY property read re-scanned every matched rule's declarations and
-/// re-parsed the element's inline `style` (O(props × matched decls) per
-/// element). One build costs about the same as ONE of those scans, so every
-/// further property read on the element is a hash lookup.
-type CascadedCache = (
-    u64,
-    std::collections::HashMap<NodeId, std::rc::Rc<CascadedMaps>>,
-);
+impl<T> Default for NodeCache<T> {
+    fn default() -> Self {
+        NodeCache { slots: Vec::new() }
+    }
+}
+
+impl<T> NodeCache<T> {
+    /// The value cached for `id` at `epoch`, if still live. (An empty or
+    /// stale slot's `Option` gates it — the initial stamp is never trusted
+    /// on its own.)
+    fn get(&self, id: NodeId, epoch: u64) -> Option<&T> {
+        match self.slots.get(id) {
+            Some((stamp, Some(v))) if *stamp == epoch => Some(v),
+            _ => None,
+        }
+    }
+
+    fn put(&mut self, id: NodeId, epoch: u64, v: T) {
+        if self.slots.len() <= id {
+            self.slots.resize_with(id + 1, || (0, None));
+        }
+        self.slots[id] = (epoch, Some(v));
+    }
+}
 
 /// One element's author-cascade winners, per target box: the element itself
 /// plus its `::before`/`::after` generated boxes (their rules ride the same
@@ -285,13 +300,13 @@ type CascadedCache = (
 /// author declaration for that property (the cascade's `None`).
 #[derive(Default)]
 struct CascadedMaps {
-    elem: std::collections::HashMap<String, String>,
-    before: std::collections::HashMap<String, String>,
-    after: std::collections::HashMap<String, String>,
+    elem: FxHashMap<String, String>,
+    before: FxHashMap<String, String>,
+    after: FxHashMap<String, String>,
 }
 
 impl CascadedMaps {
-    fn pseudo(&self, which: PseudoEl) -> &std::collections::HashMap<String, String> {
+    fn pseudo(&self, which: PseudoEl) -> &FxHashMap<String, String> {
         match which {
             PseudoEl::Before => &self.before,
             PseudoEl::After => &self.after,
@@ -301,6 +316,41 @@ impl CascadedMaps {
 
 /// The document node is always index 0.
 pub const DOCUMENT: NodeId = 0;
+
+/// Lazy pre-order walk of a subtree (see `Dom::descendants`). Advancing
+/// costs O(1) amortized: first child, else next sibling, else the first
+/// ancestor below `root` with a next sibling.
+pub struct Descendants<'a> {
+    dom: &'a Dom,
+    root: NodeId,
+    next: Option<NodeId>,
+}
+
+impl Iterator for Descendants<'_> {
+    type Item = NodeId;
+
+    fn next(&mut self) -> Option<NodeId> {
+        let cur = self.next?;
+        let mut n = self.dom.nodes[cur].first_child;
+        if n.is_none() {
+            let mut up = cur;
+            while up != self.root {
+                if let Some(s) = self.dom.nodes[up].next_sibling {
+                    n = Some(s);
+                    break;
+                }
+                // Every visited node was reached from `root`, so the parent
+                // chain leads back to it; `None` is pure defense.
+                match self.dom.nodes[up].parent {
+                    Some(p) => up = p,
+                    None => break,
+                }
+            }
+        }
+        self.next = n;
+        Some(cur)
+    }
+}
 
 impl Default for Dom {
     fn default() -> Self {
@@ -312,20 +362,20 @@ impl Dom {
     pub fn new() -> Self {
         let mut dom = Dom {
             nodes: Vec::new(),
-            shadow_roots: std::collections::HashMap::new(),
-            shadow_hosts: std::collections::HashMap::new(),
+            shadow_roots: FxHashMap::default(),
+            shadow_hosts: FxHashMap::default(),
             dirty: false,
             epoch: 0,
             style_epoch: 0,
-            adopted_styles: std::collections::HashMap::new(),
-            external_sheets: std::collections::HashMap::new(),
+            adopted_styles: FxHashMap::default(),
+            external_sheets: FxHashMap::default(),
             style_cache: RefCell::new(None),
-            computed_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
-            matched_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
-            cascaded_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
-            hidden_cache: RefCell::new((u64::MAX, std::collections::HashMap::new())),
+            computed_cache: RefCell::new((u64::MAX, FxHashMap::default())),
+            matched_cache: RefCell::new(NodeCache::default()),
+            cascaded_cache: RefCell::new(NodeCache::default()),
+            hidden_cache: RefCell::new(NodeCache::default()),
             viewport_px: (0, 0),
-            scroll_state: std::collections::HashMap::new(),
+            scroll_state: FxHashMap::default(),
             scroll_changes: Vec::new(),
             cell_px: (8, 16),
             dirty_nodes: Vec::new(),
@@ -982,18 +1032,28 @@ impl Dom {
         out
     }
 
-    /// The subtree under `root` in document order, excluding `root`.
-    pub fn descendants(&self, root: NodeId) -> Vec<NodeId> {
-        let mut out = Vec::new();
-        let mut stack: Vec<NodeId> = self.children(root);
-        stack.reverse();
-        while let Some(id) = stack.pop() {
-            out.push(id);
-            let mut kids = self.children(id);
-            kids.reverse();
-            stack.extend(kids);
+    /// The children of `id` as a LAZY iterator (no Vec) — for read-only
+    /// walks (the serializers, queries, text extraction). Use `children()`
+    /// (materialized) when the tree is mutated mid-iteration.
+    pub fn child_iter(&self, id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        std::iter::successors(self.nodes[id].first_child, move |&c| {
+            self.nodes[c].next_sibling
+        })
+    }
+
+    /// The subtree under `root` in document (pre-)order, excluding `root`,
+    /// as a LAZY allocation-free iterator: O(1) state over the first_child/
+    /// next_sibling/parent pointers — no per-node child Vec, no whole-subtree
+    /// out Vec, and early-exiting callers (getElementById, querySelector's
+    /// first match) stop walking at the hit. Borrowing `&self` for the walk
+    /// also makes mutation-during-iteration a compile error; callers that
+    /// mutate mid-walk collect first (`rewrite_inline_svgs`).
+    pub fn descendants(&self, root: NodeId) -> Descendants<'_> {
+        Descendants {
+            dom: self,
+            root,
+            next: self.nodes[root].first_child,
         }
-        out
     }
 
     pub fn tag_name(&self, id: NodeId) -> Option<&str> {
@@ -1036,7 +1096,6 @@ impl Dom {
     /// surface, used to give an unplayable `<video>` a preview thumbnail.
     pub fn meta_content(&self, key: &str) -> Option<&str> {
         self.descendants(DOCUMENT)
-            .into_iter()
             .filter(|&id| self.tag_name(id) == Some("meta"))
             .find(|&id| {
                 self.attr(id, "property")
@@ -1140,21 +1199,11 @@ impl Dom {
         // Per-epoch memo: `is_hidden` reads ~15 cascaded properties and runs once
         // per `flow_element` visit, with the same node re-tested by every
         // measurement re-descent through it — the layout's most-repeated check.
-        {
-            let cache = self.hidden_cache.borrow();
-            if cache.0 == self.epoch
-                && let Some(&hit) = cache.1.get(&id)
-            {
-                return hit;
-            }
+        if let Some(&hit) = self.hidden_cache.borrow().get(id, self.epoch) {
+            return hit;
         }
         let hidden = self.is_hidden_inner(id);
-        let mut cache = self.hidden_cache.borrow_mut();
-        if cache.0 != self.epoch {
-            cache.0 = self.epoch;
-            cache.1.clear();
-        }
-        cache.1.insert(id, hidden);
+        self.hidden_cache.borrow_mut().put(id, self.epoch, hidden);
         hidden
     }
 
@@ -1454,7 +1503,7 @@ impl Dom {
         {
             return false;
         }
-        self.children(id).iter().any(|&c| {
+        self.child_iter(id).any(|c| {
             matches!(
                 self.effective_display(c).as_deref(),
                 Some("table-row" | "table-row-group" | "table-header-group" | "table-footer-group")
@@ -1798,13 +1847,8 @@ impl Dom {
     /// on the first read of ANY of its properties (one pass over its author
     /// sources), then shared by every further read.
     fn cascaded_maps(&self, id: NodeId) -> std::rc::Rc<CascadedMaps> {
-        {
-            let cache = self.cascaded_cache.borrow();
-            if cache.0 == self.epoch
-                && let Some(hit) = cache.1.get(&id)
-            {
-                return hit.clone();
-            }
+        if let Some(hit) = self.cascaded_cache.borrow().get(id, self.epoch) {
+            return hit.clone();
         }
         let _t = casc_diag_on().then(std::time::Instant::now);
         let maps = std::rc::Rc::new(self.build_cascaded_maps(id));
@@ -1812,12 +1856,9 @@ impl Dom {
             let us = t.elapsed().as_micros() as u64;
             casc_bump(|d| d.cascaded_us += us);
         }
-        let mut cache = self.cascaded_cache.borrow_mut();
-        if cache.0 != self.epoch {
-            cache.0 = self.epoch;
-            cache.1.clear();
-        }
-        cache.1.insert(id, maps.clone());
+        self.cascaded_cache
+            .borrow_mut()
+            .put(id, self.epoch, maps.clone());
         maps
     }
 
@@ -1834,7 +1875,7 @@ impl Dom {
     /// here, matching real-browser behavior for the properties we don't
     /// track.
     fn build_cascaded_maps(&self, id: NodeId) -> CascadedMaps {
-        type Winners = std::collections::HashMap<String, (CascadeKey, String)>;
+        type Winners = FxHashMap<String, (CascadeKey, String)>;
         // Clone only on first sight or a WIN — a losing declaration costs a
         // lookup and a key compare, never an allocation.
         fn consider_into(map: &mut Winners, prop: &str, key: CascadeKey, value: &str) {
@@ -1849,9 +1890,9 @@ impl Dom {
                 }
             }
         }
-        let mut elem: Winners = Winners::new();
-        let mut before: Winners = Winners::new();
-        let mut after: Winners = Winners::new();
+        let mut elem = Winners::default();
+        let mut before = Winners::default();
+        let mut after = Winners::default();
         if let Some(style) = self.attr(id, "style") {
             for decl in style.split(';') {
                 let Some((k, v, important)) = parse_decl(decl) else {
@@ -2257,13 +2298,8 @@ impl Dom {
     /// O(elements × rules × props). Candidate rules come from the rightmost-key
     /// buckets; only those are full-matched.
     fn matched_rules(&self, id: NodeId) -> std::rc::Rc<Vec<u32>> {
-        {
-            let cache = self.matched_cache.borrow();
-            if cache.0 == self.epoch
-                && let Some(hit) = cache.1.get(&id)
-            {
-                return hit.clone();
-            }
+        if let Some(hit) = self.matched_cache.borrow().get(id, self.epoch) {
+            return hit.clone();
         }
         let index = self.style_index();
         let scope = self.tree_scope(id);
@@ -2311,12 +2347,9 @@ impl Dom {
             }
             _ => std::rc::Rc::new(Vec::new()),
         };
-        let mut cache = self.matched_cache.borrow_mut();
-        if cache.0 != self.epoch {
-            cache.0 = self.epoch;
-            cache.1.clear();
-        }
-        cache.1.insert(id, matched.clone());
+        self.matched_cache
+            .borrow_mut()
+            .put(id, self.epoch, matched.clone());
         matched
     }
 
@@ -2354,7 +2387,6 @@ impl Dom {
     /// pipeline can resolve and download them before scripts run.
     pub fn stylesheet_links(&self) -> Vec<String> {
         self.descendants(DOCUMENT)
-            .into_iter()
             .filter(|&id| self.is_stylesheet_link(id))
             .filter_map(|id| self.attr(id, "href").map(str::to_string))
             .collect()
@@ -2362,15 +2394,25 @@ impl Dom {
 
     /// Attach fetched `<link rel=stylesheet>` bodies (keyed by the raw
     /// href attribute) to their link elements; the cascade reads them
-    /// scope-aware like any `<style>`.
+    /// scope-aware like any `<style>`. ONE document walk collects the
+    /// candidate links (this used to walk the whole document once per
+    /// sheet — O(sheets × nodes) on a 48-sheet page).
     pub fn attach_external_sheets(&mut self, sheets: &[(String, String)]) {
+        if sheets.is_empty() {
+            return;
+        }
+        let links: Vec<(NodeId, String)> = self
+            .descendants(DOCUMENT)
+            .filter(|&id| self.is_stylesheet_link(id))
+            .filter_map(|id| self.attr(id, "href").map(|h| (id, h.to_string())))
+            .collect();
         for (href, css) in sheets {
-            let hit = self.descendants(DOCUMENT).into_iter().find(|&id| {
-                !self.external_sheets.contains_key(&id)
-                    && self.is_stylesheet_link(id)
-                    && self.attr(id, "href") == Some(href.as_str())
-            });
-            if let Some(id) = hit {
+            // First not-yet-attached link with this href (duplicate hrefs
+            // attach to successive links, as before).
+            let hit = links
+                .iter()
+                .find(|(id, h)| !self.external_sheets.contains_key(id) && h == href);
+            if let Some(&(id, _)) = hit {
                 self.external_sheets.insert(id, css.clone());
                 self.touch_style();
             }
@@ -2505,8 +2547,7 @@ impl Dom {
             }
         };
         let want = self.attr(slot, "name").unwrap_or("").trim().to_owned();
-        self.children(host)
-            .into_iter()
+        self.child_iter(host)
             .filter(|&c| self.attr(c, "slot").unwrap_or("").trim() == want)
             .collect()
     }
@@ -2594,11 +2635,9 @@ impl Dom {
     /// cross-origin (never-loaded) frame.
     pub fn frame_body(&self, id: NodeId) -> Option<NodeId> {
         let html = self
-            .children(id)
-            .into_iter()
+            .child_iter(id)
             .find(|&c| self.tag_name(c) == Some("html"))?;
-        self.children(html)
-            .into_iter()
+        self.child_iter(html)
             .find(|&c| self.tag_name(c) == Some("body"))
     }
 
@@ -2687,8 +2726,7 @@ impl Dom {
     /// The host's light children assigned to a slot (by name, or the
     /// default slot). Text nodes always belong to the default slot.
     fn slot_assigned(&self, host: NodeId, slot_name: Option<&str>) -> Vec<NodeId> {
-        self.children(host)
-            .into_iter()
+        self.child_iter(host)
             .filter(|&c| match (self.attr(c, "slot"), slot_name) {
                 (Some(a), Some(n)) => a == n,
                 (None, None) => true,
@@ -2729,6 +2767,17 @@ impl Dom {
             }
         }
         out
+    }
+
+    /// Whether the subtree under `id` (inclusive for a text node) contains
+    /// any non-whitespace text — the allocation-free, early-exiting form of
+    /// `!text_content(id).trim().is_empty()`, which built the whole
+    /// concatenated string only to test it (the live serializer runs this
+    /// per clickable element).
+    fn subtree_has_text(&self, id: NodeId) -> bool {
+        let non_ws =
+            |d: &NodeData| matches!(d, NodeData::Text(t) if !t.chars().all(char::is_whitespace));
+        non_ws(&self.nodes[id].data) || self.descendants(id).any(|d| non_ws(&self.nodes[d].data))
     }
 
     /// The terminal glyph for an icon element/subtree — the dominant web icon
@@ -2849,12 +2898,10 @@ impl Dom {
                 .one(StrTendril::from(html));
         // The fragment's children land under <html> under the document.
         let html_el = frag
-            .children(DOCUMENT)
-            .into_iter()
+            .child_iter(DOCUMENT)
             .find(|&c| frag.tag_name(c) == Some("html"))
             .unwrap_or(DOCUMENT);
-        frag.children(html_el)
-            .into_iter()
+        frag.child_iter(html_el)
             .map(|c| self.transplant(&frag, c))
             .collect()
     }
@@ -2889,12 +2936,12 @@ impl Dom {
             {
                 *template_contents = Some(frag);
             }
-            for c in other.children(sc) {
+            for c in other.child_iter(sc) {
                 let cc = self.transplant(other, c);
                 self.append(frag, cc);
             }
         }
-        for c in other.children(id) {
+        for c in other.child_iter(id) {
             let cc = self.transplant(other, c);
             self.append(copy, cc);
         }
@@ -2937,7 +2984,7 @@ impl Dom {
     /// `sys_inner_html`). See `serialize_js`.
     pub fn inner_html(&self, id: NodeId) -> String {
         let mut out = String::new();
-        for c in self.children(self.content_target(id)) {
+        for c in self.child_iter(self.content_target(id)) {
             self.serialize_node_inner(c, None, true, &mut out);
         }
         out
@@ -2954,11 +3001,14 @@ impl Dom {
     /// image-URL collection and layout. This is the first slice of inline-SVG
     /// support: a static snapshot of self-contained vector markup.
     pub fn rewrite_inline_svgs(&mut self) {
-        for id in self.descendants(DOCUMENT) {
-            if self.tag_name(id) != Some("svg")
-                || self.ancestor_is_svg(id)
-                || !self.svg_is_renderable(id)
-            {
+        // Materialize the candidate list first: the loop MUTATES the tree
+        // (insert/detach), which can't overlap the lazy descendants walk.
+        let svgs: Vec<NodeId> = self
+            .descendants(DOCUMENT)
+            .filter(|&id| self.tag_name(id) == Some("svg"))
+            .collect();
+        for id in svgs {
+            if self.ancestor_is_svg(id) || !self.svg_is_renderable(id) {
                 continue;
             }
             let Some(parent) = self.nodes[id].parent else {
@@ -3077,7 +3127,7 @@ impl Dom {
     ) {
         match &self.nodes[id].data {
             NodeData::Document | NodeData::Fragment => {
-                for c in self.children(id) {
+                for c in self.child_iter(id) {
                     self.serialize_node_inner(c, host, keep_template, out);
                 }
             }
@@ -3103,7 +3153,7 @@ impl Dom {
                         out.push_str(tag);
                         self.write_attrs(id, attrs, &mut |_, _| None, out);
                         out.push('>');
-                        for c in self.children(self.content_target(id)) {
+                        for c in self.child_iter(self.content_target(id)) {
                             self.serialize_node_inner(c, host, true, out);
                         }
                         out.push_str("</");
@@ -3122,8 +3172,8 @@ impl Dom {
                 // emit nothing (unchanged).
                 if matches!(tag, "iframe" | "frame") {
                     if let Some(body) = self.frame_body(id) {
-                        let kids = self.children(body);
-                        if !kids.is_empty() {
+                        let mut kids = self.child_iter(body).peekable();
+                        if kids.peek().is_some() {
                             out.push_str("<div data-trust-frame=\"\">");
                             for c in kids {
                                 self.serialize_node_inner(c, host, keep_template, out);
@@ -3140,7 +3190,7 @@ impl Dom {
                 {
                     let assigned = self.slot_assigned(h, self.attr(id, "name"));
                     if assigned.is_empty() {
-                        for c in self.children(id) {
+                        for c in self.child_iter(id) {
                             self.serialize_node_inner(c, host, keep_template, out);
                         }
                     } else {
@@ -3161,11 +3211,11 @@ impl Dom {
                 // (flattened — text extraction wants content, not
                 // composition fidelity).
                 if let Some(root) = self.shadow_root(id) {
-                    for c in self.children(root) {
+                    for c in self.child_iter(root) {
                         self.serialize_node_inner(c, Some(id), keep_template, out);
                     }
                 } else {
-                    for c in self.children(id) {
+                    for c in self.child_iter(id) {
                         self.serialize_node_inner(c, host, keep_template, out);
                     }
                 }
@@ -3217,8 +3267,8 @@ impl Dom {
         // nothing.
         if matches!(tag, "iframe" | "frame") {
             if let Some(body) = self.frame_body(id) {
-                let kids = self.children(body);
-                if !kids.is_empty() {
+                let mut kids = self.child_iter(body).peekable();
+                if kids.peek().is_some() {
                     out.push_str("<div data-trust-frame=\"\">");
                     for c in kids {
                         self.serialize_live_node(c, host, clickable, in_anchor, out);
@@ -3233,7 +3283,7 @@ impl Dom {
         {
             let assigned = self.slot_assigned(h, self.attr(id, "name"));
             if assigned.is_empty() {
-                for c in self.children(id) {
+                for c in self.child_iter(id) {
                     self.serialize_live_node(c, host, clickable, in_anchor, out);
                 }
             } else {
@@ -3276,7 +3326,7 @@ impl Dom {
             // wrapper yields no layout item, so it neither shows nor steals a
             // selection stop. (Was a `·` marker — fine for a lone control,
             // debris in a group.)
-            if self.text_content(id).trim().is_empty() {
+            if !self.subtree_has_text(id) {
                 if let Some(glyph) = self.icon_glyph(id) {
                     out.push_str(glyph);
                 } else if let Some(label) = self
@@ -3352,11 +3402,11 @@ impl Dom {
         out.push('>');
         if !VOID_ELEMENTS.contains(&tag) {
             if let Some(root) = self.shadow_root(id) {
-                for c in self.children(root) {
+                for c in self.child_iter(root) {
                     self.serialize_live_node(c, Some(id), clickable, child_in_anchor, out);
                 }
             } else {
-                for c in self.children(id) {
+                for c in self.child_iter(id) {
                     self.serialize_live_node(c, host, clickable, child_in_anchor, out);
                 }
             }
@@ -3480,7 +3530,7 @@ impl Dom {
     ) {
         match &self.nodes[id].data {
             NodeData::Document | NodeData::Fragment => {
-                for c in self.children(id) {
+                for c in self.child_iter(id) {
                     kids(c, out);
                 }
             }
@@ -3502,7 +3552,6 @@ impl Dom {
     /// classic script executes.
     pub fn scripts(&self) -> Vec<(Option<String>, String, Option<String>, NodeId)> {
         self.descendants(DOCUMENT)
-            .into_iter()
             .filter(|&d| self.tag_name(d) == Some("script"))
             .map(|d| {
                 (
@@ -3616,25 +3665,30 @@ impl Dom {
 
     /// The element's 1-based position among its parent's element children
     /// (`of_type`: only same-tag siblings; `from_end`: counted from the
-    /// last). `None` if it has no parent or isn't an element.
+    /// last). `None` if it has no parent or isn't an element. One sibling
+    /// pass, no Vec: count qualifying siblings and note our own ordinal.
     fn nth_position(&self, id: NodeId, of_type: bool, from_end: bool) -> Option<i32> {
         let parent = self.nodes[id].parent?;
         let my_tag = self.tag_name(id)?;
-        let mut sibs = Vec::new();
+        let mut count = 0i32;
+        let mut ordinal = None;
         let mut child = self.nodes[parent].first_child;
         while let Some(c) = child {
             if let Some(t) = self.tag_name(c)
                 && (!of_type || t == my_tag)
             {
-                sibs.push(c);
+                count += 1;
+                if c == id {
+                    ordinal = Some(count);
+                }
             }
             child = self.nodes[c].next_sibling;
         }
-        let idx = sibs.iter().position(|&s| s == id)?;
+        let ordinal = ordinal?;
         Some(if from_end {
-            (sibs.len() - idx) as i32
+            count - ordinal + 1
         } else {
-            (idx + 1) as i32
+            ordinal
         })
     }
 
@@ -3684,9 +3738,15 @@ impl Dom {
             return false;
         }
         if !c.classes.is_empty() {
+            // No token Vec: this runs per candidate rule per element (the
+            // rule-hash's hottest inner test), and compounds rarely want
+            // more than one or two classes.
             let classes = self.attr(id, "class").unwrap_or("");
-            let have: Vec<&str> = classes.split_ascii_whitespace().collect();
-            if !c.classes.iter().all(|w| have.contains(&w.as_str())) {
+            if !c
+                .classes
+                .iter()
+                .all(|w| classes.split_ascii_whitespace().any(|t| t == w))
+            {
                 return false;
             }
         }
@@ -4443,8 +4503,7 @@ const fn prop(name: &'static str, inherited: bool, baked: bool) -> PropDef {
 /// per-call `PROPS.iter().position()` linear scan — `computed_value` runs this
 /// ~100k times in one heavy-page layout, so the scan was pure waste.
 fn prop_index(name: &str) -> Option<usize> {
-    static INDEX: std::sync::OnceLock<std::collections::HashMap<&'static str, usize>> =
-        std::sync::OnceLock::new();
+    static INDEX: std::sync::OnceLock<FxHashMap<&'static str, usize>> = std::sync::OnceLock::new();
     INDEX
         .get_or_init(|| PROPS.iter().enumerate().map(|(i, p)| (p.name, i)).collect())
         .get(name)
@@ -4998,16 +5057,16 @@ type CascadeKey = (bool, bool, u64, (u32, u32, u32), usize);
 /// document sheets never reach in.
 #[derive(Default)]
 struct StyleIndex {
-    scopes: std::collections::HashMap<NodeId, Vec<StyleRule>>,
+    scopes: FxHashMap<NodeId, Vec<StyleRule>>,
     /// Per-scope rule index, keyed by each rule's rightmost-compound key
     /// (id/class/tag/universal) — the standard browser "rule hash" so an
     /// element only tests rules that could possibly match it (see
     /// `matched_rules`). Parallel to `scopes`; values index into it.
-    buckets: std::collections::HashMap<NodeId, RuleBuckets>,
+    buckets: FxHashMap<NodeId, RuleBuckets>,
     /// `@keyframes <name>` → the animation's END opacity (the `to`/`100%`
     /// keyframe), for honoring an `animation-fill-mode:forwards` reveal/hide.
     /// Only opacity is extracted (the one keyframe property visibility needs).
-    keyframes: std::collections::HashMap<String, f32>,
+    keyframes: FxHashMap<String, f32>,
     /// Whether any rule sets `opacity` at all — lets `paint_suppressed` skip
     /// the opacity cascade entirely on the overwhelming majority of pages.
     has_opacity: bool,
@@ -5020,9 +5079,9 @@ struct StyleIndex {
 /// lands in exactly one bucket, so the candidate sets are disjoint.
 #[derive(Default)]
 struct RuleBuckets {
-    by_id: std::collections::HashMap<String, Vec<u32>>,
-    by_class: std::collections::HashMap<String, Vec<u32>>,
-    by_tag: std::collections::HashMap<String, Vec<u32>>,
+    by_id: FxHashMap<String, Vec<u32>>,
+    by_class: FxHashMap<String, Vec<u32>>,
+    by_tag: FxHashMap<String, Vec<u32>>,
     universal: Vec<u32>,
 }
 
@@ -5255,7 +5314,7 @@ fn parse_sheet(
     css: &str,
     order: &mut usize,
     out: &mut Vec<StyleRule>,
-    keyframes: &mut std::collections::HashMap<String, f32>,
+    keyframes: &mut FxHashMap<String, f32>,
     viewport: (u32, u32),
     layers: &mut LayerRegistry,
     layer: &str,
@@ -6747,7 +6806,6 @@ mod tests {
         dom.rewrite_inline_svgs();
         let imgs: Vec<NodeId> = dom
             .descendants(DOCUMENT)
-            .into_iter()
             .filter(|&d| dom.tag_name(d) == Some("img"))
             .collect();
         // The path-bearing SVG became an <img data:…> with its <title> as alt;
@@ -6774,7 +6832,6 @@ mod tests {
         // The two non-renderable SVGs survive untouched (glyph/text fallback).
         let svgs = dom
             .descendants(DOCUMENT)
-            .into_iter()
             .filter(|&d| dom.tag_name(d) == Some("svg"))
             .count();
         assert_eq!(svgs, 2);
@@ -6798,7 +6855,6 @@ mod tests {
         dom.rewrite_inline_svgs();
         let imgs: Vec<NodeId> = dom
             .descendants(DOCUMENT)
-            .into_iter()
             .filter(|&d| dom.tag_name(d) == Some("img"))
             .collect();
         assert_eq!(imgs.len(), 2);
@@ -8059,7 +8115,6 @@ mod tests {
         let reparsed = Dom::parse_document(&html);
         let anchors = reparsed
             .descendants(DOCUMENT)
-            .into_iter()
             .filter(|&d| reparsed.tag_name(d) == Some("a"))
             .count();
         assert_eq!(anchors, 1, "anchor survives re-parse un-split: {html}");
@@ -8624,6 +8679,98 @@ mod tests {
         println!(
             "serialize after mutation: {total:?} ({:?}/serialize)",
             total / n
+        );
+    }
+
+    #[test]
+    fn descendants_iterator_walks_document_order() {
+        // The lazy pointer-walk must produce the exact pre-order document
+        // order the old materialized walk did — including climbing out of
+        // deep branches to an ancestor's next sibling, and staying INSIDE
+        // the subtree when the walk is rooted below the document.
+        let dom = Dom::parse_document(
+            "<body><div id=a><p id=b><b id=c>x</b></p><p id=d>y</p></div><span id=e>z</span></body>",
+        );
+        let tags: Vec<&str> = dom
+            .descendants(DOCUMENT)
+            .filter_map(|d| dom.tag_name(d))
+            .collect();
+        assert_eq!(tags, ["html", "head", "body", "div", "p", "b", "p", "span"]);
+        // Rooted at #a: only its subtree, never the following <span>.
+        let a = dom.get_by_id("a").unwrap();
+        let sub: Vec<&str> = dom.descendants(a).filter_map(|d| dom.tag_name(d)).collect();
+        assert_eq!(sub, ["p", "b", "p"]);
+        // A leaf element yields no element descendants.
+        let c = dom.get_by_id("c").unwrap();
+        assert_eq!(
+            dom.descendants(c)
+                .filter(|&d| dom.tag_name(d).is_some())
+                .count(),
+            0
+        );
+    }
+
+    /// Traversal cost (release:
+    /// `cargo test --release traversal_bench -- --ignored --nocapture`).
+    /// getElementById near the front and the back of a wide document,
+    /// querySelector first-match, textContent, and a full serialize —
+    /// the paths that used to materialize whole-subtree Vecs (plus a
+    /// per-node child Vec) before matching/serializing anything.
+    #[test]
+    #[ignore]
+    fn traversal_bench() {
+        let mut html = String::from("<body>");
+        html.push_str("<p id=front class=hit>first</p>");
+        for i in 0..5000 {
+            html.push_str(&format!(
+                "<div class=row><p>row {i}</p><span>cell</span></div>"
+            ));
+        }
+        html.push_str("<p id=deep class=hit2>last</p></body>");
+        let dom = Dom::parse_document(&html);
+        let n = 2000u32;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = dom.get_by_id("front");
+        }
+        let front = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = dom.get_by_id("deep");
+        }
+        let deep = t.elapsed();
+        let sel_front = SelectorList::parse(".hit").unwrap();
+        let sel_deep = SelectorList::parse(".hit2").unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = dom.query(DOCUMENT, &sel_front, true);
+        }
+        let q_front = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let _ = dom.query(DOCUMENT, &sel_deep, true);
+        }
+        let q_deep = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..50 {
+            let _ = dom.text_content(DOCUMENT);
+        }
+        let text = t.elapsed();
+        let t = std::time::Instant::now();
+        for _ in 0..50 {
+            let _ = dom.serialize(DOCUMENT);
+        }
+        let ser = t.elapsed();
+        println!(
+            "getElementById front: {:?}/call  deep: {:?}/call\n\
+             querySelector  front: {:?}/call  deep: {:?}/call\n\
+             textContent(doc): {:?}/call  serialize(doc): {:?}/call",
+            front / n,
+            deep / n,
+            q_front / n,
+            q_deep / n,
+            text / 50,
+            ser / 50
         );
     }
 
