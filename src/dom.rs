@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 use std::cell::{Ref, RefCell};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use html5ever::interface::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tendril::{StrTendril, TendrilSink};
@@ -220,6 +220,25 @@ pub struct Dom {
     /// style/viewport change, or a mutator that can't name its node) — then the
     /// app must do a full relayout, never a patch. Reset to true on take.
     dirty_attributed: bool,
+    /// Elements holding hover-type listeners (computed by the actor's
+    /// `hover_set` before each serialize): the serializer bakes
+    /// `data-trust-hover` on them so the app can resolve a hovered cell back
+    /// to an actor node. Deliberately a DEDICATED attribute — `data-trust-node`
+    /// is load-bearing for incremental-layout boundary sparsity and
+    /// scroll-region correlation, so hover hosts must not carry it.
+    hover_hosts: std::collections::HashSet<NodeId>,
+    /// The live `:hover` chain: the committed hover target + its composed
+    /// ancestors (empty at rest / no pointer). Consulted by selector matching
+    /// (`Compound.hover`); moved by `set_hover_chain`, which bumps the epoch
+    /// only when the move can change the render (see the hover probes).
+    hover_chain: FxHashSet<NodeId>,
+    /// Elements whose POPOVER is currently SHOWING (HTML §the popover
+    /// attribute — the "popover visibility state"). Written by the
+    /// `__dom_popover` syscall as page JS calls `showPopover`/`hidePopover`;
+    /// read by the UA hide rule in `is_hidden` and the `:popover-open`
+    /// pseudo-class. A removed node's stale entry is harmless (the id stops
+    /// rendering with the node).
+    popover_open: FxHashSet<NodeId>,
 }
 
 /// The kind of DOM mutation, for incremental-layout boundary mapping. See
@@ -380,9 +399,118 @@ impl Dom {
             cell_px: (8, 16),
             dirty_nodes: Vec::new(),
             dirty_attributed: true,
+            hover_hosts: std::collections::HashSet::new(),
+            hover_chain: FxHashSet::default(),
+            popover_open: FxHashSet::default(),
         };
         dom.new_node(NodeData::Document);
         dom
+    }
+
+    /// Replace the hover-host set (elements holding hover-type listeners) the
+    /// serializer marks with `data-trust-hover`. Refreshed by the actor
+    /// wherever the clickable set is refreshed — a pure marking input, so it
+    /// deliberately does NOT touch the dirty bit or the epoch.
+    pub fn set_hover_hosts(&mut self, hosts: std::collections::HashSet<NodeId>) {
+        self.hover_hosts = hosts;
+    }
+
+    /// Whether no element holds a hover-type listener (the auto-Static gate:
+    /// a hover-only page must keep its engine).
+    pub fn hover_hosts_is_empty(&self) -> bool {
+        self.hover_hosts.is_empty()
+    }
+
+    /// Whether any stylesheet rule depends on the live `:hover` chain AND
+    /// declares render-affecting properties — the CSS half of the auto-Static
+    /// gate (such a page must stay resident to restyle under the pointer).
+    pub fn hover_css_affects_rendering(&self) -> bool {
+        !self.style_index().hover_probes.is_empty()
+    }
+
+    /// The elements a render-affecting `:hover` rule could match (the style
+    /// index's non-any probes) — pure-CSS hover targets like `.menu` of
+    /// `.menu:hover .drop{display:block}`. They carry no listener, so the
+    /// listener registry can't name them; the serializer still needs to mark
+    /// them (`data-trust-hover`) or the app can never resolve a pointer cell
+    /// to them and the chain never moves there. Any-element probes (`:hover`
+    /// nested in logical pseudos) are skipped — marking everything is
+    /// marking nothing.
+    pub fn hover_css_candidates(&self) -> Vec<NodeId> {
+        self.hover_css_candidates_in(&[DOCUMENT])
+    }
+
+    /// `hover_css_candidates` restricted to the given subtrees (each root plus
+    /// its composed descendants; DOCUMENT itself never matches a probe, so the
+    /// doc-wide call composes through here unchanged). The incremental patch
+    /// path serializes only its dirty boundaries, so it only needs candidates
+    /// inside them — this keeps that path from paying a whole-document probe
+    /// walk per patch.
+    pub fn hover_css_candidates_in(&self, roots: &[NodeId]) -> Vec<NodeId> {
+        let idx = self.style_index();
+        let probes: Vec<&HoverProbe> = idx.hover_probes.iter().filter(|p| !p.any).collect();
+        if probes.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for &r in roots {
+            for e in std::iter::once(r).chain(self.composed_descendants(r)) {
+                if self.tag_name(e).is_some() && probes.iter().any(|p| p.could_match(self, e)) {
+                    out.push(e);
+                }
+            }
+        }
+        out
+    }
+
+    /// Move the live `:hover` chain to `target` + its composed ancestors
+    /// (`None`/stale target clears it). Returns whether the move can change
+    /// the RENDER: some element whose hover state flips is a candidate for a
+    /// hover-dependent rule with render-affecting declarations. Affected ⇒
+    /// bump the epoch (the per-element match/cascade memos invalidate lazily)
+    /// and mark dirty-UNATTRIBUTED via `touch` — a chain change can restyle
+    /// arbitrary descendants (`.menu:hover .dropdown`), so no incremental
+    /// patch is sound. A no-op or non-affecting move (color-only `:hover`
+    /// rules — the common web) costs no epoch, no dirty, no relayout.
+    /// Set/clear an element's popover SHOWING state (HTML §the popover
+    /// attribute). Bumps the main epoch on change — the UA hide rule and
+    /// `:popover-open` both read this, so hidden/match memos must refresh —
+    /// and marks the document dirty (an open/closed popover renders
+    /// differently by definition). Never touches `style_epoch`: the sheet set
+    /// is unchanged.
+    pub fn set_popover_open(&mut self, id: NodeId, open: bool) {
+        let changed = if open {
+            self.popover_open.insert(id)
+        } else {
+            self.popover_open.remove(&id)
+        };
+        if changed {
+            self.touch();
+        }
+    }
+
+    pub fn set_hover_chain(&mut self, target: Option<NodeId>) -> bool {
+        let mut chain: FxHashSet<NodeId> = FxHashSet::default();
+        let mut cur = target.filter(|&t| self.is_valid(t));
+        while let Some(c) = cur {
+            chain.insert(c);
+            cur = self.parent_composed(c);
+        }
+        if chain == self.hover_chain {
+            return false;
+        }
+        let affected = {
+            let idx = self.style_index();
+            !idx.hover_probes.is_empty()
+                && chain
+                    .symmetric_difference(&self.hover_chain)
+                    .any(|&e| idx.hover_probes.iter().any(|p| p.could_match(self, e)))
+        };
+        self.hover_chain = chain;
+        if affected {
+            self.touch();
+        }
+        affected
     }
 
     /// True when anything mutated since the last call; resets the flag.
@@ -1217,6 +1345,17 @@ impl Dom {
         // dialog's `display` wins, so only apply when the cascade is silent.
         if self.tag_name(id) == Some("dialog")
             && self.attr(id, "open").is_none()
+            && self.cascaded(id, "display").is_none()
+        {
+            return true;
+        }
+        // UA rule `[popover]:not(:popover-open) { display:none }` (HTML §the
+        // popover attribute): a popover renders only while SHOWN
+        // (`showPopover()` / a `popovertarget` button). Same origin ordering
+        // as the dialog rule above — an author `display` (a tooltip lib's
+        // inline `display:flex`) wins over the UA sheet.
+        if !self.popover_open.contains(&id)
+            && self.attr(id, "popover").is_some()
             && self.cascaded(id, "display").is_none()
         {
             return true;
@@ -2280,6 +2419,21 @@ impl Dom {
             .values()
             .flatten()
             .any(|r| r.decls.iter().any(|(k, _)| k == "opacity"));
+        // The hover probes: only rules that could change what we PAINT under a
+        // moved hover chain. Untracked-only declarations (color, background —
+        // nothing the terminal renders) build no probe, so `set_hover_chain`
+        // short-circuits to "unaffected" on the common color-only web.
+        index.hover_probes = index
+            .scopes
+            .values()
+            .flatten()
+            .filter(|r| {
+                r.decls
+                    .iter()
+                    .any(|(k, _)| k == "content" || k.starts_with("--") || is_tracked(k))
+            })
+            .flat_map(hover_probes_of)
+            .collect();
         // Build the rightmost-key buckets so `matched_rules` tests only
         // candidate rules per element instead of the whole scope.
         index.buckets = index
@@ -2417,6 +2571,18 @@ impl Dom {
                 self.touch_style();
             }
         }
+    }
+
+    /// Attach ONE fetched external stylesheet body to its `<link>` element —
+    /// the incremental sibling of `attach_external_sheets`, for a sheet whose
+    /// link was INJECTED by page JS after load (webpack's mini-css chunk
+    /// loader). The cascade collects it at the link's document position like
+    /// any tree sheet; `touch_style` re-parses the style index and forces the
+    /// full relayout a sheet-set change requires. Replaces any earlier body on
+    /// the same link (a loader may rewrite `href` and re-trigger the load).
+    pub fn attach_sheet_to_link(&mut self, id: NodeId, css: String) {
+        self.external_sheets.insert(id, css);
+        self.touch_style();
     }
 
     /// Attach a shadow root (a fragment) to a host element; rendering
@@ -2906,6 +3072,22 @@ impl Dom {
             .collect()
     }
 
+    /// Parse a full HTML document string into a DETACHED `Document` node in
+    /// this arena (`DOMParser.parseFromString(str, "text/html")`). Returns the
+    /// new document node, structured with the parser's real `<html>`/`<head>`/
+    /// `<body>` split — a body-fragment parse (the old approach) collapses them,
+    /// which breaks any consumer that reads `newDocument.head`/`.body` separately
+    /// (a view-transitions swap, most notably).
+    pub fn parse_document_into(&mut self, html: &str) -> NodeId {
+        let src = Dom::parse_document(html);
+        let doc = self.new_node(NodeData::Document);
+        for c in src.child_iter(DOCUMENT) {
+            let cc = self.transplant(&src, c);
+            self.append(doc, cc);
+        }
+        doc
+    }
+
     /// Deep-copy a subtree from another arena into this one. Template
     /// content rides along (html5ever parks template children there).
     fn transplant(&mut self, other: &Dom, id: NodeId) -> NodeId {
@@ -3387,6 +3569,16 @@ impl Dom {
         {
             out.push_str(&format!(" data-trust-node=\"{id}\""));
         }
+        // A hover-listener host gets its OWN marker (never data-trust-node —
+        // that attribute's presence gates incremental-layout boundaries and
+        // region correlation, and hover hosts are often ordinary flex divs
+        // that must not inflate those sets). The app's layout threads this id
+        // onto the items flowed beneath it, so a hovered cell resolves back to
+        // the actor node whose listeners (or whose ancestors', via bubbling)
+        // should hear the pointer.
+        if self.hover_hosts.contains(&id) {
+            out.push_str(&format!(" data-trust-hover=\"{id}\""));
+        }
         // A scroll container's current `scrollTop` SIGNAL (CSSOM View) rides the
         // HTML in ROWS so `flow_region` can re-seed the region's voffset — the
         // page's own `element.scrollTop` write (a chat pinning to the bottom)
@@ -3719,6 +3911,18 @@ impl Dom {
         if c.scope && scope != Some(id) {
             return false;
         }
+        // Live `:hover`: on the chain under the terminal's pointer. The
+        // per-element match memos are epoch-keyed and `set_hover_chain` bumps
+        // the epoch whenever rendering could change, so a stale chain can
+        // never serve from cache.
+        if c.hover && !self.hover_chain.contains(&id) {
+            return false;
+        }
+        // Live `:popover-open`: the element's popover is currently showing.
+        // `set_popover_open` bumps the epoch, so the match memos stay fresh.
+        if c.popover_open && !self.popover_open.contains(&id) {
+            return false;
+        }
         let Some(tag) = self.tag_name(id) else {
             return false;
         };
@@ -3882,7 +4086,14 @@ struct Compound {
     /// ones are dropped individually, and an all-invalid group simply
     /// matches nothing (the rule survives).
     selects: Vec<(Vec<Complex>, bool)>,
-    /// `:hover`, `:focus` and other pseudos we can't satisfy: parse fine,
+    /// `:hover` (live): the element must be on the chain under the terminal's
+    /// pointer (`Dom.hover_chain` — the committed hover target + its composed
+    /// ancestors). Empty chain at rest ⇒ a bare `:hover` compound is inert.
+    hover: bool,
+    /// `:popover-open` (live): the element's popover must currently be
+    /// showing (`Dom.popover_open`, written by the popover API syscall).
+    popover_open: bool,
+    /// `:focus` and other pseudos we can't satisfy: parse fine,
     /// match never (fail-open — a never-matching hide rule hides nothing,
     /// and its comma-siblings stay alive).
     never: bool,
@@ -4066,6 +4277,8 @@ impl Compound {
             && self.nots.is_empty()
             && self.selects.is_empty()
             && !self.never
+            && !self.hover
+            && !self.popover_open
             && !self.scope
             && !self.root
             && !self.host
@@ -4385,18 +4598,34 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         from_end,
                     });
                     compound.pseudos += 1;
+                } else if name == "popover-open" {
+                    // LIVE `:popover-open` (HTML §the popover attribute):
+                    // matches while the element's popover is showing. Same
+                    // shape as `:hover` — nothing open ⇒ a bare
+                    // `:popover-open` rule is inert and `:not(:popover-open)`
+                    // genuinely matches.
+                    compound.popover_open = true;
+                    compound.pseudos += 1;
+                } else if name == "hover" {
+                    // LIVE `:hover`: matches the chain under the terminal's
+                    // pointer (`hover_chain`, moved per committed hover target
+                    // by the `__dom_set_hover` syscall). No longer a
+                    // never-pseudo — at rest the chain is empty, so a bare
+                    // `:hover` rule is inert and `:not(:hover)` still
+                    // genuinely matches, exactly as before the feature.
+                    compound.hover = true;
+                    compound.pseudos += 1;
                 } else {
                     // Valid CSS we can never satisfy: parse, count for
                     // specificity, never match. Interaction pseudos are
                     // GENUINELY false at rest (no pointer, no focus), so a
-                    // `:not(:hover)` wrapping them correctly matches;
+                    // `:not(:focus)` wrapping them correctly matches;
                     // anything else unsupported is flagged so `:not` rejects
                     // it rather than inverting it into always-match.
                     compound.never = true;
                     compound.never_unknown = !matches!(
                         name.as_str(),
-                        "hover"
-                            | "active"
+                        "active"
                             | "focus"
                             | "focus-within"
                             | "focus-visible"
@@ -4568,6 +4797,10 @@ const PROPS: &[PropDef] = &[
     prop("max-height", false, true),
     prop("aspect-ratio", false, true),
     prop("object-fit", false, true),
+    // CSS Images 3 §5.4: `pixelated`/`crisp-edges` ask for nearest-neighbor
+    // scaling (blocky upscale — QR codes, pixel art). Inherited per spec;
+    // baked so the app-side re-parse of a live snapshot keeps it.
+    prop("image-rendering", true, true),
     prop("flex-wrap", false, true),
     prop("flex-flow", false, true),
     prop("flex-direction", false, true),
@@ -5070,6 +5303,96 @@ struct StyleIndex {
     /// Whether any rule sets `opacity` at all — lets `paint_suppressed` skip
     /// the opacity cascade entirely on the overwhelming majority of pages.
     has_opacity: bool,
+    /// One probe per `:hover`-bearing compound of every rule whose
+    /// applicability depends on the hover chain AND whose declarations can
+    /// change the RENDER (a `PROPS`-tracked property, generated `content`, or
+    /// a custom property — which can feed a tracked one via `var()`).
+    /// `set_hover_chain` tests the elements whose hover state flips against
+    /// these to decide whether a hover move needs a restyle at all. Color-only
+    /// `:hover` rules (the overwhelming majority of the web) build NO probes,
+    /// so hovering across such pages is free.
+    hover_probes: Vec<HoverProbe>,
+}
+
+/// A cheap could-match test for the compound that carries a `:hover` — the
+/// element that must sit ON the chain for its rule to apply. Simple keys only
+/// (tag / id / first class): false positives cost one spurious re-render;
+/// false negatives are forbidden (a missed restyle is silently wrong).
+struct HoverProbe {
+    tag: Option<String>,
+    id: Option<String>,
+    class: Option<String>,
+    /// `:hover` nested inside `:is()`/`:where()`/`:not()`/`:host()` — the
+    /// polarity/grouping analysis isn't worth it; match ANY element.
+    any: bool,
+}
+
+impl HoverProbe {
+    fn could_match(&self, dom: &Dom, e: NodeId) -> bool {
+        if self.any {
+            return true;
+        }
+        if let Some(t) = &self.tag
+            && dom.tag_name(e) != Some(t.as_str())
+        {
+            return false;
+        }
+        if let Some(i) = &self.id
+            && dom.attr(e, "id") != Some(i.as_str())
+        {
+            return false;
+        }
+        if let Some(c) = &self.class {
+            let classes = dom.attr(e, "class").unwrap_or("");
+            if !classes.split_ascii_whitespace().any(|t| t == c) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Whether `:hover` occurs anywhere INSIDE the compound's logical arguments
+/// (`:is`/`:where`/`:not`/`:host(...)`) — as opposed to directly on it.
+fn compound_has_nested_hover(c: &Compound) -> bool {
+    c.nots
+        .iter()
+        .flatten()
+        .any(|n| n.hover || compound_has_nested_hover(n))
+        || c.selects.iter().any(|(group, _)| {
+            group.iter().any(|cx| {
+                cx.0.iter()
+                    .any(|(_, cc)| cc.hover || compound_has_nested_hover(cc))
+            })
+        })
+        || c.host_inner
+            .as_deref()
+            .is_some_and(|h| h.hover || compound_has_nested_hover(h))
+}
+
+/// The hover probes of one rule: one per compound in its complex selector
+/// that carries `:hover` directly (probe = that compound's simple keys), plus
+/// an any-element probe if `:hover` hides inside logical pseudos.
+fn hover_probes_of(rule: &StyleRule) -> Vec<HoverProbe> {
+    let mut probes = Vec::new();
+    for (_, c) in &rule.selector.0 {
+        if c.hover {
+            probes.push(HoverProbe {
+                tag: c.tag.clone().filter(|t| t != "*"),
+                id: c.id.clone(),
+                class: c.classes.first().cloned(),
+                any: false,
+            });
+        } else if compound_has_nested_hover(c) {
+            probes.push(HoverProbe {
+                tag: None,
+                id: None,
+                class: None,
+                any: true,
+            });
+        }
+    }
+    probes
 }
 
 /// Rules of one scope, bucketed by the rightmost compound's most-selective
@@ -9371,6 +9694,98 @@ mod tests {
             Some("1px"),
             ":is carries the #id specificity and wins"
         );
+    }
+
+    #[test]
+    fn live_hover_matches_the_chain_and_not_hover_inverts() {
+        // `:hover` matches the committed pointer chain (target + composed
+        // ancestors) — empty at rest, so a bare `:hover` rule stays inert and
+        // `:not(:hover)` keeps matching, exactly as before the feature.
+        let mut dom = Dom::parse_document(
+            "<head><style>\
+             .row:hover{letter-spacing:2px}\
+             .row:not(:hover){text-indent:1em}\
+             .menu:hover .drop{display:none}\
+             </style></head>\
+             <body><div id=m class=menu><p id=r class=row>x</p>\
+             <p id=s class=row>y</p><p id=d class=drop>z</p></div></body>",
+        );
+        let r = dom.get_by_id("r").unwrap();
+        let s = dom.get_by_id("s").unwrap();
+        let d = dom.get_by_id("d").unwrap();
+        assert_eq!(
+            dom.computed_style(r, "letter-spacing"),
+            None,
+            ":hover inert at rest"
+        );
+        assert_eq!(
+            dom.computed_style(r, "text-indent").as_deref(),
+            Some("1em"),
+            ":not(:hover) true at rest"
+        );
+        assert!(!dom.is_hidden(d), "descendant rule inert at rest");
+
+        // Hover r: the chain is r + ancestors (m, body, html) — so the
+        // `.menu:hover .drop` descendant rule fires too; the sibling `s`
+        // (not on the chain) stays at rest.
+        let affected = dom.set_hover_chain(Some(r));
+        assert!(affected, "display/letter-spacing rules affect the render");
+        assert_eq!(
+            dom.computed_style(r, "letter-spacing").as_deref(),
+            Some("2px"),
+            ":hover matches the chain"
+        );
+        assert_eq!(
+            dom.computed_style(r, "text-indent"),
+            None,
+            ":not(:hover) inverts on the chain"
+        );
+        assert_eq!(
+            dom.computed_style(s, "letter-spacing"),
+            None,
+            "the sibling is not hovered"
+        );
+        assert!(dom.is_hidden(d), ".menu:hover .drop applies (CSS dropdown)");
+
+        // Clearing restores rest state.
+        assert!(dom.set_hover_chain(None), "clearing restyles back");
+        assert_eq!(dom.computed_style(r, "letter-spacing"), None);
+        assert!(!dom.is_hidden(d));
+    }
+
+    #[test]
+    fn hover_affected_check_skips_color_only_rules() {
+        // The efficiency answer (her call to include CSS :hover): a page whose
+        // hover rules touch only UNRENDERED properties (color/background —
+        // not in the PROPS registry) reports "unaffected" on every chain move:
+        // no epoch bump, no dirty, no relayout. A tracked-property rule on the
+        // SAME page still trips the probe only when a candidate element's
+        // state flips.
+        let mut dom = Dom::parse_document(
+            "<head><style>\
+             a:hover{color:red;background:blue}\
+             .card:hover{display:none}\
+             </style></head>\
+             <body><a id=l href=x>link</a><div id=c class=card>card</div></body>",
+        );
+        let l = dom.get_by_id("l").unwrap();
+        let c = dom.get_by_id("c").unwrap();
+        // Hovering the link: the only rule whose probe matches (`a:hover`) is
+        // color-only, so it built NO probe — unaffected, and nothing dirtied.
+        let _ = dom.take_dirty();
+        assert!(
+            !dom.set_hover_chain(Some(l)),
+            "color-only hover rules must not cost a re-render"
+        );
+        assert!(!dom.take_dirty(), "no dirty bit for an unrendered restyle");
+        // Hovering the card: `.card:hover{display:none}` is tracked → affected
+        // + dirty, and the element actually hides.
+        assert!(
+            dom.set_hover_chain(Some(c)),
+            "a display-flipping hover rule affects the render"
+        );
+        assert!(dom.take_dirty(), "affected hover move marks the page dirty");
+        assert!(dom.is_hidden(c));
     }
 
     #[test]

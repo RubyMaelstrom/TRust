@@ -32,6 +32,12 @@ use crate::ui;
 
 const RESIZE_WRAP_DEBOUNCE: Duration = Duration::from_millis(200);
 
+/// How long the pointer (mouse cursor or keyboard selection) must REST on a
+/// new target before the hover dispatch commits (`PageCmd::Hover`). The
+/// target-change diff is the load-bearing throttle; this dwell just keeps a
+/// fast sweep / arrow-key repeat from dispatching every intermediate stop.
+const HOVER_DWELL: Duration = Duration::from_millis(100);
+
 /// What the input field feeds, mirroring GNU telnet's two states: lines go
 /// to the remote host, or to the `telnet>` command prompt reached with Ctrl-].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,6 +365,9 @@ pub(crate) struct EncKey {
     pub(crate) w: u16,
     pub(crate) h: u16,
     pub(crate) crop: bool,
+    /// `image-rendering: pixelated` on the element: encode upscales with
+    /// nearest-neighbor (hard-edged blocks — a scannable QR), not Lanczos.
+    pub(crate) pixelated: bool,
     /// Recolor for an SVG box: its role (link accent vs. body text) silhouette.
     /// Ignored when the bytes decode to a raster. Part of the key so a recolor
     /// re-encodes (and the renderer keys identically).
@@ -374,6 +383,7 @@ impl EncKey {
             w: item.width,
             h: item.height,
             crop: item.crop,
+            pixelated: item.pixelated,
             tint: Some(svg_tint()),
         }
     }
@@ -389,6 +399,40 @@ pub(crate) fn svg_tint() -> crate::img::SvgTint {
         fg: [0xff, 0xff, 0xff],
         bg: color_rgb(crate::ui::theme::BG),
     }
+}
+
+/// Whether two http(s) URLs address the SAME document — equal but for their
+/// fragment. A `#anchor` link between two such URLs scrolls in place rather than
+/// re-fetching.
+fn same_document(a: &url::Url, b: &url::Url) -> bool {
+    let mut a = a.clone();
+    let mut b = b.clone();
+    a.set_fragment(None);
+    b.set_fragment(None);
+    a == b
+}
+
+/// Percent-decode a URL fragment to raw UTF-8 (a non-ASCII `id` anchor arrives
+/// `%XX`-encoded in the href). Lossy on invalid sequences; unknown `%` escapes
+/// pass through literally.
+fn pct_decode_utf8(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn color_rgb(c: ratatui::style::Color) -> [u8; 3] {
@@ -489,6 +533,19 @@ pub struct App {
     /// (reset on each new live page). Drives infinite scroll / scroll-based
     /// lazy loading: the site's own handler reacts to the threaded position.
     last_scroll_sent: Option<usize>,
+    /// The hover target last SENT to the live page (`PageCmd::Hover`): the
+    /// actor node under the terminal's pointer, or `None` after a clear (or
+    /// nothing ever sent — the two are equivalent: a clear is only worth
+    /// sending after a `Some`). Reset with the live page.
+    hover_sent: Option<usize>,
+    /// A pointer-target change awaiting the dwell: `(actor node or None =
+    /// clear, viewport CSS px of the hovered cell)`. The run loop arms a
+    /// `HOVER_DWELL` one-shot when this changes (the resize-at-rest pattern)
+    /// and commits it once the pointer rests — so a fast sweep across many
+    /// targets, or arrow-key repeat down a list, dispatches only the target
+    /// it settles on. Mouse motion and keyboard selection both feed this:
+    /// the selection IS the terminal's pointer (her call).
+    hover_want: Option<(Option<usize>, f64, f64)>,
     /// The scroll row the user INTENDS to be at on the HTTP laid-out doc, kept
     /// independent of the rendered `scroll`. A living page re-renders on its own
     /// (a timer, a fetch, an infinite-scroll load), and such a re-layout can
@@ -685,6 +742,8 @@ impl App {
             live_page: None,
             page_rx: None,
             last_scroll_sent: None,
+            hover_sent: None,
+            hover_want: None,
             scroll_intent: 0,
             region_geom_sent: std::collections::HashMap::new(),
             live_boundaries_sent: std::collections::HashSet::new(),
@@ -792,6 +851,10 @@ impl App {
             .expect("spawn terminal input reader");
         let mut pending_wrap_target: Option<(usize, bool)> = None;
         let mut wrap_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        // The hover dwell one-shot + the target it was armed for (a further
+        // change restarts the timer, so the dwell measures REST, not age).
+        let mut hover_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let mut pending_hover_target: Option<Option<usize>> = None;
         // Redraw economy: the last drawn visible-frame signature + terminal size,
         // so a wake that paints an identical browser frame skips the draw (and its
         // sixel re-render). `TRUST_NO_FRAME_SKIP` forces the old always-draw path.
@@ -910,6 +973,21 @@ impl App {
                     wrap_sleep = None;
                 }
             }
+            // The hover dwell (same one-shot pattern as the resize re-wrap): a
+            // pending pointer-target change arms it, a FURTHER change restarts
+            // it, and it fires only once the pointer rests — so a sweep across
+            // many targets dispatches only the one it settles on.
+            match self.hover_want.map(|(t, _, _)| t) {
+                Some(target) if pending_hover_target != Some(target) => {
+                    pending_hover_target = Some(target);
+                    hover_sleep = Some(Box::pin(tokio::time::sleep(HOVER_DWELL)));
+                }
+                Some(_) => {}
+                None => {
+                    pending_hover_target = None;
+                    hover_sleep = None;
+                }
+            }
             self.sync_viewer_size();
             self.sync_image_encodes();
 
@@ -959,6 +1037,15 @@ impl App {
                     pending_wrap_target = None;
                     wrap_sleep = None;
                     self.sync_browser_wrap();
+                },
+                _ = async {
+                    if let Some(sleep) = hover_sleep.as_mut() {
+                        sleep.as_mut().await;
+                    }
+                }, if hover_sleep.is_some() => {
+                    pending_hover_target = None;
+                    hover_sleep = None;
+                    self.commit_page_hover();
                 },
                 _ = tick.tick(), if self.loading() => {
                     self.spinner = self.spinner.wrapping_add(1);
@@ -1128,7 +1215,14 @@ impl App {
     /// line-based one. Returns whether an interactive target was hit.
     fn browser_mouse_hover(&mut self, col: u16, row: u16) -> bool {
         match self.browser.as_ref() {
-            Some(g) if g.doc.laid_out() => self.http_mouse_hover(col, row),
+            Some(g) if g.doc.laid_out() => {
+                let hit = self.http_mouse_hover(col, row);
+                // The pointer moved: feed the live page's hover pipeline
+                // (independent of the SELECTION hit — a hover-only div is not
+                // interactive but is a hover target; unmarked cells clear).
+                self.sync_page_hover_at(col, row);
+                hit
+            }
             Some(_) => self.gopher_mouse_hover(col, row),
             None => false,
         }
@@ -1541,6 +1635,46 @@ impl App {
             let max_scroll = g.doc.extent().saturating_sub(height.max(1));
             g.scroll = line.saturating_sub(height / 2).min(max_scroll);
         }
+    }
+
+    /// Scroll the browser view so the element with `id`/`<a name>` == `frag` is
+    /// at the top of the viewport — HTML's "scroll to the fragment". An empty
+    /// (or `top`) fragment scrolls to the document top. Resolves against the
+    /// laid-out doc's `anchor_rows`; a fragment that names no element is a no-op
+    /// (the browser stays put). Returns whether the anchor was found.
+    fn scroll_to_fragment(&mut self, frag: &str) -> bool {
+        let height = self.last_inner.1 as usize;
+        let Some(g) = self.browser.as_mut() else {
+            return false;
+        };
+        // Only the 2D layout has a row model + anchors; the line-model docs
+        // (gopher/gemini) don't do fragment scrolling.
+        if !g.doc.laid_out() {
+            return false;
+        }
+        if frag.is_empty() || frag.eq_ignore_ascii_case("top") {
+            g.scroll = 0;
+            return true;
+        }
+        // Ids carry raw text; a URL fragment may arrive percent-encoded (a
+        // non-ASCII id — a Japanese section anchor). Try the literal form first,
+        // then a decoded one.
+        let row = g
+            .doc
+            .anchor_rows
+            .get(frag)
+            .or_else(|| {
+                frag.contains('%')
+                    .then(|| pct_decode_utf8(frag))
+                    .and_then(|d| g.doc.anchor_rows.get(&d))
+            })
+            .copied();
+        let Some(row) = row else {
+            return false;
+        };
+        let max_scroll = g.doc.extent().saturating_sub(height.max(1));
+        g.scroll = row.min(max_scroll);
+        true
     }
 
     /// Refresh the status line with the find query and match counter.
@@ -2240,14 +2374,21 @@ impl App {
             return;
         }
         let font = self.picker.font_size();
+        // The current doc's blob byte mirror, for `blob:` srcs (the batches
+        // all load for the displayed browser doc).
+        let blobs = self
+            .browser
+            .as_ref()
+            .and_then(|g| g.doc.blobs.as_ref().map(|b| b.0.clone()));
         let (tx, rx) = mpsc::channel(todo.len().max(1));
         self.imgs_rx = Some(rx);
         tokio::spawn(async move {
             futures::stream::iter(todo.into_iter().map(|url| {
                 let tx = tx.clone();
                 let page = page.clone();
+                let blobs = blobs.clone();
                 async move {
-                    let decoded = load_one_image(&page, &url, font).await;
+                    let decoded = load_one_image(&page, &url, font, blobs.as_ref()).await;
                     let _ = tx.send(ImgLoadMsg { url, decoded }).await;
                 }
             }))
@@ -2394,7 +2535,10 @@ impl App {
         let meta = g.doc.meta.clone().unwrap_or_default();
         let forms = std::mem::take(&mut g.doc.forms);
         let raw = std::mem::take(&mut g.doc.raw);
+        let blobs = g.doc.blobs.take();
         g.doc = http::parse_seeded(&url, &meta, &raw, width, height, Some(&forms), &images);
+        // Same page, same blob mirror (a re-parse must not orphan blob: images).
+        g.doc.blobs = blobs;
         // A re-wrap of the SAME HTML (image relayout): the baked scroll signal is
         // stale, so the on-screen offset wins (prefer_signal = false).
         Self::carry_region_offsets(&old_offsets, &mut g.doc.regions, false);
@@ -2584,10 +2728,16 @@ impl App {
             // run-loop thread restores it (see TERMINAL_OWNER).
             let box_size = ratatui::layout::Size::new(key.w, key.h);
             let protocol = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let protocol =
-                    crate::img::encode_sliced_bytes(&picker, &raw, box_size, key.crop, key.tint)
-                        .ok()
-                        .map(|(protocol, _)| protocol)?;
+                let protocol = crate::img::encode_sliced_bytes(
+                    &picker,
+                    &raw,
+                    box_size,
+                    key.crop,
+                    key.pixelated,
+                    key.tint,
+                )
+                .ok()
+                .map(|(protocol, _)| protocol)?;
                 // Build the at-rest slice HERE, on the encode thread, so the
                 // first on-screen draw of this image is a cache hit instead of a
                 // render-thread `to_sequence` build — matters for a streaming
@@ -2760,7 +2910,7 @@ impl App {
             self.open_image(Link::Http(response.url), response.body);
             return;
         }
-        let doc = crate::http::parse(
+        let mut doc = crate::http::parse(
             &response.url,
             &response.content_type,
             &response.body,
@@ -2768,6 +2918,9 @@ impl App {
             self.last_inner.1 as usize,
             &self.image_sizes(),
         );
+        // The blob byte mirror rides the Doc (into history too) so the image
+        // pipeline can decode this page's `<img src="blob:…">` at any time.
+        doc.blobs = response.blobs.clone().map(crate::doc::BlobsHandle);
         let image_urls = doc.image_urls.clone();
         let page = response.url.clone();
         // JS visibility: a clean run gets a quiet badge; script errors
@@ -2800,11 +2953,22 @@ impl App {
             // Force the next tick to push the current scroll position (0 on a
             // fresh nav; a restored row on revive-on-back) to the new engine.
             self.last_scroll_sent = None;
+            // A fresh engine holds no hover chain; start the app's view clean.
+            self.hover_sent = None;
+            self.hover_want = None;
             self.page_js_errors = response
                 .js
                 .as_ref()
                 .map(|o| o.errors.iter().cloned().collect())
                 .unwrap_or_default();
+        }
+        // Landed on a URL carrying a `#fragment` (a followed cross-page anchor
+        // link, or an address typed with one): scroll the named element to the
+        // top, HTML's "scroll to the fragment". The shell doc's `anchor_rows` are
+        // already built; a live page keeps this scroll across its later renders
+        // (scroll is stable across `Updated`). Unknown fragment → stay at top.
+        if let Some(frag) = response.url.fragment().filter(|f| !f.is_empty()) {
+            self.scroll_to_fragment(frag);
         }
         // Kick off the parallel image pipeline; decoded images re-flow in.
         self.start_image_loads(page, image_urls);
@@ -2814,6 +2978,8 @@ impl App {
         self.live_page = None;
         self.page_rx = None;
         self.last_scroll_sent = None;
+        self.hover_sent = None;
+        self.hover_want = None;
         self.region_geom_sent.clear();
         self.region_scroll_sent.clear();
         self.region_live.clear();
@@ -2887,6 +3053,175 @@ impl App {
         }
         // On a full channel we leave `last_scroll_sent` stale: the next tick
         // retries with the latest position, so the final scroll is never lost.
+    }
+
+    /// The viewport-relative CSS-px center of a screen cell — the
+    /// `clientX`/`clientY` a hover dispatch carries (the same `cell_px`
+    /// quantization `measure_boxes`/`sync_page_scroll` use, so the engine's
+    /// coordinates agree).
+    fn viewport_px_of(&self, col: u16, row: u16) -> (f64, f64) {
+        let f = self.picker.font_size();
+        let x = (f64::from(col.saturating_sub(self.last_content_area.x)) + 0.5)
+            * f64::from(f.width.max(1));
+        let y = (f64::from(row.saturating_sub(self.last_content_area.y)) + 0.5)
+            * f64::from(f.height.max(1));
+        (x, y)
+    }
+
+    /// The live actor node that should hear the pointer at screen `(col, row)`,
+    /// or `None` (unmarked content / outside the content area — a hover clear).
+    /// Unlike `http_hit_test` this scans items of ANY kind: a hover-only
+    /// `<div>` (tooltip trigger) is not interactive and never becomes the
+    /// selection, but it IS a hover target. Resolution: the parse-time
+    /// `Doc.hover_ids` map (nearest `data-trust-hover` / `x-trust-js` marker —
+    /// deepest wins structurally), with the item's own `JsClick` link as a
+    /// fallback. The pinned fixed layer draws on top, so it resolves first.
+    fn hover_target_at(&self, col: u16, row: u16) -> Option<usize> {
+        let g = self.browser.as_ref()?;
+        let resolve = |item: &crate::layout::Item| -> Option<usize> {
+            if let Some(&actor) = g.doc.hover_ids.get(&item.node) {
+                return Some(actor);
+            }
+            match &item.link {
+                Some(crate::doc::Link::JsClick { node, .. }) => Some(*node),
+                _ => None,
+            }
+        };
+        if let Some((fi, r, i)) = self.fixed_hit_test(col, row) {
+            return resolve(&g.doc.fixed[fi].rows[r].items[i]);
+        }
+        if !self.mouse_in_content_area(col, row) || !g.doc.laid_out() {
+            return None;
+        }
+        let local_row = row.saturating_sub(self.last_content_area.y) as usize;
+        let doc_row = g.scroll + local_row;
+        if doc_row >= g.doc.rows.len() {
+            return None;
+        }
+        let local_col = col.saturating_sub(self.last_content_area.x);
+        (g.scroll..=doc_row).rev().find_map(|r| {
+            let row_offset = doc_row.saturating_sub(r);
+            if r >= g.doc.rows.len() {
+                return None;
+            }
+            let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r);
+            crate::layout::visual_columns(&row, &g.doc.carousels, r)
+                .into_iter()
+                .find_map(|(i, start)| {
+                    let item = &row.items[i];
+                    let end = start.saturating_add(item.width);
+                    let covers_row = row_offset < item.height.max(1) as usize;
+                    if covers_row && local_col >= start && local_col < end {
+                        resolve(item)
+                    } else {
+                        None
+                    }
+                })
+        })
+    }
+
+    /// Record a pointer-target change for the live page. The run loop arms the
+    /// `HOVER_DWELL` one-shot when `hover_want` differs from what was sent;
+    /// `commit_page_hover` dispatches once the pointer rests. A no-change
+    /// request is free (the diff is the load-bearing throttle), and a clear
+    /// (`None`) is only worth recording after a `Some` was sent.
+    fn request_page_hover(&mut self, target: Option<usize>, x: f64, y: f64) {
+        if self.live_page.is_none() {
+            return;
+        }
+        let current = self.hover_want.map_or(self.hover_sent, |(t, _, _)| t);
+        if current == target {
+            return;
+        }
+        self.hover_want = Some((target, x, y));
+    }
+
+    /// The dwell elapsed: send the pending hover target to the live page.
+    /// Mirrors `sync_page_scroll`'s send discipline — only record `hover_sent`
+    /// on a successful enqueue; on a full channel the want stays pending and
+    /// the run loop re-arms, so the final rest target is never lost.
+    fn commit_page_hover(&mut self) {
+        let Some((target, x, y)) = self.hover_want else {
+            return;
+        };
+        if target == self.hover_sent {
+            self.hover_want = None;
+            return;
+        }
+        let Some(handle) = self.live_page.as_ref() else {
+            self.hover_want = None;
+            return;
+        };
+        let sender = handle.cmds.clone();
+        if sender
+            .try_send(crate::js::PageCmd::Hover { node: target, x, y })
+            .is_ok()
+        {
+            self.hover_sent = target;
+            self.hover_want = None;
+        }
+    }
+
+    /// Feed the pointer position into the hover pipeline (mouse motion path).
+    /// Chrome rows / unmarked content resolve to `None`, which clears a
+    /// previously sent hover (leave/out fire on the old chain).
+    fn sync_page_hover_at(&mut self, col: u16, row: u16) {
+        if self.live_page.is_none() {
+            return;
+        }
+        let target = self.hover_target_at(col, row);
+        let (x, y) = self.viewport_px_of(col, row);
+        self.request_page_hover(target, x, y);
+    }
+
+    /// Feed the keyboard selection into the hover pipeline: the selection IS
+    /// the terminal's pointer (her call), so arrowing onto an element hovers
+    /// it — Steam's preview pane switches from the keyboard. Resolves the
+    /// selected item (fixed layer first, mirroring the draw order) to its
+    /// actor node + on-screen cell center.
+    fn sync_page_hover_selection(&mut self) {
+        if self.live_page.is_none() {
+            return;
+        }
+        let Some(g) = self.browser.as_ref() else {
+            return;
+        };
+        let resolve = |item: &crate::layout::Item| -> Option<usize> {
+            if let Some(&actor) = g.doc.hover_ids.get(&item.node) {
+                return Some(actor);
+            }
+            match &item.link {
+                Some(crate::doc::Link::JsClick { node, .. }) => Some(*node),
+                _ => None,
+            }
+        };
+        let (target, cell) = if let Some((fi, r, i)) = g.sel_fixed {
+            let f = &g.doc.fixed[fi];
+            let item = &f.rows[r].items[i];
+            let col = self.last_content_area.x as usize
+                + f.col as usize
+                + item.col as usize
+                + item.width.max(1) as usize / 2;
+            let row = self.last_content_area.y as usize + f.row as usize + r;
+            (resolve(item), (col as u16, row as u16))
+        } else if let Some((r, i)) = g.sel_item {
+            if r < g.scroll || r >= g.scroll + self.last_inner.1 as usize {
+                return; // selection is off-screen; no pointer position to report
+            }
+            let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r);
+            let Some(item) = row.items.get(i) else {
+                return;
+            };
+            let col = self.last_content_area.x as usize
+                + item.col as usize
+                + item.width.max(1) as usize / 2;
+            let srow = self.last_content_area.y as usize + (r - g.scroll);
+            (resolve(item), (col as u16, srow as u16))
+        } else {
+            return; // no selection → leave the hover state alone
+        };
+        let (x, y) = self.viewport_px_of(cell.0, cell.1);
+        self.request_page_hover(target, x, y);
     }
 
     /// Push each inner-scroll region's app-measured box geometry (CSSOM View, px)
@@ -3201,6 +3536,10 @@ impl App {
         let mut patches: Vec<crate::js::SubtreePatch> = Vec::new();
         let mut trouble: Vec<String> = Vec::new();
         let mut navigate: Option<String> = None;
+        // A same-document fragment scroll the page requested; applied AFTER the
+        // render below so it targets the freshly-rendered doc's `anchor_rows`.
+        // Newest wins.
+        let mut scroll_fragment: Option<String> = None;
         let mut submit_default = false;
         // A click-triggered native submit carries its form/submitter arena
         // nodes (the app didn't pre-record them the way the Submit path does).
@@ -3259,6 +3598,7 @@ impl App {
                     submit_nodes = Some((form, submitter));
                 }
                 Some(PageEvt::Navigate(url)) => navigate = Some(url),
+                Some(PageEvt::ScrollToFragment(frag)) => scroll_fragment = Some(frag),
                 None => break,
             }
             pending = self.page_rx.as_mut().and_then(|rx| rx.try_recv().ok());
@@ -3300,6 +3640,11 @@ impl App {
         // regions. Latest write per node wins (the loop preserves order).
         for (node, top) in scrolled {
             self.apply_region_scroll(node, top);
+        }
+        // A same-document fragment scroll (`#anchor` link inside the live page),
+        // applied after any content update so it resolves against the new doc.
+        if let Some(frag) = scroll_fragment {
+            self.scroll_to_fragment(&frag);
         }
         if !trouble.is_empty() {
             self.page_js_errors.extend(trouble.iter().cloned());
@@ -3380,7 +3725,7 @@ impl App {
         // possibly dragging the viewport, while the user just reads. Only a
         // page that ALREADY had a selection earns the lost-it fallback below.
         let had_selection = g.sel_item.is_some();
-        let doc = http::parse_seeded(
+        let mut doc = http::parse_seeded(
             &url,
             "text/html; charset=utf-8",
             &raw,
@@ -3389,6 +3734,9 @@ impl App {
             None,
             &images,
         );
+        // The live page keeps minting into the SAME map (shared Arc), so the
+        // re-parsed doc must keep carrying it.
+        doc.blobs = g.doc.blobs.clone();
         // Carry scroll-region scroll positions across the re-layout (restored
         // below, before the selection re-anchor reads the windowed rows).
         let old_offsets: Vec<_> = g.doc.regions.iter().map(|r| (r.node, r.voffset)).collect();
@@ -4266,6 +4614,15 @@ impl App {
     }
 
     fn http_move(&mut self, dir: i64, horizontal: bool) {
+        self.http_move_inner(dir, horizontal);
+        // The selection is the terminal's pointer (her call): arrowing onto an
+        // element hovers it, so hover-driven UI (Steam's preview pane) works
+        // from the keyboard. Dwell-gated like the mouse path — key repeat
+        // commits only the target the selection rests on.
+        self.sync_page_hover_selection();
+    }
+
+    fn http_move_inner(&mut self, dir: i64, horizontal: bool) {
         let height = self.last_inner.1.max(1) as usize;
         let Some(g) = &mut self.browser else { return };
         // The pinned rail links are keyboard-navigable like any other link — no
@@ -4614,6 +4971,7 @@ impl App {
         });
         let old_offsets: Vec<_> = g.doc.regions.iter().map(|r| (r.node, r.voffset)).collect();
         let raw = std::mem::take(&mut g.doc.raw);
+        let blobs = g.doc.blobs.take();
         g.doc = match g.doc.url.clone() {
             Link::Gopher(url) => gopher::parse(&url, raw, cp437, width),
             Link::Gemini(url) => {
@@ -4630,6 +4988,8 @@ impl App {
             Link::Form { .. } | Link::JsClick { .. } | Link::External(_) => return,
             Link::CarouselScroll(_) | Link::Media(_) => return,
         };
+        // Same page, same blob mirror (a re-wrap must not orphan blob: images).
+        g.doc.blobs = blobs;
         if g.doc.laid_out() {
             // Re-flow at the new width re-laid the rows; re-anchor the
             // selected item by identity and restore region scroll positions. A
@@ -4785,6 +5145,20 @@ impl App {
             },
             Link::Gemini(url) => self.start_fetch(Link::Gemini(url)),
             Link::Http(url) => {
+                // A same-document `#fragment` link scrolls to the anchor instead
+                // of re-fetching (HTML "navigate to a fragment"). A fragment link
+                // to a DIFFERENT page falls through and fetches; its fragment is
+                // applied after that page renders (see `start_fetch`).
+                if url.fragment().is_some()
+                    && let Some(Link::Http(cur)) = self.browser.as_ref().map(|g| &g.doc.url)
+                    && same_document(&url, cur)
+                {
+                    let frag = url.fragment().unwrap_or("").to_string();
+                    if !self.scroll_to_fragment(&frag) {
+                        self.status = format!("no such anchor: #{frag}");
+                    }
+                    return;
+                }
                 let referrer = self.http_referrer();
                 self.start_fetch_opts(Link::Http(url), false, referrer);
             }
@@ -5619,11 +5993,23 @@ async fn load_one_image(
     page: &Url,
     url: &str,
     font: ratatui_image::FontSize,
+    blobs: Option<&crate::js::BlobMap>,
 ) -> Option<DecodedImage> {
     // A `data:` image (a rewritten inline SVG, or a page's own data image)
     // carries its bytes — decode locally, no fetch, no SSRF concern.
     if url.starts_with("data:") {
         let raw: std::sync::Arc<[u8]> = crate::img::decode_data_url(url)?.into();
+        let cell = decoded_cell_box(raw.clone(), font).await?;
+        return Some(DecodedImage { raw, cell });
+    }
+    // A `blob:` image resolves from the page's blob byte mirror — bytes the
+    // page's own JS minted via `URL.createObjectURL` (Steam's login QR).
+    // Keyed without a fragment, like the JS-side store; never the wire.
+    if url.starts_with("blob:") {
+        let key = url.split('#').next().unwrap_or(url);
+        let raw: std::sync::Arc<[u8]> = blobs
+            .and_then(|m| m.lock().unwrap().get(key).map(|(b, _)| b.clone()))?
+            .into();
         let cell = decoded_cell_box(raw.clone(), font).await?;
         return Some(DecodedImage { raw, cell });
     }
@@ -6011,6 +6397,55 @@ mod tests {
     }
 
     #[test]
+    fn following_a_same_page_anchor_scrolls_without_refetching() {
+        // A `<a href="#id">` on the current page scrolls the view to that anchor
+        // (HTML "navigate to a fragment") instead of re-fetching. `anchor_rows`
+        // resolves the id → row; the view moves and the doc is unchanged.
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (80, 6); // small viewport so the anchor is below the fold
+        let url = url::Url::parse("https://example.com/page").unwrap();
+        let mut html = String::from("<body><a href=\"#bottom\">jump</a>");
+        for i in 0..40 {
+            html.push_str(&format!("<p>filler {i}</p>"));
+        }
+        html.push_str("<h2 id=bottom>END-MARKER</h2></body>");
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html.as_bytes(),
+            80,
+            6,
+            &Default::default(),
+        ));
+        let bottom_row = *app
+            .browser
+            .as_ref()
+            .unwrap()
+            .doc
+            .anchor_rows
+            .get("bottom")
+            .expect("anchor_rows has the #bottom section");
+        assert!(bottom_row > 6, "anchor is below the 6-row fold");
+        select_item(
+            &mut app,
+            |it| matches!(&it.link, Some(crate::doc::Link::Http(u)) if u.fragment() == Some("bottom")),
+        );
+        app.browser_follow();
+        let g = app.browser.as_ref().unwrap();
+        let max_scroll = g.doc.extent().saturating_sub(6);
+        assert_eq!(
+            g.scroll,
+            bottom_row.min(max_scroll),
+            "the view scrolled to the anchor (clamped near the end)"
+        );
+        assert!(g.scroll > 0, "the view actually moved");
+        assert!(
+            matches!(&g.doc.url, crate::doc::Link::Http(u) if u.as_str() == "https://example.com/page"),
+            "still the same document — no refetch"
+        );
+    }
+
+    #[test]
     fn v_routing_extracts_only_web_urls() {
         let mut app = super::App::new(None, 23);
         app.last_inner = (80, 24);
@@ -6131,6 +6566,80 @@ mod tests {
         app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, x, y));
 
         assert_eq!(app.browser.as_ref().unwrap().sel_item, Some(target));
+    }
+
+    #[test]
+    fn mouse_and_keyboard_hover_feed_the_live_page_diffed() {
+        // The hover pipeline end-to-end on the app side: mouse motion over a
+        // marked target records a pending hover; the (dwell-elapsed) commit
+        // sends ONE PageCmd::Hover; an unchanged target is free; a hover-only
+        // (non-interactive) element resolves via the parse-time map; leaving
+        // to chrome sends a single clear — and only after a Some was sent.
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(2, 1, 80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        // The x-trust-js anchor marker (a live clickable, actor node 42) and a
+        // data-trust-hover host (hover-only div, actor node 77) — exactly what
+        // the live serializer bakes.
+        let html = b"<body><p>plain <a href='x-trust-js:42:/next'>next</a></p>\
+             <div data-trust-hover='77'>hotzone</div></body>";
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html,
+            80,
+            0,
+            &Default::default(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        app.live_page = Some(crate::js::PageHandle { cmds: tx });
+
+        // Mouse over the anchor → pending target 42; the commit sends it.
+        let (x, y, _) = item_point(&app, |it| it.text.contains("next"));
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, x, y));
+        assert_eq!(app.hover_want.map(|(t, _, _)| t), Some(Some(42)));
+        app.commit_page_hover();
+        match rx.try_recv() {
+            Ok(crate::js::PageCmd::Hover { node, .. }) => assert_eq!(node, Some(42)),
+            other => panic!("expected Hover(42), got {other:?}"),
+        }
+        // The same target again is a no-op (the diff is the throttle).
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, x, y));
+        assert_eq!(app.hover_want, None, "unchanged target must not re-arm");
+
+        // The hover-only div is NOT interactive (never the selection), but it
+        // IS a hover target via the parse-time map.
+        let (hx, hy, _) = item_point(&app, |it| it.text.contains("hotzone"));
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, hx, hy));
+        assert_eq!(app.hover_want.map(|(t, _, _)| t), Some(Some(77)));
+        app.commit_page_hover();
+        match rx.try_recv() {
+            Ok(crate::js::PageCmd::Hover { node, .. }) => assert_eq!(node, Some(77)),
+            other => panic!("expected Hover(77), got {other:?}"),
+        }
+
+        // Leaving to chrome clears — once.
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, 0, 0));
+        assert_eq!(app.hover_want.map(|(t, _, _)| t), Some(None));
+        app.commit_page_hover();
+        match rx.try_recv() {
+            Ok(crate::js::PageCmd::Hover { node, .. }) => assert_eq!(node, None),
+            other => panic!("expected Hover(None), got {other:?}"),
+        }
+        app.on_mouse_event(mouse(crossterm::event::MouseEventKind::Moved, 0, 0));
+        assert_eq!(app.hover_want, None, "a second clear must not be queued");
+
+        // Keyboard: arrowing the selection onto the link hovers it too (the
+        // selection is the terminal's pointer).
+        app.browser.as_mut().unwrap().sel_item = None;
+        app.http_move(1, false);
+        assert_eq!(
+            app.hover_want.map(|(t, _, _)| t),
+            Some(Some(42)),
+            "keyboard selection feeds the hover pipeline"
+        );
     }
 
     #[test]
@@ -7747,6 +8256,8 @@ mod tests {
             url: url::Url::parse("https://www.imdb.com/list/ls123/").unwrap(),
             status: 202,
             content_type: String::from("text/html"),
+            headers: Vec::new(),
+            blobs: None,
             // The challenge interstitial: an empty shell with no real content.
             body: b"<html><body><div id=\"challenge-container\"></div></body></html>".to_vec(),
             js: None,
@@ -7774,6 +8285,8 @@ mod tests {
             url: base,
             status: 200,
             content_type: String::from("text/html"),
+            headers: Vec::new(),
+            blobs: None,
             body: html.as_bytes().to_vec(),
             js: None,
             live: None,
@@ -8270,7 +8783,9 @@ mod tests {
                 }
                 let (image, _) = crate::img::decode(&png).unwrap();
                 let size = ratatui::layout::Size::new(key.w, key.h);
-                if let Ok(proto) = crate::img::encode_sliced(&app.picker, image, size, key.crop) {
+                if let Ok(proto) =
+                    crate::img::encode_sliced(&app.picker, image, size, key.crop, key.pixelated)
+                {
                     app.image_protocols.insert(key, proto);
                 }
             }
@@ -8334,9 +8849,14 @@ mod tests {
             .flat_map(|r| &r.items)
             .find_map(|it| it.image.as_deref().map(|u| super::EncKey::for_item(u, it)))
             .expect("an image item is laid out");
-        let proto =
-            crate::img::encode_sliced(&app.picker, decoded, Size::new(key.w, key.h), key.crop)
-                .unwrap();
+        let proto = crate::img::encode_sliced(
+            &app.picker,
+            decoded,
+            Size::new(key.w, key.h),
+            key.crop,
+            key.pixelated,
+        )
+        .unwrap();
         app.image_protocols.insert(key.clone(), proto);
 
         // Scroll line-by-line through the image: the box key is scroll-invariant,
@@ -8420,9 +8940,14 @@ mod tests {
                 cell,
             },
         );
-        let proto =
-            crate::img::encode_sliced(&app.picker, decoded, Size::new(key.w, key.h), key.crop)
-                .unwrap();
+        let proto = crate::img::encode_sliced(
+            &app.picker,
+            decoded,
+            Size::new(key.w, key.h),
+            key.crop,
+            key.pixelated,
+        )
+        .unwrap();
         app.image_protocols.insert(key.clone(), proto);
         // The encode pass scans the region buffer ⇒ the image is LIVE ⇒ kept.
         app.sync_image_encodes();
@@ -8487,6 +9012,51 @@ mod tests {
             .to_vec()
     }
 
+    /// A `blob:` image resolves from the page's blob byte mirror (`Doc.blobs`)
+    /// — never the wire. This is how a client-GENERATED image renders: the
+    /// page mints `URL.createObjectURL(blob)` (Steam's login QR), the prelude
+    /// mirrors the bytes via `__blob_mirror`, and the app's image pipeline
+    /// decodes from the shared map. A URL missing from the map (revoked before
+    /// mirroring existed, or another page's) decodes to nothing, like a 404.
+    #[tokio::test]
+    async fn blob_image_urls_decode_from_the_doc_blob_mirror() {
+        let page = url::Url::parse("https://example.com/login").unwrap();
+        let blob_url = "blob:https://example.com/0f7c18cd-0475-4912-9865-1cd4adacebaa";
+        let blobs = crate::js::BlobMap::default();
+        blobs.lock().unwrap().insert(
+            blob_url.to_string(),
+            (svg_fixture(), String::from("image/svg+xml")),
+        );
+        let decoded = super::load_one_image(&page, blob_url, (8, 16).into(), Some(&blobs))
+            .await
+            .expect("blob image decoded from the mirror");
+        assert_eq!(decoded.raw.as_ref(), svg_fixture().as_slice());
+        // A fragment is ignored when keying the store (File API).
+        let with_frag = format!("{blob_url}#frag");
+        assert!(
+            super::load_one_image(&page, &with_frag, (8, 16).into(), Some(&blobs))
+                .await
+                .is_some(),
+            "fragment-carrying blob URL resolves"
+        );
+        // Unknown URL / no map: no decode, no network.
+        assert!(
+            super::load_one_image(
+                &page,
+                "blob:https://example.com/missing",
+                (8, 16).into(),
+                Some(&blobs)
+            )
+            .await
+            .is_none()
+        );
+        assert!(
+            super::load_one_image(&page, blob_url, (8, 16).into(), None)
+                .await
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn standalone_http_svg_routes_through_the_image_viewer() {
         let mut app = super::App::new(None, 23);
@@ -8497,6 +9067,8 @@ mod tests {
                 url: url.clone(),
                 status: 200,
                 content_type: String::from("image/svg+xml"),
+                headers: Vec::new(),
+                blobs: None,
                 body: svg_fixture(),
                 js: None,
                 live: None,

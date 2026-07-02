@@ -194,6 +194,11 @@ pub struct Item {
     /// aspect different from the image's intrinsic one. Always `false` for
     /// non-image items.
     pub crop: bool,
+    /// `image-rendering: pixelated`/`crisp-edges` on an `Image` item (CSS
+    /// Images 3 §5.4): the encoder scales with NEAREST-NEIGHBOR instead of
+    /// Lanczos, keeping upscaled blocks hard-edged — a smoothing filter turns
+    /// Steam's 41px QR GIF into an unscannable blur. False for non-images.
+    pub pixelated: bool,
     /// Paint suppression (`opacity:0` — CSS Color/Compositing): the item is
     /// fully laid out (its `col`/`width`/`height` reserve its real box, so
     /// `measure_boxes`/`getBoundingClientRect` are unaffected) but the renderer
@@ -764,6 +769,7 @@ pub fn lay_out_with_carousels(
     ScrollClips,
     Vec<BoundaryBox>,
     Vec<FixedItem>,
+    HashMap<String, usize>,
 ) {
     let mut layout = Layout::new(
         dom,
@@ -781,10 +787,43 @@ pub fn lay_out_with_carousels(
     // checks run only on the sparse baked boundary set).
     layout.capture_boundaries = true;
     layout.flow_all();
-    let (rows, carousels, fixed, regions, _element_tops, scroll_clips, boundary_recs) =
+    let (rows, carousels, fixed, regions, element_tops, scroll_clips, boundary_recs) =
         layout.finish();
     let boundaries = harvest_boundaries(boundary_recs, &rows, &regions, &carousels);
-    (rows, carousels, regions, scroll_clips, boundaries, fixed)
+    let anchor_rows = anchor_rows_from(dom, &element_tops);
+    (
+        rows,
+        carousels,
+        regions,
+        scroll_clips,
+        boundaries,
+        fixed,
+        anchor_rows,
+    )
+}
+
+/// Build the `id`/`<a name>` → first-row map for fragment scrolling from the
+/// remapped element flow positions. Keyed by the anchor string (a duplicate id
+/// keeps its topmost row).
+fn anchor_rows_from(dom: &Dom, tops: &ElementTops) -> HashMap<String, usize> {
+    let mut map: HashMap<String, usize> = HashMap::new();
+    let mut note = |name: &str, row: usize| {
+        map.entry(name.to_string())
+            .and_modify(|r| *r = (*r).min(row))
+            .or_insert(row);
+    };
+    for (&node, &(_, row)) in tops {
+        let row = row as usize;
+        if let Some(id) = dom.attr(node, "id").filter(|v| !v.is_empty()) {
+            note(id, row);
+        }
+        if dom.tag_name(node) == Some("a")
+            && let Some(name) = dom.attr(node, "name").filter(|v| !v.is_empty())
+        {
+            note(name, row);
+        }
+    }
+    map
 }
 
 /// Turn the raw per-pass boundary records into `Doc.boundaries`, keeping only the
@@ -2302,9 +2341,26 @@ impl<'a> Layout<'a> {
         if let Some(media) = self.dom.children(id).into_iter().find(|&c| {
             matches!(self.dom.tag_name(c), Some("video" | "audio")) && self.is_out_of_flow(c)
         }) {
-            let mtag = self.dom.tag_name(media).unwrap_or("video").to_owned();
-            self.flow_media(media, &mtag, ctx);
-            return;
+            // …but only when the wrapper really is player CHROME. A wrapper
+            // whose subtree holds a visible IN-FLOW <img> is the other idiom:
+            // a content image with a video overlaid on top (Steam's sale
+            // capsules mount an abspos microtrailer <video> beside the capsule
+            // <img> on first hover — treating that as a player ate the image
+            // and the capsule collapsed to its price). Player chrome (video.js
+            // / Plyr / JW) draws its poster as a background-image div, never
+            // an in-flow <img>, so this test keeps the skip for real players
+            // while an image-bearing wrapper flows normally (its <video>
+            // child then renders — or suppresses — via its own dispatch).
+            let has_content_img = self.dom.descendants(id).any(|d| {
+                self.dom.tag_name(d) == Some("img")
+                    && !self.is_out_of_flow(d)
+                    && !self.dom.is_hidden(d)
+            });
+            if !has_content_img {
+                let mtag = self.dom.tag_name(media).unwrap_or("video").to_owned();
+                self.flow_media(media, &mtag, ctx);
+                return;
+            }
         }
         // A floated element leaves normal flow: pin it to an edge and let the
         // following content wrap beside it (across blocks, until cleared or
@@ -2406,6 +2462,31 @@ impl<'a> Layout<'a> {
             && let Some(&(form, field)) = self.controls.get(&id)
         {
             cctx.link = Some(Link::Form { form, field });
+        }
+        // A hover host (the live serializer's `data-trust-hover` marker): tag
+        // the items flowed beneath it with this element, so the app's hover
+        // hit-test can resolve a cell back to the actor node via the
+        // parse-time `Doc.hover_ids` map — the render pass otherwise only
+        // attributes items to anchors. A deeper anchor/host still overrides
+        // (nearest marker wins), and unmarked pages pay one attr miss.
+        if self.dom.attr(id, "data-trust-hover").is_some() {
+            cctx.node = id;
+        }
+        // Fragment scroll targets: record the flow row where every id-bearing
+        // element (and legacy `<a name>`) is entered, so a `#id` link / URL / live
+        // hash-change can scroll it to the top. Reuses the geometry `element_tops`
+        // map — remapped through the blank-row collapse in `finish` and merged
+        // across sub-layouts — so nested (flex/grid/bordered) anchors resolve too.
+        // Cheap: one attr probe per element, id'd elements only. Under
+        // `tag_all_nodes` every element is already recorded below, so skip it.
+        if !self.tag_all_nodes
+            && (self.dom.attr(id, "id").is_some_and(|v| !v.is_empty())
+                || (tag == "a" && self.dom.attr(id, "name").is_some_and(|v| !v.is_empty())))
+        {
+            self.element_tops.entry(id).or_insert((
+                u16::try_from(self.col).unwrap_or(u16::MAX),
+                u16::try_from(self.rows.len()).unwrap_or(u16::MAX),
+            ));
         }
         // Geometry measurement: attribute every item to its nearest element so
         // `measure_boxes` can recover per-element boxes. A descendant element
@@ -3970,6 +4051,17 @@ impl<'a> Layout<'a> {
                     self.measure_width(k, avail)
                 }
             };
+            // `max-width` CAPS the hypothetical main size (CSS Flexbox §9.2.3:
+            // the flex base size is clamped by the item's min/max main size).
+            // `flex_props` already caps a DECLARED basis; an AUTO (content-
+            // sized) basis must be capped too — Steam's tab rows wrap a
+            // `width:100%` @2x capsule image (intrinsic ~2× the box) in a
+            // `max-width:231px` cell, which otherwise contributes its full
+            // intrinsic width and opens a dead gap between image and text.
+            let b = match self.len_or_pct(k, "max-width", avail) {
+                Some(mx) => b.min(mx),
+                None => b,
+            };
             // `min-width` is a HARD floor on a flex item's used main size — even
             // when the row has room (CSS Flexbox §4.5/§9.7: the hypothetical
             // main size clamps the flex base size to `min-width`). Without this
@@ -3985,6 +4077,26 @@ impl<'a> Layout<'a> {
             } else {
                 match self.css_cells(k, "min-width") {
                     Some(mw) => b.max(mw.min(avail)),
+                    // `min-width:auto` (CSS Flexbox §4.5): with no explicit
+                    // min-width a flex item's automatic minimum is its
+                    // content-based minimum — the min-content size, capped by
+                    // a definite `width` (the specified size suggestion).
+                    // Floor the hypothetical size for NON-GROWING items only:
+                    // a grow item ends at/above min-content via the grow
+                    // distribution, and inflating its base would skew that
+                    // distribution. Steam's login QR pane is `flex:0` (basis
+                    // 0, grow 0) beside a `flex:1` form — without the
+                    // automatic minimum it collapsed to zero width and the
+                    // whole QR column vanished.
+                    None if g == 0.0 => {
+                        let mut auto_min = self
+                            .measure_width(k, 1)
+                            .max(self.definite_width_floor(k).unwrap_or(0));
+                        if let Some(w) = self.css_cells(k, "width") {
+                            auto_min = auto_min.min(w);
+                        }
+                        b.max(auto_min.min(avail))
+                    }
                     None => b,
                 }
             };
@@ -4214,6 +4326,34 @@ impl<'a> Layout<'a> {
 
     /// The natural width (cells) of an element's subtree laid out at
     /// `constraint` — its content basis (at `avail`) or min-content (at 1).
+    /// The widest DEFINITE `width` declared on `id` or any in-flow, visible
+    /// descendant — the floor below which the subtree cannot compress at
+    /// min-content (CSS Sizing §5: a box with a definite preferred size does
+    /// not shrink below it to fit). Complements the `measure_width(k, 1)`
+    /// min-content probe, which clamps every box to the probe band and so
+    /// under-reports a subtree holding a definite-width box (Steam's login QR
+    /// frame, `width:calc(200px - 2.5em)` nested four levels into a `flex:0`
+    /// column). A branch stops at its first definite width — children lay
+    /// INSIDE that box. Out-of-flow boxes contribute nothing (they don't
+    /// affect their container's min-content).
+    fn definite_width_floor(&self, id: NodeId) -> Option<usize> {
+        if self.dom.is_hidden(id)
+            || matches!(
+                self.dom.computed_style(id, "position").as_deref(),
+                Some("absolute" | "fixed")
+            )
+        {
+            return None;
+        }
+        if let Some(w) = self.definite_len_cells(id, "width") {
+            return Some(w);
+        }
+        self.dom
+            .child_iter(id)
+            .filter_map(|c| self.definite_width_floor(c))
+            .max()
+    }
+
     fn measure_width(&self, id: NodeId, constraint: usize) -> usize {
         crate::dom::casc_note_measure();
         let key = (id, constraint, self.table_depth);
@@ -5219,6 +5359,7 @@ impl<'a> Layout<'a> {
                 kind: ItemKind::Link,
                 image: None,
                 crop: false,
+                pixelated: false,
                 emph: Emphasis::default(),
                 node: NO_NODE,
                 link: Some(Link::CarouselScroll(dir)),
@@ -5324,7 +5465,59 @@ impl<'a> Layout<'a> {
         // float (a latest-post avatar floated left of its title/date column)
         // flows to its right instead of painting over it.
         let avail = self.line_right.saturating_sub(self.line_left).max(1);
-        self.stack_boxes(&kids, avail, ctx);
+        // Cross-axis alignment (CSS Flexbox §8.3): in a COLUMN container the
+        // cross axis is horizontal. The default `stretch` fills the width
+        // (stack_boxes); `center`/`flex-end` size each item to FIT-CONTENT
+        // and offset it across the band — Steam's login page centers its
+        // whole bounded login card with `align-items:center` on a column
+        // wrapper, and stretching it instead pinned the card's `flex:0` QR
+        // pane to the far right edge of the terminal. `align-self` on an
+        // item overrides the container value, per spec. `flex-start`/
+        // `baseline` keep the stretch path: without painted backgrounds a
+        // left-aligned fit-content box renders identically to a stretched
+        // one, so the narrower box isn't worth the layout churn.
+        let container_align = self
+            .dom
+            .computed_style(id, "align-items")
+            .map(|v| v.trim().to_string());
+        let mut row = self.rows.len();
+        for &k in &kids {
+            let align = self
+                .dom
+                .computed_style(k, "align-self")
+                .map(|v| v.trim().to_string())
+                .filter(|v| v != "auto")
+                .or_else(|| container_align.clone());
+            let (w, offset) = match align.as_deref() {
+                Some("center" | "flex-end" | "end" | "self-end") => {
+                    // Fit-content: the content's measured width, floored by
+                    // any definite width in the subtree (a definite box never
+                    // compresses — same floor as the §4.5 automatic minimum),
+                    // capped to the band.
+                    let fit = self
+                        .measure_width(k, avail)
+                        .max(self.definite_width_floor(k).unwrap_or(0))
+                        .min(avail)
+                        .max(1);
+                    let slack = avail - fit;
+                    let off = if matches!(align.as_deref(), Some("center")) {
+                        slack / 2
+                    } else {
+                        slack
+                    };
+                    (fit, off)
+                }
+                _ => (avail, 0),
+            };
+            let b = self.layout_subtree(k, w, ctx);
+            if b.height == 0 {
+                continue;
+            }
+            self.blit(&b, (self.line_left + offset) as u16, row);
+            row += b.height as usize;
+        }
+        self.col = self.line_left;
+        self.pending_space = false;
     }
 
     /// Stack a set of child boxes vertically at `width`, each below the
@@ -5964,7 +6157,14 @@ impl<'a> Layout<'a> {
         // when laid). Fixed/`fr` tracks ignore content.
         let mut content_w = vec![0f32; ncols];
         for (it, pl) in items.iter().zip(&places) {
-            if pl.col_span == 1 && pl.col < ncols && self.track_is_intrinsic(&specs[pl.col]) {
+            // Content is measured for intrinsic tracks — and, while MEASURING,
+            // for flexible ones too (they size to content in intrinsic sizing,
+            // so their content must be known — see `size_grid_tracks`).
+            if pl.col_span == 1
+                && pl.col < ncols
+                && (self.track_is_intrinsic(&specs[pl.col])
+                    || (self.measuring && self.track_has_fr(&specs[pl.col])))
+            {
                 content_w[pl.col] = content_w[pl.col].max(self.measure_width(*it, avail) as f32);
             }
         }
@@ -6631,6 +6831,17 @@ impl<'a> Layout<'a> {
     /// Whether a track sizes to content (so the content-width pass must measure
     /// its items): `auto`/`min|max-content`/`fit-content`, or a `minmax()` with
     /// an intrinsic bound.
+    /// Whether the track's max sizing function is flexible (`fr`). During
+    /// INTRINSIC sizing these size to their content (CSS Grid §7.2.3), not
+    /// to a share of the measurement probe.
+    fn track_has_fr(&self, spec: &TrackSpec) -> bool {
+        match spec {
+            TrackSpec::Fr(_) => true,
+            TrackSpec::Minmax(_, max) => matches!(max.as_ref(), TrackSpec::Fr(_)),
+            _ => false,
+        }
+    }
+
     fn track_is_intrinsic(&self, spec: &TrackSpec) -> bool {
         match spec {
             TrackSpec::Auto
@@ -6704,9 +6915,22 @@ impl<'a> Layout<'a> {
         let fr_sum: f32 = fr.iter().sum();
         let mut size = base.clone();
         let free = avail as f32 - base_sum - gaps;
-        if free > 0.0 && fr_sum > 0.0 {
+        if fr_sum > 0.0 {
             for i in 0..n {
-                size[i] += free * fr[i] / fr_sum;
+                if fr[i] <= 0.0 {
+                    continue;
+                }
+                if self.measuring {
+                    // Intrinsic sizing (CSS Grid §7.2.3): with indefinite
+                    // available space a flexible track sizes to its CONTENT,
+                    // not to a share of the measurement probe — else any
+                    // `1fr` grid measures as the whole probe width and a
+                    // fit-content ancestor (Steam's `align-items:center`ed
+                    // login card) can never shrink-wrap it.
+                    size[i] = size[i].max(content_w[i]);
+                } else if free > 0.0 {
+                    size[i] += free * fr[i] / fr_sum;
+                }
             }
         }
         let total: f32 = size.iter().sum::<f32>() + gaps;
@@ -7032,6 +7256,7 @@ impl<'a> Layout<'a> {
             kind: ItemKind::Border,
             image: None,
             crop: false,
+            pixelated: false,
             emph: Emphasis::default(),
             node: NO_NODE,
             link: None,
@@ -7166,8 +7391,13 @@ impl<'a> Layout<'a> {
         // base size, so every such tile claimed its own shelf at full width
         // (archive.org's Top-Collections grid collapsed to one column once the
         // lazy tile images finished loading). Real (non-measuring) layout passes
-        // `false` exactly as before.
-        self.layout_subtree_inner(id, content_width, None, false, inherit)
+        // `false` exactly as before. (The table path at `flow_table` propagates
+        // the flag the same way.) Without the inheritance, a flex row nested
+        // BELOW a plain block child ran its `justify-content` during the
+        // ancestor's measurement — Steam's right-aligned price cell made its
+        // whole `flex-shrink:0` column measure ~the full row, which then
+        // shrank the title column to one cell ("…").
+        self.layout_subtree_inner(id, content_width, None, self.measuring, inherit)
     }
 
     /// `layout_subtree`, optionally ignoring the float on the root element
@@ -7631,6 +7861,18 @@ impl<'a> Layout<'a> {
         // then carry it onto `mctx` (the caption flows through `place_text`) and
         // onto the poster item below.
         self.invisible |= self.dom.paint_suppressed(id) || self.dom.visibility_hidden(id);
+        // A suppressed OUT-OF-FLOW media element paints NOTHING — not even the
+        // reserved affordance line. A browser gives an abspos box no flow
+        // space, and opacity:0 hides it; our in-flow "▶ Video" line for it is
+        // synthetic, so a suppressed one is a blank selectable row that only
+        // distorts its container's height (Steam's sale capsules keep a
+        // mounted `opacity:0` abspos microtrailer `<video>` after hover-away —
+        // the stray row misaligned the hovered capsule against its grid
+        // siblings). IN-flow suppressed media still reserves its line: that
+        // box is real layout in a browser too.
+        if self.invisible && self.is_out_of_flow(id) {
+            return;
+        }
         // The representation links to the media; following it launches mpv.
         let mut mctx = ctx.clone();
         mctx.link = Some(Link::Media(play_url));
@@ -7642,11 +7884,15 @@ impl<'a> Layout<'a> {
         self.begin_line();
 
         // The preview frame, when present AND decoded, renders as a clickable
-        // thumbnail. The element's own `poster` first; failing that (the
-        // streaming case — no poster on the live `<video>`) the page's standard
-        // Open Graph image. Sized by its decoded box (NOT the `<video>`'s CSS —
-        // that carries a `height:0`/`padding-top` 16:9 hack a poster must not
-        // inherit), capped to the content width.
+        // thumbnail. The element's own `poster` first; failing that, ONLY the
+        // streaming case (no inline source — the video plays the PAGE via
+        // yt-dlp) borrows the page's standard Open Graph image, since og:image
+        // is "a still frame of THIS PAGE's media". A poster-less video with a
+        // direct source is some inline clip, not the page's media — giving it
+        // the page banner painted Steam's sale og:image onto every microtrailer
+        // `<video>` in the store's preview pane. Sized by its decoded box (NOT
+        // the `<video>`'s CSS — that carries a `height:0`/`padding-top` 16:9
+        // hack a poster must not inherit), capped to the content width.
         let poster = (tag == "video")
             .then(|| {
                 self.dom
@@ -7657,7 +7903,11 @@ impl<'a> Layout<'a> {
                         Link::Http(u) => Some(u.to_string()),
                         _ => None,
                     })
-                    .or_else(|| page_preview_image(self.dom, self.base))
+                    .or_else(|| {
+                        streaming
+                            .then(|| page_preview_image(self.dom, self.base))
+                            .flatten()
+                    })
             })
             .flatten();
         if let Some(poster) = poster
@@ -7675,6 +7925,7 @@ impl<'a> Layout<'a> {
                 height: h,
                 image: Some(poster),
                 crop: false,
+                pixelated: false,
                 text: String::new(),
                 kind: ItemKind::Image,
                 emph: Emphasis::default(),
@@ -7993,8 +8244,9 @@ impl<'a> Layout<'a> {
         if src.is_empty() {
             return None;
         }
-        // A `data:` image (e.g. a rewritten inline SVG) keys on the URL itself.
-        if src.starts_with("data:") {
+        // A `data:` image (e.g. a rewritten inline SVG) keys on the URL itself;
+        // a `blob:` image likewise (resolved from `Doc.blobs`, not the wire).
+        if src.starts_with("data:") || src.starts_with("blob:") {
             return Some(src.to_string());
         }
         match crate::http::resolve(self.base, src) {
@@ -8042,12 +8294,19 @@ impl<'a> Layout<'a> {
             }
             self.pending_space = false;
         }
+        // CSS Images 3 §5.4: `pixelated` (and the `crisp-edges` family) ask
+        // for hard-edged nearest-neighbor scaling — the encoder honors it.
+        let pixelated = matches!(
+            self.dom.computed_value(id, "image-rendering").as_deref(),
+            Some("pixelated" | "crisp-edges" | "-moz-crisp-edges" | "-webkit-optimize-contrast")
+        );
         self.line.push(Item {
             col: self.col as u16,
             width: w,
             height: h,
             image: Some(url),
             crop,
+            pixelated,
             text: String::new(),
             kind: ItemKind::Image,
             emph: Emphasis::default(),
@@ -8983,6 +9242,7 @@ impl<'a> Layout<'a> {
             kind: ItemKind::Text,
             image: None,
             crop: false,
+            pixelated: false,
             emph: Emphasis::default(),
             node: NO_NODE,
             link: None,
@@ -9024,6 +9284,7 @@ impl<'a> Layout<'a> {
             height: 1,
             image: None,
             crop: false,
+            pixelated: false,
             text,
             kind,
             emph,
@@ -9248,6 +9509,7 @@ fn image_spacer_row(indent: usize) -> Row {
             height: 1,
             image: None,
             crop: false,
+            pixelated: false,
             text: String::new(),
             kind: ItemKind::Image,
             emph: Emphasis::default(),
@@ -9992,6 +10254,136 @@ mod tests {
         lay_out(&dom, &base, width, &[], &ControlMap::new(), images, false)
     }
 
+    /// A COLUMN flex container's cross-axis alignment (CSS Flexbox §8.3):
+    /// `align-items:center` sizes each item to FIT-CONTENT and centers it in
+    /// the band — including shrink-wrapping a `1fr` grid inside (CSS Grid
+    /// §7.2.3: flexible tracks size to content during intrinsic sizing, so
+    /// the grid can't inflate the fit measure to the whole band). Steam's
+    /// login page centers its bounded card this way; stretching it instead
+    /// pinned the card's QR pane to the terminal's far right edge.
+    #[test]
+    fn column_flex_align_center_shrink_wraps_and_centers() {
+        let html = r#"<style>
+            .page{display:flex;flex-direction:column;align-items:center}
+            .card{display:grid;grid-template-columns:1fr;gap:12px}
+            .row{display:flex;flex-direction:row}
+            .frame{width:160px}
+        </style>
+        <div class="page"><div><div class="card"><div class="row">
+            <div><p>USERNAME</p></div>
+            <div class="frame"><p>QR</p></div>
+        </div></div></div></div>"#;
+        let rows = lay(html, 200);
+        let name = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.text.contains("USERNAME"))
+            .expect("label laid out");
+        let qr = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.text.contains("QR"))
+            .expect("QR cell laid out");
+        // Shrink-wrapped: the card is ~label + 160px frame (~33 cells), so
+        // centered in 200 the label starts far from column 0 and the frame's
+        // right edge lands far from column 199.
+        assert!(
+            name.col >= 60,
+            "card must be centered, label at col {}",
+            name.col
+        );
+        assert!(
+            (qr.col + qr.width) <= 160,
+            "card must shrink-wrap, QR cell ends at {}",
+            qr.col + qr.width
+        );
+        // And the default (no align-items) still stretches: same structure
+        // minus the align lays the label at the left edge.
+        let html_stretch = html.replace(";align-items:center", "");
+        let rows = lay(&html_stretch, 200);
+        let name = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.text.contains("USERNAME"))
+            .expect("label laid out");
+        assert!(
+            name.col < 10,
+            "default stretch keeps the left edge, label at col {}",
+            name.col
+        );
+    }
+
+    /// `image-rendering: pixelated` (CSS Images 3 §5.4) rides the Image item
+    /// to the encoder, which then upscales nearest-neighbor — hard-edged
+    /// blocks, a scannable QR — instead of Lanczos smoothing. Inherited per
+    /// spec, so a wrapper's declaration reaches the `<img>`.
+    #[test]
+    fn image_rendering_pixelated_marks_the_image_item() {
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/qr.gif".to_string(), (5, 3));
+        images.insert("https://example.com/photo.jpg".to_string(), (5, 3));
+        let html = r#"<style>.qrwrap{image-rendering:pixelated}</style>
+            <div class="qrwrap"><img src="qr.gif" alt=""></div>
+            <div><img src="photo.jpg" alt=""></div>"#;
+        let rows = lay_with_images(html, 80, &images);
+        let find = |needle: &str| {
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .find(|it| it.image.as_deref().is_some_and(|u| u.contains(needle)))
+                .unwrap_or_else(|| panic!("{needle} laid out"))
+                .pixelated
+        };
+        assert!(find("qr.gif"), "pixelated inherits onto the img");
+        assert!(!find("photo.jpg"), "default images stay smooth");
+    }
+
+    /// A non-growing flex item (`flex:0` — basis 0, grow 0) still gets its
+    /// AUTOMATIC MINIMUM size (CSS Flexbox §4.5: `min-width:auto` = the
+    /// content-based minimum), including a definite-width box nested deeper in
+    /// the item (CSS Sizing §5: a definite preferred size doesn't compress at
+    /// min-content). Steam's login: the QR pane is `flex:0` beside a `flex:1`
+    /// form, its 160px frame four wrappers down — without the automatic
+    /// minimum the pane collapsed to zero and the whole QR column vanished.
+    #[test]
+    fn flex_zero_item_keeps_its_content_based_minimum() {
+        let mut images = ImageSizes::new();
+        images.insert("blob:https://x/qr".to_string(), (5, 3)); // 41x41 GIF
+        let html = r#"<style>
+            .row{display:flex;flex-direction:row}
+            .form{flex:1}
+            .qr{flex:0;display:grid;gap:4px;margin-left:40px}
+            .center{display:flex;flex-direction:column;align-items:center}
+            .rel{position:relative}
+            .frame{display:grid;width:160px;height:160px}
+            .img{width:100%}
+        </style>
+        <div class="row">
+          <div class="form"><p>account name</p><p>password</p></div>
+          <div class="qr"><div><label>Or sign in with QR</label>
+            <div class="center"><div class="rel"><div class="frame">
+              <img class="img" src="blob:https://x/qr" alt="">
+            </div></div></div>
+          </div></div>
+        </div>"#;
+        let rows = lay_with_images(html, 120, &images);
+        let img = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.kind == ItemKind::Image && it.image.is_some())
+            .expect("the QR image laid out");
+        // The pane holds its 160px (20-cell) frame; the img fills it via
+        // width:100% (not its 5-cell intrinsic), beside the form (not under).
+        assert!(
+            img.width >= 15,
+            "img must fill the definite frame, got {}",
+            img.width
+        );
+        assert!(
+            img.col >= 60,
+            "QR pane must sit beside the flex:1 form, got col {}",
+            img.col
+        );
+    }
     #[test]
     fn font_size_zero_text_renders_nothing_not_one_char_per_line() {
         // The fosstodon glitch: Mastodon hides a link's URL scheme and tail with
@@ -10101,7 +10493,7 @@ mod tests {
           </div>";
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
-        let (rows, _c, _rg, _cl, _b, fixed) = lay_out_with_carousels(
+        let (rows, _c, _rg, _cl, _b, fixed, _a) = lay_out_with_carousels(
             &dom,
             &base,
             (80, 20),
@@ -11631,6 +12023,63 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_source_video_without_poster_does_not_borrow_the_page_og_image() {
+        // og:image is "a still frame of this PAGE's media" — the right preview
+        // for a sourceless streaming player that follows to the page URL, but
+        // WRONG for an inline clip with its own direct source (Steam's home
+        // page painted its Summer Sale og:image onto every poster-less
+        // microtrailer `<video>` in the tab preview pane). Such a video keeps
+        // its caption link and renders no borrowed thumbnail.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/banner.jpg".to_owned(), (40, 22));
+        let rows = lay_with_images(
+            r#"<html><head><meta property="og:image" content="/banner.jpg"></head>
+               <body><video><source src="/microtrailer.webm" type="video/webm"></video></body></html>"#,
+            80,
+            &images,
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .all(|i| i.image.is_none()),
+            "borrowed og:image thumbnail: {:?}",
+            texts(&rows)
+        );
+        assert!(shows(&rows, "▶ Video"), "caption: {:?}", texts(&rows));
+    }
+
+    #[test]
+    fn a_suppressed_out_of_flow_video_reserves_no_affordance_row() {
+        // Steam's sale capsule after a hover-away: the mounted microtrailer
+        // <video> stays in the DOM at `position:absolute; opacity:0`. A
+        // browser paints nothing and gives it no flow space; our in-flow
+        // "▶ Video" affordance line must vanish with it — the suppressed
+        // blank row grew the hovered capsule and misaligned the grid
+        // (its price landed a row off its siblings').
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/a.jpg".to_owned(), (20, 5));
+        images.insert("https://example.com/b.jpg".to_owned(), (20, 5));
+        let rows = lay_with_images(
+            r#"<body><div style="display:flex">
+                 <div style="position:relative"><img src="/a.jpg">
+                   <video style="position:absolute;opacity:0"><source src="/t.webm" type="video/webm"></video>
+                   <div>PRICE-A</div></div>
+                 <div><img src="/b.jpg"><div>PRICE-B</div></div>
+               </div></body>"#,
+            60,
+            &images,
+        );
+        let out = all_text(&rows);
+        assert!(
+            !out.contains("Video"),
+            "suppressed abspos video leaked an affordance: {out:?}"
+        );
+        let (ra, _) = pos_of(&rows, "PRICE-A");
+        let (rb, _) = pos_of(&rows, "PRICE-B");
+        assert_eq!(ra, rb, "capsule heights must match: {out:?}");
+    }
+
+    #[test]
     fn a_videojs_transformed_player_still_renders_poster_and_caption() {
         // The real shape after video.js initialises: the <video> is renamed,
         // class vjs-tech, position:absolute, src set directly, inside a
@@ -12720,7 +13169,7 @@ mod tests {
 
         // A flex COLUMN: each item stacks on its own rows → owns them.
         let col = r#"<html><body><div style="display:flex;flex-direction:column"><div data-trust-node="5"><div>aaa</div><div>aaa</div></div><div data-trust-node="6"><div>bbb</div></div></div></body></html>"#;
-        let (_r, _c, _rg, _cl, b1, _f1) = lay_out_with_carousels(
+        let (_r, _c, _rg, _cl, b1, _f1, _a1) = lay_out_with_carousels(
             &Dom::parse_document(col),
             &base,
             (40, 0),
@@ -12738,7 +13187,7 @@ mod tests {
 
         // A flex ROW: the two items sit side by side, sharing a row.
         let row = r#"<html><body><div style="display:flex"><div data-trust-node="5">AAA</div><div data-trust-node="6">BBB</div></div></body></html>"#;
-        let (_r2, _c2, _rg2, _cl2, b2, _f2) = lay_out_with_carousels(
+        let (_r2, _c2, _rg2, _cl2, b2, _f2, _a2) = lay_out_with_carousels(
             &Dom::parse_document(row),
             &base,
             (40, 0),
@@ -12763,7 +13212,7 @@ mod tests {
         let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
         let html = r#"<html><body><p>header</p><div data-trust-node="42" style="display:flow-root"><div>l0</div><div>l1</div><div>l2</div></div><p>footer</p><div data-trust-node="9" style="display:block">plain</div></body></html>"#;
         let dom = Dom::parse_document(html);
-        let (rows, _car, _rgn, _clip, boundaries, _fixed) =
+        let (rows, _car, _rgn, _clip, boundaries, _fixed, _anchors) =
             lay_out_with_carousels(&dom, &base, (40, 0), &[], &ctrls, &imgs, false);
         let b = boundaries
             .iter()
@@ -12802,7 +13251,7 @@ mod tests {
         let html = r#"<html><body style="font-weight:bold;text-transform:uppercase"><p>head</p><div data-trust-node="7" style="display:flow-root"><div>msg0</div><div>msg1</div></div></body></html>"#;
         let dom = Dom::parse_document(html);
         let vp = (40usize, 0usize);
-        let (rows, _car, _rgn, _clip, boundaries, _fixed) =
+        let (rows, _car, _rgn, _clip, boundaries, _fixed, _anchors) =
             lay_out_with_carousels(&dom, &base, vp, &[], &ctrls, &imgs, false);
         let b = boundaries.iter().find(|b| b.node == 7).unwrap();
         let frag = {
@@ -14755,6 +15204,61 @@ mod tests {
     }
 
     #[test]
+    fn nested_justify_flex_end_does_not_inflate_a_columns_measured_width() {
+        // Steam's tab rows: a growable title column (`min-width:0`, nowrap +
+        // overflow:hidden) beside a `flex-shrink:0` price column whose price
+        // is right-justified by a flex row nested BELOW a plain block wrapper.
+        // The nested `justify-content:flex-end` must not run while the price
+        // column's intrinsic width is measured (`layout_subtree` inherits the
+        // measuring state) — it made the column measure ~the whole row, and
+        // the shrink pass then collapsed the title column to one cell ("…").
+        let rows = lay(
+            r#"<html><body><div style="display:flex">
+                 <div style="display:flex;flex-direction:column;min-width:0;flex-grow:1;flex-shrink:1">
+                   <div style="white-space:nowrap;overflow:hidden">GAME TITLE HERE</div>
+                 </div>
+                 <div style="display:flex;flex-direction:column;flex-shrink:0;min-width:0;white-space:nowrap">
+                   <div><div style="display:flex;position:relative;justify-content:flex-end">6,15€</div></div>
+                 </div>
+               </div></body></html>"#,
+            100,
+        );
+        let out = all_text(&rows);
+        assert!(out.contains("GAME TITLE HERE"), "title clipped: {out:?}");
+        assert!(out.contains("6,15€"), "price missing: {out:?}");
+        let (title_row, _) = pos_of(&rows, "GAME TITLE HERE");
+        let (price_row, _) = pos_of(&rows, "6,15€");
+        assert_eq!(title_row, price_row, "columns fell apart: {out:?}");
+    }
+
+    #[test]
+    fn auto_basis_flex_item_is_capped_by_its_max_width() {
+        // A flex cell wrapping an over-wide replaced element (a `width:100%`
+        // @2x image, intrinsic 60 cells) in a `max-width:15em` (30-cell) box:
+        // the AUTO flex basis is the measured content width CLAMPED by
+        // `max-width` (CSS Flexbox §9.2.3 hypothetical main size), so the
+        // neighbour starts right after the cap — not after the intrinsic
+        // width, which opened a dead gap between image and text (Steam's
+        // capsule cells).
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/cap.jpg".to_owned(), (60, 10));
+        let rows = lay_with_images(
+            r#"<body><div style="display:flex">
+                 <div style="max-width:15em;flex-shrink:0"><img src="/cap.jpg" style="width:100%"></div>
+                 <div>NEIGHBOR</div>
+               </div></body>"#,
+            100,
+            &images,
+        );
+        let (_, col) = pos_of(&rows, "NEIGHBOR");
+        assert!(
+            col <= 32,
+            "gap after the capped image cell: col {col} {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
     fn grid_justify_content_centers_a_shelf() {
         // A `display:grid` (shelf-packed) container honours justify-content
         // per shelf, just like a flex row: 5em·2 = 10-cell boxes, gap 1 →
@@ -15603,6 +16107,7 @@ mod tests {
             node: NO_NODE,
             link,
             crop: false,
+            pixelated: false,
             invisible: false,
         };
         let row = Row {
