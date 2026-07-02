@@ -1253,7 +1253,9 @@ pub async fn execute_js(
                         r.body.clone(),
                     );
                 }
-                externals.push((raw, resp.map(|r| r.body)));
+                // Arc so the parallel-parse pool shares the body with its
+                // worker threads instead of cloning a multi-MB bundle.
+                externals.push((raw, resp.map(|r| std::sync::Arc::new(r.body))));
             }
             Kind::Sheet => {
                 // A failed sheet is simply absent: fail-open, nothing

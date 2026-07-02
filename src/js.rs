@@ -997,7 +997,8 @@ impl ParsePool {
 /// borrows `ctx` briefly before any worker starts.
 fn dispatch_parallel_parse(
     scripts: &[(Option<String>, String, Option<String>, usize)],
-    externals: &[(String, Option<Vec<u8>>)],
+    externals: &[(String, Option<std::sync::Arc<Vec<u8>>>)],
+    cdn_keys: &std::collections::HashMap<usize, [u8; 32]>,
     cache_hits: &std::collections::HashSet<usize>,
     ctx: &mut Context,
 ) -> Option<ParsePool> {
@@ -1016,7 +1017,9 @@ fn dispatch_parallel_parse(
     // be dehydrated — so it is excluded from the lazy path per-job.
     let lazy_on = lazy_parse_on();
     let lazy_min = lazy_min();
-    let mut jobs: Vec<(usize, String, Vec<u8>, u32, bool)> = Vec::new();
+    // (script index, name, shared body, parser id, lazy-parse this job)
+    type ParseJob = (usize, String, std::sync::Arc<Vec<u8>>, u32, bool);
+    let mut jobs: Vec<ParseJob> = Vec::new();
     for (i, (src, _inline, type_attr, _node)) in scripts.iter().enumerate() {
         if !is_classic(type_attr) {
             continue;
@@ -1037,8 +1040,10 @@ fn dispatch_parallel_parse(
         // Lazy-parse this job unless it's a cacheable shared lib: the CDN image
         // cache (compiled once per session, rehydrated free) beats re-skipping
         // jQuery/D3/Vue every page, and a lazy stub can't be imaged. Big unique
-        // first-party bundles — the lazy-parse prize — are skipped.
-        let lazy_job = lazy_on && !cdn_cache_candidate(body);
+        // first-party bundles — the lazy-parse prize — are skipped. The key
+        // comes precomputed from `load_page` (SHA-256 over a multi-MB bundle
+        // is not free — it was being recomputed here and again at run time).
+        let lazy_job = lazy_on && !cdn_cache_candidate_keyed(cdn_keys.get(&i), body.len());
         jobs.push((i, src.clone(), body.clone(), id, lazy_job));
     }
     if jobs.len() < 2 {
@@ -1075,7 +1080,8 @@ fn dispatch_parallel_parse(
                         boa_parser::lazy::set_min_len(n);
                     }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let src = Source::from_bytes(&body).with_path(std::path::Path::new(&name));
+                        let src =
+                            Source::from_bytes(&body[..]).with_path(std::path::Path::new(&name));
                         boa_engine::Script::raw_parse(src, id)
                     }))
                     .unwrap_or_else(|_| Err(String::from("raw parse panicked (Boa bug)")));
@@ -1221,18 +1227,47 @@ fn cdn_cache_lookup(key: &[u8; 32]) -> CdnLookup {
 }
 
 /// Whether this external script body is, right now, a candidate for the CDN
-/// compile cache on this page: caching enabled, a true miss (`Absent` — not a
-/// hit, which is excluded earlier, nor an already-decided `NotReusable`), and
-/// small enough to admit. A candidate must compile **eagerly** so its image can
-/// be dehydrated, so parallel parse keeps it off the lazy path (and runs its
-/// page-thread compile un-suppressed). This mirrors the `store_key` decision in
-/// [`run_external_classic`] exactly, so the two never disagree on which scripts
-/// stay eager — the lazy-parse safety net (`RawScript::was_lazy_parsed`) covers
-/// the residual race where a `NotReusable` entry is evicted in between.
-fn cdn_cache_candidate(body: &[u8]) -> bool {
-    cdn_cache_enabled()
-        && cdn_cacheable(body.len())
-        && matches!(cdn_cache_lookup(&cdn_cache_key(body)), CdnLookup::Absent)
+/// compile cache on this page: caching enabled (`key` is only `Some` then), a
+/// true miss (`Absent` — not a hit, which is excluded earlier, nor an
+/// already-decided `NotReusable`), and small enough to admit. A candidate must
+/// compile **eagerly** so its image can be dehydrated, so parallel parse keeps
+/// it off the lazy path (and runs its page-thread compile un-suppressed). This
+/// mirrors the `store_key` decision in [`run_external_classic`] exactly, so the
+/// two never disagree on which scripts stay eager — the lazy-parse safety net
+/// (`RawScript::was_lazy_parsed`) covers the residual race where a
+/// `NotReusable` entry is evicted in between. Takes the PRECOMPUTED key (see
+/// [`cdn_cache_keys`]) so the SHA-256 of a multi-MB bundle is paid once per
+/// page, not once per decision point.
+fn cdn_cache_candidate_keyed(key: Option<&[u8; 32]>, body_len: usize) -> bool {
+    match key {
+        Some(k) => cdn_cacheable(body_len) && matches!(cdn_cache_lookup(k), CdnLookup::Absent),
+        None => false, // cache disabled: never a candidate (stays on the lazy path)
+    }
+}
+
+/// Precompute the CDN cache key for every external classic script that has a
+/// fetched body, by script index — the ONE place the (SHA-256) key is hashed
+/// per page. Empty when the cache is disabled, so an absent entry doubles as
+/// the "disabled" signal for [`cdn_cache_candidate_keyed`].
+fn cdn_cache_keys(
+    scripts: &[(Option<String>, String, Option<String>, usize)],
+    externals: &[(String, Option<std::sync::Arc<Vec<u8>>>)],
+) -> std::collections::HashMap<usize, [u8; 32]> {
+    let mut keys = std::collections::HashMap::new();
+    if !cdn_cache_enabled() {
+        return keys;
+    }
+    for (i, (src, _inline, type_attr, _node)) in scripts.iter().enumerate() {
+        if !is_classic(type_attr) {
+            continue;
+        }
+        let Some(src) = src else { continue };
+        let Some((_, Some(body))) = externals.iter().find(|(k, _)| k == src) else {
+            continue;
+        };
+        keys.insert(i, cdn_cache_key(body));
+    }
+    keys
 }
 
 /// Record a cache decision for `key` (the first writer wins a race; a poisoned
@@ -1275,31 +1310,16 @@ fn cdn_cache_insert(cache: &mut CdnCache, key: [u8; 32], entry: CdnEntry, bytes:
 /// Indices (into `scripts`) of external classic scripts whose compiled image is
 /// already cached as reusable. They are rehydrated rather than compiled, so they
 /// need no parse and are kept OUT of the parallel-parse pool (a worker parse of
-/// a script we'll never compile would be pure waste).
+/// a script we'll never compile would be pure waste). Reads the precomputed
+/// [`cdn_cache_keys`] (empty when the cache is disabled).
 fn cdn_cache_hits(
-    scripts: &[(Option<String>, String, Option<String>, usize)],
-    externals: &[(String, Option<Vec<u8>>)],
+    cdn_keys: &std::collections::HashMap<usize, [u8; 32]>,
 ) -> std::collections::HashSet<usize> {
-    let mut hits = std::collections::HashSet::new();
-    if !cdn_cache_enabled() {
-        return hits;
-    }
-    for (i, (src, _inline, type_attr, _node)) in scripts.iter().enumerate() {
-        if !is_classic(type_attr) {
-            continue;
-        }
-        let Some(src) = src else { continue };
-        let Some((_, Some(body))) = externals.iter().find(|(k, _)| k == src) else {
-            continue;
-        };
-        if matches!(
-            cdn_cache_lookup(&cdn_cache_key(body)),
-            CdnLookup::Reusable(_)
-        ) {
-            hits.insert(i);
-        }
-    }
-    hits
+    cdn_keys
+        .iter()
+        .filter(|(_, k)| matches!(cdn_cache_lookup(k), CdnLookup::Reusable(_)))
+        .map(|(&i, _)| i)
+        .collect()
 }
 
 /// Run one external classic script, going through the CDN compile cache.
@@ -1327,11 +1347,15 @@ fn run_external_classic(
     ctx: &mut Context,
     name: &str,
     body: &[u8],
+    // The script's precomputed cache key ([`cdn_cache_keys`]); `None` when the
+    // cache is disabled OR the caller fetched the body on demand (past the
+    // prefetch lid) and no key exists yet — then it is hashed here, once.
+    key: Option<[u8; 32]>,
     prepared: Option<Result<boa_engine::RawScript, String>>,
     budget: &Budget,
     outcome: &mut Outcome,
 ) {
-    let key = cdn_cache_enabled().then(|| cdn_cache_key(body));
+    let key = key.or_else(|| cdn_cache_enabled().then(|| cdn_cache_key(body)));
     let lookup = key.as_ref().map_or(CdnLookup::Absent, cdn_cache_lookup);
     if let CdnLookup::Reusable(image) = &lookup {
         phase(&format!(
@@ -4967,6 +4991,28 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
         )
     };
     match src {
+        // A `data:` src decodes inline — no network, exactly like a parse-time
+        // `data:` classic script (the Instagram bootloader path). Routing it
+        // through the net-prepare below rejected the non-http(s) scheme and
+        // fired `error` for a script a real browser runs.
+        Some(src) if src.trim_start().starts_with("data:") => {
+            match crate::img::decode_data_url(src.trim()) {
+                Some(body) => {
+                    let realm = ctx.realm().clone();
+                    let job = NativeAsyncJob::with_realm(
+                        async move |cell: &RefCell<&mut Context>| {
+                            let mut guard = cell.borrow_mut();
+                            eval_injected(&mut guard, "injected-data", &body);
+                            fire_script_event(&mut guard, node_id, "load");
+                            Ok(JsValue::undefined())
+                        },
+                        realm,
+                    );
+                    ctx.enqueue_job(job.into());
+                }
+                None => fire_script_event(ctx, node_id, "error"),
+            }
+        }
         Some(src) if !src.trim().is_empty() => {
             match page_net_prepare(ctx, &src, String::from("GET"), None, vec![]) {
                 // Blocked/capped/cross-private: report a failed load like a browser.
@@ -5397,8 +5443,10 @@ pub struct PageEnv {
     /// infinite-scrollers measure against it). 8x16 nominal in tests.
     pub cell_px: (u16, u16),
     /// Pre-fetched external scripts keyed by raw `src` attribute
-    /// (None = the fetch failed).
-    pub externals: Vec<(String, Option<Vec<u8>>)>,
+    /// (None = the fetch failed). `Arc` so the parallel-parse pool can hand a
+    /// body to a worker thread without cloning it — multi-MB bundles were
+    /// being duplicated wholesale at the worst moment of the load.
+    pub externals: Vec<(String, Option<std::sync::Arc<Vec<u8>>>)>,
     /// Pre-fetched `<link rel=stylesheet>` bodies keyed by raw `href`,
     /// for the display/visibility cascade (failed fetches are absent —
     /// fail-open, the page just renders un-hidden).
@@ -6139,18 +6187,22 @@ fn load_page(
         scripts.len()
     ));
 
-    // CDN compile cache (Phase 2): an external classic library compiled on an
-    // earlier page of this session is already a detached image — these scripts
-    // will be rehydrated, not compiled, so they're excluded from the parse pool
-    // below and rehydrated in the loop.
-    let cache_hits = cdn_cache_hits(&scripts, externals);
+    // CDN compile cache (Phase 2): hash each external body ONCE (`cdn_keys` —
+    // SHA-256 over a multi-MB bundle was being paid at up to three decision
+    // points). A library compiled on an earlier page of this session is
+    // already a detached image — those scripts will be rehydrated, not
+    // compiled, so they're excluded from the parse pool below and rehydrated
+    // in the loop.
+    let cdn_keys = cdn_cache_keys(&scripts, externals);
+    let cache_hits = cdn_cache_hits(&cdn_keys);
 
     // Parallel parse (Step 5a): external classic scripts raw-parse on a worker
     // pool NOW, overlapping the rest of this thread's work (the prelude already
     // ran; earlier scripts' execution and later scripts' parse now overlap). The
     // loop below still compiles + runs each in document order — only the lex/
     // parse phase moved off this thread. Cache hits are skipped (no parse needed).
-    let mut parse_pool = dispatch_parallel_parse(&scripts, externals, &cache_hits, &mut ctx);
+    let mut parse_pool =
+        dispatch_parallel_parse(&scripts, externals, &cdn_keys, &cache_hits, &mut ctx);
 
     for (i, (src, inline, type_attr, node)) in scripts.iter().enumerate() {
         let script_started = Instant::now();
@@ -6257,7 +6309,15 @@ fn load_page(
                         .as_mut()
                         .filter(|p| p.was_dispatched(i))
                         .map(|pool| pool.take(i));
-                    run_external_classic(&mut ctx, src, body, prepared, &budget, &mut outcome);
+                    run_external_classic(
+                        &mut ctx,
+                        src,
+                        body,
+                        cdn_keys.get(&i).copied(),
+                        prepared,
+                        &budget,
+                        &mut outcome,
+                    );
                 }
                 _ => {
                     // Not in the parallel prefetch (beyond the prefetch lid, or
@@ -6289,6 +6349,7 @@ fn load_page(
                             &mut ctx,
                             src,
                             &cached.body,
+                            None, // fetched on demand: no precomputed key (hashed inside)
                             None,
                             &budget,
                             &mut outcome,
@@ -7081,17 +7142,40 @@ const WORKER_SCOPE: &str = r##"
     }
     function removeTimer(id) { for (var i = 0; i < WK.timers.length; i++) if (WK.timers[i].id === id) { WK.timers.splice(i, 1); return; } }
 
-    // --- EventTarget on the worker global ---
+    // --- EventTarget on the worker global (options-aware: `once`/`signal`
+    // behave per spec, `capture` is stored for removal matching — the worker
+    // global is a flat target, so there is no capture PHASE) ---
     var LS = new Map();
     function lsFor(type) { var l = LS.get(type); if (!l) { l = []; LS.set(type, l); } return l; }
-    g.addEventListener = function (type, fn) {
-        if (typeof fn === "function" || (fn && typeof fn.handleEvent === "function")) { var l = lsFor(String(type)); if (l.indexOf(fn) < 0) l.push(fn); }
+    g.addEventListener = function (type, fn, options) {
+        if (!(typeof fn === "function" || (fn && typeof fn.handleEvent === "function"))) return;
+        var o = options === true ? { capture: true } : (options && typeof options === "object" ? options : {});
+        if (o.signal && o.signal.aborted) return;
+        var t = String(type), l = lsFor(t);
+        for (var i = 0; i < l.length; i++) if (l[i].fn === fn && l[i].capture === !!o.capture) return;
+        var entry = { fn: fn, capture: !!o.capture, once: !!o.once, removed: false };
+        l.push(entry);
+        if (o.signal && typeof o.signal.addEventListener === "function") {
+            o.signal.addEventListener("abort", function () { g.removeEventListener(t, fn, { capture: entry.capture }); }, { once: true });
+        }
     };
-    g.removeEventListener = function (type, fn) { var l = lsFor(String(type)); var i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); };
+    g.removeEventListener = function (type, fn, options) {
+        var capture = options === true || !!(options && options.capture);
+        var l = lsFor(String(type));
+        for (var i = 0; i < l.length; i++) {
+            if (l[i].fn === fn && l[i].capture === capture) { l[i].removed = true; l.splice(i, 1); return; }
+        }
+    };
     g.dispatchEvent = function (ev) {
         ev.target = g; ev.currentTarget = g;
-        var l = lsFor(ev.type).slice();
-        for (var i = 0; i < l.length; i++) { try { (typeof l[i] === "function") ? l[i].call(g, ev) : l[i].handleEvent(ev); } catch (e) { WK.errors.push(errStr(ev.type + " handler", e)); } }
+        var l = lsFor(ev.type), snap = l.slice();
+        for (var i = 0; i < snap.length; i++) {
+            var entry = snap[i];
+            if (entry.removed) continue;
+            if (entry.once) { var k = l.indexOf(entry); if (k >= 0) l.splice(k, 1); entry.removed = true; }
+            try { (typeof entry.fn === "function") ? entry.fn.call(g, ev) : entry.fn.handleEvent(ev); }
+            catch (e) { WK.errors.push(errStr(ev.type + " handler", e)); }
+        }
         return !ev.defaultPrevented;
     };
     function fireScope(type, ev) {
@@ -7158,8 +7242,17 @@ const WORKER_SCOPE: &str = r##"
         return out;
     };
     g.atob = function (s) {
-        s = String(s).replace(/[^A-Za-z0-9+/]/g, ""); var out = "", i = 0, bits = 0, acc = 0;
-        while (i < s.length) { var idx = B64.indexOf(s.charAt(i++)); if (idx < 0) continue; acc = (acc << 6) | idx; bits += 6; if (bits >= 8) { bits -= 8; out += String.fromCharCode((acc >> bits) & 0xFF); } }
+        // Strict forgiving-base64 (Infra §4.5), matching the page realm.
+        s = String(s).replace(/[\t\n\f\r ]+/g, "");
+        if (s.length % 4 === 0) s = s.replace(/={1,2}$/, "");
+        if (s.length % 4 === 1) throw new g.DOMException("Failed to execute 'atob': The string to be decoded is not correctly encoded.", "InvalidCharacterError");
+        var out = "", i = 0, bits = 0, acc = 0;
+        while (i < s.length) {
+            var idx = B64.indexOf(s.charAt(i++));
+            if (idx < 0) throw new g.DOMException("Failed to execute 'atob': The string to be decoded is not correctly encoded.", "InvalidCharacterError");
+            acc = (acc << 6) | idx; bits += 6;
+            if (bits >= 8) { bits -= 8; out += String.fromCharCode((acc >> bits) & 0xFF); }
+        }
         return out;
     };
 
@@ -7206,10 +7299,23 @@ const WORKER_SCOPE: &str = r##"
         var size = 0; for (var i = 0; i < this.__parts.length; i++) { var p = this.__parts[i]; size += (typeof p === "string") ? p.length : ((p && p.byteLength) || 0); }
         this.size = size;
     }
-    Blob.prototype.__text = function () { return this.__parts.map(function (p) { return typeof p === "string" ? p : ""; }).join(""); };
-    Blob.prototype.text = function () { return Promise.resolve(this.__text()); };
-    Blob.prototype.slice = function () { return new Blob(this.__parts, { type: this.type }); };
-    Blob.prototype.arrayBuffer = function () { var t = this.__text(), b = new Uint8Array(t.length); for (var i = 0; i < t.length; i++) b[i] = t.charCodeAt(i) & 0xFF; return Promise.resolve(b.buffer); };
+    // Byte-faithful reads via __blobBytes/__blobText (hoisted, defined with the
+    // blob-URL store below) — a structured-clone-delivered Blob arrives with
+    // Uint8Array parts, which the old string-parts-only text()/arrayBuffer()
+    // read as empty.
+    Blob.prototype.text = function () { return Promise.resolve(__blobText(__blobBytes(this))); };
+    Blob.prototype.slice = function (start, end, contentType) {
+        var bytes = __blobBytes(this), size = bytes.length;
+        var s = start === undefined ? 0 : Math.trunc(+start) || 0;
+        var e = end === undefined ? size : Math.trunc(+end) || 0;
+        s = s < 0 ? Math.max(size + s, 0) : Math.min(s, size);
+        e = e < 0 ? Math.max(size + e, 0) : Math.min(e, size);
+        var span = Math.max(e - s, 0), part = bytes.slice(s, s + span);
+        var u = new Uint8Array(part.length);
+        for (var i = 0; i < part.length; i++) u[i] = part.charCodeAt(i) & 0xFF;
+        return new Blob([u], { type: contentType === undefined ? "" : String(contentType).toLowerCase() });
+    };
+    Blob.prototype.arrayBuffer = function () { var t = __blobBytes(this), b = new Uint8Array(t.length); for (var i = 0; i < t.length; i++) b[i] = t.charCodeAt(i) & 0xFF; return Promise.resolve(b.buffer); };
     function File(parts, name, opts) { Blob.call(this, parts, opts); this.name = String(name); this.lastModified = (opts && opts.lastModified) || Date.now(); }
     File.prototype = Object.create(Blob.prototype);
     g.Blob = Blob; g.File = File;
@@ -7409,9 +7515,15 @@ fn run_worker(
     }
     let mut outcome = Outcome::default();
     let cfg = format!(
-        "globalThis.__worker_cfg = {{ id: {id}, name: {}, url: {} }};",
+        "globalThis.__worker_cfg = {{ id: {id}, name: {}, url: {}, hwc: {} }};",
         js_string(&name),
         js_string(script_url.as_str()),
+        // navigator.hardwareConcurrency: the real host core count, same honest
+        // value the page reports (the WORKER_SCOPE default of 8 was standing in
+        // because this was never passed).
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8),
     );
     run_script(
         &mut ctx,
@@ -9517,34 +9629,86 @@ fn no_incremental() -> bool {
 /// NAME inside a loaded avatar's `alt` text every second — from re-laying-out its
 /// whole ~700KB doc for a change that's invisible. We compare the canonical form
 /// but EMIT the full HTML (the app still wants `alt` for a broken-image fallback).
+///
+/// The scan is TAG-AWARE: attributes are stripped only inside a tag, never from
+/// text (text nodes don't escape quotes, so a code sample reading ` class="a"`
+/// used to be stripped from the COMPARISON — a live text mutation confined to it
+/// then dedup'd as "paints nothing" and the render went stale). The serializer
+/// escapes `<` in both text and attribute values, so a raw `<` always opens a
+/// tag; a raw `"` inside a tag always delimits a value (attr values escape `"`),
+/// so `>` inside a quoted value doesn't close the tag; comments are copied
+/// opaquely (their content is raw — Lit markers can hold anything).
 fn render_canonical(html: &str) -> String {
     let b = html.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
+    let mut in_tag = false;
+    let mut in_quote = false;
     while i < b.len() {
-        if b[i] == b' ' {
-            // Read an attribute name (ascii letters/digits/`-`).
-            let mut j = i + 1;
-            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
-                j += 1;
-            }
-            // ` name="…"` whose name is non-rendered → skip the whole attribute.
-            if j > i + 1 && b.get(j) == Some(&b'=') && b.get(j + 1) == Some(&b'"') {
-                let name = &html[i + 1..j];
-                let drop = matches!(name, "class" | "alt" | "title") || name.starts_with("aria-");
-                if drop {
-                    // Values are double-quoted (a literal `"` is `&quot;`).
-                    let mut k = j + 2;
-                    while k < b.len() && b[k] != b'"' {
-                        k += 1;
-                    }
-                    i = (k + 1).min(b.len());
+        let c = b[i];
+        if !in_tag {
+            if c == b'<' {
+                // A comment is opaque: copy through its `-->` unexamined.
+                if b[i..].starts_with(b"<!--") {
+                    let end = html[i..].find("-->").map(|e| i + e + 3).unwrap_or(b.len());
+                    out.extend_from_slice(&b[i..end]);
+                    i = end;
                     continue;
                 }
+                in_tag = true;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if in_quote {
+            if c == b'"' {
+                in_quote = false;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => {
+                in_quote = true;
+                out.push(c);
+                i += 1;
+            }
+            b'>' => {
+                in_tag = false;
+                out.push(c);
+                i += 1;
+            }
+            b' ' => {
+                // Read an attribute name (ascii letters/digits/`-`).
+                let mut j = i + 1;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
+                    j += 1;
+                }
+                // ` name="…"` whose name is non-rendered → skip the attribute.
+                if j > i + 1 && b.get(j) == Some(&b'=') && b.get(j + 1) == Some(&b'"') {
+                    let name = &html[i + 1..j];
+                    let drop =
+                        matches!(name, "class" | "alt" | "title") || name.starts_with("aria-");
+                    if drop {
+                        // Values are double-quoted (a literal `"` is `&quot;`).
+                        let mut k = j + 2;
+                        while k < b.len() && b[k] != b'"' {
+                            k += 1;
+                        }
+                        i = (k + 1).min(b.len());
+                        continue;
+                    }
+                }
+                out.push(c);
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
             }
         }
-        out.push(b[i]);
-        i += 1;
     }
     // Only whole (ASCII-delimited) attributes were removed, so the rest is intact UTF-8.
     String::from_utf8(out).unwrap_or_else(|_| html.to_string())
@@ -9985,6 +10149,9 @@ const PRELUDE: &str = r##"
     // `new KeyboardEvent(...)`, and check `e instanceof MouseEvent`. They
     // inherit Event's constructor (which already copies init-dict members),
     // so `new MouseEvent("click", { clientX: 5 })` sets `clientX`.
+    // A real subclass (Event's constructor already handles `detail`): with
+    // `CustomEvent === Event`, EVERY event was `instanceof CustomEvent`.
+    class CustomEvent extends Event {}
     class UIEvent extends Event {}
     class MouseEvent extends UIEvent {}
     class PointerEvent extends MouseEvent {}
@@ -10019,7 +10186,7 @@ const PRELUDE: &str = r##"
     }
     // createEvent("MouseEvent") must yield a MouseEvent, etc. (legacy path).
     const EVENT_INTERFACES = {
-        Event, CustomEvent: Event, Events: Event, HTMLEvents: Event,
+        Event, CustomEvent, Events: Event, HTMLEvents: Event,
         UIEvent, UIEvents: UIEvent, MouseEvent, MouseEvents: MouseEvent,
         PointerEvent, WheelEvent, DragEvent, KeyboardEvent, KeyEvents: KeyboardEvent,
         FocusEvent, InputEvent, TouchEvent, CompositionEvent, PopStateEvent,
@@ -10083,40 +10250,64 @@ const PRELUDE: &str = r##"
     // capture phase even for non-bubbling events — capture-delegated focus
     // handling depends on it). A non-bubbling event on a page with no capture
     // listeners keeps the old one-element fast path.
+    //
+    // SHADOW RETARGETING (DOM §2.9 "retargeting"): each path entry carries the
+    // shadow-adjusted target — inside the target's own shadow tree that is the
+    // real target; at the host and above, the HOST. A listener outside a
+    // component sees the component, never its internals (`e.target.closest`
+    // on light-tree delegation can't match nodes inside a shadow root, exactly
+    // like a browser). `ev.target` is restored to the real target after
+    // dispatch. Only Node targets extend their path past themselves: an XHR/
+    // WebSocket/AbortSignal is not in the tree, so its events reach nothing
+    // else (they never bubbled before either; the capture phase must not start
+    // delivering them to window).
     function dispatch(target, ev, forceBubble) {
         ev.target = target;
-        let path = null;
+        let path = null; // [{ n: node, t: shadow-adjusted target }], target-first
         if (forceBubble || ev.bubbles || captureCount > 0) {
-            path = [target];
-            let p = target instanceof Node ? (target.parentNode || target.__host) : null;
-            while (p) { path.push(p); p = p.parentNode || p.__host; }
-            if (target !== g) path.push(g);
+            path = [];
+            let n = target, t = target;
+            path.push({ n: n, t: t });
+            if (n instanceof Node) {
+                for (;;) {
+                    const parent = n.parentNode;
+                    if (parent) { n = parent; }
+                    else if (n.__host) { t = n.__host; n = t; } // shadow hop: retarget
+                    else break;
+                    path.push({ n: n, t: t });
+                }
+                if (target !== g) path.push({ n: g, t: t });
+            }
         }
         let stopped = false;
         if (path && captureCount > 0) {
             ev.eventPhase = 1; // CAPTURING_PHASE
             for (let i = path.length - 1; i >= 1; i--) {
-                ev.currentTarget = path[i];
-                invokeListeners(path[i], ev, 1);
+                ev.currentTarget = path[i].n;
+                ev.target = path[i].t;
+                invokeListeners(path[i].n, ev, 1);
                 if (ev.__stop) { stopped = true; break; }
             }
         }
         if (!stopped) {
             ev.eventPhase = 2; // AT_TARGET
             ev.currentTarget = target;
+            ev.target = target;
             invokeListeners(target, ev, 2);
             if (ev.__stop) stopped = true;
         }
         if (!stopped && path && (forceBubble || ev.bubbles)) {
             ev.eventPhase = 3; // BUBBLING_PHASE
             for (let i = 1; i < path.length; i++) {
-                ev.currentTarget = path[i];
-                invokeListeners(path[i], ev, 3);
+                ev.currentTarget = path[i].n;
+                ev.target = path[i].t;
+                invokeListeners(path[i].n, ev, 3);
                 if (ev.__stop) break;
             }
         }
         ev.eventPhase = 0;
         ev.currentTarget = null;
+        ev.target = target;
         return !ev.defaultPrevented;
     }
     trust.fire = function (target, type, bubble) {
@@ -10769,7 +10960,35 @@ const PRELUDE: &str = r##"
             return true;
         }
         hasChildNodes() { return __dom_children(this.__id).length > 0; }
-        compareDocumentPosition() { return 0; }
+        // DOM §4.4: the position of `other` relative to this node, as a
+        // bitmask. Was a stub returning 0 — which means "same node", so any
+        // caller branching on the bits (ordered insertion, focus traversal)
+        // got nonsense for every pair. Chains use parentNode (the node tree;
+        // the spec does not compose shadows here). Disconnected pairs get the
+        // spec's implementation-specific-but-CONSISTENT order (arena ids are
+        // stable for the page's life).
+        compareDocumentPosition(other) {
+            if (!(other instanceof Node)) throw new TypeError("Failed to execute 'compareDocumentPosition': parameter 1 is not of type 'Node'");
+            if (other === this) return 0;
+            const chain = (n) => { const c = [n]; let p = n.parentNode; while (p) { c.push(p); p = p.parentNode; } return c; };
+            const a = chain(this), b = chain(other);
+            if (a[a.length - 1] !== b[b.length - 1]) {
+                return 1 /* DISCONNECTED */ + 32 /* IMPLEMENTATION_SPECIFIC */
+                    + (other.__id > this.__id ? 4 /* FOLLOWING */ : 2 /* PRECEDING */);
+            }
+            if (b.indexOf(this) >= 0) return 16 + 4;  // other is CONTAINED_BY this (and follows)
+            if (a.indexOf(other) >= 0) return 8 + 2;  // other CONTAINS this (and precedes)
+            // Walk down from the shared root to the deepest common ancestor;
+            // the divergent children's sibling order decides.
+            let i = a.length - 1, j = b.length - 1;
+            while (i > 0 && j > 0 && a[i - 1] === b[j - 1]) { i--; j--; }
+            const kids = a[i].childNodes;
+            for (let k = 0; k < kids.length; k++) {
+                if (kids[k] === a[i - 1]) return 4;   // our branch first → other FOLLOWING
+                if (kids[k] === b[j - 1]) return 2;   // their branch first → other PRECEDING
+            }
+            return 1 + 32 + 4; // unreachable (both branches are children of a[i])
+        }
         normalize() {}
         // addEventListener/removeEventListener/dispatchEvent are inherited from
         // EventTarget.prototype now (Node extends EventTarget, per spec). Keeping
@@ -10782,6 +11001,10 @@ const PRELUDE: &str = r##"
     }
     Node.ELEMENT_NODE = 1; Node.TEXT_NODE = 3; Node.COMMENT_NODE = 8;
     Node.DOCUMENT_NODE = 9; Node.DOCUMENT_FRAGMENT_NODE = 11;
+    Node.DOCUMENT_POSITION_DISCONNECTED = 1; Node.DOCUMENT_POSITION_PRECEDING = 2;
+    Node.DOCUMENT_POSITION_FOLLOWING = 4; Node.DOCUMENT_POSITION_CONTAINS = 8;
+    Node.DOCUMENT_POSITION_CONTAINED_BY = 16;
+    Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC_ORDER = 32;
 
     function makeStyle() {
         return {
@@ -11122,6 +11345,10 @@ const PRELUDE: &str = r##"
         set innerText(v) { this.textContent = v; }
         insertAdjacentHTML(p, h) {
             p = String(p).toLowerCase();
+            // DOM §insert adjacent: an unrecognized position is a SyntaxError
+            // (the Rust fallback used to silently treat it as beforeend).
+            if (p !== "beforebegin" && p !== "afterbegin" && p !== "beforeend" && p !== "afterend")
+                throw new DOMException("Failed to execute 'insertAdjacentHTML': The value provided ('" + p + "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.", "SyntaxError");
             const container = (p === "beforebegin" || p === "afterend") ? this.parentNode : this;
             if (!MO.length || !container) {
                 __dom_insert_adjacent(this.__id, p, String(h));
@@ -11138,8 +11365,10 @@ const PRELUDE: &str = r##"
             const pos = String(p).toLowerCase();
             if (pos === "beforeend") this.appendChild(el);
             else if (pos === "afterbegin") this.insertBefore(el, this.firstChild);
-            else if (pos === "beforebegin" && this.parentNode) this.parentNode.insertBefore(el, this);
-            else if (pos === "afterend" && this.parentNode) this.parentNode.insertBefore(el, this.nextSibling);
+            // beforebegin/afterend with no parent: return null, no insertion (spec).
+            else if (pos === "beforebegin") { if (!this.parentNode) return null; this.parentNode.insertBefore(el, this); }
+            else if (pos === "afterend") { if (!this.parentNode) return null; this.parentNode.insertBefore(el, this.nextSibling); }
+            else throw new DOMException("Failed to execute 'insertAdjacentElement': The value provided ('" + pos + "') is not one of 'beforeBegin', 'afterBegin', 'beforeEnd', or 'afterEnd'.", "SyntaxError");
             return el;
         }
         insertAdjacentText(p, text) {
@@ -11836,7 +12065,18 @@ const PRELUDE: &str = r##"
         get head() { return this.querySelector("head"); }
         get readyState() { return trust.readyState; }
         get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
-        set title(v) { const t = this.querySelector("title"); if (t) t.textContent = String(v); }
+        // HTML §the title element: setting with no <title> CREATES one in the
+        // head (the old setter silently dropped the write); no head → no-op.
+        set title(v) {
+            let t = this.querySelector("title");
+            if (!t) {
+                const head = this.querySelector("head");
+                if (!head) return;
+                t = this.createElement("title");
+                head.appendChild(t);
+            }
+            t.textContent = String(v);
+        }
         get cookie() { return __cookie_get(); }
         set cookie(v) { __cookie_set(String(v)); }
         get location() { return g.location; }
@@ -11890,7 +12130,19 @@ const PRELUDE: &str = r##"
         get forms() { return this.querySelectorAll("form"); }
         get links() { return this.querySelectorAll("a[href]"); }
         get images() { return this.querySelectorAll("img"); }
-        get scripts() { return []; }
+        // The arena keeps script ELEMENTS (only the render serializer drops
+        // them), so this is the real collection — it returned `[]` before,
+        // hiding every script from a view-transitions swap that re-executes
+        // the new document's scripts.
+        get scripts() { return this.querySelectorAll("script"); }
+        // CSSOM §document.styleSheets: the document's sheets in tree order.
+        // Our cascade folds fetched <link> sheets in Rust-side (link.sheet is
+        // null — no CSSOM object exists for them), so the list is the <style>
+        // elements' parsed sheets. Didn't exist at all before — code iterating
+        // it threw on `undefined`.
+        get styleSheets() {
+            return new StyleSheetList(this.querySelectorAll("style").map((s) => s.sheet));
+        }
         createElement(t) {
             const el = wrap(__dom_create_element(String(t)));
             const ctor = CE.defs.get(String(t).toLowerCase());
@@ -11916,7 +12168,12 @@ const PRELUDE: &str = r##"
             }
             return wrap(__dom_get_by_id(String(i)));
         }
-        getElementsByName(n) { return this.querySelectorAll("[name=" + String(n) + "]"); }
+        // Quoted + escaped: an unquoted `[name=X]` broke on any name with
+        // selector-special characters (the FrameDocument version already quoted).
+        getElementsByName(n) {
+            const esc = String(n).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+            return this.querySelectorAll('[name="' + esc + '"]');
+        }
         // `document.elementFromPoint(x, y)` (CSSOM View): the topmost element at
         // the viewport coordinate, or null when the point is outside the
         // viewport. A terminal browser does no JS-side pixel hit-testing, so we
@@ -12443,6 +12700,15 @@ const PRELUDE: &str = r##"
         [Symbol.iterator]() { return Array.prototype[Symbol.iterator].call(this); }
     }
     function ruleList(items) { return new CSSRuleList(items); }
+    // CSSOM §StyleSheetList — the type behind `document.styleSheets` (which
+    // simply didn't exist; iterating it threw on `undefined`). Same
+    // array-like shape as CSSRuleList.
+    class StyleSheetList {
+        constructor(items) { this.length = items.length; for (let i = 0; i < items.length; i++) this[i] = items[i]; }
+        item(i) { return this[Number(i)] ?? null; }
+        [Symbol.iterator]() { return Array.prototype[Symbol.iterator].call(this); }
+        get [Symbol.toStringTag]() { return "StyleSheetList"; }
+    }
 
     class CSSRule { get cssText() { return ""; } get parentStyleSheet() { return null; } }
     class CSSStyleRule extends CSSRule {
@@ -12616,7 +12882,7 @@ const PRELUDE: &str = r##"
     g.Node = Node; g.Element = Element; g.HTMLElement = HTMLElement;
     g.Text = Text; g.Document = Document; g.HTMLDocument = Document;
     g.DocumentFragment = DocumentFragment; g.Comment = Comment;
-    g.Event = Event; g.CustomEvent = Event;
+    g.Event = Event; g.CustomEvent = CustomEvent;
     g.UIEvent = UIEvent; g.MouseEvent = MouseEvent; g.PointerEvent = PointerEvent;
     g.WheelEvent = WheelEvent; g.DragEvent = DragEvent; g.KeyboardEvent = KeyboardEvent;
     g.FocusEvent = FocusEvent; g.InputEvent = InputEvent; g.TouchEvent = TouchEvent;
@@ -12646,6 +12912,7 @@ const PRELUDE: &str = r##"
     g.CSSKeyframesRule = CSSKeyframesRule; g.CSSImportRule = CSSImportRule;
     g.CSSNamespaceRule = CSSNamespaceRule; g.CSSCounterStyleRule = CSSCounterStyleRule;
     g.CSSPropertyRule = CSSPropertyRule; g.CSSRuleList = CSSRuleList;
+    g.StyleSheetList = StyleSheetList;
     g.customElements = customElements;
     g.SVGElement = SVGElement;
     g.HTMLInputElement = HTMLInputElement; g.HTMLSelectElement = HTMLSelectElement;
@@ -12774,10 +13041,14 @@ const PRELUDE: &str = r##"
         bezierCurveTo() {} quadraticCurveTo() {} arc() {} arcTo() {}
         ellipse() {} rect() {} roundRect() {}
     };
-    // Blob/File — a standard data container. We don't do real binary I/O, but
-    // sites construct Blobs (object URLs, sanitizer/worker plumbing, feature
-    // detection) and a bare `Blob` reference (ReferenceError when absent) silently
-    // broke YouTube renderers. Tracks size/type and stringifies its text parts.
+    // Blob/File — a standard data container. Sites construct Blobs (object
+    // URLs, upload chunking, sanitizer/worker plumbing) and a bare `Blob`
+    // reference (ReferenceError when absent) silently broke YouTube renderers.
+    // The read surface is BYTE-faithful: `__blobBytes` (hoisted, defined with
+    // the blob-URL store below) flattens the parts to the true underlying
+    // bytes — string parts UTF-8, BufferSource parts raw — so slice()/text()/
+    // arrayBuffer()/stream() round-trip binary instead of losing it (slice()
+    // used to return an EMPTY blob, so upload chunkers sent nothing).
     g.Blob = class Blob {
         constructor(parts, opts) {
             this.__parts = Array.isArray(parts) ? parts.slice() : (parts ? [parts] : []);
@@ -12791,21 +13062,30 @@ const PRELUDE: &str = r##"
             this.size = size;
             this.type = (opts && opts.type) ? String(opts.type).toLowerCase() : "";
         }
-        slice(_s, _e, type) { return new g.Blob([], { type: type || this.type }); }
-        text() { return Promise.resolve(this.__parts.map((p) => (typeof p === "string" ? p : "")).join("")); }
-        arrayBuffer() { return Promise.resolve(new ArrayBuffer(0)); }
-        stream() { return null; }
+        // File API §slice: negative offsets are size-relative, the range is
+        // clamped, and the slice carries the given content type (or "").
+        slice(start, end, contentType) {
+            const bytes = __blobBytes(this);
+            const size = bytes.length;
+            let s = start === undefined ? 0 : Math.trunc(+start) || 0;
+            let e = end === undefined ? size : Math.trunc(+end) || 0;
+            if (s < 0) s = Math.max(size + s, 0); else s = Math.min(s, size);
+            if (e < 0) e = Math.max(size + e, 0); else e = Math.min(e, size);
+            const span = Math.max(e - s, 0);
+            return new g.Blob([__latin1ToBytes(bytes.slice(s, s + span))],
+                { type: contentType === undefined ? "" : String(contentType).toLowerCase() });
+        }
+        text() { return Promise.resolve(new g.TextDecoder().decode(__latin1ToBytes(__blobBytes(this)))); }
+        arrayBuffer() { return Promise.resolve(__latin1ToBytes(__blobBytes(this)).buffer); }
+        stream() {
+            const bytes = __latin1ToBytes(__blobBytes(this));
+            return new g.ReadableStream({
+                start(c) { if (bytes.length) c.enqueue(bytes); c.close(); },
+            });
+        }
     };
     g.File = class File extends g.Blob {
         constructor(parts, name, opts) { super(parts, opts); this.name = String(name); this.lastModified = (opts && opts.lastModified) || Date.now(); }
-    };
-    // The text behind a Blob/File: its string parts joined (the bytes our
-    // Blob keeps; non-string parts have no captured data here, so "").
-    const blobText = (b) => {
-        if (b === null || b === undefined) return "";
-        if (typeof b === "string") return b;
-        if (Array.isArray(b.__parts)) return b.__parts.map((p) => (typeof p === "string" ? p : "")).join("");
-        return "";
     };
     // Text -> its UTF-8 bytes as a binary (latin1) string, so btoa() and
     // ArrayBuffer views see real bytes (not surrogate-pair chars).
@@ -12964,16 +13244,18 @@ const PRELUDE: &str = r##"
                 }
             }, 0);
         }
-        readAsText(blob) { this.__read(blob, (b) => blobText(b)); }
-        readAsBinaryString(blob) { this.__read(blob, (b) => utf8Binary(blobText(b))); }
+        // Byte-faithful reads via `__blobBytes` (string-only blobs read
+        // identically to the old text-part join; binary parts now survive).
+        readAsText(blob) { this.__read(blob, (b) => new g.TextDecoder().decode(__latin1ToBytes(__blobBytes(b)))); }
+        readAsBinaryString(blob) { this.__read(blob, (b) => __blobBytes(b)); }
         readAsDataURL(blob) {
             this.__read(blob, (b) => {
                 const type = (b && b.type) || "application/octet-stream";
-                return "data:" + type + ";base64," + g.btoa(utf8Binary(blobText(b)));
+                return "data:" + type + ";base64," + g.btoa(__blobBytes(b));
             });
         }
         readAsArrayBuffer(blob) {
-            this.__read(blob, (b) => g.TextEncoder ? new g.TextEncoder().encode(blobText(b)).buffer : new ArrayBuffer(0));
+            this.__read(blob, (b) => __latin1ToBytes(__blobBytes(b)).buffer);
         }
         abort() {
             if (this.readyState !== 1) return;
@@ -13100,6 +13382,19 @@ const PRELUDE: &str = r##"
         appVersion: String(cfg.ua).replace(/^Mozilla\//, ""),
         doNotTrack: null,
         hardwareConcurrency: cfg.hardwareConcurrency || 8, maxTouchPoints: 0,
+        // Beacon API §sendBeacon: a fire-and-forget POST. We really send it
+        // (there is no unload window to defer past, so queue-and-send
+        // collapses to send-now); `true` is the spec's accepted-for-
+        // transmission signal, `false` only if the arguments are unusable.
+        // Analytics/telemetry call this unguarded from visibility handlers —
+        // a missing function was an uncaught TypeError there.
+        sendBeacon(url, data) {
+            try {
+                g.fetch(String(url), { method: "POST", body: data === undefined ? null : data, keepalive: true })
+                    .catch(() => {});
+                return true;
+            } catch (e) { return false; }
+        },
         // Permissions API (navigator.permissions.query) — feature-detected
         // widely. Returns a Promise<PermissionStatus>. We grant no device/UA
         // capability, so every query resolves to the neutral pre-decision
@@ -14138,61 +14433,15 @@ const PRELUDE: &str = r##"
         }
     }
     g.FinalizationRegistry = FinalizationRegistry;
-    // The HTML structured-clone algorithm: a deep copy that follows the
-    // object graph (handling cycles), supported by every browser as a global.
-    // Apps lean on it to snapshot state before mutating (Open WebUI's chat
-    // submit clones the attachments list before sending — without this it threw
-    // mid-submit, after the input was cleared, so the message silently never
-    // sent). Covers the cloneable types pages actually use; throws DataCloneError
-    // on functions/symbols like a real browser. No transfer support.
-    g.structuredClone = function (value) {
-        const seen = new Map();
-        const clone = (v) => {
-            const t = typeof v;
-            if (v === null || (t !== "object" && t !== "function")) {
-                if (t === "function" || t === "symbol") {
-                    throw new DOMException("value could not be cloned", "DataCloneError");
-                }
-                return v;
-            }
-            if (t === "function") {
-                throw new DOMException("value could not be cloned", "DataCloneError");
-            }
-            if (seen.has(v)) return seen.get(v);
-            if (v instanceof Date) return new Date(v.getTime());
-            if (v instanceof RegExp) return new RegExp(v.source, v.flags);
-            if (typeof ArrayBuffer !== "undefined" && v instanceof ArrayBuffer) return v.slice(0);
-            if (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView && ArrayBuffer.isView(v)) {
-                if (typeof DataView !== "undefined" && v instanceof DataView) {
-                    return new DataView(v.buffer.slice(0), v.byteOffset, v.byteLength);
-                }
-                return new v.constructor(v); // typed array: copies into a fresh buffer
-            }
-            let out;
-            if (Array.isArray(v)) {
-                out = [];
-                seen.set(v, out);
-                for (let i = 0; i < v.length; i++) out[i] = clone(v[i]);
-                return out;
-            }
-            if (v instanceof Map) {
-                out = new Map();
-                seen.set(v, out);
-                v.forEach((val, key) => out.set(clone(key), clone(val)));
-                return out;
-            }
-            if (v instanceof Set) {
-                out = new Set();
-                seen.set(v, out);
-                v.forEach((val) => out.add(clone(val)));
-                return out;
-            }
-            out = {};
-            seen.set(v, out);
-            for (const k of Object.keys(v)) out[k] = clone(v[k]);
-            return out;
-        };
-        return clone(value);
+    // The HTML structured-clone algorithm — via the SAME wire codec workers
+    // use (`__sc_serialize`/`__sc_deserialize`, defined below; single source
+    // of truth). Cycles, Map/Set, ArrayBuffer/typed arrays/DataView, Date/
+    // RegExp/Error/Blob/File all round-trip; functions, symbols, and DOM
+    // nodes throw DataCloneError — the old inline clone silently copied a DOM
+    // node as a plain object (`__id` included), a wrapper aliasing a live
+    // arena node. No transfer support (`options.transfer` ignored).
+    g.structuredClone = function (value, _options) {
+        return g.__sc_deserialize(g.__sc_serialize(value));
     };
     trust.oneShot = false;
     trust.tick = function () {
@@ -14298,10 +14547,19 @@ const PRELUDE: &str = r##"
         return out;
     };
     g.atob = (s) => {
-        s = String(s).replace(/=+$/, ""); let out = "", buf = 0, bits = 0;
+        // Forgiving-base64 decode (WHATWG Infra §4.5): strip ASCII whitespace,
+        // then up to two trailing `=` when the length is a multiple of 4; a
+        // remaining non-alphabet character or a length ≡ 1 (mod 4) throws
+        // InvalidCharacterError — we used to skip bad input silently, which
+        // turned corrupt base64 into corrupt bytes instead of the error the
+        // caller's catch path expects.
+        s = String(s).replace(/[\t\n\f\r ]+/g, "");
+        if (s.length % 4 === 0) s = s.replace(/={1,2}$/, "");
+        if (s.length % 4 === 1) throw new DOMException("Failed to execute 'atob': The string to be decoded is not correctly encoded.", "InvalidCharacterError");
+        let out = "", buf = 0, bits = 0;
         for (const ch of s) {
             const v = B64.indexOf(ch);
-            if (v < 0) continue;
+            if (v < 0) throw new DOMException("Failed to execute 'atob': The string to be decoded is not correctly encoded.", "InvalidCharacterError");
             buf = (buf << 6) | v; bits += 6;
             if (bits >= 8) { bits -= 8; out += String.fromCharCode((buf >> bits) & 255); }
         }
@@ -15010,7 +15268,7 @@ const PRELUDE: &str = r##"
         if (body === null || body === undefined) return null;
         if (typeof body === "string") return body;
         if (body instanceof URLSearchParams) return body.toString();
-        if (Array.isArray(body.__parts)) return blobText(body); // Blob/File
+        if (Array.isArray(body.__parts)) return new g.TextDecoder().decode(__latin1ToBytes(__blobBytes(body))); // Blob/File, byte-faithful
         if (typeof body.byteLength === "number") {
             try {
                 const v = body instanceof ArrayBuffer ? new Uint8Array(body)
@@ -15033,7 +15291,7 @@ const PRELUDE: &str = r##"
         if (body === null || body === undefined) return null;
         if (typeof body === "string") return utf8Binary(body);
         if (body instanceof URLSearchParams) return utf8Binary(body.toString());
-        if (Array.isArray(body.__parts)) return utf8Binary(blobText(body)); // Blob/File
+        if (Array.isArray(body.__parts)) return __blobBytes(body); // Blob/File: the true bytes ARE the wire form
         if (typeof body.byteLength === "number") {
             try {
                 const v = body instanceof ArrayBuffer ? new Uint8Array(body)
@@ -15061,7 +15319,7 @@ const PRELUDE: &str = r##"
             if (e.value && Array.isArray(e.value.__parts)) { // File
                 out += utf8Binary('Content-Disposition: form-data; name="' + escName(e.name) + '"; filename="' + escName(e.value.name == null ? "blob" : e.value.name) + '"') + "\r\n";
                 out += "Content-Type: " + (e.value.type || "application/octet-stream") + "\r\n\r\n";
-                out += utf8Binary(blobText(e.value)) + "\r\n";
+                out += __blobBytes(e.value) + "\r\n";
             } else {
                 out += utf8Binary('Content-Disposition: form-data; name="' + escName(e.name) + '"') + "\r\n\r\n";
                 out += utf8Binary(String(e.value).replace(/\r\n|\r|\n/g, "\r\n")) + "\r\n";
@@ -15393,8 +15651,27 @@ const PRELUDE: &str = r##"
             try { return new (G.DOMException || Error)(what + " could not be cloned.", "DataCloneError"); }
             catch (e) { var er = new Error(what + " could not be cloned."); er.name = "DataCloneError"; return er; }
         }
+        // A Blob/File's true bytes as a latin1 string: string parts UTF-8,
+        // BufferSource parts raw, nested blobs recursed — so a binary Blob
+        // survives postMessage instead of arriving empty. Self-contained
+        // (the codec runs in both the page and worker realms).
         function blobBytes(b) {
-            return (b.__parts || []).map(function (p) { return typeof p === "string" ? p : ""; }).join("");
+            var parts = b.__parts || [], out = "", i, j, v, p;
+            for (i = 0; i < parts.length; i++) {
+                p = parts[i];
+                if (typeof p === "string") { v = new G.TextEncoder().encode(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
+                else if (p instanceof ArrayBuffer) { v = new Uint8Array(p); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
+                else if (p && typeof p.byteLength === "number" && p.buffer) { v = new Uint8Array(p.buffer, p.byteOffset || 0, p.byteLength); for (j = 0; j < v.length; j++) out += String.fromCharCode(v[j]); }
+                else if (p && p.__parts) out += blobBytes(p);
+            }
+            return out;
+        }
+        // The decode side: rebuild the bytes as a Uint8Array part (a string
+        // part would be re-UTF-8'd by the byte-faithful Blob readers).
+        function blobPart(s) {
+            var u = new Uint8Array(s.length);
+            for (var i = 0; i < s.length; i++) u[i] = s.charCodeAt(i) & 0xff;
+            return u;
         }
         function enc(value, heap, seen) {
             var t = typeof value;
@@ -15460,8 +15737,8 @@ const PRELUDE: &str = r##"
                 case "M": return new Map();
                 case "S": return new Set();
                 case "AB": return new Uint8Array(node[1]).buffer;
-                case "F": return G.File ? new G.File([node[1]], node[3], { type: node[2], lastModified: node[4] }) : new G.Blob([node[1]], { type: node[2] });
-                case "B": return G.Blob ? new G.Blob([node[1]], { type: node[2] }) : { __blobText: node[1], type: node[2] };
+                case "F": return G.File ? new G.File([blobPart(node[1])], node[3], { type: node[2], lastModified: node[4] }) : new G.Blob([blobPart(node[1])], { type: node[2] });
+                case "B": return G.Blob ? new G.Blob([blobPart(node[1])], { type: node[2] }) : { __blobText: node[1], type: node[2] };
                 case "E": { var e = new Error(node[2]); e.name = node[1]; if (node[3]) try { e.stack = node[3]; } catch (x) {} return e; }
                 case "A": return new Array(node[1]);
                 case "O": return {};
@@ -15564,6 +15841,31 @@ const PRELUDE: &str = r##"
         }
         return s;
     }
+    // Decode a `data:` URL (RFC 2397) to response parts, or null on a
+    // malformed one: { ctype, text, bytes } — bytes as a latin1 string.
+    // base64 payloads go through the strict atob; percent-encoded payloads
+    // decode BYTEWISE (`%XX` → the byte; `+` stays literal — the trap the
+    // Instagram data:-script work pinned). Serves fetch()/XHR below, so a
+    // page's `fetch("data:…")` resolves in-realm instead of being rejected
+    // by the http(s)-only network syscall.
+    function __dataURLParts(u) {
+        const m = /^data:([^,]*),([\s\S]*)$/.exec(u);
+        if (!m) return null;
+        let meta = m[1];
+        let b64 = false;
+        if (/;base64$/i.test(meta)) { b64 = true; meta = meta.replace(/;base64$/i, ""); }
+        let bytes;
+        if (b64) {
+            try { bytes = g.atob(m[2].replace(/[\t\n\f\r ]+/g, "")); } catch (e) { return null; }
+        } else {
+            bytes = m[2].replace(/%([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+        }
+        return {
+            ctype: meta || "text/plain;charset=US-ASCII",
+            text: new g.TextDecoder().decode(__latin1ToBytes(bytes)),
+            bytes: bytes,
+        };
+    }
     // The inverse, for RESPONSE headers: the syscalls return all response
     // headers as the same `name\nvalue\n…` blob (r[4]); split it back into a
     // lowercased name→value map for `Response.headers` / XHR header getters.
@@ -15604,6 +15906,16 @@ const PRELUDE: &str = r##"
                     );
                 });
             };
+            // A `data:` URL decodes in-realm (Fetch §"scheme fetch" for data)
+            // — the network syscall is http(s)-only and used to reject these.
+            if (url.slice(0, 5) === "data:") {
+                const dp = __dataURLParts(url);
+                if (!dp) return Promise.reject(new TypeError("fetch failed: invalid data: URL"));
+                const dresp = new Response(dp.text, { status: 200, statusText: "", headers: { "content-type": dp.ctype }, url: url });
+                dresp.type = "basic";
+                dresp.__bytes = dp.bytes; // byte-exact body for arrayBuffer()/blob()
+                return Promise.resolve(dresp);
+            }
             // A `blob:` URL is served from the in-realm store, never the wire
             // (File API / Fetch §"scheme fetch" for blob). Missing/revoked entry
             // → network error (a rejected fetch), exactly like the platform.
@@ -15693,6 +16005,27 @@ const PRELUDE: &str = r##"
             this.__respObj = out;
             return out;
         }
+        // XHR §the responseXML attribute: only readable in ""/"document" mode;
+        // a document only when the response's MIME type is a document type —
+        // for "" that means XML ONLY (an HTML response reads null, which is
+        // what jQuery-era code expects); "document" mode accepts HTML too.
+        // Parsed via DOMParser (our parser is HTML — the honest approximation
+        // for XML input, same as the `response` document mode).
+        get responseXML() {
+            if (this.__respType !== "" && this.__respType !== "document")
+                throw new DOMException("responseXML is only available for '' or 'document' responseType", "InvalidStateError");
+            if (this.readyState !== 4) return null;
+            if (this.__respXML !== undefined) return this.__respXML;
+            const ct = String(this.__ctype || "").toLowerCase();
+            const isXml = /xml/.test(ct) && !/html/.test(ct);
+            const isHtml = /html/.test(ct);
+            let out = null;
+            if (isXml || (isHtml && this.__respType === "document")) {
+                try { out = new g.DOMParser().parseFromString(this.__text, isXml ? "text/xml" : "text/html"); } catch (e) { out = null; }
+            }
+            this.__respXML = out;
+            return out;
+        }
         open(method, url, isAsync) {
             this.__method = String(method).toUpperCase();
             // Resolve against the document base URL (XHR `open()`: parse url with
@@ -15726,7 +16059,7 @@ const PRELUDE: &str = r##"
             this.__aborted = true;
             if (this.__inFlight) {
                 this.__inFlight = false;
-                this.status = 0; this.__text = ""; this.__bytes = null; this.__respObj = undefined;
+                this.status = 0; this.__text = ""; this.__bytes = null; this.__respObj = undefined; this.__respXML = undefined;
                 this.readyState = 4;
                 this.__fire("readystatechange");
                 this.__fire("abort");
@@ -15759,7 +16092,7 @@ const PRELUDE: &str = r##"
             this.__text = r[2]; this.__bytes = r[3] != null ? r[3] : null;
             this.__hdrs = r.length > 4 ? __parseHdrBlob(r[4]) : null;
             if (this.__hdrs && this.__ctype && this.__hdrs["content-type"] === undefined) this.__hdrs["content-type"] = this.__ctype;
-            this.__respObj = undefined;
+            this.__respObj = undefined; this.__respXML = undefined;
             this.responseURL = this.__url;
             this.readyState = 4;
             this.__fire("readystatechange"); this.__fire("load"); this.__fire("loadend");
@@ -15785,6 +16118,16 @@ const PRELUDE: &str = r##"
                         xhr.__fire("loadend");
                     }, this.timeout);
                 }
+            }
+            // A `data:` URL decodes in-realm, mirroring fetch (a malformed one
+            // is a network error → the `error` event).
+            if (typeof this.__url === "string" && this.__url.slice(0, 5) === "data:") {
+                const dp = __dataURLParts(this.__url);
+                const arr = dp ? [200, dp.ctype || null, dp.text, dp.bytes] : null;
+                const xhr = this;
+                if (this.__sync) this.__finish(arr);
+                else g.setTimeout(function () { xhr.__finish(arr); }, 0);
+                return;
             }
             // A `blob:` URL resolves from the in-realm store, off the wire; a
             // missing/revoked entry is a network error (__finish(null) → error
@@ -18273,7 +18616,7 @@ mod tests {
         // Page A: miss → compile → store (replayable + portable) → run.
         let mut a = Context::default();
         let mut oa = Outcome::default();
-        run_external_classic(&mut a, url, lib, None, &budget, &mut oa);
+        run_external_classic(&mut a, url, lib, None, None, &budget, &mut oa);
         assert!(oa.errors.is_empty(), "{:?}", oa.errors);
         assert!(
             matches!(cdn_cache_lookup(&key), CdnLookup::Reusable(_)),
@@ -18292,7 +18635,7 @@ mod tests {
         // recreate the globals, and a later script must resolve them by name.
         let mut b = Context::default();
         let mut ob = Outcome::default();
-        run_external_classic(&mut b, url, lib, None, &budget, &mut ob);
+        run_external_classic(&mut b, url, lib, None, None, &budget, &mut ob);
         assert!(ob.errors.is_empty(), "{:?}", ob.errors);
         assert_eq!(
             b.eval(Source::from_bytes(b"libDouble(LibVer)"))
@@ -18319,7 +18662,7 @@ mod tests {
         // Page A: a true miss → compile + store + run.
         let mut a = Context::default();
         let mut oa = Outcome::default();
-        run_external_classic(&mut a, url, lib, None, &budget, &mut oa);
+        run_external_classic(&mut a, url, lib, None, None, &budget, &mut oa);
         assert!(oa.errors.is_empty(), "{:?}", oa.errors);
         assert_eq!(
             a.eval(Source::from_bytes(b"globalThis.__cdn_reuse"))
@@ -18336,7 +18679,7 @@ mod tests {
         // Page B: a fresh realm, now a cache HIT → rehydrate (carrier path).
         let mut b = Context::default();
         let mut ob = Outcome::default();
-        run_external_classic(&mut b, url, lib, None, &budget, &mut ob);
+        run_external_classic(&mut b, url, lib, None, None, &budget, &mut ob);
         assert!(ob.errors.is_empty(), "{:?}", ob.errors);
         assert_eq!(
             b.eval(Source::from_bytes(b"globalThis.__cdn_reuse"))
@@ -18361,6 +18704,7 @@ mod tests {
             &mut a,
             "https://cdn.example/np.js",
             lib,
+            None,
             None,
             &budget,
             &mut oa,
@@ -18387,21 +18731,22 @@ mod tests {
         let lib = br#"(function(){ globalThis.__cdn_hits = 1; })();"#;
         let url = "https://cdn.example/hits.js";
         let scripts = vec![(Some(url.to_string()), String::new(), None, 0usize)];
-        let externals = vec![(url.to_string(), Some(lib.to_vec()))];
+        let externals = vec![(url.to_string(), Some(std::sync::Arc::new(lib.to_vec())))];
+        let keys = cdn_cache_keys(&scripts, &externals);
 
         // Uncached → not a hit (so it WOULD go to the parse pool).
         assert!(
-            cdn_cache_hits(&scripts, &externals).is_empty(),
+            cdn_cache_hits(&keys).is_empty(),
             "an uncached library must not be flagged as a hit"
         );
         // Warm the cache.
         let mut a = Context::default();
         let mut oa = Outcome::default();
-        run_external_classic(&mut a, url, lib, None, &budget, &mut oa);
+        run_external_classic(&mut a, url, lib, None, None, &budget, &mut oa);
         assert!(oa.errors.is_empty(), "{:?}", oa.errors);
         // Cached → flagged (so it's rehydrated, not re-parsed).
         assert!(
-            cdn_cache_hits(&scripts, &externals).contains(&0),
+            cdn_cache_hits(&keys).contains(&0),
             "a cached library must be flagged for rehydration"
         );
     }
@@ -19971,6 +20316,323 @@ mod tests {
     }
 
     #[test]
+    fn render_canonical_keeps_attr_lookalikes_in_text() {
+        // Text nodes don't escape quotes, so ` class="a"` can appear verbatim
+        // in TEXT (a code sample). The old byte scan stripped it from the
+        // comparison — a live mutation confined to that text then dedup'd as
+        // "paints nothing" and the render went stale. The tag-aware scan
+        // strips only inside tags.
+        let a = r#"<pre>use class="a" here</pre>"#;
+        let b = r#"<pre>use class="b" here</pre>"#;
+        assert_ne!(
+            render_canonical(a),
+            render_canonical(b),
+            "text changes must stay visible to the dedup"
+        );
+        // Real attributes still strip (the Twitch alt-rotation dedup)…
+        let c = r#"<div class="x" style="color:red">t</div>"#;
+        let d = r#"<div class="y" style="color:red">t</div>"#;
+        assert_eq!(
+            render_canonical(c),
+            render_canonical(d),
+            "class attrs still canonicalize away"
+        );
+        // …a `>` inside a quoted attr value doesn't end the tag…
+        let e = r#"<div title="a>b" class="x">t</div>"#;
+        assert_eq!(render_canonical(e), "<div>t</div>", "quoted > handled");
+        // …and comments are opaque.
+        let f = r#"<!-- keep class="m" --><i>t</i>"#;
+        assert_eq!(render_canonical(f), f, "comment content is untouched");
+    }
+
+    #[test]
+    fn compare_document_position_reports_order_and_containment() {
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "cdp.js",
+            br##"
+            globalThis.out = {};
+            const outer = document.getElementById("outer");
+            const b = document.getElementById("b");
+            out.self = b.compareDocumentPosition(b);
+            out.contains = outer.compareDocumentPosition(b);    // CONTAINED_BY + FOLLOWING = 20
+            out.containedBy = b.compareDocumentPosition(outer); // CONTAINS + PRECEDING = 10
+            const sib = document.createElement("span");
+            outer.appendChild(sib);
+            out.following = b.compareDocumentPosition(sib);     // FOLLOWING = 4
+            out.preceding = sib.compareDocumentPosition(b);     // PRECEDING = 2
+            const det = document.createElement("div");
+            out.disconnected = b.compareDocumentPosition(det) & 33; // DISCONNECTED + IMPL_SPECIFIC
+            out.consts = Node.DOCUMENT_POSITION_CONTAINS + "," + Node.DOCUMENT_POSITION_CONTAINED_BY;
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"String(out.self)"), "0");
+        assert_eq!(s(&mut ctx, b"String(out.contains)"), "20");
+        assert_eq!(s(&mut ctx, b"String(out.containedBy)"), "10");
+        assert_eq!(s(&mut ctx, b"String(out.following)"), "4");
+        assert_eq!(s(&mut ctx, b"String(out.preceding)"), "2");
+        assert_eq!(s(&mut ctx, b"String(out.disconnected)"), "33");
+        assert_eq!(s(&mut ctx, b"out.consts"), "8,16");
+    }
+
+    #[test]
+    fn data_urls_resolve_in_realm_for_fetch_and_xhr() {
+        // Fetch §scheme fetch for data: — decoded in-realm (the network
+        // syscall is http(s)-only and used to reject these). base64 and
+        // percent forms; bytes exact through arrayBuffer().
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "data.js",
+            br##"
+            globalThis.out = {};
+            fetch("data:text/plain;base64,aGk=").then((r) => {
+                out.ct = r.headers.get("content-type");
+                return r.text();
+            }).then((t) => { out.text = t; });
+            fetch("data:application/octet-stream;base64,/wBB").then((r) => r.arrayBuffer())
+                .then((b) => { out.bytes = Array.from(new Uint8Array(b)).join(","); });
+            const x = new XMLHttpRequest();
+            x.open("GET", "data:text/plain,hello%20x+y", false);
+            x.send();
+            out.xhr = x.status + ":" + x.responseText;
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.ct"), "text/plain");
+        assert_eq!(s(&mut ctx, b"out.text"), "hi");
+        assert_eq!(s(&mut ctx, b"out.bytes"), "255,0,65");
+        // `+` stays literal in data: URLs (the Instagram trap).
+        assert_eq!(s(&mut ctx, b"out.xhr"), "200:hello x+y");
+    }
+
+    #[test]
+    fn blob_reads_are_byte_faithful_and_slice_works() {
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "blob.js",
+            br##"
+            globalThis.out = {};
+            const bin = new Uint8Array([255, 0, 65, 66]);
+            const b = new Blob([bin, "h\u00e9"], { type: "application/x-mix" });
+            b.arrayBuffer().then((buf) => { out.all = Array.from(new Uint8Array(buf)).join(","); });
+            // slice() used to return an EMPTY blob (chunkers sent nothing).
+            b.slice(1, 3).arrayBuffer().then((buf) => { out.mid = Array.from(new Uint8Array(buf)).join(","); });
+            b.slice(-2).arrayBuffer().then((buf) => { out.tail = Array.from(new Uint8Array(buf)).join(","); });
+            new Blob(["h\u00e9llo"]).text().then((t) => { out.text = t; });
+            // structuredClone routes through the wire codec: bytes round-trip,
+            // and a DOM node throws DataCloneError instead of cloning `__id`.
+            structuredClone(new Blob([bin])).arrayBuffer().then((buf) => {
+                out.cloned = Array.from(new Uint8Array(buf)).join(",");
+            });
+            try { structuredClone(document.getElementById("b")); out.node = "cloned"; }
+            catch (e) { out.node = e.name; }
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        // "hé" is 0x68 0xC3 0xA9 in UTF-8.
+        assert_eq!(s(&mut ctx, b"out.all"), "255,0,65,66,104,195,169");
+        assert_eq!(s(&mut ctx, b"out.mid"), "0,65");
+        assert_eq!(s(&mut ctx, b"out.tail"), "195,169");
+        assert_eq!(s(&mut ctx, b"out.text"), "h\u{e9}llo");
+        assert_eq!(s(&mut ctx, b"out.cloned"), "255,0,65,66");
+        assert_eq!(s(&mut ctx, b"out.node"), "DataCloneError");
+    }
+
+    #[test]
+    fn atob_throws_invalid_character_error_on_bad_input() {
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "atob.js",
+            br##"
+            globalThis.out = {};
+            out.ok = atob("aGk=");
+            out.ws = atob(" aG\n k= ");
+            try { atob("a"); out.short = "decoded"; } catch (e) { out.short = e.name; }
+            try { atob("a$b="); out.bad = "decoded"; } catch (e) { out.bad = e.name; }
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.ok"), "hi");
+        assert_eq!(s(&mut ctx, b"out.ws"), "hi");
+        assert_eq!(s(&mut ctx, b"out.short"), "InvalidCharacterError");
+        assert_eq!(s(&mut ctx, b"out.bad"), "InvalidCharacterError");
+    }
+
+    #[test]
+    fn shadow_boundaries_retarget_event_target() {
+        // DOM §2.9 retargeting: a listener OUTSIDE a shadow tree sees the HOST
+        // as `ev.target`; one inside (on the shadow root) sees the real inner
+        // target; `ev.target` is restored after dispatch.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "retarget.js",
+            br##"
+            globalThis.out = {};
+            const host = document.createElement("x-host");
+            host.id = "host";
+            document.getElementById("outer").appendChild(host);
+            const sr = host.attachShadow({ mode: "open" });
+            const inner = document.createElement("button");
+            inner.id = "inner";
+            sr.appendChild(inner);
+            sr.addEventListener("ping", (e) => { out.inside = e.target.id; });
+            document.addEventListener("ping", (e) => { out.outside = e.target.id; });
+            const ev = new Event("ping", { bubbles: true, composed: true });
+            inner.dispatchEvent(ev);
+            out.after = ev.target.id;
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.inside"), "inner");
+        assert_eq!(s(&mut ctx, b"out.outside"), "host");
+        assert_eq!(s(&mut ctx, b"out.after"), "inner");
+    }
+
+    #[test]
+    fn an_injected_data_url_script_runs_and_fires_load() {
+        // The runtime-injected twin of the parse-time data: script path — it
+        // used to hit the http(s)-only net gate and fire `error` for a script
+        // a real browser runs.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "inject-data.js",
+            br##"
+            globalThis.out = { events: [] };
+            const sc = document.createElement("script");
+            sc.addEventListener("load", () => out.events.push("load"));
+            sc.addEventListener("error", () => out.events.push("error"));
+            sc.src = "data:text/javascript,globalThis.__injected = 7;";
+            document.querySelector("body").appendChild(sc);
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"String(globalThis.__injected)"), "7");
+        assert_eq!(s(&mut ctx, b"out.events.join(',')"), "load");
+    }
+
+    #[test]
+    fn document_style_sheets_scripts_and_send_beacon_exist() {
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "surface.js",
+            br##"
+            globalThis.out = {};
+            const st = document.createElement("style");
+            st.textContent = ".a { display: flex; }";
+            document.documentElement.appendChild(st);
+            const list = document.styleSheets;
+            out.len = list.length;
+            out.isList = Object.prototype.toString.call(list).indexOf("StyleSheetList") >= 0;
+            out.rule = list[0].cssRules[0].selectorText;
+            const sc = document.createElement("script");
+            document.documentElement.appendChild(sc);
+            out.scripts = document.scripts.length;
+            out.beacon = navigator.sendBeacon("https://example.com/collect", "x=1");
+            out.ce = (new CustomEvent("t", { detail: 5 })).detail;
+            out.ceBrand = (new Event("t")) instanceof CustomEvent; // no longer every event
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"String(out.len)"), "1");
+        assert_eq!(s(&mut ctx, b"String(out.isList)"), "true");
+        assert_eq!(s(&mut ctx, b"out.rule"), ".a");
+        assert_eq!(s(&mut ctx, b"String(out.scripts)"), "1");
+        assert_eq!(s(&mut ctx, b"String(out.beacon)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.ce)"), "5");
+        assert_eq!(s(&mut ctx, b"String(out.ceBrand)"), "false");
+    }
+
+    #[test]
     fn window_open_returns_a_stub_and_never_throws() {
         // A missing `window.open` was an uncaught TypeError that aborted click
         // handlers mid-flow (erome's age gate calls `window.open(url)` then
@@ -20323,7 +20985,7 @@ mod tests {
                  <script>{PROBE}</script></body></html>"
             );
             let mut env = PageEnv::bare("https://example.com/");
-            env.externals = vec![("/bundle.js".to_string(), Some(source))];
+            env.externals = vec![("/bundle.js".to_string(), Some(std::sync::Arc::new(source)))];
             let started = Instant::now();
             // Big-stack thread, like production — see `transform_on_page_stack`
             // (lazy delazify re-analyzes on the execution stack).
@@ -20419,8 +21081,11 @@ mod tests {
         );
         let mut env = PageEnv::bare("https://example.com/");
         env.externals = vec![
-            ("/react.js".to_string(), Some(react)),
-            ("/react-dom.js".to_string(), Some(react_dom)),
+            ("/react.js".to_string(), Some(std::sync::Arc::new(react))),
+            (
+                "/react-dom.js".to_string(),
+                Some(std::sync::Arc::new(react_dom)),
+            ),
         ];
         let started = Instant::now();
         let (out, outcome) = transform(&html, &env);
@@ -20462,7 +21127,7 @@ mod tests {
         };
         let html = "<html><head><script src='/vue.js'></script></head>\n             <body><div id='target'>{{ who }}</div><script>\n             Vue.createApp({ data: function () { return { who: 'TRust template' }; } }).mount('#target');\n             </script></body></html>";
         let mut env = PageEnv::bare("https://example.com/");
-        env.externals = vec![("/vue.js".to_string(), Some(vue))];
+        env.externals = vec![("/vue.js".to_string(), Some(std::sync::Arc::new(vue)))];
         let (out, outcome) = transform(html, &env);
         eprintln!("vue template outcome: {:?}", outcome);
         for line in out
@@ -20493,7 +21158,7 @@ mod tests {
         };
         let html = "<html><head><script src='/vue.js'></script></head>\n             <body><ul id='target'><li v-for='item in items'>{{ item.name }}</li></ul><script>\n             Vue.createApp({ data: function () { return { items: [{ name: 'alpha' }, { name: 'beta' }, { name: 'gamma' }] }; } }).mount('#target');\n             </script></body></html>";
         let mut env = PageEnv::bare("https://example.com/");
-        env.externals = vec![("/vue.js".to_string(), Some(vue))];
+        env.externals = vec![("/vue.js".to_string(), Some(std::sync::Arc::new(vue)))];
         let (out, outcome) = transform(html, &env);
         eprintln!("vue v-for outcome: {outcome:?}");
         for line in out.lines().filter(|line| {
@@ -20536,7 +21201,10 @@ mod tests {
             }, 10);\
             </script></body></html>";
         let mut env = PageEnv::bare("https://example.com/");
-        env.externals = vec![("/stimulus.js".to_string(), Some(stimulus))];
+        env.externals = vec![(
+            "/stimulus.js".to_string(),
+            Some(std::sync::Arc::new(stimulus)),
+        )];
         let (out, outcome) = transform(html, &env);
         eprintln!("stimulus outcome: {outcome:?}");
         assert!(!outcome.panicked, "Stimulus panicked the engine");
@@ -20574,7 +21242,7 @@ mod tests {
             window.Alpine.start();\
             </script></body></html>";
         let mut env = PageEnv::bare("https://example.com/");
-        env.externals = vec![("/alpine.js".to_string(), Some(alpine))];
+        env.externals = vec![("/alpine.js".to_string(), Some(std::sync::Arc::new(alpine)))];
         let (out, outcome) = transform(html, &env);
         eprintln!("alpine outcome: {outcome:?}");
         assert!(!outcome.panicked, "Alpine panicked the engine");
@@ -20607,7 +21275,7 @@ mod tests {
         let html = "<html><head><script src='/htmx.js'></script></head>\
             <body><div id='present' hx-get='/x'>present</div></body></html>";
         let mut env = PageEnv::bare("https://example.com/");
-        env.externals = vec![("/htmx.js".to_string(), Some(htmx))];
+        env.externals = vec![("/htmx.js".to_string(), Some(std::sync::Arc::new(htmx)))];
         let (out, outcome) = transform(html, &env);
         eprintln!("htmx outcome: {outcome:?}");
         // Graceful degrade: no engine abort, the page content survives.
@@ -22423,8 +23091,11 @@ mod tests {
         );
         let mut env = PageEnv::bare("https://example.com/");
         env.externals = vec![
-            ("/react.js".to_string(), Some(react)),
-            ("/react-dom.js".to_string(), Some(react_dom)),
+            ("/react.js".to_string(), Some(std::sync::Arc::new(react))),
+            (
+                "/react-dom.js".to_string(),
+                Some(std::sync::Arc::new(react_dom)),
+            ),
         ];
         let (handle, mut events) = spawn_page(html, env);
 
@@ -22501,8 +23172,11 @@ mod tests {
         );
         let mut env = PageEnv::bare("https://example.com/");
         env.externals = vec![
-            ("/react.js".to_string(), Some(react)),
-            ("/react-dom.js".to_string(), Some(react_dom)),
+            ("/react.js".to_string(), Some(std::sync::Arc::new(react))),
+            (
+                "/react-dom.js".to_string(),
+                Some(std::sync::Arc::new(react_dom)),
+            ),
         ];
         let (handle, mut events) = spawn_page(html, env);
 
@@ -22668,8 +23342,11 @@ mod tests {
         );
         let mut env = PageEnv::bare("https://example.com/");
         env.externals = vec![
-            ("/react.js".to_string(), Some(react)),
-            ("/react-dom.js".to_string(), Some(react_dom)),
+            ("/react.js".to_string(), Some(std::sync::Arc::new(react))),
+            (
+                "/react-dom.js".to_string(),
+                Some(std::sync::Arc::new(react_dom)),
+            ),
         ];
         let (handle, mut events) = spawn_page(html, env);
 
@@ -26703,7 +27380,9 @@ mod tests {
         let mut env = PageEnv::bare("https://example.com/");
         env.externals = vec![(
             "/app.js".to_string(),
-            Some(b"document.getElementById('t').textContent = 'from external';".to_vec()),
+            Some(std::sync::Arc::new(
+                b"document.getElementById('t').textContent = 'from external';".to_vec(),
+            )),
         )];
         let (out, outcome) = transform(html, &env);
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
