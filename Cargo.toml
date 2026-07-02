@@ -43,6 +43,10 @@ libmudtelnet = "2.0.2"
 mimalloc = { version = "0.1", optional = true }
 ratatui = "0.30.2"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
+# FxHash for the DOM's hot maps (per-epoch caches, rule buckets, winner
+# maps). Pure Rust, already in the tree via Boa; SipHash's HashDoS
+# resistance buys nothing for arena-internal keys.
+rustc-hash = "2"
 # Static SVG image rendering. `resvg`/`usvg`/tiny-skia are pure Rust; text and
 # embedded data: raster images stay enabled for web compatibility. System-font
 # discovery reads font files through Rust and is initialized once in img.rs.

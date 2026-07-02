@@ -3524,7 +3524,6 @@ impl<'a> Layout<'a> {
         let candidate = self
             .dom
             .descendants(root)
-            .into_iter()
             .enumerate()
             .filter(|&(_, id)| self.is_modal_overlay(id))
             .max_by_key(|&(order, id)| (self.z_order(id), order))
@@ -3555,7 +3554,7 @@ impl<'a> Layout<'a> {
         let oz = self.z_order(overlay);
         // Exclude the overlay, its subtree (its own content) and its ancestors
         // (whose stacking context carries the overlay along).
-        let mut excluded: HashSet<NodeId> = self.dom.descendants(overlay).into_iter().collect();
+        let mut excluded: HashSet<NodeId> = self.dom.descendants(overlay).collect();
         excluded.insert(overlay);
         let mut up = self.dom.parent_composed(overlay);
         while let Some(p) = up {
@@ -3563,7 +3562,7 @@ impl<'a> Layout<'a> {
             up = self.dom.parent_composed(p);
         }
         let root = body_or_document(self.dom);
-        let order = self.dom.descendants(root);
+        let order: Vec<crate::dom::NodeId> = self.dom.descendants(root).collect();
         // Document-order index of the overlay, for the equal-z paint-order
         // tiebreak below (CSS 2.1 Appendix E).
         let overlay_pos = order.iter().position(|&id| id == overlay);
@@ -5244,8 +5243,7 @@ impl<'a> Layout<'a> {
         let Some(wrapper) = self.dom.parent_composed(container) else {
             return Vec::new();
         };
-        let inside: std::collections::HashSet<NodeId> =
-            self.dom.descendants(container).into_iter().collect();
+        let inside: std::collections::HashSet<NodeId> = self.dom.descendants(container).collect();
         let mut out = Vec::new();
         for d in self.dom.descendants(wrapper) {
             if d == container || inside.contains(&d) {
@@ -7922,8 +7920,7 @@ impl<'a> Layout<'a> {
         if self
             .dom
             .descendants(id)
-            .iter()
-            .any(|&d| self.dom.tag_name(d) == Some("img"))
+            .any(|d| self.dom.tag_name(d) == Some("img"))
         {
             return None;
         }
