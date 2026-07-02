@@ -74,9 +74,10 @@ pub struct CascDiag {
     pub flow_visits: u64,
     /// `measure_width` entries — intrinsic-sizing passes that re-descend subtrees.
     pub measure_calls: u64,
-    /// `cascaded` invocations (each re-parses the element's inline `style`).
+    /// `cascaded` invocations (post-winner-map: each is a hash lookup).
     pub cascaded_calls: u64,
-    /// Cumulative time inside `cascaded` (the inline-style re-parse cost).
+    /// Cumulative time building per-element cascade winner maps (one build
+    /// per element per epoch — the inline-style parse + matched-decl scan).
     pub cascaded_us: u64,
 }
 
@@ -142,12 +143,27 @@ pub struct Dom {
     /// Monotonic mutation counter (bumped with `dirty`); keys the
     /// cached visibility cascade so it rebuilds only after changes.
     epoch: u64,
+    /// Monotonic STYLE epoch: advances only when the SHEET SET can have
+    /// changed — exactly the triggers the standards define for sheet
+    /// (re)creation (HTML §4.2.6: a `<style>`'s sheet re-creates when its
+    /// child text changes or it enters/leaves the document; `<link>` sheets
+    /// respond to attribute changes; CSSOM: `@media` re-evaluates against
+    /// the viewport) plus our adopted/external-sheet attach points.
+    /// `style_cache` keys on THIS instead of `epoch`, so ordinary content
+    /// mutations no longer force a full CSS re-parse + rule-hash rebuild on
+    /// the next style read — on a CSS-heavy live page that re-parse was
+    /// paid per mutate-then-read cycle (script layout-thrash, live
+    /// serializes, measure passes). INVARIANT: never advances without
+    /// `epoch` advancing too (every bump routes through `touch_style` →
+    /// `touch`), so the per-epoch match/cascade memos — whose stored rule
+    /// INDICES point into the current index — can never outlive a rebuild.
+    style_epoch: u64,
     /// adoptedStyleSheets text per scope (DOCUMENT or a shadow root
     /// fragment), pushed by the prelude on adoption/replaceSync.
     adopted_styles: std::collections::HashMap<NodeId, String>,
     /// Fetched `<link rel=stylesheet>` text, keyed by the link element.
     external_sheets: std::collections::HashMap<NodeId, String>,
-    /// Lazily built visibility cascade, valid for one epoch.
+    /// Lazily built visibility cascade, valid for one STYLE epoch.
     style_cache: RefCell<Option<(u64, std::rc::Rc<StyleIndex>)>>,
     /// Memoized inherited `computed_value` results for the current epoch,
     /// keyed (node, property index). Inheritance walks ancestors, so the
@@ -162,13 +178,14 @@ pub struct Dom {
     /// rules × props)). With it, each element is matched ONCE per epoch (via the
     /// rightmost-key buckets), then every property/pseudo read reuses the list.
     matched_cache: RefCell<MatchedCache>,
-    /// Memoized `cascaded` results for the current epoch, keyed (node, property).
-    /// The layout reads each element's properties hundreds of times — across the
-    /// flow AND the intrinsic-measurement re-descents (which re-flow subtrees
-    /// against a shared `&Dom`) — and every `cascaded` call otherwise re-parses
-    /// the element's inline `style` from scratch. This caches the author-cascade
-    /// winner per property; cleared when the epoch advances. Pure memoization
-    /// (identical results), so it never affects the cascade outcome.
+    /// Memoized per-element cascade WINNER MAPS for the current epoch (see
+    /// `CascadedCache`/`cascaded_maps`): the layout/serializer read 30+
+    /// properties per element (across the flow AND the intrinsic-measurement
+    /// re-descents), so the winners for EVERY declared property — element
+    /// box plus `::before`/`::after` — are resolved in ONE pass on the first
+    /// read, then each read is a hash lookup. Cleared when the epoch
+    /// advances. Pure memoization (identical results), so it never affects
+    /// the cascade outcome.
     cascaded_cache: RefCell<CascadedCache>,
     /// Memoized `is_hidden` results for the current epoch. `is_hidden` reads ~15
     /// cascaded properties and runs once per `flow_element` visit (and the same
@@ -250,14 +267,37 @@ type MatchedCache = (
     std::collections::HashMap<NodeId, std::rc::Rc<Vec<u32>>>,
 );
 
-/// Per-epoch memo for `cascaded`: nested (node → property → winner) so a
-/// property lookup borrows the `&str` key without allocating. The inner
-/// `Option<String>` is the cascade winner (`None` = no author value), distinct
-/// from the OUTER `Option` of the lookup (absent = not yet computed).
+/// Per-epoch memo for `cascaded_maps`: the epoch the entries are valid for,
+/// and each element's full author-cascade WINNER MAPS, shared via `Rc`.
+/// The serializer/layout read 30+ properties per element; before this map,
+/// EVERY property read re-scanned every matched rule's declarations and
+/// re-parsed the element's inline `style` (O(props × matched decls) per
+/// element). One build costs about the same as ONE of those scans, so every
+/// further property read on the element is a hash lookup.
 type CascadedCache = (
     u64,
-    std::collections::HashMap<NodeId, std::collections::HashMap<String, Option<String>>>,
+    std::collections::HashMap<NodeId, std::rc::Rc<CascadedMaps>>,
 );
+
+/// One element's author-cascade winners, per target box: the element itself
+/// plus its `::before`/`::after` generated boxes (their rules ride the same
+/// matched list, bucketed by the rule's pseudo target). An absent key = no
+/// author declaration for that property (the cascade's `None`).
+#[derive(Default)]
+struct CascadedMaps {
+    elem: std::collections::HashMap<String, String>,
+    before: std::collections::HashMap<String, String>,
+    after: std::collections::HashMap<String, String>,
+}
+
+impl CascadedMaps {
+    fn pseudo(&self, which: PseudoEl) -> &std::collections::HashMap<String, String> {
+        match which {
+            PseudoEl::Before => &self.before,
+            PseudoEl::After => &self.after,
+        }
+    }
+}
 
 /// The document node is always index 0.
 pub const DOCUMENT: NodeId = 0;
@@ -276,6 +316,7 @@ impl Dom {
             shadow_hosts: std::collections::HashMap::new(),
             dirty: false,
             epoch: 0,
+            style_epoch: 0,
             adopted_styles: std::collections::HashMap::new(),
             external_sheets: std::collections::HashMap::new(),
             style_cache: RefCell::new(None),
@@ -336,6 +377,51 @@ impl Dom {
     fn touch_attr(&mut self, id: NodeId) {
         self.mark();
         self.dirty_nodes.push((id, DirtyKind::Attr));
+    }
+
+    /// A mutation that can change the SHEET SET (`<style>`/`<link>` tree,
+    /// text, or attribute changes; adopted/external sheet attaches; viewport
+    /// changes): advances the style epoch — invalidating the parsed style
+    /// index — AND forces the next render to a full relayout via `touch`
+    /// (a changed stylesheet can restyle anything, so no incremental patch
+    /// is sound). This is the ONLY writer of `style_epoch`, which keeps the
+    /// "style epoch never advances without the main epoch" invariant.
+    fn touch_style(&mut self) {
+        self.style_epoch = self.style_epoch.wrapping_add(1);
+        self.touch();
+    }
+
+    /// Bump the style epoch when a tree mutation involving `child` (being
+    /// appended/inserted under, or detached from, `parent`) can change the
+    /// sheet set: the node is — or its subtree contains — a `<style>`/
+    /// `<link>` element, or it's a text node directly under a `<style>`
+    /// (HTML §4.2.6: the style element's sheet re-creates when its child
+    /// nodes change or it enters/leaves the document). The dominant append
+    /// (a fresh leaf node) pays one tag check; only subtree attaches walk,
+    /// early-exiting on the first sheet element found.
+    fn note_tree_style_mutation(&mut self, parent: Option<NodeId>, child: NodeId) {
+        let styled = match &self.nodes[child].data {
+            NodeData::Text(_) => parent.is_some_and(|p| self.tag_name(p) == Some("style")),
+            NodeData::Element { .. } | NodeData::Fragment => self.subtree_has_style(child),
+            _ => false,
+        };
+        if styled {
+            self.touch_style();
+        }
+    }
+
+    /// Whether `root`'s composed subtree (inclusive) contains a `<style>` or
+    /// `<link>` element. Early-exits on the first hit; a childless node is a
+    /// single tag check.
+    fn subtree_has_style(&self, root: NodeId) -> bool {
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if matches!(self.tag_name(id), Some("style" | "link")) {
+                return true;
+            }
+            self.push_composed_children(id, &mut stack);
+        }
+        false
     }
 
     /// A childList/text change whose content lives under `id` (the parent whose
@@ -629,7 +715,7 @@ impl Dom {
     pub fn set_viewport_px(&mut self, width: u32, height: u32) {
         if self.viewport_px != (width, height) {
             self.viewport_px = (width, height);
-            self.touch();
+            self.touch_style(); // @media re-evaluates against the viewport
         }
     }
 
@@ -785,6 +871,12 @@ impl Dom {
         // The PARENT's child list is what changed; `None` (an already-orphan
         // node, e.g. a fresh child about to be appended) is a no-op for the
         // rendered tree — dirties the epoch but records no relayout target.
+        // An ATTACHED node leaving may take stylesheet(s) with it (the
+        // orphan case skips the check entirely — the fresh-node append path
+        // stays one tag check total, paid on the append side).
+        if parent.is_some() {
+            self.note_tree_style_mutation(parent, id);
+        }
         self.touch_content(parent);
         if let Some(prev) = prev {
             self.nodes[prev].next_sibling = next;
@@ -808,6 +900,7 @@ impl Dom {
 
     pub fn append(&mut self, parent: NodeId, child: NodeId) {
         self.detach(child);
+        self.note_tree_style_mutation(Some(parent), child);
         let old_last = self.nodes[parent].last_child;
         self.nodes[child].parent = Some(parent);
         self.nodes[child].prev_sibling = old_last;
@@ -832,7 +925,25 @@ impl Dom {
             self.append(parent, child);
             return;
         }
+        // Pre-insert (WHATWG DOM §4.2.4): inserting a node before ITSELF is
+        // legal — the reference becomes the node's next sibling (an in-place
+        // move). Without this the splice below would point the node's
+        // prev/next at itself, corrupting the sibling list into a cycle that
+        // hangs every later sibling walk (children/serialize/descendants).
+        let reference = if reference == child {
+            match self.nodes[child].next_sibling {
+                Some(next) => next,
+                // Already the last child: an in-place move is a re-append.
+                None => {
+                    self.append(parent, child);
+                    return;
+                }
+            }
+        } else {
+            reference
+        };
         self.detach(child);
+        self.note_tree_style_mutation(Some(parent), child);
         let prev = self.nodes[reference].prev_sibling;
         self.nodes[child].parent = Some(parent);
         self.nodes[child].prev_sibling = prev;
@@ -851,6 +962,9 @@ impl Dom {
             && let NodeData::Text(existing) = &mut self.nodes[last].data
         {
             existing.push_str(text);
+            if self.tag_name(parent) == Some("style") {
+                self.touch_style(); // the sheet's text grew
+            }
             self.touch_content(Some(parent));
             return;
         }
@@ -935,8 +1049,24 @@ impl Dom {
     }
 
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
-        if let NodeData::Element { attrs, .. } = &mut self.nodes[id].data {
-            let name = name.to_ascii_lowercase();
+        // An attribute change on a sheet-bearing element can change the
+        // sheet set (`<link rel/href/disabled>`; conservatively any).
+        let sheet_el = matches!(self.tag_name(id), Some("style" | "link"));
+        if let NodeData::Element {
+            name: qname, attrs, ..
+        } = &mut self.nodes[id].data
+        {
+            // DOM setAttribute folds the name to lowercase ONLY for elements
+            // in the HTML namespace; SVG/MathML attributes are case-sensitive
+            // (`viewBox`, `preserveAspectRatio`). Folding unconditionally
+            // pushed a duplicate lowercase attr beside the parser's cased one
+            // and left reads (case-insensitive, first match) on the stale
+            // value — a D3-style `setAttribute("viewBox", …)` never took.
+            let name = if qname.ns == ns!(html) {
+                name.to_ascii_lowercase()
+            } else {
+                name.to_string()
+            };
             if let Some(a) = attrs.iter_mut().find(|a| *a.name.local == name) {
                 // Idempotent writes are free: no dirty, no redraw.
                 if *a.value == *value {
@@ -949,15 +1079,28 @@ impl Dom {
                     value: StrTendril::from(value),
                 });
             }
+            if sheet_el {
+                self.touch_style();
+            }
             self.touch_attr(id);
         }
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        let sheet_el = matches!(self.tag_name(id), Some("style" | "link"));
         if let NodeData::Element { attrs, .. } = &mut self.nodes[id].data {
+            let before = attrs.len();
             attrs.retain(|a| !str::eq_ignore_ascii_case(&a.name.local, name));
+            // Idempotent removes are free (like `set_attr`): a redundant
+            // `removeAttribute` must not dirty the page or bust the epoch
+            // caches — frameworks call it unconditionally per render pass.
+            if attrs.len() != before {
+                if sheet_el {
+                    self.touch_style();
+                }
+                self.touch_attr(id);
+            }
         }
-        self.touch_attr(id);
     }
 
     pub fn attr_names(&self, id: NodeId) -> Vec<String> {
@@ -970,16 +1113,14 @@ impl Dom {
     }
 
     /// Is this element hidden — by the `hidden` attribute, or by the
-    /// cascaded `display`/`visibility`/`opacity` (inline style, `<style>`
-    /// elements, shadow sheets, adoptedStyleSheets, fetched `<link>`
-    /// sheets)? Winner per property is the lexicographic max of
-    /// (!important, inline, specificity, source order) — inline beats
-    /// sheets except under !important, the real rules for a single
-    /// author origin. Hidden subtrees don't render. This reads the author
-    /// cascade directly (`cascaded`), NOT inheritance: visibility is treated
-    /// like display (a hidden subtree stays hidden; no visible-child-of-
-    /// hidden-parent). For inherited/UA-defaulted values use `computed_value`;
-    /// no @-rules yet.
+    /// cascaded `display` (inline style, `<style>` elements, shadow sheets,
+    /// adoptedStyleSheets, fetched `<link>` sheets)? Winner per property is
+    /// the lexicographic max of (!important, inline, layer, specificity,
+    /// source order) — inline beats sheets except under !important, the
+    /// real rules for a single author origin (`@media`/`@supports`/`@layer`
+    /// evaluated at index build). Hidden subtrees don't render. This reads
+    /// the author cascade directly (`cascaded`), NOT inheritance. For
+    /// inherited/UA-defaulted values use `computed_value`.
     /// Whether `id` is the host of an editing region — it carries a truthy
     /// `contenteditable` attribute (`""`/`true`/`plaintext-only`). This is the
     /// editor ROOT (where the attribute sits); descendants merely inherit
@@ -1207,44 +1348,62 @@ impl Dom {
     fn effective_opacity(&self, id: NodeId) -> f32 {
         let base = self
             .cascaded(id, "opacity")
-            .and_then(|v| v.trim().parse::<f32>().ok())
+            .as_deref()
+            .and_then(parse_alpha)
             .unwrap_or(1.0);
         // Only a near-invisible base is worth the animation lookup; a normally
         // opaque (or merely faded) element shows as-is.
         if base >= OPACITY_HIDDEN {
             return base;
         }
-        let (name, fill) = self.animation_of(id);
-        if let Some(name) = name
-            && matches!(fill.as_deref(), Some("forwards" | "both"))
-            && let Some(&end) = self.style_index().keyframes.get(&name)
-        {
-            return end;
+        for (name, fill) in self.animations_of(id) {
+            if matches!(fill.as_deref(), Some("forwards" | "both"))
+                && let Some(&end) = self.style_index().keyframes.get(&name)
+            {
+                return end;
+            }
         }
         base
     }
 
-    /// The element's animation name and fill-mode, from the longhands
-    /// (`animation-name`/`animation-fill-mode`) or the `animation` shorthand.
-    fn animation_of(&self, id: NodeId) -> (Option<String>, Option<String>) {
-        let mut name = self.cascaded(id, "animation-name");
-        let mut fill = self.cascaded(id, "animation-fill-mode");
-        if (name.is_none() || fill.is_none())
-            && let Some(shorthand) = self.cascaded(id, "animation")
-        {
-            for tok in shorthand.split_whitespace() {
-                match tok {
-                    "forwards" | "backwards" | "both" => {
-                        fill.get_or_insert_with(|| tok.to_string());
-                    }
-                    _ if is_anim_keyword_or_time(tok) => {}
-                    _ => {
-                        name.get_or_insert_with(|| tok.to_string());
-                    }
-                }
-            }
-        }
-        (name.filter(|n| n != "none" && !n.is_empty()), fill)
+    /// The element's animations as `(name, fill-mode)` pairs. Both the
+    /// longhands (`animation-name`/`animation-fill-mode`) and the `animation`
+    /// shorthand are COMMA lists (css-animations-1 §4: one animation per
+    /// comma-separated item; a too-short fill-mode list repeats). The old
+    /// single-animation reader whitespace-split the whole shorthand, so
+    /// `animation: fade-in 1s forwards, pulse 2s infinite` glommed
+    /// `forwards,pulse` into one token and lost the name.
+    fn animations_of(&self, id: NodeId) -> Vec<(String, Option<String>)> {
+        let shorthand: Vec<(Option<String>, Option<String>)> = self
+            .cascaded(id, "animation")
+            .map(|s| {
+                split_top_level(&s, ',')
+                    .into_iter()
+                    .map(parse_animation_segment)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let names: Vec<Option<String>> = match self.cascaded(id, "animation-name") {
+            Some(n) => n.split(',').map(|t| Some(t.trim().to_string())).collect(),
+            None => shorthand.iter().map(|(n, _)| n.clone()).collect(),
+        };
+        let fills: Vec<Option<String>> = match self.cascaded(id, "animation-fill-mode") {
+            Some(f) => f.split(',').map(|t| Some(t.trim().to_string())).collect(),
+            None => shorthand.iter().map(|(_, f)| f.clone()).collect(),
+        };
+        names
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, n)| {
+                let n = n.filter(|n| !n.is_empty() && n != "none")?;
+                let fill = if fills.is_empty() {
+                    None
+                } else {
+                    fills[i % fills.len()].clone()
+                };
+                Some((n, fill))
+            })
+            .collect()
     }
 
     /// The cascaded `display` value for an element (the mini-cascade
@@ -1626,27 +1785,29 @@ impl Dom {
         (underline, strike)
     }
 
-    /// The mini-cascade winner for one property (`display` or
-    /// `visibility` — the two the style index tracks). Inline styles beat
-    /// tree rules by specificity/order, `!important` and source order
-    /// resolved by `CascadeKey`.
+    /// The author-cascade winner for one property on the element itself:
+    /// one hash lookup into the element's per-epoch winner maps. Inline
+    /// styles beat tree rules, `!important`/layers/specificity/source order
+    /// resolved by `CascadeKey` when the maps are built.
     fn cascaded(&self, id: NodeId, prop: &str) -> Option<String> {
         casc_bump(|d| d.cascaded_calls += 1);
-        // Per-epoch memo: the same (node, property) is read many times over one
-        // layout (flow + measurement re-descents), each call otherwise re-parsing
-        // the element's inline `style`. Borrow-only fast path; on a miss compute
-        // once and store. Pure memoization — the cascade result is unchanged.
+        self.cascaded_maps(id).elem.get(prop).cloned()
+    }
+
+    /// The element's full cascade winner maps for the current epoch, built
+    /// on the first read of ANY of its properties (one pass over its author
+    /// sources), then shared by every further read.
+    fn cascaded_maps(&self, id: NodeId) -> std::rc::Rc<CascadedMaps> {
         {
             let cache = self.cascaded_cache.borrow();
             if cache.0 == self.epoch
-                && let Some(inner) = cache.1.get(&id)
-                && let Some(hit) = inner.get(prop)
+                && let Some(hit) = cache.1.get(&id)
             {
                 return hit.clone();
             }
         }
         let _t = casc_diag_on().then(std::time::Instant::now);
-        let r = self.cascaded_inner(id, prop);
+        let maps = std::rc::Rc::new(self.build_cascaded_maps(id));
         if let Some(t) = _t {
             let us = t.elapsed().as_micros() as u64;
             casc_bump(|d| d.cascaded_us += us);
@@ -1656,25 +1817,62 @@ impl Dom {
             cache.0 = self.epoch;
             cache.1.clear();
         }
-        cache
-            .1
-            .entry(id)
-            .or_default()
-            .insert(prop.to_string(), r.clone());
-        r
+        cache.1.insert(id, maps.clone());
+        maps
     }
 
-    fn cascaded_inner(&self, id: NodeId, prop: &str) -> Option<String> {
-        let mut winner: Option<(CascadeKey, String)> = None;
+    /// ONE pass over the element's author sources — its inline `style`
+    /// (parsed once, where it used to be re-parsed per property read), its
+    /// matched rules (each rule's declarations land in the map for the box
+    /// the rule targets: the element, or its `::before`/`::after`), and its
+    /// shadow root's `:host` rules — resolving the cascade winner for EVERY
+    /// declared property at once. Winner selection is identical to the old
+    /// per-property scan: the same `CascadeKey` per declaration,
+    /// lexicographic max, later-wins on ties. Untracked properties present
+    /// in the INLINE style are kept (sheet parsing already filtered its
+    /// side): getComputedStyle of an inline-only property reads through
+    /// here, matching real-browser behavior for the properties we don't
+    /// track.
+    fn build_cascaded_maps(&self, id: NodeId) -> CascadedMaps {
+        type Winners = std::collections::HashMap<String, (CascadeKey, String)>;
+        // Clone only on first sight or a WIN — a losing declaration costs a
+        // lookup and a key compare, never an allocation.
+        fn consider_into(map: &mut Winners, prop: &str, key: CascadeKey, value: &str) {
+            match map.get_mut(prop) {
+                Some(slot) => {
+                    if key >= slot.0 {
+                        *slot = (key, value.to_string());
+                    }
+                }
+                None => {
+                    map.insert(prop.to_string(), (key, value.to_string()));
+                }
+            }
+        }
+        let mut elem: Winners = Winners::new();
+        let mut before: Winners = Winners::new();
+        let mut after: Winners = Winners::new();
         if let Some(style) = self.attr(id, "style") {
             for decl in style.split(';') {
                 let Some((k, v, important)) = parse_decl(decl) else {
                     continue;
                 };
                 for (pk, pv) in expand_box_shorthand(&k, &v) {
-                    if pk == prop {
-                        consider(&mut winner, (important, true, (0, 0, 0), usize::MAX), &pv);
-                    }
+                    // Element-attached: the inline flag outranks the layer
+                    // component, so the (unlayered) encoding is inert.
+                    // (Inline styles can't target a pseudo-element.)
+                    consider_into(
+                        &mut elem,
+                        &pk,
+                        (
+                            important,
+                            true,
+                            encode_layer(&[], important),
+                            (0, 0, 0),
+                            usize::MAX,
+                        ),
+                        &pv,
+                    );
                 }
             }
         }
@@ -1682,15 +1880,20 @@ impl Dom {
         if let Some(rules) = index.scopes.get(&self.tree_scope(id)) {
             for &ri in self.matched_rules(id).iter() {
                 let r = &rules[ri as usize];
-                // `div::before{…}` rules target a generated box, not the
-                // element — skip them in the element-property cascade.
-                if rule_pseudo(r).is_some() {
-                    continue;
-                }
+                // A `div::before{…}` rule targets the generated box, not
+                // the element — its winners land in that box's own map.
+                let target = match rule_pseudo(r) {
+                    None => &mut elem,
+                    Some(PseudoEl::Before) => &mut before,
+                    Some(PseudoEl::After) => &mut after,
+                };
                 for (pk, (imp, v)) in &r.decls {
-                    if pk == prop {
-                        consider(&mut winner, (*imp, false, r.specificity, r.order), v);
-                    }
+                    consider_into(
+                        target,
+                        pk,
+                        (*imp, false, r.layer_key(*imp), r.specificity, r.order),
+                        v,
+                    );
                 }
             }
         }
@@ -1707,13 +1910,21 @@ impl Dom {
                     continue;
                 }
                 for (pk, (imp, v)) in &r.decls {
-                    if pk == prop {
-                        consider(&mut winner, (*imp, false, r.specificity, r.order), v);
-                    }
+                    consider_into(
+                        &mut elem,
+                        pk,
+                        (*imp, false, r.layer_key(*imp), r.specificity, r.order),
+                        v,
+                    );
                 }
             }
         }
-        winner.map(|(_, v)| v)
+        let strip = |m: Winners| m.into_iter().map(|(k, (_, v))| (k, v)).collect();
+        CascadedMaps {
+            elem: strip(elem),
+            before: strip(before),
+            after: strip(after),
+        }
     }
 
     /// Whether a shadow-scope rule is a `:host`/`:host(<compound>)` rule that
@@ -1849,24 +2060,10 @@ impl Dom {
 
     /// The resolved `content` text for an element's `::before`/`::after`
     /// box, or `None` when no rule sets it (or it resolves to `none`/an
-    /// unsupported value like `counter()`). Reads only pseudo-element rules
-    /// in the element's tree scope (inline styles can't target a pseudo).
+    /// unsupported value like `counter()`). Reads the pseudo's bucket of
+    /// the element's winner maps (inline styles can't target a pseudo).
     pub fn pseudo_content(&self, id: NodeId, which: PseudoEl) -> Option<String> {
-        let index = self.style_index();
-        let rules = index.scopes.get(&self.tree_scope(id))?;
-        let mut winner: Option<(CascadeKey, String)> = None;
-        for &ri in self.matched_rules(id).iter() {
-            let r = &rules[ri as usize];
-            if rule_pseudo(r) != Some(which) {
-                continue;
-            }
-            for (pk, (imp, v)) in &r.decls {
-                if pk == "content" {
-                    consider(&mut winner, (*imp, false, r.specificity, r.order), v);
-                }
-            }
-        }
-        let raw = winner.map(|(_, v)| v)?;
+        let raw = self.cascaded_maps(id).pseudo(which).get("content")?.clone();
         // A hidden pseudo-element generates NO rendered content here — a
         // deliberate TERMINAL DEVIATION, distinct from Phase 2's element-level
         // `visibility:hidden` (which reserves a blank box). The width-reservation
@@ -1894,23 +2091,10 @@ impl Dom {
     }
 
     /// The cascade-winning value of `prop` on `id`'s `::before`/`::after`
-    /// pseudo-element, or `None` if no matching rule sets it.
+    /// pseudo-element, or `None` if no matching rule sets it. One hash
+    /// lookup into the pseudo's bucket of the element's winner maps.
     pub fn pseudo_style(&self, id: NodeId, which: PseudoEl, prop: &str) -> Option<String> {
-        let index = self.style_index();
-        let rules = index.scopes.get(&self.tree_scope(id))?;
-        let mut winner: Option<(CascadeKey, String)> = None;
-        for &ri in self.matched_rules(id).iter() {
-            let r = &rules[ri as usize];
-            if rule_pseudo(r) != Some(which) {
-                continue;
-            }
-            for (pk, (imp, v)) in &r.decls {
-                if pk == prop {
-                    consider(&mut winner, (*imp, false, r.specificity, r.order), v);
-                }
-            }
-        }
-        winner.map(|(_, v)| v)
+        self.cascaded_maps(id).pseudo(which).get(prop).cloned()
     }
 
     /// Whether `id` carries the clearfix idiom — a `::before`/`::after`
@@ -1931,21 +2115,38 @@ impl Dom {
         })
     }
 
-    /// Resolve a `content` value to display text: a quoted string (with CSS
-    /// `\HEX`/`\c` escapes), `attr(name)` → the element's attribute, or
-    /// `none`/`normal`/unsupported (`counter()`, `url()`) → `None`.
+    /// Resolve a `content` value to display text. The value is a
+    /// whitespace-separated CONCATENATION of components (CSS2 §12.2 /
+    /// css-content-3): quoted strings (with CSS `\HEX`/`\c` escapes) and
+    /// `attr(name)` → the element's attribute (empty when absent) are
+    /// joined; `none`/`normal` → `None`; a value containing any component
+    /// we can't resolve (`counter()`, `url()`, quote keywords) is dropped
+    /// whole. The old single-component reader mangled the common
+    /// `content:"(" attr(data-n) ")"` decoration idiom.
     fn parse_content_value(&self, id: NodeId, raw: &str) -> Option<String> {
         let v = raw.trim();
         if v.is_empty() || v == "none" || v == "normal" {
             return None;
         }
-        if let Some(s) = unquote_css(v) {
-            return (!s.is_empty()).then_some(s);
+        let mut out = String::new();
+        for tok in split_top_level(v, ' ') {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            if let Some(s) = unquote_css(tok) {
+                out.push_str(&s);
+                continue;
+            }
+            if let Some(inner) = tok.strip_prefix("attr(").and_then(|r| r.strip_suffix(')')) {
+                if let Some(a) = self.attr(id, inner.trim()) {
+                    out.push_str(a);
+                }
+                continue;
+            }
+            return None;
         }
-        if let Some(inner) = v.strip_prefix("attr(").and_then(|r| r.strip_suffix(')')) {
-            return self.attr(id, inner.trim()).map(str::to_owned);
-        }
-        None
+        (!out.is_empty()).then_some(out)
     }
 
     /// The root of a node's tree: DOCUMENT for the light DOM, the
@@ -1960,12 +2161,16 @@ impl Dom {
         cur
     }
 
-    /// The visibility cascade for the current epoch, built on first use
-    /// after any mutation, shared until the next one.
+    /// The parsed style index, built on first use after a STYLE-epoch
+    /// advance and shared until the next one. Keyed on `style_epoch`, NOT
+    /// the main mutation epoch: content mutations invalidate the per-element
+    /// match/cascade memos (they must — matching depends on attributes and
+    /// tree shape) but never this parse, so a live page's churn re-MATCHES
+    /// against a retained index instead of re-PARSING every sheet.
     fn style_index(&self) -> std::rc::Rc<StyleIndex> {
         let mut cache = self.style_cache.borrow_mut();
         if let Some((epoch, idx)) = cache.as_ref()
-            && *epoch == self.epoch
+            && *epoch == self.style_epoch
         {
             return idx.clone();
         }
@@ -1979,13 +2184,19 @@ impl Dom {
             d.rules += rules;
         });
         let idx = std::rc::Rc::new(built);
-        *cache = Some((self.epoch, idx.clone()));
+        *cache = Some((self.style_epoch, idx.clone()));
         idx
     }
 
     fn build_style_index(&self) -> StyleIndex {
         let mut index = StyleIndex::default();
         let mut order = 0;
+        // Cascade layers are scoped like the rules themselves ("scoped to
+        // their origin and context" — css-cascade-5): one registry per tree
+        // scope, shared across every sheet of that scope so `@layer` names
+        // resolve to the same layer order document-wide.
+        let mut layer_regs: std::collections::HashMap<NodeId, LayerRegistry> =
+            std::collections::HashMap::new();
         for id in self.composed_descendants(DOCUMENT) {
             let css: Cow<str> = match self.tag_name(id) {
                 Some("style") => Cow::Owned(self.text_content(id)),
@@ -2002,6 +2213,8 @@ impl Dom {
                 index.scopes.entry(scope).or_default(),
                 &mut index.keyframes,
                 self.viewport_px,
+                layer_regs.entry(scope).or_default(),
+                "",
             );
         }
         // Adopted sheets cascade after their scope's tree sheets (their
@@ -2017,6 +2230,8 @@ impl Dom {
                 index.scopes.entry(*scope).or_default(),
                 &mut index.keyframes,
                 self.viewport_px,
+                layer_regs.entry(*scope).or_default(),
+                "",
             );
         }
         index.has_opacity = index
@@ -2115,7 +2330,7 @@ impl Dom {
             return;
         }
         self.adopted_styles.insert(scope, css.to_string());
-        self.touch();
+        self.touch_style();
     }
 
     fn is_stylesheet_link(&self, id: NodeId) -> bool {
@@ -2157,7 +2372,7 @@ impl Dom {
             });
             if let Some(id) = hit {
                 self.external_sheets.insert(id, css.clone());
-                self.touch();
+                self.touch_style();
             }
         }
     }
@@ -2549,6 +2764,9 @@ impl Dom {
                 // A text node's content changed — its PARENT element is the
                 // relayout target (text styling/flow is an element concern).
                 let parent = self.nodes[id].parent;
+                if parent.is_some_and(|p| self.tag_name(p) == Some("style")) {
+                    self.touch_style(); // the sheet's text changed in place
+                }
                 self.touch_content(parent);
             }
             _ => {
@@ -3489,7 +3707,21 @@ impl Dom {
         {
             return false;
         }
-        c.nots.iter().all(|n| !self.matches_compound(id, n, scope))
+        // `:is()`/`:where()`: each invocation's group must have at least one
+        // matching argument (full complex selectors, this element as the
+        // subject). An empty (all-invalid, forgiving-dropped) group matches
+        // nothing.
+        if !c.selects.iter().all(|(group, _)| {
+            group
+                .iter()
+                .any(|cx| self.matches_complex(id, &cx.0, scope))
+        }) {
+            return false;
+        }
+        c.nots
+            .iter()
+            .flatten()
+            .all(|n| !self.matches_compound(id, n, scope))
     }
 }
 
@@ -3518,14 +3750,17 @@ fn escape_attr(s: &str) -> Cow<'_, str> {
 
 // ---- Selector subset ------------------------------------------------
 
-/// The workhorse selector grammar: `tag`, `*`, `#id`, `.class`,
-/// `[attr]`, `[attr⊙=value]` (⊙ ∈ {ε, ~, |, ^, $, *}), `:not(compound)`,
-/// the structural pseudo-classes (`:empty`, `:first-child`/`:last-child`/
-/// `:only-child`, `:*-of-type`, `:nth-child(An+B)` and friends), compounds
-/// thereof, and the descendant (space), child (`>`), next-sibling (`+`) and
-/// subsequent-sibling (`~`) combinators, in comma lists. Interaction pseudos
-/// (`:hover`…) and pseudo-elements parse but never match — valid CSS that
-/// can't be true in our world.
+/// The workhorse selector grammar: `tag`, `*`, `#id`, `.class` (CSS ident
+/// escapes decoded — `.md\:flex` is the class `md:flex`), `[attr]`,
+/// `[attr⊙=value]` (⊙ ∈ {ε, ~, |, ^, $, *}; trailing `i` = case-insensitive),
+/// `:not(compound)`, `:is(complex…)`/`:where(complex…)` (forgiving lists;
+/// `:where` = zero specificity), the structural pseudo-classes (`:empty`,
+/// `:first-child`/`:last-child`/`:only-child`, `:*-of-type`,
+/// `:nth-child(An+B)` and friends), compounds thereof, and the descendant
+/// (space), child (`>`), next-sibling (`+`) and subsequent-sibling (`~`)
+/// combinators, in comma lists. Interaction pseudos (`:hover`…) and
+/// pseudo-elements parse but never match — valid CSS that can't be true in
+/// our world.
 pub struct SelectorList(Vec<Complex>);
 
 struct Complex(Vec<(Combinator, Compound)>);
@@ -3571,12 +3806,33 @@ struct Compound {
     id: Option<String>,
     classes: Vec<String>,
     attrs: Vec<AttrSel>,
-    /// `:not(...)` arguments: the compound matches only if none do.
-    nots: Vec<Compound>,
+    /// `:not(...)` arguments, one inner Vec per `:not()` invocation: the
+    /// compound matches only if NO argument of ANY invocation does. The
+    /// grouping matters only for specificity — each invocation contributes
+    /// its MOST SPECIFIC argument (Selectors 4 §17), while separate
+    /// invocations all add up.
+    nots: Vec<Vec<Compound>>,
+    /// `:is(...)`/`:where(...)` (+ the legacy `:matches` alias) argument
+    /// groups, one per invocation (Selectors 4 §4.2–4.3): the compound
+    /// matches only if, for EACH group, the element matches AT LEAST ONE of
+    /// the group's complex selectors (full complex selectors — combinators
+    /// allowed — matched with this element as the subject). The bool marks
+    /// `:where`, which contributes ZERO specificity; `:is` contributes its
+    /// most specific argument. Arguments are a FORGIVING list: unparsable
+    /// ones are dropped individually, and an all-invalid group simply
+    /// matches nothing (the rule survives).
+    selects: Vec<(Vec<Complex>, bool)>,
     /// `:hover`, `:focus` and other pseudos we can't satisfy: parse fine,
     /// match never (fail-open — a never-matching hide rule hides nothing,
     /// and its comma-siblings stay alive).
     never: bool,
+    /// Set alongside `never` for pseudos that are NOT genuinely false at
+    /// rest (`:has(…)`, `:lang(…)`, …). Inside
+    /// `:not()` a `never` compound would invert to ALWAYS-match — correct
+    /// for an interaction pseudo (`:not(:hover)` really is true at rest),
+    /// but a hide rule like `.x:not(:has(img))` must die instead of hiding
+    /// every `.x`. The `:not` parser rejects these (rule dropped, fail-open).
+    never_unknown: bool,
     /// Structural pseudo-classes (`:empty`, `:nth-child(…)`, `:first-child`,
     /// `:*-of-type`, …) the element must satisfy. All must hold (AND).
     structural: Vec<Structural>,
@@ -3610,6 +3866,8 @@ struct AttrSel {
     name: String,
     op: AttrOp,
     value: Option<String>,
+    /// `[attr=value i]` (Selectors 4): compare ASCII case-insensitively.
+    ci: bool,
 }
 
 /// `An+B` (the `:nth-child` micro-grammar): position `p` (1-based) matches
@@ -3701,6 +3959,7 @@ fn structural_simple(name: &str) -> Option<Vec<Structural>> {
 }
 
 /// CSS attribute selector operators: `=`, `~=`, `|=`, `^=`, `$=`, `*=`.
+#[derive(Clone, Copy)]
 enum AttrOp {
     Exact,
     Includes,
@@ -3715,19 +3974,26 @@ impl AttrSel {
         let Some(want) = &self.value else {
             return true; // bare [attr]: presence is enough
         };
-        match self.op {
-            AttrOp::Exact => got == want,
-            AttrOp::Includes => got.split_ascii_whitespace().any(|w| w == want),
-            AttrOp::Dash => {
-                got == want
-                    || got
-                        .strip_prefix(want.as_str())
-                        .is_some_and(|r| r.starts_with('-'))
-            }
-            AttrOp::Prefix => !want.is_empty() && got.starts_with(want.as_str()),
-            AttrOp::Suffix => !want.is_empty() && got.ends_with(want.as_str()),
-            AttrOp::Substring => !want.is_empty() && got.contains(want.as_str()),
+        if self.ci {
+            // The `i` flag: fold both sides (ASCII, per Selectors 4).
+            return attr_op_matches(
+                self.op,
+                &got.to_ascii_lowercase(),
+                &want.to_ascii_lowercase(),
+            );
         }
+        attr_op_matches(self.op, got, want)
+    }
+}
+
+fn attr_op_matches(op: AttrOp, got: &str, want: &str) -> bool {
+    match op {
+        AttrOp::Exact => got == want,
+        AttrOp::Includes => got.split_ascii_whitespace().any(|w| w == want),
+        AttrOp::Dash => got == want || got.strip_prefix(want).is_some_and(|r| r.starts_with('-')),
+        AttrOp::Prefix => !want.is_empty() && got.starts_with(want),
+        AttrOp::Suffix => !want.is_empty() && got.ends_with(want),
+        AttrOp::Substring => !want.is_empty() && got.contains(want),
     }
 }
 
@@ -3738,6 +4004,7 @@ impl Compound {
             && self.classes.is_empty()
             && self.attrs.is_empty()
             && self.nots.is_empty()
+            && self.selects.is_empty()
             && !self.never
             && !self.scope
             && !self.root
@@ -3746,17 +4013,29 @@ impl Compound {
             && self.pseudo.is_none()
     }
 
-    /// (ids, classes+attrs+pseudo-classes, tags) — `:not` contributes
-    /// its argument's counts, not its own.
+    /// (ids, classes+attrs+pseudo-classes, tags+pseudo-elements). A
+    /// pseudo-ELEMENT counts like a type (Selectors 4 §17), not a class.
+    /// Each `:not()`/`:is()` invocation contributes the specificity of its
+    /// MOST SPECIFIC argument (not the sum over a comma list); separate
+    /// invocations in one compound all add up; `:where()` contributes ZERO.
     fn spec(&self) -> (u32, u32, u32) {
         let mut s = (
             u32::from(self.id.is_some()),
             self.classes.len() as u32 + self.attrs.len() as u32 + self.pseudos,
-            u32::from(matches!(&self.tag, Some(t) if t != "*")),
+            u32::from(matches!(&self.tag, Some(t) if t != "*")) + u32::from(self.pseudo.is_some()),
         );
-        for n in &self.nots {
-            let ns = n.spec();
-            s = (s.0 + ns.0, s.1 + ns.1, s.2 + ns.2);
+        for group in &self.nots {
+            if let Some(m) = group.iter().map(Compound::spec).max() {
+                s = (s.0 + m.0, s.1 + m.1, s.2 + m.2);
+            }
+        }
+        for (group, is_where) in &self.selects {
+            if *is_where {
+                continue; // `:where()`: always zero specificity
+            }
+            if let Some(m) = group.iter().map(Complex::specificity).max() {
+                s = (s.0 + m.0, s.1 + m.1, s.2 + m.2);
+            }
         }
         if let Some(inner) = &self.host_inner {
             let hs = inner.spec();
@@ -3874,7 +4153,7 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
             '[' => {
                 chars.next();
                 let inner: String = chars.by_ref().take_while(|&c| c != ']').collect();
-                let (name, op, value) = match inner.split_once('=') {
+                let (name, op, value, ci) = match inner.split_once('=') {
                     Some((n, v)) => {
                         let (n, op) = match n.chars().last() {
                             Some('~') => (&n[..n.len() - 1], AttrOp::Includes),
@@ -3884,9 +4163,26 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                             Some('*') => (&n[..n.len() - 1], AttrOp::Substring),
                             _ => (n, AttrOp::Exact),
                         };
-                        (n, op, Some(v.trim().trim_matches(['"', '\'']).to_string()))
+                        // A trailing standalone `i` makes the comparison ASCII
+                        // case-insensitive; `s` forces the (default) sensitive
+                        // match (Selectors 4 §6.3). A quoted value protects a
+                        // literal trailing i (`[t="a i"]` has no whitespace-
+                        // separated bare flag token).
+                        let mut v = v.trim();
+                        let mut ci = false;
+                        if let Some((head, flag)) = v.rsplit_once(char::is_whitespace)
+                            && !head.trim().is_empty()
+                        {
+                            if flag.eq_ignore_ascii_case("i") {
+                                ci = true;
+                                v = head.trim();
+                            } else if flag.eq_ignore_ascii_case("s") {
+                                v = head.trim();
+                            }
+                        }
+                        (n, op, Some(v.trim_matches(['"', '\'']).to_string()), ci)
                     }
-                    None => (inner.as_str(), AttrOp::Exact, None),
+                    None => (inner.as_str(), AttrOp::Exact, None, false),
                 };
                 if name.trim().is_empty() {
                     return None;
@@ -3895,6 +4191,7 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     name: name.trim().to_ascii_lowercase(),
                     op,
                     value,
+                    ci,
                 });
             }
             ':' => {
@@ -3932,6 +4229,7 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     // Step-1 :not takes compounds (no combinators) —
                     // anything fancier fails the parse (rule ignored,
                     // fail-open). Specificity comes from the argument.
+                    let mut group = Vec::new();
                     for part in split_top_level(&arg?, ',') {
                         let part = part.trim();
                         if part.is_empty() || part.contains(char::is_whitespace) {
@@ -3942,18 +4240,48 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         if inner.is_empty() || inner_chars.peek().is_some() {
                             return None;
                         }
-                        compound.nots.push(inner);
+                        // A pseudo we can't evaluate would INVERT through
+                        // `:not` into always-match (see `never_unknown`);
+                        // fail the parse so the rule dies instead.
+                        if inner.never_unknown {
+                            return None;
+                        }
+                        group.push(inner);
                     }
+                    compound.nots.push(group);
+                } else if name == "is" || name == "where" || name == "matches" {
+                    // `:is()`/`:where()` (Selectors 4 §4.2–4.3; `:matches` is
+                    // the pre-rename legacy alias of `:is`): match ANY of a
+                    // FORGIVING selector list of full complex selectors. An
+                    // unparsable argument is dropped individually — never
+                    // fatal to the rule (unlike a plain selector list); a
+                    // pseudo-element subject is invalid inside and dropped
+                    // too. Specificity is handled in `spec()` (`:is` = most
+                    // specific argument, `:where` = zero) — the pseudo
+                    // itself deliberately does NOT bump `pseudos`.
+                    let mut group = Vec::new();
+                    for part in split_top_level(&arg?, ',') {
+                        let part = part.trim();
+                        if part.is_empty() {
+                            continue;
+                        }
+                        if let Some(cx) = parse_complex(part)
+                            && cx.0.last().is_none_or(|(_, c)| c.pseudo.is_none())
+                        {
+                            group.push(cx);
+                        }
+                    }
+                    compound.selects.push((group, name == "where"));
                 } else if name == "before" || name == "after" {
                     // Generated-content pseudo-element: the compound still
                     // matches the element (tag/class parts), but the rule
-                    // targets the element's ::before/::after box.
+                    // targets the element's ::before/::after box. Counted in
+                    // `spec()` via `pseudo` (the TYPE bucket), not `pseudos`.
                     compound.pseudo = Some(if name == "before" {
                         PseudoEl::Before
                     } else {
                         PseudoEl::After
                     });
-                    compound.pseudos += 1;
                 } else if name == "scope" {
                     // Matches the query root (set by `query`); inert in the
                     // cascade. See `Compound::scope`.
@@ -3998,9 +4326,25 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     });
                     compound.pseudos += 1;
                 } else {
-                    // Valid CSS we can never satisfy (no pointer, no focus):
-                    // parse, count for specificity, never match.
+                    // Valid CSS we can never satisfy: parse, count for
+                    // specificity, never match. Interaction pseudos are
+                    // GENUINELY false at rest (no pointer, no focus), so a
+                    // `:not(:hover)` wrapping them correctly matches;
+                    // anything else unsupported is flagged so `:not` rejects
+                    // it rather than inverting it into always-match.
                     compound.never = true;
+                    compound.never_unknown = !matches!(
+                        name.as_str(),
+                        "hover"
+                            | "active"
+                            | "focus"
+                            | "focus-within"
+                            | "focus-visible"
+                            | "visited"
+                            | "target"
+                            | "checked"
+                            | "disabled"
+                    );
                     compound.pseudos += 1;
                 }
             }
@@ -4014,11 +4358,35 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
     Some(compound)
 }
 
-/// An identifier, `*`, or tag token.
+/// An identifier, `*`, or tag token, with CSS ident ESCAPES decoded
+/// (css-syntax §4.3.7, the same algorithm `unquote_css` uses for strings):
+/// `\` + 1–6 hex digits (one optional trailing whitespace terminator) → the
+/// code point; `\c` → the literal char. Tailwind-era class names lean on
+/// escapes — `.md\:flex`, `.w-1\/2`, `.hover\:underline`, `.w-\[10px\]`
+/// are the classes `md:flex`, `w-1/2`, … — so a parser without them drops
+/// every responsive/state-variant rule on such sites.
 fn take_name(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
     let mut out = String::new();
     while let Some(&c) = chars.peek() {
-        if c.is_alphanumeric() || matches!(c, '-' | '_' | '*') {
+        if c == '\\' {
+            chars.next();
+            let mut hex = String::new();
+            while hex.len() < 6 && chars.peek().is_some_and(char::is_ascii_hexdigit) {
+                hex.push(chars.next().unwrap());
+            }
+            if !hex.is_empty() {
+                // One whitespace may terminate the hex escape (`#\31 23`
+                // is the ident `123` — that space is NOT a combinator).
+                if chars.peek().is_some_and(|c| c.is_ascii_whitespace()) {
+                    chars.next();
+                }
+                if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    out.push(ch);
+                }
+            } else if let Some(lit) = chars.next() {
+                out.push(lit);
+            }
+        } else if c.is_alphanumeric() || matches!(c, '-' | '_' | '*') {
             out.push(c);
             chars.next();
         } else {
@@ -4119,6 +4487,7 @@ const PROPS: &[PropDef] = &[
     prop("padding-top", false, true),
     prop("padding-bottom", false, true),
     prop("padding-left", false, true),
+    prop("padding-right", false, true),
     prop("text-align", true, true),
     prop("font-size", true, true),
     prop("font-weight", true, true),
@@ -4201,10 +4570,12 @@ fn is_tracked(name: &str) -> bool {
 /// via `computed_display` (author cascade + the layout's own tag tables).
 fn ua_display(tag: &str) -> &'static str {
     match tag {
-        "address" | "article" | "aside" | "blockquote" | "body" | "details" | "dialog" | "div"
-        | "dl" | "dd" | "dt" | "fieldset" | "figcaption" | "figure" | "footer" | "form" | "h1"
-        | "h2" | "h3" | "h4" | "h5" | "h6" | "header" | "hgroup" | "hr" | "html" | "main"
-        | "nav" | "ol" | "p" | "pre" | "section" | "summary" | "ul" => "block",
+        "address" | "article" | "aside" | "blockquote" | "body" | "center" | "details"
+        | "dialog" | "dir" | "div" | "dl" | "dd" | "dt" | "fieldset" | "figcaption" | "figure"
+        | "footer" | "form" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "header" | "hgroup"
+        | "hr" | "html" | "legend" | "listing" | "main" | "menu" | "nav" | "ol" | "optgroup"
+        | "option" | "p" | "plaintext" | "pre" | "search" | "section" | "summary" | "ul"
+        | "xmp" => "block",
         "li" => "list-item",
         "table" => "table",
         "thead" => "table-header-group",
@@ -4304,9 +4675,80 @@ fn classify_font_size_zero(v: &str) -> Option<bool> {
 /// `opacity:0.5`) painted normally.
 const OPACITY_HIDDEN: f32 = 0.05;
 
+/// Parse a CSS `<alpha-value>`: a number, or a percentage (CSS Color 4 —
+/// `opacity: 0%` is valid and must read as 0, not fail the parse and
+/// default to fully opaque).
+fn parse_alpha(v: &str) -> Option<f32> {
+    let v = v.trim();
+    match v.strip_suffix('%') {
+        Some(p) => p.trim().parse::<f32>().ok().map(|n| n / 100.0),
+        None => v.parse::<f32>().ok(),
+    }
+}
+
+/// CSS Logical Properties → their physical equivalents. TRust renders only
+/// horizontal-tb LTR (no `writing-mode`/`direction` support), so inline =
+/// left/right and block = top/bottom — the mapping is exact for every page
+/// we can render. `margin-inline: auto` is the modern centering idiom;
+/// Mastodon-generation CSS uses the whole family.
+fn logical_to_physical(prop: &str) -> Option<&'static str> {
+    Some(match prop {
+        "margin-inline-start" => "margin-left",
+        "margin-inline-end" => "margin-right",
+        "margin-block-start" => "margin-top",
+        "margin-block-end" => "margin-bottom",
+        "padding-inline-start" => "padding-left",
+        "padding-inline-end" => "padding-right",
+        "padding-block-start" => "padding-top",
+        "padding-block-end" => "padding-bottom",
+        "inset-inline-start" => "left",
+        "inset-inline-end" => "right",
+        "inset-block-start" => "top",
+        "inset-block-end" => "bottom",
+        "inline-size" => "width",
+        "block-size" => "height",
+        "min-inline-size" => "min-width",
+        "min-block-size" => "min-height",
+        "max-inline-size" => "max-width",
+        "max-block-size" => "max-height",
+        _ => return None,
+    })
+}
+
+/// The two-value logical shorthands (`margin-inline: <start> <end>?`, …) →
+/// their physical (left/right or top/bottom) longhand pair.
+fn logical_pair(prop: &str) -> Option<(&'static str, &'static str)> {
+    Some(match prop {
+        "margin-inline" => ("margin-left", "margin-right"),
+        "margin-block" => ("margin-top", "margin-bottom"),
+        "padding-inline" => ("padding-left", "padding-right"),
+        "padding-block" => ("padding-top", "padding-bottom"),
+        "inset-inline" => ("left", "right"),
+        "inset-block" => ("top", "bottom"),
+        _ => return None,
+    })
+}
+
 /// Expand a `margin`/`padding`/`border*`/`list-style` shorthand into the
 /// longhands we track; pass anything else through unchanged.
 fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
+    // Logical properties resolve to their physical names first (LTR
+    // horizontal-tb — see `logical_to_physical`).
+    if let Some(phys) = logical_to_physical(prop) {
+        return vec![(phys.to_string(), value.to_string())];
+    }
+    if let Some((start, end)) = logical_pair(prop) {
+        let toks: Vec<&str> = value.split_whitespace().collect();
+        let (a, b) = match toks.as_slice() {
+            [x] => (*x, *x),
+            [x, y] => (*x, *y),
+            _ => return Vec::new(),
+        };
+        return vec![
+            (start.to_string(), a.to_string()),
+            (end.to_string(), b.to_string()),
+        ];
+    }
     if prop == "margin" || prop == "padding" {
         let Some([t, r, b, l]) = four_sides(value) else {
             return Vec::new();
@@ -4523,18 +4965,33 @@ struct StyleRule {
     specificity: (u32, u32, u32),
     /// Source position across every sheet of the scope.
     order: usize,
+    /// The rule's cascade-layer position (css-cascade-5 §6.4), pre-encoded
+    /// for each importance (the layer order REVERSES for `!important`).
+    /// See `encode_layer`; unlayered rules carry the implicit-final-layer
+    /// encodings.
+    layer_normal: u64,
+    layer_important: u64,
     decls: Vec<(String, (bool, String))>,
 }
 
-/// (!important, inline, specificity, source order): the cascade key;
-/// lexicographic max wins.
-type CascadeKey = (bool, bool, (u32, u32, u32), usize);
-
-fn consider(slot: &mut Option<(CascadeKey, String)>, key: CascadeKey, value: &str) {
-    if slot.as_ref().is_none_or(|(k, _)| key >= *k) {
-        *slot = Some((key, value.to_string()));
+impl StyleRule {
+    /// The importance-matched cascade-layer encoding for the cascade key.
+    fn layer_key(&self, important: bool) -> u64 {
+        if important {
+            self.layer_important
+        } else {
+            self.layer_normal
+        }
     }
 }
+
+/// (!important, inline, layer, specificity, source order): the cascade key;
+/// lexicographic max wins. `layer` is the importance-adjusted cascade-layer
+/// encoding (`encode_layer`); it sits AFTER the inline flag because
+/// element-attached styles outrank layers (css-cascade-5 §6.1 sorts
+/// "Element-Attached Styles" before "Layers"), and BEFORE specificity
+/// (layers beat specificity — the point of the feature).
+type CascadeKey = (bool, bool, u64, (u32, u32, u32), usize);
 
 /// Rules bucketed by tree scope: DOCUMENT for the light DOM, the shadow
 /// fragment for each shadow tree. Shadow sheets never leak out;
@@ -4678,20 +5135,141 @@ fn strip_css_comments(css: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// The cascade-layer name registry for ONE tree scope (css-cascade-5 §6.4:
+/// "Cascade layers are scoped to their origin and context" — a shadow
+/// tree's layer order is independent of the document's, exactly like our
+/// per-scope rule vecs). Layers are ordered by FIRST declaration; a dotted
+/// name (`a.b`) nests, so a layer's identity is its per-level
+/// sibling-declaration-index path.
+#[derive(Default)]
+struct LayerRegistry {
+    /// Fully-qualified dotted name → per-level sibling-index path.
+    paths: std::collections::HashMap<String, Vec<u32>>,
+    /// Next first-declaration index per parent name ("" = the root level).
+    counters: std::collections::HashMap<String, u32>,
+    /// Anonymous-layer uniquifier: each `@layer { … }` occurrence "gains a
+    /// unique anonymous segment" (a new layer every time).
+    anon: u32,
+}
+
+impl LayerRegistry {
+    /// Declare (idempotently) a fully-qualified dotted layer name, creating
+    /// missing ancestors, and return its path. The FIRST declaration fixes
+    /// the order; later mentions return the existing path unchanged.
+    fn declare(&mut self, name: &str) -> Vec<u32> {
+        if let Some(p) = self.paths.get(name) {
+            return p.clone();
+        }
+        let parent = name.rfind('.').map_or("", |i| &name[..i]);
+        let mut path = if parent.is_empty() {
+            Vec::new()
+        } else {
+            self.declare(parent)
+        };
+        let ctr = self.counters.entry(parent.to_string()).or_insert(0);
+        path.push(*ctr);
+        *ctr += 1;
+        self.paths.insert(name.to_string(), path.clone());
+        path
+    }
+
+    /// A fresh unique name for an anonymous `@layer { … }` block under
+    /// `parent` ("" = top level). `<` can't appear in an author CSS ident,
+    /// so anonymous names can never collide with declared ones.
+    fn anon_name(&mut self, parent: &str) -> String {
+        self.anon += 1;
+        if parent.is_empty() {
+            format!("<anon-{}>", self.anon)
+        } else {
+            format!("{parent}.<anon-{}>", self.anon)
+        }
+    }
+}
+
+/// Encode a cascade-layer path into ONE lexicographically-comparable u64
+/// (css-cascade-5 §6.4): four 16-bit per-level components, most significant
+/// first. A present component is the layer's first-declaration index among
+/// its siblings; a missing level is the IMPLICIT final (sub)layer — the
+/// spec puts a parent layer's direct rules "in an implicit sub-layer after
+/// the explicitly nested layers", and unlayered rules (the empty path) "in
+/// an implicit final layer" after everything. For NORMAL declarations the
+/// LAST layer wins, so implicit levels encode 0xFFFF (max); for IMPORTANT
+/// declarations the layer order REVERSES ("for important rules the
+/// declaration whose cascade layer is first wins"), so every component
+/// flips. Depth caps at 4 levels and width at 0xFFFE siblings — beyond
+/// either the ordering degrades gracefully (real-world sheets are flat:
+/// Tailwind v4 declares 4 top-level layers).
+fn encode_layer(path: &[u32], important: bool) -> u64 {
+    let mut key = 0u64;
+    for lvl in 0..4 {
+        let comp = match path.get(lvl) {
+            Some(&i) => {
+                let i = u64::from(i.min(0xFFFD));
+                if important { 0xFFFE - i } else { i }
+            }
+            None => {
+                if important {
+                    0
+                } else {
+                    0xFFFF
+                }
+            }
+        };
+        key = (key << 16) | comp;
+    }
+    key
+}
+
+/// A syntactically-plausible `<layer-name>` (`<ident> [ '.' <ident> ]*`).
+/// Loose on ident internals (unicode allowed) but strict on shape: no
+/// empty segments, no whitespace. An invalid name invalidates its whole
+/// `@layer` rule, per CSS error handling.
+fn valid_layer_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.split('.').all(|seg| {
+            !seg.is_empty()
+                && seg
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+        })
+}
+
+/// Qualify `name` against the enclosing layer (`@layer a { @layer b {…} }`
+/// "concatenates their names" → `a.b`).
+fn qualify_layer(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}.{name}")
+    }
+}
+
 /// Collect a sheet's tracked rules into `out`. `@keyframes` end-opacity is
 /// harvested; `@media` is evaluated against `viewport` (the CSS-pixel
 /// viewport) and its body spliced in when it matches (dropped otherwise);
-/// other @-blocks are skipped whole. Rules whose selectors don't parse are
-/// skipped (fail-open).
+/// `@layer` declares/enters cascade layers (`layers` + `layer`, the
+/// enclosing layer's qualified name, "" = unlayered); other @-blocks are
+/// skipped whole. Rules whose selectors don't parse are skipped
+/// (fail-open).
 fn parse_sheet(
     css: &str,
     order: &mut usize,
     out: &mut Vec<StyleRule>,
     keyframes: &mut std::collections::HashMap<String, f32>,
     viewport: (u32, u32),
+    layers: &mut LayerRegistry,
+    layer: &str,
 ) {
     let css = strip_css_comments(css);
     let mut rest = css.as_ref();
+    // The enclosing layer's path stamps every rule this call emits.
+    // `declare` is idempotent — the layer was declared when its block was
+    // entered, so this is a lookup.
+    let lpath = if layer.is_empty() {
+        Vec::new()
+    } else {
+        layers.declare(layer)
+    };
     loop {
         rest = rest.trim_start();
         if rest.is_empty() {
@@ -4732,7 +5310,7 @@ fn parse_sheet(
                 let query = &after[after.len() - rest_q.len()..brace_off];
                 let (block, tail) = take_block(&after[brace_off..]);
                 if media_query_matches(query, viewport) {
-                    parse_sheet(block, order, out, keyframes, viewport);
+                    parse_sheet(block, order, out, keyframes, viewport, layers, layer);
                 }
                 rest = tail;
                 continue;
@@ -4755,10 +5333,61 @@ fn parse_sheet(
                 let cond = &after[after.len() - rest_c.len()..brace_off];
                 let (block, tail) = take_block(&after[brace_off..]);
                 if supports_condition(cond) {
-                    parse_sheet(block, order, out, keyframes, viewport);
+                    parse_sheet(block, order, out, keyframes, viewport, layers, layer);
                 }
                 rest = tail;
                 continue;
+            }
+            // `@layer` (css-cascade-5 §6.4): the STATEMENT form
+            // (`@layer a, b.c;`) declares layers in order without assigning
+            // rules; the BLOCK form (`@layer name? { … }`) declares the
+            // layer on first mention and assigns the block's rules to it —
+            // the body is a full stylesheet (nested @media/@supports/@layer
+            // recurse). An anonymous block is a NEW unique layer each time.
+            // Before this, @layer blocks fell to the generic skip, so a
+            // Tailwind-v4-era sheet (everything inside layers) contributed
+            // nothing to the cascade.
+            if let Some(rest_l) = lower.strip_prefix("layer")
+                && rest_l
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-')
+            {
+                let prelude_start = after.len() - rest_l.len();
+                let semi = after.find(';');
+                let brace = after.find('{');
+                // Statement form: the `;` comes before any `{`.
+                if let Some(s) = semi
+                    && brace.is_none_or(|b| s < b)
+                {
+                    let names: Vec<&str> =
+                        after[prelude_start..s].split(',').map(str::trim).collect();
+                    // Any invalid name invalidates the whole statement (CSS
+                    // error handling); a valid list declares each in order.
+                    if names.iter().all(|n| valid_layer_name(n)) {
+                        for n in names {
+                            layers.declare(&qualify_layer(layer, n));
+                        }
+                    }
+                    rest = &after[s + 1..];
+                    continue;
+                }
+                if let Some(b) = brace {
+                    let name_txt = after[prelude_start..b].trim();
+                    let (block, tail) = take_block(&after[b..]);
+                    rest = tail;
+                    let qualified = if name_txt.is_empty() {
+                        layers.anon_name(layer)
+                    } else if valid_layer_name(name_txt) {
+                        qualify_layer(layer, name_txt)
+                    } else {
+                        continue; // malformed name: drop the block (fail-open)
+                    };
+                    layers.declare(&qualified);
+                    parse_sheet(block, order, out, keyframes, viewport, layers, &qualified);
+                    continue;
+                }
+                return; // no `;` and no `{`: malformed tail
             }
             // Other @-rules (@charset/@import end at ';'; block at-rules at
             // their balanced '}') are skipped whole.
@@ -4774,7 +5403,7 @@ fn parse_sheet(
         let selector_text = rest[..brace].trim();
         let (block, after) = take_block(&rest[brace..]);
         rest = after;
-        parse_style_rule(selector_text, block, order, out, viewport);
+        parse_style_rule(selector_text, block, order, out, viewport, &lpath);
     }
 }
 
@@ -4796,6 +5425,7 @@ fn parse_style_rule(
     order: &mut usize,
     out: &mut Vec<StyleRule>,
     viewport: (u32, u32),
+    layer: &[u32],
 ) {
     let (decl_text, nested) = split_block(block);
     let decls = collect_decls(&decl_text);
@@ -4807,6 +5437,8 @@ fn parse_style_rule(
                 specificity: selector.specificity(),
                 selector,
                 order: *order,
+                layer_normal: encode_layer(layer, false),
+                layer_important: encode_layer(layer, true),
                 decls: decls.clone(),
             });
             *order += 1;
@@ -4830,12 +5462,12 @@ fn parse_style_rule(
             if (kw_ok("media") && media_query_matches(&at[5..], viewport))
                 || (kw_ok("supports") && supports_condition(&at[8..]))
             {
-                parse_style_rule(resolved, nblock, order, out, viewport);
+                parse_style_rule(resolved, nblock, order, out, viewport, layer);
             }
             continue;
         }
         let child = expand_nesting(nsel, resolved);
-        parse_style_rule(&child, nblock, order, out, viewport);
+        parse_style_rule(&child, nblock, order, out, viewport, layer);
     }
 }
 
@@ -5021,6 +5653,10 @@ fn supports_in_parens(s: &str) -> bool {
 
 /// Split a `@supports` condition on a top-level ` and `/` or ` keyword
 /// (paren-depth 0), trimming each part. Returns one element when absent.
+/// Byte-wise: the keyword pattern is pure ASCII, so a match position is
+/// always a char boundary — a multi-byte char in the condition must never
+/// be sliced into (str-indexing `cond[i..]` at every byte offset panicked
+/// on non-ASCII input; the byte-slice compare can't).
 fn split_supports_kw(cond: &str, kw: &str) -> Vec<String> {
     let bytes = cond.as_bytes();
     let mut parts = Vec::new();
@@ -5028,13 +5664,17 @@ fn split_supports_kw(cond: &str, kw: &str) -> Vec<String> {
     let mut start = 0usize;
     let mut i = 0usize;
     let pat = format!(" {kw} ");
+    let pat = pat.as_bytes();
     while i < bytes.len() {
         match bytes[i] {
             b'(' => depth += 1,
             b')' => depth -= 1,
             _ => {}
         }
-        if depth == 0 && cond[i..].to_ascii_lowercase().starts_with(&pat) {
+        if depth == 0
+            && bytes[i..].len() >= pat.len()
+            && bytes[i..i + pat.len()].eq_ignore_ascii_case(pat)
+        {
             parts.push(cond[start..i].trim().to_string());
             i += pat.len();
             start = i;
@@ -5136,11 +5776,15 @@ fn media_query_one(q: &str, vp: (u32, u32)) -> bool {
     matches ^ negate
 }
 
-/// A single `feature: value` media condition against the viewport.
+/// A single media condition against the viewport: the classic
+/// `feature: value` form, or the Media Queries L4 range form
+/// (`width >= 40em`, `400px <= width < 900px`).
 fn media_feature_matches(inner: &str, vp: (u32, u32)) -> bool {
     let (vw, vh) = vp;
     let Some((name, value)) = inner.split_once(':') else {
-        return false; // boolean feature (`(color)`) — unrecognized, no match
+        // No colon: try the L4 range syntax; a boolean feature (`(color)`)
+        // or anything unrecognized still doesn't match.
+        return media_range_matches(inner, vp);
     };
     let value = value.trim();
     match name.trim() {
@@ -5155,6 +5799,80 @@ fn media_feature_matches(inner: &str, vp: (u32, u32)) -> bool {
             "landscape" => vw > vh,
             _ => false,
         },
+        _ => false,
+    }
+}
+
+/// The Media Queries L4 range syntax: `width >= 40em`, `width < 900px`,
+/// `400px <= width <= 900px` (Tailwind v4 and modern sheets emit these).
+/// Only `width`/`height` are evaluated; an unknown feature name, an unknown
+/// viewport (0), or an unparsable form doesn't match — the same
+/// conservative default as the colon form.
+fn media_range_matches(inner: &str, vp: (u32, u32)) -> bool {
+    // Split into operands and comparison operators. Operators are ASCII, so
+    // the byte positions sliced at are always char boundaries.
+    let bytes = inner.as_bytes();
+    let (mut operands, mut ops) = (Vec::new(), Vec::new());
+    let (mut start, mut i) = (0usize, 0usize);
+    while i < bytes.len() {
+        let len = match bytes[i] {
+            b'<' | b'>' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    2
+                } else {
+                    1
+                }
+            }
+            b'=' => 1,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        operands.push(inner[start..i].trim());
+        ops.push(&inner[i..i + len]);
+        i += len;
+        start = i;
+    }
+    operands.push(inner[start..].trim());
+    let actual = |name: &str| -> Option<u32> {
+        let v = match name {
+            "width" => vp.0,
+            "height" => vp.1,
+            _ => return None,
+        };
+        (v != 0).then_some(v)
+    };
+    let cmp = |a: u32, op: &str, b: u32| match op {
+        "<" => a < b,
+        "<=" => a <= b,
+        ">" => a > b,
+        ">=" => a >= b,
+        "=" => a == b,
+        _ => false,
+    };
+    match operands.as_slice() {
+        // `width >= 40em`
+        [name, value] if actual(name).is_some() => {
+            let (Some(a), Some(v)) = (actual(name), media_px(value)) else {
+                return false;
+            };
+            cmp(a, ops[0], v)
+        }
+        // `400px <= width` (feature on the right: flip the comparison)
+        [value, name] => {
+            let (Some(a), Some(v)) = (actual(name), media_px(value)) else {
+                return false;
+            };
+            cmp(v, ops[0], a)
+        }
+        // `400px <= width <= 900px`
+        [lo, name, hi] => {
+            let (Some(a), Some(l), Some(h)) = (actual(name), media_px(lo), media_px(hi)) else {
+                return false;
+            };
+            cmp(l, ops[0], a) && cmp(a, ops[1], h)
+        }
         _ => false,
     }
 }
@@ -5279,7 +5997,7 @@ fn keyframes_end_opacity(block: &str) -> Option<f32> {
         for decl in decls.split(';') {
             if let Some((k, v, _)) = parse_decl(decl)
                 && k == "opacity"
-                && let Ok(o) = v.trim().parse::<f32>()
+                && let Some(o) = parse_alpha(&v)
                 && best.is_none_or(|(bo, _)| offset >= bo)
             {
                 best = Some((offset, o));
@@ -5299,6 +6017,27 @@ fn keyframe_offset(sel: &str) -> Option<f32> {
             .and_then(|p| p.trim().parse::<f32>().ok())
             .map(|p| p / 100.0),
     }
+}
+
+/// One comma-separated `animation` shorthand segment → its `(name,
+/// fill-mode)`: the fill keyword and the first token that isn't a
+/// time/keyword are picked out; everything else (durations, easings,
+/// iteration counts) is skipped.
+fn parse_animation_segment(seg: &str) -> (Option<String>, Option<String>) {
+    let mut name = None;
+    let mut fill = None;
+    for tok in seg.split_whitespace() {
+        match tok {
+            "forwards" | "backwards" | "both" => {
+                fill.get_or_insert_with(|| tok.to_string());
+            }
+            _ if is_anim_keyword_or_time(tok) => {}
+            _ => {
+                name.get_or_insert_with(|| tok.to_string());
+            }
+        }
+    }
+    (name, fill)
 }
 
 /// Whether an `animation` shorthand token is a non-name part (a time, a
@@ -7612,11 +8351,902 @@ mod tests {
     }
 
     #[test]
+    fn content_mutations_retain_the_parsed_style_index() {
+        // The style-epoch split: ordinary content mutations (text, attrs,
+        // appends of ordinary nodes) must NOT rebuild the parsed style index
+        // (`Rc` identity proves retention) — while per-element matching still
+        // follows the mutation (the class toggle below styles correctly
+        // against the RETAINED index).
+        let mut dom = Dom::parse_document(
+            "<head><style>.hot{letter-spacing:3px}</style></head>\
+             <body><p id=t>x</p><div id=box></div></body>",
+        );
+        let t = dom.get_by_id("t").unwrap();
+        let box_id = dom.get_by_id("box").unwrap();
+        let idx0 = dom.style_index();
+        // Text mutation.
+        dom.set_text(t, "tick");
+        assert!(
+            std::rc::Rc::ptr_eq(&idx0, &dom.style_index()),
+            "a text edit must not re-parse the sheets"
+        );
+        // Ordinary attribute mutation — and the cascade still follows it.
+        dom.set_attr(t, "class", "hot");
+        assert!(
+            std::rc::Rc::ptr_eq(&idx0, &dom.style_index()),
+            "an attr change must not re-parse the sheets"
+        );
+        assert_eq!(
+            dom.computed_style(t, "letter-spacing").as_deref(),
+            Some("3px"),
+            "matching re-runs against the retained index"
+        );
+        // Appending an ordinary subtree.
+        let d = dom.create_element("div");
+        let s = dom.create_element("span");
+        dom.append(d, s);
+        dom.append(box_id, d);
+        assert!(
+            std::rc::Rc::ptr_eq(&idx0, &dom.style_index()),
+            "an ordinary subtree attach must not re-parse the sheets"
+        );
+        // Detaching it again.
+        dom.detach(d);
+        assert!(
+            std::rc::Rc::ptr_eq(&idx0, &dom.style_index()),
+            "an ordinary detach must not re-parse the sheets"
+        );
+    }
+
+    #[test]
+    fn style_mutations_rebuild_the_index() {
+        // The standards' sheet-(re)creation triggers (HTML §4.2.6 for
+        // <style> text/tree changes, <link> attribute changes, plus adopted
+        // sheets and the viewport) must each invalidate the parsed index —
+        // and the new rules must actually apply.
+        let mut dom = Dom::parse_document(
+            "<head><style id=sh>.a{letter-spacing:1px}</style></head>\
+             <body><p id=t class='a b c'>x</p></body>",
+        );
+        let t = dom.get_by_id("t").unwrap();
+        let sheet = dom.get_by_id("sh").unwrap();
+        let fresh = |dom: &Dom, prev: &std::rc::Rc<StyleIndex>| {
+            let now = dom.style_index();
+            !std::rc::Rc::ptr_eq(prev, &now)
+        };
+        // 1. Editing the <style> element's text.
+        let i = dom.style_index();
+        dom.set_text(sheet, ".a{letter-spacing:2px}");
+        assert!(fresh(&dom, &i), "style text edit rebuilds");
+        assert_eq!(
+            dom.computed_style(t, "letter-spacing").as_deref(),
+            Some("2px")
+        );
+        // 2. A script-created <style> appended to the tree.
+        let i = dom.style_index();
+        let st = dom.create_element("style");
+        let css = dom.create_text(".b{text-indent:4px}");
+        dom.append(st, css);
+        let head = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&n| dom.tag_name(n) == Some("head"))
+            .unwrap();
+        dom.append(head, st);
+        assert!(fresh(&dom, &i), "appending a style element rebuilds");
+        assert_eq!(dom.computed_style(t, "text-indent").as_deref(), Some("4px"));
+        // 3. A subtree attach whose NESTED content carries a <style>.
+        let i = dom.style_index();
+        let wrap = dom.create_element("div");
+        let inner = dom.create_element("style");
+        let css2 = dom.create_text(".c{text-transform:uppercase}");
+        dom.append(inner, css2);
+        dom.append(wrap, inner);
+        let body = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&n| dom.tag_name(n) == Some("body"))
+            .unwrap();
+        dom.append(body, wrap);
+        assert!(fresh(&dom, &i), "a nested-style subtree attach rebuilds");
+        assert_eq!(
+            dom.computed_value(t, "text-transform").as_deref(),
+            Some("uppercase")
+        );
+        // 4. Detaching a style element removes its rules.
+        let i = dom.style_index();
+        dom.detach(st);
+        assert!(fresh(&dom, &i), "detaching a style element rebuilds");
+        assert_eq!(dom.computed_style(t, "text-indent"), None);
+        // 5. Adopted sheets.
+        let i = dom.style_index();
+        dom.set_adopted_styles(DOCUMENT, ".a{margin-top:9px}");
+        assert!(fresh(&dom, &i), "adoptedStyleSheets rebuilds");
+        assert_eq!(dom.computed_style(t, "margin-top").as_deref(), Some("9px"));
+        // 6. Viewport change (@media re-evaluation).
+        let i = dom.style_index();
+        dom.set_viewport_px(800, 600);
+        assert!(fresh(&dom, &i), "viewport change rebuilds");
+        // 7. An attribute change on a sheet-bearing element.
+        let i = dom.style_index();
+        dom.set_attr(sheet, "media", "screen");
+        assert!(fresh(&dom, &i), "style/link attr change rebuilds");
+    }
+
+    /// The style-epoch split's honest A/B, one binary (release:
+    /// `cargo test --release style_epoch_bench -- --ignored --nocapture`).
+    /// Loop A mutates CONTENT then reads styles — the index is retained, so
+    /// each cycle pays only re-matching. Loop B touches the SHEET each cycle
+    /// — forcing the full re-parse + bucket rebuild that, before the split,
+    /// EVERY mutation paid. B−A ≈ the per-mutate-read-cycle saving.
+    #[test]
+    #[ignore]
+    fn style_epoch_bench() {
+        let mut css = String::new();
+        for i in 0..4000 {
+            css.push_str(&format!(
+                ".c{i}{{letter-spacing:{}px;margin-top:{}px;text-indent:{}px}}\n",
+                i % 9,
+                i % 5,
+                i % 3
+            ));
+        }
+        let mut html = format!("<head><style id=sh>{css}</style></head><body>");
+        for i in 0..300 {
+            html.push_str(&format!("<p id=n{i} class='c{}'>x</p>", (i * 13) % 4000));
+        }
+        html.push_str("</body>");
+        let mut dom = Dom::parse_document(&html);
+        let ids: Vec<NodeId> = (0..20)
+            .map(|i| dom.get_by_id(&format!("n{i}")).unwrap())
+            .collect();
+        let sheet = dom.get_by_id("sh").unwrap();
+        let read = |dom: &Dom| {
+            for &id in &ids {
+                for p in ["letter-spacing", "margin-top", "text-indent", "display"] {
+                    let _ = dom.computed_style(id, p);
+                }
+                let _ = dom.is_hidden(id);
+            }
+        };
+        let _ = dom.style_index(); // warm
+        let n = 200;
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            dom.set_text(ids[0], &format!("tick {i}")); // content churn
+            read(&dom);
+        }
+        let content = t.elapsed();
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            dom.set_attr(sheet, "data-i", &format!("{i}")); // sheet churn
+            read(&dom);
+        }
+        let style = t.elapsed();
+        println!(
+            "content churn (index retained): {content:?} ({:?}/cycle)\n\
+             sheet churn (index rebuilt):    {style:?} ({:?}/cycle)\n\
+             saved per mutate-then-read cycle: {:?}",
+            content / n,
+            style / n,
+            (style.saturating_sub(content)) / n
+        );
+    }
+
+    #[test]
+    fn winner_map_keeps_untracked_inline_props_and_pseudo_buckets() {
+        // The per-element winner map must preserve two easy-to-lose
+        // behaviors: (1) UNTRACKED properties declared INLINE stay readable
+        // (getComputedStyle of `background` — sheets filter untracked props
+        // at parse, inline must not); (2) a rule targeting ::before must not
+        // leak its declarations onto the element bucket, nor vice versa.
+        let dom = Dom::parse_document(
+            "<head><style>\
+             .x::before{content:\"*\";text-indent:7px}\
+             .x{letter-spacing:2px}\
+             </style></head>\
+             <body><p id=t class=x style='background:red;letter-spacing:3px'>y</p></body>",
+        );
+        let t = dom.get_by_id("t").unwrap();
+        assert_eq!(
+            dom.computed_value(t, "background").as_deref(),
+            Some("red"),
+            "untracked inline property readable (getComputedStyle path)"
+        );
+        assert_eq!(
+            dom.computed_style(t, "letter-spacing").as_deref(),
+            Some("3px"),
+            "inline beats the sheet rule"
+        );
+        assert_eq!(
+            dom.computed_style(t, "text-indent"),
+            None,
+            "::before declarations don't leak onto the element"
+        );
+        assert_eq!(
+            dom.pseudo_style(t, PseudoEl::Before, "text-indent")
+                .as_deref(),
+            Some("7px"),
+            "the pseudo bucket holds its own winners"
+        );
+        assert_eq!(
+            dom.pseudo_content(t, PseudoEl::Before).as_deref(),
+            Some("*")
+        );
+        assert_eq!(
+            dom.pseudo_style(t, PseudoEl::Before, "letter-spacing"),
+            None,
+            "element declarations don't leak onto the pseudo"
+        );
+    }
+
+    /// Cascade-read cost on the SERIALIZE path (release:
+    /// `cargo test --release cascade_winner_bench -- --ignored --nocapture`).
+    /// Each iteration bumps the epoch (one text mutation) then fully
+    /// serializes — `write_attrs` reads every baked property per element, so
+    /// this measures per-element cascade cost end to end. Compare before/
+    /// after the per-element winner map.
+    #[test]
+    #[ignore]
+    fn cascade_winner_bench() {
+        let mut css = String::new();
+        for i in 0..4000 {
+            css.push_str(&format!(
+                ".c{i}{{letter-spacing:{}px;margin-top:{}px;text-indent:{}px;padding-left:{}px}}\n",
+                i % 9,
+                i % 5,
+                i % 3,
+                i % 7
+            ));
+        }
+        // Give every element multiple matched rules + an inline style (the
+        // real-page shape: utility classes + a style attribute).
+        let mut html = format!("<head><style>{css}</style></head><body>");
+        for i in 0..400 {
+            html.push_str(&format!(
+                "<p id=n{i} class='c{} c{} c{}' style='margin-bottom:2px'>x</p>",
+                (i * 13) % 4000,
+                (i * 7 + 1) % 4000,
+                (i * 3 + 2) % 4000
+            ));
+        }
+        html.push_str("</body>");
+        let mut dom = Dom::parse_document(&html);
+        let n0 = dom.get_by_id("n0").unwrap();
+        let _ = dom.serialize(DOCUMENT); // warm
+        let n = 50u32;
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            dom.set_text(n0, &format!("tick {i}")); // epoch bump per frame
+            let _ = dom.serialize(DOCUMENT);
+        }
+        let total = t.elapsed();
+        println!(
+            "serialize after mutation: {total:?} ({:?}/serialize)",
+            total / n
+        );
+    }
+
+    #[test]
     fn clone_subtree_is_deep_and_detached() {
         let mut dom = Dom::parse_document("<body><div id=d><p>x</p></div></body>");
         let d = dom.get_by_id("d").unwrap();
         let copy = dom.clone_subtree(d, true);
         assert!(dom.node(copy).parent.is_none());
         assert_eq!(dom.text_content(copy), "x");
+    }
+
+    #[test]
+    fn insert_before_self_is_an_in_place_no_op() {
+        // WHATWG DOM §4.2.4 pre-insert: inserting a node before ITSELF is
+        // legal (the reference becomes its next sibling — an in-place move).
+        // This used to splice the node's sibling pointers to itself; every
+        // later sibling walk (children/serialize) then never terminated.
+        let mut dom =
+            Dom::parse_document("<body><div id=r><p id=a>1</p><p id=b>2</p></div></body>");
+        let r = dom.get_by_id("r").unwrap();
+        let a = dom.get_by_id("a").unwrap();
+        let b = dom.get_by_id("b").unwrap();
+        dom.insert_before(r, a, Some(a));
+        assert_eq!(dom.children(r), vec![a, b], "in-place, order kept");
+        assert_ne!(dom.node(a).next_sibling, Some(a), "no self-loop");
+        // At the END of the child list (no next sibling → plain re-append).
+        dom.insert_before(r, b, Some(b));
+        assert_eq!(dom.children(r), vec![a, b]);
+        // A sibling walk terminates with both children intact.
+        let html = dom.serialize(r);
+        assert!(html.contains('1') && html.contains('2'), "{html}");
+    }
+
+    #[test]
+    fn supports_condition_survives_non_ascii() {
+        // A multi-byte char at paren depth 0 used to panic the byte-wise
+        // ` and `/` or ` scanner (str slicing at a non-char-boundary).
+        assert!(!supports_condition("(font-family: x) and 微软"));
+        assert!(supports_condition(
+            "(font-family: 微软雅黑) or (display: grid)"
+        ));
+    }
+
+    #[test]
+    fn remove_attr_of_an_absent_attribute_stays_clean() {
+        // Idempotent removes are free, like set_attr's idempotent writes: a
+        // redundant removeAttribute must not dirty the page or invalidate the
+        // per-epoch cascade caches.
+        let mut dom = Dom::parse_document("<body><p id=a class=x>t</p></body>");
+        let a = dom.get_by_id("a").unwrap();
+        let _ = dom.take_dirty();
+        dom.remove_attr(a, "nope");
+        assert!(!dom.take_dirty(), "removing a missing attribute is free");
+        dom.remove_attr(a, "class");
+        assert!(dom.take_dirty(), "a real removal still dirties");
+        assert_eq!(dom.attr(a, "class"), None);
+    }
+
+    #[test]
+    fn padding_right_is_tracked_and_baked() {
+        // padding-right was missing from PROPS (top/bottom/left were there),
+        // so sheet-declared right padding was dropped from the cascade and
+        // never baked for the re-parsed layout arena.
+        let dom = Dom::parse_document(
+            "<head><style>#p{padding-right:2em}#q{padding:1em}</style></head>\
+             <body><div id=p>x</div><div id=q>y</div></body>",
+        );
+        let p = dom.get_by_id("p").unwrap();
+        let q = dom.get_by_id("q").unwrap();
+        assert_eq!(
+            dom.computed_style(p, "padding-right").as_deref(),
+            Some("2em")
+        );
+        assert_eq!(
+            dom.computed_style(q, "padding-right").as_deref(),
+            Some("1em"),
+            "the padding shorthand expands to the right longhand"
+        );
+        assert!(
+            dom.serialize(DOCUMENT).contains("padding-right:2em"),
+            "baked for the re-parse"
+        );
+    }
+
+    #[test]
+    fn set_attr_preserves_case_on_foreign_elements() {
+        // DOM setAttribute folds the name to lowercase only for HTML-namespace
+        // elements; SVG attributes are case-sensitive (viewBox). Folding
+        // unconditionally created a duplicate lowercase attr and left reads on
+        // the stale original — a D3-style setAttribute("viewBox") never took.
+        let mut dom = Dom::parse_document(
+            r#"<body><svg id=s viewBox="0 0 10 10"><path d="M0 0z"/></svg><div id=d></div></body>"#,
+        );
+        let s = dom.get_by_id("s").unwrap();
+        dom.set_attr(s, "viewBox", "0 0 40 40");
+        assert_eq!(
+            dom.attr(s, "viewBox"),
+            Some("0 0 40 40"),
+            "updated in place"
+        );
+        let viewboxes = dom
+            .attr_names(s)
+            .iter()
+            .filter(|n| n.eq_ignore_ascii_case("viewbox"))
+            .count();
+        assert_eq!(viewboxes, 1, "no duplicate lowercase attr");
+        // HTML elements still fold per the spec.
+        let d = dom.get_by_id("d").unwrap();
+        dom.set_attr(d, "CLASS", "x");
+        assert_eq!(dom.attr(d, "class"), Some("x"));
+        assert!(dom.attr_names(d).contains(&"class".to_string()));
+    }
+
+    #[test]
+    fn attr_selector_case_flags_match() {
+        // Selectors 4 `[attr=value i]` (and the no-op `s`). The flag used to
+        // be glued onto the value, so such selectors never matched.
+        let dom = Dom::parse_document(
+            "<body><a id=x href='FILE.PDF'>d</a><a id=y href='file.txt'>t</a></body>",
+        );
+        let q = |s: &str| {
+            dom.query(DOCUMENT, &SelectorList::parse(s).unwrap(), false)
+                .len()
+        };
+        assert_eq!(q("[href$='.pdf' i]"), 1, "i flag: case-insensitive suffix");
+        assert_eq!(q("[href$='.pdf']"), 0, "no flag: case-sensitive");
+        assert_eq!(q("[href$='.PDF' s]"), 1, "s flag: explicit sensitive");
+        // Case-insensitive FILE prefix matches BOTH file.txt and FILE.PDF —
+        // the flag parses on an unquoted value too.
+        assert_eq!(q("[href^=FILE i]"), 2, "unquoted value with flag");
+        assert_eq!(q("[href^=FILE]"), 1, "sensitive prefix matches only one");
+        assert_eq!(q("[href='file.pdf' i]"), 1, "i flag: exact");
+    }
+
+    #[test]
+    fn percentage_opacity_suppresses_paint() {
+        // CSS Color 4 <alpha-value>: `opacity: 0%` is valid; the plain-number
+        // parser used to fail on it and default to fully opaque.
+        let dom = Dom::parse_document(
+            "<head><style>.z{opacity:0%}.h{opacity:50%}</style></head>\
+             <body><div id=z class=z>a</div><div id=h class=h>b</div></body>",
+        );
+        assert!(
+            dom.paint_suppressed(dom.get_by_id("z").unwrap()),
+            "0% is invisible"
+        );
+        assert!(
+            !dom.paint_suppressed(dom.get_by_id("h").unwrap()),
+            "50% still paints"
+        );
+    }
+
+    #[test]
+    fn ua_display_covers_menu_and_form_internals() {
+        // Tags that are block in every browser's UA sheet but fell to the
+        // generic `inline` default.
+        for tag in ["menu", "option", "optgroup", "legend", "search", "dir"] {
+            assert_eq!(ua_display(tag), "block", "{tag}");
+        }
+    }
+
+    #[test]
+    fn comma_separated_animations_still_reveal_the_active_slide() {
+        // css-animations-1: `animation` and its longhands are COMMA lists.
+        // `animation: fade-in 1s forwards, pulse 2s infinite` used to glom
+        // `forwards,pulse` into one whitespace token and lose the name.
+        let dom = Dom::parse_document(
+            "<head><style>
+                @keyframes fade-in { to { opacity: 1 } }
+                .s { opacity: 0 }
+                .s.active { animation: fade-in 1s forwards, pulse 2s infinite }
+                .l2 { opacity: 0; animation-name: pulse, fade-in; animation-fill-mode: none, forwards }
+             </style></head>
+             <body><div id=a class='s active'>x</div>
+             <div id=plain class=s>y</div>
+             <div id=l2 class=l2>z</div></body>",
+        );
+        assert!(
+            !dom.paint_suppressed(dom.get_by_id("a").unwrap()),
+            "shorthand comma list: fade-in forwards ends visible"
+        );
+        assert!(
+            dom.paint_suppressed(dom.get_by_id("plain").unwrap()),
+            "inactive slide stays suppressed"
+        );
+        assert!(
+            !dom.paint_suppressed(dom.get_by_id("l2").unwrap()),
+            "longhand comma lists pair by index"
+        );
+    }
+
+    #[test]
+    fn specificity_follows_selectors_4() {
+        let spec = |s: &str| parse_complex(s).unwrap().specificity();
+        // `:not()` takes its MOST SPECIFIC argument, not the sum.
+        assert_eq!(spec(":not(.a, .b)"), (0, 1, 0));
+        assert_eq!(spec(":not(#a, .b)"), (1, 0, 0));
+        // Two separate `:not()`s still both count.
+        assert_eq!(spec(":not(.a):not(.b)"), (0, 2, 0));
+        // A pseudo-ELEMENT counts like a type, not a class.
+        assert_eq!(spec("p::before"), (0, 0, 2));
+        assert_eq!(spec(".x::after"), (0, 1, 1));
+        // And the observable consequence: a later equal-specificity rule wins
+        // where the old argument-summing put the :not rule ahead.
+        let dom = Dom::parse_document(
+            "<head><style>p:not(.q, .r){letter-spacing:1px} p.z{letter-spacing:2px}</style></head>\
+             <body><p id=t class=z>x</p></body>",
+        );
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("t").unwrap(), "letter-spacing")
+                .as_deref(),
+            Some("2px"),
+            "(0,1,1) ties → source order decides"
+        );
+    }
+
+    #[test]
+    fn content_concatenates_strings_and_attr() {
+        // CSS2 §12.2: `content` is a concatenation of components. The old
+        // single-component reader mangled `"(" attr(x) ")"`.
+        let dom = Dom::parse_document(
+            "<head><style>\
+             .p::before{content:\"(\" attr(data-n) \")\"}\
+             .c::before{content:counter(x)}\
+             .ab::before{content:\"a\" \"b\"}\
+             </style></head>\
+             <body><span class=p data-n=42>x</span><span class=c>y</span>\
+             <span class=ab>z</span></body>",
+        );
+        let by = |cls: &str| {
+            dom.descendants(DOCUMENT)
+                .into_iter()
+                .find(|&i| dom.attr(i, "class") == Some(cls))
+                .unwrap()
+        };
+        assert_eq!(
+            dom.pseudo_content(by("p"), PseudoEl::Before).as_deref(),
+            Some("(42)")
+        );
+        assert_eq!(
+            dom.pseudo_content(by("c"), PseudoEl::Before),
+            None,
+            "counter() unsupported → whole value dropped"
+        );
+        assert_eq!(
+            dom.pseudo_content(by("ab"), PseudoEl::Before).as_deref(),
+            Some("ab")
+        );
+    }
+
+    #[test]
+    fn logical_properties_map_to_physical() {
+        // CSS Logical Properties: we render only horizontal-tb LTR, so
+        // inline = left/right and block = top/bottom, exactly.
+        let dom = Dom::parse_document(
+            "<head><style>#m{margin-inline:auto}#p{padding-block:1em 2em}\
+             #w{inline-size:50%;max-inline-size:40rem}#s{margin-inline-start:1em}</style></head>\
+             <body><div id=m></div><div id=p></div><div id=w></div><div id=s></div></body>",
+        );
+        let g = |i: &str, p: &str| dom.computed_style(dom.get_by_id(i).unwrap(), p);
+        assert_eq!(g("m", "margin-left").as_deref(), Some("auto"));
+        assert_eq!(g("m", "margin-right").as_deref(), Some("auto"));
+        assert_eq!(g("p", "padding-top").as_deref(), Some("1em"));
+        assert_eq!(g("p", "padding-bottom").as_deref(), Some("2em"));
+        assert_eq!(g("w", "width").as_deref(), Some("50%"));
+        assert_eq!(g("w", "max-width").as_deref(), Some("40rem"));
+        assert_eq!(g("s", "margin-left").as_deref(), Some("1em"));
+    }
+
+    #[test]
+    fn media_query_range_syntax_evaluates() {
+        // Media Queries L4 range form (Tailwind v4 emits these).
+        let vp = (800, 600);
+        assert!(media_query_matches("(width >= 40em)", vp), "640px <= 800");
+        assert!(!media_query_matches("(width >= 1000px)", vp));
+        assert!(media_query_matches("(width <= 1000px)", vp));
+        assert!(media_query_matches("(400px <= width <= 900px)", vp));
+        assert!(!media_query_matches("(400px <= width < 800px)", vp));
+        assert!(media_query_matches("(height > 500px)", vp));
+        assert!(media_query_matches("screen and (width < 1000px)", vp));
+        assert!(
+            !media_query_matches("(width >= 40em)", (0, 0)),
+            "unknown viewport conservatively fails"
+        );
+    }
+
+    #[test]
+    fn layer_rules_apply_and_unlayered_beats_layered() {
+        // css-cascade-5 §6.4: @layer bodies used to be skipped whole (a
+        // Tailwind-v4-era sheet contributed NOTHING). Layered rules now
+        // join the cascade; unlayered rules form the implicit FINAL layer,
+        // so for normal declarations they beat any layered rule REGARDLESS
+        // of specificity — the whole point of the feature.
+        let dom = Dom::parse_document(
+            "<head><style>
+                @layer base { p { display: none } #t { letter-spacing: 9px } }
+                p.up { letter-spacing: 1px }
+             </style></head>
+             <body><p id=t class=up>x</p></body>",
+        );
+        let t = dom.get_by_id("t").unwrap();
+        assert!(dom.is_hidden(t), "a layered rule applies at all");
+        assert_eq!(
+            dom.computed_style(t, "letter-spacing").as_deref(),
+            Some("1px"),
+            "unlayered (0,1,0) beats layered (1,0,0): layers outrank specificity"
+        );
+    }
+
+    #[test]
+    fn layer_order_is_first_declaration_not_source_position() {
+        // `@layer b, a;` fixes the order (b first, a second) regardless of
+        // where the blocks appear; for normal declarations the LATER layer
+        // wins even though its block comes first in the source.
+        let dom = Dom::parse_document(
+            "<head><style>
+                @layer b, a;
+                @layer a { .x { letter-spacing: 1px } }
+                @layer b { .x { letter-spacing: 2px } }
+             </style></head>
+             <body><p id=t class=x>x</p></body>",
+        );
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("t").unwrap(), "letter-spacing")
+                .as_deref(),
+            Some("1px"),
+            "layer a is later in declaration order → wins for normal"
+        );
+    }
+
+    #[test]
+    fn important_reverses_the_layer_order() {
+        // "for important rules the declaration whose cascade layer is
+        // first wins" — and the implicit unlayered layer is LAST, so
+        // layered !important beats unlayered !important.
+        let dom = Dom::parse_document(
+            "<head><style>
+                @layer a { .x { letter-spacing: 1px !important } }
+                @layer b { .x { letter-spacing: 2px !important } }
+                .x { letter-spacing: 3px !important }
+                @layer a { .y { text-indent: 5px !important } }
+                .y { text-indent: 7px }
+             </style></head>
+             <body><p id=t class=x>x</p><p id=u class=y>y</p></body>",
+        );
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("t").unwrap(), "letter-spacing")
+                .as_deref(),
+            Some("1px"),
+            "earliest layer wins among important; unlayered important loses"
+        );
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("u").unwrap(), "text-indent")
+                .as_deref(),
+            Some("5px"),
+            "importance still beats layering (important layered > normal unlayered)"
+        );
+    }
+
+    #[test]
+    fn nested_layers_concatenate_and_parent_direct_rules_win_normal() {
+        // `@layer a { @layer b {…} }` ≡ `@layer a.b` ("nesting concatenates
+        // their names"); a parent's DIRECT rules form an implicit final
+        // sublayer AFTER explicit sublayers, so they win for normal.
+        let dom = Dom::parse_document(
+            "<head><style>
+                @layer a {
+                    @layer b { .x { letter-spacing: 1px } }
+                    .x { letter-spacing: 2px }
+                }
+                @layer a.b { .y { text-indent: 4px } }
+             </style></head>
+             <body><p id=t class='x y'>x</p></body>",
+        );
+        let t = dom.get_by_id("t").unwrap();
+        assert_eq!(
+            dom.computed_style(t, "letter-spacing").as_deref(),
+            Some("2px"),
+            "parent-direct beats sublayer for normal declarations"
+        );
+        assert_eq!(
+            dom.computed_style(t, "text-indent").as_deref(),
+            Some("4px"),
+            "the dotted form reaches the same nested layer"
+        );
+    }
+
+    #[test]
+    fn layers_compose_with_media_and_anonymous_blocks() {
+        let mut dom = Dom::parse_document(
+            "<head><style>
+                @layer a { @media (min-width: 500px) { .m { display: none } } }
+                @media (min-width: 500px) { @layer a { .n { display: none } } }
+                @layer { .anon { letter-spacing: 1px } }
+                @layer { .anon { letter-spacing: 2px } }
+             </style></head>
+             <body><p id=m class=m>m</p><p id=n class=n>n</p>
+             <p id=o class=anon>o</p></body>",
+        );
+        dom.set_viewport_px(800, 600);
+        assert!(
+            dom.is_hidden(dom.get_by_id("m").unwrap()),
+            "@media in @layer"
+        );
+        assert!(
+            dom.is_hidden(dom.get_by_id("n").unwrap()),
+            "@layer in @media"
+        );
+        // Each anonymous block is a NEW layer; the second is later → wins.
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("o").unwrap(), "letter-spacing")
+                .as_deref(),
+            Some("2px"),
+            "anonymous layers are distinct, later one wins"
+        );
+    }
+
+    #[test]
+    fn layer_names_are_scoped_per_tree() {
+        // "Cascade layers are scoped to their origin and context": a shadow
+        // tree's layer named `a` is independent of the document's `a` — the
+        // shadow sheet's own declaration order governs inside the shadow.
+        let mut dom = Dom::parse_document(
+            "<head><style>@layer z, a; @layer a { .s { letter-spacing: 1px } }</style></head>
+             <body><div id=host></div></body>",
+        );
+        let host = dom.get_by_id("host").unwrap();
+        let root = dom.attach_shadow(host);
+        let style = dom.create_element("style");
+        let css = dom.create_text(
+            "@layer a { .s { letter-spacing: 3px } } @layer z { .s { letter-spacing: 4px } }",
+        );
+        dom.append(style, css);
+        dom.append(root, style);
+        let span = dom.create_element("span");
+        dom.set_attr(span, "class", "s");
+        dom.append(root, span);
+        // In the SHADOW scope, a is declared first, z second → z wins.
+        assert_eq!(
+            dom.computed_style(span, "letter-spacing").as_deref(),
+            Some("4px"),
+            "the shadow scope has its own layer order (z declared after a)"
+        );
+    }
+
+    #[test]
+    fn tailwind_shaped_layer_statement_then_blocks() {
+        // The Tailwind v4 output shape: one statement declaring the order,
+        // then blocks appending to each layer. utilities (declared last)
+        // beats base for normal declarations, wherever the blocks sit.
+        let dom = Dom::parse_document(
+            "<head><style>
+                @layer theme, base, components, utilities;
+                @layer utilities { .u { letter-spacing: 2px } }
+                @layer base { .u { letter-spacing: 1px } p { display: block } }
+             </style></head>
+             <body><p id=t class=u>x</p></body>",
+        );
+        let t = dom.get_by_id("t").unwrap();
+        assert_eq!(
+            dom.computed_style(t, "letter-spacing").as_deref(),
+            Some("2px"),
+            "utilities beats base by declared order"
+        );
+        assert_eq!(
+            dom.computed_style(t, "display").as_deref(),
+            Some("block"),
+            "base-layer rules apply"
+        );
+    }
+
+    #[test]
+    fn selector_ident_escapes_decode_and_match() {
+        // css-syntax §4.3.7 ident escapes — the Tailwind class idiom
+        // (`.md\:flex` is the class `md:flex`). These rules used to fail the
+        // parse entirely, dropping every responsive/state-variant rule.
+        let dom = Dom::parse_document(
+            "<head><style>\
+             .md\\:flex { display: none }\
+             .w-1\\/2 { letter-spacing: 1px }\
+             .w-\\[10px\\] { letter-spacing: 2px }\
+             </style></head>\
+             <body><p id=a class='md:flex'>x</p>\
+             <p id=b class='w-1/2'>y</p>\
+             <p id=c class='w-[10px]'>z</p></body>",
+        );
+        assert!(
+            dom.is_hidden(dom.get_by_id("a").unwrap()),
+            "escaped-colon class rule applies"
+        );
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("b").unwrap(), "letter-spacing")
+                .as_deref(),
+            Some("1px"),
+            "escaped slash"
+        );
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("c").unwrap(), "letter-spacing")
+                .as_deref(),
+            Some("2px"),
+            "escaped brackets (arbitrary-value classes)"
+        );
+        // Hex escape with its whitespace terminator: `#\31 23` is id "123"
+        // (that space is the escape terminator, not a combinator).
+        let dom2 = Dom::parse_document("<body><p id='123'>q</p></body>");
+        let sel = SelectorList::parse("#\\31 23").unwrap();
+        assert_eq!(dom2.query(DOCUMENT, &sel, false).len(), 1, "hex escape");
+    }
+
+    #[test]
+    fn is_and_where_match_any_argument_forgivingly() {
+        // Selectors 4 §4.2–4.3: `:is()` matches any argument; arguments are
+        // full COMPLEX selectors; the list is FORGIVING (an unparsable
+        // argument drops individually, never killing the rule); `:matches`
+        // is the pre-rename legacy alias.
+        let dom = Dom::parse_document(
+            "<head><style>\
+             :is(.a, .b) { display: none }\
+             .wrap :is(.deep, .other) { letter-spacing: 1px }\
+             :is(:bogus!, .c) { letter-spacing: 3px }\
+             :matches(.legacy) { letter-spacing: 4px }\
+             .q:is(!!) { display: none }\
+             </style></head>\
+             <body><p id=a class=a>a</p><p id=b class=b>b</p>\
+             <p id=c class=c>c</p>\
+             <div class=wrap><span id=d class=deep>d</span></div>\
+             <span id=e class=deep>outside</span>\
+             <p id=f class=legacy>f</p><p id=q class=q>q</p></body>",
+        );
+        let g = |i: &str| dom.get_by_id(i).unwrap();
+        assert!(dom.is_hidden(g("a")), ":is matches first arg");
+        assert!(dom.is_hidden(g("b")), ":is matches second arg");
+        assert!(!dom.is_hidden(g("c")), ".c is not in the display rule");
+        assert_eq!(
+            dom.computed_style(g("d"), "letter-spacing").as_deref(),
+            Some("1px"),
+            ":is under a descendant combinator"
+        );
+        assert_eq!(
+            dom.computed_style(g("e"), "letter-spacing"),
+            None,
+            "same class outside .wrap does not match"
+        );
+        assert_eq!(
+            dom.computed_style(g("c"), "letter-spacing").as_deref(),
+            Some("3px"),
+            "forgiving: the bad argument drops, .c still matches"
+        );
+        assert_eq!(
+            dom.computed_style(g("f"), "letter-spacing").as_deref(),
+            Some("4px"),
+            "legacy :matches alias"
+        );
+        // An all-invalid group matches nothing but leaves the rule (and the
+        // element) alone.
+        assert!(
+            !dom.is_hidden(g("q")),
+            "empty forgiving list matches nothing"
+        );
+        // querySelector shares the engine.
+        let sel = SelectorList::parse(":is(.a, .b)").unwrap();
+        assert_eq!(dom.query(DOCUMENT, &sel, false).len(), 2);
+    }
+
+    #[test]
+    fn is_takes_max_argument_specificity_where_takes_zero() {
+        let spec = |s: &str| parse_complex(s).unwrap().specificity();
+        assert_eq!(spec(":is(.a, #b)"), (1, 0, 0), ":is = most specific arg");
+        assert_eq!(spec(":where(.a, #b)"), (0, 0, 0), ":where = zero");
+        assert_eq!(spec("div:is(.a)"), (0, 1, 1));
+        assert_eq!(spec(":is(.a .b.c)"), (0, 3, 0), "complex arg sums");
+        // Observable: `p:where(#t)` (0,0,1) loses to an EARLIER `.z` (0,1,0)
+        // — with :is (1,0,1) it would win. Both prove the wiring.
+        let dom = Dom::parse_document(
+            "<head><style>\
+             .z { letter-spacing: 2px }\
+             p:where(#t) { letter-spacing: 1px }\
+             </style></head>\
+             <body><p id=t class=z>x</p></body>",
+        );
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("t").unwrap(), "letter-spacing")
+                .as_deref(),
+            Some("2px"),
+            ":where contributes no specificity, so .z wins"
+        );
+        let dom = Dom::parse_document(
+            "<head><style>\
+             .z { letter-spacing: 2px }\
+             p:is(#t) { letter-spacing: 1px }\
+             </style></head>\
+             <body><p id=t class=z>x</p></body>",
+        );
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("t").unwrap(), "letter-spacing")
+                .as_deref(),
+            Some("1px"),
+            ":is carries the #id specificity and wins"
+        );
+    }
+
+    #[test]
+    fn unsupported_pseudo_inside_not_kills_the_rule_instead_of_matching_all() {
+        // `:not(:hover)` is genuinely TRUE at rest, but `:not(:has(img))`
+        // must not invert an unsupported pseudo into always-match — that
+        // turned a targeted hide rule into hide-everything. It dies instead.
+        let dom = Dom::parse_document(
+            "<head><style>\
+             .x:not(:has(img)){display:none}\
+             .y:not(:hover){letter-spacing:2px}\
+             </style></head>\
+             <body><p id=a class=x>kept</p><p id=b class=y>styled</p></body>",
+        );
+        assert!(
+            !dom.is_hidden(dom.get_by_id("a").unwrap()),
+            ":has inside :not drops the rule (fail-open)"
+        );
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("b").unwrap(), "letter-spacing")
+                .as_deref(),
+            Some("2px"),
+            ":not(:hover) still applies at rest"
+        );
     }
 }
