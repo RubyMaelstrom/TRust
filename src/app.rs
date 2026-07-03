@@ -919,6 +919,10 @@ impl App {
     /// Install the terminal-queried graphics picker (once, at startup).
     pub fn set_picker(&mut self, picker: Picker) {
         self.auto_protocol = picker.protocol_type();
+        // Publish the real cell height so the render pass converts an overflow-clip
+        // box's declared px height back to the same rows the JS geometry (which
+        // measures rows × this cell size) reported — see `layout::set_cell_px_h`.
+        crate::layout::set_cell_px_h(picker.font_size().height);
         self.picker = picker;
     }
 
