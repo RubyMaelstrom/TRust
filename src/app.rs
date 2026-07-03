@@ -218,8 +218,8 @@ impl ProbeDetector {
 }
 
 /// The gopherus-style browser state (shared by gopher and gemini): a
-/// scrolling viewport with a link cursor constrained to it, and an
-/// in-RAM back history.
+/// scrolling viewport with a link cursor constrained to it, and in-RAM
+/// back/forward history.
 pub struct BrowserView {
     pub doc: Doc,
     /// The selected link's line index (gopher/gemini line model). Always
@@ -238,6 +238,10 @@ pub struct BrowserView {
     /// First visible line/row.
     pub scroll: usize,
     history: Vec<(Doc, ViewPos, usize)>,
+    /// Pages backed away from, nearest first at the top. Going back parks
+    /// the current doc here; a NEW navigation truncates it (the standard
+    /// browser model — you can't go forward to a branch you left).
+    forward: Vec<(Doc, ViewPos, usize)>,
 }
 
 /// An open `<select>` dropdown overlay. It anchors to the field's document
@@ -294,8 +298,8 @@ struct ViewPos {
     selected: Option<usize>,
     sel_item: Option<(usize, usize)>,
     /// The page had a live JS engine when we navigated away. Going back
-    /// to it revives the page (re-runs JS) instead of restoring a frozen
-    /// snapshot whose script links/forms are dead.
+    /// (or forward) to it revives the page (re-runs JS) instead of
+    /// restoring a frozen snapshot whose script links/forms are dead.
     was_live: bool,
 }
 
@@ -1235,6 +1239,9 @@ impl App {
             (MouseEventKind::ScrollDown, true) => self.browser_wheel(3, mouse.column, mouse.row),
             (MouseEventKind::Down(MouseButton::Mouse4), true) if self.mode == Mode::Session => {
                 self.browser_back();
+            }
+            (MouseEventKind::Down(MouseButton::Mouse5), true) if self.mode == Mode::Session => {
+                self.browser_forward();
             }
             (MouseEventKind::Moved, true) if self.mode == Mode::Session => {
                 let on_link = self.browser_mouse_hover(mouse.column, mouse.row);
@@ -4470,6 +4477,9 @@ impl App {
                     was_live,
                 };
                 g.history.push((old, pos, g.scroll));
+                // A new navigation abandons the forward branch (browser
+                // model); only back/forward themselves preserve it.
+                g.forward.clear();
                 g.selected = None;
                 g.sel_item = None;
                 // A stale pinned-rail selection must not outlive its doc:
@@ -4487,6 +4497,7 @@ impl App {
                     sel_fixed: None,
                     scroll: 0,
                     history: Vec::new(),
+                    forward: Vec::new(),
                 });
             }
         }
@@ -4506,7 +4517,8 @@ impl App {
     }
 
     /// gopherus keys: Up/Down scroll the page (the highlight rides the
-    /// visible links), Right follows, Left goes back, Esc closes.
+    /// visible links), Right follows, Left goes back, Alt-Right goes
+    /// forward, Esc closes.
     fn browser_nav(&mut self, key: KeyEvent) {
         self.notice = false;
         let page = i64::from(self.last_inner.1.max(2)) - 1;
@@ -4517,6 +4529,9 @@ impl App {
             KeyCode::PageDown => self.browser_scroll(page, false),
             KeyCode::Home => self.browser_scroll(i64::MIN / 2, false),
             KeyCode::End => self.browser_scroll(i64::MAX / 2, false),
+            // Alt-Right = forward (the traditional browser pair; plain Left
+            // is already back here, so Alt-Left needs no arm of its own).
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => self.browser_forward(),
             KeyCode::Right | KeyCode::Enter => self.browser_follow(),
             KeyCode::Left => self.browser_back(),
             KeyCode::Char('v' | 'V') => self.open_in_mpv(),
@@ -4589,17 +4604,22 @@ impl App {
             && row < a.y.saturating_add(a.height)
     }
 
-    /// HTTP 2D navigation: Enter follows, Backspace goes back, Up/Down
-    /// move the selection to the nearest interactive item in an adjacent
-    /// row, Left/Right step between items (spilling to adjacent rows),
-    /// Esc closes. The arrows are free here because nav lives on
-    /// Enter/Backspace — the HTTP-only layout model.
+    /// HTTP 2D navigation: Enter follows, Backspace goes back (Alt-Left/
+    /// Alt-Right are history back/forward), Up/Down move the selection to
+    /// the nearest interactive item in an adjacent row, Left/Right step
+    /// between items (spilling to adjacent rows), Esc closes. The arrows
+    /// are free here because nav lives on Enter/Backspace — the HTTP-only
+    /// layout model.
     fn http_nav(&mut self, key: KeyEvent) {
         self.notice = false;
         let page = i64::from(self.last_inner.1.max(2)) - 1;
         match key.code {
             KeyCode::Up => self.http_move(-1, false),
             KeyCode::Down => self.http_move(1, false),
+            // Alt-Left/Alt-Right = history back/forward (the traditional
+            // browser pair), checked before the plain-arrow selection moves.
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => self.browser_back(),
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => self.browser_forward(),
             // In a carousel, ←/→ scroll the strip a card at a time; elsewhere
             // they move the selection laterally.
             KeyCode::Left if self.scroll_selected_carousel(-1) => {}
@@ -5713,11 +5733,40 @@ impl App {
     }
 
     fn browser_back(&mut self) {
+        self.browser_travel(false);
+    }
+
+    fn browser_forward(&mut self) {
+        self.browser_travel(true);
+    }
+
+    /// Shared back/forward: pop the target stack, park the leaving doc on
+    /// the opposite one (so the move is always reversible), and restore the
+    /// popped doc's position.
+    fn browser_travel(&mut self, forward: bool) {
         let js = self.js_enabled;
+        // Captured before the drop below: the doc we're leaving should be
+        // revived (not restored static) when travelled back onto.
+        let was_live = self.live_page.is_some();
         let Some(g) = &mut self.browser else { return };
-        match g.history.pop() {
+        let popped = if forward {
+            g.forward.pop()
+        } else {
+            g.history.pop()
+        };
+        match popped {
             Some((doc, pos, scroll)) => {
-                g.doc = doc;
+                let old = std::mem::replace(&mut g.doc, doc);
+                let old_pos = ViewPos {
+                    selected: g.selected,
+                    sel_item: g.sel_item,
+                    was_live,
+                };
+                if forward {
+                    g.history.push((old, old_pos, g.scroll));
+                } else {
+                    g.forward.push((old, old_pos, g.scroll));
+                }
                 g.selected = pos.selected;
                 g.sel_item = pos.sel_item;
                 // Not carried in ViewPos: the restored doc's fixed layers are
@@ -5728,7 +5777,7 @@ impl App {
                 // re-run its JS so links/forms work again, rather than
                 // restoring a frozen snapshot with dead script links. The
                 // frozen doc shows meanwhile; the reload replaces it in
-                // place (history already popped). Needs JS on + http(s).
+                // place (history already adjusted). Needs JS on + http(s).
                 let revive = pos.was_live && js;
                 let url = g.doc.url.clone();
                 // Whatever living page was foreground froze when we left.
@@ -5741,7 +5790,16 @@ impl App {
                     self.status = String::from("Reviving page scripts …");
                 }
             }
-            None => self.status = String::from("History empty (Esc returns to terminal)."),
+            None => {
+                self.status = if forward {
+                    String::from("Nothing forward in history.")
+                } else {
+                    String::from("History empty (Esc returns to terminal).")
+                };
+                // Without the notice flag the selected-link hint overrides
+                // the message and the key looks dead.
+                self.notice = true;
+            }
         }
     }
 
@@ -8286,6 +8344,7 @@ mod tests {
             sel_fixed: None,
             scroll: 0,
             history: vec![],
+            forward: vec![],
         };
         let lines = crate::ui::browser_rows(&g, 24, None);
         let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
@@ -8329,6 +8388,7 @@ mod tests {
             sel_fixed: None,
             scroll: 0,
             history: vec![],
+            forward: vec![],
         });
         app
     }
@@ -8488,6 +8548,7 @@ mod tests {
                 },
                 7,
             )],
+            forward: vec![],
         });
 
         app.on_mouse_event(mouse(
@@ -8525,6 +8586,7 @@ mod tests {
                 },
                 0,
             )],
+            forward: vec![],
         });
 
         app.browser_back();
@@ -8558,12 +8620,188 @@ mod tests {
                 },
                 0,
             )],
+            forward: vec![],
         });
 
         app.browser_back();
 
         assert!(!app.replace_nav, "static back does not reload");
         assert!(app.fetch_rx.is_none(), "no fetch for a static back");
+    }
+
+    #[test]
+    fn mouse5_goes_forward_in_browser_history() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.browser = Some(super::BrowserView {
+            doc: http_doc("/b"),
+            selected: None,
+            sel_item: None,
+            sel_fixed: None,
+            scroll: 0,
+            history: vec![],
+            forward: vec![(
+                http_doc("/c"),
+                super::ViewPos {
+                    selected: None,
+                    sel_item: None,
+                    was_live: false,
+                },
+                3,
+            )],
+        });
+
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Mouse5),
+            0,
+            0,
+        ));
+
+        let g = app.browser.as_ref().unwrap();
+        assert!(
+            matches!(&g.doc.url, Link::Http(u) if u.path() == "/c"),
+            "Mouse5 should navigate forward to the parked page"
+        );
+        assert_eq!(g.scroll, 3);
+        assert!(
+            matches!(&g.history.last().unwrap().0.url, Link::Http(u) if u.path() == "/b"),
+            "the page we left goes onto the back stack"
+        );
+    }
+
+    #[test]
+    fn back_then_forward_round_trips() {
+        // Back parks the current doc on the forward stack (it used to be
+        // dropped outright); forward restores it, position and all.
+        let mut app = super::App::new(None, 23);
+        app.browser = Some(super::BrowserView {
+            doc: http_doc("/b"),
+            selected: None,
+            sel_item: Some((0, 0)),
+            sel_fixed: None,
+            scroll: 5,
+            history: vec![(
+                http_doc("/a"),
+                super::ViewPos {
+                    selected: None,
+                    sel_item: None,
+                    was_live: false,
+                },
+                0,
+            )],
+            forward: vec![],
+        });
+
+        app.browser_back();
+        {
+            let g = app.browser.as_ref().unwrap();
+            assert!(matches!(&g.doc.url, Link::Http(u) if u.path() == "/a"));
+            assert_eq!(g.forward.len(), 1, "back parks the doc for forward");
+            assert!(g.history.is_empty());
+        }
+
+        app.browser_forward();
+        let g = app.browser.as_ref().unwrap();
+        assert!(matches!(&g.doc.url, Link::Http(u) if u.path() == "/b"));
+        assert_eq!(g.scroll, 5, "forward restores the scroll we left at");
+        assert_eq!(g.sel_item, Some((0, 0)), "and the selection");
+        assert!(g.forward.is_empty());
+        assert_eq!(g.history.len(), 1, "/a is reachable by back again");
+    }
+
+    #[test]
+    fn new_navigation_clears_forward_history_but_reload_keeps_it() {
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(http_doc("/a"));
+        app.navigate_to(http_doc("/b"));
+        app.browser_back();
+        assert_eq!(app.browser.as_ref().unwrap().forward.len(), 1);
+
+        // A reload (replace-flagged, also the revive-on-back path) swaps in
+        // place and must not abandon the forward branch.
+        app.replace_nav = true;
+        app.navigate_to(http_doc("/a"));
+        assert_eq!(app.browser.as_ref().unwrap().forward.len(), 1);
+
+        // A real navigation from a mid-history position truncates it.
+        app.navigate_to(http_doc("/d"));
+        let g = app.browser.as_ref().unwrap();
+        assert!(g.forward.is_empty(), "navigating abandons the branch");
+    }
+
+    #[tokio::test]
+    async fn forward_to_a_live_page_revives_it() {
+        // Same revive rule as back: a page that had a JS engine when we
+        // backed away from it is reloaded on forward, not shown frozen.
+        let mut app = super::App::new(None, 23);
+        app.js_enabled = true;
+        app.browser = Some(super::BrowserView {
+            doc: http_doc("/a"),
+            selected: None,
+            sel_item: None,
+            sel_fixed: None,
+            scroll: 0,
+            history: vec![],
+            forward: vec![(
+                http_doc("/b"),
+                super::ViewPos {
+                    selected: None,
+                    sel_item: None,
+                    was_live: true,
+                },
+                0,
+            )],
+        });
+
+        app.browser_forward();
+
+        assert!(app.replace_nav, "revive reloads in place");
+        assert!(app.status.contains("Reviving"), "status: {}", app.status);
+        assert!(app.fetch_rx.is_some(), "a revive fetch was started");
+        assert!(
+            matches!(&app.browser.as_ref().unwrap().doc.url, Link::Http(u) if u.path() == "/b"),
+            "the parked page shows (static) while reviving",
+        );
+    }
+
+    #[test]
+    fn alt_arrows_travel_history_in_both_nav_models() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(http_doc("/a"));
+        app.navigate_to(http_doc("/b"));
+
+        // HTTP 2D model: Alt-Left back, Alt-Right forward (plain arrows
+        // keep moving the selection).
+        app.http_nav(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert!(
+            matches!(&app.browser.as_ref().unwrap().doc.url, Link::Http(u) if u.path() == "/a")
+        );
+        app.http_nav(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert!(
+            matches!(&app.browser.as_ref().unwrap().doc.url, Link::Http(u) if u.path() == "/b")
+        );
+
+        // gopherus line model: plain Left is already back; Alt-Right goes
+        // forward instead of following the selected link.
+        app.browser_nav(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()));
+        assert!(
+            matches!(&app.browser.as_ref().unwrap().doc.url, Link::Http(u) if u.path() == "/a")
+        );
+        app.browser_nav(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert!(
+            matches!(&app.browser.as_ref().unwrap().doc.url, Link::Http(u) if u.path() == "/b")
+        );
+    }
+
+    #[test]
+    fn forward_on_an_empty_stack_is_a_polite_no_op() {
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(http_doc("/a"));
+        app.browser_forward();
+        let g = app.browser.as_ref().unwrap();
+        assert!(matches!(&g.doc.url, Link::Http(u) if u.path() == "/a"));
+        assert!(app.status.contains("Nothing forward"), "{}", app.status);
     }
 
     /// Point an HTTP laid-out doc's item selection at the first item that
@@ -9056,6 +9294,7 @@ mod tests {
             sel_fixed: None,
             scroll: 0,
             history: Vec::new(),
+            forward: Vec::new(),
         });
         (app, body)
     }

@@ -2212,6 +2212,11 @@ impl<'a> Layout<'a> {
             self.flush_block();
             self.finish_floats();
         } else {
+            // Emitted FIRST (before the body's own content) — a video/audio
+            // page's player is normally near the top of the page, so a
+            // synthesized fallback belongs there too, not buried at the very
+            // bottom of a long channel/chat page where nobody would find it.
+            self.flow_page_level_media_fallback();
             for child in self.dom.children(root) {
                 self.flow_node(child, &ctx);
             }
@@ -2223,6 +2228,75 @@ impl<'a> Layout<'a> {
             let cb_h = self.rows.len();
             self.place_positioned_children(None, 0, 0, self.width, cb_h);
         }
+    }
+
+    /// A page-level "▶ Watch in mpv" fallback for a video page whose player
+    /// never inserts an actual `<video>`/`<audio>` ELEMENT into the DOM at
+    /// all — so `flow_media`'s per-element dispatch (which already handles a
+    /// PRESENT-but-sourceless `<video>`, e.g. an MSE/blob streaming player)
+    /// never gets a chance to run. Modern streaming players increasingly
+    /// mount their playback surface only after negotiating a manifest/token
+    /// (WebCodecs/MSE-in-workers, low-latency canvases, …); when that
+    /// negotiation is walled off (Twitch's Kasada bot-check), the player can
+    /// give up before ever creating the `<video>` tag, silently removing the
+    /// ONLY hook our engine has for a mpv affordance — the exact "engine got
+    /// advanced enough to try loading the player, and that ate the mpv link"
+    /// regression she flagged. General, host-agnostic: gated on the standard
+    /// Open Graph video protocol (`og:video`/`og:video:secure_url`, the same
+    /// cross-site convention `page_preview_image` already reads for a
+    /// poster), never on a specific host. Plays the PAGE url via yt-dlp/
+    /// streamlink, exactly like the sourceless-`<video>` streaming case
+    /// (`og:video`'s own URL is usually an iframe-embed player, not a
+    /// yt-dlp-playable target). Called BEFORE the body's own content flows
+    /// (so it lands near the top, where a real player would sit), gated
+    /// purely on "no `<video>`/`<audio>` tag exists ANYWHERE in the DOM" — a
+    /// present tag always gets its own per-element representation via
+    /// `flow_media` instead, so the two can never double up.
+    fn flow_page_level_media_fallback(&mut self) {
+        if self
+            .dom
+            .descendants(DOCUMENT)
+            .any(|id| matches!(self.dom.tag_name(id), Some("video" | "audio")))
+            || !["og:video", "og:video:secure_url"]
+                .into_iter()
+                .any(|k| self.dom.meta_content(k).is_some())
+        {
+            return;
+        }
+        let mut mctx = Ctx::root();
+        mctx.link = Some(Link::Media(self.base.clone()));
+        mctx.kind = ItemKind::Link;
+        self.invisible = false;
+        self.flush_block();
+        self.begin_line();
+        if let Some(poster) = page_preview_image(self.dom, self.base)
+            && let Some(&(iw, ih)) = self.images.get(&poster)
+            && iw > 0
+            && ih > 0
+        {
+            let avail = self.width.max(1) as u16;
+            let w = iw.min(avail).max(1);
+            let h = ((ih as u32 * w as u32) / iw as u32).max(1) as u16;
+            self.line.push(Item {
+                col: self.col as u16,
+                width: w,
+                height: h,
+                image: Some(poster),
+                crop: false,
+                pixelated: false,
+                text: String::new(),
+                kind: ItemKind::Image,
+                emph: Emphasis::default(),
+                node: NO_NODE,
+                link: mctx.link.clone(),
+                invisible: false,
+            });
+            self.col += w as usize;
+            self.line_height = self.line_height.max(h);
+            self.break_line();
+        }
+        self.place_text("▶ Watch in mpv", &mctx);
+        self.break_line();
     }
 
     fn flow_node(&mut self, id: NodeId, ctx: &Ctx) {
@@ -3701,10 +3775,25 @@ impl<'a> Layout<'a> {
 
     /// Whether `id`'s used box covers the whole viewport — width and height
     /// each either fill it (`100%`/`100vw`/`100vh`) or pin both opposite
-    /// offsets to zero (`inset:0`). A `%`/inset fill is viewport-sized only
-    /// when the containing block IS the viewport: always for `position:fixed`,
-    /// for `absolute` only with no positioned ancestor. Viewport units
-    /// (`vw`/`vh`) are viewport-sized regardless of containing block.
+    /// offsets to zero (`inset:0`). Viewport units (`vw`/`vh`) are an
+    /// unambiguous author signal regardless of containing block. The `%`/
+    /// inset-derived fill is only trusted for `position:fixed`: a fixed box's
+    /// containing block IS the viewport by definition (CSS 2.1 §10.1),
+    /// unconditionally, so `inset:0` there reliably means "spans the visible
+    /// window regardless of scroll" — a real modal signal. A `position:
+    /// absolute` box with NO positioned ancestor is ALSO placed against the
+    /// initial containing block, but that box still scrolls away with the
+    /// document (unlike `fixed`) and can be clipped/constrained by ordinary
+    /// (non-positioned) ancestors our pre-layout heuristic can't see — so an
+    /// `absolute` box merely stretching to fill an indefinite/unknown-size CB
+    /// is a weak, easily-false-positive signal: an ordinary small in-page
+    /// widget (e.g. a video "play" scrim) that just happens to fill its own
+    /// small container this way is NOT a page-blocking modal, and treating it
+    /// as one wiped the whole surrounding page (nav/chat/sidebar) down to that
+    /// widget's own subtree. Only `100vw`/`100vh` (the unconditional fast path
+    /// above) still qualifies an `absolute` box geometrically; anything else
+    /// wanting modal treatment needs real dialog semantics (`is_modal_overlay`'s
+    /// `is_semantic_dialog` OR-arm).
     fn covers_viewport(&self, id: NodeId) -> bool {
         let val = |p: &str| {
             self.dom
@@ -3716,19 +3805,12 @@ impl<'a> Layout<'a> {
         let h = val("height");
         let w_vw = w.as_deref() == Some("100vw");
         let h_vh = h.as_deref() == Some("100vh");
-        let w_pct = w.as_deref() == Some("100%") || (is_zero(val("left")) && is_zero(val("right")));
-        let h_pct = h.as_deref() == Some("100%") || (is_zero(val("top")) && is_zero(val("bottom")));
-        if !((w_vw || w_pct) && (h_vh || h_pct)) {
-            return false;
-        }
         if w_vw && h_vh {
             return true;
         }
-        match self.dom.computed_style(id, "position").as_deref() {
-            Some("fixed") => true,
-            Some("absolute") => !self.has_positioned_ancestor(id),
-            _ => false,
-        }
+        let w_pct = w.as_deref() == Some("100%") || (is_zero(val("left")) && is_zero(val("right")));
+        let h_pct = h.as_deref() == Some("100%") || (is_zero(val("top")) && is_zero(val("bottom")));
+        w_pct && h_pct && self.dom.computed_style(id, "position").as_deref() == Some("fixed")
     }
 
     /// Whether an out-of-flow (`absolute`/`fixed`) box is positioned outside the
@@ -3893,25 +3975,6 @@ impl<'a> Layout<'a> {
             _ if s >= 1.0 => Some(0.0),
             _ => None,
         }
-    }
-
-    /// Whether any ancestor (up to the body) is positioned — so a `%`/inset
-    /// fill on `id` is relative to that ancestor, not the viewport.
-    fn has_positioned_ancestor(&self, id: NodeId) -> bool {
-        let mut cur = self.dom.parent_composed(id);
-        while let Some(p) = cur {
-            if matches!(self.dom.tag_name(p), Some("body" | "html")) {
-                break;
-            }
-            if matches!(
-                self.dom.computed_style(p, "position").as_deref(),
-                Some("relative" | "absolute" | "fixed" | "sticky")
-            ) {
-                return true;
-            }
-            cur = self.dom.parent_composed(p);
-        }
-        false
     }
 
     /// Whether `id` carries dialog semantics — `role=dialog`/`alertdialog`,
@@ -12186,6 +12249,102 @@ mod tests {
     }
 
     #[test]
+    fn a_video_page_with_no_video_element_at_all_still_links_to_mpv() {
+        // Regression: a modern low-latency streaming player (Twitch's newer
+        // pipeline) can give up before ever inserting a `<video>` DOM element
+        // at all (blocked mid-negotiation), which used to mean NO mpv
+        // affordance anywhere on the page — `flow_media`'s dispatch never
+        // even runs. The page still declares itself a video page via the
+        // standard Open Graph video protocol (`og:video`), the exact same
+        // cross-site convention `page_preview_image` already reads for a
+        // poster — so a page-level fallback offers "Watch in mpv" on the
+        // page URL regardless of what the player's own DOM looks like.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/preview.jpg".to_owned(), (40, 22));
+        let rows = lay_with_images(
+            r#"<html><head>
+                 <meta property="og:video" content="https://player.example.com/embed">
+                 <meta property="og:image" content="/preview.jpg">
+               </head>
+               <body><nav><a href="/browse">Browse</a></nav>
+                 <div class="player-shell"></div>
+                 <div class="chat">Stream Chat</div>
+               </body></html>"#,
+            80,
+            &images,
+        );
+        assert!(shows(&rows, "Browse"), "the rest of the page still renders");
+        assert!(shows(&rows, "Stream Chat"), "and the chat panel too");
+        assert!(
+            shows(&rows, "▶ Watch in mpv"),
+            "a page-level mpv fallback appears: {:?}",
+            texts(&rows)
+        );
+        let cap = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("Watch in mpv"))
+            .expect("a caption item");
+        assert!(
+            matches!(&cap.link, Some(Link::Media(u)) if u.as_str() == "https://example.com/"),
+            "it follows to mpv on the PAGE url (og:video is usually an iframe embed, not \
+             yt-dlp-playable): {:?}",
+            cap.link
+        );
+        let poster = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .expect(
+                "borrows the page's og:image as a preview frame, like the sourceless-video case",
+            );
+        assert_eq!(
+            poster.image.as_deref(),
+            Some("https://example.com/preview.jpg")
+        );
+    }
+
+    #[test]
+    fn a_page_without_og_video_gets_no_fallback_link() {
+        // The fallback is gated on the page declaring itself a video page
+        // (the standard `og:video` convention) — an ordinary page with no
+        // video content must not sprout a phantom mpv link.
+        let rows = lay(
+            r#"<body><nav><a href="/browse">Browse</a></nav><p>Just an article.</p></body>"#,
+            80,
+        );
+        assert!(
+            !shows(&rows, "Watch in mpv"),
+            "no video page, no mpv affordance: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn a_present_video_element_suppresses_the_page_level_fallback() {
+        // When a `<video>` element IS present (even sourceless — the
+        // existing streaming case), its own per-element representation is
+        // the one and only affordance; the page-level fallback must not ALSO
+        // fire and double it up.
+        let rows = lay(
+            r#"<html><head><meta property="og:video" content="https://player.example.com/embed"></head>
+               <body><video></video></body></html>"#,
+            80,
+        );
+        let count = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.text.contains("Watch in mpv"))
+            .count();
+        assert_eq!(
+            count,
+            1,
+            "exactly one mpv affordance, not doubled: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
     fn a_direct_source_video_without_poster_does_not_borrow_the_page_og_image() {
         // og:image is "a still frame of this PAGE's media" — the right preview
         // for a sourceless streaming player that follows to the page URL, but
@@ -17141,5 +17300,59 @@ mod tests {
             .find(|i| i.kind == ItemKind::Image)
             .expect("an image item");
         assert!(img.text.contains("cat"));
+    }
+
+    #[test]
+    fn a_smallwidget_fullbleed_scrim_is_not_a_modal() {
+        // Regression: an ordinary small in-page widget (a video "play" scrim,
+        // the video.js/streaming-site idiom) that happens to fill its own
+        // (non-positioned, small) container via `position:absolute; inset:0`
+        // must NOT be mistaken for a page-covering modal. `position:absolute`
+        // with no positioned ancestor resolves against the initial containing
+        // block, but — unlike `position:fixed` — it still scrolls away with
+        // the document and can be clipped by ordinary ancestors our pre-layout
+        // heuristic can't see; treating it as a modal wiped the WHOLE
+        // surrounding page (nav, chat, other content) down to this widget's
+        // own subtree, dropping the enclosing link along with it (the modal
+        // entry point uses a bare, context-free `Ctx::root()`). A live
+        // streaming-site page (Twitch) hit exactly this: the JS engine
+        // advanced far enough to actually mount an offline/preview "play"
+        // scrim, whose text content alone (a category badge) was enough for
+        // `overlay_has_content` to qualify it — swallowing the rest of the
+        // page and the mpv-launch link with it.
+        let rows = lay(
+            r#"<body>
+                 <nav><a href="/browse">Browse</a></nav>
+                 <div class="player-area">
+                   <a href="x-trust-js:501:"><div style="position:absolute;top:0;right:0;bottom:0;left:0">
+                     <div><p>CATEGORY</p></div>
+                     <div style="display:flex;width:100%;height:100%" aria-label="Play">
+                       <svg width="24" height="24" viewbox="0 0 24 24"><path d="M0 0"></path></svg>
+                     </div>
+                   </div></a>
+                 </div>
+                 <div class="chat"><p>Stream Chat</p></div>
+               </body>"#,
+            80,
+        );
+        assert!(
+            shows(&rows, "Browse"),
+            "the nav is NOT deferred behind the play scrim: {:?}",
+            texts(&rows)
+        );
+        assert!(
+            shows(&rows, "Stream Chat"),
+            "the chat panel is NOT deferred behind the play scrim: {:?}",
+            texts(&rows)
+        );
+        let play = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("Play"))
+            .expect("the icon-only Play control surfaces its accessible name");
+        assert!(
+            play.link.is_some(),
+            "the Play control keeps its enclosing link"
+        );
     }
 }
