@@ -515,6 +515,38 @@ struct RegionLive {
     cache: crate::layout::RegionRowCache,
 }
 
+/// `TRUST_DIAG_FRAME` present in the environment, read ONCE. The per-call
+/// `env::var_os` (an allocation + platform lookup) sat on the run loop (twice
+/// per iteration) and the page-event/decode/patch paths.
+static DIAG_FRAME: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("TRUST_DIAG_FRAME").is_some());
+
+/// Bump one `EVT_TALLY` slot (the per-second page-event breakdown printed by
+/// `TRUST_DIAG_FRAME`).
+fn tally_evt(slot: usize) {
+    EVT_TALLY.with(|t| {
+        let mut a = t.get();
+        a[slot] += 1;
+        t.set(a);
+    });
+}
+
+/// Everything under the pointer at a screen cell, found by ONE walk of the
+/// pinned fixed layer and the visible rows (each row's `visual_columns`
+/// computed once). Mouse motion needs all three every event; scanning
+/// separately for the selection and the hover target did the whole walk
+/// twice per move.
+#[derive(Default)]
+struct PointerHit {
+    /// Interactive item in the pinned fixed layer, `(fixed, row, item)`.
+    fixed: Option<(usize, usize, usize)>,
+    /// Interactive item in the scrolled doc, `(row, item)` — the selection.
+    item: Option<(usize, usize)>,
+    /// The live actor node that should hear the pointer (ANY item kind — a
+    /// hover-only div is not interactive but is a hover target).
+    hover: Option<usize>,
+}
+
 pub struct App {
     pub mode: Mode,
     /// Terminal emulation of the remote byte stream, rendered by tui-term.
@@ -685,6 +717,13 @@ pub struct App {
     /// RAM-only, session-lifetime; survives re-layout/resize so a resize
     /// never refetches. Built by the parallel pipeline.
     image_cache: HashMap<String, DecodedImage>,
+    /// URL→cell-box mirror of `image_cache` (both are insert-only, synced in
+    /// `on_img_load`) — the map every layout pass reads. Persistent so
+    /// re-parses and patches borrow it instead of rebuilding it (cloning
+    /// every URL string) per call: that clone ran on EVERY live re-render and
+    /// even on the O(one message) region-patch path, where a session's
+    /// accumulated cache could outweigh the patch itself.
+    image_sizes: crate::layout::ImageSizes,
     /// Persistent channel for finished page-image fetch+decodes. Batches are
     /// ADDITIVE: overlapping batches (the initial page load + a live patch's
     /// new emote) all deliver here. The old model — a per-batch receiver that
@@ -813,6 +852,7 @@ impl App {
             fetch_task: None,
             img_rx: None,
             image_cache: HashMap::new(),
+            image_sizes: crate::layout::ImageSizes::new(),
             imgs_tx,
             imgs_rx,
             imgs_in_flight: HashSet::new(),
@@ -931,7 +971,7 @@ impl App {
                 && sig.is_some()
                 && sig == last_frame_sig
                 && term_size == last_term_size;
-            if std::env::var_os("TRUST_DIAG_FRAME").is_some() && skip {
+            if *DIAG_FRAME && skip {
                 REDUNDANT_DRAWS.with(|c| c.set(c.get() + 1));
             }
             last_frame_sig = sig;
@@ -940,7 +980,7 @@ impl App {
             if !skip {
                 terminal.draw(|frame| ui::draw(frame, &mut self))?;
             }
-            if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+            if *DIAG_FRAME {
                 use std::io::Write;
                 FRAME_DIAG.with(|d| {
                     let (mut n, mut us) = d.get();
@@ -1230,19 +1270,30 @@ impl App {
         self.select_menu = None;
     }
 
+    /// Ctrl-] / Tab: toggle between the command console and the session.
+    /// From find it dismisses the find box (clearing its query) on the way
+    /// to the console; any pending identity prompt or dropdown is cancelled.
+    fn toggle_command_mode(&mut self) {
+        if self.mode == Mode::Find {
+            self.input.clear();
+            self.cursor = 0;
+        }
+        self.find = None;
+        self.mode = match self.mode {
+            Mode::Session | Mode::Search | Mode::Find => Mode::Command,
+            Mode::Command => Mode::Session,
+        };
+        self.cert_for = None;
+        self.select_menu = None;
+    }
+
     /// Mouse hover/click target in the browser, dispatching by layout model:
-    /// HTTP laid-out docs use the 2D item hit-test, gopher/gemini the
-    /// line-based one. Returns whether an interactive target was hit.
+    /// HTTP laid-out docs use the 2D item hit-test (which also feeds the live
+    /// hover pipeline — one scan serves both), gopher/gemini the line-based
+    /// one. Returns whether an interactive target was hit.
     fn browser_mouse_hover(&mut self, col: u16, row: u16) -> bool {
         match self.browser.as_ref() {
-            Some(g) if g.doc.laid_out() => {
-                let hit = self.http_mouse_hover(col, row);
-                // The pointer moved: feed the live page's hover pipeline
-                // (independent of the SELECTION hit — a hover-only div is not
-                // interactive but is a hover target; unmarked cells clear).
-                self.sync_page_hover_at(col, row);
-                hit
-            }
+            Some(g) if g.doc.laid_out() => self.http_mouse_hover(col, row),
             Some(_) => self.gopher_mouse_hover(col, row),
             None => false,
         }
@@ -1298,19 +1349,7 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
         {
-            // Ctrl-] from find dismisses the find box (clearing its query)
-            // on the way to the command console.
-            if self.mode == Mode::Find {
-                self.input.clear();
-                self.cursor = 0;
-            }
-            self.find = None;
-            self.mode = match self.mode {
-                Mode::Session | Mode::Search | Mode::Find => Mode::Command,
-                Mode::Command => Mode::Session,
-            };
-            self.cert_for = None;
-            self.select_menu = None;
+            self.toggle_command_mode();
             return;
         }
 
@@ -1322,17 +1361,7 @@ impl App {
             && key.modifiers.is_empty()
             && !(self.mode == Mode::Session && self.char_mode())
         {
-            if self.mode == Mode::Find {
-                self.input.clear();
-                self.cursor = 0;
-            }
-            self.find = None;
-            self.mode = match self.mode {
-                Mode::Session | Mode::Search | Mode::Find => Mode::Command,
-                Mode::Command => Mode::Session,
-            };
-            self.cert_for = None;
-            self.select_menu = None;
+            self.toggle_command_mode();
             return;
         }
 
@@ -1591,15 +1620,18 @@ impl App {
         if let Some(g) = self.browser.as_ref()
             && !query.is_empty()
         {
+            // Collected ONCE per rescan; the per-item collection was an
+            // allocation for every item in the doc on every keystroke.
+            let q: Vec<char> = query.chars().collect();
             if g.doc.laid_out() {
                 for (r, row) in g.doc.rows.iter().enumerate() {
                     for (i, item) in row.items.iter().enumerate() {
-                        push_text_matches(&item.text, &query, r, Some(i), &mut matches);
+                        push_text_matches(&item.text, &q, r, Some(i), &mut matches);
                     }
                 }
             } else {
                 for (l, line) in g.doc.lines.iter().enumerate() {
-                    push_text_matches(&line.text, &query, l, None, &mut matches);
+                    push_text_matches(&line.text, &q, l, None, &mut matches);
                 }
             }
         }
@@ -2380,15 +2412,6 @@ impl App {
         self.open_image(v.url.clone(), v.raw.clone());
     }
 
-    /// The URL→cell-box map the layout pass reads, built from the decode
-    /// cache (only decoded images get a real box; the rest stay alt text).
-    fn image_sizes(&self) -> crate::layout::ImageSizes {
-        self.image_cache
-            .iter()
-            .map(|(u, d)| (u.clone(), d.cell))
-            .collect()
-    }
-
     /// Start the parallel fetch+decode of every page image not already
     /// cached, in flight, or known-failed. Fetches overlap (pooled,
     /// `buffer_unordered`) and each decode runs on a blocking task — no
@@ -2461,6 +2484,7 @@ impl App {
             return;
         };
         self.pending_decoded_urls.push(msg.url.clone());
+        self.image_sizes.insert(msg.url.clone(), decoded.cell);
         self.image_cache.insert(msg.url, decoded);
     }
 
@@ -2516,7 +2540,7 @@ impl App {
             .filter_map(|r| r.live_node)
             .collect();
         let main_flow = urls.iter().any(|u| !confined(u));
-        if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+        if *DIAG_FRAME {
             let sample = urls
                 .iter()
                 .find(|u| !confined(u))
@@ -2550,7 +2574,7 @@ impl App {
                 self.relay_region(ln);
             }
         }
-        if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+        if *DIAG_FRAME {
             IMG_RELAYOUT.with(|c| {
                 let (us, n) = c.get();
                 c.set((us + t.elapsed().as_micros() as u64, n + 1));
@@ -2579,7 +2603,6 @@ impl App {
     fn relayout_browser(&mut self) {
         let width = (self.last_inner.0 as usize).max(10);
         let height = self.last_inner.1.max(1) as usize;
-        let images = self.image_sizes();
         let Some(g) = &mut self.browser else { return };
         let Link::Http(url) = g.doc.url.clone() else {
             return;
@@ -2598,7 +2621,15 @@ impl App {
         let forms = std::mem::take(&mut g.doc.forms);
         let raw = std::mem::take(&mut g.doc.raw);
         let blobs = g.doc.blobs.take();
-        g.doc = http::parse_seeded(&url, &meta, &raw, width, height, Some(&forms), &images);
+        g.doc = http::parse_seeded(
+            &url,
+            &meta,
+            &raw,
+            width,
+            height,
+            Some(&forms),
+            &self.image_sizes,
+        );
         // Same page, same blob mirror (a re-parse must not orphan blob: images).
         g.doc.blobs = blobs;
         // A re-wrap of the SAME HTML (image relayout): the baked scroll signal is
@@ -3011,7 +3042,7 @@ impl App {
             &response.body,
             width,
             self.last_inner.1 as usize,
-            &self.image_sizes(),
+            &self.image_sizes,
         );
         // The blob byte mirror rides the Doc (into history too) so the image
         // pipeline can decode this page's `<img src="blob:…">` at any time.
@@ -3163,56 +3194,83 @@ impl App {
         (x, y)
     }
 
-    /// The live actor node that should hear the pointer at screen `(col, row)`,
-    /// or `None` (unmarked content / outside the content area — a hover clear).
-    /// Unlike `http_hit_test` this scans items of ANY kind: a hover-only
-    /// `<div>` (tooltip trigger) is not interactive and never becomes the
-    /// selection, but it IS a hover target. Resolution: the parse-time
-    /// `Doc.hover_ids` map (nearest `data-trust-hover` / `x-trust-js` marker —
-    /// deepest wins structurally), with the item's own `JsClick` link as a
-    /// fallback. The pinned fixed layer draws on top, so it resolves first.
-    fn hover_target_at(&self, col: u16, row: u16) -> Option<usize> {
-        let g = self.browser.as_ref()?;
-        let resolve = |item: &crate::layout::Item| -> Option<usize> {
-            if let Some(&actor) = g.doc.hover_ids.get(&item.node) {
-                return Some(actor);
-            }
-            match &item.link {
-                Some(crate::doc::Link::JsClick { node, .. }) => Some(*node),
-                _ => None,
-            }
+    /// The live actor node an item resolves to for hover: the parse-time
+    /// `Doc.hover_ids` map (nearest `data-trust-hover` / `x-trust-js` marker
+    /// — deepest wins structurally), with the item's own `JsClick` link as a
+    /// fallback. Shared by the pointer hit-test and the keyboard-selection
+    /// hover path.
+    fn hover_resolve(g: &BrowserView, item: &crate::layout::Item) -> Option<usize> {
+        if let Some(&actor) = g.doc.hover_ids.get(&item.node) {
+            return Some(actor);
+        }
+        match &item.link {
+            Some(crate::doc::Link::JsClick { node, .. }) => Some(*node),
+            _ => None,
+        }
+    }
+
+    /// Everything under the pointer at screen `(col, row)` — see `PointerHit`.
+    /// The pinned fixed layer draws on top, so it resolves first (an
+    /// interactive fixed hit takes BOTH the selection and the hover; a rail
+    /// miss falls through to the doc, matching the old two-scan behavior).
+    /// The doc walk goes newest-row-first over the viewport rows reaching the
+    /// cursor cell, each row's `visual_columns` computed ONCE; within the
+    /// walk the first covering interactive item becomes the selection and the
+    /// first covering item that resolves to an actor becomes the hover —
+    /// identical results to the two independent scans this replaced, at half
+    /// the work per mouse-move event.
+    fn pointer_hit(&self, col: u16, row: u16) -> PointerHit {
+        let mut hit = PointerHit::default();
+        let Some(g) = self.browser.as_ref() else {
+            return hit;
         };
         if let Some((fi, r, i)) = self.fixed_hit_test(col, row) {
-            return resolve(&g.doc.fixed[fi].rows[r].items[i]);
+            hit.hover = Self::hover_resolve(g, &g.doc.fixed[fi].rows[r].items[i]);
+            hit.fixed = Some((fi, r, i));
+            return hit;
         }
         if !self.mouse_in_content_area(col, row) || !g.doc.laid_out() {
-            return None;
+            return hit;
         }
         let local_row = row.saturating_sub(self.last_content_area.y) as usize;
         let doc_row = g.scroll + local_row;
         if doc_row >= g.doc.rows.len() {
-            return None;
+            return hit;
         }
         let local_col = col.saturating_sub(self.last_content_area.x);
-        (g.scroll..=doc_row).rev().find_map(|r| {
-            let row_offset = doc_row.saturating_sub(r);
+        'rows: for r in (g.scroll..=doc_row).rev() {
             if r >= g.doc.rows.len() {
-                return None;
+                continue;
             }
+            let row_offset = doc_row.saturating_sub(r);
+            // The effective row merges any scroll-region buffer window over
+            // the reserved band, so the hit lands on region content; the
+            // visual columns are the SAME on-screen placement the renderer
+            // draws (carousel clip + gap-fill + overlap-append).
             let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r);
-            crate::layout::visual_columns(&row, &g.doc.carousels, r)
-                .into_iter()
-                .find_map(|(i, start)| {
-                    let item = &row.items[i];
-                    let end = start.saturating_add(item.width);
-                    let covers_row = row_offset < item.height.max(1) as usize;
-                    if covers_row && local_col >= start && local_col < end {
-                        resolve(item)
-                    } else {
-                        None
-                    }
-                })
-        })
+            for (i, start) in crate::layout::visual_columns(&row, &g.doc.carousels, r) {
+                let item = &row.items[i];
+                let end = start.saturating_add(item.width);
+                let covers = row_offset < item.height.max(1) as usize
+                    && local_col >= start
+                    && local_col < end;
+                if !covers {
+                    continue;
+                }
+                if hit.item.is_none() && item.is_interactive() {
+                    hit.item = Some((r, i));
+                }
+                if hit.hover.is_none()
+                    && let Some(actor) = Self::hover_resolve(g, item)
+                {
+                    hit.hover = Some(actor);
+                }
+                if hit.item.is_some() && hit.hover.is_some() {
+                    break 'rows;
+                }
+            }
+        }
+        hit
     }
 
     /// Record a pointer-target change for the live page. The run loop arms the
@@ -3257,18 +3315,6 @@ impl App {
         }
     }
 
-    /// Feed the pointer position into the hover pipeline (mouse motion path).
-    /// Chrome rows / unmarked content resolve to `None`, which clears a
-    /// previously sent hover (leave/out fire on the old chain).
-    fn sync_page_hover_at(&mut self, col: u16, row: u16) {
-        if self.live_page.is_none() {
-            return;
-        }
-        let target = self.hover_target_at(col, row);
-        let (x, y) = self.viewport_px_of(col, row);
-        self.request_page_hover(target, x, y);
-    }
-
     /// Feed the keyboard selection into the hover pipeline: the selection IS
     /// the terminal's pointer (her call), so arrowing onto an element hovers
     /// it — Steam's preview pane switches from the keyboard. Resolves the
@@ -3281,15 +3327,7 @@ impl App {
         let Some(g) = self.browser.as_ref() else {
             return;
         };
-        let resolve = |item: &crate::layout::Item| -> Option<usize> {
-            if let Some(&actor) = g.doc.hover_ids.get(&item.node) {
-                return Some(actor);
-            }
-            match &item.link {
-                Some(crate::doc::Link::JsClick { node, .. }) => Some(*node),
-                _ => None,
-            }
-        };
+        let resolve = |item: &crate::layout::Item| Self::hover_resolve(g, item);
         let (target, cell) = if let Some((fi, r, i)) = g.sel_fixed {
             let f = &g.doc.fixed[fi];
             let item = &f.rows[r].items[i];
@@ -3607,7 +3645,7 @@ impl App {
     fn on_page_evt(&mut self, evt: crate::js::PageEvt) {
         let _t_evt = std::time::Instant::now();
         let r = self.on_page_evt_inner(evt);
-        if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+        if *DIAG_FRAME {
             PAGE_WORK.with(|w| {
                 let (us, n, full, drains) = w.get();
                 w.set((
@@ -3648,11 +3686,7 @@ impl App {
             drains += 1;
             match pending {
                 Some(PageEvt::Updated { html, outcome } | PageEvt::Static { html, outcome }) => {
-                    EVT_TALLY.with(|t| {
-                        let mut a = t.get();
-                        a[0] += 1;
-                        t.set(a);
-                    });
+                    tally_evt(0);
                     latest_update = Some((html, outcome));
                     // A full render supersedes any patches queued before it.
                     patches.clear();
@@ -3661,11 +3695,7 @@ impl App {
                     patches: ps,
                     outcome,
                 }) => {
-                    EVT_TALLY.with(|t| {
-                        let mut a = t.get();
-                        a[1] += 1;
-                        t.set(a);
-                    });
+                    tally_evt(1);
                     self.page_js_errors.extend(outcome.errors.iter().cloned());
                     for p in ps {
                         // Coalesce: only the newest patch per boundary matters.
@@ -3674,17 +3704,9 @@ impl App {
                     }
                 }
                 Some(PageEvt::Trouble(errors)) => trouble.extend(errors),
-                Some(PageEvt::Settled) => EVT_TALLY.with(|t| {
-                    let mut a = t.get();
-                    a[3] += 1;
-                    t.set(a);
-                }),
+                Some(PageEvt::Settled) => tally_evt(3),
                 Some(PageEvt::Scrolled { node, top, .. }) => {
-                    EVT_TALLY.with(|t| {
-                        let mut a = t.get();
-                        a[2] += 1;
-                        t.set(a);
-                    });
+                    tally_evt(2);
                     scrolled.push((node, top));
                 }
                 Some(PageEvt::SubmitDefault) => submit_default = true,
@@ -3779,7 +3801,6 @@ impl App {
     fn replace_live_doc(&mut self, raw: Vec<u8>) {
         let width = (self.last_inner.0 as usize).max(10);
         let height = self.last_inner.1.max(1) as usize;
-        let images = self.image_sizes();
         let scroll_intent = self.scroll_intent;
         let Some(g) = &mut self.browser else { return };
         let Link::Http(url) = g.doc.url.clone() else {
@@ -3833,7 +3854,7 @@ impl App {
             width,
             height,
             None,
-            &images,
+            &self.image_sizes,
         );
         // The live page keeps minting into the SAME map (shared Arc), so the
         // re-parsed doc must keep carrying it.
@@ -3953,7 +3974,7 @@ impl App {
                 .iter()
                 .any(|r| r.live_node == Some(patch.node))
         });
-        if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+        if *DIAG_FRAME {
             let (nreg, live) = self.browser.as_ref().map_or((0, 0), |g| {
                 (
                     g.doc.regions.len(),
@@ -3999,7 +4020,6 @@ impl App {
             (self.last_inner.0 as usize).max(10),
             self.last_inner.1.max(1) as usize,
         );
-        let images = self.image_sizes();
         let url = match self.browser.as_ref().map(|g| g.doc.url.clone()) {
             Some(Link::Http(u)) => u,
             _ => return false,
@@ -4022,7 +4042,7 @@ impl App {
             html,
             region_width,
             viewport,
-            &images,
+            &self.image_sizes,
             node,
             &old.cache,
         ) else {
@@ -4038,7 +4058,7 @@ impl App {
                 cache: rp.row_cache.clone(),
             },
         );
-        if std::env::var_os("TRUST_DIAG_FRAME").is_some() {
+        if *DIAG_FRAME {
             eprintln!(
                 "DIAGRELAY stored node={node} keep_scroll={keep_scroll} region_img_urls={} region_live={}",
                 rp.image_urls.len(),
@@ -4113,7 +4133,6 @@ impl App {
             self.last_inner.1.max(1) as usize,
         );
         let scroll_intent = self.scroll_intent;
-        let images = self.image_sizes();
         let url = match self.browser.as_ref().map(|g| g.doc.url.clone()) {
             Some(Link::Http(u)) => u,
             _ => return false,
@@ -4141,7 +4160,7 @@ impl App {
             patch.html.as_bytes(),
             content_width,
             viewport,
-            &images,
+            &self.image_sizes,
             patch.node,
             sub_box,
         ) else {
@@ -4507,31 +4526,31 @@ impl App {
     }
 
     fn http_mouse_hover(&mut self, col: u16, row: u16) -> bool {
-        // The PINNED fixed layer is drawn ON TOP of the scrolling document, so a
-        // hover/click over it wins — hit-test it first (viewport coords).
-        if let Some(target) = self.fixed_hit_test(col, row) {
-            if let Some(g) = &mut self.browser {
+        // ONE walk finds the selection target (fixed layer first — it draws
+        // on top — then the doc) AND the live hover target; scanning twice
+        // per mouse-move was the old cost.
+        let hit = self.pointer_hit(col, row);
+        let in_area = self.mouse_in_content_area(col, row);
+        let laid_out = self.browser.as_ref().is_some_and(|g| g.doc.laid_out());
+        if let Some(g) = &mut self.browser {
+            if let Some(target) = hit.fixed {
                 g.sel_fixed = Some(target);
                 g.sel_item = None;
+            } else {
+                g.sel_fixed = None;
+                if let Some(target) = hit.item {
+                    g.sel_item = Some(target);
+                } else if in_area && laid_out {
+                    g.sel_item = None;
+                }
             }
-            return true;
         }
-        if let Some(g) = &mut self.browser {
-            g.sel_fixed = None;
-        }
-        let Some(target) = self.http_hit_test(col, row) else {
-            if self.mouse_in_content_area(col, row)
-                && self.browser.as_ref().is_some_and(|g| g.doc.laid_out())
-                && let Some(g) = &mut self.browser
-            {
-                g.sel_item = None;
-            }
-            return false;
-        };
-        if let Some(g) = &mut self.browser {
-            g.sel_item = Some(target);
-        }
-        true
+        // The pointer moved: feed the live page's hover pipeline (independent
+        // of the SELECTION hit — a hover-only div is not interactive but is a
+        // hover target; unmarked cells clear).
+        let (x, y) = self.viewport_px_of(col, row);
+        self.request_page_hover(hit.hover, x, y);
+        hit.fixed.is_some() || hit.item.is_some()
     }
 
     /// Hit-test the PINNED fixed layer at screen `(col, row)`: returns the
@@ -4568,44 +4587,6 @@ impl App {
             && col < a.x.saturating_add(a.width)
             && row >= a.y
             && row < a.y.saturating_add(a.height)
-    }
-
-    fn http_hit_test(&self, col: u16, row: u16) -> Option<(usize, usize)> {
-        if !self.mouse_in_content_area(col, row) {
-            return None;
-        }
-        let g = self.browser.as_ref()?;
-        if !g.doc.laid_out() {
-            return None;
-        }
-        let local_row = row.saturating_sub(self.last_content_area.y) as usize;
-        let doc_row = g.scroll + local_row;
-        if doc_row >= g.doc.rows.len() {
-            return None;
-        }
-        let local_col = col.saturating_sub(self.last_content_area.x);
-        (g.scroll..=doc_row).rev().find_map(|r| {
-            let row_offset = doc_row.saturating_sub(r);
-            if r >= g.doc.rows.len() {
-                return None;
-            }
-            // The effective row merges any scroll-region buffer window over the
-            // reserved band, so a click inside a region lands on its content.
-            let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r);
-            // Use the SAME on-screen placement the renderer draws (carousel
-            // clip + gap-fill + overlap-append), so a click lands on the item
-            // actually under the cursor — not the raw `item.col`, which diverges
-            // when items overlap (an overlay drawn after the content it covers).
-            crate::layout::visual_columns(&row, &g.doc.carousels, r)
-                .into_iter()
-                .find_map(|(i, start)| {
-                    let item = &row.items[i];
-                    let end = start.saturating_add(item.width);
-                    let covers_row = row_offset < item.height.max(1) as usize;
-                    (item.is_interactive() && covers_row && local_col >= start && local_col < end)
-                        .then_some((r, i))
-                })
-        })
     }
 
     /// HTTP 2D navigation: Enter follows, Backspace goes back, Up/Down
@@ -5096,7 +5077,6 @@ impl App {
         let width = (self.last_inner.0 as usize).max(10);
         let cp437 = self.encoding == Encoding::Cp437;
         let height = self.last_inner.1.max(1) as usize;
-        let images = self.image_sizes();
         let Some(g) = &mut self.browser else { return };
         if g.doc.raw.is_empty() || (g.doc.wrapped_to == width && g.doc.cp437 == cp437) {
             return;
@@ -5128,7 +5108,15 @@ impl App {
                 let meta = g.doc.meta.clone().unwrap_or_default();
                 // Seed so typed-in form values survive the re-parse.
                 let forms = std::mem::take(&mut g.doc.forms);
-                http::parse_seeded(&url, &meta, &raw, width, height, Some(&forms), &images)
+                http::parse_seeded(
+                    &url,
+                    &meta,
+                    &raw,
+                    width,
+                    height,
+                    Some(&forms),
+                    &self.image_sizes,
+                )
             }
             Link::OneShot(url) => oneshot::parse(&url, raw, width),
             Link::Form { .. } | Link::JsClick { .. } | Link::External(_) => return,
@@ -5163,7 +5151,9 @@ impl App {
                 .enumerate()
                 .filter(|(_, l)| l.link.is_some())
                 .map(|(i, _)| i)
-                .nth(n - 1)
+                // `n == 0` (the invariant says `selected` is always a link
+                // line, but don't underflow on it) → no selection.
+                .nth(n.checked_sub(1)?)
         });
         // Keep the selection on screen, roughly centered.
         let max_scroll = g.doc.lines.len().saturating_sub(height);
@@ -5261,21 +5251,15 @@ impl App {
         if self.activate_carousel_control() {
             return;
         }
-        // Auto-route recognized video links (YouTube and its various
-        // formats) straight to mpv, in EVERY view — people post these on
-        // gopher and gemini too, and following one should play it, not try
-        // to render YouTube. Manual `v` covers any other web link.
+        // Auto-route recognized video links straight to mpv, in EVERY view:
+        // YouTube in its various formats (people post these on gopher and
+        // gemini too — following one should play it, not try to render
+        // YouTube), and direct links to media mpv can play (a video/audio
+        // file, or the source behind a `<video>`/`<audio>` representation).
+        // Manual `v` covers any other web link. One resolve serves both
+        // checks (`selected_web_url` walks the doc and allocates).
         if let Some(url) = self.selected_web_url()
-            && is_youtube_video_url(&url)
-        {
-            self.launch_mpv(url);
-            return;
-        }
-        // A direct link to media mpv can play (a video/audio file, or the
-        // source behind a `<video>`/`<audio>` representation) opens in mpv too
-        // — in every view, automatic for everything mpv routinely plays.
-        if let Some(url) = self.selected_web_url()
-            && is_playable_media_url(&url)
+            && (is_youtube_video_url(&url) || is_playable_media_url(&url))
         {
             self.launch_mpv(url);
             return;
@@ -6093,26 +6077,31 @@ fn iac_code(name: &str) -> Option<u8> {
 /// are virtually always ASCII.
 fn push_text_matches(
     text: &str,
-    query: &str,
+    query: &[char],
     line: usize,
     item: Option<usize>,
     out: &mut Vec<FindMatch>,
 ) {
+    // Cheap pre-filter before any allocation: a text with fewer BYTES than
+    // the query has CHARS can't hold it (chars ≤ bytes). Most items are short
+    // words, so find-as-you-type skips the per-item char collection for them.
+    if query.is_empty() || text.len() < query.len() {
+        return;
+    }
     let lower: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
-    let q: Vec<char> = query.chars().collect();
-    if q.is_empty() || q.len() > lower.len() {
+    if query.len() > lower.len() {
         return;
     }
     let mut i = 0;
-    while i + q.len() <= lower.len() {
-        if lower[i..i + q.len()] == q[..] {
+    while i + query.len() <= lower.len() {
+        if lower[i..i + query.len()] == *query {
             out.push(FindMatch {
                 line,
                 item,
                 start: i,
-                end: i + q.len(),
+                end: i + query.len(),
             });
-            i += q.len();
+            i += query.len();
         } else {
             i += 1;
         }
@@ -8346,17 +8335,25 @@ mod tests {
 
     #[test]
     fn push_text_matches_is_case_insensitive_and_nonoverlapping() {
+        let q: Vec<char> = "foo".chars().collect();
         let mut out = Vec::new();
-        super::push_text_matches("Foo foo fOo bar", "foo", 7, None, &mut out);
+        super::push_text_matches("Foo foo fOo bar", &q, 7, None, &mut out);
         assert_eq!(out.len(), 3);
         assert_eq!((out[0].start, out[0].end), (0, 3));
         assert_eq!((out[1].start, out[1].end), (4, 7));
         assert_eq!((out[2].start, out[2].end), (8, 11));
         assert_eq!(out[0].line, 7);
         // Overlapping query advances past each hit (no double-count).
+        let q: Vec<char> = "aa".chars().collect();
         let mut out = Vec::new();
-        super::push_text_matches("aaaa", "aa", 0, None, &mut out);
+        super::push_text_matches("aaaa", &q, 0, None, &mut out);
         assert_eq!(out.len(), 2);
+        // The byte-length fast path can't reject a match it shouldn't: a
+        // multi-byte text shorter in chars than in bytes still scans.
+        let q: Vec<char> = "héllo".chars().collect();
+        let mut out = Vec::new();
+        super::push_text_matches("say Héllo", &q, 0, None, &mut out);
+        assert_eq!(out.len(), 1, "non-ASCII exact-case match still found");
     }
 
     #[test]
