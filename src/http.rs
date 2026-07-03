@@ -92,6 +92,12 @@ pub struct Response {
     /// pass, so what we render is an empty shell; the label lets the UI
     /// say so instead of showing a blank page. See `detect_challenge`.
     pub challenge: Option<String>,
+    /// The FINAL hop of this exchange was a POST (a 2xx straight off the
+    /// POST, with no redirect). A Post/Redirect/Get flow ends on a GET, so
+    /// it stays false. The browser history uses this: a true POST result
+    /// can't be refetched honestly (a re-POST double-submits), so its doc
+    /// is never evicted from the trail.
+    pub from_post: bool,
 }
 
 /// A page kept alive for interaction: commands in, renders out.
@@ -310,7 +316,13 @@ async fn fetch_redirecting(request: &Request) -> Result<Response, String> {
             .map_err(|_| String::from("timed out"))??;
         match response.status {
             301 | 302 | 303 | 307 | 308 => {}
-            _ => return Ok(response),
+            _ => {
+                let mut response = response;
+                // Recorded off the FINAL hop: 301-303 rewrite the method to
+                // GET below, so a Post/Redirect/Get flow lands here as a GET.
+                response.from_post = request.method == "POST";
+                return Ok(response);
+            }
         }
         // Redirect: fetch_once stashes the Location header in
         // content_type for 3xx (their bodies are never rendered).
@@ -701,6 +713,7 @@ fn finish_response(
             blobs: None,
             live: None,
             challenge: None,
+            from_post: false,
         });
     }
     let content_type = headers
@@ -723,6 +736,7 @@ fn finish_response(
         blobs: None,
         live: None,
         challenge: detect_challenge(&headers),
+        from_post: false,
     })
 }
 
@@ -6008,6 +6022,9 @@ customElements.define('lit-counter', LitCounter);
                       15\r\n/next\">onward</a></p>\r\n\
                       0\r\n\r\n"
                         .to_vec()
+                } else if text.starts_with("POST /prg ") {
+                    // Post/Redirect/Get: 303 rewrites the method to GET.
+                    b"HTTP/1.1 303 See Other\r\nLocation: /new\r\n\r\n".to_vec()
                 } else if text.starts_with("POST /submit ") {
                     assert!(text.contains("Content-Type: application/x-www-form-urlencoded"));
                     assert!(text.ends_with("k=v&x=y"), "body arrived: {text:?}");
@@ -6061,6 +6078,27 @@ customElements.define('lit-counter', LitCounter);
         let response = fetch(&request).await.unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"posted ok");
+        assert!(
+            response.from_post,
+            "a direct 2xx off the POST is a POST result"
+        );
+
+        // Post/Redirect/Get: the 303 hop lands on a GET, so the final page
+        // is refetchable — NOT marked as a POST result.
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/prg")).unwrap();
+        let request = Request {
+            method: String::from("POST"),
+            url,
+            body: Some((
+                String::from("application/x-www-form-urlencoded"),
+                b"k=v".to_vec(),
+            )),
+            headers: Vec::new(),
+        };
+        let response = fetch(&request).await.unwrap();
+        assert_eq!(response.status, 200);
+        assert!(response.url.path().ends_with("/new"), "followed the 303");
+        assert!(!response.from_post, "a PRG flow ends on a GET");
 
         server.abort();
     }

@@ -237,11 +237,32 @@ pub struct BrowserView {
     pub sel_fixed: Option<(usize, usize, usize)>,
     /// First visible line/row.
     pub scroll: usize,
-    history: Vec<(Doc, ViewPos, usize)>,
+    history: Vec<HistEntry>,
     /// Pages backed away from, nearest first at the top. Going back parks
     /// the current doc here; a NEW navigation truncates it (the standard
     /// browser model — you can't go forward to a branch you left).
-    forward: Vec<(Doc, ViewPos, usize)>,
+    forward: Vec<HistEntry>,
+}
+
+/// One navigation-trail entry. The trail itself (URL + restore position) is
+/// unbounded — an entry is a few hundred bytes — but the heavy parsed `doc`
+/// is RETAINED only while the entry is adjacent to the shown page (the top
+/// of its stack): one instant step in either direction, everything deeper
+/// refetches on travel (the bfcache model, her strict-memory call). The one
+/// exemption is a POST result, which can't be honestly refetched (a re-POST
+/// double-submits), so its doc stays; its images still drop (`doc_image_keep`)
+/// and are refetched on restore.
+struct HistEntry {
+    /// Where the page came from — the refetch target once `doc` is evicted.
+    url: Link,
+    pos: ViewPos,
+    scroll: usize,
+    /// The doc is a direct POST result (no PRG redirect): never evicted,
+    /// never refetched — restoring shows the retained doc, and revive-on-back
+    /// is skipped (a GET of the action URL would be a different page).
+    post: bool,
+    /// The parsed page, while this entry is adjacent (or `post`).
+    doc: Option<Doc>,
 }
 
 /// An open `<select>` dropdown overlay. It anchors to the field's document
@@ -647,6 +668,18 @@ pub struct App {
     /// The next fetched document replaces the current one instead of
     /// pushing history (`reload`).
     replace_nav: bool,
+    /// A deep back/forward is refetching an evicted trail entry: the next
+    /// fetched document completes the travel (pop the entry, park the
+    /// current doc on the opposite stack) instead of pushing history.
+    /// `Some(true)` = forward. Cleared by any other navigation intent.
+    pending_travel: Option<bool>,
+    /// The document on screen is a direct POST result (`Response.from_post`)
+    /// — recorded so its trail entry is marked exempt when navigated away
+    /// from. Restored from the entry on travel.
+    current_from_post: bool,
+    /// `from_post` of the response `navigate_to` is about to show; consumed
+    /// there into `current_from_post` (the push needs the OLD value first).
+    nav_from_post: bool,
     /// GNU telnet's `crlf` toggle: Enter sends CR LF when true, CR NUL
     /// when false (char mode only; line mode always sends CR LF).
     crlf: bool,
@@ -822,6 +855,9 @@ impl App {
             pending_live_submit: None,
             page_js_errors: std::collections::HashSet::new(),
             replace_nav: false,
+            pending_travel: None,
+            current_from_post: false,
+            nav_from_post: false,
             crlf: false,
             bells_seen: 0,
             remote_opts: HashSet::new(),
@@ -2259,6 +2295,9 @@ impl App {
     /// host opened without a scheme (see `http::fetch_web_default`). `referrer`
     /// is the page a link/form was followed from, when policy says to send one.
     fn start_fetch_opts(&mut self, target: Link, fallback_http: bool, referrer: Option<url::Url>) {
+        // A new fetch intent supersedes a pending deep-travel completion
+        // (the deep-travel path itself re-sets the flag after this call).
+        self.pending_travel = None;
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("Fetching {target} ...");
@@ -2311,6 +2350,7 @@ impl App {
     /// POST a form-encoded body to a web URL (her use case; the UX can
     /// grow content-type options once the target application is known).
     fn start_post(&mut self, url: url::Url, body: String, referrer: Option<url::Url>) {
+        self.pending_travel = None;
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("POSTing to {url} ...");
@@ -2891,8 +2931,10 @@ impl App {
         self.notice = false;
         let failed = msg.result.is_err();
         if failed {
-            // A failed reload must not make the NEXT navigation replace.
+            // A failed reload must not make the NEXT navigation replace,
+            // and a failed deep-travel refetch leaves the trail untouched.
             self.replace_nav = false;
+            self.pending_travel = None;
         }
         let width = (self.last_inner.0 as usize).max(10);
         match (msg.result, msg.target) {
@@ -2921,6 +2963,10 @@ impl App {
             }
             _ => {}
         }
+        // A deep-travel fetch that ended somewhere other than a document
+        // (image viewer, mpv, bot wall, a gemini input prompt) is spent —
+        // navigate_to consumed the flag if it ran; anything left is stale.
+        self.pending_travel = None;
     }
 
     /// Act on a gemini response by status class. 3x redirects were
@@ -3078,6 +3124,9 @@ impl App {
                 response.url, response.status
             )
         };
+        // A direct POST result's trail entry is exempt from doc eviction
+        // (refetching would re-POST); navigate_to consumes this.
+        self.nav_from_post = response.from_post;
         self.navigate_to(doc);
         // navigate_to dropped the previous living page; install this one.
         if let Some(live) = live {
@@ -3553,6 +3602,7 @@ impl App {
             task.abort();
         }
         self.fetch_rx = None;
+        self.pending_travel = None;
         self.abort_image_loads();
         self.drop_live_page();
         if was_active {
@@ -4436,7 +4486,9 @@ impl App {
     }
 
     /// Show a fetched document, pushing the current one onto the back
-    /// history (RAM-only, dropped when the view closes).
+    /// history (RAM-only, dropped when the view closes). A pending deep
+    /// back/forward (`pending_travel`) completes its trail shuffle here
+    /// instead; a pending reload (`replace_nav`) swaps in place.
     fn navigate_to(&mut self, doc: Doc) {
         // A new page replaces any image that was being viewed, and ends
         // whatever living page came before it (freeze: its last render
@@ -4454,9 +4506,52 @@ impl App {
         // living engine should be revived (not restored static) on back.
         let was_live = self.live_page.is_some();
         self.drop_live_page();
+        let travel = std::mem::take(&mut self.pending_travel);
         let replace = std::mem::take(&mut self.replace_nav);
+        let from_post = std::mem::take(&mut self.nav_from_post);
         let height = self.last_inner.1.max(1) as usize;
         match &mut self.browser {
+            // A deep back/forward refetch landing: complete the travel —
+            // pop the (evicted) entry this doc was fetched for, park the
+            // doc we're leaving on the opposite stack. Falls through to a
+            // plain push if the trail changed underneath the fetch (every
+            // trail mutation clears `pending_travel`, so it shouldn't).
+            Some(g)
+                if travel
+                    .is_some_and(|fwd| !if fwd { &g.forward } else { &g.history }.is_empty()) =>
+            {
+                let fwd = travel == Some(true);
+                let entry = if fwd {
+                    g.forward.pop()
+                } else {
+                    g.history.pop()
+                }
+                .unwrap();
+                let old = std::mem::replace(&mut g.doc, doc);
+                let parked = HistEntry {
+                    url: old.url.clone(),
+                    pos: ViewPos {
+                        selected: g.selected,
+                        sel_item: g.sel_item,
+                        was_live,
+                    },
+                    scroll: g.scroll,
+                    post: self.current_from_post,
+                    doc: Some(old),
+                };
+                if fwd {
+                    g.history.push(parked);
+                } else {
+                    g.forward.push(parked);
+                }
+                // The content is fresh, so saved selection indices are stale
+                // (same rule as revive): restore the scroll clamped to the
+                // new extent and let the tail re-pick a visible selection.
+                g.selected = None;
+                g.sel_item = None;
+                g.sel_fixed = None;
+                g.scroll = entry.scroll.min(g.doc.extent().saturating_sub(height));
+            }
             Some(g) if replace => {
                 // Reload: swap the document in place, keep history and
                 // ride the scroll — clamped to the fresh content's MAX
@@ -4471,12 +4566,18 @@ impl App {
             }
             Some(g) => {
                 let old = std::mem::replace(&mut g.doc, doc);
-                let pos = ViewPos {
-                    selected: g.selected,
-                    sel_item: g.sel_item,
-                    was_live,
+                let entry = HistEntry {
+                    url: old.url.clone(),
+                    pos: ViewPos {
+                        selected: g.selected,
+                        sel_item: g.sel_item,
+                        was_live,
+                    },
+                    scroll: g.scroll,
+                    post: self.current_from_post,
+                    doc: Some(old),
                 };
-                g.history.push((old, pos, g.scroll));
+                g.history.push(entry);
                 // A new navigation abandons the forward branch (browser
                 // model); only back/forward themselves preserve it.
                 g.forward.clear();
@@ -4501,6 +4602,15 @@ impl App {
                 });
             }
         }
+        // The shown doc's POST-ness (for the entry it'll be parked into
+        // later); a travel refetch is a GET, so `from_post` is false there.
+        self.current_from_post = from_post;
+        // Strict memory: evict docs that just became non-adjacent, then
+        // drop decoded images nothing retained references anymore.
+        if let Some(g) = &mut self.browser {
+            Self::enforce_retention(g);
+        }
+        self.sweep_image_caches();
         // A fresh page selects its first interactive target.
         if let Some(g) = &mut self.browser {
             if g.doc.laid_out() {
@@ -5740,67 +5850,143 @@ impl App {
         self.browser_travel(true);
     }
 
-    /// Shared back/forward: pop the target stack, park the leaving doc on
-    /// the opposite one (so the move is always reversible), and restore the
-    /// popped doc's position.
+    /// Shared back/forward. An entry that still holds its doc (adjacent, or
+    /// a retained POST result) restores instantly from RAM, parking the
+    /// leaving doc on the opposite stack; an EVICTED entry starts a refetch
+    /// and the arriving response completes the travel in `navigate_to` —
+    /// until then the trail is untouched, so a failed fetch changes nothing.
     fn browser_travel(&mut self, forward: bool) {
         let js = self.js_enabled;
         // Captured before the drop below: the doc we're leaving should be
         // revived (not restored static) when travelled back onto.
         let was_live = self.live_page.is_some();
+        // Any manual travel supersedes an in-flight deep-travel fetch —
+        // its doc must not shuffle a trail that changed underneath it
+        // (it degrades to a plain navigation push if it still lands).
+        self.pending_travel = None;
         let Some(g) = &mut self.browser else { return };
-        let popped = if forward {
-            g.forward.pop()
+        let src = if forward {
+            &mut g.forward
         } else {
-            g.history.pop()
+            &mut g.history
         };
-        match popped {
-            Some((doc, pos, scroll)) => {
-                let old = std::mem::replace(&mut g.doc, doc);
-                let old_pos = ViewPos {
-                    selected: g.selected,
-                    sel_item: g.sel_item,
-                    was_live,
-                };
-                if forward {
-                    g.history.push((old, old_pos, g.scroll));
-                } else {
-                    g.forward.push((old, old_pos, g.scroll));
+        let Some(top) = src.last() else {
+            self.status = if forward {
+                String::from("Nothing forward in history.")
+            } else {
+                String::from("History empty (Esc returns to terminal).")
+            };
+            // Without the notice flag the selected-link hint overrides
+            // the message and the key looks dead.
+            self.notice = true;
+            return;
+        };
+        if top.doc.is_none() {
+            // Deep travel: the doc was evicted (strict memory, depth-1
+            // retention). Refetch it; the response completes the shuffle.
+            let url = top.url.clone();
+            self.start_fetch(url);
+            self.pending_travel = Some(forward);
+            return;
+        }
+        let entry = src.pop().expect("just peeked");
+        let old = std::mem::replace(&mut g.doc, entry.doc.expect("just checked"));
+        let parked = HistEntry {
+            url: old.url.clone(),
+            pos: ViewPos {
+                selected: g.selected,
+                sel_item: g.sel_item,
+                was_live,
+            },
+            scroll: g.scroll,
+            post: self.current_from_post,
+            doc: Some(old),
+        };
+        if forward {
+            g.history.push(parked);
+        } else {
+            g.forward.push(parked);
+        }
+        // The old top of the receiving stack just became non-adjacent.
+        Self::enforce_retention(g);
+        g.selected = entry.pos.selected;
+        g.sel_item = entry.pos.sel_item;
+        // Not carried in ViewPos: the restored doc's fixed layers are
+        // a different array, so a leftover rail selection is stale.
+        g.sel_fixed = None;
+        g.scroll = entry.scroll;
+        self.current_from_post = entry.post;
+        // Revive a page that was interactive when we left it: re-run its
+        // JS so links/forms work again, rather than restoring a frozen
+        // snapshot with dead script links. The frozen doc shows meanwhile;
+        // the reload replaces it in place (history already adjusted).
+        // Needs JS on + http(s) — and never a POST result: a GET of the
+        // action URL is a different page, the retained doc stands.
+        let revive = entry.pos.was_live && js && !entry.post;
+        let url = g.doc.url.clone();
+        let image_urls = g.doc.image_urls.clone();
+        // Whatever living page was foreground froze when we left.
+        self.drop_live_page();
+        self.sweep_image_caches();
+        if revive && let Link::Http(u) = &url {
+            self.replace_nav = true;
+            self.start_fetch(Link::Http(u.clone()));
+            // After start_fetch (which sets its own "Fetching"
+            // status) so the user sees why we're reloading.
+            self.status = String::from("Reviving page scripts …");
+        } else if let Link::Http(u) = &url {
+            // Restored from RAM: refetch any images the sweep dropped
+            // while this doc sat deep in the trail (a retained POST
+            // result keeps text only); still-cached URLs no-op.
+            self.start_image_loads(u.clone(), image_urls);
+        }
+    }
+
+    /// Depth-1 doc retention: drop the parsed doc of every trail entry
+    /// that is not the top of its stack (not one step from the shown
+    /// page), except POST results (see `HistEntry`). Idempotent; runs
+    /// after every trail mutation.
+    fn enforce_retention(g: &mut BrowserView) {
+        for stack in [&mut g.history, &mut g.forward] {
+            let top = stack.len().saturating_sub(1);
+            for e in stack.iter_mut().take(top) {
+                if !e.post {
+                    e.doc = None;
                 }
-                g.selected = pos.selected;
-                g.sel_item = pos.sel_item;
-                // Not carried in ViewPos: the restored doc's fixed layers are
-                // a different array, so a leftover rail selection is stale.
-                g.sel_fixed = None;
-                g.scroll = scroll;
-                // Revive a page that was interactive when we left it:
-                // re-run its JS so links/forms work again, rather than
-                // restoring a frozen snapshot with dead script links. The
-                // frozen doc shows meanwhile; the reload replaces it in
-                // place (history already adjusted). Needs JS on + http(s).
-                let revive = pos.was_live && js;
-                let url = g.doc.url.clone();
-                // Whatever living page was foreground froze when we left.
-                self.drop_live_page();
-                if revive && let Link::Http(u) = url {
-                    self.replace_nav = true;
-                    self.start_fetch(Link::Http(u));
-                    // After start_fetch (which sets its own "Fetching"
-                    // status) so the user sees why we're reloading.
-                    self.status = String::from("Reviving page scripts …");
-                }
-            }
-            None => {
-                self.status = if forward {
-                    String::from("Nothing forward in history.")
-                } else {
-                    String::from("History empty (Esc returns to terminal).")
-                };
-                // Without the notice flag the selected-link hint overrides
-                // the message and the key looks dead.
-                self.notice = true;
             }
         }
+    }
+
+    /// Strict image memory: keep decoded images (and their size mirror)
+    /// only for URLs referenced by the docs held ADJACENT to the screen —
+    /// the current doc and the two stack tops. Anything else (including a
+    /// deep retained POST result's images) refetches on restore, like a
+    /// page load. Runs after every trail mutation; no LRU, no byte
+    /// accounting — bounded by construction.
+    fn sweep_image_caches(&mut self) {
+        let Some(g) = &self.browser else {
+            self.image_cache.clear();
+            self.image_sizes.clear();
+            return;
+        };
+        let adjacent = [
+            g.history.last().and_then(|e| e.doc.as_ref()),
+            g.forward.last().and_then(|e| e.doc.as_ref()),
+        ];
+        let keep: HashSet<&str> = g
+            .doc
+            .image_urls
+            .iter()
+            .chain(
+                adjacent
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|d| d.image_urls.iter()),
+            )
+            .map(String::as_str)
+            .collect();
+        self.image_cache.retain(|u, _| keep.contains(u.as_str()));
+        self.image_sizes.retain(|u, _| keep.contains(u.as_str()));
     }
 
     /// Run a query the page asked for: gopher type-7 search (RFC 1436:
@@ -5886,9 +6072,11 @@ impl App {
         self.browser = None;
         self.viewer = None;
         self.drop_live_page();
-        // The dropped browser's image batches have nothing to deliver to.
+        // The dropped browser's image batches have nothing to deliver to,
+        // and its decoded images (the whole trail's) die with it.
         self.abort_image_loads();
         self.failed_images.clear();
+        self.sweep_image_caches();
         self.reset_screen();
         let (handle, events) = telnet::connect(host.clone(), port, self.last_inner, use_tls);
         self.conn = Some(handle);
@@ -6102,8 +6290,11 @@ fn is_playable_media_url(url: &str) -> bool {
     let path = u.path().to_ascii_lowercase();
     const EXTS: &[&str] = &[
         // video
+        // (.ts is NOT here: on today's web it's a TypeScript source far more
+        // often than MPEG-TS — manual `v` still plays a real transport
+        // stream; .m2ts is unambiguous and stays.)
         ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".mpg", ".mpeg", ".ogv",
-        ".ts", ".m2ts", ".3gp", ".ogm", // adaptive-streaming manifests mpv plays
+        ".m2ts", ".3gp", ".ogm", // adaptive-streaming manifests mpv plays
         ".m3u8", ".mpd", // audio
         ".mp3", ".m4a", ".m4b", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav", ".wma", ".mka",
         ".weba", ".aiff", ".aif",
@@ -8308,12 +8499,41 @@ mod tests {
         assert_eq!(app.mode, super::Mode::Session);
     }
 
+    /// A trail entry holding `doc` (as every freshly-parked entry does),
+    /// with an empty saved selection.
+    fn entry(doc: crate::doc::Doc, was_live: bool, scroll: usize) -> super::HistEntry {
+        super::HistEntry {
+            url: doc.url.clone(),
+            pos: super::ViewPos {
+                selected: None,
+                sel_item: None,
+                was_live,
+            },
+            scroll,
+            post: false,
+            doc: Some(doc),
+        }
+    }
+
     fn http_doc(path: &str) -> crate::doc::Doc {
         let url = url::Url::parse(&format!("https://example.com{path}")).unwrap();
         crate::http::parse(
             &url,
             "text/html",
             b"<body><p>hi</p></body>",
+            80,
+            0,
+            &Default::default(),
+        )
+    }
+
+    /// Like `http_doc`, with an `<img>` so the doc references an image URL.
+    fn http_doc_img(path: &str, img: &str) -> crate::doc::Doc {
+        let url = url::Url::parse(&format!("https://example.com{path}")).unwrap();
+        crate::http::parse(
+            &url,
+            "text/html",
+            format!(r#"<body><p>hi</p><img src="{img}" alt="pic"></body>"#).as_bytes(),
             80,
             0,
             &Default::default(),
@@ -8539,15 +8759,7 @@ mod tests {
             sel_item: None,
             sel_fixed: None,
             scroll: 0,
-            history: vec![(
-                http_doc("/a"),
-                super::ViewPos {
-                    selected: None,
-                    sel_item: None,
-                    was_live: false,
-                },
-                7,
-            )],
+            history: vec![entry(http_doc("/a"), false, 7)],
             forward: vec![],
         });
 
@@ -8577,15 +8789,7 @@ mod tests {
             sel_item: None,
             sel_fixed: None,
             scroll: 0,
-            history: vec![(
-                http_doc("/a"),
-                super::ViewPos {
-                    selected: None,
-                    sel_item: None,
-                    was_live: true,
-                },
-                0,
-            )],
+            history: vec![entry(http_doc("/a"), true, 0)],
             forward: vec![],
         });
 
@@ -8611,15 +8815,7 @@ mod tests {
             sel_item: None,
             sel_fixed: None,
             scroll: 0,
-            history: vec![(
-                http_doc("/a"),
-                super::ViewPos {
-                    selected: None,
-                    sel_item: None,
-                    was_live: false,
-                },
-                0,
-            )],
+            history: vec![entry(http_doc("/a"), false, 0)],
             forward: vec![],
         });
 
@@ -8640,15 +8836,7 @@ mod tests {
             sel_fixed: None,
             scroll: 0,
             history: vec![],
-            forward: vec![(
-                http_doc("/c"),
-                super::ViewPos {
-                    selected: None,
-                    sel_item: None,
-                    was_live: false,
-                },
-                3,
-            )],
+            forward: vec![entry(http_doc("/c"), false, 3)],
         });
 
         app.on_mouse_event(mouse(
@@ -8664,7 +8852,7 @@ mod tests {
         );
         assert_eq!(g.scroll, 3);
         assert!(
-            matches!(&g.history.last().unwrap().0.url, Link::Http(u) if u.path() == "/b"),
+            matches!(&g.history.last().unwrap().url, Link::Http(u) if u.path() == "/b"),
             "the page we left goes onto the back stack"
         );
     }
@@ -8680,15 +8868,7 @@ mod tests {
             sel_item: Some((0, 0)),
             sel_fixed: None,
             scroll: 5,
-            history: vec![(
-                http_doc("/a"),
-                super::ViewPos {
-                    selected: None,
-                    sel_item: None,
-                    was_live: false,
-                },
-                0,
-            )],
+            history: vec![entry(http_doc("/a"), false, 0)],
             forward: vec![],
         });
 
@@ -8742,15 +8922,7 @@ mod tests {
             sel_fixed: None,
             scroll: 0,
             history: vec![],
-            forward: vec![(
-                http_doc("/b"),
-                super::ViewPos {
-                    selected: None,
-                    sel_item: None,
-                    was_live: true,
-                },
-                0,
-            )],
+            forward: vec![entry(http_doc("/b"), true, 0)],
         });
 
         app.browser_forward();
@@ -8802,6 +8974,190 @@ mod tests {
         let g = app.browser.as_ref().unwrap();
         assert!(matches!(&g.doc.url, Link::Http(u) if u.path() == "/a"));
         assert!(app.status.contains("Nothing forward"), "{}", app.status);
+    }
+
+    #[test]
+    fn deep_trail_docs_are_evicted_but_the_trail_remains() {
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(http_doc("/a"));
+        app.navigate_to(http_doc("/b"));
+        app.navigate_to(http_doc("/c"));
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.history.len(), 2, "the trail keeps every entry");
+        assert!(g.history[0].doc.is_none(), "depth-2 doc is evicted");
+        assert!(matches!(&g.history[0].url, Link::Http(u) if u.path() == "/a"));
+        assert!(g.history[1].doc.is_some(), "the adjacent doc is retained");
+    }
+
+    #[tokio::test]
+    async fn deep_back_refetches_and_completes_on_arrival() {
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(http_doc("/a"));
+        app.navigate_to(http_doc("/b"));
+        app.navigate_to(http_doc("/c"));
+        app.browser_back(); // adjacent: instant restore of /b
+        assert!(
+            matches!(&app.browser.as_ref().unwrap().doc.url, Link::Http(u) if u.path() == "/b")
+        );
+        assert!(app.fetch_rx.is_none(), "adjacent back needs no fetch");
+
+        app.browser_back(); // deep: /a was evicted → refetch
+        assert!(app.fetch_rx.is_some(), "deep back starts a refetch");
+        assert_eq!(app.pending_travel, Some(false));
+        let g = app.browser.as_ref().unwrap();
+        assert!(
+            matches!(&g.doc.url, Link::Http(u) if u.path() == "/b"),
+            "the current page stays until the refetch lands"
+        );
+        assert_eq!(g.history.len(), 1, "trail untouched while in flight");
+        assert_eq!(g.forward.len(), 1);
+
+        // The refetched doc lands (simulated): the travel completes — /b
+        // parks on forward, /a shows, and the old forward top (/c) just
+        // became non-adjacent, so its doc drops to trail-only.
+        app.navigate_to(http_doc("/a"));
+        let g = app.browser.as_ref().unwrap();
+        assert!(matches!(&g.doc.url, Link::Http(u) if u.path() == "/a"));
+        assert!(g.history.is_empty());
+        assert_eq!(g.forward.len(), 2);
+        assert!(matches!(&g.forward[1].url, Link::Http(u) if u.path() == "/b"));
+        assert!(g.forward[1].doc.is_some(), "the parked doc is adjacent");
+        assert!(g.forward[0].doc.is_none(), "/c fell out of adjacency");
+
+        // And the deep-forward mirror: /b restores instantly, /c refetches.
+        app.browser_forward();
+        assert!(
+            matches!(&app.browser.as_ref().unwrap().doc.url, Link::Http(u) if u.path() == "/b")
+        );
+        app.browser_forward();
+        assert_eq!(app.pending_travel, Some(true), "deep forward refetches");
+        assert!(app.fetch_rx.is_some());
+    }
+
+    #[tokio::test]
+    async fn deep_travel_fetch_failure_leaves_the_trail_untouched() {
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(http_doc("/a"));
+        app.navigate_to(http_doc("/b"));
+        app.navigate_to(http_doc("/c"));
+        app.browser_back(); // /b, adjacent
+        app.browser_back(); // deep → refetch starts
+        assert_eq!(app.pending_travel, Some(false));
+
+        let target = app.browser.as_ref().unwrap().history[0].url.clone();
+        app.on_fetch(super::FetchMsg {
+            target,
+            result: Err(String::from("connection refused")),
+        });
+
+        assert!(app.pending_travel.is_none(), "failure clears the intent");
+        assert!(app.notice);
+        let g = app.browser.as_ref().unwrap();
+        assert!(
+            matches!(&g.doc.url, Link::Http(u) if u.path() == "/b"),
+            "still on the page we were on"
+        );
+        assert_eq!(g.history.len(), 1);
+        assert_eq!(g.forward.len(), 1);
+        // The trail is intact: a later real navigation pushes normally.
+        app.navigate_to(http_doc("/d"));
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.history.len(), 2);
+        assert!(g.forward.is_empty(), "a real navigation truncates forward");
+    }
+
+    #[test]
+    fn post_results_are_never_evicted_and_restore_from_ram() {
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(http_doc("/form"));
+        // The POST lands: what's shown is a direct POST result.
+        app.nav_from_post = true;
+        app.navigate_to(http_doc("/submitted"));
+        assert!(app.current_from_post);
+        // Two more navigations push the POST result deep into the trail.
+        app.navigate_to(http_doc("/x"));
+        app.navigate_to(http_doc("/y"));
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.history.len(), 3);
+        assert!(g.history[0].doc.is_none(), "/form evicts normally");
+        assert!(g.history[1].post, "the POST entry is marked");
+        assert!(
+            g.history[1].doc.is_some(),
+            "and keeps its doc, however deep"
+        );
+
+        // Travel back onto it: restored from RAM, no refetch (a re-POST
+        // would double-submit; a GET of the URL is a different page).
+        app.browser_back(); // /x (adjacent)
+        app.browser_back(); // /submitted — deep but retained
+        assert!(
+            app.fetch_rx.is_none(),
+            "no refetch for a retained POST result"
+        );
+        let g = app.browser.as_ref().unwrap();
+        assert!(matches!(&g.doc.url, Link::Http(u) if u.path() == "/submitted"));
+        assert!(
+            app.current_from_post,
+            "its POST-ness survives the round trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_post_result_restores_frozen_instead_of_get_refetching() {
+        let mut app = super::App::new(None, 23);
+        app.js_enabled = true;
+        app.browser = Some(super::BrowserView {
+            doc: http_doc("/next"),
+            selected: None,
+            sel_item: None,
+            sel_fixed: None,
+            scroll: 0,
+            history: vec![super::HistEntry {
+                post: true,
+                ..entry(http_doc("/chat"), true, 0)
+            }],
+            forward: vec![],
+        });
+        app.browser_back();
+        assert!(app.fetch_rx.is_none(), "no GET revive for a POST result");
+        assert!(!app.replace_nav);
+        assert!(
+            matches!(&app.browser.as_ref().unwrap().doc.url, Link::Http(u) if u.path() == "/chat")
+        );
+    }
+
+    #[test]
+    fn image_caches_are_swept_to_adjacent_docs() {
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(http_doc_img("/a", "/a.png"));
+        app.navigate_to(http_doc_img("/b", "/b.png"));
+        for u in ["/a.png", "/b.png", "/c.png", "/stale.png"] {
+            let url = format!("https://example.com{u}");
+            app.image_cache.insert(
+                url.clone(),
+                super::DecodedImage {
+                    raw: std::sync::Arc::from(&b"px"[..]),
+                    cell: (1, 1),
+                },
+            );
+            app.image_sizes.insert(url, (8, 16));
+        }
+        // Navigating to /c makes /a non-adjacent: its decoded image (and the
+        // never-referenced stale entry) drop; current + adjacent survive.
+        app.navigate_to(http_doc_img("/c", "/c.png"));
+        let kept = |u: &str| {
+            app.image_cache
+                .contains_key(&format!("https://example.com{u}"))
+        };
+        assert!(!kept("/a.png"), "deep page's image dropped");
+        assert!(kept("/b.png"), "adjacent page's image kept");
+        assert!(kept("/c.png"), "current page's image kept");
+        assert!(!kept("/stale.png"), "unreferenced entry dropped");
+        assert!(
+            !app.image_sizes.contains_key("https://example.com/a.png"),
+            "the size mirror is swept too"
+        );
+        assert!(app.image_sizes.contains_key("https://example.com/b.png"));
     }
 
     /// Point an HTTP laid-out doc's item selection at the first item that
@@ -8862,6 +9218,11 @@ mod tests {
         assert!(!m("https://example.com/image.png"));
         assert!(!m("mailto:x@y.z"));
         assert!(!m("not a url"));
+        // `.ts` is TypeScript source on today's web far more often than
+        // MPEG-TS — dropped from auto-play (manual `v` still plays a real
+        // transport stream); `.m2ts` is unambiguous and stays.
+        assert!(!m("https://example.com/src/app.ts"));
+        assert!(m("https://example.com/cam/recording.m2ts"));
     }
 
     #[test]
@@ -9019,6 +9380,7 @@ mod tests {
             js: None,
             live: None,
             challenge: Some(String::from("AWS WAF (challenge)")),
+            from_post: false,
         };
         app.on_http_response(response, 60);
         assert!(app.notice, "the wall is surfaced as a persistent notice");
@@ -9047,6 +9409,7 @@ mod tests {
             js: None,
             live: None,
             challenge: None,
+            from_post: false,
         };
         let response =
             crate::http::execute_js(response, app.last_inner, (8, 16), Default::default()).await;
@@ -9830,6 +10193,7 @@ mod tests {
                 js: None,
                 live: None,
                 challenge: None,
+                from_post: false,
             },
             40,
         );
