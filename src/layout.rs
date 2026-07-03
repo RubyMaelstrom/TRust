@@ -140,6 +140,24 @@ pub fn borders_enabled() -> bool {
     BORDERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The terminal's real cell HEIGHT in px (the picker's font size), so the render
+/// pass can convert a definite CSS pixel height back to the SAME number of rows
+/// the JS geometry (`getBoundingClientRect` = rows × cell_px) reported. Session-
+/// global (set once from the picker, like `BORDERS_ENABLED`) rather than threaded
+/// through every `lay_out`/`parse_seeded`/test signature; defaults to 16 so tests
+/// and the 8×16 measurement fixtures round-trip exactly. Read into `Layout.
+/// cell_px_h` at construction; `measure_boxes` overrides it with its explicit
+/// `cell_px.1`. Only the overflow-clip reservation (`css_length_rows_at`) uses it.
+static CELL_PX_H: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(16);
+
+pub fn set_cell_px_h(px: u16) {
+    CELL_PX_H.store(px.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn cell_px_h() -> u16 {
+    CELL_PX_H.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Semantic/styling class of a laid-out item. The view maps these to
 /// terminal styles much as it maps `doc::Kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1094,6 +1112,9 @@ pub fn measure_boxes(
         borders,
     );
     layout.viewport_h = viewport.1;
+    // Clip reservations convert px→rows against the real cell height, so a
+    // placeholder's declared px round-trips to the rows the visible box rendered.
+    layout.cell_px_h = cell_px.1.max(1);
     layout.tag_all_nodes = true;
     layout.flow_all();
     let declared = std::mem::take(&mut layout.declared_boxes);
@@ -2088,6 +2109,12 @@ struct Layout<'a> {
     /// (React virtualized lists cache the measured height then clip). Populated
     /// under `tag_all_nodes`; the render path never touches it.
     clip_heights: HashMap<NodeId, usize>,
+    /// The terminal's real cell height in px (from the `CELL_PX_H` global, or set
+    /// explicitly by `measure_boxes`). Used ONLY by `css_length_rows_at` so an
+    /// overflow-clip box's definite px height converts back to the same rows the
+    /// visible version rendered — keeping a virtualized list's document height
+    /// stable as it swaps placeholders in/out on scroll. Copied onto sub-layouts.
+    cell_px_h: u16,
 }
 
 impl<'a> Layout<'a> {
@@ -2147,6 +2174,7 @@ impl<'a> Layout<'a> {
             shrink_wrap: false,
             invisible: false,
             clip_heights: HashMap::new(),
+            cell_px_h: cell_px_h(),
         }
     }
 
@@ -2167,6 +2195,20 @@ impl<'a> Layout<'a> {
     /// must be a clip keyword, so `overflow:hidden` / `hidden clip` count but
     /// `auto hidden` (a scroll axis) does not — mirrors `is_hidden`'s zero-axis
     /// clip test.
+    /// Rows a box RESERVES for its clipped vertical overflow — the counterpart
+    /// to `clip_heights` on the render side. `Some(rows)` when the box clips its
+    /// vertical overflow (`overflow`/`overflow-y` ∈ {hidden, clip}) AND has a
+    /// definite absolute `height`; `None` otherwise (or a `%`/`vh`/`auto`
+    /// height). The px→rows conversion uses the real cell height so the reserved
+    /// rows match what the visible (unclipped) version rendered.
+    fn clip_reserve_rows(&self, id: NodeId) -> Option<usize> {
+        if !self.clips_overflow_y(id) {
+            return None;
+        }
+        let h = self.dom.computed_style(id, "height")?;
+        css_length_rows_at(&h, self.cell_px_h)
+    }
+
     fn clips_overflow_y(&self, id: NodeId) -> bool {
         let clips_all = |v: Option<String>| {
             v.as_deref().is_some_and(|s| {
@@ -2711,12 +2753,7 @@ impl<'a> Layout<'a> {
             // opacity:0` holding a full clipped article) then reports 320px, its
             // cached height, not the article's real extent. Only a DEFINITE
             // `height` clips to a known box; `min-height`/`auto` don't cap.
-            if self.clips_overflow_y(id)
-                && let Some(h) = self
-                    .dom
-                    .computed_style(id, "height")
-                    .and_then(|v| css_length_rows(&v))
-            {
+            if let Some(h) = self.clip_reserve_rows(id) {
                 self.clip_heights.insert(id, h);
             }
         }
@@ -2755,6 +2792,74 @@ impl<'a> Layout<'a> {
                 self.flow_bordered(id, sides, ctx);
                 return;
             }
+        }
+        // A paint-suppressed block that CLIPS its vertical overflow to a definite
+        // height is a virtualized-list placeholder: React/Mastodon render an
+        // off-screen row as `height:<cachedPx>px; overflow:hidden; opacity:0`
+        // holding hidden content. Its subtree is invisible AND clipped, so it
+        // contributes nothing but its reserved height — reserve exactly that many
+        // rows (spacer rows that survive `finish`'s blank-row collapse) instead of
+        // laying the full invisible subtree. The cached px was measured from OUR
+        // OWN `getBoundingClientRect` (rows × cell_px), so it converts back to the
+        // SAME row count the visible version rendered, which keeps the DOCUMENT
+        // HEIGHT STABLE as the list virtualizes on scroll. Without it a placeholder
+        // rendered its full unclipped invisible extent and every intersection swap
+        // thrashed the doc height, teleporting the reader onto a different post on a
+        // one-line scroll.
+        //
+        // Applied in the GEOMETRY pass too (`tag_all_nodes`), NOT just the render:
+        // `measure_boxes` backs `getBoundingClientRect`/`offset*` and — critically —
+        // the IntersectionObserver the page uses to decide WHICH rows to reveal as
+        // it scrolls. If geometry flowed the placeholder at its full (unclipped)
+        // extent while the render reserved the shorter box, every row below it would
+        // sit at a DIFFERENT document position in the engine than on screen: the app
+        // scrolls in the rendered coordinate system, the engine reveals rows in the
+        // full-extent one, so scrolling reveals the wrong posts, leaves blank
+        // reserved rows on screen, and lands you on a different post when you scroll
+        // back up. Reserving in BOTH passes keeps the two coordinate systems (and
+        // `documentElement.scrollHeight`) identical. In geometry we still record the
+        // placeholder's OWN box — a node-tagged, `clip_h`-tall reserved run — so the
+        // observer sees it at its real reserved position; the invisible subtree is
+        // skipped (its children aren't observed and don't paint). The intrinsic-width
+        // pass (`measuring`) still flows inline — reserving wouldn't change a
+        // full-band block's width. Scoped to `opacity_hidden` (the sticky, whole-
+        // subtree suppression): a `visibility:hidden` box can be re-revealed by a
+        // `visibility:visible` child, so it is NOT blanked here.
+        if block_like
+            && opacity_hidden
+            && !self.measuring
+            && let Some(clip_h) = self.clip_reserve_rows(id)
+        {
+            self.flush_block();
+            if self.gap_before(id, &tag) {
+                self.push_blank();
+            }
+            // Geometry pass: tag the reserved run with the placeholder's node + box
+            // width so `measure_boxes` records the reserved box. Render pass: an
+            // inert 0-width, node-less spacer (paints nothing, stays uninteractive).
+            let (node, w) = if self.tag_all_nodes {
+                let avail = self.width.saturating_sub(self.indent).max(1);
+                let bw = self
+                    .css_cells(id, "width")
+                    .unwrap_or(avail)
+                    .min(avail)
+                    .max(1);
+                self.element_tops
+                    .entry(id)
+                    .or_insert((self.indent as u16, self.rows.len() as u16));
+                (id, bw as u16)
+            } else {
+                (NO_NODE, 0)
+            };
+            for _ in 0..clip_h {
+                self.rows.push(reserved_clip_row(self.indent, w, node));
+            }
+            if self.gap_after(id, &tag) {
+                self.push_blank();
+            }
+            self.col = self.indent;
+            self.pending_space = false;
+            return;
         }
         // A flex container lays its children out as boxes: a wrapping one
         // as a 2D grid, a row one as side-by-side columns, a column one as
@@ -9646,6 +9751,32 @@ fn image_spacer_row(indent: usize) -> Row {
     }
 }
 
+/// A reserved spacer row for a paint-suppressed overflow-clip placeholder
+/// (`flow_element`): renders nothing and survives `finish`'s blank-row collapse.
+/// In the RENDER pass it is inert (`node`=NO_NODE, `width`=0). In the GEOMETRY
+/// pass (`tag_all_nodes`) it carries the placeholder's node + box width so
+/// `measure_boxes` records the reserved box — `getBoundingClientRect` and the
+/// page's IntersectionObserver then see the SAME box the render paints, so the
+/// app scroll and the engine's row positions stay in the one coordinate system.
+fn reserved_clip_row(indent: usize, width: u16, node: NodeId) -> Row {
+    Row {
+        items: vec![Item {
+            col: indent as u16,
+            width,
+            height: 1,
+            image: None,
+            crop: false,
+            pixelated: false,
+            text: String::new(),
+            kind: ItemKind::Image,
+            emph: Emphasis::default(),
+            node,
+            link: None,
+            invisible: true,
+        }],
+    }
+}
+
 fn same_run(item: &Item, ctx: &Ctx) -> bool {
     item.kind == ctx.kind
         && item.emph == ctx.emph
@@ -9758,6 +9889,18 @@ const IMG_CSS_MAX_ROWS: usize = 12_000;
 /// return `None` (a `100%`/`%` height resolves against a container instead).
 fn css_length_rows(value: &str) -> Option<usize> {
     css_length_em(value).map(|em| em.round().max(1.0) as usize)
+}
+
+/// A definite absolute CSS length as whole ROWS at a given terminal cell height
+/// (px). Unlike `css_length_rows` — which uses the fixed 16px/row reference the
+/// rest of layout assumes (1em ≈ 1 row) — this divides the real pixel length by
+/// the ACTUAL cell height, so a length the page derived from OUR OWN geometry
+/// (`getBoundingClientRect` reports rows × cell_px) converts back to the exact
+/// same number of rows. Identical to `css_length_rows` when the cell is 16px
+/// tall (the test/measurement fixtures). `None` for `%`/`vh`/`auto`/`calc`.
+fn css_length_rows_at(value: &str, cell_px_h: u16) -> Option<usize> {
+    css_length_em(value)
+        .map(|em| ((em * 16.0) / f32::from(cell_px_h.max(1))).round().max(1.0) as usize)
 }
 
 /// A definite CSS height as ROWS (fractional, for chain multiplication): an
@@ -14149,6 +14292,87 @@ mod tests {
         assert!(
             texts(&rows).join("\n").contains("kept"),
             "a non-clipping sub-cell box still shows its content"
+        );
+    }
+
+    #[test]
+    fn a_paint_suppressed_clip_placeholder_reserves_its_declared_height() {
+        // A virtualized-list placeholder — React/Mastodon render an off-screen row
+        // as `opacity:0; overflow:hidden; height:<cachedPx>px` holding hidden
+        // content — reserves EXACTLY its declared height in rows, not its full
+        // invisible content extent. This keeps the document height STABLE as the
+        // list swaps placeholders in and out on scroll (without it a placeholder
+        // laid its whole invisible article and every intersection swap thrashed the
+        // doc height, teleporting the reader onto a different post). Ten lines of
+        // content in a 48px (3-row) suppressed+clipped box occupy 3 blank rows.
+        let tall = "l1<br>l2<br>l3<br>l4<br>l5<br>l6<br>l7<br>l8<br>l9<br>l10";
+        let rows = lay(
+            &format!(
+                r#"<body><div style="height:48px;overflow:hidden;opacity:0">{tall}</div></body>"#
+            ),
+            80,
+        );
+        assert_eq!(
+            rows.len(),
+            3,
+            "reserves 48px / 16 = 3 rows, not the 10 lines of invisible content: {:?}",
+            texts(&rows)
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .all(|it| it.text.is_empty()),
+            "the reserved rows are blank — no clipped content leaks: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn geometry_and_render_agree_on_position_after_a_placeholder() {
+        // The scroll fix reserves a virtualized placeholder's height in the RENDER;
+        // the GEOMETRY pass (`measure_boxes`, which backs getBoundingClientRect AND
+        // the page's IntersectionObserver) MUST reserve it identically. Otherwise
+        // every row below the placeholder sits at a different document position in
+        // the engine than on screen, so scrolling reveals the wrong posts and lands
+        // you on a different one when you scroll back up. A 48px (3-row) opacity:0
+        // placeholder holding 10 lines of hidden content: the marker after it lands
+        // at the SAME position in both passes — the reserved 3 rows, not the ~10-row
+        // full-content extent.
+        let tall = "l1<br>l2<br>l3<br>l4<br>l5<br>l6<br>l7<br>l8<br>l9<br>l10";
+        let html = format!(
+            r#"<body><div style="height:48px;overflow:hidden;opacity:0">{tall}</div><div id="after">MARKER</div></body>"#
+        );
+        let rows = lay(&html, 80);
+        let marker_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|it| it.text.contains("MARKER")))
+            .expect("MARKER renders");
+        assert!(
+            marker_row < 6,
+            "render places MARKER just after the reserved 3 rows, not the full 10-line extent: row {marker_row}"
+        );
+        let (dom, m) = measure(&html, 80);
+        let after_top = box_by_id(&dom, &m, "after").top;
+        assert_eq!(
+            after_top,
+            marker_row as f64 * 16.0,
+            "geometry agrees with the render on where the post after a placeholder sits"
+        );
+    }
+
+    #[test]
+    fn a_visible_clip_box_still_renders_its_content_unchanged() {
+        // The reservation is scoped to PAINT-SUPPRESSED boxes (the placeholder
+        // idiom). A visible `overflow:hidden; height:Npx` box is NOT blanked — its
+        // content renders exactly as before (no regression for fixed-height cards).
+        let rows = lay(
+            r#"<body><div style="height:48px;overflow:hidden">visibletext</div></body>"#,
+            80,
+        );
+        assert!(
+            shows(&rows, "visibletext"),
+            "a visible clip box keeps rendering its content: {:?}",
+            texts(&rows)
         );
     }
 
