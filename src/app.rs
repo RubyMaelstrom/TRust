@@ -1250,13 +1250,22 @@ impl App {
         // Remember the cursor cell so a later keyboard PgUp/PgDn can scroll the
         // region under it.
         self.last_mouse = Some((mouse.column, mouse.row));
-        // A left-click on the top address bar or the bottom status line opens
-        // the command console — a discoverable alternative to Tab/Ctrl-], in
-        // EVERY mode and view (handled before the viewer/dropdown/browser
-        // grabs below, since the chrome rows never overlap them).
-        if self.is_chrome_click(&mouse) {
-            self.open_command();
-            return;
+        // A left-click on the chrome opens the command console — a
+        // discoverable alternative to Tab/Ctrl-], in EVERY mode and view
+        // (handled before the viewer/dropdown/browser grabs below, since the
+        // chrome rows never overlap them). The top address bar prefills the
+        // console with the current page's address (an editable address bar);
+        // the bottom status line opens it as-is.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let title_row = self.last_content_area.y.saturating_sub(1);
+            if mouse.row == title_row {
+                self.open_command_with_address();
+                return;
+            }
+            if mouse.row == self.last_status_row {
+                self.open_command();
+                return;
+            }
         }
         if self.viewer.is_some() {
             return; // nothing to scroll in the image viewer
@@ -1296,21 +1305,38 @@ impl App {
         }
     }
 
-    /// A left-click on the top address bar (the bordered title row) or the
-    /// bottom status line. Active in every mode (the chrome is always drawn).
-    fn is_chrome_click(&self, mouse: &MouseEvent) -> bool {
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return false;
-        }
-        let title_row = self.last_content_area.y.saturating_sub(1);
-        mouse.row == title_row || mouse.row == self.last_status_row
-    }
-
     /// Open the command console (the same state Tab/Ctrl-] enters).
     fn open_command(&mut self) {
         self.mode = Mode::Command;
         self.cert_for = None;
         self.select_menu = None;
+    }
+
+    /// Open the command console prefilled with the current page's address,
+    /// cursor at the end — an editable address bar. With nothing addressable
+    /// on screen it behaves exactly like `open_command`.
+    fn open_command_with_address(&mut self) {
+        self.open_command();
+        if let Some(addr) = self.current_address() {
+            self.cursor = addr.chars().count();
+            self.input = addr;
+            self.select_anchor = None;
+        }
+    }
+
+    /// The address shown in the top title bar, if any: the image viewer's
+    /// URL, else the browser document's URL, else the connected telnet
+    /// `host:port`. Mirrors the title logic in `ui::draw` so a top-bar click
+    /// prefills the console with exactly what the bar displays.
+    fn current_address(&self) -> Option<String> {
+        match (&self.viewer, &self.browser) {
+            (Some(v), _) => Some(v.url.to_string()),
+            (None, Some(g)) => Some(g.doc.url.to_string()),
+            (None, None) => self
+                .host
+                .as_ref()
+                .map(|host| format!("{host}:{port}", port = self.port)),
+        }
     }
 
     /// Ctrl-] / Tab: toggle between the command console and the session.
@@ -8497,6 +8523,36 @@ mod tests {
         app.navigate_to(gopher_doc("..."));
         app.on_mouse_event(click(3));
         assert_eq!(app.mode, super::Mode::Session);
+    }
+
+    #[test]
+    fn top_bar_click_prefills_the_current_address() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(2, 1, 80, 10);
+        app.last_status_row = 13;
+        let click = |row| mouse(MouseEventKind::Down(MouseButton::Left), 5, row);
+
+        // A browser page on screen: clicking the top title row opens the
+        // console prefilled with the page's address, cursor at the end — an
+        // editable address bar.
+        app.navigate_to(gopher_doc("xxx"));
+        let addr = app.browser.as_ref().unwrap().doc.url.to_string();
+        assert!(!addr.is_empty());
+        app.on_mouse_event(click(0));
+        assert_eq!(app.mode, super::Mode::Command);
+        assert_eq!(app.input, addr);
+        assert_eq!(app.cursor, addr.chars().count());
+
+        // The bottom status line still opens the console without prefilling.
+        app.mode = super::Mode::Session;
+        app.input.clear();
+        app.cursor = 0;
+        app.on_mouse_event(click(13));
+        assert_eq!(app.mode, super::Mode::Command);
+        assert!(app.input.is_empty());
     }
 
     /// A trail entry holding `doc` (as every freshly-parked entry does),
