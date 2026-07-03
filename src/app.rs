@@ -446,6 +446,10 @@ fn color_rgb(c: ratatui::style::Color) -> [u8; 3] {
 struct EncMsg {
     key: EncKey,
     protocol: Option<SlicedProtocol>,
+    /// `App::enc_epoch` at spawn time. `set image <proto>` bumps the epoch,
+    /// so an encode still in flight under the OLD protocol is recognized and
+    /// dropped on arrival instead of caching a stale-protocol image.
+    epoch: u64,
 }
 
 /// Cap a decoded image's natural cell box (never upscales; preserves
@@ -681,8 +685,24 @@ pub struct App {
     /// RAM-only, session-lifetime; survives re-layout/resize so a resize
     /// never refetches. Built by the parallel pipeline.
     image_cache: HashMap<String, DecodedImage>,
-    /// In-flight parallel page-image fetch+decode batch.
-    imgs_rx: Option<mpsc::Receiver<ImgLoadMsg>>,
+    /// Persistent channel for finished page-image fetch+decodes. Batches are
+    /// ADDITIVE: overlapping batches (the initial page load + a live patch's
+    /// new emote) all deliver here. The old model — a per-batch receiver that
+    /// each new batch REPLACED — silently discarded the remainder of an
+    /// in-flight batch whenever a later one started.
+    imgs_tx: mpsc::Sender<ImgLoadMsg>,
+    imgs_rx: mpsc::Receiver<ImgLoadMsg>,
+    /// Image URLs currently in the fetch+decode pipeline: dedups requests
+    /// across overlapping batches, and non-empty drives the loading pulse.
+    imgs_in_flight: HashSet<String>,
+    /// Image URLs whose fetch/decode FAILED for the current page. Without
+    /// this a live page that re-renders (a chat, a timer) refetched every
+    /// broken image once per render — `start_image_loads` receives the full
+    /// URL list each update. Cleared on navigation, so a reload retries.
+    failed_images: HashSet<String>,
+    /// Handles to in-flight image batch tasks, so Esc (`stop_loading`) and
+    /// navigation ABORT the network work itself — not just the delivery.
+    imgs_tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Encoded inline-image protocols, keyed by `(url, cell_w, cell_h, crop)`.
     /// Each is a `SlicedProtocol` (encoded once for the whole box; the renderer
     /// clips it to any vertical slice), so scroll never re-encodes. Bounded to
@@ -702,6 +722,9 @@ pub struct App {
     /// Persistent channel for finished inline-image encodes.
     enc_tx: mpsc::Sender<EncMsg>,
     enc_rx: mpsc::Receiver<EncMsg>,
+    /// Generation counter for inline-image encodes, bumped by
+    /// `set image <proto>` — see `EncMsg::epoch`.
+    enc_epoch: u64,
     /// The gopher type-7 item, gemini 1x URL, or form field awaiting
     /// input (pub so the UI can label the prompt accordingly).
     pub(crate) search_target: Option<Link>,
@@ -732,6 +755,7 @@ impl App {
             None => Mode::Command,
         };
         let (enc_tx, enc_rx) = mpsc::channel(64);
+        let (imgs_tx, imgs_rx) = mpsc::channel(64);
         Self {
             mode,
             // In memory only, like the entry histories.
@@ -789,12 +813,17 @@ impl App {
             fetch_task: None,
             img_rx: None,
             image_cache: HashMap::new(),
-            imgs_rx: None,
+            imgs_tx,
+            imgs_rx,
+            imgs_in_flight: HashSet::new(),
+            failed_images: HashSet::new(),
+            imgs_tasks: Vec::new(),
             image_protocols: HashMap::new(),
             image_encoding: HashSet::new(),
             failed_encodes: HashSet::new(),
             enc_tx,
             enc_rx,
+            enc_epoch: 0,
             search_target: None,
             cert_for: None,
             select_menu: None,
@@ -817,7 +846,7 @@ impl App {
     pub fn loading(&self) -> bool {
         self.fetch_rx.is_some()
             || self.img_rx.is_some()
-            || self.imgs_rx.is_some()
+            || !self.imgs_in_flight.is_empty()
             || !self.image_encoding.is_empty()
             || self.page_busy
     }
@@ -1014,10 +1043,7 @@ impl App {
                     Some(msg) => self.on_img(msg),
                     None => self.img_rx = None,
                 },
-                msg = recv_opt(&mut self.imgs_rx) => match msg {
-                    Some(msg) => self.on_img_load(msg),
-                    None => self.imgs_rx = None,
-                },
+                Some(msg) = self.imgs_rx.recv() => self.on_img_load(msg),
                 Some(msg) = self.enc_rx.recv() => self.on_enc(msg),
                 evt = recv_opt(&mut self.page_rx) => match evt {
                     Some(evt) => {
@@ -1080,21 +1106,15 @@ impl App {
             // a burst, and a churning live page (Twitch's rotating previews) keeps
             // streaming them — relaying out the whole 396KB doc once PER image
             // pegged a core. Cache them all, relayout once.
-            if self.imgs_rx.is_some() {
-                let mut drained_imgs = 0;
-                while drained_imgs < 512 {
-                    let recv = self.imgs_rx.as_mut().map(|rx| rx.try_recv());
-                    match recv {
-                        Some(Ok(msg)) => {
-                            self.on_img_load(msg);
-                            drained_imgs += 1;
-                        }
-                        Some(Err(mpsc::error::TryRecvError::Disconnected)) => {
-                            self.imgs_rx = None;
-                            break;
-                        }
-                        _ => break, // Empty, or no receiver
+            let mut drained_imgs = 0;
+            while drained_imgs < 512 {
+                match self.imgs_rx.try_recv() {
+                    Ok(msg) => {
+                        self.on_img_load(msg);
+                        drained_imgs += 1;
                     }
+                    // Empty (the channel never closes — the app holds a sender).
+                    Err(_) => break,
                 }
             }
             self.apply_pending_image_decodes();
@@ -2010,6 +2030,14 @@ impl App {
         if let Some(v) = &mut self.viewer {
             v.encoded_for = (0, 0); // force the next sync to re-encode
         }
+        // Inline page images were encoded under the OLD protocol; drop them
+        // (and failed attempts) so `sync_image_encodes` re-encodes the
+        // on-screen set under the new one. The epoch bump makes any encode
+        // still in flight land stale and get dropped (`on_enc`).
+        self.enc_epoch += 1;
+        self.image_protocols.clear();
+        self.failed_encodes.clear();
+        self.image_encoding.clear();
     }
 
     /// GNU telnet's `status` command: print connection state into the
@@ -2361,14 +2389,20 @@ impl App {
             .collect()
     }
 
-    /// Start the parallel fetch+decode of every page image not already in
-    /// the cache. Fetches overlap (pooled, `buffer_unordered`) and each
-    /// decode runs on a blocking task — no serial wall, results stream
-    /// back over `imgs_rx` and re-layout as they land.
+    /// Start the parallel fetch+decode of every page image not already
+    /// cached, in flight, or known-failed. Fetches overlap (pooled,
+    /// `buffer_unordered`) and each decode runs on a blocking task — no
+    /// serial wall, results stream back over the persistent `imgs_rx` and
+    /// re-layout as they land. Batches are additive (see `imgs_tx`); the
+    /// task handle is kept so Esc/navigation can abort the network work.
     fn start_image_loads(&mut self, page: Url, urls: Vec<String>) {
         let todo: Vec<String> = urls
             .into_iter()
-            .filter(|u| !self.image_cache.contains_key(u))
+            .filter(|u| {
+                !self.image_cache.contains_key(u)
+                    && !self.imgs_in_flight.contains(u)
+                    && !self.failed_images.contains(u)
+            })
             .collect();
         if todo.is_empty() {
             return;
@@ -2380,9 +2414,13 @@ impl App {
             .browser
             .as_ref()
             .and_then(|g| g.doc.blobs.as_ref().map(|b| b.0.clone()));
-        let (tx, rx) = mpsc::channel(todo.len().max(1));
-        self.imgs_rx = Some(rx);
-        tokio::spawn(async move {
+        for u in &todo {
+            self.imgs_in_flight.insert(u.clone());
+        }
+        // Keep the handle list bounded: completed batches prune here.
+        self.imgs_tasks.retain(|t| !t.is_finished());
+        let tx = self.imgs_tx.clone();
+        let task = tokio::spawn(async move {
             futures::stream::iter(todo.into_iter().map(|url| {
                 let tx = tx.clone();
                 let page = page.clone();
@@ -2396,6 +2434,18 @@ impl App {
             .for_each(|_| async {})
             .await;
         });
+        self.imgs_tasks.push(task);
+    }
+
+    /// Abort every in-flight image batch — the network work itself, not just
+    /// the result delivery — and forget what was in flight. A result already
+    /// queued on the channel still arrives; `apply_pending_image_decodes`
+    /// ignores it unless the current doc references its URL.
+    fn abort_image_loads(&mut self) {
+        for task in self.imgs_tasks.drain(..) {
+            task.abort();
+        }
+        self.imgs_in_flight.clear();
     }
 
     /// One image finished decoding: cache it and record its URL so the run loop's
@@ -2403,8 +2453,12 @@ impl App {
     /// dozens; a churning live page streams chat emotes) collapses into ONE scoped
     /// re-lay, not one per image.
     fn on_img_load(&mut self, msg: ImgLoadMsg) {
+        self.imgs_in_flight.remove(&msg.url);
         let Some(decoded) = msg.decoded else {
-            return; // fetch/decode failed: the alt text stands
+            // The alt text stands — and the failure is REMEMBERED, so a live
+            // page's every-render batch can't refetch a broken image forever.
+            self.failed_images.insert(msg.url);
+            return;
         };
         self.pending_decoded_urls.push(msg.url.clone());
         self.image_cache.insert(msg.url, decoded);
@@ -2437,6 +2491,17 @@ impl App {
         let Some(g) = self.browser.as_ref() else {
             return;
         };
+        // Only decodes the CURRENT doc references can affect its layout: a
+        // result that raced a navigation (queued before its batch was
+        // aborted) must not trigger a full relayout of the unrelated new
+        // page. The cache entry stays — it's just a cache.
+        let urls: Vec<String> = urls
+            .into_iter()
+            .filter(|u| g.doc.image_urls.contains(u))
+            .collect();
+        if urls.is_empty() {
+            return;
+        }
         let confined = |u: &String| {
             g.doc
                 .regions
@@ -2475,14 +2540,11 @@ impl App {
             );
         }
         if main_flow {
-            // A main-flow image changes document flow → full relayout, then refresh
-            // every region from its CURRENT retained HTML (the full relayout rebuilt
-            // them from possibly-stale doc.raw).
+            // A main-flow image changes document flow → full relayout
+            // (`relayout_browser` then refreshes every region from its
+            // CURRENT retained HTML, since the relayout rebuilt them from
+            // possibly-stale doc.raw).
             self.relayout_browser();
-            let live: Vec<usize> = self.region_live.keys().copied().collect();
-            for ln in live {
-                self.relay_region(ln);
-            }
         } else {
             for ln in regions_hit {
                 self.relay_region(ln);
@@ -2545,6 +2607,22 @@ impl App {
         g.sel_item = item_target.and_then(|t| Self::find_item_like(&g.doc, &t));
         let max_scroll = g.doc.rows.len().saturating_sub(height);
         g.scroll = g.scroll.min(max_scroll);
+        // The re-parse rebuilt every region from `doc.raw` — the last FULL
+        // render, stale by exactly the content patched into live regions
+        // since (a chat's recent messages). Restore each from its retained
+        // patch HTML.
+        self.refresh_live_regions();
+    }
+
+    /// Re-lay every live scroll region from its RETAINED patch HTML after a
+    /// full re-layout rebuilt them from `doc.raw` (the last FULL render —
+    /// stale by exactly the content patched in since). A no-op for regions
+    /// without retained HTML, and for static pages (`region_live` empty).
+    fn refresh_live_regions(&mut self) {
+        let live: Vec<usize> = self.region_live.keys().copied().collect();
+        for ln in live {
+            self.relay_region(ln);
+        }
     }
 
     /// A hash of everything `ui::draw` paints for the VISIBLE browser frame —
@@ -2576,6 +2654,12 @@ impl App {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         g.scroll.hash(&mut h);
         g.sel_item.hash(&mut h);
+        // The gopher/gemini LINE-model selection: its highlight and the
+        // status-bar link preview both render from it, and a selection step
+        // often moves WITHOUT scrolling (a menu that fits on screen, any step
+        // above the center row) — leaving it out froze the highlight while
+        // Enter followed the invisibly-moved selection.
+        g.selected.hash(&mut h);
         // The PINNED fixed layer draws every frame independent of scroll, so its
         // selection (hover highlight + status link preview) and content must be
         // in the signature — else hovering a pinned rail link changes `sel_fixed`
@@ -2623,6 +2707,12 @@ impl App {
     }
 
     fn on_enc(&mut self, msg: EncMsg) {
+        if msg.epoch != self.enc_epoch {
+            // Encoded under a protocol setting that changed while it was in
+            // flight: obsolete. Don't touch `image_encoding` either — the key
+            // may have been re-requested under the new epoch.
+            return;
+        }
         self.image_encoding.remove(&msg.key);
         match msg.protocol {
             Some(protocol) => {
@@ -2719,6 +2809,7 @@ impl App {
         let raw = decoded.raw.clone();
         let picker = self.picker.clone();
         let tx = self.enc_tx.clone();
+        let epoch = self.enc_epoch;
         self.image_encoding.insert(key.clone());
         tokio::task::spawn_blocking(move || {
             // Runs on a tokio BLOCKING thread. Sandbox it: a decode/encode
@@ -2748,7 +2839,11 @@ impl App {
             }))
             .ok()
             .flatten();
-            let _ = tx.blocking_send(EncMsg { key, protocol });
+            let _ = tx.blocking_send(EncMsg {
+                key,
+                protocol,
+                epoch,
+            });
         });
     }
 
@@ -3406,14 +3501,14 @@ impl App {
     /// is dropped, which ends it.)
     fn stop_loading(&mut self) {
         let was_active = self.fetch_rx.is_some()
-            || self.imgs_rx.is_some()
+            || !self.imgs_in_flight.is_empty()
             || self.live_page.is_some()
             || self.page_busy;
         if let Some(task) = self.fetch_task.take() {
             task.abort();
         }
         self.fetch_rx = None;
-        self.imgs_rx = None;
+        self.abort_image_loads();
         self.drop_live_page();
         if was_active {
             self.notice = true;
@@ -3547,7 +3642,6 @@ impl App {
         // Page-initiated inner-scroll writes (CSSOM View) without a DOM mutation:
         // applied AFTER any content update so they land on the new regions.
         let mut scrolled: Vec<(usize, f64)> = Vec::new();
-        let pending_submit = self.pending_live_submit.take();
         let mut pending = Some(evt);
         let mut drains = 0u32;
         loop {
@@ -3655,7 +3749,14 @@ impl App {
             );
             self.notice = true;
         }
-        if submit_default && let Some((form, field)) = pending_submit {
+        // Consume the recorded submit target only when its SubmitDefault
+        // actually arrived. Since the engine runs at rest, an AUTONOMOUS
+        // render (a timer tick) can land between the Submit dispatch and the
+        // actor's answer — taking the record on every batch dropped it, so
+        // the fallback static submit silently never ran. Stale records can't
+        // mis-fire: every dispatch overwrites it, and `drop_live_page` clears
+        // it (a page-JS-owned submit just leaves it parked until then).
+        if submit_default && let Some((form, field)) = self.pending_live_submit.take() {
             self.submit_form_static(form, field);
         }
         if let Some((form_node, submitter_node)) = submit_nodes
@@ -3745,6 +3846,18 @@ impl App {
         // region keeps the page's position (prefer_signal = true); only an
         // un-signalled region restores the user's wheel offset.
         Self::carry_region_offsets(&old_offsets, &mut g.doc.regions, true);
+        // A rail selection survives only if its address still resolves in the
+        // re-rendered fixed layers (they can reshape under a live update).
+        if let Some((fi, r, i)) = g.sel_fixed
+            && g.doc
+                .fixed
+                .get(fi)
+                .and_then(|f| f.rows.get(r))
+                .and_then(|row| row.items.get(i))
+                .is_none()
+        {
+            g.sel_fixed = None;
+        }
         g.sel_item = selected_target
             .and_then(|target| Self::find_item_like(&g.doc, &target))
             // Lost a selection we HAD? Fall back to the first interactive item
@@ -3803,6 +3916,22 @@ impl App {
         // reader's intended place across a transient shrink.
         if let Some(v) = new_intent {
             self.scroll_intent = v;
+        }
+        // An open <select> dropdown stays up across unrelated live updates,
+        // but closes when the update removed (or retyped) the field it was
+        // bound to — its indices would otherwise commit into a stranger.
+        if let Some(menu) = &self.select_menu {
+            let still_a_select = self
+                .browser
+                .as_ref()
+                .and_then(|g| g.doc.forms.get(menu.form))
+                .and_then(|f| f.fields.get(menu.field))
+                .is_some_and(|f| matches!(f.kind, crate::doc::FieldKind::Select(_)));
+            if !still_a_select {
+                self.select_menu = None;
+                self.status = String::from("Select closed — the page updated that control.");
+                self.notice = true;
+            }
         }
         self.start_image_loads(url, image_urls);
     }
@@ -4287,19 +4416,32 @@ impl App {
         // whatever living page came before it (freeze: its last render
         // is already the doc going into history).
         self.viewer = None;
+        // An open <select> dropdown is anchored to the OLD doc's field
+        // indices; a live `Navigate` can land here while it's up.
+        self.select_menu = None;
+        // The old page's image batches die with it (the network work, not
+        // just the delivery), and its failure memory is dropped — so a
+        // reload retries images that failed last time.
+        self.abort_image_loads();
+        self.failed_images.clear();
         // Capture before dropping: a doc going into history that had a
         // living engine should be revived (not restored static) on back.
         let was_live = self.live_page.is_some();
         self.drop_live_page();
         let replace = std::mem::take(&mut self.replace_nav);
+        let height = self.last_inner.1.max(1) as usize;
         match &mut self.browser {
             Some(g) if replace => {
                 // Reload: swap the document in place, keep history and
-                // ride the scroll (clamped to the fresh content).
+                // ride the scroll — clamped to the fresh content's MAX
+                // scroll (extent − viewport), not its last row, so a
+                // shorter reload can't park the view on a lone top row
+                // with blank space below.
                 g.doc = doc;
                 g.selected = None;
                 g.sel_item = None;
-                g.scroll = g.scroll.min(g.doc.extent().saturating_sub(1));
+                g.sel_fixed = None;
+                g.scroll = g.scroll.min(g.doc.extent().saturating_sub(height));
             }
             Some(g) => {
                 let old = std::mem::replace(&mut g.doc, doc);
@@ -4311,6 +4453,11 @@ impl App {
                 g.history.push((old, pos, g.scroll));
                 g.selected = None;
                 g.sel_item = None;
+                // A stale pinned-rail selection must not outlive its doc:
+                // `selected_link` consults it FIRST, so a leftover index makes
+                // Enter dead (or follows the wrong rail link on a page that
+                // also has fixed layers).
+                g.sel_fixed = None;
                 g.scroll = 0;
             }
             None => {
@@ -4325,7 +4472,6 @@ impl App {
             }
         }
         // A fresh page selects its first interactive target.
-        let height = self.last_inner.1.max(1) as usize;
         if let Some(g) = &mut self.browser {
             if g.doc.laid_out() {
                 g.sel_item = Self::http_first_visible_item(g, height);
@@ -5002,6 +5148,12 @@ impl App {
                 Some((r, _)) => r.saturating_sub(height / 2).min(max_scroll),
                 None => g.scroll.min(max_scroll),
             };
+            // The re-wrap rebuilt every region from `doc.raw` — the last
+            // FULL render, stale by the content patched into live regions
+            // since (a chat's recent messages reverted on resize without
+            // this). Restore each from its retained patch HTML, at the new
+            // width.
+            self.refresh_live_regions();
             return;
         }
         g.selected = link_ordinal.and_then(|n| {
@@ -5491,10 +5643,21 @@ impl App {
         {
             return;
         }
-        if let Some(g) = &mut self.browser {
-            g.doc.forms[form].fields[field].value = value;
+        // Re-resolve instead of indexing: a live re-render while the dropdown
+        // was open can reshape `forms`, and the menu's indices are from the
+        // doc it opened over — a miss drops the write (never a panic).
+        if let Some(f) = self
+            .browser
+            .as_mut()
+            .and_then(|g| g.doc.forms.get_mut(form))
+            .and_then(|f| f.fields.get_mut(field))
+        {
+            f.value = value;
+            self.refresh_forms();
+        } else {
+            self.status = String::from("That control changed under a page update.");
+            self.notice = true;
         }
-        self.refresh_forms();
     }
 
     /// Map a click-triggered submit's `(form, submitter)` arena nodes to its
@@ -5573,6 +5736,9 @@ impl App {
                 g.doc = doc;
                 g.selected = pos.selected;
                 g.sel_item = pos.sel_item;
+                // Not carried in ViewPos: the restored doc's fixed layers are
+                // a different array, so a leftover rail selection is stale.
+                g.sel_fixed = None;
                 g.scroll = scroll;
                 // Revive a page that was interactive when we left it:
                 // re-run its JS so links/forms work again, rather than
@@ -5678,6 +5844,9 @@ impl App {
         self.browser = None;
         self.viewer = None;
         self.drop_live_page();
+        // The dropped browser's image batches have nothing to deliver to.
+        self.abort_image_loads();
+        self.failed_images.clear();
         self.reset_screen();
         let (handle, events) = telnet::connect(host.clone(), port, self.last_inner, use_tls);
         self.conn = Some(handle);
@@ -6104,6 +6273,8 @@ fn encode_key(key: KeyEvent, crlf: bool) -> Option<Vec<u8>> {
         KeyCode::Enter => b"\r\x00".to_vec(),
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Tab => vec![b'\t'],
+        // Shift-Tab, as CSI Z (back-tab) — BBS forms navigate fields with it.
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
         KeyCode::Esc => vec![0x1b],
         KeyCode::Up => b"\x1b[A".to_vec(),
         KeyCode::Down => b"\x1b[B".to_vec(),
@@ -6111,9 +6282,29 @@ fn encode_key(key: KeyEvent, crlf: bool) -> Option<Vec<u8>> {
         KeyCode::Left => b"\x1b[D".to_vec(),
         KeyCode::Home => b"\x1b[H".to_vec(),
         KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::Insert => b"\x1b[2~".to_vec(),
         KeyCode::Delete => b"\x1b[3~".to_vec(),
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
+        // Function keys, xterm/VT-style: SS3 P..S for F1-F4 (the VT100 PF
+        // keys), CSI n ~ for F5-F12 (with the historic VT220 gaps at 16/22).
+        // BBS door games and full-screen menus bind these; dropping them made
+        // the keys silently dead in char-mode sessions.
+        KeyCode::F(n) => match n {
+            1 => b"\x1bOP".to_vec(),
+            2 => b"\x1bOQ".to_vec(),
+            3 => b"\x1bOR".to_vec(),
+            4 => b"\x1bOS".to_vec(),
+            5 => b"\x1b[15~".to_vec(),
+            6 => b"\x1b[17~".to_vec(),
+            7 => b"\x1b[18~".to_vec(),
+            8 => b"\x1b[19~".to_vec(),
+            9 => b"\x1b[20~".to_vec(),
+            10 => b"\x1b[21~".to_vec(),
+            11 => b"\x1b[23~".to_vec(),
+            12 => b"\x1b[24~".to_vec(),
+            _ => return None,
+        },
         _ => return None,
     };
     Some(bytes)
@@ -6219,6 +6410,336 @@ mod tests {
         let enter = KeyEvent::from(KeyCode::Enter);
         assert_eq!(super::encode_key(enter, false), Some(b"\r\x00".to_vec()));
         assert_eq!(super::encode_key(enter, true), Some(b"\r\n".to_vec()));
+    }
+
+    /// Char-mode sessions forward the keys a full-screen BBS app binds:
+    /// F1-F4 as the VT100 PF keys (SS3), F5-F12 as the VT220-style CSI codes
+    /// (with the historic gaps at 16/22), Insert, and Shift-Tab as CSI Z.
+    #[test]
+    fn char_mode_encodes_function_and_editing_keys() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let k = |code| super::encode_key(KeyEvent::from(code), false);
+        assert_eq!(k(KeyCode::F(1)), Some(b"\x1bOP".to_vec()));
+        assert_eq!(k(KeyCode::F(4)), Some(b"\x1bOS".to_vec()));
+        assert_eq!(k(KeyCode::F(5)), Some(b"\x1b[15~".to_vec()));
+        assert_eq!(k(KeyCode::F(6)), Some(b"\x1b[17~".to_vec()));
+        assert_eq!(k(KeyCode::F(10)), Some(b"\x1b[21~".to_vec()));
+        assert_eq!(k(KeyCode::F(12)), Some(b"\x1b[24~".to_vec()));
+        assert_eq!(k(KeyCode::F(13)), None);
+        assert_eq!(k(KeyCode::Insert), Some(b"\x1b[2~".to_vec()));
+        assert_eq!(k(KeyCode::BackTab), Some(b"\x1b[Z".to_vec()));
+    }
+
+    /// Regression (live-verified before the fix): the redraw-economy frame
+    /// signature must track the gopher/gemini LINE-model selection. A Down
+    /// that steps the highlight without scrolling hashed identical, so the
+    /// draw was skipped — the highlight and status preview froze while Enter
+    /// followed the invisibly-moved selection.
+    #[test]
+    fn frame_sig_tracks_the_line_model_selection() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.navigate_to(gopher_doc("xxxx"));
+        let before = app.browser_frame_sig().expect("plain browser state hashes");
+        // The gopherus walk: the selection steps, the scroll stays pinned
+        // (the page fits on screen).
+        app.browser_walk(1);
+        assert_ne!(selected(&app), Some(0), "walk moved the selection");
+        let after = app.browser_frame_sig().expect("still hashable");
+        assert_ne!(before, after, "selection change must change the sig");
+    }
+
+    /// Navigating (push, back, or reload) drops a pinned-rail selection with
+    /// the doc it addressed — `selected_link` consults `sel_fixed` FIRST, so
+    /// a stale address left Enter dead (or aimed at the wrong rail link on a
+    /// page that also has fixed layers). An open <select> dropdown is
+    /// likewise anchored to the old doc and closes.
+    #[test]
+    fn navigation_clears_stale_rail_selection_and_select_menu() {
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(gopher_doc("x"));
+        app.browser.as_mut().unwrap().sel_fixed = Some((3, 2, 1));
+        app.select_menu = Some(super::SelectMenu {
+            form: 0,
+            field: 0,
+            options: vec![(String::from("A"), String::from("a"))],
+            highlight: 0,
+            scroll: 0,
+            anchor_row: 0,
+            anchor_col: 0,
+        });
+        app.navigate_to(gopher_doc("xx"));
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.sel_fixed, None, "push cleared the rail selection");
+        assert!(app.select_menu.is_none(), "push closed the dropdown");
+
+        app.browser.as_mut().unwrap().sel_fixed = Some((3, 2, 1));
+        app.browser_back();
+        assert_eq!(app.browser.as_ref().unwrap().sel_fixed, None, "back too");
+
+        app.browser.as_mut().unwrap().sel_fixed = Some((3, 2, 1));
+        app.replace_nav = true;
+        app.navigate_to(gopher_doc("xxx"));
+        assert_eq!(
+            app.browser.as_ref().unwrap().sel_fixed,
+            None,
+            "reload (replace) too"
+        );
+    }
+
+    /// A page-event batch that is NOT the submit answer (an autonomous timer
+    /// render, a bare Settled) must not consume the recorded submit target:
+    /// the engine runs at rest, so such batches routinely land between the
+    /// Submit dispatch and its SubmitDefault answer — taking the record on
+    /// every batch silently dropped the fallback static submit.
+    #[tokio::test]
+    async fn intervening_page_events_do_not_drop_the_pending_submit() {
+        let mut app = app_browsing(
+            "text/html",
+            r#"<form action="/go" method="get"><input type="text" name="q" value="hi"><input type="submit" value="Go"></form>"#,
+        );
+        app.pending_live_submit = Some((0, 1));
+        // An unrelated batch (what a timer tick's settle looks like).
+        app.on_page_evt(crate::js::PageEvt::Settled);
+        assert_eq!(app.pending_live_submit, Some((0, 1)), "record survives");
+        // The real answer arrives: the static GET submit fires.
+        app.on_page_evt(crate::js::PageEvt::SubmitDefault);
+        assert_eq!(app.pending_live_submit, None, "record consumed");
+        assert!(app.loading(), "static submit kicked off the fetch");
+        assert!(
+            app.status.contains("/go"),
+            "fetching the form action: {}",
+            app.status
+        );
+    }
+
+    /// Committing a <select> whose indices went stale (a live re-render
+    /// reshaped `forms` while the dropdown was open) drops the write with a
+    /// notice — it used to index straight into `forms[form].fields[field]`
+    /// and panic the main thread.
+    #[test]
+    fn select_commit_with_stale_indices_is_dropped_not_a_panic() {
+        let mut app = app_browsing("text/html", "<p>no forms here</p>");
+        app.select_menu = Some(super::SelectMenu {
+            form: 3,
+            field: 7,
+            options: vec![(String::from("A"), String::from("a"))],
+            highlight: 0,
+            scroll: 0,
+            anchor_row: 0,
+            anchor_col: 0,
+        });
+        app.commit_select_highlight(); // must not panic
+        assert!(app.notice, "the dropped write is surfaced");
+        assert!(app.select_menu.is_none());
+    }
+
+    /// A live re-render closes an open <select> dropdown only when it
+    /// removed (or retyped) the field the menu is bound to; an unrelated
+    /// update leaves the user's open menu alone.
+    #[test]
+    fn live_render_closes_the_select_menu_only_when_its_field_vanishes() {
+        let html = r#"<form action="/f"><select name="s"><option value="1">one</option></select></form><p id="x">hi</p>"#;
+        let mut app = app_browsing("text/html", html);
+        let field = app.browser.as_ref().unwrap().doc.forms[0]
+            .fields
+            .iter()
+            .position(|f| matches!(f.kind, crate::doc::FieldKind::Select(_)))
+            .expect("select field");
+        app.select_menu = Some(super::SelectMenu {
+            form: 0,
+            field,
+            options: vec![(String::from("one"), String::from("1"))],
+            highlight: 0,
+            scroll: 0,
+            anchor_row: 0,
+            anchor_col: 0,
+        });
+        app.replace_live_doc(html.as_bytes().to_vec());
+        assert!(app.select_menu.is_some(), "unrelated update keeps the menu");
+        app.replace_live_doc(b"<p>form gone</p>".to_vec());
+        assert!(app.select_menu.is_none(), "vanished field closes the menu");
+    }
+
+    /// `set image <proto>` drops inline-image encodes (they're baked for the
+    /// OLD protocol) and stale in-flight results land ignored — the page
+    /// otherwise kept rendering sixel after `set image halfblocks`.
+    #[test]
+    fn protocol_switch_drops_cached_and_inflight_encodes() {
+        let mut app = super::App::new(None, 23);
+        let key = super::EncKey {
+            url: String::from("https://example.com/a.png"),
+            w: 4,
+            h: 2,
+            crop: false,
+            pixelated: false,
+            tint: Some(super::svg_tint()),
+        };
+        app.failed_encodes.insert(key.clone());
+        app.image_encoding.insert(key.clone());
+        app.set_image_protocol("halfblocks");
+        assert!(app.failed_encodes.is_empty(), "failure cache dropped");
+        assert!(app.image_encoding.is_empty(), "in-flight markers dropped");
+        assert!(app.image_protocols.is_empty());
+        // A result from before the switch is recognized as stale: nothing is
+        // recorded, and a re-requested key's fresh in-flight marker survives.
+        app.image_encoding.insert(key.clone());
+        app.on_enc(super::EncMsg {
+            key: key.clone(),
+            protocol: None,
+            epoch: 0, // pre-switch epoch
+        });
+        assert!(app.failed_encodes.is_empty(), "stale result not recorded");
+        assert!(app.image_encoding.contains(&key), "fresh marker survives");
+        // A current-epoch result applies normally.
+        app.on_enc(super::EncMsg {
+            key: key.clone(),
+            protocol: None,
+            epoch: app.enc_epoch,
+        });
+        assert!(app.failed_encodes.contains(&key));
+        assert!(app.image_encoding.is_empty());
+    }
+
+    /// Esc must abort the image fetch batch itself — the old code only
+    /// dropped the receiver, so a 100-image page kept fetching them all in
+    /// the background after "Stopped — load cancelled".
+    #[tokio::test]
+    async fn stop_loading_aborts_image_batches() {
+        let mut app = app_browsing("text/html", "<p>x</p>");
+        let page = url::Url::parse("http://127.0.0.1:9/").unwrap();
+        app.start_image_loads(page, vec![String::from("http://127.0.0.1:9/a.png")]);
+        assert!(!app.imgs_in_flight.is_empty());
+        assert!(app.loading(), "a batch drives the loading pulse");
+        assert_eq!(app.imgs_tasks.len(), 1);
+        app.stop_loading();
+        assert!(app.imgs_in_flight.is_empty(), "Esc forgets in-flight urls");
+        assert!(app.imgs_tasks.is_empty(), "Esc aborted the batch task");
+        assert!(!app.loading());
+    }
+
+    /// A failed fetch/decode is REMEMBERED for the page: a live page that
+    /// re-renders every second passes the full URL list to
+    /// `start_image_loads` each time, and without the negative cache it
+    /// refetched every broken image once per render. Navigation clears the
+    /// memory, so a reload retries.
+    #[tokio::test]
+    async fn a_failed_image_is_not_refetched_until_navigation() {
+        let mut app = app_browsing("text/html", "<p>x</p>");
+        let url = String::from("https://example.com/broken.png");
+        app.on_img_load(super::ImgLoadMsg {
+            url: url.clone(),
+            decoded: None,
+        });
+        assert!(app.failed_images.contains(&url), "failure remembered");
+        let page = url::Url::parse("https://example.com/").unwrap();
+        app.start_image_loads(page, vec![url.clone()]);
+        assert!(
+            app.imgs_in_flight.is_empty(),
+            "no refetch of a known-bad url"
+        );
+        assert!(app.imgs_tasks.is_empty(), "no batch spawned");
+        app.navigate_to(gopher_doc("x"));
+        assert!(app.failed_images.is_empty(), "navigation clears the memory");
+    }
+
+    /// A reload that lands a shorter document clamps the ridden scroll to
+    /// the new MAX scroll (extent − viewport), not to the last row — which
+    /// parked the viewport on a lone top row with blank space below.
+    #[test]
+    fn reload_clamps_scroll_by_viewport_height() {
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(gopher_doc(&"i".repeat(100)));
+        app.browser.as_mut().unwrap().scroll = 90;
+        app.replace_nav = true;
+        app.navigate_to(gopher_doc(&"i".repeat(50)));
+        let height = app.last_inner.1.max(1) as usize;
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(g.scroll, 50usize.saturating_sub(height));
+    }
+
+    /// A decode that raced a navigation (its result was already queued when
+    /// the batch was aborted) must not trigger a relayout of the unrelated
+    /// NEW page — only URLs the current doc references count.
+    #[test]
+    fn stale_decodes_do_not_relayout_the_new_page() {
+        let mut app = app_browsing("text/html", "<p>no images here</p>");
+        app.pending_decoded_urls
+            .push(String::from("https://old.example/x.png"));
+        // Sentinel: a relayout re-parses and overwrites `wrapped_to` with
+        // the real width; the stale URL must not trigger one.
+        app.browser.as_mut().unwrap().doc.wrapped_to = 7777;
+        app.apply_pending_image_decodes();
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.wrapped_to,
+            7777,
+            "no relayout for a URL the doc doesn't reference"
+        );
+        assert!(app.pending_decoded_urls.is_empty(), "pending drained");
+    }
+
+    /// A resize re-wrap rebuilds regions from `doc.raw` — the last FULL
+    /// render, which on a live page is stale by exactly the content patched
+    /// into regions since (a chat's recent messages). The re-wrap must
+    /// restore each live region from its retained patch HTML, or resizing
+    /// during a chat rolled the messages back until the next patch.
+    #[test]
+    fn resize_restores_live_region_content_from_retained_html() {
+        let base = url::Url::parse("https://ex.com/").unwrap();
+        // A definite-height overflow-y box with enough content to become a
+        // Region, carrying the actor node id the live serializer bakes.
+        let stale: String = (0..40).map(|i| format!("<div>STALE{i}</div>")).collect();
+        let body = format!(
+            "<body><div data-trust-node=\"7\" style=\"height:96px;overflow-y:auto\">{stale}</div></body>"
+        );
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (40, 50);
+        let doc = crate::http::parse(
+            &base,
+            "text/html; charset=utf-8",
+            body.as_bytes(),
+            40,
+            50,
+            &crate::layout::ImageSizes::new(),
+        );
+        app.navigate_to(doc);
+        {
+            let g = app.browser.as_ref().unwrap();
+            assert_eq!(g.doc.regions.len(), 1, "the overflow box is a region");
+            assert_eq!(g.doc.regions[0].live_node, Some(7));
+        }
+        // The retained patch HTML holds the CURRENT content (what the live
+        // actor last patched in).
+        let fresh: String = (0..40).map(|i| format!("<div>FRESH{i}</div>")).collect();
+        let fragment = format!(
+            "<div data-trust-node=\"7\" style=\"height:96px;overflow-y:auto\">{fresh}</div>"
+        );
+        app.region_live.insert(
+            7,
+            super::RegionLive {
+                html: fragment.into_bytes(),
+                cache: Default::default(),
+            },
+        );
+        // Resize: the re-wrap re-parses stale raw, then must restore the
+        // region from the retained HTML.
+        app.last_inner = (60, 50);
+        app.sync_browser_wrap();
+        let g = app.browser.as_ref().unwrap();
+        let texts: Vec<&str> = g.doc.regions[0]
+            .buffer
+            .iter()
+            .flat_map(|r| &r.items)
+            .map(|it| it.text.as_str())
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("FRESH0")),
+            "region shows the retained (current) content: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("STALE0")),
+            "stale raw content did not survive the resize: {texts:?}"
+        );
     }
 
     #[test]
@@ -8466,7 +8987,7 @@ mod tests {
         assert!(app.live_page.is_some(), "clickable page stays live");
         // The shell painted first, before the setTimeout fired — no image
         // yet, so the initial-load path started no batch.
-        assert!(app.imgs_rx.is_none(), "shell carried no images");
+        assert!(app.imgs_in_flight.is_empty(), "shell carried no images");
         // Drain the filled render the settle (setTimeout) produced.
         drain_page_event(&mut app).await;
         let g = app.browser.as_ref().unwrap();
@@ -8476,7 +8997,7 @@ mod tests {
             g.doc.image_urls
         );
         assert!(
-            app.imgs_rx.is_some(),
+            !app.imgs_in_flight.is_empty(),
             "the live update kicked off the image pipeline for the new tile"
         );
     }
@@ -9152,13 +9673,8 @@ mod tests {
         app.navigate_to(doc);
         let expected_cell = super::natural_cell_box_dimensions(80, 32, app.picker.font_size());
         app.start_image_loads(page, vec![image_url.clone()]);
-        let msg = app
-            .imgs_rx
-            .as_mut()
-            .expect("inline SVG load started")
-            .recv()
-            .await
-            .expect("inline SVG load completed");
+        assert!(!app.imgs_in_flight.is_empty(), "inline SVG load started");
+        let msg = app.imgs_rx.recv().await.expect("inline SVG load completed");
         app.on_img_load(msg);
         // The run loop coalesces image-load relayouts to one per turn; drive it.
         app.apply_pending_image_decodes();
