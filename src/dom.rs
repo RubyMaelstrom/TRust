@@ -4365,6 +4365,30 @@ impl SelectorList {
             Some(SelectorList(list))
         }
     }
+
+    /// `parse`, memoized per thread — the JS `querySelector*`/`matches`
+    /// syscall entry. Pages re-query the same selector strings constantly
+    /// (every `document.body` is a `querySelector("body")`, jQuery re-runs
+    /// its `.find(...)` strings per event), and a parse is pure string→AST,
+    /// so the memo never invalidates. Failures are cached too (feature
+    /// probes retry unsupported selectors in hot paths). Bounded by a full
+    /// clear at a size lid: re-parsing is cheap, eviction bookkeeping isn't
+    /// worth it.
+    pub fn parse_cached(input: &str) -> Option<std::rc::Rc<SelectorList>> {
+        thread_local! {
+            static SELECTOR_MEMO: RefCell<FxHashMap<String, Option<std::rc::Rc<SelectorList>>>> =
+                RefCell::new(FxHashMap::default());
+        }
+        SELECTOR_MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() > 1024 {
+                m.clear();
+            }
+            m.entry(input.to_string())
+                .or_insert_with(|| SelectorList::parse(input).map(std::rc::Rc::new))
+                .clone()
+        })
+    }
 }
 
 fn parse_complex(input: &str) -> Option<Complex> {
@@ -6859,6 +6883,24 @@ impl TreeSink for Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selector_parse_memo_returns_identical_parses() {
+        // The JS syscall boundary parses selectors through the per-thread
+        // memo; a repeat of the same string must be a cache hit (same Rc), a
+        // failure must be remembered as a failure, and the memoized parse
+        // must match a direct one.
+        let a = SelectorList::parse_cached(".x > .y").unwrap();
+        let b = SelectorList::parse_cached(".x > .y").unwrap();
+        assert!(std::rc::Rc::ptr_eq(&a, &b));
+        assert!(SelectorList::parse_cached("]]bad[[").is_none());
+        assert!(SelectorList::parse_cached("]]bad[[").is_none());
+        let dom = Dom::parse_document(r#"<body><div class="x"><p class="y">t</p></div></body>"#);
+        assert_eq!(
+            dom.query(DOCUMENT, &a, false),
+            dom.query(DOCUMENT, &SelectorList::parse(".x > .y").unwrap(), false)
+        );
+    }
 
     #[test]
     fn an_out_of_flow_textless_attr_mutation_paints_nothing() {

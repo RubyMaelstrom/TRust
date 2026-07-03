@@ -3563,6 +3563,15 @@ impl<'a> Layout<'a> {
             self.shrink_wrap = explicit_w.is_none();
             let b = self.layout_subtree_inner(child, lay_w, Some(child), false, &inherit);
             self.shrink_wrap = prev_sw;
+            // The pinned box's own subtree can hold FURTHER pinned descendants
+            // (captured into its sub-layout's overlay) — carry them up
+            // translated to this box's static position, like `blit` does.
+            for f in &b.fixed {
+                let mut f = f.clone();
+                f.col += col;
+                f.row += row;
+                self.fixed.push(f);
+            }
             if b.height == 0 {
                 continue;
             }
@@ -4094,6 +4103,16 @@ impl<'a> Layout<'a> {
                             .max(self.definite_width_floor(k).unwrap_or(0));
                         if let Some(w) = self.css_cells(k, "width") {
                             auto_min = auto_min.min(w);
+                        }
+                        // "In either case, the size is clamped by the maximum
+                        // main size if it's definite" (§4.5) — without this, a
+                        // `width:100%; max-width:600px` feed column holding one
+                        // long unbreakable token (a URL pasted as plain text)
+                        // floors at its min-content instead of its max-width,
+                        // overflows the row at minimum, and the whole 3-column
+                        // layout falls back to a stack (Mastodon).
+                        if let Some(mx) = self.len_or_pct(k, "max-width", avail) {
+                            auto_min = auto_min.min(mx);
                         }
                         b.max(auto_min.min(avail))
                     }
@@ -4714,6 +4733,20 @@ impl<'a> Layout<'a> {
             self.scroll_clips.push((node, h as u16, width as u16));
         }
         if clip {
+            // A `position:fixed` box captured inside the region's content is fixed
+            // to the VIEWPORT, not the scroll container — it must NOT ride the
+            // region's windowed buffer (which scrolls). Lift its pinned overlay OUT
+            // of the buffer and pin it at the document level (translated to the
+            // region's band, exactly like `blit` does for the inline `else`
+            // branch), so a fixed rail nested inside a scrolling column stays put
+            // while the column scrolls under it. Without this the buffer's `fixed`
+            // is silently dropped when the region reserves its band.
+            for f in &buffer.fixed {
+                let mut f = f.clone();
+                f.col += band_left as u16;
+                f.row += row_base as u16;
+                self.fixed.push(f);
+            }
             // A real scroll viewport: reserve exactly H blank doc rows for the
             // band (the renderer fills them from the buffer, clipped/windowed).
             for _ in 0..h {
@@ -5001,7 +5034,12 @@ impl<'a> Layout<'a> {
                     ),
                 );
             }
-            if b.height == 0 {
+            // A 0-height box still places when it carries a pinned fixed
+            // overlay (an abspos shell whose only content is `position:fixed`):
+            // it survives occlusion (area 0 never covers or is covered), draws
+            // no rows, and the final blit propagates the overlay at its placed
+            // position.
+            if b.height == 0 && b.fixed.is_empty() {
                 continue;
             }
             let used_w = explicit_w.unwrap_or(b.width as usize).max(1);
@@ -5510,7 +5548,11 @@ impl<'a> Layout<'a> {
                 _ => (avail, 0),
             };
             let b = self.layout_subtree(k, w, ctx);
-            if b.height == 0 {
+            // A 0-height item is skipped — unless it carries a pinned fixed
+            // overlay (a pane whose only child is `position:fixed`): the blit
+            // draws no rows but propagates the overlay at this item's position
+            // (same rule as the flex-row spacer-pane guard).
+            if b.height == 0 && b.fixed.is_empty() {
                 continue;
             }
             self.blit(&b, (self.line_left + offset) as u16, row);
@@ -5528,7 +5570,11 @@ impl<'a> Layout<'a> {
         let mut row = self.rows.len();
         for &k in kids {
             let b = self.layout_subtree(k, width, ctx);
-            if b.height == 0 {
+            // A 0-height box still blits when it carries a pinned fixed overlay
+            // (Mastodon's side panes hold only a `position:fixed` rail): the
+            // blit adds no rows but propagates the overlay at the box's stack
+            // position, instead of silently dropping the rail with the box.
+            if b.height == 0 && b.fixed.is_empty() {
                 continue;
             }
             self.blit(&b, self.line_left as u16, row);
@@ -5745,6 +5791,14 @@ impl<'a> Layout<'a> {
         let constraint = explicit.unwrap_or(avail).max(1);
         let boxed = self.layout_subtree_inner(id, constraint, Some(id), false, ctx);
         if boxed.height == 0 {
+            // An empty float takes no shelf — but a pinned fixed overlay
+            // captured inside it must still reach the document layer.
+            for f in &boxed.fixed {
+                let mut f = f.clone();
+                f.col += self.line_left as u16;
+                f.row += self.rows.len() as u16;
+                self.fixed.push(f);
+            }
             return;
         }
         let w = explicit.unwrap_or(boxed.width as usize).min(full).max(1);
@@ -6015,6 +6069,10 @@ impl<'a> Layout<'a> {
                 if b.height > 0 {
                     let dy = self.align_offset(id, b.height as usize, shelf_h);
                     self.blit(b, (self.line_left + x) as u16, shelf_top + dy);
+                } else if !b.fixed.is_empty() {
+                    // 0-height item carrying a pinned fixed overlay: blit adds
+                    // no rows but propagates the overlay at the item's slot.
+                    self.blit(b, (self.line_left + x) as u16, shelf_top);
                 }
                 x += widths[k].max(1) + if k + 1 < n { gap + between } else { 0 };
             }
@@ -6104,7 +6162,9 @@ impl<'a> Layout<'a> {
             let mut x = lead;
             for (s, b) in line.iter().zip(&laid) {
                 x += s.ml;
-                if b.height > 0 {
+                // A 0-height box still blits when it carries a pinned fixed
+                // overlay (blit adds no rows, propagates the overlay).
+                if b.height > 0 || !b.fixed.is_empty() {
                     self.blit(b, (self.line_left + x) as u16, shelf_top);
                 }
                 x += s.w + s.mr;
@@ -6191,7 +6251,9 @@ impl<'a> Layout<'a> {
             let w = (widths[pl.col..end].iter().sum::<usize>() + col_gap * span.saturating_sub(1))
                 .max(1);
             let b = self.layout_subtree(*it, w, ctx);
-            if b.height == 0 {
+            // Keep a 0-height item that carries a pinned fixed overlay: its
+            // blit below adds no rows but propagates the overlay at its cell.
+            if b.height == 0 && b.fixed.is_empty() {
                 continue;
             }
             nrows = nrows.max(pl.row + pl.row_span);
@@ -10534,6 +10596,107 @@ mod tests {
             "rail pinned at its centered column, not 0: col={}",
             fixed[0].col
         );
+    }
+
+    #[test]
+    fn flex_auto_min_is_clamped_by_max_width_so_the_row_does_not_stack() {
+        // CSS Flexbox §4.5: the content-based minimum size "is clamped by the
+        // maximum main size if it's definite". A `width:100%; max-width:` feed
+        // column holding one long unbreakable token (a URL pasted as plain
+        // text — fosstodon's virtualized post placeholders) must floor at its
+        // max-width, NOT its min-content — otherwise the row overflows at
+        // minimum and the whole 3-column layout falls back to a stack,
+        // dropping the fixed rails.
+        let long_token = "x".repeat(90);
+        let html = format!(
+            "<div style='display:flex;justify-content:center'>\
+               <div style='min-width:100px'>\
+                 <div style='position:fixed;width:100px'>LEFT_RAIL</div>\
+               </div>\
+               <main style='width:100%;max-width:320px;flex-grow:0;flex-shrink:1'>\
+                 <p>{long_token}</p>\
+               </main>\
+               <div style='min-width:100px'>\
+                 <div style='position:fixed;width:100px'>RIGHT_RAIL</div>\
+               </div>\
+             </div>"
+        );
+        let dom = Dom::parse_document(&html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (rows, _c, _rg, _cl, _b, fixed, _a) = lay_out_with_carousels(
+            &dom,
+            &base,
+            (100, 20),
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
+        // Both rails captured — the row laid as columns, not a stack.
+        assert_eq!(fixed.len(), 2, "both rails captured: {}", fixed.len());
+        assert!(
+            fixed[0].row == 0 && fixed[1].row == 0,
+            "rails pin at the top (side-by-side), not stacked below the feed: rows {}/{}",
+            fixed[0].row,
+            fixed[1].row
+        );
+        assert!(
+            fixed[1].col > fixed[0].col,
+            "rails at distinct flanking columns: {}/{}",
+            fixed[0].col,
+            fixed[1].col
+        );
+        // The unbreakable token lives in the (clipped) feed column, and the
+        // feed itself is in the scrolling document.
+        let doc_text: String = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .map(|i| i.text.as_str())
+            .collect();
+        assert!(doc_text.contains('x'), "feed content in doc");
+    }
+
+    #[test]
+    fn a_zero_height_stacked_box_still_propagates_its_pinned_fixed_rail() {
+        // A column-flex stack whose item's ONLY content is a pinned
+        // `position:fixed` rail lays as a zero-height box — the stack must
+        // still propagate the captured overlay instead of dropping it with
+        // the box (the same rule the flex-row spacer-pane guard applies).
+        let html = "<div style='display:flex;flex-direction:column'>\
+            <div>\
+              <div style='position:fixed;width:50px'>STACKED_RAIL</div>\
+            </div>\
+            <p>normal flow content</p>\
+          </div>";
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (rows, _c, _rg, _cl, _b, fixed, _a) = lay_out_with_carousels(
+            &dom,
+            &base,
+            (80, 20),
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
+        assert_eq!(fixed.len(), 1, "rail captured through the stack");
+        let rail_text: String = fixed[0]
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .map(|i| i.text.as_str())
+            .collect();
+        assert!(rail_text.contains("STACKED_RAIL"), "rail: {rail_text:?}");
+        let doc_text: String = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .map(|i| i.text.as_str())
+            .collect();
+        assert!(
+            !doc_text.contains("STACKED_RAIL"),
+            "rail pinned, not in the doc: {doc_text:?}"
+        );
+        assert!(doc_text.contains("normal flow content"));
     }
 
     #[test]

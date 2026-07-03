@@ -6,7 +6,7 @@
 //! image + cross-page CDN image), parallel/lazy parse, and the living-page
 //! actor that keeps a displayed page's engine + DOM resident for dispatches.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -284,10 +284,12 @@ impl JobExecutor for PageJobExecutor {
             // Park until the next in-flight fetch resolves. The reactor
             // wakes us — no spin, no idle CPU. Its completion enqueues the
             // promise `.then` jobs we'll run on the next turn.
+            phase(&format!("job park ({} in flight)", group.len()));
             if let Some(Err(err)) = group.next().await {
                 self.clear();
                 return Err(err);
             }
+            phase(&format!("job wake ({} left)", group.len()));
             context.borrow_mut().clear_kept_objects();
         }
         Ok(())
@@ -301,20 +303,77 @@ pub fn page_context() -> Context {
     page_context_with(None).0
 }
 
+thread_local! {
+    /// The page's virtual clock as an absolute epoch time (ms) — the prelude's
+    /// `__epoch0 + timers.now`, mirrored Rust-side by the `__clock_set` syscall
+    /// from the three `timers.now` writers (tick/tickTo). `None` ⇒ real system
+    /// time: the state before the prelude anchors its epoch, and on threads
+    /// that never run a page. Thread-local because a context (and its Boa
+    /// clock) is owned by exactly one thread — the trust-js actor thread, a
+    /// worker's thread, or a test thread; `page_context_with` resets it.
+    static VIRTUAL_EPOCH_MS: Cell<Option<f64>> = const { Cell::new(None) };
+}
+
+/// Boa's `Date` clock, virtual-time-backed: `new Date()` and the native
+/// `Date.now()` read the SAME clock the prelude's timers advance, so the two
+/// can't diverge during a fast-forward settle (before this, `Date.now()` was
+/// overridden in JS to track `timers.now` while `new Date()` kept reading the
+/// real host clock — a page comparing them saw time run backwards). The JS
+/// override is gone: this is the single time source for the whole Date
+/// surface. (The known "clock doesn't advance within one synchronous block"
+/// limitation is about WHEN `timers.now` moves, and is unchanged — see the
+/// prelude's clock comment.)
+#[derive(Debug)]
+struct PageClock;
+
+impl boa_engine::context::Clock for PageClock {
+    fn now(&self) -> boa_engine::context::time::JsInstant {
+        let ms = VIRTUAL_EPOCH_MS.get().unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as f64
+        });
+        let ms = ms.max(0.0); // JsInstant is epoch-relative and non-negative
+        boa_engine::context::time::JsInstant::new(
+            (ms / 1000.0) as u64,
+            ((ms % 1000.0) * 1_000_000.0) as u32,
+        )
+    }
+}
+
+/// `__clock_set(epochMs)` — anchor the engine's `Date` clock to the page's
+/// virtual time (an absolute ms-since-epoch value). Called by the prelude when
+/// it first anchors `__epoch0` and whenever `timers.now` advances.
+fn sys_clock_set(_: &JsValue, args: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(ms) = args.first().and_then(JsValue::as_number)
+        && ms.is_finite()
+    {
+        VIRTUAL_EPOCH_MS.set(Some(ms));
+    }
+    Ok(JsValue::undefined())
+}
+
 fn page_context_with(loader: Option<Rc<WebModuleLoader>>) -> (Context, Rc<PageHooks>) {
     let hooks = Rc::new(PageHooks {
         rejections: RefCell::new(Vec::new()),
     });
     let executor = Rc::new(PageJobExecutor::default());
+    // A fresh page starts on the REAL clock; the prelude anchors its virtual
+    // epoch once its timer clock exists (reused threads would otherwise leak
+    // the previous page's frozen time into the new page's prelude boot).
+    VIRTUAL_EPOCH_MS.set(None);
     let mut ctx = match loader {
         Some(loader) => Context::builder()
             .module_loader(loader)
             .host_hooks(hooks.clone())
+            .clock(Rc::new(PageClock))
             .job_executor(executor)
             .build()
             .unwrap_or_default(),
         None => Context::builder()
             .host_hooks(hooks.clone())
+            .clock(Rc::new(PageClock))
             .job_executor(executor)
             .build()
             .unwrap_or_default(),
@@ -2259,6 +2318,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ),
         ("__cookie_get", 0, sys_cookie_get),
         ("__cookie_set", 1, sys_cookie_set),
+        ("__clock_set", 1, sys_clock_set),
         ("__storage_get", 2, sys_storage_get),
         ("__storage_set", 3, sys_storage_set),
         ("__storage_remove", 2, sys_storage_remove),
@@ -2800,7 +2860,7 @@ fn sys_query(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVal
     let dom = page_dom(ctx);
     let ids = {
         let d = dom.borrow();
-        match (arg_node(&d, args, 0), SelectorList::parse(&selector)) {
+        match (arg_node(&d, args, 0), SelectorList::parse_cached(&selector)) {
             (Some(root), Some(sel)) => d.query(root, &sel, first_only),
             _ => Vec::new(),
         }
@@ -2812,7 +2872,7 @@ fn sys_matches(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
     let selector = arg_str(args, 1, ctx);
     let dom = page_dom(ctx);
     let d = dom.borrow();
-    let hit = match (arg_node(&d, args, 0), SelectorList::parse(&selector)) {
+    let hit = match (arg_node(&d, args, 0), SelectorList::parse_cached(&selector)) {
         (Some(id), Some(sel)) => d.matches(id, &sel),
         _ => false,
     };
@@ -3025,12 +3085,26 @@ fn sys_url_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
         "password" => {
             let _ = u.set_password(if value.is_empty() { None } else { Some(&value) });
         }
-        // `.host` carries an optional `:port`; `.hostname` never does. `set_host`
-        // parses the "host[:port]" form, so route hostname through it after
-        // stripping any port the caller wrongly included (keeping the existing
-        // port), and host directly.
+        // `.host` carries an optional `:port`; `.hostname` never does. The url
+        // crate's `set_host` is hostname-only (it does NOT parse a ":port"
+        // tail), so split the port off ourselves and apply both — the WHATWG
+        // host setter runs the basic parser through host state INTO port
+        // state, so `u.host = "h:9000"` must set the port too (it silently
+        // kept the old one). A missing/empty/unparseable port section leaves
+        // the existing port unchanged, matching the parser's
+        // stop-at-validation-error behavior.
         "host" => {
-            let _ = u.set_host(if value.is_empty() { None } else { Some(&value) });
+            if value.is_empty() {
+                let _ = u.set_host(None);
+            } else {
+                let bare = host_without_port(&value);
+                let _ = u.set_host(Some(bare));
+                if bare.len() < value.len()
+                    && let Ok(p) = value[bare.len() + 1..].parse::<u16>()
+                {
+                    let _ = u.set_port(Some(p));
+                }
+            }
         }
         "hostname" => {
             let bare = host_without_port(&value);
@@ -5138,6 +5212,7 @@ fn sys_load_injected_stylesheet(
 /// to `__trust.errors` (so the `JS:n!` badge + diagnostics see it) and
 /// surviving a Boa VM panic — one bad injected script can't kill the actor.
 fn eval_injected(ctx: &mut Context, name: &str, source: &[u8]) {
+    let eval_t = Instant::now();
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Same exact `ctx.eval` unroll as `run_script`, so a dynamically
         // injected `<script>` (webpack chunk loaders inject many, sometimes
@@ -5156,6 +5231,10 @@ fn eval_injected(ctx: &mut Context, name: &str, source: &[u8]) {
         phase_end(Phase::Execute, t);
         r
     }));
+    phase(&format!(
+        "injected eval {name} +{}ms",
+        eval_t.elapsed().as_millis()
+    ));
     if let Ok(Err(err)) = res {
         let msg = format!("{name}: {err}");
         let esc = msg
@@ -5171,9 +5250,14 @@ fn eval_injected(ctx: &mut Context, name: &str, source: &[u8]) {
 /// Fire a `load`/`error` event on an injected script element (and call its
 /// `on<type>` handler), for loaders that wait on `script.onload`.
 fn fire_script_event(ctx: &mut Context, node_id: usize, ty: &str) {
+    let t = Instant::now();
     let _ = ctx.eval(Source::from_bytes(
         format!("__trust.scriptEvent({node_id}, \"{ty}\")").as_bytes(),
     ));
+    let ms = t.elapsed().as_millis();
+    if ms > 50 {
+        phase(&format!("script {ty} event node {node_id} +{ms}ms"));
+    }
 }
 
 /// `document.cookie` getter: the jar's non-HttpOnly name=value pairs
@@ -5218,11 +5302,21 @@ fn fetch_args(
     Vec<(String, String)>,
 ) {
     let url_arg = arg_str(args, 0, ctx);
+    // Fetch §2.2.1: a method is an HTTP token (RFC 9110 tchar — letters,
+    // digits, and !#$%&'*+-.^_`|~), and only a byte-case-insensitive match
+    // for the six listed methods is normalized to uppercase; anything else
+    // keeps its exact bytes. The old letters-only uppercase filter mangled
+    // extension methods (`M-SEARCH` hit the wire as `MSEARCH`).
     let mut method: String = arg_str(args, 1, ctx)
         .chars()
-        .filter(|c| c.is_ascii_alphabetic())
+        .filter(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(*c))
         .collect();
-    method.make_ascii_uppercase();
+    if ["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"]
+        .iter()
+        .any(|m| method.eq_ignore_ascii_case(m))
+    {
+        method.make_ascii_uppercase();
+    }
     if method.is_empty() {
         method = String::from("GET");
     }
@@ -5269,7 +5363,12 @@ fn parse_header_blob(blob: &str) -> Vec<(String, String)> {
 /// fine for `.text()` but corrupts binary (e.g. a `.wasm` for `instantiate-
 /// Streaming`). Carried as a 4th array element the text path ignores.
 fn body_latin1(body: &[u8]) -> JsValue {
-    str_value(&body.iter().map(|&b| b as char).collect::<String>())
+    // Latin-1 IS the byte→code-unit mapping, so hand the bytes to JsString's
+    // latin1 representation directly: ONE copy (into the string allocation),
+    // one byte per code unit. The old path collected a `String` (1-2 UTF-8
+    // bytes per byte) and re-transcoded it to UTF-16 inside `JsString::from`
+    // — two intermediate copies per response body, on every fetch/XHR result.
+    JsValue::from(JsString::from(boa_engine::string::JsStr::latin1(body)))
 }
 
 /// Response headers as the same `name\nvalue\n…` blob the request side uses
@@ -6489,23 +6588,48 @@ fn settle_page(page: &mut LoadedPage) {
     report_fn_census();
 }
 
-/// Evaluate a `__trust.*` entry point that RUNS PAGE CALLBACKS (timer ticks,
-/// IntersectionObserver delivery, image-load scans) with the same panic
-/// containment as `run_script`/`run_jobs_into`. These used to be bare
-/// `ctx.eval`s — the one remaining place a Boa VM panic inside page code could
-/// unwind the resident actor thread, silently killing the live page (and
-/// skipping the thread's allocator purge on the way out) instead of degrading
-/// to the `· JS:n!` badge. `None` = the eval failed or panicked; on panic
-/// `outcome.panicked` is set so the caller's normal Trouble path runs.
-fn guarded_eval(
+/// Call `__trust.<name>(args…)` directly — two property reads and a call, no
+/// source text. The actor's per-wake entry points (`tick`/`tickTo`/`now`/
+/// `nextDeadline`/…) used to be `ctx.eval("__trust.x()")`, each paying a full
+/// parse+compile of a tiny script EVERY wake and every dispatch. A missing
+/// `__trust` or member (a stripped test realm) is `undefined`, matching what
+/// the guarded evals it replaces produced. Arguments cross as real JsValues,
+/// so no caller escapes strings into source text anymore.
+fn call_trust(ctx: &mut Context, name: &str, args: &[JsValue]) -> JsResult<JsValue> {
+    let g = ctx.global_object();
+    let Ok(trust) = g.get(boa_engine::js_string!("__trust"), ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let Some(trust) = trust.as_object() else {
+        return Ok(JsValue::undefined());
+    };
+    let Ok(f) = trust.get(JsString::from(name), ctx) else {
+        return Ok(JsValue::undefined());
+    };
+    let Some(f) = f.as_callable() else {
+        return Ok(JsValue::undefined());
+    };
+    let f = f.clone();
+    f.call(&JsValue::undefined(), args, ctx)
+}
+
+/// [`call_trust`] with the same panic containment as `run_script`/
+/// `run_jobs_into`, for the entry points that run PAGE CALLBACKS (timer ticks,
+/// observer delivery, hover/click/form dispatch, image-load scans). Bare
+/// `ctx.eval`s here were the one remaining place a Boa VM panic inside page
+/// code could unwind the resident actor thread, silently killing the live page
+/// (and skipping the thread's allocator purge on the way out) instead of
+/// degrading to the `· JS:n!` badge. `None` = the call failed or panicked; on
+/// panic `outcome.panicked` is set so the caller's normal Trouble path runs.
+fn guarded_call_trust(
     ctx: &mut Context,
-    src: &[u8],
+    name: &str,
+    args: &[JsValue],
     what: &str,
     outcome: &mut Outcome,
 ) -> Option<JsValue> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ctx.eval(Source::from_bytes(src))
-    }));
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call_trust(ctx, name, args)));
     match result {
         Ok(Ok(v)) => Some(v),
         Ok(Err(err)) => {
@@ -6542,11 +6666,11 @@ fn settle(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Ou
         }
         // `__trust.tick` fires due-now timer callbacks (page JS) synchronously,
         // so its execution is real engine work — time it into the execute
-        // bucket. It runs via `guarded_eval` (not `run_script`/a job): a VM
-        // panic inside a timer callback must cost the page, not the actor
+        // bucket. It runs via `guarded_call_trust` (not `run_script`/a job): a
+        // VM panic inside a timer callback must cost the page, not the actor
         // thread. Timed so the profiler doesn't mis-attribute it to Rust-side.
         let t = phase_begin();
-        let ticked = guarded_eval(ctx, b"__trust.tick()", "timer tick", outcome);
+        let ticked = guarded_call_trust(ctx, "tick", &[], "timer tick", outcome);
         phase_end(Phase::Execute, t);
         match ticked {
             Some(v) if v.to_boolean() => ticks += 1,
@@ -6579,9 +6703,10 @@ fn settle_to(
         // guard it identically (a VM panic in an at-rest timer callback must
         // degrade the page, not unwind the actor).
         let t = phase_begin();
-        let fired = guarded_eval(
+        let fired = guarded_call_trust(
             ctx,
-            format!("__trust.tickTo({abs_ms})").as_bytes(),
+            "tickTo",
+            &[JsValue::from(abs_ms)],
             "timer tick",
             outcome,
         )
@@ -6611,7 +6736,7 @@ const IMG_LOAD_PASSES: usize = 3;
 fn settle_image_loads(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Outcome) {
     for _ in 0..IMG_LOAD_PASSES {
         let t = phase_begin();
-        let scheduled = guarded_eval(ctx, b"__trust.scanImageLoads()", "image load scan", outcome)
+        let scheduled = guarded_call_trust(ctx, "scanImageLoads", &[], "image load scan", outcome)
             .and_then(|v| v.as_number())
             .unwrap_or(0.0);
         phase_end(Phase::Execute, t);
@@ -7147,14 +7272,24 @@ const WORKER_SCOPE: &str = r##"
     // global is a flat target, so there is no capture PHASE) ---
     var LS = new Map();
     function lsFor(type) { var l = LS.get(type); if (!l) { l = []; LS.set(type, l); } return l; }
+    // (fn, capture) lookup via NATIVE indexOf over the parallel `l.fns`/`l.caps`
+    // arrays — same perf invariant as the page realm's `lsFind`: an interpreted
+    // per-entry scan goes quadratic under a listener-flooding script.
+    function lsFind(l, fn, capture) {
+        if (!l.fns) return -1;
+        var i = l.fns.indexOf(fn);
+        while (i >= 0 && l.caps[i] !== capture) i = l.fns.indexOf(fn, i + 1);
+        return i;
+    }
     g.addEventListener = function (type, fn, options) {
         if (!(typeof fn === "function" || (fn && typeof fn.handleEvent === "function"))) return;
         var o = options === true ? { capture: true } : (options && typeof options === "object" ? options : {});
         if (o.signal && o.signal.aborted) return;
         var t = String(type), l = lsFor(t);
-        for (var i = 0; i < l.length; i++) if (l[i].fn === fn && l[i].capture === !!o.capture) return;
+        if (lsFind(l, fn, !!o.capture) >= 0) return;
         var entry = { fn: fn, capture: !!o.capture, once: !!o.once, removed: false };
-        l.push(entry);
+        if (!l.fns) { l.fns = []; l.caps = []; }
+        l.push(entry); l.fns.push(fn); l.caps.push(entry.capture);
         if (o.signal && typeof o.signal.addEventListener === "function") {
             o.signal.addEventListener("abort", function () { g.removeEventListener(t, fn, { capture: entry.capture }); }, { once: true });
         }
@@ -7162,9 +7297,10 @@ const WORKER_SCOPE: &str = r##"
     g.removeEventListener = function (type, fn, options) {
         var capture = options === true || !!(options && options.capture);
         var l = lsFor(String(type));
-        for (var i = 0; i < l.length; i++) {
-            if (l[i].fn === fn && l[i].capture === capture) { l[i].removed = true; l.splice(i, 1); return; }
-        }
+        var i = lsFind(l, fn, capture);
+        if (i < 0) return;
+        l[i].removed = true;
+        l.splice(i, 1); l.fns.splice(i, 1); l.caps.splice(i, 1);
     };
     g.dispatchEvent = function (ev) {
         ev.target = g; ev.currentTarget = g;
@@ -7172,7 +7308,9 @@ const WORKER_SCOPE: &str = r##"
         for (var i = 0; i < snap.length; i++) {
             var entry = snap[i];
             if (entry.removed) continue;
-            if (entry.once) { var k = l.indexOf(entry); if (k >= 0) l.splice(k, 1); entry.removed = true; }
+            // `once`: remove through removeEventListener so the parallel
+            // fns/caps arrays stay aligned with the entry list.
+            if (entry.once) g.removeEventListener(ev.type, entry.fn, { capture: entry.capture });
             try { (typeof entry.fn === "function") ? entry.fn.call(g, ev) : entry.fn.handleEvent(ev); }
             catch (e) { WK.errors.push(errStr(ev.type + " handler", e)); }
         }
@@ -8343,20 +8481,19 @@ fn dispatch_hover_in(page: &mut LoadedPage, node: Option<usize>, x: f64, y: f64)
     let node = node.filter(|&n| page.dom.borrow().is_valid(n));
     let x = if x.is_finite() { x } else { 0.0 };
     let y = if y.is_finite() { y } else { 0.0 };
-    let arg = node.map_or_else(|| String::from("null"), |n| n.to_string());
-    let call = format!("__trust.hover({arg},{x},{y})");
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        page.ctx.eval(Source::from_bytes(call.as_bytes()))
-    })) {
-        Ok(Ok(_)) => {}
-        Ok(Err(err)) => page.outcome.errors.push(format!("hover: {err}")),
-        Err(_) => {
-            page.outcome.errors.push(String::from(
-                "hover: engine panic (Boa bug) — page JS halted",
-            ));
-            page.outcome.panicked = true;
-            return;
-        }
+    let arg = node.map_or(JsValue::null(), |n| JsValue::from(n as f64));
+    let mut hover_outcome = Outcome::default();
+    guarded_call_trust(
+        &mut page.ctx,
+        "hover",
+        &[arg, JsValue::from(x), JsValue::from(y)],
+        "hover",
+        &mut hover_outcome,
+    );
+    page.outcome.errors.extend(hover_outcome.errors);
+    if hover_outcome.panicked {
+        page.outcome.panicked = true;
+        return;
     }
     let mut dispatch_outcome = Outcome::default();
     settle(
@@ -8405,19 +8542,16 @@ fn dispatch_set_scroll_in(
     if !valid {
         return finish_dispatch(page, evts);
     }
-    let call = format!("__trust.fireElementScroll({node})");
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        page.ctx.eval(Source::from_bytes(call.as_bytes()))
-    })) {
-        Ok(Ok(_)) => {}
-        Ok(Err(err)) => page.outcome.errors.push(format!("scroll: {err}")),
-        Err(_) => {
-            page.outcome.errors.push(String::from(
-                "scroll: engine panic (Boa bug) — page JS halted",
-            ));
-            page.outcome.panicked = true;
-        }
-    }
+    let mut scroll_outcome = Outcome::default();
+    guarded_call_trust(
+        &mut page.ctx,
+        "fireElementScroll",
+        &[JsValue::from(node as f64)],
+        "scroll",
+        &mut scroll_outcome,
+    );
+    page.outcome.errors.extend(scroll_outcome.errors);
+    page.outcome.panicked |= scroll_outcome.panicked;
     if !page.outcome.panicked {
         let mut dispatch_outcome = Outcome::default();
         settle(
@@ -8446,9 +8580,10 @@ fn dispatch_set_scroll_in(
 /// Edge-triggered + geometry-cached: a no-op (no settle) unless it delivered
 /// entries, so a page with no observers / no geometry change pays one cheap eval.
 fn run_intersections(page: &mut LoadedPage) {
-    let delivered = guarded_eval(
+    let delivered = guarded_call_trust(
         &mut page.ctx,
-        b"__trust.updateIntersections()",
+        "updateIntersections",
+        &[],
         "intersection observer",
         &mut page.outcome,
     )
@@ -8758,8 +8893,7 @@ fn settle_bg_fetch(ctx: &mut Context, id: usize, value: JsValue) {
 /// The page's current virtual-time clock (`timers.now`, ms) — the base the
 /// at-rest loop measures real wall time forward from.
 fn js_now(page: &mut LoadedPage) -> f64 {
-    page.ctx
-        .eval(Source::from_bytes(b"__trust.now()"))
+    call_trust(&mut page.ctx, "now", &[])
         .ok()
         .and_then(|v| v.as_number())
         .unwrap_or(0.0)
@@ -8769,10 +8903,7 @@ fn js_now(page: &mut LoadedPage) -> f64 {
 /// timer, or `None` when nothing is scheduled (the loop then parks on commands
 /// with zero idle CPU).
 fn js_next_deadline(page: &mut LoadedPage) -> Option<f64> {
-    let v = page
-        .ctx
-        .eval(Source::from_bytes(b"__trust.nextDeadline()"))
-        .ok()?;
+    let v = call_trust(&mut page.ctx, "nextDeadline", &[]).ok()?;
     if v.is_null_or_undefined() {
         return None;
     }
@@ -8786,8 +8917,7 @@ fn js_next_deadline(page: &mut LoadedPage) -> Option<f64> {
 /// scroll page that has nothing else interactive would settle `Static`, drop its
 /// engine, and never reveal its below-the-fold content.
 fn js_has_scroll_work(page: &mut LoadedPage) -> bool {
-    page.ctx
-        .eval(Source::from_bytes(b"__trust.hasScrollWork()"))
+    call_trust(&mut page.ctx, "hasScrollWork", &[])
         .ok()
         .and_then(|v| v.as_boolean())
         .unwrap_or(false)
@@ -8811,10 +8941,7 @@ fn take_scroll_fragment(page: &mut LoadedPage) -> Option<String> {
     if page.outcome.panicked {
         return None;
     }
-    let v = page
-        .ctx
-        .eval(Source::from_bytes(b"__trust.takeScrollFragment()"))
-        .ok()?;
+    let v = call_trust(&mut page.ctx, "takeScrollFragment", &[]).ok()?;
     if v.is_null_or_undefined() {
         return None;
     }
@@ -8822,10 +8949,7 @@ fn take_scroll_fragment(page: &mut LoadedPage) -> Option<String> {
 }
 
 fn take_script_navigation(page: &mut LoadedPage) -> Option<String> {
-    let v = page
-        .ctx
-        .eval(Source::from_bytes(b"__trust.takeNavigation()"))
-        .ok()?;
+    let v = call_trust(&mut page.ctx, "takeNavigation", &[]).ok()?;
     if v.is_null_or_undefined() {
         return None;
     }
@@ -8861,10 +8985,9 @@ fn prepare_dispatch(page: &mut LoadedPage) {
     }
     // Give each fresh interaction its own MutationObserver loop budget: a
     // runaway observer chain in one dispatch disables delivery for the rest of
-    // THAT window, but the next click starts clean.
-    let _ = page.ctx.eval(Source::from_bytes(
-        b"__trust.moResetGuard && __trust.moResetGuard()",
-    ));
+    // THAT window, but the next click starts clean. (`call_trust` is a no-op
+    // when the member is missing, like the old `&&`-guarded eval.)
+    let _ = call_trust(&mut page.ctx, "moResetGuard", &[]);
     let _ = page.dom.borrow_mut().take_dirty();
 }
 
@@ -8887,22 +9010,21 @@ fn js_string(s: &str) -> String {
 
 fn dispatch_form_set_in(page: &mut LoadedPage, node: usize, value: &str, checked: Option<bool>) {
     prepare_dispatch(page);
-    let checked = checked
-        .map(|v| if v { "true" } else { "false" })
-        .unwrap_or("null");
-    let call = format!("__trust.formSet({node}, {}, {checked})", js_string(value));
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        page.ctx.eval(Source::from_bytes(call.as_bytes()))
-    })) {
-        Ok(Ok(_)) => {}
-        Ok(Err(err)) => page.outcome.errors.push(format!("form input: {err}")),
-        Err(_) => {
-            page.outcome.errors.push(String::from(
-                "form input: engine panic (Boa bug) — page JS halted",
-            ));
-            page.outcome.panicked = true;
-            return;
-        }
+    // The value crosses as a real JS string argument — no source-text
+    // escaping (`js_string`) and no per-edit parse+compile.
+    let checked = checked.map_or(JsValue::null(), JsValue::from);
+    let mut set_outcome = Outcome::default();
+    guarded_call_trust(
+        &mut page.ctx,
+        "formSet",
+        &[JsValue::from(node as f64), str_value(value), checked],
+        "form input",
+        &mut set_outcome,
+    );
+    page.outcome.errors.extend(set_outcome.errors);
+    if set_outcome.panicked {
+        page.outcome.panicked = true;
+        return;
     }
     let mut dispatch_outcome = Outcome::default();
     settle(
@@ -9639,76 +9761,45 @@ fn no_incremental() -> bool {
 /// so `>` inside a quoted value doesn't close the tag; comments are copied
 /// opaquely (their content is raw — Lit markers can hold anything).
 fn render_canonical(html: &str) -> String {
+    // Byte-scan for ` name="…"` and drop the non-rendered attributes
+    // (`class`/`alt`/`title`/`aria-*`) so a mutation touching only them doesn't
+    // trigger a re-render (the Twitch alt-rotation dedup). The scan is
+    // DELIBERATELY NOT tag-aware: an earlier "tag-aware" refinement (only strip
+    // inside real tags, to keep an attr-lookalike inside a code-sample's TEXT)
+    // broke fosstodon/Mastodon's incremental render entirely — its post content
+    // carries escaped inline HTML (`&lt;span class="invisible"&gt;…`), and
+    // keeping those escaped-text `class="…"` substrings made the boundary
+    // canonicals diverge across renders in a way that blanked the whole feed.
+    // The blunt whole-string strip is the known-good behavior; the code-sample
+    // text case it can't distinguish is rare and terminal-specific — far less
+    // costly than losing a live-updating feed. See the fosstodon regression note.
     let b = html.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
-    let mut in_tag = false;
-    let mut in_quote = false;
     while i < b.len() {
-        let c = b[i];
-        if !in_tag {
-            if c == b'<' {
-                // A comment is opaque: copy through its `-->` unexamined.
-                if b[i..].starts_with(b"<!--") {
-                    let end = html[i..].find("-->").map(|e| i + e + 3).unwrap_or(b.len());
-                    out.extend_from_slice(&b[i..end]);
-                    i = end;
+        if b[i] == b' ' {
+            // Read an attribute name (ascii letters/digits/`-`).
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
+                j += 1;
+            }
+            // ` name="…"` whose name is non-rendered → skip the whole attribute.
+            if j > i + 1 && b.get(j) == Some(&b'=') && b.get(j + 1) == Some(&b'"') {
+                let name = &html[i + 1..j];
+                let drop = matches!(name, "class" | "alt" | "title") || name.starts_with("aria-");
+                if drop {
+                    // Values are double-quoted (a literal `"` is `&quot;`).
+                    let mut k = j + 2;
+                    while k < b.len() && b[k] != b'"' {
+                        k += 1;
+                    }
+                    i = (k + 1).min(b.len());
                     continue;
                 }
-                in_tag = true;
-            }
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        if in_quote {
-            if c == b'"' {
-                in_quote = false;
-            }
-            out.push(c);
-            i += 1;
-            continue;
-        }
-        match c {
-            b'"' => {
-                in_quote = true;
-                out.push(c);
-                i += 1;
-            }
-            b'>' => {
-                in_tag = false;
-                out.push(c);
-                i += 1;
-            }
-            b' ' => {
-                // Read an attribute name (ascii letters/digits/`-`).
-                let mut j = i + 1;
-                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
-                    j += 1;
-                }
-                // ` name="…"` whose name is non-rendered → skip the attribute.
-                if j > i + 1 && b.get(j) == Some(&b'=') && b.get(j + 1) == Some(&b'"') {
-                    let name = &html[i + 1..j];
-                    let drop =
-                        matches!(name, "class" | "alt" | "title") || name.starts_with("aria-");
-                    if drop {
-                        // Values are double-quoted (a literal `"` is `&quot;`).
-                        let mut k = j + 2;
-                        while k < b.len() && b[k] != b'"' {
-                            k += 1;
-                        }
-                        i = (k + 1).min(b.len());
-                        continue;
-                    }
-                }
-                out.push(c);
-                i += 1;
-            }
-            _ => {
-                out.push(c);
-                i += 1;
             }
         }
+        out.push(b[i]);
+        i += 1;
     }
     // Only whole (ASCII-delimited) attributes were removed, so the rest is intact UTF-8.
     String::from_utf8(out).unwrap_or_else(|_| html.to_string())
@@ -9720,23 +9811,20 @@ fn render_canonical(html: &str) -> String {
 fn dispatch_click_in(page: &mut LoadedPage, node: usize) -> Option<String> {
     prepare_dispatch(page);
 
-    let call = format!("__trust.click({node})");
-    let prevented = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        page.ctx.eval(Source::from_bytes(call.as_bytes()))
-    })) {
-        Ok(Ok(v)) => v.to_boolean(),
-        Ok(Err(err)) => {
-            page.outcome.errors.push(format!("click: {err}"));
-            false
-        }
-        Err(_) => {
-            page.outcome.errors.push(String::from(
-                "click: engine panic (Boa bug) — page JS halted",
-            ));
-            page.outcome.panicked = true;
-            return None;
-        }
-    };
+    let mut click_outcome = Outcome::default();
+    let prevented = guarded_call_trust(
+        &mut page.ctx,
+        "click",
+        &[JsValue::from(node as f64)],
+        "click",
+        &mut click_outcome,
+    )
+    .is_some_and(|v| v.to_boolean());
+    page.outcome.errors.extend(click_outcome.errors);
+    if click_outcome.panicked {
+        page.outcome.panicked = true;
+        return None;
+    }
     let mut dispatch_outcome = Outcome::default();
     settle(
         &mut page.ctx,
@@ -9875,6 +9963,23 @@ const PRELUDE: &str = r##"
     const cfg = g.__trust_cfg || { url: "about:blank", ua: "TRust/0.1", width: 640, height: 384 };
     const trust = { errors: [], logs: [], readyState: "loading" };
     g.__trust = trust;
+
+    // --- the virtual clock ---
+    // The engine's single virtual clock (ms since page start): timers schedule
+    // against it, `performance.now()` reads it, the Event constructor stamps
+    // `timeStamp` from it, and the RUST-side Date clock mirrors it through
+    // `__clock_set` so `new Date()` and `Date.now()` agree with it too (see
+    // the clock comment in the timers section below for the full model).
+    // Declared up here because the Event class, defined early, reads it.
+    const timers = { q: [], now: 0, seq: 1 };
+    // The absolute epoch the virtual clock is anchored to — the REAL host
+    // time at prelude boot (the Rust clock answers real time until the first
+    // __clockSync). Every `timers.now` advance re-anchors the Rust clock.
+    const __epoch0 = Date.now();
+    const __clockSync = typeof __clock_set === "function"
+        ? function () { __clock_set(__epoch0 + timers.now); }
+        : function () {};
+    __clockSync();
 
     // --- node wrappers, identity-cached so wrap(id) === wrap(id) ---
     const W = new Map();
@@ -10033,16 +10138,35 @@ const PRELUDE: &str = r##"
     // (callback, capture) — a re-add with different once/passive is ignored,
     // per spec. An already-aborted signal means never add; a live signal
     // removes the listener when it aborts.
+    // Find the (callback, capture) entry index in list `l` — the DOM §2.7.3
+    // dedup/removal key — via NATIVE `indexOf` over the parallel raw-callback
+    // array `l.fns` (with `l.caps` aligned to it). PERF INVARIANT (don't
+    // regress): this scan MUST stay native. An interpreted per-entry loop here
+    // (`l[i].fn === fn && l[i].capture === …`) turned a listener-flooding page
+    // — Twitch's player registers tens of thousands of listeners while it
+    // retries its walled token — into MINUTES of settle: the scan is O(list)
+    // per add either way, but property-reading bytecode pays ~100× the
+    // constant of the Rust builtin loop, and the flood made it quadratic.
+    // The same-fn-other-capture hop below is interpreted but vanishingly rare.
+    function lsFind(l, fn, capture) {
+        const fns = l.fns;
+        if (!fns) return -1;
+        let i = fns.indexOf(fn);
+        while (i >= 0 && l.caps[i] !== capture) i = fns.indexOf(fn, i + 1);
+        return i;
+    }
     function addL(target, type, fn, options) {
         if (!(typeof fn === "function" || (fn && typeof fn.handleEvent === "function"))) return;
         const o = lsOpts(options);
         if (o.signal && o.signal.aborted) return;
         const t = String(type);
         const l = lsFor(target, t);
-        for (let i = 0; i < l.length; i++) if (l[i].fn === fn && l[i].capture === o.capture) return;
+        if (lsFind(l, fn, o.capture) >= 0) return;
         const entry = { fn: fn, capture: o.capture, once: o.once, removed: false };
-        l.push(entry);
-        if (o.capture) captureCount++;
+        // Entries are pushed HERE only, so `l`/`l.fns`/`l.caps` stay aligned.
+        if (!l.fns) { l.fns = []; l.caps = []; l.capN = 0; }
+        l.push(entry); l.fns.push(fn); l.caps.push(o.capture);
+        if (o.capture) { captureCount++; l.capN++; }
         if (o.signal && typeof o.signal.addEventListener === "function") {
             o.signal.addEventListener("abort", function () { removeL(target, t, fn, { capture: o.capture }); }, { once: true });
         }
@@ -10050,14 +10174,11 @@ const PRELUDE: &str = r##"
     function removeL(target, type, fn, options) {
         const capture = lsOpts(options).capture;
         const l = lsFor(target, String(type));
-        for (let i = 0; i < l.length; i++) {
-            if (l[i].fn === fn && l[i].capture === capture) {
-                l[i].removed = true; // in-flight dispatch snapshots skip it (spec)
-                if (l[i].capture) captureCount--;
-                l.splice(i, 1);
-                return;
-            }
-        }
+        const i = lsFind(l, fn, capture);
+        if (i < 0) return;
+        l[i].removed = true; // in-flight dispatch snapshots skip it (spec)
+        if (l[i].capture) { captureCount--; l.capN--; }
+        l.splice(i, 1); l.fns.splice(i, 1); l.caps.splice(i, 1);
     }
     class Event {
         constructor(type, opts) {
@@ -10073,7 +10194,10 @@ const PRELUDE: &str = r##"
             // CustomEvent.detail (and UIEvent.detail) default to null, not
             // undefined, when not supplied.
             this.detail = opts && "detail" in opts ? opts.detail : null;
-            this.timeStamp = 0;
+            // DOM §2.2: the creation time, relative to the time origin — i.e.
+            // `performance.now()`, which is the virtual clock (was a constant
+            // 0; rate-limiters diffing event timestamps saw no time pass).
+            this.timeStamp = timers.now;
             // Per-interface EventInit members (MouseEventInit.clientX,
             // KeyboardEventInit.key, MessageEventInit.data, …) become event
             // properties. We don't model each interface's dictionary, so copy
@@ -10110,14 +10234,39 @@ const PRELUDE: &str = r##"
             this.detail = detail === undefined ? null : detail;
             this.defaultPrevented = false;
         }
-        // The same walk dispatch() bubbles along: shadow hop via __host.
+        // DOM §2.2 composedPath(): non-empty only DURING dispatch (dispatch()
+        // builds the path and empties it when it unwinds, per spec), ordered
+        // target-first, and clipped so nodes inside a CLOSED shadow tree are
+        // invisible to listeners outside it (each struct carries `c` =
+        // root-of-closed-tree; slots aren't in our dispatch path, so the
+        // spec's slot-in-closed-tree branches are structurally never taken
+        // and are omitted).
         composedPath() {
-            if (!this.target) return [];
-            const path = [this.target];
-            let p = this.target instanceof Node ? (this.target.parentNode || this.target.__host) : null;
-            while (p) { path.push(p); p = p.parentNode || p.__host; }
-            if (this.target !== g) path.push(g);
-            return path;
+            const path = this.__path;
+            if (!path || !path.length) {
+                // The one-struct fast path (a non-bubbling event with no
+                // capture listeners registered) skips building a path array;
+                // during its at-target invocation the spec's answer is just
+                // [currentTarget]. Outside dispatch: empty, per spec.
+                return this.currentTarget ? [this.currentTarget] : [];
+            }
+            const out = [this.currentTarget];
+            let cti = 0, hidden = 0;
+            for (let i = path.length - 1; i >= 0; i--) {
+                if (path[i].c) hidden++;
+                if (path[i].n === this.currentTarget) { cti = i; break; }
+            }
+            let cur = hidden, max = hidden;
+            for (let i = cti - 1; i >= 0; i--) {
+                if (path[i].c) cur++;
+                if (cur <= max) out.unshift(path[i].n);
+            }
+            cur = hidden; max = hidden;
+            for (let i = cti + 1; i < path.length; i++) {
+                if (cur <= max) out.push(path[i].n);
+                if (path[i].c) { cur--; if (cur < max) max = cur; }
+            }
+            return out;
         }
         // Legacy positional init for the typed createEvent() interfaces. The
         // type-specific tail (view/detail/coords/keys) is accepted and stored
@@ -10229,6 +10378,17 @@ const PRELUDE: &str = r##"
         }
         const list = lsFor(cur, ev.type);
         if (!list.length) return;
+        // Skip a phase that can't match anything BEFORE slicing/iterating: the
+        // per-list capture count (`capN`, maintained by addL/removeL) makes a
+        // capture pass over an all-bubble list — or a bubble pass over an
+        // all-capture list — free. PERF INVARIANT: a page that floods one
+        // target with listeners (Twitch's walled player re-adds ~20k `load`
+        // handlers on window) pays that list's length on EVERY dispatch that
+        // walks past it otherwise; the interpreted scan of 20k dead entries
+        // per load event was seconds per dispatch.
+        const capN = list.capN || 0;
+        if (phase === 1 && capN === 0) return;
+        if (phase === 3 && capN === list.length) return;
         for (const entry of list.slice()) {
             if (entry.removed) continue;
             if (phase === 1 && !entry.capture) continue;
@@ -10240,6 +10400,33 @@ const PRELUDE: &str = r##"
             }
             catch (e) { trust.errors.push(ev.type + " handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
             if (ev.__stopNow) break;
+        }
+    }
+    // DOM §2.9 "retargeting": walk A up out of any shadow tree whose root is
+    // not a shadow-including inclusive ancestor of B — the object the world
+    // OUTSIDE that tree sees for A (a component's internals appear as the
+    // component). Used for the event path's shadow-adjusted targets and for
+    // relatedTarget adjustment.
+    function rootOfNode(a) {
+        let r = a;
+        while (r.parentNode) r = r.parentNode;
+        return r;
+    }
+    function shadowInclusiveContains(anc, b) {
+        let n = b;
+        for (;;) {
+            if (n === anc) return true;
+            n = n.parentNode || n.__host; // shadow-including: cross root→host
+            if (!n) return false;
+        }
+    }
+    function retarget(a, b) {
+        for (;;) {
+            if (!(a instanceof Node)) return a;
+            const r = rootOfNode(a);
+            if (!r.__host) return a; // A's root is not a shadow root
+            if (b instanceof Node && shadowInclusiveContains(r, b)) return a;
+            a = r.__host;
         }
     }
     // "Dispatch" (DOM §2.9): capture down the composed path, at-target, then
@@ -10256,28 +10443,79 @@ const PRELUDE: &str = r##"
     // real target; at the host and above, the HOST. A listener outside a
     // component sees the component, never its internals (`e.target.closest`
     // on light-tree delegation can't match nodes inside a shadow root, exactly
-    // like a browser). `ev.target` is restored to the real target after
-    // dispatch. Only Node targets extend their path past themselves: an XHR/
-    // WebSocket/AbortSignal is not in the tree, so its events reach nothing
-    // else (they never bubbled before either; the capture phase must not start
-    // delivering them to window).
+    // like a browser). `ev.target`/`ev.relatedTarget` are restored to the real
+    // values after dispatch (deliberate deviation from the spec's clearTargets
+    // nulling; pages read these during dispatch). Only Node targets extend
+    // their path past themselves: an XHR/WebSocket/AbortSignal is not in the
+    // tree, so its events reach nothing else (they never bubbled before
+    // either; the capture phase must not start delivering them to window).
+    //
+    // COMPOSED FLAG (DOM: a shadow root's "get the parent" returns null when
+    // the event's composed flag is unset): a non-composed event stops at the
+    // root of its target's shadow tree — the first shadow hop on this walk —
+    // so `slotchange`, non-composed customEvents, etc. never leak out of a
+    // component. RELATEDTARGET (DOM §2.9 steps 5/9.6): a relatedTarget is
+    // retargeted per path entry, the whole dispatch is skipped when target and
+    // adjusted relatedTarget collapse to the same object (a mouseover wholly
+    // inside a component, seen from outside), and propagation ends at the tree
+    // where a hop makes them collapse mid-walk.
     function dispatch(target, ev, forceBubble) {
         ev.target = target;
-        let path = null; // [{ n: node, t: shadow-adjusted target }], target-first
+        const origRelated = ev.relatedTarget;
+        const hasRelated = origRelated !== null && origRelated !== undefined;
+        let relatedAtTarget = null;
+        if (hasRelated) {
+            relatedAtTarget = retarget(origRelated, target);
+            if (target === relatedAtTarget && target !== origRelated) return !ev.defaultPrevented;
+            ev.relatedTarget = relatedAtTarget;
+        }
+        let path = null; // [{ n, t: shadow-adjusted target, r: adjusted relatedTarget, c: root-of-closed-tree }], target-first
         if (forceBubble || ev.bubbles || captureCount > 0) {
             path = [];
             let n = target, t = target;
-            path.push({ n: n, t: t });
+            path.push({ n: n, t: t, r: relatedAtTarget, c: false });
             if (n instanceof Node) {
+                let clipped = false; // ended at a shadow root / relatedTarget collapse, not the tree top
                 for (;;) {
                     const parent = n.parentNode;
                     if (parent) { n = parent; }
-                    else if (n.__host) { t = n.__host; n = t; } // shadow hop: retarget
+                    else if (n.__host) {
+                        // Shadow hop. Non-composed events stop AT the root of
+                        // the original target's tree — necessarily the first
+                        // hop this walk reaches.
+                        if (!ev.composed) { clipped = true; break; }
+                        t = n.__host; n = t; // retarget: outside sees the host
+                        // The hop crossed into the tree where both ends of an
+                        // over/out pair look the same → propagation ends
+                        // (spec: "if parent is relatedTarget, set parent to
+                        // null").
+                        if (hasRelated && retarget(origRelated, n) === n) { clipped = true; break; }
+                    }
                     else break;
-                    path.push({ n: n, t: t });
+                    path.push({
+                        n: n, t: t,
+                        r: hasRelated ? retarget(origRelated, n) : null,
+                        c: n instanceof ShadowRoot && n.__mode === "closed",
+                    });
                 }
-                if (target !== g) path.push({ n: g, t: t });
+                // DOM: a document's "get the parent" returns NULL for `load`
+                // events — a node-targeted `load` NEVER reaches the Window
+                // (that's why window.onload means the document load only).
+                // Appending window here for subresource `load`s fed a REAL
+                // amplification loop: web-vitals' whenReady helper re-adds a
+                // window capture `load` listener from inside its own handler
+                // ("complete" !== readyState → re-defer), so every script/img
+                // load event DOUBLED the list — Twitch's boot grew it to ~33k
+                // entries and minutes of dispatch time a browser never sees.
+                // Window is a parent only OF THE DOCUMENT: a walk that ended
+                // anywhere else (detached subtree, shadow clip, relatedTarget
+                // collapse) has no window in its path (DOM: only a document's
+                // "get the parent" returns the global).
+                if (!clipped && n.nodeType === 9 && target !== g && ev.type !== "load") {
+                    path.push({ n: g, t: t, r: hasRelated ? retarget(origRelated, g) : null, c: false });
+                }
             }
+            ev.__path = path; // composedPath() reads it; emptied on unwind (spec)
         }
         let stopped = false;
         if (path && captureCount > 0) {
@@ -10285,6 +10523,7 @@ const PRELUDE: &str = r##"
             for (let i = path.length - 1; i >= 1; i--) {
                 ev.currentTarget = path[i].n;
                 ev.target = path[i].t;
+                if (hasRelated) ev.relatedTarget = path[i].r;
                 invokeListeners(path[i].n, ev, 1);
                 if (ev.__stop) { stopped = true; break; }
             }
@@ -10293,6 +10532,7 @@ const PRELUDE: &str = r##"
             ev.eventPhase = 2; // AT_TARGET
             ev.currentTarget = target;
             ev.target = target;
+            if (hasRelated) ev.relatedTarget = relatedAtTarget;
             invokeListeners(target, ev, 2);
             if (ev.__stop) stopped = true;
         }
@@ -10301,13 +10541,16 @@ const PRELUDE: &str = r##"
             for (let i = 1; i < path.length; i++) {
                 ev.currentTarget = path[i].n;
                 ev.target = path[i].t;
+                if (hasRelated) ev.relatedTarget = path[i].r;
                 invokeListeners(path[i].n, ev, 3);
                 if (ev.__stop) break;
             }
         }
         ev.eventPhase = 0;
         ev.currentTarget = null;
+        ev.__path = null; // spec: "set event's path to the empty list"
         ev.target = target;
+        if (hasRelated) ev.relatedTarget = origRelated;
         return !ev.defaultPrevented;
     }
     trust.fire = function (target, type, bubble) {
@@ -10493,10 +10736,21 @@ const PRELUDE: &str = r##"
     // Popovers currently SHOWING, keyed by node id (the arena set is the
     // render truth; this mirror drives the API logic + auto-closing).
     const POPOVER_OPEN = Object.create(null);
+    // A user-interaction click per the specs: Pointer Events makes `click` a
+    // PointerEvent; UI Events gives it bubbles + cancelable + COMPOSED (it
+    // must escape shadow trees — a listener outside a component hears clicks
+    // on its internals, retargeted to the host).
+    function syntheticClickEvent() {
+        return new PointerEvent("click", {
+            bubbles: true, cancelable: true, composed: true, view: g,
+            detail: 1, button: 0, buttons: 0,
+            pointerId: 1, pointerType: "mouse", isPrimary: true,
+        });
+    }
     function activateClick(t, record) {
         if (record) trust.lastClickSubmit = null;
         if (!t) return false;
-        const ev = new Event("click", { bubbles: true, cancelable: true });
+        const ev = syntheticClickEvent();
         dispatch(t, ev, false);
         if (ev.defaultPrevented) return true;
         // Popover invoker (HTML §popover target attributes): activating a
@@ -10662,8 +10916,10 @@ const PRELUDE: &str = r##"
         // shouldUseClickEvent path), not input/change, so without this a
         // controlled checkbox never fires onChange. The checked value is
         // already set, so listeners read the post-toggle state.
-        if (withClick) dispatch(el, new Event("click", { bubbles: true, cancelable: true }), false);
-        dispatch(el, new Event("input", { bubbles: true }), false);
+        if (withClick) dispatch(el, syntheticClickEvent(), false);
+        // HTML: `input` is composed (it crosses shadow boundaries); `change`
+        // is not.
+        dispatch(el, new Event("input", { bubbles: true, composed: true }), false);
         dispatch(el, new Event("change", { bubbles: true }), false);
     }
     // Set a control property as a USER edit would, NOT a script write.
@@ -10707,12 +10963,12 @@ const PRELUDE: &str = r##"
         // the change; a plain editable, or one that reconciles from DOM
         // mutations (its MutationObserver), takes our content + input event.
         if (ceHost(el)) {
-            const bev = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: value });
+            const bev = new InputEvent("beforeinput", { bubbles: true, cancelable: true, composed: true, inputType: "insertText", data: value });
             dispatch(el, bev, false);
             if (bev.defaultPrevented) return true;
             if (el.textContent === value) return false;
             el.textContent = value;
-            dispatch(el, new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }), false);
+            dispatch(el, new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText", data: value }), false);
             return true;
         }
         const tag = el.localName;
@@ -11218,6 +11474,7 @@ const PRELUDE: &str = r##"
             const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             __dom_set_attr(this.__id, n, v);
             this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
+            this.__attrMapStale = true; // the cached NamedNodeMap rebuilds lazily
             if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, n.toLowerCase(), old, v);
             if (MO.length) moAttr(this, n, old);
@@ -11230,6 +11487,7 @@ const PRELUDE: &str = r##"
             const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             __dom_remove_attr(this.__id, n);
             this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
+            this.__attrMapStale = true; // the cached NamedNodeMap rebuilds lazily
             if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, n.toLowerCase(), old, null);
             if (MO.length) moAttr(this, n, old);
@@ -11241,15 +11499,37 @@ const PRELUDE: &str = r##"
         hasAttributes() { return __dom_attr_names(this.__id).length > 0; }
         // NamedNodeMap, array-like enough for Array.from/iteration/indexing
         // (Alpine's DOM morph does `Array.from(el.attributes)` — undefined
-        // here threw ToObject and aborted danbooru's whole render). Values
-        // re-read live; the list is a snapshot of names per access.
+        // here threw ToObject and aborted danbooru's whole render).
+        // [SameObject] per spec: ONE map per element, identity-stable across
+        // accesses; its contents rebuild lazily after an attribute write
+        // (`__attrMapStale` rides the same set/removeAttribute funnels that
+        // drop the `getAttribute` read cache), so an unchanged element pays
+        // one property read per access instead of a snapshot rebuild.
         get attributes() {
             // Plain loop + snapshot values + `this`-based methods: NO
             // closure capturing a block-scoped local invoked from a native
             // callback (Boa trap #6 — `.map`/getters here aborted the page
-            // with a define-opcode OOB panic). Values snapshot per access.
+            // with a define-opcode OOB panic). Values snapshot per rebuild.
+            let list = this.__attrMap;
+            if (list && !this.__attrMapStale) return list;
+            if (!list) {
+                list = [];
+                list.item = function (i) { return this[i] || null; };
+                list.getNamedItem = function (nm) {
+                    for (var j = 0; j < this.length; j++) if (this[j].name === String(nm)) return this[j];
+                    return null;
+                };
+                this.__attrMap = list;
+            } else {
+                // Rebuild in place (identity must survive): drop the named
+                // props of the OLD entries, then the entries themselves.
+                for (let j = 0; j < list.length; j++) {
+                    const old = list[j].name;
+                    if (old !== "length" && old !== "item" && old !== "getNamedItem") delete list[old];
+                }
+                list.length = 0;
+            }
             const names = __dom_attr_names(this.__id) || [];
-            const list = [];
             for (let i = 0; i < names.length; i++) {
                 const n = names[i];
                 const v = __dom_get_attr(this.__id, n);
@@ -11266,11 +11546,7 @@ const PRELUDE: &str = r##"
                 // Skip names that would clobber the array length / methods.
                 if (n !== "length" && n !== "item" && n !== "getNamedItem") list[n] = attr;
             }
-            list.item = function (i) { return this[i] || null; };
-            list.getNamedItem = function (nm) {
-                for (var j = 0; j < this.length; j++) if (this[j].name === String(nm)) return this[j];
-                return null;
-            };
+            this.__attrMapStale = false;
             return list;
         }
         // Lit's ?attr= boolean bindings commit through this.
@@ -13322,12 +13598,37 @@ const PRELUDE: &str = r##"
         const p = __url_parse(String(u), locState.href);
         if (p) setLocParts(p);
     };
+    // HTML §Location component setters: copy the URL, apply the component with
+    // the URL parser's state-override semantics (`__url_set` = the same WHATWG
+    // setter the URL class uses), then Location-object navigate to the result.
+    // A value the parser refuses leaves the URL unchanged, and `navigateLoc`
+    // treats an unchanged href as a no-op (deliberate deviation: the spec
+    // re-navigates — a reload — even on a no-change set; a terminal browser
+    // has nothing to gain from that).
+    const setLocPart = (which, v) => {
+        const r = __url_set(locState.href, which, String(v));
+        if (r) navigateLoc(r[0], false);
+    };
     const loc = {
         get href() { return locState.href; }, set href(v) { navigateLoc(v, false); },
-        get protocol() { return locState.protocol; }, set protocol(_v) {},
-        get host() { return locState.host; }, set host(_v) {},
-        get hostname() { return locState.hostname; }, set hostname(_v) {},
-        get port() { return locState.port; }, set port(_v) {},
+        get protocol() { return locState.protocol; },
+        set protocol(v) {
+            // Basic-parse `v + ":"` with scheme start state: the scheme is
+            // whatever precedes the first ":" (so "https:" == "https::::" ==
+            // "https", and trailing junk after the colon is ignored); a
+            // non-scheme token is a SyntaxError. Location (unlike URL) then
+            // only navigates when the result stays in the HTTP(S) family.
+            v = String(v);
+            const colon = v.indexOf(":");
+            const scheme = colon < 0 ? v : v.slice(0, colon);
+            if (!/^[A-Za-z][A-Za-z0-9+.-]*$/.test(scheme))
+                throw new DOMException("Failed to set the 'protocol' property on 'Location': '" + v + "' is not a valid protocol.", "SyntaxError");
+            const r = __url_set(locState.href, "protocol", scheme);
+            if (r && (r[1] === "http:" || r[1] === "https:")) navigateLoc(r[0], false);
+        },
+        get host() { return locState.host; }, set host(v) { setLocPart("host", v); },
+        get hostname() { return locState.hostname; }, set hostname(v) { setLocPart("hostname", v); },
+        get port() { return locState.port; }, set port(v) { setLocPart("port", v); },
         get pathname() { return locState.pathname; }, set pathname(v) { navigateLoc(locState.origin + String(v) + locState.search + locState.hash, false); },
         get search() { return locState.search; }, set search(v) { const q = String(v); navigateLoc(locState.origin + locState.pathname + (q && q[0] === "?" ? q : (q ? "?" + q : "")) + locState.hash, false); },
         get hash() { return locState.hash; }, set hash(v) { const h = String(v); navigateLoc(withoutHash(locState.href) + (h && h[0] === "#" ? h : (h ? "#" + h : "")), true); },
@@ -14363,7 +14664,9 @@ const PRELUDE: &str = r##"
     g.sessionStorage = makeStorage("session");
 
     // --- timers on virtual time, driven by the Rust settle loop ---
-    const timers = { q: [], now: 0, seq: 1 };
+    // (`timers` itself is declared at the top of the prelude — the Event
+    // class stamps `timeStamp` from it — with the `__clockSync` anchor that
+    // mirrors every `timers.now` advance into the Rust-side Date clock.)
     // HTML §8.6: `setTimeout(handler, delay, ...args)` invokes `handler` with
     // the trailing arguments. Capture them so e.g. `setTimeout(resolve, ms, v)`
     // and libraries that pass state through the timer work (they got dropped).
@@ -14471,6 +14774,7 @@ const PRELUDE: &str = r##"
         if (!best) return false;
         timers.q.splice(timers.q.indexOf(best), 1);
         timers.now = Math.max(timers.now, best.at); // a no-op in LIVE mode (best.at <= now)
+        __clockSync();
         try { best.fn.apply(undefined, best.args || []); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         return true;
     };
@@ -14498,10 +14802,12 @@ const PRELUDE: &str = r##"
             if (i < 0) continue; // cleared by an earlier callback in this batch
             timers.q.splice(i, 1);
             timers.now = Math.max(timers.now, t.at);
+            __clockSync();
             if (t.every !== null) timers.q.push({ id: t.id, at: absMs + t.every, fn: t.fn, every: t.every, args: t.args });
             try { t.fn.apply(undefined, t.args || []); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         }
         timers.now = absMs;
+        __clockSync();
         return due.length;
     };
     // The clocks track `timers.now`, the engine's single virtual clock, not the
@@ -14513,8 +14819,18 @@ const PRELUDE: &str = r##"
     // away). At REST the actor advances `timers.now` to the real monotonic clock
     // (see the wake loop), so reading time off `timers.now` is correct in BOTH
     // phases: fast-forwarded during settle, real-time at rest. `Date.now()`
-    // keeps a realistic absolute base so timestamps still look real;
+    // keeps a realistic absolute base (`__epoch0`, anchored at prelude boot —
+    // see the top of the prelude) so timestamps still look real;
     // `performance.now()` is the elapsed virtual time.
+    //
+    // The WHOLE Date surface follows this clock: the old JS-side
+    // `Date.now = () => __epoch0 + timers.now` override is gone — `__clockSync`
+    // mirrors every `timers.now` advance into the Rust-side Boa clock
+    // (`__clock_set` → `PageClock`), which `Date.now()`, `new Date()`, and
+    // every other host time read share. Before this, `new Date()` kept reading
+    // the REAL host clock while `Date.now()` was fast-forwarded — a page
+    // comparing them (or diffing two `new Date()`s across a settle) saw time
+    // stand still or run backwards.
     //
     // KNOWN LIMITATION (YouTube, deferred to a focused effort): this clock does
     // NOT advance within a single SYNCHRONOUS block — only between ticks. A
@@ -14523,8 +14839,6 @@ const PRELUDE: &str = r##"
     // sees its deadline and won't yield. Making the LIVE-mode clock real fixes
     // that but needs careful cross-site verification (load-time code that bails
     // on a `performance.now()` threshold), so it's a separate task — not landed.
-    const __epoch0 = Date.now();
-    Date.now = () => __epoch0 + timers.now;
     g.performance.now = () => timers.now;
 
     // --- console into the outcome's ring ---
@@ -15714,7 +16028,7 @@ const PRELUDE: &str = r##"
             if (cn && TYPED[cn] && v.buffer instanceof ArrayBuffer) return ["TA", cn, enc(v.buffer, heap, seen), v.byteOffset, v.length];
             if (G.File && v instanceof G.File) return ["F", blobBytes(v), v.type || "", v.name || "", v.lastModified || 0];
             if (G.Blob && v instanceof G.Blob) return ["B", blobBytes(v), v.type || ""];
-            if (v instanceof Error) return ["E", v.name || "Error", v.message || "", v.stack || ""];
+            if (v instanceof Error) return ["E", v.name || "Error", v.message || "", v.stack || "", (G.DOMException && v instanceof G.DOMException) ? 1 : 0];
             if (Array.isArray(v)) {
                 var ap = [];
                 for (var k in v) if (Object.prototype.hasOwnProperty.call(v, k)) ap.push([k, enc(v[k], heap, seen)]);
@@ -15739,7 +16053,19 @@ const PRELUDE: &str = r##"
                 case "AB": return new Uint8Array(node[1]).buffer;
                 case "F": return G.File ? new G.File([blobPart(node[1])], node[3], { type: node[2], lastModified: node[4] }) : new G.Blob([blobPart(node[1])], { type: node[2] });
                 case "B": return G.Blob ? new G.Blob([blobPart(node[1])], { type: node[2] }) : { __blobText: node[1], type: node[2] };
-                case "E": { var e = new Error(node[2]); e.name = node[1]; if (node[3]) try { e.stack = node[3]; } catch (x) {} return e; }
+                case "E": {
+                    // HTML structured deserialize: a name from the native-error
+                    // set reconstructs the matching subclass (instanceof
+                    // survives the round trip); a DOMException goes back
+                    // through its constructor keeping its name; any other name
+                    // rides a plain Error.
+                    var nm = node[1] || "Error", e;
+                    if (node[4] && typeof G.DOMException === "function") e = new G.DOMException(node[2], nm);
+                    else if (nm === "EvalError" || nm === "RangeError" || nm === "ReferenceError" || nm === "SyntaxError" || nm === "TypeError" || nm === "URIError") e = new G[nm](node[2]);
+                    else { e = new Error(node[2]); if (nm !== "Error") try { e.name = nm; } catch (x) {} }
+                    if (node[3]) try { e.stack = node[3]; } catch (x) {}
+                    return e;
+                }
                 case "A": return new Array(node[1]);
                 case "O": return {};
             }
@@ -15963,8 +16289,17 @@ const PRELUDE: &str = r##"
             super();
             this.readyState = 0; this.status = 0; this.statusText = "";
             this.__text = ""; this.__bytes = null; this.__respType = ""; this.__respObj = undefined;
-            this.responseURL = ""; this.timeout = 0; this.withCredentials = false;
+            this.responseURL = ""; this.__timeout = 0; this.withCredentials = false;
             this.__h = {}; this.__aborted = false; this.__inFlight = false;
+        }
+        // XHR §the timeout attribute: setting it while the request is
+        // synchronous (in a window realm — ours always is) throws
+        // InvalidStateError. All send paths (wire, data:, blob:) read the
+        // getter, so the rule can't be bypassed per-scheme.
+        get timeout() { return this.__timeout; }
+        set timeout(v) {
+            if (this.__sync) throw new DOMException("timeout cannot be set on a synchronous XMLHttpRequest in a window context", "InvalidStateError");
+            this.__timeout = Math.max(0, Number(v) || 0);
         }
         // `responseType` is a WebIDL enum: an invalid assignment is silently
         // ignored; changing it once loading, or on a sync request, throws
@@ -16031,6 +16366,11 @@ const PRELUDE: &str = r##"
             // Resolve against the document base URL (XHR `open()`: parse url with
             // the API base URL of the relevant settings object). blob: stays as-is.
             this.__url = resolveURL(String(url));
+            // XHR §open() step 11: a sync request in a window realm with a
+            // non-zero timeout or a non-"" responseType already set is an
+            // InvalidAccessError (the setters catch the after-open order).
+            if (isAsync === false && (this.__timeout !== 0 || this.__respType !== ""))
+                throw new DOMException("synchronous XMLHttpRequest cannot have a timeout or responseType", "InvalidAccessError");
             this.__sync = isAsync === false;
             this.readyState = 1;
             this.__fire("readystatechange");
@@ -20157,6 +20497,71 @@ mod tests {
     }
 
     #[test]
+    fn listener_dedup_index_survives_add_remove_churn() {
+        // The (fn, capture) dedup/removal lookup runs over parallel raw-fn/
+        // capture arrays (native indexOf — the interpreted per-entry scan made
+        // a listener-flooding page quadratic; see `lsFind`). A misalignment
+        // between the entry list and those arrays would remove or dedup the
+        // WRONG listener, so churn them: many distinct adds, interleaved
+        // removals from the middle, once-listeners self-removing mid-dispatch,
+        // and re-adding a previously removed callback.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "churn.js",
+            br##"
+            globalThis.out = {};
+            const b = document.getElementById("b");
+            const fired = [];
+            const fns = [];
+            for (let i = 0; i < 40; i++) {
+                const f = ((n) => () => fired.push(n))(i);
+                fns.push(f);
+                b.addEventListener("churn", f);
+                b.addEventListener("churn", f); // dup: must not double-register
+            }
+            // Interleave once-listeners that self-remove during dispatch.
+            b.addEventListener("churn", () => fired.push("once-a"), { once: true });
+            // Remove every third from the middle of the list.
+            for (let i = 3; i < 40; i += 3) b.removeEventListener("churn", fns[i]);
+            b.dispatchEvent(new Event("churn"));
+            const first = fired.slice();
+            fired.length = 0;
+            // Re-add a removed callback: must register again (not dedup'd
+            // against a stale index entry), and the once listener is gone.
+            b.addEventListener("churn", fns[3]);
+            b.dispatchEvent(new Event("churn"));
+            out.first = first.join(",");
+            out.second = fired.join(",");
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        let expect_first: Vec<String> = (0..40)
+            .filter(|i| !(i % 3 == 0 && *i >= 3))
+            .map(|i| i.to_string())
+            .chain(std::iter::once("once-a".to_string()))
+            .collect();
+        assert_eq!(s(&mut ctx, b"out.first"), expect_first.join(","));
+        let expect_second: Vec<String> = (0..40)
+            .filter(|i| !(i % 3 == 0 && *i >= 3))
+            .map(|i| i.to_string())
+            .chain(std::iter::once("3".to_string()))
+            .collect();
+        assert_eq!(s(&mut ctx, b"out.second"), expect_second.join(","));
+    }
+
+    #[test]
     fn fetch_with_an_aborted_signal_rejects_with_abort_error() {
         // Fetch §"abort fetch": an already-aborted signal rejects immediately
         // with an AbortError (before any request fires); an abort while in
@@ -20316,33 +20721,27 @@ mod tests {
     }
 
     #[test]
-    fn render_canonical_keeps_attr_lookalikes_in_text() {
-        // Text nodes don't escape quotes, so ` class="a"` can appear verbatim
-        // in TEXT (a code sample). The old byte scan stripped it from the
-        // comparison — a live mutation confined to that text then dedup'd as
-        // "paints nothing" and the render went stale. The tag-aware scan
-        // strips only inside tags.
-        let a = r#"<pre>use class="a" here</pre>"#;
-        let b = r#"<pre>use class="b" here</pre>"#;
-        assert_ne!(
-            render_canonical(a),
-            render_canonical(b),
-            "text changes must stay visible to the dedup"
-        );
-        // Real attributes still strip (the Twitch alt-rotation dedup)…
+    fn render_canonical_strips_non_rendered_attributes() {
+        // The dedup drops class/alt/title/aria-* so a mutation touching only
+        // them doesn't force a re-render (the Twitch alt-rotation case).
         let c = r#"<div class="x" style="color:red">t</div>"#;
         let d = r#"<div class="y" style="color:red">t</div>"#;
         assert_eq!(
             render_canonical(c),
             render_canonical(d),
-            "class attrs still canonicalize away"
+            "class attrs canonicalize away"
         );
-        // …a `>` inside a quoted attr value doesn't end the tag…
-        let e = r#"<div title="a>b" class="x">t</div>"#;
-        assert_eq!(render_canonical(e), "<div>t</div>", "quoted > handled");
-        // …and comments are opaque.
-        let f = r#"<!-- keep class="m" --><i>t</i>"#;
-        assert_eq!(render_canonical(f), f, "comment content is untouched");
+        // A style (layout-affecting) change is NOT stripped — it still emits.
+        let e = r#"<div style="color:red">t</div>"#;
+        let f = r#"<div style="color:blue">t</div>"#;
+        assert_ne!(
+            render_canonical(e),
+            render_canonical(f),
+            "style changes stay visible"
+        );
+        // The strip is intentionally blunt (whole-string, not tag-aware): a
+        // tag-aware variant broke Mastodon's feed (escaped inline HTML in post
+        // text), so this behaviour is deliberate. See `render_canonical`.
     }
 
     #[test]
@@ -20549,6 +20948,418 @@ mod tests {
         assert_eq!(s(&mut ctx, b"out.inside"), "inner");
         assert_eq!(s(&mut ctx, b"out.outside"), "host");
         assert_eq!(s(&mut ctx, b"out.after"), "inner");
+    }
+
+    #[test]
+    fn non_composed_events_stop_at_the_shadow_root() {
+        // DOM: a shadow root's "get the parent" returns null when the event's
+        // composed flag is unset — a non-composed event dispatched inside a
+        // shadow tree reaches listeners in THAT tree (up to its root) and
+        // nothing outside it: not the host, not the document, not window.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "composed-clip.js",
+            br##"
+            globalThis.out = { seen: [] };
+            const host = document.createElement("x-clip");
+            document.getElementById("outer").appendChild(host);
+            const sr = host.attachShadow({ mode: "open" });
+            const inner = document.createElement("button");
+            sr.appendChild(inner);
+            sr.addEventListener("ping", () => out.seen.push("sr"));
+            host.addEventListener("ping", () => out.seen.push("host"));
+            document.addEventListener("ping", () => out.seen.push("doc"));
+            window.addEventListener("ping", () => out.seen.push("win"));
+            inner.dispatchEvent(new Event("ping", { bubbles: true })); // composed: false
+            out.clipped = out.seen.join(",");
+            out.seen.length = 0;
+            inner.dispatchEvent(new Event("ping", { bubbles: true, composed: true }));
+            out.escaped = out.seen.join(",");
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.clipped"), "sr");
+        assert_eq!(s(&mut ctx, b"out.escaped"), "sr,host,doc,win");
+    }
+
+    #[test]
+    fn related_targets_retarget_and_internal_hovers_stay_internal() {
+        // DOM §2.9 relatedTarget handling: (a) a mouseover wholly inside a
+        // component (target AND relatedTarget in the same shadow tree) never
+        // escapes it — the hop where both retarget to the host ends
+        // propagation; (b) dispatching AT the host with a relatedTarget from
+        // its own shadow tree collapses at the entry check → no dispatch at
+        // all; (c) an outside listener sees a shadow-internal relatedTarget
+        // retargeted to its host.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "related.js",
+            br##"
+            globalThis.out = { seen: [] };
+            const host = document.createElement("x-rel");
+            document.getElementById("outer").appendChild(host);
+            const sr = host.attachShadow({ mode: "open" });
+            const a = document.createElement("i"), b = document.createElement("s");
+            sr.appendChild(a); sr.appendChild(b);
+            sr.addEventListener("mouseover", (e) => out.insideRelated = e.relatedTarget.localName);
+            document.addEventListener("mouseover", (e) => out.seen.push("doc:" + (e.relatedTarget && e.relatedTarget.localName)));
+            // (a) inside -> inside: stays inside the shadow tree.
+            a.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, composed: true, relatedTarget: b }));
+            out.internalStayed = out.seen.length === 0 && out.insideRelated === "s";
+            // (b) at the host with an internal relatedTarget: skipped entirely.
+            let hostRan = false;
+            host.addEventListener("mouseover", () => { hostRan = true; });
+            host.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, composed: true, relatedTarget: a }));
+            out.entrySkipped = !hostRan && out.seen.length === 0;
+            // (c) light-DOM target, shadow-internal relatedTarget: the outside
+            // listener sees the HOST as relatedTarget.
+            document.getElementById("b").dispatchEvent(new MouseEvent("mouseover", { bubbles: true, composed: true, relatedTarget: a }));
+            out.retargeted = out.seen.join(",");
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"String(out.internalStayed)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.entrySkipped)"), "true");
+        assert_eq!(s(&mut ctx, b"out.retargeted"), "doc:x-rel");
+    }
+
+    #[test]
+    fn composed_path_hides_closed_shadow_internals() {
+        // DOM §2.2 composedPath(): a listener outside a CLOSED shadow tree
+        // gets a path with the tree's internals hidden (host outward only); a
+        // listener inside it sees the full path; and outside dispatch the
+        // path is empty (the spec clears it when dispatch unwinds).
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "composed-path.js",
+            br##"
+            globalThis.out = {};
+            const host = document.createElement("x-closed");
+            document.getElementById("outer").appendChild(host);
+            const sr = host.attachShadow({ mode: "closed" });
+            const inner = document.createElement("button");
+            sr.appendChild(inner);
+            const names = (p) => p.map((n) => n === window ? "window" : (n.localName || (n.nodeType === 9 ? "#document" : "#fragment"))).join(",");
+            sr.addEventListener("ping", (e) => { out.inside = names(e.composedPath()); });
+            document.addEventListener("ping", (e) => { out.outside = names(e.composedPath()); });
+            const ev = new Event("ping", { bubbles: true, composed: true });
+            inner.dispatchEvent(ev);
+            out.after = ev.composedPath().length;
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(
+            s(&mut ctx, b"out.inside"),
+            "button,#fragment,x-closed,div,body,html,#document,window"
+        );
+        assert_eq!(
+            s(&mut ctx, b"out.outside"),
+            "x-closed,div,body,html,#document,window"
+        );
+        assert_eq!(s(&mut ctx, b"String(out.after)"), "0");
+    }
+
+    #[test]
+    fn location_component_setters_navigate_per_the_spec() {
+        // HTML §Location: protocol/host/hostname/port setters copy the URL,
+        // apply the component, and navigate. An unparseable protocol is a
+        // SyntaxError; a valid non-HTTP(S) protocol terminates silently
+        // (Location can't leave the HTTP family).
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "loc-setters.js",
+            br##"
+            globalThis.out = {};
+            location.port = "8080";
+            out.port = __trust.takeNavigation();
+            location.hostname = "example.org";
+            out.hostname = __trust.takeNavigation();
+            location.host = "example.net:9000";
+            out.host = __trust.takeNavigation();
+            location.port = "";
+            out.noPort = __trust.takeNavigation();
+            try { location.protocol = "://"; } catch (e) { out.protoErr = e.name; }
+            location.protocol = "ftp";
+            out.ftpNav = String(__trust.takeNavigation());
+            location.protocol = "http:";
+            out.http = __trust.takeNavigation();
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.port"), "https://example.com:8080/");
+        assert_eq!(s(&mut ctx, b"out.hostname"), "https://example.org:8080/");
+        assert_eq!(s(&mut ctx, b"out.host"), "https://example.net:9000/");
+        assert_eq!(s(&mut ctx, b"out.noPort"), "https://example.net/");
+        assert_eq!(s(&mut ctx, b"out.protoErr"), "SyntaxError");
+        assert_eq!(s(&mut ctx, b"out.ftpNav"), "null");
+        assert_eq!(s(&mut ctx, b"out.http"), "http://example.net/");
+    }
+
+    #[test]
+    fn new_date_and_date_now_share_the_virtual_clock() {
+        // `new Date()` reads the same virtual clock as `Date.now()` (the
+        // Rust-side PageClock mirrors `timers.now` via `__clock_set`), so a
+        // fast-forward settle advances BOTH in lockstep — a page diffing them
+        // used to see the real clock in one and the virtual clock in the
+        // other. Event.timeStamp rides the same clock (was a constant 0).
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "virtual-date.js",
+            br##"
+            globalThis.out = {};
+            const t0 = Date.now();
+            out.anchored = new Date().getTime() === t0;
+            __trust.oneShot = true;
+            setTimeout(() => {
+                out.nowDelta = Date.now() - t0;
+                out.dateDelta = new Date().getTime() - t0;
+                out.ts = new Event("x").timeStamp;
+            }, 600);
+            __trust.tick();
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"String(out.anchored)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.nowDelta)"), "600");
+        assert_eq!(s(&mut ctx, b"String(out.dateDelta)"), "600");
+        assert_eq!(s(&mut ctx, b"String(out.ts)"), "600");
+    }
+
+    #[test]
+    fn element_attributes_is_the_same_live_named_node_map() {
+        // DOM: the `attributes` getter is [SameObject] — one NamedNodeMap per
+        // element, identity-stable across accesses, its contents fresh after
+        // attribute writes (rebuilt lazily off the setAttribute funnels).
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "attr-map.js",
+            br##"
+            globalThis.out = {};
+            const el = document.getElementById("b");
+            const map = el.attributes;
+            out.same = map === el.attributes;
+            const before = map.length;
+            el.setAttribute("data-x", "1");
+            out.stillSame = el.attributes === map;
+            out.grew = map.length === before + 1;
+            out.named = el.attributes["data-x"].value;
+            el.setAttribute("data-x", "2");
+            out.freshValue = el.attributes["data-x"].value;
+            el.removeAttribute("data-x");
+            out.dropped = el.attributes.length === before && el.attributes["data-x"] === undefined;
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"String(out.same)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.stillSame)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.grew)"), "true");
+        assert_eq!(s(&mut ctx, b"out.named"), "1");
+        assert_eq!(s(&mut ctx, b"out.freshValue"), "2");
+        assert_eq!(s(&mut ctx, b"String(out.dropped)"), "true");
+    }
+
+    #[test]
+    fn xhr_timeout_follows_the_sync_rules() {
+        // XHR: `timeout` set on an already-sync request throws
+        // InvalidStateError; `open(…, false)` with a non-zero timeout (or a
+        // responseType) already set throws InvalidAccessError.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "xhr-timeout.js",
+            br##"
+            globalThis.out = {};
+            const x = new XMLHttpRequest();
+            x.timeout = 5; // fine while async (the default)
+            try { x.open("GET", "/x", false); } catch (e) { out.openErr = e.name; }
+            const y = new XMLHttpRequest();
+            y.open("GET", "/y", false);
+            try { y.timeout = 10; } catch (e) { out.setErr = e.name; }
+            out.kept = y.timeout;
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.openErr"), "InvalidAccessError");
+        assert_eq!(s(&mut ctx, b"out.setErr"), "InvalidStateError");
+        assert_eq!(s(&mut ctx, b"String(out.kept)"), "0");
+    }
+
+    #[test]
+    fn structured_clone_reconstructs_error_subclasses() {
+        // HTML structured serialize: names in the native-error set come back
+        // as that subclass (instanceof survives); DOMException round-trips
+        // through its constructor keeping its name; other names ride Error.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "clone-errors.js",
+            br##"
+            globalThis.out = {};
+            const t = structuredClone(new TypeError("boom"));
+            out.te = (t instanceof TypeError) && t.message === "boom";
+            const r = structuredClone(new RangeError("r"));
+            out.re = r instanceof RangeError;
+            const d = structuredClone(new DOMException("gone", "AbortError"));
+            out.de = (d instanceof DOMException) && d.name === "AbortError" && d.message === "gone";
+            const custom = new Error("odd"); custom.name = "MyAppError";
+            const c = structuredClone(custom);
+            out.custom = c.name === "MyAppError" && !(c instanceof TypeError);
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"String(out.te)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.re)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.de)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.custom)"), "true");
+    }
+
+    #[test]
+    fn fetch_method_tokens_keep_their_dash_and_case() {
+        // Fetch §2.2.1: methods are HTTP tokens; only the six listed methods
+        // normalize to uppercase. `M-SEARCH` used to lose its dash and
+        // extension methods were force-uppercased.
+        let mut ctx = page_context();
+        let m = |ctx: &mut Context, method: &str| {
+            let args = [str_value("http://x/"), str_value(method)];
+            fetch_args(&args, ctx).1
+        };
+        assert_eq!(m(&mut ctx, "M-SEARCH"), "M-SEARCH");
+        assert_eq!(m(&mut ctx, "m-search"), "m-search");
+        assert_eq!(m(&mut ctx, "get"), "GET");
+        assert_eq!(m(&mut ctx, "PoSt"), "POST");
+        assert_eq!(m(&mut ctx, "patch"), "patch");
+        assert_eq!(m(&mut ctx, ""), "GET");
+    }
+
+    #[test]
+    fn url_host_setter_applies_the_port() {
+        // WHATWG URL host setter: `u.host = "h:9000"` runs the basic parser
+        // through host state INTO port state — host AND port both apply. The
+        // url crate's `set_host` alone is hostname-only and silently dropped
+        // the ":port" tail (found via Location.host, which shares __url_set).
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "url-host.js",
+            br##"
+            globalThis.out = {};
+            const u = new URL("https://a.example/p?q=1#f");
+            u.host = "b.example:9000";
+            out.href = u.href;
+            out.port = u.port;
+            u.host = "c.example"; // no port section: the port is kept
+            out.kept = u.host;
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.href"), "https://b.example:9000/p?q=1#f");
+        assert_eq!(s(&mut ctx, b"out.port"), "9000");
+        assert_eq!(s(&mut ctx, b"out.kept"), "c.example:9000");
     }
 
     #[test]
