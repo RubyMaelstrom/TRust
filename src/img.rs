@@ -649,6 +649,45 @@ mod tests {
             .to_vec()
     }
 
+    /// Every emitted sixel sequence (the sliced inline-image path AND the
+    /// viewer's plain protocol) is wrapped DECSC … DECRC + CUF1, so after the
+    /// terminal processes the anchor cell's "symbol" the cursor sits at
+    /// anchor+1 — the position the ratatui backend ASSUMES when it elides the
+    /// MoveTo for a horizontally adjacent next cell. Without the wrap, sixel
+    /// scrolling mode leaves the cursor below the graphic, and a changed cell
+    /// right of a 1-cell-wide icon (the scrollbar thumb beside a vote arrow)
+    /// printed in the same run landed at a stray position while its real cell
+    /// kept stale pixels — a persistent visual break in the scrollbar.
+    #[test]
+    fn sixel_sequences_normalize_the_cursor_to_anchor_plus_one() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Sixel);
+        let png = red_png();
+        let area = Rect::new(0, 0, 12, 6);
+
+        // The sliced path (inline page images; cached sequence).
+        let (proto, _) =
+            encode_sliced_bytes(&picker, &png, Size::new(2, 1), false, false, None).unwrap();
+        let mut buf = Buffer::empty(area);
+        ratatui_image::sliced::SlicedImage::new(&proto, (0, 0).into()).render(area, &mut buf);
+        let sym = buf.cell((0, 0)).expect("anchor cell").symbol();
+        assert!(sym.starts_with("\x1b7"), "sliced: DECSC prefix");
+        assert!(sym.ends_with("\x1b8\x1b[1C"), "sliced: DECRC+CUF1 suffix");
+        assert!(sym.contains("\x1bP"), "sliced: still carries the DCS");
+
+        // The plain path (the full-panel viewer).
+        let (proto, _) = encode_bytes(&picker, &png, Size::new(4, 2), false, None).unwrap();
+        let mut buf = Buffer::empty(area);
+        ratatui_image::Image::new(&proto).render(area, &mut buf);
+        let sym = buf.cell((0, 0)).expect("anchor cell").symbol();
+        assert!(sym.starts_with("\x1b7"), "plain: DECSC prefix");
+        assert!(sym.ends_with("\x1b8\x1b[1C"), "plain: DECRC+CUF1 suffix");
+        assert!(sym.contains("\x1bP"), "plain: still carries the DCS");
+    }
+
     #[test]
     fn static_svg_is_sniffed_sized_and_rasterized_for_the_terminal_box() {
         let svg = sample_svg();

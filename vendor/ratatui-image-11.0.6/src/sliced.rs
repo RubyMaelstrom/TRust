@@ -467,7 +467,14 @@ mod sixel_slice {
         ) -> String {
             let (start, escape, end) = Parser::tmux_start_escape_end(self.is_tmux);
 
-            let mut data = String::from(start);
+            // DECSC … DECRC + CUF1 wrap (TRust patch, same as `sixel::encode`):
+            // normalize the cursor to anchor+1 after the graphic, so the
+            // ratatui backend's elided-MoveTo assumption for an adjacent next
+            // cell holds. RELATIVE save/restore, deliberately — this string is
+            // cached position-independently (`SeqKey` has no coordinates) and
+            // reused at any anchor after a scroll.
+            let mut data = String::from("\x1b7");
+            data.push_str(start);
             clear_area(&mut data, escape, width, height);
             data.push_str(self.header);
 
@@ -481,6 +488,7 @@ mod sixel_slice {
             data.push('\x1b');
             data.push('\\');
             data.push_str(end);
+            data.push_str("\x1b8\x1b[1C");
 
             data
         }

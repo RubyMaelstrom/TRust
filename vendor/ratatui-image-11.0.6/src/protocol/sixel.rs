@@ -47,7 +47,19 @@ fn encode(img: &DynamicImage, size: Size, is_tmux: bool) -> Result<String> {
     let sixel_data = sixel_encode(bytes, w as usize, h as usize, &EncodeOptions::default())
         .map_err(|err| Errors::Sixel(format!("sixel encoding error: {err}")))?;
 
-    let mut data = String::new();
+    // DECSC … DECRC + CUF1 around the whole sequence (TRust patch): after a
+    // sixel, the terminal leaves the cursor wherever its scrolling mode says
+    // (below the graphic, or right of it under DECSET 8452) — NEVER reliably
+    // at anchor+1, which is what the ratatui backend assumes when it elides
+    // the MoveTo for a horizontally ADJACENT next cell. A changed cell right
+    // of a 1-cell-wide image (a scrollbar thumb beside a small icon) was then
+    // printed at a stray position while its real cell kept stale pixels — a
+    // persistent visual break, healed only when that cell's buffer content
+    // changed. Save/restore + one step right makes the backend's assumption
+    // hold on any terminal. (`SlicedSixel::from_sixel` is unaffected: it
+    // locates the DCS by `find("\x1bP")` past the prefix, and the suffix
+    // lands in the post-`-` tail element that `bands.pop()` discards.)
+    let mut data = String::from("\x1b7");
     if is_tmux {
         if !sixel_data.starts_with('\x1b') {
             return Err(Errors::Tmux("sixel string did not start with escape"));
@@ -63,6 +75,7 @@ fn encode(img: &DynamicImage, size: Size, is_tmux: bool) -> Result<String> {
         clear_area(&mut data, escape, width, height);
         data.push_str(&sixel_data);
     }
+    data.push_str("\x1b8\x1b[1C");
 
     Ok(data)
 }

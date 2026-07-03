@@ -136,6 +136,12 @@ wasmi_collections = { path = "vendor/wasmi_collections-1.1.0" }
 # full-frame redraw — the dominant at-rest main-thread cost on sixel terminals. The
 # `SlicedProtocol::Sixel` variant now carries a 1-entry `SixelSeqCache` so an
 # unchanged on-screen image is reused instead of rebuilt. See src/sliced.rs.
+# 2026-07-03: both sixel sequence builders (`sixel::encode`, `to_sequence`) wrap
+# the payload DECSC … DECRC+CUF1 so the cursor lands at anchor+1 — the position
+# the ratatui backend assumes when it elides MoveTo for an adjacent next cell.
+# The terminal's own post-sixel cursor (below the graphic) made such cells (the
+# scrollbar thumb beside a 1-cell icon) print at stray positions, leaving
+# persistent visual breaks in the scrollbar column.
 ratatui-image = { path = "vendor/ratatui-image-11.0.6" }
 
 # Optimized binary: whole-program LTO and a single codegen unit trade
