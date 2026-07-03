@@ -15328,6 +15328,127 @@ const PRELUDE: &str = r##"
             resolvedOptions() { return Object.assign({ locale: "en-US", numeric: "always", style: "long" }, this.__o); }
             static supportedLocalesOf(l) { return supEn(l); }
         }
+        // Intl.Locale (ECMA-402): parse a Unicode BCP-47 locale identifier
+        // into its subtags + -u- keywords, with maximize()/minimize() over a
+        // COMPACT likely-subtags map. A full CLDR likelySubtags table is the
+        // +11MB ICU we deliberately rejected; this covers the world's common
+        // languages honestly and defaults unknowns to a Latn script (same
+        // en-only ethos as the rest of this shim). @formatjs/intl-localematcher
+        // (Mastodon's i18n boot; the "best fit" matcher) does
+        // `new Intl.Locale(tag).maximize()` then reads .language/.script/
+        // .region/.toString() — without Intl.Locale the whole SPA fails to
+        // mount ("TypeError: not a constructor"), a blank screen.
+        const LIKELY = {
+            en: ["Latn", "US"], es: ["Latn", "ES"], fr: ["Latn", "FR"], de: ["Latn", "DE"],
+            it: ["Latn", "IT"], pt: ["Latn", "BR"], nl: ["Latn", "NL"], sv: ["Latn", "SE"],
+            da: ["Latn", "DK"], nb: ["Latn", "NO"], nn: ["Latn", "NO"], no: ["Latn", "NO"],
+            fi: ["Latn", "FI"], is: ["Latn", "IS"], pl: ["Latn", "PL"], cs: ["Latn", "CZ"],
+            sk: ["Latn", "SK"], sl: ["Latn", "SI"], hu: ["Latn", "HU"], ro: ["Latn", "RO"],
+            hr: ["Latn", "HR"], et: ["Latn", "EE"], lv: ["Latn", "LV"], lt: ["Latn", "LT"],
+            tr: ["Latn", "TR"], id: ["Latn", "ID"], ms: ["Latn", "MY"], vi: ["Latn", "VN"],
+            tl: ["Latn", "PH"], sw: ["Latn", "TZ"], af: ["Latn", "ZA"], ca: ["Latn", "ES"],
+            eu: ["Latn", "ES"], gl: ["Latn", "ES"], cy: ["Latn", "GB"], ga: ["Latn", "IE"],
+            ru: ["Cyrl", "RU"], uk: ["Cyrl", "UA"], be: ["Cyrl", "BY"], bg: ["Cyrl", "BG"],
+            sr: ["Cyrl", "RS"], mk: ["Cyrl", "MK"], kk: ["Cyrl", "KZ"], el: ["Grek", "GR"],
+            hy: ["Armn", "AM"], ka: ["Geor", "GE"], he: ["Hebr", "IL"], yi: ["Hebr", "UA"],
+            ar: ["Arab", "EG"], fa: ["Arab", "IR"], ur: ["Arab", "PK"], ps: ["Arab", "AF"],
+            hi: ["Deva", "IN"], mr: ["Deva", "IN"], ne: ["Deva", "NP"], bn: ["Beng", "BD"],
+            pa: ["Guru", "IN"], gu: ["Gujr", "IN"], ta: ["Taml", "IN"], te: ["Telu", "IN"],
+            kn: ["Knda", "IN"], ml: ["Mlym", "IN"], si: ["Sinh", "LK"], th: ["Thai", "TH"],
+            lo: ["Laoo", "LA"], my: ["Mymr", "MM"], km: ["Khmr", "KH"], am: ["Ethi", "ET"],
+            ja: ["Jpan", "JP"], ko: ["Kore", "KR"], zh: ["Hans", "CN"], und: ["Latn", "US"],
+        };
+        const titleCase = (s) => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+        class Locale {
+            constructor(tag, options) {
+                if (tag && typeof tag === "object" && tag.__isLocale) tag = tag.toString();
+                tag = String(tag == null ? "" : tag).replace(/_/g, "-").trim();
+                var o = options || {};
+                var parts = tag.length ? tag.split("-") : [];
+                var i = 0, len = parts.length;
+                var language = "", script = "", region = "", variants = [], kw = {};
+                if (i < len && /^([a-z]{2,3}|[a-z]{5,8})$/i.test(parts[i])) language = parts[i++].toLowerCase();
+                if (i < len && /^[a-z]{4}$/i.test(parts[i])) { script = titleCase(parts[i]); i++; }
+                if (i < len && /^([a-z]{2}|[0-9]{3})$/i.test(parts[i])) region = parts[i++].toUpperCase();
+                while (i < len && /^([a-z0-9]{5,8}|[0-9][a-z0-9]{3})$/i.test(parts[i])) variants.push(parts[i++].toLowerCase());
+                // Extensions: only the -u- (Unicode) extension is interpreted;
+                // any other singleton's subtags are consumed and dropped.
+                while (i < len) {
+                    var sing = parts[i++];
+                    if (!sing || sing.length !== 1) continue;
+                    if (sing.toLowerCase() === "u") {
+                        var key = "";
+                        while (i < len && parts[i].length > 1) {
+                            var pv = parts[i++].toLowerCase();
+                            if (pv.length === 2) { key = pv; if (!(key in kw)) kw[key] = ""; }
+                            else if (key) kw[key] = kw[key] ? kw[key] + "-" + pv : pv;
+                        }
+                    } else {
+                        while (i < len && parts[i].length > 1) i++;
+                    }
+                }
+                // options override subtags + add -u- keywords (ECMA-402
+                // ApplyOptionsToTag / ApplyUnicodeExtensionToTag).
+                if (o.language != null && /^[a-z]{2,3}$/i.test(String(o.language))) language = String(o.language).toLowerCase();
+                if (o.script != null && /^[a-z]{4}$/i.test(String(o.script))) script = titleCase(String(o.script));
+                if (o.region != null && /^([a-z]{2}|[0-9]{3})$/i.test(String(o.region))) region = String(o.region).toUpperCase();
+                var okw = { calendar: "ca", collation: "co", hourCycle: "hc", caseFirst: "kf", numberingSystem: "nu" };
+                for (var ke in okw) if (o[ke] != null) kw[okw[ke]] = String(o[ke]).toLowerCase();
+                if (o.numeric != null) kw.kn = o.numeric ? "true" : "false";
+                this.__isLocale = true;
+                this.__lang = language || "und";
+                this.__script = script;
+                this.__region = region;
+                this.__variants = variants;
+                this.__kw = kw;
+            }
+            get language() { return this.__lang; }
+            get script() { return this.__script; }
+            get region() { return this.__region; }
+            get calendar() { return this.__kw.ca; }
+            get collation() { return this.__kw.co; }
+            get hourCycle() { return this.__kw.hc; }
+            get caseFirst() { return this.__kw.kf; }
+            get numberingSystem() { return this.__kw.nu; }
+            get numeric() { return "kn" in this.__kw && this.__kw.kn !== "false"; }
+            get baseName() {
+                var b = [this.__lang];
+                if (this.__script) b.push(this.__script);
+                if (this.__region) b.push(this.__region);
+                for (var k = 0; k < this.__variants.length; k++) b.push(this.__variants[k]);
+                return b.join("-");
+            }
+            __ext() {
+                var keys = Object.keys(this.__kw).sort();
+                if (!keys.length) return "";
+                var s = "-u";
+                for (var k = 0; k < keys.length; k++) { s += "-" + keys[k]; if (this.__kw[keys[k]]) s += "-" + this.__kw[keys[k]]; }
+                return s;
+            }
+            toString() { return this.baseName + this.__ext(); }
+            __build(lang, scr, reg) {
+                var b = [lang];
+                if (scr) b.push(scr);
+                if (reg) b.push(reg);
+                for (var k = 0; k < this.__variants.length; k++) b.push(this.__variants[k]);
+                return new Locale(b.join("-") + this.__ext());
+            }
+            maximize() {
+                var lang = this.__lang, scr = this.__script, reg = this.__region;
+                var like = LIKELY[lang];
+                if (like) { if (!scr) scr = like[0]; if (!reg) reg = like[1]; }
+                else if (!scr) scr = "Latn";
+                return this.__build(lang, scr, reg);
+            }
+            minimize() {
+                var m = this.maximize(), lang = m.__lang, scr = m.__script, reg = m.__region, t;
+                t = new Locale(lang).maximize();
+                if (t.__script === scr && t.__region === reg) return this.__build(lang, "", "");
+                if (reg) { t = new Locale(lang + "-" + reg).maximize(); if (t.__script === scr && t.__region === reg) return this.__build(lang, "", reg); }
+                if (scr) { t = new Locale(lang + "-" + scr).maximize(); if (t.__script === scr && t.__region === reg) return this.__build(lang, scr, ""); }
+                return this.__build(lang, scr, reg);
+            }
+        }
         // Intl.NumberFormat/DateTimeFormat/Collator are specced callable
         // WITHOUT `new` (legacy web-compat — they construct an instance
         // either way); only the newer ctors require `new`. ES classes throw
@@ -15346,7 +15467,7 @@ const PRELUDE: &str = r##"
             NumberFormat: callable(NumberFormat),
             DateTimeFormat: callable(DateTimeFormat),
             Collator: callable(Collator),
-            DisplayNames, PluralRules, RelativeTimeFormat,
+            DisplayNames, PluralRules, RelativeTimeFormat, Locale,
             getCanonicalLocales: localeList,
         };
         Number.prototype.toLocaleString = function (locales, options) { return new NumberFormat(locales, options).format(this); };
@@ -25968,13 +26089,26 @@ mod tests {
             ok.push(Intl.DateTimeFormat(0, { year: "numeric", month: "numeric", day: "numeric" })
                 .format(new Date(2026, 5, 12)) === "2026-06-12");
             ok.push(typeof Intl.Collator("en").compare === "function");
+            // Intl.Locale (ECMA-402): parse subtags + -u- keywords, maximize
+            // via the likely-subtags map. @formatjs/intl-localematcher builds
+            // `new Intl.Locale(tag).maximize()` at Mastodon boot; a missing
+            // ctor blanked the whole SPA.
+            ok.push(new Intl.Locale("en").maximize().toString() === "en-Latn-US");
+            ok.push(new Intl.Locale("EN-us").language === "en" && new Intl.Locale("en-US").region === "US");
+            ok.push(new Intl.Locale("zh").maximize().script === "Hans");
+            var loc = new Intl.Locale("ja-Jpan-JP-u-ca-japanese-hc-h12");
+            ok.push(loc.language === "ja" && loc.script === "Jpan" && loc.region === "JP");
+            ok.push(loc.calendar === "japanese" && loc.hourCycle === "h12" && loc.baseName === "ja-Jpan-JP");
+            ok.push(new Intl.Locale("en-Latn-US").minimize().toString() === "en");
+            ok.push(new Intl.Locale("en", { region: "GB", numeric: true }).toString() === "en-GB-u-kn-true");
             document.getElementById('out').textContent = ok.join(' ');
             </script></body>"##,
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(
             out.contains(
-                "true true true true true true true true true true true true true true true"
+                "true true true true true true true true true true true true true true true \
+                 true true true true true true true"
             ),
             "Intl probes failed: {out}"
         );
