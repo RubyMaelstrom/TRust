@@ -2251,29 +2251,12 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// Whether an element clips overflow (a non-`visible` `overflow`), so a
-    /// `white-space:nowrap` line inside it is truncated at its box edge.
-    fn clips_overflow(&self, id: NodeId) -> bool {
-        self.dom.computed_style(id, "overflow").is_some_and(|v| {
-            v.split_whitespace()
-                .any(|t| matches!(t, "hidden" | "clip" | "auto" | "scroll"))
-        })
-    }
-
-    /// Whether an element clips its VERTICAL overflow with `hidden`/`clip`
-    /// (NOT `auto`/`scroll` — those establish a scroll region, sized elsewhere).
-    /// A definite `height` + this ⇒ the box is exactly that height, so
-    /// `measure_boxes` caps the measured geometry to it (a React virtualized-list
-    /// placeholder's `height:N;overflow:hidden`). Every space-separated token
-    /// must be a clip keyword, so `overflow:hidden` / `hidden clip` count but
-    /// `auto hidden` (a scroll axis) does not — mirrors `is_hidden`'s zero-axis
-    /// clip test.
     /// Rows a box RESERVES for its clipped vertical overflow — the counterpart
     /// to `clip_heights` on the render side. `Some(rows)` when the box clips its
-    /// vertical overflow (`overflow`/`overflow-y` ∈ {hidden, clip}) AND has a
-    /// definite absolute `height`; `None` otherwise (or a `%`/`vh`/`auto`
-    /// height). The px→rows conversion uses the real cell height so the reserved
-    /// rows match what the visible (unclipped) version rendered.
+    /// vertical overflow (`clips_overflow_y`) AND has a definite absolute
+    /// `height`; `None` otherwise (or a `%`/`vh`/`auto` height). The px→rows
+    /// conversion uses the real cell height so the reserved rows match what the
+    /// visible (unclipped) version rendered.
     fn clip_reserve_rows(&self, id: NodeId) -> Option<usize> {
         if !self.clips_overflow_y(id) {
             return None;
@@ -2282,33 +2265,33 @@ impl<'a> Layout<'a> {
         css_length_rows_at(&h, self.cell_px_h)
     }
 
+    /// Whether an element clips its VERTICAL overflow with `hidden`/`clip`
+    /// (NOT `auto`/`scroll` — those establish a scroll region, sized
+    /// elsewhere). A definite `height` + this ⇒ the box is exactly that
+    /// height, so `measure_boxes` caps the measured geometry to it (a React
+    /// virtualized-list placeholder's `height:N;overflow:hidden`). Per-axis
+    /// via `axis_overflow`, so the `overflow-y` longhand wins over the
+    /// shorthand and a two-value `overflow: auto hidden` (y = hidden) clips.
     fn clips_overflow_y(&self, id: NodeId) -> bool {
-        let clips_all = |v: Option<String>| {
-            v.as_deref().is_some_and(|s| {
-                let mut toks = s.split_whitespace().peekable();
-                toks.peek().is_some() && toks.all(|t| matches!(t, "hidden" | "clip"))
-            })
-        };
-        clips_all(self.dom.computed_style(id, "overflow-y"))
-            || clips_all(self.dom.computed_style(id, "overflow"))
+        matches!(
+            self.axis_overflow(id, true).as_deref(),
+            Some("hidden" | "clip")
+        )
     }
 
-    /// Whether an element clips/scrolls its horizontal (flex main) axis —
-    /// `overflow` or `overflow-x` set to `auto`/`scroll`/`hidden`/`clip`. Such
-    /// a container is a scroll context, so a non-wrapping flex row that
-    /// overflows keeps its items side by side (clipped) instead of reflowing
-    /// into a vertical stack. See `flow_flex_row`.
+    /// Whether an element clips/scrolls its HORIZONTAL axis — used
+    /// `overflow-x` ∈ {`auto`, `scroll`, `hidden`, `clip`}, resolved per-axis
+    /// via `axis_overflow` (the longhand wins over the shorthand's x
+    /// component). Two consumers: a non-wrapping flex row inside such a
+    /// container keeps its items side by side (clipped) instead of reflowing
+    /// into a vertical stack (see `flow_flex_row`), and a
+    /// `white-space:nowrap` block that clips truncates its single line at its
+    /// box edge (the single-line-ellipsis card idiom).
     fn clips_x(&self, id: NodeId) -> bool {
-        [
-            self.dom.computed_style(id, "overflow"),
-            self.dom.computed_style(id, "overflow-x"),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|v| {
-            v.split_whitespace()
-                .any(|t| matches!(t, "hidden" | "clip" | "auto" | "scroll"))
-        })
+        matches!(
+            self.axis_overflow(id, false).as_deref(),
+            Some("hidden" | "clip" | "auto" | "scroll")
+        )
     }
 
     /// Flow the whole document into rows (shared by `lay_out_with_carousels`
@@ -2499,6 +2482,28 @@ impl<'a> Layout<'a> {
         if self.is_out_of_flow(id) && self.subtree_root != Some(id) {
             return;
         }
+        // Fragment scroll targets: record the flow row where every id-bearing
+        // element (and legacy `<a name>`) is entered, so a `#id` link / URL /
+        // live hash-change can scroll it to the top. Reuses the geometry
+        // `element_tops` map — remapped through the blank-row collapse in
+        // `finish` and merged across sub-layouts — so nested (flex/grid/
+        // bordered) anchors resolve too. Captured HERE, ahead of the early
+        // dispatches below, so replaced/control targets (`<img id>`, form
+        // controls, media) and floated ones anchor at their entry position; an
+        // out-of-flow target is captured inside its own placement sub-pass
+        // (the guard above returns before this) and `blit` merges it at its
+        // PLACED position. Cheap: one attr probe per element, id'd elements
+        // only. Under `tag_all_nodes` every element is recorded further down,
+        // so skip it here.
+        if !self.tag_all_nodes
+            && (self.dom.attr(id, "id").is_some_and(|v| !v.is_empty())
+                || (tag == "a" && self.dom.attr(id, "name").is_some_and(|v| !v.is_empty())))
+        {
+            self.element_tops.entry(id).or_insert((
+                u16::try_from(self.col).unwrap_or(u16::MAX),
+                u16::try_from(self.rows.len()).unwrap_or(u16::MAX),
+            ));
+        }
         // Paint suppression rides the formatting context (like `font_zero`): a
         // suppressed element and its subtree are laid out normally but painted
         // BLANK. Two CSS mechanisms, combined here:
@@ -2675,22 +2680,6 @@ impl<'a> Layout<'a> {
         // (nearest marker wins), and unmarked pages pay one attr miss.
         if self.dom.attr(id, "data-trust-hover").is_some() {
             cctx.node = id;
-        }
-        // Fragment scroll targets: record the flow row where every id-bearing
-        // element (and legacy `<a name>`) is entered, so a `#id` link / URL / live
-        // hash-change can scroll it to the top. Reuses the geometry `element_tops`
-        // map — remapped through the blank-row collapse in `finish` and merged
-        // across sub-layouts — so nested (flex/grid/bordered) anchors resolve too.
-        // Cheap: one attr probe per element, id'd elements only. Under
-        // `tag_all_nodes` every element is already recorded below, so skip it.
-        if !self.tag_all_nodes
-            && (self.dom.attr(id, "id").is_some_and(|v| !v.is_empty())
-                || (tag == "a" && self.dom.attr(id, "name").is_some_and(|v| !v.is_empty())))
-        {
-            self.element_tops.entry(id).or_insert((
-                u16::try_from(self.col).unwrap_or(u16::MAX),
-                u16::try_from(self.rows.len()).unwrap_or(u16::MAX),
-            ));
         }
         // Geometry measurement: attribute every item to its nearest element so
         // `measure_boxes` can recover per-element boxes. A descendant element
@@ -3092,13 +3081,14 @@ impl<'a> Layout<'a> {
         {
             self.ws = w;
         }
-        // A `white-space:nowrap` + `overflow:hidden` box truncates its single
-        // line at its content edge (the single-line-ellipsis card idiom). The
-        // band is already set (`begin_line` above), so `line_right` is this
-        // box's right; clip there. Saved/restored so siblings/children that
-        // inherit `nowrap` but DON'T clip overflow lay normally.
+        // A `white-space:nowrap` box that clips its x axis (`overflow` or the
+        // bare `overflow-x` longhand) truncates its single line at its content
+        // edge (the single-line-ellipsis card idiom). The band is already set
+        // (`begin_line` above), so `line_right` is this box's right; clip
+        // there. Saved/restored so siblings/children that inherit `nowrap` but
+        // DON'T clip overflow lay normally.
         let saved_clip = (self.clip_right, self.clip_done);
-        if block_like && self.ws == WhiteSpace::Nowrap && self.clips_overflow(id) {
+        if block_like && self.ws == WhiteSpace::Nowrap && self.clips_x(id) {
             self.clip_right = Some(self.line_right);
             self.clip_done = false;
         }
@@ -3886,7 +3876,7 @@ impl<'a> Layout<'a> {
             .descendants(root)
             .enumerate()
             .filter(|&(_, id)| self.is_modal_overlay(id))
-            .max_by_key(|&(order, id)| (self.z_order(id), order))
+            .max_by_key(|&(order, id)| (self.z_index(id), order))
             .map(|(_, id)| id)?;
         // The geometry test also matches a full-viewport BACKGROUND layer (a
         // hero / `position:fixed; inset:0` slideshow). That isn't a modal — a
@@ -3911,7 +3901,7 @@ impl<'a> Layout<'a> {
     /// modal", so excluding it avoids false negatives that would hide a genuine
     /// modal sitting beneath such chrome.
     fn content_paints_above(&self, overlay: NodeId) -> bool {
-        let oz = self.z_order(overlay);
+        let oz = self.z_index(overlay);
         // Exclude the overlay, its subtree (its own content) and its ancestors
         // (whose stacking context carries the overlay along).
         let mut excluded: HashSet<NodeId> = self.dom.descendants(overlay).collect();
@@ -3940,7 +3930,7 @@ impl<'a> Layout<'a> {
                 // solar battery meter, a hero slideshow) is painted under the
                 // page's positioned content that follows it — not a modal.
                 && {
-                    let cz = self.z_order(id);
+                    let cz = self.z_index(id);
                     cz > oz || (cz == oz && overlay_pos.is_some_and(|op| pos > op))
                 }
                 && self.overlay_has_content(id)
@@ -4082,6 +4072,15 @@ impl<'a> Layout<'a> {
 
     /// The element's `overflow` on one axis, honoring the `overflow-x`/`-y`
     /// longhands over the `overflow: <x> <y>` shorthand (single value = both).
+    /// THE single overflow authority: every overflow consumer (`clips_x`,
+    /// `clips_overflow_y`, `is_hscroll`, `establishes_bfc`,
+    /// `node_clips_overflow`, `scroll_region_height`, `is_clip_collapsed`)
+    /// resolves through it, so longhand-vs-shorthand precedence can't
+    /// disagree between them. Two documented simplifications: a longhand
+    /// always beats the shorthand regardless of cascade order (the cascade
+    /// doesn't expand the shorthand into the longhands), and CSS Overflow 3
+    /// §3.1's computed-value coercion (`visible` beside a scrolling axis
+    /// computes to `auto`) is not applied.
     fn axis_overflow(&self, id: NodeId, vertical: bool) -> Option<String> {
         let longhand = if vertical { "overflow-y" } else { "overflow-x" };
         if let Some(v) = self.dom.computed_style(id, longhand) {
@@ -4222,15 +4221,6 @@ impl<'a> Layout<'a> {
                 }
                 _ => false,
             })
-    }
-
-    /// The `z-index` of `id` as an integer (`auto`/unset/unparseable → 0), for
-    /// ordering overlapping overlays.
-    fn z_order(&self, id: NodeId) -> i32 {
-        self.dom
-            .computed_style(id, "z-index")
-            .and_then(|v| v.trim().parse::<i32>().ok())
-            .unwrap_or(0)
     }
 
     /// Whether a node's nearest preceding element sibling is out of flow — so
@@ -4714,15 +4704,7 @@ impl<'a> Layout<'a> {
     /// clips on the x axis AND has a `hscroll_track` (an over-wide child
     /// holding several cards).
     fn is_hscroll(&self, id: NodeId) -> bool {
-        let scrolls = self
-            .dom
-            .computed_style(id, "overflow")
-            .or_else(|| self.dom.computed_style(id, "overflow-x"))
-            .is_some_and(|v| {
-                v.split_whitespace()
-                    .any(|t| matches!(t, "hidden" | "auto" | "scroll" | "clip"))
-            });
-        scrolls && self.hscroll_track(id).is_some()
+        self.clips_x(id) && self.hscroll_track(id).is_some()
     }
 
     /// The over-wide "track" inside a scroll container `id`: a child holding a
@@ -4981,10 +4963,14 @@ impl<'a> Layout<'a> {
         let h = self.scroll_region_height(id).unwrap_or(0);
         // Lay the content into its own buffer under the recursion guard, so the
         // sub-layout flows `id`'s interior (flex/grid/block) instead of
-        // re-entering `flow_region` on `id`.
+        // re-entering `flow_region` on `id`. The measuring flag carries through:
+        // an intrinsic-width pass flows this buffer INLINE (see `clip` below),
+        // and laying it un-measured would apply justify-content/text-align
+        // offsets — inflating the measured width of any subtree holding a
+        // region (a shrink-to-fit float/flex item measured ~half the band).
         let saved = self.region_inner;
         self.region_inner = Some(id);
-        let buffer = self.layout_subtree_inner(id, width, None, false, ctx);
+        let buffer = self.layout_subtree_inner(id, width, None, self.measuring, ctx);
         self.region_inner = saved;
         let content_h = buffer.rows.len();
         // Reserve the clipped band on the REAL render pass for EVERY definite-
@@ -5647,10 +5633,12 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// The used `z-index` of a positioned box for painting order — the integer
-    /// value, or `0` for `auto`/unset/non-integer. Only the relative order among
-    /// the siblings of one containing block matters here (the occlusion collapse
-    /// in `place_positioned_children`), not stacking-context nesting.
+    /// The used `z-index` of a box for painting order — the integer value, or
+    /// `0` for `auto`/unset/non-integer. Two consumers, both comparing only the
+    /// RELATIVE order within one comparison set (never stacking-context
+    /// nesting): the modal-overlay pick (`find_modal_overlay`/
+    /// `content_paints_above`) and the positioned-sibling occlusion collapse in
+    /// `place_positioned_children`.
     fn z_index(&self, id: NodeId) -> i32 {
         self.dom
             .computed_style(id, "z-index")
@@ -6054,17 +6042,21 @@ impl<'a> Layout<'a> {
     /// Whether a block establishes a new block formatting context, so its
     /// descendant floats are contained rather than leaking to following
     /// siblings. We detect the two statically-resolvable triggers: a
-    /// non-`visible` `overflow` (the ubiquitous `overflow:hidden` clearfix)
-    /// and `display:flow-root`. Flex/grid containers and floats already lay
-    /// their content as self-contained boxes, so they're excluded by the
-    /// caller (`flex.is_none()`).
+    /// non-`visible` used `overflow` on EITHER axis (the ubiquitous
+    /// `overflow:hidden` clearfix — per-axis via `axis_overflow`, so a bare
+    /// `overflow-x`/`overflow-y` longhand counts too, CSS 2.1 §9.4.1) and
+    /// `display:flow-root`. Flex/grid containers and floats already lay their
+    /// content as self-contained boxes, so they're excluded by the caller
+    /// (`flex.is_none()`).
     fn establishes_bfc(&self, id: NodeId) -> bool {
         if self.dom.computed_display(id).as_deref() == Some("flow-root") {
             return true;
         }
-        self.dom.computed_style(id, "overflow").is_some_and(|v| {
-            v.split_whitespace()
-                .any(|t| matches!(t, "hidden" | "auto" | "scroll" | "clip"))
+        [false, true].into_iter().any(|vertical| {
+            matches!(
+                self.axis_overflow(id, vertical).as_deref(),
+                Some("hidden" | "clip" | "auto" | "scroll")
+            )
         })
     }
 
@@ -7563,21 +7555,13 @@ impl<'a> Layout<'a> {
             .max(frame_w + 1);
         let inner_w = box_w - frame_w;
         // Lay the element's own interior, marking it so the recursion stops
-        // and its margin is suppressed (we applied it out here).
-        let mut sub = Layout::new(
-            self.dom,
-            self.base,
-            inner_w,
-            self.forms,
-            self.controls,
-            self.images,
-            self.borders,
-        );
-        sub.viewport_w = self.viewport_w;
-        sub.viewport_h = self.viewport_h;
-        sub.tag_all_nodes = self.tag_all_nodes;
+        // and its margin is suppressed (we applied it out here). `make_sub`
+        // carries the pass-wide state — notably `table_depth` (the
+        // MAX_TABLE_DEPTH lid must survive a bordered box between table
+        // levels) and `measuring`/`shrink_wrap`/`modal_root`/
+        // `capture_boundaries`, which a hand-built sub silently dropped.
+        let mut sub = self.make_sub(inner_w);
         sub.inner_border_box = Some(id);
-        sub.region_inner = self.region_inner;
         // The interior pass must NOT re-float this same element: when `id` is
         // both floated and bordered, `flow_float` lays its box (skipping the
         // float) and that box's `flow_element(id)` routes here for the frame.
@@ -7841,14 +7825,17 @@ impl<'a> Layout<'a> {
     /// separate pass (a flex/grid item) still inherits an enclosing `<a>`'s
     /// link (and emphasis) — otherwise its contents would lose interactivity,
     /// exactly as a bordered box would without `flow_bordered` threading `ctx`.
-    fn layout_subtree_inner(
-        &self,
-        id: NodeId,
-        content_width: usize,
-        skip_float: Option<NodeId>,
-        measure: bool,
-        inherit: &Ctx,
-    ) -> LaidBox {
+    /// A fresh sub-layout carrying every pass-wide flag, shared cache, and
+    /// recursion guard a nested pass must inherit. ALL sub-layout construction
+    /// funnels through here (`layout_subtree_inner`, `flow_bordered`) so a
+    /// hand-built sub can't silently drop pass state again — dropping
+    /// `table_depth` reset the `MAX_TABLE_DEPTH` recursion lid across a
+    /// bordered box (hostile deep table/border nesting could then overflow the
+    /// stack), and dropping `measuring` re-applied alignment offsets (and
+    /// re-entered the expensive table column algorithm) inside measure passes.
+    /// Callers set only their own entry state on top (`subtree_root` /
+    /// `float_skip` / `inner_border_box` / a `measuring` override).
+    fn make_sub(&self, content_width: usize) -> Layout<'a> {
         let mut sub = Layout::new(
             self.dom,
             self.base,
@@ -7860,8 +7847,6 @@ impl<'a> Layout<'a> {
         );
         sub.viewport_w = self.viewport_w;
         sub.viewport_h = self.viewport_h;
-        sub.float_skip = skip_float;
-        sub.subtree_root = Some(id);
         sub.table_depth = self.table_depth;
         // Share the pass-wide intrinsic-width memo so a subtree measured by an
         // ancestor's sizing pass isn't re-measured when this pass measures it.
@@ -7872,7 +7857,7 @@ impl<'a> Layout<'a> {
         // A shrink-to-fit box's replaced descendants (the image can be nested in
         // flex/grid sub-layouts) must see the shrink-wrap context too.
         sub.shrink_wrap = self.shrink_wrap;
-        sub.measuring = measure;
+        sub.measuring = self.measuring;
         // Carry the measurement flag so a sub-layout tags its items with their
         // own nodes and records empty-element flow positions (`element_tops`);
         // `blit` then propagates that geometry back up. The render path keeps
@@ -7892,6 +7877,25 @@ impl<'a> Layout<'a> {
         // chat column lives in an abspos shell's sub-pass), so `blit` propagates
         // them up. Off when this pass isn't capturing (measure / non-live).
         sub.capture_boundaries = self.capture_boundaries;
+        // The px→rows clip conversion must use the same cell height everywhere
+        // in a pass (`measure_boxes` sets an explicit one; elsewhere this is
+        // the session global either way).
+        sub.cell_px_h = self.cell_px_h;
+        sub
+    }
+
+    fn layout_subtree_inner(
+        &self,
+        id: NodeId,
+        content_width: usize,
+        skip_float: Option<NodeId>,
+        measure: bool,
+        inherit: &Ctx,
+    ) -> LaidBox {
+        let mut sub = self.make_sub(content_width);
+        sub.float_skip = skip_float;
+        sub.subtree_root = Some(id);
+        sub.measuring = measure;
         sub.flow_node(id, inherit);
         sub.flush_block();
         sub.finish_floats();
@@ -10863,6 +10867,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fragment_anchors_cover_replaced_floated_and_positioned_targets() {
+        // Bug #7: the fragment-anchor capture in `flow_element` sat AFTER the
+        // early-return dispatches (img/controls/media/floats/out-of-flow), so
+        // `<img id>`, floated, and positioned targets never landed in
+        // `anchor_rows` and `#fragment` navigation to them silently no-op'd.
+        // In-flow/floated targets anchor at their entry position; an
+        // out-of-flow target is captured inside its placement sub-pass and
+        // `blit`-merged at its PLACED row.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/pic.png".to_owned(), (16, 8));
+        let html = r#"<body>
+            <p>intro</p>
+            <img id="pic" src="/pic.png">
+            <div id="floaty" style="float:left">F</div>
+            <div style="position:relative">
+              <div id="abs" style="position:absolute;top:32px">A</div>content
+            </div>
+            <p>outro</p>
+          </body>"#;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (_rows, _c, _rg, _sc, _b, _f, anchors) = lay_out_with_carousels(
+            &dom,
+            &base,
+            (80, 24),
+            &[],
+            &ControlMap::new(),
+            &images,
+            false,
+        );
+        assert!(
+            anchors.contains_key("pic"),
+            "an <img id> is a fragment target: {anchors:?}"
+        );
+        assert!(
+            anchors.contains_key("floaty"),
+            "a floated target anchors at its entry row: {anchors:?}"
+        );
+        assert!(
+            anchors.contains_key("abs"),
+            "a positioned target anchors at its placed row: {anchors:?}"
+        );
+    }
+
+    #[test]
+    fn a_scroll_region_does_not_inflate_intrinsic_width_measurement() {
+        // Bug #8: `flow_region` laid its buffer with `measure=false` even
+        // inside a measuring pass. The measuring pass flows the buffer INLINE,
+        // so alignment offsets — skipped while measuring everywhere else —
+        // applied and inflated the intrinsic width of any region-bearing
+        // subtree: this shrink-to-fit float measured ~half the band instead of
+        // its content width, shoving the following text far right.
+        let html = r#"<body>
+            <div style="float:left">
+              <div style="overflow-y:auto;height:32px"><div style="text-align:center">hi</div></div>
+            </div>
+            <p>after</p>
+          </body>"#;
+        let rows = lay(html, 80);
+        let after = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.text.contains("after"))
+            .expect("the following text lays out");
+        assert!(
+            after.col < 10,
+            "the float shrink-wraps to the region's content width, not a \
+             centered-offset inflation (after at col {})",
+            after.col
+        );
+    }
+
     /// Bug fix: the overlay-over-image lift (`insert_blank_rows`) must shift a
     /// scroll region recorded below the insert — regions (unlike carousels and
     /// floats) were not adjusted, so the reserved band drifted off its blank
@@ -11569,6 +11646,41 @@ mod tests {
             no_h.get(&id).unwrap().width,
             8.0,
             "unknown viewport height ⇒ vh unresolved ⇒ no floor, just content"
+        );
+    }
+
+    #[test]
+    fn nested_clip_placeholder_converts_px_with_the_explicit_cell_height() {
+        // Bug #12: sub-layouts fell back to the session-global cell height
+        // instead of the pass's explicit `cell_px`, so a clip placeholder
+        // nested in a flex item's sub-layout reserved the wrong row count
+        // under `measure_boxes`. Latent while both were 16px; real for any
+        // other terminal font size. At 32px cells, a 64px placeholder is TWO
+        // rows (64px back), not the global-16px four rows (128px).
+        let tall = "l1<br>l2<br>l3<br>l4<br>l5<br>l6<br>l7<br>l8";
+        let html = format!(
+            r#"<body><div style="display:flex"><div style="flex:1"><div id="ph" style="height:64px;overflow:hidden;opacity:0">{tall}</div></div><div style="flex:1">side</div></div></body>"#
+        );
+        let dom = Dom::parse_document(&html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let boxes = measure_boxes(
+            &dom,
+            &base,
+            (80, 24),
+            &[],
+            &ControlMap::new(),
+            (8, 32),
+            false,
+        );
+        let ph = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&n| dom.attr(n, "id") == Some("ph"))
+            .unwrap();
+        assert_eq!(
+            boxes.get(&ph).expect("the placeholder has a box").height,
+            64.0,
+            "64px at 32px cells round-trips to 2 reserved rows = 64px"
         );
     }
 
@@ -12868,6 +12980,31 @@ mod tests {
         assert!(
             all_text(&rows).contains("DEEPEST"),
             "the innermost cell content still renders past the depth lid"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_bordered_tables_hit_the_depth_lid() {
+        // Bug #9: `flow_bordered`'s hand-built sub-layout reset `table_depth`
+        // (and dropped `measuring`), so a bordered box between table levels
+        // defeated the MAX_TABLE_DEPTH recursion lid — hostile deep
+        // table/border nesting re-entered the full column algorithm per level
+        // (exponential measurement, and stack depth bounded only by the
+        // nesting). With the state carried through `make_sub`, the lid
+        // degrades deep tables to block-stacked content, which terminates
+        // and still renders the innermost content.
+        let mut html = String::from("DEEPEST");
+        for i in 0..40 {
+            html = format!(
+                "<table><tr><td><div style='border:1px solid'>L{i} {html}</div></td></tr></table>"
+            );
+        }
+        // 400 cells wide: each of the 40 nested frames eats 2 columns, and the
+        // innermost text must still have room to render on one line.
+        let rows = lay_b(&format!("<body>{html}</body>"), 400);
+        assert!(
+            all_text(&rows).contains("DEEPEST"),
+            "the innermost bordered cell content still renders past the depth lid"
         );
     }
 
@@ -14815,6 +14952,99 @@ mod tests {
         assert!(
             line.starts_with("Perman"),
             "keeps the leading text: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_overflow_x_longhand_truncates_a_nowrap_line() {
+        // Bug #11 (overflow unification): the nowrap-truncation check read only
+        // the `overflow` shorthand, so the equivalent bare `overflow-x:hidden`
+        // longhand — what card CSS commonly declares — never clipped. Every
+        // overflow consumer resolves per-axis through `axis_overflow` now.
+        let rows = lay(
+            r#"<body><div style="white-space:nowrap;overflow-x:hidden">Permanently banned forever</div></body>"#,
+            10,
+        );
+        let line = texts(&rows)[0].clone();
+        assert!(
+            display_width(&line) <= 10,
+            "clipped to the box width: {line:?}"
+        );
+        assert!(
+            line.ends_with('…'),
+            "truncation marked with an ellipsis: {line:?}"
+        );
+    }
+
+    #[test]
+    fn the_overflow_x_longhand_wins_over_the_shorthand() {
+        // `overflow:hidden` sets both axes, but the `overflow-x:visible`
+        // longhand re-opens the x axis (CSS Overflow §3) — the box no longer
+        // clips its nowrap line. The old check saw only the shorthand and
+        // truncated anyway.
+        let rows = lay(
+            r#"<body><div style="overflow:hidden;overflow-x:visible;white-space:nowrap">Permanently banned forever</div></body>"#,
+            10,
+        );
+        let line = texts(&rows)[0].clone();
+        assert!(
+            !line.contains('…'),
+            "the x axis is visible — no truncation: {line:?}"
+        );
+    }
+
+    #[test]
+    fn a_bare_overflow_longhand_establishes_a_bfc_containing_floats() {
+        // CSS 2.1 §9.4.1 / CSS Overflow 3: ANY non-visible overflow — including
+        // a bare `overflow-x:hidden` longhand — makes the block a BFC that
+        // contains its descendant floats. The shorthand-only check let the
+        // float leak beside the following sibling.
+        let html = r#"<body><div style="overflow-x:hidden"><div style="float:left">FLOAT</div></div><p>after</p></body>"#;
+        let rows = lay(html, 40);
+        let find = |needle: &str| {
+            rows.iter()
+                .enumerate()
+                .find_map(|(y, r)| {
+                    r.items
+                        .iter()
+                        .find(|it| it.text.contains(needle))
+                        .map(|it| (y, it.col))
+                })
+                .unwrap_or_else(|| panic!("{needle} renders"))
+        };
+        let float = find("FLOAT");
+        let after = find("after");
+        assert!(
+            after.0 > float.0,
+            "the float is contained — 'after' starts below it, not beside it: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(
+            after.1,
+            0,
+            "'after' returns to the left margin: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn a_two_value_overflow_shorthand_clips_the_y_axis() {
+        // `overflow: auto hidden` is `overflow-x:auto; overflow-y:hidden`
+        // (CSS Overflow §3). The old all-tokens test refused the pair, so a
+        // suppressed virtualized placeholder declaring it reserved nothing and
+        // flowed its full invisible content instead.
+        let tall = "l1<br>l2<br>l3<br>l4<br>l5<br>l6";
+        let rows = lay(
+            &format!(
+                r#"<body><div style="height:48px;overflow:auto hidden;opacity:0">{tall}</div></body>"#
+            ),
+            80,
+        );
+        assert_eq!(
+            rows.len(),
+            3,
+            "48px / 16px rows = 3 reserved rows, not the 6 invisible lines: {:?}",
+            texts(&rows)
         );
     }
 
