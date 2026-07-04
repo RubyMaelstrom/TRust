@@ -617,8 +617,16 @@ pub fn effective_row<'a>(
             let mut it = it.clone();
             let max_w = rg.width - it.col;
             if it.width > max_w {
-                it.width = max_w;
-                it.text = it.text.chars().take(max_w as usize).collect();
+                if it.text.is_empty() {
+                    // An image box: clip the reserved box to the scrollport.
+                    it.width = max_w;
+                } else {
+                    // Truncate by DISPLAY width (the binding width rule): a
+                    // char-count cut keeps up to 2× the cells of CJK/emoji
+                    // text, painting past the band and desyncing hit-tests.
+                    it.text = truncate_to_width(&it.text, max_w as usize);
+                    it.width = display_width(&it.text) as u16;
+                }
             }
             it.col += rg.left;
             merged.items.push(it);
@@ -733,6 +741,13 @@ struct LaidBox {
     /// propagates them so a region inside a float/flex/abspos sub-layout (the
     /// chat column) still reaches the document.
     regions: Vec<Region>,
+    /// Clip boxes (`Doc.scroll_clips` entries) recorded inside this box.
+    /// Position-independent (`(live_node, rows, cells)`), so `blit` propagates
+    /// them verbatim. Without this, a definite-height scroll-y box nested in a
+    /// flex/grid/float/abspos sub-layout never reached `Doc.scroll_clips`, and
+    /// the app never pushed its `clientHeight` to the live page — the one
+    /// harvest channel that didn't ride the box.
+    scroll_clips: ScrollClips,
     /// Recorded flow positions of EMPTY elements inside this box (measure
     /// pass only — `tag_all_nodes`), relative to its top-left; `blit`
     /// translates and propagates them so a boxless element nested in a
@@ -1608,6 +1623,18 @@ impl TextTransform {
     }
 }
 
+/// CSS "document white space" (CSS Text 3 §4.1.1): the ONLY characters that
+/// collapse and offer soft-wrap opportunities in the collapsing `white-space`
+/// modes. Deliberately NOT `char::is_whitespace`: U+00A0 NO-BREAK SPACE (and
+/// U+202F) have Unicode `White_Space=Yes` but are non-collapsible, NON-BREAKING
+/// glue — `10&nbsp;000` must neither wrap between its halves nor collapse its
+/// run (`&nbsp;&nbsp;&nbsp;` indentation is real spacing on old table-layout
+/// pages). Other Unicode spaces (em/ideographic) likewise render as themselves;
+/// treating them as word glue costs only a rare break opportunity.
+fn is_collapsible_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}')
+}
+
 /// Uppercase the first letter of each whitespace-separated word, leaving
 /// the rest as-is (CSS `text-transform: capitalize`).
 fn capitalize_words(s: &str) -> String {
@@ -2411,6 +2438,21 @@ impl<'a> Layout<'a> {
     /// renders directly into shadow with no slots; slotted geometry is a deferred
     /// refinement.
     fn flow_children(&self, id: NodeId) -> Vec<NodeId> {
+        // A closed `<details>` renders ONLY its first `<summary>` child (HTML
+        // rendering, "the details element": without `open` the second slot —
+        // everything else, including bare text nodes — is not rendered). The
+        // dialog/popover analogues live in `Dom::is_hidden`, but the details
+        // rule hides the CONTENT, not an element with a display to override,
+        // so the flow's child chokepoint is the faithful place for it.
+        if self.dom.tag_name(id) == Some("details") && self.dom.attr(id, "open").is_none() {
+            return self
+                .dom
+                .children(id)
+                .into_iter()
+                .find(|&c| self.dom.tag_name(c) == Some("summary"))
+                .into_iter()
+                .collect();
+        }
         // A `<slot>` is replaced by the host's light children assigned to it
         // (its fallback content only when nothing is assigned) — the flat-tree
         // projection that lets a routed component nested behind a shadow
@@ -3797,6 +3839,9 @@ impl<'a> Layout<'a> {
                 f.row += row;
                 self.fixed.push(f);
             }
+            // A definite-height scroll box inside the rail keeps its client
+            // box honest even though the rail's Region support is deferred.
+            self.scroll_clips.extend(b.scroll_clips.iter().copied());
             if b.height == 0 {
                 continue;
             }
@@ -4983,6 +5028,12 @@ impl<'a> Layout<'a> {
                 f.row += row_base as u16;
                 self.fixed.push(f);
             }
+            // Clip boxes recorded inside the buffer (a nested definite-height
+            // scroll box) still describe real client boxes — carry them up.
+            // (The nested Region itself is still dropped here — the known
+            // Phase-4 nested-regions gap — but its clientHeight stays honest.)
+            self.scroll_clips
+                .extend(buffer.scroll_clips.iter().copied());
             // A real scroll viewport: reserve exactly H blank doc rows for the
             // band (the renderer fills them from the buffer, clipped/windowed).
             for _ in 0..h {
@@ -5447,10 +5498,15 @@ impl<'a> Layout<'a> {
         })
     }
 
-    /// Insert `n` blank rows at row `at`, pushing the existing rows — and the
-    /// row references of any carousels/floats at or below `at` — down. Lets a
-    /// lifted overlay (see `place_positioned_children`) take its own row without
-    /// painting over what was there.
+    /// Insert `n` blank rows at row `at`, pushing the existing rows — and EVERY
+    /// recorded row reference at or below `at` (carousels, floats, scroll
+    /// regions, pinned fixed boxes, measured element tops, incremental-layout
+    /// boundaries) — down. Lets a lifted overlay (see
+    /// `place_positioned_children`) take its own row without painting over what
+    /// was there. Shifting only some of the side channels is a correctness
+    /// hole: a stale `Region.start_row` drifts the reserved band off its rows
+    /// (and mis-marks the reserved set in `finish`), and a stale
+    /// `BoundaryRec` span makes a live incremental patch splice the wrong rows.
     fn insert_blank_rows(&mut self, at: usize, n: usize) {
         if n == 0 || at > self.rows.len() {
             return;
@@ -5471,6 +5527,31 @@ impl<'a> Layout<'a> {
             }
             if f.bottom >= at {
                 f.bottom += n;
+            }
+        }
+        for rg in &mut self.regions {
+            if rg.start_row >= at {
+                rg.start_row += n;
+            }
+        }
+        for f in &mut self.fixed {
+            if f.row as usize >= at {
+                f.row = f.row.saturating_add(n as u16);
+            }
+        }
+        for (_, row) in self.element_tops.values_mut() {
+            if *row as usize >= at {
+                *row = row.saturating_add(n as u16);
+            }
+        }
+        for rec in self.boundary_boxes.values_mut() {
+            if rec.start_row >= at {
+                rec.start_row += n;
+            }
+            // End is EXCLUSIVE: a span ending exactly at the insert point sits
+            // wholly above it and must not grow over the inserted blanks.
+            if rec.end_row > at {
+                rec.end_row += n;
             }
         }
     }
@@ -6555,10 +6636,26 @@ impl<'a> Layout<'a> {
             return;
         }
 
+        // Caption boxes (CSS 2.1 §17.4): a `table-caption` child renders as an
+        // ordinary block ABOVE the table's grid — or below it for
+        // `caption-side:bottom` — never as grid content (`table_cell_rows`
+        // skips it, which used to drop the caption entirely: Wikipedia
+        // infoboxes lost their titles).
+        let (top_caps, bottom_caps): (Vec<NodeId>, Vec<NodeId>) = self
+            .dom
+            .children(id)
+            .into_iter()
+            .filter(|&c| self.dom.effective_display(c).as_deref() == Some("table-caption"))
+            .partition(|&c| {
+                self.dom.computed_style(c, "caption-side").as_deref() != Some("bottom")
+            });
+        self.flow_captions(&top_caps, ctx);
+
         let band = self.line_right.saturating_sub(self.line_left).max(1);
         let rows = self.table_cell_rows(id);
         let (cells, ncols) = build_table_grid(self, &rows);
         if cells.is_empty() || ncols == 0 {
+            self.flow_captions(&bottom_caps, ctx);
             if self.gap_after(id, "table") {
                 self.push_blank();
             }
@@ -6625,6 +6722,7 @@ impl<'a> Layout<'a> {
         }
         self.table_depth -= 1;
         if nrows == 0 {
+            self.flow_captions(&bottom_caps, ctx);
             if self.gap_after(id, "table") {
                 self.push_blank();
             }
@@ -6677,8 +6775,33 @@ impl<'a> Layout<'a> {
         }
         self.col = self.line_left;
         self.pending_space = false;
+        self.flow_captions(&bottom_caps, ctx);
         if self.gap_after(id, "table") {
             self.push_blank();
+        }
+    }
+
+    /// Flow a table's caption children as ordinary blocks (CSS 2.1 §17.4 — the
+    /// caption box, above or below the grid per `caption-side`). The UA sheet
+    /// centers captions (`caption { text-align: center }`); we apply that only
+    /// when the cascade resolves no `text-align` for the caption — an author
+    /// value (set on it or inherited) wins inside `flow_element` regardless,
+    /// so centering against a resolvable value would be overwritten anyway.
+    fn flow_captions(&mut self, caps: &[NodeId], ctx: &Ctx) {
+        for &c in caps {
+            let saved = self.align;
+            if self
+                .dom
+                .computed_value(c, "text-align")
+                .as_deref()
+                .and_then(Align::from_css)
+                .is_none()
+            {
+                self.align = Align::Center;
+            }
+            self.flow_node(c, ctx);
+            self.flush_block();
+            self.align = saved;
         }
     }
 
@@ -7465,7 +7588,8 @@ impl<'a> Layout<'a> {
         sub.flow_node(id, ctx);
         sub.flush_block();
         sub.finish_floats();
-        let (rows, carousels, fixed, regions, element_tops, _, boundary_boxes) = sub.finish();
+        let (rows, carousels, fixed, regions, element_tops, scroll_clips, boundary_boxes) =
+            sub.finish();
         let content = LaidBox {
             height: rows.len() as u16,
             width: inner_w as u16,
@@ -7473,6 +7597,7 @@ impl<'a> Layout<'a> {
             carousels,
             fixed,
             regions,
+            scroll_clips,
             element_tops,
             boundary_boxes,
             root: Some(id),
@@ -7538,8 +7663,16 @@ impl<'a> Layout<'a> {
                     }
                     let max_w = inner_w - it.col;
                     if it.width > max_w {
-                        it.width = max_w;
-                        it.text = it.text.chars().take(max_w as usize).collect();
+                        if it.text.is_empty() {
+                            // An image box: clip the reserved box at the bar.
+                            it.width = max_w;
+                        } else {
+                            // Truncate by DISPLAY width (the binding width
+                            // rule) so clipped CJK/emoji can't paint through
+                            // the right border bar.
+                            it.text = truncate_to_width(&it.text, max_w as usize);
+                            it.width = display_width(&it.text) as u16;
+                        }
                     }
                 }
                 it.col += col_shift;
@@ -7644,6 +7777,9 @@ impl<'a> Layout<'a> {
             carousels,
             fixed,
             regions,
+            // Clip boxes are position-independent — the frame shift doesn't
+            // touch them.
+            scroll_clips: content.scroll_clips,
             element_tops,
             boundary_boxes,
             // The frame wraps the SAME element — keep its root, but the framed
@@ -7759,7 +7895,8 @@ impl<'a> Layout<'a> {
         sub.flow_node(id, inherit);
         sub.flush_block();
         sub.finish_floats();
-        let (rows, carousels, fixed, regions, element_tops, _, boundary_boxes) = sub.finish();
+        let (rows, carousels, fixed, regions, element_tops, scroll_clips, boundary_boxes) =
+            sub.finish();
         let width = rows
             .iter()
             .flat_map(|r| &r.items)
@@ -7774,6 +7911,7 @@ impl<'a> Layout<'a> {
             carousels,
             fixed,
             regions,
+            scroll_clips,
             element_tops,
             boundary_boxes,
             root: Some(id),
@@ -7819,6 +7957,11 @@ impl<'a> Layout<'a> {
             rg.left += col_off;
             self.regions.push(rg);
         }
+        // Clip boxes (`Doc.scroll_clips`) carry no coordinates — `(live_node,
+        // rows, cells)` — so they propagate verbatim; the app pushes a live
+        // page's `clientHeight` from exactly this list, and dropping them here
+        // silently lost every scroll box nested in a sub-layout.
+        self.scroll_clips.extend(b.scroll_clips.iter().copied());
         // Pinned `position:fixed` boxes captured inside travel with the box: their
         // captured position is the box-relative flow position (their static
         // origin), so it shifts by `col_off`/`row_base` up toward the document's
@@ -7907,22 +8050,24 @@ impl<'a> Layout<'a> {
 
     /// Flow text that collapses runs of whitespace to a single space. In
     /// `nowrap` mode the words still collapse but never break the line
-    /// (the wrap is gated in `place_word`).
+    /// (the wrap is gated in `place_word`). Only CSS document white space
+    /// (`is_collapsible_space`) collapses or separates words — U+00A0 stays
+    /// INSIDE its word as non-breaking glue, per CSS Text 3 §4.1.1.
     fn place_collapsed(&mut self, text: &str, ctx: &Ctx) {
         if text.is_empty() {
             return;
         }
-        let leading = text.starts_with(char::is_whitespace);
-        let trailing = text.ends_with(char::is_whitespace);
+        let leading = text.starts_with(is_collapsible_space);
+        let trailing = text.ends_with(is_collapsible_space);
         let mut any = false;
         if leading {
             self.pending_space = true;
         }
-        for (i, word) in text.split_whitespace().enumerate() {
+        for word in text.split(is_collapsible_space).filter(|w| !w.is_empty()) {
             // Inter-word whitespace within the node collapses to one
             // space; `pending_space` carries it (and any space owed
             // across a node boundary) into the placement.
-            if i > 0 {
+            if any {
                 self.pending_space = true;
             }
             self.place_word(word, ctx);
@@ -10680,6 +10825,261 @@ mod tests {
         let dom = Dom::parse_document(html);
         let base = Url::parse("https://example.com/").unwrap();
         lay_out(&dom, &base, width, &[], &ControlMap::new(), images, false)
+    }
+
+    /// Bug fix: `Doc.scroll_clips` entries recorded inside a SUB-LAYOUT (here a
+    /// definite-height scroll box nested in a flex item) must propagate up
+    /// through `blit` like every other harvest channel — the app pushes a live
+    /// page's `clientHeight` from exactly this list, and they used to be
+    /// silently dropped at `layout_subtree_inner`.
+    #[test]
+    fn scroll_clips_propagate_out_of_flex_sub_layouts() {
+        let html = "<div style='display:flex'>\
+            <div style='flex:1'>\
+              <div data-trust-node='7' style='height:64px;overflow-y:auto'>\
+                <p>one</p><p>two</p><p>three</p><p>four</p><p>five</p><p>six</p>\
+              </div>\
+            </div>\
+            <div style='flex:1'><p>sidebar</p></div>\
+          </div>";
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (_rows, _c, regions, clips, _b, _f, _a) = lay_out_with_carousels(
+            &dom,
+            &base,
+            (80, 24),
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
+        assert!(
+            !regions.is_empty(),
+            "the nested scroll box still forms a region"
+        );
+        assert!(
+            clips.iter().any(|&(node, h, _w)| node == 7 && h == 4),
+            "the nested box's clip (node 7, 64px = 4 rows) reaches the top level: {clips:?}"
+        );
+    }
+
+    /// Bug fix: the overlay-over-image lift (`insert_blank_rows`) must shift a
+    /// scroll region recorded below the insert — regions (unlike carousels and
+    /// floats) were not adjusted, so the reserved band drifted off its blank
+    /// rows and `finish`'s reserved-row protection marked the wrong rows.
+    #[test]
+    fn overlay_lift_shifts_a_scroll_region_below_it() {
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/pic.png".to_string(), (10, 3));
+        let html = "<div style='position:relative'>\
+            <img src='/pic.png' alt=''>\
+            <div style='position:absolute;top:0;left:0'>SALE</div>\
+            <div data-trust-node='9' style='height:48px;overflow-y:auto'>\
+              <p>m1</p><p>m2</p><p>m3</p><p>m4</p><p>m5</p><p>m6</p>\
+            </div>\
+            <p>AFTER</p>\
+          </div>";
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (rows, _c, regions, _cl, _b, _f, _a) = lay_out_with_carousels(
+            &dom,
+            &base,
+            (60, 24),
+            &[],
+            &ControlMap::new(),
+            &images,
+            false,
+        );
+        // The lift really happened: the overlay sits above the image.
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|r| r.items.iter().any(|i| i.text.contains(needle)))
+                .unwrap_or_else(|| panic!("{needle} laid out"))
+        };
+        let img_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.image.is_some()))
+            .expect("image laid out");
+        assert!(row_of("SALE") < img_row, "overlay lifted above the image");
+        // The region's reserved band still points at its own blank rows (a
+        // stale start_row lands on the image's spacer rows, which carry
+        // marker items).
+        assert_eq!(regions.len(), 1);
+        let rg = &regions[0];
+        for (r, row) in rows
+            .iter()
+            .enumerate()
+            .skip(rg.start_row)
+            .take(rg.height as usize)
+        {
+            assert!(
+                row.items.is_empty(),
+                "reserved band row {r} must be blank: {:?}",
+                row.items
+            );
+        }
+        assert!(
+            row_of("AFTER") >= rg.start_row + rg.height as usize,
+            "content after the region stays below its band"
+        );
+    }
+
+    /// Bug fix: region-edge clipping truncates by DISPLAY width, not char
+    /// count — a char-count cut kept up to 2× the cells of CJK text, painting
+    /// past the scrollport and desyncing `width` from the rendered glyphs.
+    #[test]
+    fn region_clip_truncates_by_display_width_not_chars() {
+        let rg = Region {
+            node: NO_NODE,
+            start_row: 0,
+            left: 2,
+            width: 4,
+            height: 1,
+            buffer: vec![Row {
+                items: vec![Item {
+                    col: 0,
+                    width: 10,
+                    height: 1,
+                    text: "日本語です".to_string(),
+                    kind: ItemKind::Text,
+                    image: None,
+                    crop: false,
+                    pixelated: false,
+                    emph: Emphasis::default(),
+                    node: NO_NODE,
+                    link: None,
+                    invisible: false,
+                }],
+            }],
+            voffset: 0,
+            live_node: None,
+            voffset_from_page: false,
+            carousels: Vec::new(),
+            image_urls: Vec::new(),
+        };
+        let rows = vec![Row::default()];
+        let merged = effective_row(&rows, std::slice::from_ref(&rg), 0);
+        let it = &merged.items[0];
+        assert_eq!(it.text, "日本", "2 wide glyphs = the 4-cell scrollport");
+        assert_eq!(
+            it.width as usize,
+            display_width(&it.text),
+            "item width matches what actually renders"
+        );
+    }
+
+    /// Bug fix: the border frame clips interior overflow by DISPLAY width too,
+    /// so clipped CJK can't paint through the right border bar.
+    #[test]
+    fn border_clip_truncates_by_display_width_not_chars() {
+        let html = "<div style='border:1px solid;width:80px;white-space:nowrap'>日本語のテキストです</div>";
+        let rows = lay_b(html, 40);
+        let text_row = rows
+            .iter()
+            .find(|r| r.items.iter().any(|i| i.text.contains('日')))
+            .expect("content row inside the frame");
+        let it = text_row
+            .items
+            .iter()
+            .find(|i| i.text.contains('日'))
+            .unwrap();
+        let bar_col = text_row
+            .items
+            .iter()
+            .filter(|i| i.kind == ItemKind::Border)
+            .map(|i| i.col)
+            .max()
+            .expect("right border bar present");
+        assert!(
+            it.col as usize + display_width(&it.text) <= bar_col as usize,
+            "clipped text must end at or before the right bar: end={} bar={}",
+            it.col as usize + display_width(&it.text),
+            bar_col
+        );
+        assert_eq!(it.width as usize, display_width(&it.text));
+    }
+
+    /// CSS Text 3 §4.1.1: U+00A0 is NOT document white space — it neither
+    /// collapses nor offers a soft-wrap opportunity. `10&nbsp;000` stays one
+    /// unbreakable token; ordinary space runs still collapse.
+    #[test]
+    fn nbsp_neither_collapses_nor_wraps() {
+        // Narrow band: without the glue, "10" fits after "wwwwww" and "000"
+        // wraps alone; with it the whole number wraps as a unit.
+        let rows = lay("<p>wwwwww 10\u{a0}000</p>", 10);
+        let lines: Vec<String> = rows.iter().map(render_row).collect();
+        assert!(
+            lines.iter().any(|l| l.contains("10\u{a0}000")),
+            "the nbsp-glued number stays on one line: {lines:?}"
+        );
+        // Runs of NBSP are preserved, not collapsed to one space.
+        let text = all_text(&lay("<p>A\u{a0}\u{a0}\u{a0}B</p>", 20));
+        assert!(
+            text.contains("A\u{a0}\u{a0}\u{a0}B"),
+            "nbsp run preserved: {text:?}"
+        );
+        // Ordinary whitespace runs still collapse to a single space.
+        let text = all_text(&lay("<p>A  \n  B</p>", 20));
+        assert!(text.contains("A B"), "plain runs collapse: {text:?}");
+    }
+
+    /// HTML rendering, "the details element": a `<details>` without `open`
+    /// renders only its first `<summary>` — the rest of the content (elements
+    /// AND bare text) is not rendered until it opens.
+    #[test]
+    fn closed_details_renders_only_its_summary() {
+        let text = all_text(&lay(
+            "<details><summary>More info</summary><p>SECRET</p>loose text</details>",
+            60,
+        ));
+        assert!(text.contains("More info"), "summary shows: {text:?}");
+        assert!(!text.contains("SECRET"), "closed content hidden: {text:?}");
+        assert!(!text.contains("loose"), "closed bare text hidden: {text:?}");
+        let text = all_text(&lay(
+            "<details open><summary>More info</summary><p>SECRET</p></details>",
+            60,
+        ));
+        assert!(
+            text.contains("SECRET"),
+            "open details shows its content: {text:?}"
+        );
+    }
+
+    /// CSS 2.1 §17.4: a `<caption>` renders as a block above the table's grid
+    /// (below for `caption-side:bottom`), centered by the UA default. It used
+    /// to be dropped entirely (`table_cell_rows` skips caption children).
+    #[test]
+    fn table_caption_renders_above_the_grid_and_centered() {
+        let html = "<table><caption>Monthly Savings</caption>\
+            <tr><td>January</td><td>100</td></tr></table>";
+        let rows = lay(html, 60);
+        let row_of = |rows: &[Row], needle: &str| {
+            rows.iter()
+                .position(|r| r.items.iter().any(|i| i.text.contains(needle)))
+                .unwrap_or_else(|| panic!("{needle} laid out"))
+        };
+        let cap_row = row_of(&rows, "Monthly");
+        assert!(
+            cap_row < row_of(&rows, "January"),
+            "caption sits above the grid"
+        );
+        let cap = rows[cap_row]
+            .items
+            .iter()
+            .find(|i| i.text.contains("Monthly"))
+            .unwrap();
+        assert!(
+            cap.col > 0,
+            "UA default centers the caption, col={}",
+            cap.col
+        );
+        let html = "<table><caption style='caption-side:bottom'>Legend</caption>\
+            <tr><td>January</td><td>100</td></tr></table>";
+        let rows = lay(html, 60);
+        assert!(
+            row_of(&rows, "Legend") > row_of(&rows, "January"),
+            "caption-side:bottom flows it below the grid"
+        );
     }
 
     /// A COLUMN flex container's cross-axis alignment (CSS Flexbox §8.3):
