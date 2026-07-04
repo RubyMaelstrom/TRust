@@ -1566,9 +1566,48 @@ impl WhiteSpace {
             "normal" => Some(WhiteSpace::Normal),
             "nowrap" => Some(WhiteSpace::Nowrap),
             "pre" => Some(WhiteSpace::Pre),
-            "pre-wrap" => Some(WhiteSpace::PreWrap),
+            // `break-spaces` (CSS Text 4) = preserve + wrap, differing from
+            // pre-wrap only in trailing-space breaking — at terminal cell
+            // resolution the pre-wrap chunker already breaks anywhere, so
+            // they coincide (documented approximation).
+            "pre-wrap" | "break-spaces" => Some(WhiteSpace::PreWrap),
             "pre-line" => Some(WhiteSpace::PreLine),
             _ => None,
+        }
+    }
+
+    /// Fold the CSS Text 4 longhands over this (shorthand-derived) mode:
+    /// `white-space-collapse` replaces the collapse half, `text-wrap-mode`
+    /// the wrap half — §2: `white-space` is now their shorthand. Approximations
+    /// (terminal scale): `break-spaces`/`preserve-spaces` act as `preserve`,
+    /// and preserve-breaks + nowrap has no variant here (stays `PreLine`).
+    fn with_longhands(self, collapse: Option<&str>, nowrap: Option<bool>) -> WhiteSpace {
+        // Decompose to (collapse: 0 collapse / 1 preserve / 2 preserve-breaks,
+        // nowrap), override the declared half, recompose.
+        let (mut c, mut nw) = match self {
+            WhiteSpace::Normal => (0u8, false),
+            WhiteSpace::Nowrap => (0, true),
+            WhiteSpace::Pre => (1, true),
+            WhiteSpace::PreWrap => (1, false),
+            WhiteSpace::PreLine => (2, false),
+        };
+        if let Some(v) = collapse {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "collapse" => c = 0,
+                "preserve" | "break-spaces" | "preserve-spaces" => c = 1,
+                "preserve-breaks" => c = 2,
+                _ => {}
+            }
+        }
+        if let Some(n) = nowrap {
+            nw = n;
+        }
+        match (c, nw) {
+            (0, false) => WhiteSpace::Normal,
+            (0, true) => WhiteSpace::Nowrap,
+            (1, false) => WhiteSpace::PreWrap,
+            (1, true) => WhiteSpace::Pre,
+            _ => WhiteSpace::PreLine,
         }
     }
     /// Whether runs of spaces collapse to a single space.
@@ -1741,18 +1780,32 @@ fn edge_string(width: usize, left: Option<&str>, right: Option<&str>, horiz: &st
 /// glyph, a formatted ordinal (`N. `/`a. `/`i. `), or empty for `none`. Each
 /// ordinal carries its trailing `". "`; bullets a trailing space. Unknown
 /// types fall back to a disc, matching the UA default.
-fn format_list_marker(kind: &str, n: u32) -> String {
+fn format_list_marker(kind: &str, n: i64) -> String {
+    // css-counter-styles-3 §3: a <counter-style-name> that doesn't name a
+    // style we implement falls back to DECIMAL (the `_` arm — it was a
+    // bullet, which numbered nothing). Alphabetic/roman systems are defined
+    // for n ≥ 1 only; outside their range the marker also falls back to
+    // decimal (a `<ol reversed>` can count through zero into negatives).
+    let alpha = |n: i64, upper: bool| match u32::try_from(n) {
+        Ok(v) if v >= 1 => format!("{}. ", alpha_marker(v, upper)),
+        _ => format!("{n}. "),
+    };
+    let roman = |n: i64, upper: bool| match u32::try_from(n) {
+        Ok(v) if v >= 1 => format!("{}. ", roman_marker(v, upper)),
+        _ => format!("{n}. "),
+    };
     match kind {
         "none" => String::new(),
+        "disc" => "• ".to_owned(),
         "circle" => "◦ ".to_owned(),
         "square" => "▪ ".to_owned(),
         "decimal" => format!("{n}. "),
         "decimal-leading-zero" => format!("{n:02}. "),
-        "lower-alpha" | "lower-latin" => format!("{}. ", alpha_marker(n, false)),
-        "upper-alpha" | "upper-latin" => format!("{}. ", alpha_marker(n, true)),
-        "lower-roman" => format!("{}. ", roman_marker(n, false)),
-        "upper-roman" => format!("{}. ", roman_marker(n, true)),
-        _ => "• ".to_owned(),
+        "lower-alpha" | "lower-latin" => alpha(n, false),
+        "upper-alpha" | "upper-latin" => alpha(n, true),
+        "lower-roman" => roman(n, false),
+        "upper-roman" => roman(n, true),
+        _ => format!("{n}. "),
     }
 }
 
@@ -2019,7 +2072,10 @@ struct Layout<'a> {
     /// Open lists' item counters (one per nesting level, next index). Every
     /// level counts; whether the marker shows as a number, letter, roman
     /// numeral, bullet, or nothing comes from each item's `list-style-type`.
-    list_stack: Vec<u32>,
+    /// One `(counter, step)` per open list level: the NEXT item's number and
+    /// the per-item increment — `+1`, or `-1` for `<ol reversed>` (HTML
+    /// §4.4.5: reversed lists count DOWN, and may pass zero into negatives).
+    list_stack: Vec<(i64, i64)>,
     /// Horizontally-scrollable strips discovered during the pass.
     carousels: Vec<Carousel>,
     /// `position:fixed` boxes captured into the pinned overlay layer during the
@@ -2088,6 +2144,10 @@ struct Layout<'a> {
     /// Set once the active clip box has been truncated, so the rest of its
     /// (unwrappable) words are dropped instead of laid past the cut.
     clip_done: bool,
+    /// Whether the active nowrap clip marks its truncation with `…`
+    /// (`text-overflow: ellipsis` or a custom-string value — CSS Overflow 3
+    /// §5.1) or cuts silently (the initial `clip`).
+    clip_ellipsis: bool,
     /// The topmost page-covering modal overlay, if any — an out-of-flow
     /// element that covers the viewport (or is a semantic dialog) AND holds
     /// real content (an age gate, consent wall, login modal, lightbox). A
@@ -2235,6 +2295,7 @@ impl<'a> Layout<'a> {
             borders,
             clip_right: None,
             clip_done: false,
+            clip_ellipsis: false,
             modal_root: None,
             tag_all_nodes: false,
             declared_boxes: HashMap::new(),
@@ -3081,30 +3142,80 @@ impl<'a> Layout<'a> {
         {
             self.ws = w;
         }
+        // CSS Text 4 longhands: a declared `text-wrap`/`text-wrap-mode`
+        // overrides the WRAP half of the mode (Tailwind emits
+        // `text-wrap:nowrap`; `balance`/`pretty`/`stable` are wrap-with-
+        // aesthetics = wrap), `white-space-collapse` the COLLAPSE half.
+        // Inherited via the registry, so a wrapper's longhand reaches its
+        // descendants. A longhand beats the shorthand regardless of cascade
+        // order — the cascade doesn't expand `white-space` (same documented
+        // simplification as `axis_overflow`).
+        let nowrap_half = self
+            .dom
+            .computed_value(id, "text-wrap-mode")
+            .or_else(|| self.dom.computed_value(id, "text-wrap"))
+            .and_then(|v| {
+                v.split_whitespace()
+                    .find_map(|t| match t.to_ascii_lowercase().as_str() {
+                        "nowrap" => Some(true),
+                        "wrap" | "balance" | "pretty" | "stable" => Some(false),
+                        _ => None,
+                    })
+            });
+        let collapse_half = self.dom.computed_value(id, "white-space-collapse");
+        if nowrap_half.is_some() || collapse_half.is_some() {
+            self.ws = self
+                .ws
+                .with_longhands(collapse_half.as_deref(), nowrap_half);
+        }
         // A `white-space:nowrap` box that clips its x axis (`overflow` or the
         // bare `overflow-x` longhand) truncates its single line at its content
         // edge (the single-line-ellipsis card idiom). The band is already set
         // (`begin_line` above), so `line_right` is this box's right; clip
         // there. Saved/restored so siblings/children that inherit `nowrap` but
         // DON'T clip overflow lay normally.
-        let saved_clip = (self.clip_right, self.clip_done);
+        let saved_clip = (self.clip_right, self.clip_done, self.clip_ellipsis);
         if block_like && self.ws == WhiteSpace::Nowrap && self.clips_x(id) {
             self.clip_right = Some(self.line_right);
             self.clip_done = false;
+            // `text-overflow` (CSS Overflow 3 §5.1) picks the truncation
+            // style: `ellipsis` (or a custom string) marks the cut with `…`;
+            // the initial `clip` cuts silently — what the wild's card CSS
+            // declares is honored, instead of `…` unconditionally. Not
+            // inherited: read on the clipping box itself.
+            self.clip_ellipsis = self
+                .dom
+                .computed_style(id, "text-overflow")
+                .is_some_and(|v| {
+                    let v = v.trim();
+                    v.eq_ignore_ascii_case("ellipsis") || v.starts_with('"') || v.starts_with('\'')
+                });
         }
         let pushed_list = match tag.as_str() {
             "ul" => {
-                self.list_stack.push(1);
+                self.list_stack.push((1, 1));
                 true
             }
             "ol" => {
-                // `<ol start=N>` seeds the counter (default 1).
+                // `<ol start=N>` seeds the counter (default 1; negative is
+                // valid HTML). `<ol reversed>` counts DOWN (HTML §4.4.5),
+                // starting at the number of `<li>` children when no `start`
+                // is given.
                 let start = self
                     .dom
                     .attr(id, "start")
-                    .and_then(|s| s.trim().parse::<u32>().ok())
-                    .unwrap_or(1);
-                self.list_stack.push(start);
+                    .and_then(|s| s.trim().parse::<i64>().ok());
+                if self.dom.attr(id, "reversed").is_some() {
+                    let items = self
+                        .dom
+                        .children(id)
+                        .into_iter()
+                        .filter(|&c| self.dom.tag_name(c) == Some("li"))
+                        .count() as i64;
+                    self.list_stack.push((start.unwrap_or(items), -1));
+                } else {
+                    self.list_stack.push((start.unwrap_or(1), 1));
+                }
                 true
             }
             _ => false,
@@ -3336,7 +3447,7 @@ impl<'a> Layout<'a> {
             }
         }
         self.ws = saved_ws;
-        (self.clip_right, self.clip_done) = saved_clip;
+        (self.clip_right, self.clip_done, self.clip_ellipsis) = saved_clip;
         self.align = saved_align;
         if pushed_list {
             self.list_stack.pop();
@@ -4278,6 +4389,48 @@ impl<'a> Layout<'a> {
         })
     }
 
+    /// Whether the container's flex MAIN axis runs reversed —
+    /// `flex-direction: row-reverse | column-reverse`, directly or via
+    /// `flex-flow` (Flexbox §5.1: main-start and main-end swap). Items then
+    /// lay out in reverse order and `justify_offsets` packs toward the
+    /// swapped main-start. Flex containers only: `flex-direction` does not
+    /// apply to grid, so the `display:grid` fallback through the shared wrap
+    /// path is untouched.
+    fn flex_main_reversed(&self, id: NodeId) -> bool {
+        if !matches!(
+            self.dom.computed_display(id).as_deref(),
+            Some("flex" | "inline-flex")
+        ) {
+            return false;
+        }
+        let has = |prop: Option<String>| {
+            prop.is_some_and(|v| {
+                v.split_whitespace()
+                    .any(|t| matches!(t, "row-reverse" | "column-reverse"))
+            })
+        };
+        has(self.dom.computed_style(id, "flex-direction"))
+            || has(self.dom.computed_style(id, "flex-flow"))
+    }
+
+    /// Whether the container's flex CROSS axis runs reversed —
+    /// `flex-wrap: wrap-reverse`, directly or via `flex-flow` (Flexbox §5.2:
+    /// cross-start and cross-end swap). The flex LINES then stack
+    /// bottom-to-top. Flex containers only (grid has no `flex-wrap`).
+    fn flex_cross_reversed(&self, id: NodeId) -> bool {
+        if !matches!(
+            self.dom.computed_display(id).as_deref(),
+            Some("flex" | "inline-flex")
+        ) {
+            return false;
+        }
+        let has = |prop: Option<String>| {
+            prop.is_some_and(|v| v.split_whitespace().any(|t| t == "wrap-reverse"))
+        };
+        has(self.dom.computed_style(id, "flex-wrap"))
+            || has(self.dom.computed_style(id, "flex-flow"))
+    }
+
     /// Lay a non-wrapping flex-row out as side-by-side columns using the CSS
     /// flexbox main-axis algorithm: each item gets a *basis* (`flex-basis`,
     /// else `width`, resolving `%` against the row; else its content width),
@@ -4295,11 +4448,20 @@ impl<'a> Layout<'a> {
         // float the band IS the block box, so behaviour is unchanged.
         let avail = self.line_right.saturating_sub(self.line_left).max(1);
         let gap = self.flex_gap(id, avail, false);
+        // `row-reverse` (Flexbox §5.1): the main axis runs right-to-left, so
+        // the items lay out in reverse order (after the `order` sort — the
+        // direction reverses the AXIS, composing on top of order-modified
+        // document order) and `justify_offsets` packs toward the right edge.
+        let main_rev = self.flex_main_reversed(id);
+        let mut kids = self.flex_items(id);
+        if main_rev {
+            kids.reverse();
+        }
         let mut nodes = Vec::new();
         let mut basis = Vec::new();
         let mut grow = Vec::new();
         let mut shrink = Vec::new();
-        for k in self.flex_items(id) {
+        for k in kids {
             let (b_css, g, s) = self.flex_props(k, avail);
             let b = match b_css {
                 Some(w) => {
@@ -4503,7 +4665,7 @@ impl<'a> Layout<'a> {
         // items. No-op when the row is full (free == 0) or left-packed.
         let used: usize = widths.iter().map(|w| (*w).max(1)).sum::<usize>() + gaps;
         let free = avail.saturating_sub(used);
-        let (lead, between) = self.justify_offsets(id, free, n);
+        let (lead, between) = self.justify_offsets(id, free, n, main_rev);
         let row_base = self.rows.len();
         // Lay every column box first, so `align-items` can offset a column
         // shorter than the tallest within the row's (cross-axis) height.
@@ -4528,7 +4690,7 @@ impl<'a> Layout<'a> {
             // blit draws no rows but propagates the fixed overlay at this item's
             // column, so the rail lands at its reserved (centered) column.
             if boxes[i].height > 0 || !boxes[i].fixed.is_empty() {
-                let dy = self.align_offset(id, boxes[i].height as usize, line_h);
+                let dy = self.align_offset(id, nodes[i], boxes[i].height as usize, line_h);
                 self.blit(&boxes[i], (self.line_left + x) as u16, row_base + dy);
             }
             x += cw + if i + 1 < n { gap + between } else { 0 };
@@ -4540,8 +4702,13 @@ impl<'a> Layout<'a> {
     /// `justify-content` main-axis distribution of `free` leftover cells across
     /// `n` items: `(leading offset, extra spacing per inter-item gap)`. Packing
     /// (`flex-start`/`normal`/unknown) and a full row leave both zero; grow
-    /// items having eaten the free space makes this moot.
-    fn justify_offsets(&self, id: NodeId, free: usize, n: usize) -> (usize, usize) {
+    /// items having eaten the free space makes this moot. `main_rev` = the
+    /// container's main axis is reversed (`row-reverse`): the flex-relative
+    /// values swap sides (§5.1 — `flex-start` packs at the swapped main-start,
+    /// the RIGHT edge), while `start`/`end`/`left`/`right` stay put (CSS Box
+    /// Alignment: writing-mode-relative and physical values ignore the flex
+    /// direction; we are LTR-only, so start==left, end==right).
+    fn justify_offsets(&self, id: NodeId, free: usize, n: usize, main_rev: bool) -> (usize, usize) {
         // While measuring intrinsic (max-content) width, `justify-content` must
         // not apply: the flex base size is the items packed at their natural
         // widths, never spread across the row. A nested `justify-content:flex-end`
@@ -4557,32 +4724,46 @@ impl<'a> Layout<'a> {
             .as_deref()
             .map(str::trim)
         {
+            Some("flex-end") if main_rev => (0, 0),
             Some("flex-end" | "end" | "right") => (free, 0),
             Some("center") => (free / 2, 0),
             Some("space-between") if n > 1 => (0, free / (n - 1)),
             Some("space-around") => (free / (2 * n), free / n),
             Some("space-evenly") => (free / (n + 1), free / (n + 1)),
+            Some("start" | "left") => (0, 0),
+            // `flex-start` / `normal` / unknown: pack at main-start — the
+            // right edge when the main axis is reversed.
+            _ if main_rev => (free, 0),
             _ => (0, 0),
         }
     }
 
-    /// `align-items` cross-axis offset (rows from the top of the line/shelf)
-    /// for an item of height `item_h` within a band of height `line_h`. We
-    /// don't stretch item heights, so `stretch`/`baseline`/`normal`/unknown and
-    /// `flex-start` all top-align; only `center` and `flex-end` shift down.
-    fn align_offset(&self, id: NodeId, item_h: usize, line_h: usize) -> usize {
+    /// Cross-axis offset (rows from the top of the line/shelf) for an item of
+    /// height `item_h` within a band of height `line_h`: the ITEM's own
+    /// `align-self` (Flexbox §8.3 — `auto` defers to the container), else the
+    /// CONTAINER's `align-items`. This is the same resolution column flex
+    /// (`stack_flex_items`) already does; row/wrap used to read only the
+    /// container. We don't stretch item heights, so `stretch`/`baseline`/
+    /// `normal`/unknown and `flex-start` all top-align; only `center` and
+    /// `flex-end`/`end`/`self-end` shift down.
+    fn align_offset(&self, container: NodeId, item: NodeId, item_h: usize, line_h: usize) -> usize {
         let free = line_h.saturating_sub(item_h);
         if free == 0 {
             return 0;
         }
-        match self
+        let align = self
             .dom
-            .computed_style(id, "align-items")
-            .as_deref()
-            .map(str::trim)
-        {
+            .computed_style(item, "align-self")
+            .map(|v| v.trim().to_string())
+            .filter(|v| v != "auto")
+            .or_else(|| {
+                self.dom
+                    .computed_style(container, "align-items")
+                    .map(|v| v.trim().to_string())
+            });
+        match align.as_deref() {
             Some("center") => free / 2,
-            Some("flex-end" | "end") => free,
+            Some("flex-end" | "end" | "self-end") => free,
             _ => 0,
         }
     }
@@ -5802,7 +5983,13 @@ impl<'a> Layout<'a> {
     /// and the responsive fallback for a too-narrow row. Blockifies inline
     /// children (so a card's image and caption stack instead of fusing).
     fn stack_flex_items(&mut self, id: NodeId, ctx: &Ctx) {
-        let kids = self.flex_items(id);
+        let mut kids = self.flex_items(id);
+        // `column-reverse` (Flexbox §5.1): the main axis runs bottom-to-top,
+        // so the stacked items render in reverse order — the LAST item on top
+        // (a chat log that appends newest-last but displays newest-first).
+        if self.flex_main_reversed(id) {
+            kids.reverse();
+        }
         // Within the float-narrowed band (set by the block boundary's
         // `begin_line`), not the raw block box — so a stacked column beside a
         // float (a latest-post avatar floated left of its title/date column)
@@ -6060,7 +6247,10 @@ impl<'a> Layout<'a> {
         })
     }
 
-    /// The `float` side of an element (`left`/`right`), or `None`.
+    /// The `float` side of an element (`left`/`right`), or `None`. The
+    /// css-logical-1 flow-relative values map by the writing direction —
+    /// LTR-only here, so `inline-start` = left and `inline-end` = right
+    /// (dom.rs maps logical property NAMES under the same rule).
     fn float_side(&self, id: NodeId) -> Option<FloatSide> {
         match self
             .dom
@@ -6069,8 +6259,8 @@ impl<'a> Layout<'a> {
             .to_ascii_lowercase()
             .as_str()
         {
-            "left" => Some(FloatSide::Left),
-            "right" => Some(FloatSide::Right),
+            "left" | "inline-start" => Some(FloatSide::Left),
+            "right" | "inline-end" => Some(FloatSide::Right),
             _ => None,
         }
     }
@@ -6186,9 +6376,11 @@ impl<'a> Layout<'a> {
         else {
             return;
         };
+        // css-logical-1 flow-relative values map by direction (LTR-only):
+        // `inline-start` = left, `inline-end` = right — same as `float_side`.
         let (l, r) = match sides.as_str() {
-            "left" => (true, false),
-            "right" => (false, true),
+            "left" | "inline-start" => (true, false),
+            "right" | "inline-end" => (false, true),
             "both" => (true, true),
             _ => return,
         };
@@ -6281,7 +6473,18 @@ impl<'a> Layout<'a> {
             });
         }
 
-        let mut shelf_top = self.rows.len();
+        // A laid flex line, held until every line is formed so `wrap-reverse`
+        // can stack the lines bottom-to-top (Flexbox §5.2: cross-start and
+        // cross-end swap) by reversing the shelf order before placement.
+        struct Shelf {
+            boxes: Vec<LaidBox>,
+            widths: Vec<usize>,
+            lead: usize,
+            between: usize,
+            h: usize,
+        }
+        let main_rev = self.flex_main_reversed(id);
+        let mut shelves: Vec<Shelf> = Vec::new();
         let mut i = 0;
         while i < items.len() {
             // Collect a flex line: as many items as fit at their hypothetical
@@ -6364,29 +6567,54 @@ impl<'a> Layout<'a> {
                     }
                 }
             }
-            // Lay each item at its used main size, then place the line honoring
-            // `justify-content` (leftover main-axis space) and `align-items`
-            // (cross-axis offset of a short item within the line's height).
-            let boxes: Vec<LaidBox> = (0..n)
+            // Lay each item at its used main size; the line is placed below,
+            // honoring `justify-content` (leftover main-axis space) and
+            // `align-items` (cross-axis offset within the line's height).
+            let mut boxes: Vec<LaidBox> = (0..n)
                 .map(|k| self.layout_subtree(line[k].node, widths[k].max(1), ctx))
                 .collect();
             let shelf_h = boxes.iter().map(|b| b.height as usize).max().unwrap_or(0);
             let used_w: usize = widths.iter().map(|w| (*w).max(1)).sum::<usize>() + gaps;
-            let (lead, between) = self.justify_offsets(id, avail.saturating_sub(used_w), n);
-            let mut x = lead;
-            for (k, b) in boxes.iter().enumerate() {
+            let (lead, between) =
+                self.justify_offsets(id, avail.saturating_sub(used_w), n, main_rev);
+            // `row-reverse` (§5.1): the items of each LINE render in reverse
+            // order — line composition keeps order-modified document order,
+            // only the direction along the line flips.
+            if main_rev {
+                boxes.reverse();
+                widths.reverse();
+            }
+            shelves.push(Shelf {
+                boxes,
+                widths,
+                lead,
+                between,
+                h: shelf_h,
+            });
+            i = end;
+        }
+        // `wrap-reverse` (§5.2): the lines stack bottom-to-top.
+        if self.flex_cross_reversed(id) {
+            shelves.reverse();
+        }
+        let mut shelf_top = self.rows.len();
+        for s in &shelves {
+            let n = s.boxes.len();
+            let mut x = s.lead;
+            for (k, b) in s.boxes.iter().enumerate() {
                 if b.height > 0 {
-                    let dy = self.align_offset(id, b.height as usize, shelf_h);
+                    // `b.root` is the flex item this box was laid for (set by
+                    // `layout_subtree_inner`), so its own `align-self` applies.
+                    let dy = self.align_offset(id, b.root.unwrap_or(id), b.height as usize, s.h);
                     self.blit(b, (self.line_left + x) as u16, shelf_top + dy);
                 } else if !b.fixed.is_empty() {
                     // 0-height item carrying a pinned fixed overlay: blit adds
                     // no rows but propagates the overlay at the item's slot.
                     self.blit(b, (self.line_left + x) as u16, shelf_top);
                 }
-                x += widths[k].max(1) + if k + 1 < n { gap + between } else { 0 };
+                x += s.widths[k].max(1) + if k + 1 < n { gap + s.between } else { 0 };
             }
-            shelf_top += shelf_h + row_gap;
-            i = end;
+            shelf_top += s.h + row_gap;
         }
         self.col = self.line_left;
         self.pending_space = false;
@@ -6855,6 +7083,47 @@ impl<'a> Layout<'a> {
             .clamp(1, 1000)
     }
 
+    /// Per-column width preferences from the table's `<col>`/`<colgroup>`
+    /// elements (CSS 2.1 §17.5.2: a column element's non-auto `width` sets
+    /// the column in fixed layout and its target in auto layout — both read
+    /// `col_w`). `<col span=N>` repeats its width over N columns; a CHILDLESS
+    /// `<colgroup span=N width=…>` acts as N such columns, while one with
+    /// `<col>` children defers to them (HTML §4.9.3/§4.9.4). May be shorter
+    /// or longer than the cell-derived column count — the caller indexes with
+    /// `.get()`. Tag-matched (`<col>` is table-only markup); arbitrary
+    /// `display:table-column` elements aren't recognized.
+    fn table_col_specs(&self, table: NodeId) -> Vec<Option<TrackWidth>> {
+        let mut specs = Vec::new();
+        let push_cols = |el: NodeId, specs: &mut Vec<Option<TrackWidth>>| {
+            let w = self.declared_track_width(el);
+            for _ in 0..self.cell_span(el, "span") {
+                specs.push(w);
+            }
+        };
+        for child in self.dom.children(table) {
+            match self.dom.tag_name(child) {
+                Some("colgroup") => {
+                    let cols: Vec<NodeId> = self
+                        .dom
+                        .children(child)
+                        .into_iter()
+                        .filter(|&c| self.dom.tag_name(c) == Some("col"))
+                        .collect();
+                    if cols.is_empty() {
+                        push_cols(child, &mut specs);
+                    } else {
+                        for col in cols {
+                            push_cols(col, &mut specs);
+                        }
+                    }
+                }
+                Some("col") => push_cols(child, &mut specs),
+                _ => {}
+            }
+        }
+        specs
+    }
+
     /// A declared `width` on a table/cell — the CSS `width` if set, else the
     /// HTML `width` presentational attribute (HTML §15.3.13 maps it to the
     /// `width` property). `None` for `auto`/unset. A bare number on the
@@ -6933,23 +7202,46 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// Vertical offset of a cell within its (possibly taller) row band, per the
-    /// cell's `valign` attribute / `vertical-align` (top default, middle,
-    /// bottom). Baseline is approximated as top in the cell line model.
+    /// Vertical offset of a cell within its (possibly taller) row band, per
+    /// CSS 2.1 §17.5.4 + the HTML rendering spec (§15.3.3/15.3.9): at each
+    /// element, author `vertical-align` BEATS the `valign` presentational
+    /// hint (hints are author-level rules that precede all other author
+    /// rules); an undeclared cell inherits through its row and row group (the
+    /// UA sheet's `td,th,tr { vertical-align: inherit }` + `thead,tbody,tfoot
+    /// { vertical-align: middle }`), so a bare cell defaults to MIDDLE — the
+    /// classic centered table cell, matching browsers. `baseline` (and the
+    /// inline-only values, which §17.5.4 says are treated as `baseline` on
+    /// cells) is approximated as top in the cell line model.
     fn cell_valign_offset(&self, cell: Option<NodeId>, cell_h: usize, span_h: usize) -> usize {
         let slack = span_h.saturating_sub(cell_h);
         if slack == 0 {
             return 0;
         }
         let Some(id) = cell else { return 0 };
-        let v = self
-            .dom
-            .attr(id, "valign")
-            .map(|s| s.trim().to_ascii_lowercase())
-            .or_else(|| self.dom.computed_style(id, "vertical-align"));
+        let mut v = None;
+        let mut cur = Some(id);
+        while let Some(n) = cur {
+            v = self
+                .dom
+                .computed_style(n, "vertical-align")
+                .or_else(|| self.dom.attr(n, "valign").map(str::to_owned))
+                .map(|s| s.trim().to_ascii_lowercase());
+            if v.is_some() {
+                break;
+            }
+            // Climb cell → row → row group only; anything above doesn't
+            // participate in the cell alignment chain.
+            cur = self.dom.parent_composed(n).filter(|&p| {
+                matches!(
+                    self.dom.tag_name(p),
+                    Some("tr" | "tbody" | "thead" | "tfoot")
+                )
+            });
+        }
         match v.as_deref() {
             Some("bottom") => slack,
-            Some("middle") => slack / 2,
+            Some("top" | "baseline") => 0,
+            Some("middle") | None => slack / 2,
             _ => 0,
         }
     }
@@ -6977,9 +7269,14 @@ impl<'a> Layout<'a> {
             TrackWidth::Pct(p) => ((p * band as f32).round() as usize).min(band),
         });
 
-        // The per-column explicit width preference (a declared `width` on the
-        // column's first single-span cell). Always cheap to gather.
-        let mut col_w: Vec<Option<TrackWidth>> = vec![None; ncols];
+        // The per-column explicit width preference: a `<col>`/`<colgroup>`
+        // element's declared width first (§17.5.2.1 lists column elements
+        // ahead of first-row cells), else a declared `width` on the column's
+        // first single-span cell. Always cheap to gather.
+        let col_specs = self.table_col_specs(table);
+        let mut col_w: Vec<Option<TrackWidth>> = (0..ncols)
+            .map(|c| col_specs.get(c).copied().flatten())
+            .collect();
         for cell in cells {
             if cell.colspan == 1 && cell.col < ncols && col_w[cell.col].is_none() {
                 col_w[cell.col] = self.declared_track_width(cell.id);
@@ -7022,6 +7319,18 @@ impl<'a> Layout<'a> {
             let inner_bs = bs * (span - 1);
             distribute_deficit(&mut col_min[cell.col..end], mn.saturating_sub(inner_bs));
             distribute_deficit(&mut col_max[cell.col..end], mx.saturating_sub(inner_bs));
+        }
+        // A declared column width RAISES the column's max-content (§17.5.2.2:
+        // a cell `width` greater than the minimum becomes the column's
+        // maximum) — without this a `width:80px` column on a width-LESS table
+        // collapsed toward its content (`used` never counted the declaration,
+        // so the shrink pass took it back). Percentages can't floor here:
+        // they resolve against the used table width, which this very sum
+        // determines.
+        for c in 0..ncols {
+            if let Some(TrackWidth::Px(px)) = col_w[c] {
+                col_max[c] = col_max[c].max(px.min(avail));
+            }
         }
 
         // Fixed layout: a definite table width + `table-layout:fixed` ignores
@@ -8089,6 +8398,14 @@ impl<'a> Layout<'a> {
     /// inter-word space attaches to the *preceding* item (so a link's
     /// own text stays clean at its leading edge).
     fn place_word(&mut self, word: &str, ctx: &Ctx) {
+        // U+00AD SOFT HYPHEN never renders a cell of its own (CSS Text 3
+        // §6.2; unicode-width counts it as 1, so left in the text it painted
+        // a stray glyph). Words carrying one take the soft-wrap-opportunity
+        // path; it feeds back SHY-free strings, so no recursion.
+        if word.contains('\u{AD}') {
+            self.place_shy_word(word, ctx);
+            return;
+        }
         let transformed = ctx.transform.apply(word);
         let spaced = letter_space(transformed.as_ref(), ctx.letter_spacing);
         let mut text: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(spaced.as_ref());
@@ -8108,13 +8425,40 @@ impl<'a> Layout<'a> {
                 self.clip_done = true;
                 let room = right.saturating_sub(start);
                 if room == 0 {
+                    // No cell left for this word — but content IS being
+                    // omitted, and §5.1's ellipsis renders even then, by
+                    // REMOVING already-placed characters to make room:
+                    // replace the line's last cell with `…` (the previous
+                    // word may have ended exactly at the box edge).
+                    if self.clip_ellipsis
+                        && let Some(last) = self.line.last_mut()
+                        && !last.text.is_empty()
+                        && last.image.is_none()
+                    {
+                        let mut t =
+                            truncate_to_width(&last.text, (last.width as usize).saturating_sub(1));
+                        t.push('…');
+                        last.width = display_width(&t) as u16;
+                        last.text = t;
+                    }
                     self.pending_space = false;
                     return;
                 }
-                // Leave one cell for the ellipsis (drop it only if the whole
-                // box is a single cell wide).
-                let mut t = truncate_to_width(&text, room.saturating_sub(1));
-                t.push('…');
+                let t = if self.clip_ellipsis {
+                    // Leave one cell for the ellipsis (drop it only if the
+                    // whole box is a single cell wide).
+                    let mut t = truncate_to_width(&text, room.saturating_sub(1));
+                    t.push('…');
+                    t
+                } else {
+                    // `text-overflow: clip` (the initial value): cut at the
+                    // box edge without a marker.
+                    truncate_to_width(&text, room)
+                };
+                if t.is_empty() {
+                    self.pending_space = false;
+                    return;
+                }
                 wlen = display_width(&t);
                 text = std::borrow::Cow::Owned(t);
             }
@@ -8172,6 +8516,84 @@ impl<'a> Layout<'a> {
         );
     }
 
+    /// Place a word containing U+00AD SOFT HYPHEN — CSS Text 3 §6.2 / UAX #14:
+    /// each SHY is an INVISIBLE soft wrap opportunity. Not taken, it renders
+    /// nothing (zero cells); taken, a visible hyphen ends the line. The break
+    /// chosen is the LATEST opportunity that fits (browsers fill the current
+    /// line before pushing to the next). Fragments split AFTER text-transform
+    /// (transforms map SHY to itself, and re-applying a transform to a
+    /// fragment is idempotent), and widths measured post-transform/
+    /// letter-spacing so the fit test matches what `place_word` places.
+    /// Deliberate simplifications: while MEASURING, opportunities are not
+    /// taken (the word measures whole, consistent with the overflow-wrap
+    /// gate below — CSS would break min-content at every SHY), and inside
+    /// the nowrap-ellipsis clip the stripped word takes the normal
+    /// truncation path.
+    fn place_shy_word(&mut self, word: &str, ctx: &Ctx) {
+        let transformed = ctx.transform.apply(word);
+        let frags: Vec<&str> = transformed.split('\u{AD}').collect();
+        let width_of = |s: &str| -> usize {
+            let t = ctx.transform.apply(s);
+            display_width(letter_space(t.as_ref(), ctx.letter_spacing).as_ref())
+        };
+        // Longest prefix of `frags[i..]` that fits `cap` cells with its
+        // trailing hyphen; `None` when not even the first fragment does.
+        let pick = |i: usize, cap: usize| -> Option<usize> {
+            let mut best = None;
+            for k in (i + 1)..frags.len() {
+                let piece = frags[i..k].concat();
+                if piece.is_empty() {
+                    continue;
+                }
+                if width_of(&(piece + "-")) <= cap {
+                    best = Some(k);
+                } else {
+                    break;
+                }
+            }
+            best
+        };
+        let mut i = 0;
+        loop {
+            let rest = frags[i..].concat();
+            let space = usize::from(self.pending_space && self.col > self.line_left);
+            // Hand the remainder to the normal path — already SHY-free — when
+            // no opportunity is left, the context can't take one (nowrap /
+            // the ellipsis clip / measuring), or it simply fits as is.
+            if i + 1 >= frags.len()
+                || !self.ws.wraps()
+                || self.measuring
+                || self.clip_right.is_some()
+                || self.col + space + width_of(&rest) <= self.line_right
+            {
+                self.place_word(&rest, ctx);
+                return;
+            }
+            match pick(i, self.line_right.saturating_sub(self.col + space)) {
+                Some(k) => {
+                    // Fill the current line with the longest fitting prefix,
+                    // hyphenated, and continue past the break.
+                    let piece = format!("{}-", frags[i..k].concat());
+                    self.place_word(&piece, ctx);
+                    self.break_line();
+                    i = k;
+                }
+                None if self.col > self.line_left => {
+                    // Nothing fits beside the existing content: break first;
+                    // the next pass re-tests against the fresh band.
+                    self.break_line();
+                    self.pending_space = false;
+                }
+                None => {
+                    // Not even the first fragment + hyphen fits a whole band:
+                    // the oversize char-breaker takes the remainder from here.
+                    self.place_word(&rest, ctx);
+                    return;
+                }
+            }
+        }
+    }
+
     /// Place a run whose display width exceeds the band by character-breaking it
     /// across rows — CSS Text L3 §5.4 (`overflow-wrap:anywhere`/`word-break:
     /// break-all`), applied unconditionally because the terminal has no
@@ -8217,6 +8639,16 @@ impl<'a> Layout<'a> {
     /// width-fitting chunks (spaces kept). Uses `ctx.kind`, so CSS
     /// `white-space:pre` on a non-`<pre>` element keeps its own styling.
     fn place_preserved(&mut self, seg: &str, ctx: &Ctx) {
+        // U+00AD SOFT HYPHEN never renders a cell (CSS Text 3 §6.2) — strip
+        // it. No soft-wrap opportunities taken here: `pre` never breaks, and
+        // the pre-wrap budget breaker keeps its char-level behavior (a
+        // deliberate simplification).
+        let seg: std::borrow::Cow<str> = if seg.contains('\u{AD}') {
+            std::borrow::Cow::Owned(seg.chars().filter(|&c| c != '\u{AD}').collect())
+        } else {
+            std::borrow::Cow::Borrowed(seg)
+        };
+        let seg = seg.as_ref();
         if seg.is_empty() {
             return;
         }
@@ -9748,14 +10180,14 @@ impl<'a> Layout<'a> {
         if let Some(v) = self
             .dom
             .attr(li, "value")
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            && let Some(c) = self.list_stack.last_mut()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            && let Some((c, _)) = self.list_stack.last_mut()
         {
             *c = v;
         }
-        let counter = self.list_stack.last().copied().unwrap_or(1);
-        if let Some(c) = self.list_stack.last_mut() {
-            *c = c.saturating_add(1);
+        let (counter, step) = self.list_stack.last().copied().unwrap_or((1, 1));
+        if let Some((c, _)) = self.list_stack.last_mut() {
+            *c = c.saturating_add(step);
         }
         let kind = self.dom.computed_value(li, "list-style-type");
         format_list_marker(kind.as_deref().unwrap_or("disc"), counter)
@@ -12358,6 +12790,85 @@ mod tests {
     }
 
     #[test]
+    fn ol_reversed_counts_down() {
+        // HTML §4.4.5: `<ol reversed>` counts DOWN, starting at the number of
+        // `<li>` children (or `start` if given), and may run through zero
+        // into negatives. Previously the attribute was ignored.
+        let rows = lay(
+            r#"<body><ol reversed><li>alpha</li><li>beta</li><li>gamma</li></ol></body>"#,
+            40,
+        );
+        let lines = texts(&rows);
+        assert!(lines.iter().any(|l| l.contains("3. alpha")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("2. beta")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("1. gamma")), "{lines:?}");
+        let rows = lay(
+            r#"<body><ol reversed start="1"><li>one</li><li>zero</li><li>minus</li></ol></body>"#,
+            40,
+        );
+        let lines = texts(&rows);
+        assert!(lines.iter().any(|l| l.contains("1. one")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("0. zero")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("-1. minus")), "{lines:?}");
+    }
+
+    #[test]
+    fn unknown_list_style_type_falls_back_to_decimal() {
+        // css-counter-styles-3 §3: a counter-style name we don't implement
+        // renders as `decimal`, not a bullet (which numbered nothing).
+        let rows = lay(
+            r#"<body><ol style="list-style-type:lower-greek"><li>one</li><li>two</li></ol></body>"#,
+            40,
+        );
+        let lines = texts(&rows);
+        assert!(lines.iter().any(|l| l.contains("1. one")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("2. two")), "{lines:?}");
+    }
+
+    #[test]
+    fn text_wrap_nowrap_longhand_keeps_one_row() {
+        // CSS Text 4: `text-wrap` (the `text-wrap-mode` shorthand modern
+        // Tailwind emits as `text-nowrap`) overrides the wrap half of the
+        // white-space mode. Declared on a WRAPPER — the longhand inherits via
+        // the registry, so the paragraph inside stays on one row.
+        let rows = lay(
+            r#"<html><head><style>.n{text-wrap:nowrap}</style></head>
+               <body><div class="n"><p>one two three four five six</p></div></body></html>"#,
+            14,
+        );
+        let content: Vec<&Row> = rows.iter().filter(|r| !r.items.is_empty()).collect();
+        assert_eq!(
+            content.len(),
+            1,
+            "nowrap via the longhand: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(render_row(content[0]), "one two three four five six");
+    }
+
+    #[test]
+    fn white_space_collapse_preserve_keeps_spaces() {
+        // CSS Text 4: `white-space-collapse: preserve` alone = preserved
+        // spaces + wrapping (the pre-wrap composition).
+        let rows = lay(
+            r#"<body><p style="white-space-collapse:preserve">a   b</p></body>"#,
+            40,
+        );
+        assert_eq!(texts(&rows)[0], "a   b", "spaces preserved");
+    }
+
+    #[test]
+    fn break_spaces_value_preserves_spaces() {
+        // `white-space: break-spaces` = preserve + wrap (its trailing-space
+        // breaking coincides with the pre-wrap chunker at cell resolution).
+        let rows = lay(
+            r#"<body><p style="white-space:break-spaces">a   b</p></body>"#,
+            40,
+        );
+        assert_eq!(texts(&rows)[0], "a   b", "spaces preserved");
+    }
+
+    #[test]
     fn pre_preserves_whitespace_and_newlines() {
         let rows = lay("<body><pre>a   b\n  c</pre></body>", 80);
         let lines = texts(&rows);
@@ -12927,6 +13438,113 @@ mod tests {
             content_col >= 8,
             "the content column starts past the narrow menu (col {content_col})"
         );
+    }
+
+    #[test]
+    fn css_vertical_align_beats_the_valign_attribute() {
+        // HTML rendering §15.3.3: `valign` is a PRESENTATIONAL HINT — an
+        // author-level rule preceding all other author rules — so any author
+        // `vertical-align` wins. The old order read the attribute first.
+        let rows = lay(
+            r#"<body><table><tr>
+                 <td>l1<br>l2<br>l3</td>
+                 <td valign="bottom" style="vertical-align:top">X</td>
+               </tr></table></body>"#,
+            40,
+        );
+        assert_eq!(
+            row_index_of(&rows, "X"),
+            row_index_of(&rows, "l1"),
+            "CSS top beats the bottom hint: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn bare_cells_default_to_middle_vertical_alignment() {
+        // CSS 2.1 §17.5.4 / Appendix D: `td,th,tr { vertical-align: inherit }`
+        // + `thead,tbody,tfoot { vertical-align: middle }` — a cell with no
+        // declaration of its own centers in its row band, as browsers do.
+        let rows = lay(
+            r#"<body><table><tr>
+                 <td>l1<br>l2<br>l3</td>
+                 <td>X</td>
+               </tr></table></body>"#,
+            40,
+        );
+        assert_eq!(
+            row_index_of(&rows, "X"),
+            row_index_of(&rows, "l2"),
+            "an undeclared cell centers: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn row_valign_inherits_into_undeclared_cells() {
+        // The UA chain again: an undeclared cell takes its ROW's alignment
+        // (`td { vertical-align: inherit }`), here the row's `valign=bottom`
+        // presentational hint.
+        let rows = lay(
+            r#"<body><table><tr valign="bottom">
+                 <td>l1<br>l2<br>l3</td>
+                 <td>X</td>
+               </tr></table></body>"#,
+            40,
+        );
+        assert_eq!(
+            row_index_of(&rows, "X"),
+            row_index_of(&rows, "l3"),
+            "the row's bottom hint reaches the cell: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn col_elements_size_their_table_columns() {
+        // CSS 2.1 §17.5.2: a `<col width>` (or CSS width) sets its column's
+        // width preference — previously ignored entirely. A 10% column of a
+        // width-100% table in a 40-cell band is 4 cells, so the second
+        // column's content starts at col 4 (border-spacing 0).
+        let rows = lay(
+            r#"<body><table width="100%"><colgroup><col width="10%"><col></colgroup>
+                 <tr><td>a</td><td>bb</td></tr></table></body>"#,
+            40,
+        );
+        assert_eq!(pos_of(&rows, "bb").1, 4, "{:?}", texts(&rows));
+    }
+
+    #[test]
+    fn declared_cell_width_holds_on_a_widthless_table() {
+        // §17.5.2.2: a declared column width raises the column's max-content,
+        // so it survives the used-width computation even when the TABLE
+        // declares no width — an 80px (10-cell) first column holds its 10
+        // cells instead of collapsing to its 1-cell content.
+        let rows = lay(
+            r#"<body><table><tr><td width="80">a</td><td>b</td></tr></table></body>"#,
+            40,
+        );
+        assert_eq!(pos_of(&rows, "b").1, 10, "{:?}", texts(&rows));
+    }
+
+    #[test]
+    fn col_span_and_childless_colgroup_repeat_their_width() {
+        // `<col span=N>` covers N columns (HTML §4.9.4); a CHILDLESS
+        // `<colgroup span=N width=…>` acts the same (§4.9.3). Two 25%
+        // columns of a 40-cell table = 10 cells each: c starts at col 20.
+        let with_span = lay(
+            r#"<body><table width="100%"><colgroup><col span="2" width="25%"></colgroup>
+                 <tr><td>a</td><td>b</td><td>c</td></tr></table></body>"#,
+            40,
+        );
+        assert_eq!(pos_of(&with_span, "b").1, 10, "{:?}", texts(&with_span));
+        assert_eq!(pos_of(&with_span, "c").1, 20, "{:?}", texts(&with_span));
+        let childless = lay(
+            r#"<body><table width="100%"><colgroup span="2" width="25%"></colgroup>
+                 <tr><td>a</td><td>b</td><td>c</td></tr></table></body>"#,
+            40,
+        );
+        assert_eq!(pos_of(&childless, "c").1, 20, "{:?}", texts(&childless));
     }
 
     #[test]
@@ -14932,12 +15550,13 @@ mod tests {
 
     #[test]
     fn nowrap_overflow_hidden_truncates_with_an_ellipsis() {
-        // The single-line-ellipsis card idiom (`white-space:nowrap;
-        // overflow:hidden`): a too-long line is clipped at the box edge with an
-        // ellipsis instead of overflowing it (a forum post title bleeding into
-        // the sidebar). Laid in a 10-cell box.
+        // The single-line-ellipsis card idiom (the full declared triplet
+        // `white-space:nowrap; overflow:hidden; text-overflow:ellipsis`): a
+        // too-long line is clipped at the box edge with an ellipsis instead
+        // of overflowing it (a forum post title bleeding into the sidebar).
+        // Laid in a 10-cell box.
         let rows = lay(
-            r#"<body><div style="white-space:nowrap;overflow:hidden">Permanently banned forever</div></body>"#,
+            r#"<body><div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">Permanently banned forever</div></body>"#,
             10,
         );
         let line = texts(&rows)[0].clone();
@@ -14956,13 +15575,88 @@ mod tests {
     }
 
     #[test]
+    fn text_overflow_defaults_to_plain_clip() {
+        // CSS Overflow 3 §5.1: `text-overflow`'s initial value is `clip` —
+        // without a declared `ellipsis` the truncation is a silent cut at the
+        // box edge, as browsers render it (`…` used to be synthesized
+        // unconditionally).
+        let rows = lay(
+            r#"<body><div style="white-space:nowrap;overflow:hidden">Permanently banned forever</div></body>"#,
+            10,
+        );
+        let line = texts(&rows)[0].clone();
+        assert_eq!(line, "Permanentl", "a full-width silent cut: {line:?}");
+        // And an explicit `text-overflow: clip` says the same thing.
+        let rows = lay(
+            r#"<body><div style="white-space:nowrap;overflow:hidden;text-overflow:clip">Permanently banned forever</div></body>"#,
+            10,
+        );
+        assert_eq!(texts(&rows)[0], "Permanentl");
+    }
+
+    #[test]
+    fn ellipsis_replaces_the_last_cell_when_the_line_is_exactly_full() {
+        // §5.1: the ellipsis renders even when the previous word ends exactly
+        // at the box edge — characters are REMOVED to make room. "abcd efghi"
+        // fills the 10-cell box; omitting "jkl" turns it into "abcd efgh…".
+        let rows = lay(
+            r#"<body><div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">abcd efghi jkl</div></body>"#,
+            10,
+        );
+        assert_eq!(texts(&rows)[0], "abcd efgh…");
+    }
+
+    #[test]
+    fn soft_hyphen_is_invisible_when_no_break_is_taken() {
+        // CSS Text 3 §6.2: U+00AD is an INVISIBLE soft wrap opportunity —
+        // unicode-width counts it as one cell, so left in the text it painted
+        // a stray glyph mid-word ("hy­phen" 7 cells wide instead of 6).
+        let rows = lay("<body><p>hy&shy;phen</p></body>", 40);
+        let item = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.text.contains("phen"))
+            .expect("the word renders");
+        assert_eq!(item.text, "hyphen", "the SHY leaves no glyph");
+        assert_eq!(item.width, 6, "and no cell");
+    }
+
+    #[test]
+    fn soft_hyphen_breaks_at_the_latest_fitting_opportunity() {
+        // Two opportunities, a 10-cell band (the layout's minimum width), a
+        // 12-cell word: browsers break at the LATEST opportunity that fits —
+        // "aaaabbbb-" (9 cells, hyphen shown) then "cccc", never "aaaa-"
+        // early or a char-tower.
+        let rows = lay("<body><p>aaaa&shy;bbbb&shy;cccc</p></body>", 10);
+        let lines = texts(&rows);
+        assert_eq!(
+            lines[0], "aaaabbbb-",
+            "latest fitting opportunity, visible hyphen: {lines:?}"
+        );
+        assert_eq!(lines[1], "cccc", "the remainder continues: {lines:?}");
+    }
+
+    #[test]
+    fn soft_hyphen_never_renders_in_preserved_text() {
+        // `pre` never wraps, so the opportunity is never taken — the SHY
+        // still must not paint a cell.
+        let rows = lay("<body><pre>ab&shy;cd</pre></body>", 40);
+        let item = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.text.contains("cd"))
+            .expect("the pre text renders");
+        assert_eq!(item.text, "abcd");
+    }
+
+    #[test]
     fn a_bare_overflow_x_longhand_truncates_a_nowrap_line() {
         // Bug #11 (overflow unification): the nowrap-truncation check read only
         // the `overflow` shorthand, so the equivalent bare `overflow-x:hidden`
         // longhand — what card CSS commonly declares — never clipped. Every
         // overflow consumer resolves per-axis through `axis_overflow` now.
         let rows = lay(
-            r#"<body><div style="white-space:nowrap;overflow-x:hidden">Permanently banned forever</div></body>"#,
+            r#"<body><div style="white-space:nowrap;overflow-x:hidden;text-overflow:ellipsis">Permanently banned forever</div></body>"#,
             10,
         );
         let line = texts(&rows)[0].clone();
@@ -14983,13 +15677,13 @@ mod tests {
         // clips its nowrap line. The old check saw only the shorthand and
         // truncated anyway.
         let rows = lay(
-            r#"<body><div style="overflow:hidden;overflow-x:visible;white-space:nowrap">Permanently banned forever</div></body>"#,
+            r#"<body><div style="overflow:hidden;overflow-x:visible;white-space:nowrap;text-overflow:ellipsis">Permanently banned forever</div></body>"#,
             10,
         );
         let line = texts(&rows)[0].clone();
-        assert!(
-            !line.contains('…'),
-            "the x axis is visible — no truncation: {line:?}"
+        assert_eq!(
+            line, "Permanently banned forever",
+            "the x axis is visible — the nowrap line is not truncated"
         );
     }
 
@@ -16580,6 +17274,138 @@ mod tests {
             34,
             "space-between: second pushed right"
         );
+    }
+
+    #[test]
+    fn align_self_offsets_items_on_a_flex_row() {
+        // Flexbox §8.3: `align-self` overrides the container's `align-items`
+        // per item. Row flex read only the container before; column flex
+        // already resolved it — inconsistent. A 3-row line: `flex-end` lands
+        // its item on the last row, `center` on the middle one, and an item
+        // saying `flex-start` beats a `flex-end` container.
+        let rows = lay(
+            r#"<body><div style="display:flex">
+                 <div>t1<br>t2<br>t3</div>
+                 <div style="align-self:flex-end">END</div>
+                 <div style="align-self:center">MID</div>
+               </div></body>"#,
+            40,
+        );
+        let (t_row, _) = pos_of(&rows, "t1");
+        assert_eq!(pos_of(&rows, "END").0, t_row + 2, "{:?}", texts(&rows));
+        assert_eq!(pos_of(&rows, "MID").0, t_row + 1, "{:?}", texts(&rows));
+        let rows = lay(
+            r#"<body><div style="display:flex;align-items:flex-end">
+                 <div>t1<br>t2<br>t3</div>
+                 <div style="align-self:flex-start">TOP</div>
+                 <div>BOT</div>
+               </div></body>"#,
+            40,
+        );
+        let (t_row, _) = pos_of(&rows, "t1");
+        assert_eq!(
+            pos_of(&rows, "TOP").0,
+            t_row,
+            "the item's flex-start beats the container's flex-end: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(
+            pos_of(&rows, "BOT").0,
+            t_row + 2,
+            "an auto item still takes the container's flex-end"
+        );
+    }
+
+    #[test]
+    fn align_self_offsets_items_on_a_wrap_shelf() {
+        // The same §8.3 resolution on the wrap (shelf) path.
+        let rows = lay(
+            r#"<body><div style="display:flex;flex-wrap:wrap">
+                 <div>t1<br>t2<br>t3</div>
+                 <div style="align-self:flex-end">END</div>
+               </div></body>"#,
+            40,
+        );
+        let (t_row, _) = pos_of(&rows, "t1");
+        assert_eq!(
+            pos_of(&rows, "END").0,
+            t_row + 2,
+            "align-self applies within the shelf: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn flex_row_reverse_reverses_item_order_and_packs_right() {
+        // Flexbox §5.1: `row-reverse` swaps main-start and main-end — the
+        // items lay out in reverse order AND the default (flex-start) packing
+        // hugs the swapped main-start, the RIGHT edge. 3em (6-cell) boxes,
+        // gap 1 → used 13 of 40: "b" leads at col 27, "a" ends at col 40.
+        let rows = lay(
+            r#"<html><head><style>.r{display:flex;flex-direction:row-reverse}.c{width:3em}</style></head>
+               <body><div class="r"><div class="c">a</div><div class="c">b</div></div></body></html>"#,
+            40,
+        );
+        let (arow, acol) = pos_of(&rows, "a");
+        let (brow, bcol) = pos_of(&rows, "b");
+        assert_eq!(arow, brow, "one flex line: {:?}", texts(&rows));
+        assert_eq!(bcol, 27, "b leads at the packed-right group's start");
+        assert_eq!(acol, 34, "a renders last, ending at the right edge");
+    }
+
+    #[test]
+    fn flex_row_reverse_flex_end_packs_left() {
+        // Under `row-reverse`, `justify-content:flex-end` is the swapped
+        // main-END — the LEFT edge (while writing-mode `end` would stay
+        // right). Order still reversed: "b" first at col 0.
+        let rows = lay(
+            r#"<html><head><style>.r{display:flex;flex-direction:row-reverse;justify-content:flex-end}.c{width:3em}</style></head>
+               <body><div class="r"><div class="c">a</div><div class="c">b</div></div></body></html>"#,
+            40,
+        );
+        assert_eq!(pos_of(&rows, "b").1, 0, "{:?}", texts(&rows));
+        assert_eq!(pos_of(&rows, "a").1, 7, "{:?}", texts(&rows));
+    }
+
+    #[test]
+    fn flex_column_reverse_stacks_bottom_up() {
+        // §5.1: `column-reverse` runs the main axis bottom-to-top — the last
+        // item renders on top.
+        let rows = lay(
+            r#"<body><div style="display:flex;flex-direction:column-reverse"><div>first</div><div>second</div></div></body>"#,
+            40,
+        );
+        assert!(
+            pos_of(&rows, "second").0 < pos_of(&rows, "first").0,
+            "the last item stacks on top: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn flex_wrap_reverse_stacks_lines_bottom_to_top() {
+        // §5.2: `wrap-reverse` swaps cross-start and cross-end — the flex
+        // LINES stack bottom-to-top while each line keeps its left-to-right
+        // item order. 4-cell items in a 10-cell band: lines [AAAA BBBB] and
+        // [CCCC]; reversed, CCCC's line renders first.
+        let rows = lay(
+            r#"<body><div style="display:flex;flex-wrap:wrap-reverse">
+                 <div style="width:32px">AAAA</div>
+                 <div style="width:32px">BBBB</div>
+                 <div style="width:32px">CCCC</div>
+               </div></body>"#,
+            10,
+        );
+        let (arow, acol) = pos_of(&rows, "AAAA");
+        let (brow, bcol) = pos_of(&rows, "BBBB");
+        let (crow, _) = pos_of(&rows, "CCCC");
+        assert!(
+            crow < arow,
+            "the last line stacks on top: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(arow, brow, "the first line stays intact");
+        assert!(acol < bcol, "items within a line keep their order");
     }
 
     #[test]
@@ -18293,6 +19119,70 @@ mod tests {
             texts(&rows)
         );
         assert_eq!(cbelow, 0, "and returns to the full-width left edge");
+    }
+
+    #[test]
+    fn logical_float_values_map_by_direction() {
+        // css-logical-1: `float: inline-start`/`inline-end` are the
+        // flow-relative left/right (LTR-only here). They were silently
+        // ignored — the float fell into normal flow.
+        let rows = lay(
+            r#"<body><div><div style="float:inline-end">RR</div>text here</div></body>"#,
+            20,
+        );
+        let (rr_row, rr_col) = pos_of(&rows, "RR");
+        let (t_row, t_col) = pos_of(&rows, "text");
+        assert_eq!(
+            rr_row,
+            t_row,
+            "the float shares the text's row: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(rr_col, 18, "inline-end pins to the right edge");
+        assert_eq!(t_col, 0, "text flows in the remaining band");
+        let rows = lay(
+            r#"<body><div><div style="float:inline-start">LL</div>text here</div></body>"#,
+            20,
+        );
+        let (ll_row, ll_col) = pos_of(&rows, "LL");
+        let (t_row, t_col) = pos_of(&rows, "text");
+        assert_eq!(ll_row, t_row);
+        assert_eq!(ll_col, 0, "inline-start pins to the left edge");
+        assert!(t_col >= 2, "text flows beside it: {:?}", texts(&rows));
+    }
+
+    #[test]
+    fn logical_clear_values_clear_their_side() {
+        // `clear: inline-start` clears a left float (LTR), like `clear:left`;
+        // and a clearfix pseudo declaring a logical value still contains.
+        let rows = lay(
+            r#"<body><div style="float:left">FF<br>FF</div><p style="clear:inline-start">BELOW</p></body>"#,
+            40,
+        );
+        let (f_row, _) = pos_of(&rows, "FF");
+        let (b_row, b_col) = pos_of(&rows, "BELOW");
+        assert!(
+            b_row > f_row + 1,
+            "cleared below both float rows: {:?}",
+            texts(&rows)
+        );
+        assert_eq!(b_col, 0);
+        let html = r#"<html><head><style>
+            .row::after{content:"";display:table;clear:inline-end}
+            .c{float:right;width:50%}
+          </style></head>
+          <body>
+            <div class="row"><div class="c">RIGHT</div></div>
+            <p>BELOW</p>
+          </body></html>"#;
+        let rows = lay(html, 40);
+        let (r_row, _) = pos_of(&rows, "RIGHT");
+        let (b_row, _) = pos_of(&rows, "BELOW");
+        assert!(
+            b_row > r_row,
+            "a logical-value clearfix still contains its float: {:?}",
+            texts(&rows)
+        );
     }
 
     #[test]
