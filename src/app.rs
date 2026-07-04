@@ -300,17 +300,51 @@ pub struct FindState {
     pub current: Option<usize>,
 }
 
-/// One find match: a char range within a doc line (gopher/gemini line model)
-/// or within a row's item (HTTP 2D layout model).
+/// Where a find match lives — every text surface the browser draws.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FindLoc {
+    /// A doc line (gopher/gemini/oneshot line model).
+    Line(usize),
+    /// A laid-out doc row's item (HTTP 2D layout model).
+    Item { row: usize, item: usize },
+    /// Inside a scroll region's buffer: `(region index, buffer row, buffer
+    /// item)`. Revealing it scrolls the region (`voffset`), not just the doc.
+    Region {
+        region: usize,
+        brow: usize,
+        bitem: usize,
+    },
+    /// On a PINNED fixed layer (`doc.fixed[layer].rows[row].items[item]`) —
+    /// always on screen, so revealing it never scrolls.
+    Fixed {
+        layer: usize,
+        row: usize,
+        item: usize,
+    },
+}
+
+/// One find match: a char range within the text at `loc`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FindMatch {
-    /// Row index (HTTP) or line index (gopher/gemini) the match sits on.
-    pub line: usize,
-    /// Item index within the row for the HTTP model; None for the line model.
-    pub item: Option<usize>,
+    pub loc: FindLoc,
     /// Char offsets of the match within the item/line text.
     pub start: usize,
     pub end: usize,
+}
+
+impl FindMatch {
+    /// The document row this match orders/scrolls by: region matches sort
+    /// with their region's band (buffer order within it); fixed-layer
+    /// matches are pinned chrome — they sort after the document (usize::MAX)
+    /// and never drive a scroll.
+    fn order_row(&self, regions: &[crate::layout::Region]) -> usize {
+        match self.loc {
+            FindLoc::Line(l) => l,
+            FindLoc::Item { row, .. } => row,
+            FindLoc::Region { region, .. } => regions.get(region).map_or(0, |rg| rg.start_row),
+            FindLoc::Fixed { .. } => usize::MAX,
+        }
+    }
 }
 
 /// A saved selection across history pops — whichever model the doc used.
@@ -330,6 +364,10 @@ enum Payload {
     Gemini(gemini::Response),
     Http(http::Response),
     OneShot(Vec<u8>),
+    /// An internal `about:` page's gemtext source, generated locally (no
+    /// network). Rides the fetch pipe so history deep-travel refetches of
+    /// `about:` entries flow through the same completion path as the rest.
+    About(String),
 }
 
 /// Result of a background fetch.
@@ -804,6 +842,11 @@ pub struct App {
     /// The gopher type-7 item, gemini 1x URL, or form field awaiting
     /// input (pub so the UI can label the prompt accordingly).
     pub(crate) search_target: Option<Link>,
+    /// The pending Search prompt is for a secret (gemini status 11
+    /// "sensitive input", an HTML password field): the UI renders bullets
+    /// in place of the typed text. Set by EVERY site that enters
+    /// `Mode::Search` — it is only read while that mode is active.
+    pub(crate) masked_input: bool,
     /// A capsule that answered status 60: the prompt is asking for a
     /// name to mint a client identity under.
     pub(crate) cert_for: Option<GeminiUrl>,
@@ -905,6 +948,7 @@ impl App {
             enc_rx,
             enc_epoch: 0,
             search_target: None,
+            masked_input: false,
             cert_for: None,
             select_menu: None,
             find: None,
@@ -1410,6 +1454,10 @@ impl App {
                 self.on_mouse_event(mouse);
                 return;
             }
+            TermEvent::Paste(text) => {
+                self.on_paste(text).await;
+                return;
+            }
             _ => return,
         };
         if key.kind == KeyEventKind::Release {
@@ -1699,19 +1747,72 @@ impl App {
             if g.doc.laid_out() {
                 for (r, row) in g.doc.rows.iter().enumerate() {
                     for (i, item) in row.items.iter().enumerate() {
-                        push_text_matches(&item.text, &q, r, Some(i), &mut matches);
+                        push_text_matches(
+                            &item.text,
+                            &q,
+                            FindLoc::Item { row: r, item: i },
+                            &mut matches,
+                        );
+                    }
+                    // A scroll region's WHOLE buffer is searched where its
+                    // band starts (document order: content above < region
+                    // content < content below), not just the visible window.
+                    for (ri, rg) in g.doc.regions.iter().enumerate() {
+                        if rg.start_row != r {
+                            continue;
+                        }
+                        for (br, brow) in rg.buffer.iter().enumerate() {
+                            for (bi, item) in brow.items.iter().enumerate() {
+                                push_text_matches(
+                                    &item.text,
+                                    &q,
+                                    FindLoc::Region {
+                                        region: ri,
+                                        brow: br,
+                                        bitem: bi,
+                                    },
+                                    &mut matches,
+                                );
+                            }
+                        }
+                    }
+                }
+                // Pinned rails last: they're chrome, always on screen.
+                for (fi, f) in g.doc.fixed.iter().enumerate() {
+                    for (r, row) in f.rows.iter().enumerate() {
+                        for (i, item) in row.items.iter().enumerate() {
+                            push_text_matches(
+                                &item.text,
+                                &q,
+                                FindLoc::Fixed {
+                                    layer: fi,
+                                    row: r,
+                                    item: i,
+                                },
+                                &mut matches,
+                            );
+                        }
                     }
                 }
             } else {
                 for (l, line) in g.doc.lines.iter().enumerate() {
-                    push_text_matches(&line.text, &q, l, None, &mut matches);
+                    push_text_matches(&line.text, &q, FindLoc::Line(l), &mut matches);
                 }
             }
         }
         // Jump to the first match at or after the current scroll, else the top.
         let scroll = self.browser.as_ref().map_or(0, |g| g.scroll);
-        let current = (!matches.is_empty())
-            .then(|| matches.iter().position(|m| m.line >= scroll).unwrap_or(0));
+        let regions = self
+            .browser
+            .as_ref()
+            .map(|g| g.doc.regions.as_slice())
+            .unwrap_or(&[]);
+        let current = (!matches.is_empty()).then(|| {
+            matches
+                .iter()
+                .position(|m| m.order_row(regions) >= scroll)
+                .unwrap_or(0)
+        });
         if let Some(f) = self.find.as_mut() {
             f.last_query = query;
             f.matches = matches;
@@ -1745,20 +1846,49 @@ impl App {
         self.update_find_status();
     }
 
-    /// Centre the viewport on the active match's line/row.
+    /// Centre the viewport on the active match. A match inside a scroll
+    /// region also scrolls the REGION (`voffset`) so the match's buffer row
+    /// is in its window; a fixed-layer match is pinned on screen already.
     fn scroll_to_current_match(&mut self) {
-        let line = {
+        let loc = {
             let Some(f) = self.find.as_ref() else { return };
             let Some(ci) = f.current else { return };
             match f.matches.get(ci) {
-                Some(m) => m.line,
+                Some(m) => m.loc,
                 None => return,
             }
         };
         let height = self.last_inner.1 as usize;
-        if let Some(g) = self.browser.as_mut() {
-            let max_scroll = g.doc.extent().saturating_sub(height.max(1));
-            g.scroll = line.saturating_sub(height / 2).min(max_scroll);
+        let Some(g) = self.browser.as_mut() else {
+            return;
+        };
+        let mut writeback = None;
+        let line = match loc {
+            FindLoc::Line(l) => l,
+            FindLoc::Item { row, .. } => row,
+            FindLoc::Region { region, brow, .. } => {
+                let Some(rg) = g.doc.regions.get_mut(region) else {
+                    return;
+                };
+                // Scroll the region so the match's buffer row sits mid-window
+                // (clamped), then aim the doc at the band row it lands on.
+                let rh = (rg.height as usize).max(1);
+                rg.voffset = brow
+                    .saturating_sub(rh / 2)
+                    .min(rg.buffer.len().saturating_sub(rh));
+                // The user (via find) owns this position now, like a wheel
+                // scroll — a page-dictated stale signal must not yank it back,
+                // and the live element hears the new scrollTop.
+                rg.voffset_from_page = false;
+                writeback = Some((rg.live_node, rg.voffset));
+                rg.start_row + (brow - rg.voffset)
+            }
+            FindLoc::Fixed { .. } => return, // pinned: always visible
+        };
+        let max_scroll = g.doc.extent().saturating_sub(height.max(1));
+        g.scroll = line.saturating_sub(height / 2).min(max_scroll);
+        if let Some((node, voff)) = writeback {
+            self.region_writeback(node, voff);
         }
     }
 
@@ -1867,6 +1997,77 @@ impl App {
         self.select_anchor = None;
         self.active_history().detach();
         true
+    }
+
+    /// Insert a run of text at the cursor as ONE edit (the paste path):
+    /// replaces the selection; control characters are dropped (tabs land
+    /// as spaces) so they can never act as keystrokes.
+    fn insert_text(&mut self, text: &str) {
+        let clean: String = text
+            .chars()
+            .map(|c| if c == '\t' { ' ' } else { c })
+            .filter(|c| !c.is_control())
+            .collect();
+        if clean.is_empty() {
+            return;
+        }
+        self.delete_selection();
+        self.input.insert_str(self.byte_cursor(), &clean);
+        self.cursor += clean.chars().count();
+        self.active_history().detach();
+    }
+
+    /// One bracketed paste, applied atomically. Without this, a paste
+    /// replays as keystrokes — a Tab in it toggled the console, an Esc
+    /// closed the page. Text lands where typed text would; control
+    /// characters never act.
+    async fn on_paste(&mut self, text: String) {
+        match self.mode {
+            // Browsing / image viewer: keys are navigation — there is no
+            // text target, so swallow the paste rather than scatter it.
+            Mode::Session if self.browser.is_some() || self.viewer.is_some() => {
+                self.status = String::from("Paste ignored — Tab opens the console for a URL.");
+                self.notice = true;
+            }
+            // Character-at-a-time: the remote owns editing. Newlines go as
+            // CR (the terminal paste rule); when the remote app enabled
+            // bracketed paste itself (mode 2004, tracked by the emulator),
+            // it gets the markers a real terminal would send.
+            Mode::Session if self.char_mode() => {
+                let mut bytes = text.replace("\r\n", "\r").replace('\n', "\r").into_bytes();
+                if self.vt.screen().bracketed_paste() {
+                    let mut wrapped = b"\x1b[200~".to_vec();
+                    wrapped.append(&mut bytes);
+                    wrapped.extend_from_slice(b"\x1b[201~");
+                    bytes = wrapped;
+                }
+                self.send_bytes(bytes).await;
+            }
+            // Session line editor: embedded newlines send the line, so a
+            // multi-line paste types like it does into a real terminal.
+            Mode::Session => {
+                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                for (i, part) in normalized.split('\n').enumerate() {
+                    if i > 0 {
+                        let line = std::mem::take(&mut self.input);
+                        self.cursor = 0;
+                        self.select_anchor = None;
+                        self.active_history().push(&line);
+                        self.send_line(&line).await;
+                    }
+                    self.insert_text(part);
+                }
+            }
+            // Command console / prompts / find: insert only — a pasted
+            // newline must never RUN anything.
+            Mode::Command | Mode::Search | Mode::Find => {
+                let joined = text.replace("\r\n", " ").replace(['\n', '\r'], " ");
+                self.insert_text(joined.trim_end());
+                if self.mode == Mode::Find {
+                    self.recompute_find();
+                }
+            }
+        }
     }
 
     /// Move the cursor for an arrow/Home/End press: Shift extends the
@@ -2047,7 +2248,17 @@ impl App {
                 }
                 _ => self.status = String::from("usage: toggle crlf"),
             },
-            Some("status" | "st") => self.show_status(),
+            // GNU parity: `status` prints into the session feed — but that
+            // feed is hidden while a browser doc is up, so route to the
+            // about:status page there (visible, scrollable).
+            Some("status" | "st") => {
+                if self.browser.is_some() {
+                    self.open_about("status");
+                } else {
+                    self.show_status();
+                }
+            }
+            Some("help" | "?") => self.open_about("help"),
             Some("finger" | "f") => match parts.next() {
                 Some(target) => {
                     let (user, host) = match target.rsplit_once('@') {
@@ -2104,9 +2315,8 @@ impl App {
             // TODO for GNU telnet parity: full set/unset, display,
             // logout, z (suspend), ! (shell escape).
             Some(other) => {
-                self.status = format!(
-                    "unknown command: {other} (open/close/mode/send/set/toggle/finger/whois/dict/status/quit — or just type a URL)"
-                )
+                self.status =
+                    format!("unknown command: {other} (help lists commands — or just type a URL)")
             }
         }
     }
@@ -2145,9 +2355,9 @@ impl App {
         self.image_encoding.clear();
     }
 
-    /// GNU telnet's `status` command: print connection state into the
-    /// session feed, the way GNU telnet prints to the terminal.
-    fn show_status(&mut self) {
+    /// The `status` report body, one plain-text fact per line — shared by
+    /// the vt session feed print and the `about:status` page.
+    fn status_report(&self) -> String {
         let connection = match (&self.host, self.connected) {
             (Some(host), true) if self.tls => {
                 format!("Connected to {host}:{} over TLS (TOFU-pinned).", self.port)
@@ -2164,18 +2374,16 @@ impl App {
             (None, true) => "character (negotiated)",
             (None, false) => "line (negotiated)",
         };
-        let report = format!(
-            "\r\n\x1b[36m--- TRUST STATUS ---\x1b[0m\r\n\
-             {connection}\r\n\
-             Escape character: Ctrl-]\r\n\
-             Input mode: {mode}\r\n\
-             Enter sends: {eol}\r\n\
-             Encoding: {enc}\r\n\
-             JavaScript: {js}\r\n\
-             Cookies: {cookies}\r\n\
-             Remote options (WILL): {remote}\r\n\
-             Local options (DO): {local}\r\n\
-             \x1b[36m--------------------\x1b[0m\r\n",
+        format!(
+            "{connection}\n\
+             Escape character: Ctrl-]\n\
+             Input mode: {mode}\n\
+             Enter sends: {eol}\n\
+             Encoding: {enc}\n\
+             JavaScript: {js}\n\
+             Cookies: {cookies}\n\
+             Remote options (WILL): {remote}\n\
+             Local options (DO): {local}",
             eol = if self.crlf { "CR LF" } else { "CR NUL" },
             enc = match self.encoding {
                 Encoding::Utf8 => "UTF-8",
@@ -2189,8 +2397,62 @@ impl App {
             },
             remote = option_names(&self.remote_opts),
             local = option_names(&self.local_opts),
+        )
+    }
+
+    /// GNU telnet's `status` command: print connection state into the
+    /// session feed, the way GNU telnet prints to the terminal. While a
+    /// browser doc is on screen the feed is hidden, so `execute_command`
+    /// routes to the `about:status` page instead.
+    fn show_status(&mut self) {
+        let report = format!(
+            "\r\n\x1b[36m--- TRUST STATUS ---\x1b[0m\r\n{}\r\n\x1b[36m--------------------\x1b[0m\r\n",
+            self.status_report().replace('\n', "\r\n"),
         );
         self.vt.process(report.as_bytes());
+    }
+
+    /// Gemtext source of an internal `about:` page, or None for a name we
+    /// don't serve. Generated fresh each time — `about:status` reflects the
+    /// state at the moment it's (re)fetched.
+    fn about_body(&self, page: &str) -> Option<String> {
+        match page {
+            "help" => Some(String::from(HELP_PAGE)),
+            "status" => Some(format!("# TRust status\n\n{}\n", self.status_report())),
+            _ => None,
+        }
+    }
+
+    /// Build an internal page from its gemtext source. The Doc's URL is
+    /// `Link::External("about:…")`: never fetched from the network —
+    /// `start_fetch_opts` regenerates the body locally (history deep-travel),
+    /// and `sync_browser_wrap` re-wraps from the raw gemtext on resize.
+    fn about_doc(url: String, body: String, width: usize) -> Doc {
+        let width = width.max(10);
+        let lines =
+            gemini::parse_gemtext(body.as_bytes(), width, &|t| Link::External(t.to_string()));
+        Doc::from_lines(
+            Link::External(url),
+            lines,
+            body.into_bytes(),
+            width,
+            false,
+            None,
+        )
+    }
+
+    /// Open an internal `about:` page as a browser document (scrollable,
+    /// findable, in history) — how `help` always shows, and how `status`
+    /// shows when the session feed is hidden behind a browser doc.
+    fn open_about(&mut self, page: &str) {
+        let Some(body) = self.about_body(page) else {
+            self.status = format!("no such page: about:{page}");
+            return;
+        };
+        let width = (self.last_inner.0 as usize).max(10);
+        let doc = Self::about_doc(format!("about:{page}"), body, width);
+        self.status = format!("about:{page}");
+        self.navigate_to(doc);
     }
 
     /// Route an open target to the right protocol: gopher:// and
@@ -2328,6 +2590,15 @@ impl App {
         // A new fetch intent supersedes a pending deep-travel completion
         // (the deep-travel path itself re-sets the flag after this call).
         self.pending_travel = None;
+        // Internal pages regenerate locally; the body is built HERE (it
+        // needs App state) and echoed through the task so the completion
+        // path — including the deep-travel trail shuffle — stays one road.
+        let about = match &target {
+            Link::External(s) => s
+                .strip_prefix("about:")
+                .and_then(|page| self.about_body(page)),
+            _ => None,
+        };
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
         self.status = format!("Fetching {target} ...");
@@ -2337,40 +2608,44 @@ impl App {
         let storage = self.web_storage.clone();
         let js_on = self.js_enabled;
         let task = tokio::spawn(async move {
-            let result = match &target {
-                Link::Gopher(url) => gopher::fetch(url).await.map(Payload::Gopher),
-                Link::Gemini(url) => gemini::fetch(url).await.map(Payload::Gemini),
-                Link::Http(url) => {
-                    let fetched = if fallback_http {
-                        http::fetch_web_default(url).await
-                    } else {
-                        let mut req = http::Request::get(url.clone());
-                        if let Some(page) = &referrer {
-                            http::set_referrer(&mut req, page);
-                        }
-                        http::fetch(&req).await
-                    };
-                    match fetched {
-                        // JS on: full transform. JS off: still bake the page's
-                        // CSS so it lays out per its own stylesheets.
-                        Ok(response) => Ok(Payload::Http(if js_on {
-                            http::execute_js(response, viewport, cell_px, storage).await
+            let result = if let Some(body) = about {
+                Ok(Payload::About(body))
+            } else {
+                match &target {
+                    Link::Gopher(url) => gopher::fetch(url).await.map(Payload::Gopher),
+                    Link::Gemini(url) => gemini::fetch(url).await.map(Payload::Gemini),
+                    Link::Http(url) => {
+                        let fetched = if fallback_http {
+                            http::fetch_web_default(url).await
                         } else {
-                            http::css_only(response, viewport, cell_px).await
-                        })),
-                        Err(err) => Err(err),
+                            let mut req = http::Request::get(url.clone());
+                            if let Some(page) = &referrer {
+                                http::set_referrer(&mut req, page);
+                            }
+                            http::fetch(&req).await
+                        };
+                        match fetched {
+                            // JS on: full transform. JS off: still bake the page's
+                            // CSS so it lays out per its own stylesheets.
+                            Ok(response) => Ok(Payload::Http(if js_on {
+                                http::execute_js(response, viewport, cell_px, storage).await
+                            } else {
+                                http::css_only(response, viewport, cell_px).await
+                            })),
+                            Err(err) => Err(err),
+                        }
                     }
+                    Link::OneShot(url) => oneshot::fetch(url).await.map(Payload::OneShot),
+                    Link::External(url) => Err(format!("cannot fetch foreign scheme: {url}")),
+                    Link::Form { .. } => Err(String::from("form controls are not fetchable")),
+                    Link::JsClick { .. } => {
+                        Err(String::from("page-script links need their living page"))
+                    }
+                    Link::CarouselScroll(_) => Err(String::from(
+                        "carousel controls scroll in place, not fetched",
+                    )),
+                    Link::Media(_) => Err(String::from("media plays in mpv, not fetched")),
                 }
-                Link::OneShot(url) => oneshot::fetch(url).await.map(Payload::OneShot),
-                Link::External(url) => Err(format!("cannot fetch foreign scheme: {url}")),
-                Link::Form { .. } => Err(String::from("form controls are not fetchable")),
-                Link::JsClick { .. } => {
-                    Err(String::from("page-script links need their living page"))
-                }
-                Link::CarouselScroll(_) => Err(String::from(
-                    "carousel controls scroll in place, not fetched",
-                )),
-                Link::Media(_) => Err(String::from("media plays in mpv, not fetched")),
             };
             let _ = tx.send(FetchMsg { target, result }).await;
         });
@@ -2987,6 +3262,11 @@ impl App {
             }
             (Ok(Payload::Gemini(response)), _) => self.on_gemini_response(response, width),
             (Ok(Payload::Http(response)), _) => self.on_http_response(response, width),
+            (Ok(Payload::About(body)), Link::External(url)) => {
+                self.status = url.clone();
+                let doc = Self::about_doc(url, body, width);
+                self.navigate_to(doc);
+            }
             (Err(err), target) => {
                 self.status = format!("{target} — {err}");
                 self.notice = true;
@@ -3019,7 +3299,7 @@ impl App {
                 self.navigate_to(doc);
             }
             // 1x: the server wants input; reuse the search prompt.
-            // (11 is "sensitive input" — we don't mask the field yet.)
+            // 11 is "sensitive input" — the UI masks the typed text.
             10..=19 => {
                 self.status = if response.meta.is_empty() {
                     String::from("Input requested.")
@@ -3027,6 +3307,7 @@ impl App {
                     response.meta.clone()
                 };
                 self.search_target = Some(Link::Gemini(response.url));
+                self.masked_input = response.status == 11;
                 self.mode = Mode::Search;
                 self.input.clear();
                 self.cursor = 0;
@@ -3042,6 +3323,7 @@ impl App {
                     self.cursor = self.input.chars().count();
                     self.select_anchor = None;
                     self.cert_for = Some(response.url.clone());
+                    self.masked_input = false;
                     self.mode = Mode::Search;
                     self.status = format!(
                         "{} requests an identity — Enter mints a certificate with that name.",
@@ -4675,6 +4957,7 @@ impl App {
             KeyCode::Right | KeyCode::Enter => self.browser_follow(),
             KeyCode::Left => self.browser_back(),
             KeyCode::Char('v' | 'V') => self.open_in_mpv(),
+            KeyCode::Char('y' | 'Y') => self.yank_selected_url(),
             KeyCode::Esc => self.stop_loading(),
             _ => {}
         }
@@ -4777,6 +5060,7 @@ impl App {
             KeyCode::Enter => self.browser_follow(),
             KeyCode::Backspace => self.browser_back(),
             KeyCode::Char('v' | 'V') => self.open_in_mpv(),
+            KeyCode::Char('y' | 'Y') => self.yank_selected_url(),
             KeyCode::Esc => self.stop_loading(),
             _ => {}
         }
@@ -4871,13 +5155,19 @@ impl App {
             .collect()
     }
 
-    /// The first interactive item in the viewport, `(row, item)`.
+    /// The first interactive item in the viewport, `(row, item)`. Reads
+    /// through `effective_row` so scroll-region content (merged into its
+    /// band) is selectable by keyboard exactly as it is by mouse.
     fn http_first_visible_item(g: &BrowserView, height: usize) -> Option<(usize, usize)> {
         let end = (g.scroll + height).min(g.doc.rows.len());
         (g.scroll..end).find_map(|r| {
-            Self::row_interactives(&g.doc.rows[r])
-                .first()
-                .map(|&i| (r, i))
+            Self::row_interactives(&crate::layout::effective_row(
+                &g.doc.rows,
+                &g.doc.regions,
+                r,
+            ))
+            .first()
+            .map(|&i| (r, i))
         })
     }
 
@@ -4936,7 +5226,6 @@ impl App {
             return;
         }
 
-        let rows = &g.doc.rows;
         // No selection yet: the first document item, else the first rail link.
         let Some((cr, ci)) = g.sel_item else {
             g.sel_item = Self::http_first_visible_item(g, height);
@@ -4947,10 +5236,28 @@ impl App {
             return;
         };
 
+        // A selection on scroll-region content steps through the region's
+        // WHOLE buffer vertically (auto-scrolling its window), not just the
+        // rows it happens to show; only when the buffer is exhausted does
+        // the step fall out into the surrounding document.
+        if !horizontal {
+            let origin = crate::layout::item_origin(&g.doc.rows, &g.doc.regions, cr, ci);
+            if let crate::layout::ItemOrigin::Region {
+                region,
+                brow,
+                bitem,
+            } = origin
+                && self.region_step_vertical(region, brow, bitem, dir)
+            {
+                return;
+            }
+        }
+
+        let Some(g) = &mut self.browser else { return };
         let target = if horizontal {
-            Self::http_step_horizontal(rows, cr, ci, dir)
+            Self::http_step_horizontal(&g.doc.rows, &g.doc.regions, cr, ci, dir)
         } else {
-            Self::http_step_vertical(rows, cr, ci, dir)
+            Self::http_step_vertical(&g.doc.rows, &g.doc.regions, cr, ci, dir)
         };
         if let Some(next) = target {
             g.sel_item = Some(next);
@@ -4966,26 +5273,99 @@ impl App {
         self.http_keep_visible();
     }
 
+    /// Vertical keyboard step within a scroll region's buffer: find the
+    /// column-nearest interactive on the nearest buffer row in `dir`, shift
+    /// the window minimally to reveal it (a wheel-like user scroll, written
+    /// back to the live element), and select it at its band position.
+    /// Returns false when no further interactive exists in the buffer that
+    /// way — the caller steps out into the document.
+    fn region_step_vertical(&mut self, region: usize, brow: usize, bitem: usize, dir: i64) -> bool {
+        let Some(g) = &mut self.browser else {
+            return false;
+        };
+        let Some(rg) = g.doc.regions.get_mut(region) else {
+            return false;
+        };
+        let cur = rg.buffer.get(brow).and_then(|r| r.items.get(bitem));
+        let cur_col = cur.map_or(0, |it| it.col);
+        let cur_node = cur.map_or(crate::layout::NO_NODE, |it| it.node);
+        let candidates: Box<dyn Iterator<Item = usize>> = if dir > 0 {
+            Box::new((brow + 1)..rg.buffer.len())
+        } else {
+            Box::new((0..brow).rev())
+        };
+        let mut hit = None;
+        for br in candidates {
+            // Only items the merge will show (inside the scrollport's right
+            // edge) — a clipped item has no merged index to select.
+            let best = rg.buffer[br]
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| {
+                    it.link.is_some()
+                        && it.col < rg.width
+                        && (cur_node == crate::layout::NO_NODE || it.node != cur_node)
+                })
+                .min_by_key(|(_, it)| (i32::from(it.col) - i32::from(cur_col)).abs())
+                .map(|(bi, _)| bi);
+            if let Some(bi) = best {
+                hit = Some((br, bi));
+                break;
+            }
+        }
+        let Some((br, bi)) = hit else { return false };
+        // Minimal window shift to reveal the target row.
+        let rh = (rg.height as usize).max(1);
+        if br < rg.voffset {
+            rg.voffset = br;
+        } else if br >= rg.voffset + rh {
+            rg.voffset = br + 1 - rh;
+        }
+        rg.voffset_from_page = false;
+        let band = rg.start_row + (br - rg.voffset);
+        let writeback = (rg.live_node, rg.voffset);
+        // The target's merged index in the (freshly scrolled) effective row.
+        let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, band);
+        let idx = (0..row.items.len()).find(|&i| {
+            matches!(
+                crate::layout::item_origin(&g.doc.rows, &g.doc.regions, band, i),
+                crate::layout::ItemOrigin::Region { region: r2, brow: b2, bitem: i2 }
+                    if r2 == region && b2 == br && i2 == bi
+            )
+        });
+        let Some(idx) = idx else { return false };
+        g.sel_item = Some((band, idx));
+        g.sel_fixed = None;
+        self.http_keep_visible();
+        self.region_writeback(writeback.0, writeback.1);
+        true
+    }
+
     /// Next interactive item in document order from `(cr, ci)`, scanning
     /// items on the current row first, then spilling into later/earlier
-    /// rows.
+    /// rows. Rows are read through `effective_row`, so a scroll region's
+    /// visible window is stepped through like any other content.
     fn http_step_horizontal(
         rows: &[crate::layout::Row],
+        regions: &[crate::layout::Region],
         cr: usize,
         ci: usize,
         dir: i64,
     ) -> Option<(usize, usize)> {
-        let cur_node = rows[cr]
+        let eff = |r: usize| crate::layout::effective_row(rows, regions, r);
+        let here_row = eff(cr);
+        let cur_node = here_row
             .items
             .get(ci)
             .map_or(crate::layout::NO_NODE, |it| it.node);
-        let here = Self::row_interactives_excluding(&rows[cr], cur_node);
+        let here = Self::row_interactives_excluding(&here_row, cur_node);
         if dir > 0 {
             if let Some(&i) = here.iter().find(|&&i| i > ci) {
                 return Some((cr, i));
             }
             ((cr + 1)..rows.len()).find_map(|r| {
-                Self::row_interactives_excluding(&rows[r], cur_node)
+                Self::row_interactives_excluding(&eff(r), cur_node)
                     .first()
                     .map(|&i| (r, i))
             })
@@ -4994,7 +5374,7 @@ impl App {
                 return Some((cr, i));
             }
             (0..cr).rev().find_map(|r| {
-                Self::row_interactives_excluding(&rows[r], cur_node)
+                Self::row_interactives_excluding(&eff(r), cur_node)
                     .last()
                     .map(|&i| (r, i))
             })
@@ -5002,15 +5382,19 @@ impl App {
     }
 
     /// The interactive item in the next row (in `dir`) whose column is
-    /// nearest the current item's column.
+    /// nearest the current item's column. Rows are read through
+    /// `effective_row` (scroll-region windows included).
     fn http_step_vertical(
         rows: &[crate::layout::Row],
+        regions: &[crate::layout::Region],
         cr: usize,
         ci: usize,
         dir: i64,
     ) -> Option<(usize, usize)> {
-        let cur_col = rows[cr].items.get(ci).map_or(0, |it| it.col);
-        let cur_node = rows[cr]
+        let eff = |r: usize| crate::layout::effective_row(rows, regions, r);
+        let here_row = eff(cr);
+        let cur_col = here_row.items.get(ci).map_or(0, |it| it.col);
+        let cur_node = here_row
             .items
             .get(ci)
             .map_or(crate::layout::NO_NODE, |it| it.node);
@@ -5020,10 +5404,11 @@ impl App {
             Box::new((0..cr).rev())
         };
         for r in candidates {
-            let inter = Self::row_interactives_excluding(&rows[r], cur_node);
+            let row = eff(r);
+            let inter = Self::row_interactives_excluding(&row, cur_node);
             if let Some(&best) = inter
                 .iter()
-                .min_by_key(|&&i| (i32::from(rows[r].items[i].col) - i32::from(cur_col)).abs())
+                .min_by_key(|&&i| (i32::from(row.items[i].col) - i32::from(cur_col)).abs())
             {
                 return Some((r, best));
             }
@@ -5279,6 +5664,11 @@ impl App {
                 )
             }
             Link::OneShot(url) => oneshot::parse(&url, raw, width),
+            // Internal pages re-wrap from their raw gemtext source.
+            Link::External(s) if s.starts_with("about:") => {
+                let body = String::from_utf8_lossy(&raw).into_owned();
+                Self::about_doc(s, body, width)
+            }
             Link::Form { .. } | Link::JsClick { .. } | Link::External(_) => return,
             Link::CarouselScroll(_) | Link::Media(_) => return,
         };
@@ -5432,6 +5822,7 @@ impl App {
                 '0' | '1' | 'I' | 'g' | 'p' => self.start_fetch(Link::Gopher(url)),
                 '7' => {
                     self.search_target = Some(Link::Gopher(url));
+                    self.masked_input = false;
                     self.mode = Mode::Search;
                     self.input.clear();
                     self.cursor = 0;
@@ -5568,6 +5959,44 @@ impl App {
         None
     }
 
+    /// The selected link as the URL string `y` copies: any followable
+    /// scheme — web URLs resolved absolute, gopher/gemini/one-shot spelled
+    /// out, foreign schemes (mailto:, irc:) verbatim (copying is exactly
+    /// what a scheme we don't speak is for). Form controls and carousel
+    /// buttons aren't URLs.
+    fn yank_target(&self) -> Option<String> {
+        if let Some(url) = self.selected_web_url() {
+            return Some(url);
+        }
+        match self.selected_link()? {
+            Link::Gopher(u) => Some(u.to_string()),
+            Link::Gemini(u) => Some(u.to_string()),
+            Link::OneShot(u) => Some(u.to_string()),
+            Link::Media(u) => Some(u.to_string()),
+            Link::External(s) => Some(s),
+            Link::JsClick { href, .. } if !href.is_empty() => Some(href),
+            _ => None,
+        }
+    }
+
+    /// `y` in the browser: copy the selected link's URL to the system
+    /// clipboard via OSC 52 (foot supports it; nothing touches disk —
+    /// RAM-only friendly). The sequence bypasses ratatui's cell buffer:
+    /// it's a pure control string, invisible to the screen.
+    fn yank_selected_url(&mut self) {
+        let Some(url) = self.yank_target() else {
+            self.status = String::from("No link selected to copy.");
+            self.notice = true;
+            return;
+        };
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = out.write_all(osc52_copy(&url).as_bytes());
+        let _ = out.flush();
+        self.status = format!("Copied {url}");
+        self.notice = true;
+    }
+
     /// Enter on a form control: edit, toggle, cycle, or submit per kind.
     fn form_interact(&mut self, form: usize, field: usize) {
         use crate::doc::FieldKind;
@@ -5594,6 +6023,9 @@ impl App {
                 self.cursor = self.input.chars().count();
                 self.select_anchor = None;
                 self.search_target = Some(Link::Form { form, field });
+                // The page widget already bullets password values; the edit
+                // prompt must not undo that by echoing the secret.
+                self.masked_input = kind == FieldKind::Password;
                 self.mode = Mode::Search;
                 self.status = format!("Editing {name} — Enter sets, Esc cancels.");
             }
@@ -6334,6 +6766,79 @@ fn is_playable_media_url(url: &str) -> bool {
 
 const SEND_USAGE: &str = "usage: send brk|ip|ao|ayt|ec|el|ga|nop|escape";
 
+/// The OSC 52 set-clipboard control string for `text` (base64 payload,
+/// `c` = the clipboard selection, BEL-terminated).
+fn osc52_copy(text: &str) -> String {
+    format!(
+        "\x1b]52;c;{}\x07",
+        crate::img::base64_encode(text.as_bytes())
+    )
+}
+
+/// The `about:help` page source (gemtext). Command lines live in
+/// preformatted blocks so their alignment survives any terminal width.
+const HELP_PAGE: &str = "\
+# TRust help
+
+Tab or Ctrl-] opens the command console; Enter runs a line.
+A bare URL or hostname opens directly, like an address bar.
+
+## Commands
+
+```
+open <host> [port]        telnet (telnets:// for TLS)
+open <url>                gopher gemini http(s) finger …
+close                     drop the connection
+reload                    refetch the page on screen
+post <url> [body]         POST a form body to a web URL
+finger [user]@<host>      finger query
+whois <domain> [server]   whois lookup
+dict <word> [server]      dictionary lookup
+status                    connection and options report
+help                      this page
+quit                      exit
+```
+
+## Settings
+
+```
+set encoding cp437|utf8   BBS art mode
+set image sixel|halfblocks|kitty|iterm2|auto
+set js on|off             page JavaScript (default on)
+set cookies on|off        RAM-only cookies (default on)
+set borders on|off        CSS borders (default off)
+mode character|line|auto  telnet input mode
+send escape|<iac>         Ctrl-] or an IAC (brk/ip/ayt/…)
+toggle crlf               what Enter sends
+```
+
+## Browsing keys
+
+```
+Up/Down        move the selection (page scrolls along)
+Enter/Right    follow the selected link
+Left/Backspace back · Alt-Left/Alt-Right back/forward
+PgUp/PgDn      page · Home/End top/bottom
+Ctrl-F         find in page (Enter next, Shift-Enter prev)
+v              play the selected link in mpv
+y              copy the selected link URL (OSC 52)
+Esc            stop loading / close the page
+```
+
+Mouse: hover selects, click follows, wheel scrolls,
+back/forward side buttons travel history.
+
+## Telnet sessions
+
+Line mode edits locally; character mode sends every key to
+the remote (Ctrl-] still opens the console). Esc reaches the
+remote in character mode — full-screen apps depend on it.
+
+## Image viewer
+
+Left/Backspace/q/Esc close it. `set image` picks the protocol.
+";
+
 /// Map GNU telnet `send` argument names to IAC command codes (RFC 854).
 fn iac_code(name: &str) -> Option<u8> {
     Some(match name {
@@ -6354,13 +6859,7 @@ fn iac_code(name: &str) -> Option<u8> {
 /// (already lowercased) in `text` as non-overlapping char-offset ranges.
 /// Non-ASCII case is matched exactly — an honest limitation; find queries
 /// are virtually always ASCII.
-fn push_text_matches(
-    text: &str,
-    query: &[char],
-    line: usize,
-    item: Option<usize>,
-    out: &mut Vec<FindMatch>,
-) {
+fn push_text_matches(text: &str, query: &[char], loc: FindLoc, out: &mut Vec<FindMatch>) {
     // Cheap pre-filter before any allocation: a text with fewer BYTES than
     // the query has CHARS can't hold it (chars ≤ bytes). Most items are short
     // words, so find-as-you-type skips the per-item char collection for them.
@@ -6375,8 +6874,7 @@ fn push_text_matches(
     while i + query.len() <= lower.len() {
         if lower[i..i + query.len()] == *query {
             out.push(FindMatch {
-                line,
-                item,
+                loc,
                 start: i,
                 end: i + query.len(),
             });
@@ -7044,6 +7542,101 @@ mod tests {
         assert!(contents.contains("No connection."));
         assert!(contents.contains("Enter sends: CR NUL"));
         assert!(contents.contains("Encoding: UTF-8"));
+    }
+
+    #[tokio::test]
+    async fn help_command_opens_the_about_page() {
+        use crate::doc::{Kind, Link};
+        let mut app = super::App::new(None, 23);
+        app.execute_command("help").await;
+        let g = app.browser.as_ref().expect("help opens a browser doc");
+        assert!(matches!(&g.doc.url, Link::External(s) if s == "about:help"));
+        assert!(
+            g.doc
+                .lines
+                .iter()
+                .any(|l| l.kind == Kind::Heading(1) && l.text.contains("TRust help"))
+        );
+        assert!(
+            g.doc
+                .lines
+                .iter()
+                .any(|l| l.kind == Kind::Pre && l.text.contains("open <host>")),
+            "the command table renders preformatted"
+        );
+
+        // `?` is an alias.
+        let mut app = super::App::new(None, 23);
+        app.execute_command("?").await;
+        assert!(app.browser.is_some());
+    }
+
+    #[tokio::test]
+    async fn status_while_browsing_shows_a_page_and_back_returns() {
+        use crate::doc::Link;
+        let mut app = super::App::new(None, 23);
+        app.navigate_to(gopher_doc("x.x"));
+        app.execute_command("status").await;
+        let g = app.browser.as_ref().unwrap();
+        assert!(
+            matches!(&g.doc.url, Link::External(s) if s == "about:status"),
+            "status over a hidden feed renders as a page"
+        );
+        assert!(
+            g.doc
+                .lines
+                .iter()
+                .any(|l| l.text.contains("No connection."))
+        );
+        app.browser_back();
+        let g = app.browser.as_ref().unwrap();
+        assert!(
+            matches!(&g.doc.url, Link::Gopher(_)),
+            "back returns to the page"
+        );
+    }
+
+    #[test]
+    fn about_pages_rewrap_on_resize() {
+        let mut app = super::App::new(None, 23);
+        app.open_about("help");
+        let before = app.browser.as_ref().unwrap().doc.wrapped_to;
+        app.last_inner = (40, 20);
+        app.sync_browser_wrap();
+        let g = app.browser.as_ref().unwrap();
+        assert_ne!(before, 40, "the test needs a real width change");
+        assert_eq!(g.doc.wrapped_to, 40);
+        assert!(!g.doc.lines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deep_travel_regenerates_about_pages_locally() {
+        use crate::doc::Link;
+        let mut app = super::App::new(None, 23);
+        app.open_about("help");
+        app.navigate_to(http_doc("/a"));
+        app.navigate_to(http_doc("/b"));
+        let g = app.browser.as_ref().unwrap();
+        assert!(g.history[0].doc.is_none(), "the deep about entry evicts");
+        app.browser_back(); // /a, adjacent
+        app.browser_back(); // about:help — deep, refetches
+        assert_eq!(app.pending_travel, Some(false));
+        let msg = app
+            .fetch_rx
+            .as_mut()
+            .expect("a local regeneration was dispatched")
+            .recv()
+            .await
+            .expect("the about fetch settles");
+        app.on_fetch(msg);
+        let g = app.browser.as_ref().unwrap();
+        assert!(
+            matches!(&g.doc.url, Link::External(s) if s == "about:help"),
+            "travel landed back on the regenerated page"
+        );
+        assert!(!g.doc.lines.is_empty());
+        assert!(g.history.is_empty());
+        assert_eq!(g.forward.len(), 2);
     }
 
     /// Build a browser doc from a pattern: 'x' = link line, '.' = text.
@@ -8675,24 +9268,25 @@ mod tests {
 
     #[test]
     fn push_text_matches_is_case_insensitive_and_nonoverlapping() {
+        use super::FindLoc;
         let q: Vec<char> = "foo".chars().collect();
         let mut out = Vec::new();
-        super::push_text_matches("Foo foo fOo bar", &q, 7, None, &mut out);
+        super::push_text_matches("Foo foo fOo bar", &q, FindLoc::Line(7), &mut out);
         assert_eq!(out.len(), 3);
         assert_eq!((out[0].start, out[0].end), (0, 3));
         assert_eq!((out[1].start, out[1].end), (4, 7));
         assert_eq!((out[2].start, out[2].end), (8, 11));
-        assert_eq!(out[0].line, 7);
+        assert_eq!(out[0].loc, FindLoc::Line(7));
         // Overlapping query advances past each hit (no double-count).
         let q: Vec<char> = "aa".chars().collect();
         let mut out = Vec::new();
-        super::push_text_matches("aaaa", &q, 0, None, &mut out);
+        super::push_text_matches("aaaa", &q, FindLoc::Line(0), &mut out);
         assert_eq!(out.len(), 2);
         // The byte-length fast path can't reject a match it shouldn't: a
         // multi-byte text shorter in chars than in bytes still scans.
         let q: Vec<char> = "héllo".chars().collect();
         let mut out = Vec::new();
-        super::push_text_matches("say Héllo", &q, 0, None, &mut out);
+        super::push_text_matches("say Héllo", &q, FindLoc::Line(0), &mut out);
         assert_eq!(out.len(), 1, "non-ASCII exact-case match still found");
     }
 
@@ -8710,10 +9304,13 @@ mod tests {
 
         let f = app.find.as_ref().unwrap();
         assert_eq!(f.matches.len(), 3);
-        assert!(f.matches.iter().all(|m| m.item.is_none()));
         assert_eq!(
-            f.matches.iter().map(|m| m.line).collect::<Vec<_>>(),
-            [0, 1, 2]
+            f.matches.iter().map(|m| m.loc).collect::<Vec<_>>(),
+            [
+                super::FindLoc::Line(0),
+                super::FindLoc::Line(1),
+                super::FindLoc::Line(2)
+            ]
         );
         assert_eq!(f.current, Some(0));
 
@@ -8745,7 +9342,11 @@ mod tests {
 
         let f = app.find.as_ref().unwrap();
         assert_eq!(f.matches.len(), 2);
-        assert!(f.matches.iter().all(|m| m.item.is_some()));
+        assert!(
+            f.matches
+                .iter()
+                .all(|m| matches!(m.loc, super::FindLoc::Item { .. }))
+        );
         assert_eq!(f.current, Some(0));
     }
 
@@ -8777,6 +9378,148 @@ mod tests {
             g.scroll
         );
         assert_eq!(g.scroll, 48);
+    }
+
+    #[test]
+    fn keyboard_walks_links_inside_a_scroll_region() {
+        let mut app = region_app();
+        // The fresh page selected its first interactive: region content
+        // (reached through the effective row, like the mouse).
+        let g = app.browser.as_ref().unwrap();
+        let (cr, ci) = g.sel_item.expect("initial selection");
+        assert!(
+            matches!(
+                crate::layout::item_origin(&g.doc.rows, &g.doc.regions, cr, ci),
+                crate::layout::ItemOrigin::Region { .. }
+            ),
+            "keyboard selection reaches region content"
+        );
+        assert!(
+            matches!(app.selected_link(), Some(Link::Http(u)) if u.path() == "/L00"),
+            "starts on the first buffered link: {:?}",
+            app.selected_link()
+        );
+
+        // Walk deeper than the window: the region auto-scrolls under the
+        // selection instead of the selection skipping past the region.
+        for _ in 0..10 {
+            app.http_move(1, false);
+        }
+        let g = app.browser.as_ref().unwrap();
+        let rg = &g.doc.regions[0];
+        assert!(
+            matches!(app.selected_link(), Some(Link::Http(u)) if u.path() == "/L10"),
+            "ten steps land on the tenth link: {:?}",
+            app.selected_link()
+        );
+        assert!(rg.voffset > 0, "the window scrolled to follow");
+        assert!(!rg.voffset_from_page, "keyboard owns the offset now");
+
+        // Walking back up returns to the top of the buffer.
+        for _ in 0..10 {
+            app.http_move(-1, false);
+        }
+        let g = app.browser.as_ref().unwrap();
+        assert!(
+            matches!(app.selected_link(), Some(Link::Http(u)) if u.path() == "/L00"),
+            "the walk retraces to the first link: {:?}",
+            app.selected_link()
+        );
+        assert_eq!(
+            g.doc.regions[0].voffset, 0,
+            "window followed back to the top"
+        );
+    }
+
+    #[test]
+    fn find_searches_a_regions_whole_buffer_and_scrolls_it() {
+        use super::FindLoc;
+        let mut app = region_app();
+        app.open_find();
+        app.input = String::from("l35"); // deep in the buffer, case-folded
+        app.cursor = 3;
+        app.recompute_find();
+
+        let f = app.find.as_ref().unwrap();
+        assert_eq!(f.matches.len(), 1, "the whole buffer is searched");
+        let FindLoc::Region {
+            region,
+            brow,
+            bitem,
+        } = f.matches[0].loc
+        else {
+            panic!("expected a region match");
+        };
+        assert_eq!(region, 0);
+
+        // Revealed: the region scrolled its window onto the match …
+        let g = app.browser.as_ref().unwrap();
+        let rg = &g.doc.regions[0];
+        assert!(
+            rg.voffset <= brow && brow < rg.voffset + rg.height as usize,
+            "buffer row {brow} inside window at voffset {}",
+            rg.voffset
+        );
+        assert!(!rg.voffset_from_page, "find owns the offset like a wheel");
+        // … and the doc scrolled the band row into the viewport.
+        let band = rg.start_row + (brow - rg.voffset);
+        let height = app.last_inner.1 as usize;
+        assert!(
+            g.scroll <= band && band < g.scroll + height,
+            "band row {band} visible at scroll {}",
+            g.scroll
+        );
+
+        // The renderer's origin translation reaches the same item, so the
+        // highlight lands on the matched text.
+        let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, band);
+        let hit = row.items.iter().enumerate().find(|(i, _)| {
+            matches!(
+                crate::layout::item_origin(&g.doc.rows, &g.doc.regions, band, *i),
+                crate::layout::ItemOrigin::Region { region: r, brow: b, bitem: bi }
+                    if r == region && b == brow && bi == bitem
+            )
+        });
+        assert!(
+            hit.is_some_and(|(_, it)| it.text.contains("L35")),
+            "origin maps back to the matched region item"
+        );
+    }
+
+    #[test]
+    fn find_matches_on_a_pinned_rail_without_scrolling() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 20);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let html = b"<body><div style='display:flex;justify-content:center'>\
+            <div style='min-width:120px'>\
+              <div style='position:fixed;width:120px'><a href='/dest'>RAILLINK</a></div>\
+            </div>\
+            <main style='width:100px'>FEED</main>\
+          </div></body>";
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html,
+            80,
+            20,
+            &Default::default(),
+        ));
+        assert!(!app.browser.as_ref().unwrap().doc.fixed.is_empty());
+
+        app.open_find();
+        app.input = String::from("raillink");
+        app.cursor = 8;
+        app.recompute_find();
+        let f = app.find.as_ref().unwrap();
+        assert_eq!(f.matches.len(), 1, "rail text is searched");
+        assert!(matches!(f.matches[0].loc, super::FindLoc::Fixed { .. }));
+
+        // A pinned match never scrolls the document (it's always on screen).
+        let before = app.browser.as_ref().unwrap().scroll;
+        app.find_next();
+        assert_eq!(app.browser.as_ref().unwrap().scroll, before);
     }
 
     #[tokio::test]
@@ -9423,6 +10166,208 @@ mod tests {
         app.browser_follow();
         assert_eq!(app.input, "hello there");
         assert_eq!(app.cursor, "hello there".chars().count());
+    }
+
+    #[test]
+    fn osc52_copy_encodes_the_clipboard_sequence() {
+        // "hi" → aGk= (RFC 4648); c = the clipboard selection.
+        assert_eq!(super::osc52_copy("hi"), "\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn yank_copies_the_selected_link_url() {
+        // gopher line model: the selected link's full URL.
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.navigate_to(gopher_doc("x"));
+        assert_eq!(app.yank_target().as_deref(), Some("gopher://test.host/1/0"));
+        app.yank_selected_url();
+        assert!(app.status.starts_with("Copied gopher://"), "{}", app.status);
+        assert!(app.notice);
+
+        // http laid-out model: absolute web URL.
+        let html = r#"<a href="/next">next</a> <form action="/f"><input name="q"></form>"#;
+        let base = url::Url::parse("https://example.com/page").unwrap();
+        app.navigate_to(crate::http::parse(
+            &base,
+            "text/html",
+            html.as_bytes(),
+            60,
+            0,
+            &Default::default(),
+        ));
+        select_item(
+            &mut app,
+            |it| matches!(&it.link, Some(Link::Http(u)) if u.path() == "/next"),
+        );
+        assert_eq!(
+            app.yank_target().as_deref(),
+            Some("https://example.com/next")
+        );
+
+        // A form control is not a URL: yank refuses with a notice.
+        select_item(&mut app, |it| matches!(&it.link, Some(Link::Form { .. })));
+        assert_eq!(app.yank_target(), None);
+        app.yank_selected_url();
+        assert_eq!(app.status, "No link selected to copy.");
+    }
+
+    #[tokio::test]
+    async fn paste_inserts_atomically_into_the_console() {
+        use crossterm::event::Event;
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Command;
+        // Via the real event path: the Tab inside must not toggle the
+        // console, the newline must not run the command.
+        app.on_terminal_event(Event::Paste(String::from("open\texample.com\n")))
+            .await;
+        assert_eq!(app.mode, super::Mode::Command, "paste runs nothing");
+        assert_eq!(app.input, "open example.com");
+        assert_eq!(app.cursor, app.input.chars().count());
+
+        // A paste lands as one edit over the selection.
+        app.select_anchor = Some(0);
+        app.cursor = app.input.chars().count();
+        app.on_paste(String::from("gopher://sdf.org")).await;
+        assert_eq!(app.input, "gopher://sdf.org");
+    }
+
+    #[tokio::test]
+    async fn paste_while_browsing_is_swallowed() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.navigate_to(gopher_doc("x.x"));
+        app.on_paste(String::from("stray\x1btext")).await;
+        assert!(app.input.is_empty(), "no field to paste into");
+        assert!(app.notice, "the user is told where paste goes");
+        assert!(app.browser.is_some(), "the page stayed put");
+    }
+
+    #[tokio::test]
+    async fn char_mode_paste_hits_the_wire_atomically() {
+        use crate::telnet;
+        use tokio::sync::mpsc;
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.connected = true; // char_mode needs a live session
+        app.mode_override = Some(super::InputMode::Character);
+        let (tx, mut rx) = mpsc::channel(8);
+        app.conn = Some(telnet::Handle { commands: tx });
+
+        // Newlines travel as CR, the terminal paste rule.
+        app.on_paste(String::from("two\nlines\n")).await;
+        let telnet::Command::Send(bytes) = rx.recv().await.unwrap() else {
+            panic!("expected a Send");
+        };
+        assert_eq!(bytes, b"two\rlines\r".to_vec());
+
+        // A remote app that enabled bracketed paste (mode 2004) gets the
+        // markers a real terminal would send it.
+        app.vt.process(b"\x1b[?2004h");
+        app.on_paste(String::from("marked")).await;
+        let telnet::Command::Send(bytes) = rx.recv().await.unwrap() else {
+            panic!("expected a Send");
+        };
+        assert_eq!(bytes, b"\x1b[200~marked\x1b[201~".to_vec());
+    }
+
+    #[tokio::test]
+    async fn line_mode_paste_sends_completed_lines() {
+        use crate::telnet;
+        use tokio::sync::mpsc;
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        let (tx, mut rx) = mpsc::channel(8);
+        app.conn = Some(telnet::Handle { commands: tx });
+        app.input = String::from("say ");
+        app.cursor = 4;
+        app.on_paste(String::from("hello\nworld")).await;
+        // The newline completed the first line, like typing Enter …
+        let telnet::Command::Send(bytes) = rx.recv().await.unwrap() else {
+            panic!("expected a Send");
+        };
+        assert_eq!(bytes, b"say hello\r\n".to_vec());
+        // … and the remainder stays in the editor, unsent.
+        assert_eq!(app.input, "world");
+        assert_eq!(app.cursor, 5);
+    }
+
+    #[test]
+    fn gemini_sensitive_input_masks_the_prompt() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (80, 10);
+        let url = crate::gemini::GeminiUrl::parse("gemini://astro.test/pw").unwrap();
+        app.on_gemini_response(
+            crate::gemini::Response {
+                url: url.clone(),
+                status: 11,
+                meta: String::from("Password"),
+                body: Vec::new(),
+                identity: false,
+            },
+            80,
+        );
+        assert_eq!(app.mode, super::Mode::Search);
+        assert!(app.masked_input, "status 11 is sensitive input");
+
+        // Whatever is typed renders as bullets, never as the secret.
+        app.input = String::from("hunter2");
+        app.cursor = 7;
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!screen.contains("hunter2"), "the secret must not echo");
+        assert!(screen.contains("•••••••"), "bullets stand in for it");
+        assert!(screen.contains("SECRET"), "the prompt is labeled");
+
+        // Plain status 10 input is NOT masked.
+        app.on_gemini_response(
+            crate::gemini::Response {
+                url,
+                status: 10,
+                meta: String::from("Search term"),
+                body: Vec::new(),
+                identity: false,
+            },
+            80,
+        );
+        assert!(!app.masked_input);
+    }
+
+    #[test]
+    fn password_field_edit_masks_the_prompt() {
+        let html = r#"
+            <form method="POST" action="/login">
+              <input type="text" name="user">
+              <input type="password" name="pw" value="s3cret">
+            </form>"#;
+        let base = url::Url::parse("https://example.com/login").unwrap();
+        let mut app = super::App::new(None, 23);
+        app.last_inner = (60, 10);
+        app.navigate_to(crate::http::parse(
+            &base,
+            "text/html",
+            html.as_bytes(),
+            60,
+            0,
+            &Default::default(),
+        ));
+        app.form_interact(0, 1);
+        assert_eq!(app.mode, super::Mode::Search);
+        assert!(app.masked_input, "a password field masks its editor");
+        assert_eq!(app.input, "s3cret", "the value is still editable");
+
+        // A plain text field is not masked (the flag re-arms per prompt).
+        app.mode = super::Mode::Session;
+        app.form_interact(0, 0);
+        assert!(!app.masked_input);
     }
 
     #[test]
