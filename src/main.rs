@@ -105,9 +105,14 @@ async fn main() -> ExitCode {
         if !app::TERMINAL_OWNER.with(|c| c.get()) {
             return; // background panic, caught downstream — keep the TUI clean
         }
-        // A real render/run-loop panic: drop mouse capture, then let
-        // ratatui's hook restore the screen and the default hook print.
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+        // A real render/run-loop panic: drop mouse capture and paste mode,
+        // then let ratatui's hook restore the screen and the default hook
+        // print.
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste
+        );
         ratatui_hook(info);
     }));
 
@@ -117,13 +122,23 @@ async fn main() -> ExitCode {
     let picker = ratatui_image::picker::Picker::from_query_stdio()
         .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
     // Capture the mouse so wheel events scroll our scrollback instead of
-    // being translated into arrow keys by the terminal emulator.
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    // being translated into arrow keys by the terminal emulator. Bracketed
+    // paste makes a paste arrive as ONE event instead of replayed
+    // keystrokes (a pasted Tab used to open the console).
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste
+    );
     let mut app = app::App::new(host, start_port.unwrap_or(23));
     app.start_port = start_port;
     app.set_picker(picker);
     let result = app.run(terminal).await;
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
+    );
     ratatui::restore();
 
     match result {

@@ -627,6 +627,52 @@ pub fn effective_row<'a>(
     Cow::Owned(merged)
 }
 
+/// Where item `i` of `effective_row(rows, regions, row_idx)` came from: the
+/// doc row itself, or a scroll region's buffer (which buffer row and item).
+/// MUST mirror `effective_row`'s merge exactly — same region iteration
+/// order, same right-edge clip filter — so a merged index translates back
+/// to stable buffer coordinates (the find highlighter keys matches on
+/// them; a divergence highlights the wrong item).
+pub enum ItemOrigin {
+    Doc,
+    Region {
+        region: usize,
+        brow: usize,
+        bitem: usize,
+    },
+}
+
+pub fn item_origin(rows: &[Row], regions: &[Region], row_idx: usize, i: usize) -> ItemOrigin {
+    let doc_n = rows[row_idx].items.len();
+    if i < doc_n {
+        return ItemOrigin::Doc;
+    }
+    let mut next = doc_n;
+    for (ri, rg) in regions.iter().enumerate() {
+        if !rg.contains_row(row_idx) {
+            continue;
+        }
+        let brow = rg.voffset + (row_idx - rg.start_row);
+        let Some(b) = rg.buffer.get(brow) else {
+            continue;
+        };
+        for (bi, it) in b.items.iter().enumerate() {
+            if it.col >= rg.width {
+                continue;
+            }
+            if next == i {
+                return ItemOrigin::Region {
+                    region: ri,
+                    brow,
+                    bitem: bi,
+                };
+            }
+            next += 1;
+        }
+    }
+    ItemOrigin::Doc
+}
+
 /// How far above the scroll top to look for an image whose box reaches down
 /// into the viewport (a tall banner scrolled partly off the top). Bounds the
 /// per-frame back-scan; an image taller than this many cells (~5000px) is not

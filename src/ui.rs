@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use tui_term::widget::PseudoTerminal;
 
-use crate::app::{App, BrowserView, Encoding, FindState, Mode};
+use crate::app::{App, BrowserView, Encoding, FindLoc, FindState, Mode};
 use crate::doc::{Kind, Link};
 
 pub mod theme {
@@ -109,7 +109,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             // from `position:fixed`) draws over the scrolling document at a fixed
             // screen position, so it stays put while the center scrolls.
             if !g.doc.fixed.is_empty() {
-                render_fixed_layer(frame, g, inner);
+                render_fixed_layer(frame, g, inner, app.find.as_ref());
             }
             // Scroll-position indicator on the right border, when the document
             // overflows the panel.
@@ -245,24 +245,20 @@ fn render_select_menu(frame: &mut Frame, app: &mut App, inner: Rect) {
 
 /// The visible slice of a document, gopherus-style: the cursor line is
 /// highlighted when it carries a link.
-/// The find-match char ranges on a given line/item, each tagged with whether
+/// The find-match char ranges at a given location, each tagged with whether
 /// it is the active match. Already in document order (so sorted).
-fn find_ranges(
-    find: Option<&FindState>,
-    line: usize,
-    item: Option<usize>,
-) -> Vec<(usize, usize, bool)> {
+fn find_ranges(find: Option<&FindState>, loc: FindLoc) -> Vec<(usize, usize, bool)> {
     let Some(f) = find else {
         return Vec::new();
     };
     let cur = f
         .current
         .and_then(|c| f.matches.get(c))
-        .map(|m| (m.line, m.item, m.start));
+        .map(|m| (m.loc, m.start));
     f.matches
         .iter()
-        .filter(|m| m.line == line && m.item == item)
-        .map(|m| (m.start, m.end, cur == Some((m.line, m.item, m.start))))
+        .filter(|m| m.loc == loc)
+        .map(|m| (m.start, m.end, cur == Some((m.loc, m.start))))
         .collect()
 }
 
@@ -324,7 +320,7 @@ fn browser_lines<'a>(g: &'a BrowserView, height: usize, find: Option<&FindState>
             if g.selected == Some(g.scroll + i) && line.link.is_some() {
                 style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
             }
-            let ranges = find_ranges(find, g.scroll + i, None);
+            let ranges = find_ranges(find, FindLoc::Line(g.scroll + i));
             if ranges.is_empty() {
                 Line::styled(line.text.as_str(), style)
             } else {
@@ -446,7 +442,29 @@ pub(crate) fn browser_rows<'a>(
                 if selected {
                     style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 }
-                let ranges = find_ranges(find, row_idx, Some(i));
+                // Only resolve the (possibly region-buffer) origin while a
+                // find is open — this runs per item per frame.
+                let ranges = if find.is_some() {
+                    let loc =
+                        match crate::layout::item_origin(&g.doc.rows, &g.doc.regions, row_idx, i) {
+                            crate::layout::ItemOrigin::Doc => FindLoc::Item {
+                                row: row_idx,
+                                item: i,
+                            },
+                            crate::layout::ItemOrigin::Region {
+                                region,
+                                brow,
+                                bitem,
+                            } => FindLoc::Region {
+                                region,
+                                brow,
+                                bitem,
+                            },
+                        };
+                    find_ranges(find, loc)
+                } else {
+                    Vec::new()
+                };
                 if ranges.is_empty() {
                     // Owned (not `as_str`): a scroll-region row's items live in a
                     // freshly merged row (`effective_row`'s `Cow::Owned`), so the
@@ -478,7 +496,7 @@ pub(crate) fn browser_rows<'a>(
 /// position — NOT offset by scroll — so the document scrolls beneath it. Rows
 /// are placed at their box-relative columns; the box is clipped to the panel.
 /// (Text only for now — images inside a fixed rail are a follow-up.)
-fn render_fixed_layer(frame: &mut Frame, g: &BrowserView, inner: Rect) {
+fn render_fixed_layer(frame: &mut Frame, g: &BrowserView, inner: Rect, find: Option<&FindState>) {
     for (fi, item) in g.doc.fixed.iter().enumerate() {
         let sx = inner.x.saturating_add(item.col);
         if sx >= inner.right() {
@@ -496,7 +514,7 @@ fn render_fixed_layer(frame: &mut Frame, g: &BrowserView, inner: Rect) {
                 _ => None,
             };
             frame.render_widget(
-                Paragraph::new(fixed_row_line(row, sel)),
+                Paragraph::new(fixed_row_line(row, sel, find, fi, r)),
                 Rect::new(sx, sy as u16, w, 1),
             );
         }
@@ -506,7 +524,14 @@ fn render_fixed_layer(frame: &mut Frame, g: &BrowserView, inner: Rect) {
 /// A pinned fixed-layer row as a styled `Line`: items placed at their
 /// box-relative columns (gap-filled), coloured by kind + emphasis. `sel` is the
 /// hovered/selected item's index in `row.items` (highlighted reversed+bold).
-fn fixed_row_line(row: &crate::layout::Row, sel: Option<usize>) -> Line<'static> {
+/// `layer`/`row_idx` name this row for find-match highlighting.
+fn fixed_row_line(
+    row: &crate::layout::Row,
+    sel: Option<usize>,
+    find: Option<&FindState>,
+    layer: usize,
+    row_idx: usize,
+) -> Line<'static> {
     // Keep the original index (the hit-test / `sel` addresses `row.items[i]`)
     // while placing left-to-right by column.
     let mut items: Vec<(usize, &crate::layout::Item)> = row.items.iter().enumerate().collect();
@@ -533,7 +558,19 @@ fn fixed_row_line(row: &crate::layout::Row, sel: Option<usize>) -> Line<'static>
         if sel == Some(idx) {
             style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
         }
-        spans.push(Span::styled(it.text.clone(), style));
+        let ranges = find_ranges(
+            find,
+            FindLoc::Fixed {
+                layer,
+                row: row_idx,
+                item: idx,
+            },
+        );
+        if ranges.is_empty() {
+            spans.push(Span::styled(it.text.clone(), style));
+        } else {
+            spans.extend(match_spans(&it.text, style, &ranges));
+        }
         let text_w = crate::layout::display_width(&it.text) as u16;
         if it.width > text_w {
             spans.push(Span::raw(" ".repeat((it.width - text_w) as usize)));
@@ -786,13 +823,16 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
         return Paragraph::new(line).block(block);
     }
 
-    // The search prompt doubles as the form-field editor and the
-    // identity-name prompt for capsules that ask for a certificate.
+    // The search prompt doubles as the form-field editor, the identity-name
+    // prompt for capsules that ask for a certificate, and the masked secret
+    // prompt (gemini status 11, HTML password fields).
     let editing_field = matches!(app.search_target, Some(Link::Form { .. }));
     let minting_identity = app.cert_for.is_some();
+    let masked = app.mode == Mode::Search && app.masked_input;
     let (prompt, accent) = match app.mode {
         Mode::Session => ("❯ ", theme::NEON_GREEN),
         Mode::Command => ("trust> ", theme::PASTEL_GREEN),
+        Mode::Search if masked => ("secret> ", theme::PASTEL_GREEN),
         Mode::Search if minting_identity => ("name> ", theme::PASTEL_GREEN),
         Mode::Search if editing_field => ("input> ", theme::PASTEL_GREEN),
         Mode::Search => ("search> ", theme::PASTEL_GREEN),
@@ -816,6 +856,8 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
         // One virtual cell past the end hosts the cursor block.
         let ch = if i == start && start > 0 {
             '…' // more text off to the left
+        } else if masked && i < chars.len() {
+            '•' // sensitive input: never echo the secret
         } else {
             chars.get(i).copied().unwrap_or(' ')
         };
@@ -844,7 +886,9 @@ fn input_box(app: &App, width: u16) -> Paragraph<'_> {
                 .add_modifier(Modifier::BOLD),
         )),
         Mode::Search => block.title(Line::styled(
-            if minting_identity {
+            if masked {
+                " SECRET "
+            } else if minting_identity {
                 " IDENTITY "
             } else if editing_field {
                 " INPUT "
@@ -898,7 +942,8 @@ fn status_bar(app: &App) -> Paragraph<'_> {
         (Mode::Session, Some(false), _) => "· ↑↓ scroll · → follow · ← back · Esc stop · Tab cmds",
         (Mode::Session, None, true) => "· keys go to remote · Tab/Ctrl-] cmds",
         (Mode::Session, None, false) => "· Enter send · Tab/Esc cmds",
-        (Mode::Command, ..) => "· Enter run · Esc/Tab back · open <url>/close/finger/set/quit",
+        (Mode::Command, ..) => "· Enter run · Esc/Tab back · help · open <url>/close/quit",
+        (Mode::Search, ..) if app.masked_input => "· Enter send · Esc cancel · typing is hidden",
         (Mode::Search, ..) if app.cert_for.is_some() => "· Enter mints the identity · Esc cancel",
         (Mode::Search, ..) if matches!(app.search_target, Some(Link::Form { .. })) => {
             "· Enter set · Esc cancel"
