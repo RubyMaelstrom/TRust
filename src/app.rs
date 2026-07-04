@@ -632,6 +632,23 @@ pub struct App {
     /// (reset on each new live page). Drives infinite scroll / scroll-based
     /// lazy loading: the site's own handler reacts to the threaded position.
     last_scroll_sent: Option<usize>,
+    /// How many decoded-image sizes have been pushed to the live page
+    /// (`PageCmd::ImageSizes`), diffed against `image_sizes.len()` each tick —
+    /// sizes only accrue during a page's life, so the length IS the change
+    /// signal. `None` = nothing sent yet (reset with the live page), which
+    /// makes the first tick push the whole current map (revive-on-back starts
+    /// with a warm cache). Keeps the actor's geometry pass laying images
+    /// exactly like the app's render, so the boxes page JS measures match the
+    /// page on screen (CSSOM View reports the actual layout).
+    image_sizes_sent: Option<usize>,
+    /// The browser viewport (cells) last pushed to the live page
+    /// (`PageCmd::Viewport`), diffed each tick. The engine's fetch-time size
+    /// comes from whatever view was on screen when the fetch started — at
+    /// startup the session layout, a few rows TALLER than the browser view —
+    /// so the engine must adopt the true content area once the page displays
+    /// (and on resize; it fires `resize` at the Window per CSSOM View §4.1).
+    /// `None` = nothing sent yet (reset with the live page).
+    viewport_sent: Option<(u16, u16)>,
     /// The hover target last SENT to the live page (`PageCmd::Hover`): the
     /// actor node under the terminal's pointer, or `None` after a clear (or
     /// nothing ever sent — the two are equivalent: a clear is only worth
@@ -885,6 +902,8 @@ impl App {
             live_page: None,
             page_rx: None,
             last_scroll_sent: None,
+            image_sizes_sent: None,
+            viewport_sent: None,
             hover_sent: None,
             hover_want: None,
             scroll_intent: 0,
@@ -1261,7 +1280,13 @@ impl App {
             // After the input burst is coalesced, push the (now settled) scroll
             // position to the live page so its infinite-scroll / lazy-load logic
             // reacts. A no-op when the scroll row didn't move (the common case).
+            // The true viewport goes FIRST (the engine's scroll clamp and IO
+            // root read innerHeight), then the settled scroll position.
+            self.sync_page_viewport();
             self.sync_page_scroll();
+            // And any freshly decoded image sizes, so the engine measures
+            // images exactly like the app renders them (one geometry truth).
+            self.sync_page_image_sizes();
             // Push each inner-scroll region's measured geometry back to the page
             // so its `scrollHeight`/`clientHeight` getters read TRUE values (the
             // conditional chat-pin reads them). Diffed — a no-op when unchanged.
@@ -2968,6 +2993,19 @@ impl App {
                 .get(i)
                 .cloned()
         });
+        // CSS Scroll Anchoring: a decoded image ABOVE the viewport changes
+        // heights up there, which would shift the content the reader sees.
+        // Capture the topmost visible followable item (like the live-render
+        // path) and re-pin it to its screen offset after the re-flow.
+        let view_anchor: Option<(usize, crate::doc::Link)> = {
+            let bot = (g.scroll + height).min(g.doc.rows.len());
+            (g.scroll..bot).find_map(|r| {
+                crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                    .items
+                    .iter()
+                    .find_map(|it| it.link.clone().map(|l| (r, l)))
+            })
+        };
         let old_offsets: Vec<_> = g.doc.regions.iter().map(|r| (r.node, r.voffset)).collect();
         let meta = g.doc.meta.clone().unwrap_or_default();
         let forms = std::mem::take(&mut g.doc.forms);
@@ -2989,7 +3027,18 @@ impl App {
         Self::carry_region_offsets(&old_offsets, &mut g.doc.regions, false);
         g.sel_item = item_target.and_then(|t| Self::find_item_like(&g.doc, &t));
         let max_scroll = g.doc.rows.len().saturating_sub(height);
-        g.scroll = g.scroll.min(max_scroll);
+        if let Some((old_r, link)) = &view_anchor
+            && let Some(new_r) = Self::find_row_by_link(&g.doc, link, *old_r)
+        {
+            let offset = old_r.saturating_sub(g.scroll);
+            // The adjustment IS the new scroll position (CSS Scroll Anchoring):
+            // move the intent with the content, as the live paths do.
+            let shift = new_r as isize - *old_r as isize;
+            self.scroll_intent = (self.scroll_intent as isize + shift).max(0) as usize;
+            g.scroll = new_r.saturating_sub(offset).min(max_scroll);
+        } else {
+            g.scroll = g.scroll.min(max_scroll);
+        }
         // The re-parse rebuilt every region from `doc.raw` — the last FULL
         // render, stale by exactly the content patched into live regions
         // since (a chat's recent messages). Restore each from its retained
@@ -3447,6 +3496,12 @@ impl App {
             // Force the next tick to push the current scroll position (0 on a
             // fresh nav; a restored row on revive-on-back) to the new engine.
             self.last_scroll_sent = None;
+            // And the decoded-image sizes (warm on revive-on-back), so the
+            // engine's geometry pass lays images like the render does.
+            self.image_sizes_sent = None;
+            // And the true browser viewport (the engine only has the
+            // fetch-time size until the first push).
+            self.viewport_sent = None;
             // A fresh engine holds no hover chain; start the app's view clean.
             self.hover_sent = None;
             self.hover_want = None;
@@ -3472,6 +3527,8 @@ impl App {
         self.live_page = None;
         self.page_rx = None;
         self.last_scroll_sent = None;
+        self.image_sizes_sent = None;
+        self.viewport_sent = None;
         self.hover_sent = None;
         self.hover_want = None;
         self.region_geom_sent.clear();
@@ -3513,20 +3570,23 @@ impl App {
             }
             let total = g.doc.rows.len();
             let max_scroll = total.saturating_sub(viewport_rows);
-            // Within a viewport of the app's bottom, anchor to the FULL document
-            // height so the engine's viewport reaches (and STAYS at) its true
-            // bottom — its `setScroll` clamps the over-large value to its own
-            // `scrollHeight − innerHeight`. Two reasons it's a BAND, not just the
-            // exact last row: (1) it's robust to the small viewport/row-count
-            // differences between the app's layout and the engine's measure pass
-            // (the engine's innerHeight is baked at fetch time) — where an
-            // infinite-scroll sentinel lives; (2) a virtualized scroller
-            // (archive.org) UN-RENDERS its bottom section the moment the engine's
-            // scrollY steps off the bottom, shrinking the doc and bouncing the
-            // view — keeping the engine pinned to the bottom across the last
-            // viewport holds that section rendered, so the reader can scroll into
-            // it. Further up, the exact row position.
-            let y = if row >= max_scroll.saturating_sub(viewport_rows) {
+            // AT the app's bottom row, request the full document height and let
+            // the engine clamp to ITS exact bottom (`setScroll` clamps to
+            // `scrollHeight − innerHeight`, as CSSOM View clamps any
+            // over-large scrollTo) — robust to residual sub-row rounding
+            // between the two layouts, and it lands the viewport where an
+            // infinite-scroll sentinel sits. Everywhere else, the TRUE
+            // position. This used to be a whole-viewport BAND ("within a
+            // viewport of the bottom ⇒ tell the engine it's at the bottom"),
+            // compensating for two coordinate lies since fixed — the
+            // fetch-time innerHeight (PageCmd::Viewport now corrects it) and
+            // decode-blind image geometry (PageCmd::ImageSizes now unifies
+            // it). The band itself was a third lie: for the last two
+            // viewports of the doc the engine believed the reader was at the
+            // very bottom, so a virtualized feed (Mastodon) revealed the
+            // bottom articles and UN-revealed the ones actually on screen —
+            // the reader watched their posts collapse into placeholders.
+            let y = if row >= max_scroll {
                 total as f64 * cell_h
             } else {
                 row as f64 * cell_h
@@ -3547,6 +3607,76 @@ impl App {
         }
         // On a full channel we leave `last_scroll_sent` stale: the next tick
         // retries with the latest position, so the final scroll is never lost.
+    }
+
+    /// Push the browser's true content-area size (cells) to the live page when
+    /// it changed since the last send (same discipline as `sync_page_scroll`:
+    /// record only on a successful enqueue). The engine adopts it —
+    /// `innerWidth`/`innerHeight`, the geometry measure viewport — and fires
+    /// `resize` at the Window (CSSOM View §4.1). The fetch-time size the
+    /// engine was created with belongs to whatever view was on screen when
+    /// the fetch started (at startup: the session layout, taller than the
+    /// browser view), so the first push after display corrects it.
+    fn sync_page_viewport(&mut self) {
+        {
+            let Some(g) = self.browser.as_ref() else {
+                return;
+            };
+            if !g.doc.laid_out() {
+                return;
+            }
+        }
+        let vp = self.last_inner;
+        if vp.0 == 0 || vp.1 == 0 || self.viewport_sent == Some(vp) {
+            return;
+        }
+        let Some(handle) = self.live_page.as_ref() else {
+            return;
+        };
+        if handle
+            .cmds
+            .try_send(crate::js::PageCmd::Viewport {
+                cols: vp.0,
+                rows: vp.1,
+            })
+            .is_ok()
+        {
+            self.viewport_sent = Some(vp);
+        }
+    }
+
+    /// Push the decoded-image size map to the live page when it grew since the
+    /// last send (`sync_page_scroll`'s send discipline: record only on a
+    /// successful enqueue, so a full channel retries next tick). The actor
+    /// merges it into the geometry pass's `ImageSizes`, making the boxes page
+    /// JS measures match the rendered page — one layout truth for both
+    /// coordinate systems. Sizes only accrue while a page is displayed, so the
+    /// map LENGTH is the change signal.
+    fn sync_page_image_sizes(&mut self) {
+        let Some(handle) = self.live_page.as_ref() else {
+            return;
+        };
+        let n = self.image_sizes.len();
+        if self.image_sizes_sent == Some(n) {
+            return;
+        }
+        if n == 0 {
+            // Nothing to push; just mark the empty map as current.
+            self.image_sizes_sent = Some(0);
+            return;
+        }
+        let sizes: Vec<(String, (u16, u16))> = self
+            .image_sizes
+            .iter()
+            .map(|(u, &d)| (u.clone(), d))
+            .collect();
+        if handle
+            .cmds
+            .try_send(crate::js::PageCmd::ImageSizes(sizes))
+            .is_ok()
+        {
+            self.image_sizes_sent = Some(n);
+        }
     }
 
     /// The viewport-relative CSS-px center of a screen cell — the
@@ -4168,6 +4298,19 @@ impl App {
     /// (line indices shift under a mutating page; the gopherus
     /// navigation model must not jumble).
     fn replace_live_doc(&mut self, raw: Vec<u8>) {
+        // DIAG (TRUST_DUMP_RAW=<dir>): dump each live render for offline
+        // diffing/replay through the layout_dump/measure_dump harnesses —
+        // how the Steam delayed-image regression was cracked.
+        if let Some(dir) = std::env::var_os("TRUST_DUMP_RAW") {
+            let n = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = std::fs::write(
+                std::path::Path::new(&dir).join(format!("render_{n}.html")),
+                &raw,
+            );
+        }
         let width = (self.last_inner.0 as usize).max(10);
         let height = self.last_inner.1.max(1) as usize;
         let scroll_intent = self.scroll_intent;
@@ -4275,13 +4418,24 @@ impl App {
             // its old screen offset (CSS Scroll Anchoring — content the reader
             // sees stays put across the re-render); fall back to restoring toward
             // the user's intent, clamped, when the anchor didn't survive (the
-            // transient-shrink safety net). Either way DON'T touch intent (so the
+            // transient-shrink safety net — there intent stays untouched so the
             // regrow recovers it).
             _ => {
                 g.scroll = match &view_anchor {
                     Some((old_r, link)) => match Self::find_row_by_link(&g.doc, link, *old_r) {
                         Some(new_r) => {
                             let offset = old_r.saturating_sub(g.scroll);
+                            // CSS Scroll Anchoring: the adjustment IS the new
+                            // scroll position — the intent must move WITH the
+                            // anchored content (the patch path already does
+                            // this). Leaving it behind made the NEXT update's
+                            // intent-restore undo this pin: the view oscillated
+                            // between the pinned and stale rows with no user
+                            // input (observed live on a Mastodon feed as posts
+                            // above the viewport reveal/unreveal).
+                            let shift = new_r as isize - *old_r as isize;
+                            self.scroll_intent =
+                                (self.scroll_intent as isize + shift).max(0) as usize;
                             new_r.saturating_sub(offset).min(max_scroll)
                         }
                         None => scroll_intent.min(max_scroll),
@@ -8872,6 +9026,100 @@ mod tests {
             crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[new_scroll]),
             top_before,
             "the same item is still at the viewport top after the re-render"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_anchor_adjustment_moves_the_scroll_intent_with_it() {
+        // CSS Scroll Anchoring: the anchoring adjustment IS the new scroll
+        // position, so `scroll_intent` must move with it. The full-replace
+        // path used to pin `scroll` but leave the intent stale; the NEXT
+        // update's intent-restore (`patch_live_boundary`'s shift_by==0 arm,
+        // or another render's lost-anchor fallback) then snapped the view
+        // back — on a Mastodon feed the viewport oscillated between the
+        // pinned and stale rows with no user input.
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let body = |extra: usize| -> String {
+            let mut s = String::from("<body>");
+            for i in 0..extra {
+                s.push_str(&format!(r#"<div><a href="/x/{i}">x{i}</a></div>"#));
+            }
+            for i in 0..40 {
+                s.push_str(&format!(r#"<div><a href="/v/{i}">item{i}</a></div>"#));
+            }
+            s.push_str("</body>");
+            s
+        };
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            body(0).as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        ));
+        let scroll = 20usize;
+        app.browser.as_mut().unwrap().scroll = scroll;
+        app.scroll_intent = scroll;
+        // A re-render inserts 5 items above the viewport: the pin shifts
+        // scroll by 5, and the intent must ride along.
+        app.replace_live_doc(body(5).into_bytes());
+        assert_eq!(app.browser.as_ref().unwrap().scroll, scroll + 5);
+        assert_eq!(
+            app.scroll_intent,
+            scroll + 5,
+            "the intent moves with the anchoring adjustment"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_decode_reflow_keeps_the_readers_content_pinned() {
+        // CSS Scroll Anchoring through the image-decode reflow: a decoded
+        // image ABOVE the viewport grows from its one-row alt line to its
+        // real box; the content the reader sees must stay visually fixed
+        // (`relayout_browser` used to keep the raw scroll number, shoving
+        // the page down under them on every decode burst).
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let mut body = String::from(r#"<body><img src="/big.png" alt="big">"#);
+        for i in 0..40 {
+            body.push_str(&format!(r#"<div><a href="/v/{i}">item{i}</a></div>"#));
+        }
+        body.push_str("</body>");
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            body.as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        ));
+        let scroll = 20usize;
+        app.browser.as_mut().unwrap().scroll = scroll;
+        app.scroll_intent = scroll;
+        let top_before = crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
+        // The image decodes at 10×7 cells (+6 rows above the viewport).
+        app.image_sizes
+            .insert(String::from("https://example.com/big.png"), (10, 7));
+        app.relayout_browser();
+        let new_scroll = app.browser.as_ref().unwrap().scroll;
+        assert_eq!(
+            crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[new_scroll]),
+            top_before,
+            "the same item is still at the viewport top after the decode reflow"
+        );
+        assert!(
+            new_scroll > scroll,
+            "the pin shifted scroll down past the grown image"
+        );
+        assert_eq!(
+            app.scroll_intent, new_scroll,
+            "the intent moves with the adjustment"
         );
     }
 

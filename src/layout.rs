@@ -1139,9 +1139,13 @@ impl CellRect {
 /// `display:none` subtree) is simply absent — the JS getter falls back to the
 /// viewport box for those, preserving the generous measurement-gate behavior.
 /// Shadow-tree nodes keep their own box but do not union into their light-DOM
-/// host (the walk follows the light tree). Images lay out from CSS/attribute
-/// sizing only — this pass has no decoded intrinsic dimensions (no `ImageSizes`
-/// in the JS thread), so an unsized image's box is approximate.
+/// host (the walk follows the light tree). `images` carries the decoded
+/// intrinsic dimensions the app's render uses (the actor receives them via
+/// `PageCmd::ImageSizes`), so measured boxes match the rendered page — CSSOM
+/// View geometry must report the actual layout, and a virtualized feed
+/// (Mastodon) caches these heights and feeds them back as placeholder sizes;
+/// a divergence there reshapes the document under the reader. Before the
+/// first decode arrives the map is simply sparse (CSS/attribute sizing only).
 ///
 /// The box is the element's RENDERED content extent — deliberately, so a page
 /// that measures and then renders sees the geometry it will really get (the
@@ -1150,6 +1154,7 @@ impl CellRect {
 /// (as it does for flex/grid tracks, sized images, etc.); making blocks reserve
 /// their declared box is a layout change that geometry would then follow for
 /// free — see the geometry notes in CLAUDE.md.
+#[allow(clippy::too_many_arguments)] // a layout entry point with genuinely many inputs
 pub fn measure_boxes(
     dom: &Dom,
     base: &Url,
@@ -1158,15 +1163,15 @@ pub fn measure_boxes(
     controls: &ControlMap,
     cell_px: (u16, u16),
     borders: bool,
+    images: &ImageSizes,
 ) -> HashMap<NodeId, PxRect> {
-    let images = ImageSizes::new();
     let mut layout = Layout::new(
         dom,
         base,
         viewport.0.max(10),
         forms,
         controls,
-        &images,
+        images,
         borders,
     );
     layout.viewport_h = viewport.1;
@@ -1183,6 +1188,36 @@ pub fn measure_boxes(
     let (rows, _carousels, _fixed, _regions, element_tops, _scroll_clips, _boundaries) =
         layout.finish();
 
+    // DIAG (TRUST_DIAG_MEASURE): total measured height + the tallest item
+    // boxes, to localize an app-render vs engine-measure divergence. Healthy =
+    // rows here ≈ the app's doc_rows (DIAGFRAME); a large gap means the two
+    // coordinate systems diverged (see the Steam hidden-carousel-page fix in
+    // place_positioned_children).
+    if std::env::var_os("TRUST_DIAG_MEASURE").is_some() {
+        let mut tall: Vec<(u16, usize, NodeId, String)> = Vec::new();
+        for (y, r) in rows.iter().enumerate() {
+            for it in &r.items {
+                if it.height > 8 && it.node != NO_NODE {
+                    let cls = dom.attr(it.node, "class").unwrap_or("").to_owned();
+                    tall.push((
+                        it.height,
+                        y,
+                        it.node,
+                        format!(
+                            "{} {}",
+                            &it.text.chars().take(24).collect::<String>(),
+                            cls.chars().take(48).collect::<String>()
+                        ),
+                    ));
+                }
+            }
+        }
+        tall.sort_by_key(|t| std::cmp::Reverse(t.0));
+        eprintln!("DIAGMEASURE rows={} width={}", rows.len(), viewport.0);
+        for (h, y, n, d) in tall.iter().take(10) {
+            eprintln!("DIAGMEASURE   h={h} row={y} node={n} {d}");
+        }
+    }
     // Each laid item contributes a cell rectangle to its source node. An
     // inline image's `height` already counts the rows it reserves.
     let mut cells: HashMap<NodeId, CellRect> = HashMap::new();
@@ -5446,20 +5481,28 @@ impl<'a> Layout<'a> {
                     && !self.dom.is_hidden(d)
                     // A PAINT-SUPPRESSED (`opacity:0`/`visibility:hidden`)
                     // out-of-flow box paints BLANK, and being out of flow it can
-                    // never reserve in-flow space — so in the RENDER it must not
-                    // be placed at all: our deliberate "grow the containing block
-                    // to contain its positioned children" deviation (so overlays
-                    // aren't clipped) would otherwise STACK invisible boxes and
-                    // push the visible content down. Steam's featured carousels
+                    // never reserve in-flow space — so it must not be placed at
+                    // all: our deliberate "grow the containing block to contain
+                    // its positioned children" deviation (so overlays aren't
+                    // clipped) would otherwise STACK invisible boxes and push
+                    // the visible content down. Steam's featured carousels
                     // pre-render ~13 hidden `.next` pages (`position:absolute`,
                     // opacity:0) of game tiles; placing them buried the real grid
                     // ~7 viewports down behind blank rows. (An IN-FLOW suppressed
                     // box still reserves space + paints blank — Mastodon's
                     // virtualized placeholders — that path never reaches here.)
-                    // The MEASUREMENT pass (`tag_all_nodes`) still places them so
-                    // `getBoundingClientRect` stays honest; only the render skips.
-                    && (self.tag_all_nodes
-                        || !(self.dom.paint_suppressed(d) || self.dom.visibility_hidden(d)))
+                    // The MEASUREMENT pass skips them IDENTICALLY — geometry
+                    // reports what we render, and once decoded image sizes fed
+                    // the measure pass (PageCmd::ImageSizes), placing the hidden
+                    // pages ballooned the measured document to ~4× the rendered
+                    // one; every section below then "measured" viewports below
+                    // the viewport, so Steam's one-shot lazy-image watchers
+                    // (CScrollOffsetWatcher: IO, 500px buffer) never fired and
+                    // the whole page's delayed-image groups never swapped in.
+                    // They still get an honest zero-height box at their computed
+                    // position via the recording loop below.
+                    && !self.dom.paint_suppressed(d)
+                    && !self.dom.visibility_hidden(d)
                     && !self.is_clipped_offscreen(d)
                     // A pinned `position:fixed` box is captured into the overlay
                     // layer at its static position (`capture_fixed_children`),
@@ -5474,6 +5517,30 @@ impl<'a> Layout<'a> {
                     && !self.media_emitted.contains(&d)
             })
             .collect();
+        // Geometry for the paint-suppressed out-of-flow boxes skipped above:
+        // record their COMPUTED position (zero flow cost — they neither paint
+        // nor push content in the render, so they must not in the measure
+        // either), and the `element_tops` post-pass gives each an honest
+        // zero-height box there. Their descendants stay boxless (honestly not
+        // intersecting), matching what the reader's page actually shows.
+        if self.tag_all_nodes {
+            for d in self.dom.composed_descendants(root) {
+                if matches!(self.dom.node(d).data, NodeData::Element { .. })
+                    && self.is_out_of_flow(d)
+                    && !self.dom.is_hidden(d)
+                    && (self.dom.paint_suppressed(d) || self.dom.visibility_hidden(d))
+                    && self.positioned_containing_block(d) == cb
+                {
+                    let gc = (origin_col as i32 + self.abs_used_left(d, cb_w as i32, 0)).max(0);
+                    let gr =
+                        (origin_row as i32 + self.abs_used_top(d, cb_h as i32, 0).max(0)).max(0);
+                    self.element_tops.entry(d).or_insert((
+                        u16::try_from(gc).unwrap_or(u16::MAX),
+                        u16::try_from(gr).unwrap_or(u16::MAX),
+                    ));
+                }
+            }
+        }
         if kids.is_empty() {
             return;
         }
@@ -12100,6 +12167,7 @@ mod tests {
             &ControlMap::new(),
             (8, 16),
             false,
+            &ImageSizes::new(),
         );
         (dom, boxes)
     }
@@ -12138,6 +12206,186 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual diagnostic, needs TRUST_LAYOUT_FILE=<html>"]
+    fn measure_dump() {
+        // Companion to http::tests::layout_dump: run the MEASURE pass on the
+        // same html file, so app-render vs engine-measure divergence can be
+        // split into input (arena vs serialized) or internal causes.
+        let Ok(path) = std::env::var("TRUST_LAYOUT_FILE") else {
+            eprintln!("set TRUST_LAYOUT_FILE to a post-JS html file");
+            return;
+        };
+        let html = std::fs::read_to_string(&path).unwrap();
+        let (w, h): (usize, usize) = std::env::var("TRUST_DIAG_VP")
+            .ok()
+            .and_then(|s| {
+                s.split_once('x')
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+            })
+            .unwrap_or((80, 24));
+        let mut dom = Dom::parse_document(&html);
+        dom.rewrite_inline_svgs();
+        let base = Url::parse("https://store.steampowered.com/").unwrap();
+        let mut images = ImageSizes::new();
+        if let Ok(spec) = std::env::var("TRUST_LAYOUT_IMG_CELL")
+            && let Some((cw, ch)) = spec
+                .split_once('x')
+                .and_then(|(a, b)| Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?)))
+        {
+            for id in 0..dom.node_count() {
+                if dom.tag_name(id) == Some("img")
+                    && let Some(src) = dom.attr(id, "src")
+                {
+                    let key = if src.trim().starts_with("data:") {
+                        src.trim().to_string()
+                    } else if let Ok(u) = base.join(src.trim()) {
+                        u.to_string()
+                    } else {
+                        continue;
+                    };
+                    images.insert(key, (cw, ch));
+                }
+            }
+        }
+        let boxes = measure_boxes(
+            &dom,
+            &base,
+            (w, h),
+            &[],
+            &ControlMap::new(),
+            (8, 16),
+            false,
+            &images,
+        );
+        let max_bottom = boxes
+            .values()
+            .map(|r| r.top + r.height)
+            .fold(0.0f64, f64::max);
+        eprintln!(
+            "MEASURE_DUMP boxes={} doc_bottom_px={max_bottom} (rows≈{})",
+            boxes.len(),
+            (max_bottom / 16.0).round()
+        );
+        // The render path on the SAME input, for divergence accounting.
+        let (rows, _carousels, regions, _clips, _bounds, _fixed, _anchors) =
+            lay_out_with_carousels(&dom, &base, (w, h), &[], &ControlMap::new(), &images, false);
+        let mut clipped = 0usize;
+        for r in &regions {
+            clipped += r.buffer.len().saturating_sub(r.height as usize);
+        }
+        eprintln!(
+            "MEASURE_DUMP render_rows={} regions={} clipped_away_rows={clipped}",
+            rows.len(),
+            regions.len()
+        );
+    }
+
+    #[test]
+    fn measure_skips_suppressed_out_of_flow_boxes_like_the_render() {
+        // Geometry reports what we render (the binding rule). The render skips
+        // paint-suppressed out-of-flow boxes entirely (placing Steam's ~13
+        // hidden opacity:0 carousel pages buried the real grid); the measure
+        // pass must skip them IDENTICALLY — once decoded image sizes fed the
+        // measure pass, placing them ballooned the measured document to ~4×
+        // the rendered one, so every section below "measured" viewports past
+        // the viewport and one-shot lazy-image watchers never fired (the
+        // Steam blank-capsules regression). The suppressed box still gets an
+        // honest zero-height rect at its computed position; content following
+        // the containing block measures right below the VISIBLE content.
+        let html = r#"<body>
+            <div id="cb" style="position:relative">
+                <div id="vis">visible card</div>
+                <div id="hidden" style="position:absolute;opacity:0">
+                    h1<br>h2<br>h3<br>h4<br>h5<br>h6<br>h7<br>h8<br>h9<br>h10
+                </div>
+            </div>
+            <div id="after">after the carousel</div>
+        </body>"#;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let find = |id: &str| {
+            dom.descendants(DOCUMENT)
+                .into_iter()
+                .find(|&n| dom.attr(n, "id") == Some(id))
+                .unwrap()
+        };
+        let boxes = measure_boxes(
+            &dom,
+            &base,
+            (40, 24),
+            &[],
+            &ControlMap::new(),
+            (8, 16),
+            false,
+            &ImageSizes::new(),
+        );
+        let vis = boxes.get(&find("vis")).expect("visible content has a box");
+        let after = boxes.get(&find("after")).expect("following content");
+        assert_eq!(
+            after.top,
+            vis.top + vis.height,
+            "content after the CB sits right below the visible content — the \
+             suppressed box consumed no document height"
+        );
+        let hidden = boxes
+            .get(&find("hidden"))
+            .expect("the suppressed box still gets a rect at its position");
+        assert_eq!(hidden.height, 0.0, "zero-height: it paints nothing");
+    }
+
+    #[test]
+    fn measure_boxes_lays_images_from_decoded_sizes() {
+        // Geometry must report the layout the page really renders (CSSOM
+        // View): the measure pass receives the app's decoded intrinsic sizes
+        // (PageCmd::ImageSizes) and reserves the same rows the render does. A
+        // virtualized feed caches these heights and declares them back as
+        // placeholder sizes, so a divergence here reshapes the document under
+        // the reader (the Mastodon feed-scroll bug).
+        let html = r#"<body><img id="pic" src="/a.png" alt="a"><div id="after">x</div></body>"#;
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let find = |id: &str| {
+            dom.descendants(DOCUMENT)
+                .into_iter()
+                .find(|&n| dom.attr(n, "id") == Some(id))
+                .unwrap()
+        };
+        let (pic, after) = (find("pic"), find("after"));
+        let undecoded = measure_boxes(
+            &dom,
+            &base,
+            (40, 24),
+            &[],
+            &ControlMap::new(),
+            (8, 16),
+            false,
+            &ImageSizes::new(),
+        );
+        let after_top_before = undecoded.get(&after).unwrap().top;
+        let mut sizes = ImageSizes::new();
+        sizes.insert(String::from("https://example.com/a.png"), (10, 5));
+        let decoded = measure_boxes(
+            &dom,
+            &base,
+            (40, 24),
+            &[],
+            &ControlMap::new(),
+            (8, 16),
+            false,
+            &sizes,
+        );
+        assert_eq!(
+            decoded.get(&pic).unwrap().height,
+            5.0 * 16.0,
+            "the decoded image's box is its reserved rows, not the alt line"
+        );
+        assert!(
+            decoded.get(&after).unwrap().top > after_top_before,
+            "content below the image moves down by the decoded box"
+        );
+    }
+
+    #[test]
     fn viewport_height_resolves_vh_lengths_end_to_end() {
         // Phase 0a: a `vh` length resolves once the viewport HEIGHT is threaded
         // through the public entry point — not just in the free-function unit
@@ -12161,6 +12409,7 @@ mod tests {
             &ControlMap::new(),
             (8, 16),
             false,
+            &ImageSizes::new(),
         );
         assert_eq!(
             with_h.get(&id).unwrap().width,
@@ -12175,6 +12424,7 @@ mod tests {
             &ControlMap::new(),
             (8, 16),
             false,
+            &ImageSizes::new(),
         );
         assert_eq!(
             no_h.get(&id).unwrap().width,
@@ -12205,6 +12455,7 @@ mod tests {
             &ControlMap::new(),
             (8, 32),
             false,
+            &ImageSizes::new(),
         );
         let ph = dom
             .descendants(DOCUMENT)
@@ -18958,8 +19209,13 @@ mod tests {
                  page ({hide}): landed at row {after}"
             );
         }
-        // The MEASUREMENT pass still places it, so `getBoundingClientRect` on a
-        // hidden abspos box stays honest (only the RENDER skips it).
+        // The MEASUREMENT pass skips it IDENTICALLY (geometry reports what we
+        // render — measuring the hidden pages at full size ballooned the
+        // engine's document to ~4× the rendered one once decoded image sizes
+        // reached the measure pass, so every section below "measured"
+        // viewports past the viewport and one-shot lazy-image watchers never
+        // fired: the Steam blank-capsules regression). The box keeps an
+        // honest ZERO-SIZE rect at its computed position instead.
         let (dom, m) = measure(
             r#"<body><div style="position:relative;height:100px">
                  <div id="h" style="position:absolute;opacity:0;width:80px;height:64px">x</div>
@@ -18968,8 +19224,9 @@ mod tests {
         );
         let h = box_by_id(&dom, &m, "h");
         assert!(
-            h.width > 0.0 && h.height > 0.0,
-            "hidden abspos box keeps its measured box: {h:?}"
+            h.width == 0.0 && h.height == 0.0,
+            "hidden abspos box measures zero-size at its position, like the \
+             render that paints nothing there: {h:?}"
         );
     }
 
