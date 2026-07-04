@@ -325,16 +325,7 @@ impl Carousel {
     /// Advance the scroll by one card (`dir` ±1), snapping `offset` to a
     /// card's left edge and never scrolling past the last card.
     pub fn scroll_cards(&mut self, dir: i32) {
-        let view = self.view_width();
-        // The furthest offset worth scrolling to: the first stop from which
-        // the strip's tail already fits the band.
-        let need = self.width.saturating_sub(view);
-        let max_stop = self
-            .stops
-            .iter()
-            .copied()
-            .find(|&s| s >= need)
-            .unwrap_or_else(|| self.stops.last().copied().unwrap_or(0));
+        let max_stop = self.max_stop();
         if dir > 0 {
             if let Some(&next) = self
                 .stops
@@ -690,6 +681,12 @@ pub const MAX_IMAGE_LOOKBACK: usize = 256;
 /// Pass-wide memo for `measure_width`: `(node, constraint, table_depth)` → cells.
 /// `Rc` so every sub-layout in a pass shares the one cache.
 type MeasureCache = std::rc::Rc<std::cell::RefCell<HashMap<(NodeId, usize, usize), usize>>>;
+
+/// The `measure_boxes` geometry maps, shared across sub-layouts like
+/// `MeasureCache` — their values are position-independent sizes keyed by
+/// NodeId, so unlike `element_tops` they need no blit offset remapping.
+type DeclaredBoxes = std::rc::Rc<std::cell::RefCell<HashMap<NodeId, (usize, usize)>>>;
+type ClipHeights = std::rc::Rc<std::cell::RefCell<HashMap<NodeId, usize>>>;
 
 /// Per-region memoization of the laid rows of a scroll container's block
 /// children, keyed by `Dom::subtree_layout_hash` (INCREMENTAL_LAYOUT_PLAN.md
@@ -1178,8 +1175,8 @@ pub fn measure_boxes(
     layout.cell_px_h = cell_px.1.max(1);
     layout.tag_all_nodes = true;
     layout.flow_all();
-    let declared = std::mem::take(&mut layout.declared_boxes);
-    let clip_heights = std::mem::take(&mut layout.clip_heights);
+    let declared = layout.declared_boxes.take();
+    let clip_heights = layout.clip_heights.take();
     // `finish` returns `element_tops` already remapped through its blank-row
     // collapse (and accumulated from every sub-layout via `blit`), so an
     // empty element's recorded row matches the kept-row grid the cells use.
@@ -1429,6 +1426,20 @@ const MIN_COL: usize = 12;
 /// cell's subtree — from overflowing the layout stack on a pathologically deep
 /// table tree.
 const MAX_TABLE_DEPTH: usize = 8;
+
+/// Hostile-input lid on a single cell's occupancy footprint: `colspan` and
+/// `rowspan` are each clamped to 1000 (`cell_span`), but their PRODUCT drives
+/// the grid inserts in `build_table_grid` — a page of `rowspan=1000
+/// colspan=1000` cells did 10^6 inserts PER CELL. The colspan (the visually
+/// meaningful axis) is kept; the rowspan is clamped to fit the area.
+const MAX_CELL_SPAN_AREA: usize = 10_000;
+
+/// Recursion lid on nested bordered boxes (the `flow_bordered` analogue of
+/// `MAX_TABLE_DEPTH`): each level is a fresh sub-layout on the native stack,
+/// so hostile nesting could overflow it. Past the lid an element's border is
+/// dropped and its interior flows as a plain block. 32 frames already eat 64
+/// columns — beyond any legible terminal rendering.
+const MAX_BORDER_DEPTH: usize = 32;
 
 /// The containing block a percentage `height` resolves against (`Layout::
 /// height_cb`): a block-level ancestor element, or the viewport (the initial
@@ -2144,6 +2155,9 @@ struct Layout<'a> {
     /// Set once the active clip box has been truncated, so the rest of its
     /// (unwrappable) words are dropped instead of laid past the cut.
     clip_done: bool,
+    /// How many bordered boxes enclose this pass (`flow_bordered` sub-layouts,
+    /// carried through `make_sub`) — the `MAX_BORDER_DEPTH` recursion lid.
+    border_depth: usize,
     /// Whether the active nowrap clip marks its truncation with `…`
     /// (`text-overflow: ellipsis` or a custom-string value — CSS Overflow 3
     /// §5.1) or cuts silently (the initial `clip`).
@@ -2170,9 +2184,14 @@ struct Layout<'a> {
     /// reports its CSS box to `getBoundingClientRect`/`offset*` even when its
     /// content paints fewer cells. Only DEFINITE lengths are recorded (px/em/
     /// ch/%-of-a-definite-container); `auto`/indefinite `%`-height/`vh` are
-    /// left out. Populated under `tag_all_nodes`, so the render path never
-    /// touches it. See [[js-geometry-real-boxes]] Phase 2.
-    declared_boxes: HashMap<NodeId, (usize, usize)>,
+    /// left out. Populated under `tag_all_nodes` (never while `measuring` —
+    /// a probe band would clamp the recorded width), so the render path never
+    /// touches it. SHARED across sub-layouts via the `Rc` (like
+    /// `measure_cache`): the values are position-independent SIZES keyed by
+    /// NodeId, so unlike `element_tops` they need no blit offset remapping —
+    /// a floor recorded inside a flex item's sub-layout used to be silently
+    /// dropped with that sub's map. See [[js-geometry-real-boxes]] Phase 2.
+    declared_boxes: DeclaredBoxes,
     /// Measurement pass only: every element's flow position `(col, row)` at the
     /// moment the flow enters it — captured for EVERY element, including empty
     /// ones that paint no cells. `measure_boxes` uses it to give a boxless
@@ -2240,8 +2259,12 @@ struct Layout<'a> {
     /// `declared_boxes` floor — so a `height:N;overflow:hidden` placeholder
     /// reports exactly N (its cached height), not the taller unclipped content
     /// (React virtualized lists cache the measured height then clip). Populated
-    /// under `tag_all_nodes`; the render path never touches it.
-    clip_heights: HashMap<NodeId, usize>,
+    /// under `tag_all_nodes` (never while `measuring`); the render path never
+    /// touches it. SHARED across sub-layouts via the `Rc` like
+    /// `declared_boxes` (row counts are position-independent) — a VISIBLE
+    /// clipped box nested in a flex item's sub-layout used to report its
+    /// unclipped extent because the entry died with the sub's map.
+    clip_heights: ClipHeights,
     /// The terminal's real cell height in px (from the `CELL_PX_H` global, or set
     /// explicitly by `measure_boxes`). Used ONLY by `css_length_rows_at` so an
     /// overflow-clip box's definite px height converts back to the same rows the
@@ -2295,10 +2318,11 @@ impl<'a> Layout<'a> {
             borders,
             clip_right: None,
             clip_done: false,
+            border_depth: 0,
             clip_ellipsis: false,
             modal_root: None,
             tag_all_nodes: false,
-            declared_boxes: HashMap::new(),
+            declared_boxes: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             element_tops: HashMap::new(),
             capture_boundaries: false,
             boundary_boxes: HashMap::new(),
@@ -2307,7 +2331,7 @@ impl<'a> Layout<'a> {
             media_emitted: std::collections::HashSet::new(),
             shrink_wrap: false,
             invisible: false,
-            clip_heights: HashMap::new(),
+            clip_heights: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
             cell_px_h: cell_px_h(),
         }
     }
@@ -2866,7 +2890,10 @@ impl<'a> Layout<'a> {
         // the larger of `width`/`min-width` (clamped to the band, our model has
         // no horizontal scroll); height the larger of `height`/`min-height` as
         // whole rows (`%`/`vh`/`auto` are indefinite → no floor, matching CSS).
-        if self.tag_all_nodes && block_like {
+        // Never while `measuring`: the maps are SHARED across sub-layouts now,
+        // and an intrinsic-width probe's clamped band would poison the
+        // recorded floor.
+        if self.tag_all_nodes && !self.measuring && block_like {
             let avail = self.width.saturating_sub(self.indent).max(1);
             let floor_w = self
                 .css_cells(id, "width")
@@ -2881,6 +2908,7 @@ impl<'a> Layout<'a> {
                 .max();
             if floor_w.is_some() || floor_h.is_some() {
                 self.declared_boxes
+                    .borrow_mut()
                     .insert(id, (floor_w.unwrap_or(0), floor_h.unwrap_or(0)));
             }
             // The COUNTERPART cap: a definite `height` with `overflow`/
@@ -2892,7 +2920,7 @@ impl<'a> Layout<'a> {
             // cached height, not the article's real extent. Only a DEFINITE
             // `height` clips to a known box; `min-height`/`auto` don't cap.
             if let Some(h) = self.clip_reserve_rows(id) {
-                self.clip_heights.insert(id, h);
+                self.clip_heights.borrow_mut().insert(id, h);
             }
         }
         // A `display:table` element establishes a table formatting context: its
@@ -2918,7 +2946,13 @@ impl<'a> Layout<'a> {
         // framed sub-box: lay its interior, draw the bordered sides as
         // box-drawing, blit. `inner_border_box` guards the recursion (the
         // interior pass lays this same element without re-entering here).
-        if self.borders && block_like && self.inner_border_box != Some(id) {
+        if self.borders
+            && block_like
+            && self.inner_border_box != Some(id)
+            // Past the recursion lid the border is dropped and the interior
+            // flows as a plain block (hostile deep nesting; see the const).
+            && self.border_depth < MAX_BORDER_DEPTH
+        {
             let sides = self.border_sides(id);
             if sides.iter().any(Option::is_some) {
                 // Pass the inherited context so a clickable/styled ANCESTOR
@@ -3678,9 +3712,13 @@ impl<'a> Layout<'a> {
     /// transparent (keep walking); a block/flex/grid ancestor is a real block
     /// formatting context and stops the walk (the element stays block-level).
     fn in_atomic_inline_context(&self, id: NodeId) -> bool {
+        // Unbounded, like every containing-block walk (the Twitch deep-wrapper
+        // lesson — see `definite_ancestor_width`): only transparent inline
+        // ancestors continue the loop, any block-level box returns, and the
+        // tree has no cycles, so an arbitrary cap could only stop SHORT of
+        // the real formatting context.
         let mut cur = self.dom.parent_composed(id);
-        for _ in 0..8 {
-            let Some(p) = cur else { return false };
+        while let Some(p) = cur {
             match self.dom.computed_display(p).as_deref() {
                 Some("inline-block" | "inline-flex" | "inline-grid") => return true,
                 Some("inline" | "contents") => {} // transparent — keep walking
@@ -4996,6 +5034,13 @@ impl<'a> Layout<'a> {
                 Some(w) => w.clamp(1, avail),
                 None => self.measure_width(card, avail).clamp(1, avail),
             };
+            // A strip past ~65k cells can't be addressed (stops/offsets are
+            // u16, and a bare `as u16` would silently WRAP) — nor usefully
+            // scrolled. Stop laying further cards there (hostile-input lid;
+            // a real rail is a few hundred cells wide).
+            if x + avail >= u16::MAX as usize {
+                break;
+            }
             // Lay the card as a block (ignore its own float), then place it.
             let b = self.layout_subtree_inner(card, cw, Some(card), false, &Ctx::root());
             if b.height == 0 {
@@ -5604,6 +5649,12 @@ impl<'a> Layout<'a> {
         let scale = (band as f32 / union_w as f32).min(1.0);
         // Lay each box to its final (col, box, top); placement happens after so
         // a lift can shift the boxes below it.
+        // Clamp the placed column into the band before the u16 cast: a hostile
+        // `left:9999999px` is ~1.25M cells, and a bare `as u16` silently WRAPS
+        // (1,250,000 % 65,536 ≈ 4,816) — the box landed at a garbage column
+        // instead of pinning to the edge.
+        let band_max = self.width.max(1) as i32 - 1;
+        let clamp_col = move |c: i32| c.clamp(0, band_max) as u16;
         let mut blits: Vec<(u16, LaidBox, i32)> = placed
             .into_iter()
             .map(|p| {
@@ -5612,10 +5663,10 @@ impl<'a> Layout<'a> {
                     let w = ((p.used_w as f32 * scale).round() as usize).max(1);
                     let inherit = self.ancestor_link_ctx(p.node);
                     let b = self.layout_subtree_inner(p.node, w, Some(p.node), false, &inherit);
-                    let col = (origin_col as i32 + (p.left as f32 * scale).round() as i32).max(0);
-                    (col as u16, b)
+                    let col = origin_col as i32 + (p.left as f32 * scale).round() as i32;
+                    (clamp_col(col), b)
                 } else {
-                    ((origin_col as i32 + p.left).max(0) as u16, p.b)
+                    (clamp_col(origin_col as i32 + p.left), p.b)
                 };
                 (col, b, p.top)
             })
@@ -6920,9 +6971,15 @@ impl<'a> Layout<'a> {
             // Cellpadding (HTML attr) insets content when the cell sets no CSS
             // padding of its own (CSS padding, applied by the cell's own
             // `block_indent`, wins per the presentational-hint priority).
-            let has_css_pad = ["padding", "padding-left", "padding-right", "padding-top"]
-                .iter()
-                .any(|p| self.dom.computed_style(cell.id, p).is_some());
+            let has_css_pad = [
+                "padding",
+                "padding-left",
+                "padding-right",
+                "padding-top",
+                "padding-bottom",
+            ]
+            .iter()
+            .any(|p| self.dom.computed_style(cell.id, p).is_some());
             let (ph, pv) = if has_css_pad || cellpad_px == 0.0 {
                 (0, 0)
             } else {
@@ -7871,6 +7928,10 @@ impl<'a> Layout<'a> {
         // `capture_boundaries`, which a hand-built sub silently dropped.
         let mut sub = self.make_sub(inner_w);
         sub.inner_border_box = Some(id);
+        // One bordered box deeper — the MAX_BORDER_DEPTH lid's counter
+        // (`make_sub` copied the current depth; every other sub-layout kind
+        // inherits it unchanged).
+        sub.border_depth = self.border_depth + 1;
         // The interior pass must NOT re-float this same element: when `id` is
         // both floated and bordered, `flow_float` lays its box (skipping the
         // float) and that box's `flow_element(id)` routes here for the frame.
@@ -8085,7 +8146,13 @@ impl<'a> Layout<'a> {
     /// A CSS length property in terminal cells (≈ 2 cells/em, 16px=1em),
     /// resolving `%`/`vw`/`calc()` against the current band width and the
     /// viewport. `None` when unset (or `auto`/an unsupported unit). Clamped
-    /// to ≥1 cell.
+    /// to ≥1 cell — DELIBERATE: a terminal can't paint a sub-cell sliver, so
+    /// a tiny-but-nonzero length rounds up to the one cell that can show it,
+    /// and a literal `width:0` box is almost always display-hidden by dom's
+    /// zero-size rules before this is consulted. The residue (`width:0;
+    /// overflow:visible`, whose content should overflow a zero-width box)
+    /// keeps a 1-cell band as the documented approximation — modelling
+    /// visible overflow out of a zero box isn't worth a band model change.
     fn css_cells(&self, id: NodeId, prop: &str) -> Option<usize> {
         let v = self.dom.computed_style(id, prop)?;
         let avail = self.width.saturating_sub(self.indent).max(1);
@@ -8190,6 +8257,15 @@ impl<'a> Layout<'a> {
         // in a pass (`measure_boxes` sets an explicit one; elsewhere this is
         // the session global either way).
         sub.cell_px_h = self.cell_px_h;
+        // The bordered-nesting depth rides every sub-layout (the lid counts
+        // bordered ANCESTRY, whatever formatting contexts sit between);
+        // `flow_bordered` increments it on top.
+        sub.border_depth = self.border_depth;
+        // Share the geometry maps (declared floors + clip caps): their values
+        // are position-independent sizes, so a box recorded deep inside a
+        // flex/grid/bordered sub-layout reaches `measure_boxes` directly.
+        sub.declared_boxes = self.declared_boxes.clone();
+        sub.clip_heights = self.clip_heights.clone();
         sub
     }
 
@@ -8237,6 +8313,16 @@ impl<'a> Layout<'a> {
     /// `row_base + r` (creating parent rows as needed). The 2D placement
     /// primitive — items keep their node/link so selection re-anchors and
     /// vertical scroll still index by the parent row grid.
+    ///
+    /// PERF (measured 2026-07-04, don't redo): a consuming `blit(LaidBox)`
+    /// that MOVES the items instead of cloning them was built and REJECTED —
+    /// it was ~26% SLOWER on the deep-flex shape it targeted
+    /// (`blit_clone_bench`: clone ~39.6ms, move ~50ms, stable across runs).
+    /// The clone at each level re-allocates the surviving strings
+    /// back-to-back at blit time — contiguous for the later `finish` walk
+    /// and drop — while moved strings stay scattered from leaf-layout time;
+    /// the locality is worth more than the copies (the same lesson as the
+    /// mimalloc/GC findings). Keep the borrowing clone.
     fn blit(&mut self, b: &LaidBox, col_off: u16, row_base: usize) {
         for (r, row) in b.rows.iter().enumerate() {
             let target = row_base + r;
@@ -8660,21 +8746,26 @@ impl<'a> Layout<'a> {
             return;
         }
         // pre-wrap: width-budget wrap within the content box, keeping spaces.
+        // The width accumulates per glyph (`place_oversize`'s pattern) instead
+        // of re-measuring the whole buffer per pushed char — the old
+        // `display_width(&buf)` re-scan cost O(chunk width) per character,
+        // an avoidable ×band constant on big pre-wrap blobs.
         let avail = self.line_right.saturating_sub(self.line_left).max(1);
         let mut buf = String::new();
+        let mut bw = 0usize;
         let mut chars = seg.chars().peekable();
         while let Some(c) = chars.next() {
+            bw += display_width(c.encode_utf8(&mut [0u8; 4]));
             buf.push(c);
-            if display_width(&buf) >= avail && chars.peek().is_some() {
-                let len = display_width(&buf);
-                self.push_preserved_item(&buf, len, ctx);
+            if bw >= avail && chars.peek().is_some() {
+                self.push_preserved_item(&buf, bw, ctx);
                 self.break_line();
                 buf.clear();
+                bw = 0;
             }
         }
         if !buf.is_empty() {
-            let len = display_width(&buf);
-            self.push_preserved_item(&buf, len, ctx);
+            self.push_preserved_item(&buf, bw, ctx);
         }
     }
 
@@ -9343,9 +9434,12 @@ impl<'a> Layout<'a> {
         if !self.is_out_of_flow(id) {
             return None;
         }
+        // The abspos containing block is the nearest positioned ancestor at
+        // WHATEVER depth (CSS 2.1 §10.1) — unbounded like
+        // `definite_ancestor_width`; the old 4-level cap stopped short of a
+        // deeply-wrapped player frame (the Twitch deep-wrapper lesson).
         let mut cur = self.dom.parent_composed(id);
-        for _ in 0..4 {
-            let p = cur?;
+        while let Some(p) = cur {
             if matches!(
                 self.dom.computed_style(p, "position").as_deref(),
                 Some("relative" | "absolute" | "fixed" | "sticky")
@@ -9610,9 +9704,12 @@ impl<'a> Layout<'a> {
     /// (e.g. a square tile: `aspect-ratio:1` wrapper, `img{width/height:100%}`).
     /// The ancestor's width is the image's used width (it fills the cell).
     fn container_box_rows(&self, id: NodeId, used_w: usize) -> Option<usize> {
+        // Unbounded (the Twitch deep-wrapper lesson — see
+        // `definite_ancestor_width`): the sized container can sit at any
+        // depth above its `height:100%` image; the old 6-level cap was the
+        // same stop-short bug waiting on the height side.
         let mut cur = self.dom.parent_composed(id);
-        for _ in 0..6 {
-            let p = cur?;
+        while let Some(p) = cur {
             if let Some(ar) = self.css_aspect_ratio(p) {
                 return Some(rows_for_ratio(used_w, ar));
             }
@@ -9633,9 +9730,10 @@ impl<'a> Layout<'a> {
     /// fixed-height padded box keeps its own height. `used_w` is the image's
     /// used width (it fills 100% of the container).
     fn intrinsic_ratio_container_rows(&self, id: NodeId, used_w: usize) -> Option<usize> {
+        // Unbounded like `container_box_rows` above — same deep-wrapper
+        // rationale.
         let mut cur = self.dom.parent_composed(id);
-        for _ in 0..6 {
-            let p = cur?;
+        while let Some(p) = cur {
             let h_zero = match self.dom.computed_style(p, "height").as_deref() {
                 Some(h) => css_length_em(h) == Some(0.0) || h.trim() == "auto",
                 None => true,
@@ -10692,7 +10790,11 @@ fn build_table_grid(layout: &Layout, rows: &[Vec<NodeId>]) -> (Vec<TableCell>, u
                 c += 1;
             }
             let colspan = layout.cell_span(cell, "colspan");
-            let rowspan = layout.cell_span(cell, "rowspan");
+            // Cap the occupancy PRODUCT (see `MAX_CELL_SPAN_AREA`): keep the
+            // colspan, clamp the rowspan to fit the area lid.
+            let rowspan = layout
+                .cell_span(cell, "rowspan")
+                .min((MAX_CELL_SPAN_AREA / colspan).max(1));
             for rr in r..r + rowspan {
                 for cc in c..c + colspan {
                     occupied.insert((rr, cc));
@@ -12117,6 +12219,55 @@ mod tests {
     }
 
     #[test]
+    fn nested_visible_clip_box_reports_its_clipped_geometry() {
+        // `clip_heights` is shared across sub-layouts now: a VISIBLE
+        // `height:64px;overflow:hidden` box nested in a flex item's
+        // sub-layout reports exactly 64px (4 rows × 16px) — its entry used to
+        // die with the sub-layout's map, so it reported the full unclipped
+        // content extent (10 rows = 160px).
+        let tall = "l1<br>l2<br>l3<br>l4<br>l5<br>l6<br>l7<br>l8<br>l9<br>l10";
+        let (dom, m) = measure(
+            &format!(
+                r#"<body><div style="display:flex"><div style="flex:1"><div id="clip" style="height:64px;overflow:hidden">{tall}</div></div><div style="flex:1">side</div></div></body>"#
+            ),
+            80,
+        );
+        let n = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&n| dom.attr(n, "id") == Some("clip"))
+            .unwrap();
+        assert_eq!(
+            m.get(&n).expect("the clip box has geometry").height,
+            64.0,
+            "capped to the declared clipped height, not the content extent"
+        );
+    }
+
+    #[test]
+    fn nested_declared_floor_survives_sub_layouts() {
+        // `declared_boxes` is shared too: a sized block nested in a flex
+        // item's sub-layout keeps its CSS floor (80×32px) instead of
+        // collapsing to its 1-cell content extent.
+        let (dom, m) = measure(
+            r#"<body><div style="display:flex"><div style="flex:1"><div id="f" style="width:80px;height:32px">·</div></div><div style="flex:1">side</div></div></body>"#,
+            80,
+        );
+        let n = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&n| dom.attr(n, "id") == Some("f"))
+            .unwrap();
+        let b = *m.get(&n).expect("the sized block has geometry");
+        assert!(b.width >= 80.0, "declared width floor holds: {}", b.width);
+        assert!(
+            b.height >= 32.0,
+            "declared height floor holds: {}",
+            b.height
+        );
+    }
+
+    #[test]
     fn measure_boxes_stacks_blocks_vertically() {
         // Two stacked blocks: the second's box sits strictly below the first's,
         // proving the y coordinate tracks document rows (cell_px height 16).
@@ -13186,6 +13337,45 @@ mod tests {
         assert_eq!(render_row(content[0]), "one two three four five six");
     }
 
+    /// `cargo test --release blit_clone_bench -- --ignored --nocapture` —
+    /// the blit cost on a deep-flex page (styled-components shape). This is
+    /// the harness that measured the clone-vs-move decision documented on
+    /// `blit`: the borrowing clone version ~39.6ms / 50 lays, a consuming
+    /// move version ~50ms — clone wins on locality, keep it.
+    #[test]
+    #[ignore]
+    fn blit_clone_bench() {
+        let mut inner = String::new();
+        for i in 0..300 {
+            inner.push_str(&format!("<p><a href=\"/page{i}\">item number {i}</a></p>"));
+        }
+        let mut html = inner;
+        for _ in 0..8 {
+            html = format!("<div style='display:flex'><div style='flex:1'>{html}</div></div>");
+        }
+        let html = format!("<body>{html}</body>");
+        let dom = Dom::parse_document(&html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let t = std::time::Instant::now();
+        let mut rows_out = 0usize;
+        for _ in 0..50 {
+            let rows = lay_out(
+                &dom,
+                &base,
+                100,
+                &[],
+                &ControlMap::new(),
+                &ImageSizes::new(),
+                false,
+            );
+            rows_out = rows.len();
+        }
+        println!(
+            "blit bench: 50 lays of 8-deep flex x 300 links = {:?} ({rows_out} rows)",
+            t.elapsed()
+        );
+    }
+
     #[test]
     fn white_space_pre_line_keeps_newlines_collapses_spaces() {
         let rows = lay(
@@ -13528,6 +13718,24 @@ mod tests {
     }
 
     #[test]
+    fn cell_css_padding_bottom_suppresses_cellpadding() {
+        // The presentational-hint priority check missed "padding-bottom": a
+        // cell whose ONLY CSS padding is the bottom edge still has CSS
+        // padding, so the `cellpadding` attribute must lose (its horizontal
+        // inset shifted the content a cell right).
+        let rows = lay(
+            r#"<body><table cellpadding="8"><tr><td style="padding-bottom:4px">x</td></tr></table></body>"#,
+            40,
+        );
+        assert_eq!(
+            pos_of(&rows, "x").1,
+            0,
+            "CSS padding wins — no cellpadding inset: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
     fn col_span_and_childless_colgroup_repeat_their_width() {
         // `<col span=N>` covers N columns (HTML §4.9.4); a CHILDLESS
         // `<colgroup span=N width=…>` acts the same (§4.9.3). Two 25%
@@ -13623,6 +13831,170 @@ mod tests {
         assert!(
             all_text(&rows).contains("DEEPEST"),
             "the innermost bordered cell content still renders past the depth lid"
+        );
+    }
+
+    #[test]
+    fn deep_border_nesting_hits_its_own_lid() {
+        // MAX_BORDER_DEPTH: past 32 nested bordered boxes the border is
+        // dropped and the interior flows as a plain block — hostile nesting
+        // can't grow the native-stack recursion a frame per level forever.
+        // 60 nestings: the innermost text sits ≤ 32 frame columns in (one
+        // left bar each), not 60.
+        let mut html = String::from("DEEPEST");
+        for _ in 0..60 {
+            html = format!("<div style='border:1px solid'>{html}</div>");
+        }
+        let rows = lay_b(&format!("<body>{html}</body>"), 400);
+        let it = find(&rows, "DEEPEST");
+        assert!(
+            (it.col as usize) <= MAX_BORDER_DEPTH + 2,
+            "frames stop at the lid (col {})",
+            it.col
+        );
+    }
+
+    #[test]
+    fn hostile_span_products_are_capped() {
+        // MAX_CELL_SPAN_AREA: `colspan`/`rowspan` are individually clamped to
+        // 1000, but the occupancy product (10^6 grid inserts per cell) was
+        // not — a page of such cells ground the grid build to a halt. The
+        // rowspan clamps to fit the area; the table still lays and renders.
+        let mut body = String::new();
+        for r in 0..8 {
+            body.push_str(&format!(
+                "<tr><td rowspan=\"1000\" colspan=\"1000\">c{r}</td></tr>"
+            ));
+        }
+        let rows = lay(&format!("<body><table>{body}</table></body>"), 40);
+        let all = all_text(&rows);
+        assert!(all.contains("c0") && all.contains("c7"), "{all:?}");
+    }
+
+    #[test]
+    fn absurd_positioned_offsets_stay_inside_the_band() {
+        // `left:9999999px` is ~1.25M cells — the placed column must CLAMP
+        // into the band, never wrap through the `as u16` cast (1,250,000 %
+        // 65,536 ≈ 4,816 landed the box at a garbage column).
+        let rows = lay(
+            r#"<body><div style="position:relative">anchor<div style="position:absolute;left:9999999px;top:0">X</div></div></body>"#,
+            80,
+        );
+        let it = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.text == "X")
+            .unwrap_or_else(|| panic!("the positioned box renders: {:?}", texts(&rows)));
+        assert!(
+            (it.col as usize) < 80,
+            "clamped into the band: col {}",
+            it.col
+        );
+    }
+
+    #[test]
+    fn a_monster_carousel_strip_truncates_at_the_addressable_width() {
+        // A hostile rail whose cards sum past u16::MAX cells: the strip stops
+        // laying further cards at the addressable limit — the stops stay
+        // MONOTONIC (a bare `as u16` used to wrap them back toward zero).
+        let cards: String = (0..1800)
+            .map(|i| format!("<div style='width:300px'>c{i}</div>"))
+            .collect();
+        let html = format!(
+            "<body><div style='overflow-x:scroll'><div style='display:flex;flex-wrap:nowrap;width:200000px'>{cards}</div></div></body>"
+        );
+        let dom = Dom::parse_document(&html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (_r, carousels, _rg, _sc, _b, _f, _a) = lay_out_with_carousels(
+            &dom,
+            &base,
+            (40, 24),
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
+        let c = carousels.first().expect("the rail still forms a carousel");
+        assert!(
+            c.stops.windows(2).all(|w| w[0] < w[1]),
+            "stops stay monotonic — no u16 wrap"
+        );
+        assert!(
+            c.stops.len() < 1800,
+            "the strip truncates at the u16 limit ({} cards laid)",
+            c.stops.len()
+        );
+    }
+
+    #[test]
+    fn ratio_container_found_past_deep_wrappers() {
+        // The Twitch deep-wrapper lesson on the HEIGHT side: the
+        // padding-bottom aspect box (and the `aspect-ratio` variant below)
+        // can sit at ANY depth above its `height:100%` image — the old 6-level
+        // caps stopped short and the image fell back to its intrinsic box.
+        // 50% padding of a 40-cell band = 10 rows (2:1 in cell aspect).
+        let wrap = |inner: &str, n: usize| {
+            let mut s = inner.to_string();
+            for _ in 0..n {
+                s = format!("<div>{s}</div>");
+            }
+            s
+        };
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/i.png".to_owned(), (20, 10));
+        let img = r#"<img src="/i.png" style="width:100%;height:100%">"#;
+        let html = format!(
+            r#"<body><div style="height:0;padding-bottom:50%;overflow:hidden">{}</div></body>"#,
+            wrap(img, 8)
+        );
+        let rows = lay_with_images(&html, 40, &images);
+        let it = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.image.is_some())
+            .expect("the image lays out");
+        assert_eq!(it.height, 10, "sized by the ratio box, not intrinsic");
+        // `aspect-ratio` ancestor at the same depth.
+        let html = format!(
+            r#"<body><div style="aspect-ratio:2">{}</div></body>"#,
+            wrap(img, 8)
+        );
+        let rows = lay_with_images(&html, 40, &images);
+        let it = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.image.is_some())
+            .expect("the image lays out");
+        assert_eq!(it.height, 10, "sized by the aspect-ratio ancestor");
+    }
+
+    #[test]
+    fn atomic_inline_context_found_past_deep_inline_wrappers() {
+        // The same lesson for `in_atomic_inline_context`: a `display:block`
+        // image under TEN transparent inline spans inside an inline-block
+        // wrapper still rides the line (the old 8-level cap declared it
+        // block-level and broke the row).
+        let mut img = r#"<img src="/a.png" style="display:block">"#.to_string();
+        for _ in 0..10 {
+            img = format!("<span>{img}</span>");
+        }
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/a.png".to_owned(), (4, 2));
+        let html = format!(r#"<body><div style="display:inline-block">before {img}</div></body>"#);
+        let rows = lay_with_images(&html, 80, &images);
+        let text_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|it| it.text.contains("before")))
+            .expect("text renders");
+        let img_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|it| it.image.is_some()))
+            .expect("image renders");
+        assert_eq!(
+            text_row,
+            img_row,
+            "the image rides the line inside the atomic inline box: {:?}",
+            texts(&rows)
         );
     }
 
