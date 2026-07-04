@@ -2290,8 +2290,15 @@ impl Dom {
             return true;
         }
         [PseudoEl::Before, PseudoEl::After].into_iter().any(|p| {
-            self.pseudo_style(id, p, "clear")
-                .is_some_and(|v| matches!(v.trim(), "both" | "left" | "right"))
+            self.pseudo_style(id, p, "clear").is_some_and(|v| {
+                // css-logical-1 flow-relative values included (LTR-only:
+                // inline-start = left, inline-end = right), matching layout's
+                // `float_side`/`clear_floats`.
+                matches!(
+                    v.trim(),
+                    "both" | "left" | "right" | "inline-start" | "inline-end"
+                )
+            })
         })
     }
 
@@ -4776,6 +4783,9 @@ const INHERITED_LAYOUT_PROPS: &[&str] = &[
     "font-weight",
     "font-style",
     "white-space",
+    "white-space-collapse",
+    "text-wrap",
+    "text-wrap-mode",
     "text-transform",
     "letter-spacing",
     "list-style-type",
@@ -4805,6 +4815,15 @@ const PROPS: &[PropDef] = &[
     prop("font-weight", true, true),
     prop("font-style", true, true),
     prop("white-space", true, true),
+    // CSS Text 4 longhands: `white-space` is now the shorthand of
+    // `white-space-collapse` × `text-wrap-mode` (`text-wrap` shorthands the
+    // latter — modern Tailwind emits `text-wrap:nowrap`). All inherited.
+    prop("white-space-collapse", true, true),
+    prop("text-wrap", true, true),
+    prop("text-wrap-mode", true, true),
+    // CSS Overflow 3 §5.1 — chooses ellipsis vs plain clip at a nowrap
+    // truncation. NOT inherited (applies to the clipping block itself).
+    prop("text-overflow", false, true),
     prop("text-transform", true, true),
     prop("letter-spacing", true, true),
     prop("list-style-type", true, true),
