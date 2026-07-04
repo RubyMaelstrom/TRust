@@ -830,7 +830,7 @@ async fn exchange(
     }
     io.flush().await.map_err(|e| e.to_string())?;
 
-    read_response(io).await
+    read_response(io, request.method.eq_ignore_ascii_case("HEAD")).await
 }
 
 /// One CRLF-terminated line, sans terminator. Err on EOF-before-line.
@@ -861,6 +861,7 @@ async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(io: &mut R) -> Result<Str
 /// EOF. Returns (status, headers, body, reusable).
 async fn read_response<R: AsyncRead + Unpin>(
     io: &mut BufReader<R>,
+    is_head: bool,
 ) -> Result<(u16, Headers, Vec<u8>, bool, Vec<String>), String> {
     let status_line = read_line(io).await?;
     let http11 = status_line.starts_with("HTTP/1.1");
@@ -894,6 +895,18 @@ async fn read_response<R: AsyncRead + Unpin>(
         && !headers
             .get("connection")
             .is_some_and(|c| c.to_ascii_lowercase().contains("close"));
+
+    // RFC 9112 §6.3: any response to a HEAD request is terminated by the
+    // end of the header section and NEVER carries a message body, whatever
+    // `Content-Length`/`Transfer-Encoding` it advertises — those describe
+    // the body a GET would return. Reading one here would block forever on
+    // bytes that never arrive; a single HEAD to any keep-alive server (an
+    // ad framework's latency probe, a preflight resource check) hung the
+    // whole page load until `WALL_BUDGET` killed it. The socket is at a
+    // clean message boundary, so it stays poolable.
+    if is_head {
+        return Ok((status, headers, Vec::new(), reusable, set_cookies));
+    }
 
     // TRust never plays video/audio — video is mpv's job (the `v` key /
     // YouTube auto-route). Downloading media bodies is pure waste: they're
@@ -6422,7 +6435,9 @@ customElements.define('lit-counter', LitCounter);
     async fn reads_chunked_bodies() {
         let raw: &[u8] =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
-        let (status, _, body, reusable, _) = read_response(&mut BufReader::new(raw)).await.unwrap();
+        let (status, _, body, reusable, _) = read_response(&mut BufReader::new(raw), false)
+            .await
+            .unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, b"Wikipedia");
         assert!(reusable, "complete chunked response is reusable");
@@ -6431,7 +6446,9 @@ customElements.define('lit-counter', LitCounter);
         // but a truncated stream is never pooled.
         let raw: &[u8] =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4;name=v\r\nWiki\r\n5\r\npedia";
-        let (_, _, body, reusable, _) = read_response(&mut BufReader::new(raw)).await.unwrap();
+        let (_, _, body, reusable, _) = read_response(&mut BufReader::new(raw), false)
+            .await
+            .unwrap();
         assert_eq!(body, b"Wikipedia");
         assert!(
             !reusable,
@@ -6444,8 +6461,9 @@ customElements.define('lit-counter', LitCounter);
         // Content-Length delimits even with pipelined junk behind it.
         let raw: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 5\r\n\r\nhellojunk";
-        let (status, headers, body, reusable, _) =
-            read_response(&mut BufReader::new(raw)).await.unwrap();
+        let (status, headers, body, reusable, _) = read_response(&mut BufReader::new(raw), false)
+            .await
+            .unwrap();
         assert_eq!(status, 200);
         assert_eq!(headers["content-type"], "text/html");
         assert_eq!(body, b"hello");
@@ -6453,15 +6471,51 @@ customElements.define('lit-counter', LitCounter);
 
         // Connection: close means don't pool; no delimiter means EOF.
         let raw: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nstuff";
-        let (_, _, body, reusable, _) = read_response(&mut BufReader::new(raw)).await.unwrap();
+        let (_, _, body, reusable, _) = read_response(&mut BufReader::new(raw), false)
+            .await
+            .unwrap();
         assert_eq!(body, b"stuff");
         assert!(!reusable);
 
         // HTTP/1.0 is never pooled.
         let raw: &[u8] = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok";
-        let (_, _, body, reusable, _) = read_response(&mut BufReader::new(raw)).await.unwrap();
+        let (_, _, body, reusable, _) = read_response(&mut BufReader::new(raw), false)
+            .await
+            .unwrap();
         assert_eq!(body, b"ok");
         assert!(!reusable);
+    }
+
+    /// RFC 9112 §6.3: a response to a HEAD request never has a body, even
+    /// though it advertises the `Content-Length`/`Transfer-Encoding` a GET
+    /// would return. Reading one blocks forever on bytes that never arrive
+    /// (a keep-alive socket stays open), which hung whole page loads until
+    /// the JS budget expired — itsfoss.com's ad framework HEADs a 1×1 probe
+    /// image. With `is_head`, the body is empty at the header boundary and
+    /// the connection stays poolable — no read into a body that isn't there.
+    #[tokio::test]
+    async fn head_response_has_no_body_despite_content_length() {
+        // Content-Length says 95, but a HEAD carries no body. The bytes
+        // after the header block belong to the NEXT pipelined response, and
+        // must not be consumed as this one's body.
+        let raw: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 95\r\n\r\n";
+        let (status, headers, body, reusable, _) =
+            read_response(&mut BufReader::new(raw), true).await.unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(headers["content-length"], "95");
+        assert!(body.is_empty(), "HEAD body is always empty: {body:?}");
+        assert!(
+            reusable,
+            "a keep-alive HEAD is at a clean boundary, poolable"
+        );
+
+        // Same for a chunked-advertising HEAD: no chunk data follows.
+        let raw: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let (_, _, body, reusable, _) =
+            read_response(&mut BufReader::new(raw), true).await.unwrap();
+        assert!(body.is_empty(), "HEAD ignores Transfer-Encoding: {body:?}");
+        assert!(reusable);
     }
 
     #[test]
@@ -6488,7 +6542,9 @@ customElements.define('lit-counter', LitCounter);
         .into_bytes();
         raw.extend_from_slice(&gz);
         let (status, headers, body, reusable, _) =
-            read_response(&mut BufReader::new(&raw[..])).await.unwrap();
+            read_response(&mut BufReader::new(&raw[..]), false)
+                .await
+                .unwrap();
         assert_eq!(status, 200);
         assert_eq!(headers["content-encoding"], "gzip");
         assert_eq!(body, b"<html>hello compressed</html>");

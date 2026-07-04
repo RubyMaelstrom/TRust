@@ -1776,11 +1776,24 @@ type GeomCache = (
 #[derive(boa_engine::JsData)]
 struct PageGeom {
     base: url::Url,
-    width_cells: u16,
-    height_cells: u16,
+    /// Measure viewport in cells. `Cell`s because the app pushes the TRUE
+    /// browser content size once the page is displayed (and again on resize,
+    /// `PageCmd::Viewport`) — the fetch-time value comes from whatever view
+    /// was on screen when the fetch started, which at startup is the session
+    /// layout, a few rows taller than the browser view.
+    width_cells: std::cell::Cell<u16>,
+    height_cells: std::cell::Cell<u16>,
     cell_px: (u16, u16),
     borders: bool,
     cache: Rc<RefCell<GeomCache>>,
+    /// Decoded image intrinsic sizes (url → cell dims), pushed by the app as
+    /// its image pipeline finishes (`PageCmd::ImageSizes`). The measure pass
+    /// lays images from these exactly like the app's render does, so the
+    /// geometry JS reads matches the page on screen (CSSOM View reports the
+    /// actual rendered layout — a virtualized feed caches these heights and
+    /// feeds them back as placeholder sizes, so a divergence reshapes the
+    /// document under the reader). Sparse before decodes arrive.
+    images: Rc<RefCell<crate::layout::ImageSizes>>,
 }
 
 impl boa_engine::gc::Finalize for PageGeom {}
@@ -2616,16 +2629,17 @@ fn sys_match_media(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
 /// the live arena (`layout::measure_boxes`) and reused until the next mutation
 /// — lazy, so a page that never measures pays nothing.
 fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let Some((base, width_cells, height_cells, cell_px, borders, cache)) = ({
+    let Some((base, width_cells, height_cells, cell_px, borders, cache, images)) = ({
         let host = ctx.realm().host_defined();
         host.get::<PageGeom>().map(|g| {
             (
                 g.base.clone(),
-                g.width_cells,
-                g.height_cells,
+                g.width_cells.get(),
+                g.height_cells.get(),
                 g.cell_px,
                 g.borders,
                 g.cache.clone(),
+                g.images.clone(),
             )
         })
     }) else {
@@ -2649,6 +2663,7 @@ fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
                 &controls,
                 cell_px,
                 borders,
+                &images.borrow(),
             );
             c.0 = epoch;
         }
@@ -6230,11 +6245,12 @@ fn load_page(
         if let Some(base) = parsed_url.clone() {
             host.insert(PageGeom {
                 base,
-                width_cells: viewport.0,
-                height_cells: viewport.1,
+                width_cells: std::cell::Cell::new(viewport.0),
+                height_cells: std::cell::Cell::new(viewport.1),
                 cell_px,
                 borders: crate::layout::borders_enabled(),
                 cache: Rc::new(RefCell::new((u64::MAX, std::collections::HashMap::new()))),
+                images: Rc::new(RefCell::new(crate::layout::ImageSizes::new())),
             });
         }
     }
@@ -7013,6 +7029,26 @@ pub enum PageCmd {
     /// this set; one the app hasn't cached takes the full path (no failed-patch
     /// resync). Sent whenever it changes (deduped).
     LiveBoundaries(Vec<usize>),
+    /// Decoded image intrinsic sizes from the app's image pipeline (url → cell
+    /// dims). Merged into the geometry pass's `ImageSizes` so measured boxes
+    /// match what the app renders — CSSOM View geometry reports the ACTUAL
+    /// layout, and a virtualized feed (Mastodon's IntersectionObserverArticle)
+    /// caches these heights and declares them back as placeholder sizes; a
+    /// divergence reshapes the document under the reader. A change invalidates
+    /// the geometry cache and re-runs IntersectionObserver (new geometry is a
+    /// rendering update, per the spec's "run the update intersection
+    /// observations steps" each frame). The app sends the full current map
+    /// (deduped by length — sizes only accrue during a page's life).
+    ImageSizes(Vec<(String, (u16, u16))>),
+    /// The app's TRUE browser viewport in cells (first displayed, or the
+    /// terminal resized). The engine adopts it — `innerWidth`/`innerHeight`,
+    /// the geometry pass's measure viewport — and fires `resize` at the
+    /// Window (CSSOM View §4.1). Without this the engine kept the fetch-time
+    /// size for the page's life; at startup that's the session layout's,
+    /// taller than the browser view, so every geometry decision (which
+    /// articles intersect the viewport, where "the bottom" is) aimed a few
+    /// rows past what the reader sees.
+    Viewport { cols: u16, rows: u16 },
 }
 
 /// Which kind of relayout boundary a patch targets (INCREMENTAL_LAYOUT_PLAN.md
@@ -8358,6 +8394,88 @@ fn page_actor(
                 // inline patch only for a boundary the app has cached.
                 page.live_boundaries = nodes.into_iter().collect();
             }
+            PageCmd::ImageSizes(sizes) => {
+                let mut changed = false;
+                {
+                    let host = page.ctx.realm().host_defined();
+                    if let Some(geom) = host.get::<PageGeom>() {
+                        let mut imgs = geom.images.borrow_mut();
+                        for (url, dims) in sizes {
+                            if imgs.get(&url) != Some(&dims) {
+                                imgs.insert(url, dims);
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            // Stale boxes: force the next `__dom_rect` read to
+                            // re-measure (u64::MAX is the never-built sentinel).
+                            geom.cache.borrow_mut().0 = u64::MAX;
+                        }
+                    }
+                }
+                if changed {
+                    // New geometry is a rendering update: re-observe
+                    // intersections (finish_dispatch runs updateIntersections
+                    // before rendering; an image that grew an article can move
+                    // targets in/out of the viewport) and re-render if the
+                    // callbacks mutated. No mutation → `Settled` (no redraw).
+                    // A fresh dispatch budget like any other interaction, so
+                    // the IO callbacks' settle isn't starved by load leftovers.
+                    prepare_dispatch(&mut page);
+                    if !finish_dispatch(&mut page, &evts) {
+                        return;
+                    }
+                }
+            }
+            PageCmd::Viewport { cols, rows } => {
+                // Adopt the app's true browser viewport: the measure pass lays
+                // at the width the app wraps at (one coordinate system), and
+                // the prelude updates innerWidth/innerHeight + fires `resize`
+                // at the Window (CSSOM View §4.1) + re-runs intersections.
+                let mut px = None;
+                {
+                    let host = page.ctx.realm().host_defined();
+                    if let Some(geom) = host.get::<PageGeom>() {
+                        if geom.width_cells.get() != cols || geom.height_cells.get() != rows {
+                            geom.width_cells.set(cols);
+                            geom.height_cells.set(rows);
+                            geom.cache.borrow_mut().0 = u64::MAX;
+                        }
+                        px = Some((
+                            u32::from(cols) * u32::from(geom.cell_px.0.max(1)),
+                            u32::from(rows) * u32::from(geom.cell_px.1.max(1)),
+                        ));
+                    }
+                }
+                if let Some((w, h)) = px {
+                    prepare_dispatch(&mut page);
+                    let call = format!("__trust.setViewport({w},{h})");
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        page.ctx.eval(Source::from_bytes(call.as_bytes()))
+                    })) {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => page.outcome.errors.push(format!("resize: {err}")),
+                        Err(_) => {
+                            page.outcome.errors.push(String::from(
+                                "resize: engine panic (Boa bug) — page JS halted",
+                            ));
+                            page.outcome.panicked = true;
+                        }
+                    }
+                    drain_js_side(&mut page.ctx, &mut page.outcome);
+                    if page.outcome.panicked {
+                        let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(
+                            &mut page.outcome.errors,
+                        )));
+                        return;
+                    }
+                    // A resize handler may mutate (responsive JS) — re-render
+                    // if so; otherwise `Settled` clears the app's busy state.
+                    if !finish_dispatch(&mut page, &evts) {
+                        return;
+                    }
+                }
+            }
         }
     }
 }
@@ -8449,6 +8567,22 @@ fn dispatch_scroll_in(page: &mut LoadedPage, x: f64, y: f64) {
             page.outcome.panicked = true;
             return;
         }
+    }
+    // DIAG (TRUST_DIAG_FRAME): the engine's post-clamp scroll vs the app's
+    // requested y — quantifies app↔engine document-height divergence live
+    // (the lever that cracked the Mastodon feed-scroll bug: engine 6740px vs
+    // app 5984px from decode-blind image geometry). Healthy = scrollY==req_y
+    // and scrollH within a few rows of the app's doc_rows × cell height.
+    if frame_diag_on()
+        && let Ok(v) = page.ctx.eval(Source::from_bytes(
+            b"'' + window.scrollY + ' ' + document.documentElement.scrollHeight + ' ' + window.innerHeight" as &[u8],
+        ))
+    {
+        let s = v
+            .to_string(&mut page.ctx)
+            .map(|s| s.to_std_string_escaped())
+            .unwrap_or_default();
+        eprintln!("DIAGSCROLLIN req_y={y:.0} engine[scrollY scrollH innerH]={s}");
     }
     let mut dispatch_outcome = Outcome::default();
     settle(
@@ -14288,6 +14422,27 @@ const PRELUDE: &str = r##"
         // (Steam) depends on it.
         try { dispatch(g.document, new Event("scroll"), true); }
         catch (e) { trust.errors.push("scroll handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+        trust.updateIntersections();
+    };
+
+    // The app's browser viewport changed (first displayed after the load-time
+    // shell, or the terminal resized): adopt the REAL size so innerWidth/
+    // innerHeight — and everything derived from them (documentElement
+    // clientWidth/clientHeight, the IntersectionObserver root rectangle, the
+    // setScroll clamp) — report the viewport the reader actually has, then
+    // fire `resize` at the Window (CSSOM View §4.1: when the viewport is
+    // resized, fire resize at the Window) and re-run the intersection
+    // observations against the new root. Before this, the engine kept the
+    // fetch-time size for the page's whole life — a few rows taller than the
+    // browser view (the startup screen's layout), so "the app's bottom" sat
+    // short of the engine's and geometry-driven reveals aimed past the reader.
+    trust.setViewport = function (w, h) {
+        w = +w || 0; h = +h || 0;
+        if (w <= 0 || h <= 0) return;
+        if (w === g.innerWidth && h === g.innerHeight) return;
+        g.innerWidth = w; g.innerHeight = h;
+        try { dispatch(g, new Event("resize"), false); }
+        catch (e) { trust.errors.push("resize handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         trust.updateIntersections();
     };
 
@@ -22706,6 +22861,121 @@ mod tests {
         assert!(
             removed,
             "the 500ms click-driven animation must remove the banner at rest"
+        );
+    }
+
+    #[test]
+    fn decoded_image_sizes_update_geometry_and_rerun_intersections() {
+        // PageCmd::ImageSizes: the app's decoded intrinsic sizes reach the
+        // actor's measure pass, so the geometry page JS reads matches the page
+        // the app renders (CSSOM View reports the ACTUAL layout — a
+        // virtualized feed caches these heights as placeholder sizes, and a
+        // divergence reshapes the document under the reader: the Mastodon
+        // feed-scroll bug). The size change is a rendering update, so the
+        // intersection observations re-run: a probe that sat in view above an
+        // undecoded (one-row alt) image is pushed below the fold when the
+        // decode makes it 60 rows tall, and the observer sees false.
+        let (handle, mut events) = live(
+            r##"<body><img src="a.png" alt="pic">
+            <div id=probe>probe</div><div id=out>start</div><script>
+            new IntersectionObserver(function (e) {
+                document.getElementById('out').textContent =
+                    'isx=' + e[0].isIntersecting;
+            }).observe(document.getElementById('probe'));
+            </script></body>"##,
+        );
+        let mut rendered = String::new();
+        for _ in 0..4 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) | Some(PageEvt::Static { html, .. }) => {
+                    rendered = html;
+                    if rendered.contains("isx=true") {
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled) => continue,
+                other => panic!("expected a render, got {other:?}"),
+            }
+        }
+        assert!(
+            rendered.contains("isx=true"),
+            "above the undecoded image the probe is in view: {rendered}"
+        );
+        // The app decoded the image: 10×60 cells (taller than the 24-row bare
+        // viewport). Resolved against the page URL like the render's lookup.
+        handle
+            .cmds
+            .blocking_send(PageCmd::ImageSizes(vec![(
+                String::from("https://example.com/dir/a.png"),
+                (10, 60),
+            )]))
+            .unwrap();
+        let mut pushed_out = false;
+        for _ in 0..6 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    if html.contains("isx=false") {
+                        pushed_out = true;
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled) => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(
+            pushed_out,
+            "the decoded size must move the probe below the fold and re-fire IO"
+        );
+    }
+
+    #[test]
+    fn a_viewport_push_updates_inner_size_and_fires_resize() {
+        // PageCmd::Viewport: the engine adopts the app's TRUE browser content
+        // area — the fetch-time size belongs to whatever view was on screen
+        // when the fetch started (at startup, the taller session layout) — and
+        // fires `resize` at the Window (CSSOM View §4.1). innerWidth/
+        // innerHeight and everything derived (documentElement.clientHeight,
+        // the IO root) must read the new size.
+        // The button keeps the page live (the auto-Static gate counts
+        // clickables; a lone resize listener wouldn't hold the engine).
+        let (handle, mut events) = live(
+            r##"<body><div id=out>start</div>
+            <button onclick="void 0">keep</button><script>
+            window.addEventListener('resize', function () {
+                document.getElementById('out').textContent =
+                    'resized ' + window.innerWidth + 'x' + window.innerHeight +
+                    ' client=' + document.documentElement.clientHeight;
+            });
+            </script></body>"##,
+        );
+        match events.blocking_recv() {
+            Some(PageEvt::Updated { .. }) | Some(PageEvt::Static { .. }) => {}
+            other => panic!("expected the initial render, got {other:?}"),
+        }
+        handle
+            .cmds
+            .blocking_send(PageCmd::Viewport { cols: 50, rows: 20 })
+            .unwrap();
+        let mut resized = false;
+        for _ in 0..6 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    // 50×8 = 400px wide, 20×16 = 320px tall (bare cell_px 8×16).
+                    if html.contains("resized 400x320 client=320") {
+                        resized = true;
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled) => continue,
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(
+            resized,
+            "the viewport push must update inner sizes and fire resize at the Window"
         );
     }
 
