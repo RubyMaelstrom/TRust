@@ -4015,20 +4015,42 @@ impl<'a> Layout<'a> {
     /// — and clipping a box TALLER than a cell to a definite height is the
     /// inner-scroll feature (deferred), not this.
     fn is_clip_collapsed(&self, id: NodeId) -> bool {
-        let collapsed = |prop: &str, vertical: bool| {
+        let collapsed = |prop: &str, pad: [&str; 2], vertical: bool| {
             // The axis must actually clip: a 0-size `overflow:visible` box still
             // paints its overflowing content, so it is NOT collapsed.
-            !matches!(
+            if matches!(
                 self.axis_overflow(id, vertical).as_deref(),
                 None | Some("visible")
-            ) && self
+            ) {
+                return false;
+            }
+            let size_zero = self
                 .dom
                 .computed_style(id, prop)
                 .and_then(|v| css_length_em(&v))
                 // `css_length_em` is in em (≈ 2 cells/em); < 1 cell ⇔ < 0.5em.
-                .is_some_and(|em| em * 2.0 < 1.0)
+                .is_some_and(|em| em * 2.0 < 1.0);
+            if !size_zero {
+                return false;
+            }
+            // Padding on this axis makes the PADDING box non-zero, and
+            // `overflow:hidden`/`clip` clips to the PADDING box (CSS Overflow §3),
+            // so the box isn't collapsed even though its CONTENT box is 0. This is
+            // the universal responsive-image aspect-ratio placeholder —
+            // `height:0; padding-bottom:56.25%; overflow:hidden` with an
+            // absolutely-positioned `width/height:100%` child filling the padding
+            // (percentage padding resolves against the containing block's WIDTH,
+            // CSS 2.1 §8.4). A percentage or a ≥1-cell length keeps the box.
+            let has_axis_padding = pad.iter().any(|p| {
+                self.dom.computed_style(id, p).is_some_and(|v| {
+                    parse_percent(&v).is_some_and(|f| f > 0.0)
+                        || css_length_em(&v).is_some_and(|em| em * 2.0 >= 1.0)
+                })
+            });
+            !has_axis_padding
         };
-        collapsed("width", false) || collapsed("height", true)
+        collapsed("width", ["padding-left", "padding-right"], false)
+            || collapsed("height", ["padding-top", "padding-bottom"], true)
     }
 
     /// Whether an element hard-clips one axis (`overflow:hidden`/`clip`) — the
@@ -8286,6 +8308,34 @@ impl<'a> Layout<'a> {
             self.place_image_box(id, ctx, url, w, h);
             return;
         }
+        // Declaration-first replaced-element sizing (CSS 2.1 §10; HTML §4.8.4.4
+        // "dimension attributes"). A browser sizes an `<img>` from its DECLARED
+        // dimensions — the `width`/`height` presentation attributes, which also
+        // give a natural aspect ratio — and reserves that box BEFORE (and
+        // independent of) loading the pixels, so layout doesn't shift when the
+        // image arrives. We do the same: an as-yet-undecoded image with declared
+        // dimensions reserves a real placeholder box instead of collapsing to alt
+        // text. This is also what unblocks IntersectionObserver-driven lazy
+        // loaders (lazysizes et al.): the box gives the element an on-page
+        // position, so the observer can report it entering the viewport and the
+        // loader swaps `data-src`→`src`. The box is blank until the pixels decode,
+        // then `place_image_box` (above) renders the real image into the same box.
+        let avail = self.line_right.saturating_sub(self.line_left).max(1) as u16;
+        if let Some((iw, ih)) = self.declared_intrinsic_px(id) {
+            // Layers a terminal can't composite are still dropped (a full-bleed
+            // page background / a cover backdrop behind in-flow content), matching
+            // the decoded path above so a background image doesn't reserve a wall
+            // of blank rows.
+            let backdrop = !self.within_modal(id)
+                && !self.framed_foreground(id)
+                && (self.is_background_layer_image(id, iw, ih, avail)
+                    || self.is_backdrop_overlay_image(id));
+            if !backdrop {
+                let (w, h, _crop) = self.image_used_box(id, iw, ih, avail);
+                self.place_image_placeholder(id, ctx, w, h);
+                return;
+            }
+        }
         let alt = self.dom.attr(id, "alt").unwrap_or("").trim().to_owned();
         if alt.is_empty() {
             return;
@@ -8552,6 +8602,70 @@ impl<'a> Layout<'a> {
         } else {
             self.pending_space = true; // a trailing gap after the image
         }
+    }
+
+    /// Reserve the box of an `<img>` that has DECLARED dimensions but no decoded
+    /// pixels yet — the browser's not-yet-loaded replaced element. Same flow
+    /// discipline as `place_image_box` (inline: wrap-if-needed and ride the line;
+    /// block: own line), but the item carries no image URL (`image: None`) so the
+    /// renderer paints it blank while it occupies its real `w`×`h` cell box. The
+    /// box is attributed to `id`, so `measure_boxes`/`getBoundingClientRect`/
+    /// IntersectionObserver see the image at its true on-page position before it
+    /// loads. When the pixels decode, a re-layout takes the `place_image_box` path
+    /// and fills the same box.
+    fn place_image_placeholder(&mut self, id: NodeId, ctx: &Ctx, w: u16, h: u16) {
+        let block = matches!(
+            self.dom.computed_display(id).as_deref(),
+            Some("block" | "flex" | "grid" | "table" | "list-item")
+        ) && !self.in_atomic_inline_context(id);
+        if block {
+            self.flush_block();
+        } else {
+            let space = self.pending_space && self.col > self.line_left;
+            if self.col + space as usize + w as usize > self.line_right && self.col > self.line_left
+            {
+                self.break_line();
+            }
+            if self.pending_space && self.col > self.line_left {
+                self.col += 1;
+            }
+            self.pending_space = false;
+        }
+        self.line.push(Item {
+            col: self.col as u16,
+            width: w,
+            height: h,
+            image: None,
+            crop: false,
+            pixelated: false,
+            text: String::new(),
+            kind: ItemKind::Image,
+            emph: Emphasis::default(),
+            node: id,
+            link: ctx.link.clone(),
+            invisible: self.invisible,
+        });
+        self.col += w as usize;
+        self.line_height = self.line_height.max(h);
+        if block {
+            self.break_line();
+        } else {
+            self.pending_space = true;
+        }
+    }
+
+    /// The natural (intrinsic) pixel size a browser uses to size an as-yet-
+    /// unloaded `<img>`: its `width`/`height` presentation attributes. HTML maps
+    /// these to the image's natural dimensions AND derives a natural aspect ratio
+    /// from them, so a sized box exists before the pixels load (the modern
+    /// layout-shift-free behaviour). `None` when the image declares no explicit
+    /// dimensions (a bare inline icon), which keeps the alt-text fallback for a
+    /// dimensionless replaced element.
+    fn declared_intrinsic_px(&self, id: NodeId) -> Option<(u16, u16)> {
+        let w = self.img_attr_px(id, "width")?;
+        let h = self.img_attr_px(id, "height")?;
+        let clamp = |n: f32| n.round().clamp(1.0, f32::from(u16::MAX)) as u16;
+        Some((clamp(w), clamp(h)))
     }
 
     /// Whether an image is a decorative full-bleed background layer — a
@@ -15169,6 +15283,49 @@ mod tests {
             "aspect-box padding must reserve real height"
         );
         assert!(img.crop);
+    }
+
+    #[test]
+    fn undecoded_image_in_overflow_hidden_aspect_placeholder_reserves_its_box() {
+        // The Dotdash Meredith / lazysizes idiom (dailypaws, allrecipes,
+        // verywell, …): a `height:0; padding-bottom:X%; overflow:hidden`
+        // aspect-ratio placeholder holding an `<img width=… height=…>` that is
+        // LAZY-LOADED (`data-src`, no `src` until an IntersectionObserver reveals
+        // it). Two bugs conspired to give such an image NO box: (1)
+        // `is_clip_collapsed` treated the `height:0` + `overflow:hidden`
+        // placeholder as collapsed and SKIPPED its whole subtree — ignoring that
+        // `overflow` clips to the PADDING box, which the percentage
+        // `padding-bottom` makes tall (CSS Overflow §3 / CSS 2.1 §8.4); and (2)
+        // an undecoded `<img>` fell back to alt text instead of reserving its
+        // DECLARED box. With no box the image had no on-page position, so the
+        // site's IntersectionObserver never fired and it never loaded at all.
+        // Now the placeholder isn't collapsed and the image reserves its declared
+        // (width/height-attribute) aspect box BEFORE decoding — declaration-first
+        // replaced-element sizing, exactly as a browser does to avoid layout
+        // shift.
+        let rows = lay(
+            r#"<body><div style="height:0;padding-bottom:66.6%;overflow:hidden;position:relative"><img width="2000" height="1333" style="width:100%;height:auto" alt="a puppy"></div><p>after</p></body>"#,
+            40,
+        );
+        let img = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| matches!(i.kind, ItemKind::Image) && i.image.is_none())
+            .expect("undecoded image reserves a placeholder box, not skipped");
+        // width:100% => 40 cells; height:auto from the 2000×1333 attrs (ratio
+        // 1.5) => rows = 40 / (2·1.5) ≈ 13 — a real box, not a collapsed strip.
+        assert_eq!(img.width, 40);
+        assert_eq!(img.height, 13, "declared aspect box reserved before decode");
+        // The reserved box takes real vertical space: following content flows
+        // BELOW it, never over a collapsed 0-row placeholder.
+        let after_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.text.contains("after")))
+            .expect("the following paragraph is laid out");
+        assert!(
+            after_row >= 13,
+            "content flows below the reserved image box (row {after_row})"
+        );
     }
 
     #[test]
