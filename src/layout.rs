@@ -39,7 +39,7 @@ pub(crate) fn display_width(s: &str) -> usize {
 
 /// The longest leading prefix of `s` whose display width is `<= max` cells —
 /// for truncating a clipped (`overflow:hidden`) line before its ellipsis.
-fn truncate_to_width(s: &str, max: usize) -> String {
+pub(crate) fn truncate_to_width(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut w = 0;
     for c in s.chars() {
@@ -140,14 +140,15 @@ pub fn borders_enabled() -> bool {
     BORDERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The terminal's real cell HEIGHT in px (the picker's font size), so the render
-/// pass can convert a definite CSS pixel height back to the SAME number of rows
-/// the JS geometry (`getBoundingClientRect` = rows × cell_px) reported. Session-
-/// global (set once from the picker, like `BORDERS_ENABLED`) rather than threaded
-/// through every `lay_out`/`parse_seeded`/test signature; defaults to 16 so tests
-/// and the 8×16 measurement fixtures round-trip exactly. Read into `Layout.
-/// cell_px_h` at construction; `measure_boxes` overrides it with its explicit
-/// `cell_px.1`. Only the overflow-clip reservation (`css_length_rows_at`) uses it.
+/// The terminal's real cell HEIGHT in px (the picker's font size). Every
+/// vertical px→rows conversion runs through it (via `Units`), so a definite
+/// CSS pixel height maps to the same physical extent a browser gives it AND
+/// round-trips the JS geometry (`getBoundingClientRect` = rows × cell_px).
+/// Session-global (set once from the picker, like `BORDERS_ENABLED`) rather
+/// than threaded through every `lay_out`/`parse_seeded`/test signature;
+/// defaults to 16 so tests and the 8×16 measurement fixtures round-trip
+/// exactly. Read into `Layout.cell_px_h` at construction; `measure_boxes`
+/// overrides it with its explicit `cell_px.1`.
 static CELL_PX_H: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(16);
 
 pub fn set_cell_px_h(px: u16) {
@@ -156,6 +157,62 @@ pub fn set_cell_px_h(px: u16) {
 
 pub fn cell_px_h() -> u16 {
     CELL_PX_H.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The terminal's real cell WIDTH in px, completing what `CELL_PX_H` started:
+/// with both axes real, a CSS pixel length maps to the same physical extent
+/// the browser gives it on ANY terminal font, and `rows_for_ratio` keeps true
+/// aspect instead of assuming 2:1 cells. Same session-global pattern as
+/// `CELL_PX_H`; defaults to 8 (the nominal cell) so tests stay deterministic.
+static CELL_PX_W: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(8);
+
+pub fn set_cell_px_w(px: u16) {
+    CELL_PX_W.store(px.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn cell_px_w() -> u16 {
+    CELL_PX_W.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The context a CSS length resolves in: the element's computed font-size
+/// (`em`), the root's (`rem`), and the terminal's real cell box (px → cells).
+/// Built per element by `Layout::units` / `Units::of`; the default is the
+/// nominal test fixture (16px font, 8×16 cells) under which 1em = 2 cells =
+/// 1 row, the engine's historical constants.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct Units {
+    /// The element's computed font-size, CSS px.
+    pub fs: f32,
+    /// The root element's computed font-size, CSS px (the `rem` basis).
+    pub root: f32,
+    /// Terminal cell width, px.
+    pub cell_w: f32,
+    /// Terminal cell height, px.
+    pub cell_h: f32,
+}
+
+impl Default for Units {
+    fn default() -> Self {
+        Units {
+            fs: crate::dom::FONT_SIZE_INITIAL,
+            root: crate::dom::FONT_SIZE_INITIAL,
+            cell_w: 8.0,
+            cell_h: 16.0,
+        }
+    }
+}
+
+impl Units {
+    /// The resolution context for `id` in `dom`, with the session's real cell
+    /// box — for callers outside a `Layout` (dom.rs's clip checks).
+    pub(crate) fn of(dom: &Dom, id: NodeId) -> Units {
+        Units {
+            fs: dom.font_px(id),
+            root: dom.root_font_px(),
+            cell_w: f32::from(cell_px_w()),
+            cell_h: f32::from(cell_px_h()),
+        }
+    }
 }
 
 /// Semantic/styling class of a laid-out item. The view maps these to
@@ -302,12 +359,23 @@ pub struct Carousel {
     /// content and the right border would vanish on every strip row. `None`
     /// when the box has no right border. Set by `frame_box`, moved by `blit`.
     pub frame_right: Option<u16>,
+    /// Whether scrolling SNAPS to the card stops (CSS Scroll Snap 1): true only
+    /// when the page declares `scroll-snap-type` on the container. Otherwise the
+    /// strip scrolls FREELY (by a fraction of the band), never forcing an
+    /// alignment the page didn't ask for.
+    pub snap: bool,
 }
 
 impl Carousel {
     /// The band's visible width in cells.
     pub fn view_width(&self) -> u16 {
         self.right.saturating_sub(self.left)
+    }
+
+    /// The furthest FREE scroll offset (whole strip minus the visible band) —
+    /// the clamp for a non-snapping (`scroll-snap-type: none`) strip.
+    pub fn max_offset(&self) -> u16 {
+        self.width.saturating_sub(self.view_width())
     }
 
     /// Whether a doc row index falls inside this strip.
@@ -322,9 +390,19 @@ impl Carousel {
             .is_some_and(|rc| rc >= self.left && rc + w <= self.right)
     }
 
-    /// Advance the scroll by one card (`dir` ±1), snapping `offset` to a
-    /// card's left edge and never scrolling past the last card.
+    /// Advance the scroll by one step (`dir` ±1): when the strip SNAPS, to the
+    /// next/prev card edge (never past the last card); otherwise a free scroll
+    /// by ~half the band, clamped to `[0, max_offset]`.
     pub fn scroll_cards(&mut self, dir: i32) {
+        if !self.snap {
+            let step = (self.view_width() / 2).max(1);
+            self.offset = if dir > 0 {
+                self.offset.saturating_add(step).min(self.max_offset())
+            } else {
+                self.offset.saturating_sub(step)
+            };
+            return;
+        }
         let max_stop = self.max_stop();
         if dir > 0 {
             if let Some(&next) = self
@@ -350,23 +428,34 @@ impl Carousel {
             .unwrap_or_else(|| self.stops.last().copied().unwrap_or(0))
     }
 
-    /// Whether the strip can still page in `dir` (±1) — drives the
-    /// `:disabled`/greyed state of a generated scroll control at the ends.
+    /// Whether the strip can still scroll in `dir` (±1) — drives the
+    /// `:disabled`/greyed state of any scroll control at the ends.
     pub fn can_scroll(&self, dir: i32) -> bool {
+        let far = if self.snap {
+            self.max_stop()
+        } else {
+            self.max_offset()
+        };
         if dir > 0 {
-            self.offset < self.max_stop()
+            self.offset < far
         } else {
             self.offset > 0
         }
     }
 
-    /// Page the strip by ~one visible width (`dir` ±1), snapping to a card
-    /// edge and clamping at the ends — what a prev/next button does in the
-    /// CSS carousel model (a `::scroll-button` scrolls by a page, then the
-    /// scroll-snap pulls to the nearest item). Falls back to one card when a
-    /// whole page would make no progress (a card wider than the band).
+    /// Page the strip by ~one visible width (`dir` ±1). When it SNAPS, to a
+    /// card edge (the CSS carousel model — page, then scroll-snap pulls to the
+    /// nearest item); otherwise a free page clamped to `[0, max_offset]`.
     pub fn scroll_page(&mut self, dir: i32) {
         let view = self.view_width();
+        if !self.snap {
+            self.offset = if dir > 0 {
+                self.offset.saturating_add(view).min(self.max_offset())
+            } else {
+                self.offset.saturating_sub(view)
+            };
+            return;
+        }
         let max_stop = self.max_stop();
         if dir > 0 {
             let target = self.offset.saturating_add(view).min(max_stop);
@@ -439,9 +528,15 @@ pub struct Region {
     /// offsets` keeps it — the page dictated the position (a chat pinning to the
     /// bottom); when false, the user's wheel offset is restored across re-layout.
     pub voffset_from_page: bool,
-    /// Carousels found inside the buffer (buffer-relative). Kept for Phase 4
-    /// carousel-in-region composition; the Phase 1 render doesn't apply them.
+    /// Horizontal scroll strips nested inside this region (buffer-relative
+    /// coords: `start`/`left` are indices into `buffer`). The renderer windows
+    /// them within this region's window (a shelf inside a scrolling feed).
     pub carousels: Vec<Carousel>,
+    /// Vertical scroll regions nested inside this region (buffer-relative). Each
+    /// is independently scrollable — the renderer windows it within this
+    /// region's window, and wheel/keys route to the deepest one under the
+    /// cursor (a scroll container inside a scroll container, CSS Overflow L3).
+    pub regions: Vec<Region>,
     /// Absolute http(s)/`data:` URLs of EVERY `<img>` in this region's subtree —
     /// decoded or not — collected from the DOM at layout time (an undecoded image
     /// is alt text, absent from the laid `buffer`, so this is read off the
@@ -598,14 +693,24 @@ pub fn effective_row<'a>(
     let mut merged = row.clone();
     for rg in regions.iter().filter(|rg| rg.contains_row(row_idx)) {
         let buf_idx = rg.voffset + (row_idx - rg.start_row);
-        let Some(brow) = rg.buffer.get(buf_idx) else {
+        if buf_idx >= rg.buffer.len() {
             continue; // past the content tail: the band shows blank here
-        };
+        }
+        // Resolve the region's buffer row through its OWN nested regions
+        // (recursion) so a scroll container inside this one draws its own
+        // windowed content — each independently scrolled (CSS Overflow L3).
+        let brow = effective_row(&rg.buffer, &rg.regions, buf_idx);
         for it in &brow.items {
-            if it.col >= rg.width {
+            // Window through this region's nested carousels first (buffer-
+            // relative column shift/clip); no carousels ⇒ the item's own col.
+            let Some(bcol) = visible_col(&rg.carousels, buf_idx, it) else {
+                continue; // a nested strip clipped this item out of its band
+            };
+            if bcol >= rg.width {
                 continue; // beyond the scrollport's right edge: clipped away
             }
             let mut it = it.clone();
+            it.col = bcol;
             let max_w = rg.width - it.col;
             if it.width > max_w {
                 if it.text.is_empty() {
@@ -720,6 +825,7 @@ pub struct RegionRowCache {
 /// to its own top-left. `width` is the widest used column and `height` is
 /// `rows.len()`. `blit` places it into a parent at a `(col, row)` offset —
 /// the primitive under flex-wrap grids (and later columns and floats).
+#[derive(Clone)]
 struct LaidBox {
     rows: Vec<Row>,
     width: u16,
@@ -763,6 +869,44 @@ struct LaidBox {
     /// when capturing. `None` for boxes not rooted on an element.
     root: Option<NodeId>,
     lay_width: u16,
+    /// Out-of-flow (`position:absolute`/`fixed`) boxes discovered inside this
+    /// box, at coordinates relative to its top-left. They are NOT part of
+    /// `rows` — an out-of-flow box has no effect on the layout of its
+    /// containing block's siblings (CSS 2.1 §9.3.1) and does not change any
+    /// box's used height (CSS Overflow 3 §4.1) — so they ride here as a side
+    /// channel that `blit` translates and propagates upward, exactly like
+    /// `fixed`/`carousels`, and only the document ROOT composites them over the
+    /// flow (`composite_positioned`). Each entry's own `b.positioned` is empty
+    /// (already flattened into this list at collection time).
+    positioned: Vec<PositionedBox>,
+}
+
+/// An out-of-flow (`position:absolute`/`fixed`) box awaiting its final
+/// composite over the in-flow document (CSS 2.1 §9.6 / CSS Overflow 3 §2.2 —
+/// it contributes to scrollable overflow but never to flow height). Collected
+/// by `place_positioned_children` at its containing block's placed origin,
+/// propagated up through sub-layouts by `blit`, and painted last by
+/// `composite_positioned`. `col`/`row` are in the CURRENT buffer's coordinate
+/// space until `blit`/`finish` translate them to the document.
+#[derive(Clone)]
+struct PositionedBox {
+    /// Left column of the box's top-left in the current buffer. SIGNED, and
+    /// clamped into a real band only at the final composite: a translated box
+    /// can legitimately sit LEFT of its (collapsed, fit-content) wrapper's
+    /// origin in a sub-layout's coordinate space — Twitch's chat column is at
+    /// `-34rem` relative to its 1-cell wrapper — and each `blit` offset
+    /// rebases it toward its true document column.
+    col: i32,
+    /// Top row of the box's top-left in the current buffer (may exceed
+    /// `rows.len()` — an out-of-flow box placed below all in-flow content
+    /// extends the scrollable region there). Boxes composite in row order so
+    /// the image-lift row inserts only shift boxes below them; the source
+    /// element and `z-index` are already consumed at collection (the per-CB
+    /// occlusion collapse), and each box's items carry their own node id.
+    row: usize,
+    /// The laid subtree (its `positioned` is empty — nested out-of-flow boxes
+    /// are flattened into the owning list at collection time).
+    b: LaidBox,
 }
 
 /// A cell placed in a table grid (CSS 2.1 §17.5): its element and the
@@ -863,7 +1007,9 @@ pub fn lay_out_with_carousels(
     // checks run only on the sparse baked boundary set).
     layout.capture_boundaries = true;
     layout.flow_all();
-    let (rows, carousels, fixed, regions, element_tops, scroll_clips, boundary_recs) =
+    // `flow_all` has composited the out-of-flow boxes over the flow, so
+    // `finish` reports none left over (the field is drained at the root).
+    let (rows, carousels, fixed, regions, element_tops, scroll_clips, boundary_recs, _positioned) =
         layout.finish();
     let boundaries = harvest_boundaries(boundary_recs, &rows, &regions, &carousels);
     let anchor_rows = anchor_rows_from(dom, &element_tops);
@@ -971,12 +1117,14 @@ fn harvest_boundaries(
 /// inherited styling context arrives materialized on the fragment (so
 /// `computed_value` over `dom` resolves it); an anchor-wrapped boundary is
 /// excluded upstream (the actor falls back to full), so the root `Ctx` carries no
-/// link. Returns the laid buffer/carousels plus the refreshed cache (every child
-/// this pass, to seed the next). When the region's structure doesn't fit the
-/// cacheable shape (a single-child-descended block BFC with ≥2 block children),
-/// it transparently lays the region in full — always correct. Guarded by
-/// `region_incremental_layout_matches_full`.
-#[allow(clippy::too_many_arguments)]
+/// link. Returns the laid buffer/carousels, the clip boxes of every definite-
+/// height scroll box nested in the fragment (so the app can refresh their
+/// `clientHeight` — `Doc.scroll_clips` — without a full re-lay), plus the
+/// refreshed cache (every child this pass, to seed the next). When the region's
+/// structure doesn't fit the cacheable shape (a single-child-descended block
+/// BFC with ≥2 block children), it transparently lays the region in full —
+/// always correct. Guarded by `region_incremental_layout_matches_full`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn lay_out_region_fragment_cached(
     dom: &Dom,
     base: &Url,
@@ -986,7 +1134,12 @@ pub fn lay_out_region_fragment_cached(
     images: &ImageSizes,
     boundary: NodeId,
     cache: &RegionRowCache,
-) -> (Vec<Row>, Vec<Carousel>, RegionRowCache) {
+) -> (
+    Vec<Row>,
+    Vec<Carousel>,
+    Vec<(usize, u16, u16)>,
+    RegionRowCache,
+) {
     let content_width = content_width.max(1);
     let mut layout = Layout::new(
         dom,
@@ -1016,7 +1169,14 @@ pub fn lay_out_region_fragment_cached(
         }))
     });
     layout.region_child_cache = rc.clone();
-    let buffer = layout.layout_subtree_inner(boundary, content_width, None, false, &Ctx::root());
+    let mut buffer =
+        layout.layout_subtree_inner(boundary, content_width, None, false, &Ctx::root());
+    // A scroll region is a self-contained buffer the app windows on its own, so
+    // its out-of-flow boxes can't escape to the document — composite them into
+    // the region's rows here (the document root does this in `flow_all`),
+    // keeping every side channel (nested scroll clips included) on the buffer.
+    // Rare (a region holding an abspos hovercard/badge), and free when empty.
+    layout.composite_box_positioned(&mut buffer);
     let new_cache = match rc {
         Some(rc) => RegionRowCache {
             width: content_width,
@@ -1024,7 +1184,12 @@ pub fn lay_out_region_fragment_cached(
         },
         None => RegionRowCache::default(),
     };
-    (buffer.rows, buffer.carousels, new_cache)
+    (
+        buffer.rows,
+        buffer.carousels,
+        buffer.scroll_clips,
+        new_cache,
+    )
 }
 
 /// The result of laying one INLINE relayout-boundary fragment (a block-filling
@@ -1090,7 +1255,11 @@ pub fn lay_out_subtree_fragment(
     layout.flow_node(boundary, &Ctx::root());
     layout.flush_block();
     layout.finish_floats();
-    let (rows, carousels, _fixed, regions, _tops, scroll_clips, _bnd) = layout.finish();
+    // A fragment is its own document root for its out-of-flow descendants:
+    // composite them over its flow before finishing (a full document does this
+    // in `flow_all`).
+    layout.composite_positioned();
+    let (rows, carousels, _fixed, regions, _tops, scroll_clips, _bnd, _pos) = layout.finish();
     let width = rows
         .iter()
         .flat_map(|r| &r.items)
@@ -1175,8 +1344,9 @@ pub fn measure_boxes(
         borders,
     );
     layout.viewport_h = viewport.1;
-    // Clip reservations convert px→rows against the real cell height, so a
-    // placeholder's declared px round-trips to the rows the visible box rendered.
+    // Unit resolution converts px→cells against the real cell box, so a
+    // measured geometry round-trips to the cells the visible box rendered.
+    layout.cell_px_w = cell_px.0.max(1);
     layout.cell_px_h = cell_px.1.max(1);
     layout.tag_all_nodes = true;
     layout.flow_all();
@@ -1185,7 +1355,7 @@ pub fn measure_boxes(
     // `finish` returns `element_tops` already remapped through its blank-row
     // collapse (and accumulated from every sub-layout via `blit`), so an
     // empty element's recorded row matches the kept-row grid the cells use.
-    let (rows, _carousels, _fixed, _regions, element_tops, _scroll_clips, _boundaries) =
+    let (rows, _carousels, _fixed, _regions, element_tops, _scroll_clips, _boundaries, _positioned) =
         layout.finish();
 
     // DIAG (TRUST_DIAG_MEASURE): total measured height + the tallest item
@@ -1591,9 +1761,10 @@ impl Align {
 
 /// CSS `white-space`: how whitespace collapses and whether lines wrap.
 /// Inherits, so it rides on the `Layout` as a saved/restored field (like
-/// the old `<pre>` bool it generalizes).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WhiteSpace {
+/// the old `<pre>` bool it generalizes). Shared with layout2 (the one
+/// white-space model — it moves there when this engine is deleted).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WhiteSpace {
     /// Collapse runs of whitespace to one space; wrap at the width.
     Normal,
     /// Collapse, but never wrap.
@@ -1607,7 +1778,7 @@ enum WhiteSpace {
 }
 
 impl WhiteSpace {
-    fn from_css(value: &str) -> Option<WhiteSpace> {
+    pub(crate) fn from_css(value: &str) -> Option<WhiteSpace> {
         match value.trim().to_ascii_lowercase().as_str() {
             "normal" => Some(WhiteSpace::Normal),
             "nowrap" => Some(WhiteSpace::Nowrap),
@@ -1627,7 +1798,7 @@ impl WhiteSpace {
     /// the wrap half — §2: `white-space` is now their shorthand. Approximations
     /// (terminal scale): `break-spaces`/`preserve-spaces` act as `preserve`,
     /// and preserve-breaks + nowrap has no variant here (stays `PreLine`).
-    fn with_longhands(self, collapse: Option<&str>, nowrap: Option<bool>) -> WhiteSpace {
+    pub(crate) fn with_longhands(self, collapse: Option<&str>, nowrap: Option<bool>) -> WhiteSpace {
         // Decompose to (collapse: 0 collapse / 1 preserve / 2 preserve-breaks,
         // nowrap), override the declared half, recompose.
         let (mut c, mut nw) = match self {
@@ -1657,29 +1828,29 @@ impl WhiteSpace {
         }
     }
     /// Whether runs of spaces collapse to a single space.
-    fn collapses_spaces(self) -> bool {
+    pub(crate) fn collapses_spaces(self) -> bool {
         matches!(
             self,
             WhiteSpace::Normal | WhiteSpace::Nowrap | WhiteSpace::PreLine
         )
     }
     /// Whether literal `\n` forces a line break.
-    fn preserves_newlines(self) -> bool {
+    pub(crate) fn preserves_newlines(self) -> bool {
         matches!(
             self,
             WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine
         )
     }
     /// Whether lines wrap at the content width.
-    fn wraps(self) -> bool {
+    pub(crate) fn wraps(self) -> bool {
         !matches!(self, WhiteSpace::Nowrap | WhiteSpace::Pre)
     }
 }
 
 /// CSS `text-transform`: alters the rendered text of a run. Inherits, so
 /// it rides on the inline `Ctx`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TextTransform {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextTransform {
     None,
     Upper,
     Lower,
@@ -1687,7 +1858,7 @@ enum TextTransform {
 }
 
 impl TextTransform {
-    fn from_css(value: &str) -> Option<TextTransform> {
+    pub(crate) fn from_css(value: &str) -> Option<TextTransform> {
         match value.trim().to_ascii_lowercase().as_str() {
             "none" => Some(TextTransform::None),
             "uppercase" => Some(TextTransform::Upper),
@@ -1697,7 +1868,7 @@ impl TextTransform {
         }
     }
     /// Apply the transform to a text run (borrowing unchanged when `None`).
-    fn apply<'t>(self, s: &'t str) -> std::borrow::Cow<'t, str> {
+    pub(crate) fn apply<'t>(self, s: &'t str) -> std::borrow::Cow<'t, str> {
         use std::borrow::Cow;
         match self {
             TextTransform::None => Cow::Borrowed(s),
@@ -1716,7 +1887,7 @@ impl TextTransform {
 /// run (`&nbsp;&nbsp;&nbsp;` indentation is real spacing on old table-layout
 /// pages). Other Unicode spaces (em/ideographic) likewise render as themselves;
 /// treating them as word glue costs only a rare break opportunity.
-fn is_collapsible_space(c: char) -> bool {
+pub(crate) fn is_collapsible_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}')
 }
 
@@ -1826,7 +1997,7 @@ fn edge_string(width: usize, left: Option<&str>, right: Option<&str>, horiz: &st
 /// glyph, a formatted ordinal (`N. `/`a. `/`i. `), or empty for `none`. Each
 /// ordinal carries its trailing `". "`; bullets a trailing space. Unknown
 /// types fall back to a disc, matching the UA default.
-fn format_list_marker(kind: &str, n: i64) -> String {
+pub(crate) fn format_list_marker(kind: &str, n: i64) -> String {
     // css-counter-styles-3 §3: a <counter-style-name> that doesn't name a
     // style we implement falls back to DECIMAL (the `_` arm — it was a
     // bullet, which numbered nothing). Alphabetic/roman systems are defined
@@ -1959,7 +2130,7 @@ impl Ctx {
 /// Insert `cells` spaces between each pair of characters (CSS `letter-spacing`
 /// rendered as whole-cell tracking). A no-op for `cells == 0` or a single
 /// character, so it borrows in the common case.
-fn letter_space(word: &str, cells: usize) -> std::borrow::Cow<'_, str> {
+pub(crate) fn letter_space(word: &str, cells: usize) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     if cells == 0 || word.chars().count() < 2 {
         return Cow::Borrowed(word);
@@ -2059,6 +2230,24 @@ pub(crate) fn page_preview_image(dom: &Dom, base: &Url) -> Option<String> {
     None
 }
 
+/// Whether the page declares ITSELF a video page via the standard Open Graph
+/// convention: an `og:video`(/`:secure_url`) resource, or an `og:type` in the
+/// `video.*` hierarchy (ogp.me — `video.movie`/`.episode`/`.tv_show`/
+/// `.other`, what every watch page ships for embeds/shares). The cross-site
+/// signal — never a host check — shared by the page-level mpv fallback, the
+/// streaming-`<video>` play-the-page representation, and the preview-image
+/// decode gate: "play this page in mpv" is only an honest offer on a page
+/// whose canonical content IS a video (a homepage with an autoplaying hero
+/// is not one, and yt-dlp finds nothing there).
+pub(crate) fn page_declares_video(dom: &Dom) -> bool {
+    ["og:video", "og:video:secure_url"]
+        .into_iter()
+        .any(|k| dom.meta_content(k).is_some())
+        || dom
+            .meta_content("og:type")
+            .is_some_and(|t| t.trim().to_ascii_lowercase().starts_with("video"))
+}
+
 /// Elements whose subtree never renders as page text. (`<video>`/`<audio>`
 /// are NOT here — they render as a media representation via `flow_media`.)
 const SKIP: &[&str] = &[
@@ -2085,6 +2274,15 @@ struct Layout<'a> {
     /// INNER_SCROLL_PLAN.md.
     viewport_h: usize,
     rows: Vec<Row>,
+    /// The widest flex/grid row USED width seen in this (sub-)layout, in cells —
+    /// the rightmost allocated column, which can exceed the rightmost PAINTED
+    /// cell because a flex item occupies its full main size even when its
+    /// content is narrower (CSS Flexbox §9.9.1). `layout_subtree_inner` floors
+    /// the box's reported width at this so a container reports its true used
+    /// width (else an ancestor flex row under-measures it and wrongly stacks —
+    /// Steam's `hero_capsule` spotlight carousel). `0` when no flex/grid row was
+    /// laid. Fresh per sub-layout (not copied by `make_sub`).
+    flex_min_width: usize,
     /// The line currently being built.
     line: Vec<Item>,
     /// Next free column on the current line.
@@ -2131,6 +2329,14 @@ struct Layout<'a> {
     /// definite-height box) discovered during the pass — each reserves `height`
     /// blank doc rows and holds its content in a separate `buffer`. See `Region`.
     regions: Vec<Region>,
+    /// Out-of-flow (`position:absolute`/`fixed`) boxes collected during the
+    /// pass, at their containing block's placed coordinates. They are kept OUT
+    /// of `rows` so they never inflate an ancestor's height or push its
+    /// siblings (CSS 2.1 §9.3.1); `blit` propagates them upward and only the
+    /// document root composites them over the flow (`composite_positioned`),
+    /// which is what extends the scrollable region to reach them (CSS Overflow
+    /// 3 §2.2) without disturbing in-flow layout. See `PositionedBox`.
+    positioned: Vec<PositionedBox>,
     /// The CLIP box `(live_node, client_h_rows, client_w_cells)` of EVERY
     /// definite-height scroll-y box flowed — region OR currently-fitting — keyed
     /// by its baked actor node id. The app pushes these as `clientHeight`/
@@ -2300,11 +2506,12 @@ struct Layout<'a> {
     /// clipped box nested in a flex item's sub-layout used to report its
     /// unclipped extent because the entry died with the sub's map.
     clip_heights: ClipHeights,
-    /// The terminal's real cell height in px (from the `CELL_PX_H` global, or set
-    /// explicitly by `measure_boxes`). Used ONLY by `css_length_rows_at` so an
-    /// overflow-clip box's definite px height converts back to the same rows the
-    /// visible version rendered — keeping a virtualized list's document height
-    /// stable as it swaps placeholders in/out on scroll. Copied onto sub-layouts.
+    /// The terminal's real cell box in px (from the `CELL_PX_W`/`CELL_PX_H`
+    /// globals, or set explicitly by `measure_boxes`). Every absolute CSS
+    /// length converts to cells through these via `Units`, so a px length
+    /// occupies the same physical extent a browser gives it on any terminal
+    /// font. Copied onto sub-layouts.
+    cell_px_w: u16,
     cell_px_h: u16,
 }
 
@@ -2340,9 +2547,11 @@ impl<'a> Layout<'a> {
             ws: WhiteSpace::Normal,
             line_height: 1,
             list_stack: Vec::new(),
+            flex_min_width: 0,
             carousels: Vec::new(),
             fixed: Vec::new(),
             regions: Vec::new(),
+            positioned: Vec::new(),
             scroll_clips: Vec::new(),
             suppressed_controls: std::collections::HashSet::new(),
             measuring: false,
@@ -2367,7 +2576,19 @@ impl<'a> Layout<'a> {
             shrink_wrap: false,
             invisible: false,
             clip_heights: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+            cell_px_w: cell_px_w(),
             cell_px_h: cell_px_h(),
+        }
+    }
+
+    /// The unit-resolution context for `id`: its computed font-size (`em`),
+    /// the root's (`rem`), and this layout's cell box (px → cells).
+    fn units(&self, id: NodeId) -> Units {
+        Units {
+            fs: self.dom.font_px(id),
+            root: self.dom.root_font_px(),
+            cell_w: f32::from(self.cell_px_w.max(1)),
+            cell_h: f32::from(self.cell_px_h.max(1)),
         }
     }
 
@@ -2382,7 +2603,7 @@ impl<'a> Layout<'a> {
             return None;
         }
         let h = self.dom.computed_style(id, "height")?;
-        css_length_rows_at(&h, self.cell_px_h)
+        css_length_rows(&h, self.units(id))
     }
 
     /// Whether an element clips its VERTICAL overflow with `hidden`/`clip`
@@ -2446,6 +2667,12 @@ impl<'a> Layout<'a> {
             let cb_h = self.rows.len();
             self.place_positioned_children(None, 0, 0, self.width, cb_h);
         }
+        // Paint every collected out-of-flow box over the finished in-flow
+        // document (CSS 2.1 §9.6 painting / CSS Overflow 3 §2.2 scrollable
+        // region). This is the ONE place the document composites its positioned
+        // layer; sub-layouts only propagate their boxes up here (via `blit`),
+        // never inflating an ancestor's flow (§9.3.1).
+        self.composite_positioned();
     }
 
     /// A page-level "▶ Watch in mpv" fallback for a video page whose player
@@ -2475,9 +2702,7 @@ impl<'a> Layout<'a> {
             .dom
             .descendants(DOCUMENT)
             .any(|id| matches!(self.dom.tag_name(id), Some("video" | "audio")))
-            || !["og:video", "og:video:secure_url"]
-                .into_iter()
-                .any(|k| self.dom.meta_content(k).is_some())
+            || !page_declares_video(self.dom)
         {
             return;
         }
@@ -2487,6 +2712,7 @@ impl<'a> Layout<'a> {
         self.invisible = false;
         self.flush_block();
         self.begin_line();
+        let mut preview_drawn = false;
         if let Some(poster) = page_preview_image(self.dom, self.base)
             && let Some(&(iw, ih)) = self.images.get(&poster)
             && iw > 0
@@ -2512,9 +2738,14 @@ impl<'a> Layout<'a> {
             self.col += w as usize;
             self.line_height = self.line_height.max(h);
             self.break_line();
+            preview_drawn = true;
         }
-        self.place_text("▶ Watch in mpv", &mctx);
-        self.break_line();
+        // The drawn preview IS the mpv link (her call 2026-07-04); the text
+        // affordance stands in only until/unless a preview frame renders.
+        if !preview_drawn {
+            self.place_text("▶ Watch in mpv", &mctx);
+            self.break_line();
+        }
     }
 
     fn flow_node(&mut self, id: NodeId, ctx: &Ctx) {
@@ -2876,7 +3107,7 @@ impl<'a> Layout<'a> {
             .dom
             .computed_value(id, "letter-spacing")
             .as_deref()
-            .and_then(|v| resolve_cells(v, 1, (self.viewport_w, self.viewport_h)))
+            .and_then(|v| resolve_cells(v, 1, (self.viewport_w, self.viewport_h), self.units(id)))
             .unwrap_or(0);
         // `font-size:0` collapses this element's text to nothing. Definitive on
         // the element wins; otherwise inherit the parent's answer (relative
@@ -2939,7 +3170,7 @@ impl<'a> Layout<'a> {
             let floor_h = ["height", "min-height"]
                 .into_iter()
                 .filter_map(|p| self.dom.computed_style(id, p))
-                .filter_map(|v| css_length_rows(&v))
+                .filter_map(|v| css_length_rows(&v, self.units(id)))
                 .max();
             if floor_w.is_some() || floor_h.is_some() {
                 self.declared_boxes
@@ -3331,6 +3562,7 @@ impl<'a> Layout<'a> {
                 &v,
                 self.width.saturating_sub(self.indent).max(1),
                 (self.viewport_w, self.viewport_h),
+                self.units(id),
             )
         {
             self.col += cells;
@@ -3469,6 +3701,36 @@ impl<'a> Layout<'a> {
                 let gutter = self.indent.saturating_sub(marker_added);
                 self.place_list_marker(&marker, marker_start_row, gutter);
             }
+            // CSS 2.1 §8.4: PERCENTAGE vertical padding resolves against the
+            // containing block's WIDTH — which makes an (often empty) padded
+            // box the web's aspect-ratio spacer: `padding-bottom:56.25%`
+            // reserves a 16:9 frame that an `inset:0` thumbnail then fills
+            // (Twitch's ScAspectSpacer sibling, the classic responsive-embed
+            // hack). Reserve that geometry in flow, FLOORING the box at its
+            // padded height — never adding, so a box whose content already
+            // fills the ratio (the padding-on-the-image-wrapper variant, which
+            // the declared-image placeholder machinery sizes) doesn't double.
+            // Without this the frame is 0 rows tall and, out-of-flow boxes no
+            // longer inflating their ancestors (§9.3.1), every card thumbnail
+            // composited over the content BELOW its card (Twitch's whole front
+            // page piled its feed into the hero). Reserved rows carry the
+            // zero-width image-spacer marker so `finish`'s blank-row collapse
+            // keeps them for the composite to fill. ABSOLUTE (px/em) vertical
+            // padding stays unreserved — that's whitespace, not geometry, and
+            // terminal rows are precious (the borders-off philosophy).
+            let vpad_frac: f32 = ["padding-top", "padding-bottom"]
+                .iter()
+                .filter_map(|p| first_percent(self.dom.computed_style(id, p).as_deref()?))
+                .filter(|f| *f > 0.0)
+                .sum();
+            if vpad_frac > 0.0 {
+                let band_w = corner_band.1.saturating_sub(corner_band.0);
+                let want = rows_for_ratio(band_w.max(1), 1.0 / vpad_frac, self.units(id));
+                let have = self.rows.len().saturating_sub(corner_start_row);
+                for _ in have..want {
+                    self.rows.push(image_spacer_row(self.indent));
+                }
+            }
             // Incremental-layout boundary capture (INCREMENTAL_LAYOUT_PLAN.md §14):
             // the in-flow content + contained floats are now laid, so the box's
             // row span is `[corner_start_row, rows.len())`. Recorded with the
@@ -3500,7 +3762,7 @@ impl<'a> Layout<'a> {
                 let cb_h = self
                     .dom
                     .computed_style(id, "height")
-                    .and_then(|v| css_length_rows(&v))
+                    .and_then(|v| css_length_rows(&v, self.units(id)))
                     .unwrap_or(content_h)
                     .max(content_h);
                 self.place_positioned_children(
@@ -3560,6 +3822,7 @@ impl<'a> Layout<'a> {
                     &v,
                     self.width.saturating_sub(self.indent).max(1),
                     (self.viewport_w, self.viewport_h),
+                    self.units(id),
                 )
             })
             .is_some_and(|c| c > 0)
@@ -3571,8 +3834,11 @@ impl<'a> Layout<'a> {
         if self.inner_border_box == Some(id) {
             // Bordered interior: the frame sits at the margin; only padding
             // indents the content inside it.
-            return indent_cells(self.dom.computed_style(id, "padding-left").as_deref())
-                .min(self.width / 4);
+            return indent_cells(
+                self.dom.computed_style(id, "padding-left").as_deref(),
+                self.units(id),
+            )
+            .min(self.width / 4);
         }
         let ml = self.dom.computed_style(id, "margin-left");
         let pl = self.dom.computed_style(id, "padding-left");
@@ -3590,9 +3856,9 @@ impl<'a> Layout<'a> {
             let margin = if centering_gutter {
                 0
             } else {
-                indent_cells(ml.as_deref())
+                indent_cells(ml.as_deref(), self.units(id))
             };
-            (margin + indent_cells(pl.as_deref())).min(self.width / 4)
+            (margin + indent_cells(pl.as_deref(), self.units(id))).min(self.width / 4)
         } else {
             match tag {
                 "ul" | "ol" | "blockquote" | "dd" => 2,
@@ -3664,12 +3930,15 @@ impl<'a> Layout<'a> {
             return self
                 .dom
                 .computed_style(id, "padding-top")
-                .is_some_and(|v| vertical_space(&v));
+                .is_some_and(|v| vertical_space(&v, self.units(id)));
         }
         let mt = self.dom.computed_style(id, "margin-top");
         let pt = self.dom.computed_style(id, "padding-top");
         if mt.is_some() || pt.is_some() {
-            [mt, pt].into_iter().flatten().any(|v| vertical_space(&v))
+            [mt, pt]
+                .into_iter()
+                .flatten()
+                .any(|v| vertical_space(&v, self.units(id)))
         } else {
             SPACING.contains(&tag)
         }
@@ -3681,12 +3950,15 @@ impl<'a> Layout<'a> {
             return self
                 .dom
                 .computed_style(id, "padding-bottom")
-                .is_some_and(|v| vertical_space(&v));
+                .is_some_and(|v| vertical_space(&v, self.units(id)));
         }
         let mb = self.dom.computed_style(id, "margin-bottom");
         let pb = self.dom.computed_style(id, "padding-bottom");
         if mb.is_some() || pb.is_some() {
-            [mb, pb].into_iter().flatten().any(|v| vertical_space(&v))
+            [mb, pb]
+                .into_iter()
+                .flatten()
+                .any(|v| vertical_space(&v, self.units(id)))
         } else {
             SPACING.contains(&tag)
         }
@@ -4002,8 +4274,14 @@ impl<'a> Layout<'a> {
             let inherit = self.ancestor_link_ctx(child);
             let prev_sw = self.shrink_wrap;
             self.shrink_wrap = explicit_w.is_none();
-            let b = self.layout_subtree_inner(child, lay_w, Some(child), false, &inherit);
+            let mut b = self.layout_subtree_inner(child, lay_w, Some(child), false, &inherit);
             self.shrink_wrap = prev_sw;
+            // The rail's rows become an overlay layer (`FixedItem.rows`) the
+            // document-root composite can never paint into — so its abspos
+            // descendants (badges, dropdown carets, unread dots) composite into
+            // the box HERE; the merged `b.fixed`/`b.scroll_clips` then ride the
+            // existing propagation below.
+            self.composite_box_positioned(&mut b);
             // The pinned box's own subtree can hold FURTHER pinned descendants
             // (captured into its sub-layout's overlay) — carry them up
             // translated to this box's static position, like `blit` does.
@@ -4208,6 +4486,15 @@ impl<'a> Layout<'a> {
         if !self.is_out_of_flow(id) {
             return false;
         }
+        // A translate MOVES the painted box (CSS Transforms 1), and overflow
+        // clips painted content — the fraction model below judges the
+        // UN-transformed position, so a translated box is indeterminate here.
+        // Kept, and judged instead by the translate-aware laid-geometry clip
+        // test at placement. This is the off-canvas slide-in idiom: a
+        // `left:100%` panel with `translateX(-100%)` is fully VISIBLE.
+        if self.has_translate(id) {
+            return false;
+        }
         // The clip comes from the containing block (nearest positioned ancestor);
         // for `fixed` / no positioned ancestor it is the viewport, which always
         // clips. A containing block that doesn't clip can't hide the box.
@@ -4298,12 +4585,16 @@ impl<'a> Layout<'a> {
             ) {
                 return false;
             }
+            // Sub-cell on the axis: narrower than one column, or shorter
+            // than the half-row that rounds to zero rows (a definite height
+            // past that paints a real strip a browser would show).
+            let u = self.units(id);
+            let sub_cell = |px: f32| px < if vertical { u.cell_h / 2.0 } else { u.cell_w };
             let size_zero = self
                 .dom
                 .computed_style(id, prop)
-                .and_then(|v| css_length_em(&v))
-                // `css_length_em` is in em (≈ 2 cells/em); < 1 cell ⇔ < 0.5em.
-                .is_some_and(|em| em * 2.0 < 1.0);
+                .and_then(|v| css_length_px(&v, u))
+                .is_some_and(sub_cell);
             if !size_zero {
                 return false;
             }
@@ -4318,7 +4609,7 @@ impl<'a> Layout<'a> {
             let has_axis_padding = pad.iter().any(|p| {
                 self.dom.computed_style(id, p).is_some_and(|v| {
                     parse_percent(&v).is_some_and(|f| f > 0.0)
-                        || css_length_em(&v).is_some_and(|em| em * 2.0 >= 1.0)
+                        || css_length_px(&v, u).is_some_and(|px| !sub_cell(px))
                 })
             });
             !has_axis_padding
@@ -4738,6 +5029,24 @@ impl<'a> Layout<'a> {
         // items. No-op when the row is full (free == 0) or left-packed.
         let used: usize = widths.iter().map(|w| (*w).max(1)).sum::<usize>() + gaps;
         let free = avail.saturating_sub(used);
+        // A flex item OCCUPIES its allocated main size even when its own content
+        // is narrower, so a flex row's max-content contribution is the sum of
+        // its items' flex base sizes plus gaps (CSS Flexbox §9.9.1) — which can
+        // exceed the rightmost painted cell (a spotlight capsule whose art is a
+        // `width:28vw` box but whose only in-flow content is a short title).
+        // Record it so `layout_subtree_inner` reports the row's TRUE measured
+        // width; without this the container measured only to its last item's
+        // content, and an ancestor flex row then handed this row too little
+        // space and stacked it (Steam's featured `hero_capsule` carousel
+        // collapsed to a vertical column). MEASURE-ONLY deliberately: on the
+        // render pass grow has been applied (`used` ≈ the whole band), and
+        // flooring the reported width there made every shrink-to-fit consumer
+        // see a full-band box — a `right:0` abspos flyout holding a `flex:1`
+        // row lost its right anchor (left = cb_w − used_w = 0) and the
+        // occlusion collapse saw phantom full-width overlaps.
+        if self.measuring {
+            self.flex_min_width = self.flex_min_width.max(self.line_left + used);
+        }
         let (lead, between) = self.justify_offsets(id, free, n, main_rev);
         let row_base = self.rows.len();
         // Lay every column box first, so `align-items` can offset a column
@@ -4759,10 +5068,13 @@ impl<'a> Layout<'a> {
         for i in 0..n {
             let cw = widths[i].max(1);
             // Blit a 0-height item too when it carries a pinned fixed rail (a
-            // `min-width` spacer pane whose only child is `position:fixed`): the
-            // blit draws no rows but propagates the fixed overlay at this item's
-            // column, so the rail lands at its reserved (centered) column.
-            if boxes[i].height > 0 || !boxes[i].fixed.is_empty() {
+            // `min-width` spacer pane whose only child is `position:fixed`) or
+            // collected out-of-flow boxes (a fit-content wrapper whose only
+            // content is an abspos slide-in panel — Twitch's chat column): the
+            // blit draws no rows but propagates the side channels at this
+            // item's column, so the overlay lands at its true position.
+            if boxes[i].height > 0 || !boxes[i].fixed.is_empty() || !boxes[i].positioned.is_empty()
+            {
                 let dy = self.align_offset(id, nodes[i], boxes[i].height as usize, line_h);
                 self.blit(&boxes[i], (self.line_left + x) as u16, row_base + dy);
             }
@@ -4848,7 +5160,12 @@ impl<'a> Layout<'a> {
     fn flex_gap(&self, id: NodeId, avail: usize, row_axis: bool) -> usize {
         let longhand = if row_axis { "row-gap" } else { "column-gap" };
         if let Some(v) = self.dom.computed_style(id, longhand)
-            && let Some(c) = resolve_cells(&v, avail, (self.viewport_w, self.viewport_h))
+            && let Some(c) = resolve_cells(
+                &v,
+                avail,
+                (self.viewport_w, self.viewport_h),
+                self.units(id),
+            )
         {
             return c;
         }
@@ -4860,7 +5177,8 @@ impl<'a> Layout<'a> {
                 toks.get(1).or_else(|| toks.first())
             };
             if let Some(t) = tok
-                && let Some(c) = resolve_cells(t, avail, (self.viewport_w, self.viewport_h))
+                && let Some(c) =
+                    resolve_cells(t, avail, (self.viewport_w, self.viewport_h), self.units(id))
             {
                 return c;
             }
@@ -4928,7 +5246,7 @@ impl<'a> Layout<'a> {
         {
             None | Some("auto") => self.len_or_pct(id, "width", avail),
             Some("content" | "max-content" | "min-content" | "fit-content") => None,
-            Some(v) => resolve_cells(v, avail, (self.viewport_w, self.viewport_h)),
+            Some(v) => resolve_cells(v, avail, (self.viewport_w, self.viewport_h), self.units(id)),
         };
         // `max-width` caps the basis; if there is no basis yet, an explicit
         // max-width still bounds an auto (content-sized) item via the caller.
@@ -4951,6 +5269,7 @@ impl<'a> Layout<'a> {
             &self.dom.computed_style(id, prop)?,
             avail,
             (self.viewport_w, self.viewport_h),
+            self.units(id),
         )
     }
 
@@ -5103,6 +5422,9 @@ impl<'a> Layout<'a> {
                 stops,
                 offset: 0,
                 frame_right: None,
+                // The deprecated flow engine keeps its always-snap behavior;
+                // layout2 honors `scroll-snap-type` (see `paint_carousel`).
+                snap: true,
             });
         }
         self.col = self.indent;
@@ -5231,9 +5553,8 @@ impl<'a> Layout<'a> {
         // region (a shrink-to-fit float/flex item measured ~half the band).
         let saved = self.region_inner;
         self.region_inner = Some(id);
-        let buffer = self.layout_subtree_inner(id, width, None, self.measuring, ctx);
+        let mut buffer = self.layout_subtree_inner(id, width, None, self.measuring, ctx);
         self.region_inner = saved;
-        let content_h = buffer.rows.len();
         // Reserve the clipped band on the REAL render pass for EVERY definite-
         // height (h > 0) scroll-y box — overflowing or fitting alike, since the
         // box is `h` tall either way (see the doc comment). The two measurement
@@ -5244,6 +5565,17 @@ impl<'a> Layout<'a> {
         // CONTAINING a scroll region down to nothing, then char-break its content
         // into one cell per row.
         let clip = h > 0 && !self.tag_all_nodes && !self.measuring;
+        // A clipped region's buffer is windowed by the app — the document-root
+        // composite can never paint into it, so its out-of-flow boxes composite
+        // into the buffer HERE (they're part of the scroller's scrollable
+        // overflow, CSS Overflow 3 §2.2); this also merges their nested
+        // fixed/scroll_clips onto the buffer before the lifts below read them.
+        // The inline branch instead lets them ride up to the root via `blit`.
+        // BEFORE `content_h`, so scrollHeight counts an overlay below the flow.
+        if clip {
+            self.composite_box_positioned(&mut buffer);
+        }
+        let content_h = buffer.rows.len();
         let row_base = self.rows.len();
         // The live actor's node id (baked as `data-trust-node` by the serializer)
         // for the Phase-3 geometry round-trip + wheel write-back.
@@ -5319,6 +5651,7 @@ impl<'a> Layout<'a> {
                 live_node,
                 voffset_from_page: signal.is_some(),
                 carousels: buffer.carousels,
+                regions: Vec::new(),
                 image_urls,
             });
         } else {
@@ -5433,8 +5766,34 @@ impl<'a> Layout<'a> {
                 None => {
                     // Miss: lay the child in flow, capture exactly its rows.
                     let snap = self.rows.len();
+                    let side_snap = (
+                        self.positioned.len(),
+                        self.carousels.len(),
+                        self.regions.len(),
+                        self.fixed.len(),
+                        self.scroll_clips.len(),
+                    );
                     self.flow_node(child, ctx);
                     self.flush_block();
+                    // A child that touched a SIDE channel (an abspos overlay in
+                    // `positioned`, a carousel/region/fixed rail/scroll clip)
+                    // put content somewhere the captured rows don't hold — a
+                    // reuse would splice the rows and silently drop the rest
+                    // (the standard's bar is render-as-if-fully-laid; a cache
+                    // may only be transparent). Don't memoize it: it re-lays —
+                    // and re-collects those channels — every pass. Such
+                    // children are rare in a chat-shaped region, so the
+                    // de-lag win holds for the plain-rows majority.
+                    if (
+                        self.positioned.len(),
+                        self.carousels.len(),
+                        self.regions.len(),
+                        self.fixed.len(),
+                        self.scroll_clips.len(),
+                    ) != side_snap
+                    {
+                        continue;
+                    }
                     std::rc::Rc::new(self.rows[snap..].to_vec())
                 }
             };
@@ -5482,15 +5841,15 @@ impl<'a> Layout<'a> {
                     // A PAINT-SUPPRESSED (`opacity:0`/`visibility:hidden`)
                     // out-of-flow box paints BLANK, and being out of flow it can
                     // never reserve in-flow space — so it must not be placed at
-                    // all: our deliberate "grow the containing block to contain
-                    // its positioned children" deviation (so overlays aren't
-                    // clipped) would otherwise STACK invisible boxes and push
-                    // the visible content down. Steam's featured carousels
-                    // pre-render ~13 hidden `.next` pages (`position:absolute`,
-                    // opacity:0) of game tiles; placing them buried the real grid
-                    // ~7 viewports down behind blank rows. (An IN-FLOW suppressed
-                    // box still reserves space + paints blank — Mastodon's
-                    // virtualized placeholders — that path never reaches here.)
+                    // all: composited last, its blank cells would stomp the live
+                    // content beneath them, and a box below the flow would
+                    // extend the scrollable region with dead rows. Steam's
+                    // featured carousels pre-render ~13 hidden `.next` pages
+                    // (`position:absolute`, opacity:0) of game tiles; placing
+                    // them buried the real grid ~7 viewports down behind blank
+                    // rows. (An IN-FLOW suppressed box still reserves space +
+                    // paints blank — Mastodon's virtualized placeholders — that
+                    // path never reaches here.)
                     // The MEASUREMENT pass skips them IDENTICALLY — geometry
                     // reports what we render, and once decoded image sizes fed
                     // the measure pass (PageCmd::ImageSizes), placing the hidden
@@ -5544,11 +5903,42 @@ impl<'a> Layout<'a> {
         if kids.is_empty() {
             return;
         }
-        // Lay each box and resolve its used (left, top) in cells.
+        // DIAG (TRUST_DIAG_POS): trace every out-of-flow placement — the CB,
+        // its content box, and each child's used geometry/drop reason — to
+        // localize a "content vanished" report to the exact placement step.
+        let diag = std::env::var_os("TRUST_DIAG_POS").is_some() && !self.measuring;
+        let name = |id: NodeId| -> String {
+            let tag = self.dom.tag_name(id).unwrap_or("·");
+            let cls = self
+                .dom
+                .attr(id, "class")
+                .map(|c| {
+                    let c: String = c.split_whitespace().take(2).collect::<Vec<_>>().join(".");
+                    format!(".{c}")
+                })
+                .unwrap_or_default();
+            format!("<{tag}>{}", cls.chars().take(48).collect::<String>())
+        };
+        if diag {
+            eprintln!(
+                "DIAGPOS cb={} origin=({origin_col},{origin_row}) cb_w={cb_w} cb_h={cb_h} band_w={}",
+                cb.map_or("<ICB>".into(), name),
+                self.width
+            );
+        }
+        // Lay each box and resolve its used (left, top) in cells. `left`/`top`
+        // are the UN-transformed §10.3.7/§10.6.4 positions and `used_w` the
+        // un-scaled used width (what the occlusion collapse judges — a stack
+        // of coincident carousel layers separated only by transform must
+        // still collapse); `tx`/`ty`/`sx` are the transform's paint offset and
+        // scale, applied at the clip test and the final collect.
         struct Placed {
             node: NodeId,
             left: i32,
             top: i32,
+            tx: i32,
+            ty: i32,
+            sx: f32,
             used_w: usize,
             bottom_pinned: bool,
             z: i32,
@@ -5571,11 +5961,30 @@ impl<'a> Layout<'a> {
             // filled the whole content area instead of its card-sized box. Floats
             // and text are untouched (still laid at the band), so they don't wrap.
             let explicit_w = self.abs_used_width(k, cb_w);
-            let lay_w = explicit_w.unwrap_or(cb_w).clamp(1, cb_w.max(1));
+            // §10.3.7: an EXPLICIT width is the used width — an abspos box
+            // freely OVERFLOWS its containing block, so it is never clamped to
+            // the CB (Twitch's 34rem chat column hangs on a `width:fit-content`
+            // wrapper that legitimately collapses to ~0 because its only
+            // content is out-of-flow; clamping to that CB laid the whole chat
+            // one cell wide). The only lid is the TERMINAL band (no h-scroll).
+            // Shrink-to-fit (`None`) keeps the CB band as its available space,
+            // per §10.3.7's shrink-to-fit formula.
+            let lay_w = explicit_w
+                .unwrap_or(cb_w)
+                .clamp(1, self.viewport_w.max(cb_w).max(1));
             let prev_sw = self.shrink_wrap;
             self.shrink_wrap = explicit_w.is_none();
             let b = self.layout_subtree_inner(k, lay_w, Some(k), false, &inherit);
             self.shrink_wrap = prev_sw;
+            // The paint offset of a translate transform (CSS Transforms 1 §6 —
+            // % against the box's own size). Resolved once here; the clip test
+            // and the final placement below judge the PAINTED position
+            // (overflow clips painted content, and translation moves it), while
+            // the occlusion collapse deliberately stays on the UN-translated
+            // stack (coincident layers differentiated only by transform — the
+            // peek-carousel pattern — must still collapse to their top layer).
+            let used_w = explicit_w.unwrap_or(b.width as usize).max(1);
+            let (tx, ty, sx) = self.transform_offset(k, used_w, b.height as usize);
             // Geometry: record this box's COMPUTED top-left (the coordinate its
             // containing block places it at) so an EMPTY abspos box — an
             // infinite-scroll sentinel paints no cells — still gets an honest
@@ -5587,11 +5996,15 @@ impl<'a> Layout<'a> {
             // looping. A non-empty box is covered by its laid cells, so this
             // only fills the gap left by the `b.height == 0` skip below.
             if self.tag_all_nodes {
-                let uw = explicit_w.unwrap_or(b.width as usize).max(1);
-                let gc = (origin_col as i32 + self.abs_used_left(k, cb_w as i32, uw as i32)).max(0);
+                // getBoundingClientRect INCLUDES transforms (CSSOM View §12) —
+                // record the translated (painted) coordinate.
+                let gc =
+                    (origin_col as i32 + self.abs_used_left(k, cb_w as i32, used_w as i32) + tx)
+                        .max(0);
                 let gr = (origin_row as i32
-                    + self.abs_used_top(k, cb_h as i32, b.height as i32).max(0))
-                .max(0);
+                    + self.abs_used_top(k, cb_h as i32, b.height as i32).max(0)
+                    + ty)
+                    .max(0);
                 self.element_tops.insert(
                     k,
                     (
@@ -5601,31 +6014,81 @@ impl<'a> Layout<'a> {
                 );
             }
             // A 0-height box still places when it carries a pinned fixed
-            // overlay (an abspos shell whose only content is `position:fixed`):
-            // it survives occlusion (area 0 never covers or is covered), draws
-            // no rows, and the final blit propagates the overlay at its placed
-            // position.
-            if b.height == 0 && b.fixed.is_empty() {
+            // overlay (an abspos shell whose only content is `position:fixed`)
+            // OR nested out-of-flow boxes (an abspos `width:100%;height:100%`
+            // link wrapper whose ONLY content is an abspos fill image + abspos
+            // corner badges — every thumbnail-card grid): it draws no rows
+            // itself, but the composite must still reach those descendants, so
+            // it survives occlusion and its side channels propagate.
+            if b.height == 0 && b.fixed.is_empty() && b.positioned.is_empty() {
+                if diag {
+                    eprintln!("DIAGPOS   {} DROP empty (h=0)", name(k));
+                }
                 continue;
             }
-            let used_w = explicit_w.unwrap_or(b.width as usize).max(1);
             let left = self.abs_used_left(k, cb_w as i32, used_w as i32);
             // Box height is content-driven: a cell grid has no internal scroll,
             // so a fixed-height `overflow` panel can't be honored. Per §10.6.4
             // that makes height auto; `top` is then clamped to the CB so a
             // bottom-anchored tall panel rides the top instead of off-screen.
             let top = self.abs_used_top(k, cb_h as i32, b.height as i32).max(0);
+            // CSS Overflow 3 §3: a containing block that CLIPS its overflow
+            // (`overflow:hidden`/`clip`) paints nothing of a positioned child
+            // that falls ENTIRELY outside its content box on the clipped axis.
+            // Now that an out-of-flow box no longer inflates its ancestors
+            // (§9.3.1), a collapsed-overflow wrapper reports its true (often
+            // zero) in-flow content box as `cb_h`/`cb_w`, so this row/column
+            // test recognizes an off-canvas drawer that a browser hides —
+            // e.g. NBC's `height:100vh` hamburger/notification panels inside an
+            // `overflow:hidden` wrapper that shrank to its 0 in-flow height.
+            // (Fraction-based `is_clipped_offscreen`, checked in the filter
+            // above, still catches the `%`/inset off-canvas cases it always
+            // did; this adds the laid-geometry case it can't resolve.)
+            if let Some(cbid) = cb {
+                // STRICTLY past the content box (`> cb_h`, not `>=`): a box AT
+                // the origin (`top:0`) stays even when the CB's in-flow content
+                // is zero, because the clip is to the PADDING box, and a
+                // `padding-bottom:100%` aspect-ratio square (its `inset:0` fill
+                // image) or a `top:0` fill overlay must not be dropped. Only a
+                // box pushed BELOW the content box — NBC's `top:60px` drawer in
+                // a 0-height `overflow:hidden` wrapper — clips away. Judged at
+                // the PAINTED (translated) position: overflow clips painted
+                // content, and a translate moves it (`left:100%` +
+                // `translateX(-100%)` is a fully visible right-docked panel).
+                let vclip = self.clips_hard(cbid, true) && top + ty > cb_h as i32;
+                let hclip = self.clips_hard(cbid, false) && left + tx > cb_w as i32;
+                if vclip || hclip {
+                    if diag {
+                        eprintln!(
+                            "DIAGPOS   {} DROP clipped (top={top} left={left} v={vclip} h={hclip})",
+                            name(k)
+                        );
+                    }
+                    continue;
+                }
+            }
+            if diag {
+                eprintln!(
+                    "DIAGPOS   {} placed left={left} top={top} used_w={used_w} lay_w={lay_w} b={}x{}",
+                    name(k),
+                    b.width,
+                    b.height
+                );
+            }
             // A box anchored AT or BELOW the CB's bottom edge (`top:auto` and
             // `bottom ≤ 0`, e.g. a footer at `bottom:-1.5rem`) follows the
-            // content: in a scroll-free model the CB grows to contain its
-            // positioned children, so this box sits after their extent (fixed
-            // up below). An INSET bottom (`bottom > 0`) keeps the §10.6.4 clamp.
+            // content: it lands just past the extent of its positioned siblings
+            // (fixed up below). An INSET bottom (`bottom > 0`) keeps the
+            // §10.6.4 clamp.
             let bottom_pinned = self.pos_len(k, "top", cb_h).is_none()
                 && self.pos_len(k, "bottom", cb_h).is_some_and(|b| b <= 0.0);
             placed.push(Placed {
                 node: k,
                 left,
                 top,
+                tx,
+                ty,
+                sx,
                 used_w,
                 bottom_pinned,
                 z: self.z_index(k),
@@ -5689,12 +6152,22 @@ impl<'a> Layout<'a> {
                     })
                 })
                 .collect();
+            if diag {
+                for (i, occ) in occluded.iter().enumerate() {
+                    if *occ {
+                        eprintln!("DIAGPOS   {} DROP occluded", name(placed[i].node));
+                    }
+                }
+            }
             let mut iter = occluded.into_iter();
             placed.retain(|_| !iter.next().unwrap_or(false));
         }
+        // The painted right extent (translate + scale included): what must fit
+        // the band.
         let mut union_w = 0i32;
         for p in &placed {
-            union_w = union_w.max(p.left.max(0) + p.used_w as i32);
+            let painted_w = ((p.used_w as f32) * p.sx.min(1.0)).round().max(1.0) as i32;
+            union_w = union_w.max((p.left + p.tx).max(0) + painted_w);
         }
         // The CB's used height grows to contain its non-bottom-pinned content;
         // re-place each bottom-pinned box just past that extent so a footer
@@ -5712,71 +6185,229 @@ impl<'a> Layout<'a> {
         }
         // Compress-to-fit: scale columns down when the layout is wider than the
         // band actually on screen from `origin_col` (no horizontal scroll).
-        let band = self.width.saturating_sub(origin_col).max(1) as i32;
+        // The band is the TERMINAL viewport, never a sub-layout's width: an
+        // out-of-flow box escapes a narrow flex-item band (§9.3.1/§10.3.7 —
+        // Twitch's chat hangs on a wrapper that measures ~0), so judging the
+        // fit against `self.width` inside such a sub crushed the box to
+        // nothing. Inside a sub `origin_col` is sub-relative (an underestimate
+        // of the true document offset), so this errs permissive; the final
+        // clamp into the real band happens at the root composite, and content
+        // past the right edge clips there like any other overflow.
+        let band = self
+            .viewport_w
+            .max(self.width)
+            .saturating_sub(origin_col)
+            .max(1) as i32;
         let scale = (band as f32 / union_w as f32).min(1.0);
-        // Lay each box to its final (col, box, top); placement happens after so
-        // a lift can shift the boxes below it.
-        // Clamp the placed column into the band before the u16 cast: a hostile
-        // `left:9999999px` is ~1.25M cells, and a bare `as u16` silently WRAPS
-        // (1,250,000 % 65,536 ≈ 4,816) — the box landed at a garbage column
-        // instead of pinning to the edge.
-        let band_max = self.width.max(1) as i32 - 1;
-        let clamp_col = move |c: i32| c.clamp(0, band_max) as u16;
-        let mut blits: Vec<(u16, LaidBox, i32)> = placed
-            .into_iter()
-            .map(|p| {
-                let (col, b) = if scale < 1.0 {
-                    // Re-lay at the compressed width so the box's content reflows.
-                    let w = ((p.used_w as f32 * scale).round() as usize).max(1);
-                    let inherit = self.ancestor_link_ctx(p.node);
-                    let b = self.layout_subtree_inner(p.node, w, Some(p.node), false, &inherit);
-                    let col = origin_col as i32 + (p.left as f32 * scale).round() as i32;
-                    (clamp_col(col), b)
+        if diag && scale < 1.0 {
+            eprintln!("DIAGPOS   compress union_w={union_w} band={band} scale={scale:.3}");
+        }
+        // Collect each box into the `positioned` side channel at its placed
+        // (col, row) — do NOT blit it into `rows`. Keeping out-of-flow boxes out
+        // of the flow is the whole point: they must not inflate this containing
+        // block or push its siblings (CSS 2.1 §9.3.1). The document root paints
+        // them last (`composite_positioned`), which is also where the scrollable
+        // region grows to reach a box placed below the flow (CSS Overflow 3 §2.2).
+        // The collected column stays SIGNED (a translated box can sit left of
+        // its collapsed wrapper in this sub's coordinate space — blit offsets
+        // rebase it toward the document, and only the composite clamps into
+        // its surface's band); a hostile `left:9999999px` is lidded here so a
+        // huge offset can't ride the channels as a garbage coordinate.
+        let lid = (self.viewport_w.max(1) as i32).saturating_mul(2);
+        let clamp_lid = move |c: i32| c.clamp(-lid, lid);
+        for p in placed {
+            // The box's OWN transform scale (hostile-input lid), composed with
+            // the group compress-to-fit factor. A scaled box re-lays at its
+            // scaled width — the same reflow the compress path does — and
+            // shrinks toward its own center (`transform-origin` default
+            // 50% 50%): the column gains half the width it lost, the row half
+            // the height (the height delta comes out of the re-lay; a
+            // text-heavy box that got TALLER at the narrower width shifts up
+            // instead — best-effort centering on the untransformed box).
+            let own = p.sx.clamp(0.05, 8.0);
+            let target_w = ((p.used_w as f32) * scale * own).round().max(1.0) as usize;
+            let (col, b, row_shift) = if scale < 1.0 || (own - 1.0).abs() > 0.01 {
+                let pre_h = p.b.height as i32;
+                let inherit = self.ancestor_link_ctx(p.node);
+                let b = self.layout_subtree_inner(p.node, target_w, Some(p.node), false, &inherit);
+                let col = origin_col as i32
+                    + ((p.left + p.tx) as f32 * scale).round() as i32
+                    + (((p.used_w as f32) * scale * (1.0 - own)) / 2.0).round() as i32;
+                let row_shift = if (own - 1.0).abs() > 0.01 {
+                    (pre_h - b.height as i32) / 2
                 } else {
-                    (clamp_col(origin_col as i32 + p.left), p.b)
+                    0
                 };
-                (col, b, p.top)
-            })
-            .collect();
-        // A cell grid has no z-axis, and a decoded image is an atomic blit (a
-        // sixel can't be partially overwritten — see the ratatui image model),
-        // so an overlay positioned ON an image cannot be composited over it.
-        // Rather than garble it (two glyphs fighting for a cell) or shove it off
-        // to the side (the renderer's overlap-append), LIFT the overlay onto its
-        // own row(s) at the same column by inserting blank rows: the image — and
-        // the CB's content below it — shifts down, so the overlay reads just
-        // above the image (a corner deal-badge over a store capsule). Processed
-        // top-down so each insert shifts the boxes below it consistently. The
-        // insert is confined to THIS containing block's row range (each flex
-        // capsule is its own sub-box), so sibling capsules re-align instead of
-        // drifting. Text-on-text overlap is left to the coordinate model
-        // (topmost wins); only an image — which genuinely can't be composited —
-        // forces the lift.
-        blits.sort_by_key(|&(_, _, top)| top);
-        let mut inserted = 0usize;
-        for (col, b, top) in blits {
-            let h = (b.height as usize).max(1);
-            let target = ((origin_row as i32 + top).max(0) as usize) + inserted;
-            if self.overlay_hits_image(target, h, col, b.width) {
-                self.insert_blank_rows(target, h);
-                inserted += h;
-            }
-            self.blit(&b, col, target);
+                (clamp_lid(col), b, row_shift)
+            } else {
+                (clamp_lid(origin_col as i32 + p.left + p.tx), p.b, 0)
+            };
+            let row = (origin_row as i32 + p.top + p.ty + row_shift).max(0) as usize;
+            self.collect_positioned(col, row, b);
         }
         self.col = self.indent;
         self.pending_space = false;
     }
 
+    /// Add an out-of-flow box (and any out-of-flow descendants it collected) to
+    /// the `positioned` side channel at `(col, row)` in the current buffer. The
+    /// box is pushed FIRST so it composites beneath its own descendants (CSS 2.1
+    /// Appendix E tree order for equal `z-index`); each nested box is then lifted
+    /// out of `b` and re-based onto this box's coordinate, so `b.positioned` ends
+    /// empty and the root composite iterates one flat, document-ordered set.
+    fn collect_positioned(&mut self, col: i32, row: usize, mut b: LaidBox) {
+        let nested = std::mem::take(&mut b.positioned);
+        self.positioned.push(PositionedBox { col, row, b });
+        for mut n in nested {
+            n.col = n.col.saturating_add(col);
+            n.row += row;
+            self.positioned.push(n);
+        }
+    }
+
+    /// Composite the collected out-of-flow boxes over the in-flow document — the
+    /// final paint step, run once at the document root (a full page in
+    /// `flow_all`, a fragment in `lay_out_subtree_fragment`). Each box was kept
+    /// out of `rows` so it never affected flow height (CSS 2.1 §9.3.1); painting
+    /// it here is what grows the scrollable region to reach a box placed below
+    /// the flow (CSS Overflow 3 §2.2). Boxes paint in row order so the image-lift
+    /// row inserts only shift boxes below them; the per-containing-block
+    /// occlusion collapse (done at collection) plus this order reproduce the old
+    /// in-place paint order. An overlay that would land on a decoded image is
+    /// lifted onto its own rows (a sixel is an atomic blit and can't be
+    /// composited under an overlay) — and overlays that start on the SAME
+    /// pre-lift rows SHARE one lifted band, so the corner badges of a card row
+    /// land in a single stripe instead of each inserting its own document-wide
+    /// band (which staircased the badges and tore every sibling card).
+    fn composite_positioned(&mut self) {
+        if self.positioned.is_empty() {
+            return;
+        }
+        let mut boxes = std::mem::take(&mut self.positioned);
+        // Stable sort by row keeps the collection (document, then z-collapsed)
+        // order among boxes sharing a row, so a child still paints over its
+        // parent when both start on the same row.
+        boxes.sort_by_key(|p| p.row);
+        // The collected column is SIGNED (sub-relative, may be negative for a
+        // translated box); this composite is the one place the true band is
+        // known, so clamp into it here. A negative final column pins to 0 (no
+        // negative cells — the closest cell-model rendering of a box hanging
+        // off the left edge); right overflow stays and clips at render like
+        // any other overflow (no horizontal scroll).
+        let band_max = self.width.max(1) as i32 - 1;
+        let mut inserted = 0usize;
+        // The active lifted band, as (pre-lift source row of the box that
+        // forced it, its post-insert top, its height). A later overlay whose
+        // pre-lift row falls inside the band joins it — the per-containing-
+        // block confinement the old in-place lift had, restored at the root.
+        let mut band: Option<(usize, usize, usize)> = None;
+        for p in boxes {
+            let col = p.col.clamp(0, band_max) as u16;
+            let h = (p.b.height as usize).max(1);
+            let natural = p.row + inserted;
+            let mut target = natural;
+            // Only a box that paints rows can need the lift; an empty shell
+            // (its content flattened out at collection) must not insert rows.
+            if p.b.height > 0 && self.overlay_hits_image(natural, h, col, p.b.width) {
+                match band {
+                    Some((src, start, bh)) if p.row >= src && p.row < src + bh => {
+                        // Join the existing band at the same relative offset;
+                        // grow it if this box is taller than what remains.
+                        let off = p.row - src;
+                        target = start + off;
+                        if off + h > bh {
+                            let extra = off + h - bh;
+                            self.insert_blank_rows(start + bh, extra);
+                            inserted += extra;
+                            band = Some((src, start, bh + extra));
+                        }
+                    }
+                    _ => {
+                        self.insert_blank_rows(natural, h);
+                        inserted += h;
+                        band = Some((p.row, natural, h));
+                    }
+                }
+            }
+            // `p.b.positioned` is empty (flattened at collection), so this blit
+            // adds nothing back to `self.positioned`.
+            self.blit(&p.b, col, target);
+        }
+    }
+
+    /// Composite a box's collected out-of-flow descendants into its OWN rows —
+    /// for the consumers that hand a box's rows to a WINDOWED surface the
+    /// document-root composite can never paint into: a pinned fixed rail's
+    /// `FixedItem.rows` (an overlay layer) and a scroll region's buffer (the
+    /// app windows it; its positioned content is part of the scroller's
+    /// scrollable overflow, CSS Overflow 3 §2.2). Runs the root machinery on a
+    /// scratch sub-layout so the image-lift and side-channel shifts behave
+    /// identically, then hands EVERY channel back on the box — the composite's
+    /// `blit` merges each `PositionedBox`'s nested carousels/regions/fixed/
+    /// scroll_clips/element_tops into the scratch, and dropping them here would
+    /// silently lose e.g. a scroll box nested in an abspos hovercard. In-flow
+    /// consumers must NOT call this: their boxes ride `b.positioned` up to the
+    /// document root via `blit` (CSS 2.1 §9.3.1).
+    fn composite_box_positioned(&self, b: &mut LaidBox) {
+        if b.positioned.is_empty() {
+            return;
+        }
+        let mut scratch = self.make_sub((b.lay_width as usize).max(1));
+        scratch.rows = std::mem::take(&mut b.rows);
+        scratch.carousels = std::mem::take(&mut b.carousels);
+        scratch.regions = std::mem::take(&mut b.regions);
+        scratch.fixed = std::mem::take(&mut b.fixed);
+        scratch.scroll_clips = std::mem::take(&mut b.scroll_clips);
+        scratch.element_tops = std::mem::take(&mut b.element_tops);
+        scratch.boundary_boxes = std::mem::take(&mut b.boundary_boxes);
+        scratch.positioned = std::mem::take(&mut b.positioned);
+        scratch.composite_positioned();
+        b.rows = std::mem::take(&mut scratch.rows);
+        b.carousels = std::mem::take(&mut scratch.carousels);
+        b.regions = std::mem::take(&mut scratch.regions);
+        b.fixed = std::mem::take(&mut scratch.fixed);
+        b.scroll_clips = std::mem::take(&mut scratch.scroll_clips);
+        b.element_tops = std::mem::take(&mut scratch.element_tops);
+        b.boundary_boxes = std::mem::take(&mut scratch.boundary_boxes);
+        // The composite can extend the box (an overlay below its flow or wider
+        // than its painted content) — report the true extents.
+        b.height = b.rows.len().min(u16::MAX as usize) as u16;
+        let painted = b
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .map(|it| it.col.saturating_add(it.width))
+            .max()
+            .unwrap_or(0);
+        b.width = b.width.max(painted);
+    }
+
     /// Whether placing a box at rows `[at, at+h)` over columns `[col, col+w)`
     /// would land on a decoded image already laid in those cells. A terminal
     /// cell has no z-axis and a sixel is an atomic blit, so an overlay can't be
-    /// composited over an image — `place_positioned_children` lifts it onto its
+    /// composited over an image — `composite_positioned` lifts it onto its
     /// own row instead.
     fn overlay_hits_image(&self, at: usize, h: usize, col: u16, w: u16) -> bool {
         let hi = col.saturating_add(w);
-        (at..(at + h).min(self.rows.len())).any(|r| {
+        // GEOMETRIC test against real, paintable image BOXES only:
+        //   - `it.width > 0 && it.image.is_some()` — zero-width spacer markers
+        //     (the §8.4 frame reservation and image-box row reservers are
+        //     `ItemKind::Image` so the blank-row collapse keeps them) and
+        //     undecoded placeholders paint NO pixels, so an overlay there is
+        //     not over an image. Counting the frame markers made EVERY player-
+        //     chrome icon over a hero card "hit an image" — a lift cascade
+        //     that inflated the reserved band into a giant void and exiled the
+        //     hero images below the fold (Twitch's front page, steady state).
+        //   - a tall image's ITEM lives in its TOP row while its box spans
+        //     `height` rows down, so the scan starts a window ABOVE `at` and
+        //     tests each image's row+height span against [at, at+h).
+        let lo = at.saturating_sub(IMG_CSS_MAX_ROWS);
+        (lo..(at + h).min(self.rows.len())).any(|r| {
             self.rows[r].items.iter().any(|it| {
                 matches!(it.kind, ItemKind::Image)
+                    && it.width > 0
+                    && it.image.is_some()
+                    && r + (it.height.max(1) as usize) > at
                     && it.col < hi
                     && it.col.saturating_add(it.width) > col
             })
@@ -5932,6 +6563,111 @@ impl<'a> Layout<'a> {
         }
     }
 
+    /// The paint GEOMETRY a `transform` applies to an out-of-flow box — the
+    /// summed translation offset (columns, rows) and the product of uniform
+    /// scale factors. CSS Transforms 1 §6: transforms move/size the PAINTED
+    /// box after layout; a translation percentage resolves against the box's
+    /// OWN border box. Applied ONLY to out-of-flow boxes: they composite as
+    /// movable units, so a whole-cell offset is exact and a scale is a re-lay
+    /// at the scaled width (the compress-to-fit machinery) — an in-flow
+    /// element's items are welded into shared line rows the paint can't
+    /// offset, so in-flow transforms stay unapplied. Translation is the
+    /// standard slide-in/centering mechanism (Twitch's chat `translateX
+    /// (-34rem)`, `left:50%; translate(-50%,-50%)`); scale is the peek-
+    /// carousel card-sizing mechanism (Twitch's hero at `scale(0.703)`).
+    /// Documented simplifications: rotate/skew/matrix have no cell analogue
+    /// and are ignored; scale is uniform-ized (the X factor; height follows
+    /// the re-lay); translation is applied unscaled rather than composed
+    /// through the full function order; `transform-origin` is assumed at its
+    /// default (the box center).
+    fn transform_offset(&self, id: NodeId, used_w: usize, used_h: usize) -> (i32, i32, f32) {
+        let Some(t) = self.dom.computed_style(id, "transform") else {
+            return (0, 0, 1.0);
+        };
+        let t = t.trim();
+        if t.is_empty() || t.eq_ignore_ascii_case("none") {
+            return (0, 0, 1.0);
+        }
+        let u = self.units(id);
+        let (mut tx, mut ty, mut sx) = (0.0f32, 0.0f32, 1.0f32);
+        let mut rest = t;
+        while let Some(open) = rest.find('(') {
+            let name = rest[..open]
+                .rsplit(|c: char| c.is_whitespace() || c == ')')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let Some(close) = rest[open..].find(')') else {
+                break;
+            };
+            let args = &rest[open + 1..open + close];
+            rest = &rest[open + close + 1..];
+            let mut parts = split_args(args).into_iter();
+            let num = |v: Option<&str>| v.and_then(|v| v.trim().parse::<f32>().ok());
+            match name.as_str() {
+                "translatex" => {
+                    if let Some(v) = parts.next() {
+                        tx += self.translate_cols(v.trim(), used_w, u);
+                    }
+                }
+                "translatey" => {
+                    if let Some(v) = parts.next() {
+                        ty += self.translate_rows(v.trim(), used_h, u);
+                    }
+                }
+                "translate" | "translate3d" => {
+                    if let Some(v) = parts.next() {
+                        tx += self.translate_cols(v.trim(), used_w, u);
+                    }
+                    if let Some(v) = parts.next() {
+                        ty += self.translate_rows(v.trim(), used_h, u);
+                    }
+                }
+                "scale" | "scale3d" => {
+                    if let Some(f) = num(parts.next()).filter(|f| *f > 0.0) {
+                        sx *= f;
+                    }
+                }
+                "scalex" => {
+                    if let Some(f) = num(parts.next()).filter(|f| *f > 0.0) {
+                        sx *= f;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (tx.round() as i32, ty.round() as i32, sx)
+    }
+
+    /// A translate X argument in cells: `%` against the box's own width, else
+    /// the shared width resolver (px/em/rem/vw/calc…). Unresolvable → 0.
+    fn translate_cols(&self, v: &str, used_w: usize, u: Units) -> f32 {
+        resolve_cells_f32(v, used_w, (self.viewport_w, self.viewport_h), u).unwrap_or(0.0)
+    }
+
+    /// A translate Y argument in rows: `%` against the box's own height, else
+    /// the height-axis resolver (1em ≈ 1 row; `vh` against the viewport).
+    /// Unresolvable → 0.
+    fn translate_rows(&self, v: &str, used_h: usize, u: Units) -> f32 {
+        parse_percent(v)
+            .map(|f| f * used_h as f32)
+            .or_else(|| css_height_rows_f32(v, self.viewport_h, u))
+            .unwrap_or(0.0)
+    }
+
+    /// Whether the element declares a transform that MOVES or RESIZES its
+    /// painted box (translate/scale) — the fraction-based offscreen test
+    /// can't judge such a box (the transform moves the painted box back
+    /// toward/away from the clip), so it must stay indeterminate there and be
+    /// judged by the transform-aware laid-geometry clip test at placement.
+    fn has_translate(&self, id: NodeId) -> bool {
+        self.dom.computed_style(id, "transform").is_some_and(|t| {
+            let t = t.to_ascii_lowercase();
+            t.contains("translate") || t.contains("scale")
+        })
+    }
+
     /// The used `z-index` of a box for painting order — the integer value, or
     /// `0` for `auto`/unset/non-integer. Two consumers, both comparing only the
     /// RELATIVE order within one comparison set (never stacking-context
@@ -5954,7 +6690,12 @@ impl<'a> Layout<'a> {
         if t.is_empty() || t.eq_ignore_ascii_case("auto") {
             return None;
         }
-        resolve_cells_f32(t, extent, (self.viewport_w, self.viewport_h))
+        resolve_cells_f32(
+            t,
+            extent,
+            (self.viewport_w, self.viewport_h),
+            self.units(id),
+        )
     }
 
     /// Generate the carousel's prev/next scroll buttons as glyph items on the
@@ -6159,10 +6900,10 @@ impl<'a> Layout<'a> {
             };
             let b = self.layout_subtree(k, w, ctx);
             // A 0-height item is skipped — unless it carries a pinned fixed
-            // overlay (a pane whose only child is `position:fixed`): the blit
-            // draws no rows but propagates the overlay at this item's position
-            // (same rule as the flex-row spacer-pane guard).
-            if b.height == 0 && b.fixed.is_empty() {
+            // overlay or collected out-of-flow boxes: the blit draws no rows
+            // but propagates the side channels at this item's position (same
+            // rule as the flex-row spacer-pane guard).
+            if b.height == 0 && b.fixed.is_empty() && b.positioned.is_empty() {
                 continue;
             }
             self.blit(&b, (self.line_left + offset) as u16, row);
@@ -6181,10 +6922,11 @@ impl<'a> Layout<'a> {
         for &k in kids {
             let b = self.layout_subtree(k, width, ctx);
             // A 0-height box still blits when it carries a pinned fixed overlay
-            // (Mastodon's side panes hold only a `position:fixed` rail): the
-            // blit adds no rows but propagates the overlay at the box's stack
-            // position, instead of silently dropping the rail with the box.
-            if b.height == 0 && b.fixed.is_empty() {
+            // (Mastodon's side panes hold only a `position:fixed` rail) or
+            // collected out-of-flow boxes: the blit adds no rows but propagates
+            // the side channels at the box's stack position, instead of
+            // silently dropping the overlay with the box.
+            if b.height == 0 && b.fixed.is_empty() && b.positioned.is_empty() {
                 continue;
             }
             self.blit(&b, self.line_left as u16, row);
@@ -6725,9 +7467,10 @@ impl<'a> Layout<'a> {
                     // `layout_subtree_inner`), so its own `align-self` applies.
                     let dy = self.align_offset(id, b.root.unwrap_or(id), b.height as usize, s.h);
                     self.blit(b, (self.line_left + x) as u16, shelf_top + dy);
-                } else if !b.fixed.is_empty() {
-                    // 0-height item carrying a pinned fixed overlay: blit adds
-                    // no rows but propagates the overlay at the item's slot.
+                } else if !b.fixed.is_empty() || !b.positioned.is_empty() {
+                    // 0-height item carrying a pinned fixed overlay or
+                    // collected out-of-flow boxes: blit adds no rows but
+                    // propagates the side channels at the item's slot.
                     self.blit(b, (self.line_left + x) as u16, shelf_top);
                 }
                 x += s.widths[k].max(1) + if k + 1 < n { gap + s.between } else { 0 };
@@ -6757,7 +7500,7 @@ impl<'a> Layout<'a> {
             me.dom
                 .computed_style(c, side)
                 .filter(|v| v.trim() != "auto")
-                .and_then(|v| resolve_cells(&v, avail, (me.viewport_w, me.viewport_h)))
+                .and_then(|v| resolve_cells(&v, avail, (me.viewport_w, me.viewport_h), me.units(c)))
                 .unwrap_or(0)
         };
         struct Slot {
@@ -6818,8 +7561,9 @@ impl<'a> Layout<'a> {
             for (s, b) in line.iter().zip(&laid) {
                 x += s.ml;
                 // A 0-height box still blits when it carries a pinned fixed
-                // overlay (blit adds no rows, propagates the overlay).
-                if b.height > 0 || !b.fixed.is_empty() {
+                // overlay or collected out-of-flow boxes (blit adds no rows,
+                // propagates the side channels).
+                if b.height > 0 || !b.fixed.is_empty() || !b.positioned.is_empty() {
                     self.blit(b, (self.line_left + x) as u16, shelf_top);
                 }
                 x += s.w + s.mr;
@@ -6849,7 +7593,9 @@ impl<'a> Layout<'a> {
         let Some(template) = self.dom.computed_style(id, "grid-template-columns") else {
             return false;
         };
-        let Some(specs) = self.parse_track_list(&template, avail as f32, col_gap as f32) else {
+        let Some(specs) =
+            self.parse_track_list(&template, avail as f32, col_gap as f32, self.units(id))
+        else {
             return false;
         };
         let ncols = specs.len();
@@ -6906,9 +7652,10 @@ impl<'a> Layout<'a> {
             let w = (widths[pl.col..end].iter().sum::<usize>() + col_gap * span.saturating_sub(1))
                 .max(1);
             let b = self.layout_subtree(*it, w, ctx);
-            // Keep a 0-height item that carries a pinned fixed overlay: its
-            // blit below adds no rows but propagates the overlay at its cell.
-            if b.height == 0 && b.fixed.is_empty() {
+            // Keep a 0-height item that carries a pinned fixed overlay or
+            // collected out-of-flow boxes: its blit below adds no rows but
+            // propagates the side channels at its cell.
+            if b.height == 0 && b.fixed.is_empty() && b.positioned.is_empty() {
                 continue;
             }
             nrows = nrows.max(pl.row + pl.row_span);
@@ -7264,13 +8011,14 @@ impl<'a> Layout<'a> {
         if let Some(p) = parse_percent(raw) {
             return Some(TrackWidth::Pct(p));
         }
-        if let Some(em) = css_length_em(raw) {
-            return Some(TrackWidth::Px((em * 2.0).round().max(1.0) as usize));
+        let u = self.units(id);
+        if let Some(px) = css_length_px(raw, u) {
+            return Some(TrackWidth::Px((px / u.cell_w).round().max(1.0) as usize));
         }
         raw.parse::<f32>()
             .ok()
             .filter(|n| *n > 0.0)
-            .map(|n| TrackWidth::Px((n / 8.0).round().max(1.0) as usize))
+            .map(|n| TrackWidth::Px((n / u.cell_w).round().max(1.0) as usize))
     }
 
     /// Horizontal cell spacing (cells): CSS `border-spacing` if set, else the
@@ -7287,13 +8035,14 @@ impl<'a> Layout<'a> {
             });
         let Some(raw) = raw else { return 0 };
         let first = raw.split_whitespace().next().unwrap_or("0");
-        css_length_em(first)
-            .map(|em| (em * 2.0).round() as usize)
+        let u = self.units(table);
+        css_length_px(first, u)
+            .map(|px| (px / u.cell_w).round() as usize)
             .or_else(|| {
                 first
                     .parse::<f32>()
                     .ok()
-                    .map(|n| (n / 8.0).round() as usize)
+                    .map(|n| (n / u.cell_w).round() as usize)
             })
             .unwrap_or(0)
     }
@@ -7598,7 +8347,13 @@ impl<'a> Layout<'a> {
     /// `avail`). Fixed lengths resolve to cells now (against the grid's content
     /// box, `avail`); intrinsic/`fr` tracks resolve during sizing. `None` (the
     /// caller falls back) for `none`/empty or any token we can't parse.
-    fn parse_track_list(&self, value: &str, avail: f32, gap: f32) -> Option<Vec<TrackSpec>> {
+    fn parse_track_list(
+        &self,
+        value: &str,
+        avail: f32,
+        gap: f32,
+        u: Units,
+    ) -> Option<Vec<TrackSpec>> {
         let v = value.trim();
         if v.is_empty() || v.eq_ignore_ascii_case("none") {
             return None;
@@ -7611,7 +8366,7 @@ impl<'a> Layout<'a> {
                 .and_then(|r| r.strip_suffix(')'))
             {
                 let (count_s, list_s) = inner.split_once(',')?;
-                let list = self.parse_track_list(list_s, avail, gap)?;
+                let list = self.parse_track_list(list_s, avail, gap, u)?;
                 let count_s = count_s.trim();
                 let count = if count_s.eq_ignore_ascii_case("auto-fill")
                     || count_s.eq_ignore_ascii_case("auto-fit")
@@ -7628,7 +8383,7 @@ impl<'a> Layout<'a> {
                 for _ in 0..count {
                     tracks.extend(list.iter().cloned());
                 }
-            } else if let Some(spec) = self.parse_one_track(&tok, avail) {
+            } else if let Some(spec) = self.parse_one_track(&tok, avail, u) {
                 tracks.push(spec);
             } else {
                 return None;
@@ -7639,7 +8394,7 @@ impl<'a> Layout<'a> {
 
     /// Parse a single track sizing function (`auto`, `Nfr`, a length,
     /// `minmax()`, `fit-content()`, `min/max-content`). `None` if unparseable.
-    fn parse_one_track(&self, tok: &str, avail: f32) -> Option<TrackSpec> {
+    fn parse_one_track(&self, tok: &str, avail: f32, u: Units) -> Option<TrackSpec> {
         let t = tok.trim();
         match t {
             "auto" => return Some(TrackSpec::Auto),
@@ -7651,8 +8406,8 @@ impl<'a> Layout<'a> {
             let (a, b) = split_args(inner)
                 .split_first()
                 .and_then(|(a, rest)| rest.first().map(|b| (a.trim(), b.trim())))?;
-            let min = self.parse_one_track(a, avail)?;
-            let max = self.parse_one_track(b, avail)?;
+            let min = self.parse_one_track(a, avail, u)?;
+            let max = self.parse_one_track(b, avail, u)?;
             return Some(TrackSpec::Minmax(Box::new(min), Box::new(max)));
         }
         if let Some(inner) = t
@@ -7663,6 +8418,7 @@ impl<'a> Layout<'a> {
                 inner.trim(),
                 avail as usize,
                 (self.viewport_w, self.viewport_h),
+                u,
             )?;
             return Some(TrackSpec::FitContent(cap.max(0.0)));
         }
@@ -7670,7 +8426,7 @@ impl<'a> Layout<'a> {
             let f: f32 = num.trim().parse().ok()?;
             return Some(TrackSpec::Fr(f.max(0.0)));
         }
-        resolve_cells_f32(t, avail as usize, (self.viewport_w, self.viewport_h))
+        resolve_cells_f32(t, avail as usize, (self.viewport_w, self.viewport_h), u)
             .map(|c| TrackSpec::Fixed(c.max(0.0)))
     }
 
@@ -8009,8 +8765,16 @@ impl<'a> Layout<'a> {
         sub.flow_node(id, ctx);
         sub.flush_block();
         sub.finish_floats();
-        let (rows, carousels, fixed, regions, element_tops, scroll_clips, boundary_boxes) =
-            sub.finish();
+        let (
+            rows,
+            carousels,
+            fixed,
+            regions,
+            element_tops,
+            scroll_clips,
+            boundary_boxes,
+            positioned,
+        ) = sub.finish();
         let content = LaidBox {
             height: rows.len() as u16,
             width: inner_w as u16,
@@ -8023,6 +8787,7 @@ impl<'a> Layout<'a> {
             boundary_boxes,
             root: Some(id),
             lay_width: inner_w as u16,
+            positioned,
         };
         let framed = self.frame_box(content, sides);
         if framed.height > 0 {
@@ -8171,6 +8936,11 @@ impl<'a> Layout<'a> {
             f.col += col_shift;
             f.row += row_shift as u16;
         }
+        let mut positioned = content.positioned;
+        for p in &mut positioned {
+            p.col += i32::from(col_shift);
+            p.row += row_shift;
+        }
         let element_tops = content
             .element_tops
             .into_iter()
@@ -8207,12 +8977,13 @@ impl<'a> Layout<'a> {
             // box's used width is `new_w` (interior + borders).
             root: content.root,
             lay_width: new_w as u16,
+            positioned,
         }
     }
 
-    /// A CSS length property in terminal cells (≈ 2 cells/em, 16px=1em),
-    /// resolving `%`/`vw`/`calc()` against the current band width and the
-    /// viewport. `None` when unset (or `auto`/an unsupported unit). Clamped
+    /// A CSS length property in terminal cells (absolute units through the
+    /// element's font context and the real cell box — see `Units`), resolving
+    /// `%`/`vw`/`calc()` against the current band width and the viewport. `None` when unset (or `auto`/an unsupported unit). Clamped
     /// to ≥1 cell — DELIBERATE: a terminal can't paint a sub-cell sliver, so
     /// a tiny-but-nonzero length rounds up to the one cell that can show it,
     /// and a literal `width:0` box is almost always display-hidden by dom's
@@ -8223,8 +8994,13 @@ impl<'a> Layout<'a> {
     fn css_cells(&self, id: NodeId, prop: &str) -> Option<usize> {
         let v = self.dom.computed_style(id, prop)?;
         let avail = self.width.saturating_sub(self.indent).max(1);
-        resolve_cells_f32(&v, avail, (self.viewport_w, self.viewport_h))
-            .map(|c| c.round().max(1.0) as usize)
+        resolve_cells_f32(
+            &v,
+            avail,
+            (self.viewport_w, self.viewport_h),
+            self.units(id),
+        )
+        .map(|c| c.round().max(1.0) as usize)
     }
 
     /// Like `css_cells`, but FLOORS the result. For a grid column width, `N`
@@ -8233,8 +9009,13 @@ impl<'a> Layout<'a> {
     fn css_cells_floor(&self, id: NodeId, prop: &str) -> Option<usize> {
         let v = self.dom.computed_style(id, prop)?;
         let avail = self.width.saturating_sub(self.indent).max(1);
-        resolve_cells_f32(&v, avail, (self.viewport_w, self.viewport_h))
-            .map(|c| c.floor().max(1.0) as usize)
+        resolve_cells_f32(
+            &v,
+            avail,
+            (self.viewport_w, self.viewport_h),
+            self.units(id),
+        )
+        .map(|c| c.floor().max(1.0) as usize)
     }
 
     /// Lay an element's subtree out as an independent box at `content_width`,
@@ -8320,9 +9101,10 @@ impl<'a> Layout<'a> {
         // chat column lives in an abspos shell's sub-pass), so `blit` propagates
         // them up. Off when this pass isn't capturing (measure / non-live).
         sub.capture_boundaries = self.capture_boundaries;
-        // The px→rows clip conversion must use the same cell height everywhere
+        // The px→cells conversion must use the same cell box everywhere
         // in a pass (`measure_boxes` sets an explicit one; elsewhere this is
         // the session global either way).
+        sub.cell_px_w = self.cell_px_w;
         sub.cell_px_h = self.cell_px_h;
         // The bordered-nesting depth rides every sub-layout (the lid counts
         // bordered ANCESTRY, whatever formatting contexts sit between);
@@ -8351,14 +9133,29 @@ impl<'a> Layout<'a> {
         sub.flow_node(id, inherit);
         sub.flush_block();
         sub.finish_floats();
-        let (rows, carousels, fixed, regions, element_tops, scroll_clips, boundary_boxes) =
-            sub.finish();
+        // A measured flex row's max-content width is the sum of its items' base
+        // sizes, even past its last painted cell (§9.9.1) — floor the reported
+        // box width at it. Recorded only under `measuring` (see `flow_flex_row`),
+        // so render-pass boxes keep reporting their painted extent. Read before
+        // `finish` consumes `sub`.
+        let flex_min = sub.flex_min_width as u16;
+        let (
+            rows,
+            carousels,
+            fixed,
+            regions,
+            element_tops,
+            scroll_clips,
+            boundary_boxes,
+            positioned,
+        ) = sub.finish();
         let width = rows
             .iter()
             .flat_map(|r| &r.items)
             .map(|it| it.col + it.width)
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(flex_min);
         let height = rows.len() as u16;
         LaidBox {
             rows,
@@ -8372,6 +9169,7 @@ impl<'a> Layout<'a> {
             boundary_boxes,
             root: Some(id),
             lay_width: content_width.min(u16::MAX as usize) as u16,
+            positioned,
         }
     }
 
@@ -8437,6 +9235,18 @@ impl<'a> Layout<'a> {
             f.col += col_off;
             f.row += row_base as u16;
             self.fixed.push(f);
+        }
+        // Out-of-flow boxes collected inside travel with the box: their placement
+        // coordinate is box-relative, so it shifts by `col_off`/`row_base` up
+        // toward the document, exactly like a pinned fixed box — and, like every
+        // other side channel, it never touches `self.rows`, so blitting this box
+        // does NOT let its out-of-flow descendants inflate the parent's flow
+        // (CSS 2.1 §9.3.1). Only the document root composites them.
+        for p in &b.positioned {
+            let mut p = p.clone();
+            p.col += i32::from(col_off);
+            p.row += row_base;
+            self.positioned.push(p);
         }
         // Empty elements recorded in the box (measure pass only) move with it
         // too, so a boxless element nested in this sub-layout keeps its honest
@@ -8887,10 +9697,58 @@ impl<'a> Layout<'a> {
         // the page URL isn't an audio stream — so it still represents nothing.)
         let (play_url, src_node, streaming) = match self.media_source(id) {
             Some((u, n)) => (url::Url::parse(&u).ok(), n, false),
-            None if tag == "video" => (Some(self.base.clone()), None, true),
+            None if tag == "video" => {
+                // A sourceless (MSE/blob) streaming video has nothing
+                // inline-playable, so the playable target is a PAGE yt-dlp
+                // resolves. When the video sits inside a hyperlink, the
+                // anchor's target names the content the preview belongs to
+                // (the card-embedded autoplay idiom — a front-page hero /
+                // hover-preview card links to its watch page); a video with
+                // no enclosing link IS this page's player, so the page we're
+                // on is the target. Handing the card case the CURRENT page
+                // launched mpv on a homepage — yt-dlp found no video there
+                // and died silently, an mpv link that "never launches".
+                let page = match &ctx.link {
+                    Some(Link::Http(u)) => u.clone(),
+                    _ => self.base.clone(),
+                };
+                (Some(page), None, true)
+            }
             None => return, // poster-less audio with no source — nothing to show
         };
         let Some(play_url) = play_url else { return };
+        // Whether the representation plays the page we are on — the gate for
+        // borrowing this page's Open Graph image below (og:image describes
+        // THIS page's media and nothing else; borrowing it for a preview that
+        // plays a DIFFERENT page pasted the site's og logo onto a front-page
+        // hero card as a phantom "video preview").
+        let plays_this_page = streaming && play_url == *self.base;
+        // A streaming video whose only playable target would be the CURRENT
+        // page, on a page that does NOT declare itself a video page (the
+        // standard Open Graph convention — see `page_declares_video`), has no
+        // playable target at all: the homepage-autoplay hero (Twitch's
+        // front-page carousel plays a featured channel inline). Linking the
+        // homepage launched mpv into a silent yt-dlp failure ("mpv never
+        // launches"), with the site LOGO (og:image) masquerading as a video
+        // preview above it. No playable target ⇒ no LINK — but the frame can
+        // still show the video's honest STAND-IN: the preview image its card
+        // faded under the mounted player (`hidden_preview`, below). Without
+        // one there is nothing to represent at all.
+        let dead_end = plays_this_page && !page_declares_video(self.dom);
+        // The preview image a page FADED under a mounted player — the video's
+        // poster in all but name. In a browser the playing video covers it;
+        // we deliberately render no player, so the video's representation
+        // borrows the hidden image's URL (the image ITSELF stays hidden —
+        // paint fidelity is untouched). Only a paint-SUPPRESSED image
+        // qualifies: a visible sibling preview keeps flowing as normal
+        // content (the hover-preview idiom — video overlaid ON content) and
+        // must not double as a poster.
+        let hidden_preview = (streaming && tag == "video")
+            .then(|| self.hidden_preview_in_cb(id))
+            .flatten();
+        if dead_end && hidden_preview.is_none() {
+            return;
+        }
         // Paint suppression: a media representation inside an `opacity:0`/
         // `visibility:hidden` subtree reserves its box but paints blank.
         // `self.invisible` was set by `flow_element` for the wrapper before this
@@ -8911,9 +9769,16 @@ impl<'a> Layout<'a> {
             return;
         }
         // The representation links to the media; following it launches mpv.
+        // A dead-end video (no playable target — the homepage hero) renders
+        // its stand-in poster UNLINKED: an mpv link that can't play is worse
+        // than none, and the card's own channel links still work.
         let mut mctx = ctx.clone();
-        mctx.link = Some(Link::Media(play_url));
-        mctx.kind = ItemKind::Link;
+        mctx.link = (!dead_end).then_some(Link::Media(play_url));
+        mctx.kind = if dead_end {
+            ItemKind::Image
+        } else {
+            ItemKind::Link
+        };
         mctx.node = id;
         mctx.invisible = self.invisible;
 
@@ -8921,13 +9786,14 @@ impl<'a> Layout<'a> {
         self.begin_line();
 
         // The preview frame, when present AND decoded, renders as a clickable
-        // thumbnail. The element's own `poster` first; failing that, ONLY the
-        // streaming case (no inline source — the video plays the PAGE via
-        // yt-dlp) borrows the page's standard Open Graph image, since og:image
-        // is "a still frame of THIS PAGE's media". A poster-less video with a
-        // direct source is some inline clip, not the page's media — giving it
-        // the page banner painted Steam's sale og:image onto every microtrailer
-        // `<video>` in the store's preview pane. Sized by its decoded box (NOT
+        // thumbnail. The element's own `poster` first; failing that, ONLY a
+        // streaming video that plays THIS page (`plays_this_page`) borrows the
+        // page's standard Open Graph image, since og:image is "a still frame
+        // of THIS PAGE's media". A poster-less video with a direct source is
+        // some inline clip, not the page's media — giving it the page banner
+        // painted Steam's sale og:image onto every microtrailer `<video>` in
+        // the store's preview pane — and a card preview playing ANOTHER page
+        // must not wear this page's banner either. Sized by its decoded box (NOT
         // the `<video>`'s CSS — that carries a `height:0`/`padding-top` 16:9
         // hack a poster must not inherit), capped to the content width.
         let poster = (tag == "video")
@@ -8941,12 +9807,16 @@ impl<'a> Layout<'a> {
                         _ => None,
                     })
                     .or_else(|| {
-                        streaming
+                        // og:image is the PAGE's still frame — never a
+                        // dead-end card's (there it's the homepage logo).
+                        (plays_this_page && !dead_end)
                             .then(|| page_preview_image(self.dom, self.base))
                             .flatten()
                     })
+                    .or_else(|| hidden_preview.clone())
             })
             .flatten();
+        let mut preview_drawn = false;
         if let Some(poster) = poster
             && let Some(&(iw, ih)) = self.images.get(&poster)
             && iw > 0
@@ -8973,18 +9843,62 @@ impl<'a> Layout<'a> {
             self.col += w as usize;
             self.line_height = self.line_height.max(h);
             self.break_line();
+            preview_drawn = true;
         }
 
-        // The caption / fallback link. A streaming `<video>` with no inline
-        // source says so plainly (it plays the page via yt-dlp); a direct
-        // source keeps its kind + quality (`▶ Video · 720p HD`).
-        let label = if streaming {
-            String::from("▶ Watch in mpv")
-        } else {
-            self.media_label(tag, src_node)
-        };
-        self.place_text(&label, &mctx);
-        self.break_line();
+        // A DRAWN preview IS the mpv affordance (the image item above carries
+        // the media link — her call 2026-07-04: no extra text line under a
+        // preview). Only when no preview drew (no poster, not yet decoded,
+        // undecodable) does a text link stand in for the video content: a
+        // streaming `<video>` with no inline source says so plainly (it plays
+        // the page via yt-dlp); a direct source keeps its kind + quality
+        // (`▶ Video · 720p HD`). A dead-end video never writes a label — it
+        // has nothing to launch; its stand-in poster paints once decoded.
+        if !preview_drawn && !dead_end {
+            let label = if streaming {
+                String::from("▶ Watch in mpv")
+            } else {
+                self.media_label(tag, src_node)
+            };
+            self.place_text(&label, &mctx);
+            self.break_line();
+        }
+    }
+
+    /// The preview `<img>` a page FADED under a mounted player — the video's
+    /// poster in all but name. Searched within the video's containing block
+    /// (its card): the first image with a usable source whose paint is
+    /// suppressed (an `opacity:0`/`visibility:hidden` chain — the fade a page
+    /// applies once its player covers the preview). Only a HIDDEN image
+    /// qualifies: a visible sibling preview is normal flowing content (the
+    /// hover-preview idiom) and must not double as a poster. The hidden image
+    /// itself keeps its suppressed paint — only its URL is borrowed for the
+    /// video's representation.
+    fn hidden_preview_in_cb(&self, video: NodeId) -> Option<String> {
+        let cb = self.positioned_containing_block(video)?;
+        self.dom.descendants(cb).into_iter().find_map(|d| {
+            if self.dom.tag_name(d) != Some("img") {
+                return None;
+            }
+            // Chain-aware suppression walk: the fade usually sits on a
+            // transition WRAPPER, not the image itself (`paint_suppressed`
+            // reads own-element opacity; the flow accumulates the ancestor
+            // chain via `Ctx`, which this out-of-band query can't see) — so
+            // test every ancestor up to the containing block.
+            let mut cur = Some(d);
+            let mut hidden = false;
+            while let Some(n) = cur {
+                if self.dom.paint_suppressed(n) || self.dom.visibility_hidden(n) {
+                    hidden = true;
+                    break;
+                }
+                if n == cb {
+                    break;
+                }
+                cur = self.dom.parent_composed(n);
+            }
+            hidden.then(|| self.image_src(d)).flatten()
+        })
     }
 
     /// The playable URL of a `<video>`/`<audio>` element and the chosen
@@ -9476,7 +10390,10 @@ impl<'a> Layout<'a> {
             return false; // not full-bleed — a positioned thumbnail/badge
         }
         let raw_h = self.dom.computed_style(id, "height");
-        raw_h.as_deref().and_then(css_length_rows).is_none()
+        raw_h
+            .as_deref()
+            .and_then(|v| css_length_rows(v, self.units(id)))
+            .is_none()
             && raw_h.as_deref().and_then(parse_percent).is_none()
             && self.css_aspect_ratio(id).is_none()
             && self.img_attr_ratio(id).is_none()
@@ -9511,12 +10428,43 @@ impl<'a> Layout<'a> {
                 self.dom.computed_style(p, "position").as_deref(),
                 Some("relative" | "absolute" | "fixed" | "sticky")
             ) {
-                return (self.css_aspect_ratio(p).is_some() || self.has_definite_frame_width(p))
-                    .then_some(p);
+                return (self.css_aspect_ratio(p).is_some()
+                    || self.has_definite_frame_width(p)
+                    || self.padding_aspect_frame(p, id))
+                .then_some(p);
             }
             cur = self.dom.parent_composed(p);
         }
         None
+    }
+
+    /// Whether `p` establishes an intrinsic-ratio box via percentage vertical
+    /// padding (CSS 2.1 §8.4) — on itself (`height:0; padding-bottom:56.25%`)
+    /// or on an empty spacer CHILD (Twitch's ScAspectSpacer) — the responsive
+    /// media-frame idiom. Such a containing block FRAMES its fill image just
+    /// like a definite `aspect-ratio` does; without this arm the frame test
+    /// missed the spacer variant and the background-cover drop swallowed every
+    /// category/preview boxart on Twitch's towers. `probe` (the image being
+    /// framed) is excluded from the spacer scan.
+    fn padding_aspect_frame(&self, p: NodeId, probe: NodeId) -> bool {
+        let own_pad = |n: NodeId| -> f32 {
+            ["padding-bottom", "padding-top"]
+                .iter()
+                .filter_map(|prop| first_percent(self.dom.computed_style(n, prop).as_deref()?))
+                .sum()
+        };
+        let h_zero = match self.dom.computed_style(p, "height").as_deref() {
+            Some(h) => css_length_px(h, self.units(p)) == Some(0.0) || h.trim() == "auto",
+            None => true,
+        };
+        h_zero
+            && (own_pad(p) > 0.0
+                || self
+                    .dom
+                    .children(p)
+                    .into_iter()
+                    .filter(|&c| c != probe && self.dom.tag_name(c).is_some())
+                    .any(|c| own_pad(c) > 0.0))
     }
 
     /// Whether an element declares a definite, non-`100%` width — a fixed media
@@ -9654,7 +10602,7 @@ impl<'a> Layout<'a> {
                 .css_cells(id, "width")
                 .or_else(|| {
                     self.img_attr_px(id, "width")
-                        .map(|px| (px / 8.0).round().max(1.0) as usize)
+                        .map(|px| (px / self.units(id).cell_w).round().max(1.0) as usize)
                 })
                 .unwrap_or(iw),
         };
@@ -9669,10 +10617,13 @@ impl<'a> Layout<'a> {
         // Used height (rows).
         let raw_h = self.dom.computed_style(id, "height");
         let intrinsic_h = (ih * used_w / iw).max(1);
-        let used_h = if let Some(h) = raw_h.as_deref().and_then(css_length_rows) {
+        let used_h = if let Some(h) = raw_h
+            .as_deref()
+            .and_then(|v| css_length_rows(v, self.units(id)))
+        {
             h
         } else if let Some(ar) = self.css_aspect_ratio(id) {
-            rows_for_ratio(used_w, ar)
+            rows_for_ratio(used_w, ar, self.units(id))
         } else if let Some(pct) = raw_h.as_deref().and_then(parse_percent) {
             // A percentage height resolves against the containing block.
             // Priority: (1) the intrinsic-ratio "aspect box" — a height:0
@@ -9691,11 +10642,11 @@ impl<'a> Layout<'a> {
                 self.container_box_rows(id, used_w).unwrap_or(intrinsic_h)
             }
         } else if let Some(ar) = self.img_attr_ratio(id) {
-            rows_for_ratio(used_w, ar)
+            rows_for_ratio(used_w, ar, self.units(id))
         } else if let Some(px) = self.img_attr_px(id, "height") {
             // `<img height=N>` alone (no matching width attr to form a ratio):
             // the presentation-hint height in rows.
-            (px / 16.0).round().max(1.0) as usize
+            (px / self.units(id).cell_h).round().max(1.0) as usize
         } else {
             intrinsic_h
         };
@@ -9778,7 +10729,7 @@ impl<'a> Layout<'a> {
         let mut cur = self.dom.parent_composed(id);
         while let Some(p) = cur {
             if let Some(ar) = self.css_aspect_ratio(p) {
-                return Some(rows_for_ratio(used_w, ar));
+                return Some(rows_for_ratio(used_w, ar, self.units(p)));
             }
             cur = self.dom.parent_composed(p);
         }
@@ -9797,22 +10748,42 @@ impl<'a> Layout<'a> {
     /// fixed-height padded box keeps its own height. `used_w` is the image's
     /// used width (it fills 100% of the container).
     fn intrinsic_ratio_container_rows(&self, id: NodeId, used_w: usize) -> Option<usize> {
+        // The %-vertical-padding of an element itself (`padding-bottom:56.25%`
+        // on the box being examined).
+        let own_pad = |p: NodeId| -> f32 {
+            ["padding-bottom", "padding-top"]
+                .iter()
+                .filter_map(|prop| first_percent(self.dom.computed_style(p, prop).as_deref()?))
+                .sum()
+        };
         // Unbounded like `container_box_rows` above — same deep-wrapper
         // rationale.
         let mut cur = self.dom.parent_composed(id);
         while let Some(p) = cur {
             let h_zero = match self.dom.computed_style(p, "height").as_deref() {
-                Some(h) => css_length_em(h) == Some(0.0) || h.trim() == "auto",
+                Some(h) => css_length_px(h, self.units(p)) == Some(0.0) || h.trim() == "auto",
                 None => true,
             };
             if h_zero {
-                let frac: f32 = ["padding-bottom", "padding-top"]
-                    .iter()
-                    .filter_map(|prop| first_percent(self.dom.computed_style(p, prop).as_deref()?))
-                    .sum();
+                // The padding can live on the ancestor ITSELF (`height:0;
+                // padding-bottom:56.25%` — the classic hack) or on an empty
+                // in-flow SPACER CHILD of it (Twitch's ScAspectSpacer sibling
+                // of the fill: the spacer's padding gives the shared parent
+                // its height, and the abspos `height:100%` fill resolves
+                // against that parent). Both are the same §8.4 geometry.
+                let mut frac: f32 = own_pad(p);
+                if frac <= 0.0 {
+                    frac = self
+                        .dom
+                        .children(p)
+                        .into_iter()
+                        .filter(|&c| c != id && self.dom.tag_name(c).is_some())
+                        .map(own_pad)
+                        .fold(0.0, f32::max);
+                }
                 if frac > 0.0 {
                     // height_px = frac · width_px, so the box ratio is 1/frac.
-                    return Some(rows_for_ratio(used_w, 1.0 / frac));
+                    return Some(rows_for_ratio(used_w, 1.0 / frac, self.units(p)));
                 }
             }
             cur = self.dom.parent_composed(p);
@@ -9867,8 +10838,9 @@ impl<'a> Layout<'a> {
     fn definite_len_cells(&self, id: NodeId, prop: &str) -> Option<usize> {
         let raw = self.dom.computed_style(id, prop)?;
         let v = raw.trim();
-        if let Some(em) = css_length_em(v) {
-            return Some((em * 2.0).round().max(1.0) as usize);
+        let u = self.units(id);
+        if let Some(px) = css_length_px(v, u) {
+            return Some((px / u.cell_w).round().max(1.0) as usize);
         }
         let lower = v.to_ascii_lowercase();
         let is_math = ["calc(", "min(", "max(", "clamp("]
@@ -9906,7 +10878,15 @@ impl<'a> Layout<'a> {
         let mut cap: Option<usize> = None; // tightest max-width between `id` and `cur`
         while let Some(p) = cur {
             let mw = self.definite_len_cells(p, "max-width");
-            if let Some(w) = self.definite_len_cells(p, "width") {
+            // A GROWN flex item's `width` is only its flex BASE (Flexbox
+            // §7.2.2) — the used size stretches past it, so it can't anchor a
+            // percentage (Twitch's category tower: `width:12rem; flex-grow:1`
+            // items grow to fill the shelf; sizing the fill image to 12rem
+            // painted a small image inside a grown aspect frame, the giant-
+            // blank-card bug). Keep walking; its max-width still caps.
+            if !self.width_is_flex_base(p)
+                && let Some(w) = self.definite_len_cells(p, "width")
+            {
                 // A definite width breaks the chain. Clamp it by this element's
                 // own max-width and by any tighter cap nearer the descendant.
                 let w = mw.map_or(w, |m| w.min(m));
@@ -9918,6 +10898,20 @@ impl<'a> Layout<'a> {
             cur = self.dom.parent_composed(p);
         }
         cap
+    }
+
+    /// Whether the element's USED width can exceed its declared `width`
+    /// because it is a GROWING flex item on a horizontal main axis (row or
+    /// wrapping shelf): computed `flex-grow` > 0 inside a flex/grid container
+    /// that isn't column-direction. Such a `width` is the flex BASE, not the
+    /// used size.
+    fn width_is_flex_base(&self, id: NodeId) -> bool {
+        self.flex_number(id, "flex-grow").is_some_and(|g| g > 0.0)
+            && self
+                .dom
+                .parent_composed(id)
+                .and_then(|p| self.flex_mode(p))
+                .is_some_and(|m| !matches!(m, FlexMode::Column))
     }
 
     /// The element's USED height in ROWS **if it is DEFINITE** (CSS 2.1 §10.5),
@@ -9970,7 +10964,7 @@ impl<'a> Layout<'a> {
                             .then(|| (factor * self.viewport_h as f32).round().max(0.0) as usize);
                     }
                 }
-            } else if let Some(rows) = css_height_rows_f32(v, self.viewport_h) {
+            } else if let Some(rows) = css_height_rows_f32(v, self.viewport_h, self.units(cur)) {
                 return Some((factor * rows).round().max(0.0) as usize);
             } else {
                 return None; // an unresolvable unit (e.g. `vh` with unknown viewport)
@@ -10151,7 +11145,7 @@ impl<'a> Layout<'a> {
         {
             None | Some("auto") => self.len_or_pct_h(id, "height", cb_h),
             Some("content" | "max-content" | "min-content" | "fit-content") => None,
-            Some(v) => self.resolve_height_rows(v, cb_h),
+            Some(v) => self.resolve_height_rows(v, cb_h, self.units(id)),
         };
         let mut base = basis.unwrap_or_else(|| self.measure_height(id, cross_w));
         if let Some(m) = self.len_or_pct_h(id, "max-height", cb_h) {
@@ -10167,18 +11161,18 @@ impl<'a> Layout<'a> {
     /// `max-height`-style property as rows, resolving `%` against the
     /// containing-block height `cb_h` and `vh` against the viewport.
     fn len_or_pct_h(&self, id: NodeId, prop: &str, cb_h: usize) -> Option<usize> {
-        self.resolve_height_rows(&self.dom.computed_style(id, prop)?, cb_h)
+        self.resolve_height_rows(&self.dom.computed_style(id, prop)?, cb_h, self.units(id))
     }
 
     /// Resolve a vertical CSS length to rows: a `%` against the containing-block
     /// height `cb_h`, else a length/`vh` via `css_height_rows_f32` (NOT the
     /// width resolver — a cell is ~1 row/em tall but ~2 cells/em wide, so the
     /// two axes never share `resolve_cells`'s `em·2`). Rounded, never negative.
-    fn resolve_height_rows(&self, value: &str, cb_h: usize) -> Option<usize> {
+    fn resolve_height_rows(&self, value: &str, cb_h: usize, u: Units) -> Option<usize> {
         if let Some(pct) = parse_percent(value) {
             return Some((pct * cb_h as f32).round().max(0.0) as usize);
         }
-        css_height_rows_f32(value, self.viewport_h).map(|r| r.round().max(0.0) as usize)
+        css_height_rows_f32(value, self.viewport_h, u).map(|r| r.round().max(0.0) as usize)
     }
 
     /// The content height (rows) of `id`'s subtree laid out at `width`. A
@@ -10195,11 +11189,12 @@ impl<'a> Layout<'a> {
     /// approximation — only the fallback content-height measurement of an
     /// auto-height sibling depends on it.
     fn column_cross_width(&self, container: NodeId) -> usize {
+        let u = self.units(container);
         self.dom
             .computed_style(container, "width")
             .as_deref()
-            .and_then(css_length_em)
-            .map(|em| (em * 2.0).round().max(1.0) as usize)
+            .and_then(|v| css_length_px(v, u))
+            .map(|px| (px / u.cell_w).round().max(1.0) as usize)
             .or_else(|| self.definite_ancestor_width(container))
             .unwrap_or_else(|| self.viewport_w.max(1))
     }
@@ -10517,10 +11512,12 @@ impl<'a> Layout<'a> {
         ElementTops,
         ScrollClips,
         BoundaryRecs,
+        Vec<PositionedBox>,
     ) {
         let carousels = std::mem::take(&mut self.carousels);
         let mut fixed = std::mem::take(&mut self.fixed);
         let mut regions = std::mem::take(&mut self.regions);
+        let mut positioned = std::mem::take(&mut self.positioned);
         let element_tops = std::mem::take(&mut self.element_tops);
         let scroll_clips = std::mem::take(&mut self.scroll_clips);
         let boundary_boxes = std::mem::take(&mut self.boundary_boxes);
@@ -10620,6 +11617,13 @@ impl<'a> Layout<'a> {
         for f in &mut fixed {
             f.row = u16::try_from(remap_row(f.row as usize)).unwrap_or(u16::MAX);
         }
+        // Out-of-flow boxes not yet composited (a sub-box's — they ride up to
+        // the document root) move their placement row through the same collapse,
+        // so an overlay stays aligned with the content its coordinate system
+        // just re-indexed. Their own `b.rows` are self-contained and untouched.
+        for p in &mut positioned {
+            p.row = remap_row(p.row);
+        }
         (
             out,
             carousels,
@@ -10628,6 +11632,7 @@ impl<'a> Layout<'a> {
             element_tops,
             scroll_clips,
             boundary_boxes,
+            positioned,
         )
     }
 }
@@ -10759,7 +11764,7 @@ fn is_next_glyph(c: char) -> bool {
 }
 
 /// A CSS `font-weight` value reads as bold (`bold`/`bolder`/≥600).
-fn css_is_bold(value: &str) -> bool {
+pub(crate) fn css_is_bold(value: &str) -> bool {
     match value.trim().to_ascii_lowercase().as_str() {
         "bold" | "bolder" => true,
         "normal" | "lighter" => false,
@@ -10768,7 +11773,7 @@ fn css_is_bold(value: &str) -> bool {
 }
 
 /// A CSS `font-style` value reads as italic (`italic`/`oblique`).
-fn css_is_italic(value: &str) -> bool {
+pub(crate) fn css_is_italic(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "italic" | "oblique"
@@ -10793,33 +11798,22 @@ const IMG_CSS_MAX_ROWS: usize = 12_000;
 /// A vertical CSS length as terminal rows. The cell is ~2:1 (col:row), so 1em
 /// ≈ 1 row (vs ≈ 2 cols horizontally) and 1px ≈ 1/16 row. `%`/`auto`/`vh`
 /// return `None` (a `100%`/`%` height resolves against a container instead).
-fn css_length_rows(value: &str) -> Option<usize> {
-    css_length_em(value).map(|em| em.round().max(1.0) as usize)
-}
-
-/// A definite absolute CSS length as whole ROWS at a given terminal cell height
-/// (px). Unlike `css_length_rows` — which uses the fixed 16px/row reference the
-/// rest of layout assumes (1em ≈ 1 row) — this divides the real pixel length by
-/// the ACTUAL cell height, so a length the page derived from OUR OWN geometry
-/// (`getBoundingClientRect` reports rows × cell_px) converts back to the exact
-/// same number of rows. Identical to `css_length_rows` when the cell is 16px
-/// tall (the test/measurement fixtures). `None` for `%`/`vh`/`auto`/`calc`.
-fn css_length_rows_at(value: &str, cell_px_h: u16) -> Option<usize> {
-    css_length_em(value)
-        .map(|em| ((em * 16.0) / f32::from(cell_px_h.max(1))).round().max(1.0) as usize)
+fn css_length_rows(value: &str, u: Units) -> Option<usize> {
+    css_length_px(value, u).map(|px| (px / u.cell_h).round().max(1.0) as usize)
 }
 
 /// A definite CSS height as ROWS (fractional, for chain multiplication): an
-/// absolute length (em/rem/px/pt/ch, 1em ≈ 1 row) or a viewport-height unit
-/// (`vh` against `viewport_h`, already in rows). `%`/`auto` are NOT resolved
-/// here — a `%` height needs its containing block (see `Layout::definite_height`).
-/// `None` for an indefinite/unresolvable value, or `vh` when the viewport height
-/// is unknown (`viewport_h == 0`). Height stays SEPARATE from the width resolver
-/// (`resolve_cells`) on purpose: a terminal cell is ~1 row/em tall but ~2
-/// cells/em wide, so the two axes don't share a unit (`vmin`/`vmax` as a height
-/// would mix the two and are vanishingly rare — deferred). Unlike
-/// `css_length_rows` it does NOT floor at 1 row (the chain rounds once at the end).
-fn css_height_rows_f32(value: &str, viewport_h: usize) -> Option<f32> {
+/// absolute length (via `css_length_px` / the real cell height) or a
+/// viewport-height unit (`vh` against `viewport_h`, already in rows).
+/// `%`/`auto` are NOT resolved here — a `%` height needs its containing block
+/// (see `Layout::definite_height`). `None` for an indefinite/unresolvable
+/// value, or `vh` when the viewport height is unknown (`viewport_h == 0`).
+/// Height stays SEPARATE from the width resolver (`resolve_cells`) on
+/// purpose: the two axes convert through different cell dimensions
+/// (`vmin`/`vmax` as a height would mix them and are vanishingly rare —
+/// deferred). Unlike `css_length_rows` it does NOT floor at 1 row (the chain
+/// rounds once at the end).
+fn css_height_rows_f32(value: &str, viewport_h: usize, u: Units) -> Option<f32> {
     let v = value.trim();
     // Viewport-height units. A terminal has no dynamic browser chrome, so the
     // small/large/dynamic-viewport keywords (`svh`/`lvh`/`dvh`) all equal `vh`:
@@ -10830,7 +11824,7 @@ fn css_height_rows_f32(value: &str, viewport_h: usize) -> Option<f32> {
             return (viewport_h > 0).then(|| (n / 100.0) * viewport_h as f32);
         }
     }
-    css_length_em(v)
+    css_length_px(v, u).map(|px| px / u.cell_h)
 }
 
 /// A CSS percentage (`"75%"`) as a fraction (`0.75`); `None` for any other
@@ -10976,33 +11970,49 @@ fn parse_ratio(value: &str) -> Option<f32> {
     (ratio.is_finite() && ratio > 0.0).then_some(ratio)
 }
 
-/// Rows for a box `width_cols` wide at pixel aspect `ratio` (width÷height).
-/// With the nominal 8×16 cell: `height_px = width_px / ratio`, so
-/// `rows = cols / (2·ratio)` (a 1:1 box is half as many rows as columns).
-fn rows_for_ratio(width_cols: usize, ratio: f32) -> usize {
-    (width_cols as f32 / (2.0 * ratio)).round().max(1.0) as usize
+/// Rows for a box `width_cols` wide at pixel aspect `ratio` (width÷height):
+/// `height_px = width_px / ratio`, converted through the REAL cell box so the
+/// drawn aspect is physically true on any terminal font (the nominal 8×16
+/// cell gives the historical `rows = cols / (2·ratio)`).
+fn rows_for_ratio(width_cols: usize, ratio: f32, u: Units) -> usize {
+    ((width_cols as f32 * u.cell_w) / (ratio * u.cell_h))
+        .round()
+        .max(1.0) as usize
 }
 
-/// A context-free CSS length as an em-equivalent (≈ one em ≈ 2 text cells).
-/// `16px≈1em`, `12pt≈1em`, `1ch≈half an em` (one cell), unitless treated as
-/// px; the single place absolute units are understood. Context-dependent
-/// values (`%`/`vw`/`calc()`/`auto`) → `None` here — they go through
-/// `resolve_cells`, which knows the containing block and the viewport.
-pub(crate) fn css_length_em(value: &str) -> Option<f32> {
+/// An absolute CSS length as CSS px, resolved in `u`'s font context: `em`
+/// against the element's computed font-size, `rem` against the root's (CSS
+/// Values §6.2.1 — a fixed 16px here inflated every rem 1.6× on
+/// `html{font-size:62.5%}` sites like Twitch), physical units at CSS's fixed
+/// ratios (96px/in), unitless treated as px. `ch`/`ex` measure GLYPHS, and in
+/// this renderer every glyph at every font-size is one cell wide — so `ch` is
+/// the cell width by definition (the spec's own "advance of 0" evaluated
+/// against our real font metrics), keeping a `65ch` prose measure at 65
+/// characters. Context-dependent values (`%`/`vw`/`calc()`/`auto`) → `None`
+/// here — they go through `resolve_cells`, which knows the containing block
+/// and the viewport.
+pub(crate) fn css_length_px(value: &str, u: Units) -> Option<f32> {
     let v = value.trim();
     let split = v
         .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
         .unwrap_or(v.len());
     let n: f32 = v[..split].parse().ok()?;
-    match v[split..].trim() {
-        "em" | "rem" => Some(n),
-        "px" | "" => Some(n / 16.0),
-        "pt" => Some(n / 12.0),
-        // 1ch is the advance of "0" — a single cell in a monospace terminal,
-        // i.e. half our 2-cells-per-em density. The natural terminal unit.
-        "ch" => Some(n / 2.0),
-        _ => None,
-    }
+    Some(match v[split..].trim() {
+        "em" => n * u.fs,
+        "rem" => n * u.root,
+        "px" | "" => n,
+        "pt" => n * 4.0 / 3.0,
+        "pc" => n * 16.0,
+        "in" => n * 96.0,
+        "cm" => n * 96.0 / 2.54,
+        "mm" => n * 96.0 / 25.4,
+        "q" | "Q" => n * 96.0 / 101.6,
+        // One glyph advance per count (see above).
+        "ch" => n * u.cell_w,
+        // x-height: the spec's no-metrics fallback, half the em.
+        "ex" => n * 0.5 * u.fs,
+        _ => return None,
+    })
 }
 
 /// Which CSS math comparison function to fold over its arguments.
@@ -11038,7 +12048,7 @@ fn split_args(s: &str) -> Vec<&str> {
 /// keeping a parenthesised group (`minmax(a, b)`, `repeat(2, 1fr)`,
 /// `fit-content(20%)`) intact and dropping `[line-name]` groups (we don't
 /// place by named lines).
-fn split_track_tokens(s: &str) -> Vec<String> {
+pub(crate) fn split_track_tokens(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut in_names = false;
@@ -11115,7 +12125,7 @@ fn grid_mark(
 /// units (`vw` against `.0`, `vh` against `.1`, `vmin`/`vmax` against the
 /// smaller/larger). A height of `0` means this pass wasn't told the viewport
 /// height (a legacy/test caller), so `vh`/`vmin`/`vmax` stay unresolved.
-fn resolve_cells_f32(value: &str, avail: usize, viewport: (usize, usize)) -> Option<f32> {
+fn resolve_cells_f32(value: &str, avail: usize, viewport: (usize, usize), u: Units) -> Option<f32> {
     let v = value.trim();
     // `var(--name, fallback)`: stylesheets are dropped before layout, so a
     // referenced custom property is (almost always) undefined here — the
@@ -11129,14 +12139,14 @@ fn resolve_cells_f32(value: &str, avail: usize, viewport: (usize, usize)) -> Opt
         .and_then(|r| r.strip_suffix(')'))
     {
         let fallback = inner.split_once(',')?.1.trim();
-        return resolve_cells_f32(fallback, avail, viewport);
+        return resolve_cells_f32(fallback, avail, viewport, u);
     }
     if let Some(inner) = v
         .strip_prefix("calc(")
         .or_else(|| v.strip_prefix("CALC("))
         .and_then(|r| r.strip_suffix(')'))
     {
-        return resolve_calc(inner, avail, viewport);
+        return resolve_calc(inner, avail, viewport, u);
     }
     // `min()`/`max()`/`clamp()` — the modern responsive sizing functions
     // (`width: min(100%, 1043px)` = "fill the container but cap at 1043px").
@@ -11155,7 +12165,7 @@ fn resolve_cells_f32(value: &str, avail: usize, viewport: (usize, usize)) -> Opt
         {
             let args: Vec<f32> = split_args(inner)
                 .into_iter()
-                .filter_map(|a| resolve_cells_f32(a.trim(), avail, viewport))
+                .filter_map(|a| resolve_cells_f32(a.trim(), avail, viewport, u))
                 .collect();
             return match fold {
                 Fold::Min => args.into_iter().reduce(f32::min),
@@ -11198,12 +12208,12 @@ fn resolve_cells_f32(value: &str, avail: usize, viewport: (usize, usize)) -> Opt
             }
         }
     }
-    css_length_em(v).map(|em| em * 2.0)
+    css_length_px(v, u).map(|px| px / u.cell_w)
 }
 
 /// `resolve_cells_f32` rounded to whole cells (never negative).
-fn resolve_cells(value: &str, avail: usize, viewport: (usize, usize)) -> Option<usize> {
-    resolve_cells_f32(value, avail, viewport).map(|c| c.round().max(0.0) as usize)
+fn resolve_cells(value: &str, avail: usize, viewport: (usize, usize), u: Units) -> Option<usize> {
+    resolve_cells_f32(value, avail, viewport, u).map(|c| c.round().max(0.0) as usize)
 }
 
 /// A `calc()` body as cells. A real expression evaluator: `+ - * /` with the
@@ -11215,12 +12225,13 @@ fn resolve_cells(value: &str, avail: usize, viewport: (usize, usize)) -> Option<
 /// 3-column flex/grid item width (Humble Bundle's bundle item grid). Returns
 /// `None` on a parse failure or an unresolvable term, so the caller ignores
 /// the value as it did before `calc` was understood at all.
-fn resolve_calc(body: &str, avail: usize, viewport: (usize, usize)) -> Option<f32> {
+fn resolve_calc(body: &str, avail: usize, viewport: (usize, usize), u: Units) -> Option<f32> {
     let mut p = CalcParser {
         s: body.as_bytes(),
         pos: 0,
         avail,
         viewport,
+        units: u,
     };
     let v = p.sum()?;
     p.skip_ws();
@@ -11237,6 +12248,7 @@ struct CalcParser<'a> {
     pos: usize,
     avail: usize,
     viewport: (usize, usize),
+    units: Units,
 }
 
 impl CalcParser<'_> {
@@ -11308,7 +12320,7 @@ impl CalcParser<'_> {
             }
             let inner = std::str::from_utf8(&self.s[start..i]).ok()?;
             self.pos = i + 1;
-            return resolve_calc(inner, self.avail, self.viewport);
+            return resolve_calc(inner, self.avail, self.viewport, self.units);
         }
         // A value token runs to the next top-level space / `*` / `/` / `)`,
         // but a nested function call (`min(...)`, `var(...)`) carries balanced
@@ -11334,7 +12346,7 @@ impl CalcParser<'_> {
         if let Ok(n) = tok.parse::<f32>() {
             Some(n)
         } else {
-            resolve_cells_f32(tok, self.avail, self.viewport)
+            resolve_cells_f32(tok, self.avail, self.viewport, self.units)
         }
     }
 }
@@ -11344,15 +12356,15 @@ impl CalcParser<'_> {
 /// gap EXCEEDS half a line: an exactly-half-row gap — `8px`/`0.5em`/`1ch`, the
 /// web's ubiquitous "tight" spacing (a thumbnail-to-caption tab, an icon-row
 /// pad) — no longer costs a whole blank line. Gaps over half a row still do.
-fn vertical_space(value: &str) -> bool {
-    css_length_em(value).is_some_and(|em| em > 0.5)
+fn vertical_space(value: &str, u: Units) -> bool {
+    css_length_px(value, u).is_some_and(|px| px > u.cell_h / 2.0)
 }
 
-/// A horizontal length as an indent in cells (≈ 2 cells per em).
-fn indent_cells(value: Option<&str>) -> usize {
+/// A horizontal length as an indent in cells.
+fn indent_cells(value: Option<&str>, u: Units) -> usize {
     value
-        .and_then(css_length_em)
-        .map(|em| (em * 2.0).round().max(0.0) as usize)
+        .and_then(|v| css_length_px(v, u))
+        .map(|px| (px / u.cell_w).round().max(0.0) as usize)
         .unwrap_or(0)
 }
 
@@ -11633,6 +12645,7 @@ mod tests {
             live_node: None,
             voffset_from_page: false,
             carousels: Vec::new(),
+            regions: Vec::new(),
             image_urls: Vec::new(),
         };
         let rows = vec![Row::default()];
@@ -11970,19 +12983,19 @@ mod tests {
         // viewport keywords all equal `vh` (Mastodon's `height:100dvh`).
         for u in ["vh", "dvh", "svh", "lvh"] {
             assert_eq!(
-                css_height_rows_f32(&format!("100{u}"), 40),
+                css_height_rows_f32(&format!("100{u}"), 40, Units::default()),
                 Some(40.0),
                 "{u}"
             );
             assert_eq!(
-                css_height_rows_f32(&format!("50{u}"), 40),
+                css_height_rows_f32(&format!("50{u}"), 40, Units::default()),
                 Some(20.0),
                 "{u}"
             );
         }
         // Unknown viewport height ⇒ None (unchanged), non-viewport length still ok.
-        assert_eq!(css_height_rows_f32("100dvh", 0), None);
-        assert!(css_height_rows_f32("2em", 40).is_some());
+        assert_eq!(css_height_rows_f32("100dvh", 0, Units::default()), None);
+        assert!(css_height_rows_f32("2em", 40, Units::default()).is_some());
     }
 
     #[test]
@@ -12147,13 +13160,24 @@ mod tests {
     fn viewport_width_units_including_dynamic_resolve_in_cells() {
         let vp = (100usize, 40usize);
         for u in ["vw", "dvw", "svw", "lvw"] {
-            assert_eq!(resolve_cells(&format!("100{u}"), 0, vp), Some(100), "{u}");
+            assert_eq!(
+                resolve_cells(&format!("100{u}"), 0, vp, Units::default()),
+                Some(100),
+                "{u}"
+            );
         }
         for u in ["vh", "dvh", "svh", "lvh"] {
-            assert_eq!(resolve_cells(&format!("100{u}"), 0, vp), Some(40), "{u}");
+            assert_eq!(
+                resolve_cells(&format!("100{u}"), 0, vp, Units::default()),
+                Some(40),
+                "{u}"
+            );
         }
-        assert_eq!(resolve_cells("100dvmin", 0, vp), Some(40)); // min(100,40)
-        assert_eq!(resolve_cells("100lvmax", 0, vp), Some(100)); // max(100,40)
+        assert_eq!(resolve_cells("100dvmin", 0, vp, Units::default()), Some(40)); // min(100,40)
+        assert_eq!(
+            resolve_cells("100lvmax", 0, vp, Units::default()),
+            Some(100)
+        ); // max(100,40)
     }
 
     fn measure(html: &str, width: usize) -> (Dom, HashMap<NodeId, PxRect>) {
@@ -12996,6 +14020,685 @@ mod tests {
     }
 
     #[test]
+    fn abspos_never_pushes_a_later_sibling() {
+        // CSS 2.1 §9.3.1: "Absolutely positioned boxes are taken out of the
+        // normal flow. This means they have no impact on the layout of later
+        // siblings." A tall overlay inside a relative wrapper must NOT push the
+        // wrapper's following sibling down by the overlay's height — the overlay
+        // composites over/after the flow and only extends the scrollable region
+        // (CSS Overflow 3 §2.2). The old "grow the containing block to contain
+        // its positioned children" model pushed the sibling a whole overlay
+        // down (NBC's header, a viewport of blank rows).
+        // Margin-free divs so the gap is pure flow, and a 10-line overlay so a
+        // push would be unmistakable (~10 rows) versus not (~1).
+        let html = "<body>\
+            <div style=\"position:relative\"><div>ONE</div>\
+              <div style=\"position:absolute;top:0;left:0\">\
+                <div>AA</div><div>BB</div><div>CC</div><div>DD</div><div>EE</div>\
+                <div>FF</div><div>GG</div><div>HH</div><div>II</div><div>JJ</div></div>\
+            </div>\
+            <div>NEXT</div></body>";
+        let rows = lay(html, 40);
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|r| r.items.iter().any(|i| i.text.contains(needle)))
+                .unwrap_or_else(|| panic!("{needle} not laid: {:?}", texts(&rows)))
+        };
+        let (one, next) = (row_of("ONE"), row_of("NEXT"));
+        // NEXT follows ONE by the wrapper's IN-FLOW height (1 row), NOT by the
+        // 10-line overlay stacked inside it.
+        assert!(
+            next.saturating_sub(one) <= 2,
+            "NEXT pushed by the overlay (ONE@{one} NEXT@{next})"
+        );
+        // The overlay content is still reachable — composited into the document,
+        // not dropped.
+        let text = all_text(&rows);
+        assert!(
+            text.contains("AA") && text.contains("EE"),
+            "overlay reachable"
+        );
+    }
+
+    #[test]
+    fn clipped_full_viewport_drawer_reserves_no_flow() {
+        // NBC's collapsed off-canvas panel: a `height:100vh` drawer, offset into
+        // the box (`top`), inside an `overflow:hidden` wrapper with no in-flow
+        // content — so the wrapper is 0 rows tall (§9.3.1) and clips the drawer
+        // to nothing (CSS Overflow 3 §3). A browser shows the drawer nowhere and
+        // lays the following content right after the (empty) wrapper; the old
+        // model reserved a whole viewport of blank rows and buried the page.
+        let html = "<body>\
+            <div style=\"position:relative;overflow:hidden\">\
+              <div style=\"position:absolute;top:60px;left:0;width:100%;height:100vh\">DRAWER</div>\
+            </div>\
+            <p>CONTENT</p></body>";
+        let rows = lay_out_with_carousels(
+            &Dom::parse_document(html),
+            &Url::parse("https://example.com/").unwrap(),
+            (100, 40),
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        )
+        .0;
+        assert!(
+            !all_text(&rows).contains("DRAWER"),
+            "the clipped drawer paints nothing: {:?}",
+            texts(&rows)
+        );
+        let content_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.text.contains("CONTENT")))
+            .expect("CONTENT laid");
+        assert!(
+            content_row <= 1,
+            "CONTENT sits at the top, not a viewport down (row {content_row})"
+        );
+    }
+
+    #[test]
+    fn flex_row_reports_used_width_past_its_content() {
+        // CSS Flexbox §9.9.1: a flex item's max-content contribution is its flex
+        // BASE SIZE, not its (narrower) content. A flex row of fixed-width,
+        // non-shrinking cards whose content is a short label must report its full
+        // used width, so an ANCESTOR flex row that measures it hands it enough
+        // space and lays it horizontally — Steam's `hero_capsule` spotlight
+        // carousel (a `width:28vw` box holding a one-line title) collapsed into a
+        // vertical column when the container measured only to the last title.
+        let html = "<body><div style=\"display:flex\">\
+            <div style=\"display:flex;gap:1px\">\
+              <div style=\"width:200px;flex-shrink:0\"><span>AA</span></div>\
+              <div style=\"width:200px;flex-shrink:0\"><span>BB</span></div>\
+              <div style=\"width:200px;flex-shrink:0\"><span>CC</span></div>\
+            </div></div></body>";
+        let rows = lay(html, 100);
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|r| r.items.iter().any(|i| i.text.contains(needle)))
+        };
+        // All three cards land on the SAME row (laid side by side), not stacked
+        // into a column.
+        assert_eq!(
+            row_of("AA"),
+            row_of("BB"),
+            "AA and BB share a row: {rows:?}"
+        );
+        assert_eq!(
+            row_of("BB"),
+            row_of("CC"),
+            "BB and CC share a row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn abspos_inside_pinned_fixed_rail_composites() {
+        // A pinned `position:fixed` rail's rows are an overlay layer
+        // (`FixedItem.rows`) — the document-root composite can't paint into it,
+        // so `capture_fixed_children` must composite the rail's own abspos
+        // descendants (badges, dropdown carets) into the box before capturing.
+        // Dropping them left Mastodon-style rails missing their overlays.
+        let html = "<body><div class=\"columns\">\
+            <div style=\"position:fixed\"><div>RAIL</div>\
+              <div style=\"position:relative\">\
+                <div style=\"position:absolute;top:0;left:0\">BADGE</div>x</div>\
+            </div>\
+            <p>a</p><p>b</p><p>c</p></div></body>";
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (.., fixed, _an) = lay_out_with_carousels(
+            &dom,
+            &base,
+            (80, 24),
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
+        let fixed_text: String = fixed
+            .iter()
+            .flat_map(|f| f.rows.iter())
+            .flat_map(|r| r.items.iter())
+            .map(|i| i.text.as_str())
+            .collect();
+        assert!(fixed_text.contains("RAIL"), "rail content present");
+        assert!(
+            fixed_text.contains("BADGE"),
+            "abspos badge inside the fixed rail composites into its rows: {fixed_text:?}"
+        );
+    }
+
+    #[test]
+    fn abspos_inside_scroll_region_buffer_composites() {
+        // A clipped scroll region's buffer is windowed by the app — its abspos
+        // content is part of the scroller's scrollable overflow (CSS Overflow 3
+        // §2.2) and must composite INTO the buffer (`flow_region`), not vanish
+        // (the document-root composite can never reach a windowed buffer).
+        let mut body = String::from(
+            "<body><div style=\"height:64px;overflow-y:scroll\">\
+             <div style=\"position:relative\">\
+             <div style=\"position:absolute;top:0;right:0\">BADGE</div>",
+        );
+        for i in 0..30 {
+            body.push_str(&format!("<p>line {i}</p>"));
+        }
+        body.push_str("</div></div><p>AFTER</p></body>");
+        let dom = Dom::parse_document(&body);
+        let base = Url::parse("https://example.com/").unwrap();
+        let (rows, _c, regions, ..) = lay_out_with_carousels(
+            &dom,
+            &base,
+            (80, 24),
+            &[],
+            &ControlMap::new(),
+            &ImageSizes::new(),
+            false,
+        );
+        assert!(!regions.is_empty(), "a region formed: {:?}", texts(&rows));
+        let buf_text: String = regions
+            .iter()
+            .flat_map(|rg| rg.buffer.iter())
+            .flat_map(|r| r.items.iter())
+            .map(|i| i.text.as_str())
+            .collect();
+        assert!(buf_text.contains("line 3"), "region content present");
+        assert!(
+            buf_text.contains("BADGE"),
+            "abspos badge composites into the region buffer: {buf_text:?}"
+        );
+    }
+
+    #[test]
+    fn abspos_shrink_to_fit_flex_keeps_right_anchor() {
+        // The §9.9.1 measured-width floor is MEASURE-ONLY: on the render pass
+        // grow has been applied, and flooring the reported width there made a
+        // shrink-to-fit `right:0` flyout holding a `flex:1` row report the
+        // whole band as its used width — left = cb_w − used_w = 0, the flyout
+        // lost its right anchor and stretched full-width.
+        let html = "<body><div style=\"position:relative\"><div>x</div>\
+            <div style=\"position:absolute;top:0;right:0\">\
+              <div style=\"display:flex\"><div style=\"flex:1\">MENU</div></div>\
+            </div></div></body>";
+        let rows = lay(html, 80);
+        let menu = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("MENU"))
+            .expect("menu laid");
+        assert!(
+            menu.col > 40,
+            "right-anchored flyout stays right-anchored (col {})",
+            menu.col
+        );
+    }
+
+    #[test]
+    fn sibling_badge_lifts_share_one_band() {
+        // Two sibling cards, each a corner badge over a decoded image: the
+        // image-lifts must SHARE one inserted band (`composite_positioned`'s
+        // band reuse) — one insert per box staircased the badges (SALE1 a row
+        // above SALE2) and pushed every card down N bands.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/a.png".to_owned(), (20, 6));
+        images.insert("https://example.com/b.png".to_owned(), (20, 6));
+        let html = "<body><div style=\"display:flex\">\
+            <div style=\"position:relative;width:200px\">\
+              <img src=\"a.png\" width=\"160\" height=\"48\">\
+              <div style=\"position:absolute;top:0;left:0\">SALE1</div></div>\
+            <div style=\"position:relative;width:200px\">\
+              <img src=\"b.png\" width=\"160\" height=\"48\">\
+              <div style=\"position:absolute;top:0;left:0\">SALE2</div></div>\
+            </div><p>AFTER</p></body>";
+        let rows = lay_with_images(html, 80, &images);
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|r| r.items.iter().any(|i| i.text.contains(needle)))
+                .unwrap_or_else(|| panic!("{needle} not laid: {:?}", texts(&rows)))
+        };
+        assert_eq!(
+            row_of("SALE1"),
+            row_of("SALE2"),
+            "sibling badges share one lifted band: {:?}",
+            texts(&rows)
+        );
+        let img_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                r.items
+                    .iter()
+                    .any(|i| matches!(i.kind, ItemKind::Image) && i.width > 0)
+            })
+            .map(|(y, _)| y)
+            .collect();
+        assert_eq!(
+            img_rows.len(),
+            1,
+            "the images stay side by side, one band down"
+        );
+        assert!(
+            img_rows[0] > row_of("SALE1"),
+            "badges lifted above the images"
+        );
+    }
+
+    #[test]
+    fn region_cache_skips_overlay_children_and_keeps_their_badges() {
+        // The region child cache captures ROWS only — a child whose subtree
+        // contributes to a side channel (here `positioned`) can't be memoized,
+        // or the reused rows would silently drop its overlay on every warm
+        // relayout (a cache must be transparent: render-as-if-fully-laid).
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let html = "<html style=\"height:100%\"><body style=\"height:100%\">\
+            <div id=\"chat\" data-trust-node=\"983\" \
+                 style=\"height:100%;overflow-y:scroll;width:30ch\"><div class=\"msgs\">\
+              <div class=\"line\"><span>alpha</span></div>\
+              <div class=\"line\"><span>bravo</span></div>\
+              <div class=\"line\" style=\"position:relative\"><span>charlie</span>\
+                <div style=\"position:absolute;top:0;right:0\">TICK</div></div>\
+            </div></div></body></html>";
+        let dom = Dom::parse_document(html);
+        let boundary = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&id| dom.attr(id, "data-trust-node") == Some("983"))
+            .expect("the chat boundary");
+        let text_of = |rows: &[Row]| -> String {
+            rows.iter()
+                .flat_map(|r| r.items.iter())
+                .map(|i| i.text.as_str())
+                .collect()
+        };
+        let (rows1, _c1, _sc1, cache1) = lay_out_region_fragment_cached(
+            &dom,
+            &base,
+            30,
+            (40, 8),
+            &ctrls,
+            &imgs,
+            boundary,
+            &RegionRowCache::default(),
+        );
+        assert!(
+            text_of(&rows1).contains("TICK"),
+            "cold pass keeps the overlay"
+        );
+        assert_eq!(
+            cache1.children.len(),
+            2,
+            "the overlay-bearing child is NOT memoized (only the plain two are)"
+        );
+        // Warm relayout from the returned cache: the plain children reuse their
+        // rows, the overlay child re-lays — and its overlay still renders.
+        let (rows2, _c2, _sc2, _cache2) = lay_out_region_fragment_cached(
+            &dom,
+            &base,
+            30,
+            (40, 8),
+            &ctrls,
+            &imgs,
+            boundary,
+            &cache1,
+        );
+        assert!(
+            text_of(&rows2).contains("TICK"),
+            "warm (cached) relayout keeps the overlay: {:?}",
+            text_of(&rows2)
+        );
+        assert_eq!(text_of(&rows1), text_of(&rows2), "warm matches cold");
+    }
+
+    #[test]
+    fn region_fragment_returns_nested_scroll_clips() {
+        // A definite-height scroll box nested INSIDE a region fragment reports
+        // its clip box through the fragment relayout, so the app can keep its
+        // live `clientHeight` honest without a full re-lay.
+        let base = Url::parse("https://example.com/").unwrap();
+        let (ctrls, imgs) = (ControlMap::new(), ImageSizes::new());
+        let html = "<html style=\"height:100%\"><body style=\"height:100%\">\
+            <div id=\"chat\" data-trust-node=\"984\" \
+                 style=\"height:100%;overflow-y:scroll;width:30ch\"><div class=\"msgs\">\
+              <div class=\"line\"><span>alpha</span></div>\
+              <div class=\"line\"><div data-trust-node=\"985\" \
+                   style=\"height:32px;overflow-y:scroll\">\
+                <p>inner a</p><p>inner b</p><p>inner c</p></div></div>\
+            </div></div></body></html>";
+        let dom = Dom::parse_document(html);
+        let boundary = dom
+            .descendants(DOCUMENT)
+            .into_iter()
+            .find(|&id| dom.attr(id, "data-trust-node") == Some("984"))
+            .expect("the chat boundary");
+        let (_rows, _c, scroll_clips, _cache) = lay_out_region_fragment_cached(
+            &dom,
+            &base,
+            30,
+            (40, 8),
+            &ctrls,
+            &imgs,
+            boundary,
+            &RegionRowCache::default(),
+        );
+        assert!(
+            scroll_clips
+                .iter()
+                .any(|&(node, h, _)| node == 985 && h > 0),
+            "the nested scroll box's clip rides the fragment result: {scroll_clips:?}"
+        );
+    }
+
+    #[test]
+    fn abspos_explicit_width_overflows_a_collapsed_cb() {
+        // CSS 2.1 §10.3.7: an abspos box with an explicit `width` USES that
+        // width — it freely overflows its containing block. A `fit-content`
+        // wrapper whose only content is out-of-flow legitimately collapses to
+        // ~0 (out-of-flow content contributes nothing to intrinsic sizing),
+        // and the box laid inside it must NOT be crushed to the CB's width
+        // (Twitch's 34rem chat column laid ONE CELL wide, then compressed to
+        // nothing).
+        let html = "<body><div style=\"position:relative;width:2px\">\
+            <div style=\"position:absolute;top:0;left:0;width:300px\">WIDE PANEL TEXT</div>\
+            </div></body>";
+        let rows = lay(html, 80);
+        let row = rows
+            .iter()
+            .find(|r| r.items.iter().any(|i| i.text.contains("WIDE")))
+            .expect("panel laid");
+        // Laid at its explicit width: the text fits on ONE line (a 1-cell lay
+        // would char-break it into a vertical strip).
+        assert!(
+            row.items.iter().any(|i| i.text.contains("PANEL TEXT")),
+            "laid at its explicit width, not the collapsed CB: {:?}",
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn translated_abspos_panel_slides_into_the_band() {
+        // The right-docked slide-in idiom (Twitch's chat column): a flex row
+        // ends in a `width:fit-content` wrapper that collapses to ~0 (its only
+        // content is out-of-flow), and the panel inside it is
+        // `position:absolute; width:W` shifted INTO view by
+        // `transform:translateX(-W)` — CSS Transforms 1: translation moves the
+        // painted box after layout. The panel must render inside the band, on
+        // the right side, at its full width.
+        let html = "<body><div style=\"display:flex\">\
+            <div style=\"flex:1\"><p>MAIN CONTENT</p></div>\
+            <div style=\"width:fit-content\"><div style=\"position:relative\">\
+              <div style=\"position:absolute;width:240px;transform:translateX(-240px) translateZ(0)\">\
+                <p>CHAT PANEL</p></div>\
+            </div></div></div></body>";
+        let rows = lay(html, 100);
+        let chat = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("CHAT"))
+            .expect("chat panel laid");
+        // 240px = 30 cells: slid left of the wrapper (at ~col 98) into
+        // roughly [68, 98] — right side of the band, fully visible.
+        assert!(
+            chat.col >= 40 && (chat.col as usize) < 100,
+            "chat panel slides into the band's right side (col {}): {:?}",
+            chat.col,
+            texts(&rows)
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .any(|i| i.text.contains("PANEL")),
+            "laid at its full width, not a one-cell strip"
+        );
+    }
+
+    #[test]
+    fn translate_percent_centers_against_the_boxes_own_size() {
+        // The universal centering idiom: `left:50%` + `translateX(-50%)` —
+        // the percentage resolves against the box's OWN width (CSS
+        // Transforms 1 §6), landing the box centered on its CB's midpoint.
+        let html = "<body><div style=\"position:relative\"><p>x</p>\
+            <div style=\"position:absolute;top:0;left:50%;width:40ch;transform:translateX(-50%)\">CENTERED</div>\
+            </div></body>";
+        let rows = lay(html, 100);
+        let c = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("CENTERED"))
+            .expect("laid");
+        // left = 50 cells, tx = −20 (half of 40ch) → col ≈ 30.
+        assert!(
+            (25..=35).contains(&(c.col as usize)),
+            "centered at ~col 30 (got {}): {:?}",
+            c.col,
+            texts(&rows)
+        );
+    }
+
+    #[test]
+    fn translated_box_inside_a_clipping_cb_is_kept() {
+        // Off-canvas slide-in: `left:100%` parks the panel just past its
+        // clipping CB, `translateX(-100%)` slides it fully back INSIDE.
+        // Overflow clips PAINTED content and translation moves the painted
+        // box, so the panel is fully visible — both the fraction-based
+        // offscreen test and the laid-geometry clip test must keep it.
+        let html = "<body><div style=\"position:relative;overflow:hidden\"><p>base</p>\
+            <div style=\"position:absolute;top:0;left:100%;width:30ch;transform:translateX(-100%)\">DRAWER</div>\
+            </div></body>";
+        let rows = lay(html, 100);
+        assert!(
+            all_text(&rows).contains("DRAWER"),
+            "slid-in drawer visible: {:?}",
+            texts(&rows)
+        );
+        // The SAME panel without the translate parks fully outside the
+        // clipping CB → correctly hidden.
+        let html_out = "<body><div style=\"position:relative;overflow:hidden\"><p>base</p>\
+            <div style=\"position:absolute;top:0;left:100%;width:30ch\">DRAWER</div>\
+            </div></body>";
+        assert!(
+            !all_text(&lay(html_out, 100)).contains("DRAWER"),
+            "the untranslated off-canvas panel stays hidden"
+        );
+    }
+
+    #[test]
+    fn abspos_fill_image_takes_its_aspect_frame_box() {
+        // The spacer-sibling aspect idiom (Twitch's hero/feed cards): the
+        // frame's height comes from an EMPTY in-flow child's
+        // `padding-bottom:56.25%` (CSS 2.1 §8.4), and the abspos
+        // `width:100%;height:100%` image must take the FRAME as its used box
+        // (§10.3.8 — its percentages resolve against the containing block the
+        // frame establishes). Sizing it by its decoded intrinsic box instead
+        // left the reserved frame a giant void with a thumbnail-sized image
+        // (Twitch's front-page hero).
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/live.jpg".to_owned(), (40, 11)); // 320x180
+        let html = "<body><div style=\"position:relative;width:600px\">\
+            <div style=\"width:100%;overflow:hidden;position:relative\">\
+              <div style=\"padding-bottom:56.25%\"></div>\
+              <img src=\"/live.jpg\" style=\"position:absolute;top:0;left:0;width:100%;max-width:100%;height:100%\">\
+            </div>\
+            <p>CAPTION</p></div></body>";
+        let rows = lay_with_images(html, 100, &images);
+        let img = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .expect("fill image laid");
+        // 600px card = 75 cells; a 16:9 frame of it is ~21 rows.
+        assert!(
+            img.width >= 70,
+            "fills the frame width (got {}): {:?}",
+            img.width,
+            texts(&rows)
+        );
+        assert!(
+            img.height >= 18,
+            "fills the frame height (got {})",
+            img.height
+        );
+        let img_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.image.is_some()))
+            .unwrap();
+        let cap_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.text.contains("CAPTION")))
+            .expect("caption laid");
+        assert!(
+            cap_row >= img_row + 18,
+            "caption flows below the filled frame (img@{img_row} cap@{cap_row})"
+        );
+    }
+
+    #[test]
+    fn scaled_abspos_card_relays_at_its_scaled_size() {
+        // CSS Transforms scale on an out-of-flow box: the painted box is the
+        // SCALED box — re-laid at the scaled width (the compress-to-fit
+        // machinery), shrinking toward its own center (`transform-origin`
+        // default). Twitch's hero card is a wide card at `scale(0.703)`:
+        // unscaled it overflowed the band; scaled it fits like the browser's.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/live.jpg".to_owned(), (40, 11));
+        let html = "<body><div style=\"position:relative\"><p>x</p>\
+            <div style=\"position:absolute;top:0;left:0;width:800px;transform:scale(0.5)\">\
+              <div style=\"width:100%;overflow:hidden;position:relative\">\
+                <div style=\"padding-bottom:56.25%\"></div>\
+                <img src=\"/live.jpg\" style=\"position:absolute;top:0;left:0;width:100%;height:100%\">\
+              </div>\
+            </div></div></body>";
+        let rows = lay_with_images(html, 120, &images);
+        let img = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .expect("fill image laid");
+        // 800px = 100 cells unscaled; scale(0.5) → a ~50-cell box, centered on
+        // the original (col ≈ 25).
+        assert!(
+            (40..=60).contains(&(img.width as usize)),
+            "scaled width ~50 (got {})",
+            img.width
+        );
+        assert!(
+            (15..=35).contains(&(img.col as usize)),
+            "centered by the origin shift (col {})",
+            img.col
+        );
+    }
+
+    #[test]
+    fn a_mounted_player_borrows_the_faded_preview_as_poster() {
+        // Steady-state hero card: the page fades its preview image
+        // (`opacity:0`) once its player mounts — in a browser the playing
+        // video covers it. We deliberately render no player, so the video's
+        // representation borrows the HIDDEN image's URL as its poster (the
+        // image itself stays suppressed); on a NON-video page (no playable
+        // target — the homepage) the poster paints UNLINKED with no phantom
+        // "Watch in mpv". Without this the reserved hero frame painted
+        // NOTHING at all in the settled state (Twitch front page's void).
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/preview.jpg".to_owned(), (40, 11));
+        let html = r#"<html><head><meta property="og:type" content="website"></head>
+           <body><div style="position:relative;width:600px">
+             <div style="opacity:0"><img src="/preview.jpg" style="width:100%"></div>
+             <div class="video-ref"><video style="position:absolute;top:0;left:0;width:100%;height:100%"></video></div>
+             <p>ChannelName</p>
+           </div></body></html>"#;
+        let rows = lay_with_images(html, 100, &images);
+        let poster = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.as_deref() == Some("https://example.com/preview.jpg") && !i.invisible)
+            .expect("the faded preview paints as the video's poster");
+        assert!(
+            poster.link.is_none(),
+            "dead-end poster is unlinked: {:?}",
+            poster.link
+        );
+        assert!(!shows(&rows, "Watch in mpv"), "{:?}", texts(&rows));
+        assert!(shows(&rows, "ChannelName"), "card content renders");
+        // The SAME card with a VISIBLE preview (the hover-preview idiom —
+        // video overlaid ON content): the image flows once as normal content
+        // and must NOT double as a borrowed poster.
+        let html = r#"<html><head><meta property="og:type" content="website"></head>
+           <body><div style="position:relative;width:600px">
+             <div><img src="/preview.jpg" style="width:100%"></div>
+             <div class="video-ref"><video style="position:absolute;top:0;left:0;width:100%;height:100%"></video></div>
+           </div></body></html>"#;
+        let rows = lay_with_images(html, 100, &images);
+        let visible_copies = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| {
+                i.image.as_deref() == Some("https://example.com/preview.jpg") && !i.invisible
+            })
+            .count();
+        assert_eq!(visible_copies, 1, "no poster duplication");
+        assert!(!shows(&rows, "Watch in mpv"), "{:?}", texts(&rows));
+    }
+
+    #[test]
+    fn player_chrome_over_a_hero_frame_does_not_lift_cascade() {
+        // The steady-state hero: a §8.4 aspect frame, its abspos fill image,
+        // and small abspos CHROME icons scattered over it at different rows
+        // (play/volume/settings/fullscreen…). The frame's zero-width
+        // reservation markers are NOT images — chrome overlapping them must
+        // not trigger the image-lift; counting them chained a lift per icon
+        // that inflated the band into a giant void and exiled the hero image
+        // below the fold (Twitch's front page, mounted-player state).
+        let icons = r#"<div style="position:absolute;top:16px;left:8px">P</div>
+             <div style="position:absolute;top:48px;left:8px">V</div>
+             <div style="position:absolute;top:96px;left:8px">S</div>
+             <div style="position:absolute;top:160px;right:8px">T</div>
+             <div style="position:absolute;top:240px;right:8px">F</div>"#;
+        let html = format!(
+            r#"<body><div style="position:relative;width:600px">
+            <div style="width:100%;overflow:hidden;position:relative">
+              <div style="padding-bottom:56.25%"></div>
+              <img src="/live.jpg" style="position:absolute;top:0;left:0;width:100%;height:100%">
+              {icons}
+            </div>
+            <p>CAPTION</p></div></body>"#
+        );
+        // UNDECODED image: the frame holds only markers — nothing paintable,
+        // so NO icon may lift. The caption sits right below the ~21-row frame.
+        let rows = lay_with_images(&html, 100, &ImageSizes::new());
+        let cap_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.text.contains("CAPTION")))
+            .expect("caption laid");
+        assert!(
+            cap_row <= 24,
+            "no lift cascade over an empty frame (caption at row {cap_row} of {})",
+            rows.len()
+        );
+        // DECODED image: the fill paints at the frame top; the icons over it
+        // may lift at most a couple of shared bands — never a frame-sized void.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/live.jpg".to_owned(), (40, 11));
+        let rows = lay_with_images(&html, 100, &images);
+        let img_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.image.is_some()))
+            .expect("hero image painted");
+        assert!(
+            img_row <= 6,
+            "hero image stays in its frame's band (row {img_row})"
+        );
+        let cap_row = rows
+            .iter()
+            .position(|r| r.items.iter().any(|i| i.text.contains("CAPTION")))
+            .expect("caption laid");
+        assert!(
+            cap_row <= 32,
+            "no frame-sized void (caption at row {cap_row} of {})",
+            rows.len()
+        );
+    }
+
+    #[test]
     fn offscreen_clip_needs_a_clipping_containing_block() {
         // The SAME off-canvas box, but the containing block does NOT clip
         // (`overflow:visible`): a browser paints it overflowing, so we keep it
@@ -13021,13 +14724,19 @@ mod tests {
             <span style=\"position:absolute;top:0;right:0\">BADGE</span>x</div></body>";
         let modal = "<body><div style=\"position:relative;overflow:hidden\">\
             <div style=\"position:absolute;top:0;left:0;right:0;bottom:0\">MODAL</div></div></body>";
-        let px = "<body><div style=\"position:relative;overflow:hidden\">\
-            <div style=\"position:absolute;left:1200px;width:90%\">PXOFFSET</div></div></body>";
+        // A small px offset lands INSIDE the clipping box → kept.
+        let px_on = "<body><div style=\"position:relative;overflow:hidden\">\
+            <div style=\"position:absolute;left:80px;width:90%\">PXNEAR</div></div></body>";
+        // A px offset PAST the clipping box's right edge (1200px = 150 cells in a
+        // 100-cell box) is provably off-screen → dropped. The laid-geometry clip
+        // resolves the length the old fraction-only check could not.
+        let px_off = "<body><div style=\"position:relative;overflow:hidden\">\
+            <div style=\"position:absolute;left:1200px;width:90%\">PXFAR</div></div></body>";
         assert!(all_text(&lay(onscreen, 100)).contains("INFLOWISH"));
         assert!(all_text(&lay(corner, 100)).contains("BADGE"));
         assert!(all_text(&lay(modal, 100)).contains("MODAL"));
-        // A non-zero length offset is indeterminate without pixel geometry → kept.
-        assert!(all_text(&lay(px, 100)).contains("PXOFFSET"));
+        assert!(all_text(&lay(px_on, 100)).contains("PXNEAR"));
+        assert!(!all_text(&lay(px_off, 100)).contains("PXFAR"));
     }
 
     #[test]
@@ -13452,82 +15161,266 @@ mod tests {
         // containing block, vw the viewport; calc folds a +/- term chain.
         // Viewport is (width, height) in cells; here 80×24.
         let vp = (80, 24);
-        assert_eq!(resolve_cells("10ch", 100, vp), Some(10), "1ch = 1 cell");
-        assert_eq!(resolve_cells("50%", 40, vp), Some(20), "% of avail");
         assert_eq!(
-            resolve_cells("50vw", 40, vp),
+            resolve_cells("10ch", 100, vp, Units::default()),
+            Some(10),
+            "1ch = 1 cell"
+        );
+        assert_eq!(
+            resolve_cells("50%", 40, vp, Units::default()),
+            Some(20),
+            "% of avail"
+        );
+        assert_eq!(
+            resolve_cells("50vw", 40, vp, Units::default()),
             Some(40),
             "vw of viewport width"
         );
         // vh/vmin/vmax now resolve against the viewport height (24 cells).
         assert_eq!(
-            resolve_cells("50vh", 40, vp),
+            resolve_cells("50vh", 40, vp, Units::default()),
             Some(12),
             "vh of viewport height"
         );
         assert_eq!(
-            resolve_cells("100vh", 40, vp),
+            resolve_cells("100vh", 40, vp, Units::default()),
             Some(24),
             "100vh = full height"
         );
         assert_eq!(
-            resolve_cells("100vmin", 40, vp),
+            resolve_cells("100vmin", 40, vp, Units::default()),
             Some(24),
             "vmin = the smaller axis (height, 24)"
         );
         assert_eq!(
-            resolve_cells("100vmax", 40, vp),
+            resolve_cells("100vmax", 40, vp, Units::default()),
             Some(80),
             "vmax = the larger axis (width, 80)"
         );
         assert_eq!(
-            resolve_cells("calc(100% - 4ch)", 40, vp),
+            resolve_cells("calc(100% - 4ch)", 40, vp, Units::default()),
             Some(36),
             "calc subtracts a ch length from a percentage"
         );
         assert_eq!(
-            resolve_cells("calc(50% + 2ch)", 40, vp),
+            resolve_cells("calc(50% + 2ch)", 40, vp, Units::default()),
             Some(22),
             "calc adds across unit kinds"
         );
         // calc reaches viewport-height units too.
         assert_eq!(
-            resolve_cells("calc(100vh - 4ch)", 40, vp),
+            resolve_cells("calc(100vh - 4ch)", 40, vp, Units::default()),
             Some(20),
             "calc subtracts from a vh length"
         );
         // Unsupported values are ignored (None), exactly as before.
-        assert_eq!(resolve_cells("auto", 40, vp), None);
+        assert_eq!(resolve_cells("auto", 40, vp, Units::default()), None);
         // A 0 height basis means the viewport height wasn't threaded — vh/vmin/
         // vmax stay unresolved rather than collapsing to 0 (the prior behaviour).
         assert_eq!(
-            resolve_cells("12vh", 40, (80, 0)),
+            resolve_cells("12vh", 40, (80, 0), Units::default()),
             None,
             "no viewport height ⇒ vh unresolved"
         );
         assert_eq!(
-            resolve_cells("50vmin", 40, (80, 0)),
+            resolve_cells("50vmin", 40, (80, 0), Units::default()),
             None,
             "vmin needs height"
         );
         // calc multiplication/division (a unitless number is a scalar).
         assert_eq!(
-            resolve_cells("calc(100% * 2)", 40, vp),
+            resolve_cells("calc(100% * 2)", 40, vp, Units::default()),
             Some(80),
             "calc multiplies a percentage by a scalar"
         );
         assert_eq!(
-            resolve_cells("calc((100% - 4ch) / 3)", 40, vp),
+            resolve_cells("calc((100% - 4ch) / 3)", 40, vp, Units::default()),
             Some(12),
             "calc divides a grouped sub-expression — the 3-column item width"
         );
         assert_eq!(
-            resolve_cells("calc(100% / 3)", 60, vp),
+            resolve_cells("calc(100% / 3)", 60, vp, Units::default()),
             Some(20),
             "calc divides a percentage by a scalar"
         );
         // ch also flows through the absolute-unit path (indents).
-        assert_eq!(indent_cells(Some("3ch")), 3);
+        assert_eq!(indent_cells(Some("3ch"), Units::default()), 3);
+    }
+
+    #[test]
+    fn a_grown_flex_items_width_is_not_a_percentage_basis() {
+        // Twitch's category tower: `width:12rem; flex-grow:1` items in a
+        // wrapping shelf grow to fill the row, and the card's aspect frame
+        // lays at the GROWN width — so the fill image's `width:100%` must
+        // resolve against the used (grown) band too, not the declared 12rem
+        // flex base (which painted a small image inside a giant blank frame).
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/a.jpg".to_owned(), (10, 8));
+        images.insert("https://example.com/b.jpg".to_owned(), (10, 8));
+        let rows = lay_with_images(
+            r#"<body><div style="display:flex;flex-wrap:wrap;min-width:100%">
+                 <div style="width:12rem;flex-grow:1;flex-shrink:0">
+                   <img src="/a.jpg" style="width:100%">
+                 </div>
+                 <div style="width:12rem;flex-grow:1;flex-shrink:0">
+                   <img src="/b.jpg" style="width:100%">
+                 </div>
+               </div></body>"#,
+            100,
+            &images,
+        );
+        let widths: Vec<usize> = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.is_some())
+            .map(|i| i.width as usize)
+            .collect();
+        assert_eq!(widths.len(), 2, "both images render");
+        for w in &widths {
+            assert!(
+                (44..=52).contains(w),
+                "the image fills its GROWN ~half-band card, not the 24-cell flex base (got {w})"
+            );
+        }
+    }
+
+    #[test]
+    fn rem_lengths_resolve_against_the_root_font_size() {
+        // The Twitch shape: `html{font-size:62.5%}` makes 1rem = 10px, so a
+        // `width:75rem` featured card is 750px = 94 cells — NOT the 150 cells
+        // a fixed 16px rem gave it (the hero-band bug: off-center, past the
+        // viewport edge, overlapping the info column).
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/x.jpg".to_owned(), (40, 11));
+        let rows = lay_with_images(
+            r#"<html style="font-size:62.5%"><body>
+                 <div style="width:75rem"><img src="/x.jpg" style="width:100%"></div>
+               </body></html>"#,
+            240,
+            &images,
+        );
+        let img = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .expect("the image renders");
+        assert_eq!(img.width, 94, "75rem at a 10px root = 750px = 94 cells");
+    }
+
+    #[test]
+    fn em_lengths_resolve_against_the_elements_computed_font_size() {
+        // `width:10em` under a 20px font is 200px = 25 cells; and a
+        // `font-size:2em` resolves against the PARENT (CSS Fonts §6.1) while
+        // the width's em uses the element's OWN computed 40px.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/a.jpg".to_owned(), (10, 5));
+        images.insert("https://example.com/b.jpg".to_owned(), (10, 5));
+        let rows = lay_with_images(
+            r#"<body><div style="font-size:20px">
+                 <div style="width:10em"><img src="/a.jpg" style="width:100%"></div>
+                 <div style="font-size:2em;width:5em"><img src="/b.jpg" style="width:100%"></div>
+               </div></body>"#,
+            240,
+            &images,
+        );
+        let widths: Vec<usize> = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.is_some())
+            .map(|i| i.width as usize)
+            .collect();
+        assert_eq!(
+            widths,
+            vec![25, 25],
+            "10em × 20px and 5em × (2em of 20px) both = 200px = 25 cells"
+        );
+    }
+
+    #[test]
+    fn heading_and_keyword_font_sizes_feed_em_lengths() {
+        // The UA gives h1 2em of its inherited size; `x-large` is 24px.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/a.jpg".to_owned(), (10, 5));
+        images.insert("https://example.com/b.jpg".to_owned(), (10, 5));
+        let rows = lay_with_images(
+            r#"<body style="font-size:10px">
+                 <h1 style="width:10em"><img src="/a.jpg" style="width:100%"></h1>
+                 <div style="font-size:x-large;width:10em"><img src="/b.jpg" style="width:100%"></div>
+               </body>"#,
+            240,
+            &images,
+        );
+        let widths: Vec<usize> = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.is_some())
+            .map(|i| i.width as usize)
+            .collect();
+        assert_eq!(
+            widths,
+            vec![25, 30],
+            "h1: 10em × 20px = 25 cells; x-large: 10em × 24px = 30 cells"
+        );
+    }
+
+    #[test]
+    fn rem_reaches_calc_and_math_function_terms() {
+        // rem inside calc()/min() resolves through the same root basis.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/a.jpg".to_owned(), (10, 5));
+        images.insert("https://example.com/b.jpg".to_owned(), (10, 5));
+        let rows = lay_with_images(
+            r#"<html style="font-size:62.5%"><body>
+                 <div style="width:calc(10rem + 60px)"><img src="/a.jpg" style="width:100%"></div>
+                 <div style="width:min(50rem, 300px)"><img src="/b.jpg" style="width:100%"></div>
+               </body></html>"#,
+            240,
+            &images,
+        );
+        let widths: Vec<usize> = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.is_some())
+            .map(|i| i.width as usize)
+            .collect();
+        assert_eq!(
+            widths,
+            vec![20, 38],
+            "calc(100px + 60px) = 20 cells; min(500px, 300px) = 300px = 38 cells"
+        );
+    }
+
+    #[test]
+    fn the_real_cell_box_scales_px_to_physical_cells() {
+        // On a terminal with 10×20px cells a CSS px length maps to the same
+        // PHYSICAL extent as in a browser — fewer, bigger cells; and the
+        // aspect conversion uses the true cell shape. `ch` stays one glyph
+        // cell on ANY font: it is the character-count unit, and our glyphs
+        // never scale with CSS font-size.
+        let u = Units {
+            fs: 16.0,
+            root: 16.0,
+            cell_w: 10.0,
+            cell_h: 20.0,
+        };
+        assert_eq!(resolve_cells("100px", 0, (80, 24), u), Some(10));
+        assert_eq!(css_length_rows("100px", u), Some(5));
+        assert_eq!(
+            rows_for_ratio(30, 1.0, u),
+            15,
+            "300px wide, 1:1 → 300px tall = 15 rows"
+        );
+        assert_eq!(resolve_cells("40ch", 0, (80, 24), u), Some(40));
+        assert_eq!(
+            resolve_cells("40ch", 0, (80, 24), Units::default()),
+            Some(40)
+        );
+        // The nominal default reproduces the historical constants exactly.
+        assert_eq!(
+            resolve_cells("100px", 0, (80, 24), Units::default()),
+            Some(13)
+        );
+        assert_eq!(rows_for_ratio(30, 1.0, Units::default()), 15);
     }
 
     #[test]
@@ -14271,30 +16164,41 @@ mod tests {
             matches!(&poster.link, Some(Link::Media(u)) if u.as_str().ends_with("clip_720p.mp4")),
             "poster links to the media source (follows to mpv)"
         );
+        // The DRAWN preview IS the mpv affordance — no extra caption line
+        // under it (her call 2026-07-04).
         assert!(
-            shows(&rows, "▶ Video · 720p HD"),
-            "caption present: {:?}",
+            !shows(&rows, "▶ Video"),
+            "no caption under a drawn preview: {:?}",
             texts(&rows)
         );
-        // The caption is itself a link to the media.
+        // Without a decoded poster, the text link stands in for the video
+        // content, keeping its kind + quality.
+        let rows = lay_with_images(
+            r#"<body><video poster="/poster.jpg"><source src="/clip_720p.mp4" type="video/mp4" res="720" label="HD"></video></body>"#,
+            80,
+            &ImageSizes::new(),
+        );
         let cap = rows
             .iter()
             .flat_map(|r| &r.items)
-            .find(|i| i.text.contains("▶ Video"))
-            .expect("a caption item");
+            .find(|i| i.text.contains("▶ Video · 720p HD"))
+            .expect("an undecoded poster falls back to the caption link");
         assert!(matches!(&cap.link, Some(Link::Media(u)) if u.as_str().ends_with("clip_720p.mp4")));
     }
 
     #[test]
     fn a_sourceless_streaming_video_links_to_mpv_with_an_og_image_preview() {
         // A modern player (Twitch/YouTube/Kick/…) feeds its `<video>` from MSE/
-        // blob URLs: no `src`/`<source>`/`poster`. It must still offer a "play in
-        // mpv" affordance — on the PAGE url (yt-dlp resolves it) — and use the
-        // page's standard Open Graph image as the preview frame.
+        // blob URLs: no `src`/`<source>`/`poster`. On a page that DECLARES
+        // itself a video page (og:type video.* — what every real watch page
+        // ships) it must still offer a "play in mpv" affordance — on the PAGE
+        // url (yt-dlp resolves it) — and use the page's standard Open Graph
+        // image as the preview frame.
         let mut images = ImageSizes::new();
         images.insert("https://example.com/preview.jpg".to_owned(), (40, 22));
         let rows = lay_with_images(
-            r#"<html><head><meta property="og:image" content="/preview.jpg"></head>
+            r#"<html><head><meta property="og:type" content="video.other">
+                 <meta property="og:image" content="/preview.jpg"></head>
                <body><video aria-label="Live player"></video></body></html>"#,
             80,
             &images,
@@ -14313,19 +16217,88 @@ mod tests {
             "the preview follows to mpv on the page URL: {:?}",
             poster.link
         );
+        // The drawn preview IS the affordance — no text line under it.
         assert!(
-            shows(&rows, "▶ Watch in mpv"),
-            "caption: {:?}",
+            !shows(&rows, "▶ Watch in mpv"),
+            "no caption under a drawn preview: {:?}",
             texts(&rows)
+        );
+        // Undecoded og:image → the text link stands in.
+        let rows = lay_with_images(
+            r#"<html><head><meta property="og:type" content="video.other">
+                 <meta property="og:image" content="/preview.jpg"></head>
+               <body><video aria-label="Live player"></video></body></html>"#,
+            80,
+            &ImageSizes::new(),
         );
         let cap = rows
             .iter()
             .flat_map(|r| &r.items)
             .find(|i| i.text.contains("Watch in mpv"))
-            .expect("a caption item");
+            .expect("a caption item when no preview drew");
         assert!(
             matches!(&cap.link, Some(Link::Media(u)) if u.as_str() == "https://example.com/"),
-            "the caption follows to mpv too"
+            "the caption follows to mpv"
+        );
+    }
+
+    #[test]
+    fn a_homepage_autoplay_hero_video_renders_no_dead_mpv_link() {
+        // A sourceless streaming `<video>` on a page that does NOT declare
+        // itself a video page (og:type "website" — a homepage autoplaying a
+        // featured stream in a hero card, Twitch's front-page carousel) has
+        // no playable target: mpv on the homepage URL finds no video and dies
+        // silently, and the page's og:image is the site LOGO, not a preview.
+        // No representation at all — the card's own text still renders.
+        let mut images = ImageSizes::new();
+        images.insert("https://example.com/logo.jpg".to_owned(), (40, 22));
+        let rows = lay_with_images(
+            r#"<html><head><meta property="og:type" content="website">
+                 <meta property="og:image" content="/logo.jpg"></head>
+               <body><div class="hero"><video aria-label="Featured stream"></video>
+                 <p>FeaturedStreamer</p></div></body></html>"#,
+            80,
+            &images,
+        );
+        assert!(
+            !shows(&rows, "Watch in mpv"),
+            "no dead mpv link on a non-video page: {:?}",
+            texts(&rows)
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .all(|i| i.image.is_none()),
+            "the site logo does not masquerade as a video preview"
+        );
+        assert!(shows(&rows, "FeaturedStreamer"), "card content renders");
+        // The SAME hero wrapped in the card's channel link: the anchor names
+        // the content's page, so the representation plays THAT (yt-dlp
+        // resolves the channel page) — as a text link, since this page's
+        // og:image describes this page, not the linked one.
+        let rows = lay_with_images(
+            r#"<html><head><meta property="og:type" content="website">
+                 <meta property="og:image" content="/logo.jpg"></head>
+               <body><a href="/somechannel"><div class="hero">
+                 <video aria-label="Featured stream"></video></div></a></body></html>"#,
+            80,
+            &images,
+        );
+        let cap = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("Watch in mpv"))
+            .expect("an anchor-wrapped card preview links to its channel page");
+        assert!(
+            matches!(&cap.link, Some(Link::Media(u)) if u.as_str().ends_with("/somechannel")),
+            "plays the ANCHOR's page: {:?}",
+            cap.link
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|r| &r.items)
+                .all(|i| i.image.is_none()),
+            "no borrowed og:image for a preview playing another page"
         );
     }
 
@@ -14356,22 +16329,9 @@ mod tests {
         );
         assert!(shows(&rows, "Browse"), "the rest of the page still renders");
         assert!(shows(&rows, "Stream Chat"), "and the chat panel too");
-        assert!(
-            shows(&rows, "▶ Watch in mpv"),
-            "a page-level mpv fallback appears: {:?}",
-            texts(&rows)
-        );
-        let cap = rows
-            .iter()
-            .flat_map(|r| &r.items)
-            .find(|i| i.text.contains("Watch in mpv"))
-            .expect("a caption item");
-        assert!(
-            matches!(&cap.link, Some(Link::Media(u)) if u.as_str() == "https://example.com/"),
-            "it follows to mpv on the PAGE url (og:video is usually an iframe embed, not \
-             yt-dlp-playable): {:?}",
-            cap.link
-        );
+        // The decoded og:image preview IS the mpv affordance (no text line);
+        // it follows to mpv on the PAGE url (og:video is usually an iframe
+        // embed, not yt-dlp-playable).
         let poster = rows
             .iter()
             .flat_map(|r| &r.items)
@@ -14382,6 +16342,36 @@ mod tests {
         assert_eq!(
             poster.image.as_deref(),
             Some("https://example.com/preview.jpg")
+        );
+        assert!(
+            matches!(&poster.link, Some(Link::Media(u)) if u.as_str() == "https://example.com/"),
+            "the preview follows to mpv on the PAGE url: {:?}",
+            poster.link
+        );
+        assert!(
+            !shows(&rows, "▶ Watch in mpv"),
+            "no caption under a drawn preview: {:?}",
+            texts(&rows)
+        );
+        // With the og:image undecoded, the text link is the affordance.
+        let rows = lay_with_images(
+            r#"<html><head>
+                 <meta property="og:video" content="https://player.example.com/embed">
+                 <meta property="og:image" content="/preview.jpg">
+               </head>
+               <body><nav><a href="/browse">Browse</a></nav></body></html>"#,
+            80,
+            &ImageSizes::new(),
+        );
+        let cap = rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.text.contains("Watch in mpv"))
+            .expect("a caption item when no preview drew");
+        assert!(
+            matches!(&cap.link, Some(Link::Media(u)) if u.as_str() == "https://example.com/"),
+            "it follows to mpv on the PAGE url: {:?}",
+            cap.link
         );
     }
 
@@ -14499,14 +16489,20 @@ mod tests {
             120,
             &images,
         );
-        let has_poster = rows
+        let poster = rows
             .iter()
             .flat_map(|r| &r.items)
-            .any(|i| i.image.as_deref() == Some("https://example.com/poster.jpg"));
-        assert!(has_poster, "poster renders: {:?}", texts(&rows));
+            .find(|i| i.image.as_deref() == Some("https://example.com/poster.jpg"))
+            .expect("poster renders");
+        // The drawn poster IS the mpv link; no caption line under it.
         assert!(
-            shows(&rows, "▶ Video"),
-            "caption renders: {:?}",
+            matches!(&poster.link, Some(Link::Media(u)) if u.as_str().ends_with("clip_720p.mp4")),
+            "poster links to the source: {:?}",
+            poster.link
+        );
+        assert!(
+            !shows(&rows, "▶ Video"),
+            "no caption under a drawn poster: {:?}",
             texts(&rows)
         );
         // The player chrome (big-play button etc.) is suppressed — only the
@@ -14529,7 +16525,8 @@ mod tests {
         let mut images = ImageSizes::new();
         images.insert("https://example.com/preview.jpg".to_owned(), (40, 22));
         let rows = lay_with_images(
-            r#"<html><head><meta property="og:image" content="/preview.jpg"></head>
+            r#"<html><head><meta property="og:type" content="video.other">
+                 <meta property="og:image" content="/preview.jpg"></head>
                <body><div style="position:relative;width:100%;height:100%">
                  <div class="video-ref">
                    <video aria-label="Twitch video player"
@@ -14539,12 +16536,19 @@ mod tests {
             120,
             &images,
         );
+        // The drawn preview is the single affordance: exactly one frame, and
+        // no caption line at all (it only stands in when no preview drew).
         let captions = rows
             .iter()
             .flat_map(|r| &r.items)
             .filter(|i| i.text.contains("Watch in mpv"))
             .count();
-        assert_eq!(captions, 1, "exactly one caption: {:?}", texts(&rows));
+        assert_eq!(
+            captions,
+            0,
+            "no caption under a preview: {:?}",
+            texts(&rows)
+        );
         let posters = rows
             .iter()
             .flat_map(|r| &r.items)
@@ -15519,12 +17523,13 @@ mod tests {
         };
         // Patch 1 (cold): 5 messages. Populates the cache.
         let five = ["alpha", "bravo", "charlie", "delta", "echo"];
-        let (_rows1, _c1, cache1) = lay_region(&region_html(&five), &RegionRowCache::default());
+        let (_rows1, _c1, _sc1, cache1) =
+            lay_region(&region_html(&five), &RegionRowCache::default());
         assert_eq!(cache1.children.len(), 5, "five message rows cached");
         // Patch 2 (warm): append a 6th message — only it should be laid, the first
         // five reused from `cache1`.
         let six = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
-        let (rows_inc, _c2, cache2) = lay_region(&region_html(&six), &cache1);
+        let (rows_inc, _c2, _sc2, cache2) = lay_region(&region_html(&six), &cache1);
         assert_eq!(cache2.children.len(), 6, "six rows cached after the append");
         // The FULL (uncached) layout of the same six messages.
         let (rows_full, ..) = lay_region(&region_html(&six), &RegionRowCache::default());
@@ -15547,7 +17552,7 @@ mod tests {
         // Top-trim (the chat buffer cap): drop the oldest, keep appending. Still
         // matches a full relayout, and the evicted key is gone from the cache.
         let shifted = ["bravo", "charlie", "delta", "echo", "foxtrot", "golf"];
-        let (rows_shift, _c3, cache3) = lay_region(&region_html(&shifted), &cache2);
+        let (rows_shift, _c3, _sc3, cache3) = lay_region(&region_html(&shifted), &cache2);
         assert_eq!(cache3.children.len(), 6, "still six after a shift");
         let (rows_shift_full, ..) = lay_region(&region_html(&shifted), &RegionRowCache::default());
         for (a, b) in rows_shift.iter().zip(rows_shift_full.iter()) {

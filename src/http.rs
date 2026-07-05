@@ -1849,15 +1849,40 @@ pub fn parse_seeded(
             found_boundaries,
             found_fixed,
             found_anchors,
-        ) = crate::layout::lay_out_with_carousels(
-            &dom,
-            url,
-            (width, viewport_h),
-            &forms,
-            &controls,
-            images,
-            crate::layout::borders_enabled(),
-        );
+        ) = if crate::layout2::enabled() {
+            // The NEW engine (LAYOUT_OVERHAUL_PLAN.md), behind `set layout2
+            // on` until parity. It emits the pinned fixed layer (P4), vertical
+            // scroll regions + their scroll_clips (P5b), and carousels (P5c);
+            // incremental-layout boundaries are still not emitted (staged), so
+            // live-page patches take the always-correct full-relayout path.
+            let out = crate::layout2::lay_out_document(
+                &dom,
+                url,
+                (width, viewport_h),
+                &forms,
+                &controls,
+                images,
+            );
+            (
+                out.rows,
+                out.carousels,
+                out.regions,
+                out.scroll_clips,
+                Vec::new(),
+                out.fixed,
+                out.anchor_rows,
+            )
+        } else {
+            crate::layout::lay_out_with_carousels(
+                &dom,
+                url,
+                (width, viewport_h),
+                &forms,
+                &controls,
+                images,
+                crate::layout::borders_enabled(),
+            )
+        };
         if diag {
             let c = crate::dom::take_casc_diag();
             eprintln!(
@@ -1971,6 +1996,10 @@ pub struct RegionPatch {
     /// the scroll this update (a chat re-pinning to bottom); else the app keeps
     /// the reader's offset. Mirrors `flow_region`'s `data-trust-scroll-top` read.
     pub scroll_top: Option<usize>,
+    /// Clip boxes `(live_node, rows, cells)` of every definite-height scroll box
+    /// nested in the fragment — the app merges them into `Doc.scroll_clips` so a
+    /// nested scroller's `clientHeight` stays honest across region relayouts.
+    pub scroll_clips: Vec<(usize, u16, u16)>,
     /// The refreshed per-child row cache (INCREMENTAL_LAYOUT_PLAN.md §14) to
     /// store back on the region and feed the NEXT patch, so an unchanged message
     /// is reused instead of re-laid. Empty when the region wasn't cacheable.
@@ -2012,7 +2041,7 @@ pub fn lay_region_patch(
     // Memoize the scroll container's block children: only a NEW/changed message
     // is laid; unchanged ones reuse their cached rows (INCREMENTAL_LAYOUT_PLAN.md
     // §14 — the inner-scroll de-lag). Row-identical to the uncached layout.
-    let (rows, carousels, row_cache) = crate::layout::lay_out_region_fragment_cached(
+    let (rows, carousels, scroll_clips, row_cache) = crate::layout::lay_out_region_fragment_cached(
         &dom,
         url,
         content_width,
@@ -2038,6 +2067,7 @@ pub fn lay_region_patch(
         carousels,
         image_urls,
         scroll_top,
+        scroll_clips,
         row_cache,
     })
 }
@@ -2142,12 +2172,33 @@ fn collect_image_urls(dom: &crate::dom::Dom, base: &Url) -> Vec<String> {
     // A `<video>` whose source is MSE/blob (no `src`/`<source>`/`poster` — every
     // modern streaming player) renders as a "play in mpv" representation; give
     // it a preview frame from the page's standard Open Graph image so the
-    // representation has a thumbnail. Decode it only when such a video exists.
-    let has_video = dom
-        .descendants(crate::dom::DOCUMENT)
-        .into_iter()
-        .any(|id| dom.tag_name(id) == Some("video"));
-    if has_video
+    // representation has a thumbnail. The PAGE-LEVEL fallback needs the same
+    // frame for the opposite reason: NO `<video>`/`<audio>` exists at all but
+    // the page declares itself a video page via `og:video` (exactly
+    // `flow_page_level_media_fallback`'s gate) — and since a drawn preview IS
+    // the mpv link, the frame must reach the decode pipe or the affordance
+    // stays a bare text line forever.
+    let mut has_video = false;
+    let mut has_media = false;
+    for id in dom.descendants(crate::dom::DOCUMENT) {
+        match dom.tag_name(id) {
+            Some("video") => {
+                has_video = true;
+                has_media = true;
+            }
+            Some("audio") => has_media = true,
+            _ => {}
+        }
+    }
+    // Mirrors the layout gates exactly: a present `<video>` only borrows the
+    // page preview when the page IS a video page (`flow_media`'s
+    // `plays_this_page` + `page_declares_video` — a homepage autoplay hero
+    // renders no representation, so its logo og:image must not decode as a
+    // phantom preview either), and the page-level fallback needs the same
+    // declaration with no media element at all.
+    let page_is_video = crate::layout::page_declares_video(dom);
+    if page_is_video
+        && (has_video || !has_media)
         && let Some(preview) = crate::layout::page_preview_image(dom, base)
         && !urls.contains(&preview)
     {
@@ -5215,6 +5266,43 @@ mod tests {
         drop(response.live.take());
     }
 
+    #[test]
+    fn a_subtree_patch_keeps_the_documents_rem_basis() {
+        // The size-fighting bug: a patch fragment re-parses STANDALONE, so its
+        // synthesized root reset the `rem` basis to 16px — rem lengths inside
+        // an incremental patch resolved 1.6× larger than the full parse on a
+        // 62.5%-root page (archive.org's `minmax(16rem,1fr)` tile grid flipped
+        // 3↔5 columns between live updates and the first full resync).
+        // `serialize_patch` now carries the real root on an `<html>` shell and
+        // the boundary's inherited font-size resolved to px.
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<html style="font-size:62.5%"><body><div id="b"><div style="width:30rem"><img src="/x.jpg" style="width:100%"></div></div></body></html>"#,
+        );
+        let b = dom.get_by_id("b").unwrap();
+        dom.set_attr(b, "data-trust-node", "42");
+        let frag = dom.serialize_patch(b, &Default::default());
+        assert!(
+            frag.starts_with("<html style=\"font-size:10px;\">"),
+            "the shell carries the document's rem basis: {frag}"
+        );
+        let url = parse_url("https://example.com/").unwrap();
+        let mut images = crate::layout::ImageSizes::new();
+        images.insert("https://example.com/x.jpg".to_owned(), (10, 5));
+        let laid =
+            lay_subtree_patch(&url, frag.as_bytes(), 200, (200, 64), &images, 42, false).unwrap();
+        let img_w = laid
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|i| i.image.is_some())
+            .map(|i| i.width)
+            .expect("the image lays");
+        assert_eq!(
+            img_w, 38,
+            "30rem at the 10px root = 300px = 38 cells, not 60"
+        );
+    }
+
     /// Lay out a (post-JS) HTML FILE and dump the rows + carousels, to see
     /// exactly what reaches the screen. `TRUST_LAYOUT_FILE=<html> [TRUST_DIAG_VP=WxH]
     /// [TRUST_LAYOUT_GREP=substr] cargo test layout_dump -- --ignored --nocapture`
@@ -5226,10 +5314,13 @@ mod tests {
             return;
         };
         let html = std::fs::read(&path).unwrap();
-        let w: usize = std::env::var("TRUST_DIAG_VP")
+        let (w, vh): (usize, usize) = std::env::var("TRUST_DIAG_VP")
             .ok()
-            .and_then(|s| s.split_once('x').and_then(|(w, _)| w.parse().ok()))
-            .unwrap_or(80);
+            .and_then(|s| {
+                s.split_once('x')
+                    .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().unwrap_or(0))))
+            })
+            .unwrap_or((80, 0));
         let grep = std::env::var("TRUST_LAYOUT_GREP").ok();
         let url = parse_url("https://store.steampowered.com/").unwrap();
         // TRUST_LAYOUT_IMG_CELL=WxH: seed EVERY <img>'s src with a decoded cell
@@ -5258,7 +5349,7 @@ mod tests {
                 }
             }
         }
-        let doc = parse_seeded(&url, "text/html", &html, w, 0, None, &images);
+        let doc = parse_seeded(&url, "text/html", &html, w, vh, None, &images);
         // Legend: reproduce the layout DOM (same NodeIds) so we can map an
         // item's `node` back to its element (tag/id/class + box/flex props).
         let mut legend_dom = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
@@ -5301,6 +5392,33 @@ mod tests {
                 "  rows {}..{} band {}..{} width {} stops {:?}",
                 c.start, c.end, c.left, c.right, c.width, c.stops
             );
+        }
+        println!("--- {} regions ---", doc.regions.len());
+        for (i, rg) in doc.regions.iter().enumerate() {
+            println!(
+                "  #{i} node n{} live={:?} start_row {} left {} {}x{} buffer {} rows",
+                rg.node,
+                rg.live_node,
+                rg.start_row,
+                rg.left,
+                rg.width,
+                rg.height,
+                rg.buffer.len()
+            );
+            if let Some(g) = &grep {
+                for (ri, row) in rg.buffer.iter().enumerate() {
+                    let s: String = row
+                        .items
+                        .iter()
+                        .map(|it| {
+                            format!("[c{} w{} n{} {:?}] ", it.col, it.width, it.node, it.text)
+                        })
+                        .collect();
+                    if s.to_lowercase().contains(&g.to_lowercase()) {
+                        println!("    buf r{ri}: {s}");
+                    }
+                }
+            }
         }
         // TRUST_LAYOUT_NODES=n1,n2,…: also print the legend for ancestors of
         // these nodes (parent chain), to see the flex containers above an item.
