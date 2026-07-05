@@ -194,6 +194,11 @@ pub struct Dom {
     /// node is re-visited by every measurement pass that re-descends through it),
     /// so without this the visibility test is the layout's most-repeated work.
     hidden_cache: RefCell<NodeCache<bool>>,
+    /// Memoized computed `font-size` in CSS px for the current epoch (see
+    /// `font_px`): every `em`/`rem` length resolution consults it, and the
+    /// numeric composition walks ancestors, so it's cached like the other
+    /// per-element cascade reads.
+    font_cache: RefCell<NodeCache<f32>>,
     /// The CSS-pixel viewport (`cols*cell_px`, `rows*cell_px`) used to
     /// evaluate `@media` queries when the cascade is built; `(0, 0)` = unknown
     /// (width/height queries then conservatively don't match, as if skipped).
@@ -393,6 +398,7 @@ impl Dom {
             matched_cache: RefCell::new(NodeCache::default()),
             cascaded_cache: RefCell::new(NodeCache::default()),
             hidden_cache: RefCell::new(NodeCache::default()),
+            font_cache: RefCell::new(NodeCache::default()),
             viewport_px: (0, 0),
             scroll_state: FxHashMap::default(),
             scroll_changes: Vec::new(),
@@ -860,6 +866,12 @@ impl Dom {
         let from = self.parent_composed(boundary).unwrap_or(DOCUMENT);
         let mut style = String::new();
         for &p in INHERITED_LAYOUT_PROPS {
+            // font-size is carried RESOLVED below — its declared string
+            // (`62.5%`, `1.4rem`) would re-resolve against the fragment's
+            // synthesized root and land on the wrong number.
+            if p == "font-size" {
+                continue;
+            }
             if let Some(v) = self.computed_value(from, p) {
                 style.push_str(p);
                 style.push(':');
@@ -867,6 +879,9 @@ impl Dom {
                 style.push(';');
             }
         }
+        // The boundary's inherited font-size, resolved to px — the `em` basis
+        // for everything inside the fragment.
+        style.push_str(&format!("font-size:{}px;", self.font_px(from)));
         // text-decoration PROPAGATES (it doesn't inherit), so carry the
         // accumulated lines entering the boundary explicitly.
         let (underline, strike) = self.text_decoration(from);
@@ -880,8 +895,16 @@ impl Dom {
             }
             style.push(';');
         }
+        // The fragment re-parses STANDALONE, so its synthesized root would
+        // reset the `rem` basis to the 16px initial — carry the document's
+        // real root font-size on an explicit `<html>` shell (the parser
+        // adopts a leading `<html>`'s attributes as the root's). This is
+        // what kept archive.org's `minmax(16rem, 1fr)` tile grid flipping
+        // between 3 and 5 columns: full parses saw the 10px root, patches
+        // didn't ("size-fighting").
         format!(
-            "<div data-trust-frag=\"\" style=\"{}\">{}</div>",
+            "<html style=\"font-size:{}px;\"><body><div data-trust-frag=\"\" style=\"{}\">{}</div></body></html>",
+            self.root_font_px(),
             escape_attr(&style),
             self.serialize_live(boundary, clickable)
         )
@@ -983,6 +1006,88 @@ impl Dom {
             },
         };
         matches!(v.trim().to_ascii_lowercase().as_str(), "auto" | "scroll")
+    }
+
+    /// A horizontal scroll container (`overflow-x: auto|scroll`) — the strip
+    /// axis of a carousel.
+    pub fn is_hscroll_container(&self, id: NodeId) -> bool {
+        let v = match self.computed_style(id, "overflow-x") {
+            Some(v) => v,
+            None => match self.computed_style(id, "overflow") {
+                Some(sh) => sh.split_whitespace().next().unwrap_or("").to_string(),
+                None => return false,
+            },
+        };
+        matches!(v.trim().to_ascii_lowercase().as_str(), "auto" | "scroll")
+    }
+
+    /// Whether `id` clips overflow (`hidden`/`clip`, the non-scrolling values —
+    /// CSS Overflow L3 §2) on one axis: the `overflow-x`/`-y` longhand wins,
+    /// else the `overflow` shorthand (one value = both axes).
+    pub fn axis_clips_overflow(&self, id: NodeId, vertical: bool) -> bool {
+        let long = if vertical { "overflow-y" } else { "overflow-x" };
+        let v = match self.computed_style(id, long) {
+            Some(v) => v,
+            None => match self.computed_style(id, "overflow") {
+                Some(sh) => {
+                    let mut t = sh.split_whitespace();
+                    let x = t.next().unwrap_or("");
+                    let y = t.next().unwrap_or(x);
+                    (if vertical { y } else { x }).to_string()
+                }
+                None => return false,
+            },
+        };
+        matches!(v.trim().to_ascii_lowercase().as_str(), "hidden" | "clip")
+    }
+
+    /// The viewport is "locked" when the root (`html`/`body`) clips overflow on
+    /// either axis — CSS Overflow L3 §3.1: the root element's used overflow
+    /// propagates to the viewport, so an `overflow:hidden`/`clip` there stops
+    /// the viewport scrolling the document and delegates it to a descendant
+    /// scroll container (the app-shell / locked-body SPA pattern).
+    pub fn node_clips_overflow(&self, id: NodeId) -> bool {
+        self.axis_clips_overflow(id, true) || self.axis_clips_overflow(id, false)
+    }
+
+    /// Whether `id` is the page's PRINCIPAL scroll container — the one a LOCKED
+    /// viewport delegates document scrolling to (the SPA pattern where
+    /// `html`/`body` are `overflow:hidden` and one inner `overflow:auto` box
+    /// carries the main flow, e.g. Twitch's `root-scrollable` inside `<main>`).
+    /// Such a box is NOT virtualized into an inner scroll region: it flows into
+    /// the document so the page scroll scrolls it, exactly as a browser scrolls
+    /// that panel as "the page". Read purely from the page's own declarations:
+    /// CSS Overflow L3 §3.1 (root/body overflow propagation) + HTML sectioning
+    /// landmarks (`<main>` = the dominant content; `<nav>`/`<aside>` =
+    /// complementary) — never the host.
+    ///
+    /// ONE upward walk from `id` to the root: a scroll-container ancestor ⇒
+    /// `id` is NESTED ⇒ a real inner region; the nearest sectioning landmark
+    /// above `id` decides main-flow (`<main>`) vs complementary sidebar
+    /// (`<nav>`/`<aside>`, stays a region); and the viewport must be LOCKED.
+    /// Principal ⇔ locked AND (inside `<main>` OR the page declares no
+    /// enclosing landmark at all, i.e. this outermost scroller carries the flow).
+    pub fn is_principal_scroller(&self, id: NodeId) -> bool {
+        let mut viewport_locked = false;
+        let mut in_main = false;
+        let mut landmark_seen = false;
+        let mut cur = self.parent_composed(id);
+        while let Some(p) = cur {
+            if self.is_scroll_container(p) || self.is_hscroll_container(p) {
+                return false; // a scroll-container ancestor ⇒ nested inner region
+            }
+            match self.tag_name(p) {
+                Some("main") if !landmark_seen => {
+                    in_main = true;
+                    landmark_seen = true;
+                }
+                Some("nav" | "aside") if !landmark_seen => landmark_seen = true,
+                Some("html" | "body") if self.node_clips_overflow(p) => viewport_locked = true,
+                _ => {}
+            }
+            cur = self.parent_composed(p);
+        }
+        viewport_locked && (in_main || !landmark_seen)
     }
 
     /// Parse a full HTML document into a fresh arena.
@@ -1754,8 +1859,8 @@ impl Dom {
         .any(|p| {
             self.computed_style(id, p)
                 .as_deref()
-                .and_then(crate::layout::css_length_em)
-                .is_some_and(|em| em > 0.0)
+                .and_then(|v| crate::layout::css_length_px(v, crate::layout::Units::of(self, id)))
+                .is_some_and(|px| px > 0.0)
         })
     }
 
@@ -1764,7 +1869,7 @@ impl Dom {
     /// width. The accessible-name fallback in `serialize_live_node` uses this to
     /// honor an author's icon-sized clip box — a control clipped to its icon
     /// never paints its `aria-label` (CSS Overflow §overflow). `width:auto`/`%`
-    /// (`css_length_em` → `None`) is not a clip box, so the name shows.
+    /// (`css_length_px` → `None`) is not a clip box, so the name shows.
     fn name_is_clipped_out(&self, id: NodeId, label: &str) -> bool {
         // Resolve `var()` — the live (pre-bake) cascade stores raw values, and a
         // styled-components control sizes its icon box with a custom property
@@ -1783,14 +1888,15 @@ impl Dom {
         ) {
             return false;
         }
-        let Some(width_em) = self
+        let u = crate::layout::Units::of(self, id);
+        let Some(width_px) = self
             .computed_value_resolved(id, "width")
-            .and_then(|v| crate::layout::css_length_em(&v))
+            .and_then(|v| crate::layout::css_length_px(&v, u))
         else {
             return false;
         };
-        // One em ≈ 2 terminal cells; a cell ≈ one unit of display width.
-        crate::layout::display_width(label) as f32 > width_em * 2.0
+        // A cell ≈ one unit of display width.
+        crate::layout::display_width(label) as f32 > width_px / u.cell_w
     }
 
     /// Whether `id` is a content-less full-area POSITIONED OVERLAY — a click
@@ -1862,6 +1968,59 @@ impl Dom {
         self.cascaded(id, "font-size")
             .as_deref()
             .and_then(classify_font_size_zero)
+    }
+
+    /// The document's root element (`<html>`) — the element `rem` units and
+    /// `:root` refer to.
+    pub(crate) fn document_element(&self) -> Option<NodeId> {
+        self.child_iter(DOCUMENT)
+            .find(|&c| self.tag_name(c).is_some())
+    }
+
+    /// The root element's computed `font-size` in CSS px — the `rem` basis.
+    /// Twitch-idiom sites set `html { font-size: 62.5% }` so 1rem = 10px;
+    /// resolving rem against a fixed 16px inflated every rem length 1.6×.
+    pub(crate) fn root_font_px(&self) -> f32 {
+        self.document_element()
+            .map_or(FONT_SIZE_INITIAL, |r| self.font_px(r))
+    }
+
+    /// The element's COMPUTED `font-size` in CSS px (CSS Fonts §6.1) — the
+    /// `em` basis, and (on the root) the `rem` basis. Numeric composition,
+    /// not string inheritance: the own declaration resolves against the
+    /// PARENT's computed size (`%`/`em` multiply it, `rem` multiplies the
+    /// root's, absolute units and keywords stand alone); with no declaration
+    /// the UA factor for the tag applies (headings, `<small>`/`<big>`,
+    /// `<sub>`/`<sup>`), else the parent's number is inherited as-is.
+    /// Unresolvable declarations (`calc()`, dangling `var()`) inherit —
+    /// fail-open, like the rest of the cascade. Memoized per epoch.
+    pub(crate) fn font_px(&self, id: NodeId) -> f32 {
+        if let Some(&v) = self.font_cache.borrow().get(id, self.epoch) {
+            return v;
+        }
+        let parent_px = match self.nodes[id].parent {
+            Some(p) if p != DOCUMENT => self.font_px(p),
+            _ => FONT_SIZE_INITIAL,
+        };
+        // `rem` on the root element itself resolves against the initial
+        // value (a self-reference otherwise, per CSS Values §6.2.1).
+        let root_px = if Some(id) == self.document_element() {
+            FONT_SIZE_INITIAL
+        } else {
+            self.root_font_px()
+        };
+        let v = self
+            .cascaded(id, "font-size")
+            .map(|raw| self.resolve_vars(id, &raw))
+            .and_then(|decl| font_size_px(&decl, parent_px, root_px))
+            .or_else(|| {
+                self.tag_name(id)
+                    .and_then(ua_font_factor)
+                    .map(|f| f * parent_px)
+            })
+            .unwrap_or(parent_px);
+        self.font_cache.borrow_mut().put(id, self.epoch, v);
+        v
     }
 
     fn computed_cache_get(&self, id: NodeId, idx: usize) -> Option<Option<String>> {
@@ -2427,17 +2586,24 @@ impl Dom {
             .flatten()
             .any(|r| r.decls.iter().any(|(k, _)| k == "opacity"));
         // The hover probes: only rules that could change what we PAINT under a
-        // moved hover chain. Untracked-only declarations (color, background —
-        // nothing the terminal renders) build no probe, so `set_hover_chain`
+        // moved hover chain. Untracked-only declarations (color — nothing the
+        // terminal renders) build no probe, so `set_hover_chain`
         // short-circuits to "unaffected" on the common color-only web.
+        // Backgrounds are tracked for layout2's cell compositor (opaque
+        // fills), but under the flow engine they paint nothing — a hover
+        // background must not cost a relayout there. Collapses to plain
+        // `is_tracked` when layout2 becomes the engine (P9).
         index.hover_probes = index
             .scopes
             .values()
             .flatten()
             .filter(|r| {
-                r.decls
-                    .iter()
-                    .any(|(k, _)| k == "content" || k.starts_with("--") || is_tracked(k))
+                r.decls.iter().any(|(k, _)| {
+                    if k == "background-color" || k == "background-image" {
+                        return crate::layout2::enabled();
+                    }
+                    k == "content" || k.starts_with("--") || is_tracked(k)
+                })
             })
             .flat_map(hover_probes_of)
             .collect();
@@ -4832,6 +4998,10 @@ const PROPS: &[PropDef] = &[
     prop("text-decoration", false, true),
     prop("text-decoration-line", false, true),
     prop("content", false, false),
+    // CSS Box Sizing 3: whether declared width/height include border+padding.
+    // The modern web's near-universal `*{box-sizing:border-box}` reset makes
+    // this load-bearing for any width math (consumed by layout2's §10.3.3).
+    prop("box-sizing", false, true),
     prop("width", false, true),
     prop("max-width", false, true),
     prop("min-width", false, true),
@@ -4852,8 +5022,28 @@ const PROPS: &[PropDef] = &[
     prop("overflow", false, true),
     prop("overflow-x", false, true),
     prop("overflow-y", false, true),
+    // CSS Scroll Snap 1: a scroll container only card-SNAPS when it declares
+    // `scroll-snap-type` (mandatory/proximity); otherwise it scrolls freely.
+    // `scroll-snap-align` (on the items) is the snap-position alignment.
+    prop("scroll-snap-type", false, true),
+    prop("scroll-snap-align", false, true),
     prop("cursor", false, false),
+    // CSS Backgrounds 3: the layout paints no color, but a declared background
+    // is an OPAQUE FILL in the cell compositor (layout2 P4 — Appendix E paint
+    // order: a modal's background erases the page cells under its rect).
+    // `background` expands to these two in `expand_box_shorthand`.
+    prop("background-color", false, true),
+    prop("background-image", false, true),
     prop("position", false, true),
+    // CSS Transforms 1: only the TRANSLATE functions are consumed (a paint
+    // offset on out-of-flow composited boxes — `layout::translate_offset`);
+    // scale/rotate/matrix stay unapplied (visual-only deviation). Baked so
+    // the live-page re-parse keeps a JS-set slide-in offset.
+    prop("transform", false, true),
+    // CSS Transforms 2 individual transform property (the modern
+    // `translate: x y`); like `transform`, any non-none value forms a
+    // stacking context and a containing block for out-of-flow descendants.
+    prop("translate", false, true),
     prop("z-index", false, true),
     prop("top", false, true),
     prop("right", false, true),
@@ -4873,6 +5063,20 @@ const PROPS: &[PropDef] = &[
     prop("grid-auto-rows", false, true),
     prop("grid-column", false, true),
     prop("grid-row", false, true),
+    // css-grid-1 placement longhands + named areas (consumed by layout2's
+    // real §8 placement; the shorthands above stay for older content).
+    prop("grid-column-start", false, true),
+    prop("grid-column-end", false, true),
+    prop("grid-row-start", false, true),
+    prop("grid-row-end", false, true),
+    prop("grid-area", false, true),
+    prop("grid-template-areas", false, true),
+    // css-align-3 self/items alignment (flex + grid item alignment).
+    prop("align-self", false, true),
+    prop("justify-self", false, true),
+    prop("justify-items", false, true),
+    prop("place-self", false, true),
+    prop("place-items", false, true),
     prop("justify-content", false, true),
     prop("align-items", false, true),
     prop("order", false, true),
@@ -5003,6 +5207,96 @@ fn classify_font_size_zero(v: &str) -> Option<bool> {
         "em" | "ex" | "ch" | "lh" | "%" => None,
         _ => Some(false),
     }
+}
+
+/// The initial `font-size` (CSS `medium`): 16 CSS px in every browser.
+pub(crate) const FONT_SIZE_INITIAL: f32 = 16.0;
+
+/// Whether a `font` shorthand token is the `<font-size>` component: a
+/// numeric length (`16px`, `1.2em`) or an absolute/relative size keyword.
+/// (Weight numbers are matched by the shorthand's weight arm first.)
+fn font_size_token(t: &str) -> bool {
+    matches!(
+        t,
+        "xx-small"
+            | "x-small"
+            | "small"
+            | "medium"
+            | "large"
+            | "x-large"
+            | "xx-large"
+            | "xxx-large"
+            | "larger"
+            | "smaller"
+    ) || t
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+}
+
+/// The font-size factor the UA stylesheet gives a tag (the HTML spec's
+/// rendering section): headings in em, `<small>`/`<sub>`/`<sup>` `smaller`,
+/// `<big>` `larger` (the 1.2 step browsers converged on).
+fn ua_font_factor(tag: &str) -> Option<f32> {
+    Some(match tag {
+        "h1" => 2.0,
+        "h2" => 1.5,
+        "h3" => 1.17,
+        "h4" => 1.0,
+        "h5" => 0.83,
+        "h6" => 0.67,
+        "small" | "sub" | "sup" => 1.0 / 1.2,
+        "big" => 1.2,
+        _ => return None,
+    })
+}
+
+/// A `font-size` declaration in CSS px, resolved against the inherited
+/// (`parent`) and root sizes per CSS Fonts §6.1: the absolute keywords map
+/// through the medium-relative table, `larger`/`smaller` step the inherited
+/// size by 1.2, `em`/`%`/`ex`/`ch` multiply the inherited size, `rem` the
+/// root's, and the physical units convert at CSS's fixed ratios (96px/in).
+/// `None` (→ inherit) for anything unresolvable: `calc()`, a dangling
+/// `var()`, negative sizes, garbage.
+fn font_size_px(value: &str, parent: f32, root: f32) -> Option<f32> {
+    let v = value.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "xx-small" => return Some(FONT_SIZE_INITIAL * 3.0 / 5.0),
+        "x-small" => return Some(FONT_SIZE_INITIAL * 3.0 / 4.0),
+        "small" => return Some(FONT_SIZE_INITIAL * 8.0 / 9.0),
+        "medium" => return Some(FONT_SIZE_INITIAL),
+        "large" => return Some(FONT_SIZE_INITIAL * 6.0 / 5.0),
+        "x-large" => return Some(FONT_SIZE_INITIAL * 3.0 / 2.0),
+        "xx-large" => return Some(FONT_SIZE_INITIAL * 2.0),
+        "xxx-large" => return Some(FONT_SIZE_INITIAL * 3.0),
+        "larger" => return Some(parent * 1.2),
+        "smaller" => return Some(parent / 1.2),
+        "inherit" | "unset" | "revert" => return Some(parent),
+        "initial" => return Some(FONT_SIZE_INITIAL),
+        _ => {}
+    }
+    let split = v
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+        .unwrap_or(v.len());
+    let n: f32 = v[..split].parse().ok()?;
+    if n < 0.0 || !n.is_finite() {
+        return None;
+    }
+    Some(match v[split..].trim() {
+        "em" => n * parent,
+        "rem" => n * root,
+        "%" => n / 100.0 * parent,
+        // x-height / zero-advance ≈ half the em absent real font metrics.
+        "ex" | "ch" => n * 0.5 * parent,
+        "px" | "" => n,
+        "pt" => n * 4.0 / 3.0,
+        "pc" => n * 16.0,
+        "in" => n * 96.0,
+        "cm" => n * 96.0 / 2.54,
+        "mm" => n * 96.0 / 25.4,
+        "q" => n * 96.0 / 101.6,
+        _ => return None,
+    })
 }
 
 /// Below this effective opacity an element's paint is suppressed (laid out but
@@ -5190,6 +5484,46 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             ("flex-basis".to_string(), b),
         ];
     }
+    // `font`: `<style> || <variant> || <weight> || <stretch> <size>
+    // [/ <line-height>] <family>` (CSS Fonts §6.3) — expand the components we
+    // track. The size is the first size-shaped token; everything after it is
+    // line-height/family (untracked, ignored). System-font keywords
+    // (`caption`, `menu`, …) expand to nothing.
+    if prop == "font" {
+        let mut out = Vec::new();
+        for tok in value.split_whitespace() {
+            let t = tok.split('/').next().unwrap_or(tok);
+            match t.to_ascii_lowercase().as_str() {
+                "italic" | "oblique" => out.push(("font-style".to_string(), t.to_string())),
+                "bold" | "bolder" | "lighter" => {
+                    out.push(("font-weight".to_string(), t.to_string()));
+                }
+                w if w
+                    .parse::<u16>()
+                    .is_ok_and(|n| (100..=900).contains(&n) && n % 100 == 0) =>
+                {
+                    out.push(("font-weight".to_string(), t.to_string()));
+                }
+                s if font_size_token(s) => {
+                    out.push(("font-size".to_string(), t.to_string()));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        return out;
+    }
+    // `background`: only the color and the image longhands are consumed (the
+    // layout paints no color, but a declared background is an OPAQUE FILL in
+    // layout2's cell compositor). Classification is by grammar EXCLUSION —
+    // CSS Backgrounds 3 §3.10's <bg-layer> idents all come from closed
+    // keyword sets, so a remaining ident/function in the FINAL layer (the
+    // only one that may carry a color) is the <background-color>. The
+    // shorthand RESETS omitted longhands (color ← transparent, image ← none),
+    // which the cascade needs to order `background:none` after a color rule.
+    if prop == "background" {
+        return expand_background(value);
+    }
     // `list-style: <type> || <position> || <image>` — we track the type and
     // position keywords (a bare `none` counts as the type, per the shorthand
     // grammar; the image and any URL are ignored).
@@ -5207,6 +5541,167 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         return out;
     }
     vec![(prop.to_string(), value.to_string())]
+}
+
+/// `background` shorthand → the two tracked longhands (see the call site).
+fn expand_background(value: &str) -> Vec<(String, String)> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Vec::new();
+    }
+    // The raw shorthand rides along: it's untracked (sheets filter it), but
+    // the inline-style path stores untracked props for getComputedStyle.
+    let mut out = vec![("background".to_string(), v.to_string())];
+    // CSS-wide keywords apply to every longhand of the shorthand.
+    if matches!(
+        v.to_ascii_lowercase().as_str(),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    ) {
+        out.push(("background-color".to_string(), v.to_string()));
+        out.push(("background-image".to_string(), v.to_string()));
+        return out;
+    }
+    let mut color: Option<&str> = None;
+    let mut image: Option<&str> = None;
+    let layers = split_top_level_commas(v);
+    let last = layers.len() - 1;
+    for (i, layer) in layers.iter().enumerate() {
+        for tok in split_value_tokens(layer) {
+            let t = tok.to_ascii_lowercase();
+            if image.is_none() && bg_image_token(&t) {
+                image = Some(tok);
+            } else if i == last && color.is_none() && bg_color_token(&t) {
+                color = Some(tok);
+            }
+        }
+    }
+    out.push((
+        "background-color".to_string(),
+        color.unwrap_or("transparent").to_string(),
+    ));
+    out.push((
+        "background-image".to_string(),
+        image.unwrap_or("none").to_string(),
+    ));
+    out
+}
+
+/// Split a comma-separated list at paren-depth 0 (`linear-gradient(a, b)`
+/// stays one piece).
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// Split a component value into tokens at top-level whitespace and `/`
+/// (the position/size separator), keeping function calls whole.
+fn split_value_tokens(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start: Option<usize> = None;
+    for (i, b) in s.bytes().enumerate() {
+        let boundary = depth == 0 && (b.is_ascii_whitespace() || b == b'/');
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if boundary {
+            if let Some(st) = start.take() {
+                out.push(&s[st..i]);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(st) = start {
+        out.push(&s[st..]);
+    }
+    out
+}
+
+/// Whether a (lowercased) token is a `<bg-image>` value.
+fn bg_image_token(t: &str) -> bool {
+    t.starts_with("url(")
+        || t.starts_with("image(")
+        || t.starts_with("image-set(")
+        || t.starts_with("-webkit-image-set(")
+        || t.starts_with("cross-fade(")
+        || t.contains("gradient(")
+}
+
+/// Whether a (lowercased) token can only be the `<background-color>` of a
+/// `background` shorthand layer — everything the other components' closed
+/// keyword/value sets do not claim (CSS Backgrounds 3 §3.10 grammar).
+fn bg_color_token(t: &str) -> bool {
+    const NOT_COLOR: &[&str] = &[
+        // <repeat-style>, <attachment>, <box>, <position>/<bg-size> keywords.
+        "repeat",
+        "repeat-x",
+        "repeat-y",
+        "no-repeat",
+        "space",
+        "round",
+        "scroll",
+        "fixed",
+        "local",
+        "border-box",
+        "padding-box",
+        "content-box",
+        "text",
+        "center",
+        "top",
+        "bottom",
+        "left",
+        "right",
+        "auto",
+        "cover",
+        "contain",
+        "none",
+    ];
+    if t.is_empty() || NOT_COLOR.contains(&t) {
+        return false;
+    }
+    // Lengths/percentages/numbers are position/size components.
+    if t.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '+' || c == '.') {
+        return false;
+    }
+    if let Some(f) = t.split('(').next().filter(|_| t.contains('(')) {
+        // Function colors only; var()/calc()/position functions are not
+        // resolvable as a color here.
+        return matches!(
+            f,
+            "rgb"
+                | "rgba"
+                | "hsl"
+                | "hsla"
+                | "hwb"
+                | "lab"
+                | "lch"
+                | "oklab"
+                | "oklch"
+                | "color"
+                | "color-mix"
+                | "light-dark"
+        );
+    }
+    // '#rrggbb', 'transparent', 'currentcolor', or a named color — the only
+    // idents the grammar leaves.
+    true
 }
 
 /// Split a value on the first `/` at paren-depth 0 (so a `minmax(a, b)` or
@@ -7491,6 +7986,81 @@ mod tests {
         assert!(html.contains("light sec stays"), "{html}");
         assert!(!html.contains("doc target"), "{html}");
         assert!(html.contains("shadow shown"), "{html}");
+    }
+
+    #[test]
+    fn font_px_composes_the_cascade_numerically() {
+        // Computed font-size is NUMERIC composition (CSS Fonts §6.1), not
+        // string inheritance: % and em multiply the parent's computed size,
+        // rem multiplies the root's, keywords map through the medium table,
+        // and headings get the UA factor. The root here is the Twitch idiom
+        // `html{font-size:62.5%}` = 10px — the rem basis that a fixed 16px
+        // inflated 1.6× (the hero-band bug).
+        let dom = Dom::parse_document(
+            r##"<html style="font-size:62.5%"><body>
+              <div id=a style="font-size:1.5em">
+                <p id=b style="font-size:150%"><span id=c style="font-size:2rem">x</span></p>
+              </div>
+              <h2 id=d>h</h2>
+              <div id=e style="font-size:x-large">k</div>
+              <div id=f>plain</div>
+            </body></html>"##,
+        );
+        let root = dom.document_element().unwrap();
+        assert_eq!(dom.font_px(root), 10.0, "62.5% of the 16px initial");
+        assert_eq!(dom.root_font_px(), 10.0);
+        let a = dom.get_by_id("a").unwrap();
+        assert_eq!(dom.font_px(a), 15.0, "1.5em of the inherited 10px");
+        let b = dom.get_by_id("b").unwrap();
+        assert_eq!(dom.font_px(b), 22.5, "150% of the parent's 15px");
+        let c = dom.get_by_id("c").unwrap();
+        assert_eq!(dom.font_px(c), 20.0, "2rem = 2 × the 10px root, not 32px");
+        let d = dom.get_by_id("d").unwrap();
+        assert_eq!(
+            dom.font_px(d),
+            15.0,
+            "h2 = the UA 1.5em of the inherited 10px"
+        );
+        let e = dom.get_by_id("e").unwrap();
+        assert_eq!(dom.font_px(e), 24.0, "x-large = 3/2 of medium, absolute");
+        let f = dom.get_by_id("f").unwrap();
+        assert_eq!(dom.font_px(f), 10.0, "no declaration inherits the number");
+    }
+
+    #[test]
+    fn the_font_shorthand_expands_its_tracked_components() {
+        // CSS Fonts §6.3: `font: <style>||<weight> <size>[/<line-height>]
+        // <family>` — the tracked longhands come out of the shorthand; the
+        // size stops the scan (everything after is line-height/family).
+        let dom = Dom::parse_document(
+            r##"<body><div id=a style="font: italic bold 14px/1.4 sans-serif">x</div>
+            <div id=b style="font: 62.5% Arial, sans-serif">y</div></body>"##,
+        );
+        let a = dom.get_by_id("a").unwrap();
+        assert_eq!(dom.computed_value(a, "font-size").as_deref(), Some("14px"));
+        assert_eq!(
+            dom.computed_value(a, "font-weight").as_deref(),
+            Some("bold")
+        );
+        assert_eq!(
+            dom.computed_value(a, "font-style").as_deref(),
+            Some("italic")
+        );
+        assert_eq!(dom.font_px(a), 14.0);
+        let b = dom.get_by_id("b").unwrap();
+        assert_eq!(dom.computed_value(b, "font-size").as_deref(), Some("62.5%"));
+        assert_eq!(dom.font_px(b), 10.0, "62.5% of the inherited 16px");
+    }
+
+    #[test]
+    fn font_px_follows_mutations_across_epochs() {
+        // The per-epoch memo must not serve stale sizes after a style write
+        // (the live page mutates `el.style.fontSize`).
+        let mut dom = Dom::parse_document(r##"<body><div id=a>x</div></body>"##);
+        let a = dom.get_by_id("a").unwrap();
+        assert_eq!(dom.font_px(a), 16.0);
+        dom.set_attr(a, "style", "font-size: 62.5%");
+        assert_eq!(dom.font_px(a), 10.0, "the memo refreshed with the epoch");
     }
 
     #[test]

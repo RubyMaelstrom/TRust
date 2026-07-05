@@ -982,9 +982,12 @@ impl App {
     /// Install the terminal-queried graphics picker (once, at startup).
     pub fn set_picker(&mut self, picker: Picker) {
         self.auto_protocol = picker.protocol_type();
-        // Publish the real cell height so the render pass converts an overflow-clip
-        // box's declared px height back to the same rows the JS geometry (which
-        // measures rows × this cell size) reported — see `layout::set_cell_px_h`.
+        // Publish the real cell box so CSS px lengths convert to the same
+        // physical extent a browser gives them on THIS terminal font, and so
+        // the render pass converts an overflow-clip box's declared px height
+        // back to the same rows the JS geometry (which measures rows × this
+        // cell size) reported — see `layout::set_cell_px_w`/`set_cell_px_h`.
+        crate::layout::set_cell_px_w(picker.font_size().width);
         crate::layout::set_cell_px_h(picker.font_size().height);
         self.picker = picker;
     }
@@ -2257,9 +2260,21 @@ impl App {
                     self.relayout_browser();
                     self.status = String::from("Borders off (the default): borders aren't drawn.");
                 }
+                (Some("layout2"), Some("on")) => {
+                    crate::layout2::set_enabled(true);
+                    self.relayout_browser();
+                    self.status = String::from(
+                        "layout2 on: the NEW engine (P0 block/inline flow; flex/grid/positioned still stack).",
+                    );
+                }
+                (Some("layout2"), Some("off")) => {
+                    crate::layout2::set_enabled(false);
+                    self.relayout_browser();
+                    self.status = String::from("layout2 off (the default): the current engine.");
+                }
                 _ => {
                     self.status = String::from(
-                        "usage: set encoding cp437|utf8 · set image <protocol>|auto · set js on|off · set cookies on|off · set borders on|off",
+                        "usage: set encoding cp437|utf8 · set image <protocol>|auto · set js on|off · set cookies on|off · set borders on|off · set layout2 on|off",
                     )
                 }
             },
@@ -3006,7 +3021,8 @@ impl App {
                     .find_map(|it| it.link.clone().map(|l| (r, l)))
             })
         };
-        let old_offsets: Vec<_> = g.doc.regions.iter().map(|r| (r.node, r.voffset)).collect();
+        let mut old_offsets = Vec::new();
+        Self::collect_region_offsets(&g.doc.regions, &mut old_offsets);
         let meta = g.doc.meta.clone().unwrap_or_default();
         let forms = std::mem::take(&mut g.doc.forms);
         let raw = std::mem::take(&mut g.doc.raw);
@@ -4373,7 +4389,8 @@ impl App {
         doc.blobs = g.doc.blobs.clone();
         // Carry scroll-region scroll positions across the re-layout (restored
         // below, before the selection re-anchor reads the windowed rows).
-        let old_offsets: Vec<_> = g.doc.regions.iter().map(|r| (r.node, r.voffset)).collect();
+        let mut old_offsets = Vec::new();
+        Self::collect_region_offsets(&g.doc.regions, &mut old_offsets);
         g.doc = doc;
         // A live re-render carries a FRESH baked scroll signal, so a page-pinned
         // region keeps the page's position (prefer_signal = true); only an
@@ -4622,6 +4639,15 @@ impl App {
         // newly-arrived chat emote routes to this region (not the full document)
         // even though the last full render predates it.
         rg.image_urls = rp.image_urls.clone();
+        // Merge the fragment's nested scroll-clip boxes so `sync_region_state`
+        // pushes a fresh `clientHeight` for a scroller living INSIDE this region
+        // (replace-or-insert by node; a full re-lay still rebuilds the set).
+        for &(node, ch, cw) in &rp.scroll_clips {
+            match g.doc.scroll_clips.iter_mut().find(|c| c.0 == node) {
+                Some(c) => *c = (node, ch, cw),
+                None => g.doc.scroll_clips.push((node, ch, cw)),
+            }
+        }
         // Re-anchor an in-region selection by target in the new windowed content.
         if let Some(t) = selected_target {
             g.sel_item = Self::find_item_like(&g.doc, &t).or(g.sel_item);
@@ -4938,16 +4964,30 @@ impl App {
         prefer_signal: bool,
     ) {
         for rg in regions.iter_mut() {
-            if rg.node == crate::layout::NO_NODE {
-                continue;
-            }
-            // Keep the page's fresh signal on a live re-render.
-            if prefer_signal && rg.voffset_from_page {
-                continue;
-            }
-            if let Some(&(_, voff)) = old.iter().find(|&&(n, _)| n == rg.node) {
+            // Keep the page's fresh signal on a live re-render; else restore the
+            // old offset by node (regions are keyed by their stable element id).
+            if rg.node != crate::layout::NO_NODE
+                && !(prefer_signal && rg.voffset_from_page)
+                && let Some(&(_, voff)) = old.iter().find(|&&(n, _)| n == rg.node)
+            {
                 rg.voffset = voff.min(rg.max_voffset());
             }
+            // Nested scrollers persist too — a scroll region inside another.
+            Self::carry_region_offsets(old, &mut rg.regions, prefer_signal);
+        }
+    }
+
+    /// Flatten every region's `(node, voffset)` — nested scrollers included —
+    /// so the restore above re-seats them all after a full re-layout.
+    fn collect_region_offsets(
+        regions: &[crate::layout::Region],
+        out: &mut Vec<(crate::dom::NodeId, usize)>,
+    ) {
+        for rg in regions {
+            if rg.node != crate::layout::NO_NODE {
+                out.push((rg.node, rg.voffset));
+            }
+            Self::collect_region_offsets(&rg.regions, out);
         }
     }
 
@@ -5224,21 +5264,20 @@ impl App {
     /// (`dir` ±1) and re-anchor the selection to the first card now visible.
     /// Returns whether a carousel handled the key.
     fn scroll_selected_carousel(&mut self, dir: i32) -> bool {
+        // The strip to scroll: the one holding the current selection, else the
+        // one under the mouse cursor (a seamless hover-scroll, like the region
+        // wheel — no injected buttons required; the page defines itself).
+        let Some(idx) = self.carousel_to_scroll() else {
+            return false;
+        };
         let Some(g) = self.browser.as_mut() else {
-            return false;
-        };
-        let Some((row, _)) = g.sel_item else {
-            return false;
-        };
-        let Some(idx) = g.doc.carousels.iter().position(|c| c.contains_row(row)) else {
             return false;
         };
         g.doc.carousels[idx].scroll_cards(dir);
         // Re-anchor onto the first interactive card now in the band, so the
         // highlight stays visible and Enter follows something on screen.
-        let c = &g.doc.carousels[idx];
-        let (start, end, left) = (c.start, c.end, c.left);
-        let target = (start..end).find_map(|r| {
+        let c = g.doc.carousels[idx].clone();
+        let target = (c.start..c.end).find_map(|r| {
             g.doc
                 .rows
                 .get(r)?
@@ -5246,7 +5285,7 @@ impl App {
                 .iter()
                 .enumerate()
                 .find_map(|(i, it)| {
-                    (it.link.is_some() && it.col >= left && c.shows(it.col, it.width))
+                    (it.link.is_some() && it.col >= c.left && c.shows(it.col, it.width))
                         .then_some((r, i))
                 })
         });
@@ -5254,6 +5293,27 @@ impl App {
             g.sel_item = Some(sel);
         }
         true
+    }
+
+    /// The carousel `←/→` should scroll: the one holding the current selection,
+    /// else the one under the mouse cursor (hover-scroll).
+    fn carousel_to_scroll(&self) -> Option<usize> {
+        let g = self.browser.as_ref()?;
+        if let Some((row, _)) = g.sel_item
+            && let Some(idx) = g.doc.carousels.iter().position(|c| c.contains_row(row))
+        {
+            return Some(idx);
+        }
+        let (col, row) = self.last_mouse?;
+        if !self.mouse_in_content_area(col, row) || !g.doc.laid_out() {
+            return None;
+        }
+        let doc_row = g.scroll + row.saturating_sub(self.last_content_area.y) as usize;
+        let local_col = col.saturating_sub(self.last_content_area.x);
+        g.doc
+            .carousels
+            .iter()
+            .position(|c| c.contains_row(doc_row) && local_col >= c.left && local_col < c.right)
     }
 
     /// If the activated item is a generated carousel scroll control (the
@@ -5681,40 +5741,40 @@ impl App {
     /// `overscroll-behavior: contain`, NOT the chaining `auto`). Off any region,
     /// the document scrolls as before. `delta` rows, positive = down.
     fn browser_wheel(&mut self, delta: i64, col: u16, row: u16) {
-        if let Some(idx) = self.region_under(col, row) {
-            let moved = self.scroll_region_by(idx, delta);
+        if let Some(path) = self.region_path_under(col, row) {
             // A user wheel overrides the page's pin: write the new scrollTop back
             // so a conditional chat learns we scrolled and stops following.
-            if moved {
-                let (node, voff) = {
-                    let g = self.browser.as_ref().unwrap();
-                    (g.doc.regions[idx].live_node, g.doc.regions[idx].voffset)
-                };
+            if let Some((node, voff)) = self.scroll_region_path(&path, delta) {
                 self.region_writeback(node, voff);
             }
-            return; // trapped in the region — never chains to the document
+            return; // trapped in the (deepest) region — never chains to the doc
         }
         self.browser_scroll(delta, true);
     }
 
-    /// Scroll region `idx` by `delta` rows (clamped); returns whether it moved.
-    /// A user-driven scroll, so it clears `voffset_from_page` — a later re-wrap of
-    /// the same HTML (resize) preserves THIS offset, not the stale page signal.
-    fn scroll_region_by(&mut self, idx: usize, delta: i64) -> bool {
-        let Some(g) = &mut self.browser else {
-            return false;
-        };
-        let rg = &mut g.doc.regions[idx];
+    /// Scroll the region addressed by `path` (a chain of nested-region indices,
+    /// outermost first) by `delta`; returns the deepest region's live node +
+    /// new offset when it moved (for the scrollTop write-back). This is what
+    /// makes a scroll container NESTED inside another independently scrollable.
+    fn scroll_region_path(&mut self, path: &[usize], delta: i64) -> Option<(Option<usize>, usize)> {
+        let g = self.browser.as_mut()?;
+        let (&last, parents) = path.split_last()?;
+        let mut regions = &mut g.doc.regions;
+        for &idx in parents {
+            regions = &mut regions.get_mut(idx)?.regions;
+        }
+        let rg = regions.get_mut(last)?;
         let moved = rg.scroll_by(delta);
         if moved {
             rg.voffset_from_page = false;
         }
-        moved
+        moved.then_some((rg.live_node, rg.voffset))
     }
 
-    /// The index of the scroll region whose scrollport is under the cursor
-    /// `(col, row)` (absolute terminal cells), if any.
-    fn region_under(&self, col: u16, row: u16) -> Option<usize> {
+    /// The DEEPEST scroll region under the cursor, as a path of nested-region
+    /// indices (outermost first) — a wheel/key routes here, so the innermost
+    /// scroller wins (CSS: the event targets the deepest scroll container).
+    fn region_path_under(&self, col: u16, row: u16) -> Option<Vec<usize>> {
         if !self.mouse_in_content_area(col, row) {
             return None;
         }
@@ -5722,37 +5782,64 @@ impl App {
         if !g.doc.laid_out() {
             return None;
         }
-        let doc_row = g.scroll + row.saturating_sub(self.last_content_area.y) as usize;
-        let local_col = col.saturating_sub(self.last_content_area.x);
-        g.doc
-            .regions
-            .iter()
-            .position(|rg| rg.contains_row(doc_row) && rg.contains_col(local_col))
+        let mut r = g.scroll + row.saturating_sub(self.last_content_area.y) as usize;
+        let mut c = col.saturating_sub(self.last_content_area.x);
+        let mut regions: &[crate::layout::Region] = &g.doc.regions;
+        let mut path = Vec::new();
+        loop {
+            let idx = regions
+                .iter()
+                .position(|rg| rg.contains_row(r) && rg.contains_col(c))?;
+            path.push(idx);
+            let rg = &regions[idx];
+            // Descend into this region's buffer coordinates.
+            let buf_row = rg.voffset + (r - rg.start_row);
+            let buf_col = c.saturating_sub(rg.left);
+            if rg
+                .regions
+                .iter()
+                .any(|nr| nr.contains_row(buf_row) && nr.contains_col(buf_col))
+            {
+                regions = &rg.regions;
+                r = buf_row;
+                c = buf_col;
+            } else {
+                return Some(path);
+            }
+        }
     }
 
+    /// The region addressed by `path` (read-only) — for reading the deepest
+    /// region's page size.
+    fn region_at_path(&self, path: &[usize]) -> Option<&crate::layout::Region> {
+        let g = self.browser.as_ref()?;
+        let mut rg = g.doc.regions.get(*path.first()?)?;
+        for &idx in &path[1..] {
+            rg = rg.regions.get(idx)?;
+        }
+        Some(rg)
+    }
+
+    /// The index of the scroll region whose scrollport is under the cursor
+    /// `(col, row)` (absolute terminal cells), if any.
     /// PgUp/PgDn over a scroll region scrolls THAT region by a page (its own
-    /// height), using the last hovered cell ("scroll the hovered region").
-    /// Returns whether the cursor was over a region (which then TRAPS the
-    /// page key — never pages the document — to match the wheel); otherwise
-    /// `false` and the document pages as usual.
+    /// height), using the last hovered cell ("scroll the hovered region") — the
+    /// deepest one when scrollers are nested. Returns whether the cursor was
+    /// over a region (which then TRAPS the page key — never pages the document
+    /// — to match the wheel); otherwise `false` and the document pages as usual.
     fn region_page_scroll(&mut self, dir: i64) -> bool {
         let Some((col, row)) = self.last_mouse else {
             return false;
         };
-        let Some(idx) = self.region_under(col, row) else {
+        let Some(path) = self.region_path_under(col, row) else {
             return false;
         };
         // A page is the scrollport height less one row of overlap (mirrors the
         // document's `last_inner.1 - 1` page step).
-        let page = {
-            let g = self.browser.as_ref().unwrap();
-            (i64::from(g.doc.regions[idx].height) - 1).max(1)
-        };
-        if self.scroll_region_by(idx, dir * page) {
-            let (node, voff) = {
-                let g = self.browser.as_ref().unwrap();
-                (g.doc.regions[idx].live_node, g.doc.regions[idx].voffset)
-            };
+        let page = self
+            .region_at_path(&path)
+            .map_or(1, |rg| (i64::from(rg.height) - 1).max(1));
+        if let Some((node, voff)) = self.scroll_region_path(&path, dir * page) {
             self.region_writeback(node, voff);
         }
         true // over a region ⇒ trap the key (don't fall through to the document)
@@ -5794,7 +5881,8 @@ impl App {
                 .get(i)
                 .cloned()
         });
-        let old_offsets: Vec<_> = g.doc.regions.iter().map(|r| (r.node, r.voffset)).collect();
+        let mut old_offsets = Vec::new();
+        Self::collect_region_offsets(&g.doc.regions, &mut old_offsets);
         let raw = std::mem::take(&mut g.doc.raw);
         let blobs = g.doc.blobs.take();
         g.doc = match g.doc.url.clone() {
@@ -8462,6 +8550,7 @@ mod tests {
             live_node: Some(99),
             voffset_from_page: from_page,
             carousels: Vec::new(),
+            regions: Vec::new(),
             image_urls: Vec::new(),
         };
         let old = [(5usize, 9usize)];
