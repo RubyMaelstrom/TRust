@@ -75,6 +75,12 @@ pub(crate) enum Inline {
     /// inline content; the flow lays it against its containing block in the
     /// positioned post-pass. Its display is already blockified (§9.7).
     OutOfFlow(Box<BoxNode>),
+    /// A float (`float:left`/`right` — §9.5), out of normal flow and shifted to
+    /// an edge. It rides the inline list at the point it appears in source (its
+    /// margin-box top can be no higher than the line box it occurs on — §9.5.1
+    /// rule 6); the IFC pulls it aside and shortens the line boxes beside it.
+    /// Its display is blockified (§9.7), so the box is a block-level box.
+    Float(Box<BoxNode>),
 }
 
 /// One box in the tree.
@@ -207,6 +213,42 @@ pub(crate) fn build(
     }
 }
 
+/// Build a box tree rooted at an arbitrary element `boundary` (an incremental-
+/// layout relayout boundary — a scroll region or an inline IFC box), for a
+/// subtree fragment re-lay (INCREMENTAL_LAYOUT_PLAN.md). Same machinery as
+/// `build`, entered at `boundary` instead of the document root; `None` when the
+/// node generates no box (`display:none`/skipped).
+pub(crate) fn build_at(
+    dom: &Dom,
+    base: &Url,
+    controls: &ControlMap,
+    forms: &[Form],
+    vp: Vp,
+    boundary: NodeId,
+) -> Option<BoxNode> {
+    let mut b = Builder {
+        dom,
+        base,
+        controls,
+        forms,
+        vp,
+        lists: Vec::new(),
+        table_depth: 0,
+    };
+    match b.element(boundary) {
+        Built::Block(bx) => Some(*bx),
+        Built::Inline(inl) => Some(BoxNode {
+            node: boundary,
+            style: BoxStyle::of(dom, boundary, vp),
+            content: Content::Inlines(vec![inl]),
+            marker: None,
+            marker_inside: false,
+            oof: Vec::new(),
+        }),
+        _ => None,
+    }
+}
+
 /// What classifying a possibly-replaced element produced.
 enum Replaced {
     Atom(AtomKind),
@@ -308,6 +350,27 @@ impl Builder<'_> {
                 },
             };
             return Built::Inline(Inline::OutOfFlow(Box::new(b)));
+        }
+        // Float (§9.5): out of normal flow, its display blockified (§9.7). Like
+        // the out-of-flow path, it rides the inline list — but it is NOT a
+        // block-level box for the §9.2.1.1 anonymous-box split (the inline
+        // content around it forms one IFC), so it stays a `Built::Inline`.
+        if super::float::float_side(self.dom, id).is_some() {
+            let b = match rep {
+                Replaced::Atom(kind) => BoxNode {
+                    node: id,
+                    style: BoxStyle::of(self.dom, id, self.vp),
+                    content: Content::Atomic(Atom { node: id, kind }),
+                    marker: None,
+                    marker_inside: false,
+                    oof: Vec::new(),
+                },
+                _ => match blockify(disp) {
+                    Disp::Table => self.table(id),
+                    d => self.container(id, d),
+                },
+            };
+            return Built::Inline(Inline::Float(Box::new(b)));
         }
         if let Replaced::Atom(kind) = rep {
             return self.atom(id, disp, kind);
@@ -480,6 +543,12 @@ impl Builder<'_> {
                     items.push(*b);
                 }
                 Built::Inline(Inline::OutOfFlow(b)) => oof.push(*b),
+                // css-flexbox §4.1 / css-grid §6: `float` is ignored on a
+                // flex/grid item — the blockified box becomes an ordinary item.
+                Built::Inline(Inline::Float(b)) => {
+                    flush(&mut run, &mut items);
+                    items.push(*b);
+                }
                 Built::Inline(Inline::Box { node, style, kids }) => {
                     flush(&mut run, &mut items);
                     items.push(BoxNode {
@@ -907,6 +976,10 @@ fn inline_has_content(i: &Inline) -> bool {
         // the box emits no lines, so a placeholder-only run still
         // self-collapses to zero height.
         Inline::OutOfFlow(_) => true,
+        // A float keeps its run alive too — a block whose only content is a
+        // float still places the float (and self-collapses, the float being
+        // out of flow — the classic "collapsed float parent").
+        Inline::Float(_) => true,
     }
 }
 

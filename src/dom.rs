@@ -1041,15 +1041,6 @@ impl Dom {
         matches!(v.trim().to_ascii_lowercase().as_str(), "hidden" | "clip")
     }
 
-    /// The viewport is "locked" when the root (`html`/`body`) clips overflow on
-    /// either axis — CSS Overflow L3 §3.1: the root element's used overflow
-    /// propagates to the viewport, so an `overflow:hidden`/`clip` there stops
-    /// the viewport scrolling the document and delegates it to a descendant
-    /// scroll container (the app-shell / locked-body SPA pattern).
-    pub fn node_clips_overflow(&self, id: NodeId) -> bool {
-        self.axis_clips_overflow(id, true) || self.axis_clips_overflow(id, false)
-    }
-
     /// Whether `id` is the page's PRINCIPAL scroll container — the one a LOCKED
     /// viewport delegates document scrolling to (the SPA pattern where
     /// `html`/`body` are `overflow:hidden` and one inner `overflow:auto` box
@@ -1063,31 +1054,88 @@ impl Dom {
     ///
     /// ONE upward walk from `id` to the root: a scroll-container ancestor ⇒
     /// `id` is NESTED ⇒ a real inner region; the nearest sectioning landmark
-    /// above `id` decides main-flow (`<main>`) vs complementary sidebar
-    /// (`<nav>`/`<aside>`, stays a region); and the viewport must be LOCKED.
-    /// Principal ⇔ locked AND (inside `<main>` OR the page declares no
-    /// enclosing landmark at all, i.e. this outermost scroller carries the flow).
+    /// above `id` decides main-flow (`<main>`); and the viewport must be LOCKED
+    /// on the VERTICAL axis (the document-scroll axis — an `overflow-x:hidden`
+    /// root, the ubiquitous "no horizontal scrollbar" trick, does NOT stop the
+    /// document scrolling vertically, so it does not delegate scrolling).
+    ///
+    /// Principal ⇔ vertically-locked AND (inside `<main>` OR the sole app-shell
+    /// SPINE). There is at most one principal scroller, so the "carries the flow"
+    /// test keys on a UNIQUE signal: the `<main>` landmark (HTML §4.4.14 — one
+    /// per document), else `id` being the sole rendered-child spine to `<body>`
+    /// (a `<body><div overflow:auto>…</div>` app shell). The OLD fallback "OR no
+    /// enclosing landmark" wrongly marked EVERY inner scroll panel on a landmark-
+    /// less locked page as principal (e.g. humantooth.neocities.org, whose JS
+    /// locks `<html>` for a modal while several `overflow-y:scroll` content
+    /// panels — each ONE column of a two-column flex row, so NOT a sole spine —
+    /// sit in a normal-flow document): none got virtualized into bounded regions
+    /// and their content overflowed into each other. Such panels are inner regions.
     pub fn is_principal_scroller(&self, id: NodeId) -> bool {
         let mut viewport_locked = false;
         let mut in_main = false;
-        let mut landmark_seen = false;
         let mut cur = self.parent_composed(id);
         while let Some(p) = cur {
             if self.is_scroll_container(p) || self.is_hscroll_container(p) {
                 return false; // a scroll-container ancestor ⇒ nested inner region
             }
             match self.tag_name(p) {
-                Some("main") if !landmark_seen => {
-                    in_main = true;
-                    landmark_seen = true;
+                Some("main") => in_main = true,
+                Some("html" | "body") if self.axis_clips_overflow(p, true) => {
+                    viewport_locked = true;
                 }
-                Some("nav" | "aside") if !landmark_seen => landmark_seen = true,
-                Some("html" | "body") if self.node_clips_overflow(p) => viewport_locked = true,
                 _ => {}
             }
             cur = self.parent_composed(p);
         }
-        viewport_locked && (in_main || !landmark_seen)
+        viewport_locked && (in_main || self.is_app_shell_spine(id))
+    }
+
+    /// Whether `id` and every ancestor up to `<body>`/`<html>` is the SOLE
+    /// rendered element child of its parent — an app-shell spine that carries
+    /// the whole document (a locked-viewport SPA's single `overflow:auto` root),
+    /// as opposed to one content panel among siblings. A rendered element child
+    /// is one that generates a box (not `display:none`, not a metadata/script
+    /// element); text/whitespace between blocks doesn't count.
+    fn is_app_shell_spine(&self, id: NodeId) -> bool {
+        let mut cur = id;
+        loop {
+            let Some(parent) = self.node(cur).parent else {
+                return true; // reached the document root with no siblings
+            };
+            // A rendered element sibling ⇒ `cur` is one panel among many.
+            if self
+                .child_iter(parent)
+                .any(|c| c != cur && self.renders_as_box(c))
+            {
+                return false;
+            }
+            if matches!(self.tag_name(parent), Some("body" | "html")) {
+                return true;
+            }
+            cur = parent;
+        }
+    }
+
+    /// Whether `id` generates a rendered box: an element that isn't hidden and
+    /// isn't a metadata/script element (which occupy no layout space, so a
+    /// `<script>` beside the app root doesn't make the root a non-spine).
+    fn renders_as_box(&self, id: NodeId) -> bool {
+        matches!(self.node(id).data, NodeData::Element { .. })
+            && !matches!(
+                self.tag_name(id),
+                Some(
+                    "script"
+                        | "style"
+                        | "link"
+                        | "meta"
+                        | "title"
+                        | "head"
+                        | "template"
+                        | "noscript"
+                        | "base"
+                )
+            )
+            && !self.is_hidden(id)
     }
 
     /// Parse a full HTML document into a fresh arena.
@@ -5056,6 +5104,14 @@ const PROPS: &[PropDef] = &[
     prop("gap", false, true),
     prop("column-gap", false, true),
     prop("row-gap", false, true),
+    // css-multicol-1: the container count/width (§3.4) plus fill/span. Baked,
+    // not inherited; the `columns` shorthand expands to count+width. Consumed by
+    // layout2's multi-column slicer. `column-rule` is deliberately NOT tracked —
+    // we render no color, so the rule glyph is dropped (only the gap survives).
+    prop("column-count", false, true),
+    prop("column-width", false, true),
+    prop("column-fill", false, true),
+    prop("column-span", false, true),
     prop("grid-template-columns", false, true),
     prop("grid-template-rows", false, true),
     prop("grid-auto-flow", false, true),
@@ -5436,6 +5492,32 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         && matches!(rest, "gap" | "row-gap" | "column-gap")
     {
         return vec![(rest.to_string(), value.to_string())];
+    }
+    // `columns: <'column-width'> || <'column-count'>` (css-multicol-1 §6.1) —
+    // a bare integer is the count, anything else (a length) the width; the
+    // shorthand resets BOTH longhands (a missing component becomes `auto`).
+    if prop == "columns" {
+        let (mut count, mut width) = (None, None);
+        for t in value.split_whitespace() {
+            if t.eq_ignore_ascii_case("auto") {
+                continue;
+            }
+            if t.parse::<u32>().is_ok() {
+                count = Some(t);
+            } else {
+                width = Some(t);
+            }
+        }
+        return vec![
+            (
+                "column-count".to_string(),
+                count.unwrap_or("auto").to_string(),
+            ),
+            (
+                "column-width".to_string(),
+                width.unwrap_or("auto").to_string(),
+            ),
+        ];
     }
     // `grid-template: <rows> / <columns>` (the area form is ignored — we don't
     // place by name). Split on the top-level `/` into the two track lists.

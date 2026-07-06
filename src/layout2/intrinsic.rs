@@ -85,10 +85,22 @@ impl Flow<'_> {
                     // text-indent participates in intrinsic widths;
                     // percentages resolve against a zero basis here.
                     self.indent_px(if b.node == NO_NODE { inl.node } else { b.node }, 0.0),
+                    None,
                 );
                 ifc.run(inls, &here);
-                let (lines, _, _) = ifc.finish();
-                lines.iter().map(|l| l.width).max().unwrap_or(0) as f32 * self.cell_w
+                let (lines, _, _, _) = ifc.finish();
+                let inline_w =
+                    lines.iter().map(|l| l.width).max().unwrap_or(0) as f32 * self.cell_w;
+                // A float contributes its margin-box intrinsic width to the
+                // container like a block child (§9.5 / css-sizing-3 — the v1
+                // block-child approximation, correct for "float beside a
+                // paragraph"). The probe IFC skips floats, so fold them here.
+                let mut floats: Vec<&BoxNode> = Vec::new();
+                super::flow::collect_floats(inls, &mut floats);
+                floats
+                    .iter()
+                    .map(|fb| self.contribution(fb, mode, &here))
+                    .fold(inline_w, f32::max)
             }
             Content::Atomic(atom) => self.atom_intrinsic_w(atom, mode),
             Content::Grid(items) => {

@@ -24,9 +24,25 @@ use crate::layout::{
     Emphasis, ImageSizes, Item, ItemKind, Units, display_width, is_collapsible_space, letter_space,
 };
 
+use super::float::{FloatBox, FloatCtx, FloatPlace};
 use super::style::{Align2, BoxStyle, InlineStyle, LEFT, RIGHT};
 use super::tree::{Atom, AtomKind, BoxNode, Inline};
 use super::value::{Len, Vp};
+
+/// The float environment an IFC lays its line boxes against: the block
+/// formatting context's [`FloatCtx`] (queried per line and appended to when an
+/// inline float is met), the pre-laid float margin-box sizes in walk order
+/// (`boxes[k]` is the k-th `Inline::Float` the IFC encounters — the layout
+/// engine owns box laying, so the block flow lays floats and hands the IFC only
+/// their sizes), and the content box's absolute top-left in px (the frame the
+/// band queries and returned placements use). Absent = no floats: line boxes
+/// span the full content width, byte-identical to the pre-float engine.
+pub(crate) struct FloatEnv<'f> {
+    pub fc: &'f mut FloatCtx,
+    pub boxes: &'f [FloatBox],
+    pub left_x: f32,
+    pub top_y: f32,
+}
 
 /// An out-of-flow box met in the IFC: the static-position mark (§10.3.7's
 /// hypothetical-box position) — the line it would have entered on and the
@@ -105,12 +121,17 @@ pub(crate) struct LineOut {
     /// the line because a `contain`-fitted replaced box occupies more cells
     /// than its painted item reports.
     pub width: usize,
+    /// The line box's RIGHT edge in cells (the float-shortened cap it was laid
+    /// against — every line can differ beside floats). Justification at
+    /// `finish` distributes `cap - width` across this line's slots.
+    pub cap: usize,
 }
 
 /// The inline formatting context builder. Feed it the IFC's inline content,
 /// then `finish()` into line boxes. `'t` is the box tree — out-of-flow
-/// boxes met in the content are handed back as static-position marks.
-pub(crate) struct Ifc<'a, 't> {
+/// boxes met in the content are handed back as static-position marks; `'f` is
+/// the float environment borrow.
+pub(crate) struct Ifc<'a, 'f, 't> {
     dom: &'a Dom,
     base: &'a Url,
     images: &'a ImageSizes,
@@ -118,10 +139,11 @@ pub(crate) struct Ifc<'a, 't> {
     vp: Vp,
     cell_w: f32,
     cell_h: f32,
-    /// Line capacity in cells (the content width, floor-quantized).
+    /// The content width in cells (floor-quantized) — the line-box cap when no
+    /// float shortens it.
     cap: usize,
     /// The content box width in px (percentage basis for inline-box edges
-    /// and replaced sizing).
+    /// and replaced sizing; also the float band's right containing-block edge).
     cb_w_px: f32,
     /// The containing block's definite content HEIGHT in px, when it has one
     /// — the percentage basis for replaced `height`/`min-height`/`max-height`
@@ -146,9 +168,35 @@ pub(crate) struct Ifc<'a, 't> {
     /// inline boxes), in px — folded into the next placement so an edge at a
     /// wrap point travels with the content it precedes.
     pending_gap_px: f32,
+    // ---- floats (§9.5) — inert when `fc` is None ----
+    /// The BFC's float context: queried per line (`band`) and appended to when
+    /// an inline float is met (`place`). `None` = no floats (intrinsic probe,
+    /// atomic-only content) — line boxes span `[0, cap)`, byte-for-byte the
+    /// pre-float engine.
+    fc: Option<&'f mut FloatCtx>,
+    /// The pre-laid float margin-box sizes, in the order the IFC meets them.
+    float_boxes: &'f [FloatBox],
+    /// Content-box absolute top-left px (the frame float bands/placements use).
+    content_left_x: f32,
+    content_top_y: f32,
+    /// Running px height of the line boxes already flushed — the current line's
+    /// top y is `content_top_y + laid_h`.
+    laid_h: f32,
+    /// Index of the next `Inline::Float` to meet (into `float_boxes`).
+    float_next: usize,
+    /// Resolved placements (margin-box top-left px), returned by `finish`.
+    placements: Vec<FloatPlace>,
+    /// The current line box's left content edge in cells (a left float's inset).
+    line_left: usize,
+    /// The current line box's right edge in cells (a right float pulls it in).
+    line_right: usize,
+    /// `text-indent`, applied to the FIRST line only (cells).
+    indent: usize,
+    /// Whether the line about to be composed is the IFC's first (indent gate).
+    on_first_line: bool,
 }
 
-impl<'a, 't> Ifc<'a, 't> {
+impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     #[allow(clippy::too_many_arguments)] // a formatting context has this many real inputs
     pub fn new(
         dom: &'a Dom,
@@ -162,12 +210,17 @@ impl<'a, 't> Ifc<'a, 't> {
         cb_h_px: Option<f32>,
         align: Align2,
         indent_px: f32,
-    ) -> Ifc<'a, 't> {
+        floats: Option<FloatEnv<'f>>,
+    ) -> Ifc<'a, 'f, 't> {
         let cap = ((content_w_px / cell_w) + 1e-3).floor().max(1.0) as usize;
         // `text-indent` on the first line, clamped ≥0 (a terminal cannot
         // paint left of column 0 — the hanging-indent quantization).
         let indent = ((indent_px / cell_w).round().max(0.0) as usize).min(cap.saturating_sub(1));
-        Ifc {
+        let (fc, float_boxes, content_left_x, content_top_y) = match floats {
+            Some(env) => (Some(env.fc), env.boxes, env.left_x, env.top_y),
+            None => (None, &[][..], 0.0, 0.0),
+        };
+        let mut ifc = Ifc {
             dom,
             base,
             images,
@@ -183,10 +236,79 @@ impl<'a, 't> Ifc<'a, 't> {
             cur: Vec::new(),
             marks: Vec::new(),
             oofs: Vec::new(),
-            pen: indent,
-            line_start: indent,
+            pen: 0,
+            line_start: 0,
             pending_space: false,
             pending_gap_px: 0.0,
+            fc,
+            float_boxes,
+            content_left_x,
+            content_top_y,
+            laid_h: 0.0,
+            float_next: 0,
+            placements: Vec::new(),
+            line_left: 0,
+            line_right: cap,
+            indent,
+            on_first_line: true,
+        };
+        ifc.begin_line();
+        ifc
+    }
+
+    /// Set the current line box's left/right boundaries from the float band at
+    /// its vertical position (§9.5.1 — the current and subsequent line boxes are
+    /// shortened to make room for a float's margin box). With no floats the band
+    /// is the full content width, so `pen`/`line_start` land exactly where the
+    /// pre-float engine put them.
+    fn begin_line(&mut self) {
+        let (left, right) = match &self.fc {
+            Some(fc) if !fc.is_empty() => {
+                let y = self.content_top_y + self.laid_h;
+                let (li, ri) = fc.band(y, self.cell_h);
+                let own_l = self.content_left_x;
+                let own_r = own_l + self.cb_w_px;
+                let l = ((own_l.max(li) - own_l) / self.cell_w).round().max(0.0) as usize;
+                let r = ((own_r.min(ri) - own_l) / self.cell_w).floor().max(0.0) as usize;
+                (l.min(self.cap), r.min(self.cap))
+            }
+            _ => (0, self.cap),
+        };
+        self.line_left = left;
+        self.line_right = right.max(left);
+        let indent = if self.on_first_line { self.indent } else { 0 };
+        self.line_start = (self.line_left + indent).min(self.line_right.max(self.line_left));
+        self.pen = self.line_start;
+        self.pending_space = false;
+    }
+
+    /// Place the k-th inline float met (§9.5.1): pull it aside into the float
+    /// context and shorten the current + subsequent line boxes. A LEADING float
+    /// (empty current line) places at the current line's top and re-shortens
+    /// this line; a float met AFTER content on the line can't sit above that
+    /// content (rule 6), and reflowing the already-placed content is a v1 cut,
+    /// so it starts the NEXT line's band instead.
+    fn place_float(&mut self) {
+        let idx = self.float_next;
+        self.float_next += 1;
+        let leading = self.pen <= self.line_start;
+        let line_y = self.content_top_y + self.laid_h;
+        let top_min = if leading {
+            line_y
+        } else {
+            line_y + self.cell_h
+        };
+        let cb_l = self.content_left_x;
+        let cb_r = self.content_left_x + self.cb_w_px;
+        let (Some(fc), Some(fb)) = (self.fc.as_deref_mut(), self.float_boxes.get(idx).copied())
+        else {
+            return;
+        };
+        let (x, y) = fc.place(fb.side, fb.mw, fb.mh, top_min, cb_l, cb_r);
+        self.placements.push(FloatPlace { index: idx, x, y });
+        if leading {
+            // The current (empty) line's edges just moved — re-query the band.
+            self.begin_line();
         }
     }
 
@@ -212,6 +334,9 @@ impl<'a, 't> Ifc<'a, 't> {
                 x_px: self.pen as f32 * self.cell_w + self.pending_gap_px,
                 ctx: ctx.clone(),
             }),
+            // A float (§9.5): pulled aside into the float context; it emits no
+            // inline content, but shortens the line boxes beside it.
+            Inline::Float(_) => self.place_float(),
             Inline::Box { node, style, kids } => {
                 let inner = InlineStyle::derive(self.dom, *node, ctx, self.base);
                 self.marks.push((*node, self.lines.len()));
@@ -320,7 +445,7 @@ impl<'a, 't> Ifc<'a, 't> {
         }
         let mut rest: &str = t;
         while !rest.is_empty() {
-            let avail = self.cap.saturating_sub(self.pen);
+            let avail = self.line_right.saturating_sub(self.pen);
             let mut w = 0usize;
             let mut cut = rest.len();
             for (bi, c) in rest.char_indices() {
@@ -361,7 +486,7 @@ impl<'a, 't> Ifc<'a, 't> {
         let gap = self.take_gap();
         if may_wrap
             && ctx.ws.wraps()
-            && self.pen + usize::from(space) + gap + w > self.cap
+            && self.pen + usize::from(space) + gap + w > self.line_right
             && self.pen > self.line_start
         {
             self.soft_break();
@@ -663,7 +788,9 @@ impl<'a, 't> Ifc<'a, 't> {
     ) {
         let space = self.pending_space && self.pen > self.line_start;
         let gap = self.take_gap();
-        if self.pen + usize::from(space) + gap + box_w > self.cap && self.pen > self.line_start {
+        if self.pen + usize::from(space) + gap + box_w > self.line_right
+            && self.pen > self.line_start
+        {
             self.soft_break();
             self.pending_gap_px = gap as f32 * self.cell_w;
             self.place_atom(box_w, box_rows, off_cols, off_rows, item);
@@ -712,23 +839,25 @@ impl<'a, 't> Ifc<'a, 't> {
         // box occupies more cells than its painted item, so the pieces alone
         // under-report.
         let width = self.pen;
+        let cap = self.line_right;
         let mut line = LineOut {
             pieces,
             rows,
             forced,
             width,
+            cap,
         };
         // Baseline alignment quantized: bottoms on the line's last row (a
         // replaced box's baseline is its bottom margin edge — §10.8.1).
         for p in &mut line.pieces {
             p.row_off = rows - p.rows;
         }
-        // Center/right shift now; justification waits for `finish`, where
-        // "last line" is known.
-        if width < self.cap {
+        // Center/right shift now, within this line's (float-shortened) band;
+        // justification waits for `finish`, where "last line" is known.
+        if width < cap {
             let off = match self.align {
-                Align2::Center => (self.cap - width) / 2,
-                Align2::Right => self.cap - width,
+                Align2::Center => (cap - width) / 2,
+                Align2::Right => cap - width,
                 Align2::Left | Align2::Justify => 0,
             };
             if off > 0 {
@@ -738,17 +867,27 @@ impl<'a, 't> Ifc<'a, 't> {
             }
         }
         self.lines.push(line);
-        self.pen = 0;
-        self.line_start = 0;
-        self.pending_space = false;
+        // Advance past this line box, then open the next against the band at
+        // the new vertical position (a taller float may still shorten it).
+        self.laid_h += f32::from(rows) * self.cell_h;
+        self.on_first_line = false;
+        self.begin_line();
     }
 
     /// Finish the IFC: flush the trailing line, then justify (every line
     /// except forced-break lines and the last — CSS Text §7.1). Returns the
-    /// line boxes, the entered-element line marks, and the out-of-flow
-    /// static-position marks.
+    /// line boxes, the entered-element line marks, the out-of-flow
+    /// static-position marks, and the resolved float placements (margin-box
+    /// top-left px, in the content frame).
     #[allow(clippy::type_complexity)]
-    pub fn finish(mut self) -> (Vec<LineOut>, Vec<(NodeId, usize)>, Vec<OofMark<'t>>) {
+    pub fn finish(
+        mut self,
+    ) -> (
+        Vec<LineOut>,
+        Vec<(NodeId, usize)>,
+        Vec<OofMark<'t>>,
+        Vec<FloatPlace>,
+    ) {
         self.flush_line(false);
         if self.align == Align2::Justify {
             let n = self.lines.len();
@@ -756,12 +895,13 @@ impl<'a, 't> Ifc<'a, 't> {
                 if i + 1 == n || line.forced {
                     continue;
                 }
-                if line.width < self.cap {
-                    justify(line, self.cap - line.width);
+                if line.width < line.cap {
+                    let extra = line.cap - line.width;
+                    justify(line, extra);
                 }
             }
         }
-        (self.lines, self.marks, self.oofs)
+        (self.lines, self.marks, self.oofs, self.placements)
     }
 }
 

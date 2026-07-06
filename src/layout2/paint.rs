@@ -36,8 +36,13 @@ use std::collections::HashMap;
 
 use crate::dom::{Dom, NodeId};
 use crate::layout::{
-    Carousel, FixedItem, Item, NO_NODE, Region, Row, display_width, truncate_to_width,
+    Carousel, CompositeLayer, Emphasis, FixedItem, Item, ItemKind, NO_NODE, Region, Row,
+    display_width, truncate_to_width,
 };
+
+/// The overlap-composite side-table produced by a paint pass (P8): a synthetic
+/// `x-trust-composite:` URL → the layers the app alpha-blends into that box.
+pub(crate) type Composites = HashMap<String, Vec<CompositeLayer>>;
 
 use super::flow::{Clip, Frag, FragKind};
 use super::style::{BOTTOM, LEFT, RIGHT, TOP};
@@ -62,6 +67,10 @@ pub(crate) struct PaintOut {
     /// overflows). Items stay in the doc rows at their strip columns; the
     /// renderer shifts/clips them to the band via `visible_col`.
     pub carousels: Vec<Carousel>,
+    /// Alpha-composited image overlap groups (P8): synthetic `x-trust-composite:`
+    /// URL → ordered layers. A composite `Item` in `rows` (or a region/carousel
+    /// buffer) carries the synthetic URL; the app encodes it from these layers.
+    pub composites: Composites,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -74,8 +83,14 @@ pub(crate) fn paint(
     viewport: (usize, usize),
     cell_w: f32,
     cell_h: f32,
+    // `alpha` = URL→`has_alpha` from the app's decoded cache; the overlap
+    // compositor groups only overlaps where an upper image is transparent.
+    alpha: &HashMap<String, bool>,
 ) -> PaintOut {
     let cols = viewport.0;
+    // The overlap-composite side-table, filled by every `composite` call below
+    // (main pass, scroll-region buffers, carousel strips, the fixed layer).
+    let mut composites: Composites = HashMap::new();
     // Extract scroll containers FIRST. A vertical REGION paints its content
     // into a separate buffer and empties its frag (the main pass leaves a blank
     // band the renderer windows over the buffer). A horizontal CAROUSEL paints
@@ -97,13 +112,15 @@ pub(crate) fn paint(
         &mut carousels,
         &mut scroll_clips,
         &mut splices,
+        alpha,
+        &mut composites,
     );
     // The document height, computed AFTER extraction so an emptied region
     // contributes only its reserved band height (not its scrolled-away content).
     let doc_h_px = root.max_bottom().max(flow_bottom).max(0.0);
     let mut ops = Vec::new();
     build_sc(root, &mut ops, cell_w, cell_h, 0.0, 0.0);
-    let mut rows = composite(ops, cols);
+    let mut rows = composite(ops, cols, alpha, &mut composites);
     // Splice each carousel's strip rows over its (now-blank) band — the strip
     // items keep their full strip columns (possibly past the viewport), which
     // the renderer windows to the band. We inject NO scroll chrome: the page's
@@ -170,7 +187,7 @@ pub(crate) fn paint(
             }
             let mut ops = Vec::new();
             build_sc(f, &mut ops, cell_w, cell_h, f.x, f.y);
-            let brows = composite(ops, cols.saturating_sub(col).max(1));
+            let brows = composite(ops, cols.saturating_sub(col).max(1), alpha, &mut composites);
             if brows.iter().all(|r| r.items.is_empty()) {
                 return None; // nothing visible: no pinned surface
             }
@@ -189,6 +206,7 @@ pub(crate) fn paint(
         regions,
         scroll_clips,
         carousels,
+        composites,
     }
 }
 
@@ -220,6 +238,8 @@ fn extract_scrollers(
     carousels: &mut Vec<Carousel>,
     scroll_clips: &mut Vec<(usize, u16, u16)>,
     splices: &mut Vec<(usize, Vec<Row>)>,
+    alpha: &HashMap<String, bool>,
+    composites: &mut Composites,
 ) {
     let mut i = 0;
     while i < f.children.len() {
@@ -234,9 +254,22 @@ fn extract_scrollers(
                 ox,
                 oy,
                 scroll_clips,
+                alpha,
+                composites,
             ));
         } else if is_carousel(dom, &f.children[i]) {
-            paint_carousel(dom, &mut f.children[i], cw, ch, ox, oy, carousels, splices);
+            paint_carousel(
+                dom,
+                &mut f.children[i],
+                cw,
+                ch,
+                ox,
+                oy,
+                carousels,
+                splices,
+                alpha,
+                composites,
+            );
         } else {
             extract_scrollers(
                 dom,
@@ -249,6 +282,8 @@ fn extract_scrollers(
                 carousels,
                 scroll_clips,
                 splices,
+                alpha,
+                composites,
             );
         }
         i += 1;
@@ -291,6 +326,8 @@ fn paint_carousel(
     oy: f32,
     carousels: &mut Vec<Carousel>,
     splices: &mut Vec<(usize, Vec<Row>)>,
+    alpha: &HashMap<String, bool>,
+    composites: &mut Composites,
 ) {
     let pad_x = f.x + f.border[LEFT];
     let pad_w = (f.w - f.border[LEFT] - f.border[RIGHT]).max(0.0);
@@ -348,7 +385,7 @@ fn paint_carousel(
     let strip_cols = ((content_right - ox) / cw).round().max(1.0) as usize;
     let mut ops = Vec::new();
     build_sc(f, &mut ops, cw, ch, ox, f.y);
-    let strip = composite(ops, strip_cols);
+    let strip = composite(ops, strip_cols, alpha, composites);
     f.children.clear();
     let end = start_row + strip.len();
     splices.push((start_row, strip));
@@ -363,6 +400,48 @@ fn paint_carousel(
         frame_right: None,
         snap,
     });
+}
+
+/// A re-laid scroll region's `(buffer rows, nested carousels, nested
+/// scroll-clip clientHeights)` — the incremental region-patch payload.
+pub(crate) type RegionBuffer = (Vec<Row>, Vec<Carousel>, Vec<(usize, u16, u16)>);
+
+/// Lay one scroll region's subtree into its scrollable buffer for an
+/// incremental region PATCH (INCREMENTAL_LAYOUT_PLAN.md). `root` is the region
+/// node laid AS a fragment root (`lay_region_fragment`); this composites its
+/// content exactly as the full-render extraction does (`paint_region` — same
+/// scrollport origin, nested-scroller extraction, snap stops), so the patched
+/// buffer is byte-consistent with a full relayout of the same content. Returns
+/// `(buffer rows, nested carousels, nested scroll-clip clientHeights)`; nested
+/// vertical regions inside a patched region are dropped in v1 (they reappear on
+/// the next full render — the old engine's region patch does the same).
+pub(crate) fn region_buffer(dom: &Dom, root: &mut Frag<'_>, cw: f32, ch: f32) -> RegionBuffer {
+    let mut scroll_clips = Vec::new();
+    // v1 region-patch cut: the incremental region re-lay does NOT alpha-composite
+    // transparent image overlaps (empty alpha ⇒ no grouping) — such overlaps in a
+    // patched region render separately until the next full render. Always
+    // correct, matching the other P7 region-patch v1 cuts.
+    let no_alpha: HashMap<String, bool> = HashMap::new();
+    let mut composites: Composites = HashMap::new();
+    let rg = paint_region(
+        dom,
+        root,
+        cw,
+        ch,
+        0.0,
+        0.0,
+        &mut scroll_clips,
+        &no_alpha,
+        &mut composites,
+    );
+    // `paint_region` pushed this region's OWN clientHeight into `scroll_clips`
+    // (its `live_node`); the app already knows this region's geometry, so drop
+    // the self entry and keep only the NESTED scrollers' clips.
+    let self_node: Option<usize> = dom
+        .attr(root.node, "data-trust-node")
+        .and_then(|s| s.parse().ok());
+    scroll_clips.retain(|&(n, _, _)| Some(n) != self_node);
+    (rg.buffer, rg.carousels, scroll_clips)
 }
 
 /// Whether `f` is a vertical scroll region: an `overflow-y: auto|scroll`
@@ -405,6 +484,8 @@ fn paint_region(
     ox: f32,
     oy: f32,
     scroll_clips: &mut Vec<(usize, u16, u16)>,
+    alpha: &HashMap<String, bool>,
+    composites: &mut Composites,
 ) -> Region {
     let pad_x = f.x + f.border[LEFT];
     let pad_y = f.y + f.border[TOP];
@@ -432,13 +513,15 @@ fn paint_region(
         &mut n_carousels,
         scroll_clips, // nested clientHeights bubble up to the doc's scroll_clips
         &mut n_splices,
+        alpha,
+        composites,
     );
     // Paint the region's content into its buffer, origin at the padding-box
     // top-left (the scroll origin), clipped to the scrollport WIDTH — the
     // scroll axis (height) is unbounded so the buffer holds the full content.
     let mut ops = Vec::new();
     build_sc(f, &mut ops, cw, ch, pad_x, pad_y);
-    let mut buffer = composite(ops, width);
+    let mut buffer = composite(ops, width, alpha, composites);
     // Splice nested carousel strips over their (blank) bands in this buffer.
     for (s, strip) in n_splices {
         for (i, srow) in strip.into_iter().enumerate() {
@@ -589,7 +672,9 @@ fn build_sc(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32)
     }
     // E.2 step 4: in-flow, non-positioned block-level backgrounds, tree order.
     inflow_bgs(f, ops, cw, ch, ox, oy);
-    // (step 5, floats: none — floats are not implemented.)
+    // E.2 step 5: non-positioned floats, tree order (§9.5) — each as its own
+    // pseudo stacking context.
+    build_floats(f, ops, cw, ch, ox, oy);
     // E.2 step 7: in-flow, non-positioned inline content, tree order.
     inflow_content(f, ops, cw, ch, ox, oy);
     // E.2 step 8: z:auto positioned (pseudo) and z:0 SCs, one merged
@@ -613,7 +698,31 @@ fn build_sc(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32)
 fn build_pseudo(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32) {
     fill_op(f, ops, cw, ch, ox, oy);
     inflow_bgs(f, ops, cw, ch, ox, oy);
+    build_floats(f, ops, cw, ch, ox, oy);
     inflow_content(f, ops, cw, ch, ox, oy);
+}
+
+/// Appendix E step 5: paint every non-positioned float in `f`'s subtree, in
+/// tree order, each as its own pseudo stacking context — its background, its
+/// in-flow content, and its own nested floats (its positioned/SC descendants
+/// belong to the enclosing real stacking context, collected there, §9.5). The
+/// walk descends through plain in-flow boxes but treats a float atomically; a
+/// float that is itself positioned or forms a stacking context is left to the
+/// normal positioned/SC path (its `sc`/`positioned` flag wins).
+fn build_floats(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32) {
+    for c in &f.children {
+        if c.paint.sc || c.paint.positioned {
+            continue;
+        }
+        if c.paint.float {
+            fill_op(c, ops, cw, ch, ox, oy);
+            inflow_bgs(c, ops, cw, ch, ox, oy);
+            build_floats(c, ops, cw, ch, ox, oy);
+            inflow_content(c, ops, cw, ch, ox, oy);
+        } else {
+            build_floats(c, ops, cw, ch, ox, oy);
+        }
+    }
 }
 
 /// Bucket the positioned/SC descendants of `f` by stack level, descending
@@ -645,9 +754,10 @@ fn collect_positioned<'f, 't>(
 }
 
 /// In-flow, non-positioned block-level backgrounds, tree order (E.2 step 4).
+/// Floats paint as a unit in step 5 (`build_floats`), so they're skipped here.
 fn inflow_bgs(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32) {
     for c in &f.children {
-        if c.paint.sc || c.paint.positioned {
+        if c.paint.sc || c.paint.positioned || c.paint.float {
             continue;
         }
         if matches!(c.kind, FragKind::Block) {
@@ -657,10 +767,11 @@ fn inflow_bgs(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f3
     }
 }
 
-/// In-flow, non-positioned inline content, tree order (E.2 step 7).
+/// In-flow, non-positioned inline content, tree order (E.2 step 7). Floats
+/// paint as a unit in step 5 (`build_floats`), so they're skipped here.
 fn inflow_content(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32) {
     for c in &f.children {
-        if c.paint.sc || c.paint.positioned {
+        if c.paint.sc || c.paint.positioned || c.paint.float {
             continue;
         }
         if let FragKind::Line(pieces) = &c.kind {
@@ -789,8 +900,17 @@ impl RowSpans {
     }
 }
 
-/// Composite the display list into non-overlapping `Doc` rows.
-fn composite(ops: Vec<Op>, cols: usize) -> Vec<Row> {
+/// Composite the display list into non-overlapping `Doc` rows. `alpha`
+/// (URL→`has_alpha`) and `composites` drive the P8 overlap grouping: image
+/// fragments that overlap and where an upper image is transparent are folded
+/// into ONE synthetic `x-trust-composite:` emission (registered in `composites`)
+/// so the app can alpha-blend them; opaque overlaps stay separate.
+fn composite(
+    ops: Vec<Op>,
+    cols: usize,
+    alpha: &HashMap<String, bool>,
+    composites: &mut Composites,
+) -> Vec<Row> {
     let cols_u = cols as u32;
     let mut grid: Vec<RowSpans> = Vec::new();
     let ensure = |grid: &mut Vec<RowSpans>, row: usize| {
@@ -800,11 +920,6 @@ fn composite(ops: Vec<Op>, cols: usize) -> Vec<Row> {
     };
     // Clip an op's placement to the viewport band, mirroring the P0 painter:
     // left overhang cuts leading cells, the right edge truncates.
-    struct Placed {
-        row: usize,
-        col: u32,
-        item: Item,
-    }
     let mut placed: Vec<Option<Placed>> = Vec::with_capacity(ops.len());
     // ---- stamping pass (paint order) ----
     for (i, op) in ops.into_iter().enumerate() {
@@ -917,6 +1032,16 @@ fn composite(ops: Vec<Op>, cols: usize) -> Vec<Row> {
             }
         }
     }
+    // ---- P8: alpha-composite transparent image overlaps ----
+    // Group image fragments that overlap where an UPPER image is transparent
+    // into one synthetic `x-trust-composite:` emission (the app alpha-blends the
+    // layers so lower images show through upper holes). Opaque overlaps stay
+    // separate. `consumed[i]` = a placed image folded into a group.
+    let mut consumed = vec![false; placed.len()];
+    let mut groups: Vec<CompositeGroup> = Vec::new();
+    if !alpha.is_empty() {
+        group_transparent_overlaps(&placed, alpha, &mut consumed, &mut groups);
+    }
     // ---- emission pass 1: atomic images (and their opaque pixel rects) ----
     let mut rows: Vec<Row> = Vec::new();
     let ensure_rows = |rows: &mut Vec<Row>, need: usize| {
@@ -925,11 +1050,12 @@ fn composite(ops: Vec<Op>, cols: usize) -> Vec<Row> {
         }
     };
     // Opaque pixel rects per row: text landing inside them is dropped (the
-    // image pass paints pixels over those cells regardless — P8 composites).
+    // image pass paints pixels over those cells regardless — a composite renders
+    // its whole box as one widget too, so text under it drops the same way).
     let mut pixels: Vec<Vec<(u32, u32)>> = Vec::new();
     for (i, p) in placed.iter().enumerate() {
         let Some(p) = p else { continue };
-        if p.item.image.is_none() || p.item.invisible {
+        if p.item.image.is_none() || p.item.invisible || consumed[i] {
             continue;
         }
         let survives = (p.row..p.row + p.item.height.max(1) as usize)
@@ -948,6 +1074,62 @@ fn composite(ops: Vec<Op>, cols: usize) -> Vec<Row> {
         let mut item = p.item.clone();
         item.col = p.col.min(u16::MAX as u32) as u16;
         rows[p.row].items.push(item);
+    }
+    // Emit each composite group as ONE image item over its union box, keyed by a
+    // synthetic `x-trust-composite:` URL the app resolves to `composites`.
+    for g in &groups {
+        // Survives if any member still owns any cell (not fully covered by later
+        // external content painted over the whole union).
+        let survives = g.members.iter().any(|&m| {
+            let p = placed[m].as_ref().unwrap();
+            (p.row..p.row + p.item.height.max(1) as usize)
+                .any(|r| grid.get(r).is_some_and(|gr| !gr.owned(m).is_empty()))
+        });
+        if !survives {
+            continue;
+        }
+        let layers: Vec<CompositeLayer> = g
+            .members
+            .iter()
+            .map(|&m| {
+                let p = placed[m].as_ref().unwrap();
+                CompositeLayer {
+                    url: p.item.image.clone().unwrap(),
+                    dcol: (p.col - g.col).min(u32::from(u16::MAX)) as u16,
+                    drow: (p.row - g.row).min(usize::from(u16::MAX)) as u16,
+                    w: p.item.width,
+                    h: p.item.height.max(1),
+                    crop: p.item.crop,
+                    pixelated: p.item.pixelated,
+                }
+            })
+            .collect();
+        let key = composite_key(&layers);
+        let (c0, c1) = (g.col, g.col + g.w);
+        for r in g.row..g.row + g.h {
+            while pixels.len() <= r {
+                pixels.push(Vec::new());
+            }
+            pixels[r].push((c0, c1));
+        }
+        ensure_rows(&mut rows, g.row + g.h);
+        // Hover / selection map the union to the BASE (bottom) image's node/link.
+        let base = placed[g.members[0]].as_ref().unwrap();
+        rows[g.row].items.push(Item {
+            col: g.col.min(u32::from(u16::MAX)) as u16,
+            width: g.w.min(u32::from(u16::MAX)) as u16,
+            height: g.h.min(usize::from(u16::MAX)) as u16,
+            text: String::new(),
+            kind: ItemKind::Image,
+            image: Some(key.clone()),
+            emph: Emphasis::default(),
+            node: base.item.node,
+            link: base.item.link.clone(),
+            crop: false,
+            pixelated: false,
+            invisible: false,
+        });
+        composites.insert(key, layers);
     }
     // ---- emission pass 2: sliceable items (text, widgets, blank boxes) ----
     for (i, p) in placed.iter().enumerate() {
@@ -984,6 +1166,144 @@ fn composite(ops: Vec<Op>, cols: usize) -> Vec<Row> {
         row.items.sort_by_key(|it| it.col);
     }
     rows
+}
+
+/// One placed (viewport-clipped) inline item, ready to emit: its top row/col in
+/// cells and the (possibly clipped) `Item`. Built in `composite`'s stamping pass
+/// and read back in the emission passes and the P8 overlap grouping.
+struct Placed {
+    row: usize,
+    col: u32,
+    item: Item,
+}
+
+/// One alpha-composite overlap group: the `placed` indices of its member images
+/// (ascending == paint order, bottom first) and the union box in cells.
+struct CompositeGroup {
+    members: Vec<usize>,
+    col: u32,
+    row: usize,
+    w: u32,
+    h: usize,
+}
+
+/// A placed item's cell box `(col0, row0, col1, row1)` (half-open).
+fn placed_box(placed: &[Option<Placed>], i: usize) -> (u32, usize, u32, usize) {
+    let p = placed[i].as_ref().unwrap();
+    let h = p.item.height.max(1) as usize;
+    (p.col, p.row, p.col + u32::from(p.item.width), p.row + h)
+}
+
+fn boxes_overlap(a: (u32, usize, u32, usize), b: (u32, usize, u32, usize)) -> bool {
+    a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
+}
+
+/// Find connected components of overlapping visible image items and, for any
+/// component where an UPPER (later-painted) image is transparent and overlaps a
+/// lower one, record it as a composite group (marking its members `consumed`).
+/// Opaque overlaps are left alone — they stay separate, cheap image items.
+fn group_transparent_overlaps(
+    placed: &[Option<Placed>],
+    alpha: &HashMap<String, bool>,
+    consumed: &mut [bool],
+    groups: &mut Vec<CompositeGroup>,
+) {
+    let has_alpha = |i: usize| -> bool {
+        placed[i]
+            .as_ref()
+            .and_then(|p| p.item.image.as_deref())
+            .and_then(|u| alpha.get(u))
+            .copied()
+            .unwrap_or(false)
+    };
+    // Visible placed images, in paint order (index order == paint order).
+    let imgs: Vec<usize> = placed
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            p.as_ref()
+                .is_some_and(|p| p.item.image.is_some() && !p.item.invisible)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    // No composite is possible without ≥2 images AND at least one transparent
+    // one — so skip the O(images²) overlap scan on the (common) all-opaque page,
+    // even when the alpha map is fully populated with opaque entries.
+    if imgs.len() < 2 || !imgs.iter().any(|&i| has_alpha(i)) {
+        return;
+    }
+    // Union-find (path-halving) over `imgs` positions, joined on box overlap.
+    let n = imgs.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for a in 0..n {
+        for b in (a + 1)..n {
+            if boxes_overlap(placed_box(placed, imgs[a]), placed_box(placed, imgs[b])) {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                if ra != rb {
+                    parent[ra] = rb;
+                }
+            }
+        }
+    }
+    let mut comp: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (a, &img) in imgs.iter().enumerate() {
+        let r = find(&mut parent, a);
+        comp.entry(r).or_default().push(img);
+    }
+    for members in comp.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let mut members = members;
+        members.sort_unstable(); // placed index == paint order (bottom first)
+        // Composite only if some upper member is transparent AND overlaps an
+        // earlier-painted member (so its holes actually reveal a lower image).
+        let need = members.iter().enumerate().skip(1).any(|(pos, &m)| {
+            has_alpha(m)
+                && members[..pos]
+                    .iter()
+                    .any(|&l| boxes_overlap(placed_box(placed, l), placed_box(placed, m)))
+        });
+        if !need {
+            continue;
+        }
+        let (mut col0, mut row0, mut col1, mut row1) = (u32::MAX, usize::MAX, 0u32, 0usize);
+        for &m in &members {
+            let (a0, a1, a2, a3) = placed_box(placed, m);
+            col0 = col0.min(a0);
+            row0 = row0.min(a1);
+            col1 = col1.max(a2);
+            row1 = row1.max(a3);
+            consumed[m] = true;
+        }
+        groups.push(CompositeGroup {
+            members,
+            col: col0,
+            row: row0,
+            w: col1 - col0,
+            h: row1 - row0,
+        });
+    }
+}
+
+/// A deterministic, cache-stable synthetic URL for a composite group: hashing
+/// the ordered layers means an identical overlap re-keys identically (encode
+/// cache hit) and a changed member re-keys (re-encode), which is exactly the
+/// invalidation the app's `EncKey`/`image_protocols` cache wants.
+fn composite_key(layers: &[CompositeLayer]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for l in layers {
+        l.hash(&mut h);
+    }
+    format!("x-trust-composite:{:016x}", h.finish())
 }
 
 /// Subtract the `cover` intervals from `segs` (output keeps order).

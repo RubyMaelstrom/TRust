@@ -409,6 +409,20 @@ struct ImgMsg {
 struct DecodedImage {
     raw: std::sync::Arc<[u8]>,
     cell: (u16, u16),
+    /// Whether the raster has real transparency (mirrored into `image_alpha`
+    /// for layout's overlap compositor — LAYOUT_OVERHAUL_PLAN.md P8). SVG and
+    /// opaque rasters are `false`, so they never trigger a composite group.
+    has_alpha: bool,
+}
+
+/// One layer's owned inputs for a composite encode (P8): its decoded bytes plus
+/// the geometry the compositor recorded, moved onto the blocking encode thread.
+struct CompositeInput {
+    raw: std::sync::Arc<[u8]>,
+    box_cells: (u16, u16),
+    off_cells: (u16, u16),
+    crop: bool,
+    pixelated: bool,
 }
 
 /// One page image finished the parallel fetch+decode pipeline.
@@ -816,6 +830,11 @@ pub struct App {
     /// even on the O(one message) region-patch path, where a session's
     /// accumulated cache could outweigh the patch itself.
     image_sizes: crate::layout::ImageSizes,
+    /// URL→`has_alpha` mirror of `image_cache` (same insert-only sync), threaded
+    /// into layout so the overlap compositor (LAYOUT_OVERHAUL_PLAN.md P8) groups
+    /// only genuinely-transparent overlaps. An absent entry means "opaque / not
+    /// yet decoded" — no grouping, the always-correct default.
+    image_alpha: std::collections::HashMap<String, bool>,
     /// Persistent channel for finished page-image fetch+decodes. Batches are
     /// ADDITIVE: overlapping batches (the initial page load + a live patch's
     /// new emote) all deliver here. The old model — a per-batch receiver that
@@ -955,6 +974,7 @@ impl App {
             img_rx: None,
             image_cache: HashMap::new(),
             image_sizes: crate::layout::ImageSizes::new(),
+            image_alpha: std::collections::HashMap::new(),
             imgs_tx,
             imgs_rx,
             imgs_in_flight: HashSet::new(),
@@ -2877,6 +2897,7 @@ impl App {
         };
         self.pending_decoded_urls.push(msg.url.clone());
         self.image_sizes.insert(msg.url.clone(), decoded.cell);
+        self.image_alpha.insert(msg.url.clone(), decoded.has_alpha);
         self.image_cache.insert(msg.url, decoded);
     }
 
@@ -3035,6 +3056,7 @@ impl App {
             height,
             Some(&forms),
             &self.image_sizes,
+            &self.image_alpha,
         );
         // Same page, same blob mirror (a re-parse must not orphan blob: images).
         g.doc.blobs = blobs;
@@ -3231,6 +3253,18 @@ impl App {
                 }
             }
         }
+        // Fixed-layer images: the pinned `position:fixed` rails hold their rows
+        // in `doc.fixed`, not `doc.rows`, so the scans above never see them. A
+        // rail is always on-screen (viewport-pinned), so every image box in it
+        // is live (the panel `Rect` clips at render).
+        for fixed in &g.doc.fixed {
+            for row in &fixed.rows {
+                for item in &row.items {
+                    let Some(url) = &item.image else { continue };
+                    live.insert(EncKey::for_item(url, item));
+                }
+            }
+        }
         // Bound the caches: drop protocols/failures for boxes no longer in range
         // (a re-scrolled box gets one fresh encode attempt).
         self.image_protocols.retain(|k, _| live.contains(k));
@@ -3251,6 +3285,12 @@ impl App {
     /// Spawn one blocking encode of a decoded image to a sliced terminal
     /// protocol for the given cell box; the result lands over `enc_rx`.
     fn request_image_encode(&mut self, key: EncKey) {
+        // A synthetic composite box (P8): alpha-blend its layers into one
+        // protocol instead of encoding a single cached image.
+        if key.url.starts_with("x-trust-composite:") {
+            self.request_composite_encode(key);
+            return;
+        }
         let Some(decoded) = self.image_cache.get(&key.url) else {
             return;
         };
@@ -3282,6 +3322,68 @@ impl App {
                 // render-thread `to_sequence` build — matters for a streaming
                 // chat's steady flow of newly-appearing emotes (see
                 // SlicedProtocol::prewarm_sixel_cache).
+                protocol.prewarm_sixel_cache();
+                Some(protocol)
+            }))
+            .ok()
+            .flatten();
+            let _ = tx.blocking_send(EncMsg {
+                key,
+                protocol,
+                epoch,
+            });
+        });
+    }
+
+    /// Spawn one blocking alpha-composite encode for a synthetic composite box
+    /// (P8): gather each layer's decoded bytes + used box from `image_cache`,
+    /// then `img::encode_composite` blends them into one protocol keyed by the
+    /// synthetic URL. If any layer isn't decoded yet, do nothing — a later tick
+    /// retries once every layer is cached (the composite key stays uncached, so
+    /// `sync_image_encodes` re-requests it).
+    fn request_composite_encode(&mut self, key: EncKey) {
+        let Some(layers) = self
+            .browser
+            .as_ref()
+            .and_then(|g| g.doc.composites.get(&key.url).cloned())
+        else {
+            return;
+        };
+        // Each layer's owned encode inputs, bottom first. If any layer is not
+        // decoded yet, bail — a later tick retries once all are cached.
+        let mut inputs: Vec<CompositeInput> = Vec::with_capacity(layers.len());
+        for l in &layers {
+            let Some(dec) = self.image_cache.get(&l.url) else {
+                return; // a layer is not decoded yet — retry next tick
+            };
+            inputs.push(CompositeInput {
+                raw: dec.raw.clone(),
+                box_cells: (l.w, l.h),
+                off_cells: (l.dcol, l.drow),
+                crop: l.crop,
+                pixelated: l.pixelated,
+            });
+        }
+        let picker = self.picker.clone();
+        let tx = self.enc_tx.clone();
+        let epoch = self.enc_epoch;
+        let tint = svg_tint();
+        let box_size = ratatui::layout::Size::new(key.w, key.h);
+        self.image_encoding.insert(key.clone());
+        tokio::task::spawn_blocking(move || {
+            let protocol = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let refs: Vec<crate::img::CompositeInput<'_>> = inputs
+                    .iter()
+                    .map(|i| crate::img::CompositeInput {
+                        bytes: &i.raw,
+                        box_cells: ratatui::layout::Size::new(i.box_cells.0, i.box_cells.1),
+                        off_cells: i.off_cells,
+                        crop: i.crop,
+                        pixelated: i.pixelated,
+                    })
+                    .collect();
+                let protocol =
+                    crate::img::encode_composite(&picker, box_size, &refs, Some(tint)).ok()?;
                 protocol.prewarm_sixel_cache();
                 Some(protocol)
             }))
@@ -4383,6 +4485,7 @@ impl App {
             height,
             None,
             &self.image_sizes,
+            &self.image_alpha,
         );
         // The live page keeps minting into the SAME map (shared Arc), so the
         // re-parsed doc must keep carrying it.
@@ -5903,6 +6006,7 @@ impl App {
                     height,
                     Some(&forms),
                     &self.image_sizes,
+                    &self.image_alpha,
                 )
             }
             Link::OneShot(url) => oneshot::parse(&url, raw, width),
@@ -7176,8 +7280,12 @@ async fn load_one_image(
     // carries its bytes — decode locally, no fetch, no SSRF concern.
     if url.starts_with("data:") {
         let raw: std::sync::Arc<[u8]> = crate::img::decode_data_url(url)?.into();
-        let cell = decoded_cell_box(raw.clone(), font).await?;
-        return Some(DecodedImage { raw, cell });
+        let (cell, has_alpha) = decoded_cell_box(raw.clone(), font).await?;
+        return Some(DecodedImage {
+            raw,
+            cell,
+            has_alpha,
+        });
     }
     // A `blob:` image resolves from the page's blob byte mirror — bytes the
     // page's own JS minted via `URL.createObjectURL` (Steam's login QR).
@@ -7187,8 +7295,12 @@ async fn load_one_image(
         let raw: std::sync::Arc<[u8]> = blobs
             .and_then(|m| m.lock().unwrap().get(key).map(|(b, _)| b.clone()))?
             .into();
-        let cell = decoded_cell_box(raw.clone(), font).await?;
-        return Some(DecodedImage { raw, cell });
+        let (cell, has_alpha) = decoded_cell_box(raw.clone(), font).await?;
+        return Some(DecodedImage {
+            raw,
+            cell,
+            has_alpha,
+        });
     }
     let parsed = http::parse_url(url)?;
     if !http::subresource_allowed(page, &parsed) {
@@ -7204,8 +7316,12 @@ async fn load_one_image(
         return None;
     }
     let raw: std::sync::Arc<[u8]> = resp.body.into();
-    let cell = decoded_cell_box(raw.clone(), font).await?;
-    Some(DecodedImage { raw, cell })
+    let (cell, has_alpha) = decoded_cell_box(raw.clone(), font).await?;
+    Some(DecodedImage {
+        raw,
+        cell,
+        has_alpha,
+    })
 }
 
 /// Decode an image's intrinsic cell box on a blocking thread (sandboxed: a bad
@@ -7218,12 +7334,15 @@ async fn load_one_image(
 async fn decoded_cell_box(
     bytes: std::sync::Arc<[u8]>,
     font: ratatui_image::FontSize,
-) -> Option<(u16, u16)> {
+) -> Option<((u16, u16), bool)> {
     tokio::task::spawn_blocking(move || {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::img::info(&bytes)
-                .ok()
-                .map(|info| natural_cell_box_dimensions(info.width, info.height, font))
+            crate::img::info(&bytes).ok().map(|info| {
+                (
+                    natural_cell_box_dimensions(info.width, info.height, font),
+                    info.has_alpha,
+                )
+            })
         }))
         .ok()
         .flatten()
@@ -10278,6 +10397,7 @@ mod tests {
                 super::DecodedImage {
                     raw: std::sync::Arc::from(&b"px"[..]),
                     cell: (1, 1),
+                    has_alpha: false,
                 },
             );
             app.image_sizes.insert(url, (8, 16));
@@ -11299,6 +11419,7 @@ mod tests {
             super::DecodedImage {
                 raw: png.clone().into(),
                 cell,
+                has_alpha: false,
             },
         );
         let key = app
@@ -11400,6 +11521,7 @@ mod tests {
             super::DecodedImage {
                 raw: png.clone().into(),
                 cell,
+                has_alpha: false,
             },
         );
         let proto = crate::img::encode_sliced(
@@ -11567,16 +11689,18 @@ mod tests {
         // onto the rewritten <img> in `Dom::rewrite_inline_svgs` — is what
         // resizes it, applied later in `image_used_box`, not here.
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="40" viewBox="0 0 200 40"><path d="M0 0h200v40H0z"/></svg>"#;
-        let cell = super::decoded_cell_box(std::sync::Arc::from(&svg[..]), font)
+        let (cell, svg_alpha) = super::decoded_cell_box(std::sync::Arc::from(&svg[..]), font)
             .await
             .unwrap();
         assert_eq!(cell, super::natural_cell_box_dimensions(200, 40, font));
+        assert!(!svg_alpha, "SVG rasterizes to an opaque silhouette");
         // A raster keeps its natural box too — same path, no special-casing.
         let png = crate::img::red_png();
-        let raster = super::decoded_cell_box(std::sync::Arc::from(&png[..]), font)
+        let (raster, raster_alpha) = super::decoded_cell_box(std::sync::Arc::from(&png[..]), font)
             .await
             .unwrap();
         assert_eq!(raster, super::natural_cell_box_dimensions(4, 4, font));
+        assert!(!raster_alpha, "an opaque RGB PNG has no transparency");
     }
 
     #[tokio::test]

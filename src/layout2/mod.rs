@@ -37,11 +37,14 @@
 //! boundaries are intentionally not emitted yet, so live pages take the
 //! always-correct full-relayout path.
 
+mod boundary;
 mod flex;
+mod float;
 mod flow;
 mod grid;
 mod inline;
 mod intrinsic;
+mod measure;
 mod paint;
 mod replaced;
 mod style;
@@ -55,9 +58,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use url::Url;
 
 use crate::doc::Form;
-use crate::dom::Dom;
+use crate::dom::{Dom, NodeId};
 use crate::layout::{
-    Carousel, ControlMap, FixedItem, ImageSizes, Region, Row, cell_px_h, cell_px_w,
+    BoundaryBox, Carousel, ControlMap, FixedItem, ImageSizes, PxRect, Region, Row, cell_px_h,
+    cell_px_w,
 };
 
 use flow::Flow;
@@ -105,6 +109,16 @@ pub struct Output {
     /// `(live actor node, clientHeight rows, scrollport width cells)` per scroll
     /// region, for the app's per-element scroll-geometry push (CSSOM View).
     pub scroll_clips: Vec<(usize, u16, u16)>,
+    /// Incremental-layout boundaries (P7): block-filling IFC containers baked
+    /// with `data-trust-node`, so a live mutation confined to one re-lays only
+    /// its subtree (`lay_subtree_fragment`) and splices back. Empty ⇒ every live
+    /// mutation takes the always-correct full-relayout path.
+    pub boundaries: Vec<BoundaryBox>,
+    /// Alpha-composited image overlap groups (P8): synthetic `x-trust-composite:`
+    /// URL → ordered layers. A composite `Item` in `rows`/buffers carries the
+    /// synthetic URL as its `image`; the app encodes it from these layers. Empty
+    /// ⇒ no transparent image overlaps on the page.
+    pub composites: HashMap<String, Vec<crate::layout::CompositeLayer>>,
 }
 
 /// Lay an HTML document out at `viewport` = (cols, rows) — the terminal
@@ -116,6 +130,9 @@ pub fn lay_out_document(
     forms: &[Form],
     controls: &ControlMap,
     images: &ImageSizes,
+    // `alpha` = URL→`has_alpha` from the app's decoded cache; the paint
+    // compositor groups only image overlaps where an upper image is transparent.
+    alpha: &HashMap<String, bool>,
 ) -> Output {
     let cols = viewport.0.max(10);
     let cell_w = f32::from(cell_px_w());
@@ -132,6 +149,8 @@ pub fn lay_out_document(
             regions: Vec::new(),
             carousels: Vec::new(),
             scroll_clips: Vec::new(),
+            boundaries: Vec::new(),
+            composites: HashMap::new(),
         };
     };
     let flow = Flow {
@@ -145,6 +164,11 @@ pub fn lay_out_document(
         imemo: Default::default(),
     };
     let (mut frag, flow_bottom, anchors, fixed) = flow.layout(&root);
+    // Incremental-layout boundaries — collected from the fragment tree BEFORE
+    // paint extracts scroll regions (which empty their frags), then filtered to
+    // drop any overlapping a region/carousel band (that content is NOT pure
+    // `Doc.rows` — it lives in a side buffer/strip the splice can't touch).
+    let candidates = boundary::collect(dom, &frag, cell_w, cell_h);
     let mut out = paint::paint(
         dom,
         &mut frag,
@@ -154,7 +178,9 @@ pub fn lay_out_document(
         (cols, viewport.1),
         cell_w,
         cell_h,
+        alpha,
     );
+    let boundaries = filter_boundaries(candidates, &out.regions, &out.carousels);
     page_media_fallback(dom, base, images, cols, &mut out.rows);
     Output {
         rows: out.rows,
@@ -163,7 +189,216 @@ pub fn lay_out_document(
         regions: out.regions,
         carousels: out.carousels,
         scroll_clips: out.scroll_clips,
+        boundaries,
+        composites: out.composites,
     }
+}
+
+/// Drop any candidate boundary whose row span overlaps a scroll region or
+/// carousel band — those hold content in a side buffer/strip, not in `Doc.rows`,
+/// so the inline `Doc.rows` splice can't apply to them (they take the region
+/// path or the full fallback). Mirrors the old engine's `harvest_boundaries`.
+fn filter_boundaries(
+    candidates: Vec<BoundaryBox>,
+    regions: &[Region],
+    carousels: &[Carousel],
+) -> Vec<BoundaryBox> {
+    let overlaps = |a: std::ops::Range<usize>, s: usize, e: usize| a.start < e && s < a.end;
+    candidates
+        .into_iter()
+        .filter(|b| {
+            !regions.iter().any(|r| {
+                overlaps(
+                    b.row_range.clone(),
+                    r.start_row,
+                    r.start_row + r.height as usize,
+                )
+            }) && !carousels
+                .iter()
+                .any(|c| overlaps(b.row_range.clone(), c.start, c.end))
+        })
+        .collect()
+}
+
+/// JS geometry from fragments (P7): `NodeId → PxRect` (border box in CSS px)
+/// for `getBoundingClientRect`, `offset*`/`client*`, and the `scrollHeight`
+/// fallback. Lays the document out exactly as `lay_out_document` would, then
+/// reads the geometry straight off the fragment tree (`measure::boxes`) — no
+/// paint, no cell reconstruction. The signature mirrors `layout::measure_boxes`
+/// so `js::sys_rect` swaps engines on `layout2::enabled()`.
+pub fn measure_boxes(
+    dom: &Dom,
+    base: &Url,
+    viewport: (usize, usize),
+    forms: &[Form],
+    controls: &ControlMap,
+    cell_px: (u16, u16),
+    images: &ImageSizes,
+) -> HashMap<NodeId, PxRect> {
+    let cols = viewport.0.max(10);
+    // The layout runs on the SESSION cell metrics (via `Units`), so measure
+    // with the same ones for an exact round-trip; `cell_px` (what the caller
+    // wants px reported in) equals them in practice (both come from the picker).
+    let cell_w = f32::from(cell_px_w());
+    let cell_h = f32::from(cell_px_h());
+    let vp = Vp {
+        w: cols as f32 * cell_w,
+        h: viewport.1 as f32 * cell_h,
+    };
+    let Some(root) = tree::build(dom, base, controls, forms, vp) else {
+        return HashMap::new();
+    };
+    let flow = Flow {
+        dom,
+        base,
+        forms,
+        images,
+        vp,
+        cell_w,
+        cell_h,
+        imemo: Default::default(),
+    };
+    let (frag, _flow_bottom, _anchors, fixed) = flow.layout(&root);
+    measure::boxes(
+        dom,
+        &frag,
+        &fixed,
+        cell_w,
+        cell_h,
+        f64::from(cell_px.0.max(1)),
+        f64::from(cell_px.1.max(1)),
+    )
+}
+
+/// Lay one INLINE relayout-boundary subtree (a block-filling IFC box, NOT a
+/// scroll region) for the general incremental splice (INCREMENTAL_LAYOUT_PLAN.md
+/// §14; the layout2 sibling of `layout::lay_out_subtree_fragment`). `boundary`
+/// is the box in a re-parsed fragment DOM (`serialize_patch` output, inherited
+/// context materialized). `content_width` is the boundary's BORDER-box width
+/// (the band it fills, captured in `boundary::collect`). Its OWN margins are
+/// suppressed for the lay — the boundary is spliced by its border-box
+/// `origin_col`/`row_range`, so the fragment lays its border box at `(0,0)` and
+/// its content wraps at the same width, byte-for-byte with the full render (the
+/// §9 differential guard). `rows` are fragment-relative (cols from 0); the app
+/// shifts by `origin_col` and splices. Non-empty `regions`/`carousels` mean the
+/// box grew a sub-frame since capture ⇒ the app resyncs.
+#[allow(clippy::too_many_arguments)]
+pub fn lay_subtree_fragment(
+    dom: &Dom,
+    base: &Url,
+    content_width: usize,
+    viewport: (usize, usize),
+    controls: &ControlMap,
+    images: &ImageSizes,
+    boundary: NodeId,
+    _sub_box: bool,
+) -> crate::layout::SubtreeFragment {
+    let cols = content_width.max(1);
+    let cell_w = f32::from(cell_px_w());
+    let cell_h = f32::from(cell_px_h());
+    let vp = Vp {
+        w: cols as f32 * cell_w,
+        h: viewport.1 as f32 * cell_h,
+    };
+    let empty = || crate::layout::SubtreeFragment {
+        rows: Vec::new(),
+        height: 0,
+        width: 0,
+        carousels: Vec::new(),
+        regions: Vec::new(),
+        scroll_clips: Vec::new(),
+    };
+    let Some(mut root) = tree::build_at(dom, base, controls, &[], vp, boundary) else {
+        return empty();
+    };
+    // Suppress the boundary's OWN margins: it is spliced at its border-box
+    // origin, so the fragment must lay its border box at the top-left — margins
+    // live outside the border box and belong to the splice position, not the
+    // patched rows (matches `boundary::collect`'s border-box convention).
+    root.style.margin = std::array::from_fn(|_| value::Len::px(0.0));
+    let flow = Flow {
+        dom,
+        base,
+        forms: &[],
+        images,
+        vp,
+        cell_w,
+        cell_h,
+        imemo: Default::default(),
+    };
+    let (mut frag, flow_bottom, anchors, fixed) = flow.layout(&root);
+    // v1 subtree-patch cut: an inline boundary re-lay does NOT alpha-composite
+    // transparent image overlaps (empty alpha ⇒ no grouping); they reappear on
+    // the next full render, matching the region-patch v1 cut.
+    let out = paint::paint(
+        dom,
+        &mut frag,
+        &fixed,
+        flow_bottom,
+        &anchors,
+        (cols, viewport.1),
+        cell_w,
+        cell_h,
+        &HashMap::new(),
+    );
+    let width = out
+        .rows
+        .iter()
+        .flat_map(|r| &r.items)
+        .map(|it| it.col + it.width)
+        .max()
+        .unwrap_or(0);
+    crate::layout::SubtreeFragment {
+        height: out.rows.len(),
+        width,
+        rows: out.rows,
+        carousels: out.carousels,
+        regions: out.regions,
+        scroll_clips: out.scroll_clips,
+    }
+}
+
+/// Lay one scroll REGION's subtree into a fresh scrollable buffer for an
+/// incremental region patch (INCREMENTAL_LAYOUT_PLAN.md; the layout2 sibling of
+/// `layout::lay_out_region_fragment_cached`). `boundary` is the region node in a
+/// re-parsed fragment DOM (`serialize_patch` output, inherited context
+/// materialized); it is laid AS a fragment root at `content_width` (the existing
+/// `Region.width` scrollport), then composited by the same `paint_region` the
+/// full render uses — so the buffer is consistent with a full relayout. Returns
+/// `(buffer rows, nested carousels, nested scroll-clip clientHeights)`; the app
+/// swaps these into the live `Region`. (No row-cache memo in v1 — correctness
+/// over the reuse optimization; the region is small.)
+pub fn lay_region_fragment(
+    dom: &Dom,
+    base: &Url,
+    content_width: usize,
+    viewport: (usize, usize),
+    controls: &ControlMap,
+    images: &ImageSizes,
+    boundary: NodeId,
+) -> paint::RegionBuffer {
+    let cols = content_width.max(1);
+    let cell_w = f32::from(cell_px_w());
+    let cell_h = f32::from(cell_px_h());
+    let vp = Vp {
+        w: cols as f32 * cell_w,
+        h: viewport.1 as f32 * cell_h,
+    };
+    let Some(root) = tree::build_at(dom, base, controls, &[], vp, boundary) else {
+        return (Vec::new(), Vec::new(), Vec::new());
+    };
+    let flow = Flow {
+        dom,
+        base,
+        forms: &[],
+        images,
+        vp,
+        cell_w,
+        cell_h,
+        imemo: Default::default(),
+    };
+    let (mut frag, _flow_bottom, _anchors, _fixed) = flow.layout(&root);
+    paint::region_buffer(dom, &mut frag, cell_w, cell_h)
 }
 
 /// The page-level media affordance: a page that declares itself a video page
@@ -243,9 +478,20 @@ mod tests {
     }
 
     fn lay_images(html: &str, cols: usize, images: &ImageSizes) -> Output {
+        lay_full(html, cols, images, &HashMap::new())
+    }
+
+    /// Lay out with an explicit `has_alpha` map, to exercise the P8 overlap
+    /// compositor (which groups only overlaps where an upper image is transparent).
+    fn lay_full(
+        html: &str,
+        cols: usize,
+        images: &ImageSizes,
+        alpha: &HashMap<String, bool>,
+    ) -> Output {
         let dom = Dom::parse_document(html);
         let base = Url::parse("http://e.com/").unwrap();
-        lay_out_document(&dom, &base, (cols, 24), &[], &HashMap::new(), images)
+        lay_out_document(&dom, &base, (cols, 24), &[], &HashMap::new(), images, alpha)
     }
 
     /// A row's text with items placed at their columns (gaps = spaces).
@@ -660,7 +906,15 @@ mod tests {
         let dom = Dom::parse_document(html);
         let base = Url::parse("http://e.com/").unwrap();
         let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
-        lay_out_document(&dom, &base, (cols, 24), &forms, &controls, images)
+        lay_out_document(
+            &dom,
+            &base,
+            (cols, 24),
+            &forms,
+            &controls,
+            images,
+            &HashMap::new(),
+        )
     }
 
     fn img_sizes(pairs: &[(&str, u16, u16)]) -> ImageSizes {
@@ -1831,6 +2085,31 @@ mod tests {
     }
 
     #[test]
+    fn oversized_clipped_abspos_does_not_inflate_document_height() {
+        // The element-resize-detector sensor idiom (Twitch's front page, many
+        // React apps): a huge (100000px) position:absolute sizing probe lives
+        // inside an overflow:hidden container. A browser CLIPS it, so it adds
+        // NOTHING to the document's scrollable overflow (CSS Overflow L3 §3.2).
+        // Without clip-aware scrollable extent the whole page became a ~6250-row
+        // blank scroll below one screen of content.
+        let out = lay(
+            r#"<body style="margin:0"><p style="margin:0">head</p><div style="position:relative;height:16px;margin:0"><div style="position:absolute;top:0;right:0;bottom:0;left:0;overflow:hidden;visibility:hidden"><div style="position:absolute;top:0;left:0;width:100000px;height:100000px"></div></div></div><p style="margin:0">foot</p></body>"#,
+            40,
+        );
+        assert_eq!(find(&out, "head").0, 0);
+        assert_eq!(
+            find(&out, "foot").0,
+            2,
+            "footer follows the detector, not the clipped 100000px probe"
+        );
+        assert!(
+            out.rows.len() < 10,
+            "the clipped probe must not inflate the document height (got {} rows)",
+            out.rows.len()
+        );
+    }
+
+    #[test]
     fn overflow_visible_does_not_clip() {
         // The control: the same box with overflow:visible keeps all four lines
         // painting past its 2-row height (only `visible` doesn't clip).
@@ -1962,6 +2241,82 @@ mod tests {
             5,
             "its content flows into the document (all rows page-scrollable)"
         );
+    }
+
+    #[test]
+    fn principal_scroller_escapes_a_definite_height_overflow_hidden_shell() {
+        // A locked-viewport app shell (Twitch's front page) wraps its principal
+        // scroller in a definite-height `<main>{overflow:hidden}` sized to the
+        // viewport. That clip must NOT trap the page to one screen: the
+        // principal scroller's overflow propagates to the viewport (CSS Overflow
+        // L3 §3.1), so its content flows into the document past the shell. (The
+        // Twitch regression: every shelf below the fold sat laid but clipped.)
+        let mut lines = String::new();
+        for i in 0..40 {
+            lines += &format!(r#"<p style="margin:0">P{i:02}</p>"#);
+        }
+        let out = lay(
+            &format!(
+                r#"<html style="height:100%;overflow:hidden"><body style="height:100%;margin:0"><main style="height:100%;overflow:hidden;margin:0"><div style="height:100%;overflow-y:auto;margin:0">{lines}</div></main></body></html>"#
+            ),
+            20,
+        );
+        assert!(out.regions.is_empty(), "still the principal scroller");
+        assert_eq!(find(&out, "P00").0, 0);
+        assert_eq!(
+            find(&out, "P39").0,
+            39,
+            "content flows past the definite-height overflow:hidden shell, not clipped to the viewport"
+        );
+    }
+
+    #[test]
+    fn locked_viewport_sibling_panels_stay_bounded_regions() {
+        // A locked viewport (`html{overflow:hidden}` — e.g. a modal scroll-lock)
+        // over a landmark-LESS document with MULTIPLE scroll panels that are
+        // SIBLINGS (two columns of a flex row) must NOT make them all the
+        // "principal scroller": each is one panel among many, so each is a
+        // bounded inner region and its overflow can't leak into the other
+        // (the humantooth.neocities.org bug — panels overwriting each other).
+        let mut a = String::from("A0 ");
+        for i in 1..30 {
+            a += &format!("A{i}<br>");
+        }
+        let mut b = String::from("B0 ");
+        for i in 1..30 {
+            b += &format!("B{i}<br>");
+        }
+        let out = lay(
+            &format!(
+                r#"<html style="overflow:hidden"><body style="margin:0"><div style="display:flex">
+<div style="flex-grow:1;height:64px;overflow-y:scroll">{a}</div>
+<div style="flex-grow:1;height:64px;overflow-y:scroll">{b}</div>
+</div></body></html>"#
+            ),
+            60,
+        );
+        assert_eq!(
+            out.regions.len(),
+            2,
+            "both sibling panels are bounded regions, neither is the principal scroller"
+        );
+        // Neither panel's overflowing tail leaks into the flat document rows.
+        assert!(
+            absent(&out, "A29") && absent(&out, "B29"),
+            "each panel clips its overflow into its own buffer, not the doc"
+        );
+        // Each region's buffer holds ITS OWN content only (no cross-leak).
+        for r in &out.regions {
+            let has_a = r
+                .buffer
+                .iter()
+                .any(|row| row.items.iter().any(|i| i.text.contains("A29")));
+            let has_b = r
+                .buffer
+                .iter()
+                .any(|row| row.items.iter().any(|i| i.text.contains("B29")));
+            assert!(has_a ^ has_b, "a region holds exactly one panel's content");
+        }
     }
 
     #[test]
@@ -2455,6 +2810,888 @@ mod tests {
         assert!(
             !absent(&out, "DEEPEST"),
             "the innermost content renders past the depth lid"
+        );
+    }
+
+    // ---- P7: JS geometry from fragments (measure::boxes) --------------------
+    // Cells are the nominal 8×16 px; measured rects report the same integer
+    // cell grid the paint pass stamps, × cell px.
+
+    fn measure(html: &str, cols: usize, rows: usize) -> (Dom, HashMap<NodeId, PxRect>) {
+        measure_images(html, cols, rows, &HashMap::new())
+    }
+
+    fn measure_images(
+        html: &str,
+        cols: usize,
+        rows: usize,
+        images: &ImageSizes,
+    ) -> (Dom, HashMap<NodeId, PxRect>) {
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("http://e.com/").unwrap();
+        let boxes = measure_boxes(
+            &dom,
+            &base,
+            (cols, rows),
+            &[],
+            &HashMap::new(),
+            (8, 16),
+            images,
+        );
+        (dom, boxes)
+    }
+
+    fn node_by_id(dom: &Dom, id: &str) -> NodeId {
+        dom.descendants(crate::dom::DOCUMENT)
+            .find(|&n| dom.attr(n, "id") == Some(id))
+            .unwrap_or_else(|| panic!("no element #{id}"))
+    }
+
+    fn rect<'a>(dom: &Dom, boxes: &'a HashMap<NodeId, PxRect>, id: &str) -> &'a PxRect {
+        boxes
+            .get(&node_by_id(dom, id))
+            .unwrap_or_else(|| panic!("no measured box for #{id}"))
+    }
+
+    #[test]
+    fn geometry_reports_a_blocks_own_border_box() {
+        let (dom, boxes) = measure(
+            r#"<body style="margin:0"><div id="a" style="height:48px">x</div><div id="b" style="height:32px">y</div></body>"#,
+            40,
+            24,
+        );
+        let a = rect(&dom, &boxes, "a");
+        assert_eq!(
+            (a.top, a.height),
+            (0.0, 48.0),
+            "first block at the top, 48px tall"
+        );
+        let b = rect(&dom, &boxes, "b");
+        assert_eq!((b.top, b.height), (48.0, 32.0), "second block stacks below");
+    }
+
+    #[test]
+    fn geometry_gives_an_empty_sentinel_a_zero_height_box_in_flow() {
+        // The IntersectionObserver idiom: an empty marker div paints nothing,
+        // but has an honest zero-height box at its flow position (the old
+        // engine faked this with element_tops; layout2 lays a real frag).
+        let (dom, boxes) = measure(
+            r#"<body style="margin:0"><div style="height:80px">tall</div><div id="s"></div></body>"#,
+            40,
+            24,
+        );
+        let s = rect(&dom, &boxes, "s");
+        assert_eq!(
+            s.top, 80.0,
+            "the sentinel sits at the flow position past the tall block"
+        );
+        assert_eq!(s.height, 0.0);
+    }
+
+    #[test]
+    fn geometry_scroll_container_reports_content_extent_not_clientheight() {
+        // A definite-height overflow:auto box reports its CONTENT height (so
+        // scrollHeight, which reads this rect, is the scrollable extent), while
+        // clientHeight is pushed separately by the app.
+        let (dom, boxes) = measure(
+            r#"<body style="margin:0"><div id="sc" style="height:32px;overflow-y:auto">
+                 <div style="height:192px">tall content</div>
+               </div></body>"#,
+            40,
+            24,
+        );
+        let sc = rect(&dom, &boxes, "sc");
+        assert_eq!(sc.top, 0.0);
+        assert_eq!(
+            sc.height, 192.0,
+            "reports the 192px content extent (12 cells), not the 32px clip box"
+        );
+    }
+
+    #[test]
+    fn geometry_hidden_clip_box_reports_its_definite_height() {
+        // overflow:hidden (a pure clip, not a scroll container) reports its own
+        // clipped border box, not the taller content.
+        let (dom, boxes) = measure(
+            r#"<body style="margin:0"><div id="c" style="height:48px;overflow:hidden">
+                 <div style="height:200px">clipped</div>
+               </div></body>"#,
+            40,
+            24,
+        );
+        assert_eq!(rect(&dom, &boxes, "c").height, 48.0);
+    }
+
+    #[test]
+    fn geometry_inline_ancestor_aggregates_its_children_boxes() {
+        // An inline <a> wrapping a <span> generates no frag of its own; its box
+        // is the union of its descendants' pieces (composed-tree aggregation).
+        let (dom, boxes) = measure(
+            r#"<body style="margin:0"><p style="margin:0"><a id="lnk"><span>hello</span></a></p></body>"#,
+            40,
+            24,
+        );
+        let a = rect(&dom, &boxes, "lnk");
+        assert_eq!((a.left, a.top), (0.0, 0.0));
+        assert_eq!(a.width, 40.0, "5 glyphs × 8px = 40px wide");
+    }
+
+    // ---- P7: incremental region patch (measure::region_buffer) -------------
+
+    #[test]
+    fn a_region_patch_buffer_matches_the_full_render_region() {
+        // INCREMENTAL_LAYOUT_PLAN.md §9 differential guard, layout2 edition: the
+        // region buffer laid from a serialized PATCH fragment (re-parsed,
+        // ancestor-less, inherited context MATERIALIZED by serialize_patch) is
+        // byte-for-byte the region a full `lay_out_document` produces. The region
+        // inherits bold+uppercase from <body>; drop the materialization and the
+        // fragment renders non-bold/lowercase and the buffers diverge.
+        let base = Url::parse("https://example.com/").unwrap();
+        let mut html = String::from(
+            r#"<html style="height:100%"><body style="height:100%;font-weight:bold;text-transform:uppercase">"#,
+        );
+        html.push_str(r#"<div id="chat" style="height:100%;overflow-y:scroll;width:30ch">"#);
+        for i in 0..12 {
+            html.push_str(&format!("<div>msg{i:02}</div>"));
+        }
+        html.push_str("</div></body></html>");
+        let dom = Dom::parse_document(&html);
+        let viewport = (40usize, 8usize);
+        // FULL render: the region buffer as the page produces it.
+        let full = lay_out_document(
+            &dom,
+            &base,
+            viewport,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(full.regions.len(), 1, "one scroll region");
+        let region = &full.regions[0];
+        let boundary = region.node;
+        // PATCH: serialize the boundary (materialized) → re-parse → re-lay.
+        let frag = dom.serialize_patch(boundary, &std::collections::HashSet::new());
+        let fdom = Dom::parse_document(&frag);
+        let fnode = fdom
+            .descendants(crate::dom::DOCUMENT)
+            .find(|&n| fdom.attr(n, "data-trust-node").is_some())
+            .expect("the patch fragment bakes data-trust-node on the boundary");
+        let (rows, _car, _clips) = lay_region_fragment(
+            &fdom,
+            &base,
+            region.width as usize,
+            viewport,
+            &HashMap::new(),
+            &HashMap::new(),
+            fnode,
+        );
+        assert_eq!(rows.len(), region.buffer.len(), "same buffer height");
+        for (a, b) in rows.iter().zip(region.buffer.iter()) {
+            assert_eq!(row_text(a), row_text(b), "same rendered text per row");
+            let bolds_a: Vec<bool> = a.items.iter().map(|it| it.emph.bold).collect();
+            let bolds_b: Vec<bool> = b.items.iter().map(|it| it.emph.bold).collect();
+            assert_eq!(
+                bolds_a, bolds_b,
+                "materialized font-weight matches per item"
+            );
+        }
+        // Guard against both being wrong-but-equal: the inherited styling really
+        // reached the content (uppercase + bold).
+        assert!(
+            region
+                .buffer
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.emph.bold),
+            "inherited bold reached the region content"
+        );
+        assert!(
+            row_text(&region.buffer[0]).contains("MSG00"),
+            "inherited text-transform:uppercase applied"
+        );
+    }
+
+    #[test]
+    fn an_inline_ifc_boundary_is_captured_with_its_band() {
+        // A block-filling IFC container (display:flow-root) baked with
+        // data-trust-node is captured as an inline boundary; a plain block is
+        // NOT (it doesn't establish an independent formatting context).
+        let out = lay(
+            r#"<body style="margin:0"><div data-trust-node="7" style="display:flow-root"><p style="margin:0">a</p><p style="margin:0">b</p></div><div data-trust-node="8"><p>plain</p></div></body>"#,
+            40,
+        );
+        assert_eq!(out.boundaries.len(), 1, "only the IFC box is a boundary");
+        let b = &out.boundaries[0];
+        assert_eq!(b.node, 7);
+        assert_eq!(b.origin_col, 0);
+        assert!(!b.sub_box);
+        assert_eq!(b.row_range, 0..2, "two 1-row paragraphs");
+    }
+
+    #[test]
+    fn an_inline_boundary_fragment_lays_like_the_full_document() {
+        // INCREMENTAL_LAYOUT_PLAN.md §9: a block-filling IFC boundary re-laid
+        // from a serialized PATCH fragment (materialized inheritance) is byte-
+        // for-byte the rows the FULL render produced for it. The boundary
+        // inherits bold from <body>; without §4a materialization the fragment
+        // renders non-bold and diverges.
+        let base = Url::parse("http://e.com/").unwrap();
+        let mut html = String::from(
+            r#"<html><body style="margin:0;font-weight:bold"><div id="feed" data-trust-node="7" style="display:flow-root">"#,
+        );
+        for i in 0..6 {
+            html.push_str(&format!(r#"<p style="margin:0">item{i:02} word</p>"#));
+        }
+        html.push_str("</div></body></html>");
+        let dom = Dom::parse_document(&html);
+        let viewport = (30usize, 24usize);
+        let full = lay_out_document(
+            &dom,
+            &base,
+            viewport,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(full.boundaries.len(), 1);
+        let b = full.boundaries[0].clone();
+        let full_rows = &full.rows[b.row_range.clone()];
+        // PATCH: serialize the boundary (materialized) → re-parse → re-lay.
+        let bnode = node_by_id(&dom, "feed");
+        let frag = dom.serialize_patch(bnode, &std::collections::HashSet::new());
+        let fdom = Dom::parse_document(&frag);
+        let fnode = fdom
+            .descendants(crate::dom::DOCUMENT)
+            .find(|&n| fdom.attr(n, "data-trust-node").is_some())
+            .expect("serialize_patch bakes data-trust-node on the boundary");
+        let sub = lay_subtree_fragment(
+            &fdom,
+            &base,
+            b.content_width as usize,
+            viewport,
+            &HashMap::new(),
+            &HashMap::new(),
+            fnode,
+            false,
+        );
+        assert_eq!(sub.rows.len(), b.row_range.len(), "same height");
+        assert_eq!(b.origin_col, 0, "at the body's left edge");
+        for (fr, fullr) in sub.rows.iter().zip(full_rows.iter()) {
+            assert_eq!(row_text(fr), row_text(fullr), "same rendered text per row");
+            let a: Vec<bool> = fr.items.iter().map(|it| it.emph.bold).collect();
+            let c: Vec<bool> = fullr.items.iter().map(|it| it.emph.bold).collect();
+            assert_eq!(a, c, "materialized bold matches per item");
+        }
+        assert!(
+            full_rows
+                .iter()
+                .flat_map(|r| &r.items)
+                .any(|it| it.emph.bold),
+            "inherited bold reached the boundary content"
+        );
+    }
+
+    #[test]
+    fn geometry_documentelement_covers_the_whole_document_height() {
+        let (dom, boxes) = measure(
+            r#"<body style="margin:0"><div style="height:100px">a</div><div style="height:60px">b</div></body>"#,
+            40,
+            24,
+        );
+        let html = dom
+            .descendants(crate::dom::DOCUMENT)
+            .find(|&n| dom.tag_name(n) == Some("html"))
+            .unwrap();
+        assert_eq!(
+            boxes.get(&html).unwrap().height,
+            160.0,
+            "documentElement covers the full 160px document"
+        );
+    }
+
+    // ---- the P8 gate: alpha-composite of transparent image overlaps ----
+
+    /// Two `<img>` abspos-stacked in a positioned box, `badge` offset `left_px`
+    /// from `base` so they partially overlap. Both are 6×4 cells; `badge`'s
+    /// transparency is `badge_alpha`.
+    fn overlap_page(left_px: u32, base_alpha: bool, badge_alpha: bool) -> Output {
+        let images = img_sizes(&[
+            ("http://e.com/base.png", 6, 4),
+            ("http://e.com/badge.png", 6, 4),
+        ]);
+        let mut alpha = HashMap::new();
+        alpha.insert("http://e.com/base.png".to_string(), base_alpha);
+        alpha.insert("http://e.com/badge.png".to_string(), badge_alpha);
+        let html = format!(
+            r#"<body style="margin:0"><div style="position:relative;width:120px;height:64px">
+                <img src="base.png" style="position:absolute;left:0;top:0">
+                <img src="badge.png" style="position:absolute;left:{left_px}px;top:0">
+               </div></body>"#
+        );
+        lay_full(&html, 80, &images, &alpha)
+    }
+
+    fn image_items(out: &Output) -> Vec<&Item> {
+        out.rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|it| it.kind == ItemKind::Image)
+            .collect()
+    }
+
+    #[test]
+    fn a_transparent_image_over_another_folds_into_one_composite() {
+        // base at col 0, badge at col 2 (16px) — they overlap cols 2..6. The
+        // badge is transparent, so the pair becomes ONE synthetic composite the
+        // app alpha-blends (the base shows through the badge's holes).
+        let out = overlap_page(16, false, true);
+        let imgs = image_items(&out);
+        assert_eq!(imgs.len(), 1, "the overlap folds into one emission");
+        let key = imgs[0].image.as_deref().unwrap();
+        assert!(
+            key.starts_with("x-trust-composite:"),
+            "the emission is a composite ({key})"
+        );
+        // Union box: base cols 0..6 ∪ badge cols 2..8 = cols 0..8, 6→8 wide, 4 tall.
+        assert_eq!((imgs[0].col, imgs[0].width, imgs[0].height), (0, 8, 4));
+        // The side-table holds both layers in paint order (base first), with the
+        // badge offset two cells into the union.
+        let layers = out.composites.get(key).expect("layers registered");
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].url, "http://e.com/base.png");
+        assert_eq!(
+            (layers[0].dcol, layers[0].drow, layers[0].w, layers[0].h),
+            (0, 0, 6, 4)
+        );
+        assert_eq!(layers[1].url, "http://e.com/badge.png");
+        assert_eq!(
+            (layers[1].dcol, layers[1].drow, layers[1].w, layers[1].h),
+            (2, 0, 6, 4)
+        );
+    }
+
+    #[test]
+    fn an_opaque_image_overlap_stays_two_separate_items() {
+        // Same geometry, but the badge is OPAQUE — cell-overwrite is pixel-exact,
+        // so the pair stays two cheap separate items (no composite, no re-encode
+        // cost on a mutation of one).
+        let out = overlap_page(16, false, false);
+        assert!(
+            out.composites.is_empty(),
+            "no composite for an opaque overlap"
+        );
+        let imgs = image_items(&out);
+        assert_eq!(imgs.len(), 2, "both images emit separately");
+        assert!(
+            imgs.iter().all(|it| !it
+                .image
+                .as_deref()
+                .unwrap()
+                .starts_with("x-trust-composite:")),
+            "neither item is a composite"
+        );
+    }
+
+    #[test]
+    fn non_overlapping_transparent_images_are_not_grouped() {
+        // badge 96px (12 cells) right of base — no overlap, so even a transparent
+        // badge is left as its own item (nothing to composite through).
+        let out = overlap_page(96, false, true);
+        assert!(out.composites.is_empty(), "no overlap ⇒ no composite");
+        assert_eq!(image_items(&out).len(), 2);
+    }
+
+    #[test]
+    fn a_lone_transparent_image_is_never_a_composite() {
+        // A single transparent image is unchanged — grouping needs ≥2 overlapping
+        // images, so the zero-regression single-image path stays byte-identical.
+        let images = img_sizes(&[("http://e.com/solo.png", 6, 4)]);
+        let mut alpha = HashMap::new();
+        alpha.insert("http://e.com/solo.png".to_string(), true);
+        let out = lay_full(
+            r#"<body style="margin:0"><img src="solo.png"></body>"#,
+            80,
+            &images,
+            &alpha,
+        );
+        assert!(out.composites.is_empty());
+        let imgs = image_items(&out);
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].image.as_deref(), Some("http://e.com/solo.png"));
+    }
+
+    /// P8 perf gate (ignored — a timing measurement, not a pass/fail assert):
+    /// `TRUST_LAYOUT2_BENCH=1 cargo test p8_layout_bench -- --ignored --nocapture`.
+    /// Lays out a GitHub-scale synthetic page (a header, a nav flex row, and a
+    /// grid of ~300 cards each with heading/text/image, several levels deep —
+    /// ~5–6k elements) and reports ms/layout. Budget: low tens of ms.
+    #[test]
+    #[ignore = "manual perf measurement"]
+    fn p8_layout_bench() {
+        let mut html =
+            String::from(r#"<body style="margin:0"><header style="display:flex;gap:8px">"#);
+        for i in 0..12 {
+            html.push_str(&format!(
+                r#"<a href="/n{i}" style="padding:4px">Nav item {i}</a>"#
+            ));
+        }
+        html.push_str(
+            r#"</header><main style="display:grid;grid-template-columns:repeat(3,1fr);gap:16px">"#,
+        );
+        for i in 0..300 {
+            html.push_str(&format!(
+                r#"<article style="display:flex;flex-direction:column;gap:4px;padding:8px">
+                    <img src="/thumb{}.png" alt="thumb">
+                    <h3>Card heading number {i} with a fairly long title that wraps</h3>
+                    <p>Body copy for card {i}: several words of running text that the
+                       inline breaker has to lay across the card's flexed width, with a
+                       <a href="/c{i}">link</a> in the middle for good measure.</p>
+                    <div style="display:flex;gap:4px"><span>a</span><span>b</span><span>c</span></div>
+                   </article>"#,
+                i % 20
+            ));
+        }
+        html.push_str("</main></body>");
+        let images: ImageSizes = (0..20)
+            .map(|i| (format!("http://e.com/thumb{i}.png"), (12u16, 8u16)))
+            .collect();
+        let dom = Dom::parse_document(&html);
+        let base = Url::parse("http://e.com/").unwrap();
+        // Warm once (fills the style index / rule-hash caches shared per epoch),
+        // then time repeated full layouts (each builds a fresh Flow — no cross-
+        // call intrinsic memo, the real per-render cost).
+        let _ = lay_out_document(
+            &dom,
+            &base,
+            (120, 40),
+            &[],
+            &HashMap::new(),
+            &images,
+            &HashMap::new(),
+        );
+        let iters = 20;
+        let t0 = std::time::Instant::now();
+        let mut rows = 0;
+        for _ in 0..iters {
+            let out = lay_out_document(
+                &dom,
+                &base,
+                (120, 40),
+                &[],
+                &HashMap::new(),
+                &images,
+                &HashMap::new(),
+            );
+            rows = out.rows.len();
+        }
+        let per = t0.elapsed().as_secs_f64() * 1000.0 / f64::from(iters);
+        println!(
+            "p8_layout_bench: {} nodes → {rows} rows, {per:.2} ms/layout (budget: low tens of ms)",
+            dom.node_count()
+        );
+    }
+
+    #[test]
+    fn an_empty_alpha_map_disables_grouping_entirely() {
+        // The pre-decode / harness default (no alpha info) never groups, so the
+        // always-correct separate-image path is preserved.
+        let images = img_sizes(&[
+            ("http://e.com/base.png", 6, 4),
+            ("http://e.com/badge.png", 6, 4),
+        ]);
+        let out = lay_full(
+            r#"<body style="margin:0"><div style="position:relative;width:120px;height:64px">
+                <img src="base.png" style="position:absolute;left:0;top:0">
+                <img src="badge.png" style="position:absolute;left:16px;top:0">
+               </div></body>"#,
+            80,
+            &images,
+            &HashMap::new(),
+        );
+        assert!(out.composites.is_empty(), "empty alpha ⇒ no grouping");
+    }
+
+    // ---- P8b-1: floats (CSS 2.1 §9.5) ----------------------------------------
+    // Cells are 8×16px, body margin 0 → content at col 0. Image sizes are in
+    // cells (12×4 = 96×64px = 12 cols, 4 rows).
+
+    /// The row/col of the first item whose text contains `t`.
+    fn at(out: &Output, t: &str) -> (usize, usize) {
+        let (r, it) = find(out, t);
+        (r, it.col as usize)
+    }
+
+    #[test]
+    fn float_left_shortens_every_line_box_beside_it() {
+        // A 12×3 left float and a paragraph long enough to overflow it: the text
+        // flows in the shortened band beside the float on EVERY overlapping row
+        // (not just the first), then returns to full width below — the
+        // humantooth readability case.
+        let images = img_sizes(&[("http://e.com/f.png", 12, 3)]);
+        let words = (0..60).map(|_| "aa").collect::<Vec<_>>().join(" ");
+        let out = lay_images(
+            &format!(
+                r#"<body style="margin:0"><img src="f.png" style="float:left" alt="F"><p style="margin:0">{words}</p></body>"#
+            ),
+            40,
+            &images,
+        );
+        let (_, img) = first_image(&out);
+        assert_eq!((img.col, img.width, img.height), (0, 12, 3));
+        // Rows 0..3 (the float's height) each carry text, shortened into
+        // [12, 40) — beside the float on EVERY row, not only the first.
+        for r in 0..3 {
+            let leftmost = out.rows[r]
+                .items
+                .iter()
+                .filter(|i| i.image.is_none() && !i.text.trim().is_empty())
+                .map(|i| i.col)
+                .min();
+            assert_eq!(
+                leftmost,
+                Some(12),
+                "row {r} text sits just right of the float"
+            );
+        }
+        // Below the float, text returns to the left edge.
+        let below = out.rows.iter().skip(3).any(|row| {
+            row.items
+                .iter()
+                .any(|i| !i.text.trim().is_empty() && i.col == 0)
+        });
+        assert!(below, "text returns to full width below the 3-row float");
+    }
+
+    #[test]
+    fn float_right_pins_to_the_right_edge() {
+        let images = img_sizes(&[("http://e.com/f.png", 10, 3)]);
+        let out = lay_images(
+            r#"<body style="margin:0"><img src="f.png" style="float:right" alt="F"><p style="margin:0">alpha beta gamma delta epsilon zeta eta theta</p></body>"#,
+            40,
+            &images,
+        );
+        let (_, img) = first_image(&out);
+        assert_eq!(img.col, 30, "float:right pinned to 40-10");
+        // No text crosses into the float's columns.
+        let max_right = out
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.is_none())
+            .map(|i| i.col + i.width)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_right <= 30,
+            "text stays left of the right float: {max_right}"
+        );
+    }
+
+    #[test]
+    fn two_left_floats_stack_then_the_third_drops() {
+        // Three 15×3 left floats in 40 cols: two fit side by side (0, 15); the
+        // third can't (30+15 > 40) so it drops to a fresh shelf below (§9.5.1
+        // rule 2 — later same-side floats go right OR lower).
+        let images = img_sizes(&[
+            ("http://e.com/a.png", 15, 3),
+            ("http://e.com/b.png", 15, 3),
+            ("http://e.com/c.png", 15, 3),
+        ]);
+        let out = lay_images(
+            r#"<body style="margin:0"><img src="a.png" style="float:left" alt="A"><img src="b.png" style="float:left" alt="B"><img src="c.png" style="float:left" alt="C"></body>"#,
+            40,
+            &images,
+        );
+        let imgs: Vec<&Item> = out
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.is_some())
+            .collect();
+        let a = imgs
+            .iter()
+            .find(|i| i.image.as_deref() == Some("http://e.com/a.png"))
+            .unwrap();
+        let b = imgs
+            .iter()
+            .find(|i| i.image.as_deref() == Some("http://e.com/b.png"))
+            .unwrap();
+        assert_eq!(a.col, 0);
+        assert_eq!(b.col, 15, "second left float sits beside the first");
+        // The third dropped: it must occupy a row at/after the first shelf's
+        // bottom (row 3), back at the left edge.
+        let c_row = out
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| {
+                row.items
+                    .iter()
+                    .any(|i| i.image.as_deref() == Some("http://e.com/c.png"))
+            })
+            .map(|(r, _)| r)
+            .expect("third float placed");
+        assert!(
+            c_row >= 3,
+            "third float dropped to a new shelf: row {c_row}"
+        );
+    }
+
+    #[test]
+    fn left_and_right_float_frame_the_text_between() {
+        // A left float and a right float on the same band; text fills the gap
+        // between them (§9.5.1 rule 3 — a left float's right edge stays left of
+        // an adjacent right float).
+        let images = img_sizes(&[("http://e.com/l.png", 8, 3), ("http://e.com/r.png", 8, 3)]);
+        let out = lay_images(
+            r#"<body style="margin:0"><img src="l.png" style="float:left" alt="L"><img src="r.png" style="float:right" alt="R"><p style="margin:0">one two three four five six</p></body>"#,
+            40,
+            &images,
+        );
+        let (_, txt) = find(&out, "one");
+        assert!(txt.col >= 8, "text starts right of the left float");
+        let right_edge = out.rows[0]
+            .items
+            .iter()
+            .filter(|i| i.image.is_none())
+            .map(|i| i.col + i.width)
+            .max()
+            .unwrap_or(0);
+        assert!(right_edge <= 32, "text ends left of the right float (40-8)");
+    }
+
+    #[test]
+    fn clear_both_drops_a_block_below_the_float() {
+        let images = img_sizes(&[("http://e.com/f.png", 12, 5)]);
+        let out = lay_images(
+            r#"<body style="margin:0"><img src="f.png" style="float:left" alt="F"><p style="margin:0">beside</p><p style="margin:0;clear:both">cleared</p></body>"#,
+            40,
+            &images,
+        );
+        let beside = at(&out, "beside");
+        let cleared = at(&out, "cleared");
+        assert!(beside.1 >= 12, "first para sits beside the float");
+        assert_eq!(cleared.1, 0, "cleared para is full width");
+        assert!(
+            cleared.0 >= 5,
+            "clear:both drops it below the 5-row float: {}",
+            cleared.0
+        );
+    }
+
+    #[test]
+    fn a_float_wraps_content_across_following_blocks() {
+        // A tall float beside two separate paragraphs: both flow beside it
+        // (floats persist across sibling blocks in the same BFC — §9.5).
+        let images = img_sizes(&[("http://e.com/f.png", 12, 6)]);
+        let out = lay_images(
+            r#"<body style="margin:0"><img src="f.png" style="float:left" alt="F"><p style="margin:0">one two</p><p style="margin:0">four five</p></body>"#,
+            40,
+            &images,
+        );
+        let one = at(&out, "one");
+        let four = at(&out, "four");
+        assert!(one.1 >= 12, "first block beside the float");
+        assert!(
+            four.1 >= 12,
+            "second block ALSO beside the float across blocks"
+        );
+        assert!(four.0 < 6, "both within the 6-row float's height");
+    }
+
+    #[test]
+    fn auto_width_float_shrinks_to_fit_its_content() {
+        // A width:auto float sizes to its content (shrink-to-fit, §10.3.5), so
+        // the text beside it starts just past that content, not at some full
+        // column width.
+        let out = lay(
+            r#"<body style="margin:0"><div style="float:left">Hi</div><p style="margin:0">beside the tag</p></body>"#,
+            40,
+        );
+        let f = at(&out, "Hi");
+        let beside = at(&out, "beside");
+        assert_eq!(f.1, 0, "float at the left edge");
+        assert_eq!(beside.1, 2, "text starts past the 2-cell 'Hi' float");
+    }
+
+    #[test]
+    fn a_bfc_container_grows_to_contain_its_float() {
+        // An `overflow:hidden` (BFC) box grows to enclose a float taller than
+        // its other content (the clearfix idiom), so the following block starts
+        // below the whole float, at full width.
+        let images = img_sizes(&[("http://e.com/f.png", 10, 4)]);
+        let out = lay_images(
+            r#"<body style="margin:0"><div style="overflow:hidden"><img src="f.png" style="float:left" alt="F"></div><p style="margin:0">after</p></body>"#,
+            40,
+            &images,
+        );
+        let after = at(&out, "after");
+        assert_eq!(after.1, 0, "following block is full width");
+        assert!(
+            after.0 >= 4,
+            "the BFC contained the 4-row float, pushing `after` below it: row {}",
+            after.0
+        );
+    }
+
+    // ---- P8b-2: multi-column (css-multicol-1) --------------------------------
+    // 40 cols = 320px, `column-gap:normal` = 1em = 16px = 2 cells. column-count:2
+    // ⇒ N=2, W=(320-16)/2 = 152px = 19 cells; column 0 at col 0, column 1 at
+    // 168px = col 21.
+
+    /// The set of distinct starting columns of non-blank text items.
+    fn text_cols(out: &Output) -> Vec<usize> {
+        let mut cs: Vec<usize> = out
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| !i.text.trim().is_empty())
+            .map(|i| i.col as usize)
+            .collect();
+        cs.sort_unstable();
+        cs.dedup();
+        cs
+    }
+
+    #[test]
+    fn column_count_2_balances_into_two_columns() {
+        let words = (0..40)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let out = lay(
+            &format!(
+                r#"<body style="margin:0"><div style="column-count:2"><p style="margin:0">{words}</p></div></body>"#
+            ),
+            40,
+        );
+        // Column 0 sits at the left edge; column 1 past the 19-cell column + gap.
+        let cols = text_cols(&out);
+        assert!(
+            cols.iter().any(|&c| c == 0),
+            "column 0 at the left edge: {cols:?}"
+        );
+        assert!(
+            cols.iter().any(|&c| c >= 21 && c < 40),
+            "column 1 starts past the gap (col ~21): {cols:?}"
+        );
+        // No text sits in the gap [19, 21).
+        assert!(
+            !cols.iter().any(|&c| (19..21).contains(&c)),
+            "the column gap is empty: {cols:?}"
+        );
+        // Column 1 was lifted to the top by balancing, not stacked below.
+        let col1_top = out.rows.iter().position(|r| {
+            r.items
+                .iter()
+                .any(|i| i.col >= 21 && !i.text.trim().is_empty())
+        });
+        assert!(
+            col1_top.is_some_and(|r| r <= 1),
+            "column 1 begins near the top: {col1_top:?}"
+        );
+    }
+
+    #[test]
+    fn column_width_resolves_the_count_from_available_width() {
+        // §3.4 case 2: column-width:150px in 320px, gap 16px →
+        // N = floor((320+16)/(150+16)) = floor(2.02) = 2.
+        let words = (0..40)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let out = lay(
+            &format!(
+                r#"<body style="margin:0"><div style="column-width:150px"><p style="margin:0">{words}</p></div></body>"#
+            ),
+            40,
+        );
+        let cols = text_cols(&out);
+        assert!(cols.iter().any(|&c| c == 0), "column 0: {cols:?}");
+        assert!(
+            cols.iter().any(|&c| c >= 21),
+            "a second column resolved: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn column_count_caps_the_width_derived_count() {
+        // §3.4 case 3: both specified — count is the min of the two. A narrow
+        // column-width would allow 3 columns in 60 cols, but column-count:2 caps
+        // it at 2.
+        let words = (0..60)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let out = lay(
+            &format!(
+                r#"<body style="margin:0"><div style="column-count:2;column-width:80px"><p style="margin:0">{words}</p></div></body>"#
+            ),
+            60,
+        );
+        // 60 cols = 480px; column-width 80px would give floor((480+16)/96)=5,
+        // capped to 2. Two columns: 0 and past the midpoint gap.
+        let cols = text_cols(&out);
+        let far = cols.iter().copied().max().unwrap_or(0);
+        assert!(cols.iter().any(|&c| c == 0), "column 0: {cols:?}");
+        assert!(
+            (28..40).contains(&far),
+            "exactly two columns (2nd near mid): far col {far}"
+        );
+    }
+
+    #[test]
+    fn column_count_1_is_plain_block_flow() {
+        // A single column is a no-op: text fills the full width and never leaves
+        // a mid-column gap.
+        let words = (0..30)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let out = lay(
+            &format!(
+                r#"<body style="margin:0"><div style="column-count:1"><p style="margin:0">{words}</p></div></body>"#
+            ),
+            40,
+        );
+        // Full-width flow reaches well past a 19-cell column boundary on line 0.
+        let line0_right = out.rows[0]
+            .items
+            .iter()
+            .map(|i| i.col + i.width)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            line0_right > 30,
+            "single column fills the full width: {line0_right}"
+        );
+    }
+
+    #[test]
+    fn column_count_3_makes_three_columns() {
+        // 60 cols = 480px, gap 16px, N=3, W=(480-32)/3 ≈ 149px ≈ 18 cells;
+        // columns at 0, ~21, ~41.
+        let words = (0..60)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let out = lay(
+            &format!(
+                r#"<body style="margin:0"><div style="column-count:3"><p style="margin:0">{words}</p></div></body>"#
+            ),
+            60,
+        );
+        let cols = text_cols(&out);
+        assert!(cols.iter().any(|&c| c == 0), "col 0: {cols:?}");
+        assert!(
+            cols.iter().any(|&c| (18..26).contains(&c)),
+            "col 1 region: {cols:?}"
+        );
+        assert!(
+            cols.iter().any(|&c| (38..48).contains(&c)),
+            "col 2 region: {cols:?}"
         );
     }
 }

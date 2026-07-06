@@ -109,7 +109,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             // from `position:fixed`) draws over the scrolling document at a fixed
             // screen position, so it stays put while the center scrolls.
             if !g.doc.fixed.is_empty() {
-                render_fixed_layer(frame, g, inner, app.find.as_ref());
+                render_fixed_layer(frame, g, inner, app.find.as_ref(), &app.image_protocols);
             }
             // Scroll-position indicator on the right border, when the document
             // overflows the panel.
@@ -495,8 +495,19 @@ pub(crate) fn browser_rows<'a>(
 /// `position:fixed` box (a sidebar/header rail) paints at a FIXED screen
 /// position — NOT offset by scroll — so the document scrolls beneath it. Rows
 /// are placed at their box-relative columns; the box is clipped to the panel.
-/// (Text only for now — images inside a fixed rail are a follow-up.)
-fn render_fixed_layer(frame: &mut Frame, g: &BrowserView, inner: Rect, find: Option<&FindState>) {
+/// Decoded images inside a rail overlay their reserved box (a fixed avatar/logo)
+/// just like the scrolling document's inline-image pass.
+fn render_fixed_layer(
+    frame: &mut Frame,
+    g: &BrowserView,
+    inner: Rect,
+    find: Option<&FindState>,
+    protocols: &std::collections::HashMap<
+        crate::app::EncKey,
+        ratatui_image::sliced::SlicedProtocol,
+    >,
+) {
+    use ratatui_image::sliced::{SignedPosition, SlicedImage};
     for (fi, item) in g.doc.fixed.iter().enumerate() {
         let sx = inner.x.saturating_add(item.col);
         if sx >= inner.right() {
@@ -517,6 +528,33 @@ fn render_fixed_layer(frame: &mut Frame, g: &BrowserView, inner: Rect, find: Opt
                 Paragraph::new(fixed_row_line(row, sel, find, fi, r)),
                 Rect::new(sx, sy as u16, w, 1),
             );
+        }
+        // Overlay the rail's decoded images at their box-relative positions.
+        // The panel `Rect` (the rail's on-screen span) clips a tall/wide image
+        // to the rail, exactly like the region-image pass clips to its band.
+        let panel_top = i32::from(inner.y) + i32::from(item.row);
+        let panel_bot = i32::from(inner.bottom());
+        if panel_top >= panel_bot {
+            continue;
+        }
+        let panel = Rect::new(sx, panel_top as u16, w, (panel_bot - panel_top) as u16);
+        for (r, row) in item.rows.iter().enumerate() {
+            for it in &row.items {
+                let Some(url) = &it.image else { continue };
+                if it.invisible {
+                    continue; // opacity:0 — reserve the box, draw nothing
+                }
+                if u32::from(it.col) >= u32::from(w) {
+                    continue; // past the rail's right edge
+                }
+                let key = crate::app::EncKey::for_item(url, it);
+                let Some(proto) = protocols.get(&key) else {
+                    continue;
+                };
+                let position = SignedPosition::from((it.col as i16, r as i16));
+                crate::app::IMG_RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                frame.render_widget(SlicedImage::new(proto, position), panel);
+            }
         }
     }
 }
