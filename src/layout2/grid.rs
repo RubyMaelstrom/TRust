@@ -1433,6 +1433,19 @@ impl Flow<'_> {
         );
         let row_y = positions(&rows, gap_row, def_ch, dist_of(ac.as_deref()));
 
+        // Record the USED track sizes for the CSSOM resolved value that
+        // `getComputedStyle(grid-template-columns/-rows)` reports (§ CSS Grid
+        // serialization): the used lengths, not the declared `repeat(…)`.
+        if node != NO_NODE {
+            self.grid_tracks.borrow_mut().insert(
+                node,
+                (
+                    cols.iter().map(|t| t.base).collect(),
+                    rows.iter().map(|t| t.base).collect(),
+                ),
+            );
+        }
+
         // ---- finalize: vertical alignment within row areas, translate ----
         let mut frags: Vec<Frag<'t>> = Vec::with_capacity(gitems.len());
         for (g, p) in gitems.iter_mut().zip(&placed) {

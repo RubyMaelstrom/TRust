@@ -19,7 +19,7 @@
 use crate::layout::{NO_NODE, Units, display_width};
 
 use super::flow::Flow;
-use super::inline::{Ifc, control_label, media_label, media_source};
+use super::inline::{AtomBoxSize, Ifc, control_label, media_label, media_source};
 use super::style::{Align2, InlineStyle};
 use super::tree::{AtomKind, BoxNode, Content};
 use super::value::Len;
@@ -71,6 +71,23 @@ impl Flow<'_> {
                     IMode::Min => 1,
                     IMode::Max => PROBE_MAX_CELLS,
                 };
+                // An atomic inline box is opaque: it contributes its own
+                // min/max-content MARGIN-box width to the line (it never breaks
+                // across the parent's lines). The probe IFC places it like the
+                // real one, so pre-size each in walk order (mirroring floats,
+                // which the IFC instead skips + folds below).
+                let mut atoms: Vec<&BoxNode> = Vec::new();
+                super::flow::collect_atom_boxes(inls, &mut atoms);
+                let atom_sizes: Vec<AtomBoxSize> = atoms
+                    .iter()
+                    .map(|ab| {
+                        let w = self.contribution(ab, mode, &here);
+                        AtomBoxSize {
+                            w_cells: (w / self.cell_w).round().max(1.0) as usize,
+                            h_rows: 1,
+                        }
+                    })
+                    .collect();
                 let mut ifc = Ifc::new(
                     self.dom,
                     self.base,
@@ -86,9 +103,10 @@ impl Flow<'_> {
                     // percentages resolve against a zero basis here.
                     self.indent_px(if b.node == NO_NODE { inl.node } else { b.node }, 0.0),
                     None,
+                    &atom_sizes,
                 );
                 ifc.run(inls, &here);
-                let (lines, _, _, _) = ifc.finish();
+                let (lines, _, _, _, _) = ifc.finish();
                 let inline_w =
                     lines.iter().map(|l| l.width).max().unwrap_or(0) as f32 * self.cell_w;
                 // A float contributes its margin-box intrinsic width to the

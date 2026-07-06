@@ -1795,12 +1795,20 @@ impl Dom {
         {
             return false;
         }
-        self.child_iter(id).any(|c| {
+        let is_row_ish = |c: NodeId| {
             matches!(
                 self.effective_display(c).as_deref(),
                 Some("table-row" | "table-row-group" | "table-header-group" | "table-footer-group")
             )
-        })
+        };
+        // Classify over the FLAT tree: a shadow host's misparented rows live in
+        // its shadow (or are slotted). The common (non-host) path stays a lazy
+        // light-child scan — no allocation on the hot `display_of` route.
+        if self.shadow_root(id).is_some() {
+            self.flat_children(id).into_iter().any(is_row_ish)
+        } else {
+            self.child_iter(id).any(is_row_ish)
+        }
     }
 
     /// The cascaded value of any tracked property (the layout reads
@@ -2906,6 +2914,42 @@ impl Dom {
         let mut out = self.children(id);
         if let Some(shadow) = self.shadow_root(id) {
             out.extend(self.children(shadow));
+        }
+        out
+    }
+
+    /// The FLAT-TREE children of `id` (HTML §4.8.2 "flat tree"): a shadow HOST
+    /// yields its shadow root's children IN PLACE of its light children, and any
+    /// `<slot>` among them is replaced by its assigned light nodes (or the
+    /// slot's own fallback children when nothing is assigned). This is what
+    /// layout must iterate wherever it classifies children by ROLE — table
+    /// rows/cells/captions, grid `<col>` tracks — so a component that renders a
+    /// table/grid into its shadow (a `display:table` custom element slotting
+    /// light `<tr>`s) is composed like a browser, not read as empty. `children`
+    /// (light-only) and `composed_children` (light + shadow, no slot projection)
+    /// are the wrong tools there. Unlike the box-tree `tree::children`, which
+    /// hoists a `<slot>` transparently at the element level, this projects one
+    /// level of slots directly so classification sees the assigned nodes.
+    pub fn flat_children(&self, id: NodeId) -> Vec<NodeId> {
+        let base = match self.shadow_root(id) {
+            Some(shadow) => self.children(shadow),
+            None => self.children(id),
+        };
+        if !base.iter().any(|&c| self.tag_name(c) == Some("slot")) {
+            return base; // no shadow slots to project — the common case
+        }
+        let mut out = Vec::with_capacity(base.len());
+        for c in base {
+            if self.tag_name(c) == Some("slot") {
+                let assigned = self.slot_assigned_nodes(c);
+                if assigned.is_empty() {
+                    out.extend(self.children(c)); // the slot's fallback content
+                } else {
+                    out.extend(assigned);
+                }
+            } else {
+                out.push(c);
+            }
         }
         out
     }

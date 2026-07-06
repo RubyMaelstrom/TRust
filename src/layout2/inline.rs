@@ -75,6 +75,12 @@ pub(crate) struct Piece {
     /// A collapsible space materialized as the 1-cell gap before this piece
     /// (a justification slot).
     space_before: bool,
+    /// A PLACEHOLDER for an atomic inline box (`inline-block`/`inline-flex`/
+    /// `inline-grid`): it reserves the box's cells on the line (pen + line
+    /// height) but paints NOTHING — the box's real content is a separate
+    /// pre-laid fragment positioned at this piece's resolved spot (`flush_line`
+    /// records it, the block flow splices it in). `item.node` is the box id.
+    atom_box: bool,
 }
 
 impl Piece {
@@ -90,6 +96,7 @@ impl Piece {
             item,
             stretch: false,
             space_before: false,
+            atom_box: false,
         }
     }
 
@@ -104,8 +111,32 @@ impl Piece {
             item,
             stretch: false,
             space_before: false,
+            atom_box: false,
         }
     }
+}
+
+/// The pre-laid used cell size of an atomic inline box (`inline-block`/
+/// `inline-flex`/`inline-grid`) — its MARGIN box in cells (margins occupy
+/// inline space). The block flow lays the box (`item_frag`) and hands these
+/// to the IFC in walk order (`boxes[k]` = k-th `Inline::AtomBox` met), exactly
+/// like `FloatBox`.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct AtomBoxSize {
+    pub w_cells: usize,
+    pub h_rows: u16,
+}
+
+/// A resolved atomic-inline-box placement returned from the IFC: the box's
+/// element `node` (the block flow matches it to the pre-laid fragment), the
+/// line it landed on, and its margin-box top-left in cells relative to the line
+/// box (`col`) / line top (`row_off`, from bottom alignment).
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct AtomBoxPlace {
+    pub node: NodeId,
+    pub line: usize,
+    pub col: usize,
+    pub row_off: u16,
 }
 
 /// One finished line box.
@@ -186,6 +217,13 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     float_next: usize,
     /// Resolved placements (margin-box top-left px), returned by `finish`.
     placements: Vec<FloatPlace>,
+    // ---- atomic inline boxes (inline-block/-flex/-grid) — empty slice = none ----
+    /// Pre-laid margin-box cell sizes, in the order the IFC meets the boxes.
+    atom_boxes: &'f [AtomBoxSize],
+    /// Index of the next `Inline::AtomBox` to meet (into `atom_boxes`).
+    atom_next: usize,
+    /// Resolved atom-box placements (line/col/row_off), returned by `finish`.
+    atom_places: Vec<AtomBoxPlace>,
     /// The current line box's left content edge in cells (a left float's inset).
     line_left: usize,
     /// The current line box's right edge in cells (a right float pulls it in).
@@ -211,6 +249,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         align: Align2,
         indent_px: f32,
         floats: Option<FloatEnv<'f>>,
+        atom_boxes: &'f [AtomBoxSize],
     ) -> Ifc<'a, 'f, 't> {
         let cap = ((content_w_px / cell_w) + 1e-3).floor().max(1.0) as usize;
         // `text-indent` on the first line, clamped ≥0 (a terminal cannot
@@ -247,6 +286,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             laid_h: 0.0,
             float_next: 0,
             placements: Vec::new(),
+            atom_boxes,
+            atom_next: 0,
+            atom_places: Vec::new(),
             line_left: 0,
             line_right: cap,
             indent,
@@ -337,6 +379,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // A float (§9.5): pulled aside into the float context; it emits no
             // inline content, but shortens the line boxes beside it.
             Inline::Float(_) => self.place_float(),
+            // An atomic inline box (inline-block/-flex/-grid): reserve its
+            // pre-laid margin box on the line; the block flow splices its
+            // content fragment at the resolved position.
+            Inline::AtomBox(b) => self.place_atom_box(b.node),
             Inline::Box { node, style, kids } => {
                 let inner = InlineStyle::derive(self.dom, *node, ctx, self.base);
                 self.marks.push((*node, self.lines.len()));
@@ -542,6 +588,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             },
             stretch: ctx.ws.collapses_spaces(),
             space_before: space,
+            atom_box: false,
         });
         self.pen = col + w;
         self.pending_space = false;
@@ -592,6 +639,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         pixelated: false,
                         invisible: ctx.invisible,
                     },
+                    false,
                 );
             }
         }
@@ -651,6 +699,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     pixelated,
                     invisible: ctx.invisible,
                 },
+                false,
             );
             return;
         }
@@ -755,6 +804,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     pixelated: false,
                     invisible,
                 },
+                false,
             );
             return; // the drawn preview IS the mpv affordance
         }
@@ -785,6 +835,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         off_cols: u16,
         off_rows: u16,
         item: Item,
+        atom_box: bool,
     ) {
         let space = self.pending_space && self.pen > self.line_start;
         let gap = self.take_gap();
@@ -793,7 +844,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         {
             self.soft_break();
             self.pending_gap_px = gap as f32 * self.cell_w;
-            self.place_atom(box_w, box_rows, off_cols, off_rows, item);
+            self.place_atom(box_w, box_rows, off_cols, off_rows, item, atom_box);
             return;
         }
         let col = self.pen + usize::from(space) + gap;
@@ -805,9 +856,44 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             item,
             stretch: false,
             space_before: space,
+            atom_box,
         });
         self.pen = col + box_w;
         self.pending_space = false;
+    }
+
+    /// Place an atomic inline box (`inline-block`/`inline-flex`/`inline-grid`):
+    /// reserve its pre-laid margin-box cells on the line as an unbreakable
+    /// paint-nothing placeholder (`item.node` = the box id). The box's real
+    /// content is a fragment the block flow splices at this piece's resolved
+    /// position (`finish` returns the placement). The IFC only needs the size.
+    fn place_atom_box(&mut self, node: NodeId) {
+        let idx = self.atom_next;
+        self.atom_next += 1;
+        let Some(sz) = self.atom_boxes.get(idx).copied() else {
+            return;
+        };
+        self.place_atom(
+            sz.w_cells,
+            sz.h_rows,
+            0,
+            0,
+            Item {
+                col: 0,
+                width: sz.w_cells as u16,
+                height: sz.h_rows,
+                text: String::new(),
+                kind: crate::layout::ItemKind::Text,
+                image: None,
+                emph: Emphasis::default(),
+                node,
+                link: None,
+                crop: false,
+                pixelated: false,
+                invisible: false,
+            },
+            true,
+        );
     }
 
     /// Consume the owed inline-box edge width as whole cells.
@@ -866,6 +952,24 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 }
             }
         }
+        // Record atomic-inline-box placements (col/row_off now resolved) and
+        // drop their paint-nothing placeholders: the block flow splices the
+        // box's real content fragment at each spot. Removal doesn't shift the
+        // siblings — their columns are already absolute on the line.
+        if line.pieces.iter().any(|p| p.atom_box) {
+            let li = self.lines.len();
+            for p in &line.pieces {
+                if p.atom_box {
+                    self.atom_places.push(AtomBoxPlace {
+                        node: p.item.node,
+                        line: li,
+                        col: p.col,
+                        row_off: p.row_off,
+                    });
+                }
+            }
+            line.pieces.retain(|p| !p.atom_box);
+        }
         self.lines.push(line);
         // Advance past this line box, then open the next against the band at
         // the new vertical position (a taller float may still shorten it).
@@ -877,8 +981,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// Finish the IFC: flush the trailing line, then justify (every line
     /// except forced-break lines and the last — CSS Text §7.1). Returns the
     /// line boxes, the entered-element line marks, the out-of-flow
-    /// static-position marks, and the resolved float placements (margin-box
-    /// top-left px, in the content frame).
+    /// static-position marks, the resolved float placements (margin-box
+    /// top-left px, in the content frame), and the atomic-inline-box
+    /// placements (the block flow splices each box's content fragment there).
     #[allow(clippy::type_complexity)]
     pub fn finish(
         mut self,
@@ -887,6 +992,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         Vec<(NodeId, usize)>,
         Vec<OofMark<'t>>,
         Vec<FloatPlace>,
+        Vec<AtomBoxPlace>,
     ) {
         self.flush_line(false);
         if self.align == Align2::Justify {
@@ -901,7 +1007,13 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 }
             }
         }
-        (self.lines, self.marks, self.oofs, self.placements)
+        (
+            self.lines,
+            self.marks,
+            self.oofs,
+            self.placements,
+            self.atom_places,
+        )
     }
 }
 

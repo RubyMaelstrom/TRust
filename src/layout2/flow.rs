@@ -27,7 +27,7 @@ use super::flex::{
     item_flex, justify_offsets, resolve_flexible_lengths,
 };
 use super::float::{FloatBox, FloatCtx, Side};
-use super::inline::{FloatEnv, Ifc, LineOut, OofMark, Piece};
+use super::inline::{AtomBoxSize, FloatEnv, Ifc, LineOut, OofMark, Piece};
 use super::intrinsic::IMode;
 use super::style::{BOTTOM, BoxStyle, InlineStyle, LEFT, Pos, RIGHT, TOP, block_align};
 use super::tree::{AtomKind, BoxNode, Content, Inline};
@@ -262,7 +262,18 @@ pub(crate) struct Flow<'a> {
     /// The intrinsic-size memo: (element, is-min-mode) → content px. Pass-
     /// wide, so nested flex towers query each subtree once per mode.
     pub imemo: std::cell::RefCell<std::collections::HashMap<(NodeId, bool), f32>>,
+    /// Grid container → its USED track sizes in px `(columns, rows)`, recorded
+    /// by `grid_content` as it lays each grid. This is the CSSOM "resolved
+    /// value" `getComputedStyle` must report for `grid-template-columns`/`-rows`
+    /// (the used track list, e.g. `320px 320px 320px` — NOT the declared
+    /// `repeat(auto-fill, …)`). Populated by the layout pass; read by
+    /// `measure_boxes_and_grid_tracks`.
+    pub grid_tracks: std::cell::RefCell<GridTrackMap>,
 }
+
+/// Each grid container's used track sizes in px `(columns, rows)`, keyed by node
+/// — the CSSOM resolved value for `grid-template-columns`/`-rows`.
+pub(crate) type GridTrackMap = std::collections::HashMap<NodeId, (Vec<f32>, Vec<f32>)>;
 
 /// Resolved horizontal geometry of one block box (§10.3.3/§10.4).
 struct H {
@@ -512,6 +523,7 @@ impl Flow<'_> {
                             oofs,
                             float_frags,
                             float_anchors,
+                            atom_frags,
                         } = laid;
                         cur.anchors.extend(float_anchors);
                         if !lines.is_empty() {
@@ -554,6 +566,9 @@ impl Flow<'_> {
                         // any line box was produced (a float-only block collapses,
                         // but still places its float).
                         children.extend(float_frags);
+                        // Atomic inline boxes' content fragments, positioned on
+                        // their line spots.
+                        children.extend(atom_frags);
                     }
                     Content::Flex(items) => {
                         // A flex container establishes an independent formatting
@@ -612,6 +627,23 @@ impl Flow<'_> {
                                 cur.y += gh;
                             }
                             self.container_oof(b, &inl, content_x, top, &mut children);
+                        } else {
+                            // An EMPTY grid still self-collapses (lays nothing),
+                            // but a browser sizes its template tracks — and a
+                            // virtualized feed reads `getComputedStyle().grid-
+                            // template-columns` to count columns BEFORE it has
+                            // any cells. Record the resolved tracks (side effect
+                            // only; frags/height discarded, cursor untouched).
+                            let _ = self.grid_content(
+                                b,
+                                items,
+                                content_x,
+                                cur.preview(),
+                                h.content_w,
+                                ifc_cb_h,
+                                &inl,
+                                &mut Vec::new(),
+                            );
                         }
                     }
                     Content::Table(tb) => {
@@ -703,9 +735,10 @@ impl Flow<'_> {
                             super::style::Align2::Left,
                             0.0,
                             None,
+                            &[],
                         );
                         ifc.atom(atom, &inl);
-                        let (lines, _, _, _) = ifc.finish();
+                        let (lines, _, _, _, _) = ifc.finish();
                         if !lines.is_empty() {
                             let yb = *y_border.get_or_insert_with(|| {
                                 let yb = cur.flush();
@@ -1879,6 +1912,7 @@ impl Flow<'_> {
                     oofs,
                     float_frags,
                     float_anchors,
+                    atom_frags,
                 } = laid;
                 cur.anchors.extend(float_anchors);
                 let n = lines.len();
@@ -1902,6 +1936,7 @@ impl Flow<'_> {
                     children.push(oof_placeholder(m, bp_l, y));
                 }
                 children.extend(float_frags);
+                children.extend(atom_frags);
             }
             Content::Atomic(atom) => match &atom.kind {
                 AtomKind::Img { url, alt: _ } => {
@@ -1935,9 +1970,10 @@ impl Flow<'_> {
                         super::style::Align2::Left,
                         0.0,
                         None,
+                        &[],
                     );
                     ifc.atom(atom, &inl);
-                    let (lines, _, _, _) = ifc.finish();
+                    let (lines, _, _, _, _) = ifc.finish();
                     if !lines.is_empty() {
                         self.emit_lines(lines, bp_l, &mut cur, &mut children);
                     }
@@ -1975,6 +2011,19 @@ impl Flow<'_> {
                     );
                     children.extend(frags);
                     cur.y = bt + gh;
+                } else {
+                    // Empty grid: record the resolved tracks (see the block()
+                    // grid arm) without laying anything.
+                    let _ = self.grid_content(
+                        b,
+                        nested,
+                        bp_l,
+                        bt,
+                        content_w,
+                        def_h,
+                        &inl,
+                        &mut Vec::new(),
+                    );
                 }
                 self.container_oof(b, &inl, bp_l, bt, &mut children);
             }
@@ -2638,6 +2687,61 @@ impl Flow<'_> {
         }
     }
 
+    /// Lay an ATOMIC INLINE box (`inline-block`/`-flex`/`-grid` — CSS-Display-3
+    /// §2.5) as its own formatting context, ready to place on a line. Used width
+    /// = an explicit `width` (clamped) else shrink-to-fit (§10.3.9); auto margins
+    /// compute to 0 (§10.3.9). Same shape as `lay_float_box`, minus the float
+    /// side — the IFC places it in-flow instead of pulling it aside.
+    fn lay_atom_box<'t>(
+        &self,
+        ab: &'t BoxNode,
+        cb_w: f32,
+        cb_h: Option<f32>,
+        parent_inl: &InlineStyle,
+    ) -> PrelaidAtom<'t> {
+        let s = &ab.style;
+        let (m, _auto) = self.margins_of(s, cb_w);
+        let bp_l = s.border[LEFT] + self.pad(s, LEFT, cb_w);
+        let bp_r = s.border[RIGHT] + self.pad(s, RIGHT, cb_w);
+        let bp_h = bp_l + bp_r;
+        let bt = s.border[TOP] + self.pad(s, TOP, cb_w);
+        let bb = s.border[BOTTOM] + self.pad(s, BOTTOM, cb_w);
+        let spec_w = |l: &Len| {
+            l.resolve(Some(cb_w)).map(|v| {
+                if s.border_box {
+                    (v - bp_h).max(0.0)
+                } else {
+                    v.max(0.0)
+                }
+            })
+        };
+        let min_w = spec_w(&s.min_width).unwrap_or(0.0);
+        let max_w = match &s.max_width {
+            Len::None => f32::INFINITY,
+            l => spec_w(l).unwrap_or(f32::INFINITY),
+        }
+        .max(min_w);
+        let content_w = match spec_w(&s.width) {
+            Some(w) => w.clamp(min_w, max_w),
+            None => {
+                let avail = (cb_w - m[LEFT] - m[RIGHT] - bp_h).max(0.0);
+                self.shrink_to_fit(ab, avail, parent_inl)
+                    .clamp(min_w, max_w)
+            }
+        };
+        let def_h = self.height_px(&s.height, s, bt, bb, cb_h);
+        let (frag, anchors) = self.item_frag(ab, content_w, cb_w, def_h, parent_inl);
+        PrelaidAtom {
+            node: ab.node,
+            mw: m[LEFT] + frag.w + m[RIGHT],
+            mh: m[TOP] + frag.h + m[BOTTOM],
+            ml: m[LEFT],
+            mt: m[TOP],
+            frag,
+            anchors,
+        }
+    }
+
     /// Lay one inline formatting context that may contain floats (§9.5): pre-lay
     /// the floats it holds (in the order the IFC meets them), run the line
     /// breaker against the shared `fc` so the line boxes shorten beside them,
@@ -2675,6 +2779,21 @@ impl Flow<'_> {
             });
             prelaid.push(Some(pf));
         }
+        // Pre-lay every atomic inline box (inline-block/-flex/-grid) as its own
+        // formatting context; the IFC reserves its margin-box cells on the line
+        // and reports where it landed, so we splice the content fragment there.
+        let mut atom_nodes: Vec<&'t BoxNode> = Vec::new();
+        collect_atom_boxes(inls, &mut atom_nodes);
+        let mut prelaid_atoms: Vec<Option<PrelaidAtom<'t>>> = Vec::with_capacity(atom_nodes.len());
+        let mut atom_sizes: Vec<AtomBoxSize> = Vec::with_capacity(atom_nodes.len());
+        for ab in &atom_nodes {
+            let pa = self.lay_atom_box(ab, content_w, cb_h, inl);
+            atom_sizes.push(AtomBoxSize {
+                w_cells: (pa.mw / self.cell_w).round().max(1.0) as usize,
+                h_rows: (pa.mh / self.cell_h).round().max(1.0) as u16,
+            });
+            prelaid_atoms.push(Some(pa));
+        }
         let mut ifc = Ifc::new(
             self.dom,
             self.base,
@@ -2693,6 +2812,7 @@ impl Flow<'_> {
                 left_x: content_x,
                 top_y: content_top_y,
             }),
+            &atom_sizes,
         );
         if let Some(m) = marker {
             let mut mctx = inl.clone();
@@ -2700,7 +2820,7 @@ impl Flow<'_> {
             ifc.text(m, &mctx);
         }
         ifc.run(inls, inl);
-        let (lines, marks, oofs, placements) = ifc.finish();
+        let (lines, marks, oofs, placements, atom_places) = ifc.finish();
         // Place each float's fragment: its margin-box top-left is the IFC's
         // resolved position, the border box sits inside it by the leading
         // margins.
@@ -2723,12 +2843,49 @@ impl Flow<'_> {
             pf.frag.paint.float = true;
             float_frags.push(pf.frag);
         }
+        // Splice each atomic inline box's content fragment at its line spot.
+        // Line tops are `content_top_y` + the cumulative line heights (the exact
+        // ys `emit_lines` will assign), so these frags are positioned absolutely
+        // in the content frame like floats and the caller just appends them.
+        let mut line_tops = Vec::with_capacity(lines.len());
+        {
+            let mut y = content_top_y;
+            for l in &lines {
+                line_tops.push(y);
+                y += f32::from(l.rows) * self.cell_h;
+            }
+        }
+        let mut atom_frags = Vec::new();
+        for pl in atom_places {
+            let Some(mut pa) = prelaid_atoms
+                .iter_mut()
+                .find(|s| s.as_ref().is_some_and(|p| p.node == pl.node))
+                .and_then(|s| s.take())
+            else {
+                continue;
+            };
+            // The placeholder's margin-box top-left → the border box sits inside
+            // it by the leading margins.
+            let bx = content_x + pl.col as f32 * self.cell_w + pa.ml;
+            let by = line_tops.get(pl.line).copied().unwrap_or(content_top_y)
+                + f32::from(pl.row_off) * self.cell_h
+                + pa.mt;
+            Self::offset_frag(&mut pa.frag, bx, by);
+            for a in &mut pa.anchors {
+                a.1 += by;
+            }
+            // The atom box's inner anchors ride out with the float anchors (both
+            // become `cur.anchors` in the caller).
+            float_anchors.append(&mut pa.anchors);
+            atom_frags.push(pa.frag);
+        }
         InlineLaid {
             lines,
             marks,
             oofs,
             float_frags,
             float_anchors,
+            atom_frags,
         }
     }
 
@@ -2881,6 +3038,20 @@ struct PrelaidFloat<'t> {
     anchors: Vec<(NodeId, f32)>,
 }
 
+/// A pre-laid atomic inline box awaiting placement: its margin-box size, leading
+/// margins (the border box's offset within the margin box), and the laid
+/// border-box fragment (at origin, offset to its line spot once the IFC resolves
+/// it). `node` matches it to the IFC's `AtomBoxPlace`.
+struct PrelaidAtom<'t> {
+    node: NodeId,
+    mw: f32,
+    mh: f32,
+    ml: f32,
+    mt: f32,
+    frag: Frag<'t>,
+    anchors: Vec<(NodeId, f32)>,
+}
+
 /// The result of laying one inline formatting context: its line boxes, the
 /// entered-element/out-of-flow marks, and any floats it placed (already
 /// positioned in the content frame).
@@ -2890,6 +3061,10 @@ struct InlineLaid<'t> {
     oofs: Vec<OofMark<'t>>,
     float_frags: Vec<Frag<'t>>,
     float_anchors: Vec<(NodeId, f32)>,
+    /// The pre-laid content fragments of the atomic inline boxes, already
+    /// positioned in the content frame (absolute, like `float_frags`) — the
+    /// caller appends them to its children.
+    atom_frags: Vec<Frag<'t>>,
 }
 
 /// Slice one laid fragment into multi-column position (css-multicol-1): a line
@@ -2925,6 +3100,21 @@ pub(super) fn collect_floats<'t>(inls: &'t [Inline], out: &mut Vec<&'t BoxNode>)
         match i {
             Inline::Float(b) => out.push(b),
             Inline::Box { kids, .. } => collect_floats(kids, out),
+            _ => {}
+        }
+    }
+}
+
+/// Collect the atomic inline boxes (`inline-block`/`-flex`/`-grid`) an inline
+/// content list holds, in the exact order the IFC meets them — so the k-th
+/// collected box pairs with the k-th `Inline::AtomBox` the line breaker places.
+/// Descends into inline boxes (an atom box can nest in a `<span>`) but NOT into
+/// an atom box's own content (that is laid as its own formatting context).
+pub(super) fn collect_atom_boxes<'t>(inls: &'t [Inline], out: &mut Vec<&'t BoxNode>) {
+    for i in inls {
+        match i {
+            Inline::AtomBox(b) => out.push(b),
+            Inline::Box { kids, .. } => collect_atom_boxes(kids, out),
             _ => {}
         }
     }
