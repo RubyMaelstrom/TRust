@@ -81,6 +81,14 @@ pub(crate) enum Inline {
     /// rule 6); the IFC pulls it aside and shortens the line boxes beside it.
     /// Its display is blockified (§9.7), so the box is a block-level box.
     Float(Box<BoxNode>),
+    /// An ATOMIC INLINE-LEVEL box (`inline-block`/`inline-flex`/`inline-grid`
+    /// — CSS-Display-3 §2.5): its content is laid as its own INDEPENDENT
+    /// formatting context (block/flex/grid) at the element's used width, then
+    /// the whole box is placed on the parent's line as ONE opaque unit (like a
+    /// replaced box — §9.4.2/§10.8). The inner box carries the blockified
+    /// display in `content` (Blocks/Inlines/Flex/Grid/Table); the block flow
+    /// pre-lays it (`item_frag`) and hands its used cell size to the IFC.
+    AtomBox(Box<BoxNode>),
 }
 
 /// One box in the tree.
@@ -266,6 +274,23 @@ fn blockify(d: Disp) -> Disp {
     }
 }
 
+/// The INNER (blockified) display of an atomic inline-level box, or `None` when
+/// the element is not one. `inline-block`/`inline-flex`/`inline-grid`/
+/// `inline-table` lay their content as a block/flex/grid/table formatting
+/// context and ride the parent's line as one opaque box (CSS-Display-3 §2.5); an
+/// `inline-block` holding misparented table rows becomes an anonymous table
+/// (§17.2.1), mirroring `display_of`.
+fn atomic_inline_disp(dom: &Dom, id: NodeId) -> Option<Disp> {
+    match dom.effective_display(id)?.as_str() {
+        "inline-block" if dom.establishes_anonymous_table(id) => Some(Disp::Table),
+        "inline-block" => Some(Disp::Block),
+        "inline-flex" => Some(Disp::Flex),
+        "inline-grid" => Some(Disp::Grid),
+        "inline-table" => Some(Disp::Table),
+        _ => None,
+    }
+}
+
 /// What building one DOM child produced.
 enum Built {
     Block(Box<BoxNode>),
@@ -323,6 +348,21 @@ impl Builder<'_> {
             let kids = self.children(id);
             return Built::Hoist(kids);
         }
+        // A `<slot>` in a shadow tree is TRANSPARENT (HTML §4.8.2): it renders
+        // the host's assigned light nodes in its place, or its own fallback
+        // content when nothing is assigned. Hoisting mirrors the serializer and
+        // completes the flat tree `children` starts (host → shadow root). A bare
+        // `<slot>` outside any shadow tree has no host, so `slot_assigned_nodes`
+        // is empty and it falls back to its own children.
+        if tag == "slot" {
+            let assigned = self.dom.slot_assigned_nodes(id);
+            let kids = if assigned.is_empty() {
+                self.children(id)
+            } else {
+                self.build_child_list(&assigned, false)
+            };
+            return Built::Hoist(kids);
+        }
         // Replaced elements are atomic regardless of their content model.
         if tag == "br" {
             return Built::Inline(Inline::Br);
@@ -374,6 +414,18 @@ impl Builder<'_> {
         }
         if let Replaced::Atom(kind) = rep {
             return self.atom(id, disp, kind);
+        }
+        // ATOMIC INLINE-LEVEL box (`inline-block`/`inline-flex`/`inline-grid` —
+        // CSS-Display-3 §2.5): in-flow, not floated, not replaced. Its content
+        // lays as its own formatting context (the blockified inner display),
+        // and the box rides the parent's line as one opaque unit. The block
+        // flow pre-lays `AtomBox` and hands its used size to the IFC.
+        if let Some(inner) = atomic_inline_disp(self.dom, id) {
+            let b = match inner {
+                Disp::Table => self.table(id),
+                d => self.container(id, d),
+            };
+            return Built::Inline(Inline::AtomBox(Box::new(b)));
         }
         match disp {
             Disp::Table => Built::Block(Box::new(self.table(id))),
@@ -571,6 +623,14 @@ impl Builder<'_> {
                         oof: Vec::new(),
                     });
                 }
+                // css-flexbox §4.1 / css-grid §6: an atomic inline box child of
+                // a flex/grid container is BLOCKIFIED into an ordinary item (its
+                // atomic-inline-ness is stripped); the inner box already carries
+                // the blockified content.
+                Built::Inline(Inline::AtomBox(b)) => {
+                    flush(&mut run, &mut items);
+                    items.push(*b);
+                }
                 Built::Inline(i) => run.push(i),
                 Built::Hoist(_) | Built::Skip => {}
             }
@@ -639,12 +699,37 @@ impl Builder<'_> {
     /// Build the box-level children of `id`, flattening `display:contents`
     /// hoists and applying the HTML rendering rules that gate children
     /// (a closed `<details>` shows only its first `<summary>`).
+    ///
+    /// COMPOSES the shadow tree (HTML §4.8.2, the "flat tree"): a shadow HOST
+    /// renders its shadow root's children IN PLACE of its light children (which
+    /// reach the box tree only through `<slot>`s — handled in `element`). This
+    /// is the same flattening the serializer does, and it is load-bearing for
+    /// `measure_boxes`, which lays the LIVE ARENA (real shadow roots) rather than
+    /// the pre-flattened `Doc.raw` the main render uses: without it every
+    /// shadow-hosted element (archive.org's whole `<router-slot>`/`<home-page>`
+    /// app, Twitch's web components) has NO box, so `getBoundingClientRect`/
+    /// `offset*`/`client*` and the Resize/IntersectionObservers all read 0 — a
+    /// virtualized scroller then computes zero columns and renders nothing. The
+    /// main render is unaffected (`Doc.raw` has no shadow roots, so this reduces
+    /// to the light children).
     fn children(&mut self, id: NodeId) -> Vec<Built> {
         let closed_details =
             self.dom.tag_name(id) == Some("details") && self.dom.attr(id, "open").is_none();
+        let child_ids = match self.dom.shadow_root(id) {
+            Some(shadow) => self.dom.children(shadow),
+            None => self.dom.children(id),
+        };
+        self.build_child_list(&child_ids, closed_details)
+    }
+
+    /// Build a list of child node ids into box-level `Built`s: text runs become
+    /// anonymous inline text, elements build (with `display:contents` and
+    /// `<slot>` hoists flattened in), and a closed `<details>` keeps only its
+    /// first `<summary>`. Shared by `children` and the `<slot>` projection.
+    fn build_child_list(&mut self, ids: &[NodeId], closed_details: bool) -> Vec<Built> {
         let mut out = Vec::new();
         let mut summary_shown = false;
-        for c in self.dom.children(id) {
+        for &c in ids {
             if closed_details {
                 let is_summary = self.dom.tag_name(c) == Some("summary");
                 if !is_summary || summary_shown {
@@ -755,7 +840,7 @@ impl Builder<'_> {
         // above the grid, or below it for `caption-side: bottom`.
         let mut top_captions = Vec::new();
         let mut bottom_captions = Vec::new();
-        for c in self.dom.children(id) {
+        for c in self.dom.flat_children(id) {
             if self.dom.effective_display(c).as_deref() != Some("table-caption") {
                 continue;
             }
@@ -818,7 +903,7 @@ impl Builder<'_> {
         let mut body = Vec::new();
         let mut footer = Vec::new();
         let mut stray = Vec::new();
-        for child in self.dom.children(table) {
+        for child in self.dom.flat_children(table) {
             match self.dom.effective_display(child).as_deref() {
                 Some("table-header-group") => header.extend(self.group_rows(child)),
                 Some("table-footer-group") => footer.extend(self.group_rows(child)),
@@ -839,7 +924,7 @@ impl Builder<'_> {
     /// The `table-row` children of a row group, each resolved to its cells.
     fn group_rows(&self, group: NodeId) -> Vec<Vec<NodeId>> {
         self.dom
-            .children(group)
+            .flat_children(group)
             .into_iter()
             .filter(|&r| self.dom.effective_display(r).as_deref() == Some("table-row"))
             .map(|r| self.row_cells(r))
@@ -849,7 +934,7 @@ impl Builder<'_> {
     /// The `table-cell` children of a row.
     fn row_cells(&self, row: NodeId) -> Vec<NodeId> {
         self.dom
-            .children(row)
+            .flat_children(row)
             .into_iter()
             .filter(|&c| self.dom.effective_display(c).as_deref() == Some("table-cell"))
             .collect()
@@ -918,12 +1003,12 @@ impl Builder<'_> {
                 specs.push(w);
             }
         };
-        for child in self.dom.children(table) {
+        for child in self.dom.flat_children(table) {
             match self.dom.tag_name(child) {
                 Some("colgroup") => {
                     let cols: Vec<NodeId> = self
                         .dom
-                        .children(child)
+                        .flat_children(child)
                         .into_iter()
                         .filter(|&c| self.dom.tag_name(c) == Some("col"))
                         .collect();
@@ -971,6 +1056,8 @@ fn inline_has_content(i: &Inline) -> bool {
         Inline::Text(t) => !t.chars().all(is_collapsible_space),
         Inline::Box { .. } => true,
         Inline::Atom(_) => true,
+        // An atomic inline box is opaque content on the line (like an atom).
+        Inline::AtomBox(_) => true,
         Inline::Br => true,
         // Keeps its run alive so the static-position mark has a host box;
         // the box emits no lines, so a placeholder-only run still

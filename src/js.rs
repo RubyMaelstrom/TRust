@@ -1759,13 +1759,16 @@ unsafe impl boa_engine::gc::Trace for PageBlobs {
     boa_engine::gc::empty_trace!();
 }
 
-/// The geometry box map's cache: the DOM epoch it was built for, and each
-/// element's pixel box keyed by node. Stale (epoch mismatch) entries are
-/// rebuilt lazily on the next `__dom_rect` read — free for pages that never
-/// measure, one layout pass for those that do, reused until the next mutation.
+/// The geometry cache: the DOM epoch it was built for, each element's pixel box
+/// keyed by node, and (layout2 only) each grid container's used track sizes in
+/// px `(columns, rows)` — the CSSOM resolved value for `grid-template-columns`/
+/// `-rows`. ONE layout pass fills both, reused until the next mutation. Stale
+/// (epoch mismatch) entries rebuild lazily on the next `__dom_rect`/
+/// `__dom_computed` read — free for pages that never measure.
 type GeomCache = (
     u64,
     std::collections::HashMap<crate::dom::NodeId, crate::layout::PxRect>,
+    std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
 );
 
 /// Backing for the JS geometry APIs (`getBoundingClientRect`, `offset*`/
@@ -2600,6 +2603,15 @@ fn sys_set_attr(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
 /// or null when unset. The prelude falls back to inline style on null.
 fn sys_computed_style(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let name = arg_str(args, 1, ctx);
+    // `grid-template-columns`/`-rows` resolve to the USED track list (CSSOM
+    // resolved value), which layout captured — a grid-measuring library counts
+    // `getComputedStyle(el).gridTemplateColumns.split(' ')`, so the declared
+    // `repeat(auto-fill, …)` would give a wrong column count.
+    if (name == "grid-template-columns" || name == "grid-template-rows")
+        && let Some(v) = resolved_grid_tracks(ctx, args, name == "grid-template-columns")
+    {
+        return Ok(str_value(&v));
+    }
     let dom = page_dom(ctx);
     let d = dom.borrow();
     Ok(
@@ -2628,8 +2640,14 @@ fn sys_match_media(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
 /// viewport box). The map is built once per DOM epoch by one layout pass over
 /// the live arena (`layout::measure_boxes`) and reused until the next mutation
 /// — lazy, so a page that never measures pays nothing.
-fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let Some((base, width_cells, height_cells, cell_px, borders, cache, images)) = ({
+/// Ensure the geometry cache is current for the DOM's epoch — ONE layout pass
+/// per mutation, shared by `getBoundingClientRect`/`offset*`/`client*`
+/// (`sys_rect`, reading boxes `.1`) and the grid-track resolved value
+/// (`sys_computed_style`, reading tracks `.2`). Returns the cache handle so the
+/// caller can read either map; `None` when the page has no `PageGeom` (its URL
+/// didn't parse), where geometry is simply absent.
+fn ensure_geom_cache(ctx: &mut Context) -> Option<Rc<RefCell<GeomCache>>> {
+    let (base, width_cells, height_cells, cell_px, borders, cache, images) = {
         let host = ctx.realm().host_defined();
         host.get::<PageGeom>().map(|g| {
             (
@@ -2642,7 +2660,78 @@ fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
                 g.images.clone(),
             )
         })
-    }) else {
+    }?;
+    let dom = page_dom(ctx);
+    let d = dom.borrow();
+    let epoch = d.epoch();
+    let mut c = cache.borrow_mut();
+    if c.0 != epoch {
+        let (forms, controls) = crate::http::extract_forms_arena(&d, &base, None);
+        let viewport = (width_cells as usize, height_cells as usize);
+        // JS geometry reads the same engine that laid the page out
+        // (LAYOUT_OVERHAUL_PLAN.md P7): under layout2 the boxes come straight off
+        // the fragment tree AND one pass yields the used grid track sizes;
+        // otherwise the old cell-union pass (no grid tracks — falls through to
+        // the cascaded value).
+        if crate::layout2::enabled() {
+            let (boxes, tracks) = crate::layout2::measure_boxes_and_grid_tracks(
+                &d,
+                &base,
+                viewport,
+                &forms,
+                &controls,
+                cell_px,
+                &images.borrow(),
+            );
+            c.1 = boxes;
+            c.2 = tracks;
+        } else {
+            c.1 = crate::layout::measure_boxes(
+                &d,
+                &base,
+                viewport,
+                &forms,
+                &controls,
+                cell_px,
+                borders,
+                &images.borrow(),
+            );
+            c.2 = std::collections::HashMap::new();
+        }
+        c.0 = epoch;
+    }
+    drop(c);
+    Some(cache)
+}
+
+/// The CSSOM resolved value for `grid-template-columns`/`-rows`: the USED track
+/// list in px (e.g. `320px 320px 320px`), NOT the declared `repeat(auto-fill,
+/// …)`. `None` when the element isn't a laid grid (or under the old engine),
+/// so the caller falls through to the cascaded value.
+fn resolved_grid_tracks(ctx: &mut Context, args: &[JsValue], columns: bool) -> Option<String> {
+    let cache = ensure_geom_cache(ctx)?;
+    let id = {
+        let dom = page_dom(ctx);
+        let d = dom.borrow();
+        arg_node(&d, args, 0)?
+    };
+    let c = cache.borrow();
+    let (cols, rows) = c.2.get(&id)?;
+    let tracks = if columns { cols } else { rows };
+    if tracks.is_empty() {
+        return None;
+    }
+    Some(
+        tracks
+            .iter()
+            .map(|w| format!("{}px", w.round().max(0.0) as i64))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(cache) = ensure_geom_cache(ctx) else {
         return Ok(JsValue::null());
     };
     let dom = page_dom(ctx);
@@ -2650,40 +2739,6 @@ fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     let Some(id) = arg_node(&d, args, 0) else {
         return Ok(JsValue::null());
     };
-    let epoch = d.epoch();
-    {
-        let mut c = cache.borrow_mut();
-        if c.0 != epoch {
-            let (forms, controls) = crate::http::extract_forms_arena(&d, &base, None);
-            let viewport = (width_cells as usize, height_cells as usize);
-            // JS geometry reads the same engine that laid the page out
-            // (LAYOUT_OVERHAUL_PLAN.md P7): under layout2 the boxes come
-            // straight off the fragment tree; otherwise the old cell-union pass.
-            c.1 = if crate::layout2::enabled() {
-                crate::layout2::measure_boxes(
-                    &d,
-                    &base,
-                    viewport,
-                    &forms,
-                    &controls,
-                    cell_px,
-                    &images.borrow(),
-                )
-            } else {
-                crate::layout::measure_boxes(
-                    &d,
-                    &base,
-                    viewport,
-                    &forms,
-                    &controls,
-                    cell_px,
-                    borders,
-                    &images.borrow(),
-                )
-            };
-            c.0 = epoch;
-        }
-    }
     let rect = cache.borrow().1.get(&id).copied();
     Ok(match rect {
         Some(r) => JsArray::from_iter(
@@ -6265,7 +6320,11 @@ fn load_page(
                 height_cells: std::cell::Cell::new(viewport.1),
                 cell_px,
                 borders: crate::layout::borders_enabled(),
-                cache: Rc::new(RefCell::new((u64::MAX, std::collections::HashMap::new()))),
+                cache: Rc::new(RefCell::new((
+                    u64::MAX,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                ))),
                 images: Rc::new(RefCell::new(crate::layout::ImageSizes::new())),
             });
         }

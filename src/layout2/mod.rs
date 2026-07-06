@@ -162,6 +162,7 @@ pub fn lay_out_document(
         cell_w,
         cell_h,
         imemo: Default::default(),
+        grid_tracks: Default::default(),
     };
     let (mut frag, flow_bottom, anchors, fixed) = flow.layout(&root);
     // Incremental-layout boundaries — collected from the fragment tree BEFORE
@@ -226,7 +227,13 @@ fn filter_boundaries(
 /// reads the geometry straight off the fragment tree (`measure::boxes`) — no
 /// paint, no cell reconstruction. The signature mirrors `layout::measure_boxes`
 /// so `js::sys_rect` swaps engines on `layout2::enabled()`.
-pub fn measure_boxes(
+/// Build the `NodeId → PxRect` geometry map (`getBoundingClientRect`/`offset*`/
+/// `client*`) AND each grid container's used track sizes in px `(columns, rows)`
+/// from ONE layout pass — the CSSOM resolved value `getComputedStyle` reports
+/// for `grid-template-columns`/`-rows` (`js::sys_computed_style`). One pass
+/// backs both. `js::sys_rect` swaps engines on `layout2::enabled()`.
+#[allow(clippy::type_complexity)]
+pub fn measure_boxes_and_grid_tracks(
     dom: &Dom,
     base: &Url,
     viewport: (usize, usize),
@@ -234,7 +241,10 @@ pub fn measure_boxes(
     controls: &ControlMap,
     cell_px: (u16, u16),
     images: &ImageSizes,
-) -> HashMap<NodeId, PxRect> {
+) -> (
+    HashMap<NodeId, PxRect>,
+    HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
+) {
     let cols = viewport.0.max(10);
     // The layout runs on the SESSION cell metrics (via `Units`), so measure
     // with the same ones for an exact round-trip; `cell_px` (what the caller
@@ -246,7 +256,7 @@ pub fn measure_boxes(
         h: viewport.1 as f32 * cell_h,
     };
     let Some(root) = tree::build(dom, base, controls, forms, vp) else {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     };
     let flow = Flow {
         dom,
@@ -257,9 +267,10 @@ pub fn measure_boxes(
         cell_w,
         cell_h,
         imemo: Default::default(),
+        grid_tracks: Default::default(),
     };
     let (frag, _flow_bottom, _anchors, fixed) = flow.layout(&root);
-    measure::boxes(
+    let boxes = measure::boxes(
         dom,
         &frag,
         &fixed,
@@ -267,7 +278,8 @@ pub fn measure_boxes(
         cell_h,
         f64::from(cell_px.0.max(1)),
         f64::from(cell_px.1.max(1)),
-    )
+    );
+    (boxes, flow.grid_tracks.into_inner())
 }
 
 /// Lay one INLINE relayout-boundary subtree (a block-filling IFC box, NOT a
@@ -325,6 +337,7 @@ pub fn lay_subtree_fragment(
         cell_w,
         cell_h,
         imemo: Default::default(),
+        grid_tracks: Default::default(),
     };
     let (mut frag, flow_bottom, anchors, fixed) = flow.layout(&root);
     // v1 subtree-patch cut: an inline boundary re-lay does NOT alpha-composite
@@ -396,6 +409,7 @@ pub fn lay_region_fragment(
         cell_w,
         cell_h,
         imemo: Default::default(),
+        grid_tracks: Default::default(),
     };
     let (mut frag, _flow_bottom, _anchors, _fixed) = flow.layout(&root);
     paint::region_buffer(dom, &mut frag, cell_w, cell_h)
@@ -489,9 +503,28 @@ mod tests {
         images: &ImageSizes,
         alpha: &HashMap<String, bool>,
     ) -> Output {
-        let dom = Dom::parse_document(html);
-        let base = Url::parse("http://e.com/").unwrap();
-        lay_out_document(&dom, &base, (cols, 24), &[], &HashMap::new(), images, alpha)
+        // Run on a big stack like the app does (layout is on the 64MB `trust-js`
+        // thread in production): a pathologically deep box tree (the 40-nested-
+        // tables stress test) exceeds a 2MB cargo-test thread otherwise.
+        let (html, images, alpha) = (html.to_string(), images.clone(), alpha.clone());
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(move || {
+                let dom = Dom::parse_document(&html);
+                let base = Url::parse("http://e.com/").unwrap();
+                lay_out_document(
+                    &dom,
+                    &base,
+                    (cols, 24),
+                    &[],
+                    &HashMap::new(),
+                    &images,
+                    &alpha,
+                )
+            })
+            .unwrap()
+            .join()
+            .unwrap()
     }
 
     /// A row's text with items placed at their columns (gaps = spaces).
@@ -1177,6 +1210,90 @@ mod tests {
     }
 
     #[test]
+    fn inline_blocks_sit_side_by_side_on_one_line() {
+        // CSS-Display-3 §2.5: an atomic inline box flows on its parent's line at
+        // its used width (not block-stacked, not transparent). 80px = 10 cells.
+        let out = lay(
+            r#"<body style="margin:0"><span style="display:inline-block;width:80px">AAA</span><span style="display:inline-block;width:80px">BBB</span><span style="display:inline-block;width:80px">CCC</span></body>"#,
+            80,
+        );
+        let (ra, a) = find(&out, "AAA");
+        let (rb, b) = find(&out, "BBB");
+        let (rc, c) = find(&out, "CCC");
+        assert_eq!((ra, a.col), (0, 0));
+        assert_eq!((rb, b.col), (0, 10), "second box beside the first");
+        assert_eq!((rc, c.col), (0, 20), "third box beside the second");
+    }
+
+    #[test]
+    fn a_multi_row_inline_block_lays_beside_its_sibling() {
+        // The media-button shape: an inline-block whose content is icon-over-
+        // count (2 rows). Its box occupies both rows on the line, and the next
+        // box sits to its RIGHT (not below). 48px = 6 cells.
+        let out = lay(
+            r#"<body style="margin:0"><a style="display:inline-block;width:48px"><div>ICON</div><div>ONE</div></a><a style="display:inline-block;width:48px"><div>PICT</div><div>TWO</div></a></body>"#,
+            80,
+        );
+        let (ri, icon) = find(&out, "ICON");
+        let (ro, one) = find(&out, "ONE");
+        let (rp, pict) = find(&out, "PICT");
+        assert_eq!((ri, icon.col), (0, 0), "first box's icon at the top-left");
+        assert_eq!((ro, one.col), (1, 0), "its count on the second row");
+        assert_eq!(
+            (rp, pict.col),
+            (0, 6),
+            "the second box sits to the right, not stacked below"
+        );
+    }
+
+    #[test]
+    fn inline_flex_items_flow_horizontally() {
+        // `inline-flex` is an atomic inline box too (flex internally, inline on
+        // the line). 40px = 5 cells.
+        let out = lay(
+            r#"<body style="margin:0"><nav><a style="display:inline-flex;width:40px">Home</a><a style="display:inline-flex;width:40px">News</a></nav></body>"#,
+            80,
+        );
+        let (rh, h) = find(&out, "Home");
+        let (rn, n) = find(&out, "News");
+        assert_eq!((rh, h.col), (0, 0));
+        assert_eq!((rn, n.col), (0, 5), "inline-flex boxes flow on one line");
+    }
+
+    #[test]
+    fn auto_width_inline_block_shrinks_to_fit() {
+        // No explicit width → shrink-to-fit (§10.3.9): the box is as wide as its
+        // content, so the next box abuts it. "Hi" = 2 cells.
+        let out = lay(
+            r#"<body style="margin:0"><span style="display:inline-block">Hi</span><span style="display:inline-block">There</span></body>"#,
+            80,
+        );
+        let (rh, h) = find(&out, "Hi");
+        let (rt, t) = find(&out, "There");
+        assert_eq!((rh, h.col), (0, 0));
+        assert_eq!(
+            (rt, t.col),
+            (0, 2),
+            "shrink-to-fit: next box abuts at col 2"
+        );
+    }
+
+    #[test]
+    fn an_inline_block_that_overflows_wraps_to_the_next_line() {
+        // Two 80px (10-cell) boxes don't both fit in a 12-cell line, so the
+        // second wraps (it is unbreakable — placed whole on the next line).
+        let out = lay(
+            r#"<body style="margin:0"><span style="display:inline-block;width:80px">AAA</span><span style="display:inline-block;width:80px">BBB</span></body>"#,
+            12,
+        );
+        let (ra, a) = find(&out, "AAA");
+        let (rb, b) = find(&out, "BBB");
+        assert_eq!((ra, a.col), (0, 0));
+        assert!(rb > ra, "the second box wraps to the next line");
+        assert_eq!(b.col, 0, "and starts at the line's left edge");
+    }
+
+    #[test]
     fn flex_grow_distributes_by_factor() {
         let out = lay(
             r#"<body style="margin:0"><div style="display:flex">
@@ -1487,6 +1604,38 @@ mod tests {
         assert_eq!((r1, t1.col), (0, 0));
         assert_eq!((r2, t2.col), (0, 40), "second 320px track");
         assert_eq!((r3, t3.col), (1, 0), "wraps to the second grid row");
+    }
+
+    #[test]
+    fn grid_used_track_sizes_are_captured_for_getcomputedstyle() {
+        // The CSSOM resolved value of `grid-template-columns` is the USED track
+        // list in px (a grid-measuring library counts
+        // `getComputedStyle(el).gridTemplateColumns.split(' ')`), NOT the
+        // declared `repeat(auto-fill, …)`. `repeat(auto-fill, minmax(80px, 1fr))`
+        // at 640px = 8 tracks of 80px (js.rs serializes them to "80px 80px …").
+        // The grid is EMPTY on purpose: a virtualized feed reads its resolved
+        // columns BEFORE it has any cells (archive.org's infinite-scroller), and
+        // a browser still sizes an empty grid's template.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><div id="g" style="display:grid;grid-template-columns:repeat(auto-fill, minmax(80px, 1fr))"></div></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let (_, tracks) = measure_boxes_and_grid_tracks(
+            &dom,
+            &base,
+            (80, 24),
+            &[],
+            &HashMap::new(),
+            (8, 16),
+            &HashMap::new(),
+        );
+        let g = dom.get_by_id("g").unwrap();
+        let (cols, _rows) = tracks.get(&g).expect("the grid's used tracks are recorded");
+        assert_eq!(cols.len(), 8, "640px / 80px = 8 auto-fill columns");
+        assert!(
+            cols.iter().all(|&w| (w - 80.0).abs() < 0.5),
+            "each 1fr track resolves to 80px: {cols:?}"
+        );
     }
 
     #[test]
@@ -2813,6 +2962,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inline_table_is_an_atomic_inline_box() {
+        // `inline-table` (CSS-Display-3 §2.5) rides the line as one opaque box
+        // whose content is a table — two sit side by side and text follows.
+        // 48px = 6 cells.
+        let out = lay(
+            r#"<body style="margin:0"><table style="display:inline-table;width:48px"><tr><td>AA</td></tr></table><table style="display:inline-table;width:48px"><tr><td>BB</td></tr></table>after</body>"#,
+            80,
+        );
+        let (ra, a) = find(&out, "AA");
+        let (rb, b) = find(&out, "BB");
+        let (raf, af) = find(&out, "after");
+        assert_eq!((ra, a.col), (0, 0));
+        assert_eq!((rb, b.col), (0, 6), "second inline-table beside the first");
+        assert_eq!((raf, af.col), (0, 12), "text flows after on the same line");
+    }
+
+    #[test]
+    fn a_shadow_hosted_table_composes_its_rows() {
+        // A `display:table` host renders its rows FROM the FLAT tree (HTML
+        // §4.8.2): rows built into its shadow, or light rows projected through a
+        // `<slot>`. Without composing, the table's row scan saw the (empty or
+        // slotted-away) light children and the cell never rendered — the same
+        // class as archive.org's shadow app.
+        let base = Url::parse("http://e.com/").unwrap();
+        let lay_dom = |dom: &Dom| {
+            lay_out_document(
+                dom,
+                &base,
+                (80, 24),
+                &[],
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+        };
+        // (a) rows built directly into the host's shadow root.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><div id="t" style="display:table"></div></body>"#,
+        );
+        let host = dom.get_by_id("t").unwrap();
+        let shadow = dom.attach_shadow(host);
+        let row = dom.create_element("div");
+        dom.set_attr(row, "style", "display:table-row");
+        dom.append(shadow, row);
+        let cell = dom.create_element("div");
+        dom.set_attr(cell, "style", "display:table-cell");
+        dom.append(row, cell);
+        dom.append_text(cell, "SHADOWCELL");
+        assert!(
+            !absent(&lay_dom(&dom), "SHADOWCELL"),
+            "a table row in the host's shadow renders"
+        );
+        // (b) light rows projected through a `<slot>` in the shadow.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><div id="t" style="display:table"><div style="display:table-row"><div style="display:table-cell">SLOTCELL</div></div></div></body>"#,
+        );
+        let host = dom.get_by_id("t").unwrap();
+        let shadow = dom.attach_shadow(host);
+        let slot = dom.create_element("slot");
+        dom.append(shadow, slot);
+        assert!(
+            !absent(&lay_dom(&dom), "SLOTCELL"),
+            "a light table row projected through a <slot> renders"
+        );
+    }
+
     // ---- P7: JS geometry from fragments (measure::boxes) --------------------
     // Cells are the nominal 8×16 px; measured rects report the same integer
     // cell grid the paint pass stamps, × cell px.
@@ -2829,7 +3045,7 @@ mod tests {
     ) -> (Dom, HashMap<NodeId, PxRect>) {
         let dom = Dom::parse_document(html);
         let base = Url::parse("http://e.com/").unwrap();
-        let boxes = measure_boxes(
+        let boxes = measure_boxes_and_grid_tracks(
             &dom,
             &base,
             (cols, rows),
@@ -2837,7 +3053,8 @@ mod tests {
             &HashMap::new(),
             (8, 16),
             images,
-        );
+        )
+        .0;
         (dom, boxes)
     }
 
@@ -2868,6 +3085,72 @@ mod tests {
         );
         let b = rect(&dom, &boxes, "b");
         assert_eq!((b.top, b.height), (48.0, 32.0), "second block stacks below");
+    }
+
+    #[test]
+    fn geometry_composes_the_shadow_tree() {
+        // measure_boxes lays the LIVE ARENA (real shadow roots), not the
+        // pre-flattened Doc.raw the main render uses. Without composing the
+        // shadow tree, a shadow-hosted element has NO box and reads 0 — which
+        // broke archive.org's <router-slot>/<home-page> shadow app: its
+        // infinite-scroller read 0 width, computed 0 columns, and rendered an
+        // empty grid. A browser lays out the flat tree; so must the geometry map.
+        let base = Url::parse("http://e.com/").unwrap();
+        // (a) A shadow HOST renders its shadow root's children in place of light.
+        let mut dom = Dom::parse_document(r#"<body style="margin:0"><div id="host"></div></body>"#);
+        let host = node_by_id(&dom, "host");
+        let shadow = dom.attach_shadow(host);
+        let inner = dom.create_element("div");
+        dom.set_attr(inner, "id", "inner");
+        dom.set_attr(inner, "style", "height:32px");
+        dom.append(shadow, inner);
+        dom.append_text(inner, "shadow content");
+        let boxes = measure_boxes_and_grid_tracks(
+            &dom,
+            &base,
+            (80, 24),
+            &[],
+            &HashMap::new(),
+            (8, 16),
+            &HashMap::new(),
+        )
+        .0;
+        let r = boxes
+            .get(&inner)
+            .expect("a shadow-hosted div must have a box, not read as detached");
+        assert_eq!(
+            (r.width, r.height),
+            (640.0, 32.0),
+            "shadow content fills the 640px viewport width, not 0"
+        );
+
+        // (b) A <slot> projects the host's light children into the flat tree.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><div id="host"><div id="light" style="height:32px">L</div></div></body>"#,
+        );
+        let host = node_by_id(&dom, "host");
+        let shadow = dom.attach_shadow(host);
+        let slot = dom.create_element("slot");
+        dom.append(shadow, slot);
+        let light = node_by_id(&dom, "light");
+        let boxes = measure_boxes_and_grid_tracks(
+            &dom,
+            &base,
+            (80, 24),
+            &[],
+            &HashMap::new(),
+            (8, 16),
+            &HashMap::new(),
+        )
+        .0;
+        let r = boxes
+            .get(&light)
+            .expect("a slotted light child must be laid through the slot, not read as 0");
+        assert_eq!(
+            (r.width, r.height),
+            (640.0, 32.0),
+            "slotted content is laid at the host's width"
+        );
     }
 
     #[test]

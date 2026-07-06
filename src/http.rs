@@ -5443,7 +5443,7 @@ mod tests {
             let mdom = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
             let (forms2, controls2) = extract_forms_arena(&mdom, &url, None);
             let boxes = if crate::layout2::enabled() {
-                crate::layout2::measure_boxes(
+                crate::layout2::measure_boxes_and_grid_tracks(
                     &mdom,
                     &url,
                     (w, vh),
@@ -5452,6 +5452,7 @@ mod tests {
                     (8, 16),
                     &images,
                 )
+                .0
             } else {
                 crate::layout::measure_boxes(
                     &mdom,
