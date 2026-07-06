@@ -1786,13 +1786,34 @@ pub fn parse(
     viewport_h: usize,
     images: &crate::layout::ImageSizes,
 ) -> Doc {
-    parse_seeded(url, content_type, body, width, viewport_h, None, images)
+    // `parse` is the pre-decode entry (`images` empty, per the doc above), so
+    // there is nothing to alpha-composite yet — pass the shared empty alpha map.
+    parse_seeded(
+        url,
+        content_type,
+        body,
+        width,
+        viewport_h,
+        None,
+        images,
+        no_alpha(),
+    )
 }
 
 /// Like `parse`, seeding form field values from a previous parse of the
 /// same page (resize re-wraps and edits must not lose what was typed).
 /// `viewport_h` is the terminal inner height in cells — the basis for `vh`/
 /// `vmin`/`vmax` and definite region heights (0 ⇒ unknown, `vh` unresolved).
+/// A shared empty `has_alpha` map for callers with no decoded-image alpha info
+/// (the first pre-decode parse, tests, harnesses). An empty map disables the P8
+/// overlap compositor — the always-correct default (images render separately).
+pub fn no_alpha() -> &'static std::collections::HashMap<String, bool> {
+    static EMPTY: std::sync::OnceLock<std::collections::HashMap<String, bool>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(std::collections::HashMap::new)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn parse_seeded(
     url: &Url,
     content_type: &str,
@@ -1801,6 +1822,9 @@ pub fn parse_seeded(
     viewport_h: usize,
     seed: Option<&[Form]>,
     images: &crate::layout::ImageSizes,
+    // `alpha` = URL→`has_alpha` from the app's decoded cache, threaded to
+    // layout2's overlap compositor (P8). Pass `no_alpha()` when unknown.
+    alpha: &std::collections::HashMap<String, bool>,
 ) -> Doc {
     let width = width.max(10);
     let media = content_type
@@ -1819,6 +1843,7 @@ pub fn parse_seeded(
     let mut image_urls = Vec::new();
     let mut hover_ids = std::collections::HashMap::new();
     let mut anchor_rows = std::collections::HashMap::new();
+    let mut composites = std::collections::HashMap::new();
     let lines = if media.is_empty() || media == "text/html" || media == "application/xhtml+xml" {
         let html = decode_body(content_type, body);
         // The HTTP renderer: our own arena DOM laid out into rows of
@@ -1852,9 +1877,10 @@ pub fn parse_seeded(
         ) = if crate::layout2::enabled() {
             // The NEW engine (LAYOUT_OVERHAUL_PLAN.md), behind `set layout2
             // on` until parity. It emits the pinned fixed layer (P4), vertical
-            // scroll regions + their scroll_clips (P5b), and carousels (P5c);
-            // incremental-layout boundaries are still not emitted (staged), so
-            // live-page patches take the always-correct full-relayout path.
+            // scroll regions + their scroll_clips (P5b), carousels (P5c), and
+            // incremental-layout boundaries (P7 — block-filling IFC boxes, so a
+            // live mutation confined to one patches its subtree instead of a
+            // full relayout).
             let out = crate::layout2::lay_out_document(
                 &dom,
                 url,
@@ -1862,13 +1888,15 @@ pub fn parse_seeded(
                 &forms,
                 &controls,
                 images,
+                alpha,
             );
+            composites = out.composites;
             (
                 out.rows,
                 out.carousels,
                 out.regions,
                 out.scroll_clips,
-                Vec::new(),
+                out.boundaries,
                 out.fixed,
                 out.anchor_rows,
             )
@@ -1938,6 +1966,7 @@ pub fn parse_seeded(
         boundaries,
         hover_ids,
         anchor_rows,
+        composites,
     }
 }
 
@@ -2038,19 +2067,41 @@ pub fn lay_region_patch(
         .and_then(|s| s.parse::<usize>().ok());
     let t_parse = t0.elapsed();
     let t1 = std::time::Instant::now();
-    // Memoize the scroll container's block children: only a NEW/changed message
-    // is laid; unchanged ones reuse their cached rows (INCREMENTAL_LAYOUT_PLAN.md
-    // §14 — the inner-scroll de-lag). Row-identical to the uncached layout.
-    let (rows, carousels, scroll_clips, row_cache) = crate::layout::lay_out_region_fragment_cached(
-        &dom,
-        url,
-        content_width,
-        viewport,
-        &controls,
-        images,
-        boundary,
-        cache,
-    );
+    // Re-lay the region's content into a fresh buffer. Under layout2 the buffer
+    // comes from the SAME engine that laid the page out (so a patched region is
+    // consistent with the full render — LAYOUT_OVERHAUL_PLAN.md P7); the row
+    // cache is not used there (v1, correctness over the reuse memo). Otherwise
+    // the old engine memoizes the scroll container's block children so only a
+    // NEW/changed message is laid (INCREMENTAL_LAYOUT_PLAN.md §14 — the inner-
+    // scroll de-lag; row-identical to the uncached layout).
+    let (rows, carousels, scroll_clips, row_cache) = if crate::layout2::enabled() {
+        let (rows, carousels, scroll_clips) = crate::layout2::lay_region_fragment(
+            &dom,
+            url,
+            content_width,
+            viewport,
+            &controls,
+            images,
+            boundary,
+        );
+        (
+            rows,
+            carousels,
+            scroll_clips,
+            crate::layout::RegionRowCache::default(),
+        )
+    } else {
+        crate::layout::lay_out_region_fragment_cached(
+            &dom,
+            url,
+            content_width,
+            viewport,
+            &controls,
+            images,
+            boundary,
+            cache,
+        )
+    };
     if diag {
         let n_nodes = dom.descendants(crate::dom::DOCUMENT).count();
         eprintln!(
@@ -2118,16 +2169,32 @@ pub fn lay_subtree_patch(
         .find(|&id| dom.attr(id, "data-trust-node") == Some(key.as_str()))?;
     let (_forms, controls) = extract_forms_arena(&dom, url, None);
     let image_urls = collect_image_urls(&dom, url);
-    let frag = crate::layout::lay_out_subtree_fragment(
-        &dom,
-        url,
-        content_width,
-        viewport,
-        &controls,
-        images,
-        boundary,
-        sub_box,
-    );
+    // Under layout2 the subtree lays through the SAME engine that rendered the
+    // page (so a patched boundary is byte-consistent with a full relayout —
+    // LAYOUT_OVERHAUL_PLAN.md P7); otherwise the old engine.
+    let frag = if crate::layout2::enabled() {
+        crate::layout2::lay_subtree_fragment(
+            &dom,
+            url,
+            content_width,
+            viewport,
+            &controls,
+            images,
+            boundary,
+            sub_box,
+        )
+    } else {
+        crate::layout::lay_out_subtree_fragment(
+            &dom,
+            url,
+            content_width,
+            viewport,
+            &controls,
+            images,
+            boundary,
+            sub_box,
+        )
+    };
     Some(SubtreeLaid {
         height: frag.height,
         width: frag.width,
@@ -5349,7 +5416,74 @@ mod tests {
                 }
             }
         }
-        let doc = parse_seeded(&url, "text/html", &html, w, vh, None, &images);
+        // TRUST_LAYOUT_IMG_ALPHA=1 marks every seeded <img> transparent, so the
+        // offline replay can reproduce a P8 overlap composite.
+        let alpha: std::collections::HashMap<String, bool> =
+            if std::env::var_os("TRUST_LAYOUT_IMG_ALPHA").is_some() {
+                images.keys().map(|k| (k.clone(), true)).collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+        let doc = parse_seeded(&url, "text/html", &html, w, vh, None, &images, &alpha);
+        let last_nonempty = doc
+            .rows
+            .iter()
+            .rposition(|r| !r.items.is_empty())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        eprintln!(
+            "=== DOC: {} rows total, last non-empty row {} ({} blank trailing rows) ===",
+            doc.rows.len(),
+            last_nonempty,
+            doc.rows.len().saturating_sub(last_nonempty),
+        );
+        // TRUST_LAYOUT_MEASURE=<id-substr>: print the measure_boxes (getBounding
+        // ClientRect) geometry for elements whose id or class contains the substr.
+        if let Ok(sub) = std::env::var("TRUST_LAYOUT_MEASURE") {
+            let mdom = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
+            let (forms2, controls2) = extract_forms_arena(&mdom, &url, None);
+            let boxes = if crate::layout2::enabled() {
+                crate::layout2::measure_boxes(
+                    &mdom,
+                    &url,
+                    (w, vh),
+                    &forms2,
+                    &controls2,
+                    (8, 16),
+                    &images,
+                )
+            } else {
+                crate::layout::measure_boxes(
+                    &mdom,
+                    &url,
+                    (w, vh),
+                    &forms2,
+                    &controls2,
+                    (8, 16),
+                    false,
+                    &images,
+                )
+            };
+            for id in 0..mdom.node_count() {
+                let matches = mdom.attr(id, "id").is_some_and(|v| v.contains(&sub))
+                    || mdom.attr(id, "class").is_some_and(|v| v.contains(&sub));
+                if matches && let Some(r) = boxes.get(&id) {
+                    eprintln!(
+                        "  MEASURE n{id} <{}> .{} → left={:.0} top={:.0} w={:.0} h={:.0}",
+                        mdom.tag_name(id).unwrap_or("?"),
+                        mdom.attr(id, "class")
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or(""),
+                        r.left,
+                        r.top,
+                        r.width,
+                        r.height,
+                    );
+                }
+            }
+        }
         // Legend: reproduce the layout DOM (same NodeIds) so we can map an
         // item's `node` back to its element (tag/id/class + box/flex props).
         let mut legend_dom = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
@@ -6883,6 +7017,7 @@ customElements.define('lit-counter', LitCounter);
             0,
             Some(&doc.forms),
             &Default::default(),
+            no_alpha(),
         );
         assert_eq!(rewrapped.forms[0].fields[1].value, "hello there");
         assert!(

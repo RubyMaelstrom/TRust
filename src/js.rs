@@ -2655,16 +2655,32 @@ fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
         let mut c = cache.borrow_mut();
         if c.0 != epoch {
             let (forms, controls) = crate::http::extract_forms_arena(&d, &base, None);
-            c.1 = crate::layout::measure_boxes(
-                &d,
-                &base,
-                (width_cells as usize, height_cells as usize),
-                &forms,
-                &controls,
-                cell_px,
-                borders,
-                &images.borrow(),
-            );
+            let viewport = (width_cells as usize, height_cells as usize);
+            // JS geometry reads the same engine that laid the page out
+            // (LAYOUT_OVERHAUL_PLAN.md P7): under layout2 the boxes come
+            // straight off the fragment tree; otherwise the old cell-union pass.
+            c.1 = if crate::layout2::enabled() {
+                crate::layout2::measure_boxes(
+                    &d,
+                    &base,
+                    viewport,
+                    &forms,
+                    &controls,
+                    cell_px,
+                    &images.borrow(),
+                )
+            } else {
+                crate::layout::measure_boxes(
+                    &d,
+                    &base,
+                    viewport,
+                    &forms,
+                    &controls,
+                    cell_px,
+                    borders,
+                    &images.borrow(),
+                )
+            };
             c.0 = epoch;
         }
     }
@@ -6561,6 +6577,13 @@ fn settle_page(page: &mut LoadedPage) {
         // Fire `load` on any image whose reveal a handler is waiting for, so a
         // fade-in-on-load image is shown rather than hidden at `opacity:0`.
         settle_image_loads(&mut page.ctx, &page.budget, MAX_TICKS, &mut page.outcome);
+        // Deliver the FINAL ResizeObserver/IntersectionObserver observations now
+        // the DOM has finished building: a component that measured its container
+        // while the layout was still partial (a responsive grid reading a
+        // mount-time width narrower than the settled one) gets the corrected size
+        // and re-renders before the first paint, then re-settles. Edge-triggered
+        // → a no-op for a page without observers.
+        run_intersections(page);
         phase("load done");
     }
 
@@ -7150,6 +7173,11 @@ const DISPATCH_BUDGET: Duration = Duration::from_secs(1);
 const DISPATCH_NET_GRACE: Duration = Duration::from_secs(300);
 /// Settle ticks allowed after a dispatch (load-time settle uses MAX_TICKS).
 const DISPATCH_TICKS: usize = 50;
+/// Max deliver→settle passes in `run_intersections`'s observer loop. A
+/// responsive grid usually converges in 2 (deliver the real container width →
+/// it re-renders more cards → deliver the cards' new size, which it ignores).
+/// Bounded so a callback that resizes on every delivery degrades, not hangs.
+const OBSERVER_DELIVERY_PASSES: usize = 6;
 /// Settle ticks per AT-REST wake (the idle `timer_wake` loop). Unlike a dispatch
 /// — which settles a click's whole cascade to completion (`DISPATCH_TICKS`) — an
 /// at-rest wake fires ONE generation of due timers (one event-loop "task"), drains
@@ -8713,25 +8741,53 @@ fn dispatch_set_scroll_in(
 /// never re-fires it (no false→true transition) and loading dead-ends.
 /// Edge-triggered + geometry-cached: a no-op (no settle) unless it delivered
 /// entries, so a page with no observers / no geometry change pays one cheap eval.
+/// The browser's "update the rendering" observer step: deliver ResizeObserver
+/// then IntersectionObserver notifications against the CURRENT layout, and drain
+/// the work their callbacks schedule. Both are edge-triggered (a no-op unless a
+/// target's size / intersection state actually changed), so a page with no
+/// observers pays one cheap eval each.
+///
+/// It LOOPS because a callback can change geometry that the next pass must
+/// observe — a responsive grid (Twitch's shelves) re-renders more cards once its
+/// container's REAL width is finally delivered, which resizes both the container
+/// and the cards, which the next ResizeObserver pass sees. The old single-shot
+/// delivery left such a grid stuck at its mount-time (partial-layout) width. An
+/// infinite scroller's load-more `fetch()` runs OFF the JS thread and posts back
+/// as its own dispatch (where this runs again), so that chain still advances one
+/// batch per settle; the loop here converges the SYNCHRONOUS re-render cascade.
+/// Bounded — a self-feeding observer degrades to its last state, never hangs.
 fn run_intersections(page: &mut LoadedPage) {
-    let delivered = guarded_call_trust(
-        &mut page.ctx,
-        "updateIntersections",
-        &[],
-        "intersection observer",
-        &mut page.outcome,
-    )
-    .and_then(|v| v.as_number())
-    .unwrap_or(0.0);
-    if page.outcome.panicked {
-        return;
-    }
-    if delivered > 0.0 {
-        // Drain the microtasks/jobs the callbacks scheduled (a fetch's promise
-        // plumbing, a sync mutation's MutationObserver microtask). A load-more
-        // `fetch()` runs OFF the JS thread and posts back as its own fetch-done
-        // dispatch — where this runs again, so the chain advances one batch at a
-        // time until the sentinel clears the viewport.
+    for _ in 0..OBSERVER_DELIVERY_PASSES {
+        if page.outcome.panicked {
+            return;
+        }
+        let resized = guarded_call_trust(
+            &mut page.ctx,
+            "updateResizes",
+            &[],
+            "resize observer",
+            &mut page.outcome,
+        )
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+        if page.outcome.panicked {
+            return;
+        }
+        let intersected = guarded_call_trust(
+            &mut page.ctx,
+            "updateIntersections",
+            &[],
+            "intersection observer",
+            &mut page.outcome,
+        )
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+        if page.outcome.panicked {
+            return;
+        }
+        if resized + intersected <= 0.0 {
+            break;
+        }
         settle(
             &mut page.ctx,
             &page.budget,
@@ -14249,6 +14305,17 @@ const PRELUDE: &str = r##"
     // (browser behaviour; a rootMargin still pre-buffers). Registry `IO` is a
     // PLAIN ARRAY, never a Boa Set/Map — same MapLock GC trap MO documents.
     const IO = [];
+    // ResizeObserver registry — a PLAIN ARRAY (never a Boa Set/Map, the MapLock
+    // GC trap MO documents). ResizeObserver is EDGE-TRIGGERED like IO: a target's
+    // callback fires whenever its observed (border-box) size changes across the
+    // page's active life, delivered in the "update the rendering" step
+    // (`trust.updateResizes`, driven by `run_layout_observers`). An active engine
+    // MUST re-deliver — a responsive grid (Twitch's shelves) reads its
+    // container's width the moment it mounts, when the layout is still partial,
+    // and needs the corrected width delivered once the DOM finishes building or
+    // the terminal resizes; without re-delivery it stays stuck at the mount-time
+    // measurement and renders too few cards.
+    const RO = [];
     // Parse a rootMargin string into 4 {v, pct} offsets in CSS-margin order
     // (top, right, bottom, left), each px or %. Percentages resolve per-axis
     // against the root rect (top/bottom vs height, left/right vs width); the px
@@ -14443,6 +14510,9 @@ const PRELUDE: &str = r##"
         g.innerWidth = w; g.innerHeight = h;
         try { dispatch(g, new Event("resize"), false); }
         catch (e) { trust.errors.push("resize handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+        // The viewport changed, so every element's box may have — deliver
+        // ResizeObserver (a responsive grid re-columns) before intersections.
+        trust.updateResizes();
         trust.updateIntersections();
     };
 
@@ -14473,17 +14543,59 @@ const PRELUDE: &str = r##"
         return typeof g.onscroll === "function";
     };
     g.ResizeObserver = class {
-        constructor(cb) { this.__cb = cb; this.__dead = false; }
+        constructor(cb) { this.__cb = cb; this.__targets = []; }
         observe(el) {
-            g.setTimeout(() => {
-                if (this.__dead) return;
-                const r = (el && el.getBoundingClientRect) ? el.getBoundingClientRect() : g.__viewportRect();
-                const box = [{ inlineSize: r.width, blockSize: r.height }];
-                try { this.__cb([{ target: el, contentRect: r, borderBoxSize: box, contentBoxSize: box, devicePixelContentBoxSize: box }], this); }
-                catch (e) { trust.errors.push("ResizeObserver: " + ((e && e.message) || e)); }
-            }, 0);
+            if (!el) return;
+            for (let i = 0; i < this.__targets.length; i++) if (this.__targets[i].el === el) return;
+            // lastW/lastH = -1 so the FIRST delivery always fires (spec: observe
+            // queues an initial observation with the current size).
+            this.__targets.push({ el: el, lastW: -1, lastH: -1 });
+            if (RO.indexOf(this) < 0) RO.push(this);
+            // Report the initial size on a macrotask (the settle drain runs it);
+            // `updateResizes` at the end of the load settle then re-delivers the
+            // FINAL size once the DOM has finished building.
+            g.setTimeout(() => trust.updateResizes(), 0);
         }
-        unobserve() {} disconnect() { this.__dead = true; }
+        unobserve(el) {
+            for (let i = 0; i < this.__targets.length; i++) {
+                if (this.__targets[i].el === el) { this.__targets.splice(i, 1); break; }
+            }
+            if (!this.__targets.length) { const k = RO.indexOf(this); if (k >= 0) RO.splice(k, 1); }
+        }
+        disconnect() { this.__targets = []; const k = RO.indexOf(this); if (k >= 0) RO.splice(k, 1); }
+    };
+    // The spec's ResizeObserver delivery ("gather active observations" → "broadcast"):
+    // for each observer × target, measure the target's CURRENT border box and fire
+    // the callback ONLY when its size changed since the last delivery (edge-
+    // triggered — not a flood). Run in the "update the rendering" step at every
+    // settle/dispatch/viewport-resize (`run_layout_observers`), so a component that
+    // sizes itself off its container gets the corrected size as the layout evolves.
+    trust.updateResizes = function () {
+        if (!RO.length) return 0;
+        let delivered = 0;
+        const observers = RO.slice();
+        for (let oi = 0; oi < observers.length; oi++) {
+            const o = observers[oi];
+            const entries = [];
+            const targets = o.__targets.slice();
+            for (let ti = 0; ti < targets.length; ti++) {
+                const rec = targets[ti];
+                let r = null;
+                try { r = (rec.el && rec.el.getBoundingClientRect) ? rec.el.getBoundingClientRect() : null; } catch (e) { r = null; }
+                const w = r ? r.width : 0, h = r ? r.height : 0;
+                if (w === rec.lastW && h === rec.lastH) continue;
+                rec.lastW = w; rec.lastH = h;
+                const cr = r || { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+                const box = [{ inlineSize: w, blockSize: h }];
+                entries.push({ target: rec.el, contentRect: cr, borderBoxSize: box, contentBoxSize: box, devicePixelContentBoxSize: box });
+            }
+            if (entries.length) {
+                delivered += entries.length;
+                try { o.__cb(entries, o); }
+                catch (e) { trust.errors.push("ResizeObserver: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+            }
+        }
+        return delivered;
     };
     // timeRemaining MUST be positive: idle-chunked work loops are written
     // `while (deadline.timeRemaining() > 0 && hasWork()) process()`, so a 0
@@ -24766,6 +24878,49 @@ mod tests {
         let (out, outcome) = transform(html, &env);
         assert!(outcome.errors.is_empty(), "errors: {:?}", outcome.errors);
         assert!(out.contains("entries=1"), "RO entries not delivered: {out}");
+    }
+
+    #[test]
+    fn resize_observer_redelivers_when_the_observed_box_changes_size() {
+        // The active-engine invariant: a ResizeObserver fires AGAIN when its
+        // target's size changes, not just once at observe(). This is what lets a
+        // responsive grid (Twitch's shelves) correct itself — it reads its
+        // container's width at mount (partial layout), then must be re-notified
+        // with the settled width. Here the box starts at 100px, a timer widens it
+        // to 300px, and the observer must receive BOTH sizes (the second via the
+        // load-end observer delivery). Without re-delivery only "100" lands.
+        let env = PageEnv::bare("https://example.com/");
+        let html = r#"<body style="margin:0"><div id=out>none</div>
+            <div id=box style="width:100px;height:16px"></div>
+            <script>
+            const log = [];
+            const ro = new ResizeObserver(es => {
+                for (const e of es) log.push(Math.round(e.contentRect.width));
+                document.getElementById('out').textContent = log.join(',');
+            });
+            ro.observe(document.getElementById('box'));
+            setTimeout(() => { document.getElementById('box').style.width = '300px'; }, 0);
+            </script></body>"#;
+        let (out, outcome) = transform(html, &env);
+        assert!(outcome.errors.is_empty(), "errors: {:?}", outcome.errors);
+        // Extract the "out" text: two deliveries, the second wider than the first.
+        let text = out
+            .split_once("id=\"out\">")
+            .and_then(|(_, r)| r.split_once('<'))
+            .map(|(t, _)| t.to_string())
+            .unwrap_or_default();
+        let widths: Vec<u32> = text
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        assert!(
+            widths.len() >= 2,
+            "ResizeObserver did not re-deliver on size change (got {text:?})"
+        );
+        assert!(
+            *widths.last().unwrap() > widths[0],
+            "the re-delivered size should reflect the widened box (got {widths:?})"
+        );
     }
 
     #[test]

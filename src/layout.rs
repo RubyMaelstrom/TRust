@@ -366,6 +366,33 @@ pub struct Carousel {
     pub snap: bool,
 }
 
+/// One image layer of an alpha-composited overlap group (LAYOUT_OVERHAUL_PLAN.md
+/// P8). When image fragments overlap and an upper one has real transparency,
+/// the paint compositor emits a SINGLE synthetic `x-trust-composite:` image item
+/// over the union box and records the group's layers here (in `Doc.composites`,
+/// keyed by that synthetic URL). The app encodes them by alpha-compositing each
+/// layer's decoded RGBA onto a union-sized canvas in PAINT ORDER (bottom first),
+/// so a lower image shows through an upper image's transparent pixels — the one
+/// place a terminal can honor image-over-image alpha (it happens before encode,
+/// since two already-encoded opaque cell protocols can't be blended at draw
+/// time). Offsets/sizes are in terminal cells, relative to the union top-left.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CompositeLayer {
+    /// Absolute image URL / data-url — the key into the app's decoded cache.
+    pub url: String,
+    /// Column offset of this layer within the union box (cells).
+    pub dcol: u16,
+    /// Row offset of this layer within the union box (cells).
+    pub drow: u16,
+    /// This layer's own used cell box.
+    pub w: u16,
+    pub h: u16,
+    /// `object-fit: cover` for this layer (else contain).
+    pub crop: bool,
+    /// `image-rendering: pixelated` for this layer (nearest-neighbour scaling).
+    pub pixelated: bool,
+}
+
 impl Carousel {
     /// The band's visible width in cells.
     pub fn view_width(&self) -> u16 {

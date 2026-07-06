@@ -34,6 +34,31 @@ pub struct ImageInfo {
     pub width: u32,
     pub height: u32,
     pub mime: &'static str,
+    /// Whether the decoded raster carries any non-opaque pixel (a real
+    /// transparency, not merely an alpha channel that is fully 255). Layout's
+    /// overlap compositor (LAYOUT_OVERHAUL_PLAN.md P8) reads this to decide
+    /// whether an image painted OVER another must be alpha-composited into one
+    /// emission (transparent → the lower image shows through its holes) or can
+    /// stay a separate, cheap opaque overwrite. SVG is silhouette-tinted to a
+    /// fully opaque duotone, so it reports `false`.
+    pub has_alpha: bool,
+}
+
+/// Whether `image` has any genuinely transparent pixel. A color type without an
+/// alpha channel is opaque outright (no scan); otherwise the alpha channel is
+/// scanned with an early exit on the first non-opaque pixel — so an opaque RGBA
+/// PNG costs a scan that a browser would also pay, and a badge with transparent
+/// corners exits almost immediately.
+fn image_has_alpha(image: &DynamicImage) -> bool {
+    match image {
+        DynamicImage::ImageRgba8(buf) => buf.pixels().any(|p| p[3] < 255),
+        DynamicImage::ImageLumaA8(buf) => buf.pixels().any(|p| p[1] < 255),
+        DynamicImage::ImageRgba16(buf) => buf.pixels().any(|p| p[3] < u16::MAX),
+        DynamicImage::ImageLumaA16(buf) => buf.pixels().any(|p| p[1] < u16::MAX),
+        DynamicImage::ImageRgba32F(buf) => buf.pixels().any(|p| p[3] < 1.0),
+        // Any other variant has no alpha channel — opaque by construction.
+        other => other.color().has_alpha() && other.to_rgba8().pixels().any(|p| p[3] < 255),
+    }
 }
 
 /// How an SVG is recolored to match the UI. We deliberately do NOT honor an
@@ -192,6 +217,7 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo, String> {
             width: image.width(),
             height: image.height(),
             mime,
+            has_alpha: image_has_alpha(&image),
         });
     }
 
@@ -273,6 +299,9 @@ fn parse_svg(bytes: &[u8]) -> Result<SvgImage, String> {
             width: css_pixels(width),
             height: css_pixels(height),
             mime: SVG_MIME,
+            // SVG rasterizes to an opaque silhouette (`apply_silhouette` forces
+            // α=255), so it never composites as a transparent overlay.
+            has_alpha: false,
         },
     })
 }
@@ -499,6 +528,7 @@ fn decode_for_box(
             width: image.width(),
             height: image.height(),
             mime,
+            has_alpha: image_has_alpha(&image),
         };
         return Ok((image, info, false));
     }
@@ -618,6 +648,109 @@ pub fn encode_sliced(
     }
 }
 
+/// One layer of an alpha-composite overlap group (LAYOUT_OVERHAUL_PLAN.md P8):
+/// its source bytes, used cell box, cell offset within the union, and its
+/// `object-fit`/`image-rendering`. `encode_composite` decodes+fits each and
+/// alpha-blends them in order.
+pub struct CompositeInput<'a> {
+    pub bytes: &'a [u8],
+    /// The layer's own cell box (used size).
+    pub box_cells: Size,
+    /// The layer's `(col, row)` offset within the union box, in cells.
+    pub off_cells: (u16, u16),
+    pub crop: bool,
+    pub pixelated: bool,
+}
+
+/// Alpha-composite an overlap group into ONE `SlicedProtocol` (P8): allocate a
+/// transparent union-sized RGBA canvas (union cells × the terminal font box),
+/// decode+fit each layer to its own box exactly as `encode_sliced` would
+/// (`object-fit` contain/cover, `image-rendering` filter, SVG silhouette-tinted
+/// via `tint`), and `imageops::overlay` (source-over) it at its cell offset in
+/// PAINT ORDER (bottom first) — so a lower image shows through an upper image's
+/// transparent pixels. The composed canvas is already union-pixel-sized, so the
+/// final encode neither rescales nor pads (`Resize::Fit(None)`). This is the one
+/// place a terminal honors image-over-image alpha: it must happen before encode,
+/// since two already-encoded opaque cell protocols cannot be blended at draw.
+pub fn encode_composite(
+    picker: &Picker,
+    union: Size,
+    layers: &[CompositeInput<'_>],
+    tint: Option<SvgTint>,
+) -> Result<SlicedProtocol, String> {
+    let canvas = composite_canvas(picker, union, layers, tint)?;
+    // The canvas is already union-pixel-sized, so the encode neither rescales
+    // nor pads (`Resize::Fit(None)`); transparent gaps ride into the terminal.
+    SlicedProtocol::new_with_resize(
+        picker,
+        DynamicImage::ImageRgba8(canvas),
+        union,
+        Resize::Fit(None),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Build the composited union canvas (the alpha-blend core of
+/// `encode_composite`, split out so the blend/offset math is unit-testable).
+fn composite_canvas(
+    picker: &Picker,
+    union: Size,
+    layers: &[CompositeInput<'_>],
+    tint: Option<SvgTint>,
+) -> Result<image::RgbaImage, String> {
+    let font = picker.font_size();
+    let (cw, ch) = (u32::from(font.width.max(1)), u32::from(font.height.max(1)));
+    let uw = u32::from(union.width.max(1)) * cw;
+    let uh = u32::from(union.height.max(1)) * ch;
+    let mut canvas = image::RgbaImage::from_pixel(uw, uh, image::Rgba([0, 0, 0, 0]));
+    for layer in layers {
+        // SVG rasterizes to the box already (`svg_fitted`); a raster decodes at
+        // natural size and is fit to its box below.
+        let (image, _info, svg_fitted) =
+            decode_for_box(layer.bytes, picker, layer.box_cells, layer.crop, tint)?;
+        let lw = u32::from(layer.box_cells.width.max(1)) * cw;
+        let lh = u32::from(layer.box_cells.height.max(1)) * ch;
+        let filter = if layer.pixelated {
+            FilterType::Nearest
+        } else {
+            FilterType::Lanczos3
+        };
+        let placed: image::RgbaImage = if svg_fitted {
+            image.to_rgba8()
+        } else if layer.crop {
+            // object-fit: cover — fill the box, cropping the overflow.
+            image.resize_to_fill(lw, lh, filter).to_rgba8()
+        } else {
+            // object-fit: contain — scale preserving aspect, centered in a
+            // transparent tile so the letterbox slack reveals lower layers.
+            let scaled = image.resize(lw, lh, filter).to_rgba8();
+            let mut tile = image::RgbaImage::from_pixel(lw, lh, image::Rgba([0, 0, 0, 0]));
+            let dx = i64::from(lw.saturating_sub(scaled.width()) / 2);
+            let dy = i64::from(lh.saturating_sub(scaled.height()) / 2);
+            image::imageops::overlay(&mut tile, &scaled, dx, dy);
+            tile
+        };
+        let ox = i64::from(u32::from(layer.off_cells.0) * cw);
+        let oy = i64::from(u32::from(layer.off_cells.1) * ch);
+        image::imageops::overlay(&mut canvas, &placed, ox, oy);
+    }
+    Ok(canvas)
+}
+
+/// A `w×h` RGBA PNG filled with one color+alpha (composite-blend test fixture).
+#[cfg(test)]
+fn rgba_png(w: u32, h: u32, color: [u8; 4]) -> Vec<u8> {
+    let img = image::RgbaImage::from_pixel(w, h, image::Rgba(color));
+    let mut bytes = Vec::new();
+    DynamicImage::ImageRgba8(img)
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    bytes
+}
+
 /// A tiny PNG made with the same crate that decodes it (test fixture,
 /// also used by the app-level viewer tests).
 #[cfg(test)]
@@ -698,7 +831,8 @@ mod tests {
             ImageInfo {
                 width: 80,
                 height: 32,
-                mime: SVG_MIME
+                mime: SVG_MIME,
+                has_alpha: false,
             }
         );
 
@@ -835,6 +969,66 @@ mod tests {
 
         assert!(sniff(b"<html>not pixels</html>").is_none());
         assert!(decode(b"<html>not pixels</html>").is_err());
+    }
+
+    #[test]
+    fn image_has_alpha_scans_only_real_transparency() {
+        // An opaque RGB PNG has no alpha channel → false without a scan.
+        assert!(!image_has_alpha(&decode(&red_png()).unwrap().0));
+        // An RGBA PNG that happens to be fully opaque → false (scanned).
+        let opaque_rgba = decode(&rgba_png(4, 4, [10, 20, 30, 255])).unwrap().0;
+        assert!(!image_has_alpha(&opaque_rgba));
+        // An RGBA PNG with a transparent pixel → true.
+        let transparent = decode(&rgba_png(4, 4, [10, 20, 30, 0])).unwrap().0;
+        assert!(image_has_alpha(&transparent));
+    }
+
+    #[test]
+    fn composite_canvas_alpha_blends_layers_bottom_first() {
+        // P8: the bottom layer shows through an upper layer's transparent pixels,
+        // and an opaque upper layer covers it — the alpha-composite core.
+        let picker = Picker::halfblocks();
+        let font = picker.font_size();
+        let (cw, ch) = (u32::from(font.width.max(1)), u32::from(font.height.max(1)));
+        let cell = Size::new(1, 1);
+        fn input(bytes: &[u8], cell: Size) -> CompositeInput<'_> {
+            CompositeInput {
+                bytes,
+                box_cells: cell,
+                off_cells: (0, 0),
+                crop: false,
+                pixelated: false,
+            }
+        }
+        let base = rgba_png(cw, ch, [255, 0, 0, 255]); // opaque red base
+        // A fully-transparent overlay: the base shows through.
+        let clear = rgba_png(cw, ch, [0, 0, 255, 0]);
+        let canvas = composite_canvas(
+            &picker,
+            cell,
+            &[input(&base, cell), input(&clear, cell)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            canvas.get_pixel(0, 0).0,
+            [255, 0, 0, 255],
+            "a transparent overlay lets the base show through"
+        );
+        // A fully-opaque overlay covers the base.
+        let solid = rgba_png(cw, ch, [0, 0, 255, 255]);
+        let canvas = composite_canvas(
+            &picker,
+            cell,
+            &[input(&base, cell), input(&solid, cell)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            canvas.get_pixel(0, 0).0,
+            [0, 0, 255, 255],
+            "an opaque overlay covers the base"
+        );
     }
 
     #[test]

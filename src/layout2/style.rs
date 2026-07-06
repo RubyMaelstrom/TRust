@@ -161,6 +161,12 @@ pub(crate) struct BoxStyle {
     /// FILL in the cell compositor — colorless, but it erases what's under
     /// its border box in paint order (the modal/card-stack semantics).
     pub bg: bool,
+    /// `float` side (§9.5): the box leaves normal flow and shifts to this edge.
+    /// `None` = `float:none`. An out-of-flow box computes `float:none` (§9.7),
+    /// so this is `None` whenever `position` is absolute/fixed.
+    pub float: Option<super::float::Side>,
+    /// `clear` (§9.5.2): which sides may not be adjacent to an earlier float.
+    pub clear: super::float::Clear,
 }
 
 impl BoxStyle {
@@ -186,6 +192,8 @@ impl BoxStyle {
             has_transform: false,
             opacity_lt1: false,
             bg: false,
+            float: None,
+            clear: super::float::Clear::default(),
         }
     }
 
@@ -281,6 +289,13 @@ impl BoxStyle {
                 .and_then(parse_alpha)
                 .is_some_and(|a| a < 1.0),
             bg: declares_background(dom, id),
+            // §9.7: an out-of-flow box computes `float:none` (positioning wins).
+            float: if Pos::of(dom, id).out_of_flow() {
+                None
+            } else {
+                super::float::float_side(dom, id)
+            },
+            clear: super::float::clear_of(dom, id),
         }
     }
 

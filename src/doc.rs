@@ -333,6 +333,14 @@ pub struct Doc {
     /// `#fragment` link / URL / live hash-change targets that anchor — HTML's
     /// "scroll to the fragment". Empty for line-model docs (gopher/gemini/text).
     pub anchor_rows: std::collections::HashMap<String, usize>,
+    /// Alpha-composited image overlap groups (LAYOUT_OVERHAUL_PLAN.md P8): a
+    /// synthetic `x-trust-composite:` image URL → the ordered layers the app's
+    /// encode pass alpha-composites into that box's single protocol. A composite
+    /// `Item` in `rows`/region buffers carries the synthetic URL as its `image`;
+    /// the app looks its layers up here to encode. Recomputed on every layout
+    /// (never carried across re-parses, unlike `blobs`). Empty except for HTML
+    /// pages with genuinely-transparent image overlaps.
+    pub composites: std::collections::HashMap<String, Vec<crate::layout::CompositeLayer>>,
 }
 
 impl Doc {
@@ -368,6 +376,7 @@ impl Doc {
             boundaries: Vec::new(),
             hover_ids: std::collections::HashMap::new(),
             anchor_rows: std::collections::HashMap::new(),
+            composites: std::collections::HashMap::new(),
         }
     }
 

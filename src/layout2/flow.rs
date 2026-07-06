@@ -26,10 +26,11 @@ use super::flex::{
     AlignContent, AlignItem, FlexCalc, align_content_offsets, align_item_from, container_style,
     item_flex, justify_offsets, resolve_flexible_lengths,
 };
-use super::inline::{Ifc, LineOut, OofMark, Piece};
+use super::float::{FloatBox, FloatCtx, Side};
+use super::inline::{FloatEnv, Ifc, LineOut, OofMark, Piece};
 use super::intrinsic::IMode;
 use super::style::{BOTTOM, BoxStyle, InlineStyle, LEFT, Pos, RIGHT, TOP, block_align};
-use super::tree::{AtomKind, BoxNode, Content};
+use super::tree::{AtomKind, BoxNode, Content, Inline};
 use super::value::{Len, Vp};
 
 /// One laid-out fragment: a border-box rect in absolute px, plus content.
@@ -121,6 +122,12 @@ pub(crate) struct PaintFlags {
     pub cb_abs: bool,
     /// Containing block for FIXED descendants (transformed boxes only).
     pub cb_fixed: bool,
+    /// A non-positioned float (§9.5): painted in Appendix E step 5 as its own
+    /// pseudo-stacking-context (between in-flow block backgrounds and in-flow
+    /// inline content). A float that is ALSO positioned or forms a stacking
+    /// context rides the normal positioned/SC path instead, so this stays false
+    /// for it (`build_floats` re-checks `sc`/`positioned`).
+    pub float: bool,
 }
 
 /// Derive the paint flags from a box style. `item` = the box is a flex/grid
@@ -134,6 +141,9 @@ pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
         bg: s.bg,
         cb_abs: s.position.positioned() || s.has_transform,
         cb_fixed: s.has_transform,
+        // Set on the laid float fragment by `lay_inlines`, not from style
+        // (positioning wins over `float`, so the style bit alone is ambiguous).
+        float: false,
     }
 }
 
@@ -154,13 +164,24 @@ impl<'t> Frag<'t> {
     }
 
     /// The lowest border-box bottom edge in this subtree (scrollable-extent
-    /// contribution). `pub(crate)` because paint recomputes the document
-    /// height after scroll-region extraction empties region frags.
+    /// contribution), CLIPPED. Content an ancestor clips away with
+    /// `overflow: hidden|clip` is NOT part of the scrollable overflow region
+    /// (CSS Overflow L3 §3.2), so each fragment contributes at most its own
+    /// effective clip bottom — otherwise a deliberately-oversized clipped box
+    /// (the 100000px `element-resize-detector` sensor, an off-screen sizing
+    /// probe) would inflate the document to a giant blank scroll. `Frag.clip`
+    /// is populated tree-wide by `resolve_oof` before this runs. `pub(crate)`
+    /// because paint recomputes the document height after scroll-region
+    /// extraction empties region frags.
     pub(crate) fn max_bottom(&self) -> f32 {
+        let own = match self.clip {
+            Some(c) => (self.y + self.h).min(c.y1),
+            None => self.y + self.h,
+        };
         self.children
             .iter()
             .map(Frag::max_bottom)
-            .fold(self.y + self.h, f32::max)
+            .fold(own, f32::max)
     }
 }
 
@@ -276,7 +297,10 @@ impl Flow<'_> {
             .unwrap_or(0.0);
         cur.y = mt.max(0.0);
         let cb_h = (self.vp.h > 0.0).then_some(self.vp.h);
-        let mut frag = self.block(root, 0.0, self.vp.w, cb_h, &mut cur, &inl);
+        // The initial containing block establishes the document's block
+        // formatting context; the root element's floats live here (§9.4.1).
+        let mut root_fc = FloatCtx::new();
+        let mut frag = self.block(root, 0.0, self.vp.w, cb_h, &mut cur, &inl, &mut root_fc);
         // The document's height includes trailing collapsed-out margins (the
         // scrollable extent a browser gives a body bottom margin).
         let flow_bottom = cur.flush() + mb.max(0.0);
@@ -334,6 +358,7 @@ impl Flow<'_> {
     /// Lay one block-level box. `cb_x`/`cb_w` are the containing block's
     /// content-box left edge and width; `cb_h` its definite content height
     /// when it has one (percentage-height basis, §10.5).
+    #[allow(clippy::too_many_arguments)]
     fn block<'t>(
         &self,
         b: &'t BoxNode,
@@ -342,6 +367,7 @@ impl Flow<'_> {
         cb_h: Option<f32>,
         cur: &mut Cursor,
         parent_inl: &InlineStyle,
+        fc: &mut FloatCtx,
     ) -> Frag<'t> {
         let s = &b.style;
         // Anchors recorded inside this box shift with its §9.4.3/transform
@@ -368,6 +394,28 @@ impl Flow<'_> {
         let mb = s.margin[BOTTOM].resolve(Some(cb_w)).unwrap_or(0.0);
         cur.margin(mt);
 
+        // `clear` (§9.5.2): drop the box past the floats it clears in the
+        // ANCESTOR block formatting context (`fc`), before its own content.
+        // Clearance lands the border-top at the cleared floats' bottom and
+        // inhibits margin collapsing across it (the strut is discarded).
+        if s.clear.any() {
+            let ct = fc.clear_y(s.clear);
+            if ct > cur.preview() {
+                cur.y = ct;
+                cur.pos = 0.0;
+                cur.neg = 0.0;
+            }
+        }
+
+        // Does this box establish a NEW block formatting context (§9.4.1:
+        // `overflow≠visible`, `display:flow-root`)? Then its floats are
+        // contained here and don't intrude from the ancestor context; a fresh
+        // context descends into its content. Flex/grid/table items and
+        // out-of-flow boxes already lay through independent paths (`item_frag`)
+        // with their own contexts.
+        let own_bfc = self.establishes_bfc(b);
+        let mut own_fc = FloatCtx::new();
+
         // Definite heights (content-box px). A percentage against an
         // indefinite CB height is auto (§10.5).
         let spec_h = self.height_px(&s.height, s, bt, bb, cb_h);
@@ -391,241 +439,312 @@ impl Flow<'_> {
         let content_top_of = |yb: f32| yb + bt;
 
         // ---- content ----
+        // A multi-column container (css-multicol-1) lays its content once at the
+        // column width and slices it into balanced columns. Only block
+        // containers multicol; flex/grid/table with `column-*` are not multicol.
+        let multicol = matches!(b.content, Content::Blocks(_) | Content::Inlines(_))
+            .then(|| self.resolve_multicol(b.node, h.content_w))
+            .flatten();
+
+        // The float context this box's content lays against: a fresh one when
+        // this box establishes a BFC (its floats stay contained), else the
+        // ancestor's (so a float wraps content ACROSS sibling blocks — §9.5).
         let mut children: Vec<Frag> = Vec::new();
-        match &b.content {
-            Content::Blocks(kids) => {
-                let log = cur.flush_log.len();
-                for k in kids {
-                    children.push(self.block(k, content_x, h.content_w, ifc_cb_h, cur, &inl));
-                }
-                if y_border.is_none() && cur.flush_log.len() > log {
-                    // Top margin collapsed through to a descendant: our
-                    // border-top edge coincides with that first flush.
-                    y_border = Some(cur.flush_log[log]);
-                }
-            }
-            Content::Inlines(inls) => {
-                let mut ifc = Ifc::new(
-                    self.dom,
-                    self.base,
-                    self.images,
-                    self.forms,
-                    self.vp,
-                    self.cell_w,
-                    self.cell_h,
-                    h.content_w,
-                    ifc_cb_h,
-                    block_align(self.dom, style_node),
-                    self.indent_px(style_node, h.content_w),
-                );
-                if b.marker_inside
-                    && let Some(m) = &b.marker
-                {
-                    let mut mctx = inl.clone();
-                    mctx.kind = crate::layout::ItemKind::Text;
-                    ifc.text(m, &mctx);
-                }
-                ifc.run(inls, &inl);
-                let (lines, marks, oofs) = ifc.finish();
-                if !lines.is_empty() {
-                    let yb = *y_border.get_or_insert_with(|| {
-                        let yb = cur.flush();
-                        cur.y = yb; // bt == 0 on this path
-                        yb
-                    });
-                    cur.y = content_top_of(yb).max(cur.y);
-                    let n = lines.len();
-                    self.emit_lines(lines, content_x, cur, &mut children);
-                    let first = children.len() - n;
-                    let end_y = cur.y;
-                    let line_y = |idx: usize, children: &[Frag<'_>]| {
-                        if idx < n {
-                            children[first + idx].y
+        {
+            let cfc: &mut FloatCtx = if own_bfc { &mut own_fc } else { fc };
+            if let Some((n, col_w, gap_px)) = multicol {
+                // The container establishes an independent formatting context;
+                // its content flushes at the top edge like a flex/grid box.
+                let yb = *y_border.get_or_insert_with(|| {
+                    let yb = cur.flush();
+                    cur.y = yb;
+                    yb
+                });
+                cur.y = content_top_of(yb).max(cur.y);
+                let top = cur.y;
+                let (frags, ch, mut anc) =
+                    self.lay_multicol(b, content_x, top, n, col_w, gap_px, ifc_cb_h, &inl);
+                children.extend(frags);
+                cur.anchors.append(&mut anc);
+                cur.y = top + ch;
+            } else {
+                match &b.content {
+                    Content::Blocks(kids) => {
+                        let log = cur.flush_log.len();
+                        for k in kids {
+                            children.push(self.block(
+                                k,
+                                content_x,
+                                h.content_w,
+                                ifc_cb_h,
+                                cur,
+                                &inl,
+                                cfc,
+                            ));
+                        }
+                        if y_border.is_none() && cur.flush_log.len() > log {
+                            // Top margin collapsed through to a descendant: our
+                            // border-top edge coincides with that first flush.
+                            y_border = Some(cur.flush_log[log]);
+                        }
+                    }
+                    Content::Inlines(inls) => {
+                        // Floats are placed at the position the first line box would
+                        // land (the collapsed-margin landing point); the IFC lays
+                        // line boxes shortened beside them.
+                        let content_top_y = cur.preview();
+                        let marker = (b.marker_inside).then_some(b.marker.as_deref()).flatten();
+                        let laid = self.lay_inlines(
+                            inls,
+                            content_x,
+                            content_top_y,
+                            h.content_w,
+                            ifc_cb_h,
+                            block_align(self.dom, style_node),
+                            self.indent_px(style_node, h.content_w),
+                            marker,
+                            &inl,
+                            cfc,
+                        );
+                        let InlineLaid {
+                            lines,
+                            marks,
+                            oofs,
+                            float_frags,
+                            float_anchors,
+                        } = laid;
+                        cur.anchors.extend(float_anchors);
+                        if !lines.is_empty() {
+                            let yb = *y_border.get_or_insert_with(|| {
+                                let yb = cur.flush();
+                                cur.y = yb; // bt == 0 on this path
+                                yb
+                            });
+                            cur.y = content_top_of(yb).max(cur.y);
+                            let n = lines.len();
+                            self.emit_lines(lines, content_x, cur, &mut children);
+                            let first = children.len() - n;
+                            let end_y = cur.y;
+                            let line_y = |idx: usize, children: &[Frag<'_>]| {
+                                if idx < n {
+                                    children[first + idx].y
+                                } else {
+                                    end_y
+                                }
+                            };
+                            for (node, idx) in marks {
+                                cur.anchors.push((node, line_y(idx, &children)));
+                            }
+                            for m in oofs {
+                                let y = line_y(m.line, &children);
+                                children.push(oof_placeholder(m, content_x, y));
+                            }
                         } else {
-                            end_y
+                            // No line boxes: the elements still sit at this flow
+                            // position (where the box self-collapses to).
+                            for (node, _) in marks {
+                                cur.anchors.push((node, cur.preview()));
+                            }
+                            let y = cur.preview();
+                            for m in oofs {
+                                children.push(oof_placeholder(m, content_x, y));
+                            }
                         }
-                    };
-                    for (node, idx) in marks {
-                        cur.anchors.push((node, line_y(idx, &children)));
+                        // Floats sit at their placed positions regardless of whether
+                        // any line box was produced (a float-only block collapses,
+                        // but still places its float).
+                        children.extend(float_frags);
                     }
-                    for m in oofs {
-                        let y = line_y(m.line, &children);
-                        children.push(oof_placeholder(m, content_x, y));
+                    Content::Flex(items) => {
+                        // A flex container establishes an independent formatting
+                        // context: child margins never escape it, so an occupied
+                        // container flushes at its top edge like an IFC does; an
+                        // empty one self-collapses like an empty block.
+                        if !items.is_empty() || !b.oof.is_empty() {
+                            let yb = *y_border.get_or_insert_with(|| {
+                                let yb = cur.flush();
+                                cur.y = yb;
+                                yb
+                            });
+                            cur.y = content_top_of(yb).max(cur.y);
+                            let top = cur.y;
+                            if !items.is_empty() {
+                                let (frags, fh) = self.flex_content(
+                                    b,
+                                    items,
+                                    content_x,
+                                    top,
+                                    h.content_w,
+                                    ifc_cb_h,
+                                    (min_h, max_h),
+                                    &inl,
+                                    &mut cur.anchors,
+                                );
+                                children.extend(frags);
+                                cur.y += fh;
+                            }
+                            self.container_oof(b, &inl, content_x, top, &mut children);
+                        }
                     }
-                } else {
-                    // No line boxes: the elements still sit at this flow
-                    // position (where the box self-collapses to).
-                    for (node, _) in marks {
-                        cur.anchors.push((node, cur.preview()));
+                    Content::Grid(items) => {
+                        // A grid container establishes an independent formatting
+                        // context, exactly like the flex arm above.
+                        if !items.is_empty() || !b.oof.is_empty() {
+                            let yb = *y_border.get_or_insert_with(|| {
+                                let yb = cur.flush();
+                                cur.y = yb;
+                                yb
+                            });
+                            cur.y = content_top_of(yb).max(cur.y);
+                            let top = cur.y;
+                            if !items.is_empty() {
+                                let (frags, gh) = self.grid_content(
+                                    b,
+                                    items,
+                                    content_x,
+                                    top,
+                                    h.content_w,
+                                    ifc_cb_h,
+                                    &inl,
+                                    &mut cur.anchors,
+                                );
+                                children.extend(frags);
+                                cur.y += gh;
+                            }
+                            self.container_oof(b, &inl, content_x, top, &mut children);
+                        }
                     }
-                    let y = cur.preview();
-                    for m in oofs {
-                        children.push(oof_placeholder(m, content_x, y));
+                    Content::Table(tb) => {
+                        // A table establishes an independent formatting context (like
+                        // flex/grid): it flushes at its top edge when occupied and
+                        // self-collapses when empty.
+                        let occupied = tb.ncols > 0
+                            || !tb.top_captions.is_empty()
+                            || !tb.bottom_captions.is_empty();
+                        if occupied {
+                            let yb = *y_border.get_or_insert_with(|| {
+                                let yb = cur.flush();
+                                cur.y = yb;
+                                yb
+                            });
+                            cur.y = content_top_of(yb).max(cur.y);
+                            // §17.5.2: a definite width fills the band; an auto (or
+                            // min/max-content) width shrinks to fit and repositions
+                            // by §17.4 auto margins / align context. The table's width
+                            // is its CSS `width` (already resolved into `h.content_w`),
+                            // else the HTML `width` attribute (HTML §15.3.13 — not a
+                            // CSS property, so `BoxStyle` never saw it), else auto.
+                            let (avail_w, width_auto) = if s.width.resolve(Some(cb_w)).is_some() {
+                                (h.content_w, false)
+                            } else {
+                                match super::tree::declared_track_width(self.dom, b.node) {
+                                    Some(super::tree::ColSpec::Px(px)) => (px.max(1.0), false),
+                                    Some(super::tree::ColSpec::Pct(p)) => {
+                                        ((p * cb_w).max(1.0), false)
+                                    }
+                                    None => (h.content_w, true),
+                                }
+                            };
+                            let cols = self.table_columns(tb, b.node, avail_w, width_auto, &inl);
+                            // Position a table narrower than its band (§17.4 auto
+                            // margins / align). A CSS-definite width already centered
+                            // via §10.3.3 auto margins in `horizontal` (its band ==
+                            // `h.content_w` == the width, so this is a no-op there).
+                            let lead = self.table_lead(b.node, cols.table_w, h.content_w);
+                            let cap_x = content_x + lead;
+                            let cap_w = cols.table_w.max(1.0);
+                            // A table establishes an independent formatting context; its
+                            // captions' floats stay contained here.
+                            let mut tfc = FloatCtx::new();
+                            // Top captions (§17.4), then the grid, then bottom captions
+                            // — each a block box at the table's used width.
+                            for cap in &tb.top_captions {
+                                children.push(
+                                    self.block(cap, cap_x, cap_w, ifc_cb_h, cur, &inl, &mut tfc),
+                                );
+                            }
+                            let grid_top = cur.flush();
+                            let (frags, gh) = self.table_grid(
+                                tb,
+                                b.node,
+                                &cols,
+                                cap_x,
+                                grid_top,
+                                ifc_cb_h,
+                                &inl,
+                                &mut cur.anchors,
+                            );
+                            children.extend(frags);
+                            cur.y = grid_top + gh;
+                            for cap in &tb.bottom_captions {
+                                children.push(
+                                    self.block(cap, cap_x, cap_w, ifc_cb_h, cur, &inl, &mut tfc),
+                                );
+                            }
+                            // Enclose the (possibly shrunk + shifted) table.
+                            x_border += lead;
+                            h.content_w = cols.table_w;
+                        }
                     }
-                }
-            }
-            Content::Flex(items) => {
-                // A flex container establishes an independent formatting
-                // context: child margins never escape it, so an occupied
-                // container flushes at its top edge like an IFC does; an
-                // empty one self-collapses like an empty block.
-                if !items.is_empty() || !b.oof.is_empty() {
-                    let yb = *y_border.get_or_insert_with(|| {
-                        let yb = cur.flush();
-                        cur.y = yb;
-                        yb
-                    });
-                    cur.y = content_top_of(yb).max(cur.y);
-                    let top = cur.y;
-                    if !items.is_empty() {
-                        let (frags, fh) = self.flex_content(
-                            b,
-                            items,
-                            content_x,
-                            top,
+                    Content::Atomic(atom) => {
+                        // A block-level replaced box: size through the same replaced
+                        // sizing the IFC uses, then place per §10.3.4 (auto margins
+                        // center a definite-width replaced box).
+                        let mut ifc = Ifc::new(
+                            self.dom,
+                            self.base,
+                            self.images,
+                            self.forms,
+                            self.vp,
+                            self.cell_w,
+                            self.cell_h,
                             h.content_w,
                             ifc_cb_h,
-                            (min_h, max_h),
-                            &inl,
-                            &mut cur.anchors,
+                            super::style::Align2::Left,
+                            0.0,
+                            None,
                         );
-                        children.extend(frags);
-                        cur.y += fh;
-                    }
-                    self.container_oof(b, &inl, content_x, top, &mut children);
-                }
-            }
-            Content::Grid(items) => {
-                // A grid container establishes an independent formatting
-                // context, exactly like the flex arm above.
-                if !items.is_empty() || !b.oof.is_empty() {
-                    let yb = *y_border.get_or_insert_with(|| {
-                        let yb = cur.flush();
-                        cur.y = yb;
-                        yb
-                    });
-                    cur.y = content_top_of(yb).max(cur.y);
-                    let top = cur.y;
-                    if !items.is_empty() {
-                        let (frags, gh) = self.grid_content(
-                            b,
-                            items,
-                            content_x,
-                            top,
-                            h.content_w,
-                            ifc_cb_h,
-                            &inl,
-                            &mut cur.anchors,
-                        );
-                        children.extend(frags);
-                        cur.y += gh;
-                    }
-                    self.container_oof(b, &inl, content_x, top, &mut children);
-                }
-            }
-            Content::Table(tb) => {
-                // A table establishes an independent formatting context (like
-                // flex/grid): it flushes at its top edge when occupied and
-                // self-collapses when empty.
-                let occupied =
-                    tb.ncols > 0 || !tb.top_captions.is_empty() || !tb.bottom_captions.is_empty();
-                if occupied {
-                    let yb = *y_border.get_or_insert_with(|| {
-                        let yb = cur.flush();
-                        cur.y = yb;
-                        yb
-                    });
-                    cur.y = content_top_of(yb).max(cur.y);
-                    // §17.5.2: a definite width fills the band; an auto (or
-                    // min/max-content) width shrinks to fit and repositions
-                    // by §17.4 auto margins / align context. The table's width
-                    // is its CSS `width` (already resolved into `h.content_w`),
-                    // else the HTML `width` attribute (HTML §15.3.13 — not a
-                    // CSS property, so `BoxStyle` never saw it), else auto.
-                    let (avail_w, width_auto) = if s.width.resolve(Some(cb_w)).is_some() {
-                        (h.content_w, false)
-                    } else {
-                        match super::tree::declared_track_width(self.dom, b.node) {
-                            Some(super::tree::ColSpec::Px(px)) => (px.max(1.0), false),
-                            Some(super::tree::ColSpec::Pct(p)) => ((p * cb_w).max(1.0), false),
-                            None => (h.content_w, true),
+                        ifc.atom(atom, &inl);
+                        let (lines, _, _, _) = ifc.finish();
+                        if !lines.is_empty() {
+                            let yb = *y_border.get_or_insert_with(|| {
+                                let yb = cur.flush();
+                                cur.y = yb;
+                                yb
+                            });
+                            cur.y = content_top_of(yb).max(cur.y);
+                            // §10.3.4: auto left/right margins center the box. The
+                            // line's pen-based width is the box extent — a painted
+                            // `contain` item can be narrower than its box.
+                            let box_w = lines
+                                .iter()
+                                .map(|l| l.width as f32 * self.cell_w)
+                                .fold(0.0f32, f32::max);
+                            let free = (h.content_w - box_w).max(0.0);
+                            let off = match (s.margin[LEFT].is_auto(), s.margin[RIGHT].is_auto()) {
+                                (true, true) => free / 2.0,
+                                (true, false) => free,
+                                _ => 0.0,
+                            };
+                            self.emit_lines(lines, content_x + off, cur, &mut children);
                         }
-                    };
-                    let cols = self.table_columns(tb, b.node, avail_w, width_auto, &inl);
-                    // Position a table narrower than its band (§17.4 auto
-                    // margins / align). A CSS-definite width already centered
-                    // via §10.3.3 auto margins in `horizontal` (its band ==
-                    // `h.content_w` == the width, so this is a no-op there).
-                    let lead = self.table_lead(b.node, cols.table_w, h.content_w);
-                    let cap_x = content_x + lead;
-                    let cap_w = cols.table_w.max(1.0);
-                    // Top captions (§17.4), then the grid, then bottom captions
-                    // — each a block box at the table's used width.
-                    for cap in &tb.top_captions {
-                        children.push(self.block(cap, cap_x, cap_w, ifc_cb_h, cur, &inl));
                     }
-                    let grid_top = cur.flush();
-                    let (frags, gh) = self.table_grid(
-                        tb,
-                        b.node,
-                        &cols,
-                        cap_x,
-                        grid_top,
-                        ifc_cb_h,
-                        &inl,
-                        &mut cur.anchors,
-                    );
-                    children.extend(frags);
-                    cur.y = grid_top + gh;
-                    for cap in &tb.bottom_captions {
-                        children.push(self.block(cap, cap_x, cap_w, ifc_cb_h, cur, &inl));
-                    }
-                    // Enclose the (possibly shrunk + shifted) table.
-                    x_border += lead;
-                    h.content_w = cols.table_w;
                 }
-            }
-            Content::Atomic(atom) => {
-                // A block-level replaced box: size through the same replaced
-                // sizing the IFC uses, then place per §10.3.4 (auto margins
-                // center a definite-width replaced box).
-                let mut ifc = Ifc::new(
-                    self.dom,
-                    self.base,
-                    self.images,
-                    self.forms,
-                    self.vp,
-                    self.cell_w,
-                    self.cell_h,
-                    h.content_w,
-                    ifc_cb_h,
-                    super::style::Align2::Left,
-                    0.0,
-                );
-                ifc.atom(atom, &inl);
-                let (lines, _, _) = ifc.finish();
-                if !lines.is_empty() {
-                    let yb = *y_border.get_or_insert_with(|| {
-                        let yb = cur.flush();
-                        cur.y = yb;
-                        yb
-                    });
-                    cur.y = content_top_of(yb).max(cur.y);
-                    // §10.3.4: auto left/right margins center the box. The
-                    // line's pen-based width is the box extent — a painted
-                    // `contain` item can be narrower than its box.
-                    let box_w = lines
-                        .iter()
-                        .map(|l| l.width as f32 * self.cell_w)
-                        .fold(0.0f32, f32::max);
-                    let free = (h.content_w - box_w).max(0.0);
-                    let off = match (s.margin[LEFT].is_auto(), s.margin[RIGHT].is_auto()) {
-                        (true, true) => free / 2.0,
-                        (true, false) => free,
-                        _ => 0.0,
-                    };
-                    self.emit_lines(lines, content_x + off, cur, &mut children);
-                }
+            } // end multicol else
+        } // end cfc borrow
+
+        // Contain floats (§9.5): a BFC-establishing, auto-height box grows to
+        // enclose the lowest float bottom in its own context (the ubiquitous
+        // `overflow:hidden`/`flow-root` clearfix). A definite height overflows.
+        if own_bfc && spec_h.is_none() && !own_fc.is_empty() {
+            let fb = own_fc.bottom();
+            if fb > cur.preview() {
+                cur.y = fb;
+                cur.pos = 0.0;
+                cur.neg = 0.0;
+                // The float extends past the last in-flow content: our
+                // border-top edge exists even if no line box flushed.
+                y_border.get_or_insert(fb - bt);
             }
         }
 
@@ -1722,36 +1841,46 @@ impl Flow<'_> {
             y: bt,
             ..Default::default()
         };
+        // An item box (flex/grid item, table cell, out-of-flow box) establishes
+        // an independent block formatting context: its floats are contained here
+        // and cannot intrude from the ancestor context (§9.4.1).
+        let mut own_fc = FloatCtx::new();
         let mut children: Vec<Frag<'t>> = Vec::new();
         match &b.content {
             Content::Blocks(kids) => {
                 for k in kids {
-                    children.push(self.block(k, bp_l, content_w, def_h, &mut cur, &inl));
+                    children.push(self.block(
+                        k,
+                        bp_l,
+                        content_w,
+                        def_h,
+                        &mut cur,
+                        &inl,
+                        &mut own_fc,
+                    ));
                 }
             }
             Content::Inlines(inls) => {
-                let mut ifc = Ifc::new(
-                    self.dom,
-                    self.base,
-                    self.images,
-                    self.forms,
-                    self.vp,
-                    self.cell_w,
-                    self.cell_h,
+                let laid = self.lay_inlines(
+                    inls,
+                    bp_l,
+                    bt,
                     content_w,
                     def_h,
                     block_align(self.dom, style_node),
                     self.indent_px(style_node, content_w),
+                    (b.marker_inside).then_some(b.marker.as_deref()).flatten(),
+                    &inl,
+                    &mut own_fc,
                 );
-                if b.marker_inside
-                    && let Some(mk) = &b.marker
-                {
-                    let mut mctx = inl.clone();
-                    mctx.kind = crate::layout::ItemKind::Text;
-                    ifc.text(mk, &mctx);
-                }
-                ifc.run(inls, &inl);
-                let (lines, marks, oofs) = ifc.finish();
+                let InlineLaid {
+                    lines,
+                    marks,
+                    oofs,
+                    float_frags,
+                    float_anchors,
+                } = laid;
+                cur.anchors.extend(float_anchors);
                 let n = lines.len();
                 if n > 0 {
                     self.emit_lines(lines, bp_l, &mut cur, &mut children);
@@ -1772,6 +1901,7 @@ impl Flow<'_> {
                     let y = line_y(m.line, &children);
                     children.push(oof_placeholder(m, bp_l, y));
                 }
+                children.extend(float_frags);
             }
             Content::Atomic(atom) => match &atom.kind {
                 AtomKind::Img { url, alt: _ } => {
@@ -1804,9 +1934,10 @@ impl Flow<'_> {
                         def_h,
                         super::style::Align2::Left,
                         0.0,
+                        None,
                     );
                     ifc.atom(atom, &inl);
-                    let (lines, _, _) = ifc.finish();
+                    let (lines, _, _, _) = ifc.finish();
                     if !lines.is_empty() {
                         self.emit_lines(lines, bp_l, &mut cur, &mut children);
                     }
@@ -1861,8 +1992,9 @@ impl Flow<'_> {
                 };
                 let cap_x = bp_l + lead;
                 let cap_w = cols.table_w.max(1.0);
+                let mut tfc = FloatCtx::new();
                 for cap in &tb.top_captions {
-                    children.push(self.block(cap, cap_x, cap_w, def_h, &mut cur, &inl));
+                    children.push(self.block(cap, cap_x, cap_w, def_h, &mut cur, &inl, &mut tfc));
                 }
                 let grid_top = cur.flush();
                 let (frags, gh) = self.table_grid(
@@ -1878,11 +2010,16 @@ impl Flow<'_> {
                 children.extend(frags);
                 cur.y = grid_top + gh;
                 for cap in &tb.bottom_captions {
-                    children.push(self.block(cap, cap_x, cap_w, def_h, &mut cur, &inl));
+                    children.push(self.block(cap, cap_x, cap_w, def_h, &mut cur, &inl, &mut tfc));
                 }
             }
         }
         let mut content_h = (cur.flush() - bt).max(0.0);
+        // Contain floats (§9.5): an auto-height item box grows to the lowest
+        // float bottom in its own context; a definite height overflows.
+        if def_h.is_none() && !own_fc.is_empty() {
+            content_h = content_h.max((own_fc.bottom() - bt).max(0.0));
+        }
         if let Some(hd) = def_h {
             content_h = hd;
         }
@@ -2122,6 +2259,25 @@ impl Flow<'_> {
         abs_clip: Option<Clip>,
         fixed_clip: Option<Clip>,
     ) {
+        // The principal scroller's scrollable overflow propagates to the
+        // viewport (CSS Overflow L3 §3.1): its content becomes the document
+        // scroll, so it escapes any intermediate overflow-clip ancestor — a
+        // locked-viewport app shell commonly wraps it in a definite-height
+        // `<main>{overflow:hidden}` that would otherwise trap the whole page to
+        // one screen (Twitch's front page: every shelf below the fold sat laid
+        // but clipped away). It flows into the document exactly like html/body,
+        // so like them it takes no inherited clip. Gated on the cheap
+        // `is_scroll_container` read so the upward principal-scroller walk runs
+        // only for the rare scroll box that actually inherited a clip.
+        let own_clip = if own_clip.is_some()
+            && f.node != NO_NODE
+            && self.dom.is_scroll_container(f.node)
+            && self.dom.is_principal_scroller(f.node)
+        {
+            None
+        } else {
+            own_clip
+        };
         // This fragment's own painted cells are clipped by its containing-block
         // chain (`own_clip`); its in-flow descendants — and the abspos/fixed
         // descendants for which it is the containing block — are additionally
@@ -2406,5 +2562,370 @@ impl Flow<'_> {
         let minc = self.intrinsic_w(b, IMode::Min, ctx);
         let maxc = self.intrinsic_w(b, IMode::Max, ctx).max(minc);
         avail.max(minc).min(maxc).max(0.0)
+    }
+
+    /// Whether `b` establishes a new block formatting context (§9.4.1) — so its
+    /// floats are contained and it isn't itself shortened by ancestor floats.
+    /// The two statically-resolvable triggers: `display:flow-root`, and a
+    /// non-`visible` used `overflow` on either axis (`overflow:hidden` clearfix,
+    /// scroll containers). Flex/grid/table items and out-of-flow boxes lay
+    /// through `item_frag`, which establishes its own context directly.
+    fn establishes_bfc(&self, b: &BoxNode) -> bool {
+        if b.node == NO_NODE {
+            return false;
+        }
+        if self.dom.effective_display(b.node).as_deref() == Some("flow-root") {
+            return true;
+        }
+        self.scroll_container(b.node)
+    }
+
+    /// Pre-lay one float's box (§9.5 / §10.3.5): resolve its used width (shrink-
+    /// to-fit when `auto`, since a float never fills its containing block) and
+    /// lay the box, returning its margin-box size + leading margins + the laid
+    /// border-box fragment. The block flow owns box laying; the IFC is handed
+    /// only the resulting sizes to place. `cb_w`/`cb_h` are the float's
+    /// containing block (its parent block's content box).
+    fn lay_float_box<'t>(
+        &self,
+        fb: &'t BoxNode,
+        cb_w: f32,
+        cb_h: Option<f32>,
+        parent_inl: &InlineStyle,
+    ) -> PrelaidFloat<'t> {
+        let s = &fb.style;
+        let side = s.float.unwrap_or(Side::Left);
+        // §9.5: a float's `auto` margins compute to zero.
+        let (m, _auto) = self.margins_of(s, cb_w);
+        let bp_l = s.border[LEFT] + self.pad(s, LEFT, cb_w);
+        let bp_r = s.border[RIGHT] + self.pad(s, RIGHT, cb_w);
+        let bp_h = bp_l + bp_r;
+        let bt = s.border[TOP] + self.pad(s, TOP, cb_w);
+        let bb = s.border[BOTTOM] + self.pad(s, BOTTOM, cb_w);
+        let spec_w = |l: &Len| {
+            l.resolve(Some(cb_w)).map(|v| {
+                if s.border_box {
+                    (v - bp_h).max(0.0)
+                } else {
+                    v.max(0.0)
+                }
+            })
+        };
+        let min_w = spec_w(&s.min_width).unwrap_or(0.0);
+        let max_w = match &s.max_width {
+            Len::None => f32::INFINITY,
+            l => spec_w(l).unwrap_or(f32::INFINITY),
+        }
+        .max(min_w);
+        let content_w = match spec_w(&s.width) {
+            Some(w) => w.clamp(min_w, max_w),
+            None => {
+                let avail = (cb_w - m[LEFT] - m[RIGHT] - bp_h).max(0.0);
+                self.shrink_to_fit(fb, avail, parent_inl)
+                    .clamp(min_w, max_w)
+            }
+        };
+        let def_h = self.height_px(&s.height, s, bt, bb, cb_h);
+        let (frag, anchors) = self.item_frag(fb, content_w, cb_w, def_h, parent_inl);
+        PrelaidFloat {
+            side,
+            mw: m[LEFT] + frag.w + m[RIGHT],
+            mh: m[TOP] + frag.h + m[BOTTOM],
+            ml: m[LEFT],
+            mt: m[TOP],
+            frag,
+            anchors,
+        }
+    }
+
+    /// Lay one inline formatting context that may contain floats (§9.5): pre-lay
+    /// the floats it holds (in the order the IFC meets them), run the line
+    /// breaker against the shared `fc` so the line boxes shorten beside them,
+    /// then offset each placed float's border-box fragment to its resolved
+    /// position. Returns the line boxes plus the anchor/out-of-flow marks and
+    /// the positioned float fragments (in the same content frame the caller
+    /// gave, so it can splice them straight into its children). `content_top_y`
+    /// is where the first line box lands (floats can be no higher — §9.5.1).
+    #[allow(clippy::too_many_arguments)]
+    fn lay_inlines<'t>(
+        &self,
+        inls: &'t [Inline],
+        content_x: f32,
+        content_top_y: f32,
+        content_w: f32,
+        cb_h: Option<f32>,
+        align: super::style::Align2,
+        indent_px: f32,
+        marker: Option<&str>,
+        inl: &InlineStyle,
+        fc: &mut FloatCtx,
+    ) -> InlineLaid<'t> {
+        // Pre-lay every float in walk order; `boxes[k]` is the k-th one the IFC
+        // meets, `prelaid[k]` its laid fragment.
+        let mut float_nodes: Vec<&'t BoxNode> = Vec::new();
+        collect_floats(inls, &mut float_nodes);
+        let mut prelaid: Vec<Option<PrelaidFloat<'t>>> = Vec::with_capacity(float_nodes.len());
+        let mut boxes: Vec<FloatBox> = Vec::with_capacity(float_nodes.len());
+        for fb in &float_nodes {
+            let pf = self.lay_float_box(fb, content_w, cb_h, inl);
+            boxes.push(FloatBox {
+                side: pf.side,
+                mw: pf.mw,
+                mh: pf.mh,
+            });
+            prelaid.push(Some(pf));
+        }
+        let mut ifc = Ifc::new(
+            self.dom,
+            self.base,
+            self.images,
+            self.forms,
+            self.vp,
+            self.cell_w,
+            self.cell_h,
+            content_w,
+            cb_h,
+            align,
+            indent_px,
+            Some(FloatEnv {
+                fc,
+                boxes: &boxes,
+                left_x: content_x,
+                top_y: content_top_y,
+            }),
+        );
+        if let Some(m) = marker {
+            let mut mctx = inl.clone();
+            mctx.kind = crate::layout::ItemKind::Text;
+            ifc.text(m, &mctx);
+        }
+        ifc.run(inls, inl);
+        let (lines, marks, oofs, placements) = ifc.finish();
+        // Place each float's fragment: its margin-box top-left is the IFC's
+        // resolved position, the border box sits inside it by the leading
+        // margins.
+        let mut float_frags = Vec::new();
+        let mut float_anchors = Vec::new();
+        for pl in placements {
+            let Some(mut pf) = prelaid.get_mut(pl.index).and_then(|s| s.take()) else {
+                continue;
+            };
+            let bx = pl.x + pf.ml;
+            let by = pl.y + pf.mt;
+            Self::offset_frag(&mut pf.frag, bx, by);
+            for a in &mut pf.anchors {
+                a.1 += by;
+            }
+            float_anchors.append(&mut pf.anchors);
+            // Flag it for Appendix E step 5 (unless it already forms its own
+            // stacking context / is positioned, in which case the painter's
+            // sc/positioned checks route it normally).
+            pf.frag.paint.float = true;
+            float_frags.push(pf.frag);
+        }
+        InlineLaid {
+            lines,
+            marks,
+            oofs,
+            float_frags,
+            float_anchors,
+        }
+    }
+
+    /// Whether `id` establishes a multi-column container and, if so, its used
+    /// column count `N`, column content width `W`, and gap (css-multicol-1
+    /// §3.4). `None` when neither `column-width` nor `column-count` is set, or
+    /// the resolved count is 1 (a single column is plain block flow). `u` is the
+    /// container's content width.
+    fn resolve_multicol(&self, id: NodeId, u: f32) -> Option<(usize, f32, f32)> {
+        if id == NO_NODE {
+            return None;
+        }
+        let vunits = crate::layout::Units::of(self.dom, id);
+        let count = self
+            .dom
+            .computed_value(id, "column-count")
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&c| c > 0);
+        let width = self
+            .dom
+            .computed_value(id, "column-width")
+            .filter(|v| !v.trim().eq_ignore_ascii_case("auto"))
+            .and_then(|v| Len::parse(v.trim(), vunits, self.vp))
+            .and_then(|l| l.resolve(None))
+            .filter(|&w| w > 0.0);
+        if count.is_none() && width.is_none() {
+            return None; // `column-width: auto` and `column-count: auto` ⇒ not multicol
+        }
+        // `column-gap: normal` = 1em; a length/percentage resolves against U.
+        let gap = match self
+            .dom
+            .computed_value(id, "column-gap")
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("") | Some("normal") => vunits.fs,
+            Some(v) => Len::parse(v, vunits, self.vp)
+                .and_then(|l| l.resolve(Some(u)))
+                .unwrap_or(vunits.fs),
+        }
+        .max(0.0);
+        // §3.4 used count.
+        let n = match (width, count) {
+            (None, Some(c)) => c,
+            (Some(w), None) => (((u + gap) / (w + gap)).floor().max(1.0)) as usize,
+            (Some(w), Some(c)) => c.min((((u + gap) / (w + gap)).floor().max(1.0)) as usize),
+            (None, None) => return None,
+        }
+        .max(1);
+        if n <= 1 {
+            return None; // one column is identical to normal block flow
+        }
+        let w = ((u - (n - 1) as f32 * gap) / n as f32).max(0.0);
+        Some((n, w, gap))
+    }
+
+    /// Lay a multi-column container's content (css-multicol-1): lay the content
+    /// ONCE as ordinary block/inline flow at the column content width `col_w`,
+    /// then BALANCE (`column-fill:balance`, the default with an indefinite
+    /// height) by slicing the laid line boxes into `n` equal-height columns at
+    /// row granularity and translating each column into place. Returns the
+    /// sliced fragments, the container's used content height, and the (column-
+    /// translated) anchors. `content_top` is the content-box top; column 0 sits
+    /// at `content_x`, column k at `content_x + k·(col_w + gap)`.
+    #[allow(clippy::too_many_arguments)]
+    fn lay_multicol<'t>(
+        &self,
+        b: &'t BoxNode,
+        content_x: f32,
+        content_top: f32,
+        n: usize,
+        col_w: f32,
+        gap_px: f32,
+        cb_h: Option<f32>,
+        inl: &InlineStyle,
+    ) -> (Vec<Frag<'t>>, f32, Vec<(NodeId, f32)>) {
+        // ---- lay the content once, as a single tall column at col_w ----
+        // A multicol container establishes an independent formatting context.
+        let mut cur = Cursor {
+            y: content_top,
+            ..Default::default()
+        };
+        let mut sub_fc = FloatCtx::new();
+        let mut single: Vec<Frag<'t>> = Vec::new();
+        match &b.content {
+            Content::Blocks(kids) => {
+                for k in kids {
+                    single.push(self.block(k, content_x, col_w, cb_h, &mut cur, inl, &mut sub_fc));
+                }
+            }
+            Content::Inlines(inls) => {
+                let laid = self.lay_inlines(
+                    inls,
+                    content_x,
+                    content_top,
+                    col_w,
+                    cb_h,
+                    block_align(self.dom, b.node),
+                    self.indent_px(b.node, col_w),
+                    None,
+                    inl,
+                    &mut sub_fc,
+                );
+                self.emit_lines(laid.lines, content_x, &mut cur, &mut single);
+                single.extend(laid.float_frags);
+                cur.anchors.extend(laid.float_anchors);
+            }
+            // Multicol applies only to block containers; other content types
+            // never reach here (`resolve_multicol` gates the caller).
+            _ => {}
+        }
+        let h_px = (cur.flush() - content_top).max(0.0);
+        let mut anchors = std::mem::take(&mut cur.anchors);
+
+        // ---- balance: equal-height columns, sliced at row boundaries ----
+        let h_rows = (h_px / self.cell_h).round().max(0.0) as usize;
+        let col_rows = h_rows.div_ceil(n).max(1);
+        let col_h_px = col_rows as f32 * self.cell_h;
+        // The per-fragment column offset, keyed on its top row (§3.4: content
+        // fills the anonymous column boxes in order). A row `r` from the single
+        // column lands in column `k = r / col_rows`, translated right by k
+        // gaps+widths and up by k column-heights.
+        let column_shift = |y: f32| -> (f32, f32) {
+            let row = ((y - content_top) / self.cell_h).round().max(0.0) as usize;
+            let k = (row / col_rows).min(n - 1);
+            (k as f32 * (col_w + gap_px), -(k as f32) * col_h_px)
+        };
+        for a in &mut anchors {
+            let (_, dy) = column_shift(a.1);
+            a.1 += dy;
+        }
+        let mut out: Vec<Frag<'t>> = Vec::new();
+        for f in single {
+            slice_columns(f, &column_shift, &mut out);
+        }
+        (out, col_h_px, anchors)
+    }
+}
+
+/// A float's box, pre-laid by the block flow and handed to the IFC for
+/// placement: its margin-box size, leading margins, and the laid border-box
+/// fragment (at origin, offset to its placed position once the IFC resolves it).
+struct PrelaidFloat<'t> {
+    side: Side,
+    mw: f32,
+    mh: f32,
+    ml: f32,
+    mt: f32,
+    frag: Frag<'t>,
+    anchors: Vec<(NodeId, f32)>,
+}
+
+/// The result of laying one inline formatting context: its line boxes, the
+/// entered-element/out-of-flow marks, and any floats it placed (already
+/// positioned in the content frame).
+struct InlineLaid<'t> {
+    lines: Vec<LineOut>,
+    marks: Vec<(NodeId, usize)>,
+    oofs: Vec<OofMark<'t>>,
+    float_frags: Vec<Frag<'t>>,
+    float_anchors: Vec<(NodeId, f32)>,
+}
+
+/// Slice one laid fragment into multi-column position (css-multicol-1): a line
+/// box (or an out-of-flow / leaf block) is translated as a unit by the column
+/// its top row falls in; a block with children is flattened and its lines
+/// sliced individually (v1 — a block straddling a column break is split at line
+/// granularity, and its own background/border isn't re-drawn per slice). `shift`
+/// maps a fragment's absolute top-y to its `(dx, dy)` column offset.
+fn slice_columns<'t, F: Fn(f32) -> (f32, f32)>(
+    mut f: Frag<'t>,
+    shift: &F,
+    out: &mut Vec<Frag<'t>>,
+) {
+    match &f.kind {
+        FragKind::Block if !f.children.is_empty() => {
+            for c in std::mem::take(&mut f.children) {
+                slice_columns(c, shift, out);
+            }
+        }
+        _ => {
+            let (dx, dy) = shift(f.y);
+            Flow::offset_frag(&mut f, dx, dy);
+            out.push(f);
+        }
+    }
+}
+
+/// Collect the floats an inline content list holds, in the exact order the IFC
+/// meets them (document pre-order, descending into inline boxes) — so the k-th
+/// collected float pairs with the k-th `Inline::Float` the line breaker places.
+pub(super) fn collect_floats<'t>(inls: &'t [Inline], out: &mut Vec<&'t BoxNode>) {
+    for i in inls {
+        match i {
+            Inline::Float(b) => out.push(b),
+            Inline::Box { kids, .. } => collect_floats(kids, out),
+            _ => {}
+        }
     }
 }
