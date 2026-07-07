@@ -446,14 +446,22 @@ pub(crate) fn region_buffer(dom: &Dom, root: &mut Frag<'_>, cw: f32, ch: f32) ->
 
 /// Whether `f` is a vertical scroll region: an `overflow-y: auto|scroll`
 /// element (CSS Overflow L3 §2) whose content overflows its padding box (so
-/// there is scrollable overflow), that is NOT the page's principal scroller
-/// (CSS Overflow L3 §3.1 — that one flows into the document) and NOT the
-/// document root itself.
+/// there is scrollable overflow), other than the document root itself (the
+/// viewport is never a nested region — CSS Overflow L3 §3.3 governs ITS
+/// overflow separately, from `html`'s own value alone, never a descendant's).
+/// Establishing a scroll container is unconditional on any other element —
+/// there is no spec concept of a distinguished "principal" scroller that
+/// escapes this and flows into the document instead. A page that locks its
+/// own viewport (`html{overflow:hidden}`) gets exactly what that says: the
+/// viewport doesn't scroll, and every genuine `overflow:auto|scroll`
+/// descendant — however many, however deep — is its own bounded region,
+/// scrolled independently (hover + wheel), same as a real browser's own
+/// nested scrollports.
 fn is_scroll_region(dom: &Dom, f: &Frag<'_>) -> bool {
     if f.node == NO_NODE || matches!(dom.tag_name(f.node), Some("html" | "body")) {
         return false;
     }
-    if !dom.is_scroll_container(f.node) || dom.is_principal_scroller(f.node) {
+    if !dom.is_scroll_container(f.node) {
         return false;
     }
     // Scrollable overflow: a descendant border box reaches past the padding

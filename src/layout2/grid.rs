@@ -26,7 +26,7 @@ use super::intrinsic::IMode;
 use super::style::InlineStyle;
 use super::style::{BOTTOM, LEFT, RIGHT, TOP};
 use super::tree::BoxNode;
-use super::value::{Len, Vp, split_args};
+use super::value::{Len, Vp, split_args, substitute_var_fallbacks};
 
 /// One track sizing function pair per §11.2: `minmax()` splits, `<flex>`
 /// and `fit-content()` take an `auto` minimum, plain values serve as both.
@@ -170,6 +170,12 @@ fn parse_template(
     avail: Option<f32>,
     gap: f32,
 ) -> Option<Vec<Track>> {
+    // css-variables-1 §3: custom properties are substituted into the token
+    // stream BEFORE the grid grammar parses it. A `minmax(var(--x, 16rem),
+    // var(--y, 1fr))` must become `minmax(16rem, 1fr)` first, or the `1fr` flex
+    // (and `min-content`/`auto` keywords) hidden inside a `var()` are missed
+    // and the whole template drops to zero tracks (→ one implicit column).
+    let value = substitute_var_fallbacks(value);
     let v = value.trim();
     if v.is_empty() || v.eq_ignore_ascii_case("none") {
         return None;
@@ -1515,6 +1521,29 @@ mod tests {
         assert_eq!(t.len(), 5);
         // minmax(16rem=256px, 1fr): definite min governs → 2 fit in 640.
         let t = tpl("repeat(auto-fill, minmax(16rem, 1fr))", 640.0, 0.0);
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn var_fallbacks_resolve_before_track_grammar() {
+        // archive.org's infinite-scroller grid: the `1fr` flex and `16rem`
+        // length are hidden inside `var(--x, fallback)`. Without substituting
+        // the fallbacks first, the template drops to ZERO tracks → the grid
+        // auto-places into ONE implicit column (the 21768px-spacer bug).
+        let bare = tpl("repeat(auto-fill, minmax(16rem, 1fr))", 640.0, 0.0);
+        let varred = tpl(
+            "repeat(auto-fill, minmax(var(--min, 16rem), var(--max, 1fr)))",
+            640.0,
+            0.0,
+        );
+        assert_eq!(
+            varred.len(),
+            bare.len(),
+            "var() form must parse identically"
+        );
+        assert_eq!(varred.len(), 2);
+        // A bare `var()` around a whole track works too.
+        let t = tpl("var(--a, 100px) var(--b, 1fr)", 640.0, 0.0);
         assert_eq!(t.len(), 2);
     }
 

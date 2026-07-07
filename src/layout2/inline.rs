@@ -663,6 +663,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             Some(self.cb_w_px),
             self.cb_h_px,
             self.vp,
+            url,
         ) {
             let pixelated = matches!(
                 self.dom.computed_value(node, "image-rendering").as_deref(),

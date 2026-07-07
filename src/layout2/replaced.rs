@@ -41,6 +41,7 @@ pub(crate) fn size(
     cb_w: Option<f32>,
     cb_h: Option<f32>,
     vp: Vp,
+    url: Option<&str>,
 ) -> Option<Replaced> {
     let u = Units::of(dom, node);
     let css = |prop: &str, basis: Option<f32>| {
@@ -58,7 +59,28 @@ pub(crate) fn size(
     };
     let spec_w = css("width", cb_w).or_else(|| attr("width"));
     let spec_h = css("height", cb_h).or_else(|| attr("height"));
-    let ratio = ratio_of(dom, node, natural);
+    // CSS 2.1 §10.3.2 "rule 3"/§10.6.2: a replaced element with an intrinsic
+    // ratio but NO intrinsic width or height (an SVG referenced with only a
+    // `viewBox`), sized auto/auto, takes its width from the block constraint
+    // equation — the containing block's available width — not the decoder's
+    // fabricated default object size (the huge-icon bug). That equation needs a
+    // definite containing-block width, so under an intrinsic-size probe (`cb_w`
+    // None) it does not apply: sizing falls back to the decoder's natural size
+    // (the element's intrinsic contribution), unchanged from before.
+    let ratio_only = (spec_w.is_none() && spec_h.is_none() && cb_w.is_some())
+        .then(|| {
+            // A `data:` SVG's markup is in the src — read it synchronously.
+            // Otherwise the image loader records an external SVG's ratio-only
+            // ratio by URL as it decodes it.
+            dom.attr(node, "src")
+                .and_then(crate::img::svg_url_ratio_only)
+                .or_else(|| url.and_then(crate::img::svg_ratio_only_get))
+        })
+        .flatten()
+        .filter(|&r| r > 0.0);
+    // Prefer the exact viewBox ratio for a ratio-only image (the decoded
+    // natural size is cell-rounded, so its derived ratio is imprecise).
+    let ratio = ratio_only.or_else(|| ratio_of(dom, node, natural));
 
     // §10.3.2/§10.6.2 auto resolution. The 300×150/2:1 caps are the spec's
     // own last resort for a ratio-less axis.
@@ -80,10 +102,16 @@ pub(crate) fn size(
             };
             (w, h)
         }
-        (None, None) => match (natural, ratio) {
-            (Some(n), _) => n,
-            (None, Some(r)) if r > 0.0 => (300.0, 300.0 / r),
-            (None, _) => return None, // fallback-content representation
+        (None, None) => match (ratio_only, natural, ratio) {
+            // Rule 3: block-constraint width from the containing block; the
+            // height follows the ratio.
+            (Some(r), _, _) => {
+                let w = cb_w.unwrap_or(300.0).max(0.0);
+                (w, w / r)
+            }
+            (None, Some(n), _) => n,
+            (None, None, Some(r)) if r > 0.0 => (300.0, 300.0 / r),
+            (None, None, _) => return None, // fallback-content representation
         },
     };
 

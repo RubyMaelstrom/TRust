@@ -234,6 +234,80 @@ pub(crate) fn split_args(s: &str) -> Vec<&str> {
     out
 }
 
+/// Substitute every `var(--name, fallback)` in a value string with its
+/// fallback text. CSS resolves custom properties into the token stream BEFORE
+/// the property grammar parses it (css-variables-1 §3), so a value like
+/// `minmax(var(--x, 16rem), var(--y, 1fr))` must become `minmax(16rem, 1fr)`
+/// before a grid/track parser classifies `1fr` as a flex or `min-content` as a
+/// keyword — those tokens are otherwise hidden inside the `var()` and missed.
+/// We resolve to the FALLBACK (matching `parse_node`'s var handling — the
+/// author custom-property registry isn't consulted at this layer; sheets whose
+/// vars ARE defined are baked before layout). `var(--name)` with no fallback,
+/// or an unbalanced `var(`, becomes empty (the guaranteed-invalid value, per
+/// spec). Nested vars in a fallback resolve too (the loop re-scans). A `var`
+/// that is part of a longer identifier is left alone.
+pub(crate) fn substitute_var_fallbacks(s: &str) -> String {
+    let mut s = s.to_string();
+    // Bounded so a pathological self-referential fallback can't spin forever.
+    for _ in 0..64 {
+        let Some(open) = find_var_open(&s) else {
+            return s;
+        };
+        // `open` indexes the '(' after "var"; find its matching ')'.
+        let mut depth = 0i32;
+        let mut close = None;
+        for (i, &c) in s.as_bytes().iter().enumerate().skip(open) {
+            match c {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            // Unbalanced `var(` — invalid; drop from the `var` to end.
+            s.truncate(open - 3);
+            return s;
+        };
+        let inner = &s[open + 1..close];
+        let fallback = inner
+            .split_once(',')
+            .map(|(_, f)| f.trim())
+            .unwrap_or("")
+            .to_string();
+        s.replace_range(open - 3..=close, &fallback);
+    }
+    s
+}
+
+/// Byte index of the `(` of the first `var(` function token in `s`
+/// (case-insensitive), skipping a `var` that is part of a longer identifier
+/// (preceded by a name character).
+fn find_var_open(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i + 4 <= b.len() {
+        if b[i].eq_ignore_ascii_case(&b'v')
+            && b[i + 1].eq_ignore_ascii_case(&b'a')
+            && b[i + 2].eq_ignore_ascii_case(&b'r')
+            && b[i + 3] == b'('
+        {
+            let prev_is_name =
+                i > 0 && matches!(b[i - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_');
+            if !prev_is_name {
+                return Some(i + 3);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// One `calc()` term while folding: a dimensionless number, or a length
 /// linear in the percentage basis. CSS's type rules (css-values-3 §8.1.1)
 /// fall out of the arithmetic below: length×length and X÷length are type

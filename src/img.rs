@@ -339,6 +339,76 @@ fn view_box_ratio(value: &str) -> Option<f32> {
     ratio.is_finite().then_some(ratio)
 }
 
+/// The intrinsic RATIO of an SVG that has an intrinsic ratio but NO intrinsic
+/// width or height (referenced with only a `viewBox`) — the CSS 2.1
+/// §10.3.2/§10.6.2 "rule 3" case. `None` when the bytes are not SVG, when the
+/// root carries a real intrinsic width/height (a genuine intrinsic SIZE — the
+/// decoder's natural dimensions handle that), or when there is no ratio.
+///
+/// Replaced sizing consults this so an auto/auto ratio-only image takes its
+/// width from the containing block (the §10.3.2 block-constraint suggestion)
+/// instead of the decoder's fabricated "default object size" (`150×150` for a
+/// square viewBox), which otherwise renders such icons hugely oversized.
+pub(crate) fn svg_bytes_ratio_only(bytes: &[u8]) -> Option<f32> {
+    if !looks_like_svg(bytes) {
+        return None;
+    }
+    let data = bounded_svg_data(bytes).ok()?;
+    let text = std::str::from_utf8(&data).ok()?;
+    let doc = resvg::usvg::roxmltree::Document::parse(text).ok()?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "svg" {
+        return None;
+    }
+    // A definite root width OR height is an intrinsic dimension → NOT rule 3
+    // (the natural size the decoder reports already carries it).
+    if root.attribute("width").and_then(svg_length_px).is_some()
+        || root.attribute("height").and_then(svg_length_px).is_some()
+    {
+        return None;
+    }
+    root.attribute("viewBox").and_then(view_box_ratio)
+}
+
+/// `svg_bytes_ratio_only` for a `data:` SVG whose markup is carried in the URL
+/// (an inline-rewritten `<svg>` or a page-authored data image). Synchronous —
+/// the layout layer reads it without waiting on the decode pipeline. `None` for
+/// any non-`data:`-SVG source.
+pub(crate) fn svg_url_ratio_only(src: &str) -> Option<f32> {
+    let src = src.trim();
+    if src.len() < 14 || !src.as_bytes()[..14].eq_ignore_ascii_case(b"data:image/svg") {
+        return None;
+    }
+    svg_bytes_ratio_only(&decode_data_url(src)?)
+}
+
+/// Process-global cache of EXTERNAL image URLs whose SVG is ratio-only (a
+/// `viewBox` but no intrinsic width/height — §10.3.2 rule 3). An SVG's intrinsic
+/// ratio is a property of the resource, not the page, so it is keyed by URL and
+/// shared across the session like the connection pool. Populated by the image
+/// loader on decode (`note_svg_ratio_only`); read by replaced sizing
+/// (`svg_ratio_only_get`) for `<img>` elements whose markup layout can't see
+/// (only `data:` SVGs are read inline via `svg_url_ratio_only`).
+static SVG_RATIO_ONLY: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, f32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Record that the resource at `url` is a ratio-only SVG (intrinsic ratio,
+/// no intrinsic size). Called by the image loader once per decoded resource.
+pub(crate) fn note_svg_ratio_only(url: &str, ratio: f32) {
+    if ratio.is_finite() && ratio > 0.0 {
+        SVG_RATIO_ONLY
+            .lock()
+            .unwrap()
+            .insert(url.to_string(), ratio);
+    }
+}
+
+/// The recorded ratio-only ratio for a decoded external image URL, if any.
+pub(crate) fn svg_ratio_only_get(url: &str) -> Option<f32> {
+    SVG_RATIO_ONLY.lock().unwrap().get(url).copied()
+}
+
 fn concrete_object_size(
     width: Option<f32>,
     height: Option<f32>,
@@ -914,6 +984,27 @@ mod tests {
             decode_data_url("data:image/svg+xml,%3Csvg%3E%3C/svg%3E").unwrap(),
             b"<svg></svg>"
         );
+    }
+
+    #[test]
+    fn ratio_only_svg_detection() {
+        // A `viewBox` with no intrinsic width/height → rule-3 ratio.
+        let vb = br#"<svg viewBox="0 0 300 150" xmlns="http://www.w3.org/2000/svg"/>"#;
+        assert_eq!(svg_bytes_ratio_only(vb), Some(2.0));
+        // A definite width/height IS an intrinsic size → NOT rule 3.
+        assert_eq!(svg_bytes_ratio_only(&sample_svg()), None);
+        // Only one dimension present is still an intrinsic size → NOT rule 3.
+        let one = br#"<svg width="40" viewBox="0 0 300 150" xmlns="http://www.w3.org/2000/svg"/>"#;
+        assert_eq!(svg_bytes_ratio_only(one), None);
+        // No viewBox and no dimensions → no ratio.
+        let none = br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#;
+        assert_eq!(svg_bytes_ratio_only(none), None);
+        // Non-SVG bytes → None (the loader calls this on every decoded image).
+        assert_eq!(svg_bytes_ratio_only(b"\x89PNG\r\n\x1a\n"), None);
+        // The `data:` URL wrapper reads the same markup.
+        let url = "data:image/svg+xml,%3csvg%20viewBox='0%200%20300%20300'%3e%3c/svg%3e";
+        assert_eq!(svg_url_ratio_only(url), Some(1.0));
+        assert_eq!(svg_url_ratio_only("data:image/png;base64,iVBOR"), None);
     }
 
     #[test]
