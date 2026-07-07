@@ -29,9 +29,11 @@
 //! P5 splits by CSS Overflow L3 §2: `hidden`/`clip` are a pure CLIP to the
 //! padding box (P5a — sr-only boxes clip to nothing, definite-height panels
 //! clip their overflow); `auto`/`scroll` are SCROLL CONTAINERS whose overflow
-//! rides the scroll axis into a windowed buffer (a vertical Region, P5b, with
-//! the principal-scroller rule per §3.1) or an inline strip (a horizontal
-//! Carousel, P5c). Floats still degrade to honest block stacking — a staged
+//! rides the scroll axis into a windowed buffer (a vertical Region, P5b —
+//! unconditional, every `overflow:auto|scroll` element becomes one; the
+//! viewport's OWN overflow is a separate, §3.3 concern, never delegated to a
+//! descendant) or an inline strip (a horizontal Carousel, P5c). Floats still
+//! degrade to honest block stacking — a staged
 //! phase, never policy. Behind `set layout2 on` /
 //! `TRUST_LAYOUT2=1` until parity (the plan's A/B gate); incremental-layout
 //! boundaries are intentionally not emitted yet, so live pages take the
@@ -800,6 +802,62 @@ mod tests {
     }
 
     #[test]
+    fn ratio_only_svg_sizes_to_the_containing_block() {
+        // CSS 2.1 §10.3.2 rule 3: an <img> of a viewBox-only SVG (intrinsic
+        // ratio, no intrinsic width/height) sized auto/auto takes its width
+        // from the containing block — NOT the decoder's 150×150 default object
+        // size (the archive.org media-icon "giant icon" bug). Here the CB is a
+        // 80px div (10 cells); the decoder's fabricated natural is 19×9 cells.
+        let svg = "data:image/svg+xml,%3csvg%20viewBox='0%200%20300%20300'%20xmlns='http://www.w3.org/2000/svg'%3e%3c/svg%3e";
+        let mut images = HashMap::new();
+        images.insert(svg.to_string(), (19u16, 9u16));
+        let html = format!(
+            r#"<body style="margin:0"><div style="width:80px"><img src="{svg}" alt="icon"></div></body>"#
+        );
+        let out = lay_images(&html, 60, &images);
+        let img = out
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.kind == ItemKind::Image)
+            .expect("image item");
+        // 80px CB / 8px cell = 10 cells wide, square ratio → 80px/16 = 5 rows;
+        // the 19×9-cell natural would be wrong.
+        assert_eq!(
+            (img.width, img.height),
+            (10, 5),
+            "rule 3: width = containing-block width, height from ratio"
+        );
+    }
+
+    #[test]
+    fn external_ratio_only_svg_sizes_to_the_containing_block() {
+        // An EXTERNAL ratio-only SVG (layout can't read its markup): the image
+        // loader records its ratio by URL as it decodes it, and replaced sizing
+        // reads that cache to apply rule 3. Unique URL — the cache is global.
+        let url = "http://e.com/l2-ratio-only-icon-test.svg";
+        crate::img::note_svg_ratio_only(url, 1.0);
+        let mut images = HashMap::new();
+        images.insert(url.to_string(), (19u16, 9u16));
+        let out = lay_images(
+            r#"<body style="margin:0"><div style="width:80px"><img src="l2-ratio-only-icon-test.svg" alt="v"></div></body>"#,
+            60,
+            &images,
+        );
+        let img = out
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .find(|it| it.kind == ItemKind::Image)
+            .expect("image item");
+        assert_eq!(
+            (img.width, img.height),
+            (10, 5),
+            "rule 3 via the external ratio-only cache"
+        );
+    }
+
+    #[test]
     fn text_align_center_and_right() {
         let out = lay(
             r#"<body style="margin:0"><p style="margin:0;text-align:center">mid</p><p style="margin:0;text-align:right">end</p></body>"#,
@@ -1291,6 +1349,32 @@ mod tests {
         assert_eq!((ra, a.col), (0, 0));
         assert!(rb > ra, "the second box wraps to the next line");
         assert_eq!(b.col, 0, "and starts at the line's left edge");
+    }
+
+    #[test]
+    fn a_button_wrapped_in_a_click_marker_anchor_stays_clickable() {
+        // The live serializer wraps clickables (a `<button>` with a JS click
+        // listener) in `<a href="x-trust-js:<id>:<href>">` so the terminal can
+        // follow them (Link::JsClick). `<button>` defaults to `display:
+        // inline-block` (CSS-Display-3 §2.5), which layout2 lays as an ATOMIC
+        // inline box (`Inline::AtomBox`) — its own independent formatting
+        // context, pre-laid and spliced onto the line as one opaque unit. The
+        // pre-lay pass used to run with the ANCHOR'S ancestor context
+        // discarded (the enclosing `<a>`'s derived link/emphasis never
+        // reached the atom box's own content), so a wrapped button's label
+        // rendered as plain, unlinked text — the reported regression: cookie-
+        // banner "Accept"/"Customize"/"Reject" buttons stopped being
+        // clickable.
+        let out = lay(
+            r#"<body style="margin:0"><a href="x-trust-js:501:#"><button type="button">Accept</button></a></body>"#,
+            40,
+        );
+        let (_, it) = find(&out, "Accept");
+        assert!(
+            matches!(&it.link, Some(crate::doc::Link::JsClick { node: 501, .. })),
+            "the button's label keeps the wrapping anchor's click-marker link: {:?}",
+            it.link
+        );
     }
 
     #[test]
@@ -2372,34 +2456,58 @@ mod tests {
     }
 
     #[test]
-    fn the_principal_scroller_flows_into_the_document() {
-        // Locked viewport (html overflow:hidden) + the sole overflow:auto box
-        // carrying the flow ⇒ the PRINCIPAL scroller: it flows into the
-        // document (page-scrolled), NOT an inner region (CSS Overflow L3 §3.1).
+    fn an_overflow_auto_box_becomes_a_region_even_under_a_locked_viewport() {
+        // CSS Overflow L3 §2 makes `overflow:auto|scroll` a scroll container
+        // UNCONDITIONALLY — there is no spec concept of a distinguished
+        // "principal" scroller that escapes this and flows into the document
+        // instead. §3.3 (Overflow Viewport Propagation) governs the VIEWPORT's
+        // OWN overflow strictly from `html`'s own value (or `body`'s, only
+        // when html's is `visible` in both axes) — it is never delegated to
+        // some descendant box, however deeply an app locks its shell. A page
+        // that sets `html{overflow:hidden}` just gets a viewport that doesn't
+        // scroll; any genuine `overflow:auto` descendant is still its own
+        // bounded region, scrolled independently (hover + wheel), same as a
+        // real browser's own nested scrollport.
         let out = lay(
             r#"<html style="overflow:hidden"><body style="margin:0"><div style="height:48px;overflow-y:auto;margin:0"><p style="margin:0">P1</p><p style="margin:0">P2</p><p style="margin:0">P3</p><p style="margin:0">P4</p><p style="margin:0">P5</p><p style="margin:0">P6</p></div></body></html>"#,
             20,
         );
-        assert!(
-            out.regions.is_empty(),
-            "the principal scroller is not virtualized into a region"
-        );
-        assert_eq!(find(&out, "P1").0, 0);
         assert_eq!(
-            find(&out, "P6").0,
-            5,
-            "its content flows into the document (all rows page-scrollable)"
+            out.regions.len(),
+            1,
+            "the overflow:auto box is its own bounded region regardless of the locked viewport"
+        );
+        let r = &out.regions[0];
+        assert_eq!(
+            r.buffer.len(),
+            6,
+            "all 6 rows ride the region's own scrollable buffer"
+        );
+        assert!(
+            r.buffer[0].items.iter().any(|i| i.text.contains("P1")),
+            "the region's own buffer holds its content"
+        );
+        assert!(
+            r.buffer
+                .iter()
+                .any(|row| row.items.iter().any(|i| i.text.contains("P6"))),
+            "the buffer holds the full scrollable content, including what overflows the 3-row band"
+        );
+        assert!(
+            absent(&out, "P1") && absent(&out, "P6"),
+            "none of it flows into the flat document rows"
         );
     }
 
     #[test]
-    fn principal_scroller_escapes_a_definite_height_overflow_hidden_shell() {
-        // A locked-viewport app shell (Twitch's front page) wraps its principal
-        // scroller in a definite-height `<main>{overflow:hidden}` sized to the
-        // viewport. That clip must NOT trap the page to one screen: the
-        // principal scroller's overflow propagates to the viewport (CSS Overflow
-        // L3 §3.1), so its content flows into the document past the shell. (The
-        // Twitch regression: every shelf below the fold sat laid but clipped.)
+    fn overflow_auto_stays_bounded_inside_a_definite_height_overflow_hidden_shell() {
+        // Twitch's front page shape: a locked-viewport app shell wraps an
+        // `overflow:auto` panel in a definite-height `<main>{overflow:hidden}`
+        // sized to the viewport. Per §2/§3.3 that inner panel is STILL just an
+        // ordinary bounded region — nothing "escapes" a shell to become the
+        // page's own scroll. (The `<main>` landmark carries no special
+        // standing here; sectioning elements are an HTML semantics concept,
+        // not a CSS overflow-propagation one.)
         let mut lines = String::new();
         for i in 0..40 {
             lines += &format!(r#"<p style="margin:0">P{i:02}</p>"#);
@@ -2410,12 +2518,26 @@ mod tests {
             ),
             20,
         );
-        assert!(out.regions.is_empty(), "still the principal scroller");
-        assert_eq!(find(&out, "P00").0, 0);
         assert_eq!(
-            find(&out, "P39").0,
-            39,
-            "content flows past the definite-height overflow:hidden shell, not clipped to the viewport"
+            out.regions.len(),
+            1,
+            "the overflow:auto panel is a bounded region, not the document's own promoted scroll"
+        );
+        let r = &out.regions[0];
+        assert_eq!(r.buffer.len(), 40, "the region's buffer holds all 40 rows");
+        assert!(
+            r.buffer[0].items.iter().any(|i| i.text.contains("P00")),
+            "the region's own buffer holds its content"
+        );
+        assert!(
+            r.buffer
+                .iter()
+                .any(|row| row.items.iter().any(|i| i.text.contains("P39"))),
+            "the buffer holds the tail too, even though it overflows the shell's viewport-sized band"
+        );
+        assert!(
+            absent(&out, "P00") && absent(&out, "P39"),
+            "content stays confined to the region's own buffer, not flowing past the shell into the document"
         );
     }
 
@@ -2466,6 +2588,114 @@ mod tests {
                 .any(|row| row.items.iter().any(|i| i.text.contains("B29")));
             assert!(has_a ^ has_b, "a region holds exactly one panel's content");
         }
+    }
+
+    #[test]
+    fn stretched_auto_height_flex_item_relays_for_a_nested_scroll_region() {
+        // Twitch's front-page shape: a definite-height flex ROW
+        // (`overflow:hidden`, locking the app shell to one screen) holds a
+        // side-nav column whose OWN wrapper declares NO height at all —
+        // `height:auto`, stretched to the row's cross size by the default
+        // `align-items:stretch` — and INSIDE that, `.side-nav{height:100%}` →
+        // `.scrollable{height:100%;overflow:auto}` must resolve against that
+        // STRETCHED size. Two bugs used to defeat this: (1) stretch only
+        // patched the item's own reported height post-hoc instead of
+        // re-laying its subtree at the new definite height, so every
+        // percentage-height descendant still saw an indefinite containing
+        // block and just flowed at its full natural size; (2) even once (1)
+        // was fixed, the ancestor flex row's `overflow:hidden` clip baked
+        // into every descendant fragment tree-wide, capping the scrollable
+        // panel's OWN overflow test at the ancestor's bound before its
+        // internal overflow was ever measured. Together they made the
+        // sidebar's tall content flow in place instead of becoming its own
+        // scroll region — the reported bug: "Live Channels" scrolled away
+        // with the rest of the page instead of staying put.
+        let mut rows = String::new();
+        for i in 0..40 {
+            rows += &format!(r#"<div>row{i}</div>"#);
+        }
+        let out = lay(
+            &format!(
+                r#"<html style="height:100%"><body style="margin:0;height:100%">
+<div style="display:flex;height:100%;overflow:hidden">
+  <div><div class="side-nav" style="height:100%;width:10ch">
+    <div class="scrollable" style="height:100%;overflow:auto">{rows}</div>
+  </div></div>
+  <div style="flex-grow:1">main</div>
+</div></body></html>"#
+            ),
+            40,
+        );
+        assert_eq!(
+            out.regions.len(),
+            1,
+            "the tall sidebar content becomes its own bounded scroll region"
+        );
+        assert!(
+            absent(&out, "row39"),
+            "the sidebar's overflow doesn't flow into the flat document rows"
+        );
+        assert_eq!(
+            out.regions[0].buffer.len(),
+            40,
+            "the region's own buffer holds every row, scrollable internally"
+        );
+    }
+
+    #[test]
+    fn shrunk_flex_column_item_relays_for_a_nested_scroll_region() {
+        // Twitch's real front-page shape (the live-session bug this models):
+        // a definite-height flex COLUMN holds an undismissed cookie-consent
+        // banner (`flex-shrink:0`, tall natural content) ABOVE the row that
+        // carries the side-nav + main content (`height:100%`, default
+        // flex-shrink:1). The banner's own content oversubscribes the
+        // column, so §9.7 shrinks the row's USED main size to a fraction of
+        // its 100% basis (19 rows of banner in a 24-row viewport, sole
+        // shrinkable sibling ⇒ the row lands at exactly 5 rows) — CSS
+        // Flexbox §9.4 step 1 ("determine the hypothetical cross size ... by
+        // performing layout ... with the used main size") requires the row's
+        // subtree to be laid out AGAIN at that resolved size. Before the fix,
+        // only the row's own reported height was patched post-hoc; its
+        // `overflow:auto` descendant still saw the stale, pre-shrink height
+        // and reserved a 24-row band instead of 5 — the reported bug: the
+        // sidebar rendered as if nothing above it had taken any space.
+        let mut banner_lines = String::new();
+        for i in 0..19 {
+            banner_lines += &format!("<div>consent line {i}</div>");
+        }
+        let mut rows = String::new();
+        for i in 0..40 {
+            rows += &format!(r#"<div>row{i}</div>"#);
+        }
+        let out = lay(
+            &format!(
+                r#"<html style="height:100%"><body style="margin:0;height:100%">
+<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+  <div style="flex-shrink:0">{banner_lines}</div>
+  <div style="display:flex;height:100%;overflow:hidden">
+    <div><div class="side-nav" style="height:100%;width:10ch">
+      <div class="scrollable" style="height:100%;overflow:auto">{rows}</div>
+    </div></div>
+    <div style="flex-grow:1">main</div>
+  </div>
+</div></body></html>"#
+            ),
+            40,
+        );
+        assert_eq!(
+            out.regions.len(),
+            1,
+            "the sidebar becomes its own bounded scroll region even though the column was shrunk"
+        );
+        assert_eq!(
+            out.regions[0].height, 5,
+            "the region is bounded to the row's ACTUAL post-shrink size (80px/5 rows), \
+             not the stale pre-shrink 24-row guess"
+        );
+        assert!(
+            absent(&out, "row39"),
+            "the sidebar's overflow doesn't flow into the flat document rows"
+        );
     }
 
     #[test]
@@ -3852,12 +4082,9 @@ mod tests {
         );
         // Column 0 sits at the left edge; column 1 past the 19-cell column + gap.
         let cols = text_cols(&out);
+        assert!(cols.contains(&0), "column 0 at the left edge: {cols:?}");
         assert!(
-            cols.iter().any(|&c| c == 0),
-            "column 0 at the left edge: {cols:?}"
-        );
-        assert!(
-            cols.iter().any(|&c| c >= 21 && c < 40),
+            cols.iter().any(|&c| (21..40).contains(&c)),
             "column 1 starts past the gap (col ~21): {cols:?}"
         );
         // No text sits in the gap [19, 21).
@@ -3892,7 +4119,7 @@ mod tests {
             40,
         );
         let cols = text_cols(&out);
-        assert!(cols.iter().any(|&c| c == 0), "column 0: {cols:?}");
+        assert!(cols.contains(&0), "column 0: {cols:?}");
         assert!(
             cols.iter().any(|&c| c >= 21),
             "a second column resolved: {cols:?}"
@@ -3918,7 +4145,7 @@ mod tests {
         // capped to 2. Two columns: 0 and past the midpoint gap.
         let cols = text_cols(&out);
         let far = cols.iter().copied().max().unwrap_or(0);
-        assert!(cols.iter().any(|&c| c == 0), "column 0: {cols:?}");
+        assert!(cols.contains(&0), "column 0: {cols:?}");
         assert!(
             (28..40).contains(&far),
             "exactly two columns (2nd near mid): far col {far}"
@@ -3967,7 +4194,7 @@ mod tests {
             60,
         );
         let cols = text_cols(&out);
-        assert!(cols.iter().any(|&c| c == 0), "col 0: {cols:?}");
+        assert!(cols.contains(&0), "col 0: {cols:?}");
         assert!(
             cols.iter().any(|&c| (18..26).contains(&c)),
             "col 1 region: {cols:?}"

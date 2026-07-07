@@ -7316,6 +7316,12 @@ async fn load_one_image(
         return None;
     }
     let raw: std::sync::Arc<[u8]> = resp.body.into();
+    // Record an EXTERNAL SVG's ratio-only ratio (a `viewBox` with no intrinsic
+    // width/height) so replaced sizing can apply CSS 2.1 §10.3.2 rule 3 to it —
+    // layout can't read an external SVG's markup the way it reads a `data:` one.
+    if let Some(ratio) = crate::img::svg_bytes_ratio_only(&raw) {
+        crate::img::note_svg_ratio_only(url, ratio);
+    }
     let (cell, has_alpha) = decoded_cell_box(raw.clone(), font).await?;
     Some(DecodedImage {
         raw,

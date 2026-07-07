@@ -1540,18 +1540,31 @@ impl Flow<'_> {
         for &li in &order {
             let cross = line_cross[li];
             for i in lines[li].clone() {
+                // §9.4 step 11: stretch sets the item's used cross size to the
+                // line's cross size (cross-size auto, no auto cross margins).
+                // The item was laid at its HYPOTHETICAL size in the first pass
+                // (step 7) with an INDEFINITE cross size — its subtree must be
+                // laid AGAIN at the now-definite stretched height, or a
+                // descendant resolving a percentage height (or an
+                // `overflow:auto` box sizing its own scrollport) sees no
+                // constraint at all instead of the real one (an auto-height
+                // stretched item can only ever grow via a plain max() patch on
+                // its reported height — it can never shrink-and-scroll a
+                // content subtree that was laid unconstrained).
+                if fi[i].align == AlignItem::Stretch
+                    && fi[i].cross_auto
+                    && !fi[i].auto[TOP]
+                    && !fi[i].auto[BOTTOM]
+                {
+                    let stretched = (cross - fi[i].m[TOP] - fi[i].m[BOTTOM]).max(0.0);
+                    let used = calcs[i].target.max(0.0);
+                    let (frag2, anc2) =
+                        self.item_frag(fi[i].b, used, content_w, Some(stretched), inl);
+                    fi[i].frag = Some(frag2);
+                    fi[i].anchors = anc2;
+                }
                 let it = &mut fi[i];
                 let frag = it.frag.as_mut().expect("laid above");
-                // §9.4 step 11: stretch grows the item's box to the line
-                // (cross-size auto, no auto cross margins), clamped by its
-                // own min/max cross sizes.
-                if it.align == AlignItem::Stretch
-                    && it.cross_auto
-                    && !it.auto[TOP]
-                    && !it.auto[BOTTOM]
-                {
-                    frag.h = frag.h.max(cross - it.m[TOP] - it.m[BOTTOM]).max(0.0);
-                }
                 let extra = cross - (frag.h + it.m[TOP] + it.m[BOTTOM]);
                 let shift = cross_shift(extra, it.auto[TOP], it.auto[BOTTOM], it.align);
                 it.border_y = top + shift + it.m[TOP];
@@ -1743,6 +1756,29 @@ impl Flow<'_> {
                 let used = calcs[i].target.max(0.0);
                 let bp_main = fi[i].bp_main;
                 let (ml, mr) = (fi[i].m[LEFT], fi[i].m[RIGHT]);
+                // §9.4 step 1: "Determine the hypothetical cross size of each
+                // item by performing layout ... with the USED MAIN SIZE" — an
+                // unconditional step, not one gated on stretch. The item's
+                // content was laid out above (§9.2) against its OWN declared
+                // height (or, if auto, an indefinite one) purely to measure a
+                // flex base size; §9.7 above just resolved the item's real
+                // used main size, which can differ (grow/shrink, or an auto
+                // basis that was never definite to begin with). If it does,
+                // the subtree must be laid out again treating `used` as the
+                // definite height — the same "redo layout... so percentage-
+                // sized children can be resolved" the stretch case performs
+                // in `flex_row`, just on the main axis instead of the cross
+                // axis. Without it a shrunk column (e.g. a locked-viewport
+                // shell squeezed by a flex-shrink:0 sibling) keeps every
+                // percentage-height descendant resolving against the stale
+                // pre-shrink guess, so an `overflow:auto` panel inside never
+                // sees a bounded box and just renders unclipped.
+                if fi[i].def_h != Some(used) {
+                    let w = fi[i].frag.as_ref().expect("laid above").w;
+                    let (frag2, anc2) = self.item_frag(fi[i].b, w, content_w, Some(used), inl);
+                    fi[i].frag = Some(frag2);
+                    fi[i].anchors = anc2;
+                }
                 let frag = fi[i].frag.as_mut().expect("laid above");
                 frag.h = bp_main + used;
                 cross = cross.max(frag.w + ml + mr);
@@ -2308,25 +2344,33 @@ impl Flow<'_> {
         abs_clip: Option<Clip>,
         fixed_clip: Option<Clip>,
     ) {
-        // The principal scroller's scrollable overflow propagates to the
-        // viewport (CSS Overflow L3 §3.1): its content becomes the document
-        // scroll, so it escapes any intermediate overflow-clip ancestor — a
-        // locked-viewport app shell commonly wraps it in a definite-height
-        // `<main>{overflow:hidden}` that would otherwise trap the whole page to
-        // one screen (Twitch's front page: every shelf below the fold sat laid
-        // but clipped away). It flows into the document exactly like html/body,
-        // so like them it takes no inherited clip. Gated on the cheap
-        // `is_scroll_container` read so the upward principal-scroller walk runs
-        // only for the rare scroll box that actually inherited a clip.
-        let own_clip = if own_clip.is_some()
-            && f.node != NO_NODE
-            && self.dom.is_scroll_container(f.node)
-            && self.dom.is_principal_scroller(f.node)
-        {
-            None
-        } else {
-            own_clip
-        };
+        // ANY `overflow: auto|scroll` container's scrollable overflow is its
+        // OWN concern (CSS Overflow L3 §3.2), never an ancestor's: its own box
+        // is already sized by ORDINARY layout inside that ancestor (never by
+        // the ancestor's overflow-clip machinery), so an inherited hard clip
+        // is redundant for a well-formed nested scrollport — and once its
+        // content overflows, that content is pulled into its own scroll
+        // region/carousel buffer at paint time, a separate surface the main
+        // document's clip chain has no bearing on. Without this, a
+        // definite-height `overflow:hidden` ANCESTOR (a flex row locking the
+        // app shell to one screen, the ubiquitous Twitch/Mastodon-style
+        // layout) bakes ITS clip into every descendant fragment — including
+        // ones belonging to a nested `overflow:auto` sidebar/panel — so that
+        // panel's own content never reads as overflowing its own (correctly
+        // sized) box: `is_scroll_region`'s content-bottom test is clipped down
+        // to the ancestor's bound before the panel's own overflow is ever
+        // measured, and the panel silently flows in-place instead of getting
+        // its own internal scroll. (The principal scroller — CSS Overflow L3
+        // §3.1, its content becomes the document scroll — was already exempt
+        // for the analogous reason; this generalizes the same escape to every
+        // scroll container.) Gated on the cheap `is_scroll_container` read so
+        // the common non-scrolling fragment is untouched.
+        let own_clip =
+            if own_clip.is_some() && f.node != NO_NODE && self.dom.is_scroll_container(f.node) {
+                None
+            } else {
+                own_clip
+            };
         // This fragment's own painted cells are clipped by its containing-block
         // chain (`own_clip`); its in-flow descendants — and the abspos/fixed
         // descendants for which it is the containing block — are additionally
@@ -2455,6 +2499,7 @@ impl Flow<'_> {
                         Some(cb.w),
                         Some(cb.h),
                         self.vp,
+                        url.as_deref(),
                     )
                     .map(|r| (r.box_w, r.box_h))
                 }
@@ -2766,12 +2811,12 @@ impl Flow<'_> {
     ) -> InlineLaid<'t> {
         // Pre-lay every float in walk order; `boxes[k]` is the k-th one the IFC
         // meets, `prelaid[k]` its laid fragment.
-        let mut float_nodes: Vec<&'t BoxNode> = Vec::new();
-        collect_floats(inls, &mut float_nodes);
+        let mut float_nodes: Vec<(&'t BoxNode, InlineStyle)> = Vec::new();
+        collect_floats(self.dom, self.base, inls, inl, &mut float_nodes);
         let mut prelaid: Vec<Option<PrelaidFloat<'t>>> = Vec::with_capacity(float_nodes.len());
         let mut boxes: Vec<FloatBox> = Vec::with_capacity(float_nodes.len());
-        for fb in &float_nodes {
-            let pf = self.lay_float_box(fb, content_w, cb_h, inl);
+        for (fb, fctx) in &float_nodes {
+            let pf = self.lay_float_box(fb, content_w, cb_h, fctx);
             boxes.push(FloatBox {
                 side: pf.side,
                 mw: pf.mw,
@@ -2782,12 +2827,12 @@ impl Flow<'_> {
         // Pre-lay every atomic inline box (inline-block/-flex/-grid) as its own
         // formatting context; the IFC reserves its margin-box cells on the line
         // and reports where it landed, so we splice the content fragment there.
-        let mut atom_nodes: Vec<&'t BoxNode> = Vec::new();
-        collect_atom_boxes(inls, &mut atom_nodes);
+        let mut atom_nodes: Vec<(&'t BoxNode, InlineStyle)> = Vec::new();
+        collect_atom_boxes(self.dom, self.base, inls, inl, &mut atom_nodes);
         let mut prelaid_atoms: Vec<Option<PrelaidAtom<'t>>> = Vec::with_capacity(atom_nodes.len());
         let mut atom_sizes: Vec<AtomBoxSize> = Vec::with_capacity(atom_nodes.len());
-        for ab in &atom_nodes {
-            let pa = self.lay_atom_box(ab, content_w, cb_h, inl);
+        for (ab, actx) in &atom_nodes {
+            let pa = self.lay_atom_box(ab, content_w, cb_h, actx);
             atom_sizes.push(AtomBoxSize {
                 w_cells: (pa.mw / self.cell_w).round().max(1.0) as usize,
                 h_rows: (pa.mh / self.cell_h).round().max(1.0) as u16,
@@ -3095,11 +3140,24 @@ fn slice_columns<'t, F: Fn(f32) -> (f32, f32)>(
 /// Collect the floats an inline content list holds, in the exact order the IFC
 /// meets them (document pre-order, descending into inline boxes) — so the k-th
 /// collected float pairs with the k-th `Inline::Float` the line breaker places.
-pub(super) fn collect_floats<'t>(inls: &'t [Inline], out: &mut Vec<&'t BoxNode>) {
+/// Each float is paired with its OWN ambient `InlineStyle` — derived the same
+/// way `Ifc::walk` derives it for `Inline::Box` — so a float nested inside an
+/// `<a>`/`<span>` inherits that element's link/emphasis/etc, not just the
+/// IFC-root context.
+pub(super) fn collect_floats<'t>(
+    dom: &Dom,
+    base: &Url,
+    inls: &'t [Inline],
+    ctx: &InlineStyle,
+    out: &mut Vec<(&'t BoxNode, InlineStyle)>,
+) {
     for i in inls {
         match i {
-            Inline::Float(b) => out.push(b),
-            Inline::Box { kids, .. } => collect_floats(kids, out),
+            Inline::Float(b) => out.push((b, ctx.clone())),
+            Inline::Box { node, kids, .. } => {
+                let inner = InlineStyle::derive(dom, *node, ctx, base);
+                collect_floats(dom, base, kids, &inner, out);
+            }
             _ => {}
         }
     }
@@ -3110,11 +3168,24 @@ pub(super) fn collect_floats<'t>(inls: &'t [Inline], out: &mut Vec<&'t BoxNode>)
 /// collected box pairs with the k-th `Inline::AtomBox` the line breaker places.
 /// Descends into inline boxes (an atom box can nest in a `<span>`) but NOT into
 /// an atom box's own content (that is laid as its own formatting context).
-pub(super) fn collect_atom_boxes<'t>(inls: &'t [Inline], out: &mut Vec<&'t BoxNode>) {
+/// Each box is paired with its OWN ambient `InlineStyle`, derived through every
+/// wrapping `Inline::Box` it nests in — an `<a href="x-trust-js:…">` wrapping a
+/// `<button>` (default `display:inline-block`) must hand its link down to the
+/// button's content the same way it would to a plain inline text run.
+pub(super) fn collect_atom_boxes<'t>(
+    dom: &Dom,
+    base: &Url,
+    inls: &'t [Inline],
+    ctx: &InlineStyle,
+    out: &mut Vec<(&'t BoxNode, InlineStyle)>,
+) {
     for i in inls {
         match i {
-            Inline::AtomBox(b) => out.push(b),
-            Inline::Box { kids, .. } => collect_atom_boxes(kids, out),
+            Inline::AtomBox(b) => out.push((b, ctx.clone())),
+            Inline::Box { node, kids, .. } => {
+                let inner = InlineStyle::derive(dom, *node, ctx, base);
+                collect_atom_boxes(dom, base, kids, &inner, out);
+            }
             _ => {}
         }
     }

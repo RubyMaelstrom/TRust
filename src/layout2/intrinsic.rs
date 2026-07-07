@@ -76,12 +76,12 @@ impl Flow<'_> {
                 // across the parent's lines). The probe IFC places it like the
                 // real one, so pre-size each in walk order (mirroring floats,
                 // which the IFC instead skips + folds below).
-                let mut atoms: Vec<&BoxNode> = Vec::new();
-                super::flow::collect_atom_boxes(inls, &mut atoms);
+                let mut atoms: Vec<(&BoxNode, InlineStyle)> = Vec::new();
+                super::flow::collect_atom_boxes(self.dom, self.base, inls, &here, &mut atoms);
                 let atom_sizes: Vec<AtomBoxSize> = atoms
                     .iter()
-                    .map(|ab| {
-                        let w = self.contribution(ab, mode, &here);
+                    .map(|(ab, actx)| {
+                        let w = self.contribution(ab, mode, actx);
                         AtomBoxSize {
                             w_cells: (w / self.cell_w).round().max(1.0) as usize,
                             h_rows: 1,
@@ -113,11 +113,11 @@ impl Flow<'_> {
                 // container like a block child (§9.5 / css-sizing-3 — the v1
                 // block-child approximation, correct for "float beside a
                 // paragraph"). The probe IFC skips floats, so fold them here.
-                let mut floats: Vec<&BoxNode> = Vec::new();
-                super::flow::collect_floats(inls, &mut floats);
+                let mut floats: Vec<(&BoxNode, InlineStyle)> = Vec::new();
+                super::flow::collect_floats(self.dom, self.base, inls, &here, &mut floats);
                 floats
                     .iter()
-                    .map(|fb| self.contribution(fb, mode, &here))
+                    .map(|(fb, fctx)| self.contribution(fb, mode, fctx))
                     .fold(inline_w, f32::max)
             }
             Content::Atomic(atom) => self.atom_intrinsic_w(atom, mode),
@@ -204,7 +204,15 @@ impl Flow<'_> {
                     .and_then(|u| self.images.get(u))
                     .filter(|&&(w, h)| w > 0 && h > 0)
                     .map(|&(w, h)| (f32::from(w) * self.cell_w, f32::from(h) * self.cell_h));
-                match super::replaced::size(self.dom, atom.node, natural, None, None, self.vp) {
+                match super::replaced::size(
+                    self.dom,
+                    atom.node,
+                    natural,
+                    None,
+                    None,
+                    self.vp,
+                    url.as_deref(),
+                ) {
                     Some(r) => r.box_w,
                     None => text_intrinsic_cells(alt, mode) as f32 * self.cell_w,
                 }
