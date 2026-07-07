@@ -2457,17 +2457,13 @@ mod tests {
 
     #[test]
     fn an_overflow_auto_box_becomes_a_region_even_under_a_locked_viewport() {
-        // CSS Overflow L3 §2 makes `overflow:auto|scroll` a scroll container
-        // UNCONDITIONALLY — there is no spec concept of a distinguished
-        // "principal" scroller that escapes this and flows into the document
-        // instead. §3.3 (Overflow Viewport Propagation) governs the VIEWPORT's
-        // OWN overflow strictly from `html`'s own value (or `body`'s, only
-        // when html's is `visible` in both axes) — it is never delegated to
-        // some descendant box, however deeply an app locks its shell. A page
-        // that sets `html{overflow:hidden}` just gets a viewport that doesn't
-        // scroll; any genuine `overflow:auto` descendant is still its own
-        // bounded region, scrolled independently (hover + wheel), same as a
-        // real browser's own nested scrollport.
+        // CSS Overflow L3 §2 makes `overflow:auto|scroll` a scroll container, so
+        // the box's content rides its OWN buffer, never the flat document rows —
+        // that stays true here. But when the viewport is block-LOCKED
+        // (`html{overflow:hidden}`, §3.1) and this is the sole content spine of
+        // the shell (`<body><div overflow:auto>`), the region is the PAGE'S own
+        // scroller: the terminal presents it as "the page" (main scrollbar +
+        // page keys drive it), so it is flagged `principal`.
         let out = lay(
             r#"<html style="overflow:hidden"><body style="margin:0"><div style="height:48px;overflow-y:auto;margin:0"><p style="margin:0">P1</p><p style="margin:0">P2</p><p style="margin:0">P3</p><p style="margin:0">P4</p><p style="margin:0">P5</p><p style="margin:0">P6</p></div></body></html>"#,
             20,
@@ -2478,6 +2474,10 @@ mod tests {
             "the overflow:auto box is its own bounded region regardless of the locked viewport"
         );
         let r = &out.regions[0];
+        assert!(
+            r.principal,
+            "the sole scroller under a locked viewport is the principal (page) region"
+        );
         assert_eq!(
             r.buffer.len(),
             6,
@@ -2503,11 +2503,12 @@ mod tests {
     fn overflow_auto_stays_bounded_inside_a_definite_height_overflow_hidden_shell() {
         // Twitch's front page shape: a locked-viewport app shell wraps an
         // `overflow:auto` panel in a definite-height `<main>{overflow:hidden}`
-        // sized to the viewport. Per §2/§3.3 that inner panel is STILL just an
-        // ordinary bounded region — nothing "escapes" a shell to become the
-        // page's own scroll. (The `<main>` landmark carries no special
-        // standing here; sectioning elements are an HTML semantics concept,
-        // not a CSS overflow-propagation one.)
+        // sized to the viewport. That inner panel stays a bounded region (its
+        // content rides its own buffer, never the flat document), AND — because
+        // the viewport is block-locked (§3.1) and the panel is the dominant
+        // `<main>` content — it is the PRINCIPAL region: the terminal scrolls it
+        // as "the page" (main scrollbar + PgUp/PgDn), user-locked across live
+        // re-renders. This is what the reader means by "the main scroll".
         let mut lines = String::new();
         for i in 0..40 {
             lines += &format!(r#"<p style="margin:0">P{i:02}</p>"#);
@@ -2521,9 +2522,13 @@ mod tests {
         assert_eq!(
             out.regions.len(),
             1,
-            "the overflow:auto panel is a bounded region, not the document's own promoted scroll"
+            "the overflow:auto panel is a bounded region"
         );
         let r = &out.regions[0];
+        assert!(
+            r.principal,
+            "the <main> scroller under a locked viewport is the principal (page) region"
+        );
         assert_eq!(r.buffer.len(), 40, "the region's buffer holds all 40 rows");
         assert!(
             r.buffer[0].items.iter().any(|i| i.text.contains("P00")),
@@ -2570,6 +2575,10 @@ mod tests {
             out.regions.len(),
             2,
             "both sibling panels are bounded regions, neither is the principal scroller"
+        );
+        assert!(
+            out.regions.iter().all(|r| !r.principal),
+            "neither column of a two-panel flex row is the page's principal scroller (each has a rendered sibling — not the sole app-shell spine)"
         );
         // Neither panel's overflowing tail leaks into the flat document rows.
         assert!(

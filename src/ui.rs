@@ -755,12 +755,21 @@ fn render_region_images(
 /// Rendered over the right border (between the corners) so it costs no content
 /// width; absent entirely when the whole document fits.
 fn render_browser_scrollbar(frame: &mut Frame, g: &BrowserView, session_area: Rect, inner: Rect) {
-    let total = if g.doc.laid_out() {
-        g.doc.rows.len()
+    // A locked-viewport page (Twitch and every SPA app shell) carries its whole
+    // scroll in a PRINCIPAL region, not in `rows` — the document itself barely
+    // overflows. The main scrollbar then tracks THAT region (its buffer height
+    // vs its clientHeight, positioned at its voffset), because it IS the page's
+    // scroll. Otherwise the ordinary document scroll drives it.
+    let (total, viewport, position) = if let Some(rg) = g.doc.principal_region() {
+        (rg.buffer.len(), rg.height as usize, rg.voffset)
     } else {
-        g.doc.lines.len()
+        let total = if g.doc.laid_out() {
+            g.doc.rows.len()
+        } else {
+            g.doc.lines.len()
+        };
+        (total, inner.height as usize, g.scroll)
     };
-    let viewport = inner.height as usize;
     if total <= viewport {
         return; // fits — no scrollbar, the border stays whole
     }
@@ -768,7 +777,7 @@ fn render_browser_scrollbar(frame: &mut Frame, g: &BrowserView, session_area: Re
     // not the row count, so the thumb reaches both ends exactly: top at
     // `scroll == 0`, bottom at the last scroll position.
     let mut state = ScrollbarState::new(total - viewport)
-        .position(g.scroll)
+        .position(position)
         .viewport_content_length(viewport);
     let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .thumb_symbol("█")
