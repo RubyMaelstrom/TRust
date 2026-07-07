@@ -661,21 +661,61 @@ pub struct BoundaryBox {
 /// one scrolled out must not (the encode pass keying on the raw strip column
 /// is why later cards rendered blank after scrolling).
 pub fn visible_col(carousels: &[Carousel], row: usize, item: &Item) -> Option<u16> {
+    carousel_place(carousels, row, item).map(|(col, _, _)| col)
+}
+
+/// The on-screen placement of `item` under any carousel windowing `row` —
+/// `Some((screen_col, visible_width, head_cut))`, or `None` if it is scrolled
+/// entirely out of the band. TWO regimes by the item's width vs the band's:
+///
+/// - a CARD (`width <= band`) keeps the all-or-nothing rule — drawn only when it
+///   sits WHOLLY inside the band (`head_cut` 0), exactly as before, so image
+///   strips are unaffected;
+/// - a WIDE run (`width > band` — a `white-space:pre` code line longer than its
+///   `overflow-x:auto` box) is PARTIALLY clipped to the band so it can be
+///   scrolled through: `head_cut` display columns are shaved off its left and
+///   `visible_width` cells remain.
+///
+/// Items outside every carousel (or left of the band — page content beside the
+/// strip) place at their own column, full width. The right frame bar of an
+/// enclosing bordered box is static chrome at its fixed column.
+fn carousel_place(carousels: &[Carousel], row: usize, item: &Item) -> Option<(u16, u16, usize)> {
     for c in carousels {
         if !c.contains_row(row) {
             continue;
         }
-        // The enclosing box's right frame bar sits at the band edge, inside
-        // the strip span: it's static chrome, always drawn at its fixed column
-        // (never scrolled or clipped like strip cards).
         if item.kind == ItemKind::Border && Some(item.col) == c.frame_right {
-            return Some(item.col);
+            return Some((item.col, item.width, 0));
         }
-        if item.col >= c.left {
-            return c.shows(item.col, item.width).then(|| item.col - c.offset);
+        if item.col < c.left {
+            return Some((item.col, item.width, 0));
         }
+        // Screen position of the item's left edge; SIGNED — a wide run scrolled
+        // so its head is off the band's left edge starts at a negative column.
+        let screen_start = item.col as i32 - c.offset as i32;
+        let screen_end = screen_start + item.width as i32;
+        let (left, right) = (c.left as i32, c.right as i32);
+        if item.width <= c.right.saturating_sub(c.left) {
+            // Card: shown only wholly-inside (unchanged strip behaviour).
+            return (screen_start >= left && screen_end <= right).then_some((
+                screen_start as u16,
+                item.width,
+                0,
+            ));
+        }
+        // Wider than the band: clip the visible slice.
+        let vis_start = screen_start.max(left);
+        let vis_end = screen_end.min(right);
+        if vis_start >= vis_end {
+            return None;
+        }
+        return Some((
+            vis_start as u16,
+            (vis_end - vis_start) as u16,
+            (vis_start - screen_start) as usize,
+        ));
     }
-    Some(item.col)
+    Some((item.col, item.width, 0))
 }
 
 /// The on-screen start column of every item in `row` after carousel clipping,
@@ -687,22 +727,53 @@ pub fn visible_col(carousels: &[Carousel], row: usize, item: &Item) -> Option<u1
 /// and the hit-test (which read raw `item.col`) disagreed: a clickable overlay
 /// placed over an input — the homepage search bar's clear button — was drawn in
 /// one place but only hoverable in another. Returns `(item_index,
-/// visual_start_col)` left to right; `row.items[i].width` gives the extent.
-/// Carousel-clipped items (not drawn) are omitted.
-pub fn visual_columns(row: &Row, carousels: &[Carousel], row_idx: usize) -> Vec<(usize, u16)> {
-    let mut placed: Vec<(u16, usize)> = row
+/// visual_start_col, visible_width, head_cut)` left to right — the VISIBLE width
+/// (a carousel-clipped wide run shows only its in-band slice, `head_cut` display
+/// columns shaved off the left) is the extent to draw / hit-test.
+/// Carousel-clipped-out items (not drawn) are omitted.
+pub fn visual_columns(
+    row: &Row,
+    carousels: &[Carousel],
+    row_idx: usize,
+) -> Vec<(usize, u16, u16, usize)> {
+    let mut placed: Vec<(u16, usize, u16, usize)> = row
         .items
         .iter()
         .enumerate()
-        .filter_map(|(i, item)| Some((visible_col(carousels, row_idx, item)?, i)))
+        .filter_map(|(i, item)| {
+            let (col, w, cut) = carousel_place(carousels, row_idx, item)?;
+            Some((col, i, w, cut))
+        })
         .collect();
-    placed.sort_by_key(|&(c, _)| c);
+    placed.sort_by_key(|&(c, ..)| c);
     let mut out = Vec::with_capacity(placed.len());
     let mut col = 0u16;
-    for (scol, i) in placed {
+    for (scol, i, w, cut) in placed {
         let start = scol.max(col);
-        out.push((i, start));
-        col = start + row.items[i].width;
+        out.push((i, start, w, cut));
+        col = start + w;
+    }
+    out
+}
+
+/// The substring of `s` covering display columns `[skip, skip + take)` — the
+/// window of a horizontally-scrolled inline run (a `white-space:pre` code line
+/// in a carousel) that falls inside the visible band. Widths are DISPLAY cells
+/// (`display_width`); a wide glyph straddling either cut is dropped (a cell
+/// can't show half a glyph), leaving its cell blank.
+pub(crate) fn slice_display(s: &str, skip: usize, take: usize) -> String {
+    let end = skip + take;
+    let mut out = String::new();
+    let mut col = 0usize;
+    for c in s.chars() {
+        if col >= end {
+            break;
+        }
+        let cw = display_width(c.encode_utf8(&mut [0u8; 4]));
+        if col >= skip && col + cw <= end {
+            out.push(c);
+        }
+        col += cw;
     }
     out
 }
@@ -20995,11 +21066,78 @@ mod tests {
             ],
         };
         // The overlay is appended after the input (at 18, not its raw col 11),
-        // and the trailing nav item closes up behind it (no phantom gap).
+        // and the trailing nav item closes up behind it (no phantom gap). No
+        // carousel ⇒ each item's visible width is its full width, `head_cut` 0.
         assert_eq!(
             visual_columns(&row, &[], 0),
-            vec![(0, 10), (1, 18), (2, 25)]
+            vec![(0, 10, 8, 0), (1, 18, 7, 0), (2, 25, 6, 0)]
         );
+    }
+
+    #[test]
+    fn slice_display_windows_by_display_width() {
+        assert_eq!(slice_display("abcdefgh", 2, 3), "cde");
+        assert_eq!(slice_display("abc", 0, 10), "abc"); // take past the end
+        assert_eq!(slice_display("abc", 5, 3), ""); // skip past the end
+        // A wide glyph straddling either cut is dropped (can't show half a cell).
+        assert_eq!(slice_display("a世b", 1, 2), "世"); // cols: a=0, 世=1..3, b=3
+        assert_eq!(slice_display("a世b", 2, 2), "b"); // cut mid-世 → 世 dropped, b at col3
+    }
+
+    #[test]
+    fn carousel_clips_a_wide_line_to_its_band() {
+        use crate::doc::Link;
+        let mk = |col, width, text: &str| Item {
+            col,
+            width,
+            height: 1,
+            text: text.into(),
+            kind: ItemKind::Text,
+            image: None,
+            emph: Emphasis::default(),
+            node: NO_NODE,
+            link: None,
+            crop: false,
+            pixelated: false,
+            invisible: false,
+        };
+        // A single 40-cell line (a `white-space:pre` code line) in a 10-cell
+        // band [0,10). At offset 0 the first 10 cells show; at offset 12 the
+        // window slides — head-cut 12, still 10 cells wide.
+        let line = "0123456789abcdefghijklmnopqrstuvwxyzABCD"; // 40 cells
+        let row = Row {
+            items: vec![mk(0, 40, line)],
+        };
+        let car = |offset: u16| Carousel {
+            start: 0,
+            end: 1,
+            left: 0,
+            right: 10,
+            width: 40,
+            stops: vec![],
+            offset,
+            frame_right: None,
+            snap: false,
+        };
+        // Offset 0: shows columns [0,10) of the line, head-cut 0.
+        let vc = visual_columns(&row, std::slice::from_ref(&car(0)), 0);
+        assert_eq!(vc, vec![(0, 0, 10, 0)]);
+        assert_eq!(slice_display(line, 0, 10), "0123456789");
+        // Offset 12: the window is [12,22) of the line; the item still starts at
+        // the band's left (screen col 0), 10 wide, with 12 cells cut off the head.
+        let vc = visual_columns(&row, std::slice::from_ref(&car(12)), 0);
+        assert_eq!(vc, vec![(0, 0, 10, 12)]);
+        assert_eq!(slice_display(line, 12, 10), "cdefghijkl");
+        // A card that FITS the band keeps the all-or-nothing rule: at offset 0 a
+        // 6-cell item wholly inside shows; scrolled out (offset 20) it's gone.
+        let card = Row {
+            items: vec![mk(2, 6, "CARD12")],
+        };
+        assert_eq!(
+            visual_columns(&card, std::slice::from_ref(&car(0)), 0),
+            vec![(0, 2, 6, 0)]
+        );
+        assert!(visual_columns(&card, std::slice::from_ref(&car(20)), 0).is_empty());
     }
 
     #[test]

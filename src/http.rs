@@ -5306,8 +5306,12 @@ mod tests {
             && let Some(live) = response.live.as_mut()
         {
             let n: usize = nstr.parse().unwrap_or(5);
+            let step: f64 = std::env::var("TRUST_DIAG_SCROLL_STEP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100_000.0);
             for i in 1..=n {
-                let y = (i as f64) * 100_000.0;
+                let y = (i as f64) * step;
                 eprintln!("DIAG_SCROLL step {i}/{n} -> y={y}");
                 let _ = live
                     .handle

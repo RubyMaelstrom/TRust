@@ -80,6 +80,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.last_content_area = inner;
     app.last_status_row = status_area.y;
 
+    // Scrollbar tracks recorded this frame for the mouse hit-test (assigned to
+    // `app` after the match — `g` borrows `app.browser` inside the arm).
+    let mut vbar = None;
+    let mut hbars = Vec::new();
     match (&app.viewer, &app.browser) {
         (Some(v), _) => {
             frame.render_widget(block, session_area);
@@ -112,14 +116,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 render_fixed_layer(frame, g, inner, app.find.as_ref(), &app.image_protocols);
             }
             // Scroll-position indicator on the right border, when the document
-            // overflows the panel.
-            render_browser_scrollbar(frame, g, session_area, inner);
+            // overflows the panel — plus a horizontal bar under each overflowing
+            // carousel. Both are clickable/draggable (tracks recorded for the
+            // mouse hit-test).
+            vbar = render_browser_scrollbar(frame, g, session_area, inner);
+            hbars = render_carousel_scrollbars(frame, g, inner);
         }
         (None, None) => {
             let term = PseudoTerminal::new(app.vt.screen()).block(block);
             frame.render_widget(term, session_area);
         }
     }
+    app.last_vbar = vbar;
+    app.last_hbars = hbars;
 
     // An open <select> dropdown overlays everything in the panel.
     render_select_menu(frame, app, inner);
@@ -388,11 +397,25 @@ pub(crate) fn browser_rows<'a>(
             let placed = crate::layout::visual_columns(&row, carousels, row_idx);
             let mut spans: Vec<Span> = Vec::with_capacity(placed.len() * 2);
             let mut col = 0u16;
-            for (i, scol) in placed {
+            for (i, scol, vis_w, cut) in placed {
                 let item = &row.items[i];
                 if scol > col {
                     spans.push(Span::raw(" ".repeat((scol - col) as usize)));
                 }
+                // The visible slice of the item after carousel windowing: a wide
+                // `white-space:pre` line clipped to its scroll band shows only
+                // the columns in view (`cut` shaved off the left, `vis_w` wide);
+                // an unclipped item is its whole self, borrowed.
+                let clipped = cut > 0 || vis_w < item.width;
+                let text: std::borrow::Cow<str> = if clipped && !item.text.is_empty() {
+                    std::borrow::Cow::Owned(crate::layout::slice_display(
+                        &item.text,
+                        cut,
+                        vis_w as usize,
+                    ))
+                } else {
+                    std::borrow::Cow::Borrowed(item.text.as_str())
+                };
                 // Paint suppression (`opacity:0`): the item is fully laid out
                 // but painted BLANK — reserve its width with spaces and skip all
                 // styling/selection/text (its image, if any, is skipped in the
@@ -400,8 +423,8 @@ pub(crate) fn browser_rows<'a>(
                 // its real `col`/`width`/`height`), so measurement APIs report
                 // the true box while the cells render empty.
                 if item.invisible {
-                    spans.push(Span::raw(" ".repeat(item.width as usize)));
-                    col = scol + item.width;
+                    spans.push(Span::raw(" ".repeat(vis_w as usize)));
+                    col = scol + vis_w;
                     continue;
                 }
                 let mut style = item_kind_style(item.kind);
@@ -443,8 +466,12 @@ pub(crate) fn browser_rows<'a>(
                     style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 }
                 // Only resolve the (possibly region-buffer) origin while a
-                // find is open — this runs per item per frame.
-                let ranges = if find.is_some() {
+                // find is open — this runs per item per frame. A horizontally
+                // CLIPPED carousel item is skipped: its find ranges are computed
+                // against the full item text, and offsetting them into the
+                // visible slice is deferred (a rare case — searching inside a
+                // scrolled code strip).
+                let ranges = if find.is_some() && !clipped {
                     let loc =
                         match crate::layout::item_origin(&g.doc.rows, &g.doc.regions, row_idx, i) {
                             crate::layout::ItemOrigin::Doc => FindLoc::Item {
@@ -469,22 +496,23 @@ pub(crate) fn browser_rows<'a>(
                     // Owned (not `as_str`): a scroll-region row's items live in a
                     // freshly merged row (`effective_row`'s `Cow::Owned`), so the
                     // span can't borrow from it. `match_spans` already owns.
-                    spans.push(Span::styled(item.text.clone(), style));
+                    spans.push(Span::styled(text.clone().into_owned(), style));
                 } else {
-                    spans.extend(match_spans(&item.text, style, &ranges));
+                    spans.extend(match_spans(&text, style, &ranges));
                 }
                 // An item can reserve more columns than its text fills — an
                 // inline image carries an empty string but a real W×H box (the
                 // pixels are overlaid in the second pass). Pad the remainder
-                // with spaces so the row's visible width tracks `item.width`;
-                // without this an image collapses to zero width and every
-                // following item slides left UNDER it (the header logo painting
-                // over the nav links, an avatar over its post title).
-                let text_w = crate::layout::display_width(&item.text) as u16;
-                if item.width > text_w {
-                    spans.push(Span::raw(" ".repeat((item.width - text_w) as usize)));
+                // with spaces so the row's visible width tracks the item's
+                // VISIBLE width (`vis_w` — clipped to the band for a carousel
+                // wide run); without this an image collapses to zero width and
+                // every following item slides left UNDER it (the header logo
+                // painting over the nav links, an avatar over its post title).
+                let text_w = crate::layout::display_width(&text) as u16;
+                if vis_w > text_w {
+                    spans.push(Span::raw(" ".repeat((vis_w - text_w) as usize)));
                 }
-                col = scol + item.width;
+                col = scol + vis_w;
             }
             Line::from(spans)
         })
@@ -754,24 +782,29 @@ fn render_region_images(
 /// `scroll` against the total row/line count, like a real browser's scrollbar.
 /// Rendered over the right border (between the corners) so it costs no content
 /// width; absent entirely when the whole document fits.
-fn render_browser_scrollbar(frame: &mut Frame, g: &BrowserView, session_area: Rect, inner: Rect) {
+fn render_browser_scrollbar(
+    frame: &mut Frame,
+    g: &BrowserView,
+    session_area: Rect,
+    inner: Rect,
+) -> Option<crate::app::ScrollTrack> {
     // A locked-viewport page (Twitch and every SPA app shell) carries its whole
     // scroll in a PRINCIPAL region, not in `rows` — the document itself barely
     // overflows. The main scrollbar then tracks THAT region (its buffer height
     // vs its clientHeight, positioned at its voffset), because it IS the page's
     // scroll. Otherwise the ordinary document scroll drives it.
-    let (total, viewport, position) = if let Some(rg) = g.doc.principal_region() {
-        (rg.buffer.len(), rg.height as usize, rg.voffset)
+    let (total, viewport, position, principal) = if let Some(rg) = g.doc.principal_region() {
+        (rg.buffer.len(), rg.height as usize, rg.voffset, true)
     } else {
         let total = if g.doc.laid_out() {
             g.doc.rows.len()
         } else {
             g.doc.lines.len()
         };
-        (total, inner.height as usize, g.scroll)
+        (total, inner.height as usize, g.scroll, false)
     };
     if total <= viewport {
-        return; // fits — no scrollbar, the border stays whole
+        return None; // fits — no scrollbar, the border stays whole
     }
     // `content_length` is the SCROLLABLE range (max scroll = total − viewport),
     // not the row count, so the thumb reaches both ends exactly: top at
@@ -792,6 +825,63 @@ fn render_browser_scrollbar(frame: &mut Frame, g: &BrowserView, session_area: Re
         horizontal: 0,
     });
     frame.render_stateful_widget(bar, area, &mut state);
+    // The clickable/draggable track is the border column the bar drew in.
+    Some(crate::app::ScrollTrack {
+        rect: Rect::new(area.right().saturating_sub(1), area.y, 1, area.height),
+        principal,
+        content: total,
+        viewport,
+    })
+}
+
+/// Draw a horizontal scrollbar under each on-screen carousel that overflows its
+/// band, and return the drawn tracks for the mouse hit-test. The bar sits on the
+/// carousel band's BOTTOM row (the conventional place for a horizontal
+/// scrollbar), spanning the band columns; the thumb tracks the strip offset.
+/// Only carousels whose bottom row is currently on screen get one.
+fn render_carousel_scrollbars(
+    frame: &mut Frame,
+    g: &BrowserView,
+    inner: Rect,
+) -> Vec<crate::app::CarouselTrack> {
+    let mut tracks = Vec::new();
+    for (ci, c) in g.doc.carousels.iter().enumerate() {
+        if c.max_offset() == 0 || c.end == 0 {
+            continue; // nothing to scroll to
+        }
+        // Draw the bar on the row just BELOW the band (doc row `end`), clipped
+        // to the band's columns — so it never overlays the strip's own content
+        // (a single-row code block would otherwise be hidden by its own bar). It
+        // only covers the band-column slice of the following row.
+        let doc_row = c.end;
+        if doc_row < g.scroll {
+            continue;
+        }
+        let sy = inner.y as usize + (doc_row - g.scroll);
+        if sy >= inner.bottom() as usize {
+            continue; // off-screen vertically
+        }
+        // The band's on-screen column span, clamped to the panel.
+        let bx = inner.x.saturating_add(c.left).min(inner.right());
+        let bw = c.view_width().min(inner.right().saturating_sub(bx));
+        if bw == 0 {
+            continue;
+        }
+        let rect = Rect::new(bx, sy as u16, bw, 1);
+        let mut state = ScrollbarState::new((c.width.saturating_sub(c.view_width())) as usize)
+            .position(c.offset as usize)
+            .viewport_content_length(c.view_width() as usize);
+        let bar = Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
+            .thumb_symbol("█")
+            .thumb_style(Style::new().fg(theme::NEON_CYAN))
+            .track_symbol(Some("─"))
+            .track_style(Style::new().fg(theme::DIM))
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(bar, rect, &mut state);
+        tracks.push(crate::app::CarouselTrack { car: ci, rect });
+    }
+    tracks
 }
 
 /// Status-bar / strip badge for the active browser protocol.

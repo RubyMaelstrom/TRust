@@ -257,7 +257,7 @@ fn extract_scrollers(
                 alpha,
                 composites,
             ));
-        } else if is_carousel(dom, &f.children[i]) {
+        } else if is_carousel(dom, &f.children[i], cw) {
             paint_carousel(
                 dom,
                 &mut f.children[i],
@@ -293,7 +293,7 @@ fn extract_scrollers(
 /// Whether `f` is a horizontal scroll strip: an `overflow-x: auto|scroll`
 /// element (CSS Overflow L3 §2) whose content overflows its padding box to the
 /// right (there is scrollable overflow to window). Not the document root.
-fn is_carousel(dom: &Dom, f: &Frag<'_>) -> bool {
+fn is_carousel(dom: &Dom, f: &Frag<'_>, cw: f32) -> bool {
     if f.node == NO_NODE || matches!(dom.tag_name(f.node), Some("html" | "body")) {
         return false;
     }
@@ -301,12 +301,33 @@ fn is_carousel(dom: &Dom, f: &Frag<'_>) -> bool {
         return false;
     }
     let pad_right = f.x + f.w - f.border[RIGHT];
-    let content_right = f
-        .children
+    content_right_px(f, cw) > pad_right + 0.5
+}
+
+/// The right edge (absolute px) of a box's in-flow content — the max over its
+/// direct children of each child's own right edge. A LINE box carries its
+/// extent in its `Piece`s (columns relative to `x`), NOT in its `w` (which is
+/// 0), so a `white-space:pre` block's long line is measured from the rightmost
+/// piece; a block/replaced child uses its border-box right edge. This is what
+/// makes an `overflow-x:auto` element with overflowing INLINE content — a
+/// `<pre><code>` code block, `white-space:pre` text — a horizontal scroll strip
+/// (CSS Overflow L3 §2 scrollable overflow), not only a row of overflowing
+/// child boxes.
+fn content_right_px(f: &Frag<'_>, cw: f32) -> f32 {
+    f.children
         .iter()
-        .map(|c| c.x + c.w)
-        .fold(f32::MIN, f32::max);
-    content_right > pad_right + 0.5
+        .map(|c| match &c.kind {
+            FragKind::Line(pieces) => {
+                let cells = pieces
+                    .iter()
+                    .map(|p| p.col + usize::from(p.item.width))
+                    .max()
+                    .unwrap_or(0);
+                c.x + cells as f32 * cw
+            }
+            _ => c.x + c.w,
+        })
+        .fold(f32::MIN, f32::max)
 }
 
 /// Paint one horizontal scroll strip: composite its content at the strip width
@@ -336,12 +357,10 @@ fn paint_carousel(
     let start_row = ((f.y - oy) / ch).round().max(0.0) as usize;
     let band_left = ((pad_x - ox) / cw).round().max(0.0) as usize;
     let scrollport = (pad_w / cw).round().max(1.0) as usize; // the visible band
-    // The strip's scrollable extent (widest child right edge), strip-relative.
-    let content_right = f
-        .children
-        .iter()
-        .map(|c| c.x + c.w)
-        .fold(f32::MIN, f32::max);
+    // The strip's scrollable extent (widest child right edge — a LINE box
+    // contributes its inline pieces' extent, so a `white-space:pre` code block
+    // scrolls its long lines, not only wide child boxes), strip-relative.
+    let content_right = content_right_px(f, cw);
     let strip_w = (((content_right - pad_x) / cw).round().max(1.0)) as usize;
     // Snapping: only when the container declares an inline-axis scroll-snap-type
     // (x / inline / both). Its snap positions come from the cards' own

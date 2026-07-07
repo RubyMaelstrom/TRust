@@ -897,9 +897,69 @@ pub struct App {
     /// A fetch just failed (or came back empty): the status bar shows
     /// the message even while a link is selected, until the next key.
     pub(crate) notice: bool,
+    /// The vertical scrollbar's track geometry from the last draw, so a mouse
+    /// click/drag on the right-border track can seek. `None` when the document
+    /// fit the panel and no bar was drawn.
+    pub(crate) last_vbar: Option<ScrollTrack>,
+    /// Each on-screen carousel's horizontal scrollbar track from the last draw
+    /// (carousel index + the drawn track rect), for click/drag seeking.
+    pub(crate) last_hbars: Vec<CarouselTrack>,
+    /// The scrollbar the pointer grabbed on mouse-down, tracked until button-up
+    /// so motion maps to the scroll offset. `None` when not dragging a bar.
+    scroll_drag: Option<ScrollDrag>,
     conn: Option<telnet::Handle>,
     events: Option<mpsc::Receiver<telnet::Event>>,
     quit: bool,
+}
+
+/// A drawn scrollbar's geometry, recorded each frame so a mouse click/drag can
+/// seek it. `rect` is the clickable track (the right-border column for the
+/// vertical bar); `content`/`viewport` size the thumb and bound the seek.
+/// Absolute terminal cells.
+#[derive(Clone, Copy)]
+pub(crate) struct ScrollTrack {
+    pub(crate) rect: ratatui::layout::Rect,
+    /// The vertical bar drives a PRINCIPAL region's voffset, not `g.scroll`.
+    pub(crate) principal: bool,
+    pub(crate) content: usize,
+    pub(crate) viewport: usize,
+}
+
+/// A carousel's drawn horizontal scrollbar track (carousel index + rect).
+#[derive(Clone, Copy)]
+pub(crate) struct CarouselTrack {
+    pub(crate) car: usize,
+    pub(crate) rect: ratatui::layout::Rect,
+}
+
+/// Which scrollbar the pointer grabbed — motion seeks it until button-up.
+#[derive(Clone, Copy)]
+enum ScrollDrag {
+    Vertical,
+    Carousel(usize),
+}
+
+/// Whether an absolute terminal cell `(col,row)` lies inside `r`.
+fn rect_has(r: ratatui::layout::Rect, col: u16, row: u16) -> bool {
+    col >= r.x && col < r.right() && row >= r.y && row < r.bottom()
+}
+
+/// Map a pointer coordinate on a scrollbar track to a scroll position, with the
+/// thumb CENTERED on the cursor (click a spot → the thumb lands there, drag
+/// follows). `origin`/`len` are the track's start and length in cells on the
+/// scroll axis; `content`/`viewport` size the thumb the same way the renderer
+/// does. Returns a position clamped to `[0, content - viewport]`.
+fn track_position(origin: u16, len: u16, pointer: u16, content: usize, viewport: usize) -> usize {
+    let range = content.saturating_sub(viewport);
+    let len = len as usize;
+    if range == 0 || len == 0 {
+        return 0;
+    }
+    let thumb = (viewport * len / content.max(1)).clamp(1, len);
+    let denom = len.saturating_sub(thumb).max(1);
+    let within = (pointer.saturating_sub(origin) as usize).min(len - 1);
+    let thumb_top = within.saturating_sub(thumb / 2).min(denom);
+    (thumb_top * range + denom / 2) / denom
 }
 
 impl App {
@@ -992,6 +1052,9 @@ impl App {
             select_menu: None,
             find: None,
             last_select_rect: None,
+            last_vbar: None,
+            last_hbars: Vec::new(),
+            scroll_drag: None,
             notice: false,
             conn: None,
             events: None,
@@ -1371,6 +1434,25 @@ impl App {
         if self.select_menu.is_some() {
             self.select_menu_mouse(mouse);
             return;
+        }
+        // Scrollbar drag: a left-press on a drawn scrollbar track grabs it, and
+        // subsequent motion (Drag) seeks it until the button is released — the
+        // pointer counterpart to keyboard scrolling. Handled before the browser
+        // hover/click grab so a drag begun on the bar never also follows a link.
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(d) = self.scrollbar_at(mouse.column, mouse.row) {
+                    self.scroll_drag = Some(d);
+                    self.seek_scroll_drag(mouse.column, mouse.row);
+                    return;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.scroll_drag.is_some() => {
+                self.seek_scroll_drag(mouse.column, mouse.row);
+                return;
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.scroll_drag = None,
+            _ => {}
         }
         // 3 lines per wheel click, matching terminal convention.
         match (mouse.kind, self.browser.is_some()) {
@@ -3864,9 +3946,10 @@ impl App {
             // visual columns are the SAME on-screen placement the renderer
             // draws (carousel clip + gap-fill + overlap-append).
             let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r);
-            for (i, start) in crate::layout::visual_columns(&row, &g.doc.carousels, r) {
+            for (i, start, vis_w, _cut) in crate::layout::visual_columns(&row, &g.doc.carousels, r)
+            {
                 let item = &row.items[i];
-                let end = start.saturating_add(item.width);
+                let end = start.saturating_add(vis_w);
                 let covers = row_offset < item.height.max(1) as usize
                     && local_col >= start
                     && local_col < end;
@@ -5366,6 +5449,90 @@ impl App {
             KeyCode::Esc => self.stop_loading(),
             _ => {}
         }
+    }
+
+    /// Absolute terminal-cell hit-test: which drawn scrollbar (if any) covers
+    /// `(col,row)`. The vertical bar (right-border track) is tested first; a
+    /// carousel bar never overlaps it, so the order is only for determinism.
+    fn scrollbar_at(&self, col: u16, row: u16) -> Option<ScrollDrag> {
+        if let Some(v) = self.last_vbar
+            && rect_has(v.rect, col, row)
+        {
+            return Some(ScrollDrag::Vertical);
+        }
+        self.last_hbars
+            .iter()
+            .find(|h| rect_has(h.rect, col, row))
+            .map(|h| ScrollDrag::Carousel(h.car))
+    }
+
+    /// Seek the grabbed scrollbar to the pointer position (the drag body).
+    fn seek_scroll_drag(&mut self, col: u16, row: u16) {
+        match self.scroll_drag {
+            Some(ScrollDrag::Vertical) => self.vbar_seek(row),
+            Some(ScrollDrag::Carousel(car)) => self.hbar_seek(car, col),
+            None => {}
+        }
+    }
+
+    /// Map a pointer row on the vertical scrollbar track to a scroll position
+    /// (thumb centered on the cursor) and apply it — to the principal region's
+    /// voffset when the bar tracks one, else to the document scroll.
+    fn vbar_seek(&mut self, row: u16) {
+        let Some(v) = self.last_vbar else { return };
+        let pos = track_position(v.rect.y, v.rect.height, row, v.content, v.viewport);
+        if v.principal {
+            let Some(g) = self.browser.as_mut() else {
+                return;
+            };
+            let wb = g.doc.principal_region_mut().map(|rg| {
+                rg.voffset = pos.min(rg.max_voffset());
+                rg.voffset_from_page = false;
+                (rg.live_node, rg.voffset)
+            });
+            if let Some((node, voff)) = wb {
+                self.region_writeback(node, voff);
+            }
+        } else {
+            let height = self.last_inner.1.max(1) as usize;
+            let Some(g) = self.browser.as_mut() else {
+                return;
+            };
+            let max_scroll = g.doc.rows.len().saturating_sub(height);
+            g.scroll = pos.min(max_scroll);
+            // Re-aim the selection into the viewport if it scrolled away.
+            if let Some((r, _)) = g.sel_item
+                && (r < g.scroll || r >= g.scroll + height)
+            {
+                g.sel_item = Self::http_first_visible_item(g, height);
+            }
+        }
+    }
+
+    /// Map a pointer column on a carousel's horizontal scrollbar track to a
+    /// strip offset (thumb centered on the cursor) and apply it.
+    fn hbar_seek(&mut self, car: usize, col: u16) {
+        let Some(h) = self.last_hbars.iter().find(|h| h.car == car).copied() else {
+            return;
+        };
+        let Some(g) = self.browser.as_mut() else {
+            return;
+        };
+        let Some(c) = g.doc.carousels.get_mut(car) else {
+            return;
+        };
+        let max_off = c.max_offset() as usize;
+        if max_off == 0 {
+            return;
+        }
+        let pos = track_position(
+            h.rect.x,
+            h.rect.width,
+            col,
+            c.width as usize,
+            c.view_width() as usize,
+        );
+        c.offset = pos.min(max_off) as u16;
     }
 
     /// If the selection sits in a horizontal carousel, scroll it one card
@@ -8358,6 +8525,67 @@ mod tests {
     }
 
     #[test]
+    fn track_position_maps_cursor_to_scroll() {
+        // 100 rows of content, 10-row viewport (max scroll 90), track at rows
+        // 1..11: the top of the track maps to 0, the bottom near the max, and a
+        // fitting document (content ≤ viewport) never scrolls.
+        assert_eq!(super::track_position(1, 10, 1, 100, 10), 0);
+        assert!(
+            super::track_position(1, 10, 10, 100, 10) >= 85,
+            "bottom of the track seeks near the end"
+        );
+        assert_eq!(super::track_position(1, 10, 5, 8, 10), 0);
+    }
+
+    #[test]
+    fn vertical_scrollbar_click_and_drag_seek_the_document() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(1, 1, 80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let body: String = (0..60).map(|i| format!("<p>line {i}</p>")).collect();
+        let html = format!("<body>{body}</body>");
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html.as_bytes(),
+            80,
+            0,
+            &Default::default(),
+        ));
+        let total = app.browser.as_ref().unwrap().doc.rows.len();
+        assert!(total > 10, "the document is taller than the viewport");
+        // Emulate the renderer recording the right-border track (rows 1..11).
+        app.last_vbar = Some(super::ScrollTrack {
+            rect: ratatui::layout::Rect::new(81, 1, 1, 10),
+            principal: false,
+            content: total,
+            viewport: 10,
+        });
+        use crossterm::event::{MouseButton, MouseEventKind};
+        // A left-press near the BOTTOM of the track grabs it and seeks toward
+        // the end.
+        app.on_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 81, 10));
+        let after_click = app.browser.as_ref().unwrap().scroll;
+        assert!(
+            after_click > total / 2,
+            "bottom click seeks near the end (got {after_click} of {total})"
+        );
+        // Dragging back to the TOP returns the scroll to 0 (the grab persists).
+        app.on_mouse_event(mouse(MouseEventKind::Drag(MouseButton::Left), 81, 1));
+        assert_eq!(app.browser.as_ref().unwrap().scroll, 0, "drag to top → 0");
+        // Button-up releases the grab, so a later drag elsewhere is inert.
+        app.on_mouse_event(mouse(MouseEventKind::Up(MouseButton::Left), 81, 1));
+        app.on_mouse_event(mouse(MouseEventKind::Drag(MouseButton::Left), 40, 5));
+        assert_eq!(
+            app.browser.as_ref().unwrap().scroll,
+            0,
+            "no grab ⇒ a stray drag doesn't scroll"
+        );
+    }
+
+    #[test]
     fn mouse_and_keyboard_hover_feed_the_live_page_diffed() {
         // The hover pipeline end-to-end on the app side: mouse motion over a
         // marked target records a pending hover; the (dwell-elapsed) commit
@@ -8525,8 +8753,8 @@ mod tests {
         let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, rg.start_row);
         let start = crate::layout::visual_columns(&row, &g.doc.carousels, rg.start_row)
             .into_iter()
-            .find(|&(i, _)| row.items[i].is_interactive())
-            .map(|(_, c)| c)
+            .find(|&(i, ..)| row.items[i].is_interactive())
+            .map(|(_, c, ..)| c)
             .expect("a link in the region top row");
         (
             app.last_content_area.x + start,
