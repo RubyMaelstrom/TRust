@@ -1021,6 +1021,121 @@ impl Dom {
         matches!(v.trim().to_ascii_lowercase().as_str(), "auto" | "scroll")
     }
 
+    /// Whether this element clips its overflow on the BLOCK (vertical) axis —
+    /// `overflow-y: hidden|clip` (longhand, else the `overflow` shorthand's y
+    /// component, which defaults to x). On `html`/`body` this is the signal
+    /// that the VIEWPORT can't scroll the document (CSS Overflow L3 §3.1). Read
+    /// on the block axis only: the ubiquitous `overflow-x:hidden` "no sideways
+    /// scrollbar" trick must NOT read as a locked viewport.
+    fn clips_block_axis(&self, id: NodeId) -> bool {
+        let v = match self.computed_style(id, "overflow-y") {
+            Some(v) => v,
+            None => match self.computed_style(id, "overflow") {
+                Some(sh) => {
+                    let mut toks = sh.split_whitespace();
+                    let x = toks.next().unwrap_or("");
+                    toks.next().unwrap_or(x).to_string()
+                }
+                None => return false,
+            },
+        };
+        matches!(v.trim().to_ascii_lowercase().as_str(), "hidden" | "clip")
+    }
+
+    /// Whether `id` is the page's PRINCIPAL scroll container — the one a LOCKED
+    /// viewport delegates document scrolling to (the SPA app-shell pattern where
+    /// `html`/`body` are `overflow:hidden` and one inner `overflow:auto` box
+    /// carries the main flow, e.g. Twitch's `root-scrollable` inside `<main>`).
+    /// It stays a genuine scroll `Region`, but the terminal presents it as "the
+    /// page": the main scrollbar reflects its position, the page-level scroll
+    /// gestures (wheel off a nested region, PgUp/PgDn, Home/End) drive it, and
+    /// its offset is user-locked across live re-renders (the page's own scroll
+    /// signal never resets it). Read purely from the page's declarations: CSS
+    /// Overflow §3.1 (the root element's overflow propagates to the viewport; if
+    /// the root is `visible` but `<body>` is not, the body's propagates) + HTML
+    /// sectioning landmarks (`<main>` is the dominant content, `<nav>`/`<aside>`
+    /// are complementary) — never the host.
+    ///
+    /// ONE upward walk from `id` to the root: a scroll-container ancestor ⇒ `id`
+    /// is NESTED ⇒ not principal (a real inner region); the nearest sectioning
+    /// landmark above `id` decides main-flow (`<main>`) vs a complementary
+    /// sidebar (`<nav>`/`<aside>`, stays a plain region); and the viewport must
+    /// be block-axis LOCKED. Principal ⇔ locked AND (inside `<main>` OR the page
+    /// declares no enclosing landmark at all, i.e. this outermost scroller
+    /// carries the flow). Shared by both layout engines.
+    pub fn is_principal_scroller(&self, id: NodeId) -> bool {
+        if !self.is_scroll_container(id) {
+            return false;
+        }
+        let mut viewport_locked = false;
+        let mut in_main = false;
+        let mut landmark_seen = false;
+        let mut cur = self.parent_composed(id);
+        while let Some(p) = cur {
+            // A scroll-container ancestor ⇒ a nested inner region, never the page.
+            if self.is_scroll_container(p) {
+                return false;
+            }
+            match self.tag_name(p) {
+                Some("main") if !landmark_seen => {
+                    in_main = true;
+                    landmark_seen = true;
+                }
+                Some("nav" | "aside") if !landmark_seen => landmark_seen = true,
+                Some("html" | "body") if self.clips_block_axis(p) => viewport_locked = true,
+                _ => {}
+            }
+            cur = self.parent_composed(p);
+        }
+        // Inside `<main>` the landmark is the signal. Landmark-LESS, the scroller
+        // is the page only when it is the SOLE content spine of the app shell
+        // (`<body><div>…<div overflow:auto>`) — otherwise two panels of a flex
+        // row would BOTH read as principal (the humantooth over-match).
+        viewport_locked && (in_main || (!landmark_seen && self.is_sole_spine_to_body(id)))
+    }
+
+    /// Whether every ancestor between `id` and `<body>`/`<html>` has `id`'s
+    /// path child as its SOLE rendered box child — i.e. `id` is the single
+    /// content spine of the app shell, not one column among siblings. A
+    /// landmark-less locked-viewport page promotes its scroller to the principal
+    /// (page) scroller only when it is this sole spine.
+    fn is_sole_spine_to_body(&self, id: NodeId) -> bool {
+        let mut child = id;
+        let mut cur = self.parent_composed(id);
+        while let Some(p) = cur {
+            // Reaching the document root ends the spine (body/html carry the page).
+            if matches!(self.tag_name(p), Some("body" | "html")) {
+                return true;
+            }
+            // `p` must have no rendered box child other than the one we came from.
+            if self
+                .composed_children(p)
+                .into_iter()
+                .any(|c| c != child && self.renders_as_box(c))
+            {
+                return false;
+            }
+            child = p;
+            cur = self.parent_composed(p);
+        }
+        true
+    }
+
+    /// Whether `c` generates a box in normal flow — an element that isn't hidden
+    /// (`display:none`, closed dialog/popover, …) and isn't document metadata.
+    /// Text/comment nodes and metadata (`<script>`/`<style>`/`<link>`/…) don't
+    /// count as content siblings for the app-shell spine test.
+    fn renders_as_box(&self, c: NodeId) -> bool {
+        match self.tag_name(c) {
+            None => false, // text / comment — not a box for the spine test
+            Some(
+                "script" | "style" | "link" | "meta" | "title" | "base" | "head" | "template"
+                | "noscript",
+            ) => false,
+            Some(_) => !self.is_hidden(c),
+        }
+    }
+
     /// Parse a full HTML document into a fresh arena.
     pub fn parse_document(html: &str) -> Self {
         let sink = Sink {

@@ -386,6 +386,22 @@ impl Doc {
         !self.rows.is_empty()
     }
 
+    /// The page's PRINCIPAL scroll region, if any — the one a locked viewport
+    /// delegates the document scroll to (`Dom::is_principal_scroller`). Its
+    /// content lives in a region buffer rather than `rows`, so the terminal
+    /// presents it as "the page": the main scrollbar reflects it and the
+    /// page-level scroll gestures drive it. Always top-level (a nested scroller
+    /// is never principal).
+    pub fn principal_region(&self) -> Option<&crate::layout::Region> {
+        self.regions.iter().find(|r| r.principal)
+    }
+
+    /// Mutable access to the principal scroll region (for a page-level scroll
+    /// gesture that moves it).
+    pub fn principal_region_mut(&mut self) -> Option<&mut crate::layout::Region> {
+        self.regions.iter_mut().find(|r| r.principal)
+    }
+
     /// The vertical extent for scrolling: layout rows when laid out, else
     /// document lines.
     pub fn extent(&self) -> usize {

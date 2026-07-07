@@ -555,6 +555,16 @@ pub struct Region {
     /// offsets` keeps it — the page dictated the position (a chat pinning to the
     /// bottom); when false, the user's wheel offset is restored across re-layout.
     pub voffset_from_page: bool,
+    /// Whether this is the page's PRINCIPAL scroll region — the one a locked
+    /// viewport delegates document scrolling to (`Dom::is_principal_scroller`).
+    /// The terminal presents it as "the page": the main scrollbar reflects its
+    /// position, the page-level scroll gestures (wheel off a nested region,
+    /// PgUp/PgDn, Home/End) drive it, and `carry_region_offsets` keeps its
+    /// offset user-locked across live re-renders — never overridden by the
+    /// page's own `scrollTop` signal (it is the reader who scrolls "the page",
+    /// not the page, so a lagging signal must not snap it back). At most one
+    /// region on a page is principal; nested regions are never principal.
+    pub principal: bool,
     /// Horizontal scroll strips nested inside this region (buffer-relative
     /// coords: `start`/`left` are indices into `buffer`). The renderer windows
     /// them within this region's window (a shelf inside a scrolling feed).
@@ -5677,6 +5687,12 @@ impl<'a> Layout<'a> {
                 voffset,
                 live_node,
                 voffset_from_page: signal.is_some(),
+                // The old engine flows the principal scroller into the document
+                // (`scroll_region_height` returns None for it, so it never
+                // reaches here), so its regions are always non-principal — the
+                // document scroll + right scrollbar already scroll it as "the
+                // page". Only layout2 keeps the principal scroller as a Region.
+                principal: false,
                 carousels: buffer.carousels,
                 regions: Vec::new(),
                 image_urls,
@@ -12671,6 +12687,7 @@ mod tests {
             voffset: 0,
             live_node: None,
             voffset_from_page: false,
+            principal: false,
             carousels: Vec::new(),
             regions: Vec::new(),
             image_urls: Vec::new(),

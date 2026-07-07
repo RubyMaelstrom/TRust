@@ -568,6 +568,11 @@ fn paint_region(
         voffset,
         live_node,
         voffset_from_page: signal.is_some(),
+        // The one scroll region a locked viewport delegates the page scroll to
+        // (SPA app shell). A nested region can never be principal — the walk
+        // finds its scroll-container ancestor and returns false — so setting it
+        // here for every extracted region is correct at any depth.
+        principal: dom.is_principal_scroller(f.node),
         carousels: n_carousels,
         regions: n_regions,
         // Region image-reflow routing (P7 incremental layout) is not populated

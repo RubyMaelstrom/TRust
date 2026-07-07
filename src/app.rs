@@ -5069,8 +5069,13 @@ impl App {
         for rg in regions.iter_mut() {
             // Keep the page's fresh signal on a live re-render; else restore the
             // old offset by node (regions are keyed by their stable element id).
+            // The PRINCIPAL region is exempt from the signal override: the READER
+            // scrolls it as "the page", not the page, so its user offset is
+            // always restored — a lagging `data-trust-scroll-top` signal must
+            // never snap the main content back to the top on a live re-render
+            // (the "kicked back up" bug). Same guarantee `g.scroll` already has.
             if rg.node != crate::layout::NO_NODE
-                && !(prefer_signal && rg.voffset_from_page)
+                && !(prefer_signal && rg.voffset_from_page && !rg.principal)
                 && let Some(&(_, voff)) = old.iter().find(|&&(n, _)| n == rg.node)
             {
                 rg.voffset = voff.min(rg.max_voffset());
@@ -5736,6 +5741,11 @@ impl App {
     /// Scroll the HTTP viewport by `delta` rows, dropping any selection
     /// that scrolls out of view onto the nearest visible interactive item.
     fn http_scroll(&mut self, delta: i64) {
+        // A locked-viewport page scrolls its principal region as "the page"
+        // (PgUp/PgDn off a region, Home/End); its `rows` hold no scroll content.
+        if self.scroll_principal_region(delta) {
+            return;
+        }
         let height = self.last_inner.1.max(1) as usize;
         let Some(g) = &mut self.browser else { return };
         let max_scroll = g.doc.rows.len().saturating_sub(height);
@@ -5852,6 +5862,11 @@ impl App {
             }
             return; // trapped in the (deepest) region — never chains to the doc
         }
+        // Off any region: a locked-viewport page scrolls its principal region as
+        // "the page" (its content isn't in `rows`); else the document scrolls.
+        if self.scroll_principal_region(delta) {
+            return;
+        }
         self.browser_scroll(delta, true);
     }
 
@@ -5872,6 +5887,31 @@ impl App {
             rg.voffset_from_page = false;
         }
         moved.then_some((rg.live_node, rg.voffset))
+    }
+
+    /// Scroll the page's PRINCIPAL scroll region (a locked-viewport app shell —
+    /// Twitch and every SPA — keeps its whole content in a region, not in
+    /// `rows`) by `delta` rows, AS "the page": write the new scrollTop back to
+    /// the live engine and mark it user-driven so `carry_region_offsets` keeps
+    /// this position across the re-render. Returns whether a principal region
+    /// existed — when it does, the page-level gesture (wheel off a nested
+    /// region, PgUp/PgDn, Home/End) is consumed by it (there is nothing else to
+    /// scroll), even at a boundary.
+    fn scroll_principal_region(&mut self, delta: i64) -> bool {
+        let Some(g) = self.browser.as_mut() else {
+            return false;
+        };
+        let Some(rg) = g.doc.principal_region_mut() else {
+            return false;
+        };
+        let wb = rg.scroll_by(delta).then(|| {
+            rg.voffset_from_page = false;
+            (rg.live_node, rg.voffset)
+        });
+        if let Some((node, voff)) = wb {
+            self.region_writeback(node, voff);
+        }
+        true
     }
 
     /// The DEEPEST scroll region under the cursor, as a path of nested-region
@@ -8674,6 +8714,7 @@ mod tests {
             voffset,
             live_node: Some(99),
             voffset_from_page: from_page,
+            principal: false,
             carousels: Vec::new(),
             regions: Vec::new(),
             image_urls: Vec::new(),
@@ -8697,6 +8738,84 @@ mod tests {
             regions[0].voffset, 9,
             "resize preserves the on-screen position"
         );
+        // The PRINCIPAL region is exempt from the signal override — the reader
+        // scrolls it as "the page", so a live re-render restores the user's
+        // offset (9) even though the page baked a fresh signal (the "kicked back
+        // up" fix). Same lock `g.scroll` has.
+        let mut principal = mk(3, true);
+        principal.principal = true;
+        let mut regions = [principal];
+        super::App::carry_region_offsets(&old, &mut regions, true);
+        assert_eq!(
+            regions[0].voffset, 9,
+            "the principal region ignores the page signal and stays where the reader put it"
+        );
+    }
+
+    #[test]
+    fn the_principal_region_is_scrolled_as_the_page() {
+        // A locked-viewport app shell (Twitch) keeps its whole content in a
+        // principal region, not in `rows`. The page-level scroll gestures drive
+        // THAT region, and the document itself never moves.
+        let mut app = region_app();
+        assert_eq!(app.browser.as_ref().unwrap().doc.regions.len(), 1);
+        // No principal region yet ⇒ the gesture isn't consumed (document scroll).
+        assert!(
+            !app.scroll_principal_region(3),
+            "no principal region → the page-level gesture falls through to the document"
+        );
+        // Promote the region to the page's principal scroller.
+        app.browser.as_mut().unwrap().doc.regions[0].principal = true;
+        // A page key (PgDn/Home/End all route through http_scroll) pages it, and
+        // the gesture is consumed — the document rows hold no scroll content.
+        app.http_scroll(4);
+        {
+            let g = app.browser.as_ref().unwrap();
+            assert_eq!(
+                g.doc.regions[0].voffset, 4,
+                "the key scrolled the principal region"
+            );
+            assert_eq!(g.scroll, 0, "the document stayed put");
+            // The reader drove it ⇒ marked user-owned so a live re-render keeps it.
+            assert!(
+                !g.doc.regions[0].voffset_from_page,
+                "a user scroll of the principal region is not a page signal"
+            );
+        }
+        // End (a huge delta) clamps to the bottom, still on the region.
+        app.http_scroll(i64::MAX / 2);
+        let g = app.browser.as_ref().unwrap();
+        assert_eq!(
+            g.doc.regions[0].voffset,
+            g.doc.regions[0].max_voffset(),
+            "End clamps the principal region to its bottom"
+        );
+        assert_eq!(g.scroll, 0, "the document never moved");
+    }
+
+    #[test]
+    fn a_wheel_off_the_principal_region_still_scrolls_it_as_the_page() {
+        // A wheel over the chrome around the principal region (not over any
+        // region band) scrolls the principal region — it IS "the page".
+        let mut app = region_app();
+        app.browser.as_mut().unwrap().doc.regions[0].principal = true;
+        let (band_row, below) = {
+            let g = app.browser.as_ref().unwrap();
+            let rg = &g.doc.regions[0];
+            let below = app.last_content_area.y + (rg.start_row + rg.height as usize + 1) as u16;
+            (app.last_content_area.y + rg.start_row as u16, below)
+        };
+        // A wheel BELOW the region band (off it) drives the principal region.
+        app.browser_wheel(2, 3, below);
+        assert_eq!(
+            app.browser.as_ref().unwrap().doc.regions[0].voffset,
+            2,
+            "an off-region wheel scrolls the principal region"
+        );
+        assert_eq!(app.browser.as_ref().unwrap().scroll, 0, "not the document");
+        // A wheel INSIDE the band scrolls the same region directly (unchanged).
+        app.browser_wheel(1, 3, band_row);
+        assert_eq!(app.browser.as_ref().unwrap().doc.regions[0].voffset, 3);
     }
 
     #[test]
