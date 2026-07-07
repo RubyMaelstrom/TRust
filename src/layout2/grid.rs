@@ -740,21 +740,33 @@ fn size_tracks(
         distribute_group(tracks, &group, span_gaps, false);
         distribute_group(tracks, &group, span_gaps, true);
     }
-    // Flexible-track spanners: distribute minimum contributions to the
-    // flexible tracks by flex-factor ratio (all together, §11.5 last step).
+    // Flexible-track spanners (§11.5, step 4): distribute the item's minimum
+    // contribution to the spanned flexible tracks by flex-factor ratio (all
+    // together). Per §11.5.1, growing a track's BASE size to accommodate a
+    // spanning item's minimum contribution affects only tracks with an
+    // INTRINSIC min track sizing function. So a `minmax(0, 1fr)` track — whose
+    // minimum is a fixed `0` — is treated as inflexible here: its base stays
+    // 0 and §11.7 sizes it from the (definite) free space, letting the item's
+    // own `max-width` shrink it to fit. Contrast bare `1fr` = `minmax(auto,
+    // 1fr)`, whose `auto` minimum IS intrinsic, so a large spanning item grows
+    // its base and (correctly) overflows.
     let fr_items: Vec<&Contrib> = items
         .iter()
         .filter(|c| crosses_fr(&c.tracks, tracks))
         .collect();
+    let growable = |t: &Track| matches!(t.size.max, TrackFn::Fr(_)) && t.size.min.is_intrinsic();
     for c in fr_items {
+        // Tracks that don't grow here (fixed tracks, and flexible tracks with
+        // a fixed minimum) count as fixed at their current base size.
         let others: f32 = tracks[c.tracks.clone()]
             .iter()
-            .filter(|t| !matches!(t.size.max, TrackFn::Fr(_)))
+            .filter(|t| !growable(t))
             .map(|t| t.base)
             .sum();
         let space = (c.min - others - span_gaps(&c.tracks, tracks)).max(0.0);
         let factors: f32 = tracks[c.tracks.clone()]
             .iter()
+            .filter(|t| growable(t))
             .filter_map(|t| match t.size.max {
                 TrackFn::Fr(f) => Some(f),
                 _ => None,
@@ -762,7 +774,9 @@ fn size_tracks(
             .sum();
         let denom = factors.max(1.0);
         for t in tracks[c.tracks.clone()].iter_mut() {
-            if let TrackFn::Fr(f) = t.size.max {
+            if growable(t)
+                && let TrackFn::Fr(f) = t.size.max
+            {
                 t.base = t.base.max(space * (f / denom));
             }
         }
@@ -1611,6 +1625,52 @@ mod tests {
         size_tracks(&mut t, &items, Some(600.0), 0.0, false);
         let sum = t[0].base + t[1].base;
         assert!(sum >= 300.0 - 0.5, "spanner accommodated: {sum}");
+    }
+
+    #[test]
+    fn minmax_zero_fr_span_does_not_overflow() {
+        // A large item spanning 7 of 12 `minmax(0, 1fr)` tracks (the HF model-
+        // card `md:grid-cols-12` + `col-span-7` case). §11.5.1: the fixed `0`
+        // minimum is NOT an intrinsic min track sizing function, so the item's
+        // minimum contribution must NOT grow those tracks' base sizes — they
+        // stay fr-sized from the definite container, and the item overflows its
+        // own area rather than blowing the grid past the container.
+        let mut t = tpl("repeat(12, minmax(0, 1fr))", 1200.0, 0.0);
+        let items = [Contrib {
+            tracks: 0..7,
+            min: 2264.0, // a 283-cell image's min-content contribution
+            max: 2264.0,
+        }];
+        size_tracks(&mut t, &items, Some(1200.0), 0.0, true);
+        let total: f32 = t.iter().map(|x| x.base).sum();
+        assert!(
+            (total - 1200.0).abs() < 0.5,
+            "grid stays at container width, got {total}"
+        );
+        let span7: f32 = t[0..7].iter().map(|x| x.base).sum();
+        assert!(
+            (span7 - 700.0).abs() < 1.0,
+            "the 7 spanned tracks are 7/12 of 1200, got {span7}"
+        );
+    }
+
+    #[test]
+    fn bare_fr_span_overflows_via_auto_minimum() {
+        // Contrast: bare `1fr` = `minmax(auto, 1fr)`. The `auto` minimum IS
+        // intrinsic, so the same spanning item DOES grow the base sizes and the
+        // grid (correctly, per spec) overflows to hold the item's min-content.
+        let mut t = tpl("repeat(12, 1fr)", 1200.0, 0.0);
+        let items = [Contrib {
+            tracks: 0..7,
+            min: 2264.0,
+            max: 2264.0,
+        }];
+        size_tracks(&mut t, &items, Some(1200.0), 0.0, true);
+        let span7: f32 = t[0..7].iter().map(|x| x.base).sum();
+        assert!(
+            span7 >= 2264.0 - 0.5,
+            "auto-min tracks accommodate the spanner: {span7}"
+        );
     }
 
     #[test]

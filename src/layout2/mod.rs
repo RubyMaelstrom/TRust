@@ -2773,6 +2773,32 @@ mod tests {
     }
 
     #[test]
+    fn overflow_x_auto_with_inline_overflow_becomes_a_carousel() {
+        // The scrollable overflow of an `overflow-x:auto` box can come from its
+        // INLINE content (a `white-space:pre` long line), not only from wide
+        // child boxes (CSS Overflow L3 §2 — line boxes contribute to the
+        // scrollable overflow region). A `<pre><code>` code block is exactly
+        // this shape, so it must become a horizontal scroll strip too.
+        let out = lay(
+            r#"<body style="margin:0"><div style="overflow-x:auto;white-space:pre;width:80px;margin:0">ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 and the rest of this line keeps going far past the box edge</div></body>"#,
+            40,
+        );
+        assert_eq!(
+            out.carousels.len(),
+            1,
+            "inline (line-box) overflow forms a carousel"
+        );
+        let c = &out.carousels[0];
+        assert_eq!((c.left, c.right), (0, 10), "band = 80px = 10 cols");
+        assert!(
+            c.width > c.view_width(),
+            "strip ({}) wider than the band ({}) — the long line is reachable",
+            c.width,
+            c.view_width()
+        );
+    }
+
+    #[test]
     fn carousel_snaps_only_when_the_page_declares_it() {
         // scroll-snap-type on the container + scroll-snap-align on the cards ⇒
         // snap to those positions (CSS Scroll Snap 1). Here align:start ⇒ the
