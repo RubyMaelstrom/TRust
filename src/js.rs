@@ -26621,12 +26621,14 @@ mod tests {
     #[test]
     fn element_geometry_reports_real_cell_boxes() {
         // getBoundingClientRect / offset* now return the element's REAL laid-out
-        // box (a layout pass over the live DOM), not the viewport fiction.
-        // "HELLO" is 5 cells; cell_px is 8x16 → 40px wide, 16px tall. The
-        // viewport is 80x24 cells (640x384px), so a real box (40x16) is
-        // unmistakably distinct from the old fallback (640x384).
+        // box (a layout pass over the live DOM), not the viewport fiction. The
+        // probe is `inline-block` so it shrink-wraps to its content: "HELLO" is
+        // 5 cells; cell_px is 8x16 → 40px wide, 16px tall. Its left edge sits at
+        // 8px — the body's 8px UA margin. The viewport is 80x24 cells
+        // (640x384px), so a real box (40x16) is unmistakably distinct from the
+        // old fallback (640x384).
         let (out, outcome) = page(
-            r##"<body><div id=probe>HELLO</div><div id=out></div><script>
+            r##"<body><div id=probe style="display:inline-block">HELLO</div><div id=out></div><script>
             var p = document.getElementById('probe');
             var r = p.getBoundingClientRect();
             document.getElementById('out').textContent =
@@ -26635,7 +26637,7 @@ mod tests {
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(
-            out.contains("0 40 16 40 16"),
+            out.contains("8 40 16 40 16"),
             "geometry should be the real cell box, got: {out}"
         );
     }
@@ -26671,10 +26673,11 @@ mod tests {
         // Phase 2: `visibility:hidden` is paint suppression (CSS2 §11.2), not box
         // removal — the element is fully laid out, so getBoundingClientRect
         // reports its real box (not 0, not the viewport). "HELLO" = 5 cells;
-        // cell_px 8x16 → 40x16. Exercises the visibility bake through the JS
-        // serialize→re-parse→measure pipeline.
+        // cell_px 8x16 → 40x16 (the probe is `inline-block` so its box
+        // shrink-wraps to content). Exercises the visibility bake through the
+        // JS serialize→re-parse→measure pipeline.
         let (out, outcome) = page(
-            r##"<body><div id=probe style="visibility:hidden">HELLO</div><div id=out></div><script>
+            r##"<body><div id=probe style="visibility:hidden;display:inline-block">HELLO</div><div id=out></div><script>
             var r = document.getElementById('probe').getBoundingClientRect();
             document.getElementById('out').textContent = [r.width, r.height].join(' ');
             </script></body>"##,
@@ -26879,9 +26882,10 @@ mod tests {
         // it's inside the 0..384px viewport) reports `isIntersecting:true` with
         // its REAL box for `boundingClientRect` and a full ratio (1) — honest
         // viewport intersection. (A below-the-fold target would report false; see
-        // `a_below_fold_lazy_image_loads_when_scrolled_into_view`.)
+        // `a_below_fold_lazy_image_loads_when_scrolled_into_view`.) The probe is
+        // `inline-block` so its reported box shrink-wraps to content (40px).
         let (out, outcome) = page(
-            r##"<body><div id=probe>HELLO</div><div id=out></div><script>
+            r##"<body><div id=probe style="display:inline-block">HELLO</div><div id=out></div><script>
             var io = new IntersectionObserver(function (entries) {
                 var e = entries[0];
                 document.getElementById('out').textContent =

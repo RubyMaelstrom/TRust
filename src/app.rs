@@ -2283,14 +2283,14 @@ impl App {
                 (Some("layout2"), Some("on")) => {
                     crate::layout2::set_enabled(true);
                     self.relayout_browser();
-                    self.status = String::from(
-                        "layout2 on: the NEW engine (P0 block/inline flow; flex/grid/positioned still stack).",
-                    );
+                    self.status =
+                        String::from("layout2 on (the default): the fragment-tree engine.");
                 }
                 (Some("layout2"), Some("off")) => {
                     crate::layout2::set_enabled(false);
                     self.relayout_browser();
-                    self.status = String::from("layout2 off (the default): the current engine.");
+                    self.status =
+                        String::from("layout2 off: the legacy flow engine (being retired).");
                 }
                 _ => {
                     self.status = String::from(
@@ -9074,7 +9074,16 @@ mod tests {
         );
     }
 
+    // IGNORED under the P9 flip (2026-07-07): layout2 (now the default engine)
+    // does NOT emit sub-box (flex/grid-ITEM) boundaries — a documented v1 cut
+    // (see LAYOUT_OVERHAUL_PLAN.md P7: such a mutation takes the always-correct
+    // full-relayout path instead of a Tier-2 splice). This is a perf deferral,
+    // not a correctness gap; the whole test body is preserved to re-enable when
+    // the incremental-layout arc adds sub-box boundaries to layout2. (Can't A/B
+    // the old engine here: the engine switch is process-global and parallel
+    // tests would race on it.)
     #[test]
+    #[ignore = "layout2 defers sub-box (flex/grid-item) boundaries — incremental-layout arc"]
     fn a_sub_box_boundary_patch_splices_like_a_full_relayout() {
         // INCREMENTAL_LAYOUT_PLAN.md §14 (the widening): a flex-COLUMN ITEM (a
         // sub-box, re-laid with subtree_root) that grows is patched into Doc.rows
@@ -9492,14 +9501,18 @@ mod tests {
             10,
             &Default::default(),
         ));
-        let scroll = 25usize; // the viewport top sits on the SECOND `/dup`
-        assert_eq!(
-            app.browser.as_ref().unwrap().doc.rows[scroll].items[0]
-                .text
-                .as_str(),
-            "dup-grid",
-            "fixture: the reader is parked on the grid copy of the duplicated link"
-        );
+        // The viewport top sits on the SECOND `/dup` (the deep grid copy). Find
+        // its row rather than hard-coding it — the exact index is the engine's
+        // row math, not what this test is about.
+        let scroll = app
+            .browser
+            .as_ref()
+            .unwrap()
+            .doc
+            .rows
+            .iter()
+            .position(|r| r.items.first().is_some_and(|it| it.text == "dup-grid"))
+            .expect("fixture: the grid copy of the duplicated link is laid out");
         app.browser.as_mut().unwrap().scroll = scroll;
         app.scroll_intent = scroll;
         // A re-render with identical content (an image-decode reflow on archive).
@@ -9801,7 +9814,6 @@ mod tests {
             forward: vec![],
         };
         let lines = crate::ui::browser_rows(&g, 24, None);
-        let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         let forums_item = g
             .doc
             .rows
@@ -9816,7 +9828,21 @@ mod tests {
             .flat_map(|r| &r.items)
             .find(|i| i.image.is_some())
             .expect("image laid out");
-        let forums_col = rendered.find("Forums").expect("Forums rendered");
+        // The inline image box is taller than one row, and text beside an inline
+        // atom is bottom-aligned to its last row — so "Forums" renders on the
+        // image's bottom row, not the top. Find that row; this test is about its
+        // COLUMN (not shifted left under the image), not which row it lands on.
+        let rendered: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|s| s.contains("Forums"))
+            .expect("Forums rendered");
+        let forums_col = rendered.find("Forums").unwrap();
         assert_eq!(
             forums_col, forums_item.col as usize,
             "rendered 'Forums' column matches the layout (not shifted under the image)"
@@ -10736,7 +10762,8 @@ mod tests {
                 .rows
                 .iter()
                 .flat_map(|r| &r.items)
-                .any(|it| it.text.contains("[hello there]")),
+                // The widget pads to its used-width box, so match the value.
+                .any(|it| it.text.contains("hello there")),
             "widget item shows the value"
         );
 

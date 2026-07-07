@@ -34,8 +34,9 @@
 //! viewport's OWN overflow is a separate, §3.3 concern, never delegated to a
 //! descendant) or an inline strip (a horizontal Carousel, P5c). Floats still
 //! degrade to honest block stacking — a staged
-//! phase, never policy. Behind `set layout2 on` /
-//! `TRUST_LAYOUT2=1` until parity (the plan's A/B gate); incremental-layout
+//! phase, never policy. This is now the DEFAULT engine (P9 flip, 2026-07-07);
+//! `set layout2 off` / `TRUST_LAYOUT2=0` A/Bs back to the old flow engine
+//! during the soak week. Incremental-layout
 //! boundaries are intentionally not emitted yet, so live pages take the
 //! always-correct full-relayout path.
 
@@ -72,13 +73,20 @@ use value::Vp;
 /// Session-global engine switch (`set layout2 on|off`), seeded once from
 /// `TRUST_LAYOUT2` so test harnesses (`net_diag`, `layout_dump`) can A/B
 /// without a UI. Same pattern as `layout::BORDERS_ENABLED`.
-static ENABLED: AtomicBool = AtomicBool::new(false);
+///
+/// P9 FLIP (2026-07-07): layout2 is now the DEFAULT engine. The switch stays
+/// through the soak week as the escape hatch to the old flow engine
+/// (`set layout2 off` / `TRUST_LAYOUT2=0`); it — and layout.rs's flow — get
+/// deleted once the soak is clean.
+static ENABLED: AtomicBool = AtomicBool::new(true);
 
 fn env_seed() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        if std::env::var_os("TRUST_LAYOUT2").is_some_and(|v| v != "0") {
-            ENABLED.store(true, Ordering::Relaxed);
+        // Bidirectional now that the default is ON: an explicit `TRUST_LAYOUT2=0`
+        // A/Bs back to the old flow engine; any other value forces layout2 on.
+        if let Some(v) = std::env::var_os("TRUST_LAYOUT2") {
+            ENABLED.store(v != "0", Ordering::Relaxed);
         }
     });
 }

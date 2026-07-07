@@ -500,6 +500,20 @@ impl Builder<'_> {
                 None => {}
             }
         }
+        // A `contenteditable` host bound to a field (http::walk_forms_arena made
+        // it a synthetic textarea) is ONE editable widget: render it as a
+        // control atom and skip its subtree (the editor's own markup isn't ours
+        // to flow) — the same path a real `<textarea>` takes.
+        if self.dom.is_contenteditable_host(id)
+            && let Some(&(form, field)) = self.controls.get(&id)
+            && self
+                .forms
+                .get(form)
+                .and_then(|f| f.fields.get(field))
+                .is_some_and(|f| f.kind != FieldKind::Hidden)
+        {
+            return Replaced::Atom(AtomKind::Control { form, field });
+        }
         Replaced::No
     }
 
@@ -537,9 +551,34 @@ impl Builder<'_> {
         } else {
             (None, false)
         };
-        let kids = self.children(id);
+        let mut kids = self.children(id);
         if list {
             self.lists.pop();
+        }
+        // A button-less form carries its synthetic submit keyed on the form node
+        // itself (http::walk_forms_arena — there is no submit ELEMENT to map).
+        // Append it as a trailing control atom: a block form gives it its own
+        // row, a flex/inline-flex form flows it as the last item (the old
+        // engine's `place_form_stub` block-vs-inline split, structurally).
+        if tag == "form"
+            && let Some(&(form, field)) = self.controls.get(&id)
+            && self
+                .forms
+                .get(form)
+                .and_then(|f| f.fields.get(field))
+                .is_some_and(|f| f.kind == FieldKind::Submit)
+        {
+            kids.push(Built::Block(Box::new(BoxNode {
+                node: id,
+                style: BoxStyle::anonymous(),
+                content: Content::Atomic(Atom {
+                    node: id,
+                    kind: AtomKind::Control { form, field },
+                }),
+                marker: None,
+                marker_inside: false,
+                oof: Vec::new(),
+            })));
         }
         if matches!(disp, Disp::Flex | Disp::Grid) {
             let (its, oof) = self.itemize(kids);

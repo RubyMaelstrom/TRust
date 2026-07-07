@@ -6943,9 +6943,10 @@ customElements.define('lit-counter', LitCounter);
         assert_eq!(form.fields[2].label, "Send");
 
         // The hidden field never renders; the others are selectable Form
-        // items with the right control links.
+        // items with the right control links. (The text input pads to its used
+        // width — the UA-default 20ch box — so match the label, not `[label]`.)
         assert!(!has_item(&doc, "cafe123"));
-        let input = item(&doc, "[Type a message...]");
+        let input = item(&doc, "Type a message...");
         assert_eq!(input.kind, crate::layout::ItemKind::Form);
         assert_eq!(input.link, Some(Link::Form { form: 0, field: 1 }));
         let button = item(&doc, "[ Send ]");
@@ -6977,7 +6978,9 @@ customElements.define('lit-counter', LitCounter);
             "an editor is not a submitted control"
         );
         assert!(field.value.is_empty(), "whitespace-only is an empty editor");
-        let widget = item(&doc, "[Type here]");
+        // The editor widget pads to its used width (a textarea box), so match
+        // the placeholder label rather than `[label]`.
+        let widget = item(&doc, "Type here");
         assert_eq!(widget.kind, crate::layout::ItemKind::Form);
         assert_eq!(widget.link, Some(Link::Form { form: 0, field: 0 }));
 
@@ -7022,7 +7025,9 @@ customElements.define('lit-counter', LitCounter);
         );
         assert_eq!(rewrapped.forms[0].fields[1].value, "hello there");
         assert!(
-            has_item(&rewrapped, "[hello there]"),
+            // The widget pads to its used-width box, so the value no longer
+            // hugs the closing bracket — match the value itself.
+            has_item(&rewrapped, "hello there"),
             "widget item shows the typed value"
         );
     }
