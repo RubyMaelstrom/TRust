@@ -10511,14 +10511,15 @@ mod tests {
     #[test]
     fn hover_affected_check_skips_color_only_rules() {
         // The efficiency answer (her call to include CSS :hover): a page whose
-        // hover rules touch only UNRENDERED properties (color/background —
-        // not in the PROPS registry) reports "unaffected" on every chain move:
-        // no epoch bump, no dirty, no relayout. A tracked-property rule on the
-        // SAME page still trips the probe only when a candidate element's
-        // state flips.
+        // hover rules touch only UNRENDERED properties (color — not in the PROPS
+        // registry) reports "unaffected" on every chain move: no epoch bump, no
+        // dirty, no relayout. A tracked-property rule on the SAME page still
+        // trips the probe only when a candidate element's state flips.
+        // (`background` is render-affecting under layout2 — the cell compositor
+        // paints opaque fills — so it is NOT a color-only property there.)
         let mut dom = Dom::parse_document(
             "<head><style>\
-             a:hover{color:red;background:blue}\
+             a:hover{color:red}\
              .card:hover{display:none}\
              </style></head>\
              <body><a id=l href=x>link</a><div id=c class=card>card</div></body>",
