@@ -666,15 +666,17 @@ pub fn visible_col(carousels: &[Carousel], row: usize, item: &Item) -> Option<u1
 
 /// The on-screen placement of `item` under any carousel windowing `row` —
 /// `Some((screen_col, visible_width, head_cut))`, or `None` if it is scrolled
-/// entirely out of the band. TWO regimes by the item's width vs the band's:
+/// entirely out of the band. TWO regimes, by whether the item is CLIPPABLE:
 ///
-/// - a CARD (`width <= band`) keeps the all-or-nothing rule — drawn only when it
-///   sits WHOLLY inside the band (`head_cut` 0), exactly as before, so image
-///   strips are unaffected;
-/// - a WIDE run (`width > band` — a `white-space:pre` code line longer than its
-///   `overflow-x:auto` box) is PARTIALLY clipped to the band so it can be
-///   scrolled through: `head_cut` display columns are shaved off its left and
-///   `visible_width` cells remain.
+/// - an ATOMIC card (an image/replaced box, no sliceable text) that fits the
+///   band keeps the all-or-nothing rule — drawn only when it sits WHOLLY inside
+///   the band (`head_cut` 0), so image strips scroll card-by-card (a terminal
+///   cell can't horizontally half-paint an image);
+/// - TEXT (any width — a `white-space:pre` code line and every piece of it), or
+///   an atomic box wider than the band, is PARTIALLY clipped to the band so it
+///   can be scrolled through: `head_cut` display columns are shaved off its left
+///   and `visible_width` cells remain. (A sub-band text piece is clipped, NOT
+///   dropped — the old width-based split vanished code-line pieces at the edge.)
 ///
 /// Items outside every carousel (or left of the band — page content beside the
 /// strip) place at their own column, full width. The right frame bar of an
@@ -695,15 +697,25 @@ fn carousel_place(carousels: &[Carousel], row: usize, item: &Item) -> Option<(u1
         let screen_start = item.col as i32 - c.offset as i32;
         let screen_end = screen_start + item.width as i32;
         let (left, right) = (c.left as i32, c.right as i32);
-        if item.width <= c.right.saturating_sub(c.left) {
-            // Card: shown only wholly-inside (unchanged strip behaviour).
+        // An ATOMIC card — an image/replaced box with no sliceable text — keeps
+        // the all-or-nothing rule (drawn only when WHOLLY inside the band): a
+        // terminal cell can't horizontally half-paint an image, so image strips
+        // scroll card-by-card. TEXT is always clipped to the band's visible
+        // slice regardless of width, so a code line's SHORT pieces (a narrow
+        // line, a highlighted token, a trailing run) scroll through by the cell
+        // instead of VANISHING the instant they straddle a band edge — the
+        // width-based split used to treat any sub-band run as an image card,
+        // which dropped code-line pieces whole and cut lines short mid-band.
+        let atomic = item.image.is_some() || item.text.is_empty();
+        if atomic && item.width <= c.right.saturating_sub(c.left) {
             return (screen_start >= left && screen_end <= right).then_some((
                 screen_start as u16,
                 item.width,
                 0,
             ));
         }
-        // Wider than the band: clip the visible slice.
+        // Text (any width), or an atomic box wider than the band: clip the
+        // visible slice.
         let vis_start = screen_start.max(left);
         let vis_end = screen_end.min(right);
         if vis_start >= vis_end {
@@ -21128,16 +21140,39 @@ mod tests {
         let vc = visual_columns(&row, std::slice::from_ref(&car(12)), 0);
         assert_eq!(vc, vec![(0, 0, 10, 12)]);
         assert_eq!(slice_display(line, 12, 10), "cdefghijkl");
-        // A card that FITS the band keeps the all-or-nothing rule: at offset 0 a
-        // 6-cell item wholly inside shows; scrolled out (offset 20) it's gone.
-        let card = Row {
-            items: vec![mk(2, 6, "CARD12")],
+        // An IMAGE card that FITS the band keeps the all-or-nothing rule (a
+        // terminal cell can't horizontally half-paint an image): wholly inside
+        // (offset 0) it shows; STRADDLING the left edge (offset 4) it's gone.
+        let mk_img = |col, width, text: &str| Item {
+            image: Some("u".into()),
+            ..mk(col, width, text)
+        };
+        let img = Row {
+            items: vec![mk_img(2, 6, "IMGCAP")],
         };
         assert_eq!(
-            visual_columns(&card, std::slice::from_ref(&car(0)), 0),
+            visual_columns(&img, std::slice::from_ref(&car(0)), 0),
             vec![(0, 2, 6, 0)]
         );
-        assert!(visual_columns(&card, std::slice::from_ref(&car(20)), 0).is_empty());
+        assert!(
+            visual_columns(&img, std::slice::from_ref(&car(4)), 0).is_empty(),
+            "a sub-band image card straddling the band edge is dropped whole"
+        );
+        // A sub-band TEXT run, by contrast, CLIPS as it straddles instead of
+        // vanishing — a code line's short pieces scroll through cell-by-cell
+        // (the HuggingFace docstring-line disappearance). At offset 4 the 6-cell
+        // run at col 2 shows its tail: screen [-2,4) → visible [0,4), head-cut 2.
+        let short = Row {
+            items: vec![mk(2, 6, "abcdef")],
+        };
+        assert_eq!(
+            visual_columns(&short, std::slice::from_ref(&car(4)), 0),
+            vec![(0, 0, 4, 2)],
+            "sub-band text clips at the band edge, not all-or-nothing"
+        );
+        assert_eq!(slice_display("abcdef", 2, 4), "cdef");
+        // Fully scrolled off the left it is legitimately gone (window empty).
+        assert!(visual_columns(&short, std::slice::from_ref(&car(20)), 0).is_empty());
     }
 
     #[test]

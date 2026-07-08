@@ -2363,14 +2363,22 @@ impl Flow<'_> {
         // its own internal scroll. (The principal scroller — CSS Overflow L3
         // §3.1, its content becomes the document scroll — was already exempt
         // for the analogous reason; this generalizes the same escape to every
-        // scroll container.) Gated on the cheap `is_scroll_container` read so
-        // the common non-scrolling fragment is untouched.
-        let own_clip =
-            if own_clip.is_some() && f.node != NO_NODE && self.dom.is_scroll_container(f.node) {
-                None
-            } else {
-                own_clip
-            };
+        // scroll container.) This holds on EITHER axis: a HORIZONTAL scroll
+        // container (`overflow-x:auto`, a `<pre>` code block) whose long lines
+        // are pulled into a carousel buffer must likewise escape the ancestor's
+        // clip — otherwise the ancestor's right edge truncates every line at
+        // paint time (composite clips to the inherited bound), so the scrolled-
+        // away tail is never in the buffer and the strip "cuts off" mid-band no
+        // matter how far you scroll. Gated on the cheap scroll-container reads
+        // so the common non-scrolling fragment is untouched.
+        let own_clip = if own_clip.is_some()
+            && f.node != NO_NODE
+            && (self.dom.is_scroll_container(f.node) || self.dom.is_hscroll_container(f.node))
+        {
+            None
+        } else {
+            own_clip
+        };
         // This fragment's own painted cells are clipped by its containing-block
         // chain (`own_clip`); its in-flow descendants — and the abspos/fixed
         // descendants for which it is the containing block — are additionally

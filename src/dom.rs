@@ -4786,13 +4786,20 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     arg = Some(inner);
                 }
                 if name == "not" {
-                    // Step-1 :not takes compounds (no combinators) —
-                    // anything fancier fails the parse (rule ignored,
-                    // fail-open). Specificity comes from the argument.
+                    // Step-1 :not takes compounds (no top-level combinators) —
+                    // a combinator makes the parse fail (rule ignored,
+                    // fail-open) via the single-compound check below:
+                    // `parse_compound` breaks at a combinator and the leftover
+                    // `peek().is_some()` rejects it. We must NOT reject on a
+                    // naive whitespace scan, because whitespace can live INSIDE
+                    // a nested functional pseudo (`:not(:where(a, b c))`, a
+                    // Tailwind-typography idiom) or an attribute value
+                    // (`:not([title="a b"])`) — both valid single compounds.
+                    // Specificity comes from the argument.
                     let mut group = Vec::new();
                     for part in split_top_level(&arg?, ',') {
                         let part = part.trim();
-                        if part.is_empty() || part.contains(char::is_whitespace) {
+                        if part.is_empty() {
                             return None;
                         }
                         let mut inner_chars = part.chars().peekable();
@@ -10565,6 +10572,63 @@ mod tests {
                 .as_deref(),
             Some("2px"),
             ":not(:hover) still applies at rest"
+        );
+    }
+
+    #[test]
+    fn not_allows_whitespace_nested_in_a_functional_pseudo() {
+        // `:not()` takes a single compound (no TOP-LEVEL combinator), but the
+        // arg may nest whitespace inside a functional pseudo or an attribute
+        // value — those are still one compound and must parse. The old naive
+        // "reject any whitespace in the arg" guard dropped these whole rules.
+        // This is the @tailwindcss/typography `prose` code-block idiom that
+        // gives every `<pre>` its horizontal scroll region (HuggingFace model
+        // cards, and every Tailwind-prose site): the `:where(... , ... *)`
+        // list carries an inner descendant combinator.
+        let hf = ".prose :where(pre):not(:where([class~=not-prose],[class~=not-prose] *))";
+        let dom = Dom::parse_document(&format!(
+            "<head><style>{hf}{{overflow-x:auto}}</style></head>\
+             <body><div class=prose><div><pre id=t><code>x</code></pre></div>\
+             <pre id=np class=not-prose>y</pre></div></body>"
+        ));
+        assert_eq!(
+            dom.computed_value(dom.get_by_id("t").unwrap(), "overflow-x")
+                .as_deref(),
+            Some("auto"),
+            "prose <pre> gets its scroll region (whitespace nested in :where(:not(...)))"
+        );
+        assert_eq!(
+            dom.computed_value(dom.get_by_id("np").unwrap(), "overflow-x"),
+            None,
+            "a .not-prose <pre> is still excluded by the :not()"
+        );
+
+        // A genuine TOP-LEVEL combinator inside :not() must still fail the
+        // whole rule (we don't support complex-selector :not) — fail-open.
+        let dom2 = Dom::parse_document(
+            "<head><style>p:not(.a .b){overflow-x:auto}</style></head><body><p id=t>x</p></body>",
+        );
+        assert_eq!(
+            dom2.computed_value(dom2.get_by_id("t").unwrap(), "overflow-x"),
+            None,
+            ":not() with a real combinator still drops the rule"
+        );
+
+        // Whitespace inside an attribute-value :not() arg is also one compound.
+        let dom3 = Dom::parse_document(
+            "<head><style>p:not([title=\"a b\"]){overflow-x:auto}</style></head>\
+             <body><p id=t title=\"c\">x</p><p id=x title=\"a b\">y</p></body>",
+        );
+        assert_eq!(
+            dom3.computed_value(dom3.get_by_id("t").unwrap(), "overflow-x")
+                .as_deref(),
+            Some("auto"),
+            ":not([title=\"a b\"]) matches an element WITHOUT that title"
+        );
+        assert_eq!(
+            dom3.computed_value(dom3.get_by_id("x").unwrap(), "overflow-x"),
+            None,
+            "and excludes the element WITH that title"
         );
     }
 }
