@@ -501,6 +501,57 @@ mod tests {
         lay_images(html, cols, &HashMap::new())
     }
 
+    #[test]
+    fn hscroll_strip_escapes_an_overflow_hidden_ancestor_clip() {
+        // A `<pre overflow-x:auto>` code line nested inside an `overflow:hidden`
+        // ancestor (a locked model-card / app-shell column — HuggingFace) must
+        // pull its FULL line into the carousel buffer, not the ancestor's
+        // clipped slice. The ancestor's clip escape (`resolve_oof`) fired only
+        // for vertical scroll containers, so a horizontal-only scroller had its
+        // long lines truncated to the ancestor's right edge at composite time —
+        // the tail was never in the buffer and the strip "cut off" mid-band no
+        // matter how far you scrolled.
+        let line = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz"; // 62
+        let html = format!(
+            "<div style=\"width:20ch;overflow:hidden\">\
+             <pre style=\"overflow-x:auto;white-space:pre\"><code>{line}</code></pre></div>"
+        );
+        let out = lay(&html, 40);
+        assert_eq!(out.carousels.len(), 1, "the pre is a horizontal strip");
+        // The line item lives in the strip rows; its full width must survive
+        // (not be truncated to the 20-cell ancestor clip).
+        let widest = out
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|it| it.text.starts_with("ABC"))
+            .map(|it| it.width)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            widest,
+            line.chars().count() as u16,
+            "the full code line is in the buffer, not clipped to the ancestor"
+        );
+        // And it scrolls to reveal the tail: at a large offset the window shows
+        // the end of the line, filling the band.
+        let mut cars = out.carousels.clone();
+        let band = cars[0].right - cars[0].left;
+        cars[0].offset = cars[0].width.saturating_sub(band); // max offset
+        let long_row = out
+            .rows
+            .iter()
+            .position(|r| r.items.iter().any(|it| it.text.starts_with("ABC")))
+            .unwrap();
+        let vc = crate::layout::visual_columns(&out.rows[long_row], &cars, long_row);
+        let (i, _, w, cut) = vc[0];
+        let vis = crate::layout::slice_display(&out.rows[long_row].items[i].text, cut, w as usize);
+        assert!(
+            vis.ends_with("xyz"),
+            "scrolled to the end, the strip shows the line's tail: {vis:?}"
+        );
+    }
+
     fn lay_images(html: &str, cols: usize, images: &ImageSizes) -> Output {
         lay_full(html, cols, images, &HashMap::new())
     }
