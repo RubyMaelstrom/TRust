@@ -38,7 +38,17 @@ mod tls;
 mod ui;
 mod ws;
 
+use std::io::Write;
 use std::process::ExitCode;
+
+/// Pop the terminal's title stack (CSI 23;2t, the counterpart to the 22;2t
+/// push in `main`), restoring whatever title was showing before TRust took
+/// it over. Best-effort: a terminal that never pushed just ignores this.
+fn pop_terminal_title() {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[23;2t");
+    let _ = out.flush();
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -107,13 +117,14 @@ async fn main() -> ExitCode {
             return; // background panic, caught downstream — keep the TUI clean
         }
         // A real render/run-loop panic: drop mouse capture and paste mode,
-        // then let ratatui's hook restore the screen and the default hook
-        // print.
+        // pop the terminal title back, then let ratatui's hook restore the
+        // screen and the default hook print.
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableMouseCapture,
             crossterm::event::DisableBracketedPaste
         );
+        pop_terminal_title();
         ratatui_hook(info);
     }));
 
@@ -131,6 +142,13 @@ async fn main() -> ExitCode {
         crossterm::event::EnableMouseCapture,
         crossterm::event::EnableBracketedPaste
     );
+    // Take over the terminal title for the run. Push the terminal's current
+    // title onto its title stack first (CSI 22;2t — title-only, no icon:
+    // foot's ctlseqs(7) documents 22/23 with param 2 as exactly this, and
+    // it's the same xterm-family sequence elsewhere) so it can be popped
+    // back (CSI 23;2t) on exit instead of guessing/hardcoding what it was.
+    let _ = std::io::stdout().write_all(b"\x1b[22;2t");
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("TRust"));
     let mut app = app::App::new(host, start_port.unwrap_or(23));
     app.start_port = start_port;
     app.set_picker(picker);
@@ -140,6 +158,7 @@ async fn main() -> ExitCode {
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste
     );
+    pop_terminal_title();
     ratatui::restore();
 
     match result {

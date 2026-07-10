@@ -21098,7 +21098,6 @@ mod tests {
 
     #[test]
     fn carousel_clips_a_wide_line_to_its_band() {
-        use crate::doc::Link;
         let mk = |col, width, text: &str| Item {
             col,
             width,
