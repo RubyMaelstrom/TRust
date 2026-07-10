@@ -713,7 +713,32 @@ impl<'ctx> ByteCompiler<'ctx> {
         }
 
         if binding.local() {
-            return BindingKind::Local(self.local_binding_registers.get(binding).copied());
+            let reg = self.local_binding_registers.get(binding).copied();
+            if reg.is_none() && std::env::var_os("TRUST_BOA_BIND_LOG").is_some() {
+                let want_name = binding.locator().name().clone();
+                eprintln!("BIND-LOCAL-NONE lookup={binding:?}");
+                let mut same_name = 0usize;
+                for (k, v) in &self.local_binding_registers {
+                    if *k.locator().name() == want_name {
+                        same_name += 1;
+                        eprintln!("   SAME-NAME reg={v} key={k:?}");
+                    }
+                }
+                eprintln!(
+                    "   (total regs={}, same-name={})",
+                    self.local_binding_registers.len(),
+                    same_name
+                );
+                eprintln!(
+                    "   lexical_scope chain: {}",
+                    self.lexical_scope.trust_debug_chain(&want_name)
+                );
+                eprintln!(
+                    "   variable_scope chain: {}",
+                    self.variable_scope.trust_debug_chain(&want_name)
+                );
+            }
+            return BindingKind::Local(reg);
         }
 
         if let Some(index) = self.bindings_map.get(&binding.locator()) {
