@@ -284,6 +284,41 @@ impl Scope {
         self.inner.bindings.borrow().iter().any(|b| &b.name == name)
     }
 
+    /// TRust diagnostic: walk the outer chain, describing each scope's
+    /// unique_id / positional index / whether it directly binds `name`.
+    #[must_use]
+    pub fn trust_debug_chain(&self, name: &JsString) -> String {
+        let mut out = String::new();
+        let mut cur = Some(self.clone());
+        while let Some(s) = cur {
+            let bound = s
+                .inner
+                .bindings
+                .borrow()
+                .iter()
+                .find(|b| &b.name == name)
+                .map(|b| {
+                    format!(
+                        "HAS(idx={} lex={} esc={})",
+                        b.index,
+                        b.is_lex(),
+                        b.escapes()
+                    )
+                });
+            out.push_str(&format!(
+                "[uid={} index={} fn={} arrow={} {}] -> ",
+                s.inner.unique_id,
+                s.inner.index.get(),
+                s.inner.function,
+                s.inner.arrow.get(),
+                bound.as_deref().unwrap_or("no")
+            ));
+            cur = s.inner.outer.clone();
+        }
+        out.push_str("<root>");
+        out
+    }
+
     /// Get the binding locator for a binding with the given name.
     /// Fall back to the global scope if the binding is not found.
     #[must_use]

@@ -11746,6 +11746,27 @@ const PRELUDE: &str = r##"
         hasAttribute(n) { return this.getAttribute(n) !== null; }
         getAttributeNames() { return __dom_attr_names(this.__id); }
         hasAttributes() { return __dom_attr_names(this.__id).length > 0; }
+        // Attr-node accessors (DOM §4.9.2). React DOM's property commit reads
+        // getAttributeNode then removeAttributeNode; without them it threw
+        // "undefined is not a callable (reading 'removeAttributeNode')". An Attr
+        // here is the SAME plain object the `attributes` NamedNodeMap yields
+        // (name/value/ownerElement/…) — we keep no GC-wrapped Attr node.
+        getAttributeNode(n) { return this.attributes.getNamedItem(n); }
+        getAttributeNodeNS(_ns, n) { return this.attributes.getNamedItem(n); }
+        setAttributeNode(attr) {
+            const old = this.getAttributeNode(attr.name);
+            this.setAttribute(attr.name, attr.value == null ? "" : attr.value);
+            attr.ownerElement = this;
+            return old;
+        }
+        setAttributeNodeNS(attr) { return this.setAttributeNode(attr); }
+        removeAttributeNode(attr) {
+            // Spec returns the removed Attr; be lenient on a stale/foreign node
+            // (fail-open, like the rest of the platform surface) and remove by name.
+            const removed = this.getAttributeNode(attr.name) || attr;
+            this.removeAttribute(attr.name);
+            return removed;
+        }
         // NamedNodeMap, array-like enough for Array.from/iteration/indexing
         // (Alpine's DOM morph does `Array.from(el.attributes)` — undefined
         // here threw ToObject and aborted danbooru's whole render).
@@ -11763,10 +11784,21 @@ const PRELUDE: &str = r##"
             if (list && !this.__attrMapStale) return list;
             if (!list) {
                 list = [];
+                list.__owner = this;
                 list.item = function (i) { return this[i] || null; };
                 list.getNamedItem = function (nm) {
                     for (var j = 0; j < this.length; j++) if (this[j].name === String(nm)) return this[j];
                     return null;
+                };
+                // setNamedItem/removeNamedItem round out the map (DOM §4.9.1);
+                // they route through the owner's set/removeAttribute funnels.
+                list.setNamedItem = function (attr) { return this.__owner.setAttributeNode(attr); };
+                list.setNamedItemNS = function (attr) { return this.__owner.setAttributeNode(attr); };
+                list.removeNamedItem = function (nm) {
+                    const old = this.getNamedItem(nm);
+                    if (!old) throw new (g.DOMException || TypeError)("No attribute named " + nm, "NotFoundError");
+                    this.__owner.removeAttribute(String(nm));
+                    return old;
                 };
                 this.__attrMap = list;
             } else {
@@ -12679,6 +12711,13 @@ const PRELUDE: &str = r##"
         createElementNS(_, t) { return this.createElement(t); }
         createTextNode(s) { return wrap(__dom_create_text(s === undefined ? "" : String(s))); }
         createComment(s) { return wrap(__dom_create_comment(s === undefined ? "" : String(s))); }
+        // A detached Attr (DOM §4.9.2): a plain object matching what the
+        // `attributes` NamedNodeMap yields, so setAttributeNode can consume it.
+        createAttribute(n) {
+            n = String(n).toLowerCase();
+            return { name: n, localName: n, nodeName: n, namespaceURI: null, prefix: null, specified: true, ownerElement: null, value: "", nodeValue: "" };
+        }
+        createAttributeNS(_ns, n) { const a = this.createAttribute(String(n)); return a; }
         importNode(n, deep) { return n.cloneNode(!!deep); }
         createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
         createNodeIterator(root, whatToShow) { return new NodeIterator(root, whatToShow); }
@@ -12785,6 +12824,8 @@ const PRELUDE: &str = r##"
         createElementNS(_n, t) { return document.createElement(t); }
         createTextNode(s) { return document.createTextNode(s); }
         createComment(s) { return document.createComment(s); }
+        createAttribute(n) { return document.createAttribute(n); }
+        createAttributeNS(ns, n) { return document.createAttributeNS(ns, n); }
         createDocumentFragment() { return document.createDocumentFragment(); }
         createEvent(t) { return document.createEvent(t); }
         createRange() { return new Range(); }
@@ -14739,6 +14780,83 @@ const PRELUDE: &str = r##"
         for (let i = 0; i < 8; i++) o.setUint32(i * 4, h[i]);
         return out;
     }
+    // SHA-384/512 need 64-bit words JS lacks natively, so the core runs on
+    // BigInt (masked to 64 bits). digest() inputs are small (request uids,
+    // token hashes), so BigInt's cost is irrelevant; correctness is what
+    // matters. Block size 128B, 128-bit big-endian length field. ChatGPT's
+    // boot hashes with SHA-512; without it the reject aborted its init.
+    const __M64 = (1n << 64n) - 1n;
+    const __SHA512_K = [
+        0x428a2f98d728ae22n, 0x7137449123ef65cdn, 0xb5c0fbcfec4d3b2fn, 0xe9b5dba58189dbbcn,
+        0x3956c25bf348b538n, 0x59f111f1b605d019n, 0x923f82a4af194f9bn, 0xab1c5ed5da6d8118n,
+        0xd807aa98a3030242n, 0x12835b0145706fben, 0x243185be4ee4b28cn, 0x550c7dc3d5ffb4e2n,
+        0x72be5d74f27b896fn, 0x80deb1fe3b1696b1n, 0x9bdc06a725c71235n, 0xc19bf174cf692694n,
+        0xe49b69c19ef14ad2n, 0xefbe4786384f25e3n, 0x0fc19dc68b8cd5b5n, 0x240ca1cc77ac9c65n,
+        0x2de92c6f592b0275n, 0x4a7484aa6ea6e483n, 0x5cb0a9dcbd41fbd4n, 0x76f988da831153b5n,
+        0x983e5152ee66dfabn, 0xa831c66d2db43210n, 0xb00327c898fb213fn, 0xbf597fc7beef0ee4n,
+        0xc6e00bf33da88fc2n, 0xd5a79147930aa725n, 0x06ca6351e003826fn, 0x142929670a0e6e70n,
+        0x27b70a8546d22ffcn, 0x2e1b21385c26c926n, 0x4d2c6dfc5ac42aedn, 0x53380d139d95b3dfn,
+        0x650a73548baf63den, 0x766a0abb3c77b2a8n, 0x81c2c92e47edaee6n, 0x92722c851482353bn,
+        0xa2bfe8a14cf10364n, 0xa81a664bbc423001n, 0xc24b8b70d0f89791n, 0xc76c51a30654be30n,
+        0xd192e819d6ef5218n, 0xd69906245565a910n, 0xf40e35855771202an, 0x106aa07032bbd1b8n,
+        0x19a4c116b8d2d0c8n, 0x1e376c085141ab53n, 0x2748774cdf8eeb99n, 0x34b0bcb5e19b48a8n,
+        0x391c0cb3c5c95a63n, 0x4ed8aa4ae3418acbn, 0x5b9cca4f7763e373n, 0x682e6ff3d6b2b8a3n,
+        0x748f82ee5defb2fcn, 0x78a5636f43172f60n, 0x84c87814a1f0ab72n, 0x8cc702081a6439ecn,
+        0x90befffa23631e28n, 0xa4506cebde82bde9n, 0xbef9a3f7b2c67915n, 0xc67178f2e372532bn,
+        0xca273eceea26619cn, 0xd186b8c721c0c207n, 0xeada7dd6cde0eb1en, 0xf57d4f7fee6ed178n,
+        0x06f067aa72176fban, 0x0a637dc5a2c898a6n, 0x113f9804bef90daen, 0x1b710b35131c471bn,
+        0x28db77f523047d84n, 0x32caab7b40c72493n, 0x3c9ebe0a15c9bebcn, 0x431d67c49c100d4cn,
+        0x4cc5d4becb3e42b6n, 0x597f299cfc657e2an, 0x5fcb6fab3ad6faecn, 0x6c44198c4a475817n,
+    ];
+    function __sha512core(bytes, h) {
+        const bl = bytes.length;
+        const total = (bl + 1 + 16 + 127) & ~127;
+        const m = new Uint8Array(total);
+        m.set(bytes); m[bl] = 0x80;
+        const dv = new DataView(m.buffer);
+        const ml = BigInt(bl) * 8n; // fits 64 bits for any realistic input; high half stays 0
+        dv.setUint32(total - 8, Number((ml >> 32n) & 0xffffffffn));
+        dv.setUint32(total - 4, Number(ml & 0xffffffffn));
+        const w = new Array(80);
+        const rotr = (x, n) => ((x >> n) | (x << (64n - n))) & __M64;
+        for (let off = 0; off < total; off += 128) {
+            for (let i = 0; i < 16; i++) {
+                w[i] = (BigInt(dv.getUint32(off + i * 8)) << 32n) | BigInt(dv.getUint32(off + i * 8 + 4));
+            }
+            for (let i = 16; i < 80; i++) {
+                const s0 = rotr(w[i - 15], 1n) ^ rotr(w[i - 15], 8n) ^ (w[i - 15] >> 7n);
+                const s1 = rotr(w[i - 2], 19n) ^ rotr(w[i - 2], 61n) ^ (w[i - 2] >> 6n);
+                w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & __M64;
+            }
+            let a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g2 = h[6], hh = h[7];
+            for (let i = 0; i < 80; i++) {
+                const S1 = rotr(e, 14n) ^ rotr(e, 18n) ^ rotr(e, 41n), ch = (e & f) ^ ((~e & __M64) & g2);
+                const t1 = (hh + S1 + ch + __SHA512_K[i] + w[i]) & __M64;
+                const S0 = rotr(a, 28n) ^ rotr(a, 34n) ^ rotr(a, 39n), maj = (a & b) ^ (a & c) ^ (b & c);
+                const t2 = (S0 + maj) & __M64;
+                hh = g2; g2 = f; f = e; e = (d + t1) & __M64; d = c; c = b; b = a; a = (t1 + t2) & __M64;
+            }
+            h[0] = (h[0] + a) & __M64; h[1] = (h[1] + b) & __M64; h[2] = (h[2] + c) & __M64; h[3] = (h[3] + d) & __M64;
+            h[4] = (h[4] + e) & __M64; h[5] = (h[5] + f) & __M64; h[6] = (h[6] + g2) & __M64; h[7] = (h[7] + hh) & __M64;
+        }
+        return h;
+    }
+    function __sha512(bytes) {
+        const h = __sha512core(bytes, [
+            0x6a09e667f3bcc908n, 0xbb67ae8584caa73bn, 0x3c6ef372fe94f82bn, 0xa54ff53a5f1d36f1n,
+            0x510e527fade682d1n, 0x9b05688c2b3e6c1fn, 0x1f83d9abfb41bd6bn, 0x5be0cd19137e2179n]);
+        const out = new Uint8Array(64), o = new DataView(out.buffer);
+        for (let i = 0; i < 8; i++) { o.setUint32(i * 8, Number((h[i] >> 32n) & 0xffffffffn)); o.setUint32(i * 8 + 4, Number(h[i] & 0xffffffffn)); }
+        return out;
+    }
+    function __sha384(bytes) {
+        const h = __sha512core(bytes, [
+            0xcbbb9d5dc1059ed8n, 0x629a292a367cd507n, 0x9159015a3070dd17n, 0x152fecd8f70e5939n,
+            0x67332667ffc00b31n, 0x8eb44a8768581511n, 0xdb0c2e0d64f98fa7n, 0x47b5481dbefa4fa4n]);
+        const out = new Uint8Array(48), o = new DataView(out.buffer); // 384 bits = first 6 words
+        for (let i = 0; i < 6; i++) { o.setUint32(i * 8, Number((h[i] >> 32n) & 0xffffffffn)); o.setUint32(i * 8 + 4, Number(h[i] & 0xffffffffn)); }
+        return out;
+    }
     g.crypto = {
         getRandomValues(a) {
             if (a && a.length !== undefined) for (let i = 0; i < a.length; i++) a[i] = Math.floor(Math.random() * 0x100000000);
@@ -14756,6 +14874,8 @@ const PRELUDE: &str = r##"
                 const bytes = __cryptoBytes(data);
                 if (name === "SHA-1") return Promise.resolve(__sha1(bytes).buffer);
                 if (name === "SHA-256") return Promise.resolve(__sha256(bytes).buffer);
+                if (name === "SHA-384") return Promise.resolve(__sha384(bytes).buffer);
+                if (name === "SHA-512") return Promise.resolve(__sha512(bytes).buffer);
                 return Promise.reject(new Error("Unsupported digest algorithm: " + name));
             },
         },
@@ -22587,6 +22707,69 @@ mod tests {
     }
 
     #[test]
+    fn switch_discriminant_function_shadow_does_not_leak_binding() {
+        // chatgpt.com rendered a blank page: React Compiler ("use forget")
+        // output for a component (`cEn`) shaped like this. A function-local memo
+        // array `n` is used inside a `switch`'s case bodies, and the switch
+        // DISCRIMINANT contains a nested arrow that declares its OWN `let n`.
+        // Boa's `LexicallyScopedDeclarations(Switch)` recursed into the
+        // discriminant expression and, via the `visit_function_body` override,
+        // harvested the nested function's top-level `let n` — creating a PHANTOM
+        // `n` binding in the switch's CaseBlock scope. A case body's use of the
+        // real `n` then resolved to that phantom binding, which never received a
+        // register, so the bytecompiler emitted a hard `ReferenceError: access of
+        // uninitialized binding` at COMPILE time. React can't recover from a
+        // render throw during hydration and unmounted the whole tree → blank
+        // <body>. Fixed in vendored boa_ast: the LexicallyScopedDeclarations
+        // visitor now overrides `visit_switch` to collect ONLY the case bodies,
+        // never the discriminant or case conditions. General engine-correctness.
+        let html = r##"<body><div id="o">?</div><script>
+            function f(t) {
+              let n = ['MEMO'];
+              let out = [];
+              switch ((() => { let n = 99; return n; }), t) {
+                case 1: { let x = 'c1'; out.push(x); out.push(n[0]); }
+                case 2: { let x = 'c2'; out.push(x); break; }
+                default: { let x = 'def'; out.push(x); out.push(n[0]); }
+              }
+              return out.join(',');
+            }
+            document.getElementById('o').textContent =
+              f(1) + ' | ' + f(2) + ' | ' + f(9);
+            </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "engine panicked: {outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        // The memo `n` resolves correctly in every case body — and the real
+        // scoping is preserved (JS fallthrough: case 1 has no `break`, so it also
+        // runs case 2's body; each case's own `let x` shadows independently).
+        assert!(
+            out.contains("c1,MEMO,c2 | c2 | def,MEMO"),
+            "switch scoping wrong: {out}"
+        );
+    }
+
+    #[test]
+    fn switch_case_lexical_tdz_is_preserved() {
+        // Guard the fix from over-correcting: a GENUINE temporal-dead-zone access
+        // (use of a `let` before its declaration in the same block) must still
+        // throw a `ReferenceError` — the fix removes only the PHANTOM switch-scope
+        // binding, never real TDZ semantics.
+        let html = r##"<body><div id="o">?</div><script>
+            function g() { let r; { r = (x); let x = 1; } return r; }
+            try { g(); document.getElementById('o').textContent = 'NO-THROW'; }
+            catch (e) { document.getElementById('o').textContent = 'THREW:' + e.constructor.name; }
+            </script></body>"##;
+        let (out, outcome) = transform(html, &PageEnv::bare("https://example.com/"));
+        assert!(!outcome.panicked, "engine panicked: {outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("THREW:ReferenceError"),
+            "TDZ not preserved: {out}"
+        );
+    }
+
+    #[test]
     fn array_length_truncation_survives_inline_cache() {
         // A Boa inline-cache bug surfaced by Apollo Client's `optimism` cache
         // (and thus every Apollo + React page, e.g. Twitch channel content):
@@ -26394,16 +26577,20 @@ mod tests {
 
     #[test]
     fn crypto_subtle_digest_and_random_work() {
-        // Real SHA-1/SHA-256 (libraries hash request ids before they
+        // Real SHA-1/256/384/512 (libraries hash request ids before they
         // fetch — archive.org's collection search gates its tile fetch
-        // on a SHA-1 uid) plus functional getRandomValues/randomUUID.
+        // on a SHA-1 uid; ChatGPT's boot hashes with SHA-512) plus
+        // functional getRandomValues/randomUUID. Known-answer vectors for
+        // the input 'abc' (FIPS 180-4).
         let (out, outcome) = page(
-            "<body><p id=s1></p><p id=s256></p><p id=rng></p><script>\
+            "<body><p id=s1></p><p id=s256></p><p id=s384></p><p id=s512></p><p id=rng></p><script>\
              const hex = (b) => [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('');\
              const enc = new TextEncoder();\
              Promise.all([\
                crypto.subtle.digest('SHA-1', enc.encode('abc')).then(b=>{document.getElementById('s1').textContent=hex(b);}),\
                crypto.subtle.digest('SHA-256', enc.encode('abc')).then(b=>{document.getElementById('s256').textContent=hex(b);}),\
+               crypto.subtle.digest('SHA-384', enc.encode('abc')).then(b=>{document.getElementById('s384').textContent=hex(b);}),\
+               crypto.subtle.digest({name:'SHA-512'}, enc.encode('abc')).then(b=>{document.getElementById('s512').textContent=hex(b);}),\
              ]);\
              const u = crypto.randomUUID();\
              const r = crypto.getRandomValues(new Uint8Array(8));\
@@ -26420,7 +26607,57 @@ mod tests {
             out.contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
             "sha256: {out}"
         );
+        assert!(
+            out.contains("cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"),
+            "sha384: {out}"
+        );
+        assert!(
+            out.contains("ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"),
+            "sha512: {out}"
+        );
         assert!(out.contains(">ok<"), "rng: {out}");
+    }
+
+    #[test]
+    fn attr_node_methods_round_trip() {
+        // DOM §4.9.2 Attr-node surface: React DOM's property commit reads
+        // getAttributeNode then removeAttributeNode (a missing removeAttributeNode
+        // threw "undefined is not a callable" on chatgpt.com). Exercise the whole
+        // set: getAttributeNode, removeAttributeNode, createAttribute +
+        // setAttributeNode, and the NamedNodeMap set/removeNamedItem twins.
+        let (out, outcome) = page(
+            "<body><div id=d data-x=1 title=hi></div><p id=o></p><script>\
+             const d = document.getElementById('d');\
+             const parts = [];\
+             const an = d.getAttributeNode('data-x');\
+             parts.push('n=' + an.name + ',v=' + an.value + ',owner=' + (an.ownerElement === d));\
+             const removed = d.removeAttributeNode(an);\
+             parts.push('rm=' + removed.name + ',has=' + d.hasAttribute('data-x'));\
+             const na = document.createAttribute('data-y');\
+             na.value = 'yes';\
+             d.setAttributeNode(na);\
+             parts.push('set=' + d.getAttribute('data-y'));\
+             d.attributes.setNamedItem(document.createAttribute('data-z'));\
+             parts.push('map=' + d.hasAttribute('data-z'));\
+             d.attributes.removeNamedItem('title');\
+             parts.push('rmmap=' + d.hasAttribute('title'));\
+             parts.push('gone=' + (d.getAttributeNode('nope') === null));\
+             document.getElementById('o').textContent = parts.join('|');\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("n=data-x,v=1,owner=true"),
+            "getAttributeNode: {out}"
+        );
+        assert!(
+            out.contains("rm=data-x,has=false"),
+            "removeAttributeNode: {out}"
+        );
+        assert!(out.contains("set=yes"), "setAttributeNode: {out}");
+        assert!(out.contains("map=true"), "setNamedItem: {out}");
+        assert!(out.contains("rmmap=false"), "removeNamedItem: {out}");
+        assert!(out.contains("gone=true"), "missing node null: {out}");
     }
 
     #[test]

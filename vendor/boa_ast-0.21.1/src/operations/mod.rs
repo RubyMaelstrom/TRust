@@ -1948,6 +1948,27 @@ impl<'ast> Visitor<'ast> for LexicallyScopedDeclarationsVisitor<'_, 'ast> {
             }
         }
     }
+
+    // CaseBlock : { CaseClauses[opt] } / { CaseClauses[opt] DefaultClause CaseClauses[opt] }
+    //
+    // The LexicallyScopedDeclarations of a `switch` are ONLY the top-level
+    // lexical declarations of the case bodies' StatementLists. The discriminant
+    // (`switch (val)`) and each case's condition are expressions and contribute
+    // nothing. The default `Switch`/`Case` traversal visits those expressions
+    // with full recursion, so a function nested in them (e.g. an arrow in the
+    // discriminant) would be descended into and its top-level declarations
+    // harvested by the `visit_function_body` override above — polluting the
+    // switch's own block scope with bindings that belong to the nested function.
+    // Those phantom bindings never receive a register, so a later use resolving
+    // to the switch scope throws "access of uninitialized binding" at compile
+    // time. Visit only the case bodies (via the safe `visit_statement_list_item`
+    // path), never `val` or the conditions.
+    fn visit_switch(&mut self, node: &'ast crate::statement::Switch) -> ControlFlow<Self::BreakTy> {
+        for case in node.cases() {
+            self.visit_statement_list(case.body())?;
+        }
+        ControlFlow::Continue(())
+    }
 }
 /// The [`Visitor`] used to obtain the top level lexically scoped declarations of a node.
 ///
