@@ -40,8 +40,10 @@ pub(crate) enum Len {
     Val(Node),
 }
 
-/// A resolvable expression: linear in the percentage basis, or a min/max/clamp
-/// tree over linear branches.
+/// A resolvable expression: linear in the percentage basis, a min/max/clamp
+/// tree, or a calc() sum/product carrying a non-linear subtree (css-values-3
+/// §8.1 allows `calc(min(…) + 10px)` — the linear fold handles everything
+/// else).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Node {
     /// `k·basis + b` px.
@@ -52,6 +54,12 @@ pub(crate) enum Node {
     Min(Vec<Node>),
     Max(Vec<Node>),
     Clamp(Box<Node>, Box<Node>, Box<Node>),
+    /// `a + sign·b` — a calc() sum with a non-linear side. Unlike the
+    /// fail-open min/max fold, an unresolvable side makes the sum
+    /// unresolvable (there is no partial answer to an addition).
+    Sum(Box<Node>, Box<Node>, f32),
+    /// `a × f` — a calc() product with a non-linear side.
+    Scale(Box<Node>, f32),
 }
 
 impl Node {
@@ -90,6 +98,8 @@ impl Node {
                 let v = hi.map_or(v, |h| v.min(h));
                 Some(lo.map_or(v, |l| v.max(l)))
             }
+            Node::Sum(a, b, sign) => Some(a.resolve(basis)? + sign * b.resolve(basis)?),
+            Node::Scale(a, f) => Some(a.resolve(basis)? * f),
         }
     }
 }
@@ -200,7 +210,7 @@ fn parse_node(v: &str, u: Units, vp: Vp) -> Option<Node> {
     }
     leaf(v, u, vp).map(|t| match t {
         Term::Num(n) => Node::px(n), // unitless number: legacy px (quirk kept engine-wide)
-        Term::Len { k, b } => Node::Lin { k, b },
+        t => t.into_node(),
     })
 }
 
@@ -308,14 +318,16 @@ fn find_var_open(s: &str) -> Option<usize> {
     None
 }
 
-/// One `calc()` term while folding: a dimensionless number, or a length
-/// linear in the percentage basis. CSS's type rules (css-values-3 §8.1.1)
-/// fall out of the arithmetic below: length×length and X÷length are type
-/// errors ⇒ `None`.
-#[derive(Copy, Clone)]
+/// One `calc()` term while folding: a dimensionless number, a length linear
+/// in the percentage basis, or a non-linear length subtree (a nested
+/// `min()`/`max()`/`clamp()`). CSS's type rules (css-values-3 §8.1.1) fall
+/// out of the arithmetic below: length×length and X÷length are type errors
+/// ⇒ `None`.
+#[derive(Clone)]
 enum Term {
     Num(f32),
     Len { k: f32, b: f32 },
+    Tree(Node),
 }
 
 impl Term {
@@ -327,7 +339,13 @@ impl Term {
                 b: b + sign * b2,
             }),
             // number + length is a calc type error.
-            _ => None,
+            (Term::Num(_), _) | (_, Term::Num(_)) => None,
+            // A non-linear side: keep the sum as a tree.
+            (a, b) => Some(Term::Tree(Node::Sum(
+                Box::new(a.into_node()),
+                Box::new(b.into_node()),
+                sign,
+            ))),
         }
     }
 
@@ -335,7 +353,13 @@ impl Term {
         match (self, o) {
             (Term::Num(a), Term::Num(b)) => Some(Term::Num(a * b)),
             (Term::Num(n), Term::Len { k, b }) | (Term::Len { k, b }, Term::Num(n)) => {
-                Some(Term::Len { k: k * n, b: b * n })
+                Some(Term::Len {
+                    k: scale_coeff(k, n),
+                    b: scale_coeff(b, n),
+                })
+            }
+            (Term::Num(n), Term::Tree(t)) | (Term::Tree(t), Term::Num(n)) => {
+                Some(Term::Tree(Node::Scale(Box::new(t), n)))
             }
             _ => None, // length × length
         }
@@ -345,8 +369,21 @@ impl Term {
         match (self, o) {
             (_, Term::Num(0.0)) => None,
             (Term::Num(a), Term::Num(n)) => Some(Term::Num(a / n)),
-            (Term::Len { k, b }, Term::Num(n)) => Some(Term::Len { k: k / n, b: b / n }),
+            (Term::Len { k, b }, Term::Num(n)) => Some(Term::Len {
+                k: scale_coeff(k, 1.0 / n),
+                b: scale_coeff(b, 1.0 / n),
+            }),
+            (Term::Tree(t), Term::Num(n)) => Some(Term::Tree(Node::Scale(Box::new(t), 1.0 / n))),
             _ => None, // anything ÷ length
+        }
+    }
+
+    /// The length node this term denotes (caller has ruled out `Num`).
+    fn into_node(self) -> Node {
+        match self {
+            Term::Len { k, b } => Node::Lin { k, b },
+            Term::Tree(t) => t,
+            Term::Num(n) => Node::px(n),
         }
     }
 
@@ -354,9 +391,17 @@ impl Term {
     fn into_len(self) -> Option<Node> {
         match self {
             Term::Len { k, b } => Some(Node::Lin { k, b }),
+            Term::Tree(t) => Some(t),
             Term::Num(_) => None,
         }
     }
+}
+
+/// Scale one linear coefficient, keeping an exact 0 exactly 0 — a length
+/// with no percentage component must stay percentage-free under
+/// `calc(infinity * 1px)` (0 × ∞ is NaN, which would poison `resolve`).
+fn scale_coeff(c: f32, n: f32) -> f32 {
+    if c == 0.0 { 0.0 } else { c * n }
 }
 
 /// A leaf value: percentage, viewport unit, or absolute length (via the
@@ -488,16 +533,24 @@ impl Calc<'_> {
         if tok.is_empty() {
             return None;
         }
-        // A nested calc()/min()/max()/clamp()/var() must stay foldable to a
-        // linear term to participate in an enclosing calc sum; a non-linear
-        // nested min() inside calc() is deliberately unsupported (rare — the
-        // caller drops the declaration, keeping the initial value).
         let lower = tok.to_ascii_lowercase();
+        // The css-values-4 §10.6 numeric constants (calc-only idents; a bare
+        // `width: pi` is invalid CSS, so these never leak to the top level).
+        match lower.as_str() {
+            "e" => return Some(Term::Num(std::f32::consts::E)),
+            "pi" => return Some(Term::Num(std::f32::consts::PI)),
+            "infinity" => return Some(Term::Num(f32::INFINITY)),
+            "-infinity" => return Some(Term::Num(f32::NEG_INFINITY)),
+            _ => {}
+        }
+        // A nested calc()/min()/max()/clamp()/var(): a linear result folds
+        // into the enclosing sum; a non-linear one rides along as a tree
+        // (`calc(min(50%, 300px) + 1rem)`).
         if lower.contains('(') {
             let n = parse_node(tok, self.u, self.vp)?;
             return match n {
                 Node::Lin { k, b } => Some(Term::Len { k, b }),
-                _ => None,
+                n => Some(Term::Tree(n)),
             };
         }
         leaf(tok, self.u, self.vp)
@@ -584,6 +637,42 @@ mod tests {
     fn var_uses_fallback() {
         assert_eq!(val("var(--w, 12rem)").resolve(None), Some(192.0));
         assert_eq!(Len::parse("var(--w)", u(), vp()), None);
+    }
+
+    #[test]
+    fn calc_carries_nonlinear_subtrees() {
+        // A nested min()/max()/clamp() inside calc() no longer drops the
+        // declaration — the non-linear branch rides along as a tree.
+        let l = val("calc(min(50%, 300px) + 10px)");
+        assert_eq!(l.resolve(Some(400.0)), Some(210.0));
+        assert_eq!(l.resolve(Some(1000.0)), Some(310.0));
+        let l = val("calc(2 * min(10px, 5%))");
+        assert_eq!(l.resolve(Some(400.0)), Some(20.0));
+        assert_eq!(l.resolve(Some(100.0)), Some(10.0));
+        let l = val("calc(min(100%, 80px) / 2)");
+        assert_eq!(l.resolve(Some(40.0)), Some(20.0));
+        assert_eq!(l.resolve(Some(400.0)), Some(40.0));
+        // A sum with an unresolvable side is unresolvable (no partial adds).
+        assert_eq!(val("calc(min(100%) + 10px)").resolve(None), None);
+    }
+
+    #[test]
+    fn calc_numeric_constants() {
+        // css-values-4 §10.6: e / pi / infinity, calc-only idents.
+        let pi = val("calc(pi * 1px)").resolve(None).unwrap();
+        assert!((pi - std::f32::consts::PI).abs() < 1e-4);
+        let e = val("calc(e * 1px)").resolve(None).unwrap();
+        assert!((e - std::f32::consts::E).abs() < 1e-4);
+        assert!(
+            val("calc(infinity * 1px)")
+                .resolve(None)
+                .unwrap()
+                .is_infinite()
+        );
+        // A bare number is still not a length…
+        assert_eq!(Len::parse("calc(pi)", u(), vp()), None);
+        // …and the constants don't leak outside calc().
+        assert_eq!(Len::parse("pi", u(), vp()), None);
     }
 
     #[test]

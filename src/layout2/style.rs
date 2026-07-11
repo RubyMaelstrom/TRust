@@ -649,6 +649,23 @@ fn align_from_css(value: &str) -> Option<Align2> {
     }
 }
 
+/// Within-word break opportunities (CSS Text 3 §5.2 `word-break` × §5.5
+/// `overflow-wrap`), resolved to what the line breaker needs to know.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WordBrk {
+    /// Breaks only at soft-wrap opportunities; a too-long word overflows.
+    Normal,
+    /// `overflow-wrap: break-word` — an otherwise-overflowing word breaks at
+    /// the line edge, but contributes NO min-content break opportunities.
+    BreakWord,
+    /// `overflow-wrap: anywhere` (and the legacy `word-break: break-word`) —
+    /// like `BreakWord`, but the opportunities count for min-content too.
+    Anywhere,
+    /// `word-break: break-all` — a break is allowed between any two
+    /// characters, mid-line included.
+    BreakAll,
+}
+
 /// The inline formatting context inherited down the tree during the box-tree
 /// walk: everything a text run needs to become an `Item`. The cascade-
 /// inherited pieces (white-space, transform, letter-spacing, emphasis) are
@@ -667,6 +684,13 @@ pub(crate) struct InlineStyle {
     pub transform: TextTransform,
     /// `letter-spacing` as whole cells of inter-character gap (sub-cell → 0).
     pub letter: usize,
+    /// Within-word break opportunities (`overflow-wrap`/`word-break`).
+    pub brk: WordBrk,
+    /// `word-break: keep-all` — no soft wraps at CJK ideograph boundaries.
+    pub keep_all: bool,
+    /// `tab-size` in cells (CSS Text §3; a number is that many advances, a
+    /// length quantizes to cells; initial 8).
+    pub tab: usize,
     pub font_zero: bool,
     /// Paint suppression for this element's text: the sticky opacity chain OR
     /// its own computed `visibility:hidden` (re-clearable per element).
@@ -685,6 +709,9 @@ impl InlineStyle {
             ws: WhiteSpace::Normal,
             transform: TextTransform::None,
             letter: 0,
+            brk: WordBrk::Normal,
+            keep_all: false,
+            tab: 8,
             font_zero: false,
             invisible: false,
             opacity_chain: false,
@@ -729,6 +756,37 @@ impl InlineStyle {
             .as_deref()
             .and_then(|v| css_length_px(v, u))
             .map_or(0, |px| (px / u.cell_w).round().max(0.0) as usize);
+        let wb = dom
+            .computed_value(id, "word-break")
+            .map(|v| v.trim().to_ascii_lowercase());
+        s.keep_all = wb.as_deref() == Some("keep-all");
+        s.brk = match wb.as_deref() {
+            Some("break-all") => WordBrk::BreakAll,
+            // CSS Text 4 §5.2: the legacy `word-break: break-word` computes
+            // to `normal` + `overflow-wrap: anywhere` behavior.
+            Some("break-word") => WordBrk::Anywhere,
+            _ => match dom
+                .computed_value(id, "overflow-wrap")
+                .as_deref()
+                .map(str::trim)
+            {
+                Some("anywhere") => WordBrk::Anywhere,
+                Some("break-word") => WordBrk::BreakWord,
+                _ => WordBrk::Normal,
+            },
+        };
+        s.tab = dom
+            .computed_value(id, "tab-size")
+            .as_deref()
+            .map(str::trim)
+            .and_then(|v| {
+                if let Ok(n) = v.parse::<f32>() {
+                    Some(n.max(0.0).round() as usize)
+                } else {
+                    css_length_px(v, u).map(|px| (px / u.cell_w).round().max(0.0) as usize)
+                }
+            })
+            .unwrap_or(8);
         s.ws = dom
             .computed_value(id, "white-space")
             .as_deref()

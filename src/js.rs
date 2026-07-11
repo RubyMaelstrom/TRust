@@ -6172,6 +6172,9 @@ fn load_page(
     );
     // The terminal cell size, for the live serializer's px→row `scrollTop` bake.
     dom.borrow_mut().set_cell_px(cell_px.0, cell_px.1);
+    // The document URL, for the live serializer's sprite-`<use>` resolution
+    // (same base `rewrite_inline_svgs` joins against on the layout side).
+    dom.borrow_mut().set_doc_url(url::Url::parse(page_url).ok());
     if !env.sheets.is_empty() {
         dom.borrow_mut().attach_external_sheets(&env.sheets);
     }
@@ -28489,7 +28492,8 @@ mod tests {
              o.setAttribute('data-max768', String(matchMedia('(max-width: 768px)').matches));\
              o.setAttribute('data-land', String(matchMedia('(orientation: landscape)').matches));\
              o.setAttribute('data-and', String(matchMedia('screen and (min-width: 600px)').matches));\
-             o.setAttribute('data-unknown', String(matchMedia('(prefers-color-scheme: dark)').matches));\
+             o.setAttribute('data-scheme', String(matchMedia('(prefers-color-scheme: dark)').matches));\
+             o.setAttribute('data-unknown', String(matchMedia('(unknown-feature: foo)').matches));\
              </script></body>",
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -28499,7 +28503,9 @@ mod tests {
         assert!(out.contains("data-max768=\"true\""), "{out}");
         assert!(out.contains("data-land=\"true\""), "{out}");
         assert!(out.contains("data-and=\"true\""), "{out}");
-        // Unrecognized features stay false (the old conservative default).
+        // The environment features answer (dark is the terminal aesthetic)…
+        assert!(out.contains("data-scheme=\"true\""), "{out}");
+        // …while unrecognized features stay false (the conservative default).
         assert!(out.contains("data-unknown=\"false\""), "{out}");
     }
 

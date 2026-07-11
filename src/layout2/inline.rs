@@ -232,6 +232,10 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     indent: usize,
     /// Whether the line about to be composed is the IFC's first (indent gate).
     on_first_line: bool,
+    /// An intrinsic-size probe (`intrinsic_w`), not a real layout pass:
+    /// `overflow-wrap: break-word`'s emergency breaks must NOT count as
+    /// min-content opportunities (CSS Text §5.5 — unlike `anywhere`).
+    measuring: bool,
 }
 
 impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
@@ -293,9 +297,15 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             line_right: cap,
             indent,
             on_first_line: true,
+            measuring: false,
         };
         ifc.begin_line();
         ifc
+    }
+
+    /// Mark this IFC as an intrinsic-size probe (see the `measuring` field).
+    pub fn mark_measuring(&mut self) {
+        self.measuring = true;
     }
 
     /// Set the current line box's left/right boundaries from the float band at
@@ -437,16 +447,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 self.word(&word, ctx);
             }
         } else {
-            // Preserved modes: newlines force breaks; tabs advance to 8-cell
-            // stops (CSS Text §3, `tab-size` initial 8); spaces are literal.
+            // Preserved modes: newlines force breaks; tabs advance to the
+            // next `tab-size` stop (CSS Text §3; a 0 tab renders no advance);
+            // spaces are literal.
             for (i, seg) in t.split('\n').enumerate() {
                 if i > 0 {
                     self.forced_break();
                 }
                 for (j, piece) in seg.split('\t').enumerate() {
-                    if j > 0 {
+                    if j > 0 && ctx.tab > 0 {
                         let rel = self.pen.saturating_sub(self.line_start);
-                        self.pen = self.line_start + (rel / 8 + 1) * 8;
+                        self.pen = self.line_start + (rel / ctx.tab + 1) * ctx.tab;
                     }
                     if !piece.is_empty() {
                         self.preserved(piece, ctx);
@@ -459,7 +470,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// One word in a collapsing mode: split at CJK boundaries (a wide glyph
     /// is a soft-wrap opportunity on both sides — the UAX #14 ideograph rule
     /// at cell resolution), then place each segment greedily.
+    /// `word-break: keep-all` suppresses the CJK opportunities (§5.2).
     fn word(&mut self, word: &str, ctx: &InlineStyle) {
+        if ctx.keep_all {
+            self.place(word, ctx, true, true);
+            return;
+        }
         let mut seg = String::new();
         let mut first = true;
         let flush = |s: &mut String, ifc: &mut Self, first: &mut bool| {
@@ -534,6 +550,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             && ctx.ws.wraps()
             && self.pen + usize::from(space) + gap + w > self.line_right
             && self.pen > self.line_start
+            // `break-all` breaks mid-line inside the word instead of first
+            // wrapping whole (CSS Text §5.2 — every character boundary is a
+            // soft-wrap opportunity, so the greedy fill uses this line).
+            && ctx.brk != super::style::WordBrk::BreakAll
         {
             self.soft_break();
             // The owed collapsible space dies at the wrap (CSS Text §4.1.3);
@@ -541,6 +561,53 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             self.pending_gap_px = gap as f32 * self.cell_w;
             self.place(seg, ctx, false, false);
             return;
+        }
+        // Within-word breaking (CSS Text §5.2 `word-break` / §5.5
+        // `overflow-wrap`): when the segment still doesn't fit — for
+        // `break-all` at any pen position, for `anywhere`/`break-word` only
+        // as the emergency break of a word wider than its line — split it at
+        // capacity and continue on the next line. `break-word`'s breaks
+        // don't count as min-content opportunities, so measuring probes skip
+        // it (`anywhere`'s DO count — the spec's one difference).
+        if ctx.ws.wraps() && self.pen + usize::from(space) + gap + w > self.line_right {
+            let allowed = match ctx.brk {
+                super::style::WordBrk::BreakAll => true,
+                super::style::WordBrk::Anywhere => self.pen == self.line_start,
+                super::style::WordBrk::BreakWord => !self.measuring && self.pen == self.line_start,
+                super::style::WordBrk::Normal => false,
+            };
+            let avail = self
+                .line_right
+                .saturating_sub(self.pen + usize::from(space) + gap);
+            // A full line under `break-all` still owes the plain wrap.
+            if allowed && avail == 0 && self.pen > self.line_start {
+                self.soft_break();
+                self.pending_gap_px = gap as f32 * self.cell_w;
+                self.place(seg, ctx, true, false);
+                return;
+            }
+            if allowed && avail > 0 && w > avail {
+                // The widest prefix that fits (≥1 char, so progress is
+                // guaranteed even beside a huge inline-box edge).
+                let mut cells = 0usize;
+                let mut cut = 0usize;
+                for (bi, c) in seg.char_indices() {
+                    let cw = display_width(c.encode_utf8(&mut [0u8; 4]))
+                        + if bi > 0 { ctx.letter } else { 0 };
+                    if cut > 0 && cells + cw > avail {
+                        break;
+                    }
+                    cells += cw;
+                    cut = bi + c.len_utf8();
+                }
+                if cut < seg.len() {
+                    let (head, tail) = seg.split_at(cut);
+                    self.place(head, ctx, false, spaced);
+                    self.soft_break();
+                    self.place(tail, ctx, true, false);
+                    return;
+                }
+            }
         }
         // Merge into the previous piece when nothing but a collapsible space
         // separates two same-styled runs — fewer, wider items (selection and

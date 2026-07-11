@@ -105,6 +105,7 @@ impl Flow<'_> {
                     None,
                     &atom_sizes,
                 );
+                ifc.mark_measuring();
                 ifc.run(inls, &here);
                 let (lines, _, _, _, _) = ifc.finish();
                 let inline_w =

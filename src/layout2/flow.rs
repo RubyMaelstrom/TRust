@@ -396,7 +396,7 @@ impl Flow<'_> {
         // (§17.5.2) and repositions within its band (§17.4 auto margins /
         // align) — its used content width and border-box left are known only
         // after the column algorithm runs, inside the `Content::Table` arm.
-        let mut h = self.horizontal(s, cb_w);
+        let mut h = self.horizontal(b, cb_w, &inl);
         let mut x_border = cb_x + h.ml;
         let content_x = x_border + h.bp_l;
         let bt = s.border[TOP] + self.pad(s, TOP, cb_w);
@@ -1089,19 +1089,41 @@ impl Flow<'_> {
     }
 
     /// §10.3.3 + §10.4: the used horizontal geometry of a block-level,
-    /// non-replaced box in normal flow.
-    fn horizontal(&self, s: &BoxStyle, cb_w: f32) -> H {
+    /// non-replaced box in normal flow. `b`/`inl` feed the intrinsic-size
+    /// query for the css-sizing-3 keywords (`width: min-content`/
+    /// `max-content`/`fit-content`), which name the CONTENT size directly —
+    /// box-sizing does not apply to them (§5.2.2).
+    fn horizontal(&self, b: &BoxNode, cb_w: f32, inl: &InlineStyle) -> H {
+        let s = &b.style;
         let bp_l = s.border[LEFT] + self.pad(s, LEFT, cb_w);
         let bp_r = s.border[RIGHT] + self.pad(s, RIGHT, cb_w);
         let bp = bp_l + bp_r;
         // A declared width, content-box px (box-sizing adjusts).
-        let spec = |l: &Len| {
-            l.resolve(Some(cb_w)).map(|w| {
-                if s.border_box {
-                    (w - bp).max(0.0)
-                } else {
-                    w.max(0.0)
+        let intrinsic = |l: &Len| -> Option<f32> {
+            match l {
+                Len::MinContent => Some(self.intrinsic_w(b, IMode::Min, inl)),
+                Len::MaxContent => Some(self.intrinsic_w(b, IMode::Max, inl)),
+                Len::FitContent => {
+                    // fit-content = clamp(min-content, stretch-fit, max-content)
+                    // against the available space (css-sizing-3 §5.2.4).
+                    let min = self.intrinsic_w(b, IMode::Min, inl);
+                    let max = self.intrinsic_w(b, IMode::Max, inl).max(min);
+                    let ml = s.margin[LEFT].resolve(Some(cb_w)).unwrap_or(0.0);
+                    let mr = s.margin[RIGHT].resolve(Some(cb_w)).unwrap_or(0.0);
+                    Some((cb_w - ml - mr - bp).max(0.0).clamp(min, max))
                 }
+                _ => None,
+            }
+        };
+        let spec = |l: &Len| {
+            intrinsic(l).or_else(|| {
+                l.resolve(Some(cb_w)).map(|w| {
+                    if s.border_box {
+                        (w - bp).max(0.0)
+                    } else {
+                        w.max(0.0)
+                    }
+                })
             })
         };
         let min_w = spec(&s.min_width).unwrap_or(0.0);

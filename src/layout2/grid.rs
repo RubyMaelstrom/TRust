@@ -1336,19 +1336,10 @@ impl Flow<'_> {
         let col_x = positions(&cols, gap_col, Some(content_w), dist_of(jc.as_deref()));
 
         // ---- lay items at their area widths ----
-        let justify_items = {
-            let ji = cv("justify-items").or_else(|| {
-                cv("place-items")
-                    .map(|v| v.split('/').nth(1).unwrap_or(v.as_str()).trim().to_string())
-            });
-            self_align(ji.as_deref(), AlignItem::Stretch)
-        };
-        let align_items = {
-            let ai = cv("align-items").or_else(|| {
-                cv("place-items").map(|v| v.split('/').next().unwrap_or("").trim().to_string())
-            });
-            self_align(ai.as_deref(), AlignItem::Stretch)
-        };
+        // (`place-items`/`place-self` expand to these longhands in the
+        // cascade, so only the longhands are read here.)
+        let justify_items = self_align(cv("justify-items").as_deref(), AlignItem::Stretch);
+        let align_items = self_align(cv("align-items").as_deref(), AlignItem::Stretch);
         struct GItem<'t> {
             it: &'t BoxNode,
             frag: Frag<'t>,
@@ -1387,13 +1378,7 @@ impl Flow<'_> {
                     self.dom.computed_value(it.node, pn)
                 }
             };
-            let justify = {
-                let js = icv("justify-self").or_else(|| {
-                    icv("place-self")
-                        .map(|v| v.split('/').nth(1).unwrap_or(v.as_str()).trim().to_string())
-                });
-                self_align(js.as_deref(), justify_items)
-            };
+            let justify = self_align(icv("justify-self").as_deref(), justify_items);
             let width_def = s.width.resolve(Some(area_w)).map(to_content);
             let avail_c = (area_w - m[LEFT] - m[RIGHT] - bp_h).max(0.0);
             let w = match width_def {
@@ -1420,13 +1405,7 @@ impl Flow<'_> {
                 anchors: anc,
                 m,
                 auto,
-                align: {
-                    let asf = icv("align-self").or_else(|| {
-                        icv("place-self")
-                            .map(|v| v.split('/').next().unwrap_or("").trim().to_string())
-                    });
-                    self_align(asf.as_deref(), align_items)
-                },
+                align: self_align(icv("align-self").as_deref(), align_items),
             });
         }
 
