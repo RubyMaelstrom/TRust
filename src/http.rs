@@ -1353,6 +1353,7 @@ pub async fn execute_js(
         // stylesheets (flex gutter, collapsed menus) instead of UA defaults.
         _ => return css_only(response, viewport, cell_px).await,
     };
+    fetch_svg_sprite_sheets(&out, &response.url).await;
     response.body = out.into_bytes();
     // The serializer emits UTF-8 regardless of the original charset;
     // re-parses (resize re-wraps) must read it as such.
@@ -1360,6 +1361,43 @@ pub async fn execute_js(
     response.js = Some(outcome);
     response.live = live;
     response
+}
+
+/// External SVG sprite sheets: a `<use href="file.svg#id">` icon (ChatGPT,
+/// GitHub, most icon systems) keeps its geometry in one shared file resvg won't
+/// fetch itself. Fetch each referenced sheet ONCE — same subresource gate as
+/// scripts/sheets — and prime the process-global cache; the layout's
+/// `rewrite_inline_svgs` then inlines the used symbol so it rasterizes like any
+/// inline vector. Cheap-guarded: a page with no `<use>` pays one substring
+/// check. Resolved against the PAGE url so the cache key matches the one
+/// `parse_seeded`'s `rewrite_inline_svgs` computes.
+async fn fetch_svg_sprite_sheets(html: &str, page_url: &Url) {
+    if !html.contains("<use") {
+        return;
+    }
+    futures::stream::iter(crate::js::sprite_use_sheets(html).into_iter().map(|raw| {
+        let page_url = page_url.clone();
+        async move {
+            let Some(abs) = page_url
+                .join(&raw)
+                .ok()
+                .filter(|u| matches!(u.scheme(), "http" | "https"))
+                .filter(|u| subresource_allowed(&page_url, u))
+            else {
+                return;
+            };
+            if crate::dom::sprite_sheet_cached(abs.as_str()) {
+                return;
+            }
+            if let Ok(r) = fetch(&Request::get(abs.clone())).await {
+                let text = decode_body(&r.content_type, &r.body);
+                crate::dom::prime_sprite_sheet(abs.as_str(), &text);
+            }
+        }
+    }))
+    .buffered(PREFETCH_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
 }
 
 /// Fetch a page's external stylesheets — the same set + caps `execute_js`
@@ -1414,6 +1452,7 @@ pub async fn css_only(
     }
     let html = decode_body(&response.content_type, &response.body);
     let sheets = fetch_page_sheets(&html, &response.url).await;
+    fetch_svg_sprite_sheets(&html, &response.url).await;
     // The frame documents are fetched up front into a url→content map (Dom is
     // not `Send`, so it must never cross an `.await`), then installed into the
     // real arena synchronously.
@@ -1858,7 +1897,7 @@ pub fn parse_seeded(
         let mut dom = crate::dom::Dom::parse_document(&html);
         // Turn renderable inline <svg> into <img data:…> so vectors render
         // (silhouette-tinted) through the image pipeline instead of as text.
-        dom.rewrite_inline_svgs();
+        dom.rewrite_inline_svgs(Some(url));
         let t_dom = t0.elapsed();
         let t1 = std::time::Instant::now();
         let (found, controls) = extract_forms_arena(&dom, url, seed);
@@ -2054,7 +2093,7 @@ pub fn lay_region_patch(
     let t0 = std::time::Instant::now();
     let html = decode_body("text/html; charset=utf-8", fragment_html);
     let mut dom = crate::dom::Dom::parse_document(&html);
-    dom.rewrite_inline_svgs();
+    dom.rewrite_inline_svgs(Some(url));
     let key = boundary_node.to_string();
     let boundary = dom
         .descendants(crate::dom::DOCUMENT)
@@ -2161,7 +2200,7 @@ pub fn lay_subtree_patch(
 ) -> Option<SubtreeLaid> {
     let html = decode_body("text/html; charset=utf-8", fragment_html);
     let mut dom = crate::dom::Dom::parse_document(&html);
-    dom.rewrite_inline_svgs();
+    dom.rewrite_inline_svgs(Some(url));
     let key = boundary_node.to_string();
     let boundary = dom
         .descendants(crate::dom::DOCUMENT)
@@ -5393,7 +5432,23 @@ mod tests {
             })
             .unwrap_or((80, 0));
         let grep = std::env::var("TRUST_LAYOUT_GREP").ok();
-        let url = parse_url("https://store.steampowered.com/").unwrap();
+        let url = parse_url(
+            &std::env::var("TRUST_DIAG_URL")
+                .unwrap_or_else(|_| "https://store.steampowered.com/".into()),
+        )
+        .unwrap();
+        // TRUST_LAYOUT_SPRITE="path": prime the sprite sheet from a local file
+        // (keyed at EVERY external `<use>` sheet the doc references, resolved
+        // against `url`) so an offline replay resolves external-sprite icons.
+        if let Ok(p) = std::env::var("TRUST_LAYOUT_SPRITE")
+            && let Ok(text) = std::fs::read_to_string(&p)
+        {
+            for sheet in crate::js::sprite_use_sheets(&String::from_utf8_lossy(&html)) {
+                if let Link::Http(abs) = resolve(&url, &sheet) {
+                    crate::dom::prime_sprite_sheet(abs.as_str(), &text);
+                }
+            }
+        }
         // TRUST_LAYOUT_IMG_CELL=WxH: seed EVERY <img>'s src with a decoded cell
         // box, so a layout that only shows the real box once decoded (an
         // `object-fit`/`width:100%` product tile) can be reproduced offline.
@@ -5404,7 +5459,7 @@ mod tests {
                 .and_then(|(a, b)| Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?)))
         {
             let mut probe = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
-            probe.rewrite_inline_svgs();
+            probe.rewrite_inline_svgs(Some(&url));
             for id in 0..probe.node_count() {
                 if probe.tag_name(id) == Some("img")
                     && let Some(src) = probe.attr(id, "src")
@@ -5492,7 +5547,7 @@ mod tests {
         // Legend: reproduce the layout DOM (same NodeIds) so we can map an
         // item's `node` back to its element (tag/id/class + box/flex props).
         let mut legend_dom = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
-        legend_dom.rewrite_inline_svgs();
+        legend_dom.rewrite_inline_svgs(Some(&url));
         let mut seen_nodes: std::collections::BTreeSet<usize> = Default::default();
         for (ri, row) in doc.rows.iter().enumerate() {
             let mut s = String::new();

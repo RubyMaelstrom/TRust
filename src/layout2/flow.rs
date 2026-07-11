@@ -1305,6 +1305,9 @@ impl Flow<'_> {
                 anchors,
             )
         } else {
+            // For a column, the block axis IS the main axis, so the same
+            // (min_h, max_h) the row path treats as its cross clamp is this
+            // container's own main-size clamp.
             self.flex_col(
                 &fs,
                 &ordered,
@@ -1314,6 +1317,7 @@ impl Flow<'_> {
                 content_top,
                 content_w,
                 def_ch,
+                cross_clamp,
                 inl,
                 anchors,
             )
@@ -1604,6 +1608,7 @@ impl Flow<'_> {
         content_top: f32,
         content_w: f32,
         def_ch: Option<f32>,
+        main_clamp: (f32, f32),
         inl: &InlineStyle,
         anchors: &mut Vec<(NodeId, f32)>,
     ) -> (Vec<Frag<'t>>, f32) {
@@ -1749,7 +1754,20 @@ impl Flow<'_> {
             let n = r.len();
             let gaps = gap_main * n.saturating_sub(1) as f32;
             let sum_hypo: f32 = r.clone().map(|i| outer[i]).sum();
-            let inner = def_ch.unwrap_or(sum_hypo + gaps) - gaps;
+            // §9.2/§9.7: flexing distributes the container's INNER MAIN SIZE —
+            // its used height. When `height` is auto but `min-height` is definite
+            // (the full-height app shell: `min-h-full`/`min-h-screen` wrapping a
+            // `flex-1` child) that used height is at least the min-height, so
+            // there IS free space for grow. `def_ch` carries only an EXPLICIT
+            // height, so floor the content-derived available by the container's
+            // own block-axis min (and cap by max); otherwise a `flex-1` child
+            // never fills a min-height container and bottom-anchored content
+            // (`margin-top:auto`, a trailing footer) never reaches the bottom.
+            let (min_main_c, max_main_c) = main_clamp;
+            let avail = def_ch
+                .unwrap_or(sum_hypo + gaps)
+                .clamp(min_main_c, max_main_c.max(min_main_c));
+            let inner = avail - gaps;
             resolve_flexible_lengths(inner, &mut calcs[r.clone()]);
             let mut cross = 0.0f32;
             for i in r.clone() {

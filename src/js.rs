@@ -7337,7 +7337,15 @@ fn worker_prelude() -> &'static str {
             .and_then(|(_, rest)| rest.split_once("/*__WASM_END__*/"))
             .map(|(c, _)| c)
             .unwrap_or("");
-        format!("{codec}\n{WORKER_SCOPE}\n{wasm}")
+        // URLPattern is exposed in Workers (URL Pattern Standard §Exposed). Its
+        // block is likewise self-contained (own `g`, only __url_parse/RegExp from
+        // outside — both present in the worker realm), so the worker reuses it.
+        let urlpattern = PRELUDE
+            .split_once("/*__URLPATTERN_BEGIN__*/")
+            .and_then(|(_, rest)| rest.split_once("/*__URLPATTERN_END__*/"))
+            .map(|(c, _)| c)
+            .unwrap_or("");
+        format!("{codec}\n{WORKER_SCOPE}\n{urlpattern}\n{wasm}")
     })
     .as_str()
 }
@@ -10153,6 +10161,37 @@ pub fn external_stylesheets(html: &str) -> Vec<String> {
         .collect()
 }
 
+/// The external SVG sprite-sheet FILES a page references via
+/// `<use href="file.svg#id">` (or legacy `xlink:href`) — each unique file url
+/// (the part before `#`). A same-document `<use href="#id">` (empty file part)
+/// is skipped: its target rides along in the same svg. The subresource phase
+/// fetches these so `dom::rewrite_inline_svgs` can inline the used symbol.
+pub fn sprite_use_sheets(html: &str) -> Vec<String> {
+    let dom = Dom::parse_document(html);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for id in dom.descendants(crate::dom::DOCUMENT) {
+        if dom.tag_name(id) != Some("use") {
+            continue;
+        }
+        let Some(href) = dom
+            .attr(id, "href")
+            .or_else(|| dom.attr(id, "xlink:href"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some((file, frag)) = href.split_once('#') else {
+            continue;
+        };
+        if !file.is_empty() && !frag.is_empty() && seen.insert(file.to_string()) {
+            out.push(file.to_string());
+        }
+    }
+    out
+}
+
 /// The module graph the page announces up front:
 /// `<link rel=modulepreload href>` and `<script type=module src>`.
 /// The fetch pipeline downloads these in parallel and seeds the module
@@ -12426,6 +12465,73 @@ const PRELUDE: &str = r##"
     class HTMLLinkElement extends HTMLElement {
         get sheet() { return null; }
     }
+    // <dialog> (HTML §4.11.4). We implement the observable method/event surface;
+    // the modal TOP LAYER + backdrop + inertness are deliberately NOT rendered
+    // (her call — a dialog just paints where it flows, overlaps allowed). `open`
+    // reflects the boolean attribute (the layout's visibility gate); modal-ness
+    // is tracked in `__dlgModal`. show/showModal/close/requestClose follow the
+    // spec steps: InvalidStateError on an already-open show(Modal), showModal
+    // also requires connection; requestClose fires a cancelable `cancel` and
+    // aborts if prevented; "close the dialog" removes `open`, sets returnValue,
+    // and fires `close`. beforetoggle/toggle (ToggleEvent) fire like popovers.
+    // `closedBy` is intentionally omitted (its enumerated defaults are too new
+    // to implement without guessing — feature-detectable as undefined).
+    class HTMLDialogElement extends HTMLElement {
+        get open() { return this.hasAttribute("open"); }
+        set open(v) { if (v) this.setAttribute("open", ""); else this.removeAttribute("open"); }
+        get returnValue() { return this.__dlgReturn == null ? "" : this.__dlgReturn; }
+        set returnValue(v) { this.__dlgReturn = v == null ? "" : String(v); }
+        show() {
+            if (this.hasAttribute("open")) {
+                if (!this.__dlgModal) return;               // already open (non-modal): no-op
+                throw new DOMException("The dialog is already open as a modal dialog", "InvalidStateError");
+            }
+            const bev = new g.ToggleEvent("beforetoggle", { oldState: "closed", newState: "open", cancelable: true });
+            dispatch(this, bev, false);
+            if (bev.defaultPrevented || this.hasAttribute("open")) return;
+            this.setAttribute("open", "");
+            this.__dlgModal = false;
+            this.__dlgToggle("closed", "open");
+        }
+        showModal() {
+            if (this.hasAttribute("open")) throw new DOMException("The dialog is already open", "InvalidStateError");
+            if (!this.isConnected) throw new DOMException("The dialog is not connected", "InvalidStateError");
+            const bev = new g.ToggleEvent("beforetoggle", { oldState: "closed", newState: "open", cancelable: true });
+            dispatch(this, bev, false);
+            if (bev.defaultPrevented || this.hasAttribute("open")) return;
+            this.setAttribute("open", "");
+            this.__dlgModal = true;
+            this.__dlgToggle("closed", "open");
+        }
+        close(returnValue) {
+            this.__dlgClose(arguments.length ? String(returnValue) : null);
+        }
+        requestClose(returnValue) {
+            if (!this.hasAttribute("open")) return;
+            const cev = new Event("cancel", { cancelable: true });
+            dispatch(this, cev, false);
+            if (cev.defaultPrevented) return;
+            this.__dlgClose(arguments.length ? String(returnValue) : null);
+        }
+        // "Close the dialog": remove `open`, set returnValue, queue toggle + close.
+        __dlgClose(result) {
+            if (!this.hasAttribute("open")) return;
+            dispatch(this, new g.ToggleEvent("beforetoggle", { oldState: "open", newState: "closed" }), false);
+            if (!this.hasAttribute("open")) return;
+            this.removeAttribute("open");
+            this.__dlgModal = false;
+            if (result !== null) this.__dlgReturn = result;
+            const self = this;
+            g.setTimeout(function () {
+                dispatch(self, new g.ToggleEvent("toggle", { oldState: "open", newState: "closed" }), false);
+                dispatch(self, new Event("close"), false);
+            }, 0);
+        }
+        __dlgToggle(oldState, newState) {
+            const self = this;
+            g.setTimeout(function () { dispatch(self, new g.ToggleEvent("toggle", { oldState: oldState, newState: newState }), false); }, 0);
+        }
+    }
 
     // wrap() dispatches a node id (type 1) to its interface class by tag. The map
     // is memoized (localName is immutable, so a class only resolves once); an
@@ -12529,6 +12635,16 @@ const PRELUDE: &str = r##"
                         postMessage() {}, focus() {}, blur() {},
                         addEventListener() {}, removeEventListener() {},
                     };
+                    // A same-origin frame's contentWindow is a real Window with
+                    // the standard constructors. We run one realm, so exposing the
+                    // realm's globals on it is faithful: the well-known "pristine
+                    // constructor" idiom `let {URL}=iframe.contentWindow` (grabbing
+                    // an unmonkeypatched URL/Function from a hidden frame — ChatGPT's
+                    // auth bundle does this) then finds `URL` et al instead of
+                    // undefined → `new (undefined)()` "not a constructor". Own
+                    // getters below (document/location/self/window/parent…) still
+                    // shadow the global's.
+                    Object.setPrototypeOf(this.__contentWin, g);
                     this.__contentWin.self = this.__contentWin;
                     this.__contentWin.window = this.__contentWin;
                 }
@@ -13494,6 +13610,7 @@ const PRELUDE: &str = r##"
     g.HTMLIFrameElement = HTMLIFrameElement; g.HTMLFrameElement = HTMLFrameElement;
     g.HTMLTemplateElement = HTMLTemplateElement; g.HTMLMetaElement = HTMLMetaElement;
     g.HTMLStyleElement = HTMLStyleElement; g.HTMLLinkElement = HTMLLinkElement;
+    g.HTMLDialogElement = HTMLDialogElement;
     // The rest of the standard HTML element interface zoo. Browsers expose a
     // constructor for every element kind; boot code patches their prototypes
     // and feature-detects them (YouTube's kevlar reads bare `HTMLTemplateElement`,
@@ -15909,11 +16026,115 @@ const PRELUDE: &str = r##"
             F.supportedLocalesOf = Cls.supportedLocalesOf;
             return F;
         };
+        // Intl.Segmenter (ECMA-402 §Segmenter) — text segmentation by grapheme/
+        // word/sentence. Like the rest of this shim it's en/approximate (NOT the
+        // full ICU/UAX-29 machinery): grapheme clusters cover combining marks,
+        // variation selectors, emoji skin-tone modifiers, ZWJ sequences and
+        // regional-indicator (flag) pairs; word/sentence use Unicode-aware regex
+        // over `\p{L}`/`\p{N}` and terminator scanning. chatgpt (and many apps)
+        // do `new Intl.Segmenter(...)` for text metrics; without it that threw
+        // "not a constructor". `index` is the UTF-16 code-unit offset (spec).
+        const SEG_MARK = /\p{M}/u;
+        const segGraphemes = (str) => {
+            const res = [];
+            const n = str.length;
+            let i = 0;
+            while (i < n) {
+                const start = i;
+                let cp = str.codePointAt(i);
+                i += cp > 0xffff ? 2 : 1;
+                // Regional-indicator pair (a flag is exactly two RIs).
+                if (cp >= 0x1f1e6 && cp <= 0x1f1ff && i < n) {
+                    const ncp = str.codePointAt(i);
+                    if (ncp >= 0x1f1e6 && ncp <= 0x1f1ff) i += 2;
+                }
+                for (;;) {
+                    if (i >= n) break;
+                    const ncp = str.codePointAt(i);
+                    const nlen = ncp > 0xffff ? 2 : 1;
+                    if ((ncp >= 0x1f3fb && ncp <= 0x1f3ff) || ncp === 0xfe0e || ncp === 0xfe0f || SEG_MARK.test(String.fromCodePoint(ncp))) {
+                        i += nlen; continue;
+                    }
+                    if (ncp === 0x200d) { // ZWJ joins the following scalar into this cluster
+                        i += 1;
+                        if (i < n) { const jcp = str.codePointAt(i); i += jcp > 0xffff ? 2 : 1; }
+                        continue;
+                    }
+                    break;
+                }
+                res.push({ segment: str.slice(start, i), index: start });
+            }
+            return res;
+        };
+        const segWords = (str) => {
+            const res = [];
+            const re = /[\p{L}\p{N}_]+(?:['’.·’][\p{L}\p{N}_]+)*|\s+|[\s\S]/gu;
+            let m;
+            while ((m = re.exec(str)) !== null) {
+                res.push({ segment: m[0], index: m.index, isWordLike: /[\p{L}\p{N}]/u.test(m[0]) });
+                if (re.lastIndex === m.index) re.lastIndex++;
+            }
+            return res;
+        };
+        const segSentences = (str) => {
+            const res = [];
+            const n = str.length;
+            let i = 0, start = 0;
+            const term = /[.!?。！？]/;
+            const close = /[)\]'"”’»]/;
+            const ws = /\s/;
+            while (i < n) {
+                if (term.test(str[i])) {
+                    i++;
+                    while (i < n && term.test(str[i])) i++;
+                    while (i < n && close.test(str[i])) i++;
+                    while (i < n && ws.test(str[i])) i++;
+                    res.push({ segment: str.slice(start, i), index: start });
+                    start = i;
+                } else i++;
+            }
+            if (start < n) res.push({ segment: str.slice(start, n), index: start });
+            return res;
+        };
+        class Segments {
+            constructor(input, gran) {
+                this.__input = input;
+                this.__segs = gran === "word" ? segWords(input) : gran === "sentence" ? segSentences(input) : segGraphemes(input);
+                for (let k = 0; k < this.__segs.length; k++) this.__segs[k].input = input;
+            }
+            [Symbol.iterator]() {
+                const segs = this.__segs;
+                let i = 0;
+                return { next() { return i < segs.length ? { done: false, value: segs[i++] } : { done: true, value: undefined }; } };
+            }
+            containing(index) {
+                index = index === undefined ? 0 : Math.trunc(Number(index)) || 0;
+                for (let k = 0; k < this.__segs.length; k++) {
+                    const s = this.__segs[k];
+                    if (index >= s.index && index < s.index + s.segment.length) return s;
+                }
+                return undefined;
+            }
+        }
+        class Segmenter {
+            constructor(locales, options) {
+                const gran = (options && options.granularity !== undefined) ? String(options.granularity) : "grapheme";
+                if (gran !== "grapheme" && gran !== "word" && gran !== "sentence")
+                    throw new RangeError("Value " + gran + " out of range for Intl.Segmenter options property granularity");
+                this.__gran = gran;
+                const loc = Array.isArray(locales) ? locales[0] : locales;
+                this.__locale = loc ? String(loc) : "en";
+            }
+            resolvedOptions() { return { locale: this.__locale, granularity: this.__gran }; }
+            segment(input) { return new Segments(String(input), this.__gran); }
+            get [Symbol.toStringTag]() { return "Intl.Segmenter"; }
+        }
+        Segmenter.supportedLocalesOf = (locales) => localeList(locales);
         g.Intl = {
             NumberFormat: callable(NumberFormat),
             DateTimeFormat: callable(DateTimeFormat),
             Collator: callable(Collator),
-            DisplayNames, PluralRules, RelativeTimeFormat, Locale,
+            DisplayNames, PluralRules, RelativeTimeFormat, Locale, Segmenter,
             getCanonicalLocales: localeList,
         };
         Number.prototype.toLocaleString = function (locales, options) { return new NumberFormat(locales, options).format(this); };
@@ -16092,6 +16313,166 @@ const PRELUDE: &str = r##"
     }
     g.URLSearchParams = URLSearchParams;
     g.URL = URL;
+
+    // --- URLPattern (URL Pattern Standard, https://urlpattern.spec.whatwg.org/) ---
+    // A spec-aligned implementation of the common syntax: literal text, named
+    // groups (:name) with the component's default segment wildcard, the full
+    // wildcard (*), custom regex groups ((re) and :name(re)), the {…} grouping,
+    // and the ? optional modifier with path-to-regexp's automatic-prefix rule (a
+    // `/` before an optional pathname group is itself made optional). Each of the
+    // eight components compiles to an anchored RegExp + an ordered group-name
+    // list; test()/exec() parse the input (a URL string via __url_parse, or an
+    // init object) into components and run each regex. Honest deferrals (NOT
+    // faked): the +/* REPEAT modifiers compile to a functional (?:prefix(seg))+
+    // form whose captured value is the last iteration (not path-to-regexp's whole-
+    // run capture); the string constructor's authority parser handles
+    // scheme://[user[:pass]@]host[:port]/path?search#hash but not every exotic
+    // userinfo/`:port`-vs-`:group` ambiguity; a custom regex containing its OWN
+    // capturing groups can misalign the named-group map. These are rarely-used
+    // edges of an API most code drives with a single :name or * pathname pattern.
+    // Wrapped as a self-contained block (its own `g`) + markers so the WORKER
+    // realm reuses the SAME source — URLPattern is exposed in Workers (see
+    // worker_prelude()); only __url_parse/RegExp (both present in both realms)
+    // are referenced from outside.
+    /*__URLPATTERN_BEGIN__*/
+    (function (g) {
+    const UP_COMPONENTS = ["protocol", "username", "password", "hostname", "port", "pathname", "search", "hash"];
+    function upSeg(comp) { return comp === "pathname" ? "[^/]+?" : comp === "hostname" ? "[^.]+?" : ".+?"; }
+    function upSepChar(comp) { return comp === "pathname" ? "/" : comp === "hostname" ? "." : ""; }
+    function upEscRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+    function upStripLead(s, ch) { return s && s.charAt(0) === ch ? s.slice(1) : s; }
+    // Compile one component pattern into a shared state (names/unnamed/hasReg),
+    // returning the anchored-body regex source. Recurses for {…} groups.
+    function upCompileInto(pattern, seg, sep, st) {
+        let re = "", lit = "", i = 0;
+        const n = pattern.length;
+        const flush = function () { if (lit) { re += upEscRe(lit); lit = ""; } };
+        // Peel a trailing separator from the pending literal to use as a group's
+        // automatic prefix (so `/books/:id?` makes the leading `/` optional too).
+        const peel = function () {
+            if (sep && lit.length && lit.charAt(lit.length - 1) === sep) { lit = lit.slice(0, -1); flush(); return sep; }
+            flush(); return "";
+        };
+        const emit = function (prefix, body, name, mod) {
+            st.names.push(name === null ? String(st.unnamed++) : name);
+            const cap = "(" + body + ")", p = upEscRe(prefix);
+            if (mod === "?") re += "(?:" + p + cap + ")?";
+            else if (mod === "*") re += "(?:" + p + cap + ")*";
+            else if (mod === "+") re += "(?:" + p + cap + ")+";
+            else re += p + cap;
+        };
+        const readName = function () { let s = ""; while (i < n && /[A-Za-z0-9_$]/.test(pattern.charAt(i))) { s += pattern.charAt(i); i++; } return s; };
+        const readParen = function () { let depth = 0, s = ""; for (; i < n; i++) { const c = pattern.charAt(i); if (c === "\\") { s += c + (pattern.charAt(i + 1) || ""); i++; continue; } if (c === "(") { depth++; if (depth === 1) continue; } else if (c === ")") { depth--; if (depth === 0) { i++; break; } } s += c; } return s; };
+        const readBrace = function () { let depth = 0, s = ""; for (; i < n; i++) { const c = pattern.charAt(i); if (c === "\\") { s += c + (pattern.charAt(i + 1) || ""); i++; continue; } if (c === "{") { depth++; if (depth === 1) continue; } else if (c === "}") { depth--; if (depth === 0) { i++; break; } } s += c; } return s; };
+        const readMod = function () { const c = pattern.charAt(i); if (c === "?" || c === "+" || c === "*") { i++; return c; } return ""; };
+        while (i < n) {
+            const c = pattern.charAt(i);
+            if (c === "\\") { lit += pattern.charAt(i + 1) || ""; i += 2; continue; }
+            if (c === ":") { i++; const nm = readName(); const pre = peel(); let body = seg; if (pattern.charAt(i) === "(") { body = readParen(); st.hasReg = true; } emit(pre, body, nm, readMod()); continue; }
+            if (c === "(") { const pre = peel(); const body = readParen(); st.hasReg = true; emit(pre, body, null, readMod()); continue; }
+            if (c === "*") { i++; const pre = peel(); emit(pre, ".*", null, readMod()); continue; }
+            if (c === "{") { const pre = peel(); const inner = readBrace(); const mod = readMod(); const sub = upCompileInto(inner, seg, sep, st); const p = upEscRe(pre); if (mod === "?") re += "(?:" + p + sub + ")?"; else if (mod === "*") re += "(?:" + p + sub + ")*"; else if (mod === "+") re += "(?:" + p + sub + ")+"; else re += p + "(?:" + sub + ")"; continue; }
+            lit += c; i++;
+        }
+        flush();
+        return re;
+    }
+    function upCompile(pattern, comp) {
+        const st = { names: [], unnamed: 0, hasReg: false };
+        const src = upCompileInto(String(pattern), upSeg(comp), upSepChar(comp), st);
+        return { source: "^" + src + "$", names: st.names, hasReg: st.hasReg };
+    }
+    // A parsed URL's 11-part __url_parse array → the eight URLPattern components
+    // (protocol without its trailing `:`, search/hash without their `?`/`#`).
+    function upFromParsed(p) {
+        if (!p) return null;
+        return {
+            protocol: (p[1] || "").replace(/:$/, ""), username: p[9] || "", password: p[10] || "",
+            hostname: p[3] || "", port: p[4] || "", pathname: p[5] || "",
+            search: upStripLead(p[6] || "", "?"), hash: upStripLead(p[7] || "", "#"),
+        };
+    }
+    function upResolveInput(input, base) {
+        if (typeof input === "string") return upFromParsed(__url_parse(input, base != null ? String(base) : null));
+        if (input && typeof input === "object") { const o = {}; for (const cc of UP_COMPONENTS) o[cc] = input[cc] !== undefined ? String(input[cc]) : ""; return o; }
+        return null;
+    }
+    // Split a PATTERN STRING into its component patterns; omitted components
+    // default to the wildcard "*" (or, with a baseURL, the leading components come
+    // from the base). Hash/search are peeled first, then scheme://authority.
+    function upParsePatternStr(str, base) {
+        const out = { protocol: "*", username: "*", password: "*", hostname: "*", port: "*", pathname: "*", search: "*", hash: "*" };
+        let s = String(str);
+        const h = s.indexOf("#"); if (h >= 0) { out.hash = s.slice(h + 1); s = s.slice(0, h); }
+        const q = s.indexOf("?"); if (q >= 0) { out.search = s.slice(q + 1); s = s.slice(0, q); }
+        const pm = s.match(/^([^\/:{()}\\]+):\/\//);
+        if (pm) {
+            out.protocol = pm[1];
+            s = s.slice(pm[0].length);
+            const slash = s.indexOf("/");
+            let authority = slash >= 0 ? s.slice(0, slash) : s;
+            const rest = slash >= 0 ? s.slice(slash) : "";
+            const at = authority.lastIndexOf("@");
+            if (at >= 0) { const ui = authority.slice(0, at); authority = authority.slice(at + 1); const cix = ui.indexOf(":"); if (cix >= 0) { out.username = ui.slice(0, cix); out.password = ui.slice(cix + 1); } else out.username = ui; }
+            const portm = authority.match(/:([0-9*][^\/]*)$/);
+            if (portm) { out.port = portm[1]; out.hostname = authority.slice(0, authority.length - portm[0].length); }
+            else out.hostname = authority;
+            if (rest) out.pathname = rest;
+        } else if (base) {
+            const bp = upFromParsed(__url_parse(String(base), null));
+            if (bp) { out.protocol = bp.protocol; out.username = bp.username || "*"; out.password = bp.password || "*"; out.hostname = bp.hostname; out.port = bp.port || "*"; }
+            out.pathname = s || "*";
+        } else out.pathname = s || "*";
+        return out;
+    }
+    class URLPattern {
+        constructor(input, a, b) {
+            let options = {}, base;
+            if (typeof input === "string") {
+                if (typeof a === "string") { base = a; options = b || {}; } else options = a || {};
+                this.__parts = upParsePatternStr(input, base);
+            } else if (input && typeof input === "object") {
+                options = a || {};
+                const bp = input.baseURL ? upFromParsed(__url_parse(String(input.baseURL), null)) : null;
+                this.__parts = {};
+                for (const cc of UP_COMPONENTS) this.__parts[cc] = input[cc] !== undefined ? String(input[cc]) : (bp ? bp[cc] : "*");
+            } else { this.__parts = {}; for (const cc of UP_COMPONENTS) this.__parts[cc] = "*"; }
+            this.__ic = !!(options && options.ignoreCase);
+            this.__re = {}; this.__hasReg = false;
+            for (const cc of UP_COMPONENTS) {
+                const cm = upCompile(this.__parts[cc], cc);
+                this.__re[cc] = { rx: new RegExp(cm.source, this.__ic ? "i" : ""), names: cm.names };
+                if (cm.hasReg) this.__hasReg = true;
+            }
+        }
+        get protocol() { return this.__parts.protocol; }
+        get username() { return this.__parts.username; }
+        get password() { return this.__parts.password; }
+        get hostname() { return this.__parts.hostname; }
+        get port() { return this.__parts.port; }
+        get pathname() { return this.__parts.pathname; }
+        get search() { return this.__parts.search; }
+        get hash() { return this.__parts.hash; }
+        get hasRegExpGroups() { return this.__hasReg; }
+        test(input, base) { return this.exec(input, base) !== null; }
+        exec(input, base) {
+            const parts = upResolveInput(input, base);
+            if (!parts) return null;
+            const out = { inputs: base != null ? [input, base] : [input] };
+            for (const cc of UP_COMPONENTS) {
+                const rc = this.__re[cc], val = parts[cc] || "";
+                const m = rc.rx.exec(val);
+                if (!m) return null;
+                const groups = {};
+                for (let k = 0; k < rc.names.length; k++) groups[rc.names[k]] = m[k + 1];
+                out[cc] = { input: val, groups: groups };
+            }
+            return out;
+        }
+    }
+    g.URLPattern = URLPattern;
+    })(typeof globalThis !== "undefined" ? globalThis : this);
+    /*__URLPATTERN_END__*/
 
     // --- the network, over the __http_fetch_async syscall ---
     // Requests fire as async jobs; the JS thread does NOT block on them,
@@ -20671,6 +21052,182 @@ mod tests {
         );
     }
 
+    /// HTMLDialogElement (HTML §4.11.4): show/showModal/close/requestClose,
+    /// the `open` reflection + `returnValue`, InvalidStateError on an already-open
+    /// showModal and a disconnected showModal, requestClose firing a cancelable
+    /// `cancel` (a veto keeps it open), and the async `close` event. ChatGPT's
+    /// /auth/login page renders a `<dialog>` (cookie consent) and calls
+    /// showModal()/close() during a React render — a missing method threw and its
+    /// error boundary replaced the whole page with "Content failed to load".
+    #[test]
+    fn dialog_element_show_close_and_events() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><body><dialog id="d"><p>hi</p></dialog></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "dialog.js",
+            br##"
+            globalThis.out = {};
+            let cancels = 0, closes = 0;
+            const d = document.getElementById('d');
+            d.addEventListener('cancel', () => cancels++);
+            d.addEventListener('close', () => closes++);
+            out.isDialog = d instanceof HTMLDialogElement;
+            out.open0 = d.open;
+            d.showModal();
+            out.open1 = d.open;
+            // A second showModal on an open dialog throws InvalidStateError.
+            try { d.showModal(); out.reShowModal = 'no-throw'; } catch (e) { out.reShowModal = e.name; }
+            d.close('okay');
+            out.open2 = d.open;
+            out.rv = d.returnValue;
+            // show() opens; show() again on an open non-modal dialog is a silent no-op.
+            d.show();
+            out.open3 = d.open;
+            try { d.show(); out.reShow = 'noop'; } catch (e) { out.reShow = e.name; }
+            // requestClose fires a cancelable `cancel`; a veto keeps the dialog open.
+            const veto = (e) => e.preventDefault();
+            d.addEventListener('cancel', veto, { once: true });
+            d.requestClose('vetoed');
+            out.afterVeto = d.open;
+            // Un-vetoed requestClose closes and sets returnValue.
+            d.requestClose('done');
+            out.open4 = d.open;
+            out.rv2 = d.returnValue;
+            // showModal on a disconnected dialog throws InvalidStateError.
+            const detached = document.createElement('dialog');
+            try { detached.showModal(); out.detached = 'no-throw'; } catch (e) { out.detached = e.name; }
+            globalThis.getCounts = () => cancels + ',' + closes;
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"String(out.isDialog)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.open0)"), "false");
+        assert_eq!(s(&mut ctx, b"String(out.open1)"), "true");
+        assert_eq!(s(&mut ctx, b"out.reShowModal"), "InvalidStateError");
+        assert_eq!(s(&mut ctx, b"String(out.open2)"), "false");
+        assert_eq!(s(&mut ctx, b"out.rv"), "okay");
+        assert_eq!(s(&mut ctx, b"String(out.open3)"), "true");
+        assert_eq!(s(&mut ctx, b"out.reShow"), "noop");
+        assert_eq!(s(&mut ctx, b"String(out.afterVeto)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.open4)"), "false");
+        assert_eq!(s(&mut ctx, b"out.rv2"), "done");
+        assert_eq!(s(&mut ctx, b"out.detached"), "InvalidStateError");
+        // cancel fired for BOTH requestClose calls; close fired async for close()
+        // + the un-vetoed requestClose (the vetoed one never closed).
+        assert_eq!(s(&mut ctx, b"getCounts()"), "2,2");
+    }
+
+    /// URLPattern (URL Pattern Standard): object + string construction with the
+    /// common syntax (literals, :name segment groups, * wildcard, custom regex
+    /// groups, the ? optional modifier with the automatic `/` prefix, {…}
+    /// grouping), test()/exec() with named + indexed groups, and hasRegExpGroups.
+    #[test]
+    fn url_pattern_matches_common_syntax() {
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><body></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "urlpattern.js",
+            br##"
+            globalThis.out = {};
+            out.ctor = typeof URLPattern;
+            out.objTest = new URLPattern({ pathname: "/books/:id" }).test("https://example.com/books/123");
+            out.objTestNeg = new URLPattern({ pathname: "/books/:id" }).test("https://example.com/book");
+            out.execId = new URLPattern({ pathname: "/books/:id" }).exec("https://example.com/books/123").pathname.groups.id;
+            out.multi = JSON.stringify(new URLPattern({ pathname: "/:product/:user/:action" }).exec({ pathname: "/store/wanderview/view" }).pathname.groups);
+            out.wildcard = new URLPattern({ pathname: "/books/*" }).exec("https://example.com/books/1/2/3").pathname.groups["0"];
+            out.host = new URLPattern({ hostname: "*.example.com" }).exec({ hostname: "cdn.example.com" }).hostname.groups["0"];
+            out.reGrp = new URLPattern({ pathname: "/books/:id(\\d+)" }).test("https://example.com/books/123");
+            out.reGrpNeg = new URLPattern({ pathname: "/books/:id(\\d+)" }).test("https://example.com/books/abc");
+            out.optWith = new URLPattern({ pathname: "/books/:id?" }).test("https://example.com/books/123");
+            out.optWithout = new URLPattern({ pathname: "/books/:id?" }).test("https://example.com/books");
+            out.optTrail = new URLPattern({ pathname: "/books/:id?" }).test("https://example.com/books/");
+            out.brace = new URLPattern({ pathname: "/book{s}?" }).test("https://example.com/book");
+            out.typeAlt = JSON.stringify(new URLPattern({ pathname: "/:type(foo|bar)/*" }).exec({ pathname: "/foo/extra/stuff" }).pathname.groups);
+            const sp = new URLPattern("https://example.com/books/:id");
+            out.strParts = [sp.protocol, sp.hostname, sp.pathname, sp.search, sp.port].join("|");
+            out.strTest = sp.test("https://example.com/books/42");
+            out.strBase = new URLPattern("/products/:id", "https://example.com").test("https://example.com/products/9");
+            out.hasReg = new URLPattern({ pathname: "/books/:id(\\d+)" }).hasRegExpGroups;
+            out.hasRegNo = new URLPattern({ pathname: "/books/:id" }).hasRegExpGroups;
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(s(&mut ctx, b"out.ctor"), "function");
+        assert_eq!(s(&mut ctx, b"String(out.objTest)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.objTestNeg)"), "false");
+        assert_eq!(s(&mut ctx, b"out.execId"), "123");
+        assert_eq!(
+            s(&mut ctx, b"out.multi"),
+            r#"{"product":"store","user":"wanderview","action":"view"}"#
+        );
+        assert_eq!(s(&mut ctx, b"out.wildcard"), "1/2/3");
+        assert_eq!(s(&mut ctx, b"out.host"), "cdn");
+        assert_eq!(s(&mut ctx, b"String(out.reGrp)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.reGrpNeg)"), "false");
+        assert_eq!(s(&mut ctx, b"String(out.optWith)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.optWithout)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.optTrail)"), "false");
+        assert_eq!(s(&mut ctx, b"String(out.brace)"), "true");
+        assert_eq!(
+            s(&mut ctx, b"out.typeAlt"),
+            r#"{"0":"extra/stuff","type":"foo"}"#
+        );
+        assert_eq!(
+            s(&mut ctx, b"out.strParts"),
+            "https|example.com|/books/:id|*|*"
+        );
+        assert_eq!(s(&mut ctx, b"String(out.strTest)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.strBase)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.hasReg)"), "true");
+        assert_eq!(s(&mut ctx, b"String(out.hasRegNo)"), "false");
+    }
+
     /// XHR `responseType` (XHR spec §the response attribute): `"arraybuffer"`
     /// must deliver the byte-EXACT body — Steam's WebAPI transport reads
     /// binary protobuf via `xhr.response` and the old text-only `response`
@@ -24611,6 +25168,85 @@ mod tests {
         );
     }
 
+    /// URLPattern is exposed in Workers (URL Pattern Standard §Exposed): a worker
+    /// constructs a URLPattern and exec()s it off-thread. Proves the worker realm
+    /// reuses the shared `/*__URLPATTERN_*__*/` block (single source of truth).
+    #[test]
+    fn url_pattern_runs_inside_a_worker() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let worker_js = "self.onmessage = function () {\
+               var p = new URLPattern({ pathname: '/x/:id' });\
+               self.postMessage({ has: (typeof URLPattern), id: p.exec('https://e.com/x/7').pathname.groups.id });\
+             };";
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n{worker_js}"
+        )
+        .into_bytes();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener =
+            rt.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+        let port = listener.local_addr().unwrap().port();
+        rt.spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let reply = reply.clone();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let out: Vec<u8> = if String::from_utf8_lossy(&req).starts_with("GET /w.js ") {
+                    reply
+                } else {
+                    b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                };
+                let _ = sock.write_all(&out).await;
+            }
+        });
+        let html = format!(
+            "<body><pre id=o></pre><script>\
+             var w = new Worker('http://127.0.0.1:{port}/w.js');\
+             w.onmessage = function (e) {{ document.getElementById('o').textContent = \
+               'UPW has=' + e.data.has + ' id=' + e.data.id; }};\
+             w.postMessage('go');\
+             </script></body>"
+        );
+        let mut env = PageEnv::bare(&format!("http://127.0.0.1:{port}/"));
+        env.net = Some(rt.handle().clone());
+        let (handle, mut events) = spawn_page(html, env);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut got = String::new();
+        while std::time::Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(PageEvt::Updated { html, .. }) | Ok(PageEvt::Static { html, .. }) => {
+                    got = html;
+                    if got.contains("UPW ") {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        drop(handle);
+        assert!(
+            got.contains("UPW has=function id=7"),
+            "urlpattern in worker: {got}"
+        );
+    }
+
     /// React synthetic-event system, end-to-end through the page actor:
     /// a `useState` counter whose `onClick` is delegated at the root
     /// container. A real click must bubble to React's root listener, map
@@ -26832,6 +27468,43 @@ mod tests {
                  true true true true true true true"
             ),
             "Intl probes failed: {out}"
+        );
+    }
+
+    /// Intl.Segmenter (ECMA-402): chatgpt.com/auth/login does `new
+    /// Intl.Segmenter(...)` for text metrics — without it that threw "not a
+    /// constructor". en/approximate like the rest of the shim: grapheme clusters
+    /// merge combining marks/ZWJ/flags, word segments carry `isWordLike` and
+    /// cover the whole string, sentences split on terminators.
+    #[test]
+    fn intl_segmenter_segments_graphemes_words_and_sentences() {
+        let (out, outcome) = page(
+            r##"<body><div id=out></div><script>
+            var ok = [];
+            ok.push(typeof Intl.Segmenter === "function");
+            var g = new Intl.Segmenter("en", { granularity: "grapheme" });
+            ok.push(Array.from(g.segment("Hi!"), function (s) { return s.segment; }).join("|") === "H|i|!");
+            ok.push(Array.from(g.segment("café")).length === 4);
+            var w = new Intl.Segmenter("en", { granularity: "word" });
+            var wsegs = Array.from(w.segment("Hello, world!"));
+            ok.push(wsegs.map(function (s) { return s.segment; }).join("") === "Hello, world!");
+            ok.push(wsegs[0].isWordLike === true && wsegs[0].segment === "Hello" && wsegs[0].index === 0);
+            ok.push(wsegs[1].isWordLike === false && wsegs[1].segment === ",");
+            ok.push(wsegs[0].input === "Hello, world!");
+            ok.push(w.segment("Hello, world!").containing(8).segment === "world");
+            var s = new Intl.Segmenter("en", { granularity: "sentence" });
+            ok.push(Array.from(s.segment("Hi there. How are you?")).length === 2);
+            ok.push(new Intl.Segmenter().resolvedOptions().granularity === "grapheme");
+            ok.push(Object.prototype.toString.call(new Intl.Segmenter()) === "[object Intl.Segmenter]");
+            var threw = false; try { new Intl.Segmenter("en", { granularity: "bogus" }); } catch (e) { threw = (e.name === "RangeError"); }
+            ok.push(threw);
+            document.getElementById('out').textContent = ok.join(' ');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("true true true true true true true true true true true true"),
+            "Intl.Segmenter probes failed: {out}"
         );
     }
 

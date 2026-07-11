@@ -13375,7 +13375,7 @@ mod tests {
             })
             .unwrap_or((80, 24));
         let mut dom = Dom::parse_document(&html);
-        dom.rewrite_inline_svgs();
+        dom.rewrite_inline_svgs(None);
         let base = Url::parse("https://store.steampowered.com/").unwrap();
         let mut images = ImageSizes::new();
         if let Ok(spec) = std::env::var("TRUST_LAYOUT_IMG_CELL")
