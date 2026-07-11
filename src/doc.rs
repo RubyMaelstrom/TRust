@@ -39,10 +39,6 @@ pub enum Link {
     Media(url::Url),
     /// A scheme we don't speak (mailto, irc, ...) — shown, not followed.
     External(String),
-    /// A generated carousel scroll control (the CSS `::scroll-button`
-    /// model): activating it pages the nearest carousel by `dir` (−1 toward
-    /// the start, +1 toward the end) rather than navigating.
-    CarouselScroll(i8),
 }
 
 impl fmt::Display for Link {
@@ -57,8 +53,6 @@ impl fmt::Display for Link {
             Link::JsClick { .. } => f.write_str("page script"),
             Link::Media(url) => write!(f, "▶ {url}"),
             Link::External(url) => f.write_str(url),
-            Link::CarouselScroll(dir) if *dir < 0 => f.write_str("scroll back"),
-            Link::CarouselScroll(_) => f.write_str("scroll forward"),
         }
     }
 }
@@ -282,7 +276,7 @@ pub struct Doc {
     /// gemini/oneshot (which use the line model and gopherus nav) and for
     /// HTTP `text/*`; populated for HTML, where the browser renders and
     /// navigates these instead of `lines`.
-    pub rows: Vec<crate::layout::Row>,
+    pub rows: Vec<crate::layout2::Row>,
     /// Absolute http(s) URLs of every `<img>` on the page (HTML only), in
     /// document order. The app's decode pipeline fetches these; once
     /// decoded, a re-layout turns the alt-text placeholders into pixels.
@@ -294,17 +288,17 @@ pub struct Doc {
     pub blobs: Option<BlobsHandle>,
     /// Horizontally-scrollable strips (carousels) in `rows`, with their
     /// scroll offset. Empty except for HTML pages that have one.
-    pub carousels: Vec<crate::layout::Carousel>,
+    pub carousels: Vec<crate::layout2::Carousel>,
     /// `position:fixed` boxes captured into the PINNED overlay layer, in
     /// viewport coordinates. The renderer draws these on top of the scrolling
     /// `rows` window at a fixed screen position (the document scrolls beneath
     /// them). Empty except for HTML pages with a pinned fixed box (a sidebar/
-    /// header rail — Mastodon). See `crate::layout::FixedItem`.
-    pub fixed: Vec<crate::layout::FixedItem>,
+    /// header rail — Mastodon). See `crate::layout2::FixedItem`.
+    pub fixed: Vec<crate::layout2::FixedItem>,
     /// Vertical inner-scroll viewports (`overflow-y:auto|scroll` regions) in
     /// `rows`. Each reserves blank rows in `rows` and holds its content in its
     /// own buffer (the view windows it). Empty except for HTML pages with one.
-    pub regions: Vec<crate::layout::Region>,
+    pub regions: Vec<crate::layout2::Region>,
     /// The CLIP box `(live_node, client_h_rows, client_w_cells)` of EVERY
     /// definite-height `overflow-y:auto|scroll` box — whether it overflowed into
     /// a `Region` or its content currently fits (no region). The app pushes these
@@ -319,7 +313,7 @@ pub struct Doc {
     /// splices it back into `rows` (Tier 1 in-place / Tier 2 shift), leaving the
     /// rest of the document untouched. Captured on every full HTTP render of a
     /// live page; empty otherwise.
-    pub boundaries: Vec<crate::layout::BoundaryBox>,
+    pub boundaries: Vec<crate::layout2::BoundaryBox>,
     /// Layout-DOM node → live actor node of its nearest enclosing hover host
     /// (the serializer's `data-trust-hover` markers, resolved at parse time —
     /// the parsed DOM doesn't survive layout, so hover targets must be mapped
@@ -340,7 +334,7 @@ pub struct Doc {
     /// the app looks its layers up here to encode. Recomputed on every layout
     /// (never carried across re-parses, unlike `blobs`). Empty except for HTML
     /// pages with genuinely-transparent image overlaps.
-    pub composites: std::collections::HashMap<String, Vec<crate::layout::CompositeLayer>>,
+    pub composites: std::collections::HashMap<String, Vec<crate::layout2::CompositeLayer>>,
 }
 
 impl Doc {
@@ -392,13 +386,13 @@ impl Doc {
     /// presents it as "the page": the main scrollbar reflects it and the
     /// page-level scroll gestures drive it. Always top-level (a nested scroller
     /// is never principal).
-    pub fn principal_region(&self) -> Option<&crate::layout::Region> {
+    pub fn principal_region(&self) -> Option<&crate::layout2::Region> {
         self.regions.iter().find(|r| r.principal)
     }
 
     /// Mutable access to the principal scroll region (for a page-level scroll
     /// gesture that moves it).
-    pub fn principal_region_mut(&mut self) -> Option<&mut crate::layout::Region> {
+    pub fn principal_region_mut(&mut self) -> Option<&mut crate::layout2::Region> {
         self.regions.iter_mut().find(|r| r.principal)
     }
 

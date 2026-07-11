@@ -35,7 +35,7 @@
 use std::collections::HashMap;
 
 use crate::dom::{Dom, NodeId};
-use crate::layout::{
+use crate::layout2::{
     Carousel, CompositeLayer, Emphasis, FixedItem, Item, ItemKind, NO_NODE, Region, Row,
     display_width, truncate_to_width,
 };

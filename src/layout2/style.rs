@@ -11,8 +11,8 @@
 use url::Url;
 
 use crate::dom::{Dom, NodeId};
-use crate::layout::{Emphasis, NO_NODE};
-use crate::layout::{
+use crate::layout2::{Emphasis, NO_NODE};
+use crate::layout2::{
     ItemKind, TextTransform, Units, WhiteSpace, css_is_bold, css_is_italic, css_length_px,
 };
 

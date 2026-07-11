@@ -339,13 +339,13 @@ fn browser_lines<'a>(g: &'a BrowserView, height: usize, find: Option<&FindState>
         .collect()
 }
 
-use crate::layout::visible_col;
+use crate::layout2::visible_col;
 
 /// The base cyberpunk colour for an item's `kind` (before emphasis, selection,
 /// carousel-disabled, and find highlighting are layered on). Shared by the
 /// scrolling document rows and the pinned fixed layer.
-fn item_kind_style(kind: crate::layout::ItemKind) -> Style {
-    use crate::layout::ItemKind;
+fn item_kind_style(kind: crate::layout2::ItemKind) -> Style {
+    use crate::layout2::ItemKind;
     match kind {
         ItemKind::Link => Style::new().fg(theme::NEON_CYAN),
         ItemKind::Heading(1) => Style::new()
@@ -372,12 +372,12 @@ pub(crate) fn browser_rows<'a>(
     height: usize,
     find: Option<&FindState>,
 ) -> Vec<Line<'a>> {
-    use crate::layout::NO_NODE;
+    use crate::layout2::NO_NODE;
     // The selected link's source node: every item sharing it (a link that
     // wrapped across rows) highlights as one unit. Read through `effective_row`
     // so a selection on scroll-region content resolves to its buffer item.
     let sel_node = g.sel_item.and_then(|(r, i)| {
-        crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+        crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r)
             .items
             .get(i)
             .map(|it| it.node)
@@ -390,11 +390,11 @@ pub(crate) fn browser_rows<'a>(
             // band (a vertical inner-scroll viewport draws `buffer[voffset+…]`
             // here, clipped to its band) before placement, so region content
             // styles/highlights through the same path as page content.
-            let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, row_idx);
+            let row = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, row_idx);
             // Each item's on-screen start column (carousel clip + gap-fill +
             // overlap-append), shared with the hit-test so the drawn position
             // and the clickable position always agree.
-            let placed = crate::layout::visual_columns(&row, carousels, row_idx);
+            let placed = crate::layout2::visual_columns(&row, carousels, row_idx);
             let mut spans: Vec<Span> = Vec::with_capacity(placed.len() * 2);
             let mut col = 0u16;
             for (i, scol, vis_w, cut) in placed {
@@ -408,7 +408,7 @@ pub(crate) fn browser_rows<'a>(
                 // an unclipped item is its whole self, borrowed.
                 let clipped = cut > 0 || vis_w < item.width;
                 let text: std::borrow::Cow<str> = if clipped && !item.text.is_empty() {
-                    std::borrow::Cow::Owned(crate::layout::slice_display(
+                    std::borrow::Cow::Owned(crate::layout2::slice_display(
                         &item.text,
                         cut,
                         vis_w as usize,
@@ -428,18 +428,6 @@ pub(crate) fn browser_rows<'a>(
                     continue;
                 }
                 let mut style = item_kind_style(item.kind);
-                // A generated carousel scroll control greys out when it can't
-                // page that way (the spec's `:disabled` end state).
-                if let Some(crate::doc::Link::CarouselScroll(dir)) = &item.link {
-                    let active = carousels
-                        .iter()
-                        .filter(|c| c.end > row_idx)
-                        .min_by_key(|c| c.start.abs_diff(row_idx))
-                        .is_some_and(|c| c.can_scroll(i32::from(*dir)));
-                    if !active {
-                        style = Style::new().fg(theme::DIM);
-                    }
-                }
                 // Emphasis is orthogonal to kind: a link or heading can
                 // also carry bold/italic/underline/strike from tags or CSS.
                 if item.emph.bold {
@@ -472,22 +460,26 @@ pub(crate) fn browser_rows<'a>(
                 // visible slice is deferred (a rare case — searching inside a
                 // scrolled code strip).
                 let ranges = if find.is_some() && !clipped {
-                    let loc =
-                        match crate::layout::item_origin(&g.doc.rows, &g.doc.regions, row_idx, i) {
-                            crate::layout::ItemOrigin::Doc => FindLoc::Item {
-                                row: row_idx,
-                                item: i,
-                            },
-                            crate::layout::ItemOrigin::Region {
-                                region,
-                                brow,
-                                bitem,
-                            } => FindLoc::Region {
-                                region,
-                                brow,
-                                bitem,
-                            },
-                        };
+                    let loc = match crate::layout2::item_origin(
+                        &g.doc.rows,
+                        &g.doc.regions,
+                        row_idx,
+                        i,
+                    ) {
+                        crate::layout2::ItemOrigin::Doc => FindLoc::Item {
+                            row: row_idx,
+                            item: i,
+                        },
+                        crate::layout2::ItemOrigin::Region {
+                            region,
+                            brow,
+                            bitem,
+                        } => FindLoc::Region {
+                            region,
+                            brow,
+                            bitem,
+                        },
+                    };
                     find_ranges(find, loc)
                 } else {
                     Vec::new()
@@ -508,7 +500,7 @@ pub(crate) fn browser_rows<'a>(
                 // wide run); without this an image collapses to zero width and
                 // every following item slides left UNDER it (the header logo
                 // painting over the nav links, an avatar over its post title).
-                let text_w = crate::layout::display_width(&text) as u16;
+                let text_w = crate::layout2::display_width(&text) as u16;
                 if vis_w > text_w {
                     spans.push(Span::raw(" ".repeat((vis_w - text_w) as usize)));
                 }
@@ -592,7 +584,7 @@ fn render_fixed_layer(
 /// hovered/selected item's index in `row.items` (highlighted reversed+bold).
 /// `layer`/`row_idx` name this row for find-match highlighting.
 fn fixed_row_line(
-    row: &crate::layout::Row,
+    row: &crate::layout2::Row,
     sel: Option<usize>,
     find: Option<&FindState>,
     layer: usize,
@@ -600,7 +592,7 @@ fn fixed_row_line(
 ) -> Line<'static> {
     // Keep the original index (the hit-test / `sel` addresses `row.items[i]`)
     // while placing left-to-right by column.
-    let mut items: Vec<(usize, &crate::layout::Item)> = row.items.iter().enumerate().collect();
+    let mut items: Vec<(usize, &crate::layout2::Item)> = row.items.iter().enumerate().collect();
     items.sort_by_key(|(_, it)| it.col);
     let mut spans: Vec<Span> = Vec::new();
     let mut col = 0u16;
@@ -637,7 +629,7 @@ fn fixed_row_line(
         } else {
             spans.extend(match_spans(&it.text, style, &ranges));
         }
-        let text_w = crate::layout::display_width(&it.text) as u16;
+        let text_w = crate::layout2::display_width(&it.text) as u16;
         if it.width > text_w {
             spans.push(Span::raw(" ".repeat((it.width - text_w) as usize)));
         }
@@ -668,7 +660,7 @@ fn render_inline_images(
     // Back-scan above the viewport: a tall image whose top scrolled off the top
     // still reaches into view; `SlicedImage` clips it (a negative `y` skips the
     // off-screen rows — sixel bands — and the bottom is dropped).
-    let start = g.scroll.saturating_sub(crate::layout::MAX_IMAGE_LOOKBACK);
+    let start = g.scroll.saturating_sub(crate::layout2::MAX_IMAGE_LOOKBACK);
     for (off, row) in g.doc.rows[start..end].iter().enumerate() {
         let doc_row = start + off;
         for item in &row.items {
@@ -746,7 +738,9 @@ fn render_region_images(
         // Window the buffer: the visible rows plus the lookback (a tall image
         // whose top scrolled above the band still reaches down into it — a
         // negative `y` clips its top, exactly like the document pass).
-        let top = rg.voffset.saturating_sub(crate::layout::MAX_IMAGE_LOOKBACK);
+        let top = rg
+            .voffset
+            .saturating_sub(crate::layout2::MAX_IMAGE_LOOKBACK);
         let bot = rg.voffset + rg.height as usize;
         for br in top..bot {
             let Some(brow) = rg.buffer.get(br) else {
@@ -896,9 +890,9 @@ fn protocol_badge(g: &BrowserView) -> &'static str {
             crate::oneshot::Scheme::Dict => " DICT ",
         },
         Link::JsClick { .. } => " WWW ",
-        // Form controls, carousel buttons, and media representations never
-        // appear as a document's own URL.
-        Link::Form { .. } | Link::CarouselScroll(_) | Link::Media(_) => " WWW ",
+        // Form controls and media representations never appear as a document's
+        // own URL.
+        Link::Form { .. } | Link::Media(_) => " WWW ",
         Link::External(_) => " NET ",
     }
 }

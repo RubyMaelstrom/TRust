@@ -18,7 +18,7 @@
 use std::ops::Range;
 
 use crate::dom::NodeId;
-use crate::layout::{NO_NODE, Units, split_track_tokens};
+use crate::layout2::{NO_NODE, Units, split_track_tokens};
 
 use super::flex::{Justify, justify_offsets};
 use super::flow::{Flow, Frag};
@@ -1500,7 +1500,7 @@ impl Flow<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::Units;
+    use crate::layout2::Units;
 
     fn u() -> Units {
         Units::default()

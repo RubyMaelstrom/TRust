@@ -17,7 +17,7 @@
 //! left the splice shifts to, and its content wraps at the same width).
 
 use crate::dom::{Dom, NodeId};
-use crate::layout::BoundaryBox;
+use crate::layout2::BoundaryBox;
 
 use super::flow::{Frag, FragKind};
 
@@ -61,7 +61,7 @@ pub(super) fn collect(dom: &Dom, root: &Frag<'_>, cw: f32, ch: f32) -> Vec<Bound
 }
 
 fn walk(dom: &Dom, f: &Frag<'_>, cw: f32, ch: f32, out: &mut Vec<BoundaryBox>) {
-    if f.node != crate::layout::NO_NODE
+    if f.node != crate::layout2::NO_NODE
         && matches!(f.kind, FragKind::Block)
         && let Some(node) = is_boundary(dom, f.node)
     {

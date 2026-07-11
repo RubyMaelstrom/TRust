@@ -30,7 +30,6 @@ mod gopher;
 mod http;
 mod img;
 mod js;
-mod layout;
 mod layout2;
 mod oneshot;
 mod telnet;

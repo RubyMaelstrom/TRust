@@ -1823,7 +1823,7 @@ pub fn parse(
     body: &[u8],
     width: usize,
     viewport_h: usize,
-    images: &crate::layout::ImageSizes,
+    images: &crate::layout2::ImageSizes,
 ) -> Doc {
     // `parse` is the pre-decode entry (`images` empty, per the doc above), so
     // there is nothing to alpha-composite yet — pass the shared empty alpha map.
@@ -1860,7 +1860,7 @@ pub fn parse_seeded(
     width: usize,
     viewport_h: usize,
     seed: Option<&[Form]>,
-    images: &crate::layout::ImageSizes,
+    images: &crate::layout2::ImageSizes,
     // `alpha` = URL→`has_alpha` from the app's decoded cache, threaded to
     // layout2's overlap compositor (P8). Pass `no_alpha()` when unknown.
     alpha: &std::collections::HashMap<String, bool>,
@@ -1913,13 +1913,12 @@ pub fn parse_seeded(
             found_boundaries,
             found_fixed,
             found_anchors,
-        ) = if crate::layout2::enabled() {
-            // The NEW engine (LAYOUT_OVERHAUL_PLAN.md), behind `set layout2
-            // on` until parity. It emits the pinned fixed layer (P4), vertical
-            // scroll regions + their scroll_clips (P5b), carousels (P5c), and
-            // incremental-layout boundaries (P7 — block-filling IFC boxes, so a
-            // live mutation confined to one patches its subtree instead of a
-            // full relayout).
+        ) = {
+            // The fragment-tree engine (LAYOUT_OVERHAUL_PLAN.md). It emits the
+            // pinned fixed layer (P4), vertical scroll regions + their
+            // scroll_clips (P5b), carousels (P5c), and incremental-layout
+            // boundaries (P7 — block-filling IFC boxes, so a live mutation
+            // confined to one patches its subtree instead of a full relayout).
             let out = crate::layout2::lay_out_document(
                 &dom,
                 url,
@@ -1939,29 +1938,17 @@ pub fn parse_seeded(
                 out.fixed,
                 out.anchor_rows,
             )
-        } else {
-            crate::layout::lay_out_with_carousels(
-                &dom,
-                url,
-                (width, viewport_h),
-                &forms,
-                &controls,
-                images,
-                crate::layout::borders_enabled(),
-            )
         };
         if diag {
             let c = crate::dom::take_casc_diag();
             eprintln!(
-                "DIAGPARSE html={}KB nodes={} dom={}ms forms={}ms layout={}ms total={}ms | flow_visits={} measure_calls={} computed_value={} cascaded={}calls/{}ms css_parse={}ms rules={}",
+                "DIAGPARSE html={}KB nodes={} dom={}ms forms={}ms layout={}ms total={}ms | computed_value={} cascaded={}calls/{}ms css_parse={}ms rules={}",
                 html.len() / 1024,
                 dom.node_count(),
                 t_dom.as_millis(),
                 t_forms.as_millis(),
                 t2.elapsed().as_millis(),
                 t0.elapsed().as_millis(),
-                c.flow_visits,
-                c.measure_calls,
                 c.computed_value_calls,
                 c.cascaded_calls,
                 c.cascaded_us / 1000,
@@ -2055,9 +2042,9 @@ fn collect_hover_ids(
 /// metadata the app needs to swap it into the live `Region`.
 pub struct RegionPatch {
     /// The region's new scrollable content buffer (replaces `Region.buffer`).
-    pub rows: Vec<crate::layout::Row>,
+    pub rows: Vec<crate::layout2::Row>,
     /// Carousels found inside the new buffer (buffer-relative).
-    pub carousels: Vec<crate::layout::Carousel>,
+    pub carousels: Vec<crate::layout2::Carousel>,
     /// Absolute http(s) image URLs in the new buffer, to feed the decode pipe.
     pub image_urls: Vec<String>,
     /// The page's `scrollTop` SIGNAL baked on the boundary (rows), if it pinned
@@ -2068,10 +2055,6 @@ pub struct RegionPatch {
     /// nested in the fragment — the app merges them into `Doc.scroll_clips` so a
     /// nested scroller's `clientHeight` stays honest across region relayouts.
     pub scroll_clips: Vec<(usize, u16, u16)>,
-    /// The refreshed per-child row cache (INCREMENTAL_LAYOUT_PLAN.md §14) to
-    /// store back on the region and feed the NEXT patch, so an unchanged message
-    /// is reused instead of re-laid. Empty when the region wasn't cacheable.
-    pub row_cache: crate::layout::RegionRowCache,
 }
 
 /// Parse and lay out a single relayout-boundary fragment (a scroll region) for
@@ -2085,9 +2068,8 @@ pub fn lay_region_patch(
     fragment_html: &[u8],
     content_width: usize,
     viewport: (usize, usize),
-    images: &crate::layout::ImageSizes,
+    images: &crate::layout2::ImageSizes,
     boundary_node: usize,
-    cache: &crate::layout::RegionRowCache,
 ) -> Option<RegionPatch> {
     let diag = std::env::var_os("TRUST_DIAG_PATCH").is_some();
     let t0 = std::time::Instant::now();
@@ -2106,50 +2088,27 @@ pub fn lay_region_patch(
         .and_then(|s| s.parse::<usize>().ok());
     let t_parse = t0.elapsed();
     let t1 = std::time::Instant::now();
-    // Re-lay the region's content into a fresh buffer. Under layout2 the buffer
-    // comes from the SAME engine that laid the page out (so a patched region is
-    // consistent with the full render — LAYOUT_OVERHAUL_PLAN.md P7); the row
-    // cache is not used there (v1, correctness over the reuse memo). Otherwise
-    // the old engine memoizes the scroll container's block children so only a
-    // NEW/changed message is laid (INCREMENTAL_LAYOUT_PLAN.md §14 — the inner-
-    // scroll de-lag; row-identical to the uncached layout).
-    let (rows, carousels, scroll_clips, row_cache) = if crate::layout2::enabled() {
-        let (rows, carousels, scroll_clips) = crate::layout2::lay_region_fragment(
-            &dom,
-            url,
-            content_width,
-            viewport,
-            &controls,
-            images,
-            boundary,
-        );
-        (
-            rows,
-            carousels,
-            scroll_clips,
-            crate::layout::RegionRowCache::default(),
-        )
-    } else {
-        crate::layout::lay_out_region_fragment_cached(
-            &dom,
-            url,
-            content_width,
-            viewport,
-            &controls,
-            images,
-            boundary,
-            cache,
-        )
-    };
+    // Re-lay the region's content into a fresh buffer, through the SAME engine
+    // that laid the page out — so a patched region is consistent with the full
+    // render (LAYOUT_OVERHAUL_PLAN.md P7). The row cache is not used here (v1,
+    // correctness over the reuse memo).
+    let (rows, carousels, scroll_clips) = crate::layout2::lay_region_fragment(
+        &dom,
+        url,
+        content_width,
+        viewport,
+        &controls,
+        images,
+        boundary,
+    );
     if diag {
         let n_nodes = dom.descendants(crate::dom::DOCUMENT).count();
         eprintln!(
-            "DIAGPATCH region-split parse={}us layout={}us nodes={} rows={} reused={}",
+            "DIAGPATCH region-split parse={}us layout={}us nodes={} rows={}",
             t_parse.as_micros(),
             t1.elapsed().as_micros(),
             n_nodes,
             rows.len(),
-            row_cache.children.len(),
         );
     }
     Some(RegionPatch {
@@ -2158,7 +2117,6 @@ pub fn lay_region_patch(
         image_urls,
         scroll_top,
         scroll_clips,
-        row_cache,
     })
 }
 
@@ -2170,7 +2128,7 @@ pub fn lay_region_patch(
 pub struct SubtreeLaid {
     /// The boundary's new content rows (cols from 0 — the app shifts by the
     /// cached `origin_col`).
-    pub rows: Vec<crate::layout::Row>,
+    pub rows: Vec<crate::layout2::Row>,
     /// New content height (rows). `delta = height − old row span` drives the
     /// Tier-2 shift of following content.
     pub height: usize,
@@ -2194,7 +2152,7 @@ pub fn lay_subtree_patch(
     fragment_html: &[u8],
     content_width: usize,
     viewport: (usize, usize),
-    images: &crate::layout::ImageSizes,
+    images: &crate::layout2::ImageSizes,
     boundary_node: usize,
     sub_box: bool,
 ) -> Option<SubtreeLaid> {
@@ -2208,32 +2166,19 @@ pub fn lay_subtree_patch(
         .find(|&id| dom.attr(id, "data-trust-node") == Some(key.as_str()))?;
     let (_forms, controls) = extract_forms_arena(&dom, url, None);
     let image_urls = collect_image_urls(&dom, url);
-    // Under layout2 the subtree lays through the SAME engine that rendered the
-    // page (so a patched boundary is byte-consistent with a full relayout —
-    // LAYOUT_OVERHAUL_PLAN.md P7); otherwise the old engine.
-    let frag = if crate::layout2::enabled() {
-        crate::layout2::lay_subtree_fragment(
-            &dom,
-            url,
-            content_width,
-            viewport,
-            &controls,
-            images,
-            boundary,
-            sub_box,
-        )
-    } else {
-        crate::layout::lay_out_subtree_fragment(
-            &dom,
-            url,
-            content_width,
-            viewport,
-            &controls,
-            images,
-            boundary,
-            sub_box,
-        )
-    };
+    // The subtree lays through the SAME engine that rendered the page, so a
+    // patched boundary is byte-consistent with a full relayout
+    // (LAYOUT_OVERHAUL_PLAN.md P7).
+    let frag = crate::layout2::lay_subtree_fragment(
+        &dom,
+        url,
+        content_width,
+        viewport,
+        &controls,
+        images,
+        boundary,
+        sub_box,
+    );
     Some(SubtreeLaid {
         height: frag.height,
         width: frag.width,
@@ -2302,10 +2247,10 @@ fn collect_image_urls(dom: &crate::dom::Dom, base: &Url) -> Vec<String> {
     // renders no representation, so its logo og:image must not decode as a
     // phantom preview either), and the page-level fallback needs the same
     // declaration with no media element at all.
-    let page_is_video = crate::layout::page_declares_video(dom);
+    let page_is_video = crate::layout2::page_declares_video(dom);
     if page_is_video
         && (has_video || !has_media)
-        && let Some(preview) = crate::layout::page_preview_image(dom, base)
+        && let Some(preview) = crate::layout2::page_preview_image(dom, base)
         && !urls.contains(&preview)
     {
         urls.push(preview);
@@ -2655,7 +2600,7 @@ mod tests {
     use super::*;
 
     /// Find the first laid-out item whose text contains `needle`.
-    fn item<'a>(doc: &'a Doc, needle: &str) -> &'a crate::layout::Item {
+    fn item<'a>(doc: &'a Doc, needle: &str) -> &'a crate::layout2::Item {
         doc.rows
             .iter()
             .flat_map(|r| &r.items)
@@ -2685,7 +2630,7 @@ mod tests {
             html,
             80,
             24,
-            &crate::layout::ImageSizes::new(),
+            &crate::layout2::ImageSizes::new(),
         );
         let a = &doc.anchor_rows;
         eprintln!("anchor_rows = {a:?}, rows = {}", doc.rows.len());
@@ -5148,7 +5093,7 @@ mod tests {
         let html = last_html.unwrap_or_else(|| String::from_utf8_lossy(&resp.body).to_string());
         let dom = crate::dom::Dom::parse_document(&html);
         // Decode every real <img src>.
-        let mut images = crate::layout::ImageSizes::new();
+        let mut images = crate::layout2::ImageSizes::new();
         let mut srcs: Vec<(crate::dom::NodeId, url::Url)> = Vec::new();
         for id in dom.descendants(crate::dom::DOCUMENT) {
             if dom.tag_name(id) == Some("img")
@@ -5178,15 +5123,16 @@ mod tests {
             }
         }
         eprintln!("decoded {} images", images.len());
-        let (rows, _car, _rgn, _clip, _bnd, _fix, _anchors) = crate::layout::lay_out_with_carousels(
+        let rows = crate::layout2::lay_out_document(
             &dom,
             &url,
             (vp.0 as usize, vp.1 as usize),
             &[],
-            &crate::layout::ControlMap::new(),
+            &crate::layout2::ControlMap::new(),
             &images,
-            false,
-        );
+            no_alpha(),
+        )
+        .rows;
         for (y, row) in rows.iter().enumerate() {
             for it in &row.items {
                 if let Some(src) = &it.image {
@@ -5396,7 +5342,7 @@ mod tests {
             "the shell carries the document's rem basis: {frag}"
         );
         let url = parse_url("https://example.com/").unwrap();
-        let mut images = crate::layout::ImageSizes::new();
+        let mut images = crate::layout2::ImageSizes::new();
         images.insert("https://example.com/x.jpg".to_owned(), (10, 5));
         let laid =
             lay_subtree_patch(&url, frag.as_bytes(), 200, (200, 64), &images, 42, false).unwrap();
@@ -5452,7 +5398,7 @@ mod tests {
         // TRUST_LAYOUT_IMG_CELL=WxH: seed EVERY <img>'s src with a decoded cell
         // box, so a layout that only shows the real box once decoded (an
         // `object-fit`/`width:100%` product tile) can be reproduced offline.
-        let mut images = crate::layout::ImageSizes::new();
+        let mut images = crate::layout2::ImageSizes::new();
         if let Ok(spec) = std::env::var("TRUST_LAYOUT_IMG_CELL")
             && let Some((cw, ch)) = spec
                 .split_once('x')
@@ -5501,29 +5447,16 @@ mod tests {
         if let Ok(sub) = std::env::var("TRUST_LAYOUT_MEASURE") {
             let mdom = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
             let (forms2, controls2) = extract_forms_arena(&mdom, &url, None);
-            let boxes = if crate::layout2::enabled() {
-                crate::layout2::measure_boxes_and_grid_tracks(
-                    &mdom,
-                    &url,
-                    (w, vh),
-                    &forms2,
-                    &controls2,
-                    (8, 16),
-                    &images,
-                )
-                .0
-            } else {
-                crate::layout::measure_boxes(
-                    &mdom,
-                    &url,
-                    (w, vh),
-                    &forms2,
-                    &controls2,
-                    (8, 16),
-                    false,
-                    &images,
-                )
-            };
+            let boxes = crate::layout2::measure_boxes_and_grid_tracks(
+                &mdom,
+                &url,
+                (w, vh),
+                &forms2,
+                &controls2,
+                (8, 16),
+                &images,
+            )
+            .0;
             for id in 0..mdom.node_count() {
                 let matches = mdom.attr(id, "id").is_some_and(|v| v.contains(&sub))
                     || mdom.attr(id, "class").is_some_and(|v| v.contains(&sub));
@@ -5554,8 +5487,8 @@ mod tests {
             for it in &row.items {
                 let t = it.text.replace('\n', "\\n");
                 let tag = match &it.kind {
-                    crate::layout::ItemKind::Image => "IMG",
-                    crate::layout::ItemKind::Border => "BRD",
+                    crate::layout2::ItemKind::Image => "IMG",
+                    crate::layout2::ItemKind::Border => "BRD",
                     _ => "txt",
                 };
                 seen_nodes.insert(it.node);
@@ -6376,7 +6309,7 @@ customElements.define('lit-counter', LitCounter);
         );
         assert_eq!(
             item(&doc, "Arrived").kind,
-            crate::layout::ItemKind::Heading(1)
+            crate::layout2::ItemKind::Heading(1)
         );
         let link = doc
             .rows
@@ -6924,7 +6857,7 @@ customElements.define('lit-counter', LitCounter);
 
     #[test]
     fn renders_html_into_rows() {
-        use crate::layout::ItemKind;
+        use crate::layout2::ItemKind;
         let base = Url::parse("https://example.com/dir/page.html").unwrap();
         let html = r#"
             <html><body>
@@ -7006,10 +6939,10 @@ customElements.define('lit-counter', LitCounter);
         // width — the UA-default 20ch box — so match the label, not `[label]`.)
         assert!(!has_item(&doc, "cafe123"));
         let input = item(&doc, "Type a message...");
-        assert_eq!(input.kind, crate::layout::ItemKind::Form);
+        assert_eq!(input.kind, crate::layout2::ItemKind::Form);
         assert_eq!(input.link, Some(Link::Form { form: 0, field: 1 }));
         let button = item(&doc, "[ Send ]");
-        assert_eq!(button.kind, crate::layout::ItemKind::Form);
+        assert_eq!(button.kind, crate::layout2::ItemKind::Form);
         assert_eq!(button.link, Some(Link::Form { form: 0, field: 2 }));
     }
 
@@ -7040,7 +6973,7 @@ customElements.define('lit-counter', LitCounter);
         // The editor widget pads to its used width (a textarea box), so match
         // the placeholder label rather than `[label]`.
         let widget = item(&doc, "Type here");
-        assert_eq!(widget.kind, crate::layout::ItemKind::Form);
+        assert_eq!(widget.kind, crate::layout2::ItemKind::Form);
         assert_eq!(widget.link, Some(Link::Form { form: 0, field: 0 }));
 
         // `contenteditable="false"` is explicitly NOT editable.

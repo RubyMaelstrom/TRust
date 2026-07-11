@@ -20,7 +20,7 @@ use url::Url;
 
 use crate::doc::{Form, Link};
 use crate::dom::{Dom, NodeId};
-use crate::layout::{
+use crate::layout2::{
     Emphasis, ImageSizes, Item, ItemKind, Units, display_width, is_collapsible_space, letter_space,
 };
 
@@ -757,7 +757,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         };
         let Some(play) = play else { return };
         let plays_this_page = streaming && play == *self.base;
-        let dead_end = plays_this_page && !crate::layout::page_declares_video(self.dom);
+        let dead_end = plays_this_page && !crate::layout2::page_declares_video(self.dom);
         let link = (!dead_end).then_some(Link::Media(play));
         let poster = video
             .then(|| {
@@ -771,7 +771,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     })
                     .or_else(|| {
                         (plays_this_page && !dead_end)
-                            .then(|| crate::layout::page_preview_image(self.dom, self.base))
+                            .then(|| crate::layout2::page_preview_image(self.dom, self.base))
                             .flatten()
                     })
             })
@@ -884,7 +884,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 width: sz.w_cells as u16,
                 height: sz.h_rows,
                 text: String::new(),
-                kind: crate::layout::ItemKind::Text,
+                kind: crate::layout2::ItemKind::Text,
                 image: None,
                 emph: Emphasis::default(),
                 node,
