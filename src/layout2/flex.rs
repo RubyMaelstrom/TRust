@@ -11,7 +11,7 @@
 //! spec's freeze loop verbatim.
 
 use crate::dom::{Dom, NodeId};
-use crate::layout::Units;
+use crate::layout2::Units;
 
 use super::value::{Len, Vp};
 

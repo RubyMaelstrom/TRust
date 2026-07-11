@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::dom::{DOCUMENT, Dom, NodeId};
-use crate::layout::{NO_NODE, PxRect};
+use crate::layout2::{NO_NODE, PxRect};
 
 use super::flow::{Frag, FragKind};
 

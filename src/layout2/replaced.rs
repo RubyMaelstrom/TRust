@@ -8,7 +8,7 @@
 //! the caller quantizes at the paint boundary like all other geometry.
 
 use crate::dom::{Dom, NodeId};
-use crate::layout::Units;
+use crate::layout2::Units;
 
 use super::value::{Len, Vp};
 

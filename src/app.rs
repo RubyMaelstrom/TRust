@@ -337,7 +337,7 @@ impl FindMatch {
     /// with their region's band (buffer order within it); fixed-layer
     /// matches are pinned chrome — they sort after the document (usize::MAX)
     /// and never drive a scroll.
-    fn order_row(&self, regions: &[crate::layout::Region]) -> usize {
+    fn order_row(&self, regions: &[crate::layout2::Region]) -> usize {
         match self.loc {
             FindLoc::Line(l) => l,
             FindLoc::Item { row, .. } => row,
@@ -454,7 +454,7 @@ pub(crate) struct EncKey {
 impl EncKey {
     /// The cache key for an image item's box. Shared by the encode pass and the
     /// renderer so they key (and so find) the same encoded protocol.
-    pub(crate) fn for_item(url: &str, item: &crate::layout::Item) -> Self {
+    pub(crate) fn for_item(url: &str, item: &crate::layout2::Item) -> Self {
         EncKey {
             url: url.to_string(),
             w: item.width,
@@ -589,7 +589,6 @@ pub(crate) static IMG_RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic:
 #[derive(Default)]
 struct RegionLive {
     html: Vec<u8>,
-    cache: crate::layout::RegionRowCache,
 }
 
 /// `TRUST_DIAG_FRAME` present in the environment, read ONCE. The per-call
@@ -829,7 +828,7 @@ pub struct App {
     /// every URL string) per call: that clone ran on EVERY live re-render and
     /// even on the O(one message) region-patch path, where a session's
     /// accumulated cache could outweigh the patch itself.
-    image_sizes: crate::layout::ImageSizes,
+    image_sizes: crate::layout2::ImageSizes,
     /// URL→`has_alpha` mirror of `image_cache` (same insert-only sync), threaded
     /// into layout so the overlap compositor (LAYOUT_OVERHAUL_PLAN.md P8) groups
     /// only genuinely-transparent overlaps. An absent entry means "opaque / not
@@ -1033,7 +1032,7 @@ impl App {
             fetch_task: None,
             img_rx: None,
             image_cache: HashMap::new(),
-            image_sizes: crate::layout::ImageSizes::new(),
+            image_sizes: crate::layout2::ImageSizes::new(),
             image_alpha: std::collections::HashMap::new(),
             imgs_tx,
             imgs_rx,
@@ -1070,8 +1069,8 @@ impl App {
         // the render pass converts an overflow-clip box's declared px height
         // back to the same rows the JS geometry (which measures rows × this
         // cell size) reported — see `layout::set_cell_px_w`/`set_cell_px_h`.
-        crate::layout::set_cell_px_w(picker.font_size().width);
-        crate::layout::set_cell_px_h(picker.font_size().height);
+        crate::layout2::set_cell_px_w(picker.font_size().width);
+        crate::layout2::set_cell_px_h(picker.font_size().height);
         self.picker = picker;
     }
 
@@ -2352,31 +2351,19 @@ impl App {
                     self.status = String::from("JavaScript off (on is the default).");
                 }
                 (Some("borders"), Some("on")) => {
-                    crate::layout::set_borders_enabled(true);
+                    crate::layout2::set_borders_enabled(true);
                     self.relayout_browser();
                     self.status =
                         String::from("Borders on: CSS borders render as box-drawing chrome.");
                 }
                 (Some("borders"), Some("off")) => {
-                    crate::layout::set_borders_enabled(false);
+                    crate::layout2::set_borders_enabled(false);
                     self.relayout_browser();
                     self.status = String::from("Borders off (the default): borders aren't drawn.");
                 }
-                (Some("layout2"), Some("on")) => {
-                    crate::layout2::set_enabled(true);
-                    self.relayout_browser();
-                    self.status =
-                        String::from("layout2 on (the default): the fragment-tree engine.");
-                }
-                (Some("layout2"), Some("off")) => {
-                    crate::layout2::set_enabled(false);
-                    self.relayout_browser();
-                    self.status =
-                        String::from("layout2 off: the legacy flow engine (being retired).");
-                }
                 _ => {
                     self.status = String::from(
-                        "usage: set encoding cp437|utf8 · set image <protocol>|auto · set js on|off · set cookies on|off · set borders on|off · set layout2 on|off",
+                        "usage: set encoding cp437|utf8 · set image <protocol>|auto · set js on|off · set cookies on|off · set borders on|off",
                     )
                 }
             },
@@ -2783,9 +2770,6 @@ impl App {
                     Link::JsClick { .. } => {
                         Err(String::from("page-script links need their living page"))
                     }
-                    Link::CarouselScroll(_) => Err(String::from(
-                        "carousel controls scroll in place, not fetched",
-                    )),
                     Link::Media(_) => Err(String::from("media plays in mpv, not fetched")),
                 }
             };
@@ -3106,7 +3090,7 @@ impl App {
             return;
         }
         let item_target = g.sel_item.and_then(|(r, i)| {
-            crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+            crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r)
                 .items
                 .get(i)
                 .cloned()
@@ -3118,7 +3102,7 @@ impl App {
         let view_anchor: Option<(usize, crate::doc::Link)> = {
             let bot = (g.scroll + height).min(g.doc.rows.len());
             (g.scroll..bot).find_map(|r| {
-                crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r)
                     .items
                     .iter()
                     .find_map(|it| it.link.clone().map(|l| (r, l)))
@@ -3231,7 +3215,7 @@ impl App {
         self.input.hash(&mut h);
         let end = (g.scroll + vh).min(g.doc.rows.len());
         for r in g.scroll..end {
-            let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r);
+            let row = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r);
             for it in &row.items {
                 it.col.hash(&mut h);
                 it.height.hash(&mut h);
@@ -3295,7 +3279,7 @@ impl App {
         // Start the scan above the viewport top: a tall image whose top row is
         // already scrolled off the top still reaches down into view (the
         // renderer draws its lower slice).
-        let start = g.scroll.saturating_sub(crate::layout::MAX_IMAGE_LOOKBACK);
+        let start = g.scroll.saturating_sub(crate::layout2::MAX_IMAGE_LOOKBACK);
         let mut live: HashSet<EncKey> = HashSet::new();
         for (off, row) in g.doc.rows[start..end].iter().enumerate() {
             let doc_row = start + off;
@@ -3304,7 +3288,7 @@ impl App {
                 // Apply the carousel scroll/clip exactly as the renderer does
                 // (`visible_col`): a strip image scrolled into the band is live,
                 // one scrolled out of the band isn't.
-                if crate::layout::visible_col(&g.doc.carousels, doc_row, item).is_none() {
+                if crate::layout2::visible_col(&g.doc.carousels, doc_row, item).is_none() {
                     continue;
                 }
                 live.insert(EncKey::for_item(url, item));
@@ -3320,7 +3304,9 @@ impl App {
             if rg.start_row >= end || rg.start_row + rg.height as usize <= start {
                 continue;
             }
-            let top = rg.voffset.saturating_sub(crate::layout::MAX_IMAGE_LOOKBACK);
+            let top = rg
+                .voffset
+                .saturating_sub(crate::layout2::MAX_IMAGE_LOOKBACK);
             let bot = rg.voffset + rg.height as usize;
             for br in top..bot {
                 let Some(brow) = rg.buffer.get(br) else {
@@ -3897,7 +3883,7 @@ impl App {
     /// — deepest wins structurally), with the item's own `JsClick` link as a
     /// fallback. Shared by the pointer hit-test and the keyboard-selection
     /// hover path.
-    fn hover_resolve(g: &BrowserView, item: &crate::layout::Item) -> Option<usize> {
+    fn hover_resolve(g: &BrowserView, item: &crate::layout2::Item) -> Option<usize> {
         if let Some(&actor) = g.doc.hover_ids.get(&item.node) {
             return Some(actor);
         }
@@ -3945,8 +3931,8 @@ impl App {
             // the reserved band, so the hit lands on region content; the
             // visual columns are the SAME on-screen placement the renderer
             // draws (carousel clip + gap-fill + overlap-append).
-            let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r);
-            for (i, start, vis_w, _cut) in crate::layout::visual_columns(&row, &g.doc.carousels, r)
+            let row = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r);
+            for (i, start, vis_w, _cut) in crate::layout2::visual_columns(&row, &g.doc.carousels, r)
             {
                 let item = &row.items[i];
                 let end = start.saturating_add(vis_w);
@@ -4026,7 +4012,7 @@ impl App {
         let Some(g) = self.browser.as_ref() else {
             return;
         };
-        let resolve = |item: &crate::layout::Item| Self::hover_resolve(g, item);
+        let resolve = |item: &crate::layout2::Item| Self::hover_resolve(g, item);
         let (target, cell) = if let Some((fi, r, i)) = g.sel_fixed {
             let f = &g.doc.fixed[fi];
             let item = &f.rows[r].items[i];
@@ -4040,7 +4026,7 @@ impl App {
             if r < g.scroll || r >= g.scroll + self.last_inner.1 as usize {
                 return; // selection is off-screen; no pointer position to report
             }
-            let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r);
+            let row = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r);
             let Some(item) = row.items.get(i) else {
                 return;
             };
@@ -4522,7 +4508,7 @@ impl App {
         // Remember the selected item by its arena node (and link) so the
         // selection survives the DOM mutating under it.
         let selected_target = g.sel_item.and_then(|(r, i)| {
-            crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+            crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r)
                 .items
                 .get(i)
                 .cloned()
@@ -4537,7 +4523,7 @@ impl App {
         let view_anchor: Option<(usize, crate::doc::Link)> = {
             let bot = (g.scroll + height).min(g.doc.rows.len());
             (g.scroll..bot).find_map(|r| {
-                crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r)
                     .items
                     .iter()
                     .find_map(|it| it.link.clone().map(|l| (r, l)))
@@ -4763,15 +4749,9 @@ impl App {
         // The memoized child-row cache from the previous re-lay (or an empty one),
         // so unchanged messages are reused and only the new/decoded one is laid.
         let old = self.region_live.remove(&node).unwrap_or_default();
-        let Some(rp) = http::lay_region_patch(
-            &url,
-            html,
-            region_width,
-            viewport,
-            &self.image_sizes,
-            node,
-            &old.cache,
-        ) else {
+        let Some(rp) =
+            http::lay_region_patch(&url, html, region_width, viewport, &self.image_sizes, node)
+        else {
             // Re-insert so a transient miss (boundary not found) doesn't discard
             // the retained HTML/memo for the next attempt.
             self.region_live.insert(node, old);
@@ -4781,7 +4761,6 @@ impl App {
             node,
             RegionLive {
                 html: html.to_vec(),
-                cache: rp.row_cache.clone(),
             },
         );
         if *DIAG_FRAME {
@@ -4801,7 +4780,7 @@ impl App {
             .sel_item
             .filter(|&(r, _)| band.contains(&r))
             .and_then(|(r, i)| {
-                crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r)
                     .items
                     .get(i)
                     .cloned()
@@ -4938,7 +4917,7 @@ impl App {
             .sel_item
             .filter(|&(r, _)| old_range.contains(&r))
             .and_then(|(r, i)| {
-                crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r)
                     .items
                     .get(i)
                     .cloned()
@@ -4955,7 +4934,7 @@ impl App {
         let scroll_anchor: Option<(usize, crate::doc::Link)> =
             if delta != 0 && splice_at < g.scroll && g.scroll < old_range.end {
                 (g.scroll..old_range.end).find_map(|r| {
-                    crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+                    crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r)
                         .items
                         .iter()
                         .find_map(|it| it.link.clone().map(|l| (r, l)))
@@ -5092,7 +5071,7 @@ impl App {
     fn find_row_by_link(doc: &Doc, link: &crate::doc::Link, near: usize) -> Option<usize> {
         let mut best: Option<usize> = None;
         for r in 0..doc.rows.len() {
-            let here = crate::layout::effective_row(&doc.rows, &doc.regions, r)
+            let here = crate::layout2::effective_row(&doc.rows, &doc.regions, r)
                 .items
                 .iter()
                 .any(|it| it.link.as_ref() == Some(link));
@@ -5105,18 +5084,18 @@ impl App {
 
     /// Find the `(row, item)` matching `target` in fresh rows: same arena
     /// node wins (a control that moved), else same link target.
-    fn find_item_like(doc: &Doc, target: &crate::layout::Item) -> Option<(usize, usize)> {
+    fn find_item_like(doc: &Doc, target: &crate::layout2::Item) -> Option<(usize, usize)> {
         // Search the EFFECTIVE rows (region buffer windows merged in) so a
         // selection on scroll-region content re-anchors after a re-layout — the
         // returned `(r, i)` indexes the effective row, consistent with how the
         // selection is later read (`selected_link`/render through `effective_row`).
         for r in 0..doc.rows.len() {
-            let row = crate::layout::effective_row(&doc.rows, &doc.regions, r);
+            let row = crate::layout2::effective_row(&doc.rows, &doc.regions, r);
             for (i, it) in row.items.iter().enumerate() {
                 if !it.is_interactive() {
                     continue;
                 }
-                let same = (target.node != crate::layout::NO_NODE && it.node == target.node)
+                let same = (target.node != crate::layout2::NO_NODE && it.node == target.node)
                     || (it.link.is_some() && it.link == target.link);
                 if same {
                     return Some((r, i));
@@ -5146,7 +5125,7 @@ impl App {
     /// the PAGE's call, via its own `element.scrollTop` writes; we never guess it.
     fn carry_region_offsets(
         old: &[(crate::dom::NodeId, usize)],
-        regions: &mut [crate::layout::Region],
+        regions: &mut [crate::layout2::Region],
         prefer_signal: bool,
     ) {
         for rg in regions.iter_mut() {
@@ -5157,7 +5136,7 @@ impl App {
             // always restored — a lagging `data-trust-scroll-top` signal must
             // never snap the main content back to the top on a live re-render
             // (the "kicked back up" bug). Same guarantee `g.scroll` already has.
-            if rg.node != crate::layout::NO_NODE
+            if rg.node != crate::layout2::NO_NODE
                 && !(prefer_signal && rg.voffset_from_page && !rg.principal)
                 && let Some(&(_, voff)) = old.iter().find(|&&(n, _)| n == rg.node)
             {
@@ -5171,11 +5150,11 @@ impl App {
     /// Flatten every region's `(node, voffset)` — nested scrollers included —
     /// so the restore above re-seats them all after a full re-layout.
     fn collect_region_offsets(
-        regions: &[crate::layout::Region],
+        regions: &[crate::layout2::Region],
         out: &mut Vec<(crate::dom::NodeId, usize)>,
     ) {
         for rg in regions {
-            if rg.node != crate::layout::NO_NODE {
+            if rg.node != crate::layout2::NO_NODE {
                 out.push((rg.node, rg.voffset));
             }
             Self::collect_region_offsets(&rg.regions, out);
@@ -5591,54 +5570,21 @@ impl App {
             .position(|c| c.contains_row(doc_row) && local_col >= c.left && local_col < c.right)
     }
 
-    /// If the activated item is a generated carousel scroll control (the
-    /// `‹`/`›` glyphs), page the nearest carousel in its direction instead of
-    /// navigating. The selection stays on the control so repeated Enter/clicks
-    /// keep paging, like a real scroll button. Returns whether it handled it.
-    fn activate_carousel_control(&mut self) -> bool {
-        let Some(g) = self.browser.as_mut() else {
-            return false;
-        };
-        let Some((row, idx)) = g.sel_item else {
-            return false;
-        };
-        let dir = match g.doc.rows.get(row).and_then(|r| r.items.get(idx)) {
-            Some(it) => match it.link {
-                Some(crate::doc::Link::CarouselScroll(d)) => i32::from(d),
-                _ => return false,
-            },
-            None => return false,
-        };
-        // The control sits just above its band; page the nearest carousel
-        // whose band starts at or below the control's row.
-        let Some(c) = g
-            .doc
-            .carousels
-            .iter_mut()
-            .filter(|c| c.end > row)
-            .min_by_key(|c| c.start.abs_diff(row))
-        else {
-            return false;
-        };
-        c.scroll_page(dir);
-        true
-    }
-
     /// Interactive item indices on a row (followable links; form controls
     /// fold in later).
-    fn row_interactives(row: &crate::layout::Row) -> Vec<usize> {
-        Self::row_interactives_excluding(row, crate::layout::NO_NODE)
+    fn row_interactives(row: &crate::layout2::Row) -> Vec<usize> {
+        Self::row_interactives_excluding(row, crate::layout2::NO_NODE)
     }
 
     /// Interactive item indices on a row, excluding pieces of `skip` (a
     /// link that wrapped onto this row) so navigation steps link-to-link
     /// rather than through one link's own wrapped fragments.
-    fn row_interactives_excluding(row: &crate::layout::Row, skip: usize) -> Vec<usize> {
+    fn row_interactives_excluding(row: &crate::layout2::Row, skip: usize) -> Vec<usize> {
         row.items
             .iter()
             .enumerate()
             .filter(|(_, it)| {
-                it.link.is_some() && (skip == crate::layout::NO_NODE || it.node != skip)
+                it.link.is_some() && (skip == crate::layout2::NO_NODE || it.node != skip)
             })
             .map(|(i, _)| i)
             .collect()
@@ -5650,7 +5596,7 @@ impl App {
     fn http_first_visible_item(g: &BrowserView, height: usize) -> Option<(usize, usize)> {
         let end = (g.scroll + height).min(g.doc.rows.len());
         (g.scroll..end).find_map(|r| {
-            Self::row_interactives(&crate::layout::effective_row(
+            Self::row_interactives(&crate::layout2::effective_row(
                 &g.doc.rows,
                 &g.doc.regions,
                 r,
@@ -5730,8 +5676,8 @@ impl App {
         // rows it happens to show; only when the buffer is exhausted does
         // the step fall out into the surrounding document.
         if !horizontal {
-            let origin = crate::layout::item_origin(&g.doc.rows, &g.doc.regions, cr, ci);
-            if let crate::layout::ItemOrigin::Region {
+            let origin = crate::layout2::item_origin(&g.doc.rows, &g.doc.regions, cr, ci);
+            if let crate::layout2::ItemOrigin::Region {
                 region,
                 brow,
                 bitem,
@@ -5777,7 +5723,7 @@ impl App {
         };
         let cur = rg.buffer.get(brow).and_then(|r| r.items.get(bitem));
         let cur_col = cur.map_or(0, |it| it.col);
-        let cur_node = cur.map_or(crate::layout::NO_NODE, |it| it.node);
+        let cur_node = cur.map_or(crate::layout2::NO_NODE, |it| it.node);
         let candidates: Box<dyn Iterator<Item = usize>> = if dir > 0 {
             Box::new((brow + 1)..rg.buffer.len())
         } else {
@@ -5794,7 +5740,7 @@ impl App {
                 .filter(|(_, it)| {
                     it.link.is_some()
                         && it.col < rg.width
-                        && (cur_node == crate::layout::NO_NODE || it.node != cur_node)
+                        && (cur_node == crate::layout2::NO_NODE || it.node != cur_node)
                 })
                 .min_by_key(|(_, it)| (i32::from(it.col) - i32::from(cur_col)).abs())
                 .map(|(bi, _)| bi);
@@ -5815,11 +5761,11 @@ impl App {
         let band = rg.start_row + (br - rg.voffset);
         let writeback = (rg.live_node, rg.voffset);
         // The target's merged index in the (freshly scrolled) effective row.
-        let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, band);
+        let row = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, band);
         let idx = (0..row.items.len()).find(|&i| {
             matches!(
-                crate::layout::item_origin(&g.doc.rows, &g.doc.regions, band, i),
-                crate::layout::ItemOrigin::Region { region: r2, brow: b2, bitem: i2 }
+                crate::layout2::item_origin(&g.doc.rows, &g.doc.regions, band, i),
+                crate::layout2::ItemOrigin::Region { region: r2, brow: b2, bitem: i2 }
                     if r2 == region && b2 == br && i2 == bi
             )
         });
@@ -5836,18 +5782,18 @@ impl App {
     /// rows. Rows are read through `effective_row`, so a scroll region's
     /// visible window is stepped through like any other content.
     fn http_step_horizontal(
-        rows: &[crate::layout::Row],
-        regions: &[crate::layout::Region],
+        rows: &[crate::layout2::Row],
+        regions: &[crate::layout2::Region],
         cr: usize,
         ci: usize,
         dir: i64,
     ) -> Option<(usize, usize)> {
-        let eff = |r: usize| crate::layout::effective_row(rows, regions, r);
+        let eff = |r: usize| crate::layout2::effective_row(rows, regions, r);
         let here_row = eff(cr);
         let cur_node = here_row
             .items
             .get(ci)
-            .map_or(crate::layout::NO_NODE, |it| it.node);
+            .map_or(crate::layout2::NO_NODE, |it| it.node);
         let here = Self::row_interactives_excluding(&here_row, cur_node);
         if dir > 0 {
             if let Some(&i) = here.iter().find(|&&i| i > ci) {
@@ -5874,19 +5820,19 @@ impl App {
     /// nearest the current item's column. Rows are read through
     /// `effective_row` (scroll-region windows included).
     fn http_step_vertical(
-        rows: &[crate::layout::Row],
-        regions: &[crate::layout::Region],
+        rows: &[crate::layout2::Row],
+        regions: &[crate::layout2::Region],
         cr: usize,
         ci: usize,
         dir: i64,
     ) -> Option<(usize, usize)> {
-        let eff = |r: usize| crate::layout::effective_row(rows, regions, r);
+        let eff = |r: usize| crate::layout2::effective_row(rows, regions, r);
         let here_row = eff(cr);
         let cur_col = here_row.items.get(ci).map_or(0, |it| it.col);
         let cur_node = here_row
             .items
             .get(ci)
-            .map_or(crate::layout::NO_NODE, |it| it.node);
+            .map_or(crate::layout2::NO_NODE, |it| it.node);
         let candidates: Box<dyn Iterator<Item = usize>> = if dir > 0 {
             Box::new((cr + 1)..rows.len())
         } else {
@@ -6094,7 +6040,7 @@ impl App {
         }
         let mut r = g.scroll + row.saturating_sub(self.last_content_area.y) as usize;
         let mut c = col.saturating_sub(self.last_content_area.x);
-        let mut regions: &[crate::layout::Region] = &g.doc.regions;
+        let mut regions: &[crate::layout2::Region] = &g.doc.regions;
         let mut path = Vec::new();
         loop {
             let idx = regions
@@ -6121,7 +6067,7 @@ impl App {
 
     /// The region addressed by `path` (read-only) — for reading the deepest
     /// region's page size.
-    fn region_at_path(&self, path: &[usize]) -> Option<&crate::layout::Region> {
+    fn region_at_path(&self, path: &[usize]) -> Option<&crate::layout2::Region> {
         let g = self.browser.as_ref()?;
         let mut rg = g.doc.regions.get(*path.first()?)?;
         for &idx in &path[1..] {
@@ -6186,7 +6132,7 @@ impl App {
         // For laid-out docs, carry the selection over by its item identity, and
         // the scroll-region offsets so a resize keeps each region's scroll spot.
         let item_target = g.sel_item.and_then(|(r, i)| {
-            crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+            crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r)
                 .items
                 .get(i)
                 .cloned()
@@ -6223,7 +6169,7 @@ impl App {
                 Self::about_doc(s, body, width)
             }
             Link::Form { .. } | Link::JsClick { .. } | Link::External(_) => return,
-            Link::CarouselScroll(_) | Link::Media(_) => return,
+            Link::Media(_) => return,
         };
         // Same page, same blob mirror (a re-wrap must not orphan blob: images).
         g.doc.blobs = blobs;
@@ -6348,12 +6294,6 @@ impl App {
     }
 
     fn browser_follow(&mut self) {
-        // A carousel's own prev/next button scrolls the strip rather than
-        // navigating — its JS click can't reach our parse-time layout, so we
-        // page the band ourselves (the CSS `::scroll-button` behavior).
-        if self.activate_carousel_control() {
-            return;
-        }
         // Auto-route recognized video links straight to mpv, in EVERY view:
         // YouTube in its various formats (people post these on gopher and
         // gemini too — following one should play it, not try to render
@@ -6412,8 +6352,6 @@ impl App {
             Link::External(target) => {
                 self.status = format!("external link: {target}");
             }
-            // Handled by `activate_carousel_control` before this match.
-            Link::CarouselScroll(_) => {}
         }
     }
 
@@ -6474,7 +6412,7 @@ impl App {
             // Through `effective_row` so a selection that landed on scroll-region
             // content (whose items live in the region buffer, not the blank
             // reserved doc row) resolves to its link.
-            crate::layout::effective_row(&g.doc.rows, &g.doc.regions, r)
+            crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r)
                 .items
                 .get(i)?
                 .link
@@ -8040,7 +7978,7 @@ mod tests {
             body.as_bytes(),
             40,
             50,
-            &crate::layout::ImageSizes::new(),
+            &crate::layout2::ImageSizes::new(),
         );
         app.navigate_to(doc);
         {
@@ -8058,7 +7996,6 @@ mod tests {
             7,
             super::RegionLive {
                 html: fragment.into_bytes(),
-                cache: Default::default(),
             },
         );
         // Resize: the re-wrap re-parses stale raw, then must restore the
@@ -8483,7 +8420,7 @@ mod tests {
 
     fn item_point(
         app: &super::App,
-        pred: impl Fn(&crate::layout::Item) -> bool,
+        pred: impl Fn(&crate::layout2::Item) -> bool,
     ) -> (u16, u16, (usize, usize)) {
         let g = app.browser.as_ref().expect("a browser");
         for (r, row) in g.doc.rows.iter().enumerate() {
@@ -8750,8 +8687,8 @@ mod tests {
     fn region_top_link_point(app: &super::App) -> (u16, u16) {
         let g = app.browser.as_ref().unwrap();
         let rg = &g.doc.regions[0];
-        let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, rg.start_row);
-        let start = crate::layout::visual_columns(&row, &g.doc.carousels, rg.start_row)
+        let row = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, rg.start_row);
+        let start = crate::layout2::visual_columns(&row, &g.doc.carousels, rg.start_row)
             .into_iter()
             .find(|&(i, ..)| row.items[i].is_interactive())
             .map(|(_, c, ..)| c)
@@ -8931,14 +8868,14 @@ mod tests {
 
     #[test]
     fn carry_region_offsets_respects_the_page_signal_only_on_a_live_render() {
-        use crate::layout::Region;
+        use crate::layout2::Region;
         let mk = |voffset: usize, from_page: bool| Region {
             node: 5,
             start_row: 0,
             left: 0,
             width: 10,
             height: 4,
-            buffer: vec![crate::layout::Row::default(); 20], // max_voffset = 16
+            buffer: vec![crate::layout2::Row::default(); 20], // max_voffset = 16
             voffset,
             live_node: Some(99),
             voffset_from_page: from_page,
@@ -9228,8 +9165,8 @@ mod tests {
         assert_eq!(got.rows.len(), rows_before + 2, "two lines were added");
         for (i, (g, f)) in got.rows.iter().zip(full.rows.iter()).enumerate() {
             assert_eq!(
-                crate::layout::render_row(g),
-                crate::layout::render_row(f),
+                crate::layout2::render_row(g),
+                crate::layout2::render_row(f),
                 "spliced row {i} matches the full relayout"
             );
         }
@@ -9263,7 +9200,7 @@ mod tests {
             .doc
             .rows
             .iter()
-            .map(crate::layout::render_row)
+            .map(crate::layout2::render_row)
             .collect();
         let footer_row = before
             .iter()
@@ -9284,7 +9221,7 @@ mod tests {
             .doc
             .rows
             .iter()
-            .map(crate::layout::render_row)
+            .map(crate::layout2::render_row)
             .collect();
         assert_eq!(after.len(), before.len(), "row count unchanged (delta 0)");
         assert_eq!(
@@ -9376,8 +9313,8 @@ mod tests {
         );
         for (i, (g, f)) in got.iter().zip(full.rows.iter()).enumerate() {
             assert_eq!(
-                crate::layout::render_row(g),
-                crate::layout::render_row(f),
+                crate::layout2::render_row(g),
+                crate::layout2::render_row(f),
                 "spliced row {i} matches the full relayout"
             );
         }
@@ -9454,7 +9391,8 @@ mod tests {
         );
         app.browser.as_mut().unwrap().scroll = scroll;
         app.scroll_intent = scroll;
-        let top_before = crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
+        let top_before =
+            crate::layout2::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
         // The list appends a batch at the bottom (40 → 60).
         assert!(
             app.patch_live_doc(&list_patch(60)),
@@ -9470,7 +9408,7 @@ mod tests {
             "the scroll intent held too (no runaway re-anchor to the new bottom)"
         );
         assert_eq!(
-            crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]),
+            crate::layout2::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]),
             top_before,
             "the reader still sees the same item at the viewport top"
         );
@@ -9521,7 +9459,8 @@ mod tests {
         let scroll = b.row_range.end + 8;
         app.browser.as_mut().unwrap().scroll = scroll;
         app.scroll_intent = scroll;
-        let top_before = crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
+        let top_before =
+            crate::layout2::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
         // The top boundary grows 3 → 6 (three rows inserted above the viewport).
         let mut frag = String::from(
             r#"<div data-trust-frag=""><div data-trust-node="42" style="display:flow-root">"#,
@@ -9543,7 +9482,7 @@ mod tests {
             "scroll shifted down by the growth so the reader's content stays put"
         );
         assert_eq!(
-            crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[new_scroll]),
+            crate::layout2::render_row(&app.browser.as_ref().unwrap().doc.rows[new_scroll]),
             top_before,
             "the same filler line is still at the viewport top"
         );
@@ -9583,7 +9522,8 @@ mod tests {
         let scroll = 20usize;
         app.browser.as_mut().unwrap().scroll = scroll;
         app.scroll_intent = scroll;
-        let top_before = crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
+        let top_before =
+            crate::layout2::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
         // A re-render inserts 5 items above the viewport.
         app.replace_live_doc(body(5).into_bytes());
         let new_scroll = app.browser.as_ref().unwrap().scroll;
@@ -9593,7 +9533,7 @@ mod tests {
             "scroll shifted by the inserted-above count to keep the reader's content"
         );
         assert_eq!(
-            crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[new_scroll]),
+            crate::layout2::render_row(&app.browser.as_ref().unwrap().doc.rows[new_scroll]),
             top_before,
             "the same item is still at the viewport top after the re-render"
         );
@@ -9672,14 +9612,15 @@ mod tests {
         let scroll = 20usize;
         app.browser.as_mut().unwrap().scroll = scroll;
         app.scroll_intent = scroll;
-        let top_before = crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
+        let top_before =
+            crate::layout2::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
         // The image decodes at 10×7 cells (+6 rows above the viewport).
         app.image_sizes
             .insert(String::from("https://example.com/big.png"), (10, 7));
         app.relayout_browser();
         let new_scroll = app.browser.as_ref().unwrap().scroll;
         assert_eq!(
-            crate::layout::render_row(&app.browser.as_ref().unwrap().doc.rows[new_scroll]),
+            crate::layout2::render_row(&app.browser.as_ref().unwrap().doc.rows[new_scroll]),
             top_before,
             "the same item is still at the viewport top after the decode reflow"
         );
@@ -9759,7 +9700,7 @@ mod tests {
         app.last_inner = (80, 10);
         app.last_content_area = ratatui::layout::Rect::new(3, 2, 80, 10);
         let url = url::Url::parse("https://example.com/").unwrap();
-        let mut images = crate::layout::ImageSizes::new();
+        let mut images = crate::layout2::ImageSizes::new();
         images.insert("https://example.com/cat.png".to_owned(), (10, 4));
         let html = b"<body><a href='mailto:x@y.z'><img src='/cat.png' alt='cat'></a></body>";
         app.navigate_to(crate::http::parse(&url, "text/html", html, 80, 0, &images));
@@ -9806,7 +9747,7 @@ mod tests {
         app.last_inner = (80, 20);
         app.last_content_area = ratatui::layout::Rect::new(0, 1, 80, 20);
         let url = url::Url::parse("https://example.com/").unwrap();
-        let images = crate::layout::ImageSizes::new();
+        let images = crate::layout2::ImageSizes::new();
         let html = b"<body><div style='display:flex;justify-content:center'>\
             <div style='min-width:120px'>\
               <div style='position:fixed;width:120px'><a href='/dest'>RAILLINK</a></div>\
@@ -10022,7 +9963,7 @@ mod tests {
         // columns so text after it stays at its laid-out column — else the row
         // collapses left UNDER the image (the header logo painting over the
         // nav links; an avatar over its post title).
-        let mut images = crate::layout::ImageSizes::new();
+        let mut images = crate::layout2::ImageSizes::new();
         images.insert("https://example.com/logo.png".to_owned(), (6, 2));
         let url = url::Url::parse("https://example.com/").unwrap();
         let doc = crate::http::parse(
@@ -10084,7 +10025,7 @@ mod tests {
 
     /// Build an App showing a browser doc parsed from `body` with `mime`.
     fn app_browsing(mime: &str, body: &str) -> super::App {
-        let images = crate::layout::ImageSizes::new();
+        let images = crate::layout2::ImageSizes::new();
         let url = url::Url::parse("https://example.com/").unwrap();
         let doc = crate::http::parse(&url, mime, body.as_bytes(), 80, 0, &images);
         let mut app = super::App::new(None, 23);
@@ -10224,8 +10165,8 @@ mod tests {
         let (cr, ci) = g.sel_item.expect("initial selection");
         assert!(
             matches!(
-                crate::layout::item_origin(&g.doc.rows, &g.doc.regions, cr, ci),
-                crate::layout::ItemOrigin::Region { .. }
+                crate::layout2::item_origin(&g.doc.rows, &g.doc.regions, cr, ci),
+                crate::layout2::ItemOrigin::Region { .. }
             ),
             "keyboard selection reaches region content"
         );
@@ -10307,11 +10248,11 @@ mod tests {
 
         // The renderer's origin translation reaches the same item, so the
         // highlight lands on the matched text.
-        let row = crate::layout::effective_row(&g.doc.rows, &g.doc.regions, band);
+        let row = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, band);
         let hit = row.items.iter().enumerate().find(|(i, _)| {
             matches!(
-                crate::layout::item_origin(&g.doc.rows, &g.doc.regions, band, *i),
-                crate::layout::ItemOrigin::Region { region: r, brow: b, bitem: bi }
+                crate::layout2::item_origin(&g.doc.rows, &g.doc.regions, band, *i),
+                crate::layout2::ItemOrigin::Region { region: r, brow: b, bitem: bi }
                     if r == region && b == brow && bi == bitem
             )
         });
@@ -10801,7 +10742,7 @@ mod tests {
 
     /// Point an HTTP laid-out doc's item selection at the first item that
     /// matches `pred`.
-    fn select_item(app: &mut super::App, pred: impl Fn(&crate::layout::Item) -> bool) {
+    fn select_item(app: &mut super::App, pred: impl Fn(&crate::layout2::Item) -> bool) {
         let g = app.browser.as_mut().expect("a browser");
         for (r, row) in g.doc.rows.iter().enumerate() {
             if let Some(i) = row.items.iter().position(&pred) {
@@ -11708,7 +11649,7 @@ mod tests {
         let html =
             format!(r#"<body><div style="display:flex;flex-wrap:wrap">{tiles}</div></body>"#);
         let base = url::Url::parse("https://ex.com/").unwrap();
-        let mut images = crate::layout::ImageSizes::new();
+        let mut images = crate::layout2::ImageSizes::new();
         for i in 0..18 {
             images.insert(format!("https://ex.com/c{i}.png"), cell);
         }
@@ -11772,7 +11713,7 @@ mod tests {
         let (decoded, _) = crate::img::decode(&png).unwrap();
         let cell = super::natural_cell_box(&decoded, (8u16, 16u16).into());
         let base = url::Url::parse("https://ex.com/").unwrap();
-        let mut images = crate::layout::ImageSizes::new();
+        let mut images = crate::layout2::ImageSizes::new();
         images.insert("https://ex.com/banner.png".to_string(), cell);
         // Image near the top, then a long column of text (> MAX_IMAGE_LOOKBACK
         // rows) so it can scroll entirely out of the encode scan range.
@@ -11843,7 +11784,7 @@ mod tests {
         let total = app.browser.as_ref().unwrap().doc.rows.len();
         let far = total.saturating_sub(12);
         assert!(
-            far > crate::layout::MAX_IMAGE_LOOKBACK + key.h as usize,
+            far > crate::layout2::MAX_IMAGE_LOOKBACK + key.h as usize,
             "page must be tall enough to scroll the image fully out of range"
         );
         app.browser.as_mut().unwrap().scroll = far;
@@ -11865,7 +11806,7 @@ mod tests {
         let (decoded, _) = crate::img::decode(&png).unwrap();
         let cell = super::natural_cell_box(&decoded, (8u16, 16u16).into());
         let base = url::Url::parse("https://ex.com/").unwrap();
-        let mut images = crate::layout::ImageSizes::new();
+        let mut images = crate::layout2::ImageSizes::new();
         images.insert("https://ex.com/av.png".to_string(), cell);
         // A definite-height `overflow-y:auto` region whose content includes an
         // image plus enough rows to overflow (so it becomes a Region + buffer).
@@ -12114,7 +12055,7 @@ mod tests {
             html.as_bytes(),
             40,
             0,
-            &crate::layout::ImageSizes::new(),
+            &crate::layout2::ImageSizes::new(),
         );
         app.navigate_to(doc);
         let expected_cell = super::natural_cell_box_dimensions(80, 32, app.picker.font_size());

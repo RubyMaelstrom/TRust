@@ -1767,7 +1767,7 @@ unsafe impl boa_engine::gc::Trace for PageBlobs {
 /// `__dom_computed` read — free for pages that never measure.
 type GeomCache = (
     u64,
-    std::collections::HashMap<crate::dom::NodeId, crate::layout::PxRect>,
+    std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
     std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
 );
 
@@ -1787,7 +1787,6 @@ struct PageGeom {
     width_cells: std::cell::Cell<u16>,
     height_cells: std::cell::Cell<u16>,
     cell_px: (u16, u16),
-    borders: bool,
     cache: Rc<RefCell<GeomCache>>,
     /// Decoded image intrinsic sizes (url → cell dims), pushed by the app as
     /// its image pipeline finishes (`PageCmd::ImageSizes`). The measure pass
@@ -1796,7 +1795,7 @@ struct PageGeom {
     /// actual rendered layout — a virtualized feed caches these heights and
     /// feeds them back as placeholder sizes, so a divergence reshapes the
     /// document under the reader). Sparse before decodes arrive.
-    images: Rc<RefCell<crate::layout::ImageSizes>>,
+    images: Rc<RefCell<crate::layout2::ImageSizes>>,
 }
 
 impl boa_engine::gc::Finalize for PageGeom {}
@@ -2647,7 +2646,7 @@ fn sys_match_media(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
 /// caller can read either map; `None` when the page has no `PageGeom` (its URL
 /// didn't parse), where geometry is simply absent.
 fn ensure_geom_cache(ctx: &mut Context) -> Option<Rc<RefCell<GeomCache>>> {
-    let (base, width_cells, height_cells, cell_px, borders, cache, images) = {
+    let (base, width_cells, height_cells, cell_px, cache, images) = {
         let host = ctx.realm().host_defined();
         host.get::<PageGeom>().map(|g| {
             (
@@ -2655,7 +2654,6 @@ fn ensure_geom_cache(ctx: &mut Context) -> Option<Rc<RefCell<GeomCache>>> {
                 g.width_cells.get(),
                 g.height_cells.get(),
                 g.cell_px,
-                g.borders,
                 g.cache.clone(),
                 g.images.clone(),
             )
@@ -2669,35 +2667,19 @@ fn ensure_geom_cache(ctx: &mut Context) -> Option<Rc<RefCell<GeomCache>>> {
         let (forms, controls) = crate::http::extract_forms_arena(&d, &base, None);
         let viewport = (width_cells as usize, height_cells as usize);
         // JS geometry reads the same engine that laid the page out
-        // (LAYOUT_OVERHAUL_PLAN.md P7): under layout2 the boxes come straight off
-        // the fragment tree AND one pass yields the used grid track sizes;
-        // otherwise the old cell-union pass (no grid tracks — falls through to
-        // the cascaded value).
-        if crate::layout2::enabled() {
-            let (boxes, tracks) = crate::layout2::measure_boxes_and_grid_tracks(
-                &d,
-                &base,
-                viewport,
-                &forms,
-                &controls,
-                cell_px,
-                &images.borrow(),
-            );
-            c.1 = boxes;
-            c.2 = tracks;
-        } else {
-            c.1 = crate::layout::measure_boxes(
-                &d,
-                &base,
-                viewport,
-                &forms,
-                &controls,
-                cell_px,
-                borders,
-                &images.borrow(),
-            );
-            c.2 = std::collections::HashMap::new();
-        }
+        // (LAYOUT_OVERHAUL_PLAN.md P7): the boxes come straight off the fragment
+        // tree AND one pass yields the used grid track sizes.
+        let (boxes, tracks) = crate::layout2::measure_boxes_and_grid_tracks(
+            &d,
+            &base,
+            viewport,
+            &forms,
+            &controls,
+            cell_px,
+            &images.borrow(),
+        );
+        c.1 = boxes;
+        c.2 = tracks;
         c.0 = epoch;
     }
     drop(c);
@@ -6319,13 +6301,12 @@ fn load_page(
                 width_cells: std::cell::Cell::new(viewport.0),
                 height_cells: std::cell::Cell::new(viewport.1),
                 cell_px,
-                borders: crate::layout::borders_enabled(),
                 cache: Rc::new(RefCell::new((
                     u64::MAX,
                     std::collections::HashMap::new(),
                     std::collections::HashMap::new(),
                 ))),
-                images: Rc::new(RefCell::new(crate::layout::ImageSizes::new())),
+                images: Rc::new(RefCell::new(crate::layout2::ImageSizes::new())),
             });
         }
     }
@@ -7010,23 +6991,6 @@ pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
             let _ = page.ctx.eval(Source::from_bytes(b"__trust.oneShot = true"));
             settle_page(&mut page); // `load_page(.., None)` ⇒ fetches await in-line
             page.outcome.elapsed = page.started.elapsed();
-            // Inner-scroll GATE diagnostic: report definite_height for every
-            // vertical scroll container on the live (full-cascade) arena before it
-            // is serialized (which drops overflow-y/min-height). See
-            // `layout::scroll_box_report`.
-            if std::env::var("TRUST_DIAG_SCROLL_BOXES").is_ok()
-                && let Ok(base) = url::Url::parse(&env.url)
-            {
-                let d = page.dom.borrow();
-                eprintln!(
-                    "{}",
-                    crate::layout::scroll_box_report(
-                        &d,
-                        &base,
-                        (env.viewport.0 as usize, env.viewport.1 as usize),
-                    )
-                );
-            }
             let out = page.dom.borrow().serialize(DOCUMENT);
             (out, std::mem::take(&mut page.outcome))
         }

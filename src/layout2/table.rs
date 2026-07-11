@@ -18,7 +18,7 @@
 //! fragment — documented deferral).
 
 use crate::dom::NodeId;
-use crate::layout::{Units, css_length_px};
+use crate::layout2::{Units, css_length_px};
 
 use super::flow::{Flow, Frag};
 use super::intrinsic::IMode;

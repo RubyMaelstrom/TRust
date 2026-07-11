@@ -20,7 +20,7 @@ use url::Url;
 
 use crate::doc::Form;
 use crate::dom::{Dom, NodeId};
-use crate::layout::{ImageSizes, Item, NO_NODE, display_width};
+use crate::layout2::{ImageSizes, Item, NO_NODE, display_width};
 
 use super::flex::{
     AlignContent, AlignItem, FlexCalc, align_content_offsets, align_item_from, container_style,
@@ -1075,7 +1075,7 @@ impl Flow<'_> {
                 width: w as u16,
                 height: 1,
                 text: marker.to_string(),
-                kind: crate::layout::ItemKind::Text,
+                kind: crate::layout2::ItemKind::Text,
                 image: None,
                 emph: inl.emph,
                 node: NO_NODE,
@@ -1177,7 +1177,7 @@ impl Flow<'_> {
         if node == NO_NODE {
             return 0.0;
         }
-        let u = crate::layout::Units::of(self.dom, node);
+        let u = crate::layout2::Units::of(self.dom, node);
         self.dom
             .computed_value(node, "text-indent")
             .and_then(|v| Len::parse(&v, u, self.vp))
@@ -1269,7 +1269,7 @@ impl Flow<'_> {
         inl: &InlineStyle,
         anchors: &mut Vec<(NodeId, f32)>,
     ) -> (Vec<Frag<'t>>, f32) {
-        let u = crate::layout::Units::of(self.dom, b.node);
+        let u = crate::layout2::Units::of(self.dom, b.node);
         let fs = container_style(self.dom, b.node, u, self.vp);
         // Gap percentages resolve against the container's content box in
         // the gap's own axis (indefinite → zero).
@@ -1358,7 +1358,7 @@ impl Flow<'_> {
                 item_flex(
                     self.dom,
                     it.node,
-                    crate::layout::Units::of(self.dom, it.node),
+                    crate::layout2::Units::of(self.dom, it.node),
                     self.vp,
                 )
             };
@@ -1629,7 +1629,7 @@ impl Flow<'_> {
                 item_flex(
                     self.dom,
                     it.node,
-                    crate::layout::Units::of(self.dom, it.node),
+                    crate::layout2::Units::of(self.dom, it.node),
                     self.vp,
                 )
             };
@@ -2189,11 +2189,11 @@ impl Flow<'_> {
             width: paint_w,
             height: paint_rows,
             text: String::new(),
-            kind: crate::layout::ItemKind::Image,
+            kind: crate::layout2::ItemKind::Image,
             image: natural
                 .is_some()
                 .then(|| url.unwrap_or_default().to_string()),
-            emph: crate::layout::Emphasis::default(),
+            emph: crate::layout2::Emphasis::default(),
             node,
             link: inl.link.clone(),
             crop: r.crop,
@@ -2887,7 +2887,7 @@ impl Flow<'_> {
         );
         if let Some(m) = marker {
             let mut mctx = inl.clone();
-            mctx.kind = crate::layout::ItemKind::Text;
+            mctx.kind = crate::layout2::ItemKind::Text;
             ifc.text(m, &mctx);
         }
         ifc.run(inls, inl);
@@ -2969,7 +2969,7 @@ impl Flow<'_> {
         if id == NO_NODE {
             return None;
         }
-        let vunits = crate::layout::Units::of(self.dom, id);
+        let vunits = crate::layout2::Units::of(self.dom, id);
         let count = self
             .dom
             .computed_value(id, "column-count")

@@ -24,23 +24,23 @@
 //!
 //! P0 = the skeleton: block flow, inline text, images, form-control atoms,
 //! lists, real UA-stylesheet margins. Flex (P2), grid (P3), positioned/
-//! stacking/paint-order/transform-translate (P4), overflow (P5), and tables
-//! (P6, the CSS 2.1 §17 model in `table.rs`) are real.
+//! stacking/paint-order/transform-translate (P4), overflow (P5), tables
+//! (P6, the CSS 2.1 §17 model in `table.rs`), floats + multi-column (P8b) are
+//! all real.
 //! P5 splits by CSS Overflow L3 §2: `hidden`/`clip` are a pure CLIP to the
 //! padding box (P5a — sr-only boxes clip to nothing, definite-height panels
 //! clip their overflow); `auto`/`scroll` are SCROLL CONTAINERS whose overflow
 //! rides the scroll axis into a windowed buffer (a vertical Region, P5b —
 //! unconditional, every `overflow:auto|scroll` element becomes one; the
 //! viewport's OWN overflow is a separate, §3.3 concern, never delegated to a
-//! descendant) or an inline strip (a horizontal Carousel, P5c). Floats still
-//! degrade to honest block stacking — a staged
-//! phase, never policy. This is now the DEFAULT engine (P9 flip, 2026-07-07);
-//! `set layout2 off` / `TRUST_LAYOUT2=0` A/Bs back to the old flow engine
-//! during the soak week. Incremental-layout
-//! boundaries are intentionally not emitted yet, so live pages take the
+//! descendant) or an inline strip (a horizontal Carousel, P5c). This is the
+//! sole layout engine (the old flow engine was deleted after the P9 soak).
+//! Incremental-layout boundaries (P7) are emitted, so a live mutation confined
+//! to one re-lays only its subtree and splices back; everything else takes the
 //! always-correct full-relayout path.
 
 mod boundary;
+mod contract;
 mod flex;
 mod float;
 mod flow;
@@ -56,50 +56,21 @@ mod tree;
 mod value;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use url::Url;
 
 use crate::doc::Form;
 use crate::dom::{Dom, NodeId};
-use crate::layout::{
-    BoundaryBox, Carousel, ControlMap, FixedItem, ImageSizes, PxRect, Region, Row, cell_px_h,
-    cell_px_w,
-};
+
+/// The shared layout contract — the `Doc.rows`/`Item` output model, geometry
+/// primitives (`Region`/`Carousel`/`FixedItem`/`PxRect`), the `Units` px→cell
+/// context + cell/border session settings, and the CSS value/string helpers.
+/// Consumed by the renderer (ui.rs/app.rs) and by every engine module below,
+/// so it is re-exported flat at `crate::layout2::*` (formerly `crate::layout`).
+pub use contract::*;
 
 use flow::Flow;
 use value::Vp;
-
-/// Session-global engine switch (`set layout2 on|off`), seeded once from
-/// `TRUST_LAYOUT2` so test harnesses (`net_diag`, `layout_dump`) can A/B
-/// without a UI. Same pattern as `layout::BORDERS_ENABLED`.
-///
-/// P9 FLIP (2026-07-07): layout2 is now the DEFAULT engine. The switch stays
-/// through the soak week as the escape hatch to the old flow engine
-/// (`set layout2 off` / `TRUST_LAYOUT2=0`); it — and layout.rs's flow — get
-/// deleted once the soak is clean.
-static ENABLED: AtomicBool = AtomicBool::new(true);
-
-fn env_seed() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        // Bidirectional now that the default is ON: an explicit `TRUST_LAYOUT2=0`
-        // A/Bs back to the old flow engine; any other value forces layout2 on.
-        if let Some(v) = std::env::var_os("TRUST_LAYOUT2") {
-            ENABLED.store(v != "0", Ordering::Relaxed);
-        }
-    });
-}
-
-pub fn enabled() -> bool {
-    env_seed();
-    ENABLED.load(Ordering::Relaxed)
-}
-
-pub fn set_enabled(on: bool) {
-    env_seed(); // consume the env seed so it can't clobber an explicit set
-    ENABLED.store(on, Ordering::Relaxed);
-}
 
 /// What the engine hands back to `http::parse_seeded`. Carousels, regions,
 /// scroll clips, and boundaries arrive with their phases — consumers treat
@@ -128,7 +99,7 @@ pub struct Output {
     /// URL → ordered layers. A composite `Item` in `rows`/buffers carries the
     /// synthetic URL as its `image`; the app encodes it from these layers. Empty
     /// ⇒ no transparent image overlaps on the page.
-    pub composites: HashMap<String, Vec<crate::layout::CompositeLayer>>,
+    pub composites: HashMap<String, Vec<crate::layout2::CompositeLayer>>,
 }
 
 /// Lay an HTML document out at `viewport` = (cols, rows) — the terminal
@@ -235,13 +206,12 @@ fn filter_boundaries(
 /// for `getBoundingClientRect`, `offset*`/`client*`, and the `scrollHeight`
 /// fallback. Lays the document out exactly as `lay_out_document` would, then
 /// reads the geometry straight off the fragment tree (`measure::boxes`) — no
-/// paint, no cell reconstruction. The signature mirrors `layout::measure_boxes`
-/// so `js::sys_rect` swaps engines on `layout2::enabled()`.
-/// Build the `NodeId → PxRect` geometry map (`getBoundingClientRect`/`offset*`/
-/// `client*`) AND each grid container's used track sizes in px `(columns, rows)`
-/// from ONE layout pass — the CSSOM resolved value `getComputedStyle` reports
-/// for `grid-template-columns`/`-rows` (`js::sys_computed_style`). One pass
-/// backs both. `js::sys_rect` swaps engines on `layout2::enabled()`.
+/// paint, no cell reconstruction. Backs `js::sys_rect`.
+///
+/// One pass ALSO yields each grid container's used track sizes in px
+/// `(columns, rows)` — the CSSOM resolved value `getComputedStyle` reports for
+/// `grid-template-columns`/`-rows` (`js::sys_computed_style`). One pass backs
+/// both.
 #[allow(clippy::type_complexity)]
 pub fn measure_boxes_and_grid_tracks(
     dom: &Dom,
@@ -314,7 +284,7 @@ pub fn lay_subtree_fragment(
     images: &ImageSizes,
     boundary: NodeId,
     _sub_box: bool,
-) -> crate::layout::SubtreeFragment {
+) -> crate::layout2::SubtreeFragment {
     let cols = content_width.max(1);
     let cell_w = f32::from(cell_px_w());
     let cell_h = f32::from(cell_px_h());
@@ -322,7 +292,7 @@ pub fn lay_subtree_fragment(
         w: cols as f32 * cell_w,
         h: viewport.1 as f32 * cell_h,
     };
-    let empty = || crate::layout::SubtreeFragment {
+    let empty = || crate::layout2::SubtreeFragment {
         rows: Vec::new(),
         height: 0,
         width: 0,
@@ -371,7 +341,7 @@ pub fn lay_subtree_fragment(
         .map(|it| it.col + it.width)
         .max()
         .unwrap_or(0);
-    crate::layout::SubtreeFragment {
+    crate::layout2::SubtreeFragment {
         height: out.rows.len(),
         width,
         rows: out.rows,
@@ -439,16 +409,16 @@ fn page_media_fallback(
     rows: &mut Vec<Row>,
 ) {
     use crate::doc::Link;
-    use crate::layout::{Emphasis, Item, ItemKind, NO_NODE, display_width};
+    use crate::layout2::{Emphasis, Item, ItemKind, NO_NODE, display_width};
     if dom
         .descendants(crate::dom::DOCUMENT)
         .any(|id| matches!(dom.tag_name(id), Some("video" | "audio")))
-        || !crate::layout::page_declares_video(dom)
+        || !crate::layout2::page_declares_video(dom)
     {
         return;
     }
     let link = Some(Link::Media(base.clone()));
-    let poster = crate::layout::page_preview_image(dom, base)
+    let poster = crate::layout2::page_preview_image(dom, base)
         .and_then(|p| images.get(&p).map(|&(w, h)| (p, w, h)))
         .filter(|&(_, w, h)| w > 0 && h > 0);
     let item = match poster {
@@ -495,7 +465,7 @@ fn page_media_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{Item, ItemKind, display_width};
+    use crate::layout2::{Item, ItemKind, display_width};
 
     fn lay(html: &str, cols: usize) -> Output {
         lay_images(html, cols, &HashMap::new())
@@ -543,9 +513,9 @@ mod tests {
             .iter()
             .position(|r| r.items.iter().any(|it| it.text.starts_with("ABC")))
             .unwrap();
-        let vc = crate::layout::visual_columns(&out.rows[long_row], &cars, long_row);
+        let vc = crate::layout2::visual_columns(&out.rows[long_row], &cars, long_row);
         let (i, _, w, cut) = vc[0];
-        let vis = crate::layout::slice_display(&out.rows[long_row].items[i].text, cut, w as usize);
+        let vis = crate::layout2::slice_display(&out.rows[long_row].items[i].text, cut, w as usize);
         assert!(
             vis.ends_with("xyz"),
             "scrolled to the end, the strip shows the line's tail: {vis:?}"
@@ -2912,13 +2882,6 @@ mod tests {
         assert!(
             absent(&out, "‹") && absent(&out, "›"),
             "no synthesised chrome"
-        );
-        assert!(
-            !out.rows
-                .iter()
-                .flat_map(|r| &r.items)
-                .any(|i| matches!(i.link, Some(crate::doc::Link::CarouselScroll(_)))),
-            "no synthesised carousel-scroll links"
         );
     }
 

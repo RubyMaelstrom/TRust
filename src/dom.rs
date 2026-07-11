@@ -71,11 +71,6 @@ pub struct CascDiag {
     pub rules: u64,
     /// `computed_value` invocations (inheritance/UA-default resolution).
     pub computed_value_calls: u64,
-    /// `flow_element` entries — total element-flow visits this layout (a value
-    /// far above the node count means subtrees are re-flowed, e.g. measurement).
-    pub flow_visits: u64,
-    /// `measure_width` entries — intrinsic-sizing passes that re-descend subtrees.
-    pub measure_calls: u64,
     /// `cascaded` invocations (post-winner-map: each is a hash lookup).
     pub cascaded_calls: u64,
     /// Cumulative time building per-element cascade winner maps (one build
@@ -89,19 +84,9 @@ impl CascDiag {
         style_index_builds: 0,
         rules: 0,
         computed_value_calls: 0,
-        flow_visits: 0,
-        measure_calls: 0,
         cascaded_calls: 0,
         cascaded_us: 0,
     };
-}
-
-/// Layout-side counters (called from `layout.rs`); no-op when diag is off.
-pub fn casc_note_flow_visit() {
-    casc_bump(|d| d.flow_visits += 1);
-}
-pub fn casc_note_measure() {
-    casc_bump(|d| d.measure_calls += 1);
 }
 
 /// Cached once: are the cascade counters active? Off in production (no env) so
@@ -805,50 +790,6 @@ impl Dom {
             cur = self.parent_composed(c);
         }
         None
-    }
-
-    /// A content hash of `id`'s subtree (tag names, attributes, and text, in
-    /// document order) — the cache key for incremental region layout
-    /// (INCREMENTAL_LAYOUT_PLAN.md §14, per-child memoization). Two subtrees that
-    /// serialize identically hash identically, so an UNCHANGED chat message reuses
-    /// its laid rows across the per-message re-parse while a new/edited one is a
-    /// cache miss and re-laid. Over-conservative on purpose: it covers EVERY
-    /// attribute (one the layout ignores still busts the key), so a hit can never
-    /// reuse rows for layout-different content — a miss only costs a re-lay. Walks
-    /// the same `first_child`/`next_sibling` order the block flow lays children.
-    pub fn subtree_layout_hash(&self, id: NodeId) -> u64 {
-        use std::hash::Hasher;
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.hash_subtree(id, &mut h);
-        h.finish()
-    }
-
-    fn hash_subtree(&self, id: NodeId, h: &mut impl std::hash::Hasher) {
-        use std::hash::Hash;
-        match &self.nodes[id].data {
-            NodeData::Text(t) => {
-                h.write_u8(0);
-                t.hash(h);
-            }
-            NodeData::Element { name, attrs, .. } => {
-                h.write_u8(1);
-                (*name.local).hash(h);
-                for a in attrs {
-                    (*a.name.local).hash(h);
-                    (*a.value).hash(h);
-                }
-                h.write_u8(2); // open-children delimiter
-                let mut c = self.nodes[id].first_child;
-                while let Some(cid) = c {
-                    self.hash_subtree(cid, h);
-                    c = self.nodes[cid].next_sibling;
-                }
-                h.write_u8(3); // close-children delimiter
-            }
-            // Comment/doctype/fragment/document: structural marker only (they
-            // contribute no laid content).
-            _ => h.write_u8(4),
-        }
     }
 
     /// Serialize a relayout boundary's subtree as a self-contained fragment for
@@ -1872,7 +1813,7 @@ impl Dom {
             "textarea", "select", "button", "progress", "meter", "hr", "li", "summary", "details",
             "audio", "math", "source", "track", "marquee",
         ];
-        let borders = crate::layout::borders_enabled();
+        let borders = crate::layout2::borders_enabled();
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
             match &self.nodes[id].data {
@@ -1913,7 +1854,7 @@ impl Dom {
         .any(|p| {
             self.computed_style(id, p)
                 .as_deref()
-                .and_then(|v| crate::layout::css_length_px(v, crate::layout::Units::of(self, id)))
+                .and_then(|v| crate::layout2::css_length_px(v, crate::layout2::Units::of(self, id)))
                 .is_some_and(|px| px > 0.0)
         })
     }
@@ -1942,15 +1883,15 @@ impl Dom {
         ) {
             return false;
         }
-        let u = crate::layout::Units::of(self, id);
+        let u = crate::layout2::Units::of(self, id);
         let Some(width_px) = self
             .computed_value_resolved(id, "width")
-            .and_then(|v| crate::layout::css_length_px(&v, u))
+            .and_then(|v| crate::layout2::css_length_px(&v, u))
         else {
             return false;
         };
         // A cell ≈ one unit of display width.
-        crate::layout::display_width(label) as f32 > width_px / u.cell_w
+        crate::layout2::display_width(label) as f32 > width_px / u.cell_w
     }
 
     /// Whether `id` is a content-less full-area POSITIONED OVERLAY — a click
@@ -2643,21 +2584,16 @@ impl Dom {
         // moved hover chain. Untracked-only declarations (color — nothing the
         // terminal renders) build no probe, so `set_hover_chain`
         // short-circuits to "unaffected" on the common color-only web.
-        // Backgrounds are tracked for layout2's cell compositor (opaque
-        // fills), but under the flow engine they paint nothing — a hover
-        // background must not cost a relayout there. Collapses to plain
-        // `is_tracked` when layout2 becomes the engine (P9).
+        // Backgrounds ARE tracked (the cell compositor paints opaque fills), so
+        // `is_tracked` covers them — a hover background costs a relayout.
         index.hover_probes = index
             .scopes
             .values()
             .flatten()
             .filter(|r| {
-                r.decls.iter().any(|(k, _)| {
-                    if k == "background-color" || k == "background-image" {
-                        return crate::layout2::enabled();
-                    }
-                    k == "content" || k.starts_with("--") || is_tracked(k)
-                })
+                r.decls
+                    .iter()
+                    .any(|(k, _)| k == "content" || k.starts_with("--") || is_tracked(k))
             })
             .flat_map(hover_probes_of)
             .collect();

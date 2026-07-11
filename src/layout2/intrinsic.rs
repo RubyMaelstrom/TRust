@@ -16,7 +16,7 @@
 //! Results are CONTENT-box px, memoized per (element, mode); anonymous
 //! boxes are cheap composites of memoized elements.
 
-use crate::layout::{NO_NODE, Units, display_width};
+use crate::layout2::{NO_NODE, Units, display_width};
 
 use super::flow::Flow;
 use super::inline::{AtomBoxSize, Ifc, control_label, media_label, media_source};
@@ -266,7 +266,7 @@ fn text_intrinsic_cells(t: &str, mode: IMode) -> usize {
     let mut seg = 0usize;
     let mut pending_space = false;
     for c in t.chars() {
-        if crate::layout::is_collapsible_space(c) {
+        if crate::layout2::is_collapsible_space(c) {
             best = best.max(seg);
             seg = 0;
             pending_space = line > 0;

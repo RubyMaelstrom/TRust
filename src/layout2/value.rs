@@ -14,7 +14,7 @@
 //! All math is f32 CSS px; the px→cell quantization happens once, at the
 //! paint boundary (LAYOUT_OVERHAUL_PLAN.md "Quantization").
 
-use crate::layout::{Units, css_length_px};
+use crate::layout2::{Units, css_length_px};
 
 /// The viewport in CSS px for viewport-percentage units. `h == 0.0` means the
 /// pass wasn't told the viewport height (a legacy/test caller): `vh`/`vmin`/

@@ -26,7 +26,7 @@ use url::Url;
 
 use crate::doc::{FieldKind, Form, Link};
 use crate::dom::{DOCUMENT, Dom, NodeData, NodeId};
-use crate::layout::{ControlMap, Units, css_length_px, format_list_marker, is_collapsible_space};
+use crate::layout2::{ControlMap, Units, css_length_px, format_list_marker, is_collapsible_space};
 
 use super::style::{BoxStyle, Disp, Pos, display_of};
 use super::value::Vp;
@@ -616,7 +616,7 @@ impl Builder<'_> {
         let flush = |run: &mut Vec<Inline>, items: &mut Vec<BoxNode>| {
             if run.iter().any(inline_has_content) {
                 items.push(BoxNode {
-                    node: crate::layout::NO_NODE,
+                    node: crate::layout2::NO_NODE,
                     style: BoxStyle::anonymous(),
                     content: Content::Inlines(std::mem::take(run)),
                     marker: None,
@@ -825,7 +825,7 @@ impl Builder<'_> {
         let flush = |run: &mut Vec<Inline>, blocks: &mut Vec<BoxNode>| {
             if run.iter().any(inline_has_content) {
                 blocks.push(BoxNode {
-                    node: crate::layout::NO_NODE,
+                    node: crate::layout2::NO_NODE,
                     style: BoxStyle::anonymous(),
                     content: Content::Inlines(std::mem::take(run)),
                     marker: None,
