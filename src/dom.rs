@@ -199,6 +199,12 @@ pub struct Dom {
     /// Terminal cell size in px (`PageEnv.cell_px`), for the px↔row conversion
     /// when baking `data-trust-scroll-top`. Default 8×16 (the nominal).
     cell_px: (u16, u16),
+    /// The document's URL (DOM §4.5 "documents have an associated URL"). Set
+    /// by `load_page` from `PageEnv`; the live serializer resolves sprite
+    /// `<use>` hrefs against it (the SAME base `rewrite_inline_svgs` uses on
+    /// the layout side, so the `SPRITE_SHEETS` key matches). `None` = unknown
+    /// (sprite refs then count as unrenderable, the conservative answer).
+    doc_url: Option<url::Url>,
     /// Incremental layout (INCREMENTAL_LAYOUT_PLAN.md): the element nodes mutated
     /// since the last `take_dirty_targets`, with the kind of change. A mutation
     /// confined to a relayout boundary's subtree lets the app re-lay ONLY that
@@ -388,6 +394,7 @@ impl Dom {
             scroll_state: FxHashMap::default(),
             scroll_changes: Vec::new(),
             cell_px: (8, 16),
+            doc_url: None,
             dirty_nodes: Vec::new(),
             dirty_attributed: true,
             hover_hosts: std::collections::HashSet::new(),
@@ -876,6 +883,12 @@ impl Dom {
     /// `data-trust-scroll-top`. No `touch()`: it only affects the next bake.
     pub fn set_cell_px(&mut self, w: u16, h: u16) {
         self.cell_px = (w.max(1), h.max(1));
+    }
+
+    /// Set the document's URL (DOM §4.5). No `touch()`: it only affects how
+    /// the serializer resolves sprite `<use>` hrefs, not the cascade.
+    pub fn set_doc_url(&mut self, url: Option<url::Url>) {
+        self.doc_url = url;
     }
 
     /// Read a scroll metric (CSSOM View, px). `which`: 0=scrollTop, 1=scrollLeft,
@@ -1695,7 +1708,19 @@ impl Dom {
         if self.attr(id, "hidden").is_some() {
             return Some("none".to_string());
         }
-        self.cascaded(id, "display")
+        let v = self.cascaded(id, "display")?;
+        match wide_keyword(&v) {
+            // `display` doesn't inherit: `inherit` takes the parent's
+            // computed display, `initial`/`unset` the initial value
+            // (`inline`), `revert` the UA display table (`None` here — the
+            // `effective_display` fallback).
+            Some(WideKeyword::Inherit) => self.nodes[id]
+                .parent
+                .and_then(|p| self.effective_display(p)),
+            Some(WideKeyword::Initial | WideKeyword::Unset) => Some("inline".to_string()),
+            Some(WideKeyword::Revert) => None,
+            None => Some(v),
+        }
     }
 
     /// The EFFECTIVE `display` — the author's cascaded `display` if set, else
@@ -1919,28 +1944,48 @@ impl Dom {
     /// The computed value of a property — the single inheritance authority.
     /// For an inherited property (per the registry) an element that doesn't
     /// set it resolves to the parent's computed value; otherwise this is the
-    /// specified value (author cascade, else the UA default). Memoized per
-    /// epoch because the layout reads it per element. getComputedStyle and
-    /// the layout's inherited-text reads both go through here, so a property
-    /// inherits everywhere by being marked `inherited` once.
+    /// specified value (author cascade, else the UA default). The CSS-wide
+    /// keywords (css-cascade-4 §7.3) resolve here: `inherit` takes the
+    /// parent's computed value regardless of inheritedness, `initial` the
+    /// property's initial value (`None` — the caller's default), `unset`
+    /// whichever of those the property's inheritedness selects, and
+    /// `revert`/`revert-layer` roll the author origin back to the UA origin.
+    /// Memoized per epoch because the layout reads it per element.
+    /// getComputedStyle and the layout's inherited-text reads both go through
+    /// here, so a property inherits everywhere by being marked `inherited`
+    /// once.
     pub fn computed_value(&self, id: NodeId, name: &str) -> Option<String> {
         casc_bump(|d| d.computed_value_calls += 1);
         let Some(idx) = prop_index(name) else {
             // Untracked: no UA default, no inheritance — author cascade.
             return self.cascaded(id, name);
         };
-        if !PROPS[idx].inherited {
-            return self.specified(id, name);
-        }
-        if let Some(hit) = self.computed_cache_get(id, idx) {
+        let inherited = PROPS[idx].inherited;
+        if inherited && let Some(hit) = self.computed_cache_get(id, idx) {
             return hit;
         }
-        let v = self.specified(id, name).or_else(|| {
+        let parent_computed = || {
             self.nodes[id]
                 .parent
                 .and_then(|p| self.computed_value(p, name))
-        });
-        self.computed_cache_put(id, idx, v.clone());
+        };
+        let author = self.cascaded(id, name);
+        let v = match author.as_deref().and_then(wide_keyword) {
+            Some(WideKeyword::Inherit) => parent_computed(),
+            Some(WideKeyword::Initial) => None,
+            Some(WideKeyword::Unset) => inherited.then(parent_computed).flatten(),
+            // `revert` re-enters the defaulting chain below the author
+            // origin: the UA origin, else the property's normal defaulting.
+            Some(WideKeyword::Revert) => self
+                .ua_default(id, name)
+                .or_else(|| inherited.then(parent_computed).flatten()),
+            None => author
+                .or_else(|| self.ua_default(id, name))
+                .or_else(|| inherited.then(parent_computed).flatten()),
+        };
+        if inherited {
+            self.computed_cache_put(id, idx, v.clone());
+        }
         v
     }
 
@@ -2032,13 +2077,6 @@ impl Dom {
             cache.1.clear();
         }
         cache.1.insert((id, idx), v);
-    }
-
-    /// The specified value: the author cascade, or the UA default for the
-    /// element's tag. (Before inheritance — `computed_value` adds that.)
-    fn specified(&self, id: NodeId, name: &str) -> Option<String> {
-        self.cascaded(id, name)
-            .or_else(|| self.ua_default(id, name))
     }
 
     /// The user-agent default stylesheet, for the inherited properties the
@@ -3465,6 +3503,42 @@ impl Dom {
         })
     }
 
+    /// Whether `rewrite_inline_svgs` will turn this `<svg>` into a painted
+    /// `<img>` on the next layout parse — the serializer-side mirror of that
+    /// walk's per-candidate decision: an external sprite ref that resolves in
+    /// the primed sheet table (against the document URL, the same base the
+    /// rewrite uses), or renderable inline geometry.
+    fn svg_will_render(&self, id: NodeId) -> bool {
+        if self.is_hidden(id) || self.ancestor_is_svg(id) {
+            return false;
+        }
+        if let Some((file, frag)) = self.svg_sprite_ref(id) {
+            return self
+                .doc_url
+                .as_ref()
+                .and_then(|b| b.join(&file).ok())
+                .is_some_and(|abs| sprite_has_symbol(abs.as_str(), &frag));
+        }
+        self.svg_is_renderable(id)
+    }
+
+    /// Whether the subtree under `id` (inclusive) will PAINT an icon in the
+    /// laid-out page: a visible `<img>` with a source, or an `<svg>` the next
+    /// layout parse rewrites into one (`svg_will_render`). Such a clickable
+    /// needs no injected text handle — the rendered image is its visible,
+    /// selectable content (and its `alt` still carries the accessible name).
+    fn subtree_paints_icon(&self, id: NodeId) -> bool {
+        std::iter::once(id)
+            .chain(self.descendants(id))
+            .any(|n| match self.tag_name(n) {
+                Some("img") => {
+                    self.attr(n, "src").is_some_and(|s| !s.trim().is_empty()) && !self.is_hidden(n)
+                }
+                Some("svg") => self.svg_will_render(n),
+                _ => false,
+            })
+    }
+
     /// If this `<svg>`'s geometry lives in an EXTERNAL sprite sheet — a
     /// `<use href="file.svg#id">` (or legacy `xlink:href`) — return the sheet
     /// file's raw href and the fragment id. A same-document `<use href="#id">`
@@ -3752,8 +3826,12 @@ impl Dom {
             // NOTHING rather than a marker per anonymous control: the empty
             // wrapper yields no layout item, so it neither shows nor steals a
             // selection stop. (Was a `·` marker — fine for a lone control,
-            // debris in a group.)
-            if !self.subtree_has_text(id) {
+            // debris in a group.) A clickable whose icon actually PAINTS (a
+            // visible `<img>`, or an `<svg>` the layout parse rewrites into
+            // one) needs no handle either — injecting one doubles the control
+            // (ChatGPT's composer grew a `[Start dictation]` label beside the
+            // rendered mic icon once sprite icons started rasterizing).
+            if !self.subtree_has_text(id) && !self.subtree_paints_icon(id) {
                 if let Some(glyph) = self.icon_glyph(id) {
                     out.push_str(glyph);
                 } else if let Some(label) = self
@@ -4102,9 +4180,18 @@ impl Dom {
 
     /// The element's 1-based position among its parent's element children
     /// (`of_type`: only same-tag siblings; `from_end`: counted from the
-    /// last). `None` if it has no parent or isn't an element. One sibling
-    /// pass, no Vec: count qualifying siblings and note our own ordinal.
-    fn nth_position(&self, id: NodeId, of_type: bool, from_end: bool) -> Option<i32> {
+    /// last; `of`: only siblings matching the `of S` selector list — a
+    /// subject that doesn't match S itself has no ordinal). `None` if it has
+    /// no parent or isn't an element. One sibling pass, no Vec: count
+    /// qualifying siblings and note our own ordinal.
+    fn nth_position(
+        &self,
+        id: NodeId,
+        of_type: bool,
+        from_end: bool,
+        of: Option<&[Complex]>,
+        scope: Option<NodeId>,
+    ) -> Option<i32> {
         let parent = self.nodes[id].parent?;
         let my_tag = self.tag_name(id)?;
         let mut count = 0i32;
@@ -4113,6 +4200,7 @@ impl Dom {
         while let Some(c) = child {
             if let Some(t) = self.tag_name(c)
                 && (!of_type || t == my_tag)
+                && of.is_none_or(|sels| sels.iter().any(|cx| self.matches_complex(c, &cx.0, scope)))
             {
                 count += 1;
                 if c == id {
@@ -4129,15 +4217,16 @@ impl Dom {
         })
     }
 
-    fn matches_structural(&self, id: NodeId, st: &Structural) -> bool {
+    fn matches_structural(&self, id: NodeId, st: &Structural, scope: Option<NodeId>) -> bool {
         match st {
             Structural::Empty => self.is_element_empty(id),
             Structural::Nth {
                 nth,
                 of_type,
                 from_end,
+                of,
             } => self
-                .nth_position(id, *of_type, *from_end)
+                .nth_position(id, *of_type, *from_end, of.as_deref(), scope)
                 .is_some_and(|pos| nth.matches(pos)),
         }
     }
@@ -4212,8 +4301,11 @@ impl Dom {
         if !c
             .structural
             .iter()
-            .all(|st| self.matches_structural(id, st))
+            .all(|st| self.matches_structural(id, st, scope))
         {
+            return false;
+        }
+        if !c.states.iter().all(|st| self.matches_state(id, tag, st)) {
             return false;
         }
         // `:is()`/`:where()`: each invocation's group must have at least one
@@ -4243,6 +4335,248 @@ impl Dom {
             .iter()
             .flatten()
             .all(|n| !self.matches_compound(id, n, scope))
+    }
+
+    /// Evaluate one element-state pseudo-class (see [`StatePseudo`]) against
+    /// the arena. `tag` is the element's tag name (the caller already has it).
+    fn matches_state(&self, id: NodeId, tag: &str, st: &StatePseudo) -> bool {
+        match st {
+            StatePseudo::AnyLink => matches!(tag, "a" | "area") && self.attr(id, "href").is_some(),
+            StatePseudo::Checked => match tag {
+                "input" => {
+                    matches!(self.input_type(id).as_str(), "checkbox" | "radio")
+                        && self.attr(id, "checked").is_some()
+                }
+                "option" => self.attr(id, "selected").is_some(),
+                _ => false,
+            },
+            StatePseudo::Indeterminate => match tag {
+                "input" => self.input_type(id) == "radio" && !self.radio_group_has_checked(id),
+                "progress" => self.attr(id, "value").is_none(),
+                _ => false,
+            },
+            StatePseudo::Disabled => self.actually_disabled(id, tag),
+            StatePseudo::Enabled => {
+                matches!(
+                    tag,
+                    "button" | "input" | "select" | "textarea" | "optgroup" | "option" | "fieldset"
+                ) && !self.actually_disabled(id, tag)
+            }
+            StatePseudo::Required => {
+                self.required_applies(id, tag) && self.attr(id, "required").is_some()
+            }
+            StatePseudo::Optional => {
+                self.required_applies(id, tag) && self.attr(id, "required").is_none()
+            }
+            StatePseudo::ReadWrite => self.read_write(id, tag),
+            StatePseudo::ReadOnly => !self.read_write(id, tag),
+            StatePseudo::PlaceholderShown => match tag {
+                "input" => {
+                    self.attr(id, "placeholder").is_some()
+                        && self.attr(id, "value").is_none_or(str::is_empty)
+                }
+                "textarea" => self.attr(id, "placeholder").is_some() && self.is_element_empty(id),
+                _ => false,
+            },
+            StatePseudo::Lang(ranges) => {
+                let Some(lang) = self.inherited_lang(id) else {
+                    return false;
+                };
+                let lang = lang.to_ascii_lowercase();
+                ranges.iter().any(|r| {
+                    r == "*" && !lang.is_empty()
+                        || lang == *r
+                        || lang
+                            .strip_prefix(r.as_str())
+                            .is_some_and(|s| s.starts_with('-'))
+                })
+            }
+            StatePseudo::Dir(want_rtl) => self.direction_rtl(id) == *want_rtl,
+        }
+    }
+
+    /// An `<input>`'s effective type: the `type` attribute, ASCII-lowercased,
+    /// defaulting to `text`.
+    fn input_type(&self, id: NodeId) -> String {
+        self.attr(id, "type")
+            .map(|t| t.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "text".to_string())
+    }
+
+    /// Whether some radio in `id`'s radio button group is checked (HTML
+    /// §4.10.5.1.16: the group is the radios sharing a `name` under the same
+    /// form owner; a nameless radio forms a group of one).
+    fn radio_group_has_checked(&self, id: NodeId) -> bool {
+        let name = self.attr(id, "name").unwrap_or("");
+        if name.is_empty() {
+            return self.attr(id, "checked").is_some();
+        }
+        let root = self.nearest_form(id);
+        self.descendants(root).any(|c| {
+            self.tag_name(c) == Some("input")
+                && self.input_type(c) == "radio"
+                && self.attr(c, "name") == Some(name)
+                && self.nearest_form(c) == root
+                && self.attr(c, "checked").is_some()
+        })
+    }
+
+    /// The nearest `<form>` ancestor (the form owner for grouping; the `form`
+    /// content attribute's id indirection is not modeled), else the document.
+    fn nearest_form(&self, id: NodeId) -> NodeId {
+        let mut cur = self.nodes[id].parent;
+        while let Some(a) = cur {
+            if self.tag_name(a) == Some("form") {
+                return a;
+            }
+            cur = self.nodes[a].parent;
+        }
+        DOCUMENT
+    }
+
+    /// HTML's "actually disabled": a disableable element with the `disabled`
+    /// attribute, an `<option>` under a disabled `<optgroup>`, or a form
+    /// control inside a disabled `<fieldset>` (outside its first `<legend>`).
+    fn actually_disabled(&self, id: NodeId, tag: &str) -> bool {
+        match tag {
+            "button" | "input" | "select" | "textarea" => {
+                self.attr(id, "disabled").is_some() || self.disabled_by_fieldset(id)
+            }
+            "optgroup" | "fieldset" => self.attr(id, "disabled").is_some(),
+            "option" => {
+                if self.attr(id, "disabled").is_some() {
+                    return true;
+                }
+                let mut cur = self.nodes[id].parent;
+                while let Some(a) = cur {
+                    if self.tag_name(a) == Some("optgroup") {
+                        return self.attr(a, "disabled").is_some();
+                    }
+                    cur = self.nodes[a].parent;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// The disabled-fieldset rule (HTML §4.10.15): a form control descending
+    /// from a disabled `<fieldset>` is disabled, unless it sits inside that
+    /// fieldset's FIRST `<legend>` child.
+    fn disabled_by_fieldset(&self, id: NodeId) -> bool {
+        let mut cur = self.nodes[id].parent;
+        while let Some(a) = cur {
+            if self.tag_name(a) == Some("fieldset") && self.attr(a, "disabled").is_some() {
+                let in_first_legend = self
+                    .child_iter(a)
+                    .find(|&c| self.tag_name(c) == Some("legend"))
+                    .is_some_and(|l| self.is_inclusive_ancestor(l, id));
+                if !in_first_legend {
+                    return true;
+                }
+            }
+            cur = self.nodes[a].parent;
+        }
+        false
+    }
+
+    /// Is `anc` `node` itself or an ancestor of it? (Plain parent walk.)
+    fn is_inclusive_ancestor(&self, anc: NodeId, node: NodeId) -> bool {
+        let mut cur = Some(node);
+        while let Some(n) = cur {
+            if n == anc {
+                return true;
+            }
+            cur = self.nodes[n].parent;
+        }
+        false
+    }
+
+    /// Whether the `required` attribute applies to this element (HTML: text-
+    /// like/checkbox/radio/file inputs, `<select>`, `<textarea>` — not the
+    /// button-like or `hidden`/`range`/`color` input types).
+    fn required_applies(&self, id: NodeId, tag: &str) -> bool {
+        match tag {
+            "select" | "textarea" => true,
+            "input" => !matches!(
+                self.input_type(id).as_str(),
+                "hidden" | "range" | "color" | "submit" | "image" | "reset" | "button"
+            ),
+            _ => false,
+        }
+    }
+
+    /// HTML's `:read-write`: a mutable `input` (of a type `readonly` applies
+    /// to) or `<textarea>` — neither `readonly` nor disabled — or an editable
+    /// element (nearest `contenteditable` attribute not `false`). Everything
+    /// else is `:read-only`.
+    fn read_write(&self, id: NodeId, tag: &str) -> bool {
+        let mutable = match tag {
+            "textarea" => true,
+            "input" => matches!(
+                self.input_type(id).as_str(),
+                "text"
+                    | "search"
+                    | "url"
+                    | "tel"
+                    | "email"
+                    | "password"
+                    | "date"
+                    | "month"
+                    | "week"
+                    | "time"
+                    | "datetime-local"
+                    | "number"
+            ),
+            _ => false,
+        };
+        if mutable {
+            return self.attr(id, "readonly").is_none() && !self.actually_disabled(id, tag);
+        }
+        // Editing hosts / editable elements: the nearest contenteditable
+        // attribute decides (missing/"false" = not editable).
+        let mut cur = Some(id);
+        while let Some(n) = cur {
+            if let Some(ce) = self.attr(n, "contenteditable") {
+                return !ce.eq_ignore_ascii_case("false");
+            }
+            cur = self.nodes[n].parent;
+        }
+        false
+    }
+
+    /// The element's language: the nearest ancestor-or-self `lang` (or
+    /// `xml:lang`) attribute.
+    fn inherited_lang(&self, id: NodeId) -> Option<&str> {
+        let mut cur = Some(id);
+        while let Some(n) = cur {
+            if let Some(l) = self.attr(n, "lang").or_else(|| self.attr(n, "xml:lang")) {
+                return Some(l);
+            }
+            cur = self.nodes[n].parent;
+        }
+        None
+    }
+
+    /// The element's directionality per the nearest `dir` attribute; the
+    /// document default is ltr, and `dir=auto` approximates to ltr (the
+    /// engine lays out LTR only — no bidi resolution to consult).
+    fn direction_rtl(&self, id: NodeId) -> bool {
+        let mut cur = Some(id);
+        while let Some(n) = cur {
+            if let Some(d) = self.attr(n, "dir") {
+                return match d.trim().to_ascii_lowercase().as_str() {
+                    "rtl" => true,
+                    "ltr" | "auto" => false,
+                    _ => {
+                        cur = self.nodes[n].parent;
+                        continue;
+                    }
+                };
+            }
+            cur = self.nodes[n].parent;
+        }
+        false
     }
 
     /// The nearest following sibling that is an element (skips text/comments).
@@ -4489,6 +4823,9 @@ struct Compound {
     /// Structural pseudo-classes (`:empty`, `:nth-child(…)`, `:first-child`,
     /// `:*-of-type`, …) the element must satisfy. All must hold (AND).
     structural: Vec<Structural>,
+    /// Element-state pseudo-classes (`:checked`, `:disabled`, `:link`,
+    /// `:lang(…)`, …) the element must satisfy. All must hold (AND).
+    states: Vec<StatePseudo>,
     /// `:scope`: matches the element a rooted query (`querySelectorAll`/
     /// jQuery `.find()`) was called on. jQuery rewrites context-rooted comma/
     /// complex selectors to `:scope X, :scope Y`, so without this they match
@@ -4541,19 +4878,120 @@ impl Nth {
     }
 }
 
+/// An element-state pseudo-class evaluable from the arena (Selectors 4 §9
+/// link pseudos + the HTML "Pseudo-classes" section's input-state semantics).
+/// All are static tests against attributes/tree state; content mutations bump
+/// the epoch, so the per-epoch match memos stay fresh (the prelude routes
+/// `.checked`/`.value` writes through `setAttribute`, which mutates the
+/// arena).
+enum StatePseudo {
+    /// `:link` / `:any-link` — an `<a>`/`<area>` with an `href`. History-
+    /// based styling isn't modeled yet, so `:link` matches every hyperlink
+    /// and `:visited` is a never-pseudo for now.
+    AnyLink,
+    /// `:checked` — a checkbox/radio with checkedness set, or a selected
+    /// `<option>`.
+    Checked,
+    /// `:indeterminate` — a radio group with no checked radio, or a
+    /// `<progress>` with no `value`. (A checkbox's `indeterminate` is a
+    /// JS-only property the arena doesn't model yet, so it can't match
+    /// there until the prelude mirrors it.)
+    Indeterminate,
+    /// `:disabled` / `:enabled` — HTML's "actually disabled" definition,
+    /// including the disabled-`<fieldset>` descendant rule.
+    Disabled,
+    Enabled,
+    /// `:required` / `:optional` — controls the `required` attribute applies
+    /// to, with/without it.
+    Required,
+    Optional,
+    /// `:read-write` / `:read-only` — a mutable `input`/`textarea`, or an
+    /// editable (`contenteditable`) element; `:read-only` is everything else.
+    ReadWrite,
+    ReadOnly,
+    /// `:placeholder-shown` — a `placeholder`-bearing control whose value is
+    /// empty.
+    PlaceholderShown,
+    /// `:lang(<ranges>)` — language ranges matched against the inherited
+    /// `lang` attribute (RFC 4647 prefix filtering, `*` wildcard).
+    Lang(Vec<String>),
+    /// `:dir(rtl)` / `:dir(ltr)` — the nearest `dir` attribute (`auto`
+    /// approximates to `ltr`: the engine lays out LTR only). `true` = rtl.
+    Dir(bool),
+}
+
+/// Parse a state pseudo-class by name (+ its argument for the functional
+/// two). `None` = not a state pseudo (the caller falls through); a present
+/// but malformed argument also yields `None`, which the caller surfaces as a
+/// parse failure of the whole selector (the engine-wide fail-open rule).
+fn parse_state_pseudo(name: &str, arg: Option<&str>) -> Option<StatePseudo> {
+    Some(match name {
+        "link" | "any-link" => StatePseudo::AnyLink,
+        "checked" => StatePseudo::Checked,
+        "indeterminate" => StatePseudo::Indeterminate,
+        "disabled" => StatePseudo::Disabled,
+        "enabled" => StatePseudo::Enabled,
+        "required" => StatePseudo::Required,
+        "optional" => StatePseudo::Optional,
+        "read-write" => StatePseudo::ReadWrite,
+        "read-only" => StatePseudo::ReadOnly,
+        "placeholder-shown" => StatePseudo::PlaceholderShown,
+        "lang" => {
+            let ranges: Vec<String> = split_top_level(arg?, ',')
+                .into_iter()
+                .map(|r| r.trim().trim_matches(['"', '\'']).to_ascii_lowercase())
+                .filter(|r| !r.is_empty())
+                .collect();
+            if ranges.is_empty() {
+                return None;
+            }
+            StatePseudo::Lang(ranges)
+        }
+        "dir" => match arg?.trim().to_ascii_lowercase().as_str() {
+            "ltr" => StatePseudo::Dir(false),
+            "rtl" => StatePseudo::Dir(true),
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
 /// A structural pseudo-class: a positional/childless test that depends on
 /// the element's siblings, not its own attributes.
 enum Structural {
     /// `:empty` — no element or non-empty text children.
     Empty,
     /// `:nth-child(An+B)` and its variants. `of_type` counts only same-tag
-    /// siblings; `from_end` counts position from the last sibling.
+    /// siblings; `from_end` counts position from the last sibling; `of` is
+    /// Selectors 4 §5.5's `of <selector-list>` clause — only siblings
+    /// matching it are counted (and the subject must match it too).
     /// (`:first-child` = `nth(1)`, `:last-child` = `nth(1)` from end, etc.)
     Nth {
         nth: Nth,
         of_type: bool,
         from_end: bool,
+        of: Option<Vec<Complex>>,
     },
+}
+
+/// Split an `:nth-child()`/`:nth-last-child()` argument into its `An+B` text
+/// and the optional `of <selector-list>` clause. The An+B micro-grammar
+/// contains no ident but `odd`/`even`/`n`, so the first whitespace-delimited
+/// `of` token is the divider.
+fn split_nth_of(s: &str) -> (&str, Option<&str>) {
+    let lower = s.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let mut i = 0;
+    while let Some(pos) = lower[i..].find("of") {
+        let at = i + pos;
+        let bounded_left = at == 0 || b[at - 1].is_ascii_whitespace();
+        let bounded_right = b.get(at + 2).is_none_or(u8::is_ascii_whitespace);
+        if bounded_left && bounded_right && at > 0 {
+            return (&s[..at], Some(s[at + 2..].trim()));
+        }
+        i = at + 2;
+    }
+    (s, None)
 }
 
 /// Parse the `An+B` argument of `:nth-child(...)` etc. — `odd`, `even`,
@@ -4594,11 +5032,13 @@ fn structural_simple(name: &str) -> Option<Vec<Structural>> {
         nth: Nth { a: 0, b: 1 },
         of_type,
         from_end: false,
+        of: None,
     };
     let last = |of_type| Structural::Nth {
         nth: Nth { a: 0, b: 1 },
         of_type,
         from_end: true,
+        of: None,
     };
     Some(match name {
         "first-child" => vec![first(false)],
@@ -4609,6 +5049,21 @@ fn structural_simple(name: &str) -> Option<Vec<Structural>> {
         "only-of-type" => vec![first(true), last(true)],
         _ => return None,
     })
+}
+
+/// Parse an `of <selector-list>` clause: a NON-forgiving complex selector
+/// list (Selectors 4 §5.5) — any unparsable member (or a pseudo-element
+/// subject) invalidates the whole selector.
+fn parse_nth_of(sel: &str) -> Option<Vec<Complex>> {
+    let mut out = Vec::new();
+    for part in split_top_level(sel, ',') {
+        let cx = parse_complex(part.trim())?;
+        if cx.0.last().is_some_and(|(_, c)| c.pseudo.is_some()) {
+            return None;
+        }
+        out.push(cx);
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// CSS attribute selector operators: `=`, `~=`, `|=`, `^=`, `$=`, `*=`.
@@ -4666,6 +5121,7 @@ impl Compound {
             && !self.root
             && !self.host
             && self.structural.is_empty()
+            && self.states.is_empty()
             && self.pseudo.is_none()
     }
 
@@ -4697,6 +5153,15 @@ impl Compound {
         // carries zero specificity, so the complex's own specificity is it).
         for group in &self.has {
             if let Some(m) = group.iter().map(|h| h.complex.specificity()).max() {
+                s = (s.0 + m.0, s.1 + m.1, s.2 + m.2);
+            }
+        }
+        // `:nth-child(An+B of S)`: the pseudo-class (already in `pseudos`)
+        // plus the specificity of the most specific S (Selectors 4 §17).
+        for st in &self.structural {
+            if let Structural::Nth { of: Some(sels), .. } = st
+                && let Some(m) = sels.iter().map(Complex::specificity).max()
+            {
                 s = (s.0 + m.0, s.1 + m.1, s.2 + m.2);
             }
         }
@@ -4827,6 +5292,13 @@ pub fn sprite_sheet_cached(abs_url: &str) -> bool {
 fn sprite_symbol_svg(abs_url: &str, frag: &str) -> Option<String> {
     let sheets = SPRITE_SHEETS.lock().unwrap();
     sheets.get(abs_url)?.get(frag).cloned()
+}
+
+/// Whether a primed sprite sheet holds this symbol — `sprite_symbol_svg`
+/// without cloning the markup (the serializer only needs the yes/no).
+fn sprite_has_symbol(abs_url: &str, frag: &str) -> bool {
+    let sheets = SPRITE_SHEETS.lock().unwrap();
+    sheets.get(abs_url).is_some_and(|t| t.contains_key(frag))
 }
 
 /// A sprite sheet is a flat `<svg>` of `<symbol id viewBox>…</symbol>` defs.
@@ -5156,12 +5628,26 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     _ => None,
                 } {
                     // A malformed/absent An+B fails the parse (rule ignored,
-                    // fail-open) rather than silently mismatching.
-                    let nth = parse_nth(&arg?)?;
+                    // fail-open) rather than silently mismatching. The
+                    // `of <selector-list>` clause (Selectors 4 §5.5) applies
+                    // to the child-indexed forms only; its list is
+                    // NON-forgiving, so a bad member fails the parse too.
+                    let raw = arg?;
+                    let (nth_text, of_sel) = if of_type {
+                        (raw.as_str(), None)
+                    } else {
+                        split_nth_of(&raw)
+                    };
+                    let nth = parse_nth(nth_text)?;
+                    let of = match of_sel {
+                        Some(sel) => Some(parse_nth_of(sel)?),
+                        None => None,
+                    };
                     compound.structural.push(Structural::Nth {
                         nth,
                         of_type,
                         from_end,
+                        of,
                     });
                     compound.pseudos += 1;
                 } else if name == "popover-open" {
@@ -5181,13 +5667,22 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                     // genuinely matches, exactly as before the feature.
                     compound.hover = true;
                     compound.pseudos += 1;
+                } else if let Some(state) = parse_state_pseudo(&name, arg.as_deref()) {
+                    // Element-state pseudo-classes, evaluated against the
+                    // arena (`matches_state`). A malformed `:lang()`/`:dir()`
+                    // argument fails the parse (rule dropped, fail-open).
+                    compound.states.push(state);
+                    compound.pseudos += 1;
                 } else {
-                    // Valid CSS we can never satisfy: parse, count for
-                    // specificity, never match. Interaction pseudos are
-                    // GENUINELY false at rest (no pointer, no focus), so a
-                    // `:not(:focus)` wrapping them correctly matches;
-                    // anything else unsupported is flagged so `:not` rejects
-                    // it rather than inverting it into always-match.
+                    // Valid CSS we can't satisfy YET: parse, count for
+                    // specificity, never match. (Any of these can graduate
+                    // to a real evaluation when the state exists — `:hover`,
+                    // `:checked` & co. all started here.) Interaction
+                    // pseudos are GENUINELY false at rest (no pointer, no
+                    // focus), so a `:not(:focus)` wrapping them correctly
+                    // matches; anything else unsupported is flagged so
+                    // `:not` rejects it rather than inverting it into
+                    // always-match.
                     compound.never = true;
                     compound.never_unknown = !matches!(
                         name.as_str(),
@@ -5197,8 +5692,6 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                             | "focus-visible"
                             | "visited"
                             | "target"
-                            | "checked"
-                            | "disabled"
                     );
                     compound.pseudos += 1;
                 }
@@ -5294,6 +5787,39 @@ const fn prop(name: &'static str, inherited: bool, baked: bool) -> PropDef {
     }
 }
 
+/// The CSS-wide keywords (css-cascade-4 §7.3), valid as the whole value of
+/// any property. `revert-layer` (css-cascade-5 §7.3.4) rolls back to the
+/// previous cascade LAYER; the winner maps keep only the top declaration, so
+/// it degrades to `revert` — the spec's own behavior when no lower layer
+/// declares the property.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum WideKeyword {
+    Inherit,
+    Initial,
+    Unset,
+    Revert,
+}
+
+fn wide_keyword(v: &str) -> Option<WideKeyword> {
+    let t = v.trim();
+    // Fast bail on the first letter — this runs on every cascaded read.
+    match t.as_bytes().first() {
+        Some(b'i' | b'I' | b'u' | b'U' | b'r' | b'R') => {}
+        _ => return None,
+    }
+    if t.eq_ignore_ascii_case("inherit") {
+        Some(WideKeyword::Inherit)
+    } else if t.eq_ignore_ascii_case("initial") {
+        Some(WideKeyword::Initial)
+    } else if t.eq_ignore_ascii_case("unset") {
+        Some(WideKeyword::Unset)
+    } else if t.eq_ignore_ascii_case("revert") || t.eq_ignore_ascii_case("revert-layer") {
+        Some(WideKeyword::Revert)
+    } else {
+        None
+    }
+}
+
 /// `PROPS` index for a property name, via a one-time name→index map. Replaces a
 /// per-call `PROPS.iter().position()` linear scan — `computed_value` runs this
 /// ~100k times in one heavy-page layout, so the scan was pure waste.
@@ -5327,6 +5853,11 @@ const INHERITED_LAYOUT_PROPS: &[&str] = &[
     "list-style-position",
     "text-indent",
     "visibility",
+    "image-rendering",
+    "caption-side",
+    "overflow-wrap",
+    "word-break",
+    "tab-size",
 ];
 
 const PROPS: &[PropDef] = &[
@@ -5359,6 +5890,12 @@ const PROPS: &[PropDef] = &[
     // CSS Overflow 3 §5.1 — chooses ellipsis vs plain clip at a nowrap
     // truncation. NOT inherited (applies to the clipping block itself).
     prop("text-overflow", false, true),
+    // CSS Text 3 §5.2/§5.5: within-word break opportunities (`word-wrap` is
+    // the legacy alias of `overflow-wrap`, normalized at shorthand expansion)
+    // and §3 tab advance in preserved modes. All inherited per spec.
+    prop("overflow-wrap", true, true),
+    prop("word-break", true, true),
+    prop("tab-size", true, true),
     prop("text-transform", true, true),
     prop("letter-spacing", true, true),
     prop("list-style-type", true, true),
@@ -5455,8 +5992,13 @@ const PROPS: &[PropDef] = &[
     prop("place-self", false, true),
     prop("place-items", false, true),
     prop("justify-content", false, true),
+    prop("align-content", false, true),
     prop("align-items", false, true),
     prop("order", false, true),
+    // CSS 2.1 §17: the table width algorithm (`fixed` vs auto) and caption
+    // placement. `caption-side` is inherited per §17.4.1.
+    prop("table-layout", false, true),
+    prop("caption-side", true, true),
     prop("border-top-width", false, true),
     prop("border-right-width", false, true),
     prop("border-bottom-width", false, true),
@@ -5743,6 +6285,11 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     if let Some(phys) = logical_to_physical(prop) {
         return vec![(phys.to_string(), value.to_string())];
     }
+    // `word-wrap` parses exactly as `overflow-wrap` (CSS Text 3 §5.5 — a
+    // legacy alias, not a shorthand).
+    if prop == "word-wrap" {
+        return vec![("overflow-wrap".to_string(), value.to_string())];
+    }
     if let Some((start, end)) = logical_pair(prop) {
         let toks: Vec<&str> = split_top_level_ws(value);
         let (a, b) = match toks.as_slice() {
@@ -5794,17 +6341,42 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             .collect();
     }
     // `border` / `border-{side}`: a `width || style || color` shorthand. We
-    // keep the width and style (color is ignored), per side.
+    // keep the width and style (color is ignored), per side. The shorthand
+    // RESETS omitted longhands (width ← `medium`, style ← `none` — so a
+    // `border: 2px` has no visible style and computes a 0 used width, per
+    // CSS 2.1 §8.5.4); a value where NOTHING parses (`border: var(--b)`)
+    // keeps the old pass-through-nothing behavior rather than nuking.
     if prop == "border" {
+        let sides: &[&str] = &["top", "right", "bottom", "left"];
+        if wide_keyword(value).is_some() {
+            return border_longhands(sides, Some(value), Some(value));
+        }
         let (w, s) = parse_border_shorthand(value);
-        return border_longhands(&["top", "right", "bottom", "left"], w, s);
+        if w.is_none() && s.is_none() {
+            return Vec::new();
+        }
+        return border_longhands(
+            sides,
+            Some(w.unwrap_or("medium")),
+            Some(s.unwrap_or("none")),
+        );
     }
     if let Some(side) = prop
         .strip_prefix("border-")
         .filter(|s| matches!(*s, "top" | "right" | "bottom" | "left"))
     {
+        if wide_keyword(value).is_some() {
+            return border_longhands(&[side], Some(value), Some(value));
+        }
         let (w, s) = parse_border_shorthand(value);
-        return border_longhands(&[side], w, s);
+        if w.is_none() && s.is_none() {
+            return Vec::new();
+        }
+        return border_longhands(
+            &[side],
+            Some(w.unwrap_or("medium")),
+            Some(s.unwrap_or("none")),
+        );
     }
     // `grid-gap`/`grid-row-gap`/`grid-column-gap`: the deprecated aliases of
     // `gap`/`row-gap`/`column-gap` (still emitted by older toolchains and
@@ -5812,7 +6384,69 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     if let Some(rest) = prop.strip_prefix("grid-")
         && matches!(rest, "gap" | "row-gap" | "column-gap")
     {
-        return vec![(rest.to_string(), value.to_string())];
+        return expand_box_shorthand(rest, value);
+    }
+    // `gap: <row-gap> <column-gap>?` (css-align-3 §8.3) → the longhands, so
+    // the cascade resolves shorthand-vs-longhand by source order.
+    if prop == "gap" {
+        let toks = split_top_level_ws(value);
+        let (r, c) = match toks.as_slice() {
+            [x] => (*x, *x),
+            [x, y] => (*x, *y),
+            _ => return Vec::new(),
+        };
+        return vec![
+            ("row-gap".to_string(), r.to_string()),
+            ("column-gap".to_string(), c.to_string()),
+        ];
+    }
+    // `flex-flow: <'flex-direction'> || <'flex-wrap'>` (css-flexbox §5.3) —
+    // omitted components reset to their initials.
+    if prop == "flex-flow" {
+        if wide_keyword(value).is_some() {
+            return vec![
+                ("flex-direction".to_string(), value.to_string()),
+                ("flex-wrap".to_string(), value.to_string()),
+            ];
+        }
+        let (mut dir, mut wrap) = (None, None);
+        for t in value.split_whitespace() {
+            match t.to_ascii_lowercase().as_str() {
+                "row" | "row-reverse" | "column" | "column-reverse" => dir = Some(t),
+                "wrap" | "nowrap" | "wrap-reverse" => wrap = Some(t),
+                _ => return Vec::new(), // invalid token: drop whole
+            }
+        }
+        return vec![
+            (
+                "flex-direction".to_string(),
+                dir.unwrap_or("row").to_string(),
+            ),
+            (
+                "flex-wrap".to_string(),
+                wrap.unwrap_or("nowrap").to_string(),
+            ),
+        ];
+    }
+    // The `place-*` shorthands (css-align-3 §6.4/§7.4): first value is the
+    // block/align component, the optional second the inline/justify one
+    // (space-separated per spec — the old grid-side `/` split was wrong).
+    if let Some((align, justify)) = match prop {
+        "place-items" => Some(("align-items", "justify-items")),
+        "place-self" => Some(("align-self", "justify-self")),
+        "place-content" => Some(("align-content", "justify-content")),
+        _ => None,
+    } {
+        let toks = split_top_level_ws(value);
+        let (a, j) = match toks.as_slice() {
+            [x] => (*x, *x),
+            [x, y] => (*x, *y),
+            _ => return Vec::new(),
+        };
+        return vec![
+            (align.to_string(), a.to_string()),
+            (justify.to_string(), j.to_string()),
+        ];
     }
     // `columns: <'column-width'> || <'column-count'>` (css-multicol-1 §6.1) —
     // a bare integer is the count, anything else (a length) the width; the
@@ -5840,16 +6474,69 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             ),
         ];
     }
-    // `grid-template: <rows> / <columns>` (the area form is ignored — we don't
-    // place by name). Split on the top-level `/` into the two track lists.
+    // `grid-template` (css-grid-1 §7.1): `none` and the CSS-wide keywords
+    // reset all three longhands; `<rows> / <columns>` splits on the
+    // top-level `/`; the areas form (`"a a" 1fr "b b" / 1fr 1fr`) extracts
+    // the strings as `grid-template-areas`, the tokens between them as row
+    // tracks. The shorthand always RESETS what it doesn't set.
     if prop == "grid-template" {
-        if let Some((rows, cols)) = split_top_level_slash(value) {
+        let v = value.trim();
+        if v.eq_ignore_ascii_case("none") || wide_keyword(v).is_some() {
             return vec![
-                ("grid-template-rows".to_string(), rows.trim().to_string()),
-                ("grid-template-columns".to_string(), cols.trim().to_string()),
+                ("grid-template-rows".to_string(), v.to_string()),
+                ("grid-template-columns".to_string(), v.to_string()),
+                ("grid-template-areas".to_string(), v.to_string()),
             ];
         }
-        return Vec::new();
+        let (rows_part, cols) = match split_top_level_slash(value) {
+            Some((r, c)) => (r.trim().to_string(), c.trim().to_string()),
+            // No `/`: only the areas form (strings, no columns) is valid.
+            None if v.contains(['"', '\'']) => (v.to_string(), "none".to_string()),
+            None => return Vec::new(),
+        };
+        // The areas form: quoted strings are area rows; what's between them
+        // (minus line names in brackets) are the row track sizes.
+        if rows_part.contains(['"', '\'']) {
+            let mut areas = String::new();
+            let mut rows = String::new();
+            let mut chars = rows_part.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '"' || c == '\'' {
+                    let s: String = chars.by_ref().take_while(|&x| x != c).collect();
+                    if !areas.is_empty() {
+                        areas.push(' ');
+                    }
+                    areas.push_str(&format!("\"{s}\""));
+                } else if c == '[' {
+                    // Line names don't participate in track sizing here.
+                    for x in chars.by_ref() {
+                        if x == ']' {
+                            break;
+                        }
+                    }
+                } else {
+                    rows.push(c);
+                }
+            }
+            let rows = rows.split_whitespace().collect::<Vec<_>>().join(" ");
+            return vec![
+                ("grid-template-areas".to_string(), areas),
+                (
+                    "grid-template-rows".to_string(),
+                    if rows.is_empty() {
+                        "none".to_string()
+                    } else {
+                        rows
+                    },
+                ),
+                ("grid-template-columns".to_string(), cols),
+            ];
+        }
+        return vec![
+            ("grid-template-rows".to_string(), rows_part),
+            ("grid-template-columns".to_string(), cols),
+            ("grid-template-areas".to_string(), "none".to_string()),
+        ];
     }
     // `flex: none | auto | <grow> [<shrink>] [<basis>] | <basis>` → the three
     // longhands, so the CASCADE resolves them by source order (a `flex-grow:0`
@@ -5858,6 +6545,15 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     // sets basis 0 (not auto), per the spec.
     if prop == "flex" {
         let v = value.trim();
+        // The CSS-wide keywords apply to every longhand of the shorthand
+        // (they used to fall into the numeric arm as `1 1 inherit` garbage).
+        if wide_keyword(v).is_some() {
+            return vec![
+                ("flex-grow".to_string(), v.to_string()),
+                ("flex-shrink".to_string(), v.to_string()),
+                ("flex-basis".to_string(), v.to_string()),
+            ];
+        }
         let (g, s, b) = match v.to_ascii_lowercase().as_str() {
             "none" => ("0", "0", "auto".to_string()),
             "auto" => ("1", "1", "auto".to_string()),
@@ -5893,28 +6589,49 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     // line-height/family (untracked, ignored). System-font keywords
     // (`caption`, `menu`, …) expand to nothing.
     if prop == "font" {
-        let mut out = Vec::new();
+        if wide_keyword(value).is_some() {
+            return vec![
+                ("font-style".to_string(), value.to_string()),
+                ("font-weight".to_string(), value.to_string()),
+                ("font-size".to_string(), value.to_string()),
+            ];
+        }
+        let (mut style, mut weight, mut size) = (None, None, None);
         for tok in value.split_whitespace() {
             let t = tok.split('/').next().unwrap_or(tok);
             match t.to_ascii_lowercase().as_str() {
-                "italic" | "oblique" => out.push(("font-style".to_string(), t.to_string())),
-                "bold" | "bolder" | "lighter" => {
-                    out.push(("font-weight".to_string(), t.to_string()));
-                }
+                "italic" | "oblique" => style = Some(t.to_string()),
+                "bold" | "bolder" | "lighter" => weight = Some(t.to_string()),
                 w if w
                     .parse::<u16>()
                     .is_ok_and(|n| (100..=900).contains(&n) && n % 100 == 0) =>
                 {
-                    out.push(("font-weight".to_string(), t.to_string()));
+                    weight = Some(t.to_string());
                 }
                 s if font_size_token(s) => {
-                    out.push(("font-size".to_string(), t.to_string()));
+                    size = Some(t.to_string());
                     break;
                 }
                 _ => {}
             }
         }
-        return out;
+        // No size ⇒ not a valid `font` shorthand (a system-font keyword or
+        // garbage) — drop whole, as before. With a size, the shorthand
+        // RESETS the omitted longhands to `normal` (CSS Fonts §6.3).
+        let Some(size) = size else {
+            return Vec::new();
+        };
+        return vec![
+            (
+                "font-style".to_string(),
+                style.unwrap_or_else(|| "normal".into()),
+            ),
+            (
+                "font-weight".to_string(),
+                weight.unwrap_or_else(|| "normal".into()),
+            ),
+            ("font-size".to_string(), size),
+        ];
     }
     // `background`: only the color and the image longhands are consumed (the
     // layout paints no color, but a declared background is an OPAQUE FILL in
@@ -7101,16 +7818,45 @@ fn media_query_one(q: &str, vp: (u32, u32)) -> bool {
 }
 
 /// A single media condition against the viewport: the classic
-/// `feature: value` form, or the Media Queries L4 range form
-/// (`width >= 40em`, `400px <= width < 900px`).
+/// `feature: value` form, the Media Queries L4 range form (`width >= 40em`,
+/// `400px <= width < 900px`), or a boolean feature (`(hover)`).
+///
+/// The environment answers reflect what the terminal actually is: a
+/// hover-dispatching (MQ4 §7.1: `hover`), mouse-driven (`pointer: fine`)
+/// interactive browser (`display-mode: browser`, `scripting: enabled` — the
+/// evaluator only runs on the JS pipeline) on a color output device
+/// (`color: 8` — the terminal is truecolor even though the render style is
+/// monochromatic), a CHARACTER GRID (`grid: 1` — the tty case the feature
+/// was specified for), at 1 device pixel per CSS pixel (`resolution:
+/// 1dppx`). The preferences: `prefers-reduced-motion: reduce` (cells can't
+/// animate smoothly) and `prefers-color-scheme: dark` (the terminal
+/// aesthetic).
 fn media_feature_matches(inner: &str, vp: (u32, u32)) -> bool {
     let (vw, vh) = vp;
     let Some((name, value)) = inner.split_once(':') else {
-        // No colon: try the L4 range syntax; a boolean feature (`(color)`)
-        // or anything unrecognized still doesn't match.
-        return media_range_matches(inner, vp);
+        // No colon: the L4 range syntax when a comparison operator is
+        // present, else the boolean-context form (MQ4 §2.4.1: false when
+        // the feature's value would be zero/none).
+        if inner.contains(['<', '>', '=']) {
+            return media_range_matches(inner, vp);
+        }
+        return match inner.trim() {
+            "width" => vw != 0,
+            "height" => vh != 0,
+            "aspect-ratio" | "orientation" => vw != 0 && vh != 0,
+            "color" | "color-gamut" | "hover" | "any-hover" | "pointer" | "any-pointer"
+            | "update" | "scripting" | "resolution" | "grid" => true,
+            "monochrome" => false,
+            _ => false,
+        };
     };
     let value = value.trim();
+    let ratio = || {
+        (vw != 0 && vh != 0)
+            .then(|| media_ratio(value).map(|r| (vw as f32 / vh as f32, r)))
+            .flatten()
+    };
+    let num = || value.parse::<f32>().ok();
     match name.trim() {
         "min-width" => vw != 0 && media_px(value).is_some_and(|n| vw >= n),
         "max-width" => vw != 0 && media_px(value).is_some_and(|n| vw <= n),
@@ -7118,12 +7864,71 @@ fn media_feature_matches(inner: &str, vp: (u32, u32)) -> bool {
         "min-height" => vh != 0 && media_px(value).is_some_and(|n| vh >= n),
         "max-height" => vh != 0 && media_px(value).is_some_and(|n| vh <= n),
         "height" => vh != 0 && media_px(value).is_some_and(|n| vh == n),
+        // `device-*` (deprecated in MQ4 but still served): the terminal IS
+        // the screen, so they equal the viewport.
+        "min-device-width" => vw != 0 && media_px(value).is_some_and(|n| vw >= n),
+        "max-device-width" => vw != 0 && media_px(value).is_some_and(|n| vw <= n),
+        "device-width" => vw != 0 && media_px(value).is_some_and(|n| vw == n),
+        "min-device-height" => vh != 0 && media_px(value).is_some_and(|n| vh >= n),
+        "max-device-height" => vh != 0 && media_px(value).is_some_and(|n| vh <= n),
+        "device-height" => vh != 0 && media_px(value).is_some_and(|n| vh == n),
         "orientation" if vw != 0 && vh != 0 => match value {
             "portrait" => vh >= vw,
             "landscape" => vw > vh,
             _ => false,
         },
+        "aspect-ratio" => ratio().is_some_and(|(a, r)| (a - r).abs() < 1e-3),
+        "min-aspect-ratio" => ratio().is_some_and(|(a, r)| a >= r),
+        "max-aspect-ratio" => ratio().is_some_and(|(a, r)| a <= r),
+        "hover" | "any-hover" => value == "hover",
+        "pointer" | "any-pointer" => value == "fine",
+        "prefers-color-scheme" => value == "dark",
+        "prefers-reduced-motion" => value == "reduce",
+        "prefers-contrast" => value == "no-preference",
+        "forced-colors" => value == "none",
+        "color" => num() == Some(8.0),
+        "min-color" => num().is_some_and(|n| n <= 8.0),
+        "max-color" => num().is_some_and(|n| n >= 8.0),
+        "monochrome" | "min-monochrome" => num() == Some(0.0),
+        "max-monochrome" => num().is_some_and(|n| n >= 0.0),
+        "color-gamut" => value == "srgb",
+        "display-mode" => value == "browser",
+        "update" => value == "fast",
+        "scripting" => value == "enabled",
+        "grid" => matches!(value, "1"),
+        "resolution" => media_dppx(value) == Some(1.0),
+        "min-resolution" => media_dppx(value).is_some_and(|n| n <= 1.0),
+        "max-resolution" => media_dppx(value).is_some_and(|n| n >= 1.0),
+        "-webkit-device-pixel-ratio" => num() == Some(1.0),
+        "-webkit-min-device-pixel-ratio" => num().is_some_and(|n| n <= 1.0),
+        "-webkit-max-device-pixel-ratio" => num().is_some_and(|n| n >= 1.0),
         _ => false,
+    }
+}
+
+/// A media `<ratio>`: `4/3`, `16 / 9`, or a bare number (MQ4 allows both).
+fn media_ratio(value: &str) -> Option<f32> {
+    if let Some((a, b)) = value.split_once('/') {
+        let a: f32 = a.trim().parse().ok()?;
+        let b: f32 = b.trim().parse().ok()?;
+        return (b > 0.0).then(|| a / b);
+    }
+    value.trim().parse().ok()
+}
+
+/// A media `<resolution>` in device-pixels-per-CSS-px: `dppx`/`x`, `dpi`
+/// (96/in), `dpcm` (96/2.54).
+fn media_dppx(value: &str) -> Option<f32> {
+    let v = value.trim();
+    let split = v
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(v.len());
+    let n: f32 = v[..split].parse().ok()?;
+    match v[split..].trim() {
+        "dppx" | "x" => Some(n),
+        "dpi" => Some(n / 96.0),
+        "dpcm" => Some(n / (96.0 / 2.54)),
+        _ => None,
     }
 }
 
@@ -7291,9 +8096,19 @@ fn media_px(value: &str) -> Option<u32> {
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
         .unwrap_or(v.len());
     let n: f32 = v[..split].parse().ok()?;
+    // `em`/`rem` in a media query resolve against the INITIAL font size
+    // (16px), never author declarations (MQ4 §1.3); the absolute units are
+    // the css-values-4 §6.1 table.
     let px = match v[split..].trim() {
         "px" | "" => n,
         "em" | "rem" => n * 16.0,
+        "ex" | "ch" => n * 8.0,
+        "pt" => n * 4.0 / 3.0,
+        "pc" => n * 16.0,
+        "in" => n * 96.0,
+        "cm" => n * 96.0 / 2.54,
+        "mm" => n * 96.0 / 25.4,
+        "q" => n * 96.0 / 101.6,
         _ => return None,
     };
     Some(px.round().max(0.0) as u32)
@@ -7401,8 +8216,24 @@ fn is_anim_keyword_or_time(tok: &str) -> bool {
 /// `input` starts at '{'; return (inner text, after-the-matching-'}').
 fn take_block(input: &str) -> (&str, &str) {
     let mut depth = 0i32;
+    // String-aware (css-syntax §4.3.5): a `{`/`}` inside a quoted value
+    // (`content: "}"`, a font-face `unicode-range` string, …) must not move
+    // the brace depth, or a skipped at-rule desyncs the rest of the sheet.
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
     for (i, c) in input.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
         match c {
+            '"' | '\'' => quote = Some(c),
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
@@ -9071,9 +9902,40 @@ mod tests {
         assert!(!media_query_matches("(orientation: portrait)", vp));
         assert!(media_query_matches("(min-width: 40em)", vp), "40em = 640px");
         assert!(media_query_matches("not (min-width: 1000px)", vp), "not");
+        // The environment features answer what the terminal actually is:
+        // hover-dispatching, mouse-driven, dark, motion-reduced, 1dppx, a
+        // character grid, a color device.
+        assert!(media_query_matches("(hover: hover)", vp));
+        assert!(!media_query_matches("(hover: none)", vp));
+        assert!(media_query_matches("(any-pointer: fine)", vp));
+        assert!(!media_query_matches("(pointer: coarse)", vp));
+        assert!(media_query_matches("(prefers-color-scheme: dark)", vp));
+        assert!(!media_query_matches("(prefers-color-scheme: light)", vp));
+        assert!(media_query_matches("(prefers-reduced-motion: reduce)", vp));
+        assert!(media_query_matches("(resolution: 1dppx)", vp));
+        assert!(media_query_matches("(min-resolution: 96dpi)", vp));
+        assert!(!media_query_matches("(min-resolution: 2x)", vp));
+        assert!(media_query_matches("(grid: 1)", vp), "we ARE a tty grid");
+        assert!(media_query_matches("(color)", vp));
+        assert!(!media_query_matches("(monochrome)", vp));
+        assert!(media_query_matches("(update: fast)", vp));
+        assert!(media_query_matches("(scripting: enabled)", vp));
+        assert!(media_query_matches("(display-mode: browser)", vp));
+        // aspect-ratio: 800x600 = 4/3.
+        assert!(media_query_matches("(aspect-ratio: 4/3)", vp));
+        assert!(media_query_matches("(min-aspect-ratio: 1/1)", vp));
+        assert!(!media_query_matches("(min-aspect-ratio: 16/9)", vp));
+        assert!(media_query_matches("(max-aspect-ratio: 16/9)", vp));
+        // Boolean-context features (MQ4 §2.4.1).
+        assert!(media_query_matches("(hover)", vp));
+        assert!(media_query_matches("(width)", vp));
+        assert!(!media_query_matches("(width)", (0, 0)));
+        // The full absolute-unit table in media lengths: 8in = 768px.
+        assert!(media_query_matches("(min-width: 8in)", vp));
+        assert!(!media_query_matches("(min-width: 9in)", vp));
         // Unknown feature, or an unknown viewport, conservatively don't match
         // (so the rules are dropped, exactly as skipping @media used to).
-        assert!(!media_query_matches("(hover: hover)", vp));
+        assert!(!media_query_matches("(bleeding-edge-feature: on)", vp));
         assert!(!media_query_matches("(min-width: 768px)", (0, 0)));
     }
 
@@ -9494,6 +10356,57 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("href=\"/normal\""), "{html}");
+    }
+
+    #[test]
+    fn serialize_live_skips_the_text_handle_when_the_icon_paints() {
+        // The icon-only fallback exists because an icon-only clickable used
+        // to render EMPTY. A subtree whose icon actually paints — a visible
+        // <img>, an <svg> with inline geometry, or a sprite <use> that
+        // resolves against the primed sheet table — needs no injected handle:
+        // the icon is the visible content, and doubling it grew ChatGPT's
+        // composer a "[Start dictation]" label beside the rendered mic icon.
+        let mut dom = Dom::parse_document(
+            "<body>\
+             <button id=inline aria-label='Play'><svg viewBox='0 0 24 24'><path d='M0 0h24v24z'></path></svg></button>\
+             <button id=pic aria-label='Send'><img src='/send.png'></button>\
+             <button id=sprite aria-label='Start dictation'><svg><use href='/s.svg#mic'></use></svg></button>\
+             <button id=cold aria-label='Search'><svg><use href='/cold.svg#glass'></use></svg></button>\
+             </body>",
+        );
+        dom.set_doc_url(url::Url::parse("https://sprite-label-suppress.example/page").ok());
+        prime_sprite_sheet(
+            "https://sprite-label-suppress.example/s.svg",
+            "<svg><symbol id='mic' viewBox='0 0 24 24'><path d='M0 0h24v24z'/></symbol></svg>",
+        );
+        let ids: Vec<_> = ["inline", "pic", "sprite", "cold"]
+            .iter()
+            .map(|i| dom.get_by_id(i).unwrap())
+            .collect();
+        let clickable: std::collections::HashSet<_> = ids.iter().copied().collect();
+        let html = dom.serialize_live(DOCUMENT, &clickable);
+        assert!(
+            !html.contains("[Play]"),
+            "inline-geometry icon must not double its name: {html}"
+        );
+        assert!(
+            !html.contains("[Send]"),
+            "img icon must not double its name: {html}"
+        );
+        assert!(
+            !html.contains("[Start dictation]"),
+            "resolved sprite icon must not double its name: {html}"
+        );
+        // An UNRESOLVED sprite still renders nothing — the accessible name
+        // remains the control's only visible handle (graceful, as before).
+        assert!(
+            html.contains("[Search]"),
+            "cold sprite keeps its text handle: {html}"
+        );
+        // All four stay wrapped clickables either way.
+        for id in ids {
+            assert!(html.contains(&format!("x-trust-js:{id}:")), "{html}");
+        }
     }
 
     #[test]
@@ -10942,19 +11855,20 @@ mod tests {
     #[test]
     fn unsupported_pseudo_inside_not_kills_the_rule_instead_of_matching_all() {
         // `:not(:hover)` is genuinely TRUE at rest, but an UNEVALUABLE pseudo
-        // (`:lang`, which we can't satisfy) must not invert into always-match —
-        // that turned a targeted hide rule into hide-everything. It dies
-        // instead. (`:has()` is now real — see `not_has_matches_elements_*`.)
+        // (`:defined`, which we can't satisfy) must not invert into
+        // always-match — that turned a targeted hide rule into
+        // hide-everything. It dies instead. (`:has()`/`:lang()` are now real
+        // — see `not_has_matches_elements_*` / `lang_pseudo_matches_*`.)
         let dom = Dom::parse_document(
             "<head><style>\
-             .x:not(:lang(en)){display:none}\
+             .x:not(:defined){display:none}\
              .y:not(:hover){letter-spacing:2px}\
              </style></head>\
              <body><p id=a class=x>kept</p><p id=b class=y>styled</p></body>",
         );
         assert!(
             !dom.is_hidden(dom.get_by_id("a").unwrap()),
-            ":lang inside :not drops the rule (fail-open)"
+            ":defined inside :not drops the rule (fail-open)"
         );
         assert_eq!(
             dom.computed_style(dom.get_by_id("b").unwrap(), "letter-spacing")
@@ -11110,6 +12024,337 @@ mod tests {
             dom3.computed_value(dom3.get_by_id("x").unwrap(), "overflow-x"),
             None,
             "and excludes the element WITH that title"
+        );
+    }
+
+    #[test]
+    fn css_wide_keywords_resolve_in_the_cascade() {
+        let dom = Dom::parse_document(
+            "<head><style>\
+             .w{width:200px} .wi{width:inherit} .wu{width:unset}\
+             b.norm{font-weight:initial} b.rev{font-weight:revert}\
+             .ta{text-align:center} .tai{text-align:initial} .tau{text-align:unset}\
+             </style></head>\
+             <body>\
+             <div class=w><p id=wi class=wi>x</p><p id=wu class=wu>x</p></div>\
+             <b id=norm class=norm>x</b><b id=rev class=rev>x</b>\
+             <div class=ta><p id=tai class=tai>x</p><p id=tau class=tau>x</p>\
+             <p id=plain>x</p></div>\
+             </body>",
+        );
+        let id = |s: &str| dom.get_by_id(s).unwrap();
+        assert_eq!(
+            dom.computed_value(id("wi"), "width").as_deref(),
+            Some("200px"),
+            "inherit on a NON-inherited property takes the parent's computed value"
+        );
+        assert_eq!(
+            dom.computed_value(id("wu"), "width"),
+            None,
+            "unset on a non-inherited property = initial"
+        );
+        assert_eq!(
+            dom.computed_value(id("norm"), "font-weight"),
+            None,
+            "initial beats the UA origin (<b> is not bold under font-weight:initial)"
+        );
+        assert_eq!(
+            dom.computed_value(id("rev"), "font-weight").as_deref(),
+            Some("bold"),
+            "revert rolls the author origin back to the UA origin"
+        );
+        assert_eq!(
+            dom.computed_value(id("tai"), "text-align"),
+            None,
+            "initial on an INHERITED property stops inheritance"
+        );
+        assert_eq!(
+            dom.computed_value(id("tau"), "text-align").as_deref(),
+            Some("center"),
+            "unset on an inherited property inherits"
+        );
+        assert_eq!(
+            dom.computed_value(id("plain"), "text-align").as_deref(),
+            Some("center"),
+            "plain inheritance is unchanged"
+        );
+    }
+
+    #[test]
+    fn form_state_pseudo_classes_match_the_arena() {
+        let dom = Dom::parse_document(
+            "<head><style>\
+             input:checked{display:none}\
+             option:checked{display:none}\
+             button:disabled{display:none}\
+             button:enabled{letter-spacing:1px}\
+             input:required{letter-spacing:2px}\
+             input:optional{letter-spacing:3px}\
+             input:read-only{letter-spacing:4px}\
+             .ed:read-write{letter-spacing:5px}\
+             input:placeholder-shown{letter-spacing:6px}\
+             progress:indeterminate{display:none}\
+             a:any-link{letter-spacing:7px}\
+             a:link{letter-spacing:8px}\
+             </style></head>\
+             <body>\
+             <input id=c1 type=checkbox checked><input id=c2 type=checkbox>\
+             <select><option id=o1 selected>a</option><option id=o2>b</option></select>\
+             <button id=b1 disabled>x</button><button id=b2>x</button>\
+             <fieldset disabled><legend><button id=inlegend>x</button></legend>\
+             <button id=fdis>x</button></fieldset>\
+             <input id=rq type=text required>\
+             <input id=ro type=text readonly>\
+             <div id=ed class=ed contenteditable>x</div><div id=ned class=ed>x</div>\
+             <input id=ph type=text placeholder=hi>\
+             <input id=ph2 type=text placeholder=hi value=v>\
+             <progress id=p1></progress><progress id=p2 value=3 max=10></progress>\
+             <a id=l1 href=/x>x</a><a id=l2>x</a>\
+             </body>",
+        );
+        let id = |s: &str| dom.get_by_id(s).unwrap();
+        let hidden = |s: &str| dom.is_hidden(id(s));
+        let ls = |s: &str| dom.computed_style(id(s), "letter-spacing");
+        assert!(hidden("c1"), ":checked matches a checked checkbox");
+        assert!(!hidden("c2"), "and not an unchecked one");
+        assert!(hidden("o1"), ":checked matches a selected <option>");
+        assert!(!hidden("o2"));
+        assert!(hidden("b1"), ":disabled via the attribute");
+        assert_eq!(ls("b2").as_deref(), Some("1px"), ":enabled");
+        assert!(hidden("fdis"), "a disabled <fieldset> disables descendants");
+        assert!(
+            !hidden("inlegend"),
+            "…but not controls in its first <legend>"
+        );
+        assert_eq!(ls("rq").as_deref(), Some("2px"), ":required");
+        // `ro` is optional (3px) AND read-only (4px) — source order wins.
+        assert_eq!(ls("ro").as_deref(), Some("4px"), ":read-only");
+        assert_eq!(
+            ls("ed").as_deref(),
+            Some("5px"),
+            "contenteditable = :read-write"
+        );
+        assert_eq!(ls("ned"), None, "a plain div is :read-only");
+        assert_eq!(ls("ph").as_deref(), Some("6px"), ":placeholder-shown");
+        assert_eq!(
+            ls("ph2").as_deref(),
+            Some("3px"),
+            "a value hides the placeholder (falls to :optional)"
+        );
+        assert!(hidden("p1"), "<progress> without value is :indeterminate");
+        assert!(!hidden("p2"));
+        assert_eq!(
+            ls("l1").as_deref(),
+            Some("8px"),
+            ":link/:any-link on a[href]"
+        );
+        assert_eq!(ls("l2"), None, "an anchor without href is no link");
+    }
+
+    #[test]
+    fn checked_sibling_toggle_drives_a_menu() {
+        // The pure-CSS hamburger idiom: a checkbox toggles a sibling menu.
+        let dom = Dom::parse_document(
+            "<head><style>#t:checked ~ #menu{display:none}</style></head>\
+             <body><input id=t type=checkbox checked><nav id=menu>items</nav></body>",
+        );
+        assert!(dom.is_hidden(dom.get_by_id("menu").unwrap()));
+        let dom2 = Dom::parse_document(
+            "<head><style>#t:checked ~ #menu{display:none}</style></head>\
+             <body><input id=t type=checkbox><nav id=menu>items</nav></body>",
+        );
+        assert!(
+            !dom2.is_hidden(dom2.get_by_id("menu").unwrap()),
+            ":not-yet-checked toggle leaves the menu visible"
+        );
+        // And `:not(:checked)` composes (checked left the never bucket).
+        let dom3 = Dom::parse_document(
+            "<head><style>#t:not(:checked) ~ #menu{display:none}</style></head>\
+             <body><input id=t type=checkbox><nav id=menu>items</nav></body>",
+        );
+        assert!(dom3.is_hidden(dom3.get_by_id("menu").unwrap()));
+    }
+
+    #[test]
+    fn radio_group_indeterminate_scans_the_group() {
+        let dom = Dom::parse_document(
+            "<head><style>input:indeterminate{display:none}</style></head>\
+             <body>\
+             <form><input id=r1 type=radio name=g><input id=r2 type=radio name=g></form>\
+             <form><input id=r3 type=radio name=g checked>\
+             <input id=r4 type=radio name=g></form>\
+             </body>",
+        );
+        let hidden = |s: &str| dom.is_hidden(dom.get_by_id(s).unwrap());
+        assert!(hidden("r1"), "no checked radio in the group");
+        assert!(hidden("r2"));
+        assert!(!hidden("r3"), "a checked group is determinate");
+        assert!(
+            !hidden("r4"),
+            "grouping is per form owner — the sibling form's radios don't leak"
+        );
+    }
+
+    #[test]
+    fn lang_and_dir_pseudos_match_ancestors() {
+        let dom = Dom::parse_document(
+            "<head><style>\
+             :lang(en){letter-spacing:1px}\
+             :lang(fr){letter-spacing:2px}\
+             :dir(rtl){display:none}\
+             </style></head>\
+             <body>\
+             <div lang=en-US><p id=en>x</p></div>\
+             <div lang=fr><p id=fr>x</p></div>\
+             <div dir=rtl><p id=rtl>x</p></div>\
+             <p id=plain>x</p>\
+             </body>",
+        );
+        let id = |s: &str| dom.get_by_id(s).unwrap();
+        let ls = |s: &str| dom.computed_style(id(s), "letter-spacing");
+        assert_eq!(ls("en").as_deref(), Some("1px"), ":lang(en) matches en-US");
+        assert_eq!(ls("fr").as_deref(), Some("2px"));
+        assert!(dom.is_hidden(id("rtl")), ":dir(rtl) via the dir attribute");
+        assert_eq!(
+            ls("plain"),
+            None,
+            "no inherited lang → :lang matches nothing"
+        );
+        assert!(!dom.is_hidden(id("plain")), "the default direction is ltr");
+    }
+
+    #[test]
+    fn nth_child_of_selector_counts_matching_siblings() {
+        let dom = Dom::parse_document(
+            "<head><style>li:nth-child(2 of .x){display:none}</style></head>\
+             <body><ul>\
+             <li id=a class=x>1</li><li id=b>skip</li>\
+             <li id=c class=x>2</li><li id=d class=x>3</li>\
+             </ul></body>",
+        );
+        let hidden = |s: &str| dom.is_hidden(dom.get_by_id(s).unwrap());
+        assert!(!hidden("a"), "first .x");
+        assert!(!hidden("b"), "a non-matching sibling has no ordinal");
+        assert!(hidden("c"), "the SECOND .x (third child) matches");
+        assert!(!hidden("d"));
+        // odd of S counts within the filtered list.
+        let dom2 = Dom::parse_document(
+            "<head><style>li:nth-child(odd of .x){letter-spacing:1px}</style></head>\
+             <body><ul>\
+             <li id=a class=x>1</li><li id=b>skip</li>\
+             <li id=c class=x>2</li><li id=d class=x>3</li>\
+             </ul></body>",
+        );
+        let ls = |s: &str| dom2.computed_style(dom2.get_by_id(s).unwrap(), "letter-spacing");
+        assert_eq!(ls("a").as_deref(), Some("1px"));
+        assert_eq!(ls("c"), None);
+        assert_eq!(ls("d").as_deref(), Some("1px"));
+        assert_eq!(ls("b"), None);
+    }
+
+    #[test]
+    fn unknown_at_rule_skip_is_string_aware() {
+        // A `}` inside a quoted value of a SKIPPED at-rule must not close the
+        // block early and desync the rest of the sheet.
+        let dom = Dom::parse_document(
+            "<head><style>\
+             @font-face{font-family:x;descriptor:\"}\"}\
+             p{letter-spacing:1px}\
+             </style></head><body><p id=t>x</p></body>",
+        );
+        assert_eq!(
+            dom.computed_style(dom.get_by_id("t").unwrap(), "letter-spacing")
+                .as_deref(),
+            Some("1px"),
+            "the rule after the skipped at-rule survives"
+        );
+    }
+
+    #[test]
+    fn table_and_alignment_props_are_tracked_from_sheets() {
+        // These were read by the layout but missing from PROPS, so their
+        // STYLESHEET declarations were silently dropped (inline worked).
+        let dom = Dom::parse_document(
+            "<head><style>\
+             .g{align-content:center}\
+             table{table-layout:fixed;caption-side:bottom}\
+             </style></head>\
+             <body><div id=g class=g>x</div>\
+             <table id=t><caption id=cap>c</caption><tr><td>x</td></tr></table></body>",
+        );
+        let id = |s: &str| dom.get_by_id(s).unwrap();
+        assert_eq!(
+            dom.computed_value(id("g"), "align-content").as_deref(),
+            Some("center")
+        );
+        assert_eq!(
+            dom.computed_value(id("t"), "table-layout").as_deref(),
+            Some("fixed")
+        );
+        assert_eq!(
+            dom.computed_value(id("cap"), "caption-side").as_deref(),
+            Some("bottom"),
+            "caption-side inherits from the table to the caption"
+        );
+    }
+
+    #[test]
+    fn shorthand_resets_and_wide_keywords_expand() {
+        let dom = Dom::parse_document(
+            "<head><style>\
+             .b{border:2px}\
+             .fp{flex-grow:7} .f{flex:inherit}\
+             .fw{font:italic 12px serif}\
+             .gt{grid-template-columns:1fr;grid-template:none}\
+             .gap{column-gap:4px;gap:8px}\
+             .ff{flex-direction:column;flex-flow:row wrap}\
+             .pi{place-items:center start}\
+             .gta{grid-template:\"a a\" 20px \"b b\" 20px / 1fr 2fr}\
+             </style></head>\
+             <body><div id=b class=b>x</div>\
+             <div class=fp><div id=f class=f>x</div></div>\
+             <div id=fw class=fw>x</div>\
+             <div id=gt class=gt>x</div>\
+             <div id=gap class=gap>x</div>\
+             <div id=ff class=ff>x</div>\
+             <div id=pi class=pi>x</div>\
+             <div id=gta class=gta>x</div>\
+             </body>",
+        );
+        let id = |s: &str| dom.get_by_id(s).unwrap();
+        let cv = |s: &str, p: &str| dom.computed_value(id(s), p);
+        // `border: 2px` resets the omitted style to none (invisible, and a
+        // 0 used width per §8.5.3).
+        assert_eq!(cv("b", "border-top-width").as_deref(), Some("2px"));
+        assert_eq!(cv("b", "border-top-style").as_deref(), Some("none"));
+        // `flex: inherit` propagates the keyword to all three longhands.
+        assert_eq!(cv("f", "flex-grow").as_deref(), Some("7"));
+        // `font` resets omitted weight to normal.
+        assert_eq!(cv("fw", "font-style").as_deref(), Some("italic"));
+        assert_eq!(cv("fw", "font-weight").as_deref(), Some("normal"));
+        // `grid-template: none` resets the earlier columns.
+        assert_eq!(cv("gt", "grid-template-columns").as_deref(), Some("none"));
+        // `gap` expands, so the later shorthand beats the earlier longhand.
+        assert_eq!(cv("gap", "column-gap").as_deref(), Some("8px"));
+        assert_eq!(cv("gap", "row-gap").as_deref(), Some("8px"));
+        // `flex-flow` expands likewise.
+        assert_eq!(cv("ff", "flex-direction").as_deref(), Some("row"));
+        assert_eq!(cv("ff", "flex-wrap").as_deref(), Some("wrap"));
+        // `place-items` is space-separated align/justify.
+        assert_eq!(cv("pi", "align-items").as_deref(), Some("center"));
+        assert_eq!(cv("pi", "justify-items").as_deref(), Some("start"));
+        // The `grid-template` areas form splits into all three longhands.
+        assert_eq!(
+            cv("gta", "grid-template-areas").as_deref(),
+            Some("\"a a\" \"b b\"")
+        );
+        assert_eq!(
+            cv("gta", "grid-template-rows").as_deref(),
+            Some("20px 20px")
+        );
+        assert_eq!(
+            cv("gta", "grid-template-columns").as_deref(),
+            Some("1fr 2fr")
         );
     }
 }

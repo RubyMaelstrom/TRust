@@ -629,6 +629,154 @@ mod tests {
     }
 
     #[test]
+    fn overflow_wrap_breaks_an_overflowing_word() {
+        // Under `normal` an unbreakable word overflows the line whole (the
+        // output clips it at the viewport edge; nothing lands on row 1)…
+        let out = lay(
+            r#"<body style="margin:0"><p style="margin:0">abcdefghijklmno</p></body>"#,
+            10,
+        );
+        assert_eq!(row_text(&out.rows[0]), "abcdefghij");
+        assert!(absent(&out, "klmno"), "no emergency break under normal");
+        // …`overflow-wrap: break-word` takes the emergency break instead
+        // (CSS Text §5.5), and wrapped words still break normally.
+        let out = lay(
+            r#"<body style="margin:0"><p style="margin:0;overflow-wrap:break-word">abcdefghijklmno xy</p></body>"#,
+            10,
+        );
+        assert_eq!(row_text(&out.rows[0]), "abcdefghij");
+        assert_eq!(row_text(&out.rows[1]), "klmno xy");
+        // The legacy `word-wrap` alias parses identically.
+        let out = lay(
+            r#"<body style="margin:0"><p style="margin:0;word-wrap:break-word">abcdefghijklmno</p></body>"#,
+            10,
+        );
+        assert_eq!(row_text(&out.rows[1]), "klmno");
+    }
+
+    #[test]
+    fn word_break_break_all_fills_lines() {
+        // `word-break: break-all` breaks between any two characters, so the
+        // greedy fill uses the current line before wrapping (CSS Text §5.2):
+        // "bbbb" splits at the line edge instead of wrapping whole.
+        let out = lay(
+            r#"<body style="margin:0"><p style="margin:0;word-break:break-all">aaaaaaaa bbbb cccccc</p></body>"#,
+            10,
+        );
+        assert_eq!(row_text(&out.rows[0]), "aaaaaaaa b");
+        assert_eq!(row_text(&out.rows[1]), "bbb cccccc");
+    }
+
+    #[test]
+    fn word_break_keep_all_suppresses_cjk_wraps() {
+        // CJK ideographs are normally soft-wrap opportunities per glyph…
+        let out = lay(
+            r#"<body style="margin:0"><p style="margin:0">漢字漢字漢字</p></body>"#,
+            10,
+        );
+        assert_eq!(row_text(&out.rows[0]), "漢字漢字漢");
+        assert_eq!(row_text(&out.rows[1]), "字");
+        // …`keep-all` keeps the run unbreakable: it overflows like a long
+        // word (clipped at the viewport; nothing lands on row 1).
+        let out = lay(
+            r#"<body style="margin:0"><p style="margin:0;word-break:keep-all">漢字漢字漢字</p></body>"#,
+            10,
+        );
+        assert!(
+            out.rows.len() < 2 || row_text(&out.rows[1]).is_empty(),
+            "keep-all leaves nothing on the second row"
+        );
+    }
+
+    #[test]
+    fn overflow_wrap_min_content_distinction() {
+        // `break-word` adds NO min-content break opportunities: a
+        // width:min-content block still sizes to the widest word…
+        let out = lay(
+            r#"<body style="margin:0"><div style="width:min-content;overflow-wrap:break-word">abcdef</div></body>"#,
+            40,
+        );
+        assert_eq!(row_text(&out.rows[0]), "abcdef");
+        // …while `anywhere` shrinks min-content to a single glyph
+        // (CSS Text §5.5 — the one difference between the two values).
+        let out = lay(
+            r#"<body style="margin:0"><div style="width:min-content;overflow-wrap:anywhere">abcdef</div></body>"#,
+            40,
+        );
+        assert_eq!(row_text(&out.rows[0]), "a");
+        assert_eq!(row_text(&out.rows[1]), "b");
+    }
+
+    #[test]
+    fn block_width_intrinsic_keywords() {
+        // css-sizing-3 §5: the keywords on a plain BLOCK box (previously
+        // they fell to auto = fill). min-content = the widest word…
+        let out = lay(
+            r#"<body style="margin:0"><div style="width:min-content">aa bbbb</div></body>"#,
+            20,
+        );
+        assert_eq!(row_text(&out.rows[0]), "aa");
+        assert_eq!(row_text(&out.rows[1]), "bbbb");
+        // …max-content = the unwrapped single line…
+        let out = lay(
+            r#"<body style="margin:0"><div style="width:max-content">aa bbbb</div></body>"#,
+            20,
+        );
+        assert_eq!(row_text(&out.rows[0]), "aa bbbb");
+        // …fit-content: at a wide viewport it hugs the content (a nested
+        // full-width child would fill 20 cells under auto, 7 under
+        // fit-content — probe via a right-aligned second line).
+        let out = lay(
+            r#"<body style="margin:0"><div style="width:fit-content;text-align:right">aa bbbb<br>c</div></body>"#,
+            20,
+        );
+        assert_eq!(row_text(&out.rows[0]), "aa bbbb");
+        let (_, c) = find(&out, "c");
+        assert_eq!(c.col, 6, "right-aligned inside the 7-cell fit-content box");
+    }
+
+    #[test]
+    fn generated_content_renders_as_first_and_last_children() {
+        // CSS 2.1 §12.1: `::before`/`::after` boxes render (this regressed to
+        // nothing when the old flow engine was deleted — the serializer bakes
+        // the text but layout2 never consumed it). Both sources work: the
+        // live cascade (this test) and the baked attribute (the second half).
+        let out = lay(
+            "<head><style>#a::before{content:\"B-\"} #a::after{content:\"-A\"}</style></head>\
+             <body style=\"margin:0\"><p id=a style=\"margin:0\">mid</p></body>",
+            40,
+        );
+        assert_eq!(row_text(&out.rows[0]), "B-mid-A");
+        let out = lay(
+            r#"<body style="margin:0"><p style="margin:0" data-trust-before="B-" data-trust-after="-A">mid</p></body>"#,
+            40,
+        );
+        assert_eq!(row_text(&out.rows[0]), "B-mid-A");
+    }
+
+    #[test]
+    fn tab_size_sets_preserved_tab_stops() {
+        // The default: tabs advance to 8-cell stops in preserved modes.
+        let out = lay(
+            "<body style=\"margin:0\"><pre style=\"margin:0\">a\tb</pre></body>",
+            20,
+        );
+        assert_eq!(row_text(&out.rows[0]), "a       b");
+        // `tab-size: 4` moves the stops (CSS Text §3).
+        let out = lay(
+            "<body style=\"margin:0\"><pre style=\"margin:0;tab-size:4\">a\tb\tc</pre></body>",
+            20,
+        );
+        assert_eq!(row_text(&out.rows[0]), "a   b   c");
+        // A zero tab renders no advance.
+        let out = lay(
+            "<body style=\"margin:0\"><pre style=\"margin:0;tab-size:0\">a\tb</pre></body>",
+            20,
+        );
+        assert_eq!(row_text(&out.rows[0]), "ab");
+    }
+
+    #[test]
     fn sibling_margins_collapse_to_max() {
         let out = lay(
             r#"<body style="margin:0"><div style="margin-bottom:32px">a</div><div style="margin-top:16px">b</div></body>"#,
@@ -828,6 +976,30 @@ mod tests {
             .expect("reserved box");
         assert_eq!((img.width, img.height), (10, 4));
         assert_eq!(img.image, None, "no pixels yet — renderer paints blank");
+    }
+
+    #[test]
+    fn width_percent_height_auto_image_scales_by_computed_width_not_attrs() {
+        // erome.com /explore: a 250×250 thumbnail (`width`/`height` HTML
+        // attrs) styled `width:100%;height:auto` inside a narrower card.
+        // `height:auto` must resolve via the intrinsic ratio against the
+        // CSS-computed width (176px → 176px, ratio 1:1), NOT the raw 250px
+        // attribute value — the oversized box (250px = 16 rows) buried the
+        // album title/username text painted below it (the atomic-image paint
+        // rule lets a surviving image claim its whole box, even cells a
+        // later sibling legitimately owns).
+        let out = lay(
+            r#"<body style="margin:0"><div style="width:176px">
+               <img src="i.jpg" width="250" height="250" style="width:100%;height:auto" alt="x">
+               </div></body>"#,
+            40,
+        );
+        let (_, img) = first_image(&out);
+        assert_eq!(
+            (img.width, img.height),
+            (22, 11),
+            "176px computed width, height follows the 1:1 ratio — not the raw 250px attr"
+        );
     }
 
     #[test]
@@ -1275,6 +1447,52 @@ mod tests {
             1,
             "the lingering opacity:0 abspos microtrailer adds no row"
         );
+    }
+
+    #[test]
+    fn a_videojs_transformed_player_still_renders_its_caption() {
+        // erome.com's real shape after video.js initialises: the aspect-ratio
+        // hack (`height:0;padding-top:NN%`) wrapper holds the out-of-flow
+        // `<video>` tech PLUS an out-of-flow poster-overlay chrome div with
+        // its own opaque `background-color`. In our paint model a declared
+        // background is an opaque fill (§Appendix E — needed for the modal/
+        // card-stack cases), and the poster overlay sits LATER in the tree
+        // than the tech, so it legally painted over our synthesized "▶ Video"
+        // mpv-link text, leaving the whole player area blank. The player-
+        // wrapper chrome skip must drop the poster/chrome siblings from the
+        // box tree entirely so they can never clobber the media
+        // representation.
+        let out = lay(
+            r#"<body style="margin:0"><div class="player video-js" style="height:0;padding-top:56.25%;position:relative;background-color:#000">
+                 <video class="vjs-tech" src="clip_720p.mp4" style="position:absolute;width:100%;height:100%;top:0;left:0"></video>
+                 <div class="vjs-poster" style="position:absolute;top:0;left:0;width:100%;height:100%;background-color:#000"></div>
+               </div></body>"#,
+            60,
+        );
+        let (_, it) = find(&out, "▶ Video");
+        assert!(
+            matches!(&it.link, Some(crate::doc::Link::Media(u)) if u.as_str().ends_with("clip_720p.mp4")),
+            "the caption still links mpv to the source"
+        );
+    }
+
+    #[test]
+    fn player_wrapper_skip_is_gated_on_the_aspect_ratio_hack() {
+        // The player-wrapper chrome skip must NOT fire on a generic
+        // in-flow container (no `height:0`) that happens to hold real
+        // content beside an unrelated out-of-flow video — only the
+        // aspect-ratio-hack shape (which video.js/Plyr/JW always use, since
+        // every real child must escape the zero-height content box) opts
+        // in. A plain `<div>` here keeps its normal auto height, so its
+        // `<p>` sibling must render untouched.
+        let out = lay(
+            r#"<body style="margin:0"><div style="position:relative">
+                 <p style="margin:0">cap</p>
+                 <video src="t.mp4" style="position:absolute"></video>
+               </div></body>"#,
+            60,
+        );
+        find(&out, "cap");
     }
 
     // ---- the P2 gate: flexbox (the old engine's minefield, §9 as written) ----

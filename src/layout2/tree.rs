@@ -25,7 +25,7 @@
 use url::Url;
 
 use crate::doc::{FieldKind, Form, Link};
-use crate::dom::{DOCUMENT, Dom, NodeData, NodeId};
+use crate::dom::{DOCUMENT, Dom, NodeData, NodeId, PseudoEl};
 use crate::layout2::{ControlMap, Units, css_length_px, format_list_marker, is_collapsible_space};
 
 use super::style::{BoxStyle, Disp, Pos, display_of};
@@ -415,6 +415,62 @@ impl Builder<'_> {
         if let Replaced::Atom(kind) = rep {
             return self.atom(id, disp, kind);
         }
+        // A media-player WRAPPER: an element directly holding a `position:
+        // absolute`/`fixed` `<video>`/`<audio>` tech (the video.js/Plyr/JW
+        // pattern — the tech fills an aspect-ratio box via out-of-flow
+        // `top:0;left:0;width:100%;height:100%`, surrounded by control chrome:
+        // big-play button, poster overlay, control bar — all `position:
+        // absolute` too, drawn as `background-image`/empty divs we don't
+        // paint). Build the wrapper's OWN box completely normally (its
+        // aspect-ratio hack, background, and — crucially — the tech's OWN
+        // out-of-flow resolution against the wrapper's padding box all stay
+        // untouched), but DROP every sibling except the tech itself from the
+        // children DOM gathers: the chrome never enters the box tree, so it
+        // can't paint an opaque background over the media representation (a
+        // CSS `background-color` is an opaque fill in our paint model —
+        // §Appendix E — and video.js's poster overlay sits later in the tree
+        // than the `<video>` tech, so its black loading backdrop was legally
+        // winning the cells our synthesized "▶ Video" affordance needs).
+        // GATED on the wrapper's own `height:0` (the aspect-ratio-hack box —
+        // `padding-top:NN%` supplies the visual height, so EVERY real child
+        // is necessarily out-of-flow to escape the zero-height content box):
+        // that's the declared-CSS signal a generic container holding real
+        // in-flow content beside an unrelated `<video>` never has (a plain
+        // `<body>` with a paragraph and a stray absolute video flows that
+        // paragraph normally — no chrome to clobber it, nothing to skip).
+        // A wrapper whose subtree holds a visible IN-FLOW `<img>` is the other
+        // idiom (a content image with a video overlaid on hover — Steam's sale
+        // capsules) and flows normally instead: player chrome draws its poster
+        // as a background-image div, never an in-flow `<img>`.
+        if matches!(disp, Disp::Block | Disp::ListItem | Disp::Flex | Disp::Grid)
+            && self
+                .dom
+                .computed_value(id, "height")
+                .as_deref()
+                .map(str::trim)
+                .and_then(|v| css_length_px(v, Units::of(self.dom, id)))
+                .is_some_and(|h| h <= 0.0)
+            && let Some(media) = self.dom.children(id).into_iter().find(|&c| {
+                matches!(self.dom.tag_name(c), Some("video" | "audio"))
+                    && Pos::of(self.dom, c).out_of_flow()
+            })
+        {
+            let has_content_img = self.dom.descendants(id).any(|d| {
+                self.dom.tag_name(d) == Some("img")
+                    && !Pos::of(self.dom, d).out_of_flow()
+                    && !self.dom.is_hidden(d)
+            });
+            if !has_content_img {
+                let kids = self.build_child_list(&[media], false);
+                return Built::Block(Box::new(self.assemble(
+                    id,
+                    BoxStyle::of(self.dom, id, self.vp),
+                    kids,
+                    None,
+                    false,
+                )));
+            }
+        }
         // ATOMIC INLINE-LEVEL box (`inline-block`/`inline-flex`/`inline-grid` —
         // CSS-Display-3 §2.5): in-flow, not floated, not replaced. Its content
         // lays as its own formatting context (the blockified inner display),
@@ -758,7 +814,29 @@ impl Builder<'_> {
             Some(shadow) => self.dom.children(shadow),
             None => self.dom.children(id),
         };
-        self.build_child_list(&child_ids, closed_details)
+        let mut out = self.build_child_list(&child_ids, closed_details);
+        // Generated content (CSS 2.1 §12.1): the `::before`/`::after` boxes
+        // are the element's first/last children. The text arrives baked as
+        // `data-trust-before`/`-after` (the layout dom re-parses `Doc.raw`
+        // without `<style>`), or straight from the cascade when this dom
+        // still holds its sheets (direct layouts, tests).
+        if let Some(t) = self.pseudo_text(id, PseudoEl::Before, "data-trust-before") {
+            out.insert(0, Built::Inline(Inline::Text(t)));
+        }
+        if let Some(t) = self.pseudo_text(id, PseudoEl::After, "data-trust-after") {
+            out.push(Built::Inline(Inline::Text(t)));
+        }
+        out
+    }
+
+    /// An element's generated-content text for one pseudo, if any: the baked
+    /// serializer attribute, else the live cascade.
+    fn pseudo_text(&self, id: NodeId, which: PseudoEl, attr: &str) -> Option<String> {
+        let t = match self.dom.attr(id, attr) {
+            Some(t) => t.to_string(),
+            None => self.dom.pseudo_content(id, which)?,
+        };
+        (!t.is_empty()).then_some(t)
     }
 
     /// Build a list of child node ids into box-level `Built`s: text runs become
@@ -867,12 +945,9 @@ impl Builder<'_> {
         }
         self.table_depth += 1;
         let style = BoxStyle::of(self.dom, id, self.vp);
-        // `table-layout`/`caption-side` aren't tracked/inherited properties,
-        // so they read through the author cascade (`computed_style`), not
-        // `computed_value` (which is registry-driven).
         let fixed_layout = self
             .dom
-            .computed_style(id, "table-layout")
+            .computed_value(id, "table-layout")
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("fixed"));
 
         // Captions (§17.4): `table-caption` children render as block boxes
@@ -885,7 +960,7 @@ impl Builder<'_> {
             }
             let bottom = self
                 .dom
-                .computed_style(c, "caption-side")
+                .computed_value(c, "caption-side")
                 .as_deref()
                 .map(str::trim)
                 == Some("bottom");

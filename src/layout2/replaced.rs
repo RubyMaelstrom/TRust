@@ -57,8 +57,19 @@ pub(crate) fn size(
             .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
             .filter(|&v| v > 0.0)
     };
-    let spec_w = css("width", cb_w).or_else(|| attr("width"));
-    let spec_h = css("height", cb_h).or_else(|| attr("height"));
+    // HTML presentational hints are the LOWEST cascade origin: author CSS on
+    // an axis, even `auto`, must win over the attribute for THAT axis — the
+    // attribute pair only fills in when BOTH axes lack CSS (an `auto` CSS
+    // axis instead feeds the RATIO via `ratio_of`, below). Resolving each
+    // axis independently against its own attribute let a CSS `width:100%;
+    // height:auto` image (attrs present only for the ratio) get a literal
+    // raw-attribute height instead of the ratio-scaled one.
+    let css_w = css("width", cb_w);
+    let css_h = css("height", cb_h);
+    let (spec_w, spec_h) = match (css_w, css_h) {
+        (None, None) => (attr("width"), attr("height")),
+        other => other,
+    };
     // CSS 2.1 §10.3.2 "rule 3"/§10.6.2: a replaced element with an intrinsic
     // ratio but NO intrinsic width or height (an SVG referenced with only a
     // `viewBox`), sized auto/auto, takes its width from the block constraint
