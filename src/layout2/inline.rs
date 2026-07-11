@@ -21,7 +21,8 @@ use url::Url;
 use crate::doc::{Form, Link};
 use crate::dom::{Dom, NodeId};
 use crate::layout2::{
-    Emphasis, ImageSizes, Item, ItemKind, Units, display_width, is_collapsible_space, letter_space,
+    Emphasis, ImageSizes, Item, ItemKind, NO_NODE, Units, display_width, is_collapsible_space,
+    letter_space,
 };
 
 use super::float::{FloatBox, FloatCtx, FloatPlace};
@@ -376,6 +377,16 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         match inl {
             Inline::Text(t) => self.text(t, ctx),
             Inline::Br => self.forced_break(),
+            // An inline-level replaced box: its margin/border/padding edges
+            // take real inline space around the content box (§9.4.2/§10.8),
+            // through the same owed-edge channel as inline boxes — a
+            // `margin-left:50%` hero video sits at mid-line, not col 0.
+            Inline::Atom(a) if a.node != NO_NODE => {
+                let style = BoxStyle::of(self.dom, a.node, self.vp);
+                self.pending_gap_px += self.edge_px(&style, LEFT);
+                self.atom(a, ctx);
+                self.pending_gap_px += self.edge_px(&style, RIGHT);
+            }
             Inline::Atom(a) => self.atom(a, ctx),
             // A static-position mark, nothing more: the hypothetical box
             // would have entered here (§10.3.7 — "UAs are free to make a
