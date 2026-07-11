@@ -2711,6 +2711,41 @@ mod tests {
     }
 
     #[test]
+    fn min_height_flex_column_grows_flex_child_to_fill() {
+        // The full-height app-shell shape (chatgpt.com's composer column, and
+        // every `min-h-screen`/`min-h-full` layout): a definite-height block
+        // holds a `flex-direction:column` container whose height comes ONLY from
+        // `min-height:100%` (NOT an explicit `height`), wrapping a `flex:1` child
+        // that bottom-anchors a footer with `margin-top:auto`. The flex child
+        // must GROW to fill the min-height so the footer reaches the bottom.
+        // Before the fix `def_ch` carried only an explicit height, so grow
+        // distributed against content height (no free space): the footer sat
+        // right under the header and the lower two-thirds of the shell stayed
+        // blank.
+        let out = lay(
+            r#"<body style="margin:0">
+<div style="height:320px">
+  <div style="display:flex;flex-direction:column;min-height:100%">
+    <div style="display:flex;flex:1;flex-direction:column">
+      <div>HEADER</div>
+      <div style="margin-top:auto">FOOTER</div>
+    </div>
+  </div>
+</div></body>"#,
+            20,
+        );
+        let (r_header, _) = find(&out, "HEADER");
+        let (r_footer, _) = find(&out, "FOOTER");
+        assert_eq!(r_header, 0, "header at the top of the filled column");
+        // 320px shell = 20 rows; the flex:1 child fills it and margin-top:auto
+        // drops the footer to the last row (304px → row 19).
+        assert_eq!(
+            r_footer, 19,
+            "flex:1 fills the min-height column so margin-top:auto reaches the bottom"
+        );
+    }
+
+    #[test]
     fn shrunk_flex_column_item_relays_for_a_nested_scroll_region() {
         // Twitch's real front-page shape (the live-session bug this models):
         // a definite-height flex COLUMN holds an undismissed cookie-consent

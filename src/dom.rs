@@ -3445,7 +3445,7 @@ impl Dom {
     /// icon-glyph / accessible-name fallback. Runs once per DOM build, before
     /// image-URL collection and layout. This is the first slice of inline-SVG
     /// support: a static snapshot of self-contained vector markup.
-    pub fn rewrite_inline_svgs(&mut self) {
+    pub fn rewrite_inline_svgs(&mut self, base: Option<&url::Url>) {
         // Materialize the candidate list first: the loop MUTATES the tree
         // (insert/detach), which can't overlap the lazy descendants walk.
         let svgs: Vec<NodeId> = self
@@ -3453,17 +3453,35 @@ impl Dom {
             .filter(|&id| self.tag_name(id) == Some("svg"))
             .collect();
         for id in svgs {
-            if self.ancestor_is_svg(id) || !self.svg_is_renderable(id) {
+            if self.ancestor_is_svg(id) || self.is_hidden(id) {
                 continue;
             }
             let Some(parent) = self.nodes[id].parent else {
                 continue;
             };
-            let mut svg = self.serialize(id);
-            // resvg needs the namespace; an inline <svg> in HTML may omit it.
-            if !svg.contains("xmlns") {
-                svg = svg.replacen("<svg", r#"<svg xmlns="http://www.w3.org/2000/svg""#, 1);
-            }
+            // The vector geometry: an EXTERNAL sprite reference
+            // (`<use href="file.svg#id">`) resolves to the primed sheet's
+            // symbol; otherwise the svg's OWN inline geometry. An svg with
+            // neither (an unfetched sprite, an empty svg) is left untouched and
+            // renders nothing, exactly as before.
+            let svg = if let Some((file, frag)) = self.svg_sprite_ref(id) {
+                let Some(markup) = base
+                    .and_then(|b| b.join(&file).ok())
+                    .and_then(|abs| sprite_symbol_svg(abs.as_str(), &frag))
+                else {
+                    continue;
+                };
+                markup
+            } else if self.svg_is_renderable(id) {
+                let mut svg = self.serialize(id);
+                // resvg needs the namespace; an inline <svg> in HTML may omit it.
+                if !svg.contains("xmlns") {
+                    svg = svg.replacen("<svg", r#"<svg xmlns="http://www.w3.org/2000/svg""#, 1);
+                }
+                svg
+            } else {
+                continue;
+            };
             let name = self.svg_accessible_name(id);
             // Carry the SVG element's box onto the replacement <img> so layout
             // sizes the vector the way the page does. A browser sizes a replaced
@@ -3509,6 +3527,34 @@ impl Dom {
                 Some("path" | "rect" | "circle" | "ellipse" | "line" | "polyline" | "polygon")
             ) && !self.in_svg_non_render(d)
         })
+    }
+
+    /// If this `<svg>`'s geometry lives in an EXTERNAL sprite sheet — a
+    /// `<use href="file.svg#id">` (or legacy `xlink:href`) — return the sheet
+    /// file's raw href and the fragment id. A same-document `<use href="#id">`
+    /// (empty file part) is NOT a sprite: its `<symbol>`/`<defs>` target rides
+    /// along in the same serialized svg, so it flows the normal inline path.
+    fn svg_sprite_ref(&self, id: NodeId) -> Option<(String, String)> {
+        for d in self.descendants(id) {
+            if self.tag_name(d) != Some("use") {
+                continue;
+            }
+            let Some(href) = self
+                .attr(d, "href")
+                .or_else(|| self.attr(d, "xlink:href"))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let Some((file, frag)) = href.split_once('#') else {
+                continue;
+            };
+            if !file.is_empty() && !frag.is_empty() {
+                return Some((file.to_string(), frag.to_string()));
+            }
+        }
+        None
     }
 
     /// Whether a node sits inside a non-rendered SVG container (`<defs>` and
@@ -4245,10 +4291,74 @@ impl Dom {
         }) {
             return false;
         }
+        // `:has(...)`: each invocation's forgiving list must have at least one
+        // relative selector satisfied by an element in this element's subtree /
+        // following-sibling forest. An empty (all-invalid) group matches
+        // nothing. (Placed after the cheap own-element tests so `:has()`'s
+        // subtree walk runs only for elements that already match the subject.)
+        if !c
+            .has
+            .iter()
+            .all(|group| group.iter().any(|h| self.matches_has(id, h)))
+        {
+            return false;
+        }
         c.nots
             .iter()
             .flatten()
             .all(|n| !self.matches_compound(id, n, scope))
+    }
+
+    /// The nearest following sibling that is an element (skips text/comments).
+    fn next_element_sibling(&self, id: NodeId) -> Option<NodeId> {
+        let mut n = self.nodes[id].next_sibling;
+        while let Some(s) = n {
+            if self.tag_name(s).is_some() {
+                return Some(s);
+            }
+            n = self.nodes[s].next_sibling;
+        }
+        None
+    }
+
+    /// Does `subject` satisfy one `:has()` relative argument? Search the subject
+    /// SUBTREE (descendant/child leading combinator) or the following-sibling
+    /// forest (`+`/`~`), testing each candidate against the `:scope`-anchored
+    /// relative complex with `scope = subject`. Iterative (no deep recursion),
+    /// early-exits on the first match, and bounded by `HAS_MAX_VISITS` so a
+    /// pathological `*:has(*)` on a huge subtree can't blow up (the cap is a
+    /// hostile-page backstop far above any real selector's reach).
+    fn matches_has(&self, subject: NodeId, h: &HasArg) -> bool {
+        const HAS_MAX_VISITS: usize = 8192;
+        let mut stack: Vec<NodeId> = if h.sibling {
+            let mut sib = self.next_element_sibling(subject);
+            let mut v = Vec::new();
+            while let Some(s) = sib {
+                v.push(s);
+                sib = self.next_element_sibling(s);
+            }
+            v
+        } else {
+            self.child_iter(subject)
+                .filter(|&c| self.tag_name(c).is_some())
+                .collect()
+        };
+        let mut budget = HAS_MAX_VISITS;
+        while let Some(node) = stack.pop() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            if self.matches_complex(node, &h.complex.0, Some(subject)) {
+                return true;
+            }
+            for c in self.child_iter(node) {
+                if self.tag_name(c).is_some() {
+                    stack.push(c);
+                }
+            }
+        }
+        false
     }
 }
 
@@ -4291,6 +4401,72 @@ fn escape_attr(s: &str) -> Cow<'_, str> {
 pub struct SelectorList(Vec<Complex>);
 
 struct Complex(Vec<(Combinator, Compound)>);
+
+/// One argument of a `:has()` relative-selector list, compiled for matching.
+struct HasArg {
+    /// The leading combinator is a sibling one (`+`/`~`) ⇒ search the subject's
+    /// following-sibling forest; else (`>` or bare descendant) its own subtree.
+    sibling: bool,
+    /// The relative selector as a full complex anchored by a leftmost `:scope`
+    /// compound (matched with `scope` = the `:has` subject). That `:scope`
+    /// carries ZERO specificity, so this complex's specificity IS the
+    /// argument's — exactly what Selectors 4 §17 asks `:has()` to contribute.
+    complex: Complex,
+}
+
+/// Parse ONE `:has()` argument — a relative selector: an optional leading
+/// combinator (`>`/`+`/`~`, default descendant) then a complex selector.
+/// Returns `None` (the forgiving list drops it) for an unparsable argument, a
+/// pseudo-element subject, or a NESTED `:has()` (both invalid per Selectors 4).
+fn parse_relative(part: &str) -> Option<HasArg> {
+    let part = part.trim();
+    let mut chars = part.chars().peekable();
+    let (comb, sibling) = match chars.peek() {
+        Some('>') => (Combinator::Child, false),
+        Some('+') => (Combinator::NextSibling, true),
+        Some('~') => (Combinator::SubsequentSibling, true),
+        _ => (Combinator::Descendant, false),
+    };
+    if comb != Combinator::Descendant {
+        chars.next(); // consume the leading combinator
+    }
+    let rest: String = chars.collect();
+    let mut cx = parse_complex(rest.trim())?;
+    // A pseudo-element subject is invalid inside `:has()`; nested `:has()` too.
+    if cx.0.last().is_some_and(|(_, c)| c.pseudo.is_some()) || complex_uses_has(&cx.0) {
+        return None;
+    }
+    // Anchor at `:scope`: the leftmost real compound takes the leading
+    // combinator, and a zero-specificity `:scope` compound is prepended so the
+    // ancestor/sibling walk stops at the subject instead of escaping upward.
+    if let Some(first) = cx.0.first_mut() {
+        first.0 = comb;
+    }
+    let scope = Compound {
+        scope: true,
+        ..Default::default()
+    };
+    cx.0.insert(0, (Combinator::None, scope));
+    Some(HasArg {
+        sibling,
+        complex: cx,
+    })
+}
+
+/// Whether any compound in a complex selector uses `:has()` (Selectors 4
+/// forbids `:has()` nested inside `:has()`).
+fn complex_uses_has(parts: &[(Combinator, Compound)]) -> bool {
+    parts.iter().any(|(_, c)| compound_uses_has(c))
+}
+
+fn compound_uses_has(c: &Compound) -> bool {
+    !c.has.is_empty()
+        || c.nots.iter().flatten().any(compound_uses_has)
+        || c.selects
+            .iter()
+            .any(|(g, _)| g.iter().any(|cx| complex_uses_has(&cx.0)))
+        || c.host_inner.as_deref().is_some_and(compound_uses_has)
+}
 
 /// The outcome of resolving a custom property's value during `var()`
 /// substitution (CSS Variables L1 §3). `Resolved` carries its substituted
@@ -4349,6 +4525,13 @@ struct Compound {
     /// ones are dropped individually, and an all-invalid group simply
     /// matches nothing (the rule survives).
     selects: Vec<(Vec<Complex>, bool)>,
+    /// `:has(...)` (Selectors 4 §4.5, the relational pseudo-class), one entry
+    /// per invocation. Each is a FORGIVING relative-selector list: the element
+    /// matches an invocation if AT LEAST ONE of its `HasArg`s finds a matching
+    /// element in this element's subtree (or following-sibling forest). Every
+    /// invocation must hold (`.a:has(.b):has(.c)` needs both). Specificity is
+    /// the most specific argument (Selectors 4 §17), summed in `spec()`.
+    has: Vec<Vec<HasArg>>,
     /// `:hover` (live): the element must be on the chain under the terminal's
     /// pointer (`Dom.hover_chain` — the committed hover target + its composed
     /// ancestors). Empty chain at rest ⇒ a bare `:hover` compound is inert.
@@ -4539,6 +4722,7 @@ impl Compound {
             && self.attrs.is_empty()
             && self.nots.is_empty()
             && self.selects.is_empty()
+            && self.has.is_empty()
             && !self.never
             && !self.hover
             && !self.popover_open
@@ -4570,6 +4754,13 @@ impl Compound {
                 continue; // `:where()`: always zero specificity
             }
             if let Some(m) = group.iter().map(Complex::specificity).max() {
+                s = (s.0 + m.0, s.1 + m.1, s.2 + m.2);
+            }
+        }
+        // `:has()`: its most specific argument (the anchoring `:scope` compound
+        // carries zero specificity, so the complex's own specificity is it).
+        for group in &self.has {
+            if let Some(m) = group.iter().map(|h| h.complex.specificity()).max() {
                 s = (s.0 + m.0, s.1 + m.1, s.2 + m.2);
             }
         }
@@ -4613,6 +4804,131 @@ fn split_top_level(input: &str, sep: char) -> Vec<&str> {
         }
     }
     out.push(&input[start..]);
+    out
+}
+
+/// Split on TOP-LEVEL whitespace, respecting `calc()`/`var()`/`min()` parens,
+/// brackets and quotes, and collapsing runs of whitespace (empty tokens
+/// dropped). A naive `split_whitespace` tears a `calc(.25rem * -1)` value into
+/// `calc(.25rem`, `*`, `-1)`, so a box shorthand (`margin`/`padding`/`inset`)
+/// carrying a `calc()` component would parse as three sides — the `-m-1`
+/// negative-margin idiom Tailwind emits.
+fn split_top_level_ws(input: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut start: Option<usize> = None; // Some(i) ⇒ currently inside a token
+    for (i, c) in input.char_indices() {
+        if quote.is_none() && depth == 0 && c.is_whitespace() {
+            if let Some(s) = start.take() {
+                out.push(&input[s..i]);
+            }
+            continue;
+        }
+        if start.is_none() {
+            start = Some(i);
+        }
+        match (quote, c) {
+            (Some(q), ch) if ch == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(' | '[') => depth += 1,
+            (None, ')' | ']') => depth -= 1,
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push(&input[s..]);
+    }
+    out
+}
+
+/// External SVG sprite sheets, RAM-only and process-global (like the cookie
+/// jar / connection pool). Keyed by the sprite FILE's absolute URL → its symbol
+/// table (`<symbol id>` → a self-contained `<svg>` for that one symbol). The
+/// `<svg><use href="sprite.svg#id"></svg>` idiom (ChatGPT, GitHub, and most
+/// icon systems) keeps every icon's geometry in one shared file resvg won't
+/// fetch on its own; we fetch that file ONCE during the JS subresource phase
+/// (`prime_sprite_sheet`) and `rewrite_inline_svgs` inlines the referenced
+/// symbol so it rasterizes like any inline vector. Parsed once per sheet; a
+/// reparse (resize) or a second page on the same CDN reuses the table.
+/// A sprite sheet's symbol table: `<symbol id>` → its standalone `<svg>`.
+type SpriteTable = std::sync::Arc<FxHashMap<String, String>>;
+static SPRITE_SHEETS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, SpriteTable>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Cap on cached sprite sheets — a hostile-page lid, not a real limit (a design
+/// system ships one or two sheets). Sheets can be ~600KB each.
+const MAX_SPRITE_SHEETS: usize = 16;
+
+/// Parse a fetched sprite sheet ONCE into its symbol table, keyed by absolute
+/// URL. Called from the async subresource phase (`execute_js`); the sync
+/// `rewrite_inline_svgs` then reads the table. Idempotent: an already-primed
+/// URL is left alone (the sheet is immutable for the session).
+pub fn prime_sprite_sheet(abs_url: &str, text: &str) {
+    {
+        let sheets = SPRITE_SHEETS.lock().unwrap();
+        if sheets.contains_key(abs_url) || sheets.len() >= MAX_SPRITE_SHEETS {
+            return;
+        }
+    }
+    let table = build_sprite_symbols(text);
+    let mut sheets = SPRITE_SHEETS.lock().unwrap();
+    if sheets.len() < MAX_SPRITE_SHEETS {
+        sheets.insert(abs_url.to_string(), std::sync::Arc::new(table));
+    }
+}
+
+/// Whether a sprite sheet is already fetched+parsed (so the subresource phase
+/// can skip re-downloading a ~600KB sheet across navigations/reparses).
+pub fn sprite_sheet_cached(abs_url: &str) -> bool {
+    SPRITE_SHEETS.lock().unwrap().contains_key(abs_url)
+}
+
+/// The self-contained `<svg>` for one symbol of a primed sprite sheet, or
+/// `None` if the sheet wasn't fetched or has no such id.
+fn sprite_symbol_svg(abs_url: &str, frag: &str) -> Option<String> {
+    let sheets = SPRITE_SHEETS.lock().unwrap();
+    sheets.get(abs_url)?.get(frag).cloned()
+}
+
+/// A sprite sheet is a flat `<svg>` of `<symbol id viewBox>…</symbol>` defs.
+/// Turn each into a STANDALONE `<svg viewBox>` carrying that symbol's own
+/// geometry + the shape-affecting presentation attrs (`fill`/`fill-rule`/
+/// `clip-rule`) — no width/height, so the replacement `<img>`'s CSS box drives
+/// the used size (CSS 2.1 §10.3.2 rule 3, ratio-only). `currentColor` is
+/// resolved to a solid so stroke/fill outline icons still produce coverage for
+/// the silhouette tint (the icon's own colors are flattened either way).
+fn build_sprite_symbols(text: &str) -> FxHashMap<String, String> {
+    let dom = Dom::parse_document(text);
+    let mut out = FxHashMap::default();
+    for sym in dom.descendants(DOCUMENT) {
+        if dom.tag_name(sym) != Some("symbol") {
+            continue;
+        }
+        let Some(frag) = dom.attr(sym, "id").filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        // viewBox is re-emitted with the correct case regardless of how the
+        // parser stored the name (`attr` matches case-insensitively).
+        let vb = dom.attr(sym, "viewBox").unwrap_or("0 0 24 24").to_string();
+        let mut pres = String::new();
+        for k in ["fill", "fill-rule", "clip-rule"] {
+            if let Some(v) = dom.attr(sym, k) {
+                pres.push_str(&format!(r#" {k}="{}""#, escape_attr(v)));
+            }
+        }
+        let mut inner = String::new();
+        for c in dom.child_iter(sym) {
+            inner.push_str(&dom.serialize(c));
+        }
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{vb}"{pres}>{inner}</svg>"#
+        )
+        .replace("currentColor", "#000");
+        out.insert(frag.to_string(), svg);
+    }
     out
 }
 
@@ -4839,6 +5155,26 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         }
                     }
                     compound.selects.push((group, name == "where"));
+                } else if name == "has" {
+                    // `:has(<forgiving-relative-selector-list>)` (Selectors 4
+                    // §4.5): the element must have a matching element in its
+                    // subtree / following-sibling forest. A forgiving list —
+                    // unparsable/invalid args (pseudo-element subject, nested
+                    // `:has`) drop individually; an all-invalid group matches
+                    // nothing (the rule survives). Specificity is the most
+                    // specific argument, added in `spec()`; `:has` does NOT
+                    // bump `pseudos` (it's not `never`/`never_unknown` — real,
+                    // evaluable relational matching).
+                    let mut group = Vec::new();
+                    for part in split_top_level(&arg?, ',') {
+                        if part.trim().is_empty() {
+                            continue;
+                        }
+                        if let Some(h) = parse_relative(part) {
+                            group.push(h);
+                        }
+                    }
+                    compound.has.push(group);
                 } else if name == "before" || name == "after" {
                     // Generated-content pseudo-element: the compound still
                     // matches the element (tag/class parts), but the rule
@@ -5472,7 +5808,7 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         return vec![(phys.to_string(), value.to_string())];
     }
     if let Some((start, end)) = logical_pair(prop) {
-        let toks: Vec<&str> = value.split_whitespace().collect();
+        let toks: Vec<&str> = split_top_level_ws(value);
         let (a, b) = match toks.as_slice() {
             [x] => (*x, *x),
             [x, y] => (*x, *y),
@@ -5851,9 +6187,10 @@ fn split_top_level_slash(value: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// The top/right/bottom/left values of a CSS 1–4-value box shorthand.
+/// The top/right/bottom/left values of a CSS 1–4-value box shorthand. Splits
+/// on TOP-LEVEL whitespace so a `calc()`/`var()` component stays one value.
 fn four_sides(value: &str) -> Option<[&str; 4]> {
-    let p: Vec<&str> = value.split_whitespace().collect();
+    let p: Vec<&str> = split_top_level_ws(value);
     match p.as_slice() {
         [a] => Some([a, a, a, a]),
         [a, b] => Some([a, b, a, b]),
@@ -7813,7 +8150,7 @@ mod tests {
                 <svg style="display:none"><symbol id="s"><path d="M0 0z"/></symbol></svg>
                </body>"##,
         );
-        dom.rewrite_inline_svgs();
+        dom.rewrite_inline_svgs(None);
         let imgs: Vec<NodeId> = dom
             .descendants(DOCUMENT)
             .filter(|&d| dom.tag_name(d) == Some("img"))
@@ -7848,6 +8185,85 @@ mod tests {
     }
 
     #[test]
+    fn external_sprite_use_rewrites_to_a_data_image() {
+        // The `<svg><use href="sprite.svg#id"></svg>` idiom (chatgpt.com's nav
+        // icons, GitHub, most icon systems): the subresource phase primes the
+        // sheet, then `rewrite_inline_svgs` inlines the referenced symbol as a
+        // data:image the rasterizer renders. Unique URL so it can't race other
+        // tests on the process-global sheet cache.
+        let base = url::Url::parse("https://sprite-test.example/app/").unwrap();
+        prime_sprite_sheet(
+            "https://sprite-test.example/assets/sprite.svg",
+            r#"<svg xmlns="http://www.w3.org/2000/svg">
+                 <symbol id="pencil" viewBox="0 0 20 20"><path d="M2 2h16v16H2z"/></symbol>
+                 <symbol id="other" viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></symbol>
+               </svg>"#,
+        );
+        let mut dom = Dom::parse_document(
+            r#"<body><button><svg width="20" height="20" class="icon">
+                 <use href="/assets/sprite.svg#pencil"/></svg></button></body>"#,
+        );
+        dom.rewrite_inline_svgs(Some(&base));
+        let img = dom
+            .descendants(DOCUMENT)
+            .find(|&n| dom.tag_name(n) == Some("img"))
+            .expect("the sprite <use> becomes an <img>");
+        let decoded =
+            String::from_utf8(crate::img::decode_data_url(dom.attr(img, "src").unwrap()).unwrap())
+                .unwrap();
+        assert!(
+            decoded.contains(r#"viewBox="0 0 20 20""#),
+            "carries the referenced symbol's viewBox: {decoded}"
+        );
+        assert!(
+            decoded.contains("M2 2h16v16H2z"),
+            "carries the pencil geometry: {decoded}"
+        );
+        assert!(
+            !decoded.contains("M0 0h24v24"),
+            "not the OTHER symbol's geometry: {decoded}"
+        );
+        // The standalone svg actually RASTERIZES to painted pixels (a default-
+        // fill path paints black → coverage for the silhouette tint). An empty
+        // or malformed svg would decode to nothing and the icon would vanish.
+        let bytes = crate::img::decode_data_url(dom.attr(img, "src").unwrap()).unwrap();
+        let (raster, _) = crate::img::decode(&bytes).expect("symbol svg rasterizes");
+        assert!(
+            raster.to_rgba8().pixels().any(|p| p[3] > 0),
+            "the rasterized icon has painted pixels"
+        );
+        // The size attr rides onto the <img> so the icon is sized like the page.
+        assert_eq!(dom.attr(img, "width"), Some("20"));
+        // No raw <svg>/<use> left in the tree.
+        assert!(
+            !dom.descendants(DOCUMENT)
+                .any(|n| matches!(dom.tag_name(n), Some("svg" | "use")))
+        );
+    }
+
+    #[test]
+    fn unfetched_sprite_use_is_left_untouched() {
+        // A sheet that was never fetched → the svg stays an svg (renders
+        // nothing), never a broken empty <img>. Same graceful fallback as
+        // before sprite support existed.
+        let base = url::Url::parse("https://sprite-miss.example/").unwrap();
+        let mut dom = Dom::parse_document(
+            r#"<body><svg width="20" height="20"><use href="/never-fetched.svg#x"/></svg></body>"#,
+        );
+        dom.rewrite_inline_svgs(Some(&base));
+        assert!(
+            dom.descendants(DOCUMENT)
+                .any(|n| dom.tag_name(n) == Some("svg")),
+            "the svg is left in place"
+        );
+        assert!(
+            !dom.descendants(DOCUMENT)
+                .any(|n| dom.tag_name(n) == Some("img")),
+            "no empty <img> is produced"
+        );
+    }
+
+    #[test]
     fn rewrite_inline_svg_carries_the_elements_css_and_attr_size() {
         // The replacement <img> must keep the SVG element's box so layout sizes
         // the vector the way the page does — the cascaded CSS size (`style`)
@@ -7862,7 +8278,7 @@ mod tests {
                     <path d="M0 0h40v40H0z"/></svg>
                </body>"##,
         );
-        dom.rewrite_inline_svgs();
+        dom.rewrite_inline_svgs(None);
         let imgs: Vec<NodeId> = dom
             .descendants(DOCUMENT)
             .filter(|&d| dom.tag_name(d) == Some("img"))
@@ -8389,6 +8805,42 @@ mod tests {
             dom.computed_value(inner, "margin-left"),
             None,
             "margin-left does not inherit"
+        );
+    }
+
+    #[test]
+    fn box_shorthand_keeps_calc_components_whole() {
+        // `-m-1` (Tailwind's negative margin) computes to `margin: calc(.25rem
+        // * -1)`. A naive whitespace split tore that into THREE sides
+        // (top=`calc(.25rem`, right=`*`, bottom=`-1)`) — the exact corruption
+        // seen baked onto chatgpt.com's icons. The paren-aware split keeps the
+        // `calc()` whole and applies it to all four sides.
+        assert_eq!(
+            expand_box_shorthand("margin", "calc(.25rem * -1)"),
+            vec![
+                ("margin-top".to_string(), "calc(.25rem * -1)".to_string()),
+                ("margin-right".to_string(), "calc(.25rem * -1)".to_string()),
+                ("margin-bottom".to_string(), "calc(.25rem * -1)".to_string()),
+                ("margin-left".to_string(), "calc(.25rem * -1)".to_string()),
+            ]
+        );
+        // Two-value shorthand, calc vertical + plain-length horizontal.
+        assert_eq!(
+            expand_box_shorthand("padding", "calc(1rem + 2px) 0"),
+            vec![
+                ("padding-top".to_string(), "calc(1rem + 2px)".to_string()),
+                ("padding-right".to_string(), "0".to_string()),
+                ("padding-bottom".to_string(), "calc(1rem + 2px)".to_string()),
+                ("padding-left".to_string(), "0".to_string()),
+            ]
+        );
+        // A logical pair (`margin-inline`) with a calc component: two whole values.
+        assert_eq!(
+            expand_box_shorthand("margin-inline", "calc(2px + 1em) auto"),
+            vec![
+                ("margin-left".to_string(), "calc(2px + 1em)".to_string()),
+                ("margin-right".to_string(), "auto".to_string()),
+            ]
         );
     }
 
@@ -10553,25 +11005,118 @@ mod tests {
 
     #[test]
     fn unsupported_pseudo_inside_not_kills_the_rule_instead_of_matching_all() {
-        // `:not(:hover)` is genuinely TRUE at rest, but `:not(:has(img))`
-        // must not invert an unsupported pseudo into always-match — that
-        // turned a targeted hide rule into hide-everything. It dies instead.
+        // `:not(:hover)` is genuinely TRUE at rest, but an UNEVALUABLE pseudo
+        // (`:lang`, which we can't satisfy) must not invert into always-match —
+        // that turned a targeted hide rule into hide-everything. It dies
+        // instead. (`:has()` is now real — see `not_has_matches_elements_*`.)
         let dom = Dom::parse_document(
             "<head><style>\
-             .x:not(:has(img)){display:none}\
+             .x:not(:lang(en)){display:none}\
              .y:not(:hover){letter-spacing:2px}\
              </style></head>\
              <body><p id=a class=x>kept</p><p id=b class=y>styled</p></body>",
         );
         assert!(
             !dom.is_hidden(dom.get_by_id("a").unwrap()),
-            ":has inside :not drops the rule (fail-open)"
+            ":lang inside :not drops the rule (fail-open)"
         );
         assert_eq!(
             dom.computed_style(dom.get_by_id("b").unwrap(), "letter-spacing")
                 .as_deref(),
             Some("2px"),
             ":not(:hover) still applies at rest"
+        );
+    }
+
+    #[test]
+    fn has_matches_descendant_child_and_sibling_relatives() {
+        // `:has()` relative selectors: bare descendant, `>` child, `+` next
+        // sibling, `~` following sibling. Each rule hides only the elements
+        // that satisfy the relation.
+        let dom = Dom::parse_document(
+            "<head><style>\
+             .card:has(img){display:none}\
+             .row:has(> .lead){display:none}\
+             .a:has(+ .b){display:none}\
+             .h:has(~ .footer){display:none}\
+             </style></head>\
+             <body>\
+             <div id=c1 class=card><p><img src=x></p></div>\
+             <div id=c2 class=card><p>no image</p></div>\
+             <div id=r1 class=row><span class=lead>x</span></div>\
+             <div id=r2 class=row><span><span class=lead>deep</span></span></div>\
+             <div id=a1 class=a></div><div class=b></div>\
+             <div id=a2 class=a></div><div class=c></div>\
+             <div id=h1 class=h></div><div></div><div class=footer></div>\
+             <div id=h2 class=h></div><div></div>\
+             </body>",
+        );
+        let hidden = |id: &str| dom.is_hidden(dom.get_by_id(id).unwrap());
+        assert!(hidden("c1"), "descendant :has(img) — a deep <img> counts");
+        assert!(
+            !hidden("c2"),
+            ":has(img) does NOT match without a descendant img"
+        );
+        assert!(hidden("r1"), ":has(> .lead) — a direct child matches");
+        assert!(!hidden("r2"), ":has(> .lead) — a GRANDCHILD .lead does not");
+        assert!(
+            hidden("a1"),
+            ":has(+ .b) — the immediate next sibling matches"
+        );
+        assert!(!hidden("a2"), ":has(+ .b) — a non-.b next sibling does not");
+        assert!(hidden("h1"), ":has(~ .footer) — a later sibling matches");
+        assert!(!hidden("h2"), ":has(~ .footer) — none following does not");
+    }
+
+    #[test]
+    fn not_has_matches_elements_without_the_descendant() {
+        // Real `:has()` inside `:not()`: `.x:not(:has(img))` hides `.x` WITHOUT
+        // an <img> descendant and leaves `.x` WITH one alone. This is exactly
+        // the shape of chatgpt.com's `not-has-focus-visible:sr-only`
+        // skip-to-content link, which `:has()` support finally hides.
+        let dom = Dom::parse_document(
+            "<head><style>.x:not(:has(img)){display:none}</style></head>\
+             <body>\
+             <p id=a class=x>no image</p>\
+             <p id=b class=x>has image <img src=x></p>\
+             </body>",
+        );
+        assert!(
+            dom.is_hidden(dom.get_by_id("a").unwrap()),
+            ".x with no <img> descendant is hidden"
+        );
+        assert!(
+            !dom.is_hidden(dom.get_by_id("b").unwrap()),
+            ".x WITH an <img> descendant is kept"
+        );
+    }
+
+    #[test]
+    fn has_specificity_and_forgiving_and_nesting() {
+        // Specificity: `:has()` contributes its most specific argument
+        // (Selectors 4 §17), like `:is()` — the anchoring `:scope` adds zero.
+        let spec = |s: &str| parse_complex(s).unwrap().specificity();
+        assert_eq!(
+            spec("a:has(.b)"),
+            (0, 1, 1),
+            ":has(.b) = one class + the tag"
+        );
+        assert_eq!(
+            spec("a:has(> #b)"),
+            (1, 0, 1),
+            ":has(> #id) = one id + the tag"
+        );
+        // Forgiving list: an invalid arg drops, a valid one survives.
+        assert_eq!(
+            spec(":has(.ok, ::before)"),
+            (0, 1, 0),
+            "pseudo-element arg dropped"
+        );
+        // Nested :has is invalid → that argument drops (forgiving), so a lone
+        // `:has(:has(...))` matches nothing but the rule still parses.
+        assert!(
+            parse_complex(":has(:has(.x))").is_some(),
+            ":has(:has()) parses (the inner arg is dropped, not fatal)"
         );
     }
 
