@@ -338,6 +338,47 @@ impl Flow<'_> {
             None,
             None,
         );
+        // TRUST_FRAG_DIAG=1: dump the resolved fragment tree (tag/x/y/w/h/clip
+        // per box) — the ground-truth diagnostic for "an element lays right
+        // but paints wrong" (clip/cover/paint-order bugs). Pairs with the
+        // `layout_dump` harness in http.rs.
+        if std::env::var_os("TRUST_FRAG_DIAG").is_some() {
+            fn dump(dom: &Dom, f: &Frag<'_>, depth: usize) {
+                let tag = if f.node == NO_NODE {
+                    "·".to_string()
+                } else {
+                    format!(
+                        "{}#{}.{}",
+                        dom.tag_name(f.node).unwrap_or("?"),
+                        dom.attr(f.node, "id").unwrap_or(""),
+                        dom.attr(f.node, "class")
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                    )
+                };
+                eprintln!(
+                    "{:indent$}{tag} x={:.0} y={:.0} w={:.0} h={:.0} clip={:?} kind={}",
+                    "",
+                    f.x,
+                    f.y,
+                    f.w,
+                    f.h,
+                    f.clip.map(|c| (c.x0, c.x1, c.y0, c.y1)),
+                    match &f.kind {
+                        FragKind::Block => "B",
+                        FragKind::Line(_) => "L",
+                        FragKind::Oof(..) => "OOF",
+                    },
+                    indent = depth * 2
+                );
+                for c in &f.children {
+                    dump(dom, c, depth + 1);
+                }
+            }
+            dump(self.dom, &frag, 0);
+        }
         let mut fi = 0;
         while fi < fixed.len() {
             // A fixed box's own subtree can hold more out-of-flow boxes
@@ -2882,7 +2923,12 @@ impl Flow<'_> {
         for (ab, actx) in &atom_nodes {
             let pa = self.lay_atom_box(ab, content_w, cb_h, actx);
             atom_sizes.push(AtomBoxSize {
-                w_cells: (pa.mw / self.cell_w).round().max(1.0) as usize,
+                // Width CEILS to cells: a box needing 17.4 cells cannot fit in
+                // 17 — rounding down re-wraps its already-laid content (the
+                // "Install Steam" header button split rows at a 10px cell).
+                // Height still rounds: the fraction is empty px below the last
+                // line, and ceiling it would grow every 21px button to 2 rows.
+                w_cells: (pa.mw / self.cell_w - 1e-3).ceil().max(1.0) as usize,
                 h_rows: (pa.mh / self.cell_h).round().max(1.0) as u16,
             });
             prelaid_atoms.push(Some(pa));

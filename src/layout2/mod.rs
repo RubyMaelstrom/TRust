@@ -591,6 +591,124 @@ mod tests {
             .any(|r| r.items.iter().any(|i| i.text.contains(text)))
     }
 
+    #[test]
+    fn float_run_max_content_sums_into_shrink_to_fit() {
+        // §10.3.5/css-sizing-3: at max-content no soft breaks are taken, so a
+        // run of block floats measures as the SUM of their margin boxes — a
+        // shrink-to-fit abspos container (Steam's #global_header nav) must
+        // come out wide enough to hold the whole float bar on one shelf, not
+        // shrink to the widest single item and wrap every float below.
+        let out = lay(
+            r#"<body style="margin:0"><div style="position:absolute;left:200px">
+                <a style="display:block;float:left;padding:45px 7px 7px;position:relative">STORE</a>
+                <a style="display:block;float:left;padding:45px 7px 7px;position:relative">COMMUNITY</a>
+                <a style="display:block;float:left;padding:45px 7px 7px;position:relative">ABOUT</a>
+                <a style="display:block;float:left;padding:45px 7px 7px;position:relative">SUPPORT</a>
+               </div></body>"#,
+            240,
+        );
+        let (rs, s) = find(&out, "STORE");
+        let (rc, _) = find(&out, "COMMUNITY");
+        let (ra, _) = find(&out, "ABOUT");
+        let (rp, _) = find(&out, "SUPPORT");
+        assert_eq!((rs, rc, ra, rp), (rs, rs, rs, rs), "floats pack one shelf");
+        assert_eq!(s.col, 26, "left:200px = col 25, + the float's 7px padding");
+        // A clear starts a new shelf: the cleared float drops below and the
+        // shelves compete by max.
+        let out = lay(
+            r#"<body style="margin:0"><div style="position:absolute;left:0">
+                <a style="display:block;float:left">AAAA</a>
+                <a style="display:block;float:left;clear:left">BB</a>
+               </div></body>"#,
+            240,
+        );
+        let (ra, _) = find(&out, "AAAA");
+        let (rb, _) = find(&out, "BB");
+        assert!(rb > ra, "the cleared float takes its own shelf");
+    }
+
+    #[test]
+    fn inline_atom_margins_take_line_space() {
+        // §9.4.2/§10.8: an inline-level replaced box's margin edges occupy
+        // real inline space — Steam's hero `<video margin-left:50%>` label
+        // sits at mid-line, not col 0 (its margin was silently dropped).
+        let out = lay(
+            r#"<body style="margin:0"><div style="position:relative">
+                <div style="position:absolute;width:100%;overflow:hidden;z-index:1">
+                  <div style="display:block">
+                    <video preload="none" style="max-height:450px;margin-left:50%">
+                      <source src="v.webm" type="video/webm">
+                    </video>
+                  </div>
+                </div>
+               </div></body>"#,
+            240,
+        );
+        let (_, v) = find(&out, "▶ Video");
+        assert_eq!(v.col, 120, "margin-left:50% of 1920px = 960px = col 120");
+    }
+
+    #[test]
+    fn transparent_gradient_background_does_not_erase_content() {
+        // A gradient with a transparent stop is a scrim/edge fade: a browser
+        // shows the content beneath it, so it must not stamp an opaque fill
+        // over earlier-painted cells. An all-opaque gradient (and any url()
+        // layer) keeps the cover semantics.
+        let scrim = lay(
+            r#"<body style="margin:0"><div style="position:relative">
+                <span>UNDERNEATH</span>
+                <div style="position:absolute;left:0;top:0;width:400px;height:32px;z-index:5;background-image:linear-gradient(to right, rgba(0,0,0,0), rgba(0,0,0,1))"></div>
+               </div></body>"#,
+            80,
+        );
+        let (_, u) = find(&scrim, "UNDERNEATH");
+        assert_eq!(u.col, 0, "the scrim leaves the text beneath");
+        let opaque = lay(
+            r#"<body style="margin:0"><div style="position:relative">
+                <span>UNDERNEATH</span>
+                <div style="position:absolute;left:0;top:0;width:400px;height:32px;z-index:5;background-image:linear-gradient(to right, rgb(0,0,0), rgb(9,9,9))"></div>
+               </div></body>"#,
+            80,
+        );
+        assert!(
+            absent(&opaque, "UNDERNEATH"),
+            "an all-opaque gradient still covers"
+        );
+        // A predominantly-opaque backdrop with one glow stop (mean alpha
+        // ≈ 0.71 — Steam's store-nav radial) binarizes to a cover: the
+        // browser's effectively-solid bar hides what's behind it.
+        let backdrop = lay(
+            r#"<body style="margin:0"><div style="position:relative">
+                <span>UNDERNEATH</span>
+                <div style="position:absolute;left:0;top:0;width:400px;height:32px;z-index:5;background-image:radial-gradient(107% 57% at 50% 100%, rgba(24,37,53,0.2) 0%, rgba(24,37,53,0.52) 5%, rgba(24,37,53,0.85) 20%, #182535 60%, #192330 100%)"></div>
+               </div></body>"#,
+            80,
+        );
+        assert!(
+            absent(&backdrop, "UNDERNEATH"),
+            "a mostly-opaque backdrop still covers"
+        );
+    }
+
+    #[test]
+    fn fractional_atom_box_reservation_ceils() {
+        // A shrink-to-fit abspos sized from an inline-block whose max-content
+        // is a fractional cell count (13 chars + 43px padding = 147px =
+        // 18.375 cells at the 8px test cell): ROUNDING the atom-box probe
+        // down under-reports the container's max-content, and the real pass
+        // re-laying at that width re-wraps the box's own text — Steam's
+        // header "Install Steam" button split into two rows at a 10px cell.
+        // The reservation must CEIL: a box needing 18.375 cells fits in 19.
+        let out = lay(
+            r#"<body style="margin:0"><div style="position:absolute;left:0;top:0">
+                <span style="display:inline-block;padding-left:35px;padding-right:8px">Install Steam</span>
+               </div></body>"#,
+            240,
+        );
+        let (r, _) = find(&out, "Install Steam");
+        assert_eq!(r, 0, "the label stays on one line inside its box");
+    }
+
     // ---- the P0 gate: plain articles render with a browser's structure ----
     // Test cells are the nominal 8×16 px, so 1em = 16px = 1 row = 2 cols and
     // the UA sheet's px values quantize predictably: body margin 8px = 1 col,

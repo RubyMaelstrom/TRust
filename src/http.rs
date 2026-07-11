@@ -5362,6 +5362,8 @@ mod tests {
     /// Lay out a (post-JS) HTML FILE and dump the rows + carousels, to see
     /// exactly what reaches the screen. `TRUST_LAYOUT_FILE=<html> [TRUST_DIAG_VP=WxH]
     /// [TRUST_LAYOUT_GREP=substr] cargo test layout_dump -- --ignored --nocapture`
+    /// Add `TRUST_FRAG_DIAG=1` to also dump the resolved fragment tree
+    /// (tag/x/y/w/h/clip per box) — for laid-right-but-paints-wrong bugs.
     #[tokio::test]
     #[ignore = "manual diagnostic, needs TRUST_LAYOUT_FILE=<html>"]
     async fn layout_dump() {

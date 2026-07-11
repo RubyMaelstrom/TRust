@@ -351,11 +351,136 @@ fn declares_background(dom: &Dom, id: NodeId) -> bool {
                 t.as_str(),
                 "none" | "initial" | "inherit" | "unset" | "revert" | "revert-layer"
             )
+            && image_layers_cover(&t)
         {
             return true;
         }
     }
     false
+}
+
+/// Whether a `background-image` value paints an OPAQUE cover: any `url()`
+/// layer (a real image — approximated as a cover, like today's `<img>`
+/// cells), or a gradient that is predominantly opaque. We can't blend, so a
+/// gradient binarizes to the nearest of {see-through, cover} by the MEAN of
+/// its stops' declared alphas: a 0→1 edge fade or a `transparent`→scrim
+/// overlay (mean ≤ 0.5) shows the content beneath it in a browser and must
+/// not erase cells; a mostly-opaque backdrop with a subtle glow stop (Steam's
+/// store-nav radial, mean ≈ 0.7) covers like the browser's effectively-solid
+/// bar. Stop positions are deliberately not weighted in (the documented
+/// approximation — positions may be unresolvable lengths).
+fn image_layers_cover(t: &str) -> bool {
+    split_top_level_commas(t).any(|layer| {
+        let l = layer.trim();
+        if l.starts_with("url(") {
+            return true;
+        }
+        gradient_mean_alpha(l) > 0.5
+    })
+}
+
+/// The mean declared alpha of a gradient's color stops. Stops are the
+/// top-level comma parts of the function args, minus a leading
+/// direction/shape part; `transparent` = 0, a function color's written
+/// alpha, hex/named = opaque.
+fn gradient_mean_alpha(gradient: &str) -> f32 {
+    let Some(open) = gradient.find('(') else {
+        return 1.0; // not a function: keep the old always-cover behavior
+    };
+    let inner = &gradient[open + 1..gradient.rfind(')').unwrap_or(gradient.len())];
+    let mut sum = 0.0f32;
+    let mut n = 0u32;
+    for (i, part) in split_top_level_commas(inner).enumerate() {
+        let p = part.trim();
+        if i == 0 && is_gradient_direction(p) {
+            continue;
+        }
+        if p.is_empty() {
+            continue;
+        }
+        sum += stop_alpha(p);
+        n += 1;
+    }
+    if n == 0 { 1.0 } else { sum / n as f32 }
+}
+
+/// A gradient function's leading direction/shape argument (`to right`,
+/// `45deg`, `circle at center`, the radial size keywords) — not a color stop.
+fn is_gradient_direction(p: &str) -> bool {
+    p.starts_with("to ")
+        || p.starts_with("at ")
+        || p.contains(" at ")
+        || p.starts_with("circle")
+        || p.starts_with("ellipse")
+        || p.starts_with("closest-")
+        || p.starts_with("farthest-")
+        || p.starts_with("from ")
+        || p.split_whitespace().next().is_some_and(|w| {
+            ["deg", "rad", "grad", "turn"]
+                .iter()
+                .any(|u| w.ends_with(u) && w.trim_end_matches(u).parse::<f32>().is_ok())
+        })
+}
+
+/// One color stop's declared alpha: the `transparent` keyword is 0, a
+/// function color carries its written alpha (absent = opaque), anything
+/// else (hex, named color) is opaque.
+fn stop_alpha(stop: &str) -> f32 {
+    if stop.contains("transparent") {
+        return 0.0;
+    }
+    for pre in ["rgb", "hsl", "hwb"] {
+        if let Some(i) = stop.find(pre) {
+            let rest = &stop[i..];
+            if let Some(open) = rest.find('(') {
+                let inner = &rest[open + 1..];
+                let inner = &inner[..inner.find(')').unwrap_or(inner.len())];
+                return color_args_alpha(inner).unwrap_or(1.0).clamp(0.0, 1.0);
+            }
+        }
+    }
+    1.0
+}
+
+/// Split on top-level commas (outside parentheses) — background layers.
+fn split_top_level_commas(t: &str) -> impl Iterator<Item = &str> {
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut out = Vec::new();
+    for (i, c) in t.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&t[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&t[start..]);
+    out.into_iter()
+}
+
+/// The written ALPHA of a color function's argument list (`0,0,0,.5`,
+/// `0 0 0 / 50%`), `None` when no alpha component is present (opaque).
+fn color_args_alpha(args: &str) -> Option<f32> {
+    let alpha = if let Some((_, a)) = args.rsplit_once('/') {
+        a
+    } else {
+        let parts: Vec<&str> = args.split(',').collect();
+        if parts.len() < 4 {
+            return None; // no alpha component: opaque
+        }
+        parts[3]
+    };
+    let a = alpha.trim();
+    let (v, pct) = match a.strip_suffix('%') {
+        Some(p) => (p.trim(), true),
+        None => (a, false),
+    };
+    let n = v.parse::<f32>().ok()?;
+    Some(if pct { n / 100.0 } else { n })
 }
 
 /// A function color whose ALPHA component is written as zero
@@ -369,21 +494,7 @@ fn zero_alpha_color(t: &str) -> bool {
         return false;
     };
     let args = args.trim_end_matches(')');
-    let alpha = if let Some((_, a)) = args.rsplit_once('/') {
-        a
-    } else {
-        let parts: Vec<&str> = args.split(',').collect();
-        if parts.len() < 4 {
-            return false; // no alpha component: opaque
-        }
-        parts[3]
-    };
-    let a = alpha.trim();
-    a.strip_suffix('%')
-        .unwrap_or(a)
-        .trim()
-        .parse::<f32>()
-        .is_ok_and(|v| v == 0.0)
+    color_args_alpha(args).is_some_and(|v| v == 0.0)
 }
 
 /// The translation component of `transform` + the `translate` property:

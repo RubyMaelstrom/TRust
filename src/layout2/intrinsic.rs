@@ -83,7 +83,11 @@ impl Flow<'_> {
                     .map(|(ab, actx)| {
                         let w = self.contribution(ab, mode, actx);
                         AtomBoxSize {
-                            w_cells: (w / self.cell_w).round().max(1.0) as usize,
+                            // Ceil, like the real pass: rounding a 17.4-cell
+                            // box down to 17 under-reports the container's
+                            // max-content, and a shrink-to-fit ancestor sized
+                            // from it re-wraps the box's content.
+                            w_cells: (w / self.cell_w - 1e-3).ceil().max(1.0) as usize,
                             h_rows: 1,
                         }
                     })
@@ -110,16 +114,42 @@ impl Flow<'_> {
                 let (lines, _, _, _, _) = ifc.finish();
                 let inline_w =
                     lines.iter().map(|l| l.width).max().unwrap_or(0) as f32 * self.cell_w;
-                // A float contributes its margin-box intrinsic width to the
-                // container like a block child (§9.5 / css-sizing-3 — the v1
-                // block-child approximation, correct for "float beside a
-                // paragraph"). The probe IFC skips floats, so fold them here.
+                // Floats: the probe IFC skips them, so fold them here. At
+                // max-content no soft-wrap opportunity is taken (§10.3.5 /
+                // css-sizing-3), so consecutive floats sit side by side on one
+                // shelf and inline content flows beside them — their margin
+                // boxes ADD (a float menu bar measures as the sum of its
+                // items); a float that clears an earlier one starts a new
+                // shelf below, and shelves compete by max. At min-content
+                // every wrap is taken — each float may drop to its own shelf,
+                // so each contributes individually by max.
                 let mut floats: Vec<(&BoxNode, InlineStyle)> = Vec::new();
                 super::flow::collect_floats(self.dom, self.base, inls, &here, &mut floats);
-                floats
-                    .iter()
-                    .map(|(fb, fctx)| self.contribution(fb, mode, fctx))
-                    .fold(inline_w, f32::max)
+                if mode == IMode::Max {
+                    let mut shelves: Vec<f32> = vec![0.0];
+                    let mut has = super::float::Clear::default();
+                    for (fb, fctx) in &floats {
+                        let cl = fb.style.clear;
+                        if (cl.left && has.left) || (cl.right && has.right) {
+                            shelves.push(0.0);
+                            has = super::float::Clear::default();
+                        }
+                        match fb.style.float {
+                            Some(super::float::Side::Left) => has.left = true,
+                            Some(super::float::Side::Right) => has.right = true,
+                            None => {}
+                        }
+                        *shelves.last_mut().unwrap() += self.contribution(fb, mode, fctx);
+                    }
+                    // Inline content flows beside the first shelf's floats.
+                    let first = shelves[0] + inline_w;
+                    shelves.into_iter().skip(1).fold(first, f32::max)
+                } else {
+                    floats
+                        .iter()
+                        .map(|(fb, fctx)| self.contribution(fb, mode, fctx))
+                        .fold(inline_w, f32::max)
+                }
             }
             Content::Atomic(atom) => self.atom_intrinsic_w(atom, mode),
             Content::Grid(items) => {
