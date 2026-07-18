@@ -209,6 +209,32 @@ impl PageJobExecutor {
         self.async_jobs.borrow_mut().clear();
         self.other_jobs.borrow_mut().clear();
     }
+
+    /// Perform the HTML microtask checkpoint that is part of cleaning up after
+    /// a classic script, without advancing any later host work. Page
+    /// microtasks (`Promise` reactions, `queueMicrotask`, MutationObserver
+    /// delivery) all ride Boa's `PromiseJob` queue. `NativeAsyncJob`s are the
+    /// separate host work behind fetches and dynamically prepared resources;
+    /// polling those here would incorrectly keep `document.currentScript`
+    /// active across a later network/resource task.
+    fn run_microtask_checkpoint(&self, ctx: &mut Context) -> JsResult<()> {
+        loop {
+            let jobs = std::mem::take(&mut *self.promise_jobs.borrow_mut());
+            if jobs.is_empty() {
+                ctx.clear_kept_objects();
+                return Ok(());
+            }
+            let exec_t = phase_begin();
+            for job in jobs {
+                if let Err(err) = job.call(ctx) {
+                    phase_end(Phase::Execute, exec_t);
+                    self.clear();
+                    return Err(err);
+                }
+            }
+            phase_end(Phase::Execute, exec_t);
+        }
+    }
 }
 
 impl JobExecutor for PageJobExecutor {
@@ -1529,16 +1555,31 @@ fn run_external_classic(
     outcome.elapsed += started.elapsed();
 }
 
-/// Set `document.currentScript` (via the `__trust` bridge, like `readyState`)
-/// to the node id of the classic script about to run — `None` clears it back
-/// to null. A bare property write can't panic the VM, so it skips the
-/// `run_script` budget/error machinery.
-fn set_current_script(ctx: &mut Context, id: Option<usize>) {
-    let src = match id {
-        Some(id) => format!("__trust.currentScript={id};"),
-        None => "__trust.currentScript=null;".to_string(),
-    };
-    let _ = ctx.eval(Source::from_bytes(src.as_bytes()));
+/// Replace `document.currentScript` (via the `__trust` bridge, like
+/// `readyState`) and return the previous node id. HTML's script-element
+/// execution algorithm restores the old value rather than blindly clearing
+/// it: reentrant classic-script execution must reveal the innermost script and
+/// then expose its caller again when it finishes.
+fn replace_current_script(ctx: &mut Context, id: Option<usize>) -> Option<usize> {
+    let next = id.map_or_else(|| String::from("null"), |id| id.to_string());
+    let src = format!(
+        "(function(){{var old=__trust.currentScript;__trust.currentScript={next};return old;}})()"
+    );
+    ctx.eval(Source::from_bytes(src.as_bytes()))
+        .ok()
+        .and_then(|v| v.as_number())
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map(|n| n as usize)
+}
+
+/// The microtask checkpoint nested inside HTML's "run a classic script".
+/// This deliberately excludes `NativeAsyncJob`s: those represent later host
+/// work (network/resource completion), not microtasks belonging to the active
+/// script evaluation.
+fn microtask_checkpoint(ctx: &mut Context) -> JsResult<()> {
+    ctx.downcast_job_executor::<PageJobExecutor>()
+        .expect("page contexts use PageJobExecutor")
+        .run_microtask_checkpoint(ctx)
 }
 
 // ---- The DOM syscall boundary ----------------------------------------
@@ -5144,7 +5185,7 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
                     let job = NativeAsyncJob::with_realm(
                         async move |cell: &RefCell<&mut Context>| {
                             let mut guard = cell.borrow_mut();
-                            eval_injected(&mut guard, "injected-data", &body);
+                            eval_injected_classic(&mut guard, node_id, "injected-data", &body)?;
                             fire_script_event(&mut guard, node_id, "load");
                             Ok(JsValue::undefined())
                         },
@@ -5181,7 +5222,12 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
                                 Ok(resp) if (200..300).contains(&resp.status) => {
                                     let body =
                                         crate::http::decode_body(&resp.content_type, &resp.body);
-                                    eval_injected(&mut guard, &name, body.as_bytes());
+                                    eval_injected_classic(
+                                        &mut guard,
+                                        node_id,
+                                        &name,
+                                        body.as_bytes(),
+                                    )?;
                                     fire_script_event(&mut guard, node_id, "load");
                                 }
                                 _ => fire_script_event(&mut guard, node_id, "error"),
@@ -5201,7 +5247,7 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
             let job = NativeAsyncJob::with_realm(
                 async move |cell: &RefCell<&mut Context>| {
                     let mut guard = cell.borrow_mut();
-                    eval_injected(&mut guard, "injected-inline", text.as_bytes());
+                    eval_injected_classic(&mut guard, node_id, "injected-inline", text.as_bytes())?;
                     Ok(JsValue::undefined())
                 },
                 realm,
@@ -5313,6 +5359,23 @@ fn eval_injected(ctx: &mut Context, name: &str, source: &[u8]) {
             format!("__trust.errors.push(\"{esc}\")").as_bytes(),
         ));
     }
+}
+
+/// Execute a dynamically prepared classic `<script>` with the same
+/// `currentScript` scope as a parser-created one. Resource acquisition happens
+/// before this helper and the external script's `load` event happens after it,
+/// so neither later host work nor the event handler inherits the script.
+fn eval_injected_classic(
+    ctx: &mut Context,
+    node_id: usize,
+    name: &str,
+    source: &[u8],
+) -> JsResult<()> {
+    let old_current_script = replace_current_script(ctx, Some(node_id));
+    eval_injected(ctx, name, source);
+    let checkpoint = microtask_checkpoint(ctx);
+    replace_current_script(ctx, old_current_script);
+    checkpoint
 }
 
 /// Fire a `load`/`error` event on an injected script element (and call its
@@ -6453,11 +6516,12 @@ fn load_page(
             ));
             continue;
         }
-        // `document.currentScript` is the classic script element while its
-        // own code runs (null for modules and between scripts) — SvelteKit's
-        // bootstrap reads `document.currentScript.parentElement` to find its
-        // mount node, so without this the whole app fails to start.
-        set_current_script(&mut ctx, Some(*node));
+        // HTML "execute the script element": expose the classic script while
+        // it runs, INCLUDING the microtask checkpoint performed by "clean up
+        // after running script", then restore the prior value. SvelteKit reads
+        // it synchronously; Next/Turbopack reads it from a Promise job in that
+        // same checkpoint. Modules and later tasks still see null.
+        let old_current_script = replace_current_script(&mut ctx, Some(*node));
         match src {
             // `data:` URL classic script (RFC 2397): decode the body inline — no
             // network, no shared cache. Instagram/Facebook inline their entire
@@ -6543,7 +6607,11 @@ fn load_page(
             // touch the VM further — currentScript is moot once we break.)
             break;
         }
-        set_current_script(&mut ctx, None);
+        run_microtasks_into(&mut ctx, &mut outcome);
+        if outcome.panicked {
+            break;
+        }
+        replace_current_script(&mut ctx, old_current_script);
         run_jobs_into(&mut ctx, &budget, &mut outcome);
         phase(&format!(
             "script[{i}] done +{}ms",
@@ -6826,6 +6894,24 @@ fn settle_image_loads(ctx: &mut Context, budget: &Budget, max_ticks: usize, outc
             break;
         }
         settle(ctx, budget, max_ticks, outcome);
+    }
+}
+
+/// Perform the classic script's mandatory microtask checkpoint while its
+/// `document.currentScript` value is still active. This is separately guarded
+/// from the full job drain because the latter also waits for later host work.
+fn run_microtasks_into(ctx: &mut Context, outcome: &mut Outcome) {
+    let drained =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| microtask_checkpoint(ctx)));
+    match drained {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => outcome.errors.push(format!("microtask: {err}")),
+        Err(_) => {
+            outcome.errors.push(String::from(
+                "microtask: engine panic (Boa bug) — page JS halted",
+            ));
+            outcome.panicked = true;
+        }
     }
 }
 
@@ -22467,9 +22553,13 @@ mod tests {
             br##"
             globalThis.out = { events: [] };
             const sc = document.createElement("script");
-            sc.addEventListener("load", () => out.events.push("load"));
+            globalThis.__injectedScript = sc;
+            sc.addEventListener("load", () => {
+                out.events.push("load");
+                out.currentAtLoad = document.currentScript;
+            });
             sc.addEventListener("error", () => out.events.push("error"));
-            sc.src = "data:text/javascript,globalThis.__injected = 7;";
+            sc.src = "data:text/javascript,globalThis.__injected = document.currentScript === globalThis.__injectedScript ? 7 : -7; Promise.resolve().then(function(){ globalThis.__injectedMicro = document.currentScript === globalThis.__injectedScript; });";
             document.querySelector("body").appendChild(sc);
             "##,
             &budget,
@@ -22486,7 +22576,9 @@ mod tests {
                 .to_std_string_escaped()
         };
         assert_eq!(s(&mut ctx, b"String(globalThis.__injected)"), "7");
+        assert_eq!(s(&mut ctx, b"String(globalThis.__injectedMicro)"), "true");
         assert_eq!(s(&mut ctx, b"out.events.join(',')"), "load");
+        assert_eq!(s(&mut ctx, b"String(out.currentAtLoad)"), "null");
     }
 
     #[test]
@@ -23015,6 +23107,22 @@ mod tests {
 
     fn page(html: &str) -> (String, Outcome) {
         transform(html, &PageEnv::bare("https://example.com/a/page"))
+    }
+
+    #[test]
+    fn contextual_of_can_name_a_strict_lexical_binding() {
+        // ECMAScript reserves `of` only in contextual grammar positions (most
+        // visibly as the separator in `for (x of y)`). It remains a valid
+        // BindingIdentifier, including after `let` in strict code. Minifiers
+        // legitimately emit this compact declaration shape.
+        let (out, outcome) = page(
+            "<body><p id=o></p><script>\"use strict\";\
+             let of = 'contextual identifier';\
+             document.getElementById('o').textContent = of;\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("contextual identifier"), "{out}");
     }
 
     /// Diagnostic: run an arbitrary local HTML file through the full
@@ -28742,6 +28850,39 @@ mod tests {
     }
 
     #[test]
+    fn injected_classic_script_has_its_own_current_script_scope() {
+        // A dynamically prepared classic script gets the same execution scope
+        // as a parser-created one: itself synchronously and through its cleanup
+        // microtask checkpoint, then null in a later timer task. The outer
+        // script must not leak into the deferred injected-script execution.
+        let (out, outcome) = page(
+            r#"<body><script>
+            var outerScript = document.currentScript;
+            var s = document.createElement('script');
+            s.textContent = `
+                var injectedScript = document.currentScript;
+                document.body.setAttribute('data-injected-sync',
+                    injectedScript && injectedScript !== outerScript ? 'self' : 'wrong');
+                Promise.resolve().then(function () {
+                    document.body.setAttribute('data-injected-micro',
+                        document.currentScript === injectedScript ? 'self' : 'wrong');
+                    setTimeout(function () {
+                        document.body.setAttribute('data-injected-timer',
+                            document.currentScript === null ? 'null' : 'set');
+                    }, 0);
+                });
+            `;
+            document.body.appendChild(s);
+            </script></body>"#,
+        );
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains(r#"data-injected-sync="self""#), "{out}");
+        assert!(out.contains(r#"data-injected-micro="self""#), "{out}");
+        assert!(out.contains(r#"data-injected-timer="null""#), "{out}");
+    }
+
+    #[test]
     fn document_referrer_is_a_string_not_undefined() {
         // `document.referrer` must always be a STRING (HTML §3.1.5) — "" for a
         // direct navigation. Returning undefined broke connected-react-router:
@@ -29786,26 +29927,72 @@ mod tests {
     }
 
     #[test]
-    fn current_script_points_at_the_executing_classic_script() {
-        // `document.currentScript` is the classic script element while its own
-        // code runs (its parent is the element it sits in), and null once that
-        // run is over (here: in the trailing microtask). SvelteKit reads
-        // `document.currentScript.parentElement` to find its mount node.
+    fn current_script_spans_the_classic_scripts_microtask_checkpoint() {
+        // HTML "execute the script element" restores currentScript only AFTER
+        // "run the classic script"; that operation's cleanup performs a
+        // microtask checkpoint. The script is therefore still current in its
+        // Promise reactions, but not in a later timer task. SvelteKit reads it
+        // synchronously; Next/Turbopack reads it from this checkpoint.
         let (out, outcome) = page(
             "<body><pre id=o></pre><script>\
              var s = document.currentScript;\
              var rec = (s ? s.tagName : 'null') + ',' + (s ? s.parentNode.tagName : '-');\
              Promise.resolve().then(function(){\
                document.getElementById('o').textContent =\
-                 rec + ',after=' + (document.currentScript ? 'set' : 'null');\
+                 rec + ',micro=' + (document.currentScript === s ? 'same' : 'wrong');\
+               setTimeout(function(){\
+                 document.getElementById('o').textContent +=\
+                   ',timer=' + (document.currentScript === null ? 'null' : 'set');\
+               }, 0);\
              });\
              </script></body>",
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(
-            out.contains("SCRIPT,BODY,after=null"),
-            "currentScript during/after: {out}"
+            out.contains("SCRIPT,BODY,micro=same,timer=null"),
+            "currentScript across script cleanup: {out}"
         );
+    }
+
+    #[test]
+    fn external_classic_current_script_spans_its_microtask_checkpoint() {
+        // The exact modern-bundler shape behind whyalien.com: an external
+        // runtime registers work through a resolved Promise, and that work
+        // discovers its asset prefix from document.currentScript.
+        let html = "<body><pre id=o></pre><script src='/runtime-current.js'></script></body>";
+        let source = br#"
+            var ownScript = document.currentScript;
+            var sync = ownScript === document.querySelector("script[src]");
+            Promise.resolve().then(function () {
+                return Promise.resolve();
+            }).then(function () {
+                document.getElementById("o").textContent =
+                    "sync=" + sync + ",micro=" + (document.currentScript === ownScript);
+            });
+        "#;
+        let mut env = PageEnv::bare("https://example.com/");
+        env.externals = vec![(
+            "/runtime-current.js".to_string(),
+            Some(std::sync::Arc::new(source.to_vec())),
+        )];
+        let (out, outcome) = transform(html, &env);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("sync=true,micro=true"), "{out}");
+    }
+
+    #[test]
+    fn module_scripts_never_become_document_current_script() {
+        let (out, outcome) = page(
+            "<body><pre id=o></pre><script type=module>\
+             var sync = document.currentScript === null;\
+             Promise.resolve().then(function () {\
+               document.getElementById('o').textContent =\
+                 'sync=' + sync + ',micro=' + (document.currentScript === null);\
+             });\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("sync=true,micro=true"), "{out}");
     }
 
     #[test]
