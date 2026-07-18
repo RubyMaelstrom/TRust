@@ -223,6 +223,27 @@ fn let_declaration_keywords() {
         ],
         interner,
     );
+
+    // `of` is a contextual keyword only in grammar positions such as a
+    // for-of separator. ECMAScript permits it as a BindingIdentifier, so the
+    // statement-list `let` disambiguation must recognize this as a lexical
+    // declaration even in strict code.
+    let interner = &mut Interner::default();
+    check_module_parser(
+        "let of = 5;",
+        vec![ModuleItem::StatementListItem(
+            Declaration::Lexical(LexicalDeclaration::Let(
+                vec![Variable::from_identifier(
+                    Identifier::new(Sym::OF, Span::new((1, 5), (1, 7))),
+                    Some(Literal::new(5, Span::new((1, 10), (1, 11))).into()),
+                )]
+                .try_into()
+                .unwrap(),
+            ))
+            .into(),
+        )],
+        interner,
+    );
 }
 
 /// Checks `let` declaration parsing with no spaces.
