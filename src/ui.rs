@@ -361,6 +361,8 @@ fn item_kind_style(kind: crate::layout2::ItemKind) -> Style {
         ItemKind::Image => Style::new().fg(theme::DIM).add_modifier(Modifier::ITALIC),
         ItemKind::Border => Style::new().fg(theme::DIM),
         ItemKind::Text => Style::new().fg(theme::TEXT),
+        // Hit regions are geometry-only and are filtered out before rendering.
+        ItemKind::HitRegion => Style::new(),
     }
 }
 
@@ -381,6 +383,20 @@ pub(crate) fn browser_rows<'a>(
             .items
             .get(i)
             .map(|it| it.node)
+    });
+    // An empty overlay anchor has no painted item to reverse. Carry its box
+    // into the normal row renderer and reverse the visible card content below
+    // it, preserving the established selection affordance without inventing a
+    // glyph for the empty anchor.
+    let sel_hit = g.sel_item.and_then(|(r, i)| {
+        let row = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r);
+        let item = row.items.get(i)?;
+        (item.kind == crate::layout2::ItemKind::HitRegion).then_some((
+            r,
+            item.col,
+            item.width,
+            item.height.max(1),
+        ))
     });
     let carousels = &g.doc.carousels;
     let end = (g.scroll + height).min(g.doc.rows.len());
@@ -442,14 +458,21 @@ pub(crate) fn browser_rows<'a>(
                 if item.emph.strike {
                     style = style.add_modifier(Modifier::CROSSED_OUT);
                 }
-                let selected = item.is_interactive()
-                    && match sel_node {
-                        // Highlight all pieces of the selected link (it may
-                        // have wrapped); fall back to the exact item when
-                        // the selection has no source node.
-                        Some(n) if n != NO_NODE => item.node == n,
-                        _ => g.sel_item == Some((row_idx, i)),
-                    };
+                let selected_by_hit = sel_hit.is_some_and(|(r, col, width, height)| {
+                    row_idx >= r
+                        && row_idx < r + usize::from(height)
+                        && scol < col.saturating_add(width)
+                        && col < scol.saturating_add(vis_w)
+                });
+                let selected = selected_by_hit
+                    || item.is_interactive()
+                        && match sel_node {
+                            // Highlight all pieces of the selected link (it may
+                            // have wrapped); fall back to the exact item when
+                            // the selection has no source node.
+                            Some(n) if n != NO_NODE => item.node == n,
+                            _ => g.sel_item == Some((row_idx, i)),
+                        };
                 if selected {
                     style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 }

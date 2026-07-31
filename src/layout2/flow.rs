@@ -2496,10 +2496,15 @@ impl Flow<'_> {
                 let FragKind::Oof(b, ctx) = ph.kind else {
                     unreachable!()
                 };
-                // A paint-suppressed (opacity:0 chain) out-of-flow box
-                // contributes NOTHING — no cells, no scrollable extent (the
-                // Steam-microtrailer decision, now structural).
-                if ctx.opacity_suppressed() || self.dom.paint_suppressed(b.node) {
+                // A paint-suppressed (opacity:0 chain) out-of-flow box usually
+                // contributes no terminal cells. Retain it when its subtree
+                // contains a hit-testable hyperlink, however: opacity affects
+                // painting, not box generation or pointer targeting. This
+                // narrow exception preserves the old invisible-media
+                // optimization while keeping semantic transparent controls.
+                if (ctx.opacity_suppressed() || self.dom.paint_suppressed(b.node))
+                    && !self.dom.subtree_has_point_hit_target(b.node)
+                {
                     continue;
                 }
                 let fixed = b.style.position == Pos::Fixed;
