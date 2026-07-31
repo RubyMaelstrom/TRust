@@ -34,9 +34,10 @@
 
 use std::collections::HashMap;
 
+use crate::doc::Link;
 use crate::dom::{Dom, NodeId};
 use crate::layout2::{
-    Carousel, CompositeLayer, Emphasis, FixedItem, Item, ItemKind, NO_NODE, Region, Row,
+    Carousel, CompositeLayer, Emphasis, FixedItem, HitBox, Item, ItemKind, NO_NODE, Region, Row,
     display_width, truncate_to_width,
 };
 
@@ -76,6 +77,7 @@ pub(crate) struct PaintOut {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint(
     dom: &Dom,
+    base: &url::Url,
     root: &mut Frag<'_>,
     fixed: &[Frag<'_>],
     flow_bottom: f32,
@@ -88,6 +90,7 @@ pub(crate) fn paint(
     alpha: &HashMap<String, bool>,
 ) -> PaintOut {
     let cols = viewport.0;
+    let links = interaction_links(dom, base);
     // The overlap-composite side-table, filled by every `composite` call below
     // (main pass, scroll-region buffers, carousel strips, the fixed layer).
     let mut composites: Composites = HashMap::new();
@@ -112,6 +115,7 @@ pub(crate) fn paint(
         &mut carousels,
         &mut scroll_clips,
         &mut splices,
+        &links,
         alpha,
         &mut composites,
     );
@@ -119,7 +123,7 @@ pub(crate) fn paint(
     // contributes only its reserved band height (not its scrolled-away content).
     let doc_h_px = root.max_bottom().max(flow_bottom).max(0.0);
     let mut ops = Vec::new();
-    build_sc(root, &mut ops, cell_w, cell_h, 0.0, 0.0);
+    build_sc(root, &mut ops, cell_w, cell_h, 0.0, 0.0, &links);
     let mut rows = composite(ops, cols, alpha, &mut composites);
     // Splice each carousel's strip rows over its (now-blank) band — the strip
     // items keep their full strip columns (possibly past the viewport), which
@@ -186,7 +190,7 @@ pub(crate) fn paint(
                 row = row.min(vp_rows.saturating_sub(1));
             }
             let mut ops = Vec::new();
-            build_sc(f, &mut ops, cell_w, cell_h, f.x, f.y);
+            build_sc(f, &mut ops, cell_w, cell_h, f.x, f.y, &links);
             let brows = composite(ops, cols.saturating_sub(col).max(1), alpha, &mut composites);
             if brows.iter().all(|r| r.items.is_empty()) {
                 return None; // nothing visible: no pinned surface
@@ -238,6 +242,7 @@ fn extract_scrollers(
     carousels: &mut Vec<Carousel>,
     scroll_clips: &mut Vec<(usize, u16, u16)>,
     splices: &mut Vec<(usize, Vec<Row>)>,
+    links: &HashMap<NodeId, Link>,
     alpha: &HashMap<String, bool>,
     composites: &mut Composites,
 ) {
@@ -254,6 +259,7 @@ fn extract_scrollers(
                 ox,
                 oy,
                 scroll_clips,
+                links,
                 alpha,
                 composites,
             ));
@@ -267,6 +273,7 @@ fn extract_scrollers(
                 oy,
                 carousels,
                 splices,
+                links,
                 alpha,
                 composites,
             );
@@ -282,6 +289,7 @@ fn extract_scrollers(
                 carousels,
                 scroll_clips,
                 splices,
+                links,
                 alpha,
                 composites,
             );
@@ -347,6 +355,7 @@ fn paint_carousel(
     oy: f32,
     carousels: &mut Vec<Carousel>,
     splices: &mut Vec<(usize, Vec<Row>)>,
+    links: &HashMap<NodeId, Link>,
     alpha: &HashMap<String, bool>,
     composites: &mut Composites,
 ) {
@@ -403,7 +412,7 @@ fn paint_carousel(
     // rows (the document, or the parent region's buffer).
     let strip_cols = ((content_right - ox) / cw).round().max(1.0) as usize;
     let mut ops = Vec::new();
-    build_sc(f, &mut ops, cw, ch, ox, f.y);
+    build_sc(f, &mut ops, cw, ch, ox, f.y, links);
     let strip = composite(ops, strip_cols, alpha, composites);
     f.children.clear();
     let end = start_row + strip.len();
@@ -434,7 +443,13 @@ pub(crate) type RegionBuffer = (Vec<Row>, Vec<Carousel>, Vec<(usize, u16, u16)>)
 /// `(buffer rows, nested carousels, nested scroll-clip clientHeights)`; nested
 /// vertical regions inside a patched region are dropped in v1 (they reappear on
 /// the next full render — the old engine's region patch does the same).
-pub(crate) fn region_buffer(dom: &Dom, root: &mut Frag<'_>, cw: f32, ch: f32) -> RegionBuffer {
+pub(crate) fn region_buffer(
+    dom: &Dom,
+    base: &url::Url,
+    root: &mut Frag<'_>,
+    cw: f32,
+    ch: f32,
+) -> RegionBuffer {
     let mut scroll_clips = Vec::new();
     // v1 region-patch cut: the incremental region re-lay does NOT alpha-composite
     // transparent image overlaps (empty alpha ⇒ no grouping) — such overlaps in a
@@ -442,6 +457,7 @@ pub(crate) fn region_buffer(dom: &Dom, root: &mut Frag<'_>, cw: f32, ch: f32) ->
     // correct, matching the other P7 region-patch v1 cuts.
     let no_alpha: HashMap<String, bool> = HashMap::new();
     let mut composites: Composites = HashMap::new();
+    let links = interaction_links(dom, base);
     let rg = paint_region(
         dom,
         root,
@@ -450,6 +466,7 @@ pub(crate) fn region_buffer(dom: &Dom, root: &mut Frag<'_>, cw: f32, ch: f32) ->
         0.0,
         0.0,
         &mut scroll_clips,
+        &links,
         &no_alpha,
         &mut composites,
     );
@@ -511,6 +528,7 @@ fn paint_region(
     ox: f32,
     oy: f32,
     scroll_clips: &mut Vec<(usize, u16, u16)>,
+    links: &HashMap<NodeId, Link>,
     alpha: &HashMap<String, bool>,
     composites: &mut Composites,
 ) -> Region {
@@ -540,6 +558,7 @@ fn paint_region(
         &mut n_carousels,
         scroll_clips, // nested clientHeights bubble up to the doc's scroll_clips
         &mut n_splices,
+        links,
         alpha,
         composites,
     );
@@ -547,7 +566,7 @@ fn paint_region(
     // top-left (the scroll origin), clipped to the scrollport WIDTH — the
     // scroll axis (height) is unbounded so the buffer holds the full content.
     let mut ops = Vec::new();
-    build_sc(f, &mut ops, cw, ch, pad_x, pad_y);
+    build_sc(f, &mut ops, cw, ch, pad_x, pad_y, links);
     let mut buffer = composite(ops, width, alpha, composites);
     // Splice nested carousel strips over their (blank) bands in this buffer.
     for (s, strip) in n_splices {
@@ -682,13 +701,82 @@ enum Op {
         item: Item,
         clip: ClipCells,
     },
+    /// A generated interactive border box. Unlike `Item`, this does not paint
+    /// cells; it survives solely for standards hit testing when an anchor is
+    /// transparent/empty (CSSOM View paint-order targeting).
+    Hit {
+        row0: i64,
+        row1: i64,
+        col0: i64,
+        col1: i64,
+        node: NodeId,
+        link: Link,
+        clip: ClipCells,
+    },
+}
+
+/// The anchors represented by generated boxes in this layout arena. Ordinary
+/// inert elements are intentionally absent: an empty `div` is not an
+/// activation target merely because it has geometry. Live JS clickables have
+/// already been serialized as `x-trust-js:` anchors, so the same rule covers
+/// native hyperlinks and page-script activation.
+fn interaction_links(dom: &Dom, base: &url::Url) -> HashMap<NodeId, Link> {
+    let mut out = HashMap::new();
+    for node in 0..dom.node_count() {
+        if dom.tag_name(node) == Some("a")
+            && let Some(href) = dom.attr(node, "href")
+            && dom.point_hit_testable(node)
+        {
+            out.insert(node, crate::http::resolve(base, href));
+        }
+    }
+    out
+}
+
+/// Append a non-painting hit-test display-list entry for this element's
+/// generated border box. `display:none` never reaches the fragment tree;
+/// visibility, inertness and pointer-events are the remaining eligibility
+/// filters. Opacity deliberately does not participate.
+fn hit_op(
+    f: &Frag<'_>,
+    ops: &mut Vec<Op>,
+    cw: f32,
+    ch: f32,
+    ox: f32,
+    oy: f32,
+    links: &HashMap<NodeId, Link>,
+) {
+    let Some(link) = links.get(&f.node) else {
+        return;
+    };
+    if f.w <= 0.0 || f.h <= 0.0 {
+        return;
+    }
+    ops.push(Op::Hit {
+        row0: ((f.y - oy) / ch).round() as i64,
+        row1: ((f.y + f.h - oy) / ch).round() as i64,
+        col0: ((f.x - ox) / cw).round() as i64,
+        col1: ((f.x + f.w - ox) / cw).round() as i64,
+        node: f.node,
+        link: link.clone(),
+        clip: clip_cells(f.clip, ox, oy, cw, ch),
+    });
 }
 
 /// Paint one STACKING CONTEXT per Appendix E (the root element always forms
 /// one). `ox`/`oy` shift the coordinate origin (the pinned layer paints in
 /// box-relative coordinates).
-fn build_sc(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32) {
+fn build_sc(
+    f: &Frag<'_>,
+    ops: &mut Vec<Op>,
+    cw: f32,
+    ch: f32,
+    ox: f32,
+    oy: f32,
+    links: &HashMap<NodeId, Link>,
+) {
     // E.2 step 1/2: the element's own background.
+    hit_op(f, ops, cw, ch, ox, oy, links);
     fill_op(f, ops, cw, ch, ox, oy);
     // Gather this SC's positioned/SC descendants (piercing pseudo-stacking
     // contexts — their positioned descendants belong to THIS context).
@@ -700,38 +788,47 @@ fn build_sc(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32)
     pos.sort_by_key(|c| c.paint.z.unwrap_or(0));
     // E.2 step 3: negative-z stacking contexts, most negative first.
     for c in neg {
-        build_sc(c, ops, cw, ch, ox, oy);
+        build_sc(c, ops, cw, ch, ox, oy, links);
     }
     // E.2 step 4: in-flow, non-positioned block-level backgrounds, tree order.
-    inflow_bgs(f, ops, cw, ch, ox, oy);
+    inflow_bgs(f, ops, cw, ch, ox, oy, links);
     // E.2 step 5: non-positioned floats, tree order (§9.5) — each as its own
     // pseudo stacking context.
-    build_floats(f, ops, cw, ch, ox, oy);
+    build_floats(f, ops, cw, ch, ox, oy, links);
     // E.2 step 7: in-flow, non-positioned inline content, tree order.
-    inflow_content(f, ops, cw, ch, ox, oy);
+    inflow_content(f, ops, cw, ch, ox, oy, links);
     // E.2 step 8: z:auto positioned (pseudo) and z:0 SCs, one merged
     // tree-order list.
     for (c, is_sc) in zero {
         if is_sc {
-            build_sc(c, ops, cw, ch, ox, oy);
+            build_sc(c, ops, cw, ch, ox, oy, links);
         } else {
-            build_pseudo(c, ops, cw, ch, ox, oy);
+            build_pseudo(c, ops, cw, ch, ox, oy, links);
         }
     }
     // E.2 step 9: positive-z stacking contexts, smallest first.
     for c in pos {
-        build_sc(c, ops, cw, ch, ox, oy);
+        build_sc(c, ops, cw, ch, ox, oy, links);
     }
 }
 
 /// A positioned z:auto box: painted atomically for its own background and
 /// in-flow content, but its positioned descendants and child SCs were lifted
 /// into the enclosing real stacking context (E.2 step 8).
-fn build_pseudo(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32) {
+fn build_pseudo(
+    f: &Frag<'_>,
+    ops: &mut Vec<Op>,
+    cw: f32,
+    ch: f32,
+    ox: f32,
+    oy: f32,
+    links: &HashMap<NodeId, Link>,
+) {
+    hit_op(f, ops, cw, ch, ox, oy, links);
     fill_op(f, ops, cw, ch, ox, oy);
-    inflow_bgs(f, ops, cw, ch, ox, oy);
-    build_floats(f, ops, cw, ch, ox, oy);
-    inflow_content(f, ops, cw, ch, ox, oy);
+    inflow_bgs(f, ops, cw, ch, ox, oy, links);
+    build_floats(f, ops, cw, ch, ox, oy, links);
+    inflow_content(f, ops, cw, ch, ox, oy, links);
 }
 
 /// Appendix E step 5: paint every non-positioned float in `f`'s subtree, in
@@ -741,18 +838,27 @@ fn build_pseudo(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: 
 /// walk descends through plain in-flow boxes but treats a float atomically; a
 /// float that is itself positioned or forms a stacking context is left to the
 /// normal positioned/SC path (its `sc`/`positioned` flag wins).
-fn build_floats(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32) {
+fn build_floats(
+    f: &Frag<'_>,
+    ops: &mut Vec<Op>,
+    cw: f32,
+    ch: f32,
+    ox: f32,
+    oy: f32,
+    links: &HashMap<NodeId, Link>,
+) {
     for c in &f.children {
         if c.paint.sc || c.paint.positioned {
             continue;
         }
         if c.paint.float {
+            hit_op(c, ops, cw, ch, ox, oy, links);
             fill_op(c, ops, cw, ch, ox, oy);
-            inflow_bgs(c, ops, cw, ch, ox, oy);
-            build_floats(c, ops, cw, ch, ox, oy);
-            inflow_content(c, ops, cw, ch, ox, oy);
+            inflow_bgs(c, ops, cw, ch, ox, oy, links);
+            build_floats(c, ops, cw, ch, ox, oy, links);
+            inflow_content(c, ops, cw, ch, ox, oy, links);
         } else {
-            build_floats(c, ops, cw, ch, ox, oy);
+            build_floats(c, ops, cw, ch, ox, oy, links);
         }
     }
 }
@@ -787,24 +893,44 @@ fn collect_positioned<'f, 't>(
 
 /// In-flow, non-positioned block-level backgrounds, tree order (E.2 step 4).
 /// Floats paint as a unit in step 5 (`build_floats`), so they're skipped here.
-fn inflow_bgs(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32) {
+fn inflow_bgs(
+    f: &Frag<'_>,
+    ops: &mut Vec<Op>,
+    cw: f32,
+    ch: f32,
+    ox: f32,
+    oy: f32,
+    links: &HashMap<NodeId, Link>,
+) {
     for c in &f.children {
         if c.paint.sc || c.paint.positioned || c.paint.float {
             continue;
         }
         if matches!(c.kind, FragKind::Block) {
+            hit_op(c, ops, cw, ch, ox, oy, links);
             fill_op(c, ops, cw, ch, ox, oy);
         }
-        inflow_bgs(c, ops, cw, ch, ox, oy);
+        inflow_bgs(c, ops, cw, ch, ox, oy, links);
     }
 }
 
 /// In-flow, non-positioned inline content, tree order (E.2 step 7). Floats
 /// paint as a unit in step 5 (`build_floats`), so they're skipped here.
-fn inflow_content(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32) {
+fn inflow_content(
+    f: &Frag<'_>,
+    ops: &mut Vec<Op>,
+    cw: f32,
+    ch: f32,
+    ox: f32,
+    oy: f32,
+    links: &HashMap<NodeId, Link>,
+) {
     for c in &f.children {
         if c.paint.sc || c.paint.positioned || c.paint.float {
             continue;
+        }
+        if !matches!(c.kind, FragKind::Block) {
+            hit_op(c, ops, cw, ch, ox, oy, links);
         }
         if let FragKind::Line(pieces) = &c.kind {
             let base_col = ((c.x - ox) / cw).round() as i64;
@@ -819,7 +945,7 @@ fn inflow_content(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy
                 });
             }
         }
-        inflow_content(c, ops, cw, ch, ox, oy);
+        inflow_content(c, ops, cw, ch, ox, oy, links);
     }
 }
 
@@ -953,6 +1079,7 @@ fn composite(
     // Clip an op's placement to the viewport band, mirroring the P0 painter:
     // left overhang cuts leading cells, the right edge truncates.
     let mut placed: Vec<Option<Placed>> = Vec::with_capacity(ops.len());
+    let mut hits: Vec<PlacedHit> = Vec::new();
     // ---- stamping pass (paint order) ----
     for (i, op) in ops.into_iter().enumerate() {
         match op {
@@ -1061,6 +1188,32 @@ fn composite(
                     col: c0,
                     item,
                 }));
+            }
+            Op::Hit {
+                row0,
+                row1,
+                col0,
+                col1,
+                node,
+                link,
+                clip,
+            } => {
+                let c0 = col0.max(clip.c0).clamp(0, cols_u as i64);
+                let c1 = col1.min(clip.c1).clamp(c0, cols_u as i64);
+                let r0 = row0.max(clip.r0).max(0);
+                let r1 = row1.min(clip.r1).max(r0);
+                if c1 > c0 && r1 > r0 {
+                    hits.push(PlacedHit {
+                        row: r0 as usize,
+                        col: c0 as u32,
+                        width: (c1 - c0).min(i64::from(u16::MAX)) as u16,
+                        height: (r1 - r0).min(i64::from(u16::MAX)) as u16,
+                        node,
+                        link,
+                        order: i,
+                    });
+                }
+                placed.push(None);
             }
         }
     }
@@ -1197,6 +1350,56 @@ fn composite(
     for row in &mut rows {
         row.items.sort_by_key(|it| it.col);
     }
+    // A generated anchor box that already emitted a normal linked text/image
+    // item keeps the established item path. The additive hit surface is only
+    // needed for a box with no painted activation representation. This is the
+    // compatibility boundary: ordinary links and their navigation order do not
+    // change, while an empty overlay anchor finally exposes its real CSS box.
+    for hit in hits {
+        let represented = rows
+            .iter()
+            .enumerate()
+            .flat_map(|(row, items)| items.items.iter().map(move |item| (row, item)))
+            .any(|(row, item)| {
+                if item.link.as_ref() != Some(&hit.link) {
+                    return false;
+                }
+                let item_right = u32::from(item.col) + u32::from(item.width);
+                let hit_right = hit.col + u32::from(hit.width);
+                let item_bottom = row + usize::from(item.height.max(1));
+                let hit_bottom = hit.row + usize::from(hit.height.max(1));
+                row < hit_bottom
+                    && hit.row < item_bottom
+                    && u32::from(item.col) < hit_right
+                    && hit.col < item_right
+            });
+        if represented {
+            continue;
+        }
+        ensure_rows(&mut rows, hit.row + usize::from(hit.height.max(1)));
+        let item = rows[hit.row].items.len();
+        rows[hit.row].items.push(Item {
+            col: hit.col.min(u32::from(u16::MAX)) as u16,
+            width: hit.width,
+            height: hit.height.max(1),
+            text: String::new(),
+            kind: ItemKind::HitRegion,
+            image: None,
+            emph: Emphasis::default(),
+            node: hit.node,
+            link: Some(hit.link),
+            crop: false,
+            pixelated: false,
+            invisible: true,
+        });
+        rows[hit.row].hits.push(HitBox {
+            col: hit.col.min(u32::from(u16::MAX)) as u16,
+            width: hit.width,
+            height: hit.height.max(1),
+            item,
+            order: hit.order,
+        });
+    }
     rows
 }
 
@@ -1207,6 +1410,16 @@ struct Placed {
     row: usize,
     col: u32,
     item: Item,
+}
+
+struct PlacedHit {
+    row: usize,
+    col: u32,
+    width: u16,
+    height: u16,
+    node: NodeId,
+    link: Link,
+    order: usize,
 }
 
 /// One alpha-composite overlap group: the `placed` indices of its member images

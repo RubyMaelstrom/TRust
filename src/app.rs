@@ -3955,6 +3955,46 @@ impl App {
                 }
             }
         }
+        // A standards hit-test also considers generated boxes that paint no
+        // terminal cells. Keep the established visible-item path above as the
+        // compatibility-first fast path, then consult the paint-ordered link
+        // surfaces only when no ordinary interactive item covered the point.
+        if hit.item.is_none() {
+            let mut best: Option<(usize, usize, usize)> = None;
+            for r in (0..=doc_row).rev() {
+                if r >= g.doc.rows.len() {
+                    continue;
+                }
+                let row_offset = doc_row - r;
+                let effective = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r);
+                for surface in &effective.hits {
+                    if row_offset >= usize::from(surface.height.max(1)) {
+                        continue;
+                    }
+                    let Some((start, width)) =
+                        crate::layout2::hit_columns(&effective, &g.doc.carousels, r, surface)
+                    else {
+                        continue;
+                    };
+                    let end = start.saturating_add(width);
+                    if local_col < start || local_col >= end {
+                        continue;
+                    }
+                    if best.is_none_or(|(_, _, order)| surface.order > order) {
+                        best = Some((r, surface.item, surface.order));
+                    }
+                }
+            }
+            if let Some((r, i, _)) = best {
+                hit.item = Some((r, i));
+                if hit.hover.is_none() {
+                    let effective = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r);
+                    if let Some(item) = effective.items.get(i) {
+                        hit.hover = Self::hover_resolve(g, item);
+                    }
+                }
+            }
+        }
         hit
     }
 
@@ -5388,6 +5428,27 @@ impl App {
                         return Some((fi, r, i));
                     }
                 }
+            }
+            if row < oy.saturating_add(f.row) || col < ox.saturating_add(f.col) {
+                continue;
+            }
+            let local_row = row.saturating_sub(oy.saturating_add(f.row)) as usize;
+            let local_col = col.saturating_sub(ox.saturating_add(f.col));
+            let mut best: Option<(usize, usize, usize)> = None;
+            for (r, frow) in f.rows.iter().enumerate().take(local_row + 1) {
+                let row_offset = local_row - r;
+                for surface in &frow.hits {
+                    if row_offset < usize::from(surface.height.max(1))
+                        && local_col >= surface.col
+                        && local_col < surface.col.saturating_add(surface.width)
+                        && best.is_none_or(|(_, _, order)| surface.order > order)
+                    {
+                        best = Some((r, surface.item, surface.order));
+                    }
+                }
+            }
+            if let Some((r, i, _)) = best {
+                return Some((fi, r, i));
             }
         }
         None
@@ -8708,6 +8769,51 @@ mod tests {
 
         assert_eq!(app.browser.as_ref().unwrap().sel_item, Some(target));
         assert_eq!(app.status, "external link: mailto:x@y.z");
+    }
+
+    #[test]
+    fn http_mouse_left_click_activates_empty_overlay_anchor_box() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        app.last_content_area = ratatui::layout::Rect::new(3, 2, 80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let html = br#"<body style="margin:0">
+            <div style="position:relative;width:160px;height:32px">
+              <a href="mailto:fish@example.com"
+                 style="position:absolute;inset:0;z-index:1"></a>
+              <span>Fish community</span>
+            </div>
+          </body>"#;
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html,
+            80,
+            0,
+            &Default::default(),
+        ));
+        let (row, surface) = {
+            let g = app.browser.as_ref().unwrap();
+            g.doc
+                .rows
+                .iter()
+                .enumerate()
+                .find_map(|(r, row)| row.hits.first().map(|hit| (r, hit.clone())))
+                .expect("empty anchor hit surface")
+        };
+        let target = (row, surface.item);
+        let x = app.last_content_area.x + surface.col + surface.width / 2;
+        let y = app.last_content_area.y + row as u16 + surface.height / 2;
+
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            x,
+            y,
+        ));
+
+        assert_eq!(app.browser.as_ref().unwrap().sel_item, Some(target));
+        assert_eq!(app.status, "external link: mailto:fish@example.com");
     }
 
     /// An app showing a page with a fixed-height (96px ≈ 6 rows)

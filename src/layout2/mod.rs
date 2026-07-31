@@ -153,6 +153,7 @@ pub fn lay_out_document(
     let candidates = boundary::collect(dom, &frag, cell_w, cell_h);
     let mut out = paint::paint(
         dom,
+        base,
         &mut frag,
         &fixed,
         flow_bottom,
@@ -325,6 +326,7 @@ pub fn lay_subtree_fragment(
     // the next full render, matching the region-patch v1 cut.
     let out = paint::paint(
         dom,
+        base,
         &mut frag,
         &fixed,
         flow_bottom,
@@ -392,7 +394,7 @@ pub fn lay_region_fragment(
         grid_tracks: Default::default(),
     };
     let (mut frag, _flow_bottom, _anchors, _fixed) = flow.layout(&root);
-    paint::region_buffer(dom, &mut frag, cell_w, cell_h)
+    paint::region_buffer(dom, base, &mut frag, cell_w, cell_h)
 }
 
 /// The page-level media affordance: a page that declares itself a video page
@@ -456,7 +458,10 @@ fn page_media_fallback(
         },
     };
     let extra = usize::from(item.height.max(1)) - 1;
-    rows.push(Row { items: vec![item] });
+    rows.push(Row {
+        items: vec![item],
+        hits: Vec::new(),
+    });
     for _ in 0..extra {
         rows.push(Row::default());
     }
@@ -2436,6 +2441,108 @@ mod tests {
             80,
         );
         assert_eq!(row_text(&out.rows[0]), "BBAA");
+    }
+
+    #[test]
+    fn empty_overlay_anchor_exposes_its_css_box_without_painting_a_marker() {
+        // Reddit's community cards use exactly this shape: an empty anchor is
+        // stretched over visible sibling content. The anchor has no text item,
+        // but its generated box still participates in CSS point hit testing.
+        let out = lay(
+            r#"<body style="margin:0"><div style="position:relative;width:160px;height:32px">
+               <a href="/r/Fish/" style="position:absolute;inset:0;z-index:1"></a>
+               <span>r/Fish</span>
+               </div>
+               <a href="/r/Fish/">same destination elsewhere</a></body>"#,
+            80,
+        );
+        let (row_idx, title) = find(&out, "r/Fish");
+        assert_eq!((row_idx, title.col), (0, 0));
+        let surfaces: Vec<_> = out.rows.iter().flat_map(|row| &row.hits).collect();
+        assert_eq!(
+            surfaces.len(),
+            1,
+            "the empty anchor contributes one box even when a different painted link has the same URL"
+        );
+        let surface = surfaces[0];
+        assert_eq!(
+            (surface.col, surface.width, surface.height),
+            (0, 20, 2),
+            "the hit surface is the anchor's 160×32px border box"
+        );
+        let target = &out.rows[0].items[surface.item];
+        assert_eq!(target.kind, ItemKind::HitRegion);
+        assert!(target.text.is_empty(), "no synthetic glyph is painted");
+        assert!(
+            crate::layout2::visual_columns(&out.rows[0], &[], 0)
+                .iter()
+                .all(|(i, ..)| *i != surface.item),
+            "the geometry-only item never enters terminal rendering"
+        );
+        assert!(matches!(
+            target.link.as_ref(),
+            Some(crate::doc::Link::Http(url)) if url.path() == "/r/Fish/"
+        ));
+    }
+
+    #[test]
+    fn an_empty_div_does_not_become_an_activation_target() {
+        let out = lay(
+            r#"<body style="margin:0"><div style="position:relative;width:160px;height:32px">
+               <div style="position:absolute;inset:0;z-index:1"></div>
+               <span>plain card</span>
+               </div></body>"#,
+            80,
+        );
+        assert!(
+            out.rows.iter().all(|row| row.hits.is_empty()),
+            "geometry alone is not interactive semantics"
+        );
+    }
+
+    #[test]
+    fn box_hit_testing_respects_pointer_events_visibility_inert_and_opacity() {
+        let cases = [
+            ("pointer-events:none", "", false),
+            ("visibility:hidden", "", false),
+            ("interactivity:inert", "", false),
+            ("opacity:0", "", true),
+            ("", "inert", false),
+        ];
+        for (style, attr, expected) in cases {
+            let out = lay(
+                &format!(
+                    r#"<body style="margin:0"><div style="position:relative;width:80px;height:16px">
+                       <a href="/go" {attr} style="position:absolute;inset:0;{style}"></a>
+                       <span>card</span>
+                       </div></body>"#
+                ),
+                40,
+            );
+            assert_eq!(
+                out.rows.iter().any(|row| !row.hits.is_empty()),
+                expected,
+                "style={style:?}, attr={attr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_empty_anchors_keep_css_paint_order() {
+        let out = lay(
+            r#"<body style="margin:0"><div style="position:relative;width:80px;height:16px">
+               <a href="/top" style="position:absolute;inset:0;z-index:2"></a>
+               <a href="/bottom" style="position:absolute;inset:0;z-index:1"></a>
+               </div></body>"#,
+            40,
+        );
+        let row = &out.rows[0];
+        assert_eq!(row.hits.len(), 2);
+        let top = row.hits.iter().max_by_key(|hit| hit.order).unwrap();
+        assert!(matches!(
+            row.items[top.item].link.as_ref(),
+            Some(crate::doc::Link::Http(url)) if url.path() == "/top"
+        ));
     }
 
     #[test]

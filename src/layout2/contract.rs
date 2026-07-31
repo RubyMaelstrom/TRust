@@ -196,6 +196,12 @@ pub enum ItemKind {
     /// A generated border glyph (box-drawing) — rendered as quiet structural
     /// chrome (the theme's DIM), never selectable or wrapped.
     Border,
+    /// A generated, non-rendering keyboard target for an interactive CSS box
+    /// that emitted no text/image item of its own (for example an empty
+    /// absolutely-positioned `<a>` stretched over a card). Pointer geometry
+    /// lives in `Row::hits`; this item gives the existing selection/navigation
+    /// model one stable address without painting a synthetic glyph.
+    HitRegion,
 }
 
 /// One positioned inline box on a row.
@@ -273,6 +279,24 @@ impl Item {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Row {
     pub items: Vec<Item>,
+    /// Interactive CSS border boxes that exist independently of painted
+    /// terminal cells. Stored only on the row containing the box's top edge;
+    /// `height` reaches over later rows. `order` is the display-list position,
+    /// so a pointer chooses the topmost eligible box rather than whichever
+    /// visible text item happened to survive compositing.
+    pub hits: Vec<HitBox>,
+}
+
+/// A point-hit-test surface for a generated CSS box. It addresses the
+/// non-rendering `ItemKind::HitRegion` in the same row, so mouse and keyboard
+/// activation share the ordinary `Link` dispatch path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HitBox {
+    pub col: u16,
+    pub width: u16,
+    pub height: u16,
+    pub item: usize,
+    pub order: usize,
 }
 
 /// A `position:fixed` element captured into the PINNED overlay layer: its laid
@@ -657,6 +681,7 @@ pub fn visual_columns(
         .items
         .iter()
         .enumerate()
+        .filter(|(_, item)| item.kind != ItemKind::HitRegion)
         .filter_map(|(i, item)| {
             let (col, w, cut) = carousel_place(carousels, row_idx, item)?;
             Some((col, i, w, cut))
@@ -671,6 +696,22 @@ pub fn visual_columns(
         col = start + w;
     }
     out
+}
+
+/// The on-screen horizontal interval of a non-painting hit box after applying
+/// the same carousel window as its synthetic item. Unlike `visual_columns`,
+/// this deliberately does not participate in overlap-append: CSS point hit
+/// testing uses the box's painted position, while overlap-append is only the
+/// terminal's fallback for displaying overlapping text.
+pub fn hit_columns(
+    row: &Row,
+    carousels: &[Carousel],
+    row_idx: usize,
+    hit: &HitBox,
+) -> Option<(u16, u16)> {
+    let item = row.items.get(hit.item)?;
+    let (col, width, _) = carousel_place(carousels, row_idx, item)?;
+    (width > 0).then_some((col, width))
 }
 
 /// The substring of `s` covering display columns `[skip, skip + take)` — the
@@ -725,7 +766,8 @@ pub fn effective_row<'a>(
         // (recursion) so a scroll container inside this one draws its own
         // windowed content — each independently scrolled (CSS Overflow L3).
         let brow = effective_row(&rg.buffer, &rg.regions, buf_idx);
-        for it in &brow.items {
+        let mut item_map = HashMap::new();
+        for (bi, it) in brow.items.iter().enumerate() {
             // Window through this region's nested carousels first (buffer-
             // relative column shift/clip); no carousels ⇒ the item's own col.
             let Some(bcol) = visible_col(&rg.carousels, buf_idx, it) else {
@@ -750,7 +792,31 @@ pub fn effective_row<'a>(
                 }
             }
             it.col += rg.left;
+            item_map.insert(bi, merged.items.len());
             merged.items.push(it);
+        }
+        for hit in &brow.hits {
+            let Some(&item) = item_map.get(&hit.item) else {
+                continue;
+            };
+            let source = &brow.items[hit.item];
+            let Some((bcol, visible_w, _)) = carousel_place(&rg.carousels, buf_idx, source) else {
+                continue;
+            };
+            if bcol >= rg.width {
+                continue;
+            }
+            let width = visible_w.min(rg.width - bcol);
+            if width == 0 {
+                continue;
+            }
+            merged.hits.push(HitBox {
+                col: bcol + rg.left,
+                width,
+                height: hit.height.min(rg.height),
+                item,
+                order: hit.order,
+            });
         }
     }
     Cow::Owned(merged)

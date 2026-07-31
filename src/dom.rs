@@ -1611,8 +1611,47 @@ impl Dom {
     pub fn visibility_hidden(&self, id: NodeId) -> bool {
         matches!(
             self.computed_value(id, "visibility").as_deref(),
-            Some("hidden" | "collapse")
+            Some("hidden" | "force-hidden" | "collapse")
         )
+    }
+
+    /// Whether this element's generated boxes may participate in point hit
+    /// testing. CSS UI 4 §6.2 removes `pointer-events:none` boxes, CSS Display
+    /// 4 §5 excludes invisible boxes, and HTML/CSS UI inertness suppresses the
+    /// whole flat-tree subtree. Opacity is deliberately absent: a fully
+    /// transparent box remains hit-testable.
+    pub fn point_hit_testable(&self, id: NodeId) -> bool {
+        if self.visibility_hidden(id)
+            || self
+                .computed_value(id, "pointer-events")
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("none"))
+            || self
+                .computed_value(id, "interactivity")
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("inert"))
+        {
+            return false;
+        }
+        let mut cur = Some(id);
+        while let Some(node) = cur {
+            if self.attr(node, "inert").is_some() {
+                return false;
+            }
+            cur = self.parent_composed(node);
+        }
+        true
+    }
+
+    /// Whether `id` or one of its DOM descendants carries native hyperlink
+    /// activation semantics and remains eligible for point hit testing. This
+    /// lets layout retain an otherwise paint-suppressed out-of-flow subtree
+    /// only when discarding it would also discard a real interaction surface.
+    pub fn subtree_has_point_hit_target(&self, id: NodeId) -> bool {
+        (self.tag_name(id) == Some("a")
+            && self.attr(id, "href").is_some()
+            && self.point_hit_testable(id))
+            || self
+                .child_iter(id)
+                .any(|child| self.subtree_has_point_hit_target(child))
     }
 
     /// Whether an element reserves height (`vertical`) or width via positive
@@ -5853,6 +5892,8 @@ const INHERITED_LAYOUT_PROPS: &[&str] = &[
     "list-style-position",
     "text-indent",
     "visibility",
+    "pointer-events",
+    "interactivity",
     "image-rendering",
     "caption-side",
     "overflow-wrap",
@@ -5864,6 +5905,11 @@ const PROPS: &[PropDef] = &[
     //    name                    inherited  baked
     prop("display", false, true),
     prop("visibility", true, true),
+    // CSS UI 4 §6.2/§6.3: both inherit and affect hit testing without
+    // changing box generation. Bake them into live snapshots so the layout
+    // arena sees the same interaction eligibility as the resident page DOM.
+    prop("pointer-events", true, true),
+    prop("interactivity", true, true),
     prop("opacity", false, false),
     prop("animation-name", false, false),
     prop("animation-fill-mode", false, false),
