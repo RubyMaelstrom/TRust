@@ -2016,6 +2016,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cyclic_percentage_max_width_compresses_images_in_flex_items() {
+        // css-sizing-3 §5.2.1: a cyclic percentage in a replaced element's
+        // max-width resolves against zero for its min-content contribution.
+        // Thus `max-width:100%` makes these natural 616px images compressible;
+        // the flex items' automatic minimums do not pin them at 616px.
+        let images = img_sizes(&[("http://e.com/tile.png", 77, 22)]);
+        let out = lay_images(
+            r#"<body style="margin:0"><div style="display:flex;width:1520px;column-gap:16px">
+                <a style="display:block;flex:1 1 0"><div><img src="tile.png" style="display:block;max-width:100%"></div></a>
+                <a style="display:block;flex:1 1 0"><div><img src="tile.png" style="display:block;max-width:100%"></div></a>
+                <a style="display:block;flex:1 1 0"><div><img src="tile.png" style="display:block;max-width:100%"></div></a>
+               </div></body>"#,
+            240,
+            &images,
+        );
+        let boxes: Vec<(u16, u16)> = out
+            .rows
+            .iter()
+            .flat_map(|row| &row.items)
+            .filter(|item| item.kind == ItemKind::Image)
+            .map(|item| (item.col, item.width))
+            .collect();
+        assert_eq!(
+            boxes,
+            vec![(0, 62), (64, 62), (128, 62)],
+            "three flex:1 items share 1520px minus two 16px gaps equally"
+        );
+    }
+
     // ---- the P3 gate: grid (real tracks + placement on real widths) ----
 
     #[test]

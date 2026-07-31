@@ -191,11 +191,21 @@ impl Flow<'_> {
     /// A block-level child's margin-box contribution to its parent's
     /// intrinsic width: its definite (non-percentage) width — else its own
     /// intrinsic width — clamped by non-percentage min/max, plus borders,
-    /// padding, and margins (percentages and `auto` behave as zero under an
-    /// intrinsic-sizing constraint — css-sizing-3 §5.2.2).
+    /// padding, and margins (css-sizing-3 §5.2.1).
     pub(crate) fn contribution(&self, b: &BoxNode, mode: IMode, inl: &InlineStyle) -> f32 {
         let s = &b.style;
-        let side = |l: &Len| l.resolve(None).unwrap_or(0.0);
+        // Cyclic percentages in min sizes, margins, and padding resolve
+        // against zero for every intrinsic contribution. A compressible
+        // replaced element's preferred/max size does the same specifically
+        // for its min-content contribution; this is what lets an image with
+        // `max-width:100%` shrink inside an intrinsically-sized flex item.
+        let side = |l: &Len| l.resolve(Some(0.0)).unwrap_or(0.0);
+        let compressible_min = mode == IMode::Min
+            && matches!(
+                &b.content,
+                Content::Atomic(atom) if matches!(&atom.kind, AtomKind::Img { .. })
+            );
+        let preferred_basis = compressible_min.then_some(0.0);
         let bp = s.border[super::style::LEFT]
             + s.border[super::style::RIGHT]
             + side(&s.padding[super::style::LEFT]).max(0.0)
@@ -209,13 +219,20 @@ impl Flow<'_> {
         };
         let content = s
             .width
-            .resolve(None)
+            .resolve(preferred_basis)
             .map(to_content)
             .unwrap_or_else(|| self.intrinsic_w(b, mode, inl));
-        let min = s.min_width.resolve(None).map(to_content).unwrap_or(0.0);
+        let min = s
+            .min_width
+            .resolve(Some(0.0))
+            .map(to_content)
+            .unwrap_or(0.0);
         let max = match &s.max_width {
             Len::None => f32::INFINITY,
-            l => l.resolve(None).map(to_content).unwrap_or(f32::INFINITY),
+            l => l
+                .resolve(preferred_basis)
+                .map(to_content)
+                .unwrap_or(f32::INFINITY),
         }
         .max(min);
         content.clamp(min, max)
@@ -225,8 +242,8 @@ impl Flow<'_> {
     }
 
     /// A replaced/control/media atom's content intrinsic width, px. Under an
-    /// intrinsic constraint percentages behave as auto, so the replaced
-    /// sizing runs with no percentage basis.
+    /// intrinsic constraint percentages behave as auto here; `contribution`
+    /// applies the special cyclic-percentage constraints around this content.
     fn atom_intrinsic_w(&self, atom: &super::tree::Atom, mode: IMode) -> f32 {
         match &atom.kind {
             AtomKind::Img { url, alt } => {
