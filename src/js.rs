@@ -7212,6 +7212,17 @@ pub struct SubtreePatch {
     pub tier: BoundaryTier,
 }
 
+/// The already-constructed, application/x-www-form-urlencoded form entry list
+/// for a page-driven native submission. Carrying it across the actor boundary
+/// is essential for non-rendered forms: live rendering intentionally omits
+/// `display:none` subtrees, but HTML still submits their successful controls.
+#[derive(Debug, Clone)]
+pub struct FormSubmission {
+    pub action: String,
+    pub method: String,
+    pub body: String,
+}
+
 /// Page → app.
 #[derive(Debug)]
 pub enum PageEvt {
@@ -7259,12 +7270,15 @@ pub enum PageEvt {
     /// The page did not prevent a form submit; the app should perform
     /// the normal HTTP form submission it already prepared.
     SubmitDefault,
-    /// A CLICK on a submit control fired the form's `submit` event and the
-    /// page did not prevent it — the app should run the native GET/POST for
-    /// this form. Carries the form + submitter arena nodes (the app maps them
-    /// to its doc-model indices); unlike `SubmitDefault` the app hasn't
-    /// pre-recorded which form, because the click path didn't know.
-    SubmitForm { form: usize, submitter: usize },
+    /// A click or `requestSubmit()` fired the form's `submit` event and the page
+    /// did not prevent it — the app should run the native GET/POST for this
+    /// form. The submitter is absent for no-argument `requestSubmit()`, which is
+    /// observably different from choosing the form's first submit button.
+    SubmitForm {
+        form: usize,
+        submitter: Option<usize>,
+        submission: Option<FormSubmission>,
+    },
 }
 
 #[derive(Debug)]
@@ -8220,12 +8234,27 @@ fn page_actor(
     // (Console is left cumulative — it's a diagnostic channel, not a count.)
     if painted_live {
         page.outcome.errors.clear();
+        // requestSubmit() may have run synchronously during parsing or
+        // DOMContentLoaded. Emit it only after the first paint; its entry list
+        // was captured from the complete resident DOM (including hidden forms).
+        if let Some((form, submitter, submission)) = take_form_submit(&mut page) {
+            let _ = evts.blocking_send(PageEvt::SubmitForm {
+                form,
+                submitter,
+                submission,
+            });
+            return;
+        }
     }
 
     // Drain the rest of the lifecycle (background network + timers).
     settle_page(&mut page);
     page.outcome.elapsed = page.started.elapsed();
     let changed = page.dom.borrow_mut().take_dirty();
+    // An async DOMContentLoaded/load handler can reach requestSubmit() while
+    // settle_page drains its promise continuation. Keep the intent until after
+    // the settled DOM has been serialized.
+    let pending_form_submit = take_form_submit(&mut page);
     if painted_live && !changed {
         // Shell already reflects the settled page; nothing new to send.
     } else {
@@ -8259,6 +8288,7 @@ fn page_actor(
             && !has_scroll_work
             && !has_workers
             && !has_hover_work
+            && pending_form_submit.is_none()
         {
             let _ = evts.blocking_send(PageEvt::Static { html: out, outcome });
             return;
@@ -8269,6 +8299,14 @@ fn page_actor(
         {
             return;
         }
+    }
+    if let Some((form, submitter, submission)) = pending_form_submit {
+        let _ = evts.blocking_send(PageEvt::SubmitForm {
+            form,
+            submitter,
+            submission,
+        });
+        return;
     }
 
     // The at-rest event loop. The actor selects between the app's command
@@ -8359,9 +8397,18 @@ fn page_actor(
                 // If the page didn't prevent the `submit`, the app runs the
                 // native GET/POST (a prevented submit falls through to the
                 // re-render below — the page owns the update).
-                if let Some((form, submitter)) = take_click_submit(&mut page) {
+                if let Some((form, submitter, submission)) = take_click_submit(&mut page) {
+                    // Serialize any synchronous submit-handler mutations before
+                    // asking the app to construct the form entry list.
+                    if !finish_dispatch_render(&mut page, &evts, false) {
+                        return;
+                    }
                     if evts
-                        .blocking_send(PageEvt::SubmitForm { form, submitter })
+                        .blocking_send(PageEvt::SubmitForm {
+                            form,
+                            submitter: Some(submitter),
+                            submission,
+                        })
                         .is_err()
                     {
                         return;
@@ -8923,8 +8970,17 @@ fn finish_dispatch(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageE
     // freshly-rendered doc (its `anchor_rows` are current). Captured before the
     // render — the click handler that set it has already run.
     let frag = take_scroll_fragment(page);
-    if !finish_dispatch_render(page, evts) {
+    if !finish_dispatch_render(page, evts, true) {
         return false;
+    }
+    if let Some((form, submitter, submission)) = take_form_submit(page) {
+        return evts
+            .blocking_send(PageEvt::SubmitForm {
+                form,
+                submitter,
+                submission,
+            })
+            .is_ok();
     }
     if let Some(frag) = frag {
         return evts.blocking_send(PageEvt::ScrollToFragment(frag)).is_ok();
@@ -8935,6 +8991,7 @@ fn finish_dispatch(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageE
 fn finish_dispatch_render(
     page: &mut LoadedPage,
     evts: &tokio::sync::mpsc::Sender<PageEvt>,
+    acknowledge_settle: bool,
 ) -> bool {
     if page.outcome.panicked {
         // Engine bug: degrade to static, last render stands.
@@ -8970,7 +9027,7 @@ fn finish_dispatch_render(
     if !scrolls.is_empty() {
         return true; // the Scrolled events stood in for Settled
     }
-    evts.blocking_send(PageEvt::Settled).is_ok()
+    !acknowledge_settle || evts.blocking_send(PageEvt::Settled).is_ok()
 }
 
 /// Send a `PageEvt::Scrolled` for each page-initiated scroll write; returns
@@ -9272,7 +9329,7 @@ fn take_script_navigation(page: &mut LoadedPage) -> Option<String> {
 /// on a submit control whose `submit` event the page didn't cancel). Returns
 /// the `(form, submitter)` arena nodes so the app runs the native GET/POST; a
 /// prevented submit (page owns it) and a non-submit click both return None.
-fn take_click_submit(page: &mut LoadedPage) -> Option<(usize, usize)> {
+fn take_click_submit(page: &mut LoadedPage) -> Option<(usize, usize, Option<FormSubmission>)> {
     let v = page
         .ctx
         .eval(Source::from_bytes(
@@ -9282,7 +9339,52 @@ fn take_click_submit(page: &mut LoadedPage) -> Option<(usize, usize)> {
         .ok()?;
     let s = v.to_string(&mut page.ctx).ok()?.to_std_string_lossy();
     let (f, sub) = s.split_once(',')?;
-    Some((f.trim().parse().ok()?, sub.trim().parse().ok()?))
+    let form = f.trim().parse().ok()?;
+    let submitter = sub.trim().parse().ok()?;
+    let submission = form_submission(page, form, Some(submitter));
+    Some((form, submitter, submission))
+}
+
+/// A standards-driven `HTMLFormElement.requestSubmit()` that completed without
+/// cancellation. The optional second arena node is absent for requestSubmit()
+/// with no argument, so the app does not invent a successful submit button.
+fn take_form_submit(
+    page: &mut LoadedPage,
+) -> Option<(usize, Option<usize>, Option<FormSubmission>)> {
+    let v = call_trust(&mut page.ctx, "takeFormSubmit", &[]).ok()?;
+    let s = v.to_string(&mut page.ctx).ok()?.to_std_string_lossy();
+    let (form, submitter) = s.split_once(',')?;
+    let form = form.trim().parse().ok()?;
+    let submitter = (!submitter.trim().is_empty())
+        .then(|| submitter.trim().parse().ok())
+        .flatten();
+    let submission = form_submission(page, form, submitter);
+    Some((form, submitter, submission))
+}
+
+/// Construct successful controls and submitter overrides in the page realm,
+/// where the complete DOM still exists (including non-rendered form subtrees).
+fn form_submission(
+    page: &mut LoadedPage,
+    form: usize,
+    submitter: Option<usize>,
+) -> Option<FormSubmission> {
+    let submitter = submitter
+        .map(|id| JsValue::from(id as f64))
+        .unwrap_or_else(JsValue::null);
+    let value = call_trust(
+        &mut page.ctx,
+        "formSubmission",
+        &[JsValue::from(form as f64), submitter],
+    )
+    .ok()?;
+    let json = value.to_string(&mut page.ctx).ok()?.to_std_string_lossy();
+    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    Some(FormSubmission {
+        action: value.get("action")?.as_str()?.to_string(),
+        method: value.get("method")?.as_str()?.to_string(),
+        body: value.get("body")?.as_str()?.to_string(),
+    })
 }
 
 fn prepare_dispatch(page: &mut LoadedPage) {
@@ -11122,7 +11224,7 @@ const PRELUDE: &str = r##"
         // runs the native GET/POST.
         const btn = submitControlFor(t);
         if (btn) {
-            const form = nearestForm(btn);
+            const form = formOwner(btn);
             if (form) {
                 const sev = new Event("submit", { bubbles: true, cancelable: true });
                 sev.submitter = btn;
@@ -11250,6 +11352,80 @@ const PRELUDE: &str = r##"
         }
         return null;
     }
+    // HTML form-owner reset/association rules, including controls explicitly
+    // associated through `form=id` rather than nested in the form. Activation,
+    // requestSubmit(), and the live controls collection share this helper.
+    function formOwner(el) {
+        if (!el || el.nodeType !== 1) return null;
+        const explicit = el.getAttribute("form");
+        if (explicit !== null) {
+            const owner = g.document && g.document.getElementById(explicit);
+            return owner && owner.localName === "form" ? owner : null;
+        }
+        return nearestForm(el.parentNode);
+    }
+    function listedFormControls(form) {
+        if (!form || !g.document) return [];
+        return g.document
+            .querySelectorAll("button,fieldset,input,object,output,select,textarea")
+            .filter(function (el) {
+                // input[type=image] is form-associated but expressly excluded
+                // from HTMLFormElement.elements.
+                return !(el.localName === "input" && String(el.type || "").toLowerCase() === "image")
+                    && formOwner(el) === form;
+            });
+    }
+    function controlWillValidate(el) {
+        const type = el.localName === "input" ? String(el.type || "text").toLowerCase() : "";
+        return !(el.hasAttribute("disabled")
+            || el.hasAttribute("readonly")
+            || (el.localName === "input" && ["hidden", "button", "reset", "submit", "image"].includes(type)));
+    }
+    function controlValidity(el) {
+        const type = el.localName === "input" ? String(el.type || "text").toLowerCase() : "";
+        const barred = !controlWillValidate(el);
+        let valueMissing = false;
+        if (!barred && el.hasAttribute("required")) {
+            if (type === "checkbox") {
+                valueMissing = !el.checked;
+            } else if (type === "radio") {
+                const owner = formOwner(el);
+                const name = el.getAttribute("name") || "";
+                valueMissing = !g.document.querySelectorAll("input").some(function (radio) {
+                    return String(radio.type).toLowerCase() === "radio"
+                        && (radio.getAttribute("name") || "") === name
+                        && formOwner(radio) === owner
+                        && radio.checked;
+                });
+            } else {
+                valueMissing = String(el.value || "") === "";
+            }
+        }
+        const customError = !!el.__trustValidationMessage;
+        return {
+            valueMissing: valueMissing, customError: customError,
+            typeMismatch: false, patternMismatch: false, tooLong: false, tooShort: false,
+            rangeUnderflow: false, rangeOverflow: false, stepMismatch: false, badInput: false,
+            valid: !valueMissing && !customError,
+        };
+    }
+    function installConstraintValidation(C) {
+        Object.defineProperties(C.prototype, {
+            willValidate: { configurable: true, get() { return controlWillValidate(this); } },
+            validity: { configurable: true, get() { return controlValidity(this); } },
+            validationMessage: { configurable: true, get() {
+                if (this.__trustValidationMessage) return this.__trustValidationMessage;
+                return controlValidity(this).valueMissing ? "Please fill out this field." : "";
+            }},
+        });
+        C.prototype.setCustomValidity = function (message) { this.__trustValidationMessage = String(message); };
+        C.prototype.checkValidity = function () {
+            if (controlValidity(this).valid) return true;
+            dispatch(this, new Event("invalid", { cancelable: true }), false);
+            return false;
+        };
+        C.prototype.reportValidity = C.prototype.checkValidity;
+    }
     function fireFormEvents(el, withClick) {
         // Toggling a checkbox/radio dispatches a click as part of the user
         // activation, BEFORE input/change. It matters: React detects
@@ -11349,10 +11525,113 @@ const PRELUDE: &str = r##"
     trust.formSubmit = function (formId, submitterId) {
         const form = wrap(formId);
         if (!form) return false;
-        const ev = new Event("submit", { bubbles: true, cancelable: true });
-        ev.submitter = submitterId === null || submitterId === undefined ? null : wrap(submitterId);
+        const ev = new SubmitEvent("submit", {
+            bubbles: true,
+            cancelable: true,
+            submitter: submitterId === null || submitterId === undefined ? null : wrap(submitterId),
+        });
         dispatch(form, ev, false);
         return ev.defaultPrevented;
+    };
+    // requestSubmit() runs synchronously in JS through the submit event, then
+    // plans a browsing-context navigation. The Rust page actor drains this
+    // read-once signal only after serializing any handler/control mutations.
+    trust.queueFormSubmit = function (formId, submitterId) {
+        trust.pendingFormSubmit = { form: formId, submitter: submitterId };
+    };
+    trust.takeFormSubmit = function () {
+        const s = trust.pendingFormSubmit;
+        trust.pendingFormSubmit = null;
+        return s ? (String(s.form) + "," + (s.submitter === null ? "" : String(s.submitter))) : "";
+    };
+    // Construct the HTML form entry list inside the resident page realm. The
+    // render serializer intentionally omits display:none/hidden DOM, so asking
+    // the app's painted document to reconstruct this data loses exactly the
+    // verification/payment-style forms that are commonly hidden.
+    trust.formSubmission = function (formId, submitterId) {
+        const form = wrap(formId);
+        if (!form || form.localName !== "form") return "";
+        const submitter = submitterId === null || submitterId === undefined ? null : wrap(submitterId);
+        const params = new URLSearchParams();
+        function disabled(control) {
+            if (control.hasAttribute("disabled")) return true;
+            let parent = control.parentNode;
+            while (parent && parent !== form) {
+                if (parent.localName === "fieldset" && parent.hasAttribute("disabled")) {
+                    let firstLegend = null;
+                    for (const child of parent.children) {
+                        if (child.localName === "legend") { firstLegend = child; break; }
+                    }
+                    if (!firstLegend || !firstLegend.contains(control)) return true;
+                }
+                parent = parent.parentNode;
+            }
+            return false;
+        }
+        function optionDisabled(option) {
+            return option.hasAttribute("disabled")
+                || (option.parentNode && option.parentNode.localName === "optgroup"
+                    && option.parentNode.hasAttribute("disabled"));
+        }
+        for (const control of listedFormControls(form)) {
+            if (disabled(control)) continue;
+            const tag = control.localName;
+            if (tag === "fieldset" || tag === "object" || tag === "output") continue;
+            const name = control.getAttribute("name") || "";
+            if (!name) continue;
+            if (tag === "button") {
+                if (control !== submitter) continue;
+                params.append(name, control.value || "");
+                continue;
+            }
+            if (tag === "select") {
+                let appended = false;
+                for (const option of control.options) {
+                    if (option.selected && !optionDisabled(option)) {
+                        params.append(name, option.value);
+                        appended = true;
+                    }
+                }
+                // A non-multiple select with no explicit selectedness has its
+                // first option selected by default.
+                if (!appended && !control.multiple && control.options.length) {
+                    const option = control.options[0];
+                    if (!optionDisabled(option)) params.append(name, option.value);
+                }
+                continue;
+            }
+            if (tag === "input") {
+                const type = String(control.type || "text").toLowerCase();
+                if (type === "button" || type === "reset" || type === "file" || type === "image") continue;
+                if (type === "submit") {
+                    if (control !== submitter) continue;
+                } else if ((type === "checkbox" || type === "radio") && !control.checked) {
+                    continue;
+                }
+                params.append(name, control.value || ((type === "checkbox" || type === "radio") ? "on" : ""));
+                continue;
+            }
+            if (tag === "textarea") params.append(name, control.value);
+        }
+        // input[type=image] is excluded from form.elements but can be an
+        // explicit submitter; a programmatic activation has coordinates 0,0.
+        if (submitter && submitter.localName === "input" && String(submitter.type).toLowerCase() === "image") {
+            const name = submitter.getAttribute("name") || "";
+            params.append(name ? name + ".x" : "x", "0");
+            params.append(name ? name + ".y" : "y", "0");
+        }
+        const actionAttr = submitter && submitter.hasAttribute("formaction")
+            ? submitter.getAttribute("formaction")
+            : form.getAttribute("action");
+        const methodAttr = submitter && submitter.hasAttribute("formmethod")
+            ? submitter.getAttribute("formmethod")
+            : form.getAttribute("method");
+        let method = String(methodAttr || "get").toLowerCase();
+        if (method !== "post" && method !== "dialog") method = "get";
+        let action;
+        try { action = new URL(actionAttr || g.location.href, g.location.href).href; }
+        catch (e) { action = g.location.href; }
+        return JSON.stringify({ action: action, method: method, body: params.toString() });
     };
 
     // --- the DOM classes over the syscall boundary ---
@@ -12477,11 +12756,60 @@ const PRELUDE: &str = r##"
         get value() { return this.textContent; }
         set value(v) { this.textContent = String(v); }
     }
+    installConstraintValidation(HTMLInputElement);
+    installConstraintValidation(HTMLSelectElement);
+    installConstraintValidation(HTMLTextAreaElement);
     // Interfaces with no extra accessors of their own; the reflected attributes
     // (name/value/type/href/src/disabled) are installed on them below.
     class HTMLButtonElement extends HTMLElement {}
     class HTMLScriptElement extends HTMLElement {}
-    class HTMLFormElement extends HTMLElement {}
+    class HTMLFormElement extends HTMLElement {
+        get elements() {
+            return this.__trustElements
+                || (this.__trustElements = new HTMLFormControlsCollection(this));
+        }
+        get length() { return this.elements.length; }
+        checkValidity() {
+            for (const control of listedFormControls(this)) {
+                if (typeof control.checkValidity === "function" && !control.checkValidity()) return false;
+            }
+            return true;
+        }
+        reportValidity() { return this.checkValidity(); }
+        requestSubmit(submitter) {
+            const supplied = arguments.length > 0 && submitter !== undefined;
+            if (supplied) {
+                if (!submitter || submitControlFor(submitter) !== submitter) {
+                    throw new TypeError("Failed to execute 'requestSubmit' on 'HTMLFormElement': The specified element is not a submit button.");
+                }
+                if (formOwner(submitter) !== this) {
+                    throw new DOMException("The specified element is not owned by this form element.", "NotFoundError");
+                }
+            } else {
+                submitter = null;
+            }
+            // The form submission algorithm aborts before validation/event
+            // dispatch when the form cannot navigate.
+            if (!this.isConnected || this.__trustFiringSubmit) return;
+            const skipValidation = this.hasAttribute("novalidate")
+                || (submitter && submitter.hasAttribute("formnovalidate"));
+            if (!skipValidation && !this.checkValidity()) return;
+            const ev = new SubmitEvent("submit", {
+                bubbles: true,
+                cancelable: true,
+                submitter: submitter,
+            });
+            this.__trustFiringSubmit = true;
+            try {
+                dispatch(this, ev, false);
+            } finally {
+                this.__trustFiringSubmit = false;
+            }
+            if (!ev.defaultPrevented) {
+                trust.queueFormSubmit(this.__id, submitter ? submitter.__id : null);
+            }
+        }
+    }
     class HTMLImageElement extends HTMLElement {}
     // HTMLHyperlinkElementUtils (the create-an-<a>-to-parse-URLs trick;
     // router-slot reads m.pathname) lives on <a> and <area>; href + the URL
@@ -13609,8 +13937,91 @@ const PRELUDE: &str = r##"
     // Element.attributes.
     class NodeList {}
     class HTMLCollection {}
+    // WHATWG DOM/HTML collections are live, array-indexed legacy platform
+    // objects. Recompute membership at each observable operation so DOM moves,
+    // removals, and `form=id` reassociation are visible through an already-held
+    // collection object.
+    function collectionProxy(target) {
+        return new Proxy(target, {
+            get(t, p, r) {
+                if (typeof p === "string" && /^(0|[1-9][0-9]*)$/.test(p))
+                    return t.item(Number(p));
+                if (Reflect.has(t, p)) return Reflect.get(t, p, r);
+                if (typeof p === "string") {
+                    const named = t.namedItem(p);
+                    return named === null ? undefined : named;
+                }
+                return undefined;
+            },
+        });
+    }
+    class RadioNodeList extends NodeList {
+        constructor(resolve) {
+            super();
+            this.__resolve = resolve;
+            return collectionProxy(this);
+        }
+        __list() { return this.__resolve(); }
+        get length() { return this.__list().length; }
+        item(index) {
+            index = Number(index);
+            return Number.isInteger(index) && index >= 0 ? (this.__list()[index] || null) : null;
+        }
+        get value() {
+            for (const el of this.__list()) {
+                if (el.localName === "input" && String(el.type).toLowerCase() === "radio" && el.checked)
+                    return el.value;
+            }
+            return "";
+        }
+        set value(value) {
+            value = String(value);
+            for (const el of this.__list()) {
+                if (el.localName === "input" && String(el.type).toLowerCase() === "radio" && el.value === value) {
+                    el.checked = true;
+                    return;
+                }
+            }
+        }
+        forEach(fn, thisArg) { return this.__list().forEach(fn, thisArg); }
+        [Symbol.iterator]() { return this.__list()[Symbol.iterator](); }
+        get [Symbol.toStringTag]() { return "RadioNodeList"; }
+    }
+    class HTMLFormControlsCollection extends HTMLCollection {
+        constructor(form) {
+            super();
+            this.__form = form;
+            return collectionProxy(this);
+        }
+        __list() { return listedFormControls(this.__form); }
+        get length() { return this.__list().length; }
+        item(index) {
+            index = Number(index);
+            return Number.isInteger(index) && index >= 0 ? (this.__list()[index] || null) : null;
+        }
+        namedItem(name) {
+            name = String(name);
+            if (name === "") return null;
+            const form = this.__form;
+            const matches = function () {
+                return listedFormControls(form).filter(function (el) {
+                    return el.id === name || el.getAttribute("name") === name;
+                });
+            };
+            const list = matches();
+            if (!list.length) return null;
+            if (list.length === 1) return list[0];
+            return new RadioNodeList(matches);
+        }
+        forEach(fn, thisArg) { return this.__list().forEach(fn, thisArg); }
+        [Symbol.iterator]() { return this.__list()[Symbol.iterator](); }
+        get [Symbol.toStringTag]() { return "HTMLFormControlsCollection"; }
+    }
     class NamedNodeMap {}
-    g.NodeList = NodeList; g.HTMLCollection = HTMLCollection; g.NamedNodeMap = NamedNodeMap;
+    g.NodeList = NodeList; g.HTMLCollection = HTMLCollection;
+    g.RadioNodeList = RadioNodeList;
+    g.HTMLFormControlsCollection = HTMLFormControlsCollection;
+    g.NamedNodeMap = NamedNodeMap;
     g.EventTarget = EventTarget; g.Window = Window; g.CharacterData = CharacterData;
     g.CDATASection = CDATASection; g.ProcessingInstruction = ProcessingInstruction;
     g.DocumentType = DocumentType; g.Attr = Attr;
@@ -26189,6 +26600,130 @@ mod tests {
             "Items deactivated after click"
         );
         assert_eq!(border_of(&html, "t2"), "4px", "Merchants now active");
+    }
+
+    #[test]
+    fn form_elements_is_a_live_named_controls_collection() {
+        // HTML §4.10.3 + DOM §4.2.10: form.elements is live, indexed, includes
+        // explicitly-associated controls, excludes input[type=image], and its
+        // named lookup returns a RadioNodeList when several controls match.
+        let (out, outcome) = page(
+            r##"<body>
+            <form id=f>
+              <input id=answer name=solution>
+              <input type=radio name=choice value=a>
+              <input type=radio name=choice value=b checked>
+              <input type=image name=map>
+            </form>
+            <input id=outside name=external form=f>
+            <pre id=out></pre>
+            <script>
+            const form = document.getElementById('f');
+            const controls = form.elements;
+            const before = controls.length;
+            const area = document.createElement('textarea');
+            area.name = 'later';
+            form.appendChild(area);
+            const choices = controls.namedItem('choice');
+            document.getElementById('out').textContent = [
+              controls instanceof HTMLFormControlsCollection,
+              before, controls.length, form.length,
+              controls[0] === document.getElementById('answer'),
+              controls.item(3) === area,
+              controls.namedItem('solution') === document.getElementById('answer'),
+              controls.solution === document.getElementById('answer'),
+              controls.namedItem('external') === document.getElementById('outside'),
+              controls.namedItem('map') === null,
+              choices instanceof RadioNodeList, choices.length, choices.value
+            ].join('|');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("true|4|5|5|true|true|true|true|true|true|true|2|b"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn request_submit_checks_the_submitter_contract() {
+        let (out, outcome) = page(
+            r##"<body>
+            <form id=a><input id=text><button id=mine>Go</button></form>
+            <form id=b><button id=other>Other</button></form>
+            <pre id=out></pre>
+            <script>
+            const names = [];
+            const a = document.getElementById('a');
+            const text = document.getElementById('text');
+            const mine = document.getElementById('mine');
+            const other = document.getElementById('other');
+            a.addEventListener('submit', e => { e.preventDefault(); names.push(e.submitter === mine ? 'mine' : 'bad'); });
+            try { a.requestSubmit(text); } catch (e) { names.push(e.name); }
+            try { a.requestSubmit(other); } catch (e) { names.push(e.name); }
+            text.setAttribute('required', '');
+            text.addEventListener('invalid', () => names.push('invalid'));
+            a.requestSubmit(mine);
+            text.removeAttribute('required');
+            a.requestSubmit(mine);
+            document.getElementById('out').textContent = names.join('|');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("TypeError|NotFoundError|invalid|mine"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn async_request_submit_serializes_then_asks_for_native_navigation() {
+        // Mirrors Reddit's verification document: an async DOMContentLoaded
+        // handler computes a hidden value through form.elements.namedItem(),
+        // then requestSubmit() with no explicit submitter.
+        let (_handle, mut events) = live(
+            r##"<body><form action="/verify">
+            <input type=hidden name=solution value=0>
+            <button name=go value=chosen>Continue</button>
+            </form><script>
+            document.addEventListener('DOMContentLoaded', async function () {
+              const form = document.forms[0];
+              await Promise.resolve(21);
+              form.elements.namedItem('solution').value = 42;
+              form.requestSubmit();
+            });
+            </script></body>"##,
+        );
+        let mut latest = String::new();
+        loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    latest = html;
+                }
+                Some(PageEvt::SubmitForm {
+                    submitter,
+                    submission,
+                    ..
+                }) => {
+                    assert_eq!(
+                        submitter, None,
+                        "no-argument requestSubmit has no submitter"
+                    );
+                    let submission = submission.expect("entry list built in the live DOM");
+                    assert_eq!(submission.action, "https://example.com/verify");
+                    assert_eq!(submission.method, "get");
+                    assert_eq!(submission.body, "solution=42");
+                    break;
+                }
+                Some(PageEvt::Settled) => {}
+                other => panic!("expected native requestSubmit navigation, got {other:?}"),
+            }
+        }
+        assert!(
+            latest.contains("name=\"solution\"") && latest.contains("value=\"42\""),
+            "the app must receive the mutated successful control before submit: {latest}"
+        );
     }
 
     #[test]

@@ -24,6 +24,7 @@ dependencies = [
  "rcgen",
  "resvg",
  "rustc-hash",
+ "serde_json",
  "sha2 0.11.0",
  "svgtypes",
  "textwrap",

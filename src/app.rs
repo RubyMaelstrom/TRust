@@ -4360,9 +4360,11 @@ impl App {
         // Newest wins.
         let mut scroll_fragment: Option<String> = None;
         let mut submit_default = false;
-        // A click-triggered native submit carries its form/submitter arena
-        // nodes (the app didn't pre-record them the way the Submit path does).
-        let mut submit_nodes: Option<(usize, usize)> = None;
+        // A page-triggered native submit carries its form and optional
+        // submitter arena nodes (requestSubmit() has no submitter when called
+        // without an argument).
+        let mut submit_nodes: Option<(usize, Option<usize>, Option<crate::js::FormSubmission>)> =
+            None;
         // Page-initiated inner-scroll writes (CSSOM View) without a DOM mutation:
         // applied AFTER any content update so they land on the new regions.
         let mut scrolled: Vec<(usize, f64)> = Vec::new();
@@ -4396,8 +4398,12 @@ impl App {
                     scrolled.push((node, top));
                 }
                 Some(PageEvt::SubmitDefault) => submit_default = true,
-                Some(PageEvt::SubmitForm { form, submitter }) => {
-                    submit_nodes = Some((form, submitter));
+                Some(PageEvt::SubmitForm {
+                    form,
+                    submitter,
+                    submission,
+                }) => {
+                    submit_nodes = Some((form, submitter, submission));
                 }
                 Some(PageEvt::Navigate(url)) => navigate = Some(url),
                 Some(PageEvt::ScrollToFragment(frag)) => scroll_fragment = Some(frag),
@@ -4465,12 +4471,16 @@ impl App {
         // mis-fire: every dispatch overwrites it, and `drop_live_page` clears
         // it (a page-JS-owned submit just leaves it parked until then).
         if submit_default && let Some((form, field)) = self.pending_live_submit.take() {
-            self.submit_form_static(form, field);
+            self.submit_form_static(form, Some(field));
         }
-        if let Some((form_node, submitter_node)) = submit_nodes
-            && let Some((form, field)) = self.form_indices_for_nodes(form_node, submitter_node)
-        {
-            self.submit_form_static(form, field);
+        if let Some((form_node, submitter_node, submission)) = submit_nodes {
+            if let Some(submission) = submission {
+                self.submit_page_form(submission);
+            } else if let Some((form, field)) =
+                self.form_indices_for_nodes(form_node, submitter_node)
+            {
+                self.submit_form_static(form, field);
+            }
         }
         if let Some(url) = navigate {
             // An un-prevented click on a live anchor: a real navigation, so it
@@ -6727,15 +6737,14 @@ impl App {
         }
     }
 
-    /// Map a click-triggered submit's `(form, submitter)` arena nodes to its
-    /// doc-model `(form_index, field_index)`. The submitter falls back to the
-    /// form's Submit control (then field 0) when it isn't itself a tracked
-    /// field, so the native GET/POST still encodes a submit button.
+    /// Map a page-triggered submit's form and optional submitter arena nodes to
+    /// the doc model. No-argument `requestSubmit()` intentionally maps to
+    /// `None`: HTML does not serialize an arbitrary submit button in that case.
     fn form_indices_for_nodes(
         &self,
         form_node: usize,
-        submitter_node: usize,
-    ) -> Option<(usize, usize)> {
+        submitter_node: Option<usize>,
+    ) -> Option<(usize, Option<usize>)> {
         use crate::doc::FieldKind;
         let g = self.browser.as_ref()?;
         let form_index = g
@@ -6744,12 +6753,15 @@ impl App {
             .iter()
             .position(|f| f.live_node == Some(form_node))?;
         let form = &g.doc.forms[form_index];
-        let field = form
-            .fields
-            .iter()
-            .position(|f| f.live_node == Some(submitter_node))
-            .or_else(|| form.fields.iter().position(|f| f.kind == FieldKind::Submit))
-            .unwrap_or(0);
+        let field = submitter_node.map(|node| {
+            form.fields
+                .iter()
+                .position(|f| f.live_node == Some(node))
+                // A live submitter should normally have a node mapping. Keep
+                // the native click path resilient if extraction omitted it.
+                .or_else(|| form.fields.iter().position(|f| f.kind == FieldKind::Submit))
+                .unwrap_or(0)
+        });
         Some((form_index, field))
     }
 
@@ -6763,17 +6775,17 @@ impl App {
         {
             return;
         }
-        self.submit_form_static(form, pressed);
+        self.submit_form_static(form, Some(pressed));
     }
 
     /// Fire a static form: GET serializes into the action's query string,
     /// POST goes form-urlencoded through the existing post plumbing.
-    fn submit_form_static(&mut self, form: usize, pressed: usize) {
+    fn submit_form_static(&mut self, form: usize, submitter: Option<usize>) {
         use crate::doc::FormMethod;
         let Some(form) = self.browser.as_ref().and_then(|g| g.doc.forms.get(form)) else {
             return;
         };
-        let query = form.encode(pressed);
+        let query = form.encode(submitter);
         let action = form.action.clone();
         let referrer = self.http_referrer();
         match form.method {
@@ -6783,6 +6795,24 @@ impl App {
                 self.start_fetch_opts(Link::Http(url), false, referrer);
             }
             FormMethod::Post => self.start_post(action, query, referrer),
+        }
+    }
+
+    /// Navigate a page-driven form entry list constructed in the resident JS
+    /// DOM. Unlike the painted `Doc`, that DOM retains hidden/display:none
+    /// controls, which remain successful controls under the HTML standard.
+    fn submit_page_form(&mut self, submission: crate::js::FormSubmission) {
+        let Ok(mut action) = url::Url::parse(&submission.action) else {
+            return;
+        };
+        let referrer = self.http_referrer();
+        match submission.method.as_str() {
+            "post" => self.start_post(action, submission.body, referrer),
+            "dialog" => {}
+            _ => {
+                action.set_query((!submission.body.is_empty()).then_some(&submission.body));
+                self.start_fetch_opts(Link::Http(action), false, referrer);
+            }
         }
     }
 
@@ -7787,6 +7817,33 @@ mod tests {
         assert!(
             app.status.contains("/go"),
             "fetching the form action: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn page_form_payload_submits_even_when_the_form_is_not_painted() {
+        // Live rendering omits display:none form subtrees. A requestSubmit
+        // event therefore carries the entry list built in the resident page
+        // DOM, rather than depending on a form-node mapping in the painted Doc.
+        let mut app = app_browsing(
+            "text/html",
+            "<main>Please wait</main><form style=\"display:none\"><input name=solution></form>",
+        );
+        app.on_page_evt(crate::js::PageEvt::SubmitForm {
+            form: 999,
+            submitter: None,
+            submission: Some(crate::js::FormSubmission {
+                action: String::from("https://example.com/verify?old=discarded"),
+                method: String::from("get"),
+                body: String::from("solution=42&token=abc"),
+            }),
+        });
+        assert!(app.loading(), "page-driven native GET started");
+        assert!(
+            app.status
+                .contains("https://example.com/verify?solution=42&token=abc"),
+            "GET entry list replaces the action query: {}",
             app.status
         );
     }

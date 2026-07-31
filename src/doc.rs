@@ -170,9 +170,10 @@ pub struct Form {
 }
 
 impl Form {
-    /// Serialize the successful fields urlencoded, `pressed` being the
-    /// index of the submit control that fired (only that one is sent).
-    pub fn encode(&self, pressed: usize) -> String {
+    /// Serialize the successful fields urlencoded. `submitter` is the index of
+    /// the submit control that fired; `None` is the HTML `requestSubmit()`
+    /// no-argument case, where no submit button contributes a name/value pair.
+    pub fn encode(&self, submitter: Option<usize>) -> String {
         let mut out = url::form_urlencoded::Serializer::new(String::new());
         for (i, field) in self.fields.iter().enumerate() {
             if field.name.is_empty() {
@@ -180,7 +181,7 @@ impl Form {
             }
             match &field.kind {
                 FieldKind::Submit => {
-                    if i == pressed {
+                    if Some(i) == submitter {
                         out.append_pair(&field.name, &field.value);
                     }
                 }
@@ -481,14 +482,19 @@ mod tests {
         // Unchecked boxes stay home; only the pressed submit is sent;
         // spaces and ampersands urlencode.
         assert_eq!(
-            form.encode(5),
+            form.encode(Some(5)),
             "session=cafe123&msg=hello+there+%26+good+night&go=Send"
         );
         form.fields[2].checked = true;
         form.fields[3].checked = true;
         assert_eq!(
-            form.encode(6),
+            form.encode(Some(6)),
             "session=cafe123&msg=hello+there+%26+good+night&box=on&pick=b&alt=Other"
+        );
+        assert_eq!(
+            form.encode(None),
+            "session=cafe123&msg=hello+there+%26+good+night&box=on&pick=b",
+            "requestSubmit() without a submitter excludes every submit button"
         );
     }
 
