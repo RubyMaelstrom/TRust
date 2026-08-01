@@ -730,6 +730,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// unavailable image), and the decode pipeline's re-layout turns it into
     /// pixels.
     pub fn image(&mut self, node: NodeId, url: Option<&str>, alt: &str, ctx: &InlineStyle) {
+        // A player often paints its `<video poster>` again as an absolutely
+        // positioned sibling `<img>` so custom controls can cover the native
+        // element. That later image wins CSS painting order; carry the media
+        // target onto the pixels the user actually sees, or the real media
+        // representation underneath becomes an unreachable link (X-style
+        // players). Association is by the standardized poster URL and nearest
+        // containing band, never by a class or host name.
+        let link = url
+            .and_then(|u| poster_media_target(self.dom, self.base, node, u))
+            .map(Link::Media)
+            .or_else(|| ctx.link.clone());
         let natural = url
             .and_then(|u| self.images.get(u))
             .filter(|&&(w, h)| w > 0 && h > 0)
@@ -773,7 +784,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         .then(|| url.unwrap_or_default().to_string()),
                     emph: Emphasis::default(),
                     node,
-                    link: ctx.link.clone(),
+                    link,
                     crop: r.crop,
                     pixelated,
                     invisible: ctx.invisible,
@@ -797,12 +808,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// drawn preview IS the link — her call 2026-07-04, no extra text line
     /// under it), else a labeled text link. Durable decisions ported from
     /// the old engine: a sourceless (MSE/blob) streaming video targets the
-    /// PAGE yt-dlp resolves — the enclosing card link, else this page; a
-    /// streaming video whose only target would be THIS page when the page
-    /// does NOT declare itself a video page (Open Graph — `og:video`) is a
-    /// DEAD END (the homepage-autoplay hero): no link. og:image is borrowed
-    /// as a poster ONLY when the representation plays this page (og:image
-    /// describes THIS page's media and nothing else). The old engine's
+    /// PAGE yt-dlp resolves — the enclosing card link, else this page.
+    /// Every rendered video remains an activation target: HTML §4.8.8
+    /// explicitly permits a user agent that cannot render video to represent
+    /// the element as a link to an external playback utility. og:image is
+    /// borrowed as a poster ONLY when the representation plays this page
+    /// (og:image describes THIS page's media and nothing else). The old engine's
     /// faded-poster borrow (`hidden_preview_in_cb`) is deletion-list
     /// machinery and deliberately NOT ported — the fragment stack reads it
     /// once positioned layout lands (P4).
@@ -827,6 +838,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             None if video => {
                 let page = match &ctx.link {
                     Some(Link::Http(u)) => u.clone(),
+                    // The resident-page serializer rewrites a live anchor to
+                    // `x-trust-js:<node>:<original href>` so activation can run
+                    // through the page actor. Media is intentionally delegated
+                    // to mpv instead; resolve that preserved href directly and
+                    // do not run the inline player UI (Twitch-style cards).
+                    Some(Link::JsClick { href, .. }) if !href.trim().is_empty() => {
+                        match crate::http::resolve(self.base, href) {
+                            Link::Http(u) => u,
+                            _ => self.base.clone(),
+                        }
+                    }
                     _ => self.base.clone(),
                 };
                 (Some(page), None, true)
@@ -835,8 +857,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         };
         let Some(play) = play else { return };
         let plays_this_page = streaming && play == *self.base;
-        let dead_end = plays_this_page && !crate::layout2::page_declares_video(self.dom);
-        let link = (!dead_end).then_some(Link::Media(play));
+        let link = Some(Link::Media(play));
         let poster = video
             .then(|| {
                 self.dom
@@ -848,7 +869,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         _ => None,
                     })
                     .or_else(|| {
-                        (plays_this_page && !dead_end)
+                        plays_this_page
                             .then(|| crate::layout2::page_preview_image(self.dom, self.base))
                             .flatten()
                     })
@@ -886,9 +907,6 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 false,
             );
             return; // the drawn preview IS the mpv affordance
-        }
-        if dead_end {
-            return; // nothing playable and no poster: nothing to show
         }
         let label = if streaming {
             String::from("▶ Watch in mpv")
@@ -1096,6 +1114,106 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     }
 }
 
+/// The URL handed to mpv when a media element is activated. Native HTML
+/// sources and associated structured-media URLs win; a sourceless video is an
+/// MSE/blob player whose stable, externally resolvable target is its nearest
+/// enclosing page link or the current page. Sourceless audio has no honest
+/// target.
+pub(crate) fn media_target(dom: &Dom, base: &Url, node: NodeId) -> Option<Url> {
+    if let Some((source, _)) = media_source(dom, base, node) {
+        return Url::parse(&source).ok();
+    }
+    if dom.tag_name(node) != Some("video") {
+        return None;
+    }
+    let mut ancestor = dom.parent_composed(node);
+    while let Some(id) = ancestor {
+        if dom.tag_name(id) == Some("a")
+            && let Some(href) = dom.attr(id, "href")
+        {
+            return match crate::http::resolve(base, href) {
+                Link::Http(url) => Some(url),
+                Link::JsClick { href, .. } if !href.trim().is_empty() => {
+                    match crate::http::resolve(base, &href) {
+                        Link::Http(url) => Some(url),
+                        _ => Some(base.clone()),
+                    }
+                }
+                _ => Some(base.clone()),
+            };
+        }
+        ancestor = dom.parent_composed(id);
+    }
+    Some(base.clone())
+}
+
+/// If `image` repeats a nearby `<video poster>`, return that video's playable
+/// target. HTML §4.8.8 defines the poster as a representative frame; custom
+/// players commonly duplicate it into a sibling image for their overlay UI.
+pub(super) fn poster_media_target(
+    dom: &Dom,
+    base: &Url,
+    image: NodeId,
+    image_url: &str,
+) -> Option<Url> {
+    // The ordinary document may contain hundreds of images. Only a positioned
+    // image can be the custom overlay that paints over the native poster; this
+    // O(1) gate keeps the structural media scan off every normal `<img>` path.
+    if !matches!(
+        dom.computed_value(image, "position").as_deref(),
+        Some("absolute" | "fixed")
+    ) {
+        return None;
+    }
+    let image_url = match crate::http::resolve(base, image_url) {
+        Link::Http(u) => u,
+        _ => return None,
+    };
+    let videos: Vec<_> = dom
+        .descendants(crate::dom::DOCUMENT)
+        .filter(|&id| dom.tag_name(id) == Some("video"))
+        .filter(|&id| {
+            dom.attr(id, "poster")
+                .map(str::trim)
+                .and_then(|p| match crate::http::resolve(base, p) {
+                    Link::Http(u) => Some(u),
+                    _ => None,
+                })
+                .is_some_and(|u| u == image_url)
+        })
+        .filter_map(|id| {
+            media_source(dom, base, id)
+                .and_then(|(target, _)| Url::parse(&target).ok())
+                .map(|target| (id, target))
+        })
+        .collect();
+    let mut ancestor = dom.parent_composed(image);
+    while let Some(root) = ancestor {
+        let mut nearby = videos
+            .iter()
+            .filter(|(id, _)| composed_contains(dom, root, *id));
+        let first = nearby.next();
+        if let Some((_, target)) = first
+            && nearby.next().is_none()
+        {
+            return Some(target.clone());
+        }
+        ancestor = dom.parent_composed(root);
+    }
+    None
+}
+
+fn composed_contains(dom: &Dom, ancestor: NodeId, node: NodeId) -> bool {
+    let mut current = Some(node);
+    while let Some(id) = current {
+        if id == ancestor {
+            return true;
+        }
+        current = dom.parent_composed(id);
+    }
+    false
+}
+
 /// CSS Text §7.3 justification at cell resolution: distribute `extra` cells
 /// across the line's expansion opportunities — the collapsible spaces inside
 /// stretchable runs and the materialized inter-run space gaps — left to
@@ -1176,6 +1294,17 @@ pub(crate) fn media_source(dom: &Dom, base: &Url, id: NodeId) -> Option<(String,
         {
             return Some((u.to_string(), Some(c)));
         }
+    }
+    // Native HTML source selection above remains authoritative. Only when the
+    // media element is sourceless consult its associated standardized
+    // structured-media item: modern MSE players publish the bytes/player here
+    // while never assigning `video.src` (WHATWG HTML §5 Microdata; Schema.org
+    // MediaObject `contentUrl`/`embedUrl`).
+    let video = dom.tag_name(id) == Some("video");
+    if matches!(dom.tag_name(id), Some("video" | "audio"))
+        && let Some(media) = crate::layout2::structured_media_for(dom, base, id, video)
+    {
+        return Some((media.target.to_string(), None));
     }
     None
 }

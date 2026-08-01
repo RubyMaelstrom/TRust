@@ -2258,7 +2258,10 @@ impl Flow<'_> {
                 .then(|| url.unwrap_or_default().to_string()),
             emph: crate::layout2::Emphasis::default(),
             node,
-            link: inl.link.clone(),
+            link: url
+                .and_then(|u| super::inline::poster_media_target(self.dom, self.base, node, u))
+                .map(crate::doc::Link::Media)
+                .or_else(|| inl.link.clone()),
             crop: r.crop,
             pixelated,
             invisible: inl.invisible,

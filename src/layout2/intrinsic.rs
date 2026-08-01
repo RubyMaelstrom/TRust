@@ -281,8 +281,8 @@ impl Flow<'_> {
                 display_width(&label) as f32 * self.cell_w
             }
             AtomKind::Media { video } => {
-                // A decoded poster's box, else the text affordance's width
-                // (over-estimating a dead-end costs nothing but space).
+                // A decoded poster's box, else the external-player text
+                // affordance's width.
                 let poster = self
                     .dom
                     .attr(atom.node, "poster")

@@ -2242,11 +2242,11 @@ fn collect_image_urls(dom: &crate::dom::Dom, base: &Url) -> Vec<String> {
         }
     }
     // Mirrors the layout gates exactly: a present `<video>` only borrows the
-    // page preview when the page IS a video page (`flow_media`'s
-    // `plays_this_page` + `page_declares_video` — a homepage autoplay hero
-    // renders no representation, so its logo og:image must not decode as a
-    // phantom preview either), and the page-level fallback needs the same
-    // declaration with no media element at all.
+    // page preview when the page IS a video page. Every `<video>` has an mpv
+    // activation surface, but a generic page's `og:image` still describes the
+    // page rather than that particular element (a homepage logo must not be
+    // borrowed as a phantom poster). The page-level fallback needs the same
+    // declaration when no media element mounts at all.
     let page_is_video = crate::layout2::page_declares_video(dom);
     if page_is_video
         && (has_video || !has_media)

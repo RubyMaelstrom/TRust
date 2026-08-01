@@ -419,7 +419,10 @@ fn page_media_fallback(
     {
         return;
     }
-    let link = Some(Link::Media(base.clone()));
+    let target = crate::layout2::unique_structured_media(dom, base, true)
+        .map(|m| m.target)
+        .unwrap_or_else(|| base.clone());
+    let link = Some(Link::Media(target));
     let poster = crate::layout2::page_preview_image(dom, base)
         .and_then(|p| images.get(&p).map(|&(w, h)| (p, w, h)))
         .filter(|&(_, w, h)| w > 0 && h > 0);
@@ -1513,15 +1516,149 @@ mod tests {
     }
 
     #[test]
-    fn sourceless_video_on_non_video_page_is_dead_end() {
-        let out = lay(r#"<body style="margin:0"><video></video></body>"#, 60);
-        assert!(
-            !out.rows
-                .iter()
-                .flat_map(|r| &r.items)
-                .any(|i| i.text.contains("mpv") || i.link.is_some()),
-            "homepage-autoplay hero: no playable target, no link"
+    fn sourceless_video_targets_a_live_anchors_preserved_href() {
+        let out = lay(
+            r#"<body style="margin:0"><a href="x-trust-js:42:/channel"><video></video></a></body>"#,
+            60,
         );
+        let (_, it) = find(&out, "▶ Watch in mpv");
+        assert!(
+            matches!(&it.link, Some(crate::doc::Link::Media(u)) if u.path() == "/channel"),
+            "a live-page preview keeps the anchor URL for mpv instead of running its player"
+        );
+    }
+
+    #[test]
+    fn sourceless_video_uses_associated_schema_video_object() {
+        let images = img_sizes(&[("http://e.com/frame.jpg", 16, 9)]);
+        let out = lay_images(
+            r#"<body style="margin:0"><article>
+                 <div><video poster="frame.jpg"></video><button>Play</button></div>
+                 <div itemprop="video" itemscope itemtype="https://schema.org/VideoObject">
+                   <meta itemprop="name" content="A clip">
+                   <meta itemprop="contentUrl" content="https://cdn.e.com/clip.mp4?quality=1080">
+                   <meta itemprop="thumbnailUrl" content="frame.jpg">
+                 </div>
+               </article></body>"#,
+            60,
+            &images,
+        );
+        let (_, poster) = first_image(&out);
+        assert!(
+            matches!(&poster.link, Some(crate::doc::Link::Media(u)) if u.as_str() == "https://cdn.e.com/clip.mp4?quality=1080"),
+            "Schema.org contentUrl is the actual media bytes"
+        );
+    }
+
+    #[test]
+    fn duplicated_custom_player_poster_keeps_the_media_link() {
+        let images = img_sizes(&[("http://e.com/frame.jpg", 16, 9)]);
+        let out = lay_images(
+            r#"<body style="margin:0"><article>
+                 <div style="position:relative;overflow:hidden;width:128px;height:72px">
+                   <video poster="frame.jpg"></video>
+                   <img src="frame.jpg" alt="" style="position:absolute;inset:0;width:100%;height:100%">
+                 </div>
+                 <div itemprop="video" itemscope itemtype="https://schema.org/VideoObject">
+                   <meta itemprop="contentUrl" content="https://cdn.e.com/clip.mp4">
+                 </div>
+               </article></body>"#,
+            60,
+            &images,
+        );
+        let posters: Vec<_> = out
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter(|i| i.image.as_deref() == Some("http://e.com/frame.jpg"))
+            .collect();
+        assert!(!posters.is_empty(), "the custom poster paints");
+        assert!(
+            posters.iter().all(|i| {
+                matches!(&i.link, Some(crate::doc::Link::Media(u)) if u.as_str() == "https://cdn.e.com/clip.mp4")
+            }),
+            "{posters:#?}"
+        );
+    }
+
+    #[test]
+    fn repeated_schema_video_cards_keep_their_own_targets() {
+        let out = lay(
+            r#"<body style="margin:0">
+                 <article><video></video><div itemprop="video" itemscope itemtype="http://schema.org/VideoObject"><link itemprop="contentUrl" href="/one.mp4"></div></article>
+                 <article><video></video><div itemprop="video" itemscope itemtype="https://schema.org/VideoObject"><link itemprop="contentUrl" href="/two.mp4"></div></article>
+               </body>"#,
+            60,
+        );
+        let targets: Vec<_> = out
+            .rows
+            .iter()
+            .flat_map(|r| &r.items)
+            .filter_map(|i| match &i.link {
+                Some(crate::doc::Link::Media(u)) => Some(u.path().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, ["/one.mp4", "/two.mp4"]);
+    }
+
+    #[test]
+    fn schema_media_microdata_honors_itemref_and_nested_item_scope() {
+        let out = lay(
+            r#"<body style="margin:0">
+                 <video></video>
+                 <div itemscope itemtype="https://schema.org/VideoObject" itemref="media-details">
+                   <div itemprop="encoding" itemscope itemtype="https://schema.org/MediaObject">
+                     <meta itemprop="contentUrl" content="/nested-decoy.mp4">
+                   </div>
+                 </div>
+                 <div id="media-details"><meta itemprop="name contentUrl" content="/referred.mp4"></div>
+               </body>"#,
+            60,
+        );
+        let (_, it) = find(&out, "▶ Video");
+        assert!(
+            matches!(&it.link, Some(crate::doc::Link::Media(u)) if u.path() == "/referred.mp4"),
+            "HTML's itemref target participates, while a nested item stops the property walk"
+        );
+    }
+
+    #[test]
+    fn every_sourceless_video_is_an_external_player_activation() {
+        let out = lay(r#"<body style="margin:0"><video></video></body>"#, 60);
+        let (_, it) = find(&out, "▶ Watch in mpv");
+        assert!(matches!(
+            &it.link,
+            Some(crate::doc::Link::Media(url)) if url.as_str() == "http://e.com/"
+        ));
+    }
+
+    #[test]
+    fn custom_player_video_box_remains_an_mpv_hit_surface() {
+        let out = lay(
+            r#"<body style="margin:0"><div style="position:relative;width:320px;height:160px">
+                 <video style="position:absolute;inset:0;width:100%;height:100%"></video>
+                 <a href="x-trust-js:42:" style="position:absolute;inset:0;z-index:1">Play</a>
+               </div></body>"#,
+            60,
+        );
+        let (row, hit) = out
+            .rows
+            .iter()
+            .enumerate()
+            .flat_map(|(row, r)| r.hits.iter().map(move |hit| (row, hit)))
+            .find(|(row, hit)| {
+                matches!(
+                    out.rows[*row].items[hit.item].link,
+                    Some(crate::doc::Link::Media(_))
+                )
+            })
+            .expect("video box media surface");
+        assert_eq!((hit.col, hit.width, hit.height), (0, 40, 10));
+        assert!(matches!(
+            &out.rows[row].items[hit.item].link,
+            Some(crate::doc::Link::Media(url)) if url.as_str() == "http://e.com/"
+        ));
     }
 
     #[test]

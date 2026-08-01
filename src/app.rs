@@ -3922,6 +3922,44 @@ impl App {
             return hit;
         }
         let local_col = col.saturating_sub(self.last_content_area.x);
+        // A terminal cannot execute the page's inline media playback. When a
+        // custom player paints a JS play button over a `<video>`, the video's
+        // standards-permitted external-player representation owns activation
+        // throughout its generated box; otherwise the visually obvious click
+        // merely runs a playback script that can never succeed here.
+        let mut media_surface: Option<(usize, usize, usize)> = None;
+        for r in (0..=doc_row).rev() {
+            if r >= g.doc.rows.len() {
+                continue;
+            }
+            let row_offset = doc_row - r;
+            let effective = crate::layout2::effective_row(&g.doc.rows, &g.doc.regions, r);
+            for surface in &effective.hits {
+                if row_offset >= usize::from(surface.height.max(1)) {
+                    continue;
+                }
+                let Some((start, width)) =
+                    crate::layout2::hit_columns(&effective, &g.doc.carousels, r, surface)
+                else {
+                    continue;
+                };
+                let end = start.saturating_add(width);
+                if local_col >= start
+                    && local_col < end
+                    && matches!(
+                        effective.items[surface.item].link,
+                        Some(crate::doc::Link::Media(_))
+                    )
+                    && media_surface.is_none_or(|(_, _, order)| surface.order > order)
+                {
+                    media_surface = Some((r, surface.item, surface.order));
+                }
+            }
+        }
+        if let Some((r, i, _)) = media_surface {
+            hit.item = Some((r, i));
+            return hit;
+        }
         'rows: for r in (g.scroll..=doc_row).rev() {
             if r >= g.doc.rows.len() {
                 continue;
@@ -5417,6 +5455,30 @@ impl App {
         let g = self.browser.as_ref()?;
         let (ox, oy) = (self.last_content_area.x, self.last_content_area.y);
         for (fi, f) in g.doc.fixed.iter().enumerate().rev() {
+            if row >= oy.saturating_add(f.row) && col >= ox.saturating_add(f.col) {
+                let local_row = row.saturating_sub(oy.saturating_add(f.row)) as usize;
+                let local_col = col.saturating_sub(ox.saturating_add(f.col));
+                let mut media: Option<(usize, usize, usize)> = None;
+                for (r, frow) in f.rows.iter().enumerate().take(local_row + 1) {
+                    let row_offset = local_row - r;
+                    for surface in &frow.hits {
+                        if row_offset < usize::from(surface.height.max(1))
+                            && local_col >= surface.col
+                            && local_col < surface.col.saturating_add(surface.width)
+                            && matches!(
+                                frow.items[surface.item].link,
+                                Some(crate::doc::Link::Media(_))
+                            )
+                            && media.is_none_or(|(_, _, order)| surface.order > order)
+                        {
+                            media = Some((r, surface.item, surface.order));
+                        }
+                    }
+                }
+                if let Some((r, i, _)) = media {
+                    return Some((fi, r, i));
+                }
+            }
             for (r, frow) in f.rows.iter().enumerate() {
                 if oy as usize + f.row as usize + r != row as usize {
                     continue;
@@ -8814,6 +8876,55 @@ mod tests {
 
         assert_eq!(app.browser.as_ref().unwrap().sel_item, Some(target));
         assert_eq!(app.status, "external link: mailto:fish@example.com");
+    }
+
+    #[test]
+    fn a_custom_players_video_surface_wins_over_its_js_play_overlay() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 20);
+        app.last_content_area = ratatui::layout::Rect::new(2, 1, 80, 20);
+        let url = url::Url::parse("https://example.com/watch").unwrap();
+        let html = br#"<body style="margin:0">
+            <div style="position:relative;width:320px;height:160px">
+              <video style="position:absolute;inset:0;width:100%;height:100%"></video>
+              <a href="x-trust-js:42:" style="position:absolute;inset:0;z-index:1">Play</a>
+            </div>
+          </body>"#;
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html,
+            80,
+            0,
+            &Default::default(),
+        ));
+        let (row, surface) = {
+            let g = app.browser.as_ref().unwrap();
+            g.doc
+                .rows
+                .iter()
+                .enumerate()
+                .flat_map(|(r, row)| row.hits.iter().map(move |hit| (r, hit)))
+                .find(|(r, hit)| {
+                    matches!(
+                        g.doc.rows[*r].items[hit.item].link,
+                        Some(crate::doc::Link::Media(_))
+                    )
+                })
+                .map(|(r, hit)| (r, hit.clone()))
+                .expect("video media hit surface")
+        };
+        let x = app.last_content_area.x + surface.col + surface.width / 2;
+        let y = app.last_content_area.y + row as u16 + surface.height / 2;
+        let hit = app.pointer_hit(x, y);
+        let target = hit.item.expect("interactive player surface");
+        let item = &app.browser.as_ref().unwrap().doc.rows[target.0].items[target.1];
+        assert!(matches!(
+            &item.link,
+            Some(crate::doc::Link::Media(url)) if url.as_str() == "https://example.com/watch"
+        ));
+        assert_eq!(hit.hover, None, "the inline play script is not dispatched");
     }
 
     /// An app showing a page with a fixed-height (96px ≈ 6 rows)
