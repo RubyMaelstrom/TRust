@@ -62,10 +62,9 @@ impl OneShotUrl {
             (Scheme::Finger, r)
         } else if let Some(r) = s.strip_prefix("whois://") {
             (Scheme::Whois, r)
-        } else if let Some(r) = s.strip_prefix("dict://") {
-            (Scheme::Dict, r)
         } else {
-            return None;
+            let r = s.strip_prefix("dict://")?;
+            (Scheme::Dict, r)
         };
         let (authority, query) = match rest.split_once('/') {
             Some((a, q)) => (a, q),

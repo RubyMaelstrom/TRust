@@ -1171,18 +1171,194 @@ pub(crate) fn page_preview_image(dom: &Dom, base: &Url) -> Option<String> {
             return Some(u.to_string());
         }
     }
+    unique_structured_media(dom, base, true).and_then(|m| m.thumbnail)
+}
+
+/// A media resource described by HTML Microdata + Schema.org. Modern players
+/// commonly leave `<video>` sourceless (MSE owns it) while publishing the real
+/// resource beside it as a `VideoObject`/`AudioObject`. HTML §5.2.5 defines
+/// which nodes are properties of an item (including `itemref`, and stopping at
+/// nested `itemscope` nodes); §5.2.4 defines the value-bearing attribute for
+/// each element. Schema.org's `MediaObject` vocabulary defines `contentUrl` as
+/// the actual media bytes and `embedUrl` as a player for that specific media.
+#[derive(Clone, Debug)]
+pub(crate) struct StructuredMedia {
+    pub(crate) item: NodeId,
+    pub(crate) target: Url,
+    pub(crate) thumbnail: Option<String>,
+}
+
+/// Find the structured-media item associated with `media`. Association is
+/// deliberately structural, never host-based: at the nearest ancestor band
+/// containing exactly one media element of this kind and exactly one matching
+/// Schema.org item, the two are unambiguous. This covers a page's sole player
+/// and repeated preview cards without assigning one card's URL to another.
+pub(crate) fn structured_media_for(
+    dom: &Dom,
+    base: &Url,
+    media: NodeId,
+    video: bool,
+) -> Option<StructuredMedia> {
+    let candidates = structured_media_items(dom, base, video);
+    if candidates.is_empty() {
+        return None;
+    }
+    let media_tag = if video { "video" } else { "audio" };
+    let peer_media: Vec<_> = dom
+        .descendants(crate::dom::DOCUMENT)
+        .filter(|&id| dom.tag_name(id) == Some(media_tag))
+        .collect();
+    let mut ancestor = Some(media);
+    while let Some(root) = ancestor {
+        let in_band: Vec<_> = candidates
+            .iter()
+            .filter(|m| composed_contains(dom, root, m.item))
+            .collect();
+        if in_band.len() == 1
+            && peer_media
+                .iter()
+                .filter(|&&id| composed_contains(dom, root, id))
+                .take(2)
+                .count()
+                == 1
+        {
+            return Some(in_band[0].clone());
+        }
+        ancestor = dom.parent_composed(root);
+    }
     None
 }
 
-/// Whether the page declares ITSELF a video page via the standard Open Graph
-/// convention: an `og:video`(/`:secure_url`) resource, or an `og:type` in the
-/// `video.*` hierarchy (ogp.me — `video.movie`/`.episode`/`.tv_show`/
-/// `.other`, what every watch page ships for embeds/shares). The cross-site
-/// signal — never a host check — shared by the page-level mpv fallback, the
-/// streaming-`<video>` play-the-page representation, and the preview-image
-/// decode gate: "play this page in mpv" is only an honest offer on a page
-/// whose canonical content IS a video (a homepage with an autoplaying hero
-/// is not one, and yt-dlp finds nothing there).
+fn composed_contains(dom: &Dom, ancestor: NodeId, node: NodeId) -> bool {
+    let mut current = Some(node);
+    while let Some(id) = current {
+        if id == ancestor {
+            return true;
+        }
+        current = dom.parent_composed(id);
+    }
+    false
+}
+
+/// The one structured video describing the page, if there is exactly one.
+/// Uniqueness is the cross-site distinction between a watch page and an
+/// aggregate/gallery containing several independent videos.
+pub(crate) fn unique_structured_media(
+    dom: &Dom,
+    base: &Url,
+    video: bool,
+) -> Option<StructuredMedia> {
+    let mut items = structured_media_items(dom, base, video).into_iter();
+    let first = items.next()?;
+    items.next().is_none().then_some(first)
+}
+
+fn structured_media_items(dom: &Dom, base: &Url, video: bool) -> Vec<StructuredMedia> {
+    let kind = if video { "VideoObject" } else { "AudioObject" };
+    dom.descendants(crate::dom::DOCUMENT)
+        .filter(|&id| schema_item_is(dom, id, kind))
+        .filter_map(|item| {
+            let target = ["contentUrl", "embedUrl", "url"]
+                .into_iter()
+                .find_map(|name| microdata_url_property(dom, base, item, name))?;
+            let thumbnail = ["thumbnailUrl", "thumbnail"]
+                .into_iter()
+                .find_map(|name| microdata_url_property(dom, base, item, name))
+                .map(|u| u.to_string());
+            Some(StructuredMedia {
+                item,
+                target,
+                thumbnail,
+            })
+        })
+        .collect()
+}
+
+fn schema_item_is(dom: &Dom, id: NodeId, kind: &str) -> bool {
+    if dom.namespace_uri(id) != Some("http://www.w3.org/1999/xhtml")
+        || dom.attr(id, "itemscope").is_none()
+    {
+        return false;
+    }
+    dom.attr(id, "itemtype").is_some_and(|types| {
+        types.split_ascii_whitespace().any(|ty| {
+            Url::parse(ty).is_ok_and(|u| {
+                matches!(u.scheme(), "http" | "https")
+                    && matches!(u.host_str(), Some("schema.org" | "www.schema.org"))
+                    && u.path().trim_matches('/') == kind
+            })
+        })
+    })
+}
+
+/// First property value in Microdata tree order. This is the HTML §5.2.5
+/// pending-list walk: seed the item's children plus `itemref` targets, do not
+/// descend through a nested item, and accept every whitespace-separated
+/// `itemprop` name on the current element.
+fn microdata_url_property(dom: &Dom, base: &Url, item: NodeId, name: &str) -> Option<Url> {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut pending: VecDeque<NodeId> = dom.children(item).into();
+    if let Some(refs) = dom.attr(item, "itemref") {
+        for target in refs
+            .split_ascii_whitespace()
+            .filter_map(|id| dom.get_by_id(id))
+        {
+            pending.push_back(target);
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut results = HashSet::new();
+    while let Some(id) = pending.pop_front() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let is_html = dom.namespace_uri(id) == Some("http://www.w3.org/1999/xhtml");
+        let is_property = is_html
+            && dom
+                .attr(id, "itemprop")
+                .is_some_and(|names| names.split_ascii_whitespace().any(|n| n == name));
+        let has_scope = is_html && dom.attr(id, "itemscope").is_some();
+        if is_property && !has_scope {
+            results.insert(id);
+        }
+        if !has_scope {
+            pending.extend(dom.children(id));
+        }
+    }
+    // Step 6 sorts the result nodes in tree order before values are read.
+    dom.descendants(crate::dom::DOCUMENT)
+        .filter(|id| results.contains(id))
+        .find_map(|id| {
+            let raw = microdata_value(dom, id)?.trim();
+            match crate::http::resolve(base, raw) {
+                Link::Http(url) => Some(url),
+                _ => None,
+            }
+        })
+}
+
+/// The URL-capable cases of HTML §5.2.4's property-value algorithm. Schema.org
+/// URL properties should use these URL property elements; `meta[content]` is
+/// also accepted because the algorithm defines its string value and deployed
+/// Schema.org producers commonly use it for machine-only URLs.
+fn microdata_value(dom: &Dom, id: NodeId) -> Option<&str> {
+    match dom.tag_name(id)? {
+        "meta" => dom.attr(id, "content"),
+        "audio" | "embed" | "iframe" | "img" | "source" | "track" | "video" => dom.attr(id, "src"),
+        "a" | "area" | "link" => dom.attr(id, "href"),
+        "object" => dom.attr(id, "data"),
+        _ => None,
+    }
+}
+
+/// Whether the page declares ITSELF a video page via cross-site metadata: an
+/// Open Graph `og:video`(/`:secure_url`) resource, an `og:type` in the
+/// `video.*` hierarchy (ogp.me), or exactly one Schema.org `VideoObject`.
+/// Uniqueness keeps a gallery/feed from becoming one ambiguous page-level
+/// target. This signal — never a host check — is shared by the page-level mpv
+/// fallback and preview-image decode gate. A present `<video>` is itself the
+/// standardized playback signal and does not need metadata qualification.
 pub(crate) fn page_declares_video(dom: &Dom) -> bool {
     ["og:video", "og:video:secure_url"]
         .into_iter()
@@ -1190,6 +1366,12 @@ pub(crate) fn page_declares_video(dom: &Dom) -> bool {
         || dom
             .meta_content("og:type")
             .is_some_and(|t| t.trim().to_ascii_lowercase().starts_with("video"))
+        || dom
+            .descendants(crate::dom::DOCUMENT)
+            .filter(|&id| schema_item_is(dom, id, "VideoObject"))
+            .take(2)
+            .count()
+            == 1
 }
 
 /// A CSS `font-weight` value reads as bold (`bold`/`bolder`/≥600).

@@ -729,6 +729,16 @@ fn interaction_links(dom: &Dom, base: &url::Url) -> HashMap<NodeId, Link> {
         {
             out.insert(node, crate::http::resolve(base, href));
         }
+        // HTML §4.8.8: a user agent unable to render video may represent the
+        // element as a link to an external playback utility. The generated
+        // VIDEO border box is therefore an activation surface of its own,
+        // independent of custom-player buttons painted over the media tech.
+        if matches!(dom.tag_name(node), Some("video" | "audio"))
+            && dom.point_hit_testable(node)
+            && let Some(target) = super::inline::media_target(dom, base, node)
+        {
+            out.insert(node, Link::Media(target));
+        }
     }
     out
 }
@@ -1356,23 +1366,28 @@ fn composite(
     // compatibility boundary: ordinary links and their navigation order do not
     // change, while an empty overlay anchor finally exposes its real CSS box.
     for hit in hits {
-        let represented = rows
-            .iter()
-            .enumerate()
-            .flat_map(|(row, items)| items.items.iter().map(move |item| (row, item)))
-            .any(|(row, item)| {
-                if item.link.as_ref() != Some(&hit.link) {
-                    return false;
-                }
-                let item_right = u32::from(item.col) + u32::from(item.width);
-                let hit_right = hit.col + u32::from(hit.width);
-                let item_bottom = row + usize::from(item.height.max(1));
-                let hit_bottom = hit.row + usize::from(hit.height.max(1));
-                row < hit_bottom
-                    && hit.row < item_bottom
-                    && u32::from(item.col) < hit_right
-                    && hit.col < item_right
-            });
+        // An ordinary anchor needs no second hit surface once linked content
+        // represents it. A media element is different: its small textual
+        // caption represents the WHOLE generated video box, including the
+        // custom controls that paint over it, so retain that box surface.
+        let represented = !matches!(hit.link, Link::Media(_))
+            && rows
+                .iter()
+                .enumerate()
+                .flat_map(|(row, items)| items.items.iter().map(move |item| (row, item)))
+                .any(|(row, item)| {
+                    if item.link.as_ref() != Some(&hit.link) {
+                        return false;
+                    }
+                    let item_right = u32::from(item.col) + u32::from(item.width);
+                    let hit_right = hit.col + u32::from(hit.width);
+                    let item_bottom = row + usize::from(item.height.max(1));
+                    let hit_bottom = hit.row + usize::from(hit.height.max(1));
+                    row < hit_bottom
+                        && hit.row < item_bottom
+                        && u32::from(item.col) < hit_right
+                        && hit.col < item_right
+                });
         if represented {
             continue;
         }

@@ -2458,10 +2458,10 @@ impl Dom {
                 VarResult::Cycle => return None,
                 // Guaranteed-invalid / undefined target: substitute the
                 // fallback if present, else this value is invalid.
-                VarResult::Undefined => match fallback {
-                    Some(f) => out.push_str(&self.substitute_vars(id, f, active)?),
-                    None => return None,
-                },
+                VarResult::Undefined => {
+                    let fallback = fallback?;
+                    out.push_str(&self.substitute_vars(id, fallback, active)?);
+                }
             }
             rest = &after[end + 1..];
         }
