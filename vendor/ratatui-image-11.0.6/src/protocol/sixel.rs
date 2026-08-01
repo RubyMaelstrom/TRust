@@ -44,8 +44,19 @@ fn encode(img: &DynamicImage, size: Size, is_tmux: bool) -> Result<String> {
     let width = size.width;
     let height = size.height;
 
-    let sixel_data = sixel_encode(bytes, w as usize, h as usize, &EncodeOptions::default())
+    let mut sixel_data = sixel_encode(bytes, w as usize, h as usize, &EncodeOptions::default())
         .map_err(|err| Errors::Sixel(format!("sixel encoding error: {err}")))?;
+
+    // A final Graphics New Line has no following band to position, so it
+    // cannot affect the image. It can, however, advance the sixel active
+    // position past the bottom margin and scroll the whole terminal. Remove
+    // that side effect while retaining GNLs between image bands.
+    //
+    // VT330/VT340 Programmer Reference Manual, Vol. 2, chapter 14:
+    // "Graphics New Line (-)" and "Sixel Scrolling Mode".
+    if sixel_data.ends_with("-\x1b\\") {
+        sixel_data.remove(sixel_data.len() - 3);
+    }
 
     // DECSC … DECRC + CUF1 around the whole sequence (TRust patch): after a
     // sixel, the terminal leaves the cursor wherever its scrolling mode says
@@ -123,5 +134,22 @@ impl StatefulProtocolTrait for Sixel {
             ..*self
         };
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use image::DynamicImage;
+    use ratatui::layout::Size;
+
+    use super::encode;
+
+    #[test]
+    fn encoded_sixel_does_not_end_with_a_graphics_new_line() {
+        let image = DynamicImage::new_rgb8(8, 12);
+        let data = encode(&image, Size::new(1, 1), false).unwrap();
+        let terminator = data.rfind("\x1b\\").expect("sixel string terminator");
+
+        assert_ne!(data.as_bytes()[terminator - 1], b'-');
     }
 }

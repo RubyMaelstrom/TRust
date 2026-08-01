@@ -482,9 +482,13 @@ mod sixel_slice {
 
             data.push_str(&sliced_bands.join("-"));
 
-            if !sliced_bands.is_empty() {
-                data.push('-');
-            }
+            // Do not append a Graphics New Line after the final visible band.
+            // With no following band it paints nothing, while at the bottom
+            // margin it can scroll the terminal and displace every existing
+            // sixel. Inter-band GNLs remain in `join("-")` above.
+            //
+            // VT330/VT340 Programmer Reference Manual, Vol. 2, chapter 14:
+            // "Graphics New Line (-)" and "Sixel Scrolling Mode".
             data.push('\x1b');
             data.push('\\');
             data.push_str(end);
@@ -657,7 +661,7 @@ mod sixel_slice {
                 let mut source = sliced_sixel.borrow_owner().data.as_str();
                 source = source.strip_suffix("\x1b\\").unwrap();
                 source = source.trim_end_matches('-');
-                let source = format!("{source}-\x1b\\");
+                let source = format!("{source}\x1b\\");
 
                 let sliced_sixel_data = sliced_sixel.borrow_dependent();
                 let sliced = sliced_sixel_data.to_sequence(0, 0, size.height, size.width);
@@ -712,6 +716,22 @@ mod sixel_slice {
 
             // one row is 20px, so 3 bands make 18px
             assert_eq!(3, sliced.bands(0, 11).len());
+        }
+
+        #[test]
+        fn test_sequence_has_no_final_graphics_new_line() {
+            let data = String::from("\x1bPq\"1;1;8;12#0band1-band2-\x1b\\");
+            let sixel = Sixel {
+                data,
+                size: Size::new(1, 2),
+                is_tmux: false,
+            };
+            let sliced = SlicedSixel::from_sixel(sixel, 6, false);
+            let sequence = sliced.borrow_dependent().to_sequence(0, 0, 1, 2);
+            let terminator = sequence.rfind("\x1b\\").expect("sixel string terminator");
+
+            assert_ne!(sequence.as_bytes()[terminator - 1], b'-');
+            assert!(sequence[..terminator].contains("band1-band2"));
         }
     }
 }
