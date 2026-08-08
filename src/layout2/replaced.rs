@@ -57,18 +57,29 @@ pub(crate) fn size(
             .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
             .filter(|&v| v > 0.0)
     };
-    // HTML presentational hints are the LOWEST cascade origin: author CSS on
-    // an axis, even `auto`, must win over the attribute for THAT axis — the
-    // attribute pair only fills in when BOTH axes lack CSS (an `auto` CSS
-    // axis instead feeds the RATIO via `ratio_of`, below). Resolving each
-    // axis independently against its own attribute let a CSS `width:100%;
-    // height:auto` image (attrs present only for the ratio) get a literal
-    // raw-attribute height instead of the ratio-scaled one.
+    // HTML Rendering §14.3.3 maps width/height attributes to presentational
+    // hints for the corresponding CSS properties and to `aspect-ratio`.
+    // Presentational hints sit below ordinary author declarations in the
+    // author origin. Apply that cascade independently per axis: an explicit
+    // author `height:auto` therefore suppresses the `height` attribute even
+    // though parsing `auto` yields no definite length, while a width attribute
+    // remains available if the author did not declare `width`.
+    //
+    // Checking only the parsed lengths loses the distinction between an
+    // undeclared axis and an explicitly-auto axis. On 9to5linux article hero
+    // images that turned width=1400 height=800 + max-width:100%;height:auto
+    // into a width-clamped but still 800px-tall box.
     let css_w = css("width", cb_w);
     let css_h = css("height", cb_h);
-    let (spec_w, spec_h) = match (css_w, css_h) {
-        (None, None) => (attr("width"), attr("height")),
-        other => other,
+    let spec_w = if dom.author_declares(node, "width") {
+        css_w
+    } else {
+        attr("width")
+    };
+    let spec_h = if dom.author_declares(node, "height") {
+        css_h
+    } else {
+        attr("height")
     };
     // CSS 2.1 §10.3.2 "rule 3"/§10.6.2: a replaced element with an intrinsic
     // ratio but NO intrinsic width or height (an SVG referenced with only a

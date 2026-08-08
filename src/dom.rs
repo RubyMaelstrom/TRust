@@ -2213,6 +2213,17 @@ impl Dom {
         self.cascaded_maps(id).elem.get(prop).cloned()
     }
 
+    /// Whether the author cascade supplies this property on the element.
+    ///
+    /// This differs deliberately from [`computed_value`](Self::computed_value):
+    /// an explicit author `height:auto` computes to the same value as the
+    /// property's initial value, but still outranks an HTML `height` attribute's
+    /// presentational hint. Replaced-element sizing needs that distinction when
+    /// it inserts HTML dimension attributes at their specified cascade origin.
+    pub(crate) fn author_declares(&self, id: NodeId, prop: &str) -> bool {
+        self.cascaded_maps(id).elem.contains_key(prop)
+    }
+
     /// The element's full cascade winner maps for the current epoch, built
     /// on the first read of ANY of its properties (one pass over its author
     /// sources), then shared by every further read.
@@ -2511,9 +2522,9 @@ impl Dom {
     /// Whether `id` carries the clearfix idiom — a `::before`/`::after`
     /// pseudo-element that `clear`s floats (`.clearfix`, Bootstrap's `.row`,
     /// `.group`, …). Such a block CONTAINS its descendant floats (the universal
-    /// pre-flexbox containment pattern: `::after{content:"";clear:both}`), so
-    /// the layout treats it as a block formatting context. Without it a float
-    /// grid leaks past its row and the next section paints on top of it.
+    /// pre-flexbox containment pattern: `::after{content:"";clear:both}`): the
+    /// generated pseudo is the final in-flow clearing child. Without it a
+    /// float grid leaks past its row and the next section paints on top of it.
     pub fn has_clearing_pseudo(&self, id: NodeId) -> bool {
         // The baked marker (set by the serializer when the real CSS was still
         // in scope) — the layout re-parses without the `::after{clear}` rule.
@@ -2521,15 +2532,24 @@ impl Dom {
             return true;
         }
         [PseudoEl::Before, PseudoEl::After].into_iter().any(|p| {
-            self.pseudo_style(id, p, "clear").is_some_and(|v| {
-                // css-logical-1 flow-relative values included (LTR-only:
-                // inline-start = left, inline-end = right), matching layout's
-                // `float_side`/`clear_floats`.
-                matches!(
-                    v.trim(),
-                    "both" | "left" | "right" | "inline-start" | "inline-end"
-                )
-            })
+            // `content:normal|none` (or display:none) generates no pseudo box,
+            // so its `clear` declaration cannot affect layout (CSS Pseudo 4
+            // §4.1 / CSS Content 3 §1). An empty STRING still generates
+            // a box — precisely the standard clearfix — even though it has no
+            // text for `pseudo_content` to return.
+            self.pseudo_style(id, p, "content").is_some_and(|v| {
+                let v = v.trim();
+                !v.is_empty() && !matches!(v, "normal" | "none")
+            }) && self.pseudo_style(id, p, "display").as_deref() != Some("none")
+                && self.pseudo_style(id, p, "clear").is_some_and(|v| {
+                    // css-logical-1 flow-relative values included (LTR-only:
+                    // inline-start = left, inline-end = right), matching layout's
+                    // `float_side`/`clear_floats`.
+                    matches!(
+                        v.trim(),
+                        "both" | "left" | "right" | "inline-start" | "inline-end"
+                    )
+                })
         })
     }
 

@@ -1129,6 +1129,33 @@ mod tests {
     }
 
     #[test]
+    fn author_height_auto_overrides_only_the_height_presentational_hint() {
+        // 9to5linux article hero shape: the HTML dimensions provide early
+        // width/height and aspect-ratio hints, while the stylesheet constrains
+        // width and explicitly returns height to auto. The author `height:auto`
+        // outranks only the height hint; max-width then constrains the remaining
+        // width hint and the auto height follows the decoded preferred ratio
+        // (the attribute ratio is the pre-decode fallback).
+        // Treating explicit auto as "no declaration" produced 40×50 cells:
+        // width was clamped to the viewport but the raw 800px height survived.
+        let images = img_sizes(&[("http://e.com/hero.webp", 80, 23)]);
+        let out = lay_images(
+            r#"<style>img { max-width:100%; height:auto }</style>
+               <body style="margin:0">
+                 <img src="hero.webp" width="1400" height="800">
+               </body>"#,
+            40,
+            &images,
+        );
+        let (_, img) = first_image(&out);
+        assert_eq!(
+            (img.width, img.height),
+            (40, 12),
+            "the constrained width re-derives auto height through the preferred ratio"
+        );
+    }
+
+    #[test]
     fn ratio_only_svg_sizes_to_the_containing_block() {
         // CSS 2.1 §10.3.2 rule 3: an <img> of a viewBox-only SVG (intrinsic
         // ratio, no intrinsic width/height) sized auto/auto takes its width
@@ -2093,6 +2120,26 @@ mod tests {
     }
 
     #[test]
+    fn overflow_clip_keeps_the_content_based_automatic_minimum() {
+        // Flexbox §4.5 keys the automatic minimum on CSS Overflow's
+        // scrollable/non-scrollable values. `clip` is non-scrollable, unlike
+        // `hidden`, so the long word retains its min-content floor.
+        let out = lay(
+            r#"<body style="margin:0"><div style="display:flex;width:160px">
+                <div style="flex:1;overflow:clip">unshrinkablelongword</div>
+                <div style="flex:1">x</div>
+               </div></body>"#,
+            80,
+        );
+        let (_, x) = find(&out, "x");
+        assert!(
+            x.col > 10,
+            "clip preserves the first item's min-content floor: col {}",
+            x.col
+        );
+    }
+
+    #[test]
     fn nested_flex_tower_lays_out() {
         let out = lay(
             r#"<body style="margin:0"><div style="display:flex;flex-direction:column">
@@ -2933,6 +2980,21 @@ mod tests {
             find(&out, "real").0,
             0,
             "the sub-cell box reserves no rows either"
+        );
+    }
+
+    #[test]
+    fn overflow_clip_keeps_a_mostly_visible_negative_margin_text_row() {
+        // The clip begins 5px into the 16px glyph row. A graphical UA shows
+        // most of the line; the cell paint boundary must not discard it merely
+        // because the two independently snapped edges straddle a row boundary.
+        let out = lay(
+            r#"<body style="margin:0"><div style="height:9px"></div><div style="overflow:hidden"><p style="margin:-5px 0 0">mostly visible</p></div></body>"#,
+            40,
+        );
+        assert!(
+            !absent(&out, "mostly visible"),
+            "11/16px of the glyph row remains inside the CSS clip"
         );
     }
 
@@ -4748,6 +4810,120 @@ mod tests {
             after.0 >= 4,
             "the BFC contained the 4-row float, pushing `after` below it: row {}",
             after.0
+        );
+    }
+
+    #[test]
+    fn an_auto_width_bfc_uses_the_remaining_band_beside_a_float() {
+        // CSS 2.2 §9.5: the BFC root's BORDER box may be narrowed beside a
+        // float, but must not overlap the float's MARGIN box. This is the
+        // canonical media-object/article-list pattern used by 9to5linux.com.
+        let images = img_sizes(&[("http://e.com/f.png", 10, 4)]);
+        let (dom, boxes) = measure_images(
+            r#"<body style="margin:0"><img src="f.png" style="float:left;margin-right:16px"><div id="content" style="overflow:hidden"><p style="margin:0">headline and summary</p></div></body>"#,
+            40,
+            20,
+            &images,
+        );
+        let content = rect(&dom, &boxes, "content");
+        assert_eq!(content.left, 96.0, "80px image + 16px float margin");
+        assert_eq!(content.width, 224.0, "the BFC uses the remaining 28 cols");
+    }
+
+    #[test]
+    fn a_right_float_narrows_an_auto_width_bfc_from_the_other_side() {
+        let images = img_sizes(&[("http://e.com/f.png", 10, 4)]);
+        let (dom, boxes) = measure_images(
+            r#"<body style="margin:0"><img src="f.png" style="float:right;margin-left:16px"><div id="content" style="overflow:hidden"><p style="margin:0">headline and summary</p></div></body>"#,
+            40,
+            20,
+            &images,
+        );
+        let content = rect(&dom, &boxes, "content");
+        assert_eq!(content.left, 0.0);
+        assert_eq!(content.width, 224.0, "the right float excludes 12 cols");
+    }
+
+    #[test]
+    fn a_definite_bfc_that_cannot_fit_is_placed_below_the_float() {
+        // CSS 2.2 §9.5 permits clearing the BFC root when its used width
+        // cannot fit beside the preceding float.
+        let images = img_sizes(&[("http://e.com/f.png", 12, 4)]);
+        let (dom, boxes) = measure_images(
+            r#"<body style="margin:0"><img src="f.png" style="float:left"><div id="content" style="overflow:hidden;width:280px"><p style="margin:0">wide</p></div></body>"#,
+            40,
+            20,
+            &images,
+        );
+        let content = rect(&dom, &boxes, "content");
+        assert_eq!(content.left, 0.0);
+        assert!(
+            content.top >= 64.0,
+            "the 280px BFC clears the 96px-wide, 64px-tall float: {content:?}"
+        );
+        assert_eq!(content.width, 280.0);
+    }
+
+    #[test]
+    fn overflow_clip_does_not_establish_a_bfc() {
+        // CSS Overflow 3 §3.1 explicitly distinguishes `clip` from
+        // `hidden`: clip does not establish an independent formatting context,
+        // so the block box remains full-width while its LINE boxes wrap.
+        let images = img_sizes(&[("http://e.com/f.png", 10, 4)]);
+        let (dom, boxes) = measure_images(
+            r#"<body style="margin:0"><img src="f.png" style="float:left"><div id="content" style="overflow:clip"><p style="margin:0">headline and summary</p></div></body>"#,
+            40,
+            20,
+            &images,
+        );
+        let content = rect(&dom, &boxes, "content");
+        assert_eq!(content.left, 0.0);
+        assert_eq!(content.width, 320.0);
+    }
+
+    #[test]
+    fn a_clearing_pseudo_contains_the_media_float_without_isolating_text() {
+        // The generated `::after { clear:both }` is a final in-flow child, not
+        // a new formatting context. It expands the article through the float;
+        // the overflow-hidden sibling independently takes the adjacent band.
+        let images = img_sizes(&[("http://e.com/f.png", 10, 4)]);
+        let (dom, boxes) = measure_images(
+            r#"<style>.clearfix::after{content:"";display:table;clear:both}</style><body style="margin:0"><article id="entry" class="clearfix"><img src="f.png" style="float:left;margin-right:16px"><div id="content" style="overflow:hidden"><p style="margin:0">headline and summary</p></div></article><div id="next">next article</div></body>"#,
+            40,
+            20,
+            &images,
+        );
+        let entry = rect(&dom, &boxes, "entry");
+        let content = rect(&dom, &boxes, "content");
+        let next = rect(&dom, &boxes, "next");
+        assert_eq!((content.left, content.width), (96.0, 224.0));
+        assert!(
+            entry.height >= 64.0,
+            "clearfix contains the float: {entry:?}"
+        );
+        assert!(
+            next.top >= 64.0,
+            "the next article starts below the contained float: {next:?}"
+        );
+    }
+
+    #[test]
+    fn clear_on_an_ungenerated_pseudo_does_not_create_a_clearfix() {
+        // CSS Content 3 §1: `content:normal` computes to `none` on ::after,
+        // inhibiting pseudo-element creation. Its `clear` declaration therefore
+        // cannot make the float-only parent contain its float.
+        let images = img_sizes(&[("http://e.com/f.png", 10, 4)]);
+        let (dom, boxes) = measure_images(
+            r#"<style>.not-a-clearfix::after{clear:both}</style><body style="margin:0"><div id="entry" class="not-a-clearfix"><img src="f.png" style="float:left"></div><div id="next">next</div></body>"#,
+            40,
+            20,
+            &images,
+        );
+        assert_eq!(rect(&dom, &boxes, "entry").height, 0.0);
+        assert_eq!(
+            rect(&dom, &boxes, "next").top,
+            0.0,
+            "the following block remains beside the uncontained float"
         );
     }
 
