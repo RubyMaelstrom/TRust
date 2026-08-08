@@ -891,6 +891,51 @@ mod tests {
         assert!(sym.contains("\x1bP"), "plain: still carries the DCS");
     }
 
+    /// Regression for the sliced-sixels parser after the encoder stopped
+    /// emitting a trailing Graphics New Line. The DCS String Terminator ends
+    /// the payload; it is not necessary for a `-` to precede it. Discarding the
+    /// final split element in that form removes six real pixel rows and leaves
+    /// the terminal's old bitmap/text damage visible while scrolling.
+    #[test]
+    fn sliced_sixel_retains_final_band_before_string_terminator() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+        use ratatui_image::picker::ProtocolType;
+        use ratatui_image::sliced::{SignedPosition, SlicedImage};
+
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Sixel);
+        let font = picker.font_size();
+        let size = Size::new(2, 3);
+        let image = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            u32::from(size.width) * u32::from(font.width),
+            u32::from(size.height) * u32::from(font.height),
+            image::Rgb([0x24, 0x91, 0xff]),
+        ));
+        let protocol = encode_sliced(&picker, image, size, false, false).unwrap();
+        let area = Rect::new(0, 0, size.width, size.height);
+        let mut buf = Buffer::empty(area);
+        SlicedImage::new(&protocol, SignedPosition::from((0, 0))).render(area, &mut buf);
+
+        let sequence = buf[(0, 0)].symbol();
+        let dcs_start = sequence.find("\x1bP").expect("sixel DCS");
+        let dcs_end = dcs_start
+            + sequence[dcs_start..]
+                .find("\x1b\\")
+                .expect("sixel String Terminator")
+            + 2;
+        let dcs = &sequence[dcs_start..dcs_end - 2];
+        let payload = dcs.split_once('q').expect("sixel data introducer").1;
+        let bands = payload.matches('-').count() + usize::from(!payload.is_empty());
+
+        assert_eq!(
+            bands * 6,
+            usize::from(size.height) * usize::from(font.height),
+            "the final sixel band immediately before ST must not be discarded"
+        );
+    }
+
     #[test]
     fn static_svg_is_sniffed_sized_and_rasterized_for_the_terminal_box() {
         let svg = sample_svg();

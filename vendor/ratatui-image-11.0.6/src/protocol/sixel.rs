@@ -68,8 +68,7 @@ fn encode(img: &DynamicImage, size: Size, is_tmux: bool) -> Result<String> {
     // persistent visual break, healed only when that cell's buffer content
     // changed. Save/restore + one step right makes the backend's assumption
     // hold on any terminal. (`SlicedSixel::from_sixel` is unaffected: it
-    // locates the DCS by `find("\x1bP")` past the prefix, and the suffix
-    // lands in the post-`-` tail element that `bands.pop()` discards.)
+    // locates and parses the inner DCS independently of this wrapper.)
     let mut data = String::from("\x1b7");
     if is_tmux {
         if !sixel_data.starts_with('\x1b') {

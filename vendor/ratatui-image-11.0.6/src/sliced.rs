@@ -479,7 +479,6 @@ mod sixel_slice {
             data.push_str(self.header);
 
             let sliced_bands = self.bands(skip_line_count, drop_line_count);
-
             data.push_str(&sliced_bands.join("-"));
 
             // Do not append a Graphics New Line after the final visible band.
@@ -502,12 +501,28 @@ mod sixel_slice {
         pub fn from_sixel(sixel: Sixel, font_height: u16, is_tmux: bool) -> SlicedSixel {
             SlicedSixel::new(sixel, |s| {
                 let size = s.size;
-                let dcs_start = s.data.find("\u{1b}P").unwrap_or(0);
+                // `Sixel::encode` removes the encoder's trailing Graphics New
+                // Line before the String Terminator. Parse the DCS boundary
+                // itself instead of assuming `split('-')` therefore ends in a
+                // disposable tail: that assumption dropped the final *real*
+                // sixel band after the trailing GNL was removed.
+                //
+                // In a tmux passthrough, the inner DCS and ST escape bytes are
+                // doubled. Start at that inner DCS so `to_sequence` can wrap
+                // the retained header in exactly one fresh passthrough.
+                let dcs = if is_tmux { "\x1b\x1bP" } else { "\x1bP" };
+                let st = if is_tmux { "\x1b\x1b\\" } else { "\x1b\\" };
+                let dcs_start = s.data.find(dcs).unwrap_or(0);
                 let data = &s.data[dcs_start..];
                 let header_end = find_sixel_data_start(data);
                 let (header, body) = data.split_at(header_end);
-                let mut bands: Vec<&str> = body.split('-').collect();
-                bands.pop();
+                let body = body.split_once(st).map_or(body, |(body, _)| body);
+                let body = body.strip_suffix('-').unwrap_or(body);
+                let bands = if body.is_empty() {
+                    Vec::new()
+                } else {
+                    body.split('-').collect()
+                };
                 SlicedSixelData {
                     size,
                     font_height,
@@ -598,7 +613,6 @@ mod sixel_slice {
 
         #[test]
         fn test_sixel_slice_bands() {
-            // TODO: is there always a `-` before `<esc>\`?
             let data = String::from("\x1b[6X\x1bPq\"1;1;8;16#0band1-band2-band3-\x1b\\");
             let sixel = Sixel {
                 data,
@@ -609,6 +623,47 @@ mod sixel_slice {
             let sliced = sliced.borrow_dependent();
             // band1 should be skipped, band2 should be present
             assert_eq!(sliced.bands, vec!["#0band1", "band2", "band3"]);
+        }
+
+        #[test]
+        fn test_sixel_slice_bands_without_trailing_graphics_new_line() {
+            // This is the shape produced by `protocol::sixel::encode`: the
+            // encoder's final `-` is deliberately removed before ST. The last
+            // image band is data, not a terminator tail, and must survive.
+            let data = String::from(
+                "\x1b7\x1b[6X\x1bP9;1;0q#0band1-band2-band3\x1b\\\x1b8\x1b[1C",
+            );
+            let sixel = Sixel {
+                data,
+                size: Size::default(),
+                is_tmux: false,
+            };
+            let sliced = SlicedSixel::from_sixel(sixel, 6, false);
+
+            assert_eq!(
+                sliced.borrow_dependent().bands,
+                vec!["#0band1", "band2", "band3"]
+            );
+        }
+
+        #[test]
+        fn test_tmux_slice_uses_inner_dcs_without_losing_last_band() {
+            let data = String::from(
+                "\x1b7\x1bPtmux;\x1b\x1bP9;1;0q#0band1-band2\x1b\x1b\\\x1b\\\x1b8\x1b[1C",
+            );
+            let sixel = Sixel {
+                data,
+                size: Size::new(1, 2),
+                is_tmux: true,
+            };
+            let sliced = SlicedSixel::from_sixel(sixel, 6, true);
+            let sliced = sliced.borrow_dependent();
+
+            assert_eq!(sliced.header, "\x1b\x1bP9;1;0q");
+            assert_eq!(sliced.bands, vec!["#0band1", "band2"]);
+            let sequence = sliced.to_sequence(0, 0, 1, 2);
+            assert!(sequence.starts_with("\x1b7\x1bPtmux;"));
+            assert_eq!(sequence.matches("\x1bPtmux;").count(), 1);
         }
 
         #[test]
