@@ -186,6 +186,18 @@ impl PageCache {
         drop(self.fetch(handle, url));
     }
 
+    /// Test helper for seeding a body when response headers are immaterial.
+    #[cfg(test)]
+    pub fn seed(&self, url: String, status: u16, content_type: String, body: Vec<u8>) {
+        self.seed_with_headers(
+            url,
+            status,
+            content_type.clone(),
+            vec![(String::from("content-type"), content_type)],
+            body,
+        );
+    }
+
     /// An existing entry (in-flight or done) for `url`, or None. The
     /// page's own `fetch()` uses this to join a known subresource request
     /// WITHOUT caching arbitrary API GETs — a miss falls through to a
@@ -225,12 +237,20 @@ impl PageCache {
         }
     }
 
-    /// Seed an already-fetched body (the initial `execute_js` prefetch).
-    pub fn seed(&self, url: String, status: u16, content_type: String, body: Vec<u8>) {
+    /// Seed an already-fetched response without discarding metadata that the
+    /// Fetch and HTML processing models inspect later (notably `nosniff`).
+    pub fn seed_with_headers(
+        &self,
+        url: String,
+        status: u16,
+        content_type: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) {
         use futures::future::FutureExt as _;
         let resp = std::sync::Arc::new(CachedResp {
             status,
-            headers: vec![(String::from("content-type"), content_type.clone())],
+            headers,
             content_type,
             body,
         });
@@ -1137,6 +1157,81 @@ pub(crate) fn decode_body(content_type: &str, body: &[u8]) -> String {
     }
 }
 
+/// Whether a MIME type is a JavaScript MIME type (MIME Sniffing §4.2).
+/// Parameters do not participate in the essence match.
+fn is_javascript_mime_type(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        essence.as_str(),
+        "application/ecmascript"
+            | "application/javascript"
+            | "application/x-ecmascript"
+            | "application/x-javascript"
+            | "text/ecmascript"
+            | "text/javascript"
+            | "text/javascript1.0"
+            | "text/javascript1.1"
+            | "text/javascript1.2"
+            | "text/javascript1.3"
+            | "text/javascript1.4"
+            | "text/javascript1.5"
+            | "text/jscript"
+            | "text/livescript"
+            | "text/x-ecmascript"
+            | "text/x-javascript"
+    )
+}
+
+/// Fetch §3.6: only the first comma-separated value controls `nosniff`.
+fn has_nosniff(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-content-type-options"))
+        .and_then(|(_, value)| value.split(',').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("nosniff"))
+}
+
+/// HTML "fetch a classic script" plus Fetch's `nosniff` response check.
+/// Classic scripts retain the web-compatible historical behavior of accepting
+/// a non-JavaScript MIME type when `nosniff` is absent.
+pub(crate) fn classic_script_response_allowed(
+    status: u16,
+    content_type: &str,
+    headers: &[(String, String)],
+) -> bool {
+    (200..300).contains(&status) && (!has_nosniff(headers) || is_javascript_mime_type(content_type))
+}
+
+/// HTML "fetch a single module script": HTTP(S) modules require both an OK
+/// response and a JavaScript MIME type, independently of `nosniff`.
+pub(crate) fn module_script_response_allowed(status: u16, content_type: &str) -> bool {
+    (200..300).contains(&status) && is_javascript_mime_type(content_type)
+}
+
+/// Fetch's style-destination `nosniff` check, plus the ordinary OK-status
+/// requirement for obtaining an external stylesheet.
+pub(crate) fn stylesheet_response_allowed(
+    status: u16,
+    content_type: &str,
+    headers: &[(String, String)],
+) -> bool {
+    if !(200..300).contains(&status) {
+        return false;
+    }
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    !has_nosniff(headers) || essence == "text/css"
+}
+
 /// External classic scripts prefetched in parallel for one page. A browser has
 /// no such cap; it's only a parallelism lid (politeness toward one host) and a
 /// hostile-page lid. It must clear a real code-split SPA's chunk count — a
@@ -1270,30 +1365,54 @@ pub async fn execute_js(
     for (kind, raw, resolved, resp) in results {
         match kind {
             Kind::Script => {
-                // Seed the cache too: the module entry is a classic-script
-                // <src>, and the loader/bundler reach it through the cache.
+                // HTML "fetch a classic script" rejects non-OK responses;
+                // Fetch additionally rejects a non-JavaScript MIME type when
+                // the response opts into `X-Content-Type-Options: nosniff`.
+                // Preserve the complete metadata in the shared HTTP cache, but
+                // only expose an allowed body to the parser/executor.
                 if let (Some(u), Some(r)) = (resolved.as_ref(), resp.as_ref()) {
-                    cache.seed(
+                    cache.seed_with_headers(
                         u.to_string(),
                         r.status,
                         r.content_type.clone(),
+                        r.headers.clone(),
                         r.body.clone(),
                     );
                 }
+                let allowed = resp.as_ref().is_some_and(|r| {
+                    classic_script_response_allowed(r.status, &r.content_type, &r.headers)
+                });
                 // Arc so the parallel-parse pool shares the body with its
                 // worker threads instead of cloning a multi-MB bundle.
-                externals.push((raw, resp.map(|r| std::sync::Arc::new(r.body))));
+                externals.push((
+                    raw,
+                    resp.filter(|_| allowed)
+                        .map(|r| std::sync::Arc::new(r.body)),
+                ));
             }
             Kind::Sheet => {
                 // A failed sheet is simply absent: fail-open, nothing
                 // gets hidden.
-                if let Some(r) = resp {
+                if let Some(r) = resp
+                    .filter(|r| stylesheet_response_allowed(r.status, &r.content_type, &r.headers))
+                {
                     sheets.push((raw, decode_body(&r.content_type, &r.body)));
                 }
             }
             Kind::Preload => {
+                // Every entry here is a modulepreload or a module-script entry.
+                // Keep the full response in the shared HTTP cache. The module
+                // consumer performs HTML's mandatory OK-status + JavaScript
+                // MIME check before parsing, including for rejected responses;
+                // caching those responses avoids an incorrect second request.
                 if let (Some(u), Some(r)) = (resolved, resp) {
-                    cache.seed(u.to_string(), r.status, r.content_type, r.body);
+                    cache.seed_with_headers(
+                        u.to_string(),
+                        r.status,
+                        r.content_type,
+                        r.headers,
+                        r.body,
+                    );
                 }
             }
         }
@@ -2599,6 +2718,48 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
 mod tests {
     use super::*;
 
+    #[test]
+    fn script_and_style_response_metadata_checks_follow_fetch_and_html() {
+        let nosniff = vec![(
+            "X-Content-Type-Options".to_string(),
+            " nosniff, ignored".to_string(),
+        )];
+        assert!(classic_script_response_allowed(200, "text/plain", &[]));
+        assert!(!classic_script_response_allowed(
+            200,
+            "text/plain",
+            &nosniff
+        ));
+        assert!(classic_script_response_allowed(
+            200,
+            "Application/JavaScript; charset=utf-8",
+            &nosniff
+        ));
+        assert!(classic_script_response_allowed(
+            200,
+            "text/javascript1.5",
+            &nosniff
+        ));
+        assert!(!classic_script_response_allowed(
+            404,
+            "text/javascript",
+            &[]
+        ));
+
+        // Module scripts never get classic script's historical MIME leniency.
+        assert!(module_script_response_allowed(200, "text/javascript"));
+        assert!(!module_script_response_allowed(200, "text/plain"));
+        assert!(!module_script_response_allowed(404, "text/javascript"));
+
+        assert!(stylesheet_response_allowed(200, "text/plain", &[]));
+        assert!(!stylesheet_response_allowed(200, "text/plain", &nosniff));
+        assert!(stylesheet_response_allowed(
+            200,
+            "text/css; charset=utf-8",
+            &nosniff
+        ));
+    }
+
     /// Find the first laid-out item whose text contains `needle`.
     fn item<'a>(doc: &'a Doc, needle: &str) -> &'a crate::layout2::Item {
         doc.rows
@@ -2721,6 +2882,74 @@ mod tests {
         assert_eq!(response.content_type, "text/html; charset=utf-8");
         let outcome = response.js.expect("outcome recorded");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_js_enforces_status_nosniff_and_module_mime_metadata() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).into_owned();
+                let reply = if text.starts_with("GET /page ") {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                     <body><div id=out>start</div>\
+                     <script src=/nosniff.js></script>\
+                     <script src=/legacy.js></script>\
+                     <script src=/gone.js></script>\
+                     <script type=module src=/wrong-module.js></script>\
+                     <script>document.getElementById('out').textContent += '-inline';</script></body>"
+                        .to_string()
+                } else if text.starts_with("GET /nosniff.js ") {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n\
+                     document.getElementById('out').textContent='BAD-NOSNIFF';"
+                        .to_string()
+                } else if text.starts_with("GET /legacy.js ") {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n\
+                     document.getElementById('out').textContent += '-legacy';"
+                        .to_string()
+                } else if text.starts_with("GET /gone.js ") {
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n\
+                     document.getElementById('out').textContent='BAD-STATUS';"
+                        .to_string()
+                } else if text.starts_with("GET /wrong-module.js ") {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n\
+                     document.getElementById('out').textContent='BAD-MODULE-MIME';"
+                        .to_string()
+                } else {
+                    "HTTP/1.1 404 Nope\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                };
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let body = String::from_utf8_lossy(&response.body);
+        assert!(body.contains("start-legacy-inline"), "{body}");
+        assert!(
+            !body.contains("BAD-"),
+            "forbidden response body ran: {body}"
+        );
+        let outcome = response.js.as_ref().expect("js ran");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.modules_skipped, 1);
         server.abort();
     }
 

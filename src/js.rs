@@ -30,6 +30,23 @@ pub const WALL_BUDGET: Duration = Duration::from_secs(60);
 /// and free), so a slow server can't starve a fast page of its scripts.
 pub const COMPUTE_BUDGET: Duration = Duration::from_secs(30);
 
+/// Diagnostic-only extension for exceptionally large applications. The normal
+/// page limit remains [`COMPUTE_BUDGET`]; a manual diagnostic may set
+/// `TRUST_DIAG_COMPUTE_SECS` to let a heavy page finish booting, but the value
+/// is capped by [`WALL_BUDGET`] so the diagnostic cannot remove the page-wide
+/// wall bound. Read once because this is consulted at every script boundary.
+fn compute_budget() -> Duration {
+    static BUDGET: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let secs = std::env::var("TRUST_DIAG_COMPUTE_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(COMPUTE_BUDGET.as_secs())
+            .clamp(1, WALL_BUDGET.as_secs());
+        Duration::from_secs(secs)
+    })
+}
+
 /// Most loop iterations any single script evaluation may run. Real-world
 /// bundle boots measured in the canary use a few hundred thousand at
 /// most; ten million leaves headroom while still catching `while(true)`
@@ -832,7 +849,7 @@ pub fn run_script(
     budget: &Budget,
     outcome: &mut Outcome,
 ) {
-    if budget.exhausted() || outcome.elapsed >= COMPUTE_BUDGET {
+    if budget.exhausted() || outcome.elapsed >= compute_budget() {
         outcome
             .errors
             .push(format!("{name}: skipped, page JS budget exhausted"));
@@ -920,7 +937,7 @@ fn run_rehydrated_image(
     budget: &Budget,
     outcome: &mut Outcome,
 ) {
-    if budget.exhausted() || outcome.elapsed >= COMPUTE_BUDGET {
+    if budget.exhausted() || outcome.elapsed >= compute_budget() {
         outcome
             .errors
             .push(format!("{name}: skipped, page JS budget exhausted"));
@@ -976,7 +993,7 @@ fn run_prelude(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
         run_rehydrated_image(ctx, "prelude", image, budget, outcome);
         return;
     }
-    if budget.exhausted() || outcome.elapsed >= COMPUTE_BUDGET {
+    if budget.exhausted() || outcome.elapsed >= compute_budget() {
         outcome
             .errors
             .push(String::from("prelude: skipped, page JS budget exhausted"));
@@ -1465,7 +1482,7 @@ fn run_external_classic(
         _ => None,
     };
 
-    if budget.exhausted() || outcome.elapsed >= COMPUTE_BUDGET {
+    if budget.exhausted() || outcome.elapsed >= compute_budget() {
         outcome
             .errors
             .push(format!("{name}: skipped, page JS budget exhausted"));
@@ -5211,15 +5228,22 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
                             let result = crate::http::fetch(&request).await;
                             let mut guard = cell.borrow_mut();
                             match result {
-                                // HTML §"fetch a classic script": only an OK (2xx)
-                                // response runs. A non-ok status (a 404'd webpack
-                                // chunk, a 5xx) is a load FAILURE — fire `error`,
-                                // never execute the error-page body as script.
+                                // HTML "fetch a classic script" requires an OK
+                                // response. Fetch's `nosniff` check additionally
+                                // requires a JavaScript MIME type when requested
+                                // by the response. Fail the element load instead
+                                // of executing an error page or forbidden body.
                                 // (Running a 404's HTML body as JS produced a
                                 // spurious `SyntaxError: unexpected token '<'`; the
                                 // loader's own onerror — webpack's ChunkLoadError —
                                 // is the correct, faithful signal instead.)
-                                Ok(resp) if (200..300).contains(&resp.status) => {
+                                Ok(resp)
+                                    if crate::http::classic_script_response_allowed(
+                                        resp.status,
+                                        &resp.content_type,
+                                        &resp.headers,
+                                    ) =>
+                                {
                                     let body =
                                         crate::http::decode_body(&resp.content_type, &resp.body);
                                     eval_injected_classic(
@@ -5303,7 +5327,13 @@ fn sys_load_injected_stylesheet(
                     let result = crate::http::fetch(&request).await;
                     let mut guard = cell.borrow_mut();
                     match result {
-                        Ok(resp) if (200..300).contains(&resp.status) => {
+                        Ok(resp)
+                            if crate::http::stylesheet_response_allowed(
+                                resp.status,
+                                &resp.content_type,
+                                &resp.headers,
+                            ) =>
+                        {
                             let css = crate::http::decode_body(&resp.content_type, &resp.body);
                             page_dom(&mut guard)
                                 .borrow_mut()
@@ -6001,6 +6031,9 @@ impl boa_engine::module::ModuleLoader for WebModuleLoader {
         }
         .ok_or_else(fail)?;
         let cached = fetch.await.ok().ok_or_else(fail)?;
+        if !crate::http::module_script_response_allowed(cached.status, &cached.content_type) {
+            return Err(fail().into());
+        }
         phase(&format!(
             "module {} {key}",
             if hit { "CACHED" } else { "NETWORK" }
@@ -6473,7 +6506,12 @@ fn load_page(
                             .as_ref()
                             .and_then(|u| load_module_body(&mut ctx, &env.cache, u));
                         match (resolved, cached) {
-                            (Some(resolved), Some(cached)) => {
+                            (Some(resolved), Some(cached))
+                                if crate::http::module_script_response_allowed(
+                                    cached.status,
+                                    &cached.content_type,
+                                ) =>
+                            {
                                 let path = resolved.to_string();
                                 speculate_imports(&mut ctx, &resolved, &cached.body);
                                 run_module(
@@ -6583,15 +6621,21 @@ fn load_page(
                         .as_ref()
                         .and_then(|u| load_module_body(&mut ctx, &env.cache, u))
                     {
-                        run_external_classic(
-                            &mut ctx,
-                            src,
-                            &cached.body,
-                            None, // fetched on demand: no precomputed key (hashed inside)
-                            None,
-                            &budget,
-                            &mut outcome,
-                        );
+                        if crate::http::classic_script_response_allowed(
+                            cached.status,
+                            &cached.content_type,
+                            &cached.headers,
+                        ) {
+                            run_external_classic(
+                                &mut ctx,
+                                src,
+                                &cached.body,
+                                None, // fetched on demand: no precomputed key (hashed inside)
+                                None,
+                                &budget,
+                                &mut outcome,
+                            );
+                        }
                     } else {
                         outcome.errors.push(format!("{src}: not fetched"));
                     }
@@ -7745,6 +7789,24 @@ const WORKER_SCOPE: &str = r##"
         if (u.slice(0, 5) === "blob:") delete __blobURLStore[u];
     };
 
+    // HTML "fetch a classic worker-imported script" uses Fetch's script
+    // destination response check. Keep the legacy JavaScript MIME types from
+    // MIME Sniffing; with `nosniff`, anything else is a network error.
+    var __jsMimes = Object.create(null);
+    for (var __jm of ["application/ecmascript", "application/javascript", "application/x-ecmascript", "application/x-javascript", "text/ecmascript", "text/javascript", "text/javascript1.0", "text/javascript1.1", "text/javascript1.2", "text/javascript1.3", "text/javascript1.4", "text/javascript1.5", "text/jscript", "text/livescript", "text/x-ecmascript", "text/x-javascript"]) __jsMimes[__jm] = true;
+    function __classicScriptResponseOK(r) {
+        if (!r || r[0] < 200 || r[0] >= 300) return false;
+        var lines = String(r[4] || "").split("\n"), nosniff = false;
+        for (var i = 0; i + 1 < lines.length; i += 2) {
+            if (lines[i].toLowerCase() === "x-content-type-options") {
+                nosniff = lines[i + 1].split(",", 1)[0].trim().toLowerCase() === "nosniff";
+                break;
+            }
+        }
+        var essence = String(r[1] || "").split(";", 1)[0].trim().toLowerCase();
+        return !nosniff || !!__jsMimes[essence];
+    }
+
     // --- importScripts (classic, synchronous fetch + global eval) ---
     g.importScripts = function () {
         for (var i = 0; i < arguments.length; i++) {
@@ -7757,7 +7819,7 @@ const WORKER_SCOPE: &str = r##"
             }
             var rp = __url_parse(u, g.location.href); if (rp) u = rp[0];
             var r = __http_fetch(u, "GET", null, null, "");
-            if (!r || r[0] < 200 || r[0] >= 300) throw new Error("importScripts failed: " + u + " (" + (r ? r[0] : "network error") + ")");
+            if (!__classicScriptResponseOK(r)) throw new Error("importScripts failed: " + u + " (" + (r ? r[0] : "network error") + ")");
             (0, eval)(r[2]);
         }
     };
@@ -7889,7 +7951,13 @@ fn run_worker(
         None,
         Vec::new(),
     ) {
-        Some(resp) if (200..300).contains(&resp.status) => {
+        Some(resp)
+            if crate::http::classic_script_response_allowed(
+                resp.status,
+                &resp.content_type,
+                &resp.headers,
+            ) =>
+        {
             String::from_utf8_lossy(&resp.body).into_owned()
         }
         _ => {
@@ -11802,7 +11870,13 @@ const PRELUDE: &str = r##"
         after(...ns) { const p = this.parentNode; if (!p) return; const r = this.nextSibling; for (const n of ns) p.insertBefore(n && typeof n === "object" ? n : g.document.createTextNode(String(n)), r); }
         replaceWith(...ns) { this.before(...ns); this.remove(); }
         replaceChildren(...ns) { let c; while ((c = this.firstChild)) this.removeChild(c); this.append(...ns); }
-        cloneNode(deep) { return wrap(__dom_clone(this.__id, !!deep)); }
+        cloneNode(deep) {
+            const clone = wrap(__dom_clone(this.__id, !!deep));
+            // Cloning creates a fresh script element rather than a
+            // parser-inserted one, so its force-async flag starts true.
+            if (clone instanceof HTMLScriptElement) clone.__trustForceAsync = true;
+            return clone;
+        }
         contains(o) { while (o) { if (o === this) return true; o = o.parentNode; } return false; }
         isSameNode(o) { return o === this; }
         // WHATWG DOM §4.4 "equals": same interface (nodeType), the type's own
@@ -11989,11 +12063,16 @@ const PRELUDE: &str = r##"
     // an instance, then patch `DOMTokenList.prototype` — so the global has to
     // exist AND prototype patches have to reach every instance. The methods read
     // the live `class` attribute through `__el` so the list stays in sync with
-    // direct `setAttribute("class", …)` writes.
+    // direct attribute writes. `blocking` supplies its supported-token set;
+    // lists such as classList with no supported tokens throw from supports().
     class DOMTokenList {
-        constructor(el) { this.__el = el; }
-        __get() { return (this.__el.getAttribute("class") || "").split(/\s+/).filter(Boolean); }
-        __set(l) { this.__el.setAttribute("class", l.join(" ")); }
+        constructor(el, attr, supported) {
+            this.__el = el;
+            this.__attr = attr || "class";
+            this.__supported = supported || null;
+        }
+        __get() { return (this.__el.getAttribute(this.__attr) || "").split(/\s+/).filter(Boolean); }
+        __set(l) { this.__el.setAttribute(this.__attr, l.join(" ")); }
         add(...cs) { const l = this.__get(); for (const c of cs) if (!l.includes(String(c))) l.push(String(c)); this.__set(l); }
         remove(...cs) { const ss = cs.map(String); this.__set(this.__get().filter((x) => !ss.includes(x))); }
         toggle(c, force) {
@@ -12011,11 +12090,14 @@ const PRELUDE: &str = r##"
         }
         contains(c) { return this.__get().includes(String(c)); }
         item(i) { return this.__get()[i] ?? null; }
-        supports() { return true; }
+        supports(token) {
+            if (!this.__supported) throw new TypeError("DOMTokenList has no supported tokens");
+            return this.__supported.includes(String(token));
+        }
         get length() { return this.__get().length; }
-        get value() { return this.__el.getAttribute("class") || ""; }
-        set value(v) { this.__el.setAttribute("class", String(v)); }
-        toString() { return this.__el.getAttribute("class") || ""; }
+        get value() { return this.__el.getAttribute(this.__attr) || ""; }
+        set value(v) { this.__el.setAttribute(this.__attr, String(v)); }
+        toString() { return this.__el.getAttribute(this.__attr) || ""; }
         forEach(fn, thisArg) { this.__get().forEach((t, i) => fn.call(thisArg, t, i, this)); }
         keys() { return this.__get().keys(); }
         values() { return this.__get().values(); }
@@ -12091,6 +12173,10 @@ const PRELUDE: &str = r##"
         }
         setAttribute(n, v) {
             n = String(n); v = String(v);
+            // HTMLScriptElement's force-async flag is cleared whenever its
+            // async content attribute is added. Removing it later must not
+            // restore force-async (HTML "prepare the script element").
+            if (n.toLowerCase() === "async" && this.localName === "script") this.__trustForceAsync = false;
             const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             __dom_set_attr(this.__id, n, v);
             this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
@@ -12759,10 +12845,70 @@ const PRELUDE: &str = r##"
     installConstraintValidation(HTMLInputElement);
     installConstraintValidation(HTMLSelectElement);
     installConstraintValidation(HTMLTextAreaElement);
-    // Interfaces with no extra accessors of their own; the reflected attributes
-    // (name/value/type/href/src/disabled) are installed on them below.
+    // Interfaces whose simple reflected attributes are installed below.
     class HTMLButtonElement extends HTMLElement {}
-    class HTMLScriptElement extends HTMLElement {}
+    // HTML §the-script-element. Keep this interface complete rather than
+    // scattering script behavior across generic Element reflectors. The
+    // force-async state is an internal flag: parser-created scripts begin
+    // false, while Document.createElement marks new script elements true.
+    class HTMLScriptElement extends HTMLElement {
+        get type() { return this.getAttribute("type") || ""; }
+        set type(v) { this.setAttribute("type", String(v)); }
+        get src() {
+            const raw = this.getAttribute("src");
+            if (raw === null) return "";
+            const parsed = __url_parse(raw, baseHref());
+            return parsed ? parsed[0] : raw;
+        }
+        set src(v) { this.setAttribute("src", String(v)); }
+        get noModule() { return this.hasAttribute("nomodule"); }
+        set noModule(v) { if (v) this.setAttribute("nomodule", ""); else this.removeAttribute("nomodule"); }
+        get async() { return this.__trustForceAsync === true || this.hasAttribute("async"); }
+        set async(v) {
+            this.__trustForceAsync = false;
+            if (v) this.setAttribute("async", ""); else this.removeAttribute("async");
+        }
+        get defer() { return this.hasAttribute("defer"); }
+        set defer(v) { if (v) this.setAttribute("defer", ""); else this.removeAttribute("defer"); }
+        get blocking() {
+            return this.__trustBlocking
+                || (this.__trustBlocking = new DOMTokenList(this, "blocking", ["render"]));
+        }
+        get crossOrigin() {
+            const raw = this.getAttribute("crossorigin");
+            if (raw === null) return null;
+            return raw.toLowerCase() === "use-credentials" ? "use-credentials" : "anonymous";
+        }
+        set crossOrigin(v) {
+            if (v === null) this.removeAttribute("crossorigin");
+            else this.setAttribute("crossorigin", String(v));
+        }
+        get referrerPolicy() {
+            const raw = (this.getAttribute("referrerpolicy") || "").toLowerCase();
+            return ["no-referrer", "no-referrer-when-downgrade", "origin", "origin-when-cross-origin", "same-origin", "strict-origin", "strict-origin-when-cross-origin", "unsafe-url"].includes(raw) ? raw : "";
+        }
+        set referrerPolicy(v) { this.setAttribute("referrerpolicy", String(v)); }
+        get integrity() { return this.getAttribute("integrity") || ""; }
+        set integrity(v) { this.setAttribute("integrity", String(v)); }
+        get fetchPriority() {
+            const raw = (this.getAttribute("fetchpriority") || "").toLowerCase();
+            return raw === "high" || raw === "low" ? raw : "auto";
+        }
+        set fetchPriority(v) { this.setAttribute("fetchpriority", String(v)); }
+        get text() { return this.textContent; }
+        set text(v) { this.textContent = String(v); }
+        // Obsolete but required IDL members (HTML §obsolete features).
+        get charset() { return this.getAttribute("charset") || ""; }
+        set charset(v) { this.setAttribute("charset", String(v)); }
+        get event() { return this.getAttribute("event") || ""; }
+        set event(v) { this.setAttribute("event", String(v)); }
+        get htmlFor() { return this.getAttribute("for") || ""; }
+        set htmlFor(v) { this.setAttribute("for", String(v)); }
+        static supports(type) {
+            type = String(type);
+            return type === "classic" || type === "module" || type === "importmap" || type === "speculationrules";
+        }
+    }
     class HTMLFormElement extends HTMLElement {
         get elements() {
             return this.__trustElements
@@ -13199,6 +13345,11 @@ const PRELUDE: &str = r##"
         }
         createElement(t) {
             const el = wrap(__dom_create_element(String(t)));
+            // HTML's script-element creation steps give dynamically created
+            // scripts a true force-async flag. Setting async (as an IDL or
+            // content attribute) clears it; parser-created wrappers never get
+            // this marker and therefore default to false.
+            if (el.localName === "script") el.__trustForceAsync = true;
             const ctor = CE.defs.get(String(t).toLowerCase());
             if (ctor) upgradeElement(el, ctor);
             return el;
@@ -30126,6 +30277,60 @@ mod tests {
             out.contains("start-classic") && !out.contains("NOMODULE-RAN"),
             "nomodule skipped, classic ran: {out}"
         );
+    }
+
+    #[test]
+    fn html_script_element_exposes_the_complete_standard_interface() {
+        // HTML §the-script-element plus the required obsolete members. This
+        // also exercises the force-async flag: parser-created scripts start
+        // false; dynamically created scripts start true and adding `async`
+        // clears the flag permanently, even if the attribute is removed.
+        let (out, outcome) = page(
+            r#"<body><pre id=o></pre>
+            <script id=data type=application/json>{"baseUrl":"/api"}</script>
+            <script id=runner>
+            var data = document.getElementById("data");
+            var parsed = JSON.parse(data.text).baseUrl === "/api";
+            data.text = "replacement";
+            var textForwarded = data.textContent === "replacement";
+            var runner = document.getElementById("runner");
+            var s = document.createElement("script");
+            var clone = runner.cloneNode();
+            var forceAsync = s.async === true && clone.async === true && runner.async === false;
+            s.setAttribute("async", ""); s.removeAttribute("async");
+            var forceCleared = s.async === false;
+            s.type = "module"; s.src = "/asset.js"; s.noModule = true; s.defer = true;
+            var b = s.blocking; b.add("render");
+            var reflected = s.type === "module" && /\/asset\.js$/.test(s.src)
+                && s.noModule && s.defer && s.getAttribute("nomodule") === "";
+            var blocking = b === s.blocking && b.value === "render"
+                && b.supports("render") && !b.supports("anything-else");
+            var crossMissing = s.crossOrigin === null;
+            s.crossOrigin = "invalid"; var crossInvalid = s.crossOrigin === "anonymous";
+            s.crossOrigin = "USE-CREDENTIALS"; var crossKnown = s.crossOrigin === "use-credentials";
+            s.referrerPolicy = "invalid"; var refInvalid = s.referrerPolicy === "";
+            s.referrerPolicy = "STRICT-ORIGIN"; var refKnown = s.referrerPolicy === "strict-origin";
+            var priorityDefault = s.fetchPriority === "auto";
+            s.fetchPriority = "HIGH"; var priorityKnown = s.fetchPriority === "high";
+            s.integrity = "sha256-test";
+            s.charset = "utf-8"; s.event = "load"; s.htmlFor = "legacy-target";
+            var legacy = s.integrity === "sha256-test" && s.charset === "utf-8"
+                && s.event === "load" && s.htmlFor === "legacy-target"
+                && s.getAttribute("for") === "legacy-target";
+            var supports = HTMLScriptElement.supports("classic")
+                && HTMLScriptElement.supports("module")
+                && HTMLScriptElement.supports("importmap")
+                && HTMLScriptElement.supports("speculationrules")
+                && !HTMLScriptElement.supports("Module")
+                && !HTMLScriptElement.supports("unknown");
+            var ok = parsed && textForwarded && forceAsync && forceCleared
+                && reflected && blocking && crossMissing && crossInvalid && crossKnown
+                && refInvalid && refKnown && priorityDefault && priorityKnown && legacy && supports;
+            document.getElementById("o").textContent = ok ? "SCRIPT-IDL-OK" : "SCRIPT-IDL-BAD";
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("SCRIPT-IDL-OK"), "{out}");
     }
 
     #[test]
