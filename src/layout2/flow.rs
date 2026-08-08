@@ -281,6 +281,13 @@ struct H {
     bp_l: f32,
     bp_r: f32,
     content_w: f32,
+    /// The minimum content-box width after `min-width` resolution. A BFC root
+    /// may become narrower beside a float, but never through its minimum.
+    min_w: f32,
+    /// `width:auto` boxes may use the narrower band beside an ancestor float;
+    /// definite/intrinsic widths retain their used width and move below when
+    /// that width does not fit.
+    auto_w: bool,
 }
 
 impl Flow<'_> {
@@ -439,7 +446,6 @@ impl Flow<'_> {
         // after the column algorithm runs, inside the `Content::Table` arm.
         let mut h = self.horizontal(b, cb_w, &inl);
         let mut x_border = cb_x + h.ml;
-        let content_x = x_border + h.bp_l;
         let bt = s.border[TOP] + self.pad(s, TOP, cb_w);
         let bb = s.border[BOTTOM] + self.pad(s, BOTTOM, cb_w);
         let mt = s.margin[TOP].resolve(Some(cb_w)).unwrap_or(0.0);
@@ -467,6 +473,47 @@ impl Flow<'_> {
         // with their own contexts.
         let own_bfc = self.establishes_bfc(b);
         let mut own_fc = FloatCtx::new();
+
+        // CSS 2.2 §9.5: the border box of an in-flow BFC root, table, or
+        // block-level replaced element must not overlap a preceding float's
+        // margin box. Flexbox §3 and Grid §5.1 give their containers the
+        // same independent-formatting-context exclusion. Prefer the adjacent
+        // band (narrowing an auto-width box as CSS 2 explicitly permits); if
+        // its used/minimum width cannot fit, place it below the floats.
+        let avoids_floats = own_bfc
+            || matches!(
+                b.content,
+                Content::Flex(_) | Content::Grid(_) | Content::Table(_) | Content::Atomic(_)
+            );
+        if avoids_floats && !fc.is_empty() {
+            let top = cur.preview();
+            let (float_l, float_r, float_bottom) = fc.exclusion_band(top);
+            let band_l = cb_x.max(float_l);
+            let band_r = (cb_x + cb_w).min(float_r);
+            let mr = s.margin[RIGHT].resolve(Some(cb_w)).unwrap_or(0.0);
+            let left = (cb_x + h.ml).max(band_l);
+            let right = (cb_x + cb_w - mr).min(band_r);
+            let available_border = (right - left).max(0.0);
+            let used_border = h.bp_l + h.content_w + h.bp_r;
+            let min_border = h.bp_l + h.min_w + h.bp_r;
+            if h.auto_w && available_border >= min_border {
+                x_border = left;
+                h.content_w = (available_border - h.bp_l - h.bp_r)
+                    .max(h.min_w)
+                    .min(h.content_w);
+            } else if available_border >= used_border {
+                x_border = left.min(right - used_border).max(band_l);
+            } else if float_bottom > top {
+                // CSS 2.2 §9.5 explicitly permits clearing the formatting-
+                // context root when there is insufficient adjacent space.
+                cur.y = float_bottom;
+                cur.pos = 0.0;
+                cur.neg = 0.0;
+                x_border = cb_x + h.ml;
+            }
+        }
+        let content_x = x_border + h.bp_l;
+        let box_top = cur.preview();
 
         // Definite heights (content-box px). A percentage against an
         // indefinite CB height is auto (§10.5).
@@ -522,6 +569,14 @@ impl Flow<'_> {
             } else {
                 match &b.content {
                     Content::Blocks(kids) => {
+                        // A formatting-context root's child margins do not
+                        // collapse through its boundary (CSS 2.2 §8.3.1 /
+                        // §9.4.1). Establish its top before the first child;
+                        // that child's own margin is then applied inside it.
+                        if own_bfc && !kids.is_empty() {
+                            let yb = *y_border.get_or_insert_with(|| cur.flush());
+                            cur.y = content_top_of(yb).max(cur.y);
+                        }
                         let log = cur.flush_log.len();
                         for k in kids {
                             children.push(self.block(
@@ -806,6 +861,26 @@ impl Flow<'_> {
                 }
             } // end multicol else
         } // end cfc borrow
+
+        // A generated clearing pseudo-element participates as the final
+        // in-flow child. The live serializer bakes this signal because the
+        // app-side layout parse no longer has the originating stylesheet.
+        // Emulate its `clear` operation, rather than turning the parent into a
+        // BFC: a clearfix contains descendant floats but does not isolate the
+        // parent from floats in its surrounding formatting context.
+        if b.node != NO_NODE && self.dom.has_clearing_pseudo(b.node) {
+            let clear_fc = if own_bfc { &own_fc } else { &*fc };
+            let ct = clear_fc.clear_y(super::float::Clear {
+                left: true,
+                right: true,
+            });
+            if ct > cur.preview() {
+                y_border.get_or_insert(box_top);
+                cur.y = ct;
+                cur.pos = 0.0;
+                cur.neg = 0.0;
+            }
+        }
 
         // Contain floats (§9.5): a BFC-establishing, auto-height box grows to
         // enclose the lowest float bottom in its own context (the ubiquitous
@@ -1214,6 +1289,8 @@ impl Flow<'_> {
             bp_l,
             bp_r,
             content_w: w,
+            min_w,
+            auto_w: s.width.is_auto(),
         }
     }
 
@@ -2321,7 +2398,7 @@ impl Flow<'_> {
         for prop in ["overflow-x", "overflow-y", "overflow"] {
             if matches!(
                 self.dom.computed_value(node, prop).as_deref(),
-                Some("hidden" | "auto" | "scroll" | "clip" | "overlay")
+                Some("hidden" | "auto" | "scroll" | "overlay")
             ) {
                 return true;
             }
@@ -2756,7 +2833,7 @@ impl Flow<'_> {
     }
 
     /// Whether `b` establishes a new block formatting context (§9.4.1) — so its
-    /// floats are contained and it isn't itself shortened by ancestor floats.
+    /// floats are contained and its border box excludes ancestor floats.
     /// The two statically-resolvable triggers: `display:flow-root`, and a
     /// non-`visible` used `overflow` on either axis (`overflow:hidden` clearfix,
     /// scroll containers). Flex/grid/table items and out-of-flow boxes lay
@@ -2768,7 +2845,18 @@ impl Flow<'_> {
         if self.dom.effective_display(b.node).as_deref() == Some("flow-root") {
             return true;
         }
-        self.scroll_container(b.node)
+        // CSS Overflow 3 §3.1: visible/clip are the non-formatting-context
+        // values. In particular, unlike hidden, `overflow:clip` does *not*
+        // establish an independent formatting context.
+        for prop in ["overflow-x", "overflow-y", "overflow"] {
+            if self.dom.computed_value(b.node, prop).is_some_and(|v| {
+                v.split_whitespace()
+                    .any(|v| matches!(v, "hidden" | "auto" | "scroll" | "overlay"))
+            }) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Pre-lay one float's box (§9.5 / §10.3.5): resolve its used width (shrink-

@@ -139,6 +139,35 @@ impl FloatCtx {
         (left, right)
     }
 
+    /// The horizontal exclusion band for an in-flow formatting-context root
+    /// whose border box starts at `top`, plus the bottom of the floats that
+    /// constrain it. Unlike [`Self::band`], this must consider a preceding
+    /// float whose top is *below* `top`: the root's eventual height is not yet
+    /// known, and its border box must not overlap that float's margin box at
+    /// any vertical position (CSS 2.2 §9.5, "The border box ... must not
+    /// overlap the margin box of any floats"). Taking the intersection beside
+    /// all preceding floats that continue below `top` gives block layout a
+    /// stable adjacent band; if the box cannot fit, it is placed below
+    /// `bottom` instead, as the same rule permits.
+    pub fn exclusion_band(&self, top: f32) -> (f32, f32, f32) {
+        let mut left = f32::MIN;
+        let mut right = f32::MAX;
+        let mut bottom = f32::MIN;
+        for f in &self.lefts {
+            if f.y1 > top {
+                left = left.max(f.x1);
+                bottom = bottom.max(f.y1);
+            }
+        }
+        for f in &self.rights {
+            if f.y1 > top {
+                right = right.min(f.x0);
+                bottom = bottom.max(f.y1);
+            }
+        }
+        (left, right, bottom)
+    }
+
     /// Place a `w`×`h` float margin box on `side` within the containing block's
     /// inline range `[cb_l, cb_r]`, as high as possible at or below `top_min`
     /// (§9.5.1 rules 2/3/4/5/6/7/8/9): scan the candidate shelf tops (the given

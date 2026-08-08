@@ -682,6 +682,35 @@ fn clip_cells(clip: Option<Clip>, ox: f32, oy: f32, cw: f32, ch: f32) -> ClipCel
     }
 }
 
+/// Quantize a clip for a one-row text item. A CSS clip can cut through a glyph
+/// row between terminal-cell boundaries (for example a heading pulled 5px
+/// above an `overflow:hidden` media-object body). If at least half of the row
+/// remains inside the px clip, preserve that snapped cell; otherwise nearest-
+/// edge quantization would sometimes discard a mostly-visible line solely
+/// because the ancestor and line edges round in opposite directions. Sub-cell
+/// visually-hidden boxes still suppress their text because less than half a
+/// row is visible.
+fn text_item_clip_cells(
+    clip: Option<Clip>,
+    item_y: f32,
+    ox: f32,
+    oy: f32,
+    cw: f32,
+    ch: f32,
+) -> ClipCells {
+    let mut cells = clip_cells(clip, ox, oy, cw, ch);
+    let Some(c) = clip else {
+        return cells;
+    };
+    let visible = (item_y + ch).min(c.y1) - item_y.max(c.y0);
+    if visible >= ch / 2.0 {
+        let row = ((item_y - oy) / ch).round() as i64;
+        cells.r0 = cells.r0.min(row);
+        cells.r1 = cells.r1.max(row + 1);
+    }
+    cells
+}
+
 /// One display-list entry, in painting order. Each carries the effective clip
 /// (the fragment's containing-block clip chain) the compositor intersects with
 /// the viewport before stamping.
@@ -945,10 +974,17 @@ fn inflow_content(
         if let FragKind::Line(pieces) = &c.kind {
             let base_col = ((c.x - ox) / cw).round() as i64;
             let top_row = ((c.y - oy) / ch).round() as i64;
-            let clip = clip_cells(c.clip, ox, oy, cw, ch);
             for p in pieces {
+                let row_delta = i64::from(p.row_off) + i64::from(p.box_off_rows);
+                let item_y = c.y + row_delta as f32 * ch;
+                let clip =
+                    if p.item.image.is_none() && !p.item.text.is_empty() && p.item.height <= 1 {
+                        text_item_clip_cells(c.clip, item_y, ox, oy, cw, ch)
+                    } else {
+                        clip_cells(c.clip, ox, oy, cw, ch)
+                    };
                 ops.push(Op::Item {
-                    row: top_row + i64::from(p.row_off) + i64::from(p.box_off_rows),
+                    row: top_row + row_delta,
                     col: base_col + p.col as i64,
                     item: p.item.clone(),
                     clip,
