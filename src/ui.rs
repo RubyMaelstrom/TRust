@@ -661,12 +661,50 @@ fn fixed_row_line(
     Line::from(spans)
 }
 
-/// Overlay encoded inline images onto their reserved boxes within the
-/// browser viewport. `inner` is the content rect (inside the border);
-/// row `r` of the visible slice maps to screen row `inner.y + r`, the
-/// item's `col` to `inner.x + col`. An image only draws when its whole
-/// box fits the viewport (the stateless widget won't clip — keeps sixel
-/// from corrupting); a partly-scrolled image waits, alt text in its place.
+/// First viewport row at which a single-cell terminal-image anchor at `col`
+/// survives the later fixed-layer paint pass.
+///
+/// A sixel's whole command stream lives in its top-left Ratatui cell. If a
+/// `position:fixed` row paints that cell afterward, the command disappears
+/// from the final buffer even though the rest of the image box remains marked
+/// `Skip`. The terminal then retains the old bitmap while newly exposed text
+/// erases it. Move the slice's anchor below those covering rows; this is also
+/// the correct CSS paint result, since that part of the scrolling image is
+/// behind the fixed stacking context.
+fn image_anchor_clip_top(fixed: &[crate::layout2::FixedItem], col: u16, height: u16) -> u16 {
+    (0..height)
+        .find(|&screen_row| {
+            !fixed.iter().any(|layer| {
+                let Some(local_col) = col.checked_sub(layer.col) else {
+                    return false;
+                };
+                let Some(local_row) = screen_row.checked_sub(layer.row) else {
+                    return false;
+                };
+                let Some(row) = layer.rows.get(usize::from(local_row)) else {
+                    return false;
+                };
+
+                // `fixed_row_line` gap-fills from column zero through the end
+                // of its last item, so every cell in that interval is painted
+                // (including spaces before the first nav item).
+                row.items
+                    .iter()
+                    .map(|item| item.col.saturating_add(item.width))
+                    .max()
+                    .is_some_and(|right| local_col < right)
+            })
+        })
+        .unwrap_or(height)
+}
+
+/// Overlay encoded inline images onto their reserved boxes within the browser
+/// viewport. `inner` is the content rect (inside the border); row `r` of the
+/// visible slice maps to screen row `inner.y + r`, and the item's `col` maps to
+/// `inner.x + col`. `SlicedImage` clips the encoded protocol to the visible
+/// rows. When a fixed stacking layer covers the normal top-left anchor, the
+/// slice starts below that layer so the later fixed paint cannot discard the
+/// image's one-cell terminal command stream.
 fn render_inline_images(
     frame: &mut Frame,
     g: &BrowserView,
@@ -702,14 +740,27 @@ fn render_inline_images(
             let Some(proto) = protocols.get(&key) else {
                 continue;
             };
+            let clip_top = image_anchor_clip_top(&g.doc.fixed, scol, inner.height);
+            if clip_top >= inner.height {
+                continue;
+            }
+            let image_panel = ratatui::layout::Rect::new(
+                inner.x,
+                inner.y.saturating_add(clip_top),
+                inner.width,
+                inner.height - clip_top,
+            );
             // Position the box's top-left relative to the content rect; `y` may
-            // be negative (scrolled above the top). One scroll-independent
-            // encode serves every position, so a partly-visible image renders
-            // at the same scale as a fully-visible one (no resize-on-scroll).
-            let position =
-                SignedPosition::from((scol as i16, (doc_row as isize - g.scroll as isize) as i16));
+            // be negative (scrolled above the top or under a fixed header).
+            // One scroll-independent encode serves every position, so a
+            // partly-visible image renders at the same scale as a fully-visible
+            // one (no resize-on-scroll).
+            let position = SignedPosition::from((
+                scol as i16,
+                (doc_row as isize - g.scroll as isize - clip_top as isize) as i16,
+            ));
             crate::app::IMG_RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            frame.render_widget(SlicedImage::new(proto, position), inner);
+            frame.render_widget(SlicedImage::new(proto, position), image_panel);
         }
     }
     render_region_images(frame, g, inner, protocols);
@@ -1160,7 +1211,28 @@ fn status_bar(app: &App) -> Paragraph<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::window_start;
+    use super::{image_anchor_clip_top, window_start};
+    use crate::layout2::{Emphasis, FixedItem, Item, ItemKind, NO_NODE, Row};
+
+    fn painted_row(width: u16) -> Row {
+        Row {
+            items: vec![Item {
+                col: 0,
+                width,
+                height: 1,
+                text: " ".repeat(usize::from(width)),
+                kind: ItemKind::Text,
+                image: None,
+                emph: Emphasis::default(),
+                node: NO_NODE,
+                link: None,
+                crop: false,
+                pixelated: false,
+                invisible: false,
+            }],
+            hits: Vec::new(),
+        }
+    }
 
     #[test]
     fn input_window_keeps_cursor_and_tail_visible() {
@@ -1175,5 +1247,45 @@ mod tests {
         assert_eq!(window_start(0, 30, 10), 0);
         // Degenerate width never panics or hides the cursor.
         assert_eq!(window_start(4, 4, 1), 4);
+    }
+
+    #[test]
+    fn article_image_anchor_moves_below_a_fixed_header() {
+        // 9to5linux article shape: the hero is in normal flow at col 2, while
+        // a viewport-fixed navigation bar paints the first three rows. Sixel
+        // stores the whole graphic in its anchor cell, so anchoring at row 0
+        // lets the later header pass replace the command and leaves only stale
+        // terminal pixels. The visible slice must instead begin at row 3.
+        let header = FixedItem {
+            col: 0,
+            row: 0,
+            rows: vec![painted_row(100), painted_row(100), painted_row(100)],
+            z: 9999,
+        };
+
+        assert_eq!(image_anchor_clip_top(&[header], 2, 40), 3);
+    }
+
+    #[test]
+    fn unrelated_fixed_content_does_not_clip_an_image_anchor() {
+        let right_rail = FixedItem {
+            col: 90,
+            row: 0,
+            rows: vec![painted_row(20), painted_row(20)],
+            z: 1,
+        };
+        let lower_bar = FixedItem {
+            col: 0,
+            row: 1,
+            rows: vec![painted_row(100)],
+            z: 2,
+        };
+
+        assert_eq!(image_anchor_clip_top(&[right_rail], 2, 40), 0);
+        assert_eq!(
+            image_anchor_clip_top(&[lower_bar], 2, 40),
+            0,
+            "an uncovered row-zero anchor survives; the later bar paints over only its own row"
+        );
     }
 }
