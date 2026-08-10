@@ -25,6 +25,11 @@ use super::flow::{Clip, Frag, FragKind};
 struct Builder<'a> {
     dom: &'a Dom,
     base: &'a Url,
+    /// Finite extent used when a CSS clip is unbounded on one axis. CSS
+    /// Overflow L3 §3 defines that axis as unclipped; display-list paths,
+    /// unlike CSS clip edges, cannot contain ±∞, so the extent must cover the
+    /// paintable document and leave the final viewport clip to the compositor.
+    clip_extent: CssRect,
     commands: Vec<DisplayCommand>,
     lines: Vec<PaintLine>,
     image_requests: Vec<ImageRequest>,
@@ -34,11 +39,17 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(dom: &'a Dom, base: &'a Url, root: &Frag<'_>, fixed: &[Frag<'_>]) -> Self {
-        let _ = fixed;
+    fn new(
+        dom: &'a Dom,
+        base: &'a Url,
+        root: &Frag<'_>,
+        fixed: &[Frag<'_>],
+        flow_bottom: f32,
+    ) -> Self {
         let mut this = Self {
             dom,
             base,
+            clip_extent: paint_extent(root, fixed, flow_bottom),
             commands: Vec::new(),
             lines: Vec::new(),
             image_requests: Vec::new(),
@@ -61,12 +72,38 @@ impl<'a> Builder<'a> {
 
     fn effective_clip(&self, node: NodeId, hard: Option<Clip>) -> Option<CssRect> {
         let _ = node;
-        hard.map(clip_rect)
+        hard.map(|clip| self.clip_rect(clip))
     }
 
     fn ancestor_clip(&self, node: NodeId, hard: Option<Clip>) -> Option<CssRect> {
         let _ = node;
-        hard.map(clip_rect)
+        hard.map(|clip| self.clip_rect(clip))
+    }
+
+    fn clip_rect(&self, clip: Clip) -> CssRect {
+        let extent_right = self.clip_extent.x + self.clip_extent.width;
+        let extent_bottom = self.clip_extent.y + self.clip_extent.height;
+        let x0 = if clip.x0.is_finite() {
+            clip.x0
+        } else {
+            self.clip_extent.x
+        };
+        let y0 = if clip.y0.is_finite() {
+            clip.y0
+        } else {
+            self.clip_extent.y
+        };
+        let x1 = if clip.x1.is_finite() {
+            clip.x1
+        } else {
+            extent_right
+        };
+        let y1 = if clip.y1.is_finite() {
+            clip.y1
+        } else {
+            extent_bottom
+        };
+        CssRect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
     }
 
     fn push_scroll_ancestors(&mut self, node: NodeId) -> usize {
@@ -181,7 +218,7 @@ pub(super) fn paint(
     fixed: &[Frag<'_>],
     flow_bottom: f32,
 ) -> PagePaint {
-    let mut builder = Builder::new(dom, base, root, fixed);
+    let mut builder = Builder::new(dom, base, root, fixed, flow_bottom);
     build_sc(root, &mut builder);
     let primitives = std::mem::take(&mut builder.commands);
     let mut fixed: Vec<_> = fixed.iter().collect();
@@ -1094,6 +1131,69 @@ fn subtree_extent(fragment: &Frag<'_>) -> (f32, f32) {
     )
 }
 
+/// Return a finite rectangle covering all paintable fragment borders. The
+/// fragment clip is applied while finding the extent, so intentionally huge
+/// overflow-hidden probes do not turn an unbounded display-list clip into a
+/// huge raster path. The viewport compositor still supplies the final screen
+/// clip; this extent only replaces CSS's conceptual unbounded axis.
+fn paint_extent(root: &Frag<'_>, fixed: &[Frag<'_>], flow_bottom: f32) -> CssRect {
+    let mut bounds = (
+        0.0_f32,
+        0.0_f32,
+        1.0_f32,
+        flow_bottom.max(root.max_bottom()).max(1.0),
+    );
+
+    fn visit(fragment: &Frag<'_>, bounds: &mut (f32, f32, f32, f32)) {
+        let (mut x0, mut y0, mut x1, mut y1) = (
+            fragment.x,
+            fragment.y,
+            fragment.x + fragment.w,
+            fragment.y + fragment.h,
+        );
+        if let Some(clip) = fragment.clip {
+            if clip.x0.is_finite() {
+                x0 = x0.max(clip.x0);
+            }
+            if clip.y0.is_finite() {
+                y0 = y0.max(clip.y0);
+            }
+            if clip.x1.is_finite() {
+                x1 = x1.min(clip.x1);
+            }
+            if clip.y1.is_finite() {
+                y1 = y1.min(clip.y1);
+            }
+        }
+        if x0.is_finite()
+            && y0.is_finite()
+            && x1.is_finite()
+            && y1.is_finite()
+            && x1 > x0
+            && y1 > y0
+        {
+            bounds.0 = bounds.0.min(x0);
+            bounds.1 = bounds.1.min(y0);
+            bounds.2 = bounds.2.max(x1);
+            bounds.3 = bounds.3.max(y1);
+        }
+        for child in &fragment.children {
+            visit(child, bounds);
+        }
+    }
+
+    visit(root, &mut bounds);
+    for fragment in fixed {
+        visit(fragment, &mut bounds);
+    }
+    CssRect::new(
+        bounds.0,
+        bounds.1,
+        (bounds.2 - bounds.0).max(1.0),
+        (bounds.3 - bounds.1).max(1.0),
+    )
+}
+
 fn padding_box(fragment: &Frag<'_>) -> CssRect {
     let [top, right, bottom, left] = fragment.border;
     CssRect::new(
@@ -1101,15 +1201,6 @@ fn padding_box(fragment: &Frag<'_>) -> CssRect {
         fragment.y + top,
         (fragment.w - left - right).max(0.0),
         (fragment.h - top - bottom).max(0.0),
-    )
-}
-
-fn clip_rect(clip: Clip) -> CssRect {
-    CssRect::new(
-        clip.x0,
-        clip.y0,
-        (clip.x1 - clip.x0).max(0.0),
-        (clip.y1 - clip.y0).max(0.0),
     )
 }
 

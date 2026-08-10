@@ -4640,6 +4640,36 @@ mod tests {
     }
 
     #[test]
+    fn graphical_flex_display_image_keeps_intrinsic_width() {
+        let src = "data:image/svg+xml,<svg viewBox='0 0 184 148'></svg>";
+        let mut images = ImageSizes::new();
+        images.insert(src.to_string(), (184, 148));
+        let dom = Dom::parse_document(&format!(
+            "<body style=\"margin:0\"><picture style=\"display:contents\"><img id=\"logo\" src=\"{src}\" style=\"display:flex;width:auto;height:124px;margin:0 auto 32px;max-width:100%\"></picture><div id=\"search\">Search</div></body>"
+        ));
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(960.0, 640.0),
+            &forms,
+            &controls,
+            &images,
+        );
+        let logo = layout.boxes.get(&node_by_id(&dom, "logo")).unwrap();
+        assert!(
+            (logo.width - 184.0 * 124.0 / 148.0).abs() < 0.1,
+            "a replaced image with display:flex and auto width must use its intrinsic ratio, got {logo:?}"
+        );
+        let search = layout.boxes.get(&node_by_id(&dom, "search")).unwrap();
+        assert!(
+            search.top >= logo.top + logo.height + 31.9,
+            "content after the logo must follow its used margin, got {search:?} after {logo:?}"
+        );
+    }
+
+    #[test]
     fn graphical_outside_marker_uses_parent_paint_style_without_a_dom_node() {
         // CSS Display 3 §2.5: an anonymous box inherits through its box-tree
         // parent. The marker remains synthesized (`NO_NODE`) for interaction,

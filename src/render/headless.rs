@@ -218,6 +218,55 @@ mod tests {
     }
 
     #[test]
+    fn one_axis_overflow_clip_stays_finite_and_rasterizes() {
+        // CSS Overflow L3 allows overflow-x:hidden with the y axis left
+        // unbounded. The display-list boundary must materialize that axis as
+        // a finite document extent: sending ±∞ to a backend clip path makes
+        // an otherwise valid page disappear.
+        let base = Url::parse("https://example.test/").unwrap();
+        let html = r#"
+            <style>html,body { margin:0; background:#101010 }</style>
+            <div style="width:120px;height:64px;overflow-x:hidden;background:#24364a">
+              <div style="height:180px;background:#5a2d72;color:white">visible</div>
+            </div>
+        "#;
+        let dom = crate::dom::Dom::parse_document(html);
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(240.0, 180.0),
+            &forms,
+            &controls,
+            &ImageSizes::new(),
+        );
+        for command in layout
+            .paint
+            .primitives
+            .iter()
+            .chain(layout.paint.fixed_primitives.iter())
+        {
+            if let DisplayCommand::PushClip(PaintShape::Rect(rect)) = command {
+                assert!(
+                    rect.x.is_finite()
+                        && rect.y.is_finite()
+                        && rect.width.is_finite()
+                        && rect.height.is_finite(),
+                    "CSS clip reached the display list with non-finite geometry: {rect:?}"
+                );
+            }
+        }
+        let frame = render_html(html, &base, CssSize::new(240.0, 180.0)).unwrap();
+        assert!(
+            frame
+                .pixels
+                .chunks_exact(4)
+                .any(|pixel| pixel == [90, 45, 114, 255]),
+            "the visible child background was lost during rasterization"
+        );
+    }
+
+    #[test]
     fn caller_supplied_image_handle_rasterizes_without_blob_in_command() {
         let base = Url::parse("https://example.test/").unwrap();
         let html = "<img src='pixel.png' width=8 height=8>";
