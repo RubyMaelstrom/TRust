@@ -26,10 +26,10 @@ use trust::render::vello_hybrid::{PresentOutcome, VelloHybridRenderer};
 use trust::render::{
     ChromeModel, ControlId, CssRect, DisplayCommand, EditorVisual, HeartVisual, ImageHandle,
     ImageResource, ImageStore, PageHit, PaintBrush, PaintColor, PaintShape, RasterBackend,
-    RendererKind, RendererPreference, Scene, ScrollbarAxis, StrokeStyle, TextSelection,
-    desktop_chrome, desktop_heart_image_handle, horizontal_heart_track, paint_desktop_overlay,
-    paint_text_editor, scrollbar_fraction, scrollbar_position, scrollbar_track_fraction,
-    vertical_heart_track,
+    RendererKind, RendererPreference, Scene, ScrollContainer, ScrollbarAxis, StrokeStyle,
+    TextSelection, desktop_chrome, desktop_heart_image_handle, horizontal_heart_track,
+    paint_desktop_overlay, paint_text_editor, scrollbar_fraction, scrollbar_position,
+    scrollbar_track_fraction, vertical_heart_track,
 };
 use trust::text::{TextEditor, TextStyle};
 use winit::application::ApplicationHandler;
@@ -465,6 +465,27 @@ struct DesktopApp {
     /// after a present. Only browser/UI invalidation is allowed to consume CPU
     /// and build a new frame; this latch prevents an idle presentation loop.
     redraw_pending: bool,
+}
+
+/// Apply a wheel delta to the deepest scroll container and return the portion
+/// that could not be consumed. CSS Overflow 3 §2.3 allows that residual to
+/// continue to an ancestor scrollport (the default `overscroll-behavior:auto`);
+/// this matters for auto-height `overflow:auto` wrappers whose scroll range is
+/// zero even though their computed overflow makes them discoverable.
+fn scroll_container_delta(container: &ScrollContainer, delta: CssPoint) -> (CssPoint, CssPoint) {
+    let mut next = container.offset;
+    let mut residual = delta;
+    if container.horizontal {
+        let max_x = (container.content.width - container.viewport.width).max(0.0);
+        next.x = (container.offset.x + delta.x).clamp(0.0, max_x);
+        residual.x = delta.x - (next.x - container.offset.x);
+    }
+    if container.vertical {
+        let max_y = (container.content.height - container.viewport.height).max(0.0);
+        next.y = (container.offset.y + delta.y).clamp(0.0, max_y);
+        residual.y = delta.y - (next.y - container.offset.y);
+    }
+    (next, residual)
 }
 
 impl DesktopApp {
@@ -3168,63 +3189,61 @@ impl DesktopApp {
             self.request_redraw();
             return;
         }
+        let mut remaining = CssPoint::new(dx, dy);
         if let Some(container) = self
             .scene
             .as_ref()
             .and_then(|scene| scene.scroll_container_at(self.pointer))
             .cloned()
         {
-            let left = if container.horizontal {
-                (container.offset.x + dx).clamp(
-                    0.0,
-                    (container.content.width - container.viewport.width).max(0.0),
-                )
-            } else {
-                container.offset.x
-            };
-            let top = if container.vertical {
-                (container.offset.y + dy).clamp(
-                    0.0,
-                    (container.content.height - container.viewport.height).max(0.0),
-                )
-            } else {
-                container.offset.y
-            };
-            if let Some(cache) = &mut self.page_layout {
-                cache.document.dom.set_scroll_pos(
-                    container.node,
-                    f64::from(top),
-                    f64::from(left),
-                    false,
-                );
-                if let Some(scroll) = cache
-                    .layout
-                    .paint
-                    .scroll_containers
-                    .iter_mut()
-                    .find(|scroll| scroll.node == container.node)
-                {
-                    scroll.offset = CssPoint::new(left, top);
+            let (next, residual) = scroll_container_delta(&container, remaining);
+            let changed = next != container.offset;
+            if changed {
+                if let Some(cache) = &mut self.page_layout {
+                    cache.document.dom.set_scroll_pos(
+                        container.node,
+                        f64::from(next.y),
+                        f64::from(next.x),
+                        false,
+                    );
+                    if let Some(scroll) = cache
+                        .layout
+                        .paint
+                        .scroll_containers
+                        .iter_mut()
+                        .find(|scroll| scroll.node == container.node)
+                    {
+                        scroll.offset = next;
+                    }
                 }
+                self.dispatch(UserAction::SetNestedScroll {
+                    actor: container.actor,
+                    top: next.y,
+                    left: next.x,
+                });
+                // Scrolling changes composition transforms and sticky
+                // resolution, not CSS box geometry. Updating the retained
+                // pixel scroll metadata avoids a full DOM/style/layout pass
+                // per touchpad tick.
+                self.request_redraw();
             }
-            self.dispatch(UserAction::SetNestedScroll {
-                actor: container.actor,
-                top,
-                left,
-            });
-            // Scrolling changes composition transforms and sticky resolution,
-            // not CSS box geometry. Updating the retained pixel scroll
-            // metadata avoids a full DOM/style/layout pass per touchpad tick.
-            self.request_redraw();
-            return;
+            // CSS Overflow 3 §2.3 and CSSOM View's scrolling model allow a
+            // user scroll to continue to the ancestor scrollport when the
+            // targeted overflow:auto box reaches an edge. This is essential
+            // for auto-height wrappers such as Erome's #main: it is reported
+            // as a scroll container, but its own range is zero.
+            remaining = residual;
+            if remaining.x.abs() <= f32::EPSILON && remaining.y.abs() <= f32::EPSILON {
+                return;
+            }
         }
         let Some(scene) = &self.scene else { return };
         let max_x = (scene.page_size.width - scene.content_viewport.width).max(0.0);
         let max_y = (scene.page_size.height - scene.content_viewport.height).max(0.0);
         let current = self.browser.interaction().scroll;
         self.dispatch(UserAction::SetViewportScroll(CssPoint::new(
-            (current.x + dx).clamp(0.0, max_x),
-            (current.y + dy).clamp(0.0, max_y),
+            (current.x + remaining.x).clamp(0.0, max_x),
+            (current.y + remaining.y).clamp(0.0, max_y),
         )));
     }
 
@@ -4270,6 +4289,38 @@ mod tests {
         pending = true;
         assert!(consume_pending_redraw(&mut pending));
         assert!(!consume_pending_redraw(&mut pending));
+    }
+
+    #[test]
+    fn zero_range_auto_scroll_container_passes_wheel_to_viewport() {
+        let container = ScrollContainer {
+            node: 1,
+            actor: None,
+            viewport: CssRect::new(0.0, 0.0, 800.0, 600.0),
+            content: CssSize::new(800.0, 600.0),
+            offset: CssPoint::default(),
+            horizontal: true,
+            vertical: true,
+        };
+        let (next, residual) = scroll_container_delta(&container, CssPoint::new(0.0, 120.0));
+        assert_eq!(next, CssPoint::default());
+        assert_eq!(residual, CssPoint::new(0.0, 120.0));
+    }
+
+    #[test]
+    fn wheel_chaining_preserves_unconsumed_axis_at_inner_edge() {
+        let container = ScrollContainer {
+            node: 1,
+            actor: None,
+            viewport: CssRect::new(0.0, 0.0, 800.0, 600.0),
+            content: CssSize::new(1_200.0, 900.0),
+            offset: CssPoint::new(200.0, 300.0),
+            horizontal: true,
+            vertical: true,
+        };
+        let (next, residual) = scroll_container_delta(&container, CssPoint::new(80.0, 700.0));
+        assert_eq!(next, CssPoint::new(280.0, 300.0));
+        assert_eq!(residual, CssPoint::new(0.0, 700.0));
     }
 
     #[test]
