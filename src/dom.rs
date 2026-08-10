@@ -3670,6 +3670,46 @@ impl Dom {
             })
     }
 
+    /// Whether the subtree already contains a visible native form control.
+    ///
+    /// HTML form controls have their own user-agent rendering (and the layout
+    /// pass turns that rendering into a terminal-cell widget).  An accessible
+    /// name is metadata for the accessibility tree, not additional visual
+    /// content: emitting the name on a clickable wrapper as well would paint a
+    /// second copy beside the control.  Hidden inputs are successful controls
+    /// for submission but have no rendered widget, so they do not count here.
+    /// (HTML Standard §4.10; Accessible Name and Description Computation §4.)
+    fn subtree_paints_native_control(&self, id: NodeId) -> bool {
+        std::iter::once(id).chain(self.descendants(id)).any(|n| {
+            if self.is_hidden(n) {
+                return false;
+            }
+            match self.tag_name(n) {
+                Some("input") => self
+                    .attr(n, "type")
+                    .is_none_or(|ty| !ty.eq_ignore_ascii_case("hidden")),
+                Some("select" | "textarea") => true,
+                // A button gets a layout form atom only when it has a form
+                // owner.  Keep the accessible-name handle for a formless
+                // icon button, whose visible representation is otherwise
+                // absent from the terminal document.
+                Some("button") => {
+                    let mut parent = self.nodes[n].parent;
+                    let mut owner = false;
+                    while let Some(p) = parent {
+                        if self.tag_name(p) == Some("form") {
+                            owner = true;
+                            break;
+                        }
+                        parent = self.nodes[p].parent;
+                    }
+                    owner
+                }
+                _ => false,
+            }
+        })
+    }
+
     /// If this `<svg>`'s geometry lives in an EXTERNAL sprite sheet — a
     /// `<use href="file.svg#id">` (or legacy `xlink:href`) — return the sheet
     /// file's raw href and the fragment id. A same-document `<use href="#id">`
@@ -3962,7 +4002,10 @@ impl Dom {
             // one) needs no handle either — injecting one doubles the control
             // (ChatGPT's composer grew a `[Start dictation]` label beside the
             // rendered mic icon once sprite icons started rasterizing).
-            if !self.subtree_has_text(id) && !self.subtree_paints_icon(id) {
+            if !self.subtree_has_text(id)
+                && !self.subtree_paints_icon(id)
+                && !self.subtree_paints_native_control(id)
+            {
                 if let Some(glyph) = self.icon_glyph(id) {
                     out.push_str(glyph);
                 } else if let Some(label) = self
@@ -10722,6 +10765,33 @@ mod tests {
         for id in ids {
             assert!(html.contains(&format!("x-trust-js:{id}:")), "{html}");
         }
+    }
+
+    #[test]
+    fn serialize_live_does_not_duplicate_native_control_labels() {
+        // HTML form controls already have a visible widget representation in
+        // the layout contract.  Their aria-label/title/value remains metadata
+        // for the accessibility tree; it must not also become a wrapper's
+        // bracketed text handle (HTML §4.10; AccName §4).
+        let dom = Dom::parse_document(
+            "<body><form><input id=q title='Google Suche' name=q>\
+             <input id=submit type=submit value='Google Suche'></form></body>",
+        );
+        let submit = dom.get_by_id("submit").unwrap();
+        let clickable = std::collections::HashSet::from([submit]);
+        let html = dom.serialize_live(DOCUMENT, &clickable);
+        assert!(
+            html.contains(&format!("x-trust-js:{submit}:")),
+            "submit control remains live: {html}"
+        );
+        assert!(
+            !html.contains("[Google Suche]"),
+            "native submit's value is not painted a second time: {html}"
+        );
+        assert!(
+            !html.contains("[Google Suche ]"),
+            "native text control's title is not painted as a wrapper label: {html}"
+        );
     }
 
     #[test]
