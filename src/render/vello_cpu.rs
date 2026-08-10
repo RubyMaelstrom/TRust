@@ -19,7 +19,7 @@ use vello_cpu::{ImageSource, Pixmap, RenderContext, Resources};
 use super::{
     Affine2d, BlendMode, CssRect, DecorationStyle, DisplayCommand, ImageFit, ImageHandle,
     ImageSampling, LineCap, PaintBrush, PaintColor, PaintShape, PathElement, Primitive,
-    RasterBackend, RasterFrame, Scene, StrokeStyle,
+    RasterBackend, RasterFrame, Scene, StrokeStyle, is_desktop_heart_image_handle,
 };
 use crate::core::PhysicalSize;
 
@@ -104,7 +104,9 @@ impl VelloCpuRenderer {
             .images
             .keys()
             .copied()
-            .filter(|handle| !live_images.contains(handle))
+            .filter(|handle| {
+                !live_images.contains(handle) && !is_desktop_heart_image_handle(*handle)
+            })
             .collect();
         for handle in stale {
             if let Some(CachedImage {
@@ -421,7 +423,10 @@ impl VelloCpuRenderer {
             let victim = self
                 .images
                 .iter()
-                .filter(|(_, image)| image.last_used_frame != self.frame_id)
+                .filter(|(handle, image)| {
+                    !is_desktop_heart_image_handle(**handle)
+                        && image.last_used_frame != self.frame_id
+                })
                 .min_by_key(|(_, image)| image.last_used_frame)
                 .map(|(handle, _)| *handle);
             if let Some(victim) = victim
@@ -1032,5 +1037,56 @@ mod tests {
         let mut renderer = VelloCpuRenderer::new();
         assert!(renderer.render(&scene).is_ok());
         assert!(renderer.images.is_empty());
+    }
+
+    #[test]
+    fn alternating_desktop_heart_frames_remain_resident() {
+        let snapshot = BrowserSnapshot {
+            address: String::new(),
+            status: String::new(),
+            loading: false,
+            can_go_back: false,
+            can_go_forward: false,
+            focused: false,
+            viewport: CssSize::new(80.0, 60.0),
+            page_revision: 0,
+        };
+        let mut scene = desktop_shell(
+            ViewportMetrics::from_physical(PhysicalSize::new(80, 60), ScaleFactor::new(1.0)),
+            &snapshot,
+        );
+        let idle = crate::render::desktop_heart_image_handle(false);
+        let active = crate::render::desktop_heart_image_handle(true);
+        for handle in [idle, active] {
+            scene.image_store.insert(
+                handle,
+                ImageResource {
+                    width: 2,
+                    height: 2,
+                    rgba: Arc::from([255u8; 16]),
+                    has_alpha: false,
+                },
+            );
+        }
+        scene.primitives.push(DisplayCommand::Image {
+            rect: CssRect::new(2.0, 2.0, 20.0, 20.0),
+            handle: idle,
+            source_rect: None,
+            fit: ImageFit::Fill,
+            sampling: ImageSampling::Smooth,
+            clip: None,
+            node: 0,
+            link: None,
+        });
+
+        let mut renderer = VelloCpuRenderer::new();
+        renderer.render(&scene).unwrap();
+        assert!(renderer.images.contains_key(&idle));
+        if let Some(DisplayCommand::Image { handle, .. }) = scene.primitives.last_mut() {
+            *handle = active;
+        }
+        renderer.render(&scene).unwrap();
+        assert!(renderer.images.contains_key(&idle));
+        assert!(renderer.images.contains_key(&active));
     }
 }

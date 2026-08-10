@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use accesskit::{
@@ -27,8 +27,9 @@ use trust::render::{
     ChromeModel, ControlId, CssRect, DisplayCommand, EditorVisual, HeartVisual, ImageHandle,
     ImageResource, ImageStore, PageHit, PaintBrush, PaintColor, PaintShape, RasterBackend,
     RendererKind, RendererPreference, Scene, ScrollbarAxis, StrokeStyle, TextSelection,
-    desktop_chrome, horizontal_heart_track, paint_desktop_overlay, paint_text_editor,
-    scrollbar_fraction, scrollbar_position, scrollbar_track_fraction, vertical_heart_track,
+    desktop_chrome, desktop_heart_image_handle, horizontal_heart_track, paint_desktop_overlay,
+    paint_text_editor, scrollbar_fraction, scrollbar_position, scrollbar_track_fraction,
+    vertical_heart_track,
 };
 use trust::text::{TextEditor, TextStyle};
 use winit::application::ApplicationHandler;
@@ -55,6 +56,44 @@ const IMAGE_PROGRESS_RELAYOUT_DELAY: std::time::Duration = std::time::Duration::
 /// default object size without applying a responsive candidate's density; no
 /// decodable image can reach this pair (the decoder caps each axis at 12,000).
 const PENDING_IMAGE_SIZE: (u32, u32) = (u32::MAX, u32::MAX);
+const IDLE_HEART_PNG: &[u8] = include_bytes!("../assets/IdleHeart30.png");
+const ACTIVE_HEART_PNG: &[u8] = include_bytes!("../assets/ActiveHeart30.png");
+static HEART_ASSETS: OnceLock<Result<[(ImageHandle, ImageResource); 2], String>> = OnceLock::new();
+
+fn embedded_heart_assets() -> &'static Result<[(ImageHandle, ImageResource); 2], String> {
+    HEART_ASSETS.get_or_init(|| {
+        // PNG Third Edition §6.2 defines PNG alpha as non-associated. TRust's
+        // graphical decoder preserves that straight RGBA representation until
+        // each Vello backend performs its one retained upload conversion.
+        // https://www.w3.org/TR/png-3/#6AlphaRepresentation
+        let idle = trust::img::decode_graphical(IDLE_HEART_PNG)?;
+        let active = trust::img::decode_graphical(ACTIVE_HEART_PNG)?;
+        if [(&idle, "idle"), (&active, "active")]
+            .iter()
+            .any(|(image, _)| image.width != 30 || image.height != 30 || !image.has_alpha)
+        {
+            return Err(String::from(
+                "embedded heart assets must be 30×30 PNGs with alpha",
+            ));
+        }
+        Ok([
+            (desktop_heart_image_handle(false), idle),
+            (desktop_heart_image_handle(true), active),
+        ])
+    })
+}
+
+fn ensure_embedded_heart_assets(store: &ImageStore) -> Result<(), String> {
+    let assets = embedded_heart_assets()
+        .as_ref()
+        .map_err(std::clone::Clone::clone)?;
+    for (handle, image) in assets {
+        if !store.contains(*handle) {
+            store.insert(*handle, image.clone());
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 enum DesktopEvent {
@@ -431,6 +470,10 @@ impl DesktopApp {
         initial_navigation: Option<String>,
     ) -> Self {
         let style = chrome_text_style();
+        let image_store = ImageStore::default();
+        if let Err(error) = ensure_embedded_heart_assets(&image_store) {
+            eprintln!("trust-desktop: heart assets unavailable: {error}");
+        }
         Self {
             browser,
             renderer: None,
@@ -458,7 +501,7 @@ impl DesktopApp {
             protocol_page: None,
             runtime,
             event_proxy,
-            image_store: ImageStore::default(),
+            image_store,
             image_sizes: trust::layout2::ImageSizes::new(),
             image_loads: ImageLoadScheduler::default(),
             image_tasks: HashMap::new(),
@@ -1233,6 +1276,10 @@ impl DesktopApp {
         // cheap overlay model immediately before composing it over the page.
         let mut chrome = self.chrome_model(&snapshot);
         let mut scene = desktop_chrome(self.metrics, &snapshot, &chrome);
+        // Page galleries share the bounded decoded store and may evict old
+        // entries. The two tiny UI images remain decoded once in HEART_ASSETS;
+        // restoring an evicted entry is only an Arc clone, never a PNG decode.
+        let _ = ensure_embedded_heart_assets(&self.image_store);
         scene.image_store = self.image_store.clone();
 
         let generation = self.browser.document_generation();
@@ -4217,6 +4264,26 @@ mod tests {
         pending = true;
         assert!(consume_pending_redraw(&mut pending));
         assert!(!consume_pending_redraw(&mut pending));
+    }
+
+    #[test]
+    fn embedded_heart_states_decode_once_into_retained_rgba_images() {
+        let store = ImageStore::default();
+        ensure_embedded_heart_assets(&store).unwrap();
+        assert_ne!(
+            desktop_heart_image_handle(false),
+            desktop_heart_image_handle(true)
+        );
+        for active in [false, true] {
+            let image = store
+                .get(desktop_heart_image_handle(active))
+                .expect("embedded heart is installed");
+            assert_eq!((image.width, image.height), (30, 30));
+            assert!(image.has_alpha);
+            assert_eq!(image.rgba.len(), 30 * 30 * 4);
+        }
+        ensure_embedded_heart_assets(&store).unwrap();
+        assert_eq!(store.len(), 2, "restoring assets does not duplicate them");
     }
 
     #[test]
