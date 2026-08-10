@@ -85,69 +85,11 @@ fn new_vt(rows: u16, cols: u16) -> Vt {
     vt100::Parser::new_with_callbacks(rows, cols, SCROLLBACK_LINES, VtCallbacks::default())
 }
 
-const HISTORY_CAP: usize = 500;
-
 /// Lines of session scrollback kept in memory.
 const SCROLLBACK_LINES: usize = 10_000;
-
-/// In-memory entry history for the input field (Up/Down recall). Never
-/// persisted — it lives and dies with the process.
-#[derive(Default)]
-struct History {
-    entries: Vec<String>,
-    /// Index into `entries` while browsing; None when editing a fresh line.
-    nav: Option<usize>,
-    /// The unfinished line stashed when browsing starts, restored when the
-    /// user arrows back past the newest entry.
-    draft: String,
-}
-
-impl History {
-    fn push(&mut self, line: &str) {
-        self.nav = None;
-        if line.is_empty() || self.entries.last().is_some_and(|last| last == line) {
-            return;
-        }
-        if self.entries.len() == HISTORY_CAP {
-            self.entries.remove(0);
-        }
-        self.entries.push(line.to_string());
-    }
-
-    /// Step to an older entry, stashing the in-progress line first.
-    fn up(&mut self, current: &str) -> Option<String> {
-        let i = match self.nav {
-            None if !self.entries.is_empty() => {
-                self.draft = current.to_string();
-                self.entries.len() - 1
-            }
-            Some(i) if i > 0 => i - 1,
-            _ => return None,
-        };
-        self.nav = Some(i);
-        Some(self.entries[i].clone())
-    }
-
-    /// Step to a newer entry, or back to the stashed draft past the end.
-    fn down(&mut self) -> Option<String> {
-        match self.nav {
-            Some(i) if i + 1 < self.entries.len() => {
-                self.nav = Some(i + 1);
-                Some(self.entries[i + 1].clone())
-            }
-            Some(_) => {
-                self.nav = None;
-                Some(std::mem::take(&mut self.draft))
-            }
-            None => None,
-        }
-    }
-
-    /// Editing a recalled entry detaches it from the browse position.
-    fn detach(&mut self) {
-        self.nav = None;
-    }
-}
+#[cfg(test)]
+use crate::command::HISTORY_CAP;
+use crate::command::{HELP_PAGE, History};
 
 /// Terminal queries a server may send to probe the "terminal" — which is
 /// our embedded emulator, so we must answer where a real terminal would.
@@ -2254,6 +2196,8 @@ impl App {
         match parts.next() {
             None => {}
             Some("quit" | "q" | "exit") => self.quit = true,
+            Some("back") => self.browser_back(),
+            Some("forward") => self.browser_forward(),
             Some("reload") => self.reload(),
             Some("close" | "c") => match self.conn.take() {
                 Some(conn) => {
@@ -2758,6 +2702,9 @@ impl App {
                             http::css_only(response, viewport, cell_px).await
                         }))
                     }
+                    Ok(crate::core::FetchedDocument::Internal(_)) => Err(String::from(
+                        "internal document cannot come from the network",
+                    )),
                     Err(error) => Err(error),
                 }
             };
@@ -7325,57 +7272,19 @@ impl App {
 
 /// Resolve a port argument: a number, or a well-known service name —
 /// GNU telnet's getservbyname, in miniature.
-pub fn parse_port(s: &str) -> Option<u16> {
-    if let Ok(port) = s.parse() {
-        return Some(port);
-    }
-    Some(match s {
-        "echo" => 7,
-        "daytime" => 13,
-        "chargen" => 19,
-        "ftp" => 21,
-        "telnet" => 23,
-        "smtp" | "mail" => 25,
-        "whois" | "nicname" => 43,
-        "domain" => 53,
-        "gopher" => 70,
-        "finger" => 79,
-        "http" | "www" => 80,
-        "pop3" => 110,
-        "nntp" => 119,
-        "imap" => 143,
-        "https" => 443,
-        "telnets" => 992,
-        "gemini" => 1965,
-        "dict" => 2628,
-        "irc" => 6667,
-        _ => return None,
-    })
-}
+pub use crate::command::parse_port;
 
 /// Whether a bare console token looks like a web host/address — a dotted
 /// name (`example.com`, `192.168.0.1`), `host:port`, or `localhost` — so it
 /// opens as if `open` had been typed. Conservative on purpose: real command
 /// typos (no dot, no `localhost`) still fall through to the usage hint.
 /// Tokens are whitespace-split, so they never contain spaces.
-fn looks_like_host(s: &str) -> bool {
-    let host = s.split(':').next().unwrap_or(s);
-    host == "localhost" || (host.contains('.') && !host.starts_with('.') && !host.ends_with('.'))
-}
+use crate::command::looks_like_host;
 
 /// Split a trailing `:port` off a host string, the way users write
 /// telnet targets (`isharmud.com:23`). Hosts with more than one colon
 /// (raw IPv6 literals) are left whole.
-fn split_host_port(s: &str) -> (&str, Option<u16>) {
-    if let Some((host, port)) = s.rsplit_once(':')
-        && !host.is_empty()
-        && !host.contains(':')
-        && let Ok(port) = port.parse::<u16>()
-    {
-        return (host, Some(port));
-    }
-    (s, None)
-}
+use crate::command::split_host_port;
 
 /// Pass a BEL through to the real terminal.
 fn ring_terminal_bell() {
@@ -7451,70 +7360,6 @@ fn osc52_copy(text: &str) -> String {
         crate::img::base64_encode(text.as_bytes())
     )
 }
-
-/// The `about:help` page source (gemtext). Command lines live in
-/// preformatted blocks so their alignment survives any terminal width.
-const HELP_PAGE: &str = "\
-# TRust help
-
-Tab or Ctrl-] opens the command console; Enter runs a line.
-A bare URL or hostname opens directly, like an address bar.
-
-## Commands
-
-```
-open <host> [port]        telnet (telnets:// for TLS)
-open <url>                gopher gemini http(s) finger …
-close                     drop the connection
-reload                    refetch the page on screen
-post <url> [body]         POST a form body to a web URL
-finger [user]@<host>      finger query
-whois <domain> [server]   whois lookup
-dict <word> [server]      dictionary lookup
-status                    connection and options report
-help                      this page
-quit                      exit
-```
-
-## Settings
-
-```
-set encoding cp437|utf8   BBS art mode
-set image sixel|halfblocks|kitty|iterm2|auto
-set js on|off             page JavaScript (default on)
-set cookies on|off        RAM-only cookies (default on)
-set borders on|off        CSS borders (default off)
-mode character|line|auto  telnet input mode
-send escape|<iac>         Ctrl-] or an IAC (brk/ip/ayt/…)
-toggle crlf               what Enter sends
-```
-
-## Browsing keys
-
-```
-Up/Down        move the selection (page scrolls along)
-Enter/Right    follow the selected link
-Left/Backspace back · Alt-Left/Alt-Right back/forward
-PgUp/PgDn      page · Home/End top/bottom
-Ctrl-F         find in page (Enter next, Shift-Enter prev)
-v              play the selected link in mpv
-y              copy the selected link URL (OSC 52)
-Esc            stop loading / close the page
-```
-
-Mouse: hover selects, click follows, wheel scrolls,
-back/forward side buttons travel history.
-
-## Telnet sessions
-
-Line mode edits locally; character mode sends every key to
-the remote (Ctrl-] still opens the console). Esc reaches the
-remote in character mode — full-screen apps depend on it.
-
-## Image viewer
-
-Left/Backspace/q/Esc close it. `set image` picks the protocol.
-";
 
 /// Map GNU telnet `send` argument names to IAC command codes (RFC 854).
 fn iac_code(name: &str) -> Option<u8> {

@@ -43,6 +43,20 @@ pub fn document(page: &BrowserPage) -> Option<Doc> {
         (FetchedDocument::OneShot(raw), Link::OneShot(url)) => {
             crate::oneshot::parse(url, raw.clone(), usize::MAX / 4)
         }
+        (FetchedDocument::Internal(raw), Link::External(url)) => {
+            let lines = crate::gemini::parse_gemtext(raw, usize::MAX / 4, &|target| {
+                crate::gemini::absolute_link(target)
+                    .unwrap_or_else(|| Link::External(target.to_string()))
+            });
+            Doc::from_lines(
+                Link::External(url.clone()),
+                lines,
+                raw.clone(),
+                usize::MAX / 4,
+                false,
+                Some(String::from("text/gemini")),
+            )
+        }
         (FetchedDocument::Http(response), Link::Http(url)) => {
             let text = String::from_utf8_lossy(&response.body);
             Doc::from_lines(
