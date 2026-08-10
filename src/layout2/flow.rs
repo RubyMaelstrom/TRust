@@ -30,7 +30,7 @@ use super::float::{FloatBox, FloatCtx, Side};
 use super::inline::{AtomBoxSize, FloatEnv, Ifc, InlineItem, LineOut, OofMark, Piece};
 use super::intrinsic::IMode;
 use super::style::{BOTTOM, BoxStyle, InlineStyle, LEFT, Pos, RIGHT, TOP, block_align};
-use super::tree::{AtomKind, BoxNode, Content, Inline};
+use super::tree::{Atom, AtomKind, BoxNode, Content, Inline};
 use super::value::{Len, Vp};
 
 /// One laid-out fragment: a border-box rect in absolute px, plus content.
@@ -470,6 +470,53 @@ impl Flow<'_> {
         // align) — its used content width and border-box left are known only
         // after the column algorithm runs, inside the `Content::Table` arm.
         let mut h = self.horizontal(b, cb_w, &inl);
+        // CSS 2.1 §10.3.4 says a block-level replaced element's auto width is
+        // resolved by the inline-replaced algorithm (§10.3.2), then its
+        // margins are solved with the ordinary block equation. The generic
+        // non-replaced `width:auto` path above fills the containing block;
+        // applying it to `<img style="display:flex">` (a valid replaced
+        // element display value) turns an intrinsic logo into a full-width
+        // block and pushes following content out of the viewport.
+        if s.width.is_auto()
+            && let Content::Atomic(Atom {
+                kind:
+                    AtomKind::Img {
+                        url,
+                        density,
+                        dimension_source,
+                        ..
+                    },
+                ..
+            }) = &b.content
+        {
+            let natural = crate::responsive_image::density_corrected_size(
+                url.as_deref().and_then(|url| self.images.get(url)),
+                *density,
+            );
+            if let Some(replaced) = super::replaced::size(
+                self.dom,
+                b.node,
+                super::replaced::ImageInput {
+                    dimension_source: *dimension_source,
+                    natural,
+                    url: url.as_deref(),
+                },
+                Some(cb_w),
+                cb_h,
+                self.vp,
+            ) {
+                let ml = s.margin[LEFT].resolve(Some(cb_w));
+                let mr = s.margin[RIGHT].resolve(Some(cb_w));
+                let free = cb_w - replaced.box_w - h.bp_l - h.bp_r;
+                h.ml = match (s.margin[LEFT].is_auto(), s.margin[RIGHT].is_auto()) {
+                    (true, true) => (free / 2.0).max(0.0),
+                    (true, false) => (free - mr.unwrap_or(0.0)).max(0.0),
+                    _ => ml.unwrap_or(0.0),
+                };
+                h.content_w = replaced.box_w.max(0.0);
+                h.auto_w = false;
+            }
+        }
         let mut x_border = cb_x + h.ml;
         let bt = s.border[TOP] + self.pad(s, TOP, cb_w);
         let bb = s.border[BOTTOM] + self.pad(s, BOTTOM, cb_w);
