@@ -50,6 +50,7 @@ pub(crate) enum AlignItem {
     Start,
     End,
     Center,
+    Baseline,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -165,9 +166,7 @@ pub(crate) fn align_item_from(v: &str, auto: AlignItem) -> AlignItem {
         "flex-end" | "end" | "self-end" => AlignItem::End,
         "center" => AlignItem::Center,
         "stretch" | "normal" => AlignItem::Stretch,
-        // Baseline alignment quantized to the line start (a cell grid has no
-        // sub-row baselines; text-led items coincide anyway).
-        "baseline" | "first baseline" | "last baseline" => AlignItem::Start,
+        "baseline" | "first baseline" | "last baseline" => AlignItem::Baseline,
         _ => auto,
     }
 }

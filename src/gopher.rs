@@ -200,7 +200,16 @@ fn parse_menu(raw: &[u8], cp437: bool, width: usize) -> Vec<DocLine> {
             .map(|h| decode(h, cp437).trim().to_string())
             .unwrap_or_default();
         let selector = decode(fields[1], cp437);
-        let link = if item_type == 'h' && selector.starts_with("URL:") {
+        let link = if item_type == '8' && !host.is_empty() {
+            Some(Link::Telnet {
+                host,
+                port: fields
+                    .get(3)
+                    .and_then(|p| decode(p, cp437).trim().parse().ok())
+                    .unwrap_or(23),
+                tls: false,
+            })
+        } else if item_type == 'h' && selector.starts_with("URL:") {
             // `h` items conventionally carry a web URL in the selector;
             // those are followable in our own browser now.
             let target = &selector["URL:".len()..];
@@ -306,6 +315,23 @@ mod tests {
         assert_eq!(doc.lines[5].text, "stray text without tabs");
         // A tab-leading line (empty type field) must not panic.
         assert_eq!(doc.lines[6].kind, Kind::Info);
+    }
+
+    #[test]
+    fn item_type_eight_is_a_telnet_session_target() {
+        // RFC 1436 §3.8 defines type 8 as a Telnet session and puts the
+        // user/display string in the selector field.
+        let url = GopherUrl::parse("gopher://example.org").unwrap();
+        let doc = parse(
+            &url,
+            b"8Play the MUD\tguest\tmud.example\t2323\r\n.\r\n".to_vec(),
+            false,
+            80,
+        );
+        assert!(matches!(
+            &doc.lines[0].link,
+            Some(Link::Telnet { host, port: 2323, tls: false }) if host == "mud.example"
+        ));
     }
 
     #[test]

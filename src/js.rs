@@ -1831,22 +1831,19 @@ type GeomCache = (
 
 /// Backing for the JS geometry APIs (`getBoundingClientRect`, `offset*`/
 /// `client*`, IntersectionObserver/ResizeObserver). Holds the immutable layout
-/// inputs the measure pass needs (the page base, content width in cells, the
-/// terminal's cell pixel size, and whether borders draw) plus the lazily built,
-/// epoch-keyed box map. See `sys_rect` and `layout::measure_boxes`.
+/// inputs the measure pass needs (the page base and CSS-pixel viewport) plus
+/// the lazily built, epoch-keyed box map. See `sys_rect` and
+/// `layout2::measure_boxes_css`.
 #[derive(boa_engine::JsData)]
 struct PageGeom {
     base: url::Url,
-    /// Measure viewport in cells. `Cell`s because the app pushes the TRUE
-    /// browser content size once the page is displayed (and again on resize,
-    /// `PageCmd::Viewport`) — the fetch-time value comes from whatever view
-    /// was on screen when the fetch started, which at startup is the session
-    /// layout, a few rows taller than the browser view.
-    width_cells: std::cell::Cell<u16>,
-    height_cells: std::cell::Cell<u16>,
-    cell_px: (u16, u16),
+    /// The current initial containing block in CSS pixels. The frontend pushes
+    /// the true content viewport once displayed and on resize. Device scale and
+    /// terminal cell geometry are resolved before this boundary.
+    viewport: std::cell::Cell<crate::layout2::Viewport>,
     cache: Rc<RefCell<GeomCache>>,
-    /// Decoded image intrinsic sizes (url → cell dims), pushed by the app as
+    /// Decoded image intrinsic sizes (URL → intrinsic CSS/image pixels), pushed
+    /// by the app as
     /// its image pipeline finishes (`PageCmd::ImageSizes`). The measure pass
     /// lays images from these exactly like the app's render does, so the
     /// geometry JS reads matches the page on screen (CSSOM View reports the
@@ -2704,14 +2701,12 @@ fn sys_match_media(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
 /// caller can read either map; `None` when the page has no `PageGeom` (its URL
 /// didn't parse), where geometry is simply absent.
 fn ensure_geom_cache(ctx: &mut Context) -> Option<Rc<RefCell<GeomCache>>> {
-    let (base, width_cells, height_cells, cell_px, cache, images) = {
+    let (base, viewport, cache, images) = {
         let host = ctx.realm().host_defined();
         host.get::<PageGeom>().map(|g| {
             (
                 g.base.clone(),
-                g.width_cells.get(),
-                g.height_cells.get(),
-                g.cell_px,
+                g.viewport.get(),
                 g.cache.clone(),
                 g.images.clone(),
             )
@@ -2723,17 +2718,15 @@ fn ensure_geom_cache(ctx: &mut Context) -> Option<Rc<RefCell<GeomCache>>> {
     let mut c = cache.borrow_mut();
     if c.0 != epoch {
         let (forms, controls) = crate::http::extract_forms_arena(&d, &base, None);
-        let viewport = (width_cells as usize, height_cells as usize);
         // JS geometry reads the same engine that laid the page out
         // (LAYOUT_OVERHAUL_PLAN.md P7): the boxes come straight off the fragment
         // tree AND one pass yields the used grid track sizes.
-        let (boxes, tracks) = crate::layout2::measure_boxes_and_grid_tracks(
+        let (boxes, tracks) = crate::layout2::measure_boxes_css(
             &d,
             &base,
             viewport,
             &forms,
             &controls,
-            cell_px,
             &images.borrow(),
         );
         c.1 = boxes;
@@ -6256,18 +6249,17 @@ fn load_page(
     let page_url = env.url.as_str();
     let viewport = env.viewport;
     let cell_px = env.cell_px;
+    let viewport_css = crate::layout2::Viewport::new(
+        f32::from(viewport.0) * f32::from(cell_px.0.max(1)),
+        f32::from(viewport.1) * f32::from(cell_px.1.max(1)),
+    );
     let externals = &env.externals;
     let mut outcome = Outcome::default();
     let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
-    // The CSS-pixel viewport (cols/rows × the terminal's cell size) that the
-    // cascade evaluates `@media` against — the same window the page sees as
-    // innerWidth/innerHeight below.
-    dom.borrow_mut().set_viewport_px(
-        u32::from(viewport.0) * u32::from(cell_px.0.max(1)),
-        u32::from(viewport.1) * u32::from(cell_px.1.max(1)),
-    );
-    // The terminal cell size, for the live serializer's px→row `scrollTop` bake.
-    dom.borrow_mut().set_cell_px(cell_px.0, cell_px.1);
+    // The cascade and CSSOM share one CSS-pixel viewport. The terminal frontend
+    // performed its cells→CSS-pixels conversion before this DOM boundary.
+    dom.borrow_mut()
+        .set_viewport_px(viewport_css.width, viewport_css.height);
     // The document URL, for the live serializer's sprite-`<use>` resolution
     // (same base `rewrite_inline_svgs` joins against on the layout side).
     dom.borrow_mut().set_doc_url(url::Url::parse(page_url).ok());
@@ -6397,9 +6389,7 @@ fn load_page(
         if let Some(base) = parsed_url.clone() {
             host.insert(PageGeom {
                 base,
-                width_cells: std::cell::Cell::new(viewport.0),
-                height_cells: std::cell::Cell::new(viewport.1),
-                cell_px,
+                viewport: std::cell::Cell::new(viewport_css),
                 cache: Rc::new(RefCell::new((
                     u64::MAX,
                     std::collections::HashMap::new(),
@@ -6418,8 +6408,8 @@ fn load_page(
     let cfg = format!(
         "globalThis.__trust_cfg = {{ url: \"{}\", ua: \"TRust/0.1\", width: {}, height: {}, hardwareConcurrency: {} }};",
         esc_js(page_url),
-        u32::from(viewport.0) * u32::from(cell_px.0.max(1)),
-        u32::from(viewport.1) * u32::from(cell_px.1.max(1)),
+        viewport_css.width,
+        viewport_css.height,
         // navigator.hardwareConcurrency reports the real host logical-processor
         // count (HTML NavigatorConcurrentHardware) — honest, not a fixed spoof.
         std::thread::available_parallelism()
@@ -7095,12 +7085,20 @@ pub fn css_bake(
 /// (an async fetch + `Dom::install_frame_document`) between parse and
 /// serialize, the script-less mirror of the JS pipeline's frame loading.
 pub fn css_prepare(html: &str, viewport: (u16, u16), cell_px: (u16, u16)) -> Dom {
+    css_prepare_css(
+        html,
+        crate::layout2::Viewport::new(
+            f32::from(viewport.0) * f32::from(cell_px.0.max(1)),
+            f32::from(viewport.1) * f32::from(cell_px.1.max(1)),
+        ),
+    )
+}
+
+/// Parse a CSS-only page using a native CSS-pixel viewport. Frontends map
+/// their own coordinate system before calling this canonical entry point.
+pub fn css_prepare_css(html: &str, viewport: crate::layout2::Viewport) -> Dom {
     let mut dom = Dom::parse_document(html);
-    dom.set_viewport_px(
-        u32::from(viewport.0) * u32::from(cell_px.0.max(1)),
-        u32::from(viewport.1) * u32::from(cell_px.1.max(1)),
-    );
-    dom.set_cell_px(cell_px.0, cell_px.1);
+    dom.set_viewport_px(viewport.width, viewport.height);
     dom
 }
 
@@ -7208,8 +7206,8 @@ pub enum PageCmd {
     /// this set; one the app hasn't cached takes the full path (no failed-patch
     /// resync). Sent whenever it changes (deduped).
     LiveBoundaries(Vec<usize>),
-    /// Decoded image intrinsic sizes from the app's image pipeline (url → cell
-    /// dims). Merged into the geometry pass's `ImageSizes` so measured boxes
+    /// Decoded image intrinsic sizes from the app's image pipeline (url → CSS
+    /// intrinsic pixels). Merged into the geometry pass's `ImageSizes` so measured boxes
     /// match what the app renders — CSSOM View geometry reports the ACTUAL
     /// layout, and a virtualized feed (Mastodon's IntersectionObserverArticle)
     /// caches these heights and declares them back as placeholder sizes; a
@@ -7218,16 +7216,16 @@ pub enum PageCmd {
     /// rendering update, per the spec's "run the update intersection
     /// observations steps" each frame). The app sends the full current map
     /// (deduped by length — sizes only accrue during a page's life).
-    ImageSizes(Vec<(String, (u16, u16))>),
-    /// The app's TRUE browser viewport in cells (first displayed, or the
-    /// terminal resized). The engine adopts it — `innerWidth`/`innerHeight`,
+    ImageSizes(Vec<(String, (u32, u32))>),
+    /// The frontend's true browser viewport in CSS pixels (first displayed, or
+    /// resized). The engine adopts it — `innerWidth`/`innerHeight`,
     /// the geometry pass's measure viewport — and fires `resize` at the
     /// Window (CSSOM View §4.1). Without this the engine kept the fetch-time
     /// size for the page's life; at startup that's the session layout's,
     /// taller than the browser view, so every geometry decision (which
     /// articles intersect the viewport, where "the bottom" is) aimed a few
     /// rows past what the reader sees.
-    Viewport { cols: u16, rows: u16 },
+    Viewport(crate::layout2::Viewport),
 }
 
 /// Which kind of relayout boundary a patch targets (INCREMENTAL_LAYOUT_PLAN.md
@@ -7325,7 +7323,7 @@ pub enum PageEvt {
     },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PageHandle {
     pub cmds: tokio::sync::mpsc::Sender<PageCmd>,
 }
@@ -8690,29 +8688,33 @@ fn page_actor(
                     }
                 }
             }
-            PageCmd::Viewport { cols, rows } => {
+            PageCmd::Viewport(viewport) => {
                 // Adopt the app's true browser viewport: the measure pass lays
                 // at the width the app wraps at (one coordinate system), and
                 // the prelude updates innerWidth/innerHeight + fires `resize`
-                // at the Window (CSSOM View §4.1) + re-runs intersections.
-                let mut px = None;
+                // at the Window (CSSOM View §4.1) + re-runs intersections. The
+                // cascade uses the same viewport, so media queries re-evaluate.
+                let viewport = crate::layout2::Viewport::new(viewport.width, viewport.height);
+                let mut accepted = false;
                 {
                     let host = page.ctx.realm().host_defined();
                     if let Some(geom) = host.get::<PageGeom>() {
-                        if geom.width_cells.get() != cols || geom.height_cells.get() != rows {
-                            geom.width_cells.set(cols);
-                            geom.height_cells.set(rows);
+                        if geom.viewport.get() != viewport {
+                            geom.viewport.set(viewport);
                             geom.cache.borrow_mut().0 = u64::MAX;
                         }
-                        px = Some((
-                            u32::from(cols) * u32::from(geom.cell_px.0.max(1)),
-                            u32::from(rows) * u32::from(geom.cell_px.1.max(1)),
-                        ));
+                        accepted = true;
                     }
                 }
-                if let Some((w, h)) = px {
+                if accepted {
+                    page.dom
+                        .borrow_mut()
+                        .set_viewport_px(viewport.width, viewport.height);
                     prepare_dispatch(&mut page);
-                    let call = format!("__trust.setViewport({w},{h})");
+                    let call = format!(
+                        "__trust.setViewport({},{})",
+                        viewport.width, viewport.height
+                    );
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         page.ctx.eval(Source::from_bytes(call.as_bytes()))
                     })) {
@@ -11236,6 +11238,55 @@ const PRELUDE: &str = r##"
         }
         return null;
     }
+    function resetControlFor(el) {
+        let n = el;
+        while (n && n.nodeType === 1) {
+            const tag = n.localName;
+            const type = (n.getAttribute("type") || (tag === "button" ? "submit" : "text")).toLowerCase();
+            if ((tag === "button" || tag === "input") && type === "reset") return n;
+            n = n.parentNode;
+        }
+        return null;
+    }
+    // HTML §4.10.23: fire the cancelable reset event, then restore each
+    // resettable element's value/checkedness/selectedness from markup.
+    function resetForm(form) {
+        const event = new Event("reset", { bubbles: true, cancelable: true });
+        dispatch(form, event, false);
+        if (event.defaultPrevented) return false;
+        const controls = form.querySelectorAll("input, textarea, select");
+        for (let i = 0; i < controls.length; i++) {
+            const control = controls[i];
+            if (control.localName === "select") {
+                const options = control.querySelectorAll("option");
+                let any = false;
+                for (let j = 0; j < options.length; j++) {
+                    const selected = control.__trustResetSelected
+                        ? !!control.__trustResetSelected[j]
+                        : options[j].hasAttribute("selected");
+                    options[j].selected = selected;
+                    any = any || options[j].selected;
+                }
+                if (!any && options.length) options[0].selected = true;
+            } else if (control.localName === "textarea") {
+                control.value = control.__trustResetValue === undefined
+                    ? (control.textContent || "")
+                    : control.__trustResetValue;
+            } else {
+                const type = (control.getAttribute("type") || "text").toLowerCase();
+                if (type === "checkbox" || type === "radio") {
+                    control.checked = control.__trustResetChecked === undefined
+                        ? control.hasAttribute("checked")
+                        : !!control.__trustResetChecked;
+                } else if (! ["button", "submit", "reset", "image", "file"].includes(type)) {
+                    control.value = control.__trustResetValue === undefined
+                        ? (control.getAttribute("value") || "")
+                        : control.__trustResetValue;
+                }
+            }
+        }
+        return true;
+    }
     // Activate an element as a click does: fire a bubbling, cancelable `click`
     // event, then (unless prevented) run the submit-control activation. Shared
     // by the actor's `trust.click` (a real user click, `record` = true so the
@@ -11282,6 +11333,12 @@ const PRELUDE: &str = r##"
                 } catch (e) {}
                 return true;
             }
+        }
+        const reset = resetControlFor(t);
+        if (reset) {
+            const form = formOwner(reset);
+            if (form) resetForm(form);
+            return true;
         }
         // The default action of activating a submit control is to submit its
         // form (HTML). A live <button>/<input type=submit> reaches the app as a
@@ -11561,11 +11618,13 @@ const PRELUDE: &str = r##"
         const isToggle = tag === "input" && (type === "checkbox" || type === "radio");
         let changed = false;
         if (isToggle) {
+            if (el.__trustResetChecked === undefined) el.__trustResetChecked = el.hasAttribute("checked");
             const want = !!checked;
             if (type === "radio" && want && el.name) {
                 const scope = nearestForm(el) || g.document;
                 for (const r of scope.querySelectorAll("input")) {
                     if (r !== el && String(r.type || "").toLowerCase() === "radio" && r.name === el.name && r.checked) {
+                        if (r.__trustResetChecked === undefined) r.__trustResetChecked = r.hasAttribute("checked");
                         nativeSet(r, "checked", false);
                         changed = true;
                     }
@@ -11573,6 +11632,9 @@ const PRELUDE: &str = r##"
             }
             if (el.checked !== want) { nativeSet(el, "checked", want); changed = true; }
         } else if (tag === "select") {
+            if (!el.__trustResetSelected) {
+                el.__trustResetSelected = el.querySelectorAll("option").map(o => o.hasAttribute("selected"));
+            }
             for (const o of el.querySelectorAll("option")) {
                 const ov = o.getAttribute("value") === null ? o.textContent : o.getAttribute("value");
                 const want = ov === value;
@@ -11583,8 +11645,10 @@ const PRELUDE: &str = r##"
                 }
             }
         } else if (tag === "textarea") {
+            if (el.__trustResetValue === undefined) el.__trustResetValue = el.textContent;
             if (el.textContent !== value) { el.textContent = value; changed = true; }
         } else {
+            if (el.__trustResetValue === undefined) el.__trustResetValue = el.getAttribute("value") || "";
             if (el.value !== value) { nativeSet(el, "value", value); changed = true; }
         }
         if (changed) fireFormEvents(el, isToggle);
@@ -24421,8 +24485,9 @@ mod tests {
         // divergence reshapes the document under the reader: the Mastodon
         // feed-scroll bug). The size change is a rendering update, so the
         // intersection observations re-run: a probe that sat in view above an
-        // undecoded (one-row alt) image is pushed below the fold when the
-        // decode makes it 60 rows tall, and the observer sees false.
+        // undecoded alt-sized image is pushed below the fold when the decode
+        // gives it a 960 CSS-pixel intrinsic height, and the observer sees
+        // false.
         let (handle, mut events) = live(
             r##"<body><img src="a.png" alt="pic">
             <div id=probe>probe</div><div id=out>start</div><script>
@@ -24449,13 +24514,14 @@ mod tests {
             rendered.contains("isx=true"),
             "above the undecoded image the probe is in view: {rendered}"
         );
-        // The app decoded the image: 10×60 cells (taller than the 24-row bare
-        // viewport). Resolved against the page URL like the render's lookup.
+        // The app decoded the image: the raw 10×960 intrinsic pixel size is
+        // taller than the bare 384 CSS-pixel viewport. Resolved against the
+        // page URL like the render's lookup.
         handle
             .cmds
             .blocking_send(PageCmd::ImageSizes(vec![(
                 String::from("https://example.com/dir/a.png"),
-                (10, 60),
+                (10, 960),
             )]))
             .unwrap();
         let mut pushed_out = false;
@@ -24480,8 +24546,8 @@ mod tests {
 
     #[test]
     fn a_viewport_push_updates_inner_size_and_fires_resize() {
-        // PageCmd::Viewport: the engine adopts the app's TRUE browser content
-        // area — the fetch-time size belongs to whatever view was on screen
+        // PageCmd::Viewport: the engine adopts the frontend's TRUE CSS-pixel
+        // content area — the fetch-time size belongs to whatever view was on screen
         // when the fetch started (at startup, the taller session layout) — and
         // fires `resize` at the Window (CSSOM View §4.1). innerWidth/
         // innerHeight and everything derived (documentElement.clientHeight,
@@ -24504,14 +24570,15 @@ mod tests {
         }
         handle
             .cmds
-            .blocking_send(PageCmd::Viewport { cols: 50, rows: 20 })
+            .blocking_send(PageCmd::Viewport(crate::layout2::Viewport::new(
+                400.0, 320.0,
+            )))
             .unwrap();
         let mut resized = false;
         for _ in 0..6 {
             match events.blocking_recv() {
                 Some(PageEvt::Updated { html, outcome }) => {
                     assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
-                    // 50×8 = 400px wide, 20×16 = 320px tall (bare cell_px 8×16).
                     if html.contains("resized 400x320 client=320") {
                         resized = true;
                         break;
@@ -25544,8 +25611,8 @@ mod tests {
     /// Phase 3 inner scroll, end-to-end: the app pushes a region's box geometry
     /// (`RegionGeom`), the page reads the TRUE `clientHeight`/`scrollHeight` and
     /// pins (`scrollTop = scrollHeight`), and the next render bakes
-    /// `data-trust-scroll-top` (rows) — the signal `flow_region` re-seeds the
-    /// region's voffset from. Proves the geometry round-trip + the `scrollTop`
+    /// `data-trust-scroll-top` in CSS pixels — the terminal adapter later uses
+    /// the signal to seed its region row. Proves the geometry round-trip + the `scrollTop`
     /// setter (clamp to `scrollHeight − clientHeight`) + the baked signal
     /// together, which is exactly the chat pin-to-bottom path.
     #[test]
@@ -25634,7 +25701,7 @@ mod tests {
         let signal = id_after(&got, "data-trust-scroll-top=\"");
         assert!(
             signal > 0,
-            "the pin baked a non-zero scrollTop signal (rows): {got}"
+            "the pin baked a non-zero scrollTop signal (CSS px): {got}"
         );
     }
 
@@ -26990,6 +27057,86 @@ mod tests {
     }
 
     #[test]
+    fn reset_activation_restores_user_mutated_form_defaults() {
+        // HTML §4.10.23: reset fires its cancelable event and restores each
+        // resettable control to the value/checkedness from before user edits.
+        let (handle, mut events) = live(
+            "<body><form><input name=message value=alpha><input type=checkbox name=flag checked>\
+             <button type=reset>Reset</button></form><script>document.body.dataset.live='1';</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("live form should render");
+        };
+        let message = live_node_after(&html, "name=\"message\"");
+        let flag = live_node_after(&html, "name=\"flag\"");
+        let reset = live_node_after(&html, "<button");
+
+        handle
+            .cmds
+            .blocking_send(PageCmd::SetValue {
+                node: message,
+                value: String::from("beta"),
+                checked: None,
+            })
+            .unwrap();
+        let _ = events.blocking_recv();
+        handle
+            .cmds
+            .blocking_send(PageCmd::SetValue {
+                node: flag,
+                value: String::from("on"),
+                checked: Some(false),
+            })
+            .unwrap();
+        let _ = events.blocking_recv();
+        handle.cmds.blocking_send(PageCmd::Click(reset)).unwrap();
+        let html = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => break html,
+                Some(PageEvt::Settled) => continue,
+                other => panic!("expected reset update, got {other:?}"),
+            }
+        };
+        assert!(html.contains("name=\"message\" value=\"alpha\""), "{html}");
+        assert!(
+            html.contains("type=\"checkbox\" name=\"flag\" checked"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn canceling_the_reset_event_preserves_current_values() {
+        let (handle, mut events) = live(
+            "<body><form><input name=message value=alpha><button type=reset>Reset</button></form>\
+             <script>document.querySelector('form').addEventListener('reset', e => { e.preventDefault(); document.body.dataset.canceled='yes'; });</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("live form should render");
+        };
+        let message = live_node_after(&html, "name=\"message\"");
+        let reset = live_node_after(&html, "<button");
+        handle
+            .cmds
+            .blocking_send(PageCmd::SetValue {
+                node: message,
+                value: String::from("beta"),
+                checked: None,
+            })
+            .unwrap();
+        let _ = events.blocking_recv();
+        handle.cmds.blocking_send(PageCmd::Click(reset)).unwrap();
+        let html = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => break html,
+                Some(PageEvt::Settled) => continue,
+                other => panic!("expected canceled reset update, got {other:?}"),
+            }
+        };
+        assert!(html.contains("name=\"message\" value=\"beta\""), "{html}");
+        assert!(html.contains("data-canceled=\"yes\""), "{html}");
+    }
+
+    #[test]
     fn live_form_submit_prevent_default_updates_in_place() {
         let (handle, mut events) = live(
             "<body><form><input name=msg value=hi><button type=submit value=go>Send</button><p id=out></p></form>\
@@ -28290,16 +28437,14 @@ mod tests {
     }
 
     #[test]
-    fn element_geometry_reports_real_cell_boxes() {
+    fn element_geometry_reports_fractional_css_pixel_boxes() {
         // getBoundingClientRect / offset* now return the element's REAL laid-out
-        // box (a layout pass over the live DOM), not the viewport fiction. The
-        // probe is `inline-block` so it shrink-wraps to its content: "HELLO" is
-        // 5 cells; cell_px is 8x16 → 40px wide, 16px tall. Its left edge sits at
-        // 8px — the body's 8px UA margin. The viewport is 80x24 cells
-        // (640x384px), so a real box (40x16) is unmistakably distinct from the
-        // old fallback (640x384).
+        // CSS-pixel box (a layout pass over the live DOM), not the viewport
+        // fiction and not terminal-cell-rounded geometry. Its left edge sits at
+        // the body's 8px UA margin; fractional specified dimensions survive the
+        // layout/JS boundary.
         let (out, outcome) = page(
-            r##"<body><div id=probe style="display:inline-block">HELLO</div><div id=out></div><script>
+            r##"<body><div id=probe style="display:inline-block;width:123.5px;height:45.25px">HELLO</div><div id=out></div><script>
             var p = document.getElementById('probe');
             var r = p.getBoundingClientRect();
             document.getElementById('out').textContent =
@@ -28308,8 +28453,8 @@ mod tests {
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(
-            out.contains("8 40 16 40 16"),
-            "geometry should be the real cell box, got: {out}"
+            out.contains("8 123.5 45.25 123.5 45.25"),
+            "geometry should preserve the real CSS-pixel box, got: {out}"
         );
     }
 
@@ -28343,20 +28488,19 @@ mod tests {
     fn visibility_hidden_element_reports_its_real_box() {
         // Phase 2: `visibility:hidden` is paint suppression (CSS2 §11.2), not box
         // removal — the element is fully laid out, so getBoundingClientRect
-        // reports its real box (not 0, not the viewport). "HELLO" = 5 cells;
-        // cell_px 8x16 → 40x16 (the probe is `inline-block` so its box
-        // shrink-wraps to content). Exercises the visibility bake through the
-        // JS serialize→re-parse→measure pipeline.
+        // reports its real fractional CSS-pixel box (not 0, not the viewport).
+        // Exercises the visibility bake through the JS
+        // serialize→re-parse→measure pipeline.
         let (out, outcome) = page(
-            r##"<body><div id=probe style="visibility:hidden;display:inline-block">HELLO</div><div id=out></div><script>
+            r##"<body><div id=probe style="visibility:hidden;display:inline-block;width:123.5px;height:45.25px">HELLO</div><div id=out></div><script>
             var r = document.getElementById('probe').getBoundingClientRect();
             document.getElementById('out').textContent = [r.width, r.height].join(' ');
             </script></body>"##,
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(
-            out.contains(">40 16<"),
-            "visibility:hidden keeps its real 40x16 box, got: {out}"
+            out.contains(">123.5 45.25<"),
+            "visibility:hidden keeps its real CSS-pixel box, got: {out}"
         );
     }
 
@@ -28554,9 +28698,10 @@ mod tests {
         // its REAL box for `boundingClientRect` and a full ratio (1) — honest
         // viewport intersection. (A below-the-fold target would report false; see
         // `a_below_fold_lazy_image_loads_when_scrolled_into_view`.) The probe is
-        // `inline-block` so its reported box shrink-wraps to content (40px).
+        // `inline-block` with a fractional specified width, proving that the IO
+        // record consumes the same unquantized CSS-pixel fragment geometry.
         let (out, outcome) = page(
-            r##"<body><div id=probe style="display:inline-block">HELLO</div><div id=out></div><script>
+            r##"<body><div id=probe style="display:inline-block;width:123.5px">HELLO</div><div id=out></div><script>
             var io = new IntersectionObserver(function (entries) {
                 var e = entries[0];
                 document.getElementById('out').textContent =
@@ -28567,7 +28712,7 @@ mod tests {
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(
-            out.contains("true 40 1"),
+            out.contains("true 123.5 1"),
             "IO record should carry the real box + full ratio, got: {out}"
         );
     }
@@ -28922,7 +29067,7 @@ mod tests {
         // post-mutation re-evaluation fix.
         handle
             .cmds
-            .blocking_send(PageCmd::Scroll { x: 0.0, y: 1100.0 })
+            .blocking_send(PageCmd::Scroll { x: 0.0, y: 1300.0 })
             .unwrap();
         assert!(
             recv_until(&mut events, "item-31"),

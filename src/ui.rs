@@ -16,16 +16,20 @@ use crate::doc::{Kind, Link};
 pub mod theme {
     use ratatui::style::Color;
 
-    pub const NEON_PINK: Color = Color::Rgb(0xff, 0x2b, 0xd6);
-    pub const NEON_CYAN: Color = Color::Rgb(0x00, 0xff, 0xf9);
-    pub const NEON_GREEN: Color = Color::Rgb(0x39, 0xff, 0x14);
+    const fn color(rgb: crate::theme::Rgb) -> Color {
+        Color::Rgb(rgb[0], rgb[1], rgb[2])
+    }
+
+    pub const NEON_PINK: Color = color(crate::theme::NEON_PINK);
+    pub const NEON_CYAN: Color = color(crate::theme::NEON_CYAN);
+    pub const NEON_GREEN: Color = color(crate::theme::NEON_GREEN);
     /// Soft pastel green for interactive fields (form controls, input
     /// prompts/badges) — gentler than the bright NEON_GREEN.
-    pub const PASTEL_GREEN: Color = Color::Rgb(0xa8, 0xe6, 0xa1);
-    pub const AMBER: Color = Color::Rgb(0xff, 0xb0, 0x00);
-    pub const DIM: Color = Color::Rgb(0x6e, 0x4e, 0x9e);
-    pub const TEXT: Color = Color::Rgb(0xc8, 0xc8, 0xdc);
-    pub const BG: Color = Color::Rgb(0x0b, 0x02, 0x21);
+    pub const PASTEL_GREEN: Color = color(crate::theme::PASTEL_GREEN);
+    pub const AMBER: Color = color(crate::theme::AMBER);
+    pub const DIM: Color = color(crate::theme::DIM);
+    pub const TEXT: Color = color(crate::theme::TEXT);
+    pub const BG: Color = color(crate::theme::BG);
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -963,6 +967,7 @@ fn protocol_badge(g: &BrowserView) -> &'static str {
             crate::oneshot::Scheme::Whois => " WHOIS ",
             crate::oneshot::Scheme::Dict => " DICT ",
         },
+        Link::Telnet { .. } => " TELNET ",
         Link::JsClick { .. } => " WWW ",
         // Form controls and media representations never appear as a document's
         // own URL.

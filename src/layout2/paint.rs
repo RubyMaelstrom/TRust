@@ -1,5 +1,5 @@
-//! Paint: the fragment tree → `Doc.rows` in CSS 2.1 **Appendix E** order,
-//! composited at CELL granularity — overlaps are allowed and correct.
+//! Terminal compatibility adapter: the canonical CSS-pixel fragment tree →
+//! `Doc.rows` in CSS 2.1 **Appendix E** order, composited at cell granularity.
 //!
 //! Two stages:
 //!
@@ -47,6 +47,12 @@ pub(crate) type Composites = HashMap<String, Vec<CompositeLayer>>;
 
 use super::flow::{Clip, Frag, FragKind};
 use super::style::{BOTTOM, LEFT, RIGHT, TOP};
+
+static BORDERS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_borders_enabled(on: bool) {
+    BORDERS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 
 pub(crate) struct PaintOut {
     pub rows: Vec<Row>,
@@ -123,7 +129,10 @@ pub(crate) fn paint(
     // contributes only its reserved band height (not its scrolled-away content).
     let doc_h_px = root.max_bottom().max(flow_bottom).max(0.0);
     let mut ops = Vec::new();
-    build_sc(root, &mut ops, cell_w, cell_h, 0.0, 0.0, &links);
+    let line_rows = line_row_map(root, 0.0, 0.0, cell_w, cell_h, cols);
+    build_sc(
+        dom, root, &mut ops, cell_w, cell_h, 0.0, 0.0, &links, &line_rows,
+    );
     let mut rows = composite(ops, cols, alpha, &mut composites);
     // Splice each carousel's strip rows over its (now-blank) band — the strip
     // items keep their full strip columns (possibly past the viewport), which
@@ -190,8 +199,12 @@ pub(crate) fn paint(
                 row = row.min(vp_rows.saturating_sub(1));
             }
             let mut ops = Vec::new();
-            build_sc(f, &mut ops, cell_w, cell_h, f.x, f.y, &links);
-            let brows = composite(ops, cols.saturating_sub(col).max(1), alpha, &mut composites);
+            let fixed_cols = cols.saturating_sub(col).max(1);
+            let line_rows = line_row_map(f, f.x, f.y, cell_w, cell_h, fixed_cols);
+            build_sc(
+                dom, f, &mut ops, cell_w, cell_h, f.x, f.y, &links, &line_rows,
+            );
+            let brows = composite(ops, fixed_cols, alpha, &mut composites);
             if brows.iter().all(|r| r.items.is_empty()) {
                 return None; // nothing visible: no pinned surface
             }
@@ -321,17 +334,17 @@ fn is_carousel(dom: &Dom, f: &Frag<'_>, cw: f32) -> bool {
 /// `<pre><code>` code block, `white-space:pre` text — a horizontal scroll strip
 /// (CSS Overflow L3 §2 scrollable overflow), not only a row of overflowing
 /// child boxes.
-fn content_right_px(f: &Frag<'_>, cw: f32) -> f32 {
+fn content_right_px(f: &Frag<'_>, _cw: f32) -> f32 {
     f.children
         .iter()
         .map(|c| match &c.kind {
-            FragKind::Line(pieces) => {
-                let cells = pieces
+            FragKind::Line(line) => {
+                let right = line
+                    .pieces
                     .iter()
-                    .map(|p| p.col + usize::from(p.item.width))
-                    .max()
-                    .unwrap_or(0);
-                c.x + cells as f32 * cw
+                    .map(|p| p.x + p.box_width)
+                    .fold(0.0, f32::max);
+                c.x + right
             }
             _ => c.x + c.w,
         })
@@ -412,7 +425,8 @@ fn paint_carousel(
     // rows (the document, or the parent region's buffer).
     let strip_cols = ((content_right - ox) / cw).round().max(1.0) as usize;
     let mut ops = Vec::new();
-    build_sc(f, &mut ops, cw, ch, ox, f.y, links);
+    let line_rows = line_row_map(f, ox, f.y, cw, ch, strip_cols);
+    build_sc(dom, f, &mut ops, cw, ch, ox, f.y, links, &line_rows);
     let strip = composite(ops, strip_cols, alpha, composites);
     f.children.clear();
     let end = start_row + strip.len();
@@ -566,7 +580,8 @@ fn paint_region(
     // top-left (the scroll origin), clipped to the scrollport WIDTH — the
     // scroll axis (height) is unbounded so the buffer holds the full content.
     let mut ops = Vec::new();
-    build_sc(f, &mut ops, cw, ch, pad_x, pad_y, links);
+    let line_rows = line_row_map(f, pad_x, pad_y, cw, ch, width);
+    build_sc(dom, f, &mut ops, cw, ch, pad_x, pad_y, links, &line_rows);
     let mut buffer = composite(ops, width, alpha, composites);
     // Splice nested carousel strips over their (blank) bands in this buffer.
     for (s, strip) in n_splices {
@@ -581,17 +596,19 @@ fn paint_region(
     let content_h = buffer.len(); // scrollHeight
     // Empty the frag: the main pass now leaves `height` blank rows for the band.
     f.children.clear();
-    // The page's own scrollTop signal (baked `data-trust-scroll-top`, in rows)
-    // seeds the offset, clamped to [0, scrollHeight − clientHeight] (CSSOM
-    // View); its `data-trust-node` correlates the region with the live actor
-    // element for the geometry round-trip + wheel write-back.
+    // The page's own scrollTop signal is canonical CSS-pixel DOM state. This
+    // terminal adapter converts it to rows here, then clamps it to
+    // [0, scrollHeight − clientHeight] (CSSOM View). Its `data-trust-node`
+    // correlates the region with the live actor for geometry round-trips.
     let live_node: Option<usize> = dom
         .attr(f.node, "data-trust-node")
         .and_then(|s| s.parse().ok());
     let max_voffset = content_h.saturating_sub(height);
     let signal = dom
         .attr(f.node, "data-trust-scroll-top")
-        .and_then(|s| s.parse::<usize>().ok());
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|px| (px / ch).round().max(0.0) as usize);
     let voffset = signal.map_or(0, |r| r.min(max_voffset));
     if let Some(node) = live_node {
         scroll_clips.push((node, height as u16, width as u16));
@@ -627,13 +644,10 @@ fn collect_node_rows(f: &Frag<'_>, cell_h: f32, out: &mut HashMap<NodeId, usize>
             .and_modify(|r| *r = (*r).min(row))
             .or_insert(row);
     }
-    if let FragKind::Line(pieces) = &f.kind {
-        for p in pieces {
+    if let FragKind::Line(line) = &f.kind {
+        for p in &line.pieces {
             if p.item.node != NO_NODE {
-                let row = (((f.y / cell_h).round() as i64
-                    + i64::from(p.row_off)
-                    + i64::from(p.box_off_rows))
-                .max(0)) as usize;
+                let row = (((f.y + p.y + p.paint_y) / cell_h).round() as i64).max(0) as usize;
                 out.entry(p.item.node)
                     .and_modify(|r| *r = (*r).min(row))
                     .or_insert(row);
@@ -802,10 +816,140 @@ fn hit_op(
     });
 }
 
+/// Assign each canonical line box a terminal row without allowing two
+/// vertically distinct proportional lines to collapse onto one cell row.
+/// Lines sharing the same CSS y (columns/flex siblings) intentionally share a
+/// row. This map exists only for compatibility painting; canonical y/height
+/// and CSSOM geometry remain untouched.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TerminalLinePlacement {
+    pub row: i64,
+    columns: usize,
+    continuation_col: i64,
+}
+
+pub(crate) fn line_row_map(
+    root: &Frag<'_>,
+    ox: f32,
+    oy: f32,
+    cell_w: f32,
+    cell_h: f32,
+    columns: usize,
+) -> HashMap<usize, TerminalLinePlacement> {
+    fn collect<'a, 'tree>(
+        fragment: &'a Frag<'tree>,
+        positioned: bool,
+        lines: &mut Vec<(&'a Frag<'tree>, bool)>,
+    ) {
+        if matches!(fragment.kind, FragKind::Line(_)) {
+            lines.push((fragment, positioned));
+        }
+        for child in &fragment.children {
+            collect(child, positioned || child.paint.positioned, lines);
+        }
+    }
+
+    let mut lines = Vec::new();
+    collect(root, false, &mut lines);
+    lines.sort_by(|(left, _), (right, _)| {
+        left.y
+            .total_cmp(&right.y)
+            .then_with(|| left.x.total_cmp(&right.x))
+    });
+    let mut map = HashMap::with_capacity(lines.len());
+    let mut previous_y: Option<f32> = None;
+    let mut previous_row = i64::MIN;
+    let mut next_row = i64::MIN;
+    for (line, positioned) in lines {
+        let preferred = ((line.y - oy) / cell_h).round() as i64;
+        let line_start = ((line.x - ox) / cell_w).round().max(0.0) as i64;
+        let span = terminal_line_span(line, ox, cell_w, cell_h, columns, line_start);
+        let vertically_clipped_away = line.clip.is_some_and(|clip| {
+            ((clip.y0 - oy) / cell_h).round() as i64 >= ((clip.y1 - oy) / cell_h).round() as i64
+        });
+        if positioned || vertically_clipped_away {
+            map.insert(
+                std::ptr::from_ref(line) as usize,
+                TerminalLinePlacement {
+                    row: preferred,
+                    columns,
+                    continuation_col: line_start,
+                },
+            );
+            continue;
+        }
+        let same_band = previous_y.is_some_and(|y| (line.y - y).abs() <= 0.01);
+        let row = if same_band {
+            previous_row
+        } else if previous_row == i64::MIN {
+            preferred
+        } else {
+            preferred.max(next_row)
+        };
+        map.insert(
+            std::ptr::from_ref(line) as usize,
+            TerminalLinePlacement {
+                row,
+                columns,
+                continuation_col: line_start,
+            },
+        );
+        previous_y = Some(line.y);
+        previous_row = row;
+        next_row = next_row.max(row + span.max(1));
+    }
+    map
+}
+
+fn terminal_piece_width(piece: &super::inline::Piece, cell_w: f32, cell_h: f32) -> usize {
+    if piece.item.image.is_some() || (piece.shaped.is_none() && piece.item.text.is_empty()) {
+        let x0 = (piece.paint_x / cell_w).round();
+        let x1 = ((piece.paint_x + piece.paint_width) / cell_w).round();
+        let y0 = (piece.paint_y / cell_h).round();
+        let y1 = ((piece.paint_y + piece.paint_height) / cell_h).round();
+        let _height = (y1 - y0).max(1.0);
+        (x1 - x0).max(1.0) as usize
+    } else {
+        display_width(&piece.item.text) + usize::from(piece.space_before)
+    }
+}
+
+fn terminal_line_span(
+    line: &Frag<'_>,
+    ox: f32,
+    cell_w: f32,
+    cell_h: f32,
+    columns: usize,
+    continuation_col: i64,
+) -> i64 {
+    let FragKind::Line(line_fragment) = &line.kind else {
+        return 1;
+    };
+    let mut row_offset = 0i64;
+    let mut pen = continuation_col;
+    for piece in &line_fragment.pieces {
+        let width = terminal_piece_width(piece, cell_w, cell_h) as i64;
+        let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
+        if piece.space_before && piece.item.image.is_none() && !piece.item.text.is_empty() {
+            preferred -= 1;
+        }
+        let mut col = preferred.max(pen);
+        if columns > 0 && col > continuation_col && col + width > columns as i64 {
+            row_offset += 1;
+            pen = continuation_col;
+            col = pen;
+        }
+        pen = col + width;
+    }
+    row_offset + 1
+}
+
 /// Paint one STACKING CONTEXT per Appendix E (the root element always forms
 /// one). `ox`/`oy` shift the coordinate origin (the pinned layer paints in
 /// box-relative coordinates).
+#[allow(clippy::too_many_arguments)]
 fn build_sc(
+    dom: &Dom,
     f: &Frag<'_>,
     ops: &mut Vec<Op>,
     cw: f32,
@@ -813,10 +957,11 @@ fn build_sc(
     ox: f32,
     oy: f32,
     links: &HashMap<NodeId, Link>,
+    line_rows: &HashMap<usize, TerminalLinePlacement>,
 ) {
     // E.2 step 1/2: the element's own background.
     hit_op(f, ops, cw, ch, ox, oy, links);
-    fill_op(f, ops, cw, ch, ox, oy);
+    fill_op(dom, f, ops, cw, ch, ox, oy);
     // Gather this SC's positioned/SC descendants (piercing pseudo-stacking
     // contexts — their positioned descendants belong to THIS context).
     let mut neg: Vec<&Frag<'_>> = Vec::new();
@@ -827,34 +972,36 @@ fn build_sc(
     pos.sort_by_key(|c| c.paint.z.unwrap_or(0));
     // E.2 step 3: negative-z stacking contexts, most negative first.
     for c in neg {
-        build_sc(c, ops, cw, ch, ox, oy, links);
+        build_sc(dom, c, ops, cw, ch, ox, oy, links, line_rows);
     }
     // E.2 step 4: in-flow, non-positioned block-level backgrounds, tree order.
-    inflow_bgs(f, ops, cw, ch, ox, oy, links);
+    inflow_bgs(dom, f, ops, cw, ch, ox, oy, links, line_rows);
     // E.2 step 5: non-positioned floats, tree order (§9.5) — each as its own
     // pseudo stacking context.
-    build_floats(f, ops, cw, ch, ox, oy, links);
+    build_floats(dom, f, ops, cw, ch, ox, oy, links, line_rows);
     // E.2 step 7: in-flow, non-positioned inline content, tree order.
-    inflow_content(f, ops, cw, ch, ox, oy, links);
+    inflow_content(f, ops, cw, ch, ox, oy, links, line_rows);
     // E.2 step 8: z:auto positioned (pseudo) and z:0 SCs, one merged
     // tree-order list.
     for (c, is_sc) in zero {
         if is_sc {
-            build_sc(c, ops, cw, ch, ox, oy, links);
+            build_sc(dom, c, ops, cw, ch, ox, oy, links, line_rows);
         } else {
-            build_pseudo(c, ops, cw, ch, ox, oy, links);
+            build_pseudo(dom, c, ops, cw, ch, ox, oy, links, line_rows);
         }
     }
     // E.2 step 9: positive-z stacking contexts, smallest first.
     for c in pos {
-        build_sc(c, ops, cw, ch, ox, oy, links);
+        build_sc(dom, c, ops, cw, ch, ox, oy, links, line_rows);
     }
 }
 
 /// A positioned z:auto box: painted atomically for its own background and
 /// in-flow content, but its positioned descendants and child SCs were lifted
 /// into the enclosing real stacking context (E.2 step 8).
+#[allow(clippy::too_many_arguments)]
 fn build_pseudo(
+    dom: &Dom,
     f: &Frag<'_>,
     ops: &mut Vec<Op>,
     cw: f32,
@@ -862,12 +1009,13 @@ fn build_pseudo(
     ox: f32,
     oy: f32,
     links: &HashMap<NodeId, Link>,
+    line_rows: &HashMap<usize, TerminalLinePlacement>,
 ) {
     hit_op(f, ops, cw, ch, ox, oy, links);
-    fill_op(f, ops, cw, ch, ox, oy);
-    inflow_bgs(f, ops, cw, ch, ox, oy, links);
-    build_floats(f, ops, cw, ch, ox, oy, links);
-    inflow_content(f, ops, cw, ch, ox, oy, links);
+    fill_op(dom, f, ops, cw, ch, ox, oy);
+    inflow_bgs(dom, f, ops, cw, ch, ox, oy, links, line_rows);
+    build_floats(dom, f, ops, cw, ch, ox, oy, links, line_rows);
+    inflow_content(f, ops, cw, ch, ox, oy, links, line_rows);
 }
 
 /// Appendix E step 5: paint every non-positioned float in `f`'s subtree, in
@@ -877,7 +1025,9 @@ fn build_pseudo(
 /// walk descends through plain in-flow boxes but treats a float atomically; a
 /// float that is itself positioned or forms a stacking context is left to the
 /// normal positioned/SC path (its `sc`/`positioned` flag wins).
+#[allow(clippy::too_many_arguments)]
 fn build_floats(
+    dom: &Dom,
     f: &Frag<'_>,
     ops: &mut Vec<Op>,
     cw: f32,
@@ -885,6 +1035,7 @@ fn build_floats(
     ox: f32,
     oy: f32,
     links: &HashMap<NodeId, Link>,
+    line_rows: &HashMap<usize, TerminalLinePlacement>,
 ) {
     for c in &f.children {
         if c.paint.sc || c.paint.positioned {
@@ -892,12 +1043,12 @@ fn build_floats(
         }
         if c.paint.float {
             hit_op(c, ops, cw, ch, ox, oy, links);
-            fill_op(c, ops, cw, ch, ox, oy);
-            inflow_bgs(c, ops, cw, ch, ox, oy, links);
-            build_floats(c, ops, cw, ch, ox, oy, links);
-            inflow_content(c, ops, cw, ch, ox, oy, links);
+            fill_op(dom, c, ops, cw, ch, ox, oy);
+            inflow_bgs(dom, c, ops, cw, ch, ox, oy, links, line_rows);
+            build_floats(dom, c, ops, cw, ch, ox, oy, links, line_rows);
+            inflow_content(c, ops, cw, ch, ox, oy, links, line_rows);
         } else {
-            build_floats(c, ops, cw, ch, ox, oy, links);
+            build_floats(dom, c, ops, cw, ch, ox, oy, links, line_rows);
         }
     }
 }
@@ -932,7 +1083,9 @@ fn collect_positioned<'f, 't>(
 
 /// In-flow, non-positioned block-level backgrounds, tree order (E.2 step 4).
 /// Floats paint as a unit in step 5 (`build_floats`), so they're skipped here.
+#[allow(clippy::too_many_arguments)]
 fn inflow_bgs(
+    dom: &Dom,
     f: &Frag<'_>,
     ops: &mut Vec<Op>,
     cw: f32,
@@ -940,6 +1093,7 @@ fn inflow_bgs(
     ox: f32,
     oy: f32,
     links: &HashMap<NodeId, Link>,
+    _line_rows: &HashMap<usize, TerminalLinePlacement>,
 ) {
     for c in &f.children {
         if c.paint.sc || c.paint.positioned || c.paint.float {
@@ -947,14 +1101,15 @@ fn inflow_bgs(
         }
         if matches!(c.kind, FragKind::Block) {
             hit_op(c, ops, cw, ch, ox, oy, links);
-            fill_op(c, ops, cw, ch, ox, oy);
+            fill_op(dom, c, ops, cw, ch, ox, oy);
         }
-        inflow_bgs(c, ops, cw, ch, ox, oy, links);
+        inflow_bgs(dom, c, ops, cw, ch, ox, oy, links, _line_rows);
     }
 }
 
 /// In-flow, non-positioned inline content, tree order (E.2 step 7). Floats
 /// paint as a unit in step 5 (`build_floats`), so they're skipped here.
+#[allow(clippy::too_many_arguments)]
 fn inflow_content(
     f: &Frag<'_>,
     ops: &mut Vec<Op>,
@@ -963,6 +1118,7 @@ fn inflow_content(
     ox: f32,
     oy: f32,
     links: &HashMap<NodeId, Link>,
+    line_rows: &HashMap<usize, TerminalLinePlacement>,
 ) {
     for c in &f.children {
         if c.paint.sc || c.paint.positioned || c.paint.float {
@@ -971,47 +1127,332 @@ fn inflow_content(
         if !matches!(c.kind, FragKind::Block) {
             hit_op(c, ops, cw, ch, ox, oy, links);
         }
-        if let FragKind::Line(pieces) = &c.kind {
-            let base_col = ((c.x - ox) / cw).round() as i64;
-            let top_row = ((c.y - oy) / ch).round() as i64;
-            for p in pieces {
-                let row_delta = i64::from(p.row_off) + i64::from(p.box_off_rows);
-                let item_y = c.y + row_delta as f32 * ch;
-                let clip =
-                    if p.item.image.is_none() && !p.item.text.is_empty() && p.item.height <= 1 {
-                        text_item_clip_cells(c.clip, item_y, ox, oy, cw, ch)
-                    } else {
-                        clip_cells(c.clip, ox, oy, cw, ch)
-                    };
+        if let FragKind::Line(line) = &c.kind {
+            // Proportional CSS advances do not map monotonically to terminal
+            // display-cell widths (for example `Multi:` may shape narrower
+            // than six 8px cells). Preserve the inline sequence at this final
+            // compatibility boundary: snap each piece's preferred CSS-pixel
+            // origin, then advance it past the preceding adapted piece on the
+            // same terminal row. This never feeds back into line breaking or
+            // fragment geometry.
+            let mut row_pens: HashMap<i64, i64> = HashMap::new();
+            let mut wrap_offset = 0i64;
+            for p in &line.pieces {
+                let mut item_x = c.x + p.x + p.paint_x;
+                // A terminal row has no typographic baseline. Anchor adapted
+                // items to the canonical line-box top (plus object-fit inset),
+                // not to the glyph/image baseline offset: a short inline image
+                // and the following line may otherwise round onto the same row
+                // and overwrite each other in the cell compositor.
+                let item_y = c.y + p.paint_y;
+                let mut item = Item {
+                    col: 0,
+                    width: 0,
+                    height: 1,
+                    text: p.item.text.clone(),
+                    kind: p.item.kind,
+                    image: p.item.image.clone(),
+                    emph: p.item.emph,
+                    node: p.item.node,
+                    link: p.item.link.clone(),
+                    crop: p.item.crop,
+                    pixelated: p.item.pixelated,
+                    invisible: p.item.invisible,
+                };
+                quantize_item(&mut item, p, cw, ch);
+                if p.space_before && item.image.is_none() && !item.text.is_empty() {
+                    // The terminal compatibility model deliberately represents
+                    // a collapsed proportional-space gap as one cell.
+                    item.text.insert(0, ' ');
+                    item.width = item.width.saturating_add(1);
+                    item_x -= cw;
+                }
+                let clip = if item.image.is_none() && !item.text.is_empty() && item.height <= 1 {
+                    text_item_clip_cells(c.clip, item_y, ox, oy, cw, ch)
+                } else {
+                    clip_cells(c.clip, ox, oy, cw, ch)
+                };
+                let placement = line_rows
+                    .get(&(std::ptr::from_ref(c) as usize))
+                    .copied()
+                    .unwrap_or(TerminalLinePlacement {
+                        row: ((c.y - oy) / ch).round() as i64,
+                        columns: usize::MAX,
+                        continuation_col: ((c.x - ox) / cw).round() as i64,
+                    });
+                let baseline_offset = if item.image.is_some() {
+                    0
+                } else {
+                    (p.y / ch).round() as i64
+                };
+                let mut row =
+                    placement.row + baseline_offset + (p.paint_y / ch).round() as i64 + wrap_offset;
+                let mut preferred_col = if wrap_offset > 0 {
+                    placement.continuation_col
+                } else {
+                    ((item_x - ox) / cw).round() as i64
+                };
+                let mut pen = *row_pens.entry(row).or_insert(preferred_col);
+                let mut col = preferred_col.max(pen);
+                if placement.columns != usize::MAX
+                    && col > placement.continuation_col
+                    && col + i64::from(item.width) > placement.columns as i64
+                {
+                    wrap_offset += 1;
+                    row += 1;
+                    preferred_col = placement.continuation_col;
+                    pen = *row_pens.entry(row).or_insert(preferred_col);
+                    col = preferred_col.max(pen);
+                }
+                let pen = row_pens.entry(row).or_insert(col);
+                *pen = col + i64::from(item.width);
                 ops.push(Op::Item {
-                    row: top_row + row_delta,
-                    col: base_col + p.col as i64,
-                    item: p.item.clone(),
+                    row,
+                    col,
+                    item,
                     clip,
                 });
             }
         }
-        inflow_content(c, ops, cw, ch, ox, oy, links);
+        inflow_content(c, ops, cw, ch, ox, oy, links, line_rows);
     }
 }
 
-/// The opaque background fill of a fragment's border box, when it has one.
-fn fill_op(f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32) {
-    if !f.paint.bg {
-        return;
+/// The one canonical CSS-pixel → terminal-cell adaptation for inline items.
+/// It affects only the legacy `Item` copy; fragment and shaped-run geometry
+/// remains untouched for graphical paint and CSSOM consumers.
+fn quantize_item(item: &mut Item, piece: &super::inline::Piece, cw: f32, ch: f32) {
+    if item.image.is_some() || (piece.shaped.is_none() && item.text.is_empty()) {
+        let x0 = (piece.paint_x / cw).round();
+        let x1 = ((piece.paint_x + piece.paint_width) / cw).round();
+        let y0 = (piece.paint_y / ch).round();
+        let y1 = ((piece.paint_y + piece.paint_height) / ch).round();
+        item.width = (x1 - x0).max(1.0).min(u16::MAX as f32) as u16;
+        item.height = (y1 - y0).max(1.0).min(u16::MAX as f32) as u16;
+    } else {
+        item.width = display_width(&item.text).min(u16::MAX as usize) as u16;
+        item.height = 1;
     }
+}
+
+/// Whether a canonical background should claim an opaque terminal cell span.
+///
+/// The graphical display list retains every non-transparent background. The
+/// terminal cannot alpha-blend arbitrary CSS image/gradient layers, so its
+/// historical binary cover approximation is deliberately quarantined here,
+/// after layout and immediately before cell compositing.
+fn terminal_background_covers(dom: &Dom, node: NodeId) -> bool {
+    if node == NO_NODE {
+        return false;
+    }
+    if let Some(color) = dom.computed_value(node, "background-color") {
+        let color = color.trim().to_ascii_lowercase();
+        if !color.is_empty()
+            && !matches!(
+                color.as_str(),
+                "transparent"
+                    | "none"
+                    | "initial"
+                    | "inherit"
+                    | "unset"
+                    | "revert"
+                    | "revert-layer"
+            )
+            && !zero_alpha_color(&color)
+        {
+            return true;
+        }
+    }
+    let Some(image) = dom.computed_value(node, "background-image") else {
+        return false;
+    };
+    let image = image.trim().to_ascii_lowercase();
+    if image.is_empty()
+        || matches!(
+            image.as_str(),
+            "none" | "initial" | "inherit" | "unset" | "revert" | "revert-layer"
+        )
+    {
+        return false;
+    }
+    split_top_level_commas(&image).any(|layer| {
+        let layer = layer.trim();
+        layer.starts_with("url(") || gradient_mean_alpha(layer) > 0.5
+    })
+}
+
+fn gradient_mean_alpha(gradient: &str) -> f32 {
+    let Some(open) = gradient.find('(') else {
+        return 1.0;
+    };
+    let inner = &gradient[open + 1..gradient.rfind(')').unwrap_or(gradient.len())];
+    let mut sum = 0.0;
+    let mut count = 0u32;
+    for (index, part) in split_top_level_commas(inner).enumerate() {
+        let part = part.trim();
+        if index == 0 && is_gradient_direction(part) {
+            continue;
+        }
+        if !part.is_empty() {
+            sum += color_stop_alpha(part);
+            count += 1;
+        }
+    }
+    if count == 0 { 1.0 } else { sum / count as f32 }
+}
+
+fn is_gradient_direction(part: &str) -> bool {
+    part.starts_with("to ")
+        || part.starts_with("at ")
+        || part.contains(" at ")
+        || part.starts_with("circle")
+        || part.starts_with("ellipse")
+        || part.starts_with("closest-")
+        || part.starts_with("farthest-")
+        || part.starts_with("from ")
+        || part.split_whitespace().next().is_some_and(|word| {
+            ["deg", "rad", "grad", "turn"].iter().any(|unit| {
+                word.ends_with(unit) && word.trim_end_matches(unit).parse::<f32>().is_ok()
+            })
+        })
+}
+
+fn color_stop_alpha(stop: &str) -> f32 {
+    if stop.contains("transparent") {
+        return 0.0;
+    }
+    for prefix in ["rgb", "hsl", "hwb"] {
+        if let Some(index) = stop.find(prefix) {
+            let rest = &stop[index..];
+            if let Some(open) = rest.find('(') {
+                let inner = &rest[open + 1..];
+                let inner = &inner[..inner.find(')').unwrap_or(inner.len())];
+                return color_args_alpha(inner).unwrap_or(1.0).clamp(0.0, 1.0);
+            }
+        }
+    }
+    1.0
+}
+
+fn split_top_level_commas(value: &str) -> impl Iterator<Item = &str> {
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts.into_iter()
+}
+
+fn color_args_alpha(arguments: &str) -> Option<f32> {
+    let alpha = if let Some((_, alpha)) = arguments.rsplit_once('/') {
+        alpha
+    } else {
+        let parts: Vec<&str> = arguments.split(',').collect();
+        if parts.len() < 4 {
+            return None;
+        }
+        parts[3]
+    };
+    let alpha = alpha.trim();
+    let (number, percentage) = match alpha.strip_suffix('%') {
+        Some(number) => (number.trim(), true),
+        None => (alpha, false),
+    };
+    let value = number.parse::<f32>().ok()?;
+    Some(if percentage { value / 100.0 } else { value })
+}
+
+fn zero_alpha_color(color: &str) -> bool {
+    if !(color.starts_with("rgb") || color.starts_with("hsl") || color.starts_with("hwb")) {
+        return false;
+    }
+    let Some((_, arguments)) = color.split_once('(') else {
+        return false;
+    };
+    color_args_alpha(arguments.trim_end_matches(')')).is_some_and(|alpha| alpha == 0.0)
+}
+
+/// The opaque background fill of a fragment's border box, when it has one.
+fn fill_op(dom: &Dom, f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32) {
     let row0 = ((f.y - oy) / ch).round() as i64;
     let row1 = ((f.y - oy + f.h) / ch).round() as i64;
     let col0 = ((f.x - ox) / cw).round() as i64;
     let col1 = ((f.x - ox + f.w) / cw).round() as i64;
-    if row1 > row0 && col1 > col0 {
+    let clip = clip_cells(f.clip, ox, oy, cw, ch);
+    if f.paint.bg && terminal_background_covers(dom, f.node) && row1 > row0 && col1 > col0 {
         ops.push(Op::Fill {
             row0,
             row1,
             col0,
             col1,
-            clip: clip_cells(f.clip, ox, oy, cw, ch),
+            clip,
         });
+    }
+    if !BORDERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        || f.border.iter().all(|width| *width <= 0.0)
+        || row1 <= row0
+        || col1 <= col0
+    {
+        return;
+    }
+    let horizontal = "─".repeat((col1 - col0) as usize);
+    let border_item = |text: String| Item {
+        col: 0,
+        width: display_width(&text).min(u16::MAX as usize) as u16,
+        height: 1,
+        text,
+        kind: ItemKind::Border,
+        image: None,
+        emph: Emphasis::default(),
+        node: f.node,
+        link: None,
+        crop: false,
+        pixelated: false,
+        invisible: false,
+    };
+    if f.border[TOP] > 0.0 {
+        ops.push(Op::Item {
+            row: row0,
+            col: col0,
+            item: border_item(horizontal.clone()),
+            clip,
+        });
+    }
+    if f.border[BOTTOM] > 0.0 {
+        ops.push(Op::Item {
+            row: row1 - 1,
+            col: col0,
+            item: border_item(horizontal),
+            clip,
+        });
+    }
+    for row in row0..row1 {
+        if f.border[LEFT] > 0.0 {
+            ops.push(Op::Item {
+                row,
+                col: col0,
+                item: border_item(String::from("│")),
+                clip,
+            });
+        }
+        if f.border[RIGHT] > 0.0 {
+            ops.push(Op::Item {
+                row,
+                col: col1 - 1,
+                item: border_item(String::from("│")),
+                clip,
+            });
+        }
     }
 }
 

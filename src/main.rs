@@ -1,44 +1,7 @@
-// mimalloc as the global allocator (default-on `mimalloc` feature): ~17%
-// faster JS parse+compile, which are dominated by millions of tiny AST/
-// CodeBlock allocations. `--no-default-features` falls back to the system
-// allocator (pure Rust). See the feature note in Cargo.toml.
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-/// Return freed allocator memory to the OS — a one-shot called at navigation
-/// boundaries (the V8 "idle GC on navigation" analogue). mimalloc retains a
-/// heavy page's freed pages for reuse, so after you leave e.g. YouTube the
-/// resident set never falls on its own; `mi_collect(true)` forces reclamation +
-/// purge of free/abandoned segments back to the OS. No-op on the pure-Rust
-/// (glibc) build, which already trims/`munmap`s on its own.
-pub fn release_allocator_memory() {
-    #[cfg(feature = "mimalloc")]
-    // SAFETY: `mi_collect` is a process-global mimalloc management entry point
-    // with no preconditions; it only reclaims memory that is already unused.
-    unsafe {
-        libmimalloc_sys::mi_collect(true);
-    }
-}
-
-mod app;
-mod cp437;
-mod doc;
-mod dom;
-mod gemini;
-mod gopher;
-mod http;
-mod img;
-mod js;
-mod layout2;
-mod oneshot;
-mod telnet;
-mod tls;
-mod ui;
-mod ws;
-
 use std::io::Write;
 use std::process::ExitCode;
+
+use trust::frontend::tui;
 
 /// Pop the terminal's title stack (CSI 23;2t, the counterpart to the 22;2t
 /// push in `main`), restoring whatever title was showing before TRust took
@@ -60,7 +23,7 @@ async fn main() -> ExitCode {
     let start_port = match args.next() {
         // Numeric, or a well-known service name ("telnet", "smtp", ...)
         // like GNU telnet's getservbyname.
-        Some(p) => match app::parse_port(&p) {
+        Some(p) => match tui::parse_port(&p) {
             Some(p) => Some(p),
             None => {
                 eprintln!("trust: bad port or service name: {p}");
@@ -74,7 +37,7 @@ async fn main() -> ExitCode {
     // This thread (the `#[tokio::main]` `block_on` driver) owns the live
     // terminal, and the run loop never migrates off it (verified). Claim it
     // BEFORE installing the hook below, which gates on this flag.
-    app::TERMINAL_OWNER.with(|c| c.set(true));
+    tui::TERMINAL_OWNER.with(|c| c.set(true));
     // `ratatui::init()` just installed a panic hook that calls
     // `ratatui::restore()` UNCONDITIONALLY, on EVERY panic, on ANY thread,
     // before the previous hook. That is the partial-crash bug: background
@@ -104,7 +67,7 @@ async fn main() -> ExitCode {
                     .name()
                     .unwrap_or("<unnamed>")
                     .to_string();
-                let owner = app::TERMINAL_OWNER.with(|c| c.get());
+                let owner = tui::TERMINAL_OWNER.with(|c| c.get());
                 let bt = std::backtrace::Backtrace::force_capture();
                 let _ = writeln!(
                     f,
@@ -112,7 +75,7 @@ async fn main() -> ExitCode {
                 );
             }
         }
-        if !app::TERMINAL_OWNER.with(|c| c.get()) {
+        if !tui::TERMINAL_OWNER.with(|c| c.get()) {
             return; // background panic, caught downstream — keep the TUI clean
         }
         // A real render/run-loop panic: drop mouse capture and paste mode,
@@ -148,8 +111,8 @@ async fn main() -> ExitCode {
     // back (CSI 23;2t) on exit instead of guessing/hardcoding what it was.
     let _ = std::io::stdout().write_all(b"\x1b[22;2t");
     let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle("TRust"));
-    let mut app = app::App::new(host, start_port.unwrap_or(23));
-    app.start_port = start_port;
+    let mut app = tui::App::new(host, start_port.unwrap_or(23));
+    app.set_start_port(start_port);
     app.set_picker(picker);
     let result = app.run(terminal).await;
     let _ = crossterm::execute!(

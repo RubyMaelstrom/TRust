@@ -4,15 +4,15 @@
 //! built, and resolved (possibly many times) against a containing-block basis
 //! during layout. Everything that can be known at parse time is folded to a
 //! number then: absolute units, `em`/`rem` (the element's/root's font size is
-//! fixed per element), `ch`/`ex` (glyph metrics are the terminal's), and the
+//! fixed per element), `ch`/`ex` (from the element's font metrics), and the
 //! viewport units (the viewport is fixed per pass). Only percentages stay
 //! symbolic — and CSS's `calc()` grammar only permits multiplying a length by
 //! a NUMBER (never length × length), so every valid `calc()` is LINEAR in the
 //! percentage basis and folds to `k·basis + b`. `min()`/`max()`/`clamp()`
 //! break linearity and keep a small tree.
 //!
-//! All math is f32 CSS px; the px→cell quantization happens once, at the
-//! paint boundary (LAYOUT_OVERHAUL_PLAN.md "Quantization").
+//! All math is f32 CSS px; the px→cell quantization happens once, in the
+//! terminal adapter.
 
 use crate::layout2::{Units, css_length_px};
 
@@ -415,9 +415,9 @@ fn leaf(v: &str, u: Units, vp: Vp) -> Option<Term> {
             b: 0.0,
         });
     }
-    // Viewport-percentage units. A terminal has no dynamic chrome, so the
-    // small/large/dynamic qualifiers (`svh`/`lvh`/`dvw`, …) equal the classic
-    // units: strip the base suffix, then an optional trailing `d`/`s`/`l`.
+    // This engine currently receives one layout viewport, so the
+    // small/large/dynamic qualifiers (`svh`/`lvh`/`dvw`, …) use that same
+    // basis: strip the base suffix, then an optional trailing `d`/`s`/`l`.
     // Longer suffixes first so `vmin` isn't caught by `vh`-less scans.
     for (suffix, basis) in [
         ("vmin", (vp.h > 0.0).then(|| vp.w.min(vp.h))),
@@ -562,7 +562,7 @@ mod tests {
     use super::*;
 
     fn u() -> Units {
-        Units::default() // 16px font, 8×16 cell
+        Units::default() // 16px font with a shaped `ch` basis
     }
 
     fn vp() -> Vp {

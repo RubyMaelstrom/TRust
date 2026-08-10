@@ -1,18 +1,19 @@
-//! The shared layout contract: the output model the browser view renders,
-//! and the primitives the `layout2` engine produces it with.
+//! Shared semantic types plus the terminal compatibility output contract.
 //!
-//! A page lays out as a vertical stack of `Row`s, each a left-to-right
+//! Canonical geometry lives in the CSS-pixel fragments in `flow.rs`; graphical
+//! paint uses `render::PagePaint`. After layout, the terminal adapter represents
+//! a page as a vertical stack of `Row`s, each a left-to-right
 //! sequence of positioned `Item`s — so a row can hold several links, inline
 //! images, and form controls. Vertical scroll indexes by row; lateral
 //! navigation indexes by item. This module owns that contract: `Row`/`Item`/
 //! `ItemKind`/`Emphasis`; the scroll/overlay surfaces (`Region`, `Carousel`,
-//! `FixedItem`, `CompositeLayer`); `PxRect` geometry for the JS box APIs; the
-//! `Units` px→cell context and the session cell-size/border settings; and the
+//! `FixedItem`, `CompositeLayer`); `PxRect` geometry for the JS box APIs; CSS
+//! length-resolution `Units`; and the
 //! CSS value and string helpers shared across the engine (`css_length_px`,
-//! `split_track_tokens`, `display_width`, `format_list_marker`, `letter_space`,
+//! `split_track_tokens`, `display_width`, `format_list_marker`,
 //! `is_collapsible_space`, …).
 //!
-//! `layout2::lay_out_document` produces `Row`s from the fragment tree; the
+//! `layout2::lay_out_document` adapts the fragment tree into `Row`s; the
 //! renderer (`ui.rs`/`app.rs`) consumes them. These items are re-exported flat
 //! at `crate::layout2::*`.
 
@@ -54,11 +55,92 @@ pub(crate) fn truncate_to_width(s: &str, max: usize) -> String {
 /// form controls as selectable `Link::Form` items.
 pub type ControlMap = HashMap<NodeId, (usize, usize)>;
 
-/// Map from an image's absolute URL to its decoded cell box `(width,
-/// height)`, built by the app's decode pipeline. An image present here
-/// lays out as a real W×H box (reserving rows); one absent falls back to
-/// alt text.
-pub type ImageSizes = HashMap<String, (u16, u16)>;
+/// Map from an image's absolute URL to its intrinsic dimensions in image/CSS
+/// pixels. These are the decoded resource's natural dimensions, never a
+/// terminal-cell box; terminal image scaling happens after canonical layout.
+pub type ImageSizes = HashMap<String, (u32, u32)>;
+
+/// The initial containing block for canonical HTML layout, in CSS pixels.
+/// Device scale and terminal cells are presentation concerns and are not part
+/// of this contract (CSS Values and Units 4 §6.1.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Viewport {
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Viewport {
+    pub fn new(width: f32, height: f32) -> Self {
+        Self {
+            width: finite_non_negative(width),
+            height: finite_non_negative(height),
+        }
+    }
+}
+
+/// Terminal presentation parameters at the sole CSS-pixel-to-cell boundary.
+///
+/// This is intentionally distinct from [`Viewport`]: canonical layout sees
+/// only the derived CSS-pixel initial containing block, while the adapter uses
+/// the cell metrics afterward to quantize its compatibility `Row`/`Item`
+/// output. Keeping the metrics in this value also avoids process-global font
+/// state when pages are laid out concurrently.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerminalViewport {
+    pub columns: usize,
+    pub rows: usize,
+    pub cell_width: f32,
+    pub cell_height: f32,
+}
+
+impl TerminalViewport {
+    pub fn new(columns: usize, rows: usize, cell_width: f32, cell_height: f32) -> Self {
+        Self {
+            columns: columns.max(10),
+            rows,
+            cell_width: finite_positive(cell_width),
+            cell_height: finite_positive(cell_height),
+        }
+    }
+
+    pub fn from_font_pixels(columns: usize, rows: usize, cell_pixels: (u16, u16)) -> Self {
+        Self::new(
+            columns,
+            rows,
+            f32::from(cell_pixels.0.max(1)),
+            f32::from(cell_pixels.1.max(1)),
+        )
+    }
+
+    pub fn css_viewport(self) -> Viewport {
+        Viewport::new(
+            self.columns as f32 * self.cell_width,
+            self.rows as f32 * self.cell_height,
+        )
+    }
+}
+
+impl Default for TerminalViewport {
+    fn default() -> Self {
+        Self::new(80, 24, 8.0, 16.0)
+    }
+}
+
+fn finite_non_negative(value: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn finite_positive(value: f32) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        1.0
+    }
+}
 
 /// The CLIP box `(live_node, client_h_rows, client_w_cells)` of every
 /// definite-height scroll-y box flowed (region or fitting). See `Doc.scroll_clips`.
@@ -71,11 +153,9 @@ pub const NO_NODE: NodeId = usize::MAX;
 /// A laid-out element's box in CSS pixels — the backing for the JS geometry
 /// APIs (`getBoundingClientRect`, `offset*`/`client*`, IntersectionObserver/
 /// ResizeObserver records). `left`/`top` are the element's document-origin
-/// position and `width`/`height` its size, each a whole number of terminal
-/// cells scaled by the cell's pixel size. The cell quantization is deliberate:
-/// the geometry a page reads back must agree with what we actually paint, so a
-/// page that measures and then renders sees the box it will really get (we
-/// cannot draw sub-cell, so reporting sub-cell precision would be a fiction).
+/// position and `width`/`height` its size. Values come directly from canonical
+/// fragments and may be fractional; CSSOM View never observes terminal-cell
+/// or device-pixel quantization.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PxRect {
     pub left: f64,
@@ -84,93 +164,56 @@ pub struct PxRect {
     pub height: f64,
 }
 
-/// Whether CSS borders render as box-drawing chrome. Session-global,
-/// default OFF (her call — terminal vertical space is at a premium and most
-/// page borders are subtle 1px underlines not worth a cell row each). The
-/// `set borders on` command flips it; `http::parse_seeded` reads it when
-/// laying a document out.
-static BORDERS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn set_borders_enabled(on: bool) {
-    BORDERS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn borders_enabled() -> bool {
-    BORDERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// The terminal's real cell HEIGHT in px (the picker's font size). Every
-/// vertical px→rows conversion runs through it (via `Units`), so a definite
-/// CSS pixel height maps to the same physical extent a browser gives it AND
-/// round-trips the JS geometry (`getBoundingClientRect` = rows × cell_px).
-/// Session-global (set once from the picker, like `BORDERS_ENABLED`) rather
-/// than threaded through every layout call; defaults to 16 so tests and the
-/// 8×16 measurement fixtures round-trip exactly. Read through `Units`;
-/// `layout2::measure_boxes_and_grid_tracks` overrides it with its explicit
-/// `cell_px.1`.
-static CELL_PX_H: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(16);
-
-pub fn set_cell_px_h(px: u16) {
-    CELL_PX_H.store(px.max(1), std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn cell_px_h() -> u16 {
-    CELL_PX_H.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// The terminal's real cell WIDTH in px, completing what `CELL_PX_H` started:
-/// with both axes real, a CSS pixel length maps to the same physical extent
-/// the browser gives it on ANY terminal font, and `rows_for_ratio` keeps true
-/// aspect instead of assuming 2:1 cells. Same session-global pattern as
-/// `CELL_PX_H`; defaults to 8 (the nominal cell) so tests stay deterministic.
-static CELL_PX_W: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(8);
-
-pub fn set_cell_px_w(px: u16) {
-    CELL_PX_W.store(px.max(1), std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn cell_px_w() -> u16 {
-    CELL_PX_W.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// The context a CSS length resolves in: the element's computed font-size
-/// (`em`), the root's (`rem`), and the terminal's real cell box (px → cells).
-/// Built per element by the engine (`Units::of` for callers outside a layout
-/// pass); the default is the
-/// nominal test fixture (16px font, 8×16 cells) under which 1em = 2 cells =
-/// 1 row, the engine's historical constants.
+/// (`em`), the root's (`rem`), and the measured advance of U+0030 (`ch`).
+/// Terminal metrics deliberately do not appear here.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) struct Units {
     /// The element's computed font-size, CSS px.
     pub fs: f32,
     /// The root element's computed font-size, CSS px (the `rem` basis).
     pub root: f32,
-    /// Terminal cell width, px.
-    pub cell_w: f32,
-    /// Terminal cell height, px.
-    pub cell_h: f32,
+    /// Advance measure of U+0030 ZERO in the element's actual font, CSS px.
+    pub ch: f32,
 }
 
 impl Default for Units {
     fn default() -> Self {
+        let style = crate::text::TextStyle::default();
         Units {
-            fs: crate::dom::FONT_SIZE_INITIAL,
-            root: crate::dom::FONT_SIZE_INITIAL,
-            cell_w: 8.0,
-            cell_h: 16.0,
+            fs: style.size,
+            root: style.size,
+            ch: crate::text::zero_advance(&style),
         }
     }
 }
 
 impl Units {
-    /// The resolution context for `id` in `dom`, with the session's real cell
-    /// box — for callers outside a layout pass (dom.rs's clip checks).
+    /// The resolution context for `id` in `dom`.
     pub(crate) fn of(dom: &Dom, id: NodeId) -> Units {
+        let fs = dom.font_px(id);
+        let family = dom
+            .computed_value(id, "font-family")
+            .unwrap_or_else(|| String::from("sans-serif"));
+        let weight = dom
+            .computed_value(id, "font-weight")
+            .as_deref()
+            .and_then(css_font_weight)
+            .unwrap_or(400.0);
+        let italic = dom
+            .computed_value(id, "font-style")
+            .is_some_and(|value| css_is_italic(&value));
+        let ch = crate::text::zero_advance(&crate::text::TextStyle {
+            family,
+            size: fs,
+            weight,
+            italic,
+            ..crate::text::TextStyle::default()
+        });
         Units {
-            fs: dom.font_px(id),
+            fs,
             root: dom.root_font_px(),
-            cell_w: f32::from(cell_px_w()),
-            cell_h: f32::from(cell_px_h()),
+            ch,
         }
     }
 }
@@ -559,7 +602,7 @@ impl Region {
 /// cell) that OWN their rows (no sibling shares a row — proven geometrically at
 /// harvest) and are width-stable (verified on patch). A box that shares its rows
 /// with siblings is excluded → full path (always correct).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BoundaryBox {
     /// The live actor node id (baked as `data-trust-node`) — the app maps a
     /// `Patched{node}` to this cached box.
@@ -569,6 +612,11 @@ pub struct BoundaryBox {
     /// The left edge (cells) where the re-laid fragment's column 0 maps when
     /// spliced back.
     pub origin_col: u16,
+    /// Fractional CSS-pixel phase of the border-box origin within its terminal
+    /// cell. Incremental re-layout reuses this phase before quantization so a
+    /// proportional line at (say) y=18.625px snaps exactly as it did in the
+    /// full document rather than as if the subtree began at y=0.
+    pub quantization_phase: (f32, f32),
     /// The width fed to the fragment re-lay (the band, for a block-filling box;
     /// the track width, for a sub-box) so it wraps identically.
     pub content_width: u16,
@@ -580,6 +628,12 @@ pub struct BoundaryBox {
     /// block-filling in-flow box (fills its band, no width verify).
     pub sub_box: bool,
 }
+
+// `quantization_phase` is produced only by `rem_euclid` over finite positive
+// cell metrics and finite fragment coordinates, so it can never contain NaN.
+// Under that construction invariant, the derived `PartialEq` is an equivalence
+// relation and the terminal document's existing `Eq` contract remains sound.
+impl Eq for BoundaryBox {}
 
 /// The on-screen column for an item in doc row `row`, applying any carousel
 /// scroll offset and clipping. `None` means the item is scrolled out of its
@@ -1139,25 +1193,6 @@ fn roman_marker(mut n: u32, upper: bool) -> String {
     if upper { s.to_uppercase() } else { s }
 }
 
-/// Insert `cells` spaces between each pair of characters (CSS `letter-spacing`
-/// rendered as whole-cell tracking). A no-op for `cells == 0` or a single
-/// character, so it borrows in the common case.
-pub(crate) fn letter_space(word: &str, cells: usize) -> std::borrow::Cow<'_, str> {
-    use std::borrow::Cow;
-    if cells == 0 || word.chars().count() < 2 {
-        return Cow::Borrowed(word);
-    }
-    let gap = " ".repeat(cells);
-    let mut out = String::with_capacity(word.len() + cells * word.chars().count());
-    for (i, c) in word.chars().enumerate() {
-        if i > 0 {
-            out.push_str(&gap);
-        }
-        out.push(c);
-    }
-    Cow::Owned(out)
-}
-
 /// The page's standard preview image (Open Graph `og:image`, else Twitter's
 /// `twitter:image`), resolved to an absolute http(s) URL. This is the
 /// cross-site convention for "a still frame of this page's media" — used to
@@ -1374,12 +1409,19 @@ pub(crate) fn page_declares_video(dom: &Dom) -> bool {
             == 1
 }
 
-/// A CSS `font-weight` value reads as bold (`bold`/`bolder`/≥600).
-pub(crate) fn css_is_bold(value: &str) -> bool {
+/// Resolve the numeric CSS Fonts weight used by the font matcher. Relative
+/// weights are approximated against the inherited normal face until the
+/// cascade stores parent-relative numeric computed values.
+pub(crate) fn css_font_weight(value: &str) -> Option<f32> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "bold" | "bolder" => true,
-        "normal" | "lighter" => false,
-        n => n.parse::<u32>().is_ok_and(|w| w >= 600),
+        "normal" => Some(400.0),
+        "bold" => Some(700.0),
+        "bolder" => Some(700.0),
+        "lighter" => Some(300.0),
+        number => number
+            .parse::<f32>()
+            .ok()
+            .map(|weight| weight.clamp(1.0, 1000.0)),
     }
 }
 
@@ -1395,13 +1437,11 @@ pub(crate) fn css_is_italic(value: &str) -> bool {
 /// against the element's computed font-size, `rem` against the root's (CSS
 /// Values §6.2.1 — a fixed 16px here inflated every rem 1.6× on
 /// `html{font-size:62.5%}` sites like Twitch), physical units at CSS's fixed
-/// ratios (96px/in), unitless treated as px. `ch`/`ex` measure GLYPHS, and in
-/// this renderer every glyph at every font-size is one cell wide — so `ch` is
-/// the cell width by definition (the spec's own "advance of 0" evaluated
-/// against our real font metrics), keeping a `65ch` prose measure at 65
-/// characters. Context-dependent values (`%`/`vw`/`calc()`/`auto`) → `None`
-/// here — they go through `resolve_cells`, which knows the containing block
-/// and the viewport.
+/// ratios (96px/in), unitless treated as px. `ch` is the shaped advance of
+/// U+0030 ZERO in the element's selected font; `ex` uses the CSS-permitted
+/// 0.5em fallback until an x-height query is threaded into `Units`.
+/// Context-dependent values (`%`/`vw`/`calc()`/`auto`) return `None` here;
+/// `value.rs` resolves them with the containing block and layout viewport.
 pub(crate) fn css_length_px(value: &str, u: Units) -> Option<f32> {
     let v = value.trim();
     let split = v
@@ -1419,7 +1459,7 @@ pub(crate) fn css_length_px(value: &str, u: Units) -> Option<f32> {
         "mm" => n * 96.0 / 25.4,
         "q" | "Q" => n * 96.0 / 101.6,
         // One glyph advance per count (see above).
-        "ch" => n * u.cell_w,
+        "ch" => n * u.ch,
         // x-height: the spec's no-metrics fallback, half the em.
         "ex" => n * 0.5 * u.fs,
         _ => return None,

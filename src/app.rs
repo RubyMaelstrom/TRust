@@ -401,14 +401,13 @@ struct ImgMsg {
     result: Result<(Protocol, String), String>,
 }
 
-/// A page image decoded once and kept in RAM: the raw bytes (for the
-/// stateless encode), its pixel size, and the cell box chosen decode-first
-/// from the terminal's font aspect. Layout reads `cell`; the renderer
-/// encodes `raw` to a `Protocol` for that box.
+/// A page image decoded once and kept in RAM. Canonical layout reads the raw
+/// intrinsic pixel dimensions; `cell` is retained only for the terminal image
+/// protocol adapter and never feeds CSS replaced sizing.
 #[derive(Clone)]
 struct DecodedImage {
     raw: std::sync::Arc<[u8]>,
-    cell: (u16, u16),
+    intrinsic: (u32, u32),
     /// Whether the raster has real transparency (mirrored into `image_alpha`
     /// for layout's overlap compositor — LAYOUT_OVERHAUL_PLAN.md P8). SVG and
     /// opaque rasters are `false`, so they never trigger a composite group.
@@ -531,6 +530,7 @@ struct EncMsg {
 
 /// Cap a decoded image's natural cell box (never upscales; preserves
 /// aspect). Layout clamps width further to the content width.
+#[cfg(test)]
 const IMG_MAX_CELLS: (f32, f32) = (80.0, 24.0);
 
 thread_local! {
@@ -556,7 +556,7 @@ thread_local! {
     /// loop — never migrates off its thread, even multi-threaded with
     /// spawned tasks (verified). So the owner flag set at run-loop entry
     /// stays valid for every draw.
-    pub(crate) static TERMINAL_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static TERMINAL_OWNER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Diagnostic (`TRUST_DIAG_FRAME`): redraws this second + their summed draw
     /// time (µs), to size the main-thread render/encode cost.
     static FRAME_DIAG: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
@@ -654,8 +654,10 @@ pub struct App {
     /// exactly like the app's render, so the boxes page JS measures match the
     /// page on screen (CSSOM View reports the actual layout).
     image_sizes_sent: Option<usize>,
-    /// The browser viewport (cells) last pushed to the live page
-    /// (`PageCmd::Viewport`), diffed each tick. The engine's fetch-time size
+    /// The terminal browser viewport (cells) last mapped to CSS pixels and
+    /// pushed to the live page (`PageCmd::Viewport`), diffed each tick. The
+    /// cell pair is only the terminal frontend's invalidation key; the engine
+    /// receives a CSS-pixel [`crate::layout2::Viewport`]. Its fetch-time size
     /// comes from whatever view was on screen when the fetch started — at
     /// startup the session layout, a few rows TALLER than the browser view —
     /// so the engine must adopt the true content area once the page displays
@@ -1064,14 +1066,15 @@ impl App {
     /// Install the terminal-queried graphics picker (once, at startup).
     pub fn set_picker(&mut self, picker: Picker) {
         self.auto_protocol = picker.protocol_type();
-        // Publish the real cell box so CSS px lengths convert to the same
-        // physical extent a browser gives them on THIS terminal font, and so
-        // the render pass converts an overflow-clip box's declared px height
-        // back to the same rows the JS geometry (which measures rows × this
-        // cell size) reported — see `layout::set_cell_px_w`/`set_cell_px_h`.
-        crate::layout2::set_cell_px_w(picker.font_size().width);
-        crate::layout2::set_cell_px_h(picker.font_size().height);
+        // The picker remains frontend state. Its cell metrics are passed
+        // explicitly into each terminal layout/adaptation call; canonical CSS
+        // layout and concurrent page actors never read process-global cells.
         self.picker = picker;
+    }
+
+    /// Record whether the startup port was explicitly supplied by the CLI.
+    pub fn set_start_port(&mut self, port: Option<u16>) {
+        self.start_port = port;
     }
 
     /// A fetch or image encode is in flight (drives the loading pulse).
@@ -2740,37 +2743,22 @@ impl App {
             let result = if let Some(body) = about {
                 Ok(Payload::About(body))
             } else {
-                match &target {
-                    Link::Gopher(url) => gopher::fetch(url).await.map(Payload::Gopher),
-                    Link::Gemini(url) => gemini::fetch(url).await.map(Payload::Gemini),
-                    Link::Http(url) => {
-                        let fetched = if fallback_http {
-                            http::fetch_web_default(url).await
+                match crate::core::fetch_protocol(&target, fallback_http, referrer.as_ref()).await {
+                    Ok(crate::core::FetchedDocument::Gopher(raw)) => Ok(Payload::Gopher(raw)),
+                    Ok(crate::core::FetchedDocument::Gemini(response)) => {
+                        Ok(Payload::Gemini(response))
+                    }
+                    Ok(crate::core::FetchedDocument::OneShot(raw)) => Ok(Payload::OneShot(raw)),
+                    Ok(crate::core::FetchedDocument::Http(response)) => {
+                        // JS on: full transform. JS off: still bake the page's
+                        // CSS so it lays out per its own stylesheets.
+                        Ok(Payload::Http(if js_on {
+                            http::execute_js(response, viewport, cell_px, storage).await
                         } else {
-                            let mut req = http::Request::get(url.clone());
-                            if let Some(page) = &referrer {
-                                http::set_referrer(&mut req, page);
-                            }
-                            http::fetch(&req).await
-                        };
-                        match fetched {
-                            // JS on: full transform. JS off: still bake the page's
-                            // CSS so it lays out per its own stylesheets.
-                            Ok(response) => Ok(Payload::Http(if js_on {
-                                http::execute_js(response, viewport, cell_px, storage).await
-                            } else {
-                                http::css_only(response, viewport, cell_px).await
-                            })),
-                            Err(err) => Err(err),
-                        }
+                            http::css_only(response, viewport, cell_px).await
+                        }))
                     }
-                    Link::OneShot(url) => oneshot::fetch(url).await.map(Payload::OneShot),
-                    Link::External(url) => Err(format!("cannot fetch foreign scheme: {url}")),
-                    Link::Form { .. } => Err(String::from("form controls are not fetchable")),
-                    Link::JsClick { .. } => {
-                        Err(String::from("page-script links need their living page"))
-                    }
-                    Link::Media(_) => Err(String::from("media plays in mpv, not fetched")),
+                    Err(error) => Err(error),
                 }
             };
             let _ = tx.send(FetchMsg { target, result }).await;
@@ -2908,7 +2896,6 @@ impl App {
         if todo.is_empty() {
             return;
         }
-        let font = self.picker.font_size();
         // The current doc's blob byte mirror, for `blob:` srcs (the batches
         // all load for the displayed browser doc).
         let blobs = self
@@ -2927,7 +2914,7 @@ impl App {
                 let page = page.clone();
                 let blobs = blobs.clone();
                 async move {
-                    let decoded = load_one_image(&page, &url, font, blobs.as_ref()).await;
+                    let decoded = load_one_image(&page, &url, blobs.as_ref()).await;
                     let _ = tx.send(ImgLoadMsg { url, decoded }).await;
                 }
             }))
@@ -2962,7 +2949,7 @@ impl App {
             return;
         };
         self.pending_decoded_urls.push(msg.url.clone());
-        self.image_sizes.insert(msg.url.clone(), decoded.cell);
+        self.image_sizes.insert(msg.url.clone(), decoded.intrinsic);
         self.image_alpha.insert(msg.url.clone(), decoded.has_alpha);
         self.image_cache.insert(msg.url, decoded);
     }
@@ -3082,6 +3069,7 @@ impl App {
     fn relayout_browser(&mut self) {
         let width = (self.last_inner.0 as usize).max(10);
         let height = self.last_inner.1.max(1) as usize;
+        let font = self.picker.font_size();
         let Some(g) = &mut self.browser else { return };
         let Link::Http(url) = g.doc.url.clone() else {
             return;
@@ -3120,6 +3108,7 @@ impl App {
             &raw,
             width,
             height,
+            (font.width, font.height),
             Some(&forms),
             &self.image_sizes,
             &self.image_alpha,
@@ -3636,12 +3625,14 @@ impl App {
             self.open_image(Link::Http(response.url), response.body);
             return;
         }
-        let mut doc = crate::http::parse(
+        let font = self.picker.font_size();
+        let mut doc = crate::http::parse_terminal(
             &response.url,
             &response.content_type,
             &response.body,
             width,
             self.last_inner.1 as usize,
+            (font.width, font.height),
             &self.image_sizes,
         );
         // The blob byte mirror rides the Doc (into history too) so the image
@@ -3734,10 +3725,9 @@ impl App {
     /// once per run-loop iteration (after input is coalesced) — a single
     /// chokepoint that catches every path that moves `scroll` (wheel, PageUp/Down,
     /// Home/End, Ctrl-F jumps, selection). Cheap and idle-safe: a no-op unless a
-    /// live laid-out doc's first visible row actually changed. `y` is in CSS px,
-    /// `row * cell_height` — the SAME quantization `layout::measure_boxes` uses
-    /// for element geometry, so the engine's scroll window and box coordinates
-    /// agree.
+    /// live laid-out doc's first visible row actually changed. `y` is in CSS px:
+    /// the terminal frontend maps `row * cell_height` before crossing into the
+    /// live engine, whose element geometry is already native CSS pixels.
     fn sync_page_scroll(&mut self) {
         let viewport_rows = self.last_inner.1 as usize;
         let cell_h = f64::from(self.picker.font_size().height.max(1));
@@ -3795,7 +3785,7 @@ impl App {
         // retries with the latest position, so the final scroll is never lost.
     }
 
-    /// Push the browser's true content-area size (cells) to the live page when
+    /// Push the browser's true CSS-pixel content-area size to the live page when
     /// it changed since the last send (same discipline as `sync_page_scroll`:
     /// record only on a successful enqueue). The engine adopts it —
     /// `innerWidth`/`innerHeight`, the geometry measure viewport — and fires
@@ -3819,12 +3809,14 @@ impl App {
         let Some(handle) = self.live_page.as_ref() else {
             return;
         };
+        let font = self.picker.font_size();
+        let viewport = crate::layout2::Viewport::new(
+            f32::from(vp.0) * f32::from(font.width.max(1)),
+            f32::from(vp.1) * f32::from(font.height.max(1)),
+        );
         if handle
             .cmds
-            .try_send(crate::js::PageCmd::Viewport {
-                cols: vp.0,
-                rows: vp.1,
-            })
+            .try_send(crate::js::PageCmd::Viewport(viewport))
             .is_ok()
         {
             self.viewport_sent = Some(vp);
@@ -3851,7 +3843,7 @@ impl App {
             self.image_sizes_sent = Some(0);
             return;
         }
-        let sizes: Vec<(String, (u16, u16))> = self
+        let sizes: Vec<(String, (u32, u32))> = self
             .image_sizes
             .iter()
             .map(|(u, &d)| (u.clone(), d))
@@ -3865,10 +3857,9 @@ impl App {
         }
     }
 
-    /// The viewport-relative CSS-px center of a screen cell — the
-    /// `clientX`/`clientY` a hover dispatch carries (the same `cell_px`
-    /// quantization `measure_boxes`/`sync_page_scroll` use, so the engine's
-    /// coordinates agree).
+    /// The viewport-relative CSS-pixel center of a screen cell. This is the
+    /// terminal input adapter's cell→CSS mapping for the `clientX`/`clientY`
+    /// carried by hover dispatch; live layout geometry itself is never cells.
     fn viewport_px_of(&self, col: u16, row: u16) -> (f64, f64) {
         let f = self.picker.font_size();
         let x = (f64::from(col.saturating_sub(self.last_content_area.x)) + 0.5)
@@ -4588,6 +4579,7 @@ impl App {
         }
         let width = (self.last_inner.0 as usize).max(10);
         let height = self.last_inner.1.max(1) as usize;
+        let font = self.picker.font_size();
         let scroll_intent = self.scroll_intent;
         let Some(g) = &mut self.browser else { return };
         let Link::Http(url) = g.doc.url.clone() else {
@@ -4640,6 +4632,7 @@ impl App {
             &raw,
             width,
             height,
+            (font.width, font.height),
             None,
             &self.image_sizes,
             &self.image_alpha,
@@ -4837,9 +4830,16 @@ impl App {
         // The memoized child-row cache from the previous re-lay (or an empty one),
         // so unchanged messages are reused and only the new/decoded one is laid.
         let old = self.region_live.remove(&node).unwrap_or_default();
-        let Some(rp) =
-            http::lay_region_patch(&url, html, region_width, viewport, &self.image_sizes, node)
-        else {
+        let font = self.picker.font_size();
+        let Some(rp) = http::lay_region_patch(
+            &url,
+            html,
+            region_width,
+            viewport,
+            (font.width, font.height),
+            &self.image_sizes,
+            node,
+        ) else {
             // Re-insert so a transient miss (boundary not found) doesn't discard
             // the retained HTML/memo for the next attempt.
             self.region_live.insert(node, old);
@@ -4942,7 +4942,7 @@ impl App {
         // Look up the cached box for this boundary (by the actor node id baked as
         // `data-trust-node`). A miss = the cache is out of sync (a full render
         // hasn't captured it yet, or it was dropped) → resync.
-        let (old_range, origin_col, content_width, old_width, sub_box) = {
+        let (old_range, origin_col, content_width, old_width, sub_box, quantization_phase) = {
             let Some(g) = self.browser.as_ref() else {
                 return false;
             };
@@ -4955,6 +4955,7 @@ impl App {
                 b.content_width as usize,
                 b.width,
                 b.sub_box,
+                b.quantization_phase,
             )
         };
         let Some(laid) = http::lay_subtree_patch(
@@ -4962,9 +4963,14 @@ impl App {
             patch.html.as_bytes(),
             content_width,
             viewport,
+            {
+                let font = self.picker.font_size();
+                (font.width, font.height)
+            },
             &self.image_sizes,
             patch.node,
             sub_box,
+            quantization_phase,
         ) else {
             return false;
         };
@@ -6252,6 +6258,7 @@ impl App {
         let width = (self.last_inner.0 as usize).max(10);
         let cp437 = self.encoding == Encoding::Cp437;
         let height = self.last_inner.1.max(1) as usize;
+        let font = self.picker.font_size();
         let Some(g) = &mut self.browser else { return };
         if g.doc.raw.is_empty() || (g.doc.wrapped_to == width && g.doc.cp437 == cp437) {
             return;
@@ -6290,6 +6297,7 @@ impl App {
                     &raw,
                     width,
                     height,
+                    (font.width, font.height),
                     Some(&forms),
                     &self.image_sizes,
                     &self.image_alpha,
@@ -6301,7 +6309,9 @@ impl App {
                 let body = String::from_utf8_lossy(&raw).into_owned();
                 Self::about_doc(s, body, width)
             }
-            Link::Form { .. } | Link::JsClick { .. } | Link::External(_) => return,
+            Link::Form { .. } | Link::JsClick { .. } | Link::External(_) | Link::Telnet { .. } => {
+                return;
+            }
             Link::Media(_) => return,
         };
         // Same page, same blob mirror (a re-wrap must not orphan blob: images).
@@ -6476,6 +6486,7 @@ impl App {
                 self.start_fetch_opts(Link::Http(url), false, referrer);
             }
             Link::OneShot(url) => self.start_fetch(Link::OneShot(url)),
+            Link::Telnet { host, port, tls } => self.open(host, port, tls),
             // A `<video>`/`<audio>` representation: hand its URL to mpv (a direct
             // file, or — for a streaming player — the page URL that yt-dlp
             // resolves). The terminal can't play it inline.
@@ -6692,6 +6703,26 @@ impl App {
             }
             FieldKind::Select(options) => self.open_select_menu(form, field, options, &value),
             FieldKind::Submit => self.submit_form(form, field),
+            FieldKind::Button => {
+                if let Some(node) = live_node {
+                    self.dispatch_click(node);
+                }
+            }
+            FieldKind::Reset => {
+                if let Some(node) = live_node {
+                    self.dispatch_click(node);
+                    return;
+                }
+                if let Some(g) = &mut self.browser
+                    && let Some(form) = g.doc.forms.get_mut(form)
+                {
+                    for field in &mut form.fields {
+                        field.value = field.default_value.clone();
+                        field.checked = field.default_checked;
+                    }
+                }
+                self.refresh_forms();
+            }
             FieldKind::Hidden => {}
         }
     }
@@ -7292,7 +7323,7 @@ impl App {
 
 /// Resolve a port argument: a number, or a well-known service name —
 /// GNU telnet's getservbyname, in miniature.
-pub(crate) fn parse_port(s: &str) -> Option<u16> {
+pub fn parse_port(s: &str) -> Option<u16> {
     if let Ok(port) = s.parse() {
         return Some(port);
     }
@@ -7571,17 +7602,16 @@ const IMG_FETCH_CONCURRENCY: usize = 8;
 async fn load_one_image(
     page: &Url,
     url: &str,
-    font: ratatui_image::FontSize,
     blobs: Option<&crate::js::BlobMap>,
 ) -> Option<DecodedImage> {
     // A `data:` image (a rewritten inline SVG, or a page's own data image)
     // carries its bytes — decode locally, no fetch, no SSRF concern.
     if url.starts_with("data:") {
         let raw: std::sync::Arc<[u8]> = crate::img::decode_data_url(url)?.into();
-        let (cell, has_alpha) = decoded_cell_box(raw.clone(), font).await?;
+        let (intrinsic, has_alpha) = decoded_intrinsic(raw.clone()).await?;
         return Some(DecodedImage {
             raw,
-            cell,
+            intrinsic,
             has_alpha,
         });
     }
@@ -7593,10 +7623,10 @@ async fn load_one_image(
         let raw: std::sync::Arc<[u8]> = blobs
             .and_then(|m| m.lock().unwrap().get(key).map(|(b, _)| b.clone()))?
             .into();
-        let (cell, has_alpha) = decoded_cell_box(raw.clone(), font).await?;
+        let (intrinsic, has_alpha) = decoded_intrinsic(raw.clone()).await?;
         return Some(DecodedImage {
             raw,
-            cell,
+            intrinsic,
             has_alpha,
         });
     }
@@ -7620,33 +7650,27 @@ async fn load_one_image(
     if let Some(ratio) = crate::img::svg_bytes_ratio_only(&raw) {
         crate::img::note_svg_ratio_only(url, ratio);
     }
-    let (cell, has_alpha) = decoded_cell_box(raw.clone(), font).await?;
+    let (intrinsic, has_alpha) = decoded_intrinsic(raw.clone()).await?;
     Some(DecodedImage {
         raw,
-        cell,
+        intrinsic,
         has_alpha,
     })
 }
 
-/// Decode an image's intrinsic cell box on a blocking thread (sandboxed: a bad
+/// Decode an image's intrinsic pixel dimensions on a blocking thread (sandboxed: a bad
 /// image fails to `None`, never unwinds the worker — the terminal is safe
 /// regardless, only the run loop restores it). The intrinsic box is the
 /// fallback size; an SVG (or any image) whose element carries a CSS/attr
 /// `width`/`height` is sized by that in `image_used_box`, which is why a
 /// rewritten inline `<svg>` keeps the original element's box (see
 /// `Dom::rewrite_inline_svgs`) instead of being clamped here.
-async fn decoded_cell_box(
-    bytes: std::sync::Arc<[u8]>,
-    font: ratatui_image::FontSize,
-) -> Option<((u16, u16), bool)> {
+async fn decoded_intrinsic(bytes: std::sync::Arc<[u8]>) -> Option<((u32, u32), bool)> {
     tokio::task::spawn_blocking(move || {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::img::info(&bytes).ok().map(|info| {
-                (
-                    natural_cell_box_dimensions(info.width, info.height, font),
-                    info.has_alpha,
-                )
-            })
+            crate::img::info(&bytes)
+                .ok()
+                .map(|info| ((info.width, info.height), info.has_alpha))
         }))
         .ok()
         .flatten()
@@ -7659,10 +7683,6 @@ async fn decoded_cell_box(
 /// scaled down (never up) to fit `IMG_MAX_CELLS` while preserving aspect.
 /// Layout clamps the width further to the content width (rescaling height).
 #[cfg(test)]
-fn natural_cell_box(image: &image::DynamicImage, font: ratatui_image::FontSize) -> (u16, u16) {
-    natural_cell_box_dimensions(image.width(), image.height(), font)
-}
-
 fn natural_cell_box_dimensions(
     width: u32,
     height: u32,
@@ -7745,6 +7765,27 @@ fn encode_key(key: KeyEvent, crlf: bool) -> Option<Vec<u8>> {
 mod tests {
     use super::{HISTORY_CAP, History};
     use crate::doc::Link;
+
+    fn parse_for_app(
+        app: &super::App,
+        url: &url::Url,
+        content_type: &str,
+        body: &[u8],
+        width: usize,
+        viewport_height: usize,
+        images: &crate::layout2::ImageSizes,
+    ) -> crate::doc::Doc {
+        let font = app.picker.font_size();
+        crate::http::parse_terminal(
+            url,
+            content_type,
+            body,
+            width,
+            viewport_height,
+            (font.width, font.height),
+            images,
+        )
+    }
 
     #[test]
     fn recalls_entries_and_restores_draft() {
@@ -8482,7 +8523,8 @@ mod tests {
             html.push_str(&format!("<p>filler {i}</p>"));
         }
         html.push_str("<h2 id=bottom>END-MARKER</h2></body>");
-        app.navigate_to(crate::http::parse(
+        app.navigate_to(parse_for_app(
+            &app,
             &url,
             "text/html",
             html.as_bytes(),
@@ -9088,8 +9130,10 @@ mod tests {
 
     /// A region app whose scroll container carries the live serializer's
     /// `data-trust-node` (so the app can correlate it with the resident actor),
-    /// and optionally a baked `data-trust-scroll-top` signal (rows).
-    fn region_app_with_node(scroll_top: Option<u32>) -> super::App {
+    /// and optionally a baked CSS-pixel `data-trust-scroll-top` signal. This
+    /// helper accepts rows for concise terminal expectations, then performs the
+    /// same 16px-per-row frontend mapping as the live page path.
+    fn region_app_with_node(scroll_top_rows: Option<u32>) -> super::App {
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
         app.last_inner = (80, 10);
@@ -9099,8 +9143,8 @@ mod tests {
         for i in 0..40 {
             links.push_str(&format!("<div><a href='/L{i:02}'>L{i:02}</a></div>"));
         }
-        let sig = scroll_top
-            .map(|t| format!(" data-trust-scroll-top='{t}'"))
+        let sig = scroll_top_rows
+            .map(|row| format!(" data-trust-scroll-top='{}'", row * 16))
             .unwrap_or_default();
         let html = format!(
             "<html><body><div id='s' data-trust-node='99'{sig} style='height:96px;overflow-y:auto'>{links}</div></body></html>"
@@ -9118,9 +9162,9 @@ mod tests {
 
     #[test]
     fn a_baked_scroll_top_signal_seeds_the_region_voffset() {
-        // The page set `element.scrollTop`; the live serializer baked it (rows)
-        // + the actor node id, and `flow_region` opens the region there (CSSOM
-        // View — obey the page, no top-vs-bottom heuristic).
+        // The page set `element.scrollTop`; the live serializer baked CSS px +
+        // the actor node id, and the terminal adapter opens the region at the
+        // corresponding row (CSSOM View — obey the page, no heuristic).
         let app = region_app_with_node(Some(7));
         let rg = &app.browser.as_ref().unwrap().doc.regions[0];
         assert_eq!(
@@ -9391,7 +9435,8 @@ mod tests {
             s
         };
         // Initial render (3 lines) captures Doc.boundaries[42].
-        app.navigate_to(crate::http::parse(
+        app.navigate_to(parse_for_app(
+            &app,
             &url,
             "text/html",
             page(3).as_bytes(),
@@ -9422,7 +9467,8 @@ mod tests {
             "the inline boundary patch applies"
         );
         // The mutated page laid the full way is the oracle.
-        let full = crate::http::parse(
+        let full = parse_for_app(
+            &app,
             &url,
             "text/html",
             page(5).as_bytes(),
@@ -9459,7 +9505,8 @@ mod tests {
         app.last_inner = (80, 10);
         let url = url::Url::parse("https://example.com/").unwrap();
         let html = r#"<html><body><p>HEADER</p><div data-trust-node="42" style="display:flow-root"><div>old0</div><div>old1</div></div><p>FOOTER</p></body></html>"#;
-        app.navigate_to(crate::http::parse(
+        app.navigate_to(parse_for_app(
+            &app,
             &url,
             "text/html",
             html.as_bytes(),
@@ -9542,7 +9589,8 @@ mod tests {
             s.push_str(r#"</div><div>after</div></div><p>FOOTER</p></body></html>"#);
             s
         };
-        app.navigate_to(crate::http::parse(
+        app.navigate_to(parse_for_app(
+            &app,
             &url,
             "text/html",
             page(2).as_bytes(),
@@ -9608,7 +9656,8 @@ mod tests {
             s.push_str(&format!(r#"<div><a href="/v/{i}">item{i}</a></div>"#));
         }
         s.push_str("</div><p>FOOTER</p></body></html>");
-        app.navigate_to(crate::http::parse(
+        app.navigate_to(parse_for_app(
+            &app,
             &url,
             "text/html",
             s.as_bytes(),
@@ -9711,7 +9760,8 @@ mod tests {
             s.push_str("</body></html>");
             s
         };
-        app.navigate_to(crate::http::parse(
+        app.navigate_to(parse_for_app(
+            &app,
             &url,
             "text/html",
             page(3).as_bytes(),
@@ -9785,7 +9835,8 @@ mod tests {
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
         app.last_inner = (80, 10);
-        app.navigate_to(crate::http::parse(
+        app.navigate_to(parse_for_app(
+            &app,
             &url,
             "text/html",
             body(0).as_bytes(),
@@ -9837,7 +9888,8 @@ mod tests {
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
         app.last_inner = (80, 10);
-        app.navigate_to(crate::http::parse(
+        app.navigate_to(parse_for_app(
+            &app,
             &url,
             "text/html",
             body(0).as_bytes(),
@@ -9875,7 +9927,8 @@ mod tests {
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
         app.last_inner = (80, 10);
-        app.navigate_to(crate::http::parse(
+        app.navigate_to(parse_for_app(
+            &app,
             &url,
             "text/html",
             body.as_bytes(),
@@ -9888,9 +9941,13 @@ mod tests {
         app.scroll_intent = scroll;
         let top_before =
             crate::layout2::render_row(&app.browser.as_ref().unwrap().doc.rows[scroll]);
-        // The image decodes at 10×7 cells (+6 rows above the viewport).
-        app.image_sizes
-            .insert(String::from("https://example.com/big.png"), (10, 7));
+        // Intrinsic data is raw pixels. Choose a resource whose natural box is
+        // 10×7 cells only at this terminal-adapter boundary.
+        let font = app.picker.font_size();
+        app.image_sizes.insert(
+            String::from("https://example.com/big.png"),
+            (u32::from(font.width) * 10, u32::from(font.height) * 7),
+        );
         app.relayout_browser();
         let new_scroll = app.browser.as_ref().unwrap().scroll;
         assert_eq!(
@@ -9936,7 +9993,8 @@ mod tests {
         let mut app = super::App::new(None, 23);
         app.mode = super::Mode::Session;
         app.last_inner = (80, 10);
-        app.navigate_to(crate::http::parse(
+        app.navigate_to(parse_for_app(
+            &app,
             &url,
             "text/html",
             body().as_bytes(),
@@ -9975,7 +10033,9 @@ mod tests {
         app.last_content_area = ratatui::layout::Rect::new(3, 2, 80, 10);
         let url = url::Url::parse("https://example.com/").unwrap();
         let mut images = crate::layout2::ImageSizes::new();
-        images.insert("https://example.com/cat.png".to_owned(), (10, 4));
+        // Intrinsic sizes are raw image/CSS pixels. At this test adapter's
+        // explicit 8×16px terminal cells, 80×64 becomes a 10×4-cell item.
+        images.insert("https://example.com/cat.png".to_owned(), (80, 64));
         let html = b"<body><a href='mailto:x@y.z'><img src='/cat.png' alt='cat'></a></body>";
         app.navigate_to(crate::http::parse(&url, "text/html", html, 80, 0, &images));
 
@@ -10990,7 +11050,7 @@ mod tests {
                 url.clone(),
                 super::DecodedImage {
                     raw: std::sync::Arc::from(&b"px"[..]),
-                    cell: (1, 1),
+                    intrinsic: (8, 16),
                     has_alpha: false,
                 },
             );
@@ -11906,11 +11966,6 @@ mod tests {
         image::DynamicImage::ImageRgb8(cover)
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .unwrap();
-        let cell = super::natural_cell_box(
-            &image::load_from_memory(&png).unwrap(),
-            (8u16, 16u16).into(),
-        );
-
         // A wrapping grid of tiles, each: <a> → contain cover + title.
         let mut tiles = String::new();
         for i in 0..18 {
@@ -11925,7 +11980,7 @@ mod tests {
         let base = url::Url::parse("https://ex.com/").unwrap();
         let mut images = crate::layout2::ImageSizes::new();
         for i in 0..18 {
-            images.insert(format!("https://ex.com/c{i}.png"), cell);
+            images.insert(format!("https://ex.com/c{i}.png"), (140, 90));
         }
 
         let mut app = super::App::new(None, 23);
@@ -11985,10 +12040,12 @@ mod tests {
         use ratatui::layout::Size;
         let png = crate::img::red_png();
         let (decoded, _) = crate::img::decode(&png).unwrap();
-        let cell = super::natural_cell_box(&decoded, (8u16, 16u16).into());
         let base = url::Url::parse("https://ex.com/").unwrap();
         let mut images = crate::layout2::ImageSizes::new();
-        images.insert("https://ex.com/banner.png".to_string(), cell);
+        images.insert(
+            "https://ex.com/banner.png".to_string(),
+            (decoded.width(), decoded.height()),
+        );
         // Image near the top, then a long column of text (> MAX_IMAGE_LOOKBACK
         // rows) so it can scroll entirely out of the encode scan range.
         let mut body = String::from(r#"<body><img src="/banner.png">"#);
@@ -12013,7 +12070,7 @@ mod tests {
             "https://ex.com/banner.png".to_string(),
             super::DecodedImage {
                 raw: png.clone().into(),
-                cell,
+                intrinsic: (decoded.width(), decoded.height()),
                 has_alpha: false,
             },
         );
@@ -12078,10 +12135,12 @@ mod tests {
         use ratatui::layout::Size;
         let png = crate::img::red_png();
         let (decoded, _) = crate::img::decode(&png).unwrap();
-        let cell = super::natural_cell_box(&decoded, (8u16, 16u16).into());
         let base = url::Url::parse("https://ex.com/").unwrap();
         let mut images = crate::layout2::ImageSizes::new();
-        images.insert("https://ex.com/av.png".to_string(), cell);
+        images.insert(
+            "https://ex.com/av.png".to_string(),
+            (decoded.width(), decoded.height()),
+        );
         // A definite-height `overflow-y:auto` region whose content includes an
         // image plus enough rows to overflow (so it becomes a Region + buffer).
         let mut content = String::from(r#"<img src="/av.png">"#);
@@ -12115,7 +12174,7 @@ mod tests {
             "https://ex.com/av.png".to_string(),
             super::DecodedImage {
                 raw: png.clone().into(),
-                cell,
+                intrinsic: (decoded.width(), decoded.height()),
                 has_alpha: false,
             },
         );
@@ -12206,34 +12265,25 @@ mod tests {
             blob_url.to_string(),
             (svg_fixture(), String::from("image/svg+xml")),
         );
-        let decoded = super::load_one_image(&page, blob_url, (8, 16).into(), Some(&blobs))
+        let decoded = super::load_one_image(&page, blob_url, Some(&blobs))
             .await
             .expect("blob image decoded from the mirror");
         assert_eq!(decoded.raw.as_ref(), svg_fixture().as_slice());
         // A fragment is ignored when keying the store (File API).
         let with_frag = format!("{blob_url}#frag");
         assert!(
-            super::load_one_image(&page, &with_frag, (8, 16).into(), Some(&blobs))
+            super::load_one_image(&page, &with_frag, Some(&blobs))
                 .await
                 .is_some(),
             "fragment-carrying blob URL resolves"
         );
         // Unknown URL / no map: no decode, no network.
         assert!(
-            super::load_one_image(
-                &page,
-                "blob:https://example.com/missing",
-                (8, 16).into(),
-                Some(&blobs)
-            )
-            .await
-            .is_none()
-        );
-        assert!(
-            super::load_one_image(&page, blob_url, (8, 16).into(), None)
+            super::load_one_image(&page, "blob:https://example.com/missing", Some(&blobs))
                 .await
                 .is_none()
         );
+        assert!(super::load_one_image(&page, blob_url, None).await.is_none());
     }
 
     #[tokio::test]
@@ -12284,17 +12334,22 @@ mod tests {
         // onto the rewritten <img> in `Dom::rewrite_inline_svgs` — is what
         // resizes it, applied later in `image_used_box`, not here.
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="40" viewBox="0 0 200 40"><path d="M0 0h200v40H0z"/></svg>"#;
-        let (cell, svg_alpha) = super::decoded_cell_box(std::sync::Arc::from(&svg[..]), font)
+        let (intrinsic, svg_alpha) = super::decoded_intrinsic(std::sync::Arc::from(&svg[..]))
             .await
             .unwrap();
-        assert_eq!(cell, super::natural_cell_box_dimensions(200, 40, font));
+        assert_eq!(intrinsic, (200, 40));
+        assert_eq!(
+            super::natural_cell_box_dimensions(intrinsic.0, intrinsic.1, font),
+            super::natural_cell_box_dimensions(200, 40, font)
+        );
         assert!(!svg_alpha, "SVG rasterizes to an opaque silhouette");
         // A raster keeps its natural box too — same path, no special-casing.
         let png = crate::img::red_png();
-        let (raster, raster_alpha) = super::decoded_cell_box(std::sync::Arc::from(&png[..]), font)
-            .await
-            .unwrap();
-        assert_eq!(raster, super::natural_cell_box_dimensions(4, 4, font));
+        let (raster_intrinsic, raster_alpha) =
+            super::decoded_intrinsic(std::sync::Arc::from(&png[..]))
+                .await
+                .unwrap();
+        assert_eq!(raster_intrinsic, (4, 4));
         assert!(!raster_alpha, "an opaque RGB PNG has no transparency");
     }
 
@@ -12323,12 +12378,14 @@ mod tests {
             format!(r#"<body><p>before</p><img src="{image_url}" alt="logo"><p>after</p></body>"#);
         let mut app = super::App::new(None, 23);
         app.last_inner = (40, 12);
-        let doc = crate::http::parse(
+        let font = app.picker.font_size();
+        let doc = crate::http::parse_terminal(
             &page,
             "text/html; charset=utf-8",
             html.as_bytes(),
             40,
             0,
+            (font.width, font.height),
             &crate::layout2::ImageSizes::new(),
         );
         app.navigate_to(doc);
@@ -12342,7 +12399,7 @@ mod tests {
         server.await.unwrap();
 
         let decoded = app.image_cache.get(&image_url).expect("SVG cached");
-        assert_eq!(decoded.cell, expected_cell);
+        assert_eq!(decoded.intrinsic, (80, 32));
         let item = app
             .browser
             .as_ref()

@@ -18,6 +18,13 @@ pub enum Link {
     Http(url::Url),
     /// finger://, whois://, or dict:// one-shot queries.
     OneShot(crate::oneshot::OneShotUrl),
+    /// A VT terminal connection. This remains a cell protocol even though
+    /// HTML layout is pixel-native.
+    Telnet {
+        host: String,
+        port: u16,
+        tls: bool,
+    },
     /// An HTML form control: indices into the document's `forms`.
     Form {
         form: usize,
@@ -48,6 +55,11 @@ impl fmt::Display for Link {
             Link::Gemini(url) => url.fmt(f),
             Link::Http(url) => url.fmt(f),
             Link::OneShot(url) => url.fmt(f),
+            Link::Telnet { host, port, tls } => write!(
+                f,
+                "{}://{host}:{port}",
+                if *tls { "telnets" } else { "telnet" }
+            ),
             Link::Form { .. } => f.write_str("form control"),
             Link::JsClick { href, .. } if !href.is_empty() => f.write_str(href),
             Link::JsClick { .. } => f.write_str("page script"),
@@ -82,6 +94,10 @@ pub enum FieldKind {
     Select(Vec<(String, String)>),
     /// Enter submits the form.
     Submit,
+    /// Script/native button with no automatic submit behavior.
+    Button,
+    /// Restores controls to their markup defaults.
+    Reset,
 }
 
 /// One control in an HTML form, in document order.
@@ -91,6 +107,9 @@ pub struct Field {
     pub value: String,
     /// Checkbox / radio state.
     pub checked: bool,
+    /// Markup state restored by the HTML reset algorithm.
+    pub default_value: String,
+    pub default_checked: bool,
     /// Placeholder text (editable fields) or button label (submits).
     pub label: String,
     pub kind: FieldKind,
@@ -115,9 +134,13 @@ impl Field {
         };
         match &self.kind {
             FieldKind::Hidden => String::new(),
-            FieldKind::Submit => {
+            FieldKind::Submit | FieldKind::Button | FieldKind::Reset => {
                 let label = if self.label.is_empty() {
-                    "Submit"
+                    match self.kind {
+                        FieldKind::Reset => "Reset",
+                        FieldKind::Button => "Button",
+                        _ => "Submit",
+                    }
                 } else {
                     self.label.as_str()
                 };
@@ -185,6 +208,7 @@ impl Form {
                         out.append_pair(&field.name, &field.value);
                     }
                 }
+                FieldKind::Button | FieldKind::Reset => {}
                 FieldKind::Checkbox | FieldKind::Radio => {
                     if field.checked {
                         // "on" is the HTML default for value-less boxes.
@@ -457,6 +481,8 @@ mod tests {
             name: name.into(),
             value: value.into(),
             checked: false,
+            default_value: value.into(),
+            default_checked: false,
             label: String::new(),
             kind,
             live_node: None,

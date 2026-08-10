@@ -20,14 +20,14 @@ use url::Url;
 
 use crate::doc::Form;
 use crate::dom::{Dom, NodeId};
-use crate::layout2::{ImageSizes, Item, NO_NODE, display_width};
+use crate::layout2::{ImageSizes, NO_NODE};
 
 use super::flex::{
     AlignContent, AlignItem, FlexCalc, align_content_offsets, align_item_from, container_style,
     item_flex, justify_offsets, resolve_flexible_lengths,
 };
 use super::float::{FloatBox, FloatCtx, Side};
-use super::inline::{AtomBoxSize, FloatEnv, Ifc, LineOut, OofMark, Piece};
+use super::inline::{AtomBoxSize, FloatEnv, Ifc, InlineItem, LineOut, OofMark, Piece};
 use super::intrinsic::IMode;
 use super::style::{BOTTOM, BoxStyle, InlineStyle, LEFT, Pos, RIGHT, TOP, block_align};
 use super::tree::{AtomKind, BoxNode, Content, Inline};
@@ -53,7 +53,7 @@ pub(crate) struct Frag<'t> {
     /// How the Appendix E painter treats this fragment.
     pub paint: PaintFlags,
     /// The effective clip rectangle (absolute px) applied to this fragment's
-    /// OWN painted cells at paint time — `None` = unclipped. Set by the
+    /// own paint output — `None` = unclipped. Set by the
     /// CB-aware `resolve_oof` pass: clip inheritance follows the containing-
     /// block chain (a positioned box is clipped by its containing block's
     /// clip, NOT by its static-position tree parent), which is exactly the
@@ -93,8 +93,8 @@ impl Clip {
 #[derive(Debug)]
 pub(crate) enum FragKind<'t> {
     Block,
-    /// A line box: placed inline items (cols in cells relative to `x`).
-    Line(Vec<Piece>),
+    /// A line box with retained typographic metrics in CSS pixels.
+    Line(LineFrag),
     /// An out-of-flow box's placeholder, sitting at its STATIC POSITION
     /// (§10.3.7/§10.6.4) in the fragment tree so every later translation
     /// moves it consistently; the positioned post-pass (`resolve_oof`)
@@ -103,9 +103,19 @@ pub(crate) enum FragKind<'t> {
     Oof(&'t BoxNode, Box<InlineStyle>),
 }
 
+#[derive(Debug)]
+pub(crate) struct LineFrag {
+    pub pieces: Vec<Piece>,
+    pub width: f32,
+    pub height: f32,
+    pub baseline: f32,
+    pub ascent: f32,
+    pub descent: f32,
+}
+
 /// The painter-facing summary of a box's stacking/positioning style
 /// (§9.9/Appendix E, css-position-3 §2.2, css-transforms-1 §3).
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug)]
 pub(crate) struct PaintFlags {
     /// A positioned box (§9.3.2) — Appendix E step 8 when no real stacking
     /// context is formed (the z:auto pseudo-stacking-context).
@@ -114,8 +124,9 @@ pub(crate) struct PaintFlags {
     /// `z.unwrap_or(0)`.
     pub sc: bool,
     pub z: Option<i32>,
-    /// Paints a background: an opaque fill over the border box in the cell
-    /// compositor (erases what's beneath in paint order).
+    /// Exact group opacity retained from the typed box snapshot.
+    pub opacity: f32,
+    /// Paints a background over the border box in display-list order.
     pub bg: bool,
     /// Containing block for absolutely positioned descendants (§10.1:
     /// positioned; transforms-1 §3: any transform).
@@ -130,6 +141,21 @@ pub(crate) struct PaintFlags {
     pub float: bool,
 }
 
+impl Default for PaintFlags {
+    fn default() -> Self {
+        Self {
+            positioned: false,
+            sc: false,
+            z: None,
+            opacity: 1.0,
+            bg: false,
+            cb_abs: false,
+            cb_fixed: false,
+            float: false,
+        }
+    }
+}
+
 /// Derive the paint flags from a box style. `item` = the box is a flex/grid
 /// item (a non-auto z-index then forms a stacking context even at
 /// position:static — css-flexbox §4.3).
@@ -138,6 +164,7 @@ pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
         positioned: s.position.positioned(),
         sc: s.stacking_context(item),
         z: s.z_index,
+        opacity: s.opacity,
         bg: s.bg,
         cb_abs: s.position.positioned() || s.has_transform,
         cb_fixed: s.has_transform,
@@ -222,7 +249,7 @@ struct Cursor {
     /// flush that happened inside it.
     flush_log: Vec<f32>,
     /// Flow positions of inline ELEMENTS (from the IFCs' entry marks) — the
-    /// anchor rows of boxes that paint nothing (`<a name>`, empty ids).
+    /// anchor positions of boxes that paint nothing (`<a name>`, empty ids).
     anchors: Vec<(NodeId, f32)>,
 }
 
@@ -257,8 +284,6 @@ pub(crate) struct Flow<'a> {
     pub forms: &'a [Form],
     pub images: &'a ImageSizes,
     pub vp: Vp,
-    pub cell_w: f32,
-    pub cell_h: f32,
     /// The intrinsic-size memo: (element, is-min-mode) → content px. Pass-
     /// wide, so nested flex towers query each subtree once per mode.
     pub imemo: std::cell::RefCell<std::collections::HashMap<(NodeId, bool), f32>>,
@@ -728,7 +753,7 @@ impl Flow<'_> {
                             // but a browser sizes its template tracks — and a
                             // virtualized feed reads `getComputedStyle().grid-
                             // template-columns` to count columns BEFORE it has
-                            // any cells. Record the resolved tracks (side effect
+                            // any items. Record the resolved tracks (side effect
                             // only; frags/height discarded, cursor untouched).
                             let _ = self.grid_content(
                                 b,
@@ -824,8 +849,6 @@ impl Flow<'_> {
                             self.images,
                             self.forms,
                             self.vp,
-                            self.cell_w,
-                            self.cell_h,
                             h.content_w,
                             ifc_cb_h,
                             super::style::Align2::Left,
@@ -845,10 +868,7 @@ impl Flow<'_> {
                             // §10.3.4: auto left/right margins center the box. The
                             // line's pen-based width is the box extent — a painted
                             // `contain` item can be narrower than its box.
-                            let box_w = lines
-                                .iter()
-                                .map(|l| l.width as f32 * self.cell_w)
-                                .fold(0.0f32, f32::max);
+                            let box_w = lines.iter().map(|l| l.width).fold(0.0f32, f32::max);
                             let free = (h.content_w - box_w).max(0.0);
                             let off = match (s.margin[LEFT].is_auto(), s.margin[RIGHT].is_auto()) {
                                 (true, true) => free / 2.0,
@@ -1129,17 +1149,25 @@ impl Flow<'_> {
     /// cursor by each line's height (line boxes pack — no margins between).
     fn emit_lines(&self, lines: Vec<LineOut>, x: f32, cur: &mut Cursor, out: &mut Vec<Frag<'_>>) {
         for line in lines {
-            let hpx = f32::from(line.rows) * self.cell_h;
+            let hpx = line.height;
+            let line_frag = LineFrag {
+                pieces: line.pieces,
+                width: line.width,
+                height: line.height,
+                baseline: line.baseline,
+                ascent: line.ascent,
+                descent: line.descent,
+            };
             out.push(Frag {
                 node: NO_NODE,
                 x,
                 y: cur.y,
-                w: 0.0,
+                w: line.width,
                 h: hpx,
                 border: [0.0; 4],
                 paint: PaintFlags::default(),
                 clip: None,
-                kind: FragKind::Line(line.pieces),
+                kind: FragKind::Line(line_frag),
                 children: Vec::new(),
             });
             cur.y += hpx;
@@ -1147,7 +1175,7 @@ impl Flow<'_> {
     }
 
     /// The outside `::marker` of a list item: right-aligned against the
-    /// content edge, on the first line's row (CSS Lists — the marker sits in
+    /// content edge, on the first line box (CSS Lists — the marker sits in
     /// the gutter the UA list padding provides).
     fn marker_frag(
         &self,
@@ -1175,31 +1203,42 @@ impl Flow<'_> {
         let y = first_line_y(children)
             .or(y_border.map(|yb| yb + bt))
             .unwrap_or(0.0);
-        let w = display_width(marker);
-        let x = (content_x - w as f32 * self.cell_w).max(0.0);
+        let shaped = crate::text::shape(marker, &inl.text_style());
+        let w = shaped.advance;
+        let h = shaped.line_height;
+        let baseline = shaped.baseline;
+        let x = (content_x - w).max(0.0);
         Frag {
             node: NO_NODE,
             x,
             y,
-            w: w as f32 * self.cell_w,
-            h: self.cell_h,
+            w,
+            h,
             border: [0.0; 4],
             paint: PaintFlags::default(),
             clip: None,
-            kind: FragKind::Line(vec![Piece::solo(Item {
-                col: 0,
-                width: w as u16,
-                height: 1,
-                text: marker.to_string(),
-                kind: crate::layout2::ItemKind::Text,
-                image: None,
-                emph: inl.emph,
-                node: NO_NODE,
-                link: None,
-                crop: false,
-                pixelated: false,
-                invisible: inl.invisible,
-            })]),
+            kind: FragKind::Line(LineFrag {
+                pieces: vec![Piece::shaped(
+                    InlineItem {
+                        text: marker.to_string(),
+                        kind: crate::layout2::ItemKind::Text,
+                        image: None,
+                        emph: inl.emph,
+                        style_node: inl.node,
+                        node: NO_NODE,
+                        link: None,
+                        crop: false,
+                        pixelated: false,
+                        invisible: inl.invisible,
+                    },
+                    shaped,
+                )],
+                width: w,
+                height: h,
+                baseline,
+                ascent: baseline,
+                descent: (h - baseline).max(0.0),
+            }),
             children: Vec::new(),
         }
     }
@@ -1385,11 +1424,32 @@ pub(super) fn cross_shift(extra: f32, auto_start: bool, auto_end: bool, align: A
         (true, false) => extra,
         (false, true) => 0.0,
         (false, false) => match align {
-            AlignItem::Start | AlignItem::Stretch => 0.0,
+            AlignItem::Start | AlignItem::Stretch | AlignItem::Baseline => 0.0,
             AlignItem::Center => extra / 2.0,
             AlignItem::End => extra,
         },
     }
+}
+
+/// First in-flow line baseline relative to a fragment's border-box top. This
+/// is the baseline set exported by an ordinary flex item for `align-items:
+/// baseline` (CSS Flexbox §8.5/§9.4). A caller supplies the border-edge
+/// fallback for a fragment with no line boxes.
+fn first_baseline(fragment: &Frag<'_>) -> Option<f32> {
+    fn absolute(fragment: &Frag<'_>, best: &mut Option<(f32, f32)>) {
+        if let FragKind::Line(line) = &fragment.kind {
+            let candidate = (fragment.y, fragment.y + line.baseline);
+            if best.is_none_or(|current| candidate.0 < current.0) {
+                *best = Some(candidate);
+            }
+        }
+        for child in &fragment.children {
+            absolute(child, best);
+        }
+    }
+    let mut best = None;
+    absolute(fragment, &mut best);
+    best.map(|(_, baseline)| baseline - fragment.y)
 }
 
 impl Flow<'_> {
@@ -1595,6 +1655,7 @@ impl Flow<'_> {
         let outer: Vec<f32> = calcs.iter().map(FlexCalc::outer_hypo).collect();
         let lines = collect_lines(&outer, fs.wrap, content_w, gap_main);
         let mut line_cross: Vec<f32> = Vec::with_capacity(lines.len());
+        let mut line_baseline: Vec<Option<f32>> = Vec::with_capacity(lines.len());
         for r in &lines {
             let n = r.len();
             let inner = content_w - gap_main * n.saturating_sub(1) as f32;
@@ -1606,6 +1667,29 @@ impl Flow<'_> {
                 cross = cross.max(frag.h + fi[i].m[TOP] + fi[i].m[BOTTOM]);
                 fi[i].frag = Some(frag);
                 fi[i].anchors = anc;
+            }
+            // Flexbox §9.4 step 8: baseline participants share one real
+            // typographic baseline; the line cross size includes the largest
+            // distance above and below it. Items without a line synthesize a
+            // baseline from their border-box end edge.
+            let mut above = 0.0f32;
+            let mut below = 0.0f32;
+            let mut has_baseline = false;
+            for i in r.clone() {
+                if fi[i].align != AlignItem::Baseline || fi[i].auto[TOP] || fi[i].auto[BOTTOM] {
+                    continue;
+                }
+                let frag = fi[i].frag.as_ref().expect("laid above");
+                let baseline = first_baseline(frag).unwrap_or(frag.h);
+                above = above.max(fi[i].m[TOP] + baseline);
+                below = below.max(fi[i].m[BOTTOM] + (frag.h - baseline).max(0.0));
+                has_baseline = true;
+            }
+            if has_baseline {
+                cross = cross.max(above + below);
+                line_baseline.push(Some(above));
+            } else {
+                line_baseline.push(None);
             }
             line_cross.push(cross);
         }
@@ -1710,8 +1794,17 @@ impl Flow<'_> {
                 let it = &mut fi[i];
                 let frag = it.frag.as_mut().expect("laid above");
                 let extra = cross - (frag.h + it.m[TOP] + it.m[BOTTOM]);
-                let shift = cross_shift(extra, it.auto[TOP], it.auto[BOTTOM], it.align);
-                it.border_y = top + shift + it.m[TOP];
+                if it.align == AlignItem::Baseline
+                    && !it.auto[TOP]
+                    && !it.auto[BOTTOM]
+                    && let Some(line_baseline) = line_baseline[li]
+                {
+                    let baseline = first_baseline(frag).unwrap_or(frag.h);
+                    it.border_y = top + line_baseline - baseline;
+                } else {
+                    let shift = cross_shift(extra, it.auto[TOP], it.auto[BOTTOM], it.align);
+                    it.border_y = top + shift + it.m[TOP];
+                }
             }
             top += cross + between_c + gap_cross;
         }
@@ -1838,7 +1931,7 @@ impl Flow<'_> {
                     .unwrap_or(f32::INFINITY),
             };
             // §4.5 in the block axis: the content-based minimum is the laid
-            // content height (exact in a cell model — text cannot compress).
+            // content height; shaped line boxes do not compress after layout.
             let min_main = match &s.min_height {
                 Len::Auto => {
                     if self.scroll_container(it.node) {
@@ -2157,8 +2250,6 @@ impl Flow<'_> {
                         self.images,
                         self.forms,
                         self.vp,
-                        self.cell_w,
-                        self.cell_h,
                         content_w,
                         def_h,
                         super::style::Align2::Left,
@@ -2305,7 +2396,7 @@ impl Flow<'_> {
         let natural = url
             .and_then(|u| self.images.get(u))
             .filter(|&&(w, h)| w > 0 && h > 0)
-            .map(|&(w, h)| (f32::from(w) * self.cell_w, f32::from(h) * self.cell_h));
+            .map(|&(w, h)| (w as f32, h as f32));
         let ratio = super::replaced::ratio_of(self.dom, node, natural);
         let box_h = def_h
             .or_else(|| ratio.map(|r| content_w / r))
@@ -2313,27 +2404,18 @@ impl Flow<'_> {
             .unwrap_or_else(|| (content_w / 2.0).min(150.0));
         let r =
             super::replaced::apply_fit(self.dom, node, natural, content_w.max(1.0), box_h.max(1.0));
-        let box_w_c = ((r.box_w / self.cell_w).round().max(1.0) as usize).max(1);
-        let box_rows = (r.box_h / self.cell_h).round().max(1.0) as u16;
-        let paint_w = ((r.paint_w / self.cell_w).round().max(1.0) as u16).min(box_w_c as u16);
-        let paint_rows = ((r.paint_h / self.cell_h).round().max(1.0) as u16).min(box_rows);
-        let off_c =
-            ((r.off_x / self.cell_w).round().max(0.0) as usize).min(box_w_c - paint_w as usize);
-        let off_r = ((r.off_y / self.cell_h).round().max(0.0) as u16).min(box_rows - paint_rows);
         let pixelated = matches!(
             self.dom.computed_value(node, "image-rendering").as_deref(),
             Some("pixelated" | "crisp-edges" | "-moz-crisp-edges" | "-webkit-optimize-contrast")
         );
-        let item = Item {
-            col: 0,
-            width: paint_w,
-            height: paint_rows,
+        let item = InlineItem {
             text: String::new(),
             kind: crate::layout2::ItemKind::Image,
             image: natural
                 .is_some()
                 .then(|| url.unwrap_or_default().to_string()),
             emph: crate::layout2::Emphasis::default(),
+            style_node: node,
             node,
             link: url
                 .and_then(|u| super::inline::poster_media_target(self.dom, self.base, node, u))
@@ -2348,11 +2430,20 @@ impl Flow<'_> {
             x,
             y,
             w: r.box_w,
-            h: f32::from(box_rows) * self.cell_h,
+            h: r.box_h,
             border: [0.0; 4],
             paint: PaintFlags::default(),
             clip: None,
-            kind: FragKind::Line(vec![Piece::boxed(item, box_rows, off_c, off_r)]),
+            kind: FragKind::Line(LineFrag {
+                pieces: vec![Piece::boxed(
+                    item, r.box_w, r.box_h, r.off_x, r.off_y, r.paint_w, r.paint_h,
+                )],
+                width: r.box_w,
+                height: r.box_h,
+                baseline: r.box_h,
+                ascent: r.box_h,
+                descent: 0.0,
+            }),
             children: Vec::new(),
         }
     }
@@ -2424,7 +2515,7 @@ impl Flow<'_> {
     /// (css-transforms-1 §3) and they stay in the document.
     ///
     /// This pass ALSO computes each fragment's clip rectangle: `own_clip` is
-    /// the clip applying to a fragment's own painted cells (from its
+    /// the clip applying to a fragment's own paint output (from its
     /// containing-block chain), and it threads a separate abspos/fixed clip so
     /// a positioned box picks up its containing block's clip — the CB chain,
     /// not the static-position tree parent, is what CSS Overflow L3 §3 clips a
@@ -2540,7 +2631,7 @@ impl Flow<'_> {
         } else {
             own_clip
         };
-        // This fragment's own painted cells are clipped by its containing-block
+        // This fragment's own paint output is clipped by its containing-block
         // chain (`own_clip`); its in-flow descendants — and the abspos/fixed
         // descendants for which it is the containing block — are additionally
         // clipped by the padding box it establishes when it clips overflow.
@@ -2577,7 +2668,7 @@ impl Flow<'_> {
                     unreachable!()
                 };
                 // A paint-suppressed (opacity:0 chain) out-of-flow box usually
-                // contributes no terminal cells. Retain it when its subtree
+                // contributes no visible paint. Retain it when its subtree
                 // contains a hit-testable hyperlink, however: opacity affects
                 // painting, not box generation or pointer targeting. This
                 // narrow exception preserves the old invisible-media
@@ -2665,7 +2756,7 @@ impl Flow<'_> {
                         .as_deref()
                         .and_then(|u| self.images.get(u))
                         .filter(|&&(w, h)| w > 0 && h > 0)
-                        .map(|&(w, h)| (f32::from(w) * self.cell_w, f32::from(h) * self.cell_h));
+                        .map(|&(w, h)| (w as f32, h as f32));
                     super::replaced::size(
                         self.dom,
                         atom.node,
@@ -3010,7 +3101,7 @@ impl Flow<'_> {
             prelaid.push(Some(pf));
         }
         // Pre-lay every atomic inline box (inline-block/-flex/-grid) as its own
-        // formatting context; the IFC reserves its margin-box cells on the line
+        // formatting context; the IFC reserves its margin box on the line
         // and reports where it landed, so we splice the content fragment there.
         let mut atom_nodes: Vec<(&'t BoxNode, InlineStyle)> = Vec::new();
         collect_atom_boxes(self.dom, self.base, inls, inl, &mut atom_nodes);
@@ -3019,13 +3110,8 @@ impl Flow<'_> {
         for (ab, actx) in &atom_nodes {
             let pa = self.lay_atom_box(ab, content_w, cb_h, actx);
             atom_sizes.push(AtomBoxSize {
-                // Width CEILS to cells: a box needing 17.4 cells cannot fit in
-                // 17 — rounding down re-wraps its already-laid content (the
-                // "Install Steam" header button split rows at a 10px cell).
-                // Height still rounds: the fraction is empty px below the last
-                // line, and ceiling it would grow every 21px button to 2 rows.
-                w_cells: (pa.mw / self.cell_w - 1e-3).ceil().max(1.0) as usize,
-                h_rows: (pa.mh / self.cell_h).round().max(1.0) as u16,
+                width: pa.mw.max(0.0),
+                height: pa.mh.max(0.0),
             });
             prelaid_atoms.push(Some(pa));
         }
@@ -3035,8 +3121,6 @@ impl Flow<'_> {
             self.images,
             self.forms,
             self.vp,
-            self.cell_w,
-            self.cell_h,
             content_w,
             cb_h,
             align,
@@ -3087,7 +3171,7 @@ impl Flow<'_> {
             let mut y = content_top_y;
             for l in &lines {
                 line_tops.push(y);
-                y += f32::from(l.rows) * self.cell_h;
+                y += l.height;
             }
         }
         let mut atom_frags = Vec::new();
@@ -3101,10 +3185,8 @@ impl Flow<'_> {
             };
             // The placeholder's margin-box top-left → the border box sits inside
             // it by the leading margins.
-            let bx = content_x + pl.col as f32 * self.cell_w + pa.ml;
-            let by = line_tops.get(pl.line).copied().unwrap_or(content_top_y)
-                + f32::from(pl.row_off) * self.cell_h
-                + pa.mt;
+            let bx = content_x + pl.x + pa.ml;
+            let by = line_tops.get(pl.line).copied().unwrap_or(content_top_y) + pl.y + pa.mt;
             Self::offset_frag(&mut pa.frag, bx, by);
             for a in &mut pa.anchors {
                 a.1 += by;
@@ -3181,7 +3263,7 @@ impl Flow<'_> {
     /// ONCE as ordinary block/inline flow at the column content width `col_w`,
     /// then BALANCE (`column-fill:balance`, the default with an indefinite
     /// height) by slicing the laid line boxes into `n` equal-height columns at
-    /// row granularity and translating each column into place. Returns the
+    /// line-box granularity and translating each column into place. Returns the
     /// sliced fragments, the container's used content height, and the (column-
     /// translated) anchors. `content_top` is the content-box top; column 0 sits
     /// at `content_x`, column k at `content_x + k·(col_w + gap)`.
@@ -3235,17 +3317,14 @@ impl Flow<'_> {
         let h_px = (cur.flush() - content_top).max(0.0);
         let mut anchors = std::mem::take(&mut cur.anchors);
 
-        // ---- balance: equal-height columns, sliced at row boundaries ----
-        let h_rows = (h_px / self.cell_h).round().max(0.0) as usize;
-        let col_rows = h_rows.div_ceil(n).max(1);
-        let col_h_px = col_rows as f32 * self.cell_h;
-        // The per-fragment column offset, keyed on its top row (§3.4: content
-        // fills the anonymous column boxes in order). A row `r` from the single
-        // column lands in column `k = r / col_rows`, translated right by k
-        // gaps+widths and up by k column-heights.
+        // ---- balance: equal-height columns in canonical CSS pixels ----
+        let col_h_px = (h_px / n as f32).max(1.0);
+        // The per-fragment column offset, keyed on its top CSS-pixel position
+        // (§3.4: content fills the anonymous column boxes in order). A
+        // fragment at block offset `y` lands in the corresponding column and
+        // is translated right by its preceding gaps/widths.
         let column_shift = |y: f32| -> (f32, f32) {
-            let row = ((y - content_top) / self.cell_h).round().max(0.0) as usize;
-            let k = (row / col_rows).min(n - 1);
+            let k = (((y - content_top).max(0.0) / col_h_px).floor() as usize).min(n - 1);
             (k as f32 * (col_w + gap_px), -(k as f32) * col_h_px)
         };
         for a in &mut anchors {
@@ -3304,7 +3383,7 @@ struct InlineLaid<'t> {
 
 /// Slice one laid fragment into multi-column position (css-multicol-1): a line
 /// box (or an out-of-flow / leaf block) is translated as a unit by the column
-/// its top row falls in; a block with children is flattened and its lines
+/// its top edge falls in; a block with children is flattened and its lines
 /// sliced individually (v1 — a block straddling a column break is split at line
 /// granularity, and its own background/border isn't re-drawn per slice). `shift`
 /// maps a fragment's absolute top-y to its `(dx, dy)` column offset.

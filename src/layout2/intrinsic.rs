@@ -4,7 +4,7 @@
 //!
 //! The load-bearing idea: INLINE intrinsic widths are measured by running
 //! the REAL line breaker (`Ifc`) under the spec's constraints — min-content
-//! = lay at a 1-cell available width (every soft-wrap opportunity taken; a
+//! = lay at a near-zero CSS-pixel available width (every soft-wrap opportunity taken; a
 //! line's used width is then its widest unbreakable segment), max-content =
 //! lay at an effectively infinite width (only forced breaks break). One
 //! source of truth: an item floored at its min-content size provably fits
@@ -16,17 +16,18 @@
 //! Results are CONTENT-box px, memoized per (element, mode); anonymous
 //! boxes are cheap composites of memoized elements.
 
-use crate::layout2::{NO_NODE, Units, display_width};
+use crate::layout2::{NO_NODE, Units};
 
 use super::flow::Flow;
-use super::inline::{AtomBoxSize, Ifc, control_label, media_label, media_source};
+use super::inline::{
+    AtomBoxSize, ControlWidthBasis, Ifc, control_label, media_label, media_source,
+};
 use super::style::{Align2, InlineStyle};
 use super::tree::{AtomKind, BoxNode, Content};
 use super::value::Len;
 
-/// The max-content probe's "infinite" available width, in cells. Far beyond
-/// any real content, small enough that cell↔px round-trips stay exact in f32.
-const PROBE_MAX_CELLS: usize = 1_000_000;
+/// The max-content probe's effectively infinite CSS-pixel width.
+const PROBE_MAX_PX: f32 = 10_000_000.0;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub(crate) enum IMode {
@@ -68,8 +69,8 @@ impl Flow<'_> {
                 .fold(0.0f32, f32::max),
             Content::Inlines(inls) => {
                 let cap = match mode {
-                    IMode::Min => 1,
-                    IMode::Max => PROBE_MAX_CELLS,
+                    IMode::Min => 0.01,
+                    IMode::Max => PROBE_MAX_PX,
                 };
                 // An atomic inline box is opaque: it contributes its own
                 // min/max-content MARGIN-box width to the line (it never breaks
@@ -83,12 +84,8 @@ impl Flow<'_> {
                     .map(|(ab, actx)| {
                         let w = self.contribution(ab, mode, actx);
                         AtomBoxSize {
-                            // Ceil, like the real pass: rounding a 17.4-cell
-                            // box down to 17 under-reports the container's
-                            // max-content, and a shrink-to-fit ancestor sized
-                            // from it re-wraps the box's content.
-                            w_cells: (w / self.cell_w - 1e-3).ceil().max(1.0) as usize,
-                            h_rows: 1,
+                            width: w.max(0.0),
+                            height: actx.text_style().size.max(1.0),
                         }
                     })
                     .collect();
@@ -98,9 +95,7 @@ impl Flow<'_> {
                     self.images,
                     self.forms,
                     self.vp,
-                    self.cell_w,
-                    self.cell_h,
-                    cap as f32 * self.cell_w,
+                    cap,
                     None,
                     Align2::Left,
                     // text-indent participates in intrinsic widths;
@@ -112,8 +107,7 @@ impl Flow<'_> {
                 ifc.mark_measuring();
                 ifc.run(inls, &here);
                 let (lines, _, _, _, _) = ifc.finish();
-                let inline_w =
-                    lines.iter().map(|l| l.width).max().unwrap_or(0) as f32 * self.cell_w;
+                let inline_w = lines.iter().map(|l| l.width).fold(0.0, f32::max);
                 // Floats: the probe IFC skips them, so fold them here. At
                 // max-content no soft-wrap opportunity is taken (§10.3.5 /
                 // css-sizing-3), so consecutive floats sit side by side on one
@@ -151,7 +145,7 @@ impl Flow<'_> {
                         .fold(inline_w, f32::max)
                 }
             }
-            Content::Atomic(atom) => self.atom_intrinsic_w(atom, mode),
+            Content::Atomic(atom) => self.atom_intrinsic_w(atom, mode, &here),
             Content::Grid(items) => {
                 // Grid intrinsic sizing under a constraint (§11.9 runs the
                 // whole track algorithm) — approximated pending real
@@ -244,14 +238,14 @@ impl Flow<'_> {
     /// A replaced/control/media atom's content intrinsic width, px. Under an
     /// intrinsic constraint percentages behave as auto here; `contribution`
     /// applies the special cyclic-percentage constraints around this content.
-    fn atom_intrinsic_w(&self, atom: &super::tree::Atom, mode: IMode) -> f32 {
+    fn atom_intrinsic_w(&self, atom: &super::tree::Atom, mode: IMode, inl: &InlineStyle) -> f32 {
         match &atom.kind {
             AtomKind::Img { url, alt } => {
                 let natural = url
                     .as_deref()
                     .and_then(|u| self.images.get(u))
                     .filter(|&&(w, h)| w > 0 && h > 0)
-                    .map(|&(w, h)| (f32::from(w) * self.cell_w, f32::from(h) * self.cell_h));
+                    .map(|&(w, h)| (w as f32, h as f32));
                 match super::replaced::size(
                     self.dom,
                     atom.node,
@@ -262,7 +256,7 @@ impl Flow<'_> {
                     url.as_deref(),
                 ) {
                     Some(r) => r.box_w,
-                    None => text_intrinsic_cells(alt, mode) as f32 * self.cell_w,
+                    None => text_intrinsic(alt, mode, inl),
                 }
             }
             AtomKind::Control { form, field } => {
@@ -273,12 +267,12 @@ impl Flow<'_> {
                     self.dom,
                     atom.node,
                     f,
-                    None,
-                    usize::MAX,
-                    self.cell_w,
+                    ControlWidthBasis::Intrinsic,
+                    f32::INFINITY,
+                    inl,
                     self.vp,
                 );
-                display_width(&label) as f32 * self.cell_w
+                text_intrinsic(&label, mode, inl)
             }
             AtomKind::Media { video } => {
                 // A decoded poster's box, else the external-player text
@@ -292,47 +286,26 @@ impl Flow<'_> {
                     })
                     .and_then(|p| self.images.get(&p).copied());
                 if let Some((w, _)) = poster.filter(|&(w, h)| w > 0 && h > 0) {
-                    return f32::from(w) * self.cell_w;
+                    return w as f32;
                 }
                 let label = match media_source(self.dom, self.base, atom.node) {
                     Some((_, sn)) => media_label(self.dom, *video, sn),
                     None if *video => String::from("▶ Watch in mpv"),
                     None => return 0.0,
                 };
-                display_width(&label) as f32 * self.cell_w
+                text_intrinsic(&label, mode, inl)
             }
         }
     }
 }
 
-/// Plain-text intrinsic width in cells: min = the widest unbreakable
-/// segment (words split at wide-glyph boundaries, like the line breaker);
-/// max = the collapsed single-line width.
-fn text_intrinsic_cells(t: &str, mode: IMode) -> usize {
-    let mut best = 0usize;
-    let mut line = 0usize;
-    let mut seg = 0usize;
-    let mut pending_space = false;
-    for c in t.chars() {
-        if crate::layout2::is_collapsible_space(c) {
-            best = best.max(seg);
-            seg = 0;
-            pending_space = line > 0;
-            continue;
-        }
-        let cw = display_width(c.encode_utf8(&mut [0u8; 4]));
-        if cw >= 2 {
-            // A wide glyph is its own unbreakable segment.
-            best = best.max(seg).max(cw);
-            seg = 0;
-        } else {
-            seg += cw;
-        }
-        line += cw + usize::from(std::mem::take(&mut pending_space));
-    }
-    best = best.max(seg);
+/// Text intrinsic width from the same Unicode shaper/break analyzer used by
+/// inline layout. No character count or terminal-cell proxy participates.
+fn text_intrinsic(t: &str, mode: IMode, inl: &InlineStyle) -> f32 {
+    let (min, max) =
+        crate::text::content_widths(t, &inl.text_style(), crate::text::TextBreakStyle::default());
     match mode {
-        IMode::Min => best,
-        IMode::Max => line,
+        IMode::Min => min,
+        IMode::Max => max,
     }
 }
