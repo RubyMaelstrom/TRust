@@ -9552,8 +9552,24 @@ fn take_click_submit(page: &mut LoadedPage) -> Option<(usize, usize, Option<Form
     let (f, sub) = s.split_once(',')?;
     let form = f.trim().parse().ok()?;
     let submitter = sub.trim().parse().ok()?;
+    // The page-realm default action has already handled this local submit. Do
+    // not fall back to the app's static form parser if entry-list extraction
+    // failed for any unrelated reason (that parser treats unknown methods as
+    // GET and would turn method="dialog" into an accidental navigation).
+    if form_method_is_dialog(page, form, submitter) {
+        return None;
+    }
     let submission = form_submission(page, form, Some(submitter));
     Some((form, submitter, submission))
+}
+
+fn form_method_is_dialog(page: &LoadedPage, form: usize, submitter: usize) -> bool {
+    let dom = page.dom.borrow();
+    let method = dom
+        .attr(submitter, "formmethod")
+        .or_else(|| dom.attr(form, "method"))
+        .unwrap_or("get");
+    method.trim().eq_ignore_ascii_case("dialog")
 }
 
 /// A standards-driven `HTMLFormElement.requestSubmit()` that completed without
@@ -11428,6 +11444,44 @@ const PRELUDE: &str = r##"
         }
         return true;
     }
+    // HTML §4.10.22.3: a form whose submitter's method is "dialog" closes
+    // its nearest ancestor dialog after the submit event is not canceled.  It
+    // is a local dialog result, not a network navigation.  Keep this in the
+    // page realm so both user activation and requestSubmit() follow the same
+    // default-action algorithm and the dialog's close event/returnValue are
+    // observable to page JavaScript.
+    function formMethodFor(form, submitter) {
+        const attr = submitter && submitter.hasAttribute("formmethod")
+            ? submitter.getAttribute("formmethod")
+            : form.getAttribute("method");
+        const method = String(attr || "get").toLowerCase();
+        return method === "post" || method === "dialog" ? method : "get";
+    }
+    function nearestDialog(form) {
+        let p = form && form.parentNode;
+        while (p && p.nodeType === 1) {
+            if (p.localName === "dialog") return p;
+            p = p.parentNode;
+        }
+        return null;
+    }
+    function handleDialogSubmission(form, submitter) {
+        if (formMethodFor(form, submitter) !== "dialog") return false;
+        const subject = nearestDialog(form);
+        // The HTML algorithm consumes method=dialog even when no ancestor
+        // dialog exists; in that case there is simply no close to perform.
+        if (!subject) return true;
+        let result = null;
+        if (submitter && submitter.localName === "input"
+            && String(submitter.type || "").toLowerCase() === "image") {
+            result = "0,0";
+        } else if (submitter
+            && (submitter.localName === "button" || submitter.localName === "input")) {
+            result = submitter.value || "";
+        }
+        subject.close(result);
+        return true;
+    }
     // Activate an element as a click does: fire a bubbling, cancelable `click`
     // event, then (unless prevented) run the submit-control activation. Shared
     // by the actor's `trust.click` (a real user click, `record` = true so the
@@ -11496,6 +11550,7 @@ const PRELUDE: &str = r##"
                 sev.submitter = btn;
                 dispatch(form, sev, false);
                 if (record) trust.lastClickSubmit = { form: form.__id, submitter: btn.__id, prevented: sev.defaultPrevented };
+                if (!sev.defaultPrevented) handleDialogSubmission(form, btn);
                 return sev.defaultPrevented;
             }
         }
@@ -11804,6 +11859,7 @@ const PRELUDE: &str = r##"
             submitter: submitterId === null || submitterId === undefined ? null : wrap(submitterId),
         });
         dispatch(form, ev, false);
+        if (!ev.defaultPrevented && handleDialogSubmission(form, ev.submitter)) return true;
         return ev.defaultPrevented;
     };
     // requestSubmit() runs synchronously in JS through the submit event, then
@@ -13157,6 +13213,7 @@ const PRELUDE: &str = r##"
                 this.__trustFiringSubmit = false;
             }
             if (!ev.defaultPrevented) {
+                if (handleDialogSubmission(this, submitter)) return;
                 trust.queueFormSubmit(this.__id, submitter ? submitter.__id : null);
             }
         }
@@ -27155,6 +27212,74 @@ mod tests {
             Some(PageEvt::SubmitForm { .. }) => {}
             other => {
                 panic!("unprevented submit-button click should ask app to submit, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn clicking_a_method_dialog_submit_closes_the_ancestor_dialog() {
+        // HTML §4.10.22.3 step 11: method="dialog" is a local default
+        // action.  It closes the nearest open <dialog>, stores the submitter's
+        // value as returnValue, and must not ask the app to navigate to the
+        // form action.
+        let (handle, mut events) = live(
+            "<body><dialog id=d open><form method=dialog><button type=submit value=accept>Accept</button></form></dialog><script>void 0;</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("open dialog should render a live page");
+        };
+        let button = live_node_after(&html, "<button");
+        handle.cmds.blocking_send(PageCmd::Click(button)).unwrap();
+        let html = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    break html;
+                }
+                Some(PageEvt::Settled) => continue,
+                Some(PageEvt::SubmitForm { .. } | PageEvt::SubmitDefault) => {
+                    panic!("method=dialog must not navigate")
+                }
+                other => panic!("expected closed-dialog render, got {other:?}"),
+            }
+        };
+        assert!(
+            !html.contains("<dialog"),
+            "closed dialog is removed from the rendered tree: {html}"
+        );
+    }
+
+    #[test]
+    fn clicking_an_input_submitter_submits_hidden_consent_fields() {
+        // Google’s consent page uses ordinary POST forms with hidden state and
+        // an aria-labelled input[type=submit].  The submitter's visible value
+        // is already the native control widget; activation must still include
+        // the hidden successful controls in the resident DOM entry list.
+        let (handle, mut events) = live(
+            "<body><form action='https://consent.example/save' method=post>\
+             <input type=hidden name=gl value=DE>\
+             <input aria-label='Accept all' type=submit value='Accept all'>\
+             </form><script>document.querySelector('input[type=submit]').addEventListener('click', function () {});</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("consent form should render live");
+        };
+        let submitter = live_node_after(&html, "aria-label=\"Accept all\"");
+        handle
+            .cmds
+            .blocking_send(PageCmd::Click(submitter))
+            .unwrap();
+        loop {
+            match events.blocking_recv() {
+                Some(PageEvt::SubmitForm { submission, .. }) => {
+                    let submission = submission.expect("resident form entry list");
+                    assert_eq!(submission.action, "https://consent.example/save");
+                    assert_eq!(submission.method, "post");
+                    assert_eq!(submission.body, "gl=DE");
+                    break;
+                }
+                Some(PageEvt::Updated { .. } | PageEvt::Settled) => continue,
+                other => panic!("expected native consent POST, got {other:?}"),
             }
         }
     }

@@ -720,19 +720,19 @@ fn pool_put(key: PoolKey, io: BufReader<Conn>) {
 //
 // Cookies are ON by default, RAM-only, and never persisted. We CAPTURE
 // `Set-Cookie`, expose non-HttpOnly matches to page JS via
-// `document.cookie`, and send matching cookies back on requests. The
-// privacy line is exact-host isolation: `Domain=` is ignored, so a cookie
-// set by `shop.example` is only for `shop.example`, never `example` or
-// `other.example`. `set cookies off` disables capture, sends, and
-// document.cookie exposure without deleting the in-memory jar. Subset of
-// RFC 6265: name=value plus Path/Secure/HttpOnly/Max-Age(=0 deletes);
-// Domain/Expires/SameSite ignored.
+// `document.cookie`, and send matching cookies back on requests. Cookie scope
+// follows RFC 6265: a cookie without `Domain=` is host-only, while an explicit
+// domain can cover matching subdomains. `set cookies off` disables capture,
+// sends, and document.cookie exposure without deleting the in-memory jar.
+// This bounded session jar implements name/value, Domain, Path, Secure,
+// HttpOnly, and Max-Age(=0 deletes); it intentionally remains non-persistent.
 
 #[derive(Clone)]
 struct Cookie {
     name: String,
     value: String,
-    domain: String, // exact lowercased host that created it
+    domain: String, // lowercased host-only host or explicit domain scope
+    host_only: bool,
     path: String,
     secure: bool,
     http_only: bool,
@@ -771,7 +771,9 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
         return;
     }
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    let (domain, mut path) = (host.clone(), String::from("/"));
+    let (mut domain, mut path) = (host.clone(), default_cookie_path(url));
+    let mut host_only = true;
+    let mut invalid_domain = false;
     let (mut secure, mut http_only, mut max_age) = (false, false, None::<i64>);
     for attr in rest.split(';') {
         let attr = attr.trim();
@@ -781,8 +783,15 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
                 (k.trim().to_ascii_lowercase(), v.trim().to_string())
             });
         match k.as_str() {
-            // Deliberately ignored: cookies are exact-host only in TRust.
-            "domain" => {}
+            "domain" => {
+                let candidate = v.strip_prefix('.').unwrap_or(&v).to_ascii_lowercase();
+                if candidate.is_empty() || !domain_matches(&host, &candidate) {
+                    invalid_domain = true;
+                } else {
+                    domain = candidate;
+                    host_only = false;
+                }
+            }
             "path" if v.starts_with('/') => path = v,
             "secure" => secure = true,
             "httponly" => http_only = true,
@@ -793,6 +802,9 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
     if from_js {
         http_only = false;
     }
+    if invalid_domain {
+        return;
+    }
     let mut jar = COOKIE_JAR.lock().unwrap();
     jar.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
     if max_age.is_some_and(|m| m <= 0) {
@@ -802,6 +814,7 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
         name,
         value,
         domain,
+        host_only,
         path,
         secure,
         http_only,
@@ -811,8 +824,50 @@ fn store_cookie(url: &Url, line: &str, from_js: bool) {
     }
 }
 
+/// RFC 6265 §5.1.3 domain-match. The suffix form is only valid for DNS host
+/// names; an IP address must not inherit a cookie from a dotted suffix.
+fn domain_matches(host: &str, domain: &str) -> bool {
+    if host == domain {
+        return true;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    host.strip_suffix(domain)
+        .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+/// RFC 6265 §5.1.4 default-path for a Set-Cookie received on `url`.
+fn default_cookie_path(url: &Url) -> String {
+    let path = url.path();
+    if !path.starts_with('/') {
+        return String::from("/");
+    }
+    let Some(last) = path.rfind('/') else {
+        return String::from("/");
+    };
+    if last == 0 {
+        String::from("/")
+    } else {
+        path[..last].to_string()
+    }
+}
+
+/// RFC 6265 §5.1.4 path-match. A prefix ending in `/` matches descendants,
+/// but `/foo` does not match `/foobar`.
+fn cookie_path_matches(request_path: &str, cookie_path: &str) -> bool {
+    request_path == cookie_path
+        || request_path
+            .strip_prefix(cookie_path)
+            .is_some_and(|rest| cookie_path.ends_with('/') || rest.starts_with('/'))
+}
+
 fn cookie_domain_match(host: &str, c: &Cookie) -> bool {
-    host == c.domain
+    if c.host_only {
+        host == c.domain
+    } else {
+        domain_matches(host, &c.domain)
+    }
 }
 
 /// The `document.cookie` string for a page: name=value pairs for every
@@ -830,14 +885,15 @@ pub(crate) fn cookies_for_js(page: &Url) -> String {
         .filter(|c| !c.http_only)
         .filter(|c| !c.secure || https)
         .filter(|c| cookie_domain_match(&host, c))
-        .filter(|c| path == c.path || path.starts_with(&c.path))
+        .filter(|c| cookie_path_matches(path, &c.path))
         .map(|c| format!("{}={}", c.name, c.value))
         .collect::<Vec<_>>()
         .join("; ")
 }
 
 /// A `document.cookie = "..."` write from page JS. Stored in the same
-/// RAM-only, exact-host jar used for requests.
+/// RAM-only cookie jar used for requests; Domain is validated against the
+/// current document host.
 pub(crate) fn set_cookie_from_js(page: &Url, line: &str) {
     store_cookie(page, line, true);
 }
@@ -853,7 +909,7 @@ pub(crate) fn cookies_for_request(url: &Url) -> String {
     jar.iter()
         .filter(|c| !c.secure || https)
         .filter(|c| cookie_domain_match(&host, c))
-        .filter(|c| path == c.path || path.starts_with(&c.path))
+        .filter(|c| cookie_path_matches(path, &c.path))
         .map(|c| format!("{}={}", c.name, c.value))
         .collect::<Vec<_>>()
         .join("; ")
@@ -7040,7 +7096,7 @@ customElements.define('lit-counter', LitCounter);
     }
 
     #[test]
-    fn cookie_jar_is_exact_host_and_request_visible() {
+    fn cookie_jar_honors_domain_path_and_request_visibility() {
         let _guard = COOKIE_TEST_LOCK.lock().unwrap();
         set_cookies_enabled(true);
         // Unique domain so the process-global jar doesn't collide with
@@ -7063,17 +7119,48 @@ customElements.define('lit-counter', LitCounter);
         assert!(req.contains("sid=abc"), "sent to exact host: {req}");
         assert!(req.contains("secret=xyz"), "HttpOnly still sent: {req}");
 
-        // Domain= is deliberately ignored: no sibling or parent host gets it.
+        // An explicit Domain scope reaches matching sibling/parent hosts, while
+        // the host-only cookies remain isolated to the response host.
         let sib = parse_url("https://other.ckjar-test.example/").unwrap();
-        assert!(cookies_for_js(&sib).is_empty(), "sibling sees nothing");
         assert!(
-            cookies_for_request(&sib).is_empty(),
-            "sibling sends nothing"
+            cookies_for_js(&sib).contains("sid=abc"),
+            "sibling sees Domain cookie"
+        );
+        assert!(
+            cookies_for_request(&sib).contains("sid=abc"),
+            "sibling sends Domain cookie"
+        );
+        assert!(
+            !cookies_for_request(&sib).contains("pref=dark"),
+            "host-only cookie leaked"
+        );
+        assert!(
+            !cookies_for_request(&sib).contains("secret=xyz"),
+            "HttpOnly host-only cookie leaked"
         );
         let parent = parse_url("https://ckjar-test.example/").unwrap();
         assert!(
-            cookies_for_request(&parent).is_empty(),
-            "parent sends nothing"
+            cookies_for_request(&parent).contains("sid=abc"),
+            "parent sends Domain cookie"
+        );
+
+        // A Domain attribute outside the response host is rejected, and path
+        // matching does not confuse `/foo` with `/foobar`.
+        store_cookie(&resp, "bad=1; Domain=attacker.example; Path=/", false);
+        assert!(
+            !cookies_for_request(&page).contains("bad=1"),
+            "invalid Domain accepted"
+        );
+        store_cookie(&resp, "scoped=1; Path=/foo", false);
+        let child = parse_url("https://shop.ckjar-test.example/foo/bar").unwrap();
+        assert!(
+            cookies_for_request(&child).contains("scoped=1"),
+            "path child matched"
+        );
+        let sibling_path = parse_url("https://shop.ckjar-test.example/foobar").unwrap();
+        assert!(
+            !cookies_for_request(&sibling_path).contains("scoped=1"),
+            "path prefix overmatched"
         );
 
         // Secure cookies don't surface or send over http.
@@ -7101,6 +7188,23 @@ customElements.define('lit-counter', LitCounter);
         assert!(
             cookies_for_request(&page).contains("fromjs=1"),
             "JS-set cookie sent to exact host"
+        );
+    }
+
+    #[test]
+    fn google_consent_domain_cookie_survives_sibling_redirect() {
+        let _guard = COOKIE_TEST_LOCK.lock().unwrap();
+        set_cookies_enabled(true);
+        let save = parse_url("https://consent.google.ca/save").unwrap();
+        let continue_url = parse_url("https://translate.google.ca/?ucbcb=1").unwrap();
+        store_cookie(
+            &save,
+            "SOCS=accepted; Domain=.google.ca; Path=/; Secure",
+            false,
+        );
+        assert!(
+            cookies_for_request(&continue_url).contains("SOCS=accepted"),
+            "Google's Domain=.google.ca consent state must reach the sibling continuation host"
         );
     }
 
@@ -7154,7 +7258,7 @@ customElements.define('lit-counter', LitCounter);
     // document_cookie_reflects_captured_set_cookie.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn redirect_sends_captured_exact_host_cookie() {
+    async fn redirect_sends_captured_host_cookie() {
         let _guard = COOKIE_TEST_LOCK.lock().unwrap();
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -7668,6 +7772,46 @@ customElements.define('lit-counter', LitCounter);
         let button = item(&doc, "[ Send ]");
         assert_eq!(button.kind, crate::layout2::ItemKind::Form);
         assert_eq!(button.link, Some(Link::Form { form: 0, field: 2 }));
+    }
+
+    #[test]
+    fn parses_google_consent_accept_and_decline_as_post_forms() {
+        // The consent page is intentionally script-free: desktop activation
+        // must use the native form path, retain hidden state, and submit the
+        // selected input[type=submit] rather than treating its aria-label as
+        // a second visual control.
+        let base = Url::parse("https://consent.google.ca/ml").unwrap();
+        let html = r#"
+            <form action="https://consent.google.ca/save" method="POST">
+              <input type="hidden" name="gl" value="GB">
+              <input type="hidden" name="continue" value="https://www.google.ca/">
+              <input type="submit" value="Reject all" aria-label="Reject all">
+            </form>
+            <form action="https://consent.google.ca/save" method="POST">
+              <input type="hidden" name="gl" value="GB">
+              <input type="hidden" name="continue" value="https://www.google.ca/">
+              <input type="submit" value="Accept all" aria-label="Accept all">
+            </form>"#;
+        let doc = parse(
+            &base,
+            "text/html",
+            html.as_bytes(),
+            80,
+            0,
+            &Default::default(),
+        );
+        assert_eq!(doc.forms.len(), 2);
+        assert_eq!(doc.forms[0].fields.len(), 3);
+        assert_eq!(
+            doc.forms[0].encode(Some(2)),
+            "gl=GB&continue=https%3A%2F%2Fwww.google.ca%2F"
+        );
+        assert_eq!(
+            doc.forms[1].encode(Some(2)),
+            "gl=GB&continue=https%3A%2F%2Fwww.google.ca%2F"
+        );
+        assert!(has_item(&doc, "[ Reject all ]"));
+        assert!(has_item(&doc, "[ Accept all ]"));
     }
 
     #[test]
