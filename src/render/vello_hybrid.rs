@@ -37,7 +37,7 @@ use super::vello_cpu::{
 use super::{
     Affine2d, CssRect, DecorationStyle, DisplayCommand, ImageFit, ImageHandle, ImageResource,
     ImageSampling, PaintBrush, PaintColor, Primitive, RasterBackend, RasterFrame, RendererKind,
-    Scene,
+    Scene, is_desktop_heart_image_handle,
 };
 use crate::core::{CssPoint, PhysicalSize};
 
@@ -530,7 +530,9 @@ impl VelloHybridRenderer {
             .images
             .keys()
             .copied()
-            .filter(|handle| !live_images.contains(handle))
+            .filter(|handle| {
+                !live_images.contains(handle) && !is_desktop_heart_image_handle(*handle)
+            })
             .collect();
         for handle in stale {
             if let Some(CachedImage {
@@ -794,7 +796,10 @@ impl VelloHybridRenderer {
             let victim = self
                 .images
                 .iter()
-                .filter(|(_, image)| image.last_used_frame != self.frame_id)
+                .filter(|(handle, image)| {
+                    !is_desktop_heart_image_handle(**handle)
+                        && image.last_used_frame != self.frame_id
+                })
                 .min_by_key(|(_, image)| image.last_used_frame)
                 .map(|(handle, _)| *handle);
             if let Some(victim) = victim

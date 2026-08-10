@@ -1019,9 +1019,11 @@ fn shape_contains(shape: &PaintShape, point: CssPoint) -> bool {
 
 pub const COMMAND_PANEL_HEIGHT: f32 = 122.0;
 pub const FIND_PANEL_HEIGHT: f32 = 64.0;
-const HEART_SIZE: f32 = 14.0;
-const HEART_HIT_SIZE: f32 = 26.0;
-const HEART_EDGE_INSET: f32 = 9.0;
+const HEART_SIZE: f32 = 30.0;
+const HEART_HIT_SIZE: f32 = 34.0;
+const HEART_EDGE_INSET: f32 = 17.0;
+const HEART_IDLE_SOURCE: &str = "trust:ui/heart/idle-v1";
+const HEART_ACTIVE_SOURCE: &str = "trust:ui/heart/active-v1";
 
 const fn theme_color(rgb: crate::theme::Rgb) -> PaintColor {
     PaintColor::Rgba(rgb[0], rgb[1], rgb[2], 255)
@@ -1034,6 +1036,24 @@ const UI_AMBER: PaintColor = theme_color(crate::theme::AMBER);
 const UI_DIM: PaintColor = theme_color(crate::theme::DIM);
 const HEART_DEPTH: PaintColor = PaintColor::Rgba(98, 17, 104, 255);
 const HEART_LIGHT: PaintColor = PaintColor::Rgba(255, 232, 246, 255);
+
+/// Stable retained-image identity for the two embedded desktop heart states.
+/// The animation clock selects a state and changes only its destination rect;
+/// neither backend decodes or uploads pixels per frame.
+pub fn desktop_heart_image_handle(active: bool) -> ImageHandle {
+    ImageHandle::for_source(if active {
+        HEART_ACTIVE_SOURCE
+    } else {
+        HEART_IDLE_SOURCE
+    })
+}
+
+/// The two-frame desktop jewel is intentionally retained across scene frames.
+/// A heartbeat displays only one handle at a time, so treating the other as a
+/// stale page image would destroy and re-upload the pair on every state change.
+pub(crate) fn is_desktop_heart_image_handle(handle: ImageHandle) -> bool {
+    handle == desktop_heart_image_handle(false) || handle == desktop_heart_image_handle(true)
+}
 
 /// Build the chrome-free desktop surface. Browse mode gives the page the full
 /// client area; COMMAND/FIND reserve only their solid bottom instrument panel.
@@ -1355,8 +1375,9 @@ fn paint_heart_scrollbars(scene: &mut Scene, heart: HeartVisual) {
                 enabled: true,
             });
         }
-        paint_crystalline_heart(
+        paint_heart(
             &mut scene.primitives,
+            &scene.image_store,
             center,
             HEART_SIZE
                 * (1.0 + heart.energy.clamp(0.0, 1.0) * 0.08)
@@ -1409,8 +1430,9 @@ fn paint_heart_scrollbars(scene: &mut Scene, heart: HeartVisual) {
             ),
             enabled: true,
         });
-        paint_crystalline_heart(
+        paint_heart(
             &mut scene.primitives,
+            &scene.image_store,
             center,
             HEART_SIZE
                 * (1.0 + heart.energy.clamp(0.0, 1.0) * 0.08)
@@ -1434,7 +1456,11 @@ pub fn vertical_heart_track(viewport: CssRect, reserve_corner: bool) -> (f32, f3
     let start = viewport.y + HEART_HIT_SIZE / 2.0;
     let end = (viewport.y + viewport.height
         - HEART_HIT_SIZE / 2.0
-        - if reserve_corner { 18.0 } else { 0.0 })
+        - if reserve_corner {
+            HEART_HIT_SIZE + 2.0
+        } else {
+            0.0
+        })
     .max(start);
     (start, end)
 }
@@ -1443,17 +1469,42 @@ pub fn horizontal_heart_track(viewport: CssRect, reserve_corner: bool) -> (f32, 
     let start = viewport.x + HEART_HIT_SIZE / 2.0;
     let end = (viewport.x + viewport.width
         - HEART_HIT_SIZE / 2.0
-        - if reserve_corner { 18.0 } else { 0.0 })
+        - if reserve_corner {
+            HEART_HIT_SIZE + 2.0
+        } else {
+            0.0
+        })
     .max(start);
     (start, end)
 }
 
-fn paint_crystalline_heart(
+fn paint_heart(
     primitives: &mut Vec<Primitive>,
+    image_store: &ImageStore,
     center: CssPoint,
     size: f32,
     energy: f32,
 ) {
+    let handle = desktop_heart_image_handle(energy > 0.45);
+    if image_store.contains(handle) {
+        primitives.push(Primitive::Image {
+            rect: CssRect::new(center.x - size / 2.0, center.y - size / 2.0, size, size),
+            handle,
+            source_rect: None,
+            fit: ImageFit::Fill,
+            sampling: ImageSampling::Smooth,
+            clip: None,
+            node: 0,
+            link: None,
+        });
+    } else {
+        // An embedded-asset decode failure must not remove the scrollbar. Keep
+        // the original tiny vector as a dependency-free degraded path.
+        paint_fallback_heart(primitives, center, size * (14.0 / HEART_SIZE), energy);
+    }
+}
+
+fn paint_fallback_heart(primitives: &mut Vec<Primitive>, center: CssPoint, size: f32, energy: f32) {
     let scale = size / 14.0;
     let point = |x: f32, y: f32| CssPoint::new(center.x + x * scale, center.y + y * scale);
     let outer = PaintShape::Path(vec![
@@ -1757,6 +1808,17 @@ mod tests {
             ViewportMetrics::from_physical(PhysicalSize::new(800, 600), ScaleFactor::default());
         let mut scene = desktop_shell(viewport, &snapshot());
         scene.page_size = CssSize::new(800.0, 1_800.0);
+        for active in [false, true] {
+            scene.image_store.insert(
+                desktop_heart_image_handle(active),
+                ImageResource {
+                    width: 30,
+                    height: 30,
+                    rgba: Arc::from(vec![0; 30 * 30 * 4]),
+                    has_alpha: true,
+                },
+            );
+        }
         let model = ChromeModel {
             heart: HeartVisual {
                 vertical_visible: true,
@@ -1771,9 +1833,33 @@ mod tests {
             .iter()
             .find(|control| control.id == ControlId::VerticalHeart)
             .expect("scrollable pages expose the heart thumb");
-        assert_eq!(HEART_SIZE, 14.0);
-        assert_eq!((heart.rect.width, heart.rect.height), (26.0, 26.0));
+        assert_eq!(HEART_SIZE, 30.0);
+        assert_eq!((heart.rect.width, heart.rect.height), (34.0, 34.0));
         assert_eq!(heart.rect.y + heart.rect.height / 2.0, 300.0);
+        assert!(scene.primitives.iter().any(|primitive| matches!(
+            primitive,
+            Primitive::Image { handle, rect, .. }
+                if *handle == desktop_heart_image_handle(false)
+                    && rect.width == 30.0
+                    && rect.height == 30.0
+        )));
+        let active_model = ChromeModel {
+            heart: HeartVisual {
+                vertical_visible: true,
+                vertical_fraction: Some(0.5),
+                energy: 1.0,
+                ..HeartVisual::default()
+            },
+            ..ChromeModel::default()
+        };
+        paint_desktop_overlay(&mut scene, &snapshot(), &active_model);
+        assert!(scene.primitives.iter().any(|primitive| matches!(
+            primitive,
+            Primitive::Image { handle, rect, .. }
+                if *handle == desktop_heart_image_handle(true)
+                    && (rect.width - 32.4).abs() < 0.01
+                    && (rect.height - 32.4).abs() < 0.01
+        )));
         assert_eq!(
             scene.control_at(CssPoint::new(788.0, 100.0)),
             Some(ControlId::VerticalRail)
@@ -1785,9 +1871,9 @@ mod tests {
         );
         assert_eq!(scrollbar_fraction(600.0, 1_800.0, 600.0), Some(0.5));
         assert_eq!(scrollbar_position(0.5, 1_800.0, 600.0), 600.0);
-        assert_eq!(scrollbar_track_fraction(300.0, 13.0, 587.0), 0.5);
-        assert_eq!(scrollbar_track_fraction(-20.0, 13.0, 587.0), 0.0);
-        assert_eq!(scrollbar_track_fraction(900.0, 13.0, 587.0), 1.0);
+        assert_eq!(scrollbar_track_fraction(300.0, 17.0, 583.0), 0.5);
+        assert_eq!(scrollbar_track_fraction(-20.0, 17.0, 583.0), 0.0);
+        assert_eq!(scrollbar_track_fraction(900.0, 17.0, 583.0), 1.0);
         assert!(
             !scene
                 .controls
