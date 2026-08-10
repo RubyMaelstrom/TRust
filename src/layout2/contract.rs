@@ -359,6 +359,9 @@ pub struct FixedItem {
     pub rows: Vec<Row>,
     /// Paint order — higher draws last (over lower). From `z-index`.
     pub z: i32,
+    /// A full-viewport decorative fixed box with `z-index:auto` paints below
+    /// later content in its stacking context; it remains viewport-pinned.
+    pub under_document: bool,
 }
 
 /// A horizontally-scrollable strip (an `overflow-x` container whose content

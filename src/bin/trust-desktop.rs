@@ -299,7 +299,13 @@ fn scheduled_page_images(
     collect_visible_image_handles(&page.layout.paint.primitives, band, &mut visible);
     // Fixed-position image commands are viewport-relative. They are cheap and
     // necessarily near the user whenever their layer is active.
-    for command in &page.layout.paint.fixed_primitives {
+    for command in page
+        .layout
+        .paint
+        .fixed_under_primitives
+        .iter()
+        .chain(page.layout.paint.fixed_primitives.iter())
+    {
         if let trust::render::DisplayCommand::Image { handle, .. } = command {
             visible.insert(*handle);
         }

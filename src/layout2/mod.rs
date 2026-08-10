@@ -191,6 +191,7 @@ pub fn lay_out_graphical(
                 background: None,
                 lines: Vec::new(),
                 primitives: Vec::new(),
+                fixed_under_primitives: Vec::new(),
                 fixed_primitives: Vec::new(),
                 image_requests: Vec::new(),
                 scroll_containers: Vec::new(),
@@ -214,7 +215,7 @@ pub fn lay_out_graphical(
     let flow_done = started.elapsed();
     let boxes = measure::boxes(dom, &frag, &fixed);
     let measure_done = started.elapsed();
-    let paint = graphics::paint(dom, base, &frag, &fixed, flow_bottom);
+    let paint = graphics::paint(dom, base, &frag, &fixed, flow_bottom, vp.w, vp.h);
     if trace {
         eprintln!(
             "layout: tree={:?} flow={:?} measure={:?} paint={:?} total={:?}",
@@ -3341,6 +3342,23 @@ mod tests {
             "right:0 at 640px viewport → 560px = col 70"
         );
         assert!(right.rows[0].items.iter().any(|i| i.text == "RIGHT"));
+    }
+
+    #[test]
+    fn viewport_fixed_backdrop_is_marked_below_document() {
+        let out = lay(
+            r#"<body style="margin:0">
+               <div style="position:fixed;top:0;right:0;bottom:0;left:0;background:#123">
+                 <img src="backdrop.png" alt="backdrop">
+               </div>
+               <div style="position:relative">main content</div></body>"#,
+            80,
+        );
+        assert_eq!(out.fixed.len(), 1);
+        assert!(
+            out.fixed[0].under_document,
+            "a non-interactive viewport backdrop remains pinned but cannot cover later content"
+        );
     }
 
     #[test]

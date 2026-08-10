@@ -5410,6 +5410,9 @@ impl App {
         let g = self.browser.as_ref()?;
         let (ox, oy) = (self.last_content_area.x, self.last_content_area.y);
         for (fi, f) in g.doc.fixed.iter().enumerate().rev() {
+            if f.under_document {
+                continue;
+            }
             if row >= oy.saturating_add(f.row) && col >= ox.saturating_add(f.col) {
                 let local_row = row.saturating_sub(oy.saturating_add(f.row)) as usize;
                 let local_col = col.saturating_sub(ox.saturating_add(f.col));
@@ -5702,6 +5705,9 @@ impl App {
     fn fixed_interactives(g: &BrowserView) -> Vec<(usize, usize, usize)> {
         let mut out = Vec::new();
         for (fi, f) in g.doc.fixed.iter().enumerate() {
+            if f.under_document {
+                continue;
+            }
             for (r, row) in f.rows.iter().enumerate() {
                 for (i, it) in row.items.iter().enumerate() {
                     if it.is_interactive() {

@@ -102,6 +102,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             frame.render_widget(ratatui_image::Image::new(&v.protocol), image_area);
         }
         (None, Some(g)) => {
+            // Decorative viewport-fixed backdrops are pinned to the screen but
+            // paint below the document's later stacking-context content.
+            if g.doc.fixed.iter().any(|item| item.under_document) {
+                render_fixed_layer(
+                    frame,
+                    g,
+                    inner,
+                    app.find.as_ref(),
+                    &app.image_protocols,
+                    true,
+                );
+            }
             let doc = Paragraph::new(browser_lines(g, inner.height as usize, app.find.as_ref()))
                 .block(block);
             frame.render_widget(doc, session_area);
@@ -117,7 +129,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             // from `position:fixed`) draws over the scrolling document at a fixed
             // screen position, so it stays put while the center scrolls.
             if !g.doc.fixed.is_empty() {
-                render_fixed_layer(frame, g, inner, app.find.as_ref(), &app.image_protocols);
+                render_fixed_layer(
+                    frame,
+                    g,
+                    inner,
+                    app.find.as_ref(),
+                    &app.image_protocols,
+                    false,
+                );
             }
             // Scroll-position indicator on the right border, when the document
             // overflows the panel — plus a horizontal bar under each overflowing
@@ -553,9 +572,13 @@ fn render_fixed_layer(
         crate::app::EncKey,
         ratatui_image::sliced::SlicedProtocol,
     >,
+    under_document: bool,
 ) {
     use ratatui_image::sliced::{SignedPosition, SlicedImage};
     for (fi, item) in g.doc.fixed.iter().enumerate() {
+        if item.under_document != under_document {
+            continue;
+        }
         let sx = inner.x.saturating_add(item.col);
         if sx >= inner.right() {
             continue;
@@ -679,6 +702,9 @@ fn image_anchor_clip_top(fixed: &[crate::layout2::FixedItem], col: u16, height: 
     (0..height)
         .find(|&screen_row| {
             !fixed.iter().any(|layer| {
+                if layer.under_document {
+                    return false;
+                }
                 let Some(local_col) = col.checked_sub(layer.col) else {
                     return false;
                 };
@@ -1266,6 +1292,7 @@ mod tests {
             row: 0,
             rows: vec![painted_row(100), painted_row(100), painted_row(100)],
             z: 9999,
+            under_document: false,
         };
 
         assert_eq!(image_anchor_clip_top(&[header], 2, 40), 3);
@@ -1278,12 +1305,14 @@ mod tests {
             row: 0,
             rows: vec![painted_row(20), painted_row(20)],
             z: 1,
+            under_document: false,
         };
         let lower_bar = FixedItem {
             col: 0,
             row: 1,
             rows: vec![painted_row(100)],
             z: 2,
+            under_document: false,
         };
 
         assert_eq!(image_anchor_clip_top(&[right_rail], 2, 40), 0);

@@ -213,6 +213,12 @@ pub(crate) fn paint(
                 row: row.min(u16::MAX as usize) as u16,
                 rows: brows,
                 z: f.paint.z.unwrap_or(0),
+                under_document: super::flow::fixed_backdrop(
+                    dom,
+                    f,
+                    cols as f32 * cell_w,
+                    vp_rows as f32 * cell_h,
+                ),
             })
         })
         .collect();
