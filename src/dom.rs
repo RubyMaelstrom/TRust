@@ -189,6 +189,10 @@ pub struct Dom {
     /// (width/height queries then conservatively don't match, as if skipped).
     /// Set by `execute_js` from `PageEnv`.
     viewport_px: (f32, f32),
+    /// Output-device pixel density used by HTML responsive-image selection.
+    /// It does not enter CSS layout geometry; it only chooses a source whose
+    /// normalized density is appropriate for the device.
+    device_pixel_ratio: f32,
     /// Per-element inner-scroll state (CSSOM View `element.scrollTop`, Phase 3).
     /// Keyed by node; absent = never scrolled / not a measured scroll box.
     scroll_state: FxHashMap<NodeId, ScrollBox>,
@@ -388,6 +392,7 @@ impl Dom {
             hidden_cache: RefCell::new(NodeCache::default()),
             font_cache: RefCell::new(NodeCache::default()),
             viewport_px: (0.0, 0.0),
+            device_pixel_ratio: 1.0,
             scroll_state: FxHashMap::default(),
             scroll_changes: Vec::new(),
             doc_url: None,
@@ -874,13 +879,62 @@ impl Dom {
     /// unrecognized features (e.g. `prefers-*`, `hover`, `pointer`) don't match
     /// (the conservative default the old stub had for every query).
     pub fn media_matches(&self, query: &str) -> bool {
-        media_query_matches(query, self.viewport_px)
+        media_query_matches_with_density(query, self.viewport_px, self.device_pixel_ratio)
+    }
+
+    /// Evaluate against an explicit CSS viewport. Environment-sensitive
+    /// algorithms that already carry their layout pass's viewport use this so
+    /// a stale/default DOM environment cannot disagree with that pass.
+    pub fn media_matches_at(&self, query: &str, width: f32, height: f32) -> bool {
+        self.media_matches_at_density(query, width, height, self.device_pixel_ratio)
+    }
+
+    pub fn media_matches_at_density(
+        &self,
+        query: &str,
+        width: f32,
+        height: f32,
+        device_pixel_ratio: f32,
+    ) -> bool {
+        media_query_matches_with_density(
+            query,
+            (width.max(0.0), height.max(0.0)),
+            device_pixel_ratio,
+        )
+    }
+
+    /// Current CSS-pixel viewport for environment-sensitive HTML algorithms.
+    pub fn viewport_px(&self) -> (f32, f32) {
+        self.viewport_px
+    }
+
+    /// Set the output device density used by `srcset` candidate selection.
+    /// HTML §4.8.4.3.13 permits reselection when the environment changes; the
+    /// DOM epoch invalidates geometry/current-source consumers together.
+    pub fn set_device_pixel_ratio(&mut self, ratio: f32) {
+        let ratio = if ratio.is_finite() && ratio > 0.0 {
+            ratio
+        } else {
+            1.0
+        };
+        if self.device_pixel_ratio != ratio {
+            self.device_pixel_ratio = ratio;
+            self.touch_style(); // resolution/device-pixel-ratio media queries
+        }
+    }
+
+    pub fn device_pixel_ratio(&self) -> f32 {
+        self.device_pixel_ratio
     }
 
     /// Set the document's URL (DOM §4.5). No `touch()`: it only affects how
     /// the serializer resolves sprite `<use>` hrefs, not the cascade.
     pub fn set_doc_url(&mut self, url: Option<url::Url>) {
         self.doc_url = url;
+    }
+
+    pub fn doc_url(&self) -> Option<&url::Url> {
+        self.doc_url.as_ref()
     }
 
     /// Read a scroll metric (CSSOM View, px). `which`: 0=scrollTop, 1=scrollLeft,
@@ -2643,6 +2697,10 @@ impl Dom {
     fn build_style_index(&self) -> StyleIndex {
         let mut index = StyleIndex::default();
         let mut order = 0;
+        let media = MediaEnvironment {
+            viewport: self.viewport_px,
+            density: self.device_pixel_ratio,
+        };
         // Cascade layers are scoped like the rules themselves ("scoped to
         // their origin and context" — css-cascade-5): one registry per tree
         // scope, shared across every sheet of that scope so `@layer` names
@@ -2664,7 +2722,7 @@ impl Dom {
                 &mut order,
                 index.scopes.entry(scope).or_default(),
                 &mut index.keyframes,
-                self.viewport_px,
+                media,
                 layer_regs.entry(scope).or_default(),
                 "",
             );
@@ -2681,7 +2739,7 @@ impl Dom {
                 &mut order,
                 index.scopes.entry(*scope).or_default(),
                 &mut index.keyframes,
-                self.viewport_px,
+                media,
                 layer_regs.entry(*scope).or_default(),
                 "",
             );
@@ -7513,12 +7571,18 @@ fn qualify_layer(prefix: &str, name: &str) -> String {
 /// enclosing layer's qualified name, "" = unlayered); other @-blocks are
 /// skipped whole. Rules whose selectors don't parse are skipped
 /// (fail-open).
+#[derive(Clone, Copy)]
+struct MediaEnvironment {
+    viewport: (f32, f32),
+    density: f32,
+}
+
 fn parse_sheet(
     css: &str,
     order: &mut usize,
     out: &mut Vec<StyleRule>,
     keyframes: &mut FxHashMap<String, f32>,
-    viewport: (f32, f32),
+    media: MediaEnvironment,
     layers: &mut LayerRegistry,
     layer: &str,
 ) {
@@ -7571,8 +7635,8 @@ fn parse_sheet(
             {
                 let query = &after[after.len() - rest_q.len()..brace_off];
                 let (block, tail) = take_block(&after[brace_off..]);
-                if media_query_matches(query, viewport) {
-                    parse_sheet(block, order, out, keyframes, viewport, layers, layer);
+                if media_query_matches_with_density(query, media.viewport, media.density) {
+                    parse_sheet(block, order, out, keyframes, media, layers, layer);
                 }
                 rest = tail;
                 continue;
@@ -7595,7 +7659,7 @@ fn parse_sheet(
                 let cond = &after[after.len() - rest_c.len()..brace_off];
                 let (block, tail) = take_block(&after[brace_off..]);
                 if supports_condition(cond) {
-                    parse_sheet(block, order, out, keyframes, viewport, layers, layer);
+                    parse_sheet(block, order, out, keyframes, media, layers, layer);
                 }
                 rest = tail;
                 continue;
@@ -7646,7 +7710,7 @@ fn parse_sheet(
                         continue; // malformed name: drop the block (fail-open)
                     };
                     layers.declare(&qualified);
-                    parse_sheet(block, order, out, keyframes, viewport, layers, &qualified);
+                    parse_sheet(block, order, out, keyframes, media, layers, &qualified);
                     continue;
                 }
                 return; // no `;` and no `{`: malformed tail
@@ -7665,7 +7729,7 @@ fn parse_sheet(
         let selector_text = rest[..brace].trim();
         let (block, after) = take_block(&rest[brace..]);
         rest = after;
-        parse_style_rule(selector_text, block, order, out, viewport, &lpath);
+        parse_style_rule(selector_text, block, order, out, media, &lpath);
     }
 }
 
@@ -7686,7 +7750,7 @@ fn parse_style_rule(
     block: &str,
     order: &mut usize,
     out: &mut Vec<StyleRule>,
-    viewport: (f32, f32),
+    media: MediaEnvironment,
     layer: &[u32],
 ) {
     let (decl_text, nested) = split_block(block);
@@ -7721,15 +7785,16 @@ fn parse_style_rule(
                         .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '-')
                 })
             };
-            if (kw_ok("media") && media_query_matches(&at[5..], viewport))
+            if (kw_ok("media")
+                && media_query_matches_with_density(&at[5..], media.viewport, media.density))
                 || (kw_ok("supports") && supports_condition(&at[8..]))
             {
-                parse_style_rule(resolved, nblock, order, out, viewport, layer);
+                parse_style_rule(resolved, nblock, order, out, media, layer);
             }
             continue;
         }
         let child = expand_nesting(nsel, resolved);
-        parse_style_rule(&child, nblock, order, out, viewport, layer);
+        parse_style_rule(&child, nblock, order, out, media, layer);
     }
 }
 
@@ -8001,16 +8066,26 @@ fn css_supports(prop: &str, value: &str) -> bool {
 /// features are evaluated, `not`/`only` honored. Anything unrecognized — or a
 /// width/height test with an unknown viewport — makes that query NOT match,
 /// which drops its rules exactly as skipping the whole `@media` block used to.
+#[cfg(test)]
 fn media_query_matches(query: &str, vp: (f32, f32)) -> bool {
+    media_query_matches_with_density(query, vp, 1.0)
+}
+
+fn media_query_matches_with_density(query: &str, vp: (f32, f32), density: f32) -> bool {
+    let density = if density.is_finite() && density > 0.0 {
+        density
+    } else {
+        1.0
+    };
     query
         .split(',')
-        .any(|q| media_query_one(&q.trim().to_ascii_lowercase(), vp))
+        .any(|q| media_query_one(&q.trim().to_ascii_lowercase(), vp, density))
 }
 
 /// One comma-separated media query (already lowercased). A leading
 /// `not`/`only` is a prefix on the whole query (not an `and`-joined part);
 /// the rest is a media type and/or `and`-joined `(feature: value)` conditions.
-fn media_query_one(q: &str, vp: (f32, f32)) -> bool {
+fn media_query_one(q: &str, vp: (f32, f32), density: f32) -> bool {
     let mut q = q.trim();
     let mut negate = false;
     if let Some(rest) = q.strip_prefix("not ") {
@@ -8029,7 +8104,7 @@ fn media_query_one(q: &str, vp: (f32, f32)) -> bool {
             continue;
         }
         if let Some(inner) = part.strip_prefix('(') {
-            if !media_feature_matches(inner.trim_end_matches(')'), vp) {
+            if !media_feature_matches(inner.trim_end_matches(')'), vp, density) {
                 matches = false;
             }
         } else {
@@ -8058,7 +8133,7 @@ fn media_query_one(q: &str, vp: (f32, f32)) -> bool {
 /// 1dppx`). The preferences: `prefers-reduced-motion: reduce` (cells can't
 /// animate smoothly) and `prefers-color-scheme: dark` (the terminal
 /// aesthetic).
-fn media_feature_matches(inner: &str, vp: (f32, f32)) -> bool {
+fn media_feature_matches(inner: &str, vp: (f32, f32), density: f32) -> bool {
     let (vw, vh) = vp;
     let Some((name, value)) = inner.split_once(':') else {
         // No colon: the L4 range syntax when a comparison operator is
@@ -8123,12 +8198,12 @@ fn media_feature_matches(inner: &str, vp: (f32, f32)) -> bool {
         "update" => value == "fast",
         "scripting" => value == "enabled",
         "grid" => matches!(value, "1"),
-        "resolution" => media_dppx(value) == Some(1.0),
-        "min-resolution" => media_dppx(value).is_some_and(|n| n <= 1.0),
-        "max-resolution" => media_dppx(value).is_some_and(|n| n >= 1.0),
-        "-webkit-device-pixel-ratio" => num() == Some(1.0),
-        "-webkit-min-device-pixel-ratio" => num().is_some_and(|n| n <= 1.0),
-        "-webkit-max-device-pixel-ratio" => num().is_some_and(|n| n >= 1.0),
+        "resolution" => media_dppx(value) == Some(density),
+        "min-resolution" => media_dppx(value).is_some_and(|n| n <= density),
+        "max-resolution" => media_dppx(value).is_some_and(|n| n >= density),
+        "-webkit-device-pixel-ratio" => num() == Some(density),
+        "-webkit-min-device-pixel-ratio" => num().is_some_and(|n| n <= density),
+        "-webkit-max-device-pixel-ratio" => num().is_some_and(|n| n >= density),
         _ => false,
     }
 }
@@ -10142,6 +10217,16 @@ mod tests {
         assert!(media_query_matches("(resolution: 1dppx)", vp));
         assert!(media_query_matches("(min-resolution: 96dpi)", vp));
         assert!(!media_query_matches("(min-resolution: 2x)", vp));
+        assert!(media_query_matches_with_density(
+            "(resolution: 2dppx)",
+            vp,
+            2.0
+        ));
+        assert!(media_query_matches_with_density(
+            "(-webkit-min-device-pixel-ratio: 2)",
+            vp,
+            2.0
+        ));
         assert!(media_query_matches("(grid: 1)", vp), "we ARE a tty grid");
         assert!(media_query_matches("(color)", vp));
         assert!(!media_query_matches("(monochrome)", vp));

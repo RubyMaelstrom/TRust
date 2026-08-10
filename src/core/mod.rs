@@ -214,6 +214,9 @@ pub enum UserAction {
     Reload,
     Stop,
     Resize(CssSize),
+    /// Output-device pixels per CSS pixel (monitor scale / browser zoom
+    /// density), kept separate from CSS viewport geometry.
+    DevicePixelRatio(f32),
     Focus(bool),
     PointerMove(CssPoint),
     PointerButton {
@@ -381,6 +384,10 @@ pub struct InteractionState {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ActionOutcome {
     pub invalidated: bool,
+    /// The current document crossed a load-retirement boundary. Frontends must
+    /// stop their own document-scoped work while retaining completed pixels
+    /// needed to paint the frozen page until the replacement commits.
+    pub loading_retired: bool,
 }
 
 /// Durable browser/protocol controller shared by native frontends.
@@ -406,8 +413,10 @@ pub struct BrowserController {
     storage: crate::js::WebStorage,
     external_address: Option<String>,
     generation: u64,
+    document_generation: u64,
     status: String,
     viewport: CssSize,
+    device_pixel_ratio: f32,
     interaction: InteractionState,
 }
 
@@ -433,8 +442,10 @@ impl BrowserController {
             storage: Default::default(),
             external_address: None,
             generation: 0,
+            document_generation: 0,
             status: String::from("Ready"),
             viewport,
+            device_pixel_ratio: 1.0,
             interaction: InteractionState::default(),
         }
     }
@@ -462,10 +473,11 @@ impl BrowserController {
         self.current.as_ref()
     }
 
-    /// Changes whenever a navigation/reload generation starts. Frontends use
-    /// it solely to invalidate derived page layout caches.
+    /// Identity of the committed document. It changes only when a replacement
+    /// document commits, never while the old document remains visibly frozen
+    /// behind an in-progress or failed navigation.
     pub fn document_generation(&self) -> u64 {
-        self.generation
+        self.document_generation
     }
 
     pub fn invalidation_handle(&self) -> InvalidationHandle {
@@ -499,6 +511,7 @@ impl BrowserController {
         }
         self.external_address = Some(address.into());
         self.generation = self.generation.wrapping_add(1);
+        self.document_generation = self.generation;
         self.status = String::from("Connecting terminal session …");
         self.invalidation.request_redraw();
     }
@@ -519,6 +532,7 @@ impl BrowserController {
     }
 
     pub fn handle_action(&mut self, action: UserAction) -> ActionOutcome {
+        let generation_before = self.generation;
         let invalidated = match action {
             UserAction::Navigate(address) => self.begin_address(&address, NavigationIntent::New),
             UserAction::Back => self.begin_history(false),
@@ -526,7 +540,10 @@ impl BrowserController {
             UserAction::Reload => {
                 let Some(current) = &self.current else {
                     self.status = String::from("Nothing to reload.");
-                    return ActionOutcome { invalidated: true };
+                    return ActionOutcome {
+                        invalidated: true,
+                        loading_retired: false,
+                    };
                 };
                 self.begin_fetch(
                     current.target.clone(),
@@ -542,6 +559,20 @@ impl BrowserController {
                 } else {
                     self.viewport = size;
                     self.send_live(crate::js::PageCmd::Viewport(layout_viewport(size)));
+                    true
+                }
+            }
+            UserAction::DevicePixelRatio(ratio) => {
+                let ratio = if ratio.is_finite() && ratio > 0.0 {
+                    ratio
+                } else {
+                    1.0
+                };
+                if self.device_pixel_ratio == ratio {
+                    false
+                } else {
+                    self.device_pixel_ratio = ratio;
+                    self.send_live(crate::js::PageCmd::DevicePixelRatio(ratio));
                     true
                 }
             }
@@ -649,12 +680,16 @@ impl BrowserController {
             }
             UserAction::Key(_) | UserAction::TextInput(_) => false,
         };
-        ActionOutcome { invalidated }
+        ActionOutcome {
+            invalidated,
+            loading_retired: self.generation != generation_before,
+        }
     }
 
     /// Drain all async completions currently queued. Returns whether visible
     /// state changed and therefore a redraw should be requested.
-    pub fn process_async_events(&mut self) -> bool {
+    pub fn process_async_events(&mut self) -> ActionOutcome {
+        let generation_before = self.generation;
         let mut changed = false;
         while let Ok(event) = self.rx.try_recv() {
             match event {
@@ -668,7 +703,10 @@ impl BrowserController {
                 }
             }
         }
-        changed
+        ActionOutcome {
+            invalidated: changed,
+            loading_retired: self.generation != generation_before,
+        }
     }
 
     fn begin_address(&mut self, address: &str, intent: NavigationIntent) -> bool {
@@ -727,11 +765,19 @@ impl BrowserController {
         let tx = self.tx.clone();
         let invalidation = self.invalidation.clone();
         let viewport = self.viewport;
+        let device_pixel_ratio = self.device_pixel_ratio;
         let storage = self.storage.clone();
         self.task = Some(self.runtime.spawn(async move {
-            let result =
-                fetch_protocol_interactive(&target, fallback_http, None, viewport, storage, None)
-                    .await;
+            let result = fetch_protocol_interactive(
+                &target,
+                fallback_http,
+                None,
+                viewport,
+                device_pixel_ratio,
+                storage,
+                None,
+            )
+            .await;
             if tx
                 .send(CoreEvent::FetchFinished { generation, result })
                 .is_ok()
@@ -762,6 +808,7 @@ impl BrowserController {
                 };
                 self.status = page.status.clone();
                 let old = self.current.replace(page);
+                self.document_generation = generation;
                 match pending.intent {
                     NavigationIntent::New => {
                         if let Some(old) = old {
@@ -797,6 +844,9 @@ impl BrowserController {
                 if let Some(live) = live {
                     self.attach_live_page(generation, live);
                     self.send_live(crate::js::PageCmd::Viewport(layout_viewport(self.viewport)));
+                    self.send_live(crate::js::PageCmd::DevicePixelRatio(
+                        self.device_pixel_ratio,
+                    ));
                 }
             }
             Err(error) => {
@@ -825,7 +875,9 @@ impl BrowserController {
     }
 
     fn drop_live_page(&mut self) {
-        self.live_page = None;
+        if let Some(page) = self.live_page.take() {
+            page.retire();
+        }
         self.pending_live_submit = None;
         if let Some(task) = self.live_task.take() {
             task.abort();
@@ -971,11 +1023,19 @@ impl BrowserController {
         let tx = self.tx.clone();
         let invalidation = self.invalidation.clone();
         let viewport = self.viewport;
+        let device_pixel_ratio = self.device_pixel_ratio;
         let storage = self.storage.clone();
         self.task = Some(self.runtime.spawn(async move {
-            let result =
-                fetch_protocol_interactive(&target, false, None, viewport, storage, Some(body))
-                    .await;
+            let result = fetch_protocol_interactive(
+                &target,
+                false,
+                None,
+                viewport,
+                device_pixel_ratio,
+                storage,
+                Some(body),
+            )
+            .await;
             if tx
                 .send(CoreEvent::FetchFinished { generation, result })
                 .is_ok()
@@ -1025,6 +1085,7 @@ async fn fetch_protocol_interactive(
     fallback_http: bool,
     referrer: Option<&url::Url>,
     viewport: CssSize,
+    device_pixel_ratio: f32,
     storage: crate::js::WebStorage,
     post_body: Option<String>,
 ) -> Result<FetchedDocument, String> {
@@ -1059,7 +1120,14 @@ async fn fetch_protocol_interactive(
             viewport.width.round().clamp(1.0, f32::from(u16::MAX)) as u16,
             viewport.height.round().clamp(1.0, f32::from(u16::MAX)) as u16,
         );
-        response = http::execute_js(response, css_viewport, (1, 1), storage).await;
+        response = http::execute_js_for_device(
+            response,
+            css_viewport,
+            (1, 1),
+            device_pixel_ratio,
+            storage,
+        )
+        .await;
         Ok(FetchedDocument::Http(response))
     } else {
         fetch_protocol(target, fallback_http, referrer).await
@@ -1322,7 +1390,7 @@ mod tests {
         browser.handle_action(UserAction::Navigate(format!("http://{address}/")));
 
         wake_rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        assert!(browser.process_async_events());
+        assert!(browser.process_async_events().invalidated);
         assert!(!browser.snapshot().loading);
         assert!(matches!(
             browser.current_page().map(|page| &page.document),
@@ -1394,6 +1462,53 @@ mod tests {
         assert_eq!(
             browser.current_page().unwrap().address(),
             "gopher://one.example/1"
+        );
+    }
+
+    #[test]
+    fn navigation_retires_loading_without_reidentifying_the_visible_document() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(800.0, 600.0));
+        let target = |host: &str| {
+            Link::Gopher(gopher::GopherUrl {
+                host: host.to_string(),
+                port: 70,
+                item_type: '1',
+                selector: String::new(),
+            })
+        };
+        browser.generation = 1;
+        browser.pending = Some(PendingNavigation {
+            generation: 1,
+            target: target("old.example"),
+            fallback_http: false,
+            intent: NavigationIntent::New,
+        });
+        assert!(browser.finish_fetch(1, Ok(FetchedDocument::Gopher(vec![1]))));
+        assert_eq!(browser.document_generation(), 1);
+
+        let outcome = browser.handle_action(UserAction::Activate(target("next.example")));
+        assert!(outcome.loading_retired);
+        assert_eq!(
+            browser.document_generation(),
+            1,
+            "starting navigation must leave the frozen document's identity intact"
+        );
+        assert_eq!(
+            browser.current_page().unwrap().address(),
+            "gopher://old.example/1"
+        );
+
+        let generation = browser.pending.as_ref().unwrap().generation;
+        assert!(browser.finish_fetch(generation, Err(String::from("offline"))));
+        assert_eq!(browser.document_generation(), 1);
+        assert_eq!(
+            browser.current_page().unwrap().address(),
+            "gopher://old.example/1"
         );
     }
 }

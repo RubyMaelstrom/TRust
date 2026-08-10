@@ -240,20 +240,27 @@ impl Flow<'_> {
     /// applies the special cyclic-percentage constraints around this content.
     fn atom_intrinsic_w(&self, atom: &super::tree::Atom, mode: IMode, inl: &InlineStyle) -> f32 {
         match &atom.kind {
-            AtomKind::Img { url, alt } => {
-                let natural = url
-                    .as_deref()
-                    .and_then(|u| self.images.get(u))
-                    .filter(|&&(w, h)| w > 0 && h > 0)
-                    .map(|&(w, h)| (w as f32, h as f32));
+            AtomKind::Img {
+                url,
+                density,
+                dimension_source,
+                alt,
+            } => {
+                let natural = crate::responsive_image::density_corrected_size(
+                    url.as_deref().and_then(|url| self.images.get(url)),
+                    *density,
+                );
                 match super::replaced::size(
                     self.dom,
                     atom.node,
-                    natural,
+                    super::replaced::ImageInput {
+                        dimension_source: *dimension_source,
+                        natural,
+                        url: url.as_deref(),
+                    },
                     None,
                     None,
                     self.vp,
-                    url.as_deref(),
                 ) {
                     Some(r) => r.box_w,
                     None => text_intrinsic(alt, mode, inl),
@@ -284,9 +291,11 @@ impl Flow<'_> {
                         crate::doc::Link::Http(u) => Some(u.to_string()),
                         _ => None,
                     })
-                    .and_then(|p| self.images.get(&p).copied());
-                if let Some((w, _)) = poster.filter(|&(w, h)| w > 0 && h > 0) {
-                    return w as f32;
+                    .and_then(|p| {
+                        crate::responsive_image::density_corrected_size(self.images.get(&p), 1.0)
+                    });
+                if let Some((w, _)) = poster {
+                    return w;
                 }
                 let label = match media_source(self.dom, self.base, atom.node) {
                     Some((_, sn)) => media_label(self.dom, *video, sn),

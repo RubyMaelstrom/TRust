@@ -2226,14 +2226,21 @@ impl Flow<'_> {
                 children.extend(atom_frags);
             }
             Content::Atomic(atom) => match &atom.kind {
-                AtomKind::Img { url, alt: _ } => {
+                AtomKind::Img {
+                    url,
+                    density,
+                    dimension_source,
+                    alt: _,
+                } => {
                     // The imposed width IS the replaced item's used main
                     // size; the cross comes from its definite height, else
                     // through the natural ratio (§9.4 replaced hypothetical
                     // cross), else the natural/ratio-less fallbacks.
                     let line = self.img_line_at(
                         atom.node,
+                        *dimension_source,
                         url.as_deref(),
+                        *density,
                         content_w,
                         def_h,
                         &inl,
@@ -2386,18 +2393,20 @@ impl Flow<'_> {
     fn img_line_at<'t>(
         &self,
         node: NodeId,
+        dimension_source: NodeId,
         url: Option<&str>,
+        density: f32,
         content_w: f32,
         def_h: Option<f32>,
         inl: &InlineStyle,
         x: f32,
         y: f32,
     ) -> Frag<'t> {
-        let natural = url
-            .and_then(|u| self.images.get(u))
-            .filter(|&&(w, h)| w > 0 && h > 0)
-            .map(|&(w, h)| (w as f32, h as f32));
-        let ratio = super::replaced::ratio_of(self.dom, node, natural);
+        let natural = crate::responsive_image::density_corrected_size(
+            url.and_then(|url| self.images.get(url)),
+            density,
+        );
+        let ratio = super::replaced::ratio_of(self.dom, node, dimension_source, natural);
         let box_h = def_h
             .or_else(|| ratio.map(|r| content_w / r))
             .or(natural.map(|(_, nh)| nh))
@@ -2751,20 +2760,27 @@ impl Flow<'_> {
         // before any constraint solving.
         let replaced = match &b.content {
             Content::Atomic(atom) => match &atom.kind {
-                AtomKind::Img { url, .. } => {
-                    let natural = url
-                        .as_deref()
-                        .and_then(|u| self.images.get(u))
-                        .filter(|&&(w, h)| w > 0 && h > 0)
-                        .map(|&(w, h)| (w as f32, h as f32));
+                AtomKind::Img {
+                    url,
+                    density,
+                    dimension_source,
+                    ..
+                } => {
+                    let natural = crate::responsive_image::density_corrected_size(
+                        url.as_deref().and_then(|url| self.images.get(url)),
+                        *density,
+                    );
                     super::replaced::size(
                         self.dom,
                         atom.node,
-                        natural,
+                        super::replaced::ImageInput {
+                            dimension_source: *dimension_source,
+                            natural,
+                            url: url.as_deref(),
+                        },
                         Some(cb.w),
                         Some(cb.h),
                         self.vp,
-                        url.as_deref(),
                     )
                     .map(|r| (r.box_w, r.box_h))
                 }

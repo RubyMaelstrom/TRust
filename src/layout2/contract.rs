@@ -55,9 +55,10 @@ pub(crate) fn truncate_to_width(s: &str, max: usize) -> String {
 /// form controls as selectable `Link::Form` items.
 pub type ControlMap = HashMap<NodeId, (usize, usize)>;
 
-/// Map from an image's absolute URL to its intrinsic dimensions in image/CSS
-/// pixels. These are the decoded resource's natural dimensions, never a
-/// terminal-cell box; terminal image scaling happens after canonical layout.
+/// Map from an image's absolute URL to its decoded resource dimensions in
+/// image pixels. Responsive-image width/density descriptors apply their
+/// density correction per `<img>` before these become CSS natural dimensions;
+/// terminal image scaling happens only after canonical layout.
 pub type ImageSizes = HashMap<String, (u32, u32)>;
 
 /// The initial containing block for canonical HTML layout, in CSS pixels.

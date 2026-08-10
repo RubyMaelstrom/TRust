@@ -52,7 +52,10 @@ const IMAGE_FETCH_CONCURRENCY: usize = 8;
 /// expensive than fetching another bounded network wave, so this fallback must
 /// never interrupt an ordinary gallery burst every few hundred milliseconds.
 const IMAGE_PROGRESS_RELAYOUT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
-const PENDING_IMAGE_SIZE: (u32, u32) = (300, 150);
+/// Internal `ImageSizes` sentinel. Layout turns it into HTML's 300×150 CSS
+/// default object size without applying a responsive candidate's density; no
+/// decodable image can reach this pair (the decoder caps each axis at 12,000).
+const PENDING_IMAGE_SIZE: (u32, u32) = (u32::MAX, u32::MAX);
 
 #[derive(Debug)]
 enum DesktopEvent {
@@ -95,6 +98,7 @@ struct PageLayoutCache {
     generation: u64,
     revision: u64,
     viewport: CssSize,
+    device_pixel_ratio: f32,
     document: trust::http::GraphicalDocument,
     layout: trust::layout2::GraphicalLayout,
     title: String,
@@ -122,6 +126,7 @@ struct ImageLoadScheduler {
     pending: HashSet<ImageHandle>,
     failed: HashSet<ImageHandle>,
     completed: HashSet<ImageHandle>,
+    retired: bool,
 }
 
 impl ImageLoadScheduler {
@@ -136,6 +141,18 @@ impl ImageLoadScheduler {
         self.pending.clear();
         self.failed.clear();
         self.completed.clear();
+        self.retired = false;
+        true
+    }
+
+    fn retire(&mut self) -> bool {
+        if self.retired {
+            return false;
+        }
+        self.retired = true;
+        self.epoch = self.epoch.wrapping_add(1);
+        self.queued.clear();
+        self.pending.clear();
         true
     }
 
@@ -144,10 +161,13 @@ impl ImageLoadScheduler {
     }
 
     fn accepts(&self, generation: u64, image_epoch: u64) -> bool {
-        self.generation == Some(generation) && self.epoch == image_epoch
+        !self.retired && self.generation == Some(generation) && self.epoch == image_epoch
     }
 
     fn enqueue(&mut self, request: trust::render::ImageRequest) {
+        if self.retired {
+            return;
+        }
         if self.pending.contains(&request.handle)
             || self.failed.contains(&request.handle)
             || self.completed.contains(&request.handle)
@@ -159,6 +179,9 @@ impl ImageLoadScheduler {
     }
 
     fn take_ready(&mut self, slots: usize) -> Vec<trust::render::ImageRequest> {
+        if self.retired {
+            return Vec::new();
+        }
         (0..slots).filter_map(|_| self.queued.pop_front()).collect()
     }
 
@@ -178,6 +201,10 @@ impl ImageLoadScheduler {
         self.failed.remove(&handle);
         self.pending.remove(&handle);
         self.completed.insert(handle)
+    }
+
+    fn retry_evicted(&mut self, handle: ImageHandle) {
+        self.completed.remove(&handle);
     }
 }
 
@@ -200,6 +227,98 @@ fn image_sizes_for_layout(
         }
     }
     sizes
+}
+
+/// HTML lazy-image scheduling with a two-viewport look-ahead. Eager resources
+/// keep their existing immediate path; lazy resources enter the queue shortly
+/// before they can be painted. The returned visible set is also the only set
+/// allowed to retry after decoded-cache eviction, preventing an off-screen
+/// gallery from cycling forever through the bounded LRU.
+fn scheduled_page_images(
+    page: &PageLayoutCache,
+    scroll: CssPoint,
+    viewport: CssSize,
+) -> (Vec<trust::render::ImageRequest>, HashSet<ImageHandle>) {
+    let band = CssRect::new(
+        scroll.x - viewport.width,
+        scroll.y - viewport.height * 2.0,
+        viewport.width * 3.0,
+        viewport.height * 5.0,
+    );
+    let mut visible = HashSet::new();
+    collect_visible_image_handles(&page.layout.paint.primitives, band, &mut visible);
+    // Fixed-position image commands are viewport-relative. They are cheap and
+    // necessarily near the user whenever their layer is active.
+    for command in &page.layout.paint.fixed_primitives {
+        if let trust::render::DisplayCommand::Image { handle, .. } = command {
+            visible.insert(*handle);
+        }
+    }
+    let requests = page
+        .layout
+        .paint
+        .image_requests
+        .iter()
+        .filter(|request| {
+            !page.document.lazy_image_handles.contains(&request.handle)
+                || visible.contains(&request.handle)
+        })
+        .cloned()
+        .collect();
+    (requests, visible)
+}
+
+fn collect_visible_image_handles(
+    commands: &[trust::render::DisplayCommand],
+    band: CssRect,
+    visible: &mut HashSet<ImageHandle>,
+) {
+    let mut transform = trust::render::Affine2d::IDENTITY;
+    let mut stack = Vec::new();
+    for command in commands {
+        match command {
+            trust::render::DisplayCommand::PushTransform(next) => {
+                stack.push(transform);
+                transform = transform.then(*next);
+            }
+            trust::render::DisplayCommand::PopTransform => {
+                transform = stack.pop().unwrap_or(trust::render::Affine2d::IDENTITY);
+            }
+            trust::render::DisplayCommand::Image { rect, handle, .. } => {
+                let corners = [
+                    CssPoint::new(rect.x, rect.y),
+                    CssPoint::new(rect.x + rect.width, rect.y),
+                    CssPoint::new(rect.x, rect.y + rect.height),
+                    CssPoint::new(rect.x + rect.width, rect.y + rect.height),
+                ]
+                .map(|point| transform.map_point(point));
+                let left = corners
+                    .iter()
+                    .map(|point| point.x)
+                    .fold(f32::INFINITY, f32::min);
+                let right = corners
+                    .iter()
+                    .map(|point| point.x)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let top = corners
+                    .iter()
+                    .map(|point| point.y)
+                    .fold(f32::INFINITY, f32::min);
+                let bottom = corners
+                    .iter()
+                    .map(|point| point.y)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if left < band.x + band.width
+                    && right > band.x
+                    && top < band.y + band.height
+                    && bottom > band.y
+                {
+                    visible.insert(*handle);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 struct TerminalSession {
@@ -248,6 +367,10 @@ struct DesktopApp {
     cursor_icon: CursorIcon,
     modifiers: ModifiersState,
     focus: FocusTarget,
+    /// The command-line URL starts only after the native window reports its
+    /// real CSS viewport and device scale. Responsive scripts must not observe
+    /// the constructor's provisional 1x environment during initial parsing.
+    initial_navigation: Option<String>,
     initial_address_focus_pending: bool,
     address: TextEditor,
     find: TextEditor,
@@ -288,6 +411,7 @@ impl DesktopApp {
         runtime: Handle,
         event_proxy: EventLoopProxy<DesktopEvent>,
         renderer_preference: RendererPreference,
+        initial_navigation: Option<String>,
     ) -> Self {
         let style = chrome_text_style();
         Self {
@@ -307,6 +431,7 @@ impl DesktopApp {
             cursor_icon: CursorIcon::Default,
             modifiers: ModifiersState::empty(),
             focus: FocusTarget::Page,
+            initial_navigation,
             initial_address_focus_pending: true,
             address: TextEditor::new("", &style, 600.0, false),
             find: TextEditor::new("", &style, 500.0, false),
@@ -344,8 +469,12 @@ impl DesktopApp {
         generation: u64,
         page: &url::Url,
         requests: &[trust::render::ImageRequest],
+        visible_retries: &HashSet<ImageHandle>,
     ) {
         self.sync_image_document(generation, page);
+        if self.image_loads.retired {
+            return;
+        }
         let image_epoch = self.image_loads.epoch();
         for request in requests {
             if let Some(image) = self.image_store.get(request.handle) {
@@ -357,6 +486,12 @@ impl DesktopApp {
                     self.decoded_images_pending_layout = true;
                 }
                 continue;
+            }
+            if self.image_loads.completed.contains(&request.handle) {
+                if !visible_retries.contains(&request.handle) {
+                    continue;
+                }
+                self.image_loads.retry_evicted(request.handle);
             }
             self.image_loads.enqueue(request.clone());
         }
@@ -375,6 +510,22 @@ impl DesktopApp {
         // full decoded gallery would pin its high-water after navigation.
         self.image_store.clear();
         self.image_sizes.clear();
+        for (_, task) in self.image_tasks.drain() {
+            task.abort();
+        }
+        self.image_flush_scheduled = false;
+        self.decoded_images_pending_layout = false;
+    }
+
+    /// Stop all unfinished work owned by the displayed document while keeping
+    /// its completed layout and decoded pixels available as a frozen snapshot.
+    /// HTML §7.5.11's abort-a-document algorithm cancels document fetches and
+    /// discards their queued tasks; the epoch makes already-queued native
+    /// completion events equally inert.
+    fn retire_page_loading(&mut self) {
+        if !self.image_loads.retire() {
+            return;
+        }
         for (_, task) in self.image_tasks.drain() {
             task.abort();
         }
@@ -474,7 +625,11 @@ impl DesktopApp {
         if leaves_keyboard_target {
             self.keyboard_target = None;
         }
-        if self.browser.handle_action(action).invalidated {
+        let outcome = self.browser.handle_action(action);
+        if outcome.loading_retired {
+            self.retire_page_loading();
+        }
+        if outcome.invalidated {
             self.request_redraw();
         }
     }
@@ -513,6 +668,9 @@ impl DesktopApp {
             }
         });
         self.browser.open_external_session(address.clone());
+        self.retire_page_loading();
+        self.image_store.clear();
+        self.image_sizes.clear();
         self.page_layout = None;
         self.protocol_page = None;
         self.terminal = Some(TerminalSession {
@@ -535,6 +693,9 @@ impl DesktopApp {
         let scale = ScaleFactor::new(scale_factor.unwrap_or_else(|| window.scale_factor()));
         self.metrics =
             ViewportMetrics::from_physical(PhysicalSize::new(size.width, size.height), scale);
+        self.dispatch(UserAction::DevicePixelRatio(
+            self.metrics.scale_factor.get() as f32,
+        ));
         self.dispatch(UserAction::Resize(self.browser_viewport()));
     }
 
@@ -593,6 +754,7 @@ impl DesktopApp {
     }
 
     fn ensure_page_layout(&mut self, viewport: CssSize) {
+        let device_pixel_ratio = self.metrics.scale_factor.get() as f32;
         let generation = self.browser.document_generation();
         let revision = self.browser.snapshot().page_revision;
         let current_http_url = self.browser.current_page().and_then(|page| {
@@ -605,6 +767,7 @@ impl DesktopApp {
             cache.generation == generation
                 && cache.revision == revision
                 && cache.viewport == viewport
+                && cache.device_pixel_ratio == device_pixel_ratio
                 && current_http_url == Some(&cache.document.base)
         });
         if current {
@@ -620,9 +783,19 @@ impl DesktopApp {
                 return None;
             };
             if let Some(html) = page.rendered_html() {
-                trust::http::graphical_document_from_html(response, html, seed.as_deref())
+                trust::http::graphical_document_from_html_for_environment(
+                    response,
+                    html,
+                    seed.as_deref(),
+                    trust::layout2::Viewport::new(viewport.width, viewport.height),
+                    device_pixel_ratio,
+                )
             } else {
-                trust::http::graphical_document(response)
+                trust::http::graphical_document_for_environment(
+                    response,
+                    trust::layout2::Viewport::new(viewport.width, viewport.height),
+                    device_pixel_ratio,
+                )
             }
         });
         let layout_image_sizes = if let Some(document) = &document {
@@ -634,14 +807,14 @@ impl DesktopApp {
             // already-decoded intrinsic sizes and receives one bounded reflow
             // when this batch settles.
             let requests = document
-                .image_urls
+                .eager_image_urls
                 .iter()
                 .map(|source| trust::render::ImageRequest {
                     handle: ImageHandle::for_source(source),
                     source: source.clone(),
                 })
                 .collect::<Vec<_>>();
-            self.request_page_images(generation, &document.base, &requests);
+            self.request_page_images(generation, &document.base, &requests, &HashSet::new());
             image_sizes_for_layout(
                 &self.image_sizes,
                 &self.image_loads.failed,
@@ -685,6 +858,7 @@ impl DesktopApp {
                 generation,
                 revision,
                 viewport,
+                device_pixel_ratio,
                 document,
                 layout,
                 title,
@@ -910,18 +1084,9 @@ impl DesktopApp {
         let generation = self.browser.document_generation();
         if let Some(page) = &self.page_layout {
             let base = page.document.base.clone();
-            let mut requests = page.layout.paint.image_requests.clone();
-            // Paint commands only contain an image handle once canonical
-            // replaced sizing has enough intrinsic/CSS geometry to emit a
-            // box. HTML obtains image data before that point, so discovery
-            // must also use the parsed document's resolved source set.
-            requests.extend(page.document.image_urls.iter().map(|source| {
-                trust::render::ImageRequest {
-                    handle: ImageHandle::for_source(source),
-                    source: source.clone(),
-                }
-            }));
-            self.request_page_images(generation, &base, &requests);
+            let (requests, visible_retries) =
+                scheduled_page_images(page, self.browser.interaction().scroll, page_viewport);
+            self.request_page_images(generation, &base, &requests, &visible_retries);
         }
         if let Some(terminal) = &mut self.terminal {
             let line_mode = !terminal.char_mode();
@@ -2644,7 +2809,13 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             return;
         }
         self.update_metrics(None);
-        self.browser.process_async_events();
+        if let Some(address) = self.initial_navigation.take() {
+            self.navigate(address);
+        }
+        let outcome = self.browser.process_async_events();
+        if outcome.loading_retired {
+            self.retire_page_loading();
+        }
         self.apply_initial_address_focus();
         self.request_redraw();
     }
@@ -2659,11 +2830,17 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DesktopEvent) {
         match event {
             DesktopEvent::BrowserWake => {
-                let changed = self.browser.process_async_events();
-                if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
-                    eprintln!("desktop: browser wake changed={changed}");
+                let outcome = self.browser.process_async_events();
+                if outcome.loading_retired {
+                    self.retire_page_loading();
                 }
-                if changed {
+                if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
+                    eprintln!(
+                        "desktop: browser wake changed={} retired={}",
+                        outcome.invalidated, outcome.loading_retired
+                    );
+                }
+                if outcome.invalidated {
                     self.scroll_to_fragment();
                     self.request_redraw();
                 }
@@ -3398,10 +3575,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         runtime.handle().clone(),
         event_loop.create_proxy(),
         options.renderer,
+        options.address,
     );
-    if let Some(address) = options.address {
-        app.navigate(address);
-    }
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -3550,6 +3725,34 @@ mod tests {
     }
 
     #[test]
+    fn retiring_a_document_stops_requests_without_erasing_available_images() {
+        let page = url::Url::parse("https://example.com/gallery").unwrap();
+        let mut scheduler = ImageLoadScheduler::default();
+        assert!(scheduler.reset(7, &page));
+        let available = image_request(1);
+        let pending = image_request(2);
+        scheduler.mark_cached(available.handle);
+        scheduler.enqueue(pending.clone());
+        let active_epoch = scheduler.epoch();
+
+        assert!(scheduler.retire());
+        assert_ne!(scheduler.epoch(), active_epoch);
+        assert!(scheduler.pending.is_empty());
+        assert!(scheduler.completed.contains(&available.handle));
+        scheduler.enqueue(pending);
+        assert!(scheduler.take_ready(1).is_empty());
+        assert!(
+            !scheduler.reset(7, &page),
+            "painting the frozen document must not reactivate its scheduler"
+        );
+
+        let next = url::Url::parse("https://example.com/next").unwrap();
+        assert!(scheduler.reset(8, &next));
+        scheduler.enqueue(image_request(3));
+        assert_eq!(scheduler.take_ready(1).len(), 1);
+    }
+
+    #[test]
     fn cached_image_enters_available_state_only_once() {
         let page = url::Url::parse("https://example.com/").unwrap();
         let mut scheduler = ImageLoadScheduler::default();
@@ -3580,5 +3783,45 @@ mod tests {
         assert_eq!(sizes.get(&pending.source), Some(&PENDING_IMAGE_SIZE));
         assert_eq!(sizes.get(&available.source), Some(&(640, 480)));
         assert_eq!(sizes.get(&broken.source), None);
+    }
+
+    #[test]
+    fn lazy_visibility_applies_nested_transforms_and_skips_far_images() {
+        let near = image_request(1).handle;
+        let far = image_request(2).handle;
+        let commands = vec![
+            trust::render::DisplayCommand::PushTransform(trust::render::Affine2d::translate(
+                0.0, -800.0,
+            )),
+            trust::render::DisplayCommand::Image {
+                rect: CssRect::new(0.0, 900.0, 100.0, 100.0),
+                handle: near,
+                source_rect: None,
+                fit: trust::render::ImageFit::Contain,
+                sampling: trust::render::ImageSampling::Smooth,
+                clip: None,
+                node: 1,
+                link: None,
+            },
+            trust::render::DisplayCommand::PopTransform,
+            trust::render::DisplayCommand::Image {
+                rect: CssRect::new(0.0, 5_000.0, 100.0, 100.0),
+                handle: far,
+                source_rect: None,
+                fit: trust::render::ImageFit::Contain,
+                sampling: trust::render::ImageSampling::Smooth,
+                clip: None,
+                node: 2,
+                link: None,
+            },
+        ];
+        let mut visible = HashSet::new();
+        collect_visible_image_handles(
+            &commands,
+            CssRect::new(0.0, 0.0, 800.0, 1_800.0),
+            &mut visible,
+        );
+        assert!(visible.contains(&near));
+        assert!(!visible.contains(&far));
     }
 }
