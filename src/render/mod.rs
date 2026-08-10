@@ -489,16 +489,12 @@ pub struct PagePaint {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlId {
-    Back,
-    Forward,
-    Reload,
-    Stop,
-    Address,
-    Console,
     Find,
-    FindPrevious,
-    FindNext,
-    FindClose,
+    Command,
+    VerticalRail,
+    HorizontalRail,
+    VerticalHeart,
+    HorizontalHeart,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -510,14 +506,32 @@ pub struct EditorVisual {
 
 #[derive(Clone, Debug, Default)]
 pub struct ChromeModel {
-    pub address: EditorVisual,
-    pub address_focused: bool,
-    pub title: String,
+    pub command: Option<EditorVisual>,
     pub status: String,
+    pub status_label: String,
     pub link_preview: String,
     pub find: Option<EditorVisual>,
     pub find_count: Option<(usize, usize)>,
-    pub console: Option<EditorVisual>,
+    pub heart: HeartVisual,
+}
+
+/// Dynamic state for the two overlay heart scrollbars. Fractions are visual
+/// positions; document scroll remains authoritative in the controller.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HeartVisual {
+    pub vertical_visible: bool,
+    pub vertical_fraction: Option<f32>,
+    pub horizontal_fraction: Option<f32>,
+    pub energy: f32,
+    pub vertical_engaged: bool,
+    pub horizontal_engaged: bool,
+    pub dragging: Option<ScrollbarAxis>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollbarAxis {
+    Vertical,
+    Horizontal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1003,247 +1017,493 @@ fn shape_contains(shape: &PaintShape, point: CssPoint) -> bool {
     }
 }
 
-/// Build the permanent minimal desktop shell. This is graphical chrome—not a
-/// Ratatui frame. The desktop frontend appends the canonical page display list
-/// into the returned content viewport.
+pub const COMMAND_PANEL_HEIGHT: f32 = 122.0;
+pub const FIND_PANEL_HEIGHT: f32 = 64.0;
+const HEART_SIZE: f32 = 14.0;
+const HEART_HIT_SIZE: f32 = 26.0;
+const HEART_EDGE_INSET: f32 = 9.0;
+
+const fn theme_color(rgb: crate::theme::Rgb) -> PaintColor {
+    PaintColor::Rgba(rgb[0], rgb[1], rgb[2], 255)
+}
+
+const UI_BG: PaintColor = theme_color(crate::theme::BG);
+const UI_PINK: PaintColor = theme_color(crate::theme::NEON_PINK);
+const UI_CYAN: PaintColor = theme_color(crate::theme::NEON_CYAN);
+const UI_AMBER: PaintColor = theme_color(crate::theme::AMBER);
+const UI_DIM: PaintColor = theme_color(crate::theme::DIM);
+const HEART_DEPTH: PaintColor = PaintColor::Rgba(98, 17, 104, 255);
+const HEART_LIGHT: PaintColor = PaintColor::Rgba(255, 232, 246, 255);
+
+/// Build the chrome-free desktop surface. Browse mode gives the page the full
+/// client area; COMMAND/FIND reserve only their solid bottom instrument panel.
 pub fn desktop_shell(viewport: ViewportMetrics, browser: &BrowserSnapshot) -> Scene {
     desktop_chrome(
         viewport,
         browser,
         &ChromeModel {
-            address: EditorVisual {
-                text: browser.address.clone(),
-                ..EditorVisual::default()
-            },
-            address_focused: browser.focused,
             status: browser.status.clone(),
             ..ChromeModel::default()
         },
     )
 }
 
-/// Practical renderer-neutral desktop chrome. Every label and editable value
-/// is a retained Parley glyph run, consumed through the same display list and
-/// Vello/Glifo path as page text.
 pub fn desktop_chrome(
     viewport: ViewportMetrics,
-    browser: &BrowserSnapshot,
+    _browser: &BrowserSnapshot,
     model: &ChromeModel,
 ) -> Scene {
-    const BUTTON: f32 = 36.0;
-    const GAP: f32 = 8.0;
-    const TOP: f32 = 8.0;
-
-    let extra = if model.find.is_some() || model.console.is_some() {
-        38.0
+    let panel_height = if model.command.is_some() {
+        COMMAND_PANEL_HEIGHT
+    } else if model.find.is_some() {
+        FIND_PANEL_HEIGHT
     } else {
         0.0
-    };
-    let chrome_height: f32 = 82.0 + extra;
-
-    let width = viewport.css.width;
-    let height = viewport.css.height;
-    let mut primitives = Vec::with_capacity(48);
-    let whole = CssRect::new(0.0, 0.0, width, height);
-    let chrome = CssRect::new(0.0, 0.0, width, chrome_height.min(height));
+    }
+    .min(viewport.css.height);
     let content = CssRect::new(
         0.0,
-        chrome_height.min(height),
-        width,
-        (height - chrome_height).max(0.0),
+        0.0,
+        viewport.css.width,
+        (viewport.css.height - panel_height).max(0.0),
     );
-    primitives.push(Primitive::FillRect {
-        rect: whole,
-        color: PaintColor::Window,
-    });
-    primitives.push(Primitive::FillRect {
-        rect: chrome,
-        color: PaintColor::Chrome,
-    });
-    primitives.push(Primitive::FillRect {
-        rect: content,
-        color: PaintColor::Content,
-    });
-
-    let ids = [
-        (ControlId::Back, browser.can_go_back),
-        (ControlId::Forward, browser.can_go_forward),
-        (
-            ControlId::Reload,
-            !browser.loading && !browser.address.is_empty(),
-        ),
-        (ControlId::Stop, browser.loading),
-        (ControlId::Console, true),
-        (ControlId::Find, true),
-    ];
-    let mut controls = Vec::with_capacity(12);
-    for (index, (id, enabled)) in ids.into_iter().enumerate() {
-        let rect = CssRect::new(GAP + index as f32 * (BUTTON + GAP), TOP, BUTTON, BUTTON);
-        controls.push(ControlRegion { id, rect, enabled });
-        primitives.push(Primitive::FillRect {
-            rect,
-            color: if enabled {
-                PaintColor::Surface
-            } else {
-                PaintColor::Muted
-            },
-        });
-        add_control_icon(&mut primitives, id, rect, enabled);
-    }
-
-    let address_x = GAP + 6.0 * (BUTTON + GAP);
-    let address = CssRect::new(address_x, TOP, (width - address_x - GAP).max(0.0), BUTTON);
-    controls.push(ControlRegion {
-        id: ControlId::Address,
-        rect: address,
-        enabled: true,
-    });
-    primitives.push(Primitive::FillRect {
-        rect: address,
-        color: if model.address_focused {
-            PaintColor::Foreground
-        } else {
-            PaintColor::Surface
-        },
-    });
-    let inset = 2.0;
-    primitives.push(Primitive::FillRect {
-        rect: CssRect::new(
-            address.x + inset,
-            address.y + inset,
-            (address.width - inset * 2.0).max(0.0),
-            (address.height - inset * 2.0).max(0.0),
-        ),
-        color: PaintColor::Window,
-    });
-
-    paint_text_editor(
-        &mut primitives,
-        &model.address,
-        address,
-        PaintColor::Foreground,
-    );
-
-    if browser.loading {
-        primitives.push(Primitive::FillRect {
-            rect: CssRect::new(0.0, chrome.height - 3.0, (width * 0.32).max(24.0), 3.0),
-            color: PaintColor::Loading,
-        });
-    }
-
-    let title = if model.title.is_empty() {
-        "TRust Desktop"
-    } else {
-        model.title.as_str()
-    };
-    paint_chrome_text(
-        &mut primitives,
-        title,
-        CssPoint::new(GAP, 52.0),
-        13.0,
-        PaintColor::Foreground,
-        (width * 0.45).max(20.0),
-    );
-    let status = if model.link_preview.is_empty() {
-        model.status.as_str()
-    } else {
-        model.link_preview.as_str()
-    };
-    paint_chrome_text(
-        &mut primitives,
-        status,
-        CssPoint::new((width * 0.46).max(GAP), 52.0),
-        13.0,
-        PaintColor::Muted,
-        (width * 0.53 - GAP).max(20.0),
-    );
-
-    let overlay_y = 82.0;
-    if let Some(find) = &model.find {
-        let field = CssRect::new(GAP, overlay_y, (width - 174.0).max(80.0), 30.0);
-        controls.push(ControlRegion {
-            id: ControlId::Find,
-            rect: field,
-            enabled: true,
-        });
-        primitives.push(Primitive::FillRect {
-            rect: field,
-            color: PaintColor::Window,
-        });
-        paint_text_editor(&mut primitives, find, field, PaintColor::Foreground);
-        for (index, id) in [
-            ControlId::FindPrevious,
-            ControlId::FindNext,
-            ControlId::FindClose,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let rect = CssRect::new(width - 158.0 + index as f32 * 50.0, overlay_y, 44.0, 30.0);
-            controls.push(ControlRegion {
-                id,
-                rect,
-                enabled: true,
-            });
-            primitives.push(Primitive::FillRect {
-                rect,
-                color: PaintColor::Surface,
-            });
-            paint_chrome_text(
-                &mut primitives,
-                match id {
-                    ControlId::FindPrevious => "↑",
-                    ControlId::FindNext => "↓",
-                    _ => "×",
-                },
-                CssPoint::new(rect.x + 15.0, rect.y + 6.0),
-                15.0,
-                PaintColor::Foreground,
-                rect.width - 8.0,
-            );
-        }
-        if let Some((current, total)) = model.find_count {
-            paint_chrome_text(
-                &mut primitives,
-                &format!("{current}/{total}"),
-                CssPoint::new((field.x + field.width - 60.0).max(field.x), field.y + 7.0),
-                12.0,
-                PaintColor::Muted,
-                55.0,
-            );
-        }
-    } else if let Some(console) = &model.console {
-        let field = CssRect::new(GAP, overlay_y, (width - GAP * 2.0).max(80.0), 30.0);
-        controls.push(ControlRegion {
-            id: ControlId::Console,
-            rect: field,
-            enabled: true,
-        });
-        primitives.push(Primitive::FillRect {
-            rect: field,
-            color: PaintColor::Window,
-        });
-        paint_chrome_text(
-            &mut primitives,
-            ":",
-            CssPoint::new(field.x + 7.0, field.y + 6.0),
-            15.0,
-            PaintColor::Accent,
-            12.0,
-        );
-        let input = CssRect::new(field.x + 16.0, field.y, field.width - 16.0, field.height);
-        paint_text_editor(&mut primitives, console, input, PaintColor::Foreground);
-    }
-
     Scene {
         viewport,
-        primitives,
-        controls,
+        primitives: vec![Primitive::FillRect {
+            rect: CssRect::new(0.0, 0.0, viewport.css.width, viewport.css.height),
+            color: UI_BG,
+        }],
+        controls: Vec::new(),
         content_viewport: content,
         image_store: ImageStore::default(),
         page_scroll_containers: Vec::new(),
         page_size: CssSize::default(),
     }
+}
+
+/// Paint the lightweight TRust-owned overlay after the page display list. The
+/// hearts intentionally derive their range from the same `page_size`, viewport,
+/// and CSS-pixel scroll used by [`Scene::append_page`]. CSSOM View §4 clamps
+/// viewport scrolling to scrolling-area size minus viewport size.
+pub fn paint_desktop_overlay(scene: &mut Scene, _browser: &BrowserSnapshot, model: &ChromeModel) {
+    if let Some(command) = &model.command {
+        paint_command_panel(scene, command, model);
+    } else if let Some(find) = &model.find {
+        paint_find_panel(scene, find, model.find_count);
+    } else {
+        paint_browse_hints(scene, model);
+    }
+    paint_heart_scrollbars(scene, model.heart);
+}
+
+/// Normalized scrollbar position over the actual scrollable range. A fixed-size
+/// jewel can use this fraction without pretending its size is the viewport to
+/// document ratio.
+pub fn scrollbar_fraction(position: f32, content: f32, viewport: f32) -> Option<f32> {
+    let range = (content - viewport).max(0.0);
+    (range > f32::EPSILON).then(|| (position / range).clamp(0.0, 1.0))
+}
+
+/// Inverse of [`scrollbar_fraction`], used by heart dragging.
+pub fn scrollbar_position(fraction: f32, content: f32, viewport: f32) -> f32 {
+    fraction.clamp(0.0, 1.0) * (content - viewport).max(0.0)
+}
+
+/// Convert a thumb-center or rail-click coordinate into the same normalized
+/// range used for scroll state. CSSOM View's eventual position clamp is
+/// mirrored here so clicks outside the two end centers land exactly at an end.
+pub fn scrollbar_track_fraction(coordinate: f32, start: f32, end: f32) -> f32 {
+    if end > start {
+        ((coordinate - start) / (end - start)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn paint_command_panel(scene: &mut Scene, editor: &EditorVisual, model: &ChromeModel) {
+    let panel = CssRect::new(
+        0.0,
+        scene.content_viewport.y + scene.content_viewport.height,
+        scene.viewport.css.width,
+        COMMAND_PANEL_HEIGHT.min(scene.viewport.css.height),
+    );
+    scene.primitives.push(Primitive::FillRect {
+        rect: panel,
+        color: UI_BG,
+    });
+    let border_y = panel.y + 9.5;
+    scene.primitives.push(Primitive::Stroke {
+        shape: PaintShape::Path(vec![
+            PathElement::MoveTo(CssPoint::new(8.0, border_y)),
+            PathElement::LineTo(CssPoint::new(18.0, border_y)),
+            PathElement::MoveTo(CssPoint::new(118.0, border_y)),
+            PathElement::LineTo(CssPoint::new((panel.width - 8.0).max(118.0), border_y)),
+        ]),
+        brush: PaintBrush::Solid(UI_CYAN),
+        style: StrokeStyle::solid(1.0),
+    });
+    let plate = PaintShape::Path(vec![
+        PathElement::MoveTo(CssPoint::new(18.0, panel.y + 1.0)),
+        PathElement::LineTo(CssPoint::new(111.0, panel.y + 1.0)),
+        PathElement::LineTo(CssPoint::new(118.0, panel.y + 8.0)),
+        PathElement::LineTo(CssPoint::new(111.0, panel.y + 19.0)),
+        PathElement::LineTo(CssPoint::new(18.0, panel.y + 19.0)),
+        PathElement::Close,
+    ]);
+    scene.primitives.push(Primitive::Fill {
+        shape: plate,
+        brush: PaintBrush::Solid(UI_PINK),
+    });
+    paint_ui_text(
+        &mut scene.primitives,
+        "COMMAND",
+        CssPoint::new(29.0, panel.y + 2.5),
+        UI_BG,
+        80.0,
+        command_text_style(),
+    );
+
+    let input_y = panel.y + 27.0;
+    paint_ui_text(
+        &mut scene.primitives,
+        "trust>",
+        CssPoint::new(20.0, input_y + 3.0),
+        UI_CYAN,
+        58.0,
+        command_text_style(),
+    );
+    let input = CssRect::new(79.0, input_y, (panel.width - 95.0).max(1.0), 25.0);
+    scene.controls.push(ControlRegion {
+        id: ControlId::Command,
+        rect: CssRect::new(14.0, input_y - 3.0, (panel.width - 28.0).max(1.0), 31.0),
+        enabled: true,
+    });
+    paint_command_editor(&mut scene.primitives, editor, input);
+
+    let status_y = panel.y + 61.0;
+    let label = if model.status_label.is_empty() {
+        "TRUST"
+    } else {
+        model.status_label.as_str()
+    };
+    let label_width = (label.chars().count() as f32 * 9.5 + 10.0).clamp(46.0, 150.0);
+    scene.primitives.push(Primitive::FillRect {
+        rect: CssRect::new(18.0, status_y - 2.0, label_width, 21.0),
+        color: UI_PINK,
+    });
+    paint_ui_text(
+        &mut scene.primitives,
+        label,
+        CssPoint::new(23.0, status_y),
+        UI_BG,
+        label_width - 8.0,
+        command_text_style(),
+    );
+    paint_ui_text(
+        &mut scene.primitives,
+        &model.status,
+        CssPoint::new(27.0 + label_width, status_y),
+        UI_CYAN,
+        (panel.width - label_width - 48.0).max(1.0),
+        command_text_style(),
+    );
+
+    let keys_y = panel.y + 92.0;
+    paint_ui_text(
+        &mut scene.primitives,
+        "[KEYS]",
+        CssPoint::new(20.0, keys_y),
+        UI_AMBER,
+        62.0,
+        command_text_style(),
+    );
+    paint_ui_text(
+        &mut scene.primitives,
+        "TAB close  ENTER run/open  ↑↓ history  ESC stop  help reference",
+        CssPoint::new(83.0, keys_y),
+        UI_AMBER,
+        (panel.width - 100.0).max(1.0),
+        command_text_style(),
+    );
+}
+
+fn paint_find_panel(scene: &mut Scene, editor: &EditorVisual, count: Option<(usize, usize)>) {
+    let panel = CssRect::new(
+        0.0,
+        scene.content_viewport.y + scene.content_viewport.height,
+        scene.viewport.css.width,
+        FIND_PANEL_HEIGHT.min(scene.viewport.css.height),
+    );
+    scene.primitives.push(Primitive::FillRect {
+        rect: panel,
+        color: UI_BG,
+    });
+    scene.primitives.push(Primitive::FillRect {
+        rect: CssRect::new(0.0, panel.y, panel.width, 1.0),
+        color: UI_CYAN,
+    });
+    paint_ui_text(
+        &mut scene.primitives,
+        "FIND>",
+        CssPoint::new(20.0, panel.y + 13.0),
+        UI_PINK,
+        55.0,
+        command_text_style(),
+    );
+    let input = CssRect::new(76.0, panel.y + 10.0, (panel.width - 160.0).max(1.0), 25.0);
+    scene.controls.push(ControlRegion {
+        id: ControlId::Find,
+        rect: CssRect::new(14.0, panel.y + 7.0, (panel.width - 28.0).max(1.0), 31.0),
+        enabled: true,
+    });
+    paint_command_editor(&mut scene.primitives, editor, input);
+    let count = count.map_or_else(
+        || String::from("0/0"),
+        |(at, total)| format!("{at}/{total}"),
+    );
+    paint_ui_text(
+        &mut scene.primitives,
+        &count,
+        CssPoint::new((panel.width - 68.0).max(8.0), panel.y + 13.0),
+        UI_CYAN,
+        60.0,
+        command_text_style(),
+    );
+    paint_ui_text(
+        &mut scene.primitives,
+        "ENTER/↓ next  SHIFT+ENTER/↑ previous  TAB command  ESC stop",
+        CssPoint::new(20.0, panel.y + 39.0),
+        UI_AMBER,
+        (panel.width - 40.0).max(1.0),
+        command_text_style(),
+    );
+}
+
+fn paint_browse_hints(scene: &mut Scene, model: &ChromeModel) {
+    let bottom = scene.content_viewport.y + scene.content_viewport.height;
+    if !model.link_preview.is_empty() {
+        let style = command_text_style_with_size(12.0);
+        let shaped = crate::text::shape(&model.link_preview, &style);
+        let width = (shaped.advance + 18.0).min((scene.viewport.css.width - 24.0).max(1.0));
+        let rect = CssRect::new(6.0, (bottom - 27.0).max(0.0), width, 23.0);
+        scene
+            .primitives
+            .push(Primitive::FillRect { rect, color: UI_BG });
+        scene.primitives.push(Primitive::FillRect {
+            rect: CssRect::new(rect.x, rect.y, 2.0, rect.height),
+            color: UI_CYAN,
+        });
+        paint_ui_text(
+            &mut scene.primitives,
+            &model.link_preview,
+            CssPoint::new(rect.x + 9.0, rect.y + 3.0),
+            UI_CYAN,
+            (rect.width - 13.0).max(1.0),
+            style,
+        );
+    }
+    if model.link_preview.is_empty() {
+        paint_ui_text(
+            &mut scene.primitives,
+            "TAB · COMMAND",
+            CssPoint::new(10.0, (bottom - 14.0).max(0.0)),
+            UI_DIM,
+            108.0,
+            command_text_style_with_size(9.0),
+        );
+    }
+}
+
+fn paint_heart_scrollbars(scene: &mut Scene, heart: HeartVisual) {
+    let viewport = scene.content_viewport;
+    let vertical_range =
+        scrollbar_fraction(0.0, scene.page_size.height, scene.content_viewport.height);
+    let horizontal_range =
+        scrollbar_fraction(0.0, scene.page_size.width, scene.content_viewport.width);
+    if heart.vertical_visible || vertical_range.is_some() {
+        let actual = vertical_range.unwrap_or(0.0);
+        let fraction = heart.vertical_fraction.unwrap_or(actual).clamp(0.0, 1.0);
+        let (start, end) = vertical_heart_track(viewport, horizontal_range.is_some());
+        let center = CssPoint::new(
+            viewport.x + viewport.width - HEART_EDGE_INSET,
+            start + (end - start) * fraction,
+        );
+        let engaged = heart.vertical_engaged || heart.dragging == Some(ScrollbarAxis::Vertical);
+        if vertical_range.is_some() {
+            if engaged {
+                scene.primitives.push(Primitive::Stroke {
+                    shape: PaintShape::Path(vec![
+                        PathElement::MoveTo(CssPoint::new(center.x, start)),
+                        PathElement::LineTo(CssPoint::new(center.x, end)),
+                    ]),
+                    brush: PaintBrush::Solid(if heart.dragging == Some(ScrollbarAxis::Vertical) {
+                        UI_CYAN
+                    } else {
+                        UI_DIM
+                    }),
+                    style: StrokeStyle::solid(1.0),
+                });
+            }
+            scene.controls.push(ControlRegion {
+                id: ControlId::VerticalRail,
+                rect: CssRect::new(
+                    center.x - HEART_HIT_SIZE / 2.0,
+                    start,
+                    HEART_HIT_SIZE,
+                    (end - start).max(1.0),
+                ),
+                enabled: true,
+            });
+        }
+        paint_crystalline_heart(
+            &mut scene.primitives,
+            center,
+            HEART_SIZE
+                * (1.0 + heart.energy.clamp(0.0, 1.0) * 0.08)
+                * if engaged { 1.04 } else { 1.0 },
+            heart.energy.max(if engaged { 0.65 } else { 0.0 }),
+        );
+        scene.controls.push(ControlRegion {
+            id: ControlId::VerticalHeart,
+            rect: CssRect::new(
+                center.x - HEART_HIT_SIZE / 2.0,
+                center.y - HEART_HIT_SIZE / 2.0,
+                HEART_HIT_SIZE,
+                HEART_HIT_SIZE,
+            ),
+            // Even a non-scrolling document owns the visible overlay pixels;
+            // it simply cannot begin a drag until a real range exists.
+            enabled: true,
+        });
+    }
+    if let Some(actual) = horizontal_range {
+        let fraction = heart.horizontal_fraction.unwrap_or(actual).clamp(0.0, 1.0);
+        let (start, end) =
+            horizontal_heart_track(viewport, heart.vertical_visible || vertical_range.is_some());
+        let center = CssPoint::new(
+            start + (end - start) * fraction,
+            viewport.y + viewport.height - HEART_EDGE_INSET,
+        );
+        let engaged = heart.horizontal_engaged || heart.dragging == Some(ScrollbarAxis::Horizontal);
+        if engaged {
+            scene.primitives.push(Primitive::Stroke {
+                shape: PaintShape::Path(vec![
+                    PathElement::MoveTo(CssPoint::new(start, center.y)),
+                    PathElement::LineTo(CssPoint::new(end, center.y)),
+                ]),
+                brush: PaintBrush::Solid(if heart.dragging == Some(ScrollbarAxis::Horizontal) {
+                    UI_CYAN
+                } else {
+                    UI_DIM
+                }),
+                style: StrokeStyle::solid(1.0),
+            });
+        }
+        scene.controls.push(ControlRegion {
+            id: ControlId::HorizontalRail,
+            rect: CssRect::new(
+                start,
+                center.y - HEART_HIT_SIZE / 2.0,
+                (end - start).max(1.0),
+                HEART_HIT_SIZE,
+            ),
+            enabled: true,
+        });
+        paint_crystalline_heart(
+            &mut scene.primitives,
+            center,
+            HEART_SIZE
+                * (1.0 + heart.energy.clamp(0.0, 1.0) * 0.08)
+                * if engaged { 1.04 } else { 1.0 },
+            heart.energy.max(if engaged { 0.65 } else { 0.0 }),
+        );
+        scene.controls.push(ControlRegion {
+            id: ControlId::HorizontalHeart,
+            rect: CssRect::new(
+                center.x - HEART_HIT_SIZE / 2.0,
+                center.y - HEART_HIT_SIZE / 2.0,
+                HEART_HIT_SIZE,
+                HEART_HIT_SIZE,
+            ),
+            enabled: true,
+        });
+    }
+}
+
+pub fn vertical_heart_track(viewport: CssRect, reserve_corner: bool) -> (f32, f32) {
+    let start = viewport.y + HEART_HIT_SIZE / 2.0;
+    let end = (viewport.y + viewport.height
+        - HEART_HIT_SIZE / 2.0
+        - if reserve_corner { 18.0 } else { 0.0 })
+    .max(start);
+    (start, end)
+}
+
+pub fn horizontal_heart_track(viewport: CssRect, reserve_corner: bool) -> (f32, f32) {
+    let start = viewport.x + HEART_HIT_SIZE / 2.0;
+    let end = (viewport.x + viewport.width
+        - HEART_HIT_SIZE / 2.0
+        - if reserve_corner { 18.0 } else { 0.0 })
+    .max(start);
+    (start, end)
+}
+
+fn paint_crystalline_heart(
+    primitives: &mut Vec<Primitive>,
+    center: CssPoint,
+    size: f32,
+    energy: f32,
+) {
+    let scale = size / 14.0;
+    let point = |x: f32, y: f32| CssPoint::new(center.x + x * scale, center.y + y * scale);
+    let outer = PaintShape::Path(vec![
+        PathElement::MoveTo(point(0.0, -2.5)),
+        PathElement::LineTo(point(-3.6, -6.6)),
+        PathElement::LineTo(point(-6.8, -4.7)),
+        PathElement::LineTo(point(-6.8, -1.0)),
+        PathElement::LineTo(point(0.0, 6.8)),
+        PathElement::LineTo(point(6.8, -1.0)),
+        PathElement::LineTo(point(6.8, -4.7)),
+        PathElement::LineTo(point(3.6, -6.6)),
+        PathElement::Close,
+    ]);
+    primitives.push(Primitive::Fill {
+        shape: outer.clone(),
+        brush: PaintBrush::Solid(UI_PINK),
+    });
+    primitives.push(Primitive::Fill {
+        shape: PaintShape::Path(vec![
+            PathElement::MoveTo(point(-6.8, -1.0)),
+            PathElement::LineTo(point(0.0, 6.8)),
+            PathElement::LineTo(point(0.0, -2.5)),
+            PathElement::Close,
+        ]),
+        brush: PaintBrush::Solid(HEART_DEPTH),
+    });
+    primitives.push(Primitive::Fill {
+        shape: PaintShape::Path(vec![
+            PathElement::MoveTo(point(0.0, -2.5)),
+            PathElement::LineTo(point(3.6, -6.6)),
+            PathElement::LineTo(point(6.8, -4.7)),
+            PathElement::LineTo(point(4.6, -1.0)),
+            PathElement::Close,
+        ]),
+        brush: PaintBrush::Solid(if energy > 0.45 { UI_CYAN } else { UI_PINK }),
+    });
+    primitives.push(Primitive::Stroke {
+        shape: outer,
+        brush: PaintBrush::Solid(UI_CYAN),
+        style: StrokeStyle::solid((0.75 + energy.clamp(0.0, 1.0) * 0.45) * scale),
+    });
+    primitives.push(Primitive::Fill {
+        shape: PaintShape::Path(vec![
+            PathElement::MoveTo(point(-4.5, -4.4)),
+            PathElement::LineTo(point(-3.1, -5.2)),
+            PathElement::LineTo(point(-2.3, -3.9)),
+            PathElement::Close,
+        ]),
+        brush: PaintBrush::Solid(HEART_LIGHT),
+    });
 }
 
 pub fn paint_text_editor(
@@ -1272,6 +1532,32 @@ pub fn paint_text_editor(
         primitives.push(Primitive::FillRect {
             rect: caret.translate(origin.x, origin.y),
             color,
+        });
+    }
+    primitives.push(Primitive::PopClip);
+}
+
+fn paint_command_editor(primitives: &mut Vec<Primitive>, editor: &EditorVisual, rect: CssRect) {
+    let origin = CssPoint::new(rect.x, rect.y + 3.0);
+    primitives.push(Primitive::PushClip(PaintShape::Rect(rect)));
+    for selection in &editor.selection {
+        primitives.push(Primitive::FillRect {
+            rect: selection.translate(origin.x, origin.y),
+            color: UI_CYAN,
+        });
+    }
+    paint_ui_text(
+        primitives,
+        &editor.text,
+        origin,
+        UI_PINK,
+        rect.width.max(1.0),
+        command_text_style(),
+    );
+    if let Some(caret) = editor.caret {
+        primitives.push(Primitive::FillRect {
+            rect: caret.translate(origin.x, origin.y),
+            color: HEART_LIGHT,
         });
     }
     primitives.push(Primitive::PopClip);
@@ -1316,83 +1602,51 @@ fn paint_chrome_text(
     });
 }
 
-fn add_control_icon(primitives: &mut Vec<Primitive>, id: ControlId, rect: CssRect, enabled: bool) {
-    let color = if enabled {
-        PaintColor::Foreground
-    } else {
-        PaintColor::Chrome
-    };
-    let cx = rect.x + rect.width / 2.0;
-    let cy = rect.y + rect.height / 2.0;
-    match id {
-        ControlId::Back => primitives.push(Primitive::FillPolygon {
-            points: vec![
-                CssPoint::new(cx - 8.0, cy),
-                CssPoint::new(cx + 5.0, cy - 9.0),
-                CssPoint::new(cx + 5.0, cy + 9.0),
-            ],
+fn paint_ui_text(
+    primitives: &mut Vec<Primitive>,
+    text: &str,
+    origin: CssPoint,
+    color: PaintColor,
+    width: f32,
+    style: crate::text::TextStyle,
+) {
+    if text.is_empty() || width <= 0.0 {
+        return;
+    }
+    let end = crate::text::first_line_end(
+        text,
+        &style,
+        width,
+        crate::text::TextBreakStyle {
+            wrap: false,
+            ..crate::text::TextBreakStyle::default()
+        },
+    );
+    let shaped = crate::text::shape(text.get(..end).unwrap_or(text), &style);
+    primitives.push(Primitive::GlyphRun {
+        origin,
+        shaped,
+        color,
+        decoration: TextDecorationPaint {
             color,
-        }),
-        ControlId::Forward => primitives.push(Primitive::FillPolygon {
-            points: vec![
-                CssPoint::new(cx + 8.0, cy),
-                CssPoint::new(cx - 5.0, cy - 9.0),
-                CssPoint::new(cx - 5.0, cy + 9.0),
-            ],
-            color,
-        }),
-        ControlId::Reload => {
-            primitives.push(Primitive::FillRect {
-                rect: CssRect::new(cx - 8.0, cy - 8.0, 16.0, 5.0),
-                color,
-            });
-            primitives.push(Primitive::FillRect {
-                rect: CssRect::new(cx + 3.0, cy - 8.0, 5.0, 16.0),
-                color,
-            });
-            primitives.push(Primitive::FillPolygon {
-                points: vec![
-                    CssPoint::new(cx + 9.0, cy + 8.0),
-                    CssPoint::new(cx + 1.0, cy + 8.0),
-                    CssPoint::new(cx + 9.0, cy + 1.0),
-                ],
-                color,
-            });
-        }
-        ControlId::Stop => primitives.push(Primitive::FillRect {
-            rect: CssRect::new(cx - 7.0, cy - 7.0, 14.0, 14.0),
-            color,
-        }),
-        ControlId::Console => {
-            primitives.push(Primitive::FillRect {
-                rect: CssRect::new(cx - 9.0, cy - 8.0, 18.0, 16.0),
-                color,
-            });
-            primitives.push(Primitive::FillRect {
-                rect: CssRect::new(cx - 7.0, cy - 6.0, 14.0, 12.0),
-                color: PaintColor::Surface,
-            });
-        }
-        ControlId::Find => {
-            primitives.push(Primitive::Stroke {
-                shape: PaintShape::RoundedRect {
-                    rect: CssRect::new(cx - 8.0, cy - 8.0, 12.0, 12.0),
-                    radii: CornerRadii {
-                        corners: [(6.0, 6.0); 4],
-                    },
-                },
-                brush: PaintBrush::Solid(color),
-                style: StrokeStyle::solid(2.0),
-            });
-            primitives.push(Primitive::FillRect {
-                rect: CssRect::new(cx + 3.0, cy + 3.0, 8.0, 2.0),
-                color,
-            });
-        }
-        ControlId::Address
-        | ControlId::FindPrevious
-        | ControlId::FindNext
-        | ControlId::FindClose => {}
+            style: DecorationStyle::Solid,
+        },
+        clip: None,
+        node: 0,
+        link: None,
+    });
+}
+
+fn command_text_style() -> crate::text::TextStyle {
+    command_text_style_with_size(crate::theme::TERMINAL_FONT_SIZE_CSS_PX)
+}
+
+fn command_text_style_with_size(size: f32) -> crate::text::TextStyle {
+    crate::text::TextStyle {
+        family: crate::theme::TERMINAL_FONT_FAMILY.to_string(),
+        size,
+        weight: crate::theme::TERMINAL_FONT_WEIGHT,
+        ..crate::text::TextStyle::default()
     }
 }
 
@@ -1471,19 +1725,103 @@ mod tests {
     }
 
     #[test]
-    fn chrome_hit_testing_uses_css_coordinates_at_any_device_scale() {
+    fn browse_mode_has_no_placeholder_chrome_at_any_device_scale() {
         let viewport =
             ViewportMetrics::from_physical(PhysicalSize::new(1600, 1200), ScaleFactor::new(2.0));
         let scene = desktop_shell(viewport, &snapshot());
-        assert_eq!(scene.content_viewport.y, 82.0);
+        assert_eq!(scene.content_viewport, CssRect::new(0.0, 0.0, 800.0, 600.0));
+        assert!(scene.controls.is_empty());
+    }
+
+    #[test]
+    fn command_mode_reserves_only_its_bottom_panel() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(800, 600), ScaleFactor::default());
+        let model = ChromeModel {
+            command: Some(EditorVisual::default()),
+            ..ChromeModel::default()
+        };
+        let mut scene = desktop_chrome(viewport, &snapshot(), &model);
+        assert_eq!(scene.content_viewport.y, 0.0);
+        assert_eq!(scene.content_viewport.height, 600.0 - COMMAND_PANEL_HEIGHT);
+        paint_desktop_overlay(&mut scene, &snapshot(), &model);
         assert_eq!(
-            scene.control_at(CssPoint::new(20.0, 20.0)),
-            Some(ControlId::Back)
+            scene.control_at(CssPoint::new(300.0, 600.0 - COMMAND_PANEL_HEIGHT + 30.0)),
+            Some(ControlId::Command)
         );
-        assert_eq!(scene.control_at(CssPoint::new(64.0, 20.0)), None);
+    }
+
+    #[test]
+    fn heart_and_clickable_rail_map_to_the_scroll_range() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(800, 600), ScaleFactor::default());
+        let mut scene = desktop_shell(viewport, &snapshot());
+        scene.page_size = CssSize::new(800.0, 1_800.0);
+        let model = ChromeModel {
+            heart: HeartVisual {
+                vertical_visible: true,
+                vertical_fraction: Some(0.5),
+                ..HeartVisual::default()
+            },
+            ..ChromeModel::default()
+        };
+        paint_desktop_overlay(&mut scene, &snapshot(), &model);
+        let heart = scene
+            .controls
+            .iter()
+            .find(|control| control.id == ControlId::VerticalHeart)
+            .expect("scrollable pages expose the heart thumb");
+        assert_eq!(HEART_SIZE, 14.0);
+        assert_eq!((heart.rect.width, heart.rect.height), (26.0, 26.0));
+        assert_eq!(heart.rect.y + heart.rect.height / 2.0, 300.0);
         assert_eq!(
-            scene.control_at(CssPoint::new(300.0, 20.0)),
-            Some(ControlId::Address)
+            scene.control_at(CssPoint::new(788.0, 100.0)),
+            Some(ControlId::VerticalRail)
+        );
+        assert_eq!(
+            scene.control_at(CssPoint::new(788.0, 300.0)),
+            Some(ControlId::VerticalHeart),
+            "the jewel must win hit testing over its rail"
+        );
+        assert_eq!(scrollbar_fraction(600.0, 1_800.0, 600.0), Some(0.5));
+        assert_eq!(scrollbar_position(0.5, 1_800.0, 600.0), 600.0);
+        assert_eq!(scrollbar_track_fraction(300.0, 13.0, 587.0), 0.5);
+        assert_eq!(scrollbar_track_fraction(-20.0, 13.0, 587.0), 0.0);
+        assert_eq!(scrollbar_track_fraction(900.0, 13.0, 587.0), 1.0);
+        assert!(
+            !scene
+                .controls
+                .iter()
+                .any(|control| control.id == ControlId::HorizontalHeart),
+            "a fitting page must not grow a horizontal scrollbar"
+        );
+    }
+
+    #[test]
+    fn genuine_horizontal_overflow_gets_a_clickable_rail_and_heart() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(800, 600), ScaleFactor::default());
+        let mut scene = desktop_shell(viewport, &snapshot());
+        scene.page_size = CssSize::new(1_600.0, 1_800.0);
+        let model = ChromeModel {
+            heart: HeartVisual {
+                vertical_visible: true,
+                vertical_fraction: Some(0.5),
+                horizontal_fraction: Some(0.5),
+                ..HeartVisual::default()
+            },
+            ..ChromeModel::default()
+        };
+        paint_desktop_overlay(&mut scene, &snapshot(), &model);
+        assert_eq!(
+            scene.control_at(CssPoint::new(100.0, 588.0)),
+            Some(ControlId::HorizontalRail)
+        );
+        assert!(
+            scene
+                .controls
+                .iter()
+                .any(|control| control.id == ControlId::HorizontalHeart)
         );
     }
 

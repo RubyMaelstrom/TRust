@@ -24,6 +24,7 @@ pub fn release_allocator_memory() {
 }
 
 pub mod accessibility;
+pub mod command;
 pub mod core;
 pub mod render;
 pub mod responsive_image;

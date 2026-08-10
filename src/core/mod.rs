@@ -288,6 +288,23 @@ where
 struct HistoryEntry {
     target: Link,
     fallback_http: bool,
+    /// Trusted in-process documents have no transport to refetch from.
+    /// Retain their small source so Back/Forward uses the same history path.
+    internal_source: Option<Vec<u8>>,
+}
+
+impl HistoryEntry {
+    fn from_page(page: BrowserPage) -> Self {
+        let internal_source = match page.document {
+            FetchedDocument::Internal(source) => Some(source),
+            _ => None,
+        };
+        Self {
+            target: page.target,
+            fallback_http: page.fallback_http,
+            internal_source,
+        }
+    }
 }
 
 /// Raw protocol result retained by the shared controller. HTTP responses feed
@@ -299,6 +316,8 @@ pub enum FetchedDocument {
     Gemini(gemini::Response),
     Http(http::Response),
     OneShot(Vec<u8>),
+    /// A trusted, in-process Gemtext document such as `about:help`.
+    Internal(Vec<u8>),
 }
 
 #[derive(Debug)]
@@ -493,6 +512,71 @@ impl BrowserController {
         self.invalidation.request_redraw();
     }
 
+    /// Apply the process-wide in-memory cookie preference through the shared
+    /// browser boundary, so frontends do not reach through to HTTP internals.
+    pub fn set_cookies_enabled(&mut self, enabled: bool) {
+        http::set_cookies_enabled(enabled);
+        self.set_status(if enabled {
+            "Cookies on: RAM-only, exact-host only."
+        } else {
+            "Cookies off."
+        });
+    }
+
+    /// Start a typed COMMAND `post` through the same request and navigation
+    /// commit path used by an HTML form submission.
+    pub fn post(&mut self, url: url::Url, body: String) -> ActionOutcome {
+        let generation_before = self.generation;
+        self.begin_post(url, body);
+        self.invalidation.request_redraw();
+        ActionOutcome {
+            invalidated: true,
+            loading_retired: self.generation != generation_before,
+        }
+    }
+
+    /// Commit a trusted in-process Gemtext document through the ordinary
+    /// graphical document/history path. This is the desktop counterpart of
+    /// the terminal frontend's `about:` pages and keeps their shared source
+    /// scrollable, selectable, and reachable through browser history.
+    pub fn open_internal_gemtext(
+        &mut self,
+        address: impl Into<String>,
+        source: impl Into<Vec<u8>>,
+    ) -> ActionOutcome {
+        let generation_before = self.generation;
+        self.begin_internal_gemtext(
+            Link::External(address.into()),
+            source.into(),
+            NavigationIntent::New,
+        );
+        ActionOutcome {
+            invalidated: true,
+            loading_retired: self.generation != generation_before,
+        }
+    }
+
+    fn begin_internal_gemtext(&mut self, target: Link, source: Vec<u8>, intent: NavigationIntent) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        self.drop_live_page();
+        self.external_address = None;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        self.pending = Some(PendingNavigation {
+            generation,
+            target,
+            fallback_http: false,
+            intent,
+        });
+        // `finish_fetch` is deliberately reused so internal documents obey
+        // exactly the same history, scroll reset, and commit transitions as a
+        // protocol response, without starting a network task.
+        let _ = self.finish_fetch(generation, Ok(FetchedDocument::Internal(source)));
+        self.invalidation.request_redraw();
+    }
+
     /// Install a frontend-owned protocol view (currently the graphical VT
     /// session) into shared chrome without introducing terminal-emulator state
     /// into the browser/layout core.
@@ -503,10 +587,7 @@ impl BrowserController {
         self.drop_live_page();
         self.pending = None;
         if let Some(old) = self.current.take() {
-            self.back.push(HistoryEntry {
-                target: old.target,
-                fallback_http: old.fallback_http,
-            });
+            self.back.push(HistoryEntry::from_page(old));
             self.forward.clear();
         }
         self.external_address = Some(address.into());
@@ -735,6 +816,18 @@ impl BrowserController {
             };
             return true;
         };
+        if let Some(source) = entry.internal_source {
+            self.begin_internal_gemtext(
+                entry.target,
+                source,
+                if forward {
+                    NavigationIntent::Forward
+                } else {
+                    NavigationIntent::Back
+                },
+            );
+            return true;
+        }
         self.begin_fetch(
             entry.target,
             entry.fallback_http,
@@ -812,10 +905,7 @@ impl BrowserController {
                 match pending.intent {
                     NavigationIntent::New => {
                         if let Some(old) = old {
-                            self.back.push(HistoryEntry {
-                                target: old.target,
-                                fallback_http: old.fallback_http,
-                            });
+                            self.back.push(HistoryEntry::from_page(old));
                         }
                         self.forward.clear();
                     }
@@ -823,19 +913,13 @@ impl BrowserController {
                     NavigationIntent::Back => {
                         let _ = self.back.pop();
                         if let Some(old) = old {
-                            self.forward.push(HistoryEntry {
-                                target: old.target,
-                                fallback_http: old.fallback_http,
-                            });
+                            self.forward.push(HistoryEntry::from_page(old));
                         }
                     }
                     NavigationIntent::Forward => {
                         let _ = self.forward.pop();
                         if let Some(old) = old {
-                            self.back.push(HistoryEntry {
-                                target: old.target,
-                                fallback_http: old.fallback_http,
-                            });
+                            self.back.push(HistoryEntry::from_page(old));
                         }
                     }
                 }
@@ -857,14 +941,20 @@ impl BrowserController {
     }
 
     fn stop(&mut self) -> bool {
-        let Some(pending) = self.pending.take() else {
+        let pending = self.pending.take();
+        let had_live_page = self.live_page.is_some() || self.live_task.is_some();
+        if pending.is_none() && !had_live_page {
             return false;
-        };
+        }
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        self.drop_live_page();
         self.generation = self.generation.wrapping_add(1);
-        self.status = format!("Stopped loading {}.", pending.target);
+        self.status = pending.map_or_else(
+            || String::from("Stopped — page scripts killed."),
+            |pending| format!("Stopped loading {} — page scripts killed.", pending.target),
+        );
         true
     }
 
@@ -1152,10 +1242,11 @@ fn fetched_status(target: &Link, document: &FetchedDocument) -> String {
         }
         FetchedDocument::Gopher(bytes) => format!("{target} — {} bytes", bytes.len()),
         FetchedDocument::OneShot(bytes) => format!("{target} — {} bytes", bytes.len()),
+        FetchedDocument::Internal(_) => target.to_string(),
     }
 }
 
-/// Parse an address-bar target into a fetchable protocol target. A bare host is
+/// Parse a typed navigation target into a fetchable protocol target. A bare host is
 /// HTTPS with HTTP fallback, matching the existing terminal address behavior.
 pub fn parse_navigation_target(address: &str) -> Result<(Link, bool), String> {
     let address = address.trim();
@@ -1462,6 +1553,34 @@ mod tests {
         assert_eq!(
             browser.current_page().unwrap().address(),
             "gopher://one.example/1"
+        );
+    }
+
+    #[test]
+    fn internal_documents_use_the_normal_back_and_forward_trail() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(800.0, 600.0));
+
+        browser.open_internal_gemtext("about:help", b"# help".to_vec());
+        browser.open_internal_gemtext("about:status", b"# status".to_vec());
+        assert!(browser.snapshot().can_go_back);
+
+        browser.handle_action(UserAction::Back);
+        let page = browser.current_page().expect("back commits synchronously");
+        assert_eq!(page.address(), "about:help");
+        assert!(matches!(&page.document, FetchedDocument::Internal(source) if source == b"# help"));
+
+        browser.handle_action(UserAction::Forward);
+        let page = browser
+            .current_page()
+            .expect("forward commits synchronously");
+        assert_eq!(page.address(), "about:status");
+        assert!(
+            matches!(&page.document, FetchedDocument::Internal(source) if source == b"# status")
         );
     }
 
