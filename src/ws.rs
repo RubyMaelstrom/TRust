@@ -90,12 +90,12 @@ pub fn connect(
     handle: &tokio::runtime::Handle,
     id: usize,
     events: mpsc::Sender<(usize, WsIn)>,
-) -> mpsc::Sender<WsOut> {
+) -> (mpsc::Sender<WsOut>, tokio::task::JoinHandle<()>) {
     let (out_tx, out_rx) = mpsc::channel::<WsOut>(64);
-    handle.spawn(async move {
+    let task = handle.spawn(async move {
         run_session(url, origin, cookie, id, events, out_rx).await;
     });
-    out_tx
+    (out_tx, task)
 }
 
 async fn run_session(

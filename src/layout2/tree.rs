@@ -24,7 +24,7 @@
 
 use url::Url;
 
-use crate::doc::{FieldKind, Form, Link};
+use crate::doc::{FieldKind, Form};
 use crate::dom::{DOCUMENT, Dom, NodeData, NodeId, PseudoEl};
 use crate::layout2::{ControlMap, Units, css_length_px, format_list_marker, is_collapsible_space};
 
@@ -43,7 +43,12 @@ pub(crate) struct Atom {
 pub(crate) enum AtomKind {
     /// An `<img>`: the resolved absolute URL (http(s)/`data:`/`blob:`) and the
     /// alt text fallback for the not-yet-decoded state.
-    Img { url: Option<String>, alt: String },
+    Img {
+        url: Option<String>,
+        density: f32,
+        dimension_source: NodeId,
+        alt: String,
+    },
     /// A form control, rendered as its widget label (`Field::row_label`).
     Control { form: usize, field: usize },
     /// A `<video>`/`<audio>` media representation (the "play in mpv"
@@ -521,8 +526,13 @@ impl Builder<'_> {
     /// paths): its atom kind, a skip (nothing to draw), or not-replaced.
     fn replaced(&mut self, id: NodeId, tag: &str) -> Replaced {
         if tag == "img" {
+            let selected = self.image_src(id);
             return Replaced::Atom(AtomKind::Img {
-                url: self.image_src(id),
+                url: selected.as_ref().map(|selected| selected.source.clone()),
+                density: selected.as_ref().map_or(1.0, |selected| selected.density),
+                dimension_source: selected
+                    .as_ref()
+                    .map_or(id, |selected| selected.dimension_source),
                 alt: self
                     .dom
                     .attr(id, "alt")
@@ -1141,21 +1151,18 @@ impl Builder<'_> {
         specs
     }
 
-    /// The absolute URL of an `<img>`'s `src`: `data:`/`blob:` key on the URL
-    /// itself (blob bytes come from `Doc.blobs`, never the wire); http(s)
-    /// resolves against the base; other schemes have no image pipeline.
-    fn image_src(&self, id: NodeId) -> Option<String> {
-        let src = self.dom.attr(id, "src")?.trim();
-        if src.is_empty() {
-            return None;
-        }
-        if src.starts_with("data:") || src.starts_with("blob:") {
-            return Some(src.to_string());
-        }
-        match crate::http::resolve(self.base, src) {
-            Link::Http(u) => Some(u.to_string()),
-            _ => None,
-        }
+    /// WHATWG HTML's selected responsive-image source. One selector owns URL,
+    /// density, picture ordering, media/type filtering, and dimension hints for
+    /// discovery, layout, and the live `currentSrc` API.
+    fn image_src(&self, id: NodeId) -> Option<crate::responsive_image::SelectedImage> {
+        let selected = crate::responsive_image::select(
+            self.dom,
+            id,
+            self.base,
+            crate::layout2::Viewport::new(self.vp.w, self.vp.h),
+            self.dom.device_pixel_ratio(),
+        )?;
+        crate::responsive_image::loadable_source(&selected).then_some(selected)
     }
 }
 

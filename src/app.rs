@@ -3701,7 +3701,9 @@ impl App {
     }
 
     fn drop_live_page(&mut self) {
-        self.live_page = None;
+        if let Some(page) = self.live_page.take() {
+            page.retire();
+        }
         self.page_rx = None;
         self.last_scroll_sent = None;
         self.image_sizes_sent = None;
@@ -8770,7 +8772,7 @@ mod tests {
             &Default::default(),
         ));
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        app.live_page = Some(crate::js::PageHandle { cmds: tx });
+        app.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
 
         // Mouse over the anchor → pending target 42; the commit sends it.
         let (x, y, _) = item_point(&app, |it| it.text.contains("next"));
@@ -9307,7 +9309,7 @@ mod tests {
         // sends its new scrollTop back so a conditional pin learns we scrolled.
         let mut app = region_app_with_node(None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        app.live_page = Some(crate::js::PageHandle { cmds: tx });
+        app.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
         let start_row = app.browser.as_ref().unwrap().doc.regions[0].start_row;
         let rg_row = app.last_content_area.y + start_row as u16 + 1;
         app.on_mouse_event(mouse(
@@ -9330,7 +9332,7 @@ mod tests {
     fn sync_region_state_pushes_geometry_then_dedups() {
         let mut app = region_app_with_node(None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-        app.live_page = Some(crate::js::PageHandle { cmds: tx });
+        app.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
         app.sync_region_state();
         match rx.try_recv().expect("a RegionGeom push") {
             crate::js::PageCmd::RegionGeom { items } => {

@@ -75,7 +75,89 @@ pub use contract::*;
 pub use terminal::set_borders_enabled;
 
 use flow::Flow;
-use value::Vp;
+use value::{Len, Vp};
+
+/// Resolve HTML's `<source-size-value>` through the same CSS Values parser as
+/// layout. Percentages are excluded by the HTML `sizes` grammar; `auto` and
+/// non-length sizing keywords likewise do not produce a source size here.
+pub(crate) fn image_source_size_px(
+    dom: &Dom,
+    node: NodeId,
+    value: &str,
+    viewport: Viewport,
+) -> Option<f32> {
+    if contains_css_percentage(value) || contains_non_math_css_function(value) {
+        return None;
+    }
+    Len::parse(
+        value,
+        Units::of(dom, node),
+        Vp {
+            w: viewport.width,
+            h: viewport.height,
+        },
+    )
+    .and_then(|length| length.resolve(None))
+    .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn contains_non_math_css_function(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_alphabetic() || matches!(bytes[index], b'-' | b'_') {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'-' | b'_'))
+            {
+                index += 1;
+            }
+            let mut next = index;
+            while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                next += 1;
+            }
+            if bytes.get(next) == Some(&b'(') {
+                let name = value[start..index].to_ascii_lowercase();
+                // These are the CSS math functions the shared length engine
+                // currently evaluates. Other CSS functions are invalid in a
+                // source-size value; newer math functions fail closed until
+                // their numeric evaluator is available here.
+                if !matches!(name.as_str(), "calc" | "min" | "max" | "clamp") {
+                    return true;
+                }
+            }
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
+fn contains_css_percentage(value: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+        } else if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if ch == '%' {
+            return true;
+        }
+    }
+    false
+}
 
 /// Canonical graphical result: a CSS-pixel display list plus the same fragment
 /// geometry consumed by CSSOM View. No terminal or device-pixel types occur.
@@ -541,13 +623,13 @@ fn page_media_fallback(
         .map(|m| m.target)
         .unwrap_or_else(|| base.clone());
     let link = Some(Link::Media(target));
-    let poster = crate::layout2::page_preview_image(dom, base)
-        .and_then(|p| images.get(&p).map(|&(w, h)| (p, w, h)))
-        .filter(|&(_, w, h)| w > 0 && h > 0);
+    let poster = crate::layout2::page_preview_image(dom, base).and_then(|p| {
+        crate::responsive_image::density_corrected_size(images.get(&p), 1.0).map(|(w, h)| (p, w, h))
+    });
     let item = match poster {
         Some((url, iw, ih)) => {
             let w = (iw as usize).min(cols).max(1) as u16;
-            let h = ((ih * u32::from(w)) / iw).max(1) as u16;
+            let h = (ih * f32::from(w) / iw).max(1.0) as u16;
             Item {
                 col: 0,
                 width: w,
@@ -1328,6 +1410,32 @@ mod tests {
         assert!((image.y + image.height - line.baseline).abs() < 0.01);
         assert!((origin.y + shaped.baseline - line.baseline).abs() < 0.01);
         assert!(origin.x >= image.x + image.width - 0.01);
+    }
+
+    #[test]
+    fn responsive_density_corrects_decoded_natural_dimensions() {
+        let images = HashMap::from([("http://e.com/two.png".to_string(), (600u32, 400u32))]);
+        let layout = lay_graphical(
+            r#"<body style="margin:0"><img src="giant.png"
+                srcset="two.png 600w, giant.png 3840w"
+                sizes="300px"></body>"#,
+            800.0,
+            &images,
+        );
+        let image = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                crate::render::Primitive::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .expect("selected responsive image paint operation");
+        assert_eq!((image.width, image.height), (300.0, 200.0));
+        assert_eq!(
+            layout.paint.image_requests[0].source,
+            "http://e.com/two.png"
+        );
     }
 
     #[test]

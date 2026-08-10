@@ -109,9 +109,27 @@ pub struct GraphicalDocument {
     pub forms: Vec<Form>,
     pub controls: crate::layout2::ControlMap,
     pub image_urls: Vec<String>,
+    /// Selected sources whose `img` is not in HTML's Lazy state, plus posters
+    /// and page-level previews. These retain the existing eager overlap with
+    /// layout; lazy sources wait for the frontend's viewport prefetch band.
+    pub eager_image_urls: Vec<String>,
+    /// A source is lazy only when every `img` selecting it is lazy. Shared
+    /// eager/lazy URLs are eager, matching the eager request's stronger need.
+    pub lazy_image_handles: std::collections::HashSet<crate::render::ImageHandle>,
 }
 
 pub fn graphical_document(response: &Response) -> Option<GraphicalDocument> {
+    graphical_document_for_environment(response, crate::layout2::Viewport::new(960.0, 558.0), 1.0)
+}
+
+/// Parse a graphical document for the frontend's real responsive-image
+/// environment. CSS layout stays in CSS pixels; the device scale is used only
+/// by HTML's source-candidate selection.
+pub fn graphical_document_for_environment(
+    response: &Response,
+    viewport: crate::layout2::Viewport,
+    device_pixel_ratio: f32,
+) -> Option<GraphicalDocument> {
     let media = response
         .content_type
         .split(';')
@@ -123,7 +141,13 @@ pub fn graphical_document(response: &Response) -> Option<GraphicalDocument> {
         return None;
     }
     let html = decode_body(&response.content_type, &response.body);
-    graphical_document_from_html(response, &html, None)
+    graphical_document_from_html_for_environment(
+        response,
+        &html,
+        None,
+        viewport,
+        device_pixel_ratio,
+    )
 }
 
 /// Build the graphical presentation from a resident page actor's latest
@@ -133,6 +157,22 @@ pub fn graphical_document_from_html(
     response: &Response,
     html: &str,
     seed: Option<&[Form]>,
+) -> Option<GraphicalDocument> {
+    graphical_document_from_html_for_environment(
+        response,
+        html,
+        seed,
+        crate::layout2::Viewport::new(960.0, 558.0),
+        1.0,
+    )
+}
+
+pub fn graphical_document_from_html_for_environment(
+    response: &Response,
+    html: &str,
+    seed: Option<&[Form]>,
+    viewport: crate::layout2::Viewport,
+    device_pixel_ratio: f32,
 ) -> Option<GraphicalDocument> {
     let media = response
         .content_type
@@ -145,15 +185,20 @@ pub fn graphical_document_from_html(
         return None;
     }
     let mut dom = crate::dom::Dom::parse_document(html);
+    dom.set_doc_url(Some(response.url.clone()));
+    dom.set_viewport_px(viewport.width, viewport.height);
+    dom.set_device_pixel_ratio(device_pixel_ratio);
     dom.rewrite_inline_svgs(Some(&response.url));
     let (forms, controls) = extract_forms_arena(&dom, &response.url, seed);
-    let image_urls = collect_image_urls(&dom, &response.url);
+    let images = collect_image_urls(&dom, &response.url, viewport, device_pixel_ratio);
     Some(GraphicalDocument {
         dom,
         base: response.url.clone(),
         forms,
         controls,
-        image_urls,
+        image_urls: images.all,
+        eager_image_urls: images.eager,
+        lazy_image_handles: images.lazy_handles,
     })
 }
 
@@ -214,8 +259,75 @@ pub type SharedFetch = futures::future::Shared<futures::future::BoxFuture<'stati
 /// uncached API GETs bypass it (`peek` never inserts), so polling reads
 /// stay fresh.
 #[derive(Default)]
+pub struct PageTaskScope {
+    cancelled: std::sync::atomic::AtomicBool,
+    tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+    fetches: std::sync::Mutex<Vec<futures::future::AbortHandle>>,
+}
+
+impl PageTaskScope {
+    /// Spawn work owned by one document. HTML §7.5.11 requires aborting every
+    /// fetch in a document's context and discarding its pending work when the
+    /// document load is stopped; keeping the abort handles in one scope makes
+    /// that lifecycle boundary explicit instead of relying on result filtering.
+    pub fn spawn<F>(&self, handle: &tokio::runtime::Handle, future: F)
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        use std::sync::atomic::Ordering;
+
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.retain(|task| !task.is_finished());
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        tasks.push(handle.spawn(future).abort_handle());
+    }
+
+    pub fn track<T>(&self, task: tokio::task::JoinHandle<T>)
+    where
+        T: Send + 'static,
+    {
+        use std::sync::atomic::Ordering;
+
+        let mut tasks = self.tasks.lock().unwrap();
+        tasks.retain(|task| !task.is_finished());
+        if self.cancelled.load(Ordering::Acquire) {
+            task.abort();
+            return;
+        }
+        tasks.push(task.abort_handle());
+    }
+
+    fn track_fetch(&self, fetch: futures::future::AbortHandle) {
+        use std::sync::atomic::Ordering;
+
+        let mut fetches = self.fetches.lock().unwrap();
+        if self.cancelled.load(Ordering::Acquire) {
+            fetch.abort();
+            return;
+        }
+        fetches.push(fetch);
+    }
+
+    pub fn cancel(&self) {
+        use std::sync::atomic::Ordering;
+
+        self.cancelled.store(true, Ordering::Release);
+        for task in self.tasks.lock().unwrap().drain(..) {
+            task.abort();
+        }
+        for fetch in self.fetches.lock().unwrap().drain(..) {
+            fetch.abort();
+        }
+    }
+}
+
+#[derive(Default)]
 pub struct PageCache {
     map: std::sync::Mutex<HashMap<String, SharedFetch>>,
+    tasks: std::sync::Arc<PageTaskScope>,
 }
 
 impl std::fmt::Debug for PageCache {
@@ -226,6 +338,33 @@ impl std::fmt::Debug for PageCache {
 }
 
 impl PageCache {
+    pub fn with_task_scope(tasks: std::sync::Arc<PageTaskScope>) -> Self {
+        Self {
+            map: Default::default(),
+            tasks,
+        }
+    }
+
+    pub fn task_scope(&self) -> std::sync::Arc<PageTaskScope> {
+        self.tasks.clone()
+    }
+
+    pub fn spawn<F>(&self, handle: &tokio::runtime::Handle, future: F)
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.tasks.spawn(handle, future);
+    }
+
+    /// Retire this page's subresource work. Completed response bodies may
+    /// remain elsewhere as immutable presentation data, but no task in this
+    /// document scope is allowed to continue or schedule new network work.
+    pub fn cancel(&self) {
+        self.tasks.cancel();
+        self.map.lock().unwrap().clear();
+    }
+
     /// Get-or-start the shared fetch for `url`. The first caller spawns it
     /// (driven concurrently on the runtime, so speculative prefetch makes
     /// progress before anyone awaits); every later caller shares that one
@@ -238,23 +377,29 @@ impl PageCache {
         if let Some(f) = map.get(&key) {
             return f.clone();
         }
-        let fut = async move {
-            match fetch(&Request::get(url)).await {
-                Ok(r) => Ok(std::sync::Arc::new(CachedResp {
-                    status: r.status,
-                    content_type: r.content_type,
-                    headers: r.headers,
-                    body: r.body,
-                })),
-                Err(_) => Err(()),
-            }
-        }
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        self.tasks.track_fetch(abort);
+        let fut = futures::future::Abortable::new(
+            async move {
+                match fetch(&Request::get(url)).await {
+                    Ok(r) => Ok(std::sync::Arc::new(CachedResp {
+                        status: r.status,
+                        content_type: r.content_type,
+                        headers: r.headers,
+                        body: r.body,
+                    })),
+                    Err(_) => Err(()),
+                }
+            },
+            registration,
+        )
+        .map(|result| result.unwrap_or(Err(())))
         .boxed()
         .shared();
         map.insert(key, fut.clone());
         // Drive it now (dropping the JoinHandle doesn't cancel the task):
         // speculation overlaps with everything, even with no awaiter yet.
-        handle.spawn(fut.clone());
+        self.spawn(handle, fut.clone());
         fut
     }
 
@@ -1349,11 +1494,28 @@ const PREFETCH_CONCURRENCY: usize = 8;
 /// Never fails: trouble lands in `response.js` and the original body
 /// survives.
 pub async fn execute_js(
-    mut response: Response,
+    response: Response,
     viewport: (u16, u16),
     cell_px: (u16, u16),
     storage: crate::js::WebStorage,
 ) -> Response {
+    execute_js_for_device(response, viewport, cell_px, 1.0, storage).await
+}
+
+/// Desktop/native entry carrying the real output-device density into the
+/// page's responsive-image environment and `window.devicePixelRatio`.
+pub async fn execute_js_for_device(
+    mut response: Response,
+    viewport: (u16, u16),
+    cell_px: (u16, u16),
+    device_pixel_ratio: f32,
+    storage: crate::js::WebStorage,
+) -> Response {
+    let device_pixel_ratio = if device_pixel_ratio.is_finite() && device_pixel_ratio > 0.0 {
+        device_pixel_ratio
+    } else {
+        1.0
+    };
     let media = response
         .content_type
         .split(';')
@@ -1507,6 +1669,7 @@ pub async fn execute_js(
         url: response.url.to_string(),
         viewport,
         cell_px,
+        device_pixel_ratio,
         externals,
         sheets,
         cache,
@@ -2113,6 +2276,12 @@ pub fn parse_seeded(
         let diag = std::env::var_os("TRUST_DIAG_FRAME").is_some();
         let t0 = std::time::Instant::now();
         let mut dom = crate::dom::Dom::parse_document(&html);
+        let terminal_viewport =
+            crate::layout2::TerminalViewport::from_font_pixels(width, viewport_h, cell_px);
+        let css_viewport = terminal_viewport.css_viewport();
+        dom.set_doc_url(Some(url.clone()));
+        dom.set_viewport_px(css_viewport.width, css_viewport.height);
+        dom.set_device_pixel_ratio(1.0);
         // Turn renderable inline <svg> into <img data:…> so vectors render
         // (silhouette-tinted) through the image pipeline instead of as text.
         dom.rewrite_inline_svgs(Some(url));
@@ -2120,7 +2289,7 @@ pub fn parse_seeded(
         let t1 = std::time::Instant::now();
         let (found, controls) = extract_forms_arena(&dom, url, seed);
         forms = found;
-        image_urls = collect_image_urls(&dom, url);
+        image_urls = collect_image_urls(&dom, url, css_viewport, 1.0).all;
         let t_forms = t1.elapsed();
         let t2 = std::time::Instant::now();
         let (
@@ -2140,7 +2309,7 @@ pub fn parse_seeded(
             let out = crate::layout2::lay_out_document(
                 &dom,
                 url,
-                crate::layout2::TerminalViewport::from_font_pixels(width, viewport_h, cell_px),
+                terminal_viewport,
                 &forms,
                 &controls,
                 images,
@@ -2295,6 +2464,12 @@ pub fn lay_region_patch(
     let t0 = std::time::Instant::now();
     let html = decode_body("text/html; charset=utf-8", fragment_html);
     let mut dom = crate::dom::Dom::parse_document(&html);
+    let terminal_viewport =
+        crate::layout2::TerminalViewport::from_font_pixels(viewport.0, viewport.1, cell_px);
+    let css_viewport = terminal_viewport.css_viewport();
+    dom.set_doc_url(Some(url.clone()));
+    dom.set_viewport_px(css_viewport.width, css_viewport.height);
+    dom.set_device_pixel_ratio(1.0);
     dom.rewrite_inline_svgs(Some(url));
     let key = boundary_node.to_string();
     let boundary = dom
@@ -2302,7 +2477,7 @@ pub fn lay_region_patch(
         .into_iter()
         .find(|&id| dom.attr(id, "data-trust-node") == Some(key.as_str()))?;
     let (_forms, controls) = extract_forms_arena(&dom, url, None);
-    let image_urls = collect_image_urls(&dom, url);
+    let image_urls = collect_image_urls(&dom, url, css_viewport, 1.0).all;
     let scroll_top = dom
         .attr(boundary, "data-trust-scroll-top")
         .and_then(|s| s.parse::<f32>().ok())
@@ -2318,7 +2493,7 @@ pub fn lay_region_patch(
         &dom,
         url,
         content_width,
-        crate::layout2::TerminalViewport::from_font_pixels(viewport.0, viewport.1, cell_px),
+        terminal_viewport,
         &controls,
         images,
         boundary,
@@ -2383,6 +2558,12 @@ pub fn lay_subtree_patch(
 ) -> Option<SubtreeLaid> {
     let html = decode_body("text/html; charset=utf-8", fragment_html);
     let mut dom = crate::dom::Dom::parse_document(&html);
+    let terminal_viewport =
+        crate::layout2::TerminalViewport::from_font_pixels(viewport.0, viewport.1, cell_px);
+    let css_viewport = terminal_viewport.css_viewport();
+    dom.set_doc_url(Some(url.clone()));
+    dom.set_viewport_px(css_viewport.width, css_viewport.height);
+    dom.set_device_pixel_ratio(1.0);
     dom.rewrite_inline_svgs(Some(url));
     let key = boundary_node.to_string();
     let boundary = dom
@@ -2390,7 +2571,7 @@ pub fn lay_subtree_patch(
         .into_iter()
         .find(|&id| dom.attr(id, "data-trust-node") == Some(key.as_str()))?;
     let (_forms, controls) = extract_forms_arena(&dom, url, None);
-    let image_urls = collect_image_urls(&dom, url);
+    let image_urls = collect_image_urls(&dom, url, css_viewport, 1.0).all;
     // The subtree lays through the SAME engine that rendered the page, so a
     // patched boundary is byte-consistent with a full relayout
     // (LAYOUT_OVERHAUL_PLAN.md P7).
@@ -2398,7 +2579,7 @@ pub fn lay_subtree_patch(
         &dom,
         url,
         content_width,
-        crate::layout2::TerminalViewport::from_font_pixels(viewport.0, viewport.1, cell_px),
+        terminal_viewport,
         &controls,
         images,
         boundary,
@@ -2418,17 +2599,38 @@ pub fn lay_subtree_patch(
 
 /// The absolute http(s) URLs of every `<img src>` in document order,
 /// de-duplicated (the decode pipeline fetches each once).
-fn collect_image_urls(dom: &crate::dom::Dom, base: &Url) -> Vec<String> {
+struct CollectedImages {
+    all: Vec<String>,
+    eager: Vec<String>,
+    lazy_handles: std::collections::HashSet<crate::render::ImageHandle>,
+}
+
+fn collect_image_urls(
+    dom: &crate::dom::Dom,
+    base: &Url,
+    viewport: crate::layout2::Viewport,
+    device_pixel_ratio: f32,
+) -> CollectedImages {
     let mut urls = Vec::new();
+    let mut eager = Vec::new();
+    let mut lazy_handles = std::collections::HashSet::new();
     for id in dom.descendants(crate::dom::DOCUMENT) {
         // `<img src>` and `<video poster>` (the poster renders as the video's
         // clickable thumbnail) both feed the decode pipeline.
-        let src = match dom.tag_name(id) {
-            Some("img") => dom.attr(id, "src"),
-            Some("video") => dom.attr(id, "poster"),
-            _ => None,
-        };
-        let Some(src) = src.map(str::trim).filter(|s| !s.is_empty()) else {
+        let selected = (dom.tag_name(id) == Some("img"))
+            .then(|| crate::responsive_image::select(dom, id, base, viewport, device_pixel_ratio))
+            .flatten()
+            .filter(crate::responsive_image::loadable_source);
+        let poster = (dom.tag_name(id) == Some("video"))
+            .then(|| dom.attr(id, "poster"))
+            .flatten()
+            .map(str::trim)
+            .filter(|source| !source.is_empty());
+        let Some(src) = selected
+            .as_ref()
+            .map(|selected| selected.source.as_str())
+            .or(poster)
+        else {
             continue;
         };
         // A `data:` image (inline SVG rewritten to one, or a page's own data
@@ -2442,8 +2644,21 @@ fn collect_image_urls(dom: &crate::dom::Dom, base: &Url) -> Vec<String> {
         } else {
             continue;
         };
+        let is_lazy = selected.is_some()
+            && dom
+                .attr(id, "loading")
+                .is_some_and(|value| value.eq_ignore_ascii_case("lazy"));
+        let handle = crate::render::ImageHandle::for_source(&u);
         if !urls.contains(&u) {
-            urls.push(u);
+            urls.push(u.clone());
+        }
+        if is_lazy && !eager.contains(&u) {
+            lazy_handles.insert(handle);
+        } else {
+            lazy_handles.remove(&handle);
+            if !eager.contains(&u) {
+                eager.push(u);
+            }
         }
     }
     // A `<video>` whose source is MSE/blob (no `src`/`<source>`/`poster` — every
@@ -2479,9 +2694,15 @@ fn collect_image_urls(dom: &crate::dom::Dom, base: &Url) -> Vec<String> {
         && let Some(preview) = crate::layout2::page_preview_image(dom, base)
         && !urls.contains(&preview)
     {
+        lazy_handles.remove(&crate::render::ImageHandle::for_source(&preview));
+        eager.push(preview.clone());
         urls.push(preview);
     }
-    urls
+    CollectedImages {
+        all: urls,
+        eager,
+        lazy_handles,
+    }
 }
 
 /// Resolve an href against the page, mapping schemes to our link types.
@@ -2881,12 +3102,53 @@ mod tests {
         );
 
         assert_eq!(
-            collect_image_urls(&dom, &base),
+            collect_image_urls(
+                &dom,
+                &base,
+                crate::layout2::Viewport::new(800.0, 600.0),
+                1.0,
+            )
+            .all,
             vec![
                 String::from("https://cdn.example.test/header.png"),
                 String::from("https://www.example.test/gallery/thumbs/one.jpg"),
                 String::from("https://www.example.test/poster.webp"),
             ]
+        );
+    }
+
+    #[test]
+    fn graphical_discovery_selects_responsive_candidate_and_defers_lazy_image() {
+        let base = Url::parse("https://www.example.test/gallery/").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            r#"<img loading="lazy" src="giant-3840.webp"
+                 srcset="small-640.webp 640w, medium-960.webp 960w, giant-3840.webp 3840w"
+                 sizes="100vw">
+               <video poster="poster.webp"></video>"#,
+        );
+        let images = collect_image_urls(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(800.0, 600.0),
+            1.0,
+        );
+        assert_eq!(
+            images.all,
+            vec![
+                String::from("https://www.example.test/gallery/medium-960.webp"),
+                String::from("https://www.example.test/gallery/poster.webp"),
+            ]
+        );
+        assert_eq!(
+            images.eager,
+            vec![String::from("https://www.example.test/gallery/poster.webp")]
+        );
+        assert!(
+            images
+                .lazy_handles
+                .contains(&crate::render::ImageHandle::for_source(
+                    "https://www.example.test/gallery/medium-960.webp"
+                ))
         );
     }
 
@@ -7145,6 +7407,53 @@ customElements.define('lit-counter', LitCounter);
             .unwrap();
         assert_eq!(body, b"ok");
         assert!(!reusable);
+    }
+
+    #[tokio::test]
+    async fn document_task_scope_aborts_owned_work_and_rejects_new_work() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Dropped(std::sync::Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let scope = std::sync::Arc::new(PageTaskScope::default());
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let marker = dropped.clone();
+        scope.spawn(&tokio::runtime::Handle::current(), async move {
+            let _guard = Dropped(marker);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        scope.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let marker = started.clone();
+        scope.spawn(&tokio::runtime::Handle::current(), async move {
+            marker.store(true, Ordering::Release);
+        });
+        tokio::task::yield_now().await;
+        assert!(!started.load(Ordering::Acquire));
+
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        let fresh_scope = PageTaskScope::default();
+        fresh_scope.track_fetch(abort);
+        let waiting = tokio::spawn(futures::future::Abortable::new(
+            std::future::pending::<()>(),
+            registration,
+        ));
+        fresh_scope.cancel();
+        assert!(waiting.await.unwrap().is_err());
     }
 
     /// RFC 9112 §6.3: a response to a HEAD request never has a body, even

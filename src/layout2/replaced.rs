@@ -29,6 +29,17 @@ pub(crate) struct Replaced {
     pub crop: bool,
 }
 
+/// Resource-dependent inputs to replaced-image sizing. Keeping the selected
+/// dimension source, density-corrected natural size, and selected URL together
+/// prevents callers from accidentally mixing metadata from the `src` fallback
+/// with the active responsive candidate.
+#[derive(Clone, Copy)]
+pub(crate) struct ImageInput<'a> {
+    pub dimension_source: NodeId,
+    pub natural: Option<(f32, f32)>,
+    pub url: Option<&'a str>,
+}
+
 /// Resolve a replaced element's used size. `natural` is the decoded
 /// intrinsic size in px when known. `None` = nothing determines a box (no
 /// natural size, no usable specified sizes, no ratio): the element renders
@@ -37,12 +48,16 @@ pub(crate) struct Replaced {
 pub(crate) fn size(
     dom: &Dom,
     node: NodeId,
-    natural: Option<(f32, f32)>,
+    image: ImageInput<'_>,
     cb_w: Option<f32>,
     cb_h: Option<f32>,
     vp: Vp,
-    url: Option<&str>,
 ) -> Option<Replaced> {
+    let ImageInput {
+        dimension_source,
+        natural,
+        url,
+    } = image;
     let u = Units::of(dom, node);
     let css = |prop: &str, basis: Option<f32>| {
         dom.computed_value(node, prop)
@@ -53,7 +68,7 @@ pub(crate) fn size(
     // The HTML width/height attributes are presentational hints for the
     // specified size (and, as a pair, the modern pre-decode ratio source).
     let attr = |name: &str| {
-        dom.attr(node, name)
+        dom.attr(dimension_source, name)
             .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
             .filter(|&v| v > 0.0)
     };
@@ -94,8 +109,10 @@ pub(crate) fn size(
             // A `data:` SVG's markup is in the src — read it synchronously.
             // Otherwise the image loader records an external SVG's ratio-only
             // ratio by URL as it decodes it.
-            dom.attr(node, "src")
-                .and_then(crate::img::svg_url_ratio_only)
+            // Responsive images size from the selected resource, never the
+            // `src` fallback that HTML suppresses when a width-descriptor
+            // source set is active.
+            url.and_then(crate::img::svg_url_ratio_only)
                 .or_else(|| url.and_then(crate::img::svg_ratio_only_get))
         })
         .flatten()
@@ -103,7 +120,7 @@ pub(crate) fn size(
     // Prefer the exact viewBox ratio for a ratio-only image. A decoder may
     // supply a rasterized fallback size whose ratio differs slightly from the
     // vector's author-provided viewBox.
-    let ratio = ratio_only.or_else(|| ratio_of(dom, node, natural));
+    let ratio = ratio_only.or_else(|| ratio_of(dom, node, dimension_source, natural));
 
     // §10.3.2/§10.6.2 auto resolution. The 300×150/2:1 caps are the spec's
     // own last resort for a ratio-less axis.
@@ -237,9 +254,14 @@ pub(crate) fn apply_fit(
 /// The natural-ratio chain a replaced element sizes through: intrinsic,
 /// else the width/height ATTRIBUTE pair (HTML's pre-decode reservation
 /// rule), else CSS `aspect-ratio`.
-pub(crate) fn ratio_of(dom: &Dom, node: NodeId, natural: Option<(f32, f32)>) -> Option<f32> {
+pub(crate) fn ratio_of(
+    dom: &Dom,
+    node: NodeId,
+    dimension_source: NodeId,
+    natural: Option<(f32, f32)>,
+) -> Option<f32> {
     let attr = |name: &str| {
-        dom.attr(node, name)
+        dom.attr(dimension_source, name)
             .and_then(|v| v.trim().trim_end_matches("px").parse::<f32>().ok())
             .filter(|&v| v > 0.0)
     };

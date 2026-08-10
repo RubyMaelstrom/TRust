@@ -26,6 +26,7 @@ pub fn release_allocator_memory() {
 pub mod accessibility;
 pub mod core;
 pub mod render;
+pub mod responsive_image;
 
 // These are the existing engine modules. They are declared exactly once here;
 // binaries import this library rather than compiling private copies with `mod`.

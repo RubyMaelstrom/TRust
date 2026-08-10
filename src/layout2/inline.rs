@@ -773,7 +773,19 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// flow can size a block-level replaced box through the same path.
     pub fn atom(&mut self, a: &Atom, ctx: &InlineStyle) {
         match &a.kind {
-            AtomKind::Img { url, alt } => self.image(a.node, url.as_deref(), alt, ctx),
+            AtomKind::Img {
+                url,
+                density,
+                dimension_source,
+                alt,
+            } => self.image(
+                a.node,
+                *dimension_source,
+                url.as_deref(),
+                *density,
+                alt,
+                ctx,
+            ),
             AtomKind::Media { video } => self.media(a.node, *video, ctx),
             AtomKind::Control { form, field } => {
                 let Some(f) = self.forms.get(*form).and_then(|f| f.fields.get(*field)) else {
@@ -836,7 +848,15 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// text flows as an Image-kind run (HTML's inline representation of an
     /// unavailable image), and the decode pipeline's re-layout turns it into
     /// pixels.
-    pub fn image(&mut self, node: NodeId, url: Option<&str>, alt: &str, ctx: &InlineStyle) {
+    pub fn image(
+        &mut self,
+        node: NodeId,
+        dimension_source: NodeId,
+        url: Option<&str>,
+        density: f32,
+        alt: &str,
+        ctx: &InlineStyle,
+    ) {
         // A player often paints its `<video poster>` again as an absolutely
         // positioned sibling `<img>` so custom controls can cover the native
         // element. That later image wins CSS painting order; carry the media
@@ -848,18 +868,21 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             .and_then(|u| poster_media_target(self.dom, self.base, node, u))
             .map(Link::Media)
             .or_else(|| ctx.link.clone());
-        let natural = url
-            .and_then(|u| self.images.get(u))
-            .filter(|&&(w, h)| w > 0 && h > 0)
-            .map(|&(w, h)| (w as f32, h as f32));
+        let natural = crate::responsive_image::density_corrected_size(
+            url.and_then(|url| self.images.get(url)),
+            density,
+        );
         if let Some(r) = super::replaced::size(
             self.dom,
             node,
-            natural,
+            super::replaced::ImageInput {
+                dimension_source,
+                natural,
+                url,
+            },
             Some(self.cb_w_px),
             self.cb_h_px,
             self.vp,
-            url,
         ) {
             let pixelated = matches!(
                 self.dom.computed_value(node, "image-rendering").as_deref(),
@@ -980,15 +1003,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             })
             .flatten();
         if let Some(poster) = poster
-            && let Some(&(iw, ih)) = self.images.get(&poster)
-            && iw > 0
-            && ih > 0
+            && let Some((iw, ih)) =
+                crate::responsive_image::density_corrected_size(self.images.get(&poster), 1.0)
         {
             // The poster draws at its DECODED box capped to the line — never
             // the video's CSS box, which often carries a `height:0`/padding
             // aspect hack a poster must not inherit.
-            let w = (iw as f32).min(self.cap).max(1.0);
-            let h = (ih as f32 * w / iw as f32).max(1.0);
+            let w = iw.min(self.cap).max(1.0);
+            let h = (ih * w / iw).max(1.0);
             self.place_atom(
                 AtomGeometry {
                     box_width: w,

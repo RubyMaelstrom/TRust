@@ -1670,6 +1670,13 @@ enum WorkerKind {
     Module,
 }
 
+struct WorkerLaunch {
+    id: usize,
+    script_url: url::Url,
+    kind: WorkerKind,
+    name: String,
+}
+
 /// Channel the worker threads post `(worker id, WorkerOut)` back on; the page
 /// actor's forwarder relays each as a `PageCmd::Worker`.
 type WorkerSender = tokio::sync::mpsc::Sender<(usize, WorkerOut)>;
@@ -1725,6 +1732,7 @@ unsafe impl boa_engine::gc::Trace for PageNet {
 struct PageWs {
     handle: tokio::runtime::Handle,
     page: url::Url,
+    tasks: std::sync::Arc<crate::http::PageTaskScope>,
     events: tokio::sync::mpsc::Sender<(usize, crate::ws::WsIn)>,
     sockets: RefCell<std::collections::HashMap<usize, tokio::sync::mpsc::Sender<crate::ws::WsOut>>>,
     next_id: std::cell::Cell<usize>,
@@ -1747,6 +1755,7 @@ unsafe impl boa_engine::gc::Trace for PageWs {
 struct PageWorkers {
     handle: tokio::runtime::Handle,
     page: url::Url,
+    tasks: std::sync::Arc<crate::http::PageTaskScope>,
     /// Cloned into each worker's `WorkerSelf` so `self.postMessage`/errors reach
     /// the actor (forwarded as `PageCmd::Worker`).
     events: WorkerSender,
@@ -1841,6 +1850,8 @@ struct PageGeom {
     /// the true content viewport once displayed and on resize. Device scale and
     /// terminal cell geometry are resolved before this boundary.
     viewport: std::cell::Cell<crate::layout2::Viewport>,
+    /// Output-device density for HTML's source-candidate selection only.
+    device_pixel_ratio: std::cell::Cell<f32>,
     cache: Rc<RefCell<GeomCache>>,
     /// Decoded image intrinsic sizes (URL → intrinsic CSS/image pixels), pushed
     /// by the app as
@@ -2348,6 +2359,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_namespace", 1, sys_namespace),
         ("__dom_get_attr", 2, sys_get_attr),
         ("__dom_computed", 2, sys_computed_style),
+        ("__image_current_src", 1, sys_image_current_src),
         ("__match_media", 1, sys_match_media),
         ("__dom_rect", 1, sys_rect),
         ("__dom_scroll_get", 2, sys_scroll_get),
@@ -2686,6 +2698,45 @@ fn sys_match_media(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
     let dom = page_dom(ctx);
     let matches = dom.borrow().media_matches(&query);
     Ok(JsValue::from(matches))
+}
+
+/// `HTMLImageElement.currentSrc` — the absolute URL selected by WHATWG HTML's
+/// responsive-image algorithms for the actor's current viewport/device scale.
+fn sys_image_current_src(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let environment = {
+        let host = ctx.realm().host_defined();
+        host.get::<PageGeom>().map(|geom| {
+            (
+                geom.base.clone(),
+                geom.viewport.get(),
+                geom.device_pixel_ratio.get(),
+            )
+        })
+    };
+    let dom = page_dom(ctx);
+    let d = dom.borrow();
+    let Some(id) = arg_node(&d, args, 0) else {
+        return Ok(str_value(""));
+    };
+    let fallback = d.doc_url().cloned();
+    let (base, viewport, density) = match environment {
+        Some(environment) => environment,
+        None => {
+            let Some(base) = fallback else {
+                return Ok(str_value(""));
+            };
+            let (width, height) = d.viewport_px();
+            (
+                base,
+                crate::layout2::Viewport::new(width, height),
+                d.device_pixel_ratio(),
+            )
+        }
+    };
+    Ok(
+        crate::responsive_image::select(&d, id, &base, viewport, density)
+            .map_or_else(|| str_value(""), |selected| str_value(&selected.source)),
+    )
 }
 
 /// Geometry backing for `getBoundingClientRect`/`offset*`/`client*` and the
@@ -3324,6 +3375,11 @@ fn page_net_fetch(
     headers: Vec<(String, String)>,
 ) -> Option<crate::http::Response> {
     let (handle, request) = page_net_prepare(ctx, target, method, body, headers)?;
+    let cache = ctx
+        .realm()
+        .host_defined()
+        .get::<PageNet>()
+        .map(|net| net.cache.clone())?;
     phase(&format!("src: PAGE-SYNC {}", request.url));
     // A synchronous fetch must block the page thread, but it can be reached from
     // INSIDE the job loop — an iframe-hydrate sweep or a sync XHR running as a
@@ -3335,7 +3391,7 @@ fn page_net_fetch(
     // XHR) this behaves identically — the spawned task runs on the app runtime
     // and the page thread blocks on the channel until it lands.
     let (tx, rx) = std::sync::mpsc::channel();
-    handle.spawn(async move {
+    cache.spawn(&handle, async move {
         let _ = tx.send(crate::http::fetch(&request).await);
     });
     rx.recv().ok().and_then(|r| r.ok())
@@ -3426,7 +3482,14 @@ fn sys_http_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
 /// request off the JS thread. `None` ⇒ run it as an awaited Boa job (during
 /// load, or in the one-shot `transform`, where the result must be in hand
 /// before serialize).
-fn bg_fetch_ctx(ctx: &Context) -> Option<(usize, FetchSender, tokio::runtime::Handle)> {
+fn bg_fetch_ctx(
+    ctx: &Context,
+) -> Option<(
+    usize,
+    FetchSender,
+    tokio::runtime::Handle,
+    std::sync::Arc<crate::http::PageCache>,
+)> {
     let host = ctx.realm().host_defined();
     let net = host.get::<PageNet>()?;
     if !net.dispatch.get() {
@@ -3435,7 +3498,7 @@ fn bg_fetch_ctx(ctx: &Context) -> Option<(usize, FetchSender, tokio::runtime::Ha
     let tx = net.fetch_events.clone()?;
     let id = net.next_fetch_id.get();
     net.next_fetch_id.set(id + 1);
-    Some((id, tx, net.handle.clone()))
+    Some((id, tx, net.handle.clone(), net.cache.clone()))
 }
 
 fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -3446,14 +3509,14 @@ fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
     // `(id, result)`, which the actor settles + re-renders (see
     // `dispatch_fetch_done`). The promise is created by `__trust.bgFetch(id)`,
     // resolved later by `settleFetch`.
-    if let Some((id, tx, handle)) = bg_fetch_ctx(ctx) {
+    if let Some((id, tx, handle, cache)) = bg_fetch_ctx(ctx) {
         // GET dedup: join the cache's single in-flight/done request (no cap spend).
         if method == "GET"
             && body.is_none()
             && let Some(shared) = peek_page_cache(ctx, &url_arg)
         {
             phase(&format!("src: PAGE-CACHE-BG {url_arg}"));
-            handle.spawn(async move {
+            cache.spawn(&handle, async move {
                 let out = shared.await.ok().map(|c| {
                     (
                         c.status,
@@ -3480,7 +3543,7 @@ fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
             }
             Some((_handle, request)) => {
                 phase(&format!("src: PAGE-ASYNC-BG {}", request.url));
-                handle.spawn(async move {
+                cache.spawn(&handle, async move {
                     let out = crate::http::fetch(&request).await.ok().map(|r| {
                         (
                             r.status,
@@ -3635,7 +3698,7 @@ fn sys_ws_open(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
         let c = crate::http::cookies_for_request(&http_equiv);
         (!c.is_empty()).then_some(c)
     };
-    let out_tx = crate::ws::connect(
+    let (out_tx, task) = crate::ws::connect(
         resolved,
         origin,
         cookie,
@@ -3643,6 +3706,7 @@ fn sys_ws_open(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
         id,
         wsh.events.clone(),
     );
+    wsh.tasks.track(task);
     wsh.sockets.borrow_mut().insert(id, out_tx);
     Ok(JsValue::new(id as i32))
 }
@@ -3739,14 +3803,21 @@ fn sys_worker_spawn(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
     workers.next_id.set(id + 1);
     let (ctl_tx, ctl_rx) = tokio::sync::mpsc::channel::<WorkerCtl>(64);
     let handle = workers.handle.clone();
+    let tasks = workers.tasks.clone();
     let to_page = workers.events.clone();
+    let launch = WorkerLaunch {
+        id,
+        script_url: resolved,
+        kind,
+        name,
+    };
     // The worker runs on its OWN 64MB-stack OS thread (Boa's parser recurses on
     // the native stack; same reason the page thread is wide). Named `trust-*` so
     // the panic hook swallows a Boa VM panic into a graceful per-worker degrade.
     let spawned = std::thread::Builder::new()
         .name(format!("trust-worker-{id}"))
         .stack_size(PAGE_STACK)
-        .spawn(move || run_worker(id, resolved, kind, name, handle, to_page, ctl_rx));
+        .spawn(move || run_worker(launch, handle, tasks, to_page, ctl_rx));
     if spawned.is_err() {
         return Ok(JsValue::new(-1));
     }
@@ -5695,6 +5766,9 @@ pub struct PageEnv {
     /// terminal looks like a wide browser; SPAs/responsive layouts and
     /// infinite-scrollers measure against it). 8x16 nominal in tests.
     pub cell_px: (u16, u16),
+    /// Output-device pixels per CSS pixel. HTML responsive-image selection
+    /// consumes this without letting device pixels enter layout geometry.
+    pub device_pixel_ratio: f32,
     /// Pre-fetched external scripts keyed by raw `src` attribute
     /// (None = the fetch failed). `Arc` so the parallel-parse pool can hand a
     /// body to a worker thread without cloning it — multi-MB bundles were
@@ -5731,6 +5805,7 @@ impl PageEnv {
             url: url.to_string(),
             viewport: (80, 24),
             cell_px: (8, 16),
+            device_pixel_ratio: 1.0,
             externals: Vec::new(),
             sheets: Vec::new(),
             cache: std::sync::Arc::new(crate::http::PageCache::default()),
@@ -6260,6 +6335,8 @@ fn load_page(
     // performed its cells→CSS-pixels conversion before this DOM boundary.
     dom.borrow_mut()
         .set_viewport_px(viewport_css.width, viewport_css.height);
+    dom.borrow_mut()
+        .set_device_pixel_ratio(env.device_pixel_ratio);
     // The document URL, for the live serializer's sprite-`<use>` resolution
     // (same base `rewrite_inline_svgs` joins against on the layout side).
     dom.borrow_mut().set_doc_url(url::Url::parse(page_url).ok());
@@ -6362,6 +6439,7 @@ fn load_page(
             host.insert(PageWs {
                 handle,
                 page,
+                tasks: env.cache.task_scope(),
                 events: ws_tx,
                 sockets: RefCell::new(std::collections::HashMap::new()),
                 next_id: std::cell::Cell::new(1),
@@ -6377,6 +6455,7 @@ fn load_page(
             host.insert(PageWorkers {
                 handle,
                 page,
+                tasks: env.cache.task_scope(),
                 events: worker_tx,
                 workers: RefCell::new(std::collections::HashMap::new()),
                 next_id: std::cell::Cell::new(1),
@@ -6390,6 +6469,7 @@ fn load_page(
             host.insert(PageGeom {
                 base,
                 viewport: std::cell::Cell::new(viewport_css),
+                device_pixel_ratio: std::cell::Cell::new(env.device_pixel_ratio),
                 cache: Rc::new(RefCell::new((
                     u64::MAX,
                     std::collections::HashMap::new(),
@@ -6406,10 +6486,11 @@ fn load_page(
     // CSS-pixel viewport from the real terminal: cols/rows times the
     // terminal's cell pixel size (the picker's font size; 8x16 nominal).
     let cfg = format!(
-        "globalThis.__trust_cfg = {{ url: \"{}\", ua: \"TRust/0.1\", width: {}, height: {}, hardwareConcurrency: {} }};",
+        "globalThis.__trust_cfg = {{ url: \"{}\", ua: \"TRust/0.1\", width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {} }};",
         esc_js(page_url),
         viewport_css.width,
         viewport_css.height,
+        env.device_pixel_ratio,
         // navigator.hardwareConcurrency reports the real host logical-processor
         // count (HTML NavigatorConcurrentHardware) — honest, not a fixed spoof.
         std::thread::available_parallelism()
@@ -7206,8 +7287,9 @@ pub enum PageCmd {
     /// this set; one the app hasn't cached takes the full path (no failed-patch
     /// resync). Sent whenever it changes (deduped).
     LiveBoundaries(Vec<usize>),
-    /// Decoded image intrinsic sizes from the app's image pipeline (url → CSS
-    /// intrinsic pixels). Merged into the geometry pass's `ImageSizes` so measured boxes
+    /// Decoded image resource sizes from the app's image pipeline (url → raw
+    /// image pixels). Responsive-image density correction happens per element
+    /// in the geometry pass. Merged into its `ImageSizes` so measured boxes
     /// match what the app renders — CSSOM View geometry reports the ACTUAL
     /// layout, and a virtualized feed (Mastodon's IntersectionObserverArticle)
     /// caches these heights and declares them back as placeholder sizes; a
@@ -7226,6 +7308,10 @@ pub enum PageCmd {
     /// articles intersect the viewport, where "the bottom" is) aimed a few
     /// rows past what the reader sees.
     Viewport(crate::layout2::Viewport),
+    /// Output-device pixels per CSS pixel. This is intentionally separate from
+    /// the CSS viewport: it reselects responsive-image candidates and updates
+    /// `window.devicePixelRatio` without changing layout coordinates.
+    DevicePixelRatio(f32),
 }
 
 /// Which kind of relayout boundary a patch targets (INCREMENTAL_LAYOUT_PLAN.md
@@ -7323,9 +7409,32 @@ pub enum PageEvt {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PageHandle {
     pub cmds: tokio::sync::mpsc::Sender<PageCmd>,
+    cache: std::sync::Arc<crate::http::PageCache>,
+}
+
+impl PageHandle {
+    /// Freeze the document: cancel its fetch group before dropping the command
+    /// sender lets the resident actor, workers, sockets and timers wind down.
+    pub fn retire(&self) {
+        self.cache.cancel();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_sender(cmds: tokio::sync::mpsc::Sender<PageCmd>) -> Self {
+        Self {
+            cmds,
+            cache: Default::default(),
+        }
+    }
+}
+
+impl Drop for PageHandle {
+    fn drop(&mut self) {
+        self.retire();
+    }
 }
 
 /// Wall budget for a single user-event dispatch's COMPUTE (a fetch fired
@@ -7399,6 +7508,7 @@ pub fn spawn_page(
     html: String,
     env: PageEnv,
 ) -> (PageHandle, tokio::sync::mpsc::Receiver<PageEvt>) {
+    let cache = env.cache.clone();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
     let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(16);
     // The actor keeps a clone of its own command sender so a WebSocket task can
@@ -7425,7 +7535,13 @@ pub fn spawn_page(
     if spawned.is_err() {
         // The dropped evt sender tells the caller the page is gone.
     }
-    (PageHandle { cmds: cmd_tx }, evt_rx)
+    (
+        PageHandle {
+            cmds: cmd_tx,
+            cache,
+        },
+        evt_rx,
+    )
 }
 
 /// The full worker-scope JS: the shared structured-clone codec (extracted from
@@ -7868,14 +7984,18 @@ enum WWake {
 /// eval is `catch_unwind`-guarded and the thread is named `trust-*` so a Boa VM
 /// panic degrades THIS worker (an `error` to the page) instead of the process.
 fn run_worker(
-    id: usize,
-    script_url: url::Url,
-    kind: WorkerKind,
-    name: String,
+    launch: WorkerLaunch,
     handle: tokio::runtime::Handle,
+    tasks: std::sync::Arc<crate::http::PageTaskScope>,
     to_page: WorkerSender,
     mut ctl_rx: tokio::sync::mpsc::Receiver<WorkerCtl>,
 ) {
+    let WorkerLaunch {
+        id,
+        script_url,
+        kind,
+        name,
+    } = launch;
     let _ = kind; // v1 loads a module worker's entry as a classic script (fast-follow)
     let (mut ctx, _hooks) = page_context_with(None);
     if register_syscalls(&mut ctx).is_err() {
@@ -7906,7 +8026,7 @@ fn run_worker(
             dispatch: std::cell::Cell::new(false),
             fetch_events: None,
             next_fetch_id: std::cell::Cell::new(1),
-            cache: std::sync::Arc::new(crate::http::PageCache::default()),
+            cache: std::sync::Arc::new(crate::http::PageCache::with_task_scope(tasks)),
         });
     }
     let mut outcome = Outcome::default();
@@ -8101,17 +8221,17 @@ fn setup_page_workers(
     mut worker_evt_rx: tokio::sync::mpsc::Receiver<(usize, WorkerOut)>,
     cmd_self: &tokio::sync::mpsc::Sender<PageCmd>,
 ) {
-    let Some(handle) = page
+    let Some((handle, cache)) = page
         .ctx
         .realm()
         .host_defined()
         .get::<PageNet>()
-        .map(|n| n.handle.clone())
+        .map(|n| (n.handle.clone(), n.cache.clone()))
     else {
         return;
     };
     let weak = cmd_self.downgrade();
-    handle.spawn(async move {
+    cache.spawn(&handle, async move {
         while let Some((id, event)) = worker_evt_rx.recv().await {
             let Some(tx) = weak.upgrade() else { break };
             if tx.send(PageCmd::Worker { id, event }).await.is_err() {
@@ -8173,12 +8293,12 @@ fn setup_page_ws(
     mut ws_evt_rx: tokio::sync::mpsc::Receiver<(usize, crate::ws::WsIn)>,
     cmd_self: &tokio::sync::mpsc::Sender<PageCmd>,
 ) {
-    let Some(handle) = page
+    let Some((handle, cache)) = page
         .ctx
         .realm()
         .host_defined()
         .get::<PageNet>()
-        .map(|n| n.handle.clone())
+        .map(|n| (n.handle.clone(), n.cache.clone()))
     else {
         return;
     };
@@ -8187,7 +8307,7 @@ fn setup_page_ws(
     // never exit (a real deadlock the test suite caught). The forwarder upgrades
     // to send; once the app's (strong) sender is gone, upgrade fails and it stops.
     let weak = cmd_self.downgrade();
-    handle.spawn(async move {
+    cache.spawn(&handle, async move {
         while let Some((id, event)) = ws_evt_rx.recv().await {
             let Some(tx) = weak.upgrade() else { break };
             if tx.send(PageCmd::Ws { id, event }).await.is_err() {
@@ -8739,6 +8859,27 @@ fn page_actor(
                     if !finish_dispatch(&mut page, &evts) {
                         return;
                     }
+                }
+            }
+            PageCmd::DevicePixelRatio(ratio) => {
+                let ratio = if ratio.is_finite() && ratio > 0.0 {
+                    ratio
+                } else {
+                    1.0
+                };
+                {
+                    let host = page.ctx.realm().host_defined();
+                    if let Some(geom) = host.get::<PageGeom>() {
+                        geom.device_pixel_ratio.set(ratio);
+                        geom.cache.borrow_mut().0 = u64::MAX;
+                    }
+                }
+                page.dom.borrow_mut().set_device_pixel_ratio(ratio);
+                let call = format!("globalThis.devicePixelRatio={ratio}");
+                if let Err(error) = page.ctx.eval(Source::from_bytes(call.as_bytes())) {
+                    page.outcome
+                        .errors
+                        .push(format!("devicePixelRatio: {error}"));
                 }
             }
         }
@@ -13020,7 +13161,9 @@ const PRELUDE: &str = r##"
             }
         }
     }
-    class HTMLImageElement extends HTMLElement {}
+    class HTMLImageElement extends HTMLElement {
+        get currentSrc() { return __image_current_src(this.__id); }
+    }
     // HTMLHyperlinkElementUtils (the create-an-<a>-to-parse-URLs trick;
     // router-slot reads m.pathname) lives on <a> and <area>; href + the URL
     // components are installed via installUrlParts below.
@@ -14344,6 +14487,10 @@ const PRELUDE: &str = r##"
     reflectOn(["HTMLImageElement", "HTMLScriptElement", "HTMLIFrameElement",
         "HTMLEmbedElement", "HTMLSourceElement", "HTMLTrackElement",
         "HTMLInputElement", "HTMLFrameElement"], "src", reflectUrlDesc);
+    reflectOn(["HTMLImageElement", "HTMLSourceElement"], "srcset", reflectStrDesc);
+    reflectOn(["HTMLImageElement", "HTMLSourceElement"], "sizes", reflectStrDesc);
+    reflectOn(["HTMLSourceElement"], "media", reflectStrDesc);
+    reflectOn(["HTMLImageElement"], "loading", reflectStrDesc);
     // SVG element interface zoo (all extend SVGElement). SvelteKit's link
     // handler branches on `e instanceof SVGAElement` to read `href.baseVal`
     // vs `href` — a bare `SVGAElement` was a ReferenceError that broke its
@@ -14807,7 +14954,7 @@ const PRELUDE: &str = r##"
     g.screen = { width: cfg.width, height: cfg.height, availWidth: cfg.width, availHeight: cfg.height, colorDepth: 24, pixelDepth: 24 };
     g.innerWidth = cfg.width; g.innerHeight = cfg.height;
     g.outerWidth = cfg.width; g.outerHeight = cfg.height;
-    g.devicePixelRatio = 1; g.pageXOffset = 0; g.pageYOffset = 0;
+    g.devicePixelRatio = cfg.devicePixelRatio; g.pageXOffset = 0; g.pageYOffset = 0;
     g.scrollX = 0; g.scrollY = 0;
     // History real enough for SPA routers: state round-trips and the
     // URL arguments land in location (router-slot writes state then
@@ -29446,6 +29593,34 @@ mod tests {
         assert!(out.contains("data-scheme=\"true\""), "{out}");
         // …while unrecognized features stay false (the conservative default).
         assert!(out.contains("data-unknown=\"false\""), "{out}");
+    }
+
+    #[test]
+    fn image_current_src_uses_srcset_sizes_picture_and_device_density() {
+        let mut env = PageEnv::bare("https://example.com/gallery/page");
+        env.viewport = (600, 400);
+        env.cell_px = (1, 1);
+        env.device_pixel_ratio = 2.0;
+        let (out, outcome) = transform(
+            r#"<body><picture>
+              <source media="(max-width: 700px)" type="image/webp"
+                srcset="small.webp 600w, medium.webp 1200w, giant.webp 3840w"
+                sizes="50vw">
+              <img id=hero src="giant-fallback.webp">
+            </picture><script>
+              var img = document.getElementById('hero');
+              img.setAttribute('data-current', img.currentSrc);
+              img.setAttribute('data-dpr', String(devicePixelRatio));
+            </script></body>"#,
+            &env,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("data-current=\"https://example.com/gallery/small.webp\""),
+            "{out}"
+        );
+        assert!(out.contains("data-dpr=\"2\""), "{out}");
+        assert!(!out.contains("data-current=\"https://example.com/gallery/giant-fallback.webp\""));
     }
 
     #[test]
