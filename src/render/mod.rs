@@ -480,6 +480,10 @@ pub struct PagePaint {
     pub background: Option<PaintColor>,
     pub lines: Vec<PaintLine>,
     pub primitives: Vec<Primitive>,
+    /// Viewport-fixed commands that paint below the scrolling document. These
+    /// are still pinned to the viewport, but remain behind later content in
+    /// the same stacking context (CSS 2.1 Appendix E §E.2 tree order).
+    pub fixed_under_primitives: Vec<Primitive>,
     /// Viewport-fixed commands are composed after the scrolled document list.
     pub fixed_primitives: Vec<Primitive>,
     pub image_requests: Vec<ImageRequest>,
@@ -838,6 +842,19 @@ impl Scene {
         });
         self.primitives
             .push(Primitive::PushClip(PaintShape::Rect(self.content_viewport)));
+        // A fixed box is not automatically a topmost overlay. CSS Positioned
+        // Layout §2.2 makes it a stacking context, while CSS 2.1 Appendix E
+        // §E.2 still orders z-index:auto siblings in tree order. Backdrop
+        // fixed boxes therefore paint in a viewport-pinned underlay slot.
+        if !page.fixed_under_primitives.is_empty() {
+            self.primitives
+                .push(Primitive::PushTransform(Affine2d::translate(
+                    self.content_viewport.x,
+                    self.content_viewport.y,
+                )));
+            self.append_sticky_commands(&page.fixed_under_primitives, page, CssPoint::default());
+            self.primitives.push(Primitive::PopTransform);
+        }
         self.primitives
             .push(Primitive::PushTransform(Affine2d::translate(
                 self.content_viewport.x - scroll.x,

@@ -217,14 +217,25 @@ pub(super) fn paint(
     root: &Frag<'_>,
     fixed: &[Frag<'_>],
     flow_bottom: f32,
+    viewport_w: f32,
+    viewport_h: f32,
 ) -> PagePaint {
     let mut builder = Builder::new(dom, base, root, fixed, flow_bottom);
     build_sc(root, &mut builder);
     let primitives = std::mem::take(&mut builder.commands);
     let mut fixed: Vec<_> = fixed.iter().collect();
     fixed.sort_by_key(|fragment| fragment.paint.z.unwrap_or(0));
+    let mut fixed_under_primitives = Vec::new();
+    let mut fixed_primitives = Vec::new();
     for fragment in fixed {
+        let start = builder.commands.len();
         build_sc(fragment, &mut builder);
+        let commands = builder.commands.split_off(start);
+        if super::flow::fixed_backdrop(dom, fragment, viewport_w, viewport_h) {
+            fixed_under_primitives.extend(commands);
+        } else {
+            fixed_primitives.extend(commands);
+        }
     }
     PagePaint {
         width: (root.x + root.w).max(0.0),
@@ -232,7 +243,8 @@ pub(super) fn paint(
         background: None,
         lines: builder.lines,
         primitives,
-        fixed_primitives: builder.commands,
+        fixed_under_primitives,
+        fixed_primitives,
         image_requests: builder.image_requests,
         scroll_containers: builder.scroll_containers,
         sticky_constraints: builder.sticky_constraints,

@@ -267,6 +267,42 @@ mod tests {
     }
 
     #[test]
+    fn fixed_viewport_backdrop_paints_under_later_positioned_content() {
+        // CSS Positioned Layout §2.2 + CSS 2.1 Appendix E §E.2: a fixed
+        // backdrop remains viewport-pinned, but a later z-index:auto positioned
+        // sibling paints above it in tree order. The old renderer appended all
+        // fixed commands after the document and hid the red app surface.
+        let base = Url::parse("https://example.test/").unwrap();
+        let html = r#"
+            <style>
+              html, body { margin:0; width:240px; height:180px }
+              .backdrop { position:fixed; inset:0; background:#112233 }
+              #app { position:relative; width:240px; height:180px; background:#f00 }
+            </style>
+            <div class="backdrop"></div><div id="app"></div>
+        "#;
+        let dom = crate::dom::Dom::parse_document(html);
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let layout = crate::layout2::lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(240.0, 180.0),
+            &forms,
+            &controls,
+            &ImageSizes::new(),
+        );
+        assert!(!layout.paint.fixed_under_primitives.is_empty());
+        assert!(layout.paint.fixed_primitives.is_empty());
+        let frame = render_html(html, &base, CssSize::new(240.0, 180.0)).unwrap();
+        let center = ((90 * 240 + 120) * 4) as usize;
+        assert_eq!(
+            &frame.pixels[center..center + 4],
+            &[255, 0, 0, 255],
+            "later positioned content must paint above the fixed backdrop"
+        );
+    }
+
+    #[test]
     fn caller_supplied_image_handle_rasterizes_without_blob_in_command() {
         let base = Url::parse("https://example.test/").unwrap();
         let html = "<img src='pixel.png' width=8 height=8>";
