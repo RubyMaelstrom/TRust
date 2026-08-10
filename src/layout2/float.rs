@@ -9,9 +9,9 @@
 //! `band` (how much a line box at a given vertical position is shortened),
 //! `place` (§9.5.1 placement of a new float), and `clear_y`/`bottom` (§9.5.2
 //! clearance and BFC containment). Everything is absolute CSS px in the frame of
-//! the block-formatting-context root that owns the context; the px→cell
-//! quantization stays at the paint boundary, so floats shorten line boxes at row
-//! granularity naturally.
+//! the block-formatting-context root that owns the context. Float bands and
+//! line-box intersections remain fractional CSS pixels; only the terminal
+//! adapter later quantizes their painted result.
 
 use crate::dom::{Dom, NodeId};
 
@@ -174,9 +174,8 @@ impl FloatCtx {
     /// minimum plus every existing float's bottom), and take the first where the
     /// float fits the band left after existing same-side floats and without
     /// crossing an opposite float. Returns the placed margin-box top-left. When
-    /// nothing fits (a float wider than any open band — a desktop column in a
-    /// terminal viewport), it lands at the lowest shelf and overflows, which the
-    /// terminal simply cannot h-scroll to (the documented structural clip).
+    /// nothing fits (a float wider than any open band), it lands at the lowest
+    /// shelf and overflows its containing block as CSS permits.
     pub fn place(
         &mut self,
         side: Side,

@@ -4,29 +4,24 @@
 //! White-space collapsing runs as ONE state machine across the whole IFC, so
 //! collapsing spans inline-box boundaries (`a <b> b</b>` keeps one space) and
 //! the mode can change mid-context (a `white-space:pre` span inside a normal
-//! paragraph). Text capacity is quantized to glyph cells at the line-box
-//! boundary — one glyph = one cell, one line box = one row — which is the
-//! engine's single px→cell interpretation; everything else is spec behavior:
+//! paragraph). Text is shaped and measured in CSS pixels by TRust's Parley
+//! adapter; terminal quantization is a later compatibility stage. Everything
+//! else is CSS inline behavior:
 //! greedy breaking at soft-wrap opportunities (spaces, and between CJK
 //! ideographs), an unbreakable word longer than the line OVERFLOWS (clipped
 //! at the viewport edge at paint, like a browser before you scroll right),
 //! `text-align` incl. real justification, `text-indent` on the first line,
-//! forced breaks from `<br>`/preserved newlines, tab stops every 8 cells in
-//! preserved modes, and bottom-aligned atomics (baseline alignment: a
-//! replaced box's baseline is its bottom margin edge, so text beside an
-//! image sits on the image's last row).
+//! forced breaks from `<br>`/preserved newlines, measured tab stops, and real
+//! baseline-aligned text and atomic inlines.
 
 use url::Url;
 
 use crate::doc::{Form, Link};
 use crate::dom::{Dom, NodeId};
-use crate::layout2::{
-    Emphasis, ImageSizes, Item, ItemKind, NO_NODE, Units, display_width, is_collapsible_space,
-    letter_space,
-};
+use crate::layout2::{Emphasis, ImageSizes, ItemKind, NO_NODE, Units, is_collapsible_space};
 
 use super::float::{FloatBox, FloatCtx, FloatPlace};
-use super::style::{Align2, BoxStyle, InlineStyle, LEFT, RIGHT};
+use super::style::{Align2, BoxStyle, InlineStyle, LEFT, RIGHT, TabSize, VerticalAlign};
 use super::tree::{Atom, AtomKind, BoxNode, Inline};
 use super::value::{Len, Vp};
 
@@ -57,59 +52,117 @@ pub(crate) struct OofMark<'t> {
     pub ctx: InlineStyle,
 }
 
-/// One placed inline item: `col` cells from the line box's left edge,
-/// `row_off` rows from its top (filled at line finish — bottom alignment).
+/// One placed inline item in CSS pixels. Shaped text is retained so paint does
+/// not repeat font selection or shaping.
 #[derive(Debug)]
 pub(crate) struct Piece {
-    pub col: usize,
-    pub row_off: u16,
-    /// The piece's BOX height in rows — what the line box accommodates and
-    /// bottom-aligns. For a replaced element under `object-fit: contain`
-    /// the painted item can be SHORTER than its box (`item.height` ≤ `rows`),
-    /// letterboxed at `box_off_rows` below the box top.
-    pub rows: u16,
-    pub box_off_rows: u16,
-    pub item: Item,
+    pub x: f32,
+    pub y: f32,
+    pub box_width: f32,
+    pub box_height: f32,
+    /// Object-fit paint rectangle relative to the piece box.
+    pub paint_x: f32,
+    pub paint_y: f32,
+    pub paint_width: f32,
+    pub paint_height: f32,
+    pub ascent: f32,
+    pub descent: f32,
+    pub vertical_align: VerticalAlign,
+    pub item: InlineItem,
+    pub shaped: Option<crate::text::ShapedText>,
+    /// Ordinary text pieces retain their CSS text style so adjacent words can
+    /// be accumulated by advance and shaped once when the line closes.
+    text_style: Option<crate::text::TextStyle>,
     /// Whether this piece's text is justification-stretchable (built under a
     /// collapsing white-space mode — preserved spaces never stretch).
     stretch: bool,
-    /// A collapsible space materialized as the 1-cell gap before this piece
+    /// A collapsible space materialized as the measured gap before this piece
     /// (a justification slot).
-    space_before: bool,
+    pub(crate) space_before: bool,
     /// A PLACEHOLDER for an atomic inline box (`inline-block`/`inline-flex`/
-    /// `inline-grid`): it reserves the box's cells on the line (pen + line
+    /// `inline-grid`): it reserves the box on the line (pen + line
     /// height) but paints NOTHING — the box's real content is a separate
     /// pre-laid fragment positioned at this piece's resolved spot (`flush_line`
     /// records it, the block flow splices it in). `item.node` is the box id.
     atom_box: bool,
 }
 
+/// Frontend-neutral inline paint and interaction payload. Canonical fragments
+/// never carry the terminal `Item`'s cell coordinates or dimensions; the
+/// terminal adapter constructs those only while quantizing a piece.
+#[derive(Clone, Debug)]
+pub(crate) struct InlineItem {
+    pub text: String,
+    pub kind: ItemKind,
+    pub image: Option<String>,
+    pub emph: Emphasis,
+    /// Element whose computed style supplies paint values for this item.
+    ///
+    /// This is deliberately separate from `node`: CSS Display 3 anonymous
+    /// boxes inherit through their box-tree parentage, while synthesized
+    /// content such as an outside list marker has no DOM node of its own.
+    /// Keeping `node == NO_NODE` preserves the interaction/selection contract
+    /// without making graphical paint query the DOM with the sentinel.
+    pub style_node: NodeId,
+    pub node: NodeId,
+    pub link: Option<Link>,
+    pub crop: bool,
+    pub pixelated: bool,
+    pub invisible: bool,
+}
+
 impl Piece {
     /// An atomic piece with an explicit box (a replaced flex item laid at
-    /// an imposed size): the box is `box_rows` tall, the painted item sits
-    /// `col` cells / `off_rows` rows into it (object-fit letterboxing).
-    pub(crate) fn boxed(item: Item, box_rows: u16, col: usize, off_rows: u16) -> Piece {
+    /// an imposed size), with an independent object-fit paint rectangle.
+    pub(crate) fn boxed(
+        item: InlineItem,
+        box_width: f32,
+        box_height: f32,
+        paint_x: f32,
+        paint_y: f32,
+        paint_width: f32,
+        paint_height: f32,
+    ) -> Piece {
         Piece {
-            col,
-            row_off: 0,
-            rows: box_rows.max(1),
-            box_off_rows: off_rows,
+            x: 0.0,
+            y: 0.0,
+            box_width,
+            box_height,
+            paint_x,
+            paint_y,
+            paint_width,
+            paint_height,
+            ascent: box_height,
+            descent: 0.0,
+            vertical_align: VerticalAlign::Baseline,
             item,
+            shaped: None,
+            text_style: None,
             stretch: false,
             space_before: false,
             atom_box: false,
         }
     }
 
-    /// A synthesized one-item piece (list markers) — placed at the line
-    /// origin, one row, never justification-stretchable.
-    pub(crate) fn solo(item: Item) -> Piece {
+    pub(crate) fn shaped(item: InlineItem, shaped: crate::text::ShapedText) -> Piece {
+        let width = shaped.advance;
+        let height = shaped.line_height;
+        let ascent = shaped.baseline;
         Piece {
-            col: 0,
-            row_off: 0,
-            rows: item.height.max(1),
-            box_off_rows: 0,
+            x: 0.0,
+            y: 0.0,
+            box_width: width,
+            box_height: height,
+            paint_x: 0.0,
+            paint_y: 0.0,
+            paint_width: width,
+            paint_height: height,
+            ascent,
+            descent: (height - ascent).max(0.0),
+            vertical_align: VerticalAlign::Baseline,
             item,
+            shaped: Some(shaped),
+            text_style: None,
             stretch: false,
             space_before: false,
             atom_box: false,
@@ -117,46 +170,58 @@ impl Piece {
     }
 }
 
-/// The pre-laid used cell size of an atomic inline box (`inline-block`/
-/// `inline-flex`/`inline-grid`) — its MARGIN box in cells (margins occupy
+/// The pre-laid CSS-pixel size of an atomic inline box (`inline-block`/
+/// `inline-flex`/`inline-grid`) — its MARGIN box (margins occupy
 /// inline space). The block flow lays the box (`item_frag`) and hands these
 /// to the IFC in walk order (`boxes[k]` = k-th `Inline::AtomBox` met), exactly
 /// like `FloatBox`.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct AtomBoxSize {
-    pub w_cells: usize,
-    pub h_rows: u16,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AtomGeometry {
+    box_width: f32,
+    box_height: f32,
+    paint_x: f32,
+    paint_y: f32,
+    paint_width: f32,
+    paint_height: f32,
 }
 
 /// A resolved atomic-inline-box placement returned from the IFC: the box's
 /// element `node` (the block flow matches it to the pre-laid fragment), the
-/// line it landed on, and its margin-box top-left in cells relative to the line
-/// box (`col`) / line top (`row_off`, from bottom alignment).
+/// line it landed on, and its margin-box top-left in CSS pixels relative to the
+/// line box.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct AtomBoxPlace {
     pub node: NodeId,
     pub line: usize,
-    pub col: usize,
-    pub row_off: u16,
+    pub x: f32,
+    pub y: f32,
 }
 
 /// One finished line box.
 #[derive(Debug)]
 pub(crate) struct LineOut {
     pub pieces: Vec<Piece>,
-    /// Height in rows (≥1; >1 when an atomic rides the line).
-    pub rows: u16,
+    pub height: f32,
+    pub baseline: f32,
+    pub ascent: f32,
+    pub descent: f32,
     /// Ended by a forced break (`<br>`/preserved newline) — exempt from
     /// justification, like the IFC's last line.
     pub forced: bool,
-    /// Used cells (the pen at flush) — the alignment/justify extent. Kept on
-    /// the line because a `contain`-fitted replaced box occupies more cells
+    /// Used CSS pixels (the pen at flush) — the alignment/justify extent. Kept on
+    /// the line because a `contain`-fitted replaced box occupies more space
     /// than its painted item reports.
-    pub width: usize,
-    /// The line box's RIGHT edge in cells (the float-shortened cap it was laid
+    pub width: f32,
+    /// The line box's available band in CSS pixels (float-shortened).
     /// against — every line can differ beside floats). Justification at
-    /// `finish` distributes `cap - width` across this line's slots.
-    pub cap: usize,
+    pub left: f32,
+    pub right: f32,
 }
 
 /// The inline formatting context builder. Feed it the IFC's inline content,
@@ -169,11 +234,9 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     images: &'a ImageSizes,
     forms: &'a [Form],
     vp: Vp,
-    cell_w: f32,
-    cell_h: f32,
-    /// The content width in cells (floor-quantized) — the line-box cap when no
-    /// float shortens it.
-    cap: usize,
+    /// The content width in CSS pixels — the line-box cap when no float
+    /// shortens it.
+    cap: f32,
     /// The content box width in px (percentage basis for inline-box edges
     /// and replaced sizing; also the float band's right containing-block edge).
     cb_w_px: f32,
@@ -193,8 +256,8 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// Out-of-flow boxes met (static-position marks for the positioned
     /// post-pass) — they emit no pieces.
     oofs: Vec<OofMark<'t>>,
-    pen: usize,
-    line_start: usize,
+    pen: f32,
+    line_start: f32,
     pending_space: bool,
     /// Owed inline-box edge width (margins/borders/padding of opened/closed
     /// inline boxes), in px — folded into the next placement so an edge at a
@@ -219,24 +282,26 @@ pub(crate) struct Ifc<'a, 'f, 't> {
     /// Resolved placements (margin-box top-left px), returned by `finish`.
     placements: Vec<FloatPlace>,
     // ---- atomic inline boxes (inline-block/-flex/-grid) — empty slice = none ----
-    /// Pre-laid margin-box cell sizes, in the order the IFC meets the boxes.
+    /// Pre-laid margin-box CSS sizes, in the order the IFC meets the boxes.
     atom_boxes: &'f [AtomBoxSize],
     /// Index of the next `Inline::AtomBox` to meet (into `atom_boxes`).
     atom_next: usize,
-    /// Resolved atom-box placements (line/col/row_off), returned by `finish`.
+    /// Resolved atom-box placements, returned by `finish`.
     atom_places: Vec<AtomBoxPlace>,
-    /// The current line box's left content edge in cells (a left float's inset).
-    line_left: usize,
-    /// The current line box's right edge in cells (a right float pulls it in).
-    line_right: usize,
-    /// `text-indent`, applied to the FIRST line only (cells).
-    indent: usize,
+    /// The current line box's CSS-pixel float band.
+    line_left: f32,
+    line_right: f32,
+    /// `text-indent`, applied to the first formatted line (CSS px).
+    indent: f32,
     /// Whether the line about to be composed is the IFC's first (indent gate).
     on_first_line: bool,
     /// An intrinsic-size probe (`intrinsic_w`), not a real layout pass:
     /// `overflow-wrap: break-word`'s emergency breaks must NOT count as
     /// min-content opportunities (CSS Text §5.5 — unlike `anywhere`).
     measuring: bool,
+    /// The block container's inherited font/line-height strut. CSS Inline 3
+    /// §5.1 requires it to participate even on an otherwise empty line.
+    strut: crate::text::ShapedText,
 }
 
 impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
@@ -247,8 +312,6 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         images: &'a ImageSizes,
         forms: &'a [Form],
         vp: Vp,
-        cell_w: f32,
-        cell_h: f32,
         content_w_px: f32,
         cb_h_px: Option<f32>,
         align: Align2,
@@ -256,10 +319,14 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         floats: Option<FloatEnv<'f>>,
         atom_boxes: &'f [AtomBoxSize],
     ) -> Ifc<'a, 'f, 't> {
-        let cap = ((content_w_px / cell_w) + 1e-3).floor().max(1.0) as usize;
-        // `text-indent` on the first line, clamped ≥0 (a terminal cannot
-        // paint left of column 0 — the hanging-indent quantization).
-        let indent = ((indent_px / cell_w).round().max(0.0) as usize).min(cap.saturating_sub(1));
+        let cap = content_w_px.max(0.0);
+        // CSS Text 3 §9.1 permits a negative hanging indent; do not clamp it
+        // to a presentation edge in canonical layout.
+        let indent = if indent_px.is_finite() {
+            indent_px
+        } else {
+            0.0
+        };
         let (fc, float_boxes, content_left_x, content_top_y) = match floats {
             Some(env) => (Some(env.fc), env.boxes, env.left_x, env.top_y),
             None => (None, &[][..], 0.0, 0.0),
@@ -270,8 +337,6 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             images,
             forms,
             vp,
-            cell_w,
-            cell_h,
             cap,
             cb_w_px: content_w_px,
             cb_h_px,
@@ -280,8 +345,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             cur: Vec::new(),
             marks: Vec::new(),
             oofs: Vec::new(),
-            pen: 0,
-            line_start: 0,
+            pen: 0.0,
+            line_start: 0.0,
             pending_space: false,
             pending_gap_px: 0.0,
             fc,
@@ -294,11 +359,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             atom_boxes,
             atom_next: 0,
             atom_places: Vec::new(),
-            line_left: 0,
+            line_left: 0.0,
             line_right: cap,
             indent,
             on_first_line: true,
             measuring: false,
+            strut: crate::text::shape(" ", &crate::text::TextStyle::default()),
         };
         ifc.begin_line();
         ifc
@@ -318,19 +384,23 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let (left, right) = match &self.fc {
             Some(fc) if !fc.is_empty() => {
                 let y = self.content_top_y + self.laid_h;
-                let (li, ri) = fc.band(y, self.cell_h);
+                // Probe with the root inline's nominal line height. Once a
+                // line is built, `laid_h` advances by its actual metrics and
+                // the next band is queried at the true y.
+                let probe_h = 1.2 * crate::dom::FONT_SIZE_INITIAL;
+                let (li, ri) = fc.band(y, probe_h);
                 let own_l = self.content_left_x;
                 let own_r = own_l + self.cb_w_px;
-                let l = ((own_l.max(li) - own_l) / self.cell_w).round().max(0.0) as usize;
-                let r = ((own_r.min(ri) - own_l) / self.cell_w).floor().max(0.0) as usize;
+                let l = (own_l.max(li) - own_l).max(0.0);
+                let r = (own_r.min(ri) - own_l).max(0.0);
                 (l.min(self.cap), r.min(self.cap))
             }
-            _ => (0, self.cap),
+            _ => (0.0, self.cap),
         };
         self.line_left = left;
         self.line_right = right.max(left);
-        let indent = if self.on_first_line { self.indent } else { 0 };
-        self.line_start = (self.line_left + indent).min(self.line_right.max(self.line_left));
+        let indent = if self.on_first_line { self.indent } else { 0.0 };
+        self.line_start = self.line_left + indent;
         self.pen = self.line_start;
         self.pending_space = false;
     }
@@ -349,7 +419,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let top_min = if leading {
             line_y
         } else {
-            line_y + self.cell_h
+            line_y + crate::dom::FONT_SIZE_INITIAL * 1.2
         };
         let cb_l = self.content_left_x;
         let cb_r = self.content_left_x + self.cb_w_px;
@@ -368,6 +438,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// Lay the IFC's content. `root` is the block container's own inline
     /// context (text directly under the block uses it).
     pub fn run(&mut self, content: &'t [Inline], root: &InlineStyle) {
+        self.strut = crate::text::shape(" ", &root.text_style());
         for inl in content {
             self.walk(inl, root);
         }
@@ -394,7 +465,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             Inline::OutOfFlow(b) => self.oofs.push(OofMark {
                 b,
                 line: self.lines.len(),
-                x_px: self.pen as f32 * self.cell_w + self.pending_gap_px,
+                x_px: self.pen + self.pending_gap_px,
                 ctx: ctx.clone(),
             }),
             // A float (§9.5): pulled aside into the float context; it emits no
@@ -403,7 +474,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // An atomic inline box (inline-block/-flex/-grid): reserve its
             // pre-laid margin box on the line; the block flow splices its
             // content fragment at the resolved position.
-            Inline::AtomBox(b) => self.place_atom_box(b.node),
+            Inline::AtomBox(b) => self.place_atom_box(b.node, ctx),
             Inline::Box { node, style, kids } => {
                 let inner = InlineStyle::derive(self.dom, *node, ctx, self.base);
                 self.marks.push((*node, self.lines.len()));
@@ -432,7 +503,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// Emit a text run under `ctx`.
     pub fn text(&mut self, t: &str, ctx: &InlineStyle) {
         if ctx.font_zero {
-            // `font-size:0` text occupies zero cells (the copyable-but-unseen
+            // `font-size:0` text occupies no CSS geometry (the copyable-but-unseen
             // idiom); it neither paints nor owes spaces.
             return;
         }
@@ -466,9 +537,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     self.forced_break();
                 }
                 for (j, piece) in seg.split('\t').enumerate() {
-                    if j > 0 && ctx.tab > 0 {
-                        let rel = self.pen.saturating_sub(self.line_start);
-                        self.pen = self.line_start + (rel / ctx.tab + 1) * ctx.tab;
+                    if j > 0 {
+                        let tab = self.tab_advance(ctx);
+                        if tab > 0.0 {
+                            let rel = (self.pen - self.line_start).max(0.0);
+                            self.pen = self.line_start + (rel / tab).floor().mul_add(tab, tab);
+                        }
                     }
                     if !piece.is_empty() {
                         self.preserved(piece, ctx);
@@ -478,35 +552,11 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         }
     }
 
-    /// One word in a collapsing mode: split at CJK boundaries (a wide glyph
-    /// is a soft-wrap opportunity on both sides — the UAX #14 ideograph rule
-    /// at cell resolution), then place each segment greedily.
-    /// `word-break: keep-all` suppresses the CJK opportunities (§5.2).
+    /// One word in a collapsing mode. Parley's Unicode line breaker supplies
+    /// UAX #14 opportunities (including CJK and complex scripts); CSS remains
+    /// responsible for the selected word/overflow break strengths.
     fn word(&mut self, word: &str, ctx: &InlineStyle) {
-        if ctx.keep_all {
-            self.place(word, ctx, true, true);
-            return;
-        }
-        let mut seg = String::new();
-        let mut first = true;
-        let flush = |s: &mut String, ifc: &mut Self, first: &mut bool| {
-            if !s.is_empty() {
-                ifc.place(s, ctx, true, *first);
-                *first = false;
-                s.clear();
-            }
-        };
-        for c in word.chars() {
-            if display_width(c.encode_utf8(&mut [0u8; 4])) >= 2 {
-                flush(&mut seg, self, &mut first);
-                let wide = c.to_string();
-                self.place(&wide, ctx, true, first);
-                first = false;
-            } else {
-                seg.push(c);
-            }
-        }
-        flush(&mut seg, self, &mut first);
+        self.place_wrapped(word, ctx, true, true);
     }
 
     /// Preserved-mode text: place, breaking anywhere at capacity when the
@@ -516,33 +566,108 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             self.place(t, ctx, false, true);
             return;
         }
-        let mut rest: &str = t;
+        self.place_wrapped(t, ctx, false, true);
+    }
+
+    fn break_style(&self, ctx: &InlineStyle) -> crate::text::TextBreakStyle {
+        use crate::text::{TextBreakStyle, TextOverflowWrap, TextWordBreak};
+        let word_break = if ctx.keep_all {
+            TextWordBreak::KeepAll
+        } else if ctx.brk == super::style::WordBrk::BreakAll {
+            TextWordBreak::BreakAll
+        } else {
+            TextWordBreak::Normal
+        };
+        let overflow_wrap = match ctx.brk {
+            super::style::WordBrk::Anywhere => TextOverflowWrap::Anywhere,
+            super::style::WordBrk::BreakWord if !self.measuring => TextOverflowWrap::BreakWord,
+            _ => TextOverflowWrap::Normal,
+        };
+        TextBreakStyle {
+            wrap: ctx.ws.wraps(),
+            word_break,
+            overflow_wrap,
+        }
+    }
+
+    /// Break a styled run at Unicode cluster boundaries. This is deliberately
+    /// an inline-composition loop rather than a second text layout engine:
+    /// Parley chooses every break and measures every produced piece.
+    fn place_wrapped(
+        &mut self,
+        mut rest: &str,
+        ctx: &InlineStyle,
+        may_wrap: bool,
+        mut spaced: bool,
+    ) {
         while !rest.is_empty() {
-            let avail = self.line_right.saturating_sub(self.pen);
-            let mut w = 0usize;
-            let mut cut = rest.len();
-            for (bi, c) in rest.char_indices() {
-                let cw = display_width(c.encode_utf8(&mut [0u8; 4]));
-                if w + cw > avail {
-                    cut = bi;
-                    break;
-                }
-                w += cw;
-            }
-            if cut == 0 {
-                if self.pen > self.line_start {
-                    self.soft_break();
-                    continue;
-                }
-                // A single glyph wider than the line: place it anyway.
-                cut = rest.chars().next().map_or(rest.len(), char::len_utf8);
-            }
-            let (head, tail) = rest.split_at(cut);
-            self.place(head, ctx, false, true);
-            rest = tail;
-            if !rest.is_empty() {
+            let gap = self.pending_gap_px;
+            let space = if spaced && self.pending_space && self.pen > self.line_start {
+                Self::space_advance(ctx)
+            } else {
+                0.0
+            };
+            let avail = (self.line_right - self.pen - gap - space).max(0.0);
+            let full = crate::text::shape(rest, &ctx.text_style());
+            // Parley line breaking is substantially more expensive than
+            // retaining an already-shaped run. If the complete run fits,
+            // there cannot be a chosen soft wrap inside it; only ask Parley
+            // for the first legal break when the line actually overflows.
+            // CSS Text's break opportunities and emergency-wrap rules remain
+            // authoritative in `first_line_end` for that overflow case.
+            let break_style = self.break_style(ctx);
+            // Under normal/keep-all breaking an ASCII identifier contains no
+            // internal soft-wrap opportunity. This covers common class/tag
+            // labels without asking Parley to rediscover that fact under the
+            // 0px min-content probe; punctuation and every complex script
+            // still go through Parley's Unicode line breaker.
+            let plainly_unbreakable = !break_style.wrap
+                || (matches!(
+                    break_style.word_break,
+                    crate::text::TextWordBreak::Normal | crate::text::TextWordBreak::KeepAll
+                ) && matches!(
+                    break_style.overflow_wrap,
+                    crate::text::TextOverflowWrap::Normal
+                ) && rest
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_'));
+            let cut = if full.advance <= avail || plainly_unbreakable {
+                rest.len()
+            } else {
+                crate::text::first_line_end(rest, &ctx.text_style(), avail, break_style)
+            };
+            if cut > 0 && cut < rest.len() {
+                let (head, tail) = rest.split_at(cut);
+                self.place(head, ctx, false, spaced);
                 self.soft_break();
+                rest = tail;
+                spaced = false;
+                continue;
             }
+            if ctx.ws.wraps()
+                && full.advance > avail
+                && self.pen > self.line_start
+                && (may_wrap || cut == 0)
+            {
+                self.soft_break();
+                // Collapsible leading whitespace is discarded at the break;
+                // inline box edges remain pending in CSS pixels.
+                spaced = false;
+                continue;
+            }
+            self.place(rest, ctx, false, spaced);
+            break;
+        }
+    }
+
+    fn space_advance(ctx: &InlineStyle) -> f32 {
+        crate::text::shape(" ", &ctx.text_style()).advance.max(0.0)
+    }
+
+    fn tab_advance(&self, ctx: &InlineStyle) -> f32 {
+        match ctx.tab {
+            TabSize::Spaces(n) => Self::space_advance(ctx) * n.max(0.0),
+            TabSize::Length(px) => px.max(0.0),
         }
     }
 
@@ -550,16 +675,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// allowed; `spaced` = an owed collapsible space applies before it (false
     /// between CJK segments of one word).
     fn place(&mut self, seg: &str, ctx: &InlineStyle, may_wrap: bool, spaced: bool) {
-        let text = letter_space(seg, ctx.letter);
-        let w = display_width(&text);
-        if w == 0 {
+        let shaped = crate::text::shape(seg, &ctx.text_style());
+        let w = shaped.advance;
+        if w <= 0.0 {
             return;
         }
         let space = spaced && self.pending_space && self.pen > self.line_start;
+        let space_width = if space { Self::space_advance(ctx) } else { 0.0 };
         let gap = self.take_gap();
         if may_wrap
             && ctx.ws.wraps()
-            && self.pen + usize::from(space) + gap + w > self.line_right
+            && self.pen + space_width + gap + w > self.line_right
             && self.pen > self.line_start
             // `break-all` breaks mid-line inside the word instead of first
             // wrapping whole (CSS Text §5.2 — every character boundary is a
@@ -569,61 +695,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             self.soft_break();
             // The owed collapsible space dies at the wrap (CSS Text §4.1.3);
             // an owed inline-box edge travels with the content it precedes.
-            self.pending_gap_px = gap as f32 * self.cell_w;
+            self.pending_gap_px = gap;
             self.place(seg, ctx, false, false);
             return;
         }
-        // Within-word breaking (CSS Text §5.2 `word-break` / §5.5
-        // `overflow-wrap`): when the segment still doesn't fit — for
-        // `break-all` at any pen position, for `anywhere`/`break-word` only
-        // as the emergency break of a word wider than its line — split it at
-        // capacity and continue on the next line. `break-word`'s breaks
-        // don't count as min-content opportunities, so measuring probes skip
-        // it (`anywhere`'s DO count — the spec's one difference).
-        if ctx.ws.wraps() && self.pen + usize::from(space) + gap + w > self.line_right {
-            let allowed = match ctx.brk {
-                super::style::WordBrk::BreakAll => true,
-                super::style::WordBrk::Anywhere => self.pen == self.line_start,
-                super::style::WordBrk::BreakWord => !self.measuring && self.pen == self.line_start,
-                super::style::WordBrk::Normal => false,
-            };
-            let avail = self
-                .line_right
-                .saturating_sub(self.pen + usize::from(space) + gap);
-            // A full line under `break-all` still owes the plain wrap.
-            if allowed && avail == 0 && self.pen > self.line_start {
-                self.soft_break();
-                self.pending_gap_px = gap as f32 * self.cell_w;
-                self.place(seg, ctx, true, false);
-                return;
-            }
-            if allowed && avail > 0 && w > avail {
-                // The widest prefix that fits (≥1 char, so progress is
-                // guaranteed even beside a huge inline-box edge).
-                let mut cells = 0usize;
-                let mut cut = 0usize;
-                for (bi, c) in seg.char_indices() {
-                    let cw = display_width(c.encode_utf8(&mut [0u8; 4]))
-                        + if bi > 0 { ctx.letter } else { 0 };
-                    if cut > 0 && cells + cw > avail {
-                        break;
-                    }
-                    cells += cw;
-                    cut = bi + c.len_utf8();
-                }
-                if cut < seg.len() {
-                    let (head, tail) = seg.split_at(cut);
-                    self.place(head, ctx, false, spaced);
-                    self.soft_break();
-                    self.place(tail, ctx, true, false);
-                    return;
-                }
-            }
-        }
-        // Merge into the previous piece when nothing but a collapsible space
-        // separates two same-styled runs — fewer, wider items (selection and
-        // find work run-wise, matching the old engine's item granularity).
-        if gap == 0
+        // Merge adjacent same-styled words into one retained shaped run so
+        // shaping can cross ordinary whitespace and selection/hit testing
+        // keeps useful run granularity. Justified lines keep spaces
+        // as explicit gaps because their advances are expanded per line.
+        if !self.measuring
+            && self.align != Align2::Justify
+            && gap == 0.0
             && let Some(last) = self.cur.last_mut()
             && last.item.kind == ctx.kind
             && last.item.emph == ctx.emph
@@ -632,43 +714,58 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             && last.item.invisible == ctx.invisible
             && last.stretch == ctx.ws.collapses_spaces()
             && last.item.image.is_none()
-            && last.rows == 1
-            && last.col + display_width(&last.item.text) == self.pen
+            && (last.x + last.box_width - self.pen).abs() < 0.01
         {
             if space {
                 last.item.text.push(' ');
             }
-            last.item.text.push_str(&text);
-            last.item.width = display_width(&last.item.text) as u16;
-            self.pen += usize::from(space) + w;
+            last.item.text.push_str(seg);
+            // The advance of ordinary words separated by a collapsed U+0020
+            // is additive. Keep the greedy line geometry now, then perform
+            // one complete bidi/fallback shape in `flush_line`. Reshaping the
+            // growing prefix here performed 1+2+…+N glyph work for N words.
+            last.box_width += space_width + w;
+            last.paint_width = last.box_width;
+            last.shaped = None;
+            last.text_style = Some(ctx.text_style());
+            self.pen = last.x + last.box_width;
             self.pending_space = false;
             return;
         }
-        let col = self.pen + usize::from(space) + gap;
+        let x = self.pen + space_width + gap;
+        let height = shaped.line_height;
+        let ascent = shaped.baseline;
         self.cur.push(Piece {
-            col,
-            row_off: 0,
-            rows: 1,
-            box_off_rows: 0,
-            item: Item {
-                col: 0,
-                width: w as u16,
-                height: 1,
-                text: text.into_owned(),
+            x,
+            y: 0.0,
+            box_width: w,
+            box_height: height,
+            paint_x: 0.0,
+            paint_y: 0.0,
+            paint_width: w,
+            paint_height: height,
+            ascent,
+            descent: (height - ascent).max(0.0),
+            vertical_align: ctx.vertical_align,
+            item: InlineItem {
+                text: seg.to_string(),
                 kind: ctx.kind,
                 image: None,
                 emph: ctx.emph,
+                style_node: ctx.node,
                 node: ctx.node,
                 link: ctx.link.clone(),
                 crop: false,
                 pixelated: false,
                 invisible: ctx.invisible,
             },
+            shaped: Some(shaped),
+            text_style: Some(ctx.text_style()),
             stretch: ctx.ws.collapses_spaces(),
             space_before: space,
             atom_box: false,
         });
-        self.pen = col + w;
+        self.pen = x + w;
         self.pending_space = false;
     }
 
@@ -686,28 +783,35 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     self.dom,
                     a.node,
                     f,
-                    Some(self.cb_w_px),
+                    if self.measuring {
+                        ControlWidthBasis::Intrinsic
+                    } else {
+                        ControlWidthBasis::ContainingBlock(self.cb_w_px)
+                    },
                     self.cap,
-                    self.cell_w,
+                    ctx,
                     self.vp,
                 );
                 if label.is_empty() {
                     return;
                 }
-                let w = display_width(&label);
+                let shaped = crate::text::shape(&label, &ctx.text_style());
+                let w = shaped.advance;
                 self.place_atom(
-                    w,
-                    1,
-                    0,
-                    0,
-                    Item {
-                        col: 0,
-                        width: w as u16,
-                        height: 1,
+                    AtomGeometry {
+                        box_width: w,
+                        box_height: shaped.line_height,
+                        paint_x: 0.0,
+                        paint_y: 0.0,
+                        paint_width: w,
+                        paint_height: shaped.line_height,
+                    },
+                    InlineItem {
                         text: label,
                         kind: ItemKind::Form,
                         image: None,
                         emph: Emphasis::default(),
+                        style_node: a.node,
                         node: a.node,
                         link: Some(Link::Form {
                             form: *form,
@@ -717,7 +821,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         pixelated: false,
                         invisible: ctx.invisible,
                     },
+                    Some(shaped),
                     false,
+                    ctx.vertical_align,
+                    Self::space_advance(ctx),
                 );
             }
         }
@@ -744,7 +851,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let natural = url
             .and_then(|u| self.images.get(u))
             .filter(|&&(w, h)| w > 0 && h > 0)
-            .map(|&(w, h)| (f32::from(w) * self.cell_w, f32::from(h) * self.cell_h));
+            .map(|&(w, h)| (w as f32, h as f32));
         if let Some(r) = super::replaced::size(
             self.dom,
             node,
@@ -760,36 +867,33 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     "pixelated" | "crisp-edges" | "-moz-crisp-edges" | "-webkit-optimize-contrast"
                 )
             );
-            let box_w = ((r.box_w / self.cell_w).round().max(1.0) as usize).max(1);
-            let box_rows = (r.box_h / self.cell_h).round().max(1.0) as u16;
-            let paint_w = ((r.paint_w / self.cell_w).round().max(1.0) as u16).min(box_w as u16);
-            let paint_rows = ((r.paint_h / self.cell_h).round().max(1.0) as u16).min(box_rows);
-            let off_c =
-                ((r.off_x / self.cell_w).round().max(0.0) as u16).min(box_w as u16 - paint_w);
-            let off_r =
-                ((r.off_y / self.cell_h).round().max(0.0) as u16).min(box_rows - paint_rows);
             self.place_atom(
-                box_w,
-                box_rows,
-                off_c,
-                off_r,
-                Item {
-                    col: 0,
-                    width: paint_w,
-                    height: paint_rows,
+                AtomGeometry {
+                    box_width: r.box_w,
+                    box_height: r.box_h,
+                    paint_x: r.off_x,
+                    paint_y: r.off_y,
+                    paint_width: r.paint_w,
+                    paint_height: r.paint_h,
+                },
+                InlineItem {
                     text: String::new(),
                     kind: ItemKind::Image,
                     image: natural
                         .is_some()
                         .then(|| url.unwrap_or_default().to_string()),
                     emph: Emphasis::default(),
+                    style_node: node,
                     node,
                     link,
                     crop: r.crop,
                     pixelated,
                     invisible: ctx.invisible,
                 },
+                None,
                 false,
+                ctx.vertical_align,
+                Self::space_advance(ctx),
             );
             return;
         }
@@ -821,7 +925,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let own_suppressed = self.dom.paint_suppressed(node) || self.dom.visibility_hidden(node);
         // A paint-suppressed OUT-OF-FLOW media element contributes nothing:
         // an abspos box takes no normal-flow space (§9.3.1 — such boxes are
-        // laid in-flow only until P4) and a suppressed one paints no cells,
+        // laid in-flow only until P4) and a suppressed one paints no content,
         // so its net contribution is zero (Steam's lingering `opacity:0`
         // abspos microtrailer must not grow its capsule).
         let invisible = ctx.invisible || own_suppressed;
@@ -883,28 +987,33 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // The poster draws at its DECODED box capped to the line — never
             // the video's CSS box, which often carries a `height:0`/padding
             // aspect hack a poster must not inherit.
-            let w = (iw as usize).min(self.cap).max(1);
-            let h = ((u32::from(ih) * w as u32) / u32::from(iw)).max(1) as u16;
+            let w = (iw as f32).min(self.cap).max(1.0);
+            let h = (ih as f32 * w / iw as f32).max(1.0);
             self.place_atom(
-                w,
-                h,
-                0,
-                0,
-                Item {
-                    col: 0,
-                    width: w as u16,
-                    height: h,
+                AtomGeometry {
+                    box_width: w,
+                    box_height: h,
+                    paint_x: 0.0,
+                    paint_y: 0.0,
+                    paint_width: w,
+                    paint_height: h,
+                },
+                InlineItem {
                     text: String::new(),
                     kind: ItemKind::Image,
                     image: Some(poster),
                     emph: Emphasis::default(),
+                    style_node: node,
                     node,
                     link: link.clone(),
                     crop: false,
                     pixelated: false,
                     invisible,
                 },
+                None,
                 false,
+                ctx.vertical_align,
+                Self::space_advance(ctx),
             );
             return; // the drawn preview IS the mpv affordance
         }
@@ -921,83 +1030,105 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.text(&label, &mctx);
     }
 
-    /// Place an atomic box of `box_w`×`box_rows` cells (unbreakable). The
+    /// Place an atomic CSS-pixel box (unbreakable). The
     /// painted `item` may be smaller than its box (`object-fit: contain`
-    /// letterboxing), offset `off_cols`/`off_rows` from the box's top-left;
+    /// letterboxing), offset from the box's top-left;
     /// the pen and the line height always advance by the BOX.
     fn place_atom(
         &mut self,
-        box_w: usize,
-        box_rows: u16,
-        off_cols: u16,
-        off_rows: u16,
-        item: Item,
+        geometry: AtomGeometry,
+        item: InlineItem,
+        shaped: Option<crate::text::ShapedText>,
         atom_box: bool,
+        vertical_align: VerticalAlign,
+        space_advance: f32,
     ) {
         let space = self.pending_space && self.pen > self.line_start;
+        let space_width = if space { space_advance.max(0.0) } else { 0.0 };
         let gap = self.take_gap();
-        if self.pen + usize::from(space) + gap + box_w > self.line_right
+        if self.pen + space_width + gap + geometry.box_width > self.line_right
             && self.pen > self.line_start
         {
             self.soft_break();
-            self.pending_gap_px = gap as f32 * self.cell_w;
-            self.place_atom(box_w, box_rows, off_cols, off_rows, item, atom_box);
+            self.pending_gap_px = gap;
+            self.place_atom(
+                geometry,
+                item,
+                shaped,
+                atom_box,
+                vertical_align,
+                space_advance,
+            );
             return;
         }
-        let col = self.pen + usize::from(space) + gap;
+        let x = self.pen + space_width + gap;
         self.cur.push(Piece {
-            col: col + off_cols as usize,
-            row_off: 0,
-            rows: box_rows,
-            box_off_rows: off_rows,
+            x,
+            y: 0.0,
+            box_width: geometry.box_width,
+            box_height: geometry.box_height,
+            paint_x: geometry.paint_x,
+            paint_y: geometry.paint_y,
+            paint_width: geometry.paint_width,
+            paint_height: geometry.paint_height,
+            ascent: geometry.box_height,
+            descent: 0.0,
+            vertical_align,
             item,
+            shaped,
+            text_style: None,
             stretch: false,
             space_before: space,
             atom_box,
         });
-        self.pen = col + box_w;
+        self.pen = x + geometry.box_width;
         self.pending_space = false;
     }
 
     /// Place an atomic inline box (`inline-block`/`inline-flex`/`inline-grid`):
-    /// reserve its pre-laid margin-box cells on the line as an unbreakable
+    /// reserve its pre-laid margin box on the line as an unbreakable
     /// paint-nothing placeholder (`item.node` = the box id). The box's real
     /// content is a fragment the block flow splices at this piece's resolved
     /// position (`finish` returns the placement). The IFC only needs the size.
-    fn place_atom_box(&mut self, node: NodeId) {
+    fn place_atom_box(&mut self, node: NodeId, ctx: &InlineStyle) {
         let idx = self.atom_next;
         self.atom_next += 1;
         let Some(sz) = self.atom_boxes.get(idx).copied() else {
             return;
         };
         self.place_atom(
-            sz.w_cells,
-            sz.h_rows,
-            0,
-            0,
-            Item {
-                col: 0,
-                width: sz.w_cells as u16,
-                height: sz.h_rows,
+            AtomGeometry {
+                box_width: sz.width,
+                box_height: sz.height,
+                paint_x: 0.0,
+                paint_y: 0.0,
+                paint_width: sz.width,
+                paint_height: sz.height,
+            },
+            InlineItem {
                 text: String::new(),
                 kind: crate::layout2::ItemKind::Text,
                 image: None,
                 emph: Emphasis::default(),
+                style_node: node,
                 node,
                 link: None,
                 crop: false,
                 pixelated: false,
                 invisible: false,
             },
+            None,
             true,
+            ctx.vertical_align,
+            Self::space_advance(ctx),
         );
     }
 
-    /// Consume the owed inline-box edge width as whole cells.
-    fn take_gap(&mut self) -> usize {
-        let cells = (self.pending_gap_px / self.cell_w).round().max(0.0) as usize;
+    /// Consume the owed inline-box edge width without quantization.
+    fn take_gap(&mut self) -> f32 {
+        let gap = self.pending_gap_px.max(0.0);
         self.pending_gap_px = 0.0;
-        cells
+        gap
     }
 
     fn soft_break(&mut self) {
@@ -1011,48 +1142,97 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     }
 
     fn flush_line(&mut self, forced: bool) {
-        let pieces = std::mem::take(&mut self.cur);
+        let mut pieces = std::mem::take(&mut self.cur);
         if pieces.is_empty() && !forced {
             self.pen = self.line_start;
             self.pending_space = false;
             return;
         }
-        let rows = pieces.iter().map(|p| p.rows).max().unwrap_or(1);
-        // The pen is the line's used extent — a `contain`-fitted replaced
-        // box occupies more cells than its painted item, so the pieces alone
-        // under-report.
-        let width = self.pen;
-        let cap = self.line_right;
+        // Adjacent same-style words were measured individually for greedy
+        // wrapping and accumulated into one logical piece. Shape that final
+        // piece once here so bidi ordering, fallback runs, and cluster mapping
+        // describe the complete painted text. A tiny shaping delta moves only
+        // the following pieces and remains in CSS-pixel geometry.
+        let mut shift = 0.0;
+        for piece in &mut pieces {
+            piece.x += shift;
+            let Some(style) = piece.text_style.as_ref() else {
+                continue;
+            };
+            if piece.shaped.is_some() || piece.item.text.is_empty() {
+                continue;
+            }
+            let old_width = piece.box_width;
+            let shaped = crate::text::shape(&piece.item.text, style);
+            piece.box_width = shaped.advance;
+            piece.paint_width = shaped.advance;
+            piece.box_height = shaped.line_height;
+            piece.paint_height = shaped.line_height;
+            piece.ascent = shaped.baseline;
+            piece.descent = (shaped.line_height - shaped.baseline).max(0.0);
+            piece.shaped = Some(shaped);
+            shift += piece.box_width - old_width;
+        }
+        self.pen += shift;
+        let strut = &self.strut;
+        let ascent = pieces
+            .iter()
+            .map(|p| match p.vertical_align {
+                VerticalAlign::Shift(rise) => p.ascent + rise,
+                _ => p.ascent,
+            })
+            .fold(strut.baseline, f32::max);
+        let descent = pieces
+            .iter()
+            .map(|p| match p.vertical_align {
+                VerticalAlign::Shift(rise) => p.descent - rise,
+                _ => p.descent,
+            })
+            .fold((strut.line_height - strut.baseline).max(0.0), f32::max);
+        let height = (ascent + descent).max(strut.line_height);
+        let baseline = ascent;
+        for p in &mut pieces {
+            p.y = match p.vertical_align {
+                VerticalAlign::Baseline => baseline - p.ascent,
+                VerticalAlign::Shift(rise) => baseline - p.ascent - rise,
+                VerticalAlign::Top => 0.0,
+                VerticalAlign::Bottom => (height - p.box_height).max(0.0),
+                VerticalAlign::Middle => ((height - p.box_height) / 2.0).max(0.0),
+            };
+        }
+        // The pen is the line's used extent. A contain-fitted replaced box
+        // occupies its full object box even when its paint rectangle is less.
+        let width = (self.pen - self.line_left).max(0.0);
         let mut line = LineOut {
             pieces,
-            rows,
+            height,
+            baseline,
+            ascent,
+            descent,
             forced,
             width,
-            cap,
+            left: self.line_left,
+            right: self.line_right,
         };
-        // Baseline alignment quantized: bottoms on the line's last row (a
-        // replaced box's baseline is its bottom margin edge — §10.8.1).
-        for p in &mut line.pieces {
-            p.row_off = rows - p.rows;
-        }
         // Center/right shift now, within this line's (float-shortened) band;
         // justification waits for `finish`, where "last line" is known.
-        if width < cap {
+        let free = (self.line_right - self.pen).max(0.0);
+        if free > 0.0 {
             let off = match self.align {
-                Align2::Center => (cap - width) / 2,
-                Align2::Right => cap - width,
-                Align2::Left | Align2::Justify => 0,
+                Align2::Center => free / 2.0,
+                Align2::Right => free,
+                Align2::Left | Align2::Justify => 0.0,
             };
-            if off > 0 {
+            if off > 0.0 {
                 for p in &mut line.pieces {
-                    p.col += off;
+                    p.x += off;
                 }
             }
         }
-        // Record atomic-inline-box placements (col/row_off now resolved) and
+        // Record atomic-inline-box placements (x/y now resolved) and
         // drop their paint-nothing placeholders: the block flow splices the
         // box's real content fragment at each spot. Removal doesn't shift the
-        // siblings — their columns are already absolute on the line.
+        // siblings — their x positions are already absolute on the line.
         if line.pieces.iter().any(|p| p.atom_box) {
             let li = self.lines.len();
             for p in &line.pieces {
@@ -1060,8 +1240,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     self.atom_places.push(AtomBoxPlace {
                         node: p.item.node,
                         line: li,
-                        col: p.col,
-                        row_off: p.row_off,
+                        x: p.x,
+                        y: p.y,
                     });
                 }
             }
@@ -1070,7 +1250,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         self.lines.push(line);
         // Advance past this line box, then open the next against the band at
         // the new vertical position (a taller float may still shorten it).
-        self.laid_h += f32::from(rows) * self.cell_h;
+        self.laid_h += height;
         self.on_first_line = false;
         self.begin_line();
     }
@@ -1098,8 +1278,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 if i + 1 == n || line.forced {
                     continue;
                 }
-                if line.width < line.cap {
-                    let extra = line.cap - line.width;
+                let cap = (line.right - line.left).max(0.0);
+                if line.width < cap {
+                    let extra = cap - line.width;
                     justify(line, extra);
                 }
             }
@@ -1214,68 +1395,30 @@ fn composed_contains(dom: &Dom, ancestor: NodeId, node: NodeId) -> bool {
     false
 }
 
-/// CSS Text §7.3 justification at cell resolution: distribute `extra` cells
-/// across the line's expansion opportunities — the collapsible spaces inside
-/// stretchable runs and the materialized inter-run space gaps — left to
-/// right, one extra cell per remainder slot.
-fn justify(line: &mut LineOut, extra: usize) {
-    enum Slot {
-        /// The 1-cell gap before piece `i`.
-        Gap(usize),
-        /// The space at byte `b` inside piece `i`'s text.
-        Space(usize, usize),
-    }
-    let mut slots: Vec<Slot> = Vec::new();
-    for (pi, p) in line.pieces.iter().enumerate() {
-        if p.space_before {
-            slots.push(Slot::Gap(pi));
-        }
-        if p.stretch {
-            for (bi, c) in p.item.text.char_indices() {
-                if c == ' ' {
-                    slots.push(Slot::Space(pi, bi));
-                }
-            }
-        }
-    }
+/// CSS Text §7.3 justification in CSS pixels. Collapsed spaces are retained
+/// as explicit gaps between pieces, so expansion changes geometry without
+/// manufacturing extra U+0020 characters or reshaping glyph runs.
+fn justify(line: &mut LineOut, extra: f32) {
+    let slots: Vec<usize> = line
+        .pieces
+        .iter()
+        .enumerate()
+        .filter_map(|(index, piece)| piece.space_before.then_some(index))
+        .collect();
     if slots.is_empty() {
         return;
     }
-    let base = extra / slots.len();
-    let mut rem = extra % slots.len();
-    let mut add_before = vec![0usize; line.pieces.len()];
-    let mut add_inside: Vec<Vec<(usize, usize)>> = vec![Vec::new(); line.pieces.len()];
-    for s in slots {
-        let n = base + usize::from(rem > 0);
-        rem = rem.saturating_sub(1);
-        if n == 0 {
-            continue;
+    let per_slot = extra / slots.len() as f32;
+    let mut slot = slots.into_iter().peekable();
+    let mut shift = 0.0;
+    for (index, piece) in line.pieces.iter_mut().enumerate() {
+        if slot.peek() == Some(&index) {
+            shift += per_slot;
+            slot.next();
         }
-        match s {
-            Slot::Gap(pi) => add_before[pi] += n,
-            Slot::Space(pi, bi) => add_inside[pi].push((bi, n)),
-        }
+        piece.x += shift;
     }
-    let mut shift = 0usize;
-    for (pi, p) in line.pieces.iter_mut().enumerate() {
-        shift += add_before[pi];
-        p.col += shift;
-        if !add_inside[pi].is_empty() {
-            let mut text = String::with_capacity(p.item.text.len() + extra);
-            let mut last = 0usize;
-            for &(bi, n) in &add_inside[pi] {
-                text.push_str(&p.item.text[last..=bi]);
-                for _ in 0..n {
-                    text.push(' ');
-                }
-                shift += n;
-                last = bi + 1;
-            }
-            text.push_str(&p.item.text[last..]);
-            p.item.text = text;
-            p.item.width = display_width(&p.item.text) as u16;
-        }
-    }
+    line.width += extra;
 }
 
 /// The playable URL of a media element and the chosen `<source>` node (for
@@ -1343,13 +1486,22 @@ pub(crate) fn media_label(dom: &Dom, video: bool, src_node: Option<NodeId>) -> S
 /// attribute, else the UA default of 20 character advances — so a form's
 /// input boxes read as boxes, exactly as wide as the page asked. The value
 /// is never truncated (typed content outranks the declared width).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ControlWidthBasis {
+    /// A normal layout pass with a definite containing-block width.
+    ContainingBlock(f32),
+    /// An intrinsic contribution. CSS Sizing 3 §5.2.1 treats a cyclic
+    /// percentage size as `auto` while calculating that contribution.
+    Intrinsic,
+}
+
 pub(crate) fn control_label(
     dom: &Dom,
     node: NodeId,
     f: &crate::doc::Field,
-    cb_w: Option<f32>,
-    cap: usize,
-    cell_w: f32,
+    width_basis: ControlWidthBasis,
+    cap: f32,
+    inline_style: &InlineStyle,
     vp: Vp,
 ) -> String {
     let mut label = f.row_label();
@@ -1361,29 +1513,36 @@ pub(crate) fn control_label(
         return label;
     }
     let u = Units::of(dom, node);
-    let css_cells = dom
+    let css_width = dom
         .computed_value(node, "width")
         .and_then(|v| Len::parse(&v, u, vp))
-        .and_then(|l| l.resolve(cb_w))
-        .map(|px| (px / cell_w).round().max(1.0) as usize);
+        .and_then(|l| {
+            l.resolve(match width_basis {
+                ControlWidthBasis::ContainingBlock(width) => Some(width),
+                ControlWidthBasis::Intrinsic => None,
+            })
+        });
     let attr_ch = |name: &str| {
         dom.attr(node, name)
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
     };
-    // `size`/`cols` are measured in character advances = cells; the
-    // widget's brackets add 2. HTML defaults both to 20.
+    // HTML's `size`/`cols` are character advances. They are deliberately
+    // resolved with this control's shaped `ch` basis, never terminal cells.
     let attr_name = if f.kind == FieldKind::Textarea {
         "cols"
     } else {
         "size"
     };
-    let target = css_cells
-        .unwrap_or_else(|| attr_ch(attr_name).unwrap_or(20) + 2)
-        .min(cap);
-    let have = display_width(&label);
+    let text_style = inline_style.text_style();
+    let target = css_width.unwrap_or_else(|| {
+        crate::text::zero_advance(&text_style) * (attr_ch(attr_name).unwrap_or(20) + 2) as f32
+    });
+    let target = target.min(cap).max(0.0);
+    let have = crate::text::shape(&label, &text_style).advance;
     if have < target && label.ends_with(']') {
-        let pad = " ".repeat(target - have);
+        let space = crate::text::shape(" ", &text_style).advance.max(0.01);
+        let pad = " ".repeat(((target - have) / space).ceil() as usize);
         label.truncate(label.len() - 1);
         label.push_str(&pad);
         label.push(']');

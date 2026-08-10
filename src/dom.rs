@@ -184,11 +184,11 @@ pub struct Dom {
     /// numeric composition walks ancestors, so it's cached like the other
     /// per-element cascade reads.
     font_cache: RefCell<NodeCache<f32>>,
-    /// The CSS-pixel viewport (`cols*cell_px`, `rows*cell_px`) used to
-    /// evaluate `@media` queries when the cascade is built; `(0, 0)` = unknown
+    /// The CSS-pixel viewport used to evaluate `@media` queries when the
+    /// cascade is built; `(0, 0)` = unknown
     /// (width/height queries then conservatively don't match, as if skipped).
     /// Set by `execute_js` from `PageEnv`.
-    viewport_px: (u32, u32),
+    viewport_px: (f32, f32),
     /// Per-element inner-scroll state (CSSOM View `element.scrollTop`, Phase 3).
     /// Keyed by node; absent = never scrolled / not a measured scroll box.
     scroll_state: FxHashMap<NodeId, ScrollBox>,
@@ -196,9 +196,6 @@ pub struct Dom {
     /// drain — delivered to the app as `PageEvt::Scrolled` so a pure scroll (no
     /// DOM mutation) re-windows a region WITHOUT a full re-parse/relayout.
     scroll_changes: Vec<(NodeId, f64, f64)>,
-    /// Terminal cell size in px (`PageEnv.cell_px`), for the px↔row conversion
-    /// when baking `data-trust-scroll-top`. Default 8×16 (the nominal).
-    cell_px: (u16, u16),
     /// The document's URL (DOM §4.5 "documents have an associated URL"). Set
     /// by `load_page` from `PageEnv`; the live serializer resolves sprite
     /// `<use>` hrefs against it (the SAME base `rewrite_inline_svgs` uses on
@@ -390,10 +387,9 @@ impl Dom {
             cascaded_cache: RefCell::new(NodeCache::default()),
             hidden_cache: RefCell::new(NodeCache::default()),
             font_cache: RefCell::new(NodeCache::default()),
-            viewport_px: (0, 0),
+            viewport_px: (0.0, 0.0),
             scroll_state: FxHashMap::default(),
             scroll_changes: Vec::new(),
-            cell_px: (8, 16),
             doc_url: None,
             dirty_nodes: Vec::new(),
             dirty_attributed: true,
@@ -858,10 +854,13 @@ impl Dom {
         )
     }
 
-    /// Set the CSS-pixel viewport (`cols*cell_px`, `rows*cell_px`) that
-    /// `@media` queries evaluate against. Invalidates the cascade cache when
-    /// it changes so breakpoint-gated rules re-resolve.
-    pub fn set_viewport_px(&mut self, width: u32, height: u32) {
+    /// Set the CSS-pixel viewport that `@media` queries evaluate against.
+    /// Invalidates the cascade cache when it changes so breakpoint-gated rules
+    /// re-resolve. Device scale and terminal cell metrics never enter this
+    /// state (Media Queries 4 §5.1).
+    pub fn set_viewport_px(&mut self, width: f32, height: f32) {
+        let width = width.max(0.0);
+        let height = height.max(0.0);
         if self.viewport_px != (width, height) {
             self.viewport_px = (width, height);
             self.touch_style(); // @media re-evaluates against the viewport
@@ -876,13 +875,6 @@ impl Dom {
     /// (the conservative default the old stub had for every query).
     pub fn media_matches(&self, query: &str) -> bool {
         media_query_matches(query, self.viewport_px)
-    }
-
-    /// Set the terminal cell pixel size (`PageEnv.cell_px`) — used to convert the
-    /// px `scrollTop` to rows when the live serializer bakes
-    /// `data-trust-scroll-top`. No `touch()`: it only affects the next bake.
-    pub fn set_cell_px(&mut self, w: u16, h: u16) {
-        self.cell_px = (w.max(1), h.max(1));
     }
 
     /// Set the document's URL (DOM §4.5). No `touch()`: it only affects how
@@ -1580,8 +1572,8 @@ impl Dom {
         false
     }
 
-    /// Whether the element's own PAINT is suppressed by `opacity:0` (effective
-    /// opacity below `OPACITY_HIDDEN`). Unlike `is_hidden` (box generation),
+    /// Whether the element's own PAINT is suppressed by an effective
+    /// `opacity` of exactly zero. Unlike `is_hidden` (box generation),
     /// this does NOT remove the element from layout: CSS Color/Compositing lays
     /// out and measures an `opacity:0` element exactly as if visible, then
     /// paints it (and its subtree, as a group) fully transparent. The layout
@@ -1596,7 +1588,7 @@ impl Dom {
                 .is_some_and(|s| s.contains("opacity"))
         };
         (self.style_index().has_opacity || has_inline_opacity())
-            && self.effective_opacity(id) < OPACITY_HIDDEN
+            && self.effective_opacity(id) <= 0.0
     }
 
     /// Whether the element's own PAINT is suppressed by `visibility:hidden`
@@ -1677,16 +1669,16 @@ impl Dom {
     /// names a keyframe set whose END opacity is known — that resting value.
     /// So `.slides{opacity:0}` hides, while `.slides.active{animation:fade-in
     /// forwards}` (ending `opacity:1`) shows, with no slideshow-specific code.
-    fn effective_opacity(&self, id: NodeId) -> f32 {
+    pub fn effective_opacity(&self, id: NodeId) -> f32 {
         let base = self
             .cascaded(id, "opacity")
             .as_deref()
             .and_then(parse_alpha)
             .unwrap_or(1.0);
-        // Only a near-invisible base is worth the animation lookup; a normally
-        // opaque (or merely faded) element shows as-is.
-        if base >= OPACITY_HIDDEN {
-            return base;
+        // Only a fully transparent base is worth the animation lookup; every
+        // non-zero value must survive for group compositing in graphical paint.
+        if base > 0.0 {
+            return base.clamp(0.0, 1.0);
         }
         for (name, fill) in self.animations_of(id) {
             if matches!(fill.as_deref(), Some("forwards" | "both"))
@@ -1695,7 +1687,7 @@ impl Dom {
                 return end;
             }
         }
-        base
+        base.clamp(0.0, 1.0)
     }
 
     /// The element's animations as `(name, fill-mode)` pairs. Both the
@@ -1860,11 +1852,11 @@ impl Dom {
         None
     }
 
-    /// Whether the subtree rooted at `root` (inclusive) paints any cell in our
-    /// renderer: any non-whitespace text, any replaced/control/marker element,
-    /// any `::before`/`::after` generated content, or (borders on) a drawn
-    /// border. We render no color/background, so a plain container with none of
-    /// those paints nothing. Early-exits on the first painting node. Generic
+    /// Whether the subtree rooted at `root` (inclusive) has any CSS-painted
+    /// content: text, a replaced/control/marker element, generated content,
+    /// border, or background. This is canonical paintability; a frontend's
+    /// inability or choice not to draw a primitive cannot change box-tree
+    /// construction. Early-exits on the first painting node. Generic
     /// containers (`div`/`span`/headings/…) paint only via their text children,
     /// which are checked; only the POSITIVE painting tags below count as
     /// self-painting, so an unlisted generic tag is correctly non-painting and an
@@ -1877,7 +1869,6 @@ impl Dom {
             "textarea", "select", "button", "progress", "meter", "hr", "li", "summary", "details",
             "audio", "math", "source", "track", "marquee",
         ];
-        let borders = crate::layout2::borders_enabled();
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
             match &self.nodes[id].data {
@@ -1891,7 +1882,15 @@ impl Dom {
                     {
                         return true;
                     }
-                    if borders && self.has_drawn_border(id) {
+                    let background = self
+                        .computed_style(id, "background-image")
+                        .is_some_and(|value| !matches!(value.trim(), "" | "none"))
+                        || self
+                            .computed_style(id, "background-color")
+                            .is_some_and(|value| {
+                                !matches!(value.trim(), "" | "transparent" | "rgba(0, 0, 0, 0)")
+                            });
+                    if self.has_drawn_border(id) || background {
                         return true;
                     }
                     let mut c = self.nodes[id].first_child;
@@ -1954,8 +1953,23 @@ impl Dom {
         else {
             return false;
         };
-        // A cell ≈ one unit of display width.
-        crate::layout2::display_width(label) as f32 > width_px / u.cell_w
+        let style = crate::text::TextStyle {
+            family: self
+                .computed_value(id, "font-family")
+                .unwrap_or_else(|| String::from("sans-serif")),
+            size: u.fs,
+            weight: self
+                .computed_value(id, "font-weight")
+                .as_deref()
+                .and_then(crate::layout2::css_font_weight)
+                .unwrap_or(400.0),
+            italic: self
+                .computed_value(id, "font-style")
+                .as_deref()
+                .is_some_and(crate::layout2::css_is_italic),
+            ..crate::text::TextStyle::default()
+        };
+        crate::text::shape(label, &style).advance > width_px
     }
 
     /// Whether `id` is a content-less full-area POSITIONED OVERLAY — a click
@@ -3961,17 +3975,15 @@ impl Dom {
         if self.hover_hosts.contains(&id) {
             out.push_str(&format!(" data-trust-hover=\"{id}\""));
         }
-        // A scroll container's current `scrollTop` SIGNAL (CSSOM View) rides the
-        // HTML in ROWS so `flow_region` can re-seed the region's voffset — the
-        // page's own `element.scrollTop` write (a chat pinning to the bottom)
-        // survives the re-parse, exactly like a baked form value. (The box
-        // GEOMETRY round-trips separately via a `PageCmd`; only the position is
-        // baked, since the app already measures the geometry.)
-        if is_scroll && let Some(sb) = self.scroll_state.get(&id) {
-            let rows = (sb.top / f64::from(self.cell_px.1.max(1))).round();
-            if rows >= 1.0 {
-                out.push_str(&format!(" data-trust-scroll-top=\"{}\"", rows as i64));
-            }
+        // A scroll container's current `scrollTop` signal (CSSOM View) rides the
+        // HTML in CSS pixels so it survives the live snapshot/re-parse exactly
+        // like a baked form value. A terminal consumer quantizes this value only
+        // when constructing its Region; graphical consumers keep it unchanged.
+        if is_scroll
+            && let Some(sb) = self.scroll_state.get(&id)
+            && sb.top >= 1.0
+        {
+            out.push_str(&format!(" data-trust-scroll-top=\"{}\"", sb.top));
         }
         out.push('>');
         if !VOID_ELEMENTS.contains(&tag) {
@@ -5898,19 +5910,25 @@ fn prop_index(name: &str) -> Option<usize> {
 /// the `inherited=true` rows below. (`visibility` is inherited but a rendered
 /// boundary is by definition visible, so it's a near-no-op; included for rigor.)
 const INHERITED_LAYOUT_PROPS: &[&str] = &[
+    "color",
     "text-align",
     "font-size",
+    "font-family",
     "font-weight",
     "font-style",
+    "line-height",
     "white-space",
     "white-space-collapse",
     "text-wrap",
     "text-wrap-mode",
     "text-transform",
     "letter-spacing",
+    "word-spacing",
     "list-style-type",
     "list-style-position",
     "text-indent",
+    "text-decoration-color",
+    "text-decoration-style",
     "visibility",
     "pointer-events",
     "interactivity",
@@ -5925,6 +5943,10 @@ const PROPS: &[PropDef] = &[
     //    name                    inherited  baked
     prop("display", false, true),
     prop("visibility", true, true),
+    // CSS Color 4: `color` is inherited and is the `currentcolor` source for
+    // borders and text decorations. Graphical paint must retain it instead of
+    // falling back to the terminal theme at the end of layout.
+    prop("color", true, true),
     // CSS UI 4 §6.2/§6.3: both inherit and affect hit testing without
     // changing box generation. Bake them into live snapshots so the layout
     // arena sees the same interaction eligibility as the resident page DOM.
@@ -5944,8 +5966,10 @@ const PROPS: &[PropDef] = &[
     prop("padding-right", false, true),
     prop("text-align", true, true),
     prop("font-size", true, true),
+    prop("font-family", true, true),
     prop("font-weight", true, true),
     prop("font-style", true, true),
+    prop("line-height", true, true),
     prop("white-space", true, true),
     // CSS Text 4 longhands: `white-space` is now the shorthand of
     // `white-space-collapse` × `text-wrap-mode` (`text-wrap` shorthands the
@@ -5964,11 +5988,19 @@ const PROPS: &[PropDef] = &[
     prop("tab-size", true, true),
     prop("text-transform", true, true),
     prop("letter-spacing", true, true),
+    prop("word-spacing", true, true),
+    // CSS Inline 3 §4.2: inline-level boxes align against real typographic
+    // baselines. The first pixel-native cut implements the interoperable CSS2
+    // values in layout2 and retains unknown values as baseline.
+    prop("vertical-align", false, true),
     prop("list-style-type", true, true),
     prop("list-style-position", true, true),
     prop("text-indent", true, true),
     prop("text-decoration", false, true),
     prop("text-decoration-line", false, true),
+    prop("text-decoration-color", false, true),
+    prop("text-decoration-style", false, true),
+    prop("text-shadow", true, true),
     prop("content", false, false),
     // CSS Box Sizing 3: whether declared width/height include border+padding.
     // The modern web's near-universal `*{box-sizing:border-box}` reset makes
@@ -5982,6 +6014,7 @@ const PROPS: &[PropDef] = &[
     prop("max-height", false, true),
     prop("aspect-ratio", false, true),
     prop("object-fit", false, true),
+    prop("object-position", false, true),
     // CSS Images 3 §5.4: `pixelated`/`crisp-edges` ask for nearest-neighbor
     // scaling (blocky upscale — QR codes, pixel art). Inherited per spec;
     // baked so the app-side re-parse of a live snapshot keeps it.
@@ -6006,16 +6039,27 @@ const PROPS: &[PropDef] = &[
     // `background` expands to these two in `expand_box_shorthand`.
     prop("background-color", false, true),
     prop("background-image", false, true),
+    prop("background-repeat", false, true),
+    prop("background-position", false, true),
+    prop("background-size", false, true),
+    prop("background-origin", false, true),
+    prop("background-clip", false, true),
+    prop("background-attachment", false, true),
     prop("position", false, true),
     // CSS Transforms 1: only the TRANSLATE functions are consumed (a paint
     // offset on out-of-flow composited boxes — `layout::translate_offset`);
     // scale/rotate/matrix stay unapplied (visual-only deviation). Baked so
     // the live-page re-parse keeps a JS-set slide-in offset.
     prop("transform", false, true),
+    prop("transform-origin", false, true),
     // CSS Transforms 2 individual transform property (the modern
     // `translate: x y`); like `transform`, any non-none value forms a
     // stacking context and a containing block for out-of-flow descendants.
     prop("translate", false, true),
+    prop("mix-blend-mode", false, true),
+    prop("isolation", false, true),
+    prop("filter", false, true),
+    prop("box-shadow", false, true),
     prop("z-index", false, true),
     prop("top", false, true),
     prop("right", false, true),
@@ -6073,6 +6117,14 @@ const PROPS: &[PropDef] = &[
     prop("border-right-style", false, true),
     prop("border-bottom-style", false, true),
     prop("border-left-style", false, true),
+    prop("border-top-color", false, true),
+    prop("border-right-color", false, true),
+    prop("border-bottom-color", false, true),
+    prop("border-left-color", false, true),
+    prop("border-top-left-radius", false, true),
+    prop("border-top-right-radius", false, true),
+    prop("border-bottom-right-radius", false, true),
+    prop("border-bottom-left-radius", false, true),
 ];
 
 fn is_tracked(name: &str) -> bool {
@@ -6284,11 +6336,6 @@ fn font_size_px(value: &str, parent: f32, root: f32) -> Option<f32> {
     })
 }
 
-/// Below this effective opacity an element's paint is suppressed (laid out but
-/// painted blank — `paint_suppressed`). Keeps merely-faded content (e.g.
-/// `opacity:0.5`) painted normally.
-const OPACITY_HIDDEN: f32 = 0.05;
-
 /// Parse a CSS `<alpha-value>`: a number, or a percentage (CSS Color 4 —
 /// `opacity: 0%` is valid and must read as 0, not fail the parse and
 /// default to fully opaque).
@@ -6379,6 +6426,26 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             (format!("{prop}-left"), l.to_string()),
         ];
     }
+    // CSS Backgrounds and Borders 3 §5.5: horizontal radii precede an
+    // optional slash and vertical radii follow it. Keep the paired used-value
+    // syntax in each corner longhand for graphical rounded geometry.
+    if prop == "border-radius" {
+        let (horizontal, vertical) =
+            split_top_level_slash(value).map_or((value, value), |(h, v)| (h.trim(), v.trim()));
+        let (Some(h), Some(v)) = (four_sides(horizontal), four_sides(vertical)) else {
+            return Vec::new();
+        };
+        return [
+            "border-top-left-radius",
+            "border-top-right-radius",
+            "border-bottom-right-radius",
+            "border-bottom-left-radius",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| (name.to_string(), format!("{} {}", h[i], v[i])))
+        .collect();
+    }
     // `inset`: 1–4 values, top/right/bottom/left (the offset shorthand a
     // full-viewport modal often uses, `inset:0`).
     if prop == "inset" {
@@ -6392,10 +6459,11 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             ("left".to_string(), l.to_string()),
         ];
     }
-    // `border-width`/`border-style`: 1–4 values, top/right/bottom/left.
+    // `border-width`/`border-style`/`border-color`: 1–4 values,
+    // top/right/bottom/left.
     if let Some(kind) = prop
         .strip_prefix("border-")
-        .filter(|k| *k == "width" || *k == "style")
+        .filter(|k| *k == "width" || *k == "style" || *k == "color")
     {
         let Some(sides) = four_sides(value) else {
             return Vec::new();
@@ -6407,7 +6475,7 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             .collect();
     }
     // `border` / `border-{side}`: a `width || style || color` shorthand. We
-    // keep the width and style (color is ignored), per side. The shorthand
+    // retain all three components per side. The shorthand
     // RESETS omitted longhands (width ← `medium`, style ← `none` — so a
     // `border: 2px` has no visible style and computes a 0 used width, per
     // CSS 2.1 §8.5.4); a value where NOTHING parses (`border: var(--b)`)
@@ -6415,16 +6483,17 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     if prop == "border" {
         let sides: &[&str] = &["top", "right", "bottom", "left"];
         if wide_keyword(value).is_some() {
-            return border_longhands(sides, Some(value), Some(value));
+            return border_longhands(sides, Some(value), Some(value), Some(value));
         }
-        let (w, s) = parse_border_shorthand(value);
-        if w.is_none() && s.is_none() {
+        let (w, s, c) = parse_border_shorthand(value);
+        if w.is_none() && s.is_none() && c.is_none() {
             return Vec::new();
         }
         return border_longhands(
             sides,
             Some(w.unwrap_or("medium")),
             Some(s.unwrap_or("none")),
+            Some(c.unwrap_or("currentcolor")),
         );
     }
     if let Some(side) = prop
@@ -6432,16 +6501,17 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         .filter(|s| matches!(*s, "top" | "right" | "bottom" | "left"))
     {
         if wide_keyword(value).is_some() {
-            return border_longhands(&[side], Some(value), Some(value));
+            return border_longhands(&[side], Some(value), Some(value), Some(value));
         }
-        let (w, s) = parse_border_shorthand(value);
-        if w.is_none() && s.is_none() {
+        let (w, s, c) = parse_border_shorthand(value);
+        if w.is_none() && s.is_none() && c.is_none() {
             return Vec::new();
         }
         return border_longhands(
             &[side],
             Some(w.unwrap_or("medium")),
             Some(s.unwrap_or("none")),
+            Some(c.unwrap_or("currentcolor")),
         );
     }
     // `grid-gap`/`grid-row-gap`/`grid-column-gap`: the deprecated aliases of
@@ -6652,7 +6722,7 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     // `font`: `<style> || <variant> || <weight> || <stretch> <size>
     // [/ <line-height>] <family>` (CSS Fonts §6.3) — expand the components we
     // track. The size is the first size-shaped token; everything after it is
-    // line-height/family (untracked, ignored). System-font keywords
+    // the optional line-height and family. System-font keywords
     // (`caption`, `menu`, …) expand to nothing.
     if prop == "font" {
         if wide_keyword(value).is_some() {
@@ -6660,10 +6730,14 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 ("font-style".to_string(), value.to_string()),
                 ("font-weight".to_string(), value.to_string()),
                 ("font-size".to_string(), value.to_string()),
+                ("line-height".to_string(), value.to_string()),
+                ("font-family".to_string(), value.to_string()),
             ];
         }
+        let tokens = split_top_level_ws(value);
         let (mut style, mut weight, mut size) = (None, None, None);
-        for tok in value.split_whitespace() {
+        let mut size_index = None;
+        for (index, tok) in tokens.iter().copied().enumerate() {
             let t = tok.split('/').next().unwrap_or(tok);
             match t.to_ascii_lowercase().as_str() {
                 "italic" | "oblique" => style = Some(t.to_string()),
@@ -6676,6 +6750,7 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 }
                 s if font_size_token(s) => {
                     size = Some(t.to_string());
+                    size_index = Some(index);
                     break;
                 }
                 _ => {}
@@ -6687,6 +6762,29 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
         let Some(size) = size else {
             return Vec::new();
         };
+        let index = size_index.unwrap_or(0);
+        let size_token = tokens[index];
+        let mut line_height = size_token
+            .split_once('/')
+            .map(|(_, height)| height.trim().to_string())
+            .filter(|height| !height.is_empty());
+        let mut family_start = index + 1;
+        if line_height.is_none() && tokens.get(family_start).copied() == Some("/") {
+            line_height = tokens
+                .get(family_start + 1)
+                .map(|height| (*height).to_string());
+            family_start += 2;
+        } else if line_height.is_none()
+            && tokens
+                .get(family_start)
+                .is_some_and(|token| token.starts_with('/'))
+        {
+            line_height = tokens
+                .get(family_start)
+                .map(|height| height.trim_start_matches('/').to_string());
+            family_start += 1;
+        }
+        let family = tokens[family_start..].join(" ");
         return vec![
             (
                 "font-style".to_string(),
@@ -6697,6 +6795,18 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
                 weight.unwrap_or_else(|| "normal".into()),
             ),
             ("font-size".to_string(), size),
+            (
+                "line-height".to_string(),
+                line_height.unwrap_or_else(|| "normal".into()),
+            ),
+            (
+                "font-family".to_string(),
+                if family.is_empty() {
+                    "serif".into()
+                } else {
+                    family
+                },
+            ),
         ];
     }
     // `background`: only the color and the image longhands are consumed (the
@@ -6729,7 +6839,10 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     vec![(prop.to_string(), value.to_string())]
 }
 
-/// `background` shorthand → the two tracked longhands (see the call site).
+/// `background` shorthand → retained graphical longhands. This is deliberately
+/// conservative: image/color grammar is preserved exactly, while repeat,
+/// attachment and boxes are recognized from their closed keyword sets. An
+/// omitted component is reset to its initial value as the shorthand requires.
 fn expand_background(value: &str) -> Vec<(String, String)> {
     let v = value.trim();
     if v.is_empty() {
@@ -6743,19 +6856,29 @@ fn expand_background(value: &str) -> Vec<(String, String)> {
         v.to_ascii_lowercase().as_str(),
         "inherit" | "initial" | "unset" | "revert" | "revert-layer"
     ) {
-        out.push(("background-color".to_string(), v.to_string()));
-        out.push(("background-image".to_string(), v.to_string()));
+        for name in [
+            "background-color",
+            "background-image",
+            "background-repeat",
+            "background-position",
+            "background-size",
+            "background-origin",
+            "background-clip",
+            "background-attachment",
+        ] {
+            out.push((name.to_string(), v.to_string()));
+        }
         return out;
     }
     let mut color: Option<&str> = None;
-    let mut image: Option<&str> = None;
+    let mut images = Vec::new();
     let layers = split_top_level_commas(v);
     let last = layers.len() - 1;
     for (i, layer) in layers.iter().enumerate() {
         for tok in split_value_tokens(layer) {
             let t = tok.to_ascii_lowercase();
-            if image.is_none() && bg_image_token(&t) {
-                image = Some(tok);
+            if bg_image_token(&t) {
+                images.push(tok);
             } else if i == last && color.is_none() && bg_color_token(&t) {
                 color = Some(tok);
             }
@@ -6767,8 +6890,23 @@ fn expand_background(value: &str) -> Vec<(String, String)> {
     ));
     out.push((
         "background-image".to_string(),
-        image.unwrap_or("none").to_string(),
+        if images.is_empty() {
+            "none".to_string()
+        } else {
+            images.join(", ")
+        },
     ));
+    // Full layer position/size parsing is intentionally left to the retained
+    // paint snapshot. These initial values are nevertheless important: a
+    // shorthand resets an earlier longhand even when it omits the component.
+    out.extend([
+        ("background-repeat".to_string(), "repeat".to_string()),
+        ("background-position".to_string(), "0% 0%".to_string()),
+        ("background-size".to_string(), "auto auto".to_string()),
+        ("background-origin".to_string(), "padding-box".to_string()),
+        ("background-clip".to_string(), "border-box".to_string()),
+        ("background-attachment".to_string(), "scroll".to_string()),
+    ]);
     out
 }
 
@@ -6919,17 +7057,18 @@ fn four_sides(value: &str) -> Option<[&str; 4]> {
     }
 }
 
-/// The `(width, style)` of a `border`/`border-<side>` shorthand (color
-/// dropped). Order-independent: the style keyword and a width token (`thin`/
-/// `medium`/`thick` or a length) are picked out; anything else is the color.
-fn parse_border_shorthand(value: &str) -> (Option<&str>, Option<&str>) {
+/// The `(width, style, color)` of a `border`/`border-<side>` shorthand.
+/// Order-independent: the style keyword and a width token (`thin`/`medium`/
+/// `thick` or a length) are picked out; a recognized color is retained.
+fn parse_border_shorthand(value: &str) -> (Option<&str>, Option<&str>, Option<&str>) {
     const STYLES: &[&str] = &[
         "none", "hidden", "solid", "dashed", "dotted", "double", "groove", "ridge", "inset",
         "outset",
     ];
     let mut width = None;
     let mut style = None;
-    for tok in value.split_whitespace() {
+    let mut color = None;
+    for tok in split_value_tokens(value) {
         if STYLES.contains(&tok) {
             style = Some(tok);
         } else if tok == "thin"
@@ -6938,12 +7077,25 @@ fn parse_border_shorthand(value: &str) -> (Option<&str>, Option<&str>) {
             || tok.starts_with(|c: char| c.is_ascii_digit() || c == '.')
         {
             width = Some(tok);
+        } else if tok.eq_ignore_ascii_case("currentcolor")
+            || tok.eq_ignore_ascii_case("transparent")
+            || tok.parse::<svgtypes::Color>().is_ok()
+            || tok.starts_with("hsl(")
+            || tok.starts_with("hwb(")
+            || tok.starts_with("color(")
+        {
+            color = Some(tok);
         }
     }
-    (width, style)
+    (width, style, color)
 }
 
-fn border_longhands(sides: &[&str], w: Option<&str>, s: Option<&str>) -> Vec<(String, String)> {
+fn border_longhands(
+    sides: &[&str],
+    w: Option<&str>,
+    s: Option<&str>,
+    c: Option<&str>,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for side in sides {
         if let Some(w) = w {
@@ -6951,6 +7103,9 @@ fn border_longhands(sides: &[&str], w: Option<&str>, s: Option<&str>) -> Vec<(St
         }
         if let Some(s) = s {
             out.push((format!("border-{side}-style"), s.to_string()));
+        }
+        if let Some(c) = c {
+            out.push((format!("border-{side}-color"), c.to_string()));
         }
     }
     out
@@ -7363,7 +7518,7 @@ fn parse_sheet(
     order: &mut usize,
     out: &mut Vec<StyleRule>,
     keyframes: &mut FxHashMap<String, f32>,
-    viewport: (u32, u32),
+    viewport: (f32, f32),
     layers: &mut LayerRegistry,
     layer: &str,
 ) {
@@ -7405,8 +7560,8 @@ fn parse_sheet(
             // `@media <query> { ... }`: evaluate the query against the
             // viewport and splice the matching block's rules into the cascade
             // (recurse, so nested @media and normal rules both work); drop the
-            // body when it doesn't match. The viewport is what `execute_js`
-            // reports (`cols*cell_px`).
+            // body when it doesn't match. The viewport is the shared
+            // CSS-pixel initial containing block reported to page script.
             if let Some(rest_q) = lower.strip_prefix("media")
                 && rest_q
                     .chars()
@@ -7531,7 +7686,7 @@ fn parse_style_rule(
     block: &str,
     order: &mut usize,
     out: &mut Vec<StyleRule>,
-    viewport: (u32, u32),
+    viewport: (f32, f32),
     layer: &[u32],
 ) {
     let (decl_text, nested) = split_block(block);
@@ -7831,6 +7986,12 @@ fn css_supports(prop: &str, value: &str) -> bool {
                 | "flow-root"
         );
     }
+    // Retained for clean diagnostics/future backend work, but not painted.
+    // Merely preserving a declaration must not make feature queries select a
+    // path whose required visual effect TRust cannot provide.
+    if prop == "filter" {
+        return false;
+    }
     is_tracked(&prop)
 }
 
@@ -7840,7 +8001,7 @@ fn css_supports(prop: &str, value: &str) -> bool {
 /// features are evaluated, `not`/`only` honored. Anything unrecognized — or a
 /// width/height test with an unknown viewport — makes that query NOT match,
 /// which drops its rules exactly as skipping the whole `@media` block used to.
-fn media_query_matches(query: &str, vp: (u32, u32)) -> bool {
+fn media_query_matches(query: &str, vp: (f32, f32)) -> bool {
     query
         .split(',')
         .any(|q| media_query_one(&q.trim().to_ascii_lowercase(), vp))
@@ -7849,7 +8010,7 @@ fn media_query_matches(query: &str, vp: (u32, u32)) -> bool {
 /// One comma-separated media query (already lowercased). A leading
 /// `not`/`only` is a prefix on the whole query (not an `and`-joined part);
 /// the rest is a media type and/or `and`-joined `(feature: value)` conditions.
-fn media_query_one(q: &str, vp: (u32, u32)) -> bool {
+fn media_query_one(q: &str, vp: (f32, f32)) -> bool {
     let mut q = q.trim();
     let mut negate = false;
     if let Some(rest) = q.strip_prefix("not ") {
@@ -7897,7 +8058,7 @@ fn media_query_one(q: &str, vp: (u32, u32)) -> bool {
 /// 1dppx`). The preferences: `prefers-reduced-motion: reduce` (cells can't
 /// animate smoothly) and `prefers-color-scheme: dark` (the terminal
 /// aesthetic).
-fn media_feature_matches(inner: &str, vp: (u32, u32)) -> bool {
+fn media_feature_matches(inner: &str, vp: (f32, f32)) -> bool {
     let (vw, vh) = vp;
     let Some((name, value)) = inner.split_once(':') else {
         // No colon: the L4 range syntax when a comparison operator is
@@ -7907,9 +8068,9 @@ fn media_feature_matches(inner: &str, vp: (u32, u32)) -> bool {
             return media_range_matches(inner, vp);
         }
         return match inner.trim() {
-            "width" => vw != 0,
-            "height" => vh != 0,
-            "aspect-ratio" | "orientation" => vw != 0 && vh != 0,
+            "width" => vw != 0.0,
+            "height" => vh != 0.0,
+            "aspect-ratio" | "orientation" => vw != 0.0 && vh != 0.0,
             "color" | "color-gamut" | "hover" | "any-hover" | "pointer" | "any-pointer"
             | "update" | "scripting" | "resolution" | "grid" => true,
             "monochrome" => false,
@@ -7918,27 +8079,27 @@ fn media_feature_matches(inner: &str, vp: (u32, u32)) -> bool {
     };
     let value = value.trim();
     let ratio = || {
-        (vw != 0 && vh != 0)
-            .then(|| media_ratio(value).map(|r| (vw as f32 / vh as f32, r)))
+        (vw != 0.0 && vh != 0.0)
+            .then(|| media_ratio(value).map(|r| (vw / vh, r)))
             .flatten()
     };
     let num = || value.parse::<f32>().ok();
     match name.trim() {
-        "min-width" => vw != 0 && media_px(value).is_some_and(|n| vw >= n),
-        "max-width" => vw != 0 && media_px(value).is_some_and(|n| vw <= n),
-        "width" => vw != 0 && media_px(value).is_some_and(|n| vw == n),
-        "min-height" => vh != 0 && media_px(value).is_some_and(|n| vh >= n),
-        "max-height" => vh != 0 && media_px(value).is_some_and(|n| vh <= n),
-        "height" => vh != 0 && media_px(value).is_some_and(|n| vh == n),
+        "min-width" => vw != 0.0 && media_px(value).is_some_and(|n| vw >= n),
+        "max-width" => vw != 0.0 && media_px(value).is_some_and(|n| vw <= n),
+        "width" => vw != 0.0 && media_px(value).is_some_and(|n| vw == n),
+        "min-height" => vh != 0.0 && media_px(value).is_some_and(|n| vh >= n),
+        "max-height" => vh != 0.0 && media_px(value).is_some_and(|n| vh <= n),
+        "height" => vh != 0.0 && media_px(value).is_some_and(|n| vh == n),
         // `device-*` (deprecated in MQ4 but still served): the terminal IS
         // the screen, so they equal the viewport.
-        "min-device-width" => vw != 0 && media_px(value).is_some_and(|n| vw >= n),
-        "max-device-width" => vw != 0 && media_px(value).is_some_and(|n| vw <= n),
-        "device-width" => vw != 0 && media_px(value).is_some_and(|n| vw == n),
-        "min-device-height" => vh != 0 && media_px(value).is_some_and(|n| vh >= n),
-        "max-device-height" => vh != 0 && media_px(value).is_some_and(|n| vh <= n),
-        "device-height" => vh != 0 && media_px(value).is_some_and(|n| vh == n),
-        "orientation" if vw != 0 && vh != 0 => match value {
+        "min-device-width" => vw != 0.0 && media_px(value).is_some_and(|n| vw >= n),
+        "max-device-width" => vw != 0.0 && media_px(value).is_some_and(|n| vw <= n),
+        "device-width" => vw != 0.0 && media_px(value).is_some_and(|n| vw == n),
+        "min-device-height" => vh != 0.0 && media_px(value).is_some_and(|n| vh >= n),
+        "max-device-height" => vh != 0.0 && media_px(value).is_some_and(|n| vh <= n),
+        "device-height" => vh != 0.0 && media_px(value).is_some_and(|n| vh == n),
+        "orientation" if vw != 0.0 && vh != 0.0 => match value {
             "portrait" => vh >= vw,
             "landscape" => vw > vh,
             _ => false,
@@ -8003,7 +8164,7 @@ fn media_dppx(value: &str) -> Option<f32> {
 /// Only `width`/`height` are evaluated; an unknown feature name, an unknown
 /// viewport (0), or an unparsable form doesn't match — the same
 /// conservative default as the colon form.
-fn media_range_matches(inner: &str, vp: (u32, u32)) -> bool {
+fn media_range_matches(inner: &str, vp: (f32, f32)) -> bool {
     // Split into operands and comparison operators. Operators are ASCII, so
     // the byte positions sliced at are always char boundaries.
     let bytes = inner.as_bytes();
@@ -8030,15 +8191,15 @@ fn media_range_matches(inner: &str, vp: (u32, u32)) -> bool {
         start = i;
     }
     operands.push(inner[start..].trim());
-    let actual = |name: &str| -> Option<u32> {
+    let actual = |name: &str| -> Option<f32> {
         let v = match name {
             "width" => vp.0,
             "height" => vp.1,
             _ => return None,
         };
-        (v != 0).then_some(v)
+        (v != 0.0).then_some(v)
     };
-    let cmp = |a: u32, op: &str, b: u32| match op {
+    let cmp = |a: f32, op: &str, b: f32| match op {
         "<" => a < b,
         "<=" => a <= b,
         ">" => a > b,
@@ -8156,7 +8317,7 @@ fn icon_glyph_for(name: &str) -> Option<&'static str> {
     })
 }
 
-fn media_px(value: &str) -> Option<u32> {
+fn media_px(value: &str) -> Option<f32> {
     let v = value.trim();
     let split = v
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
@@ -8177,7 +8338,7 @@ fn media_px(value: &str) -> Option<u32> {
         "q" => n * 96.0 / 101.6,
         _ => return None,
     };
-    Some(px.round().max(0.0) as u32)
+    Some(px.max(0.0))
 }
 
 /// The opacity at an `@keyframes` animation's END — the value at the highest
@@ -9954,7 +10115,7 @@ mod tests {
 
     #[test]
     fn media_queries_evaluate_against_the_viewport() {
-        let vp = (800, 600); // 800x600 CSS px
+        let vp = (800.0, 600.0); // 800x600 CSS px
         assert!(media_query_matches("(min-width: 768px)", vp));
         assert!(!media_query_matches("(min-width: 1000px)", vp));
         assert!(media_query_matches("(max-width: 1000px)", vp));
@@ -9995,14 +10156,18 @@ mod tests {
         // Boolean-context features (MQ4 §2.4.1).
         assert!(media_query_matches("(hover)", vp));
         assert!(media_query_matches("(width)", vp));
-        assert!(!media_query_matches("(width)", (0, 0)));
+        assert!(!media_query_matches("(width)", (0.0, 0.0)));
         // The full absolute-unit table in media lengths: 8in = 768px.
         assert!(media_query_matches("(min-width: 8in)", vp));
         assert!(!media_query_matches("(min-width: 9in)", vp));
+        // Media Queries use CSS-pixel lengths, not integer framebuffer pixels.
+        let fractional = (799.5, 600.25);
+        assert!(media_query_matches("(width: 799.5px)", fractional));
+        assert!(!media_query_matches("(min-width: 800px)", fractional));
         // Unknown feature, or an unknown viewport, conservatively don't match
         // (so the rules are dropped, exactly as skipping @media used to).
         assert!(!media_query_matches("(bleeding-edge-feature: on)", vp));
-        assert!(!media_query_matches("(min-width: 768px)", (0, 0)));
+        assert!(!media_query_matches("(min-width: 768px)", (0.0, 0.0)));
     }
 
     #[test]
@@ -10270,14 +10435,13 @@ mod tests {
     }
 
     #[test]
-    fn a_scroll_container_bakes_its_node_id_and_scroll_top_in_rows() {
+    fn a_scroll_container_bakes_its_node_id_and_scroll_top_in_css_pixels() {
         // The live serializer marks a vertical scroll container with a stable
-        // node id AND the page's current scrollTop SIGNAL in rows, so the app's
-        // `flow_region` can re-seed the region's voffset across the re-parse.
+        // node id AND the page's current scrollTop signal in CSS pixels. A
+        // terminal adapter may quantize it later; DOM state never stores rows.
         let mut dom = Dom::parse_document(
             "<body><div id=s style='overflow-y:auto;height:96px'><p>x</p></div></body>",
         );
-        dom.set_cell_px(8, 16);
         let s = dom.get_by_id("s").unwrap();
         assert!(
             dom.is_scroll_container(s),
@@ -10286,15 +10450,15 @@ mod tests {
         // The app pushed the clip box; the page's setter clamped + stored the
         // position (here we drive the syscalls directly).
         dom.set_scroll_geom(s, 160.0, 100.0);
-        dom.set_scroll_pos(s, 320.0, 0.0, true); // 320px / 16px = 20 rows
+        dom.set_scroll_pos(s, 320.0, 0.0, true);
         let html = dom.serialize_live(DOCUMENT, &std::collections::HashSet::new());
         assert!(
             html.contains("data-trust-node="),
             "the scroll container carries an actor node id: {html}"
         );
         assert!(
-            html.contains("data-trust-scroll-top=\"20\""),
-            "the scrollTop signal is baked in rows: {html}"
+            html.contains("data-trust-scroll-top=\"320\""),
+            "the scrollTop signal is baked in CSS pixels: {html}"
         );
     }
 
@@ -10972,7 +11136,7 @@ mod tests {
         assert_eq!(dom.computed_style(t, "margin-top").as_deref(), Some("9px"));
         // 6. Viewport change (@media re-evaluation).
         let i = dom.style_index();
-        dom.set_viewport_px(800, 600);
+        dom.set_viewport_px(800.0, 600.0);
         assert!(fresh(&dom, &i), "viewport change rebuilds");
         // 7. An attribute change on a sheet-bearing element.
         let i = dom.style_index();
@@ -11496,7 +11660,7 @@ mod tests {
     #[test]
     fn media_query_range_syntax_evaluates() {
         // Media Queries L4 range form (Tailwind v4 emits these).
-        let vp = (800, 600);
+        let vp = (800.0, 600.0);
         assert!(media_query_matches("(width >= 40em)", vp), "640px <= 800");
         assert!(!media_query_matches("(width >= 1000px)", vp));
         assert!(media_query_matches("(width <= 1000px)", vp));
@@ -11505,7 +11669,7 @@ mod tests {
         assert!(media_query_matches("(height > 500px)", vp));
         assert!(media_query_matches("screen and (width < 1000px)", vp));
         assert!(
-            !media_query_matches("(width >= 40em)", (0, 0)),
+            !media_query_matches("(width >= 40em)", (0.0, 0.0)),
             "unknown viewport conservatively fails"
         );
     }
@@ -11623,7 +11787,7 @@ mod tests {
              <body><p id=m class=m>m</p><p id=n class=n>n</p>
              <p id=o class=anon>o</p></body>",
         );
-        dom.set_viewport_px(800, 600);
+        dom.set_viewport_px(800.0, 600.0);
         assert!(
             dom.is_hidden(dom.get_by_id("m").unwrap()),
             "@media in @layer"
@@ -11883,14 +12047,11 @@ mod tests {
     }
 
     #[test]
-    fn hover_affected_check_skips_color_only_rules() {
-        // The efficiency answer (her call to include CSS :hover): a page whose
-        // hover rules touch only UNRENDERED properties (color — not in the PROPS
-        // registry) reports "unaffected" on every chain move: no epoch bump, no
-        // dirty, no relayout. A tracked-property rule on the SAME page still
-        // trips the probe only when a candidate element's state flips.
-        // (`background` is render-affecting under layout2 — the cell compositor
-        // paints opaque fills — so it is NOT a color-only property there.)
+    fn hover_affected_check_includes_graphical_color_rules() {
+        // Color is real graphical paint, so a hover that changes it must
+        // invalidate retained page paint even though it does not change
+        // geometry. A display-changing rule on the same page still dirties and
+        // additionally changes box generation.
         let mut dom = Dom::parse_document(
             "<head><style>\
              a:hover{color:red}\
@@ -11900,14 +12061,14 @@ mod tests {
         );
         let l = dom.get_by_id("l").unwrap();
         let c = dom.get_by_id("c").unwrap();
-        // Hovering the link: the only rule whose probe matches (`a:hover`) is
-        // color-only, so it built NO probe — unaffected, and nothing dirtied.
+        // Hovering the link changes a retained foreground brush.
         let _ = dom.take_dirty();
         assert!(
-            !dom.set_hover_chain(Some(l)),
-            "color-only hover rules must not cost a re-render"
+            dom.set_hover_chain(Some(l)),
+            "graphical color hover must request repaint"
         );
-        assert!(!dom.take_dirty(), "no dirty bit for an unrendered restyle");
+        assert!(dom.take_dirty(), "paint restyle marks the page dirty");
+        assert_eq!(dom.computed_value(l, "color").as_deref(), Some("red"));
         // Hovering the card: `.card:hover{display:none}` is tracked → affected
         // + dirty, and the element actually hides.
         assert!(

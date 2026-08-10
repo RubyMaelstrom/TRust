@@ -100,8 +100,9 @@ pub(crate) fn size(
         })
         .flatten()
         .filter(|&r| r > 0.0);
-    // Prefer the exact viewBox ratio for a ratio-only image (the decoded
-    // natural size is cell-rounded, so its derived ratio is imprecise).
+    // Prefer the exact viewBox ratio for a ratio-only image. A decoder may
+    // supply a rasterized fallback size whose ratio differs slightly from the
+    // vector's author-provided viewBox.
     let ratio = ratio_only.or_else(|| ratio_of(dom, node, natural));
 
     // §10.3.2/§10.6.2 auto resolution. The 300×150/2:1 caps are the spec's
@@ -179,7 +180,7 @@ pub(crate) fn size(
     // map; a reserved-but-undecoded box paints blank regardless. `none` maps
     // to `scale-down` (painting the natural size CLIPPED by the box needs
     // sub-image crop offsets the emission model doesn't carry — the
-    // documented cell-scale approximation; `scale-down` is its ≤-natural
+    // documented paint-model approximation; `scale-down` is its ≤-natural
     // half and identical whenever the image doesn't overflow the box).
     Some(apply_fit(dom, node, natural, box_w, box_h))
 }
@@ -188,7 +189,7 @@ pub(crate) fn size(
 /// flag. `fill` (initial) stretches to the box; `cover` fills and crops;
 /// `contain` letterboxes centered (`object-position` initial 50% 50%);
 /// `none` maps to `scale-down` (sub-image crop offsets don't exist in the
-/// emission model — the documented cell-scale approximation, identical
+/// emission model — the documented paint-model approximation, identical
 /// whenever the image doesn't overflow its box).
 pub(crate) fn apply_fit(
     dom: &Dom,

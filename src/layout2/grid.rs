@@ -204,8 +204,8 @@ fn parse_template(
                 }),
                 n => {
                     let n: usize = n.parse().ok().filter(|&n| n >= 1)?;
-                    // Lid against hostile repeat counts (the grid itself is
-                    // capped by the terminal's paintable area anyway).
+                    // Bound hostile repeat counts independently of viewport or
+                    // renderer size.
                     for _ in 0..n.min(1000) {
                         segs.extend(sizes.iter().cloned().map(Seg::One));
                     }

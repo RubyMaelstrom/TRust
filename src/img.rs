@@ -230,7 +230,6 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo, String> {
 /// viewport, reduced when necessary to stay inside the pixmap allocation cap.
 /// Viewer and inline-image callers should prefer encode_bytes so SVG is
 /// rasterized at the actual terminal box instead of this intrinsic fallback.
-#[cfg(test)]
 pub fn decode(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
     if image::guess_format(bytes).is_ok() {
         return decode_raster(bytes);
@@ -239,6 +238,22 @@ pub fn decode(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
     let svg = parse_svg(bytes)?;
     let image = rasterize_svg(&svg.tree, svg.info.width, svg.info.height, false)?;
     Ok((image, SVG_MIME))
+}
+
+/// Decode an HTML/CSS image into the renderer-neutral resource format. Raster
+/// formats keep their decoded alpha; SVG remains on the existing secure resvg
+/// static-image path and is rasterized at its CSS intrinsic size. No terminal
+/// tinting, cell sizing, or graphics protocol enters this path.
+pub fn decode_graphical(bytes: &[u8]) -> Result<crate::render::ImageResource, String> {
+    let (image, _) = decode(bytes)?;
+    let has_alpha = image_has_alpha(&image);
+    let rgba = image.to_rgba8();
+    Ok(crate::render::ImageResource {
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba: Arc::from(rgba.into_raw()),
+        has_alpha,
+    })
 }
 
 fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
@@ -268,8 +283,9 @@ struct SvgImage {
 fn parse_svg(bytes: &[u8]) -> Result<SvgImage, String> {
     let data = bounded_svg_data(bytes)?;
     let text = std::str::from_utf8(&data).map_err(|_| String::from("SVG is not UTF-8"))?;
-    let xml =
-        resvg::usvg::roxmltree::Document::parse(text).map_err(|e| format!("svg XML parse: {e}"))?;
+    let text = svg_without_external_doctype(text)?;
+    let xml = resvg::usvg::roxmltree::Document::parse(text.as_ref())
+        .map_err(|e| format!("svg XML parse: {e}"))?;
     let root = xml.root_element();
     if root.tag_name().name() != "svg" {
         return Err(String::from("SVG document root is not <svg>"));
@@ -304,6 +320,98 @@ fn parse_svg(bytes: &[u8]) -> Result<SvgImage, String> {
             has_alpha: false,
         },
     })
+}
+
+/// Return XML markup with an external-only document type declaration removed.
+///
+/// XML 1.0 Fifth Edition, §2.8 permits a `doctypedecl`, while §5.1 allows a
+/// non-validating processor not to read its external subset. SVG 1.1 assets in
+/// the wild still commonly carry the published W3C external identifier. We do
+/// exactly that here: validate the declaration, never resolve its system ID,
+/// and pass the remaining document to the secure static SVG parser.
+///
+/// Internal subsets stay disabled. Besides not being needed for the external
+/// SVG DTD marker, accepting them would enable document-authored entity
+/// expansion before usvg sees the already bounded but otherwise untrusted XML.
+fn svg_without_external_doctype(text: &str) -> Result<Cow<'_, str>, String> {
+    let Some((start, end)) = external_doctype_range(text)? else {
+        return Ok(Cow::Borrowed(text));
+    };
+
+    // Validate the original declaration with the XML parser before removing
+    // it. `roxmltree` recognizes but does not fetch an external subset.
+    let options = resvg::usvg::roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    resvg::usvg::roxmltree::Document::parse_with_options(text, options)
+        .map_err(|e| format!("svg XML parse: {e}"))?;
+
+    let mut stripped = String::with_capacity(text.len() - (end - start) + 1);
+    stripped.push_str(&text[..start]);
+    // Keep prologue and root tokens separated even for compact input such as
+    // `<!DOCTYPE svg><svg ...>`.
+    stripped.push('\n');
+    stripped.push_str(&text[end..]);
+    Ok(Cow::Owned(stripped))
+}
+
+/// Locate an external-only XML document type declaration in the prologue.
+/// Returns the byte range including its closing `>`. A `[` outside a quoted
+/// public/system identifier starts an internal subset and is rejected.
+fn external_doctype_range(text: &str) -> Result<Option<(usize, usize)>, String> {
+    let bytes = text.as_bytes();
+    let mut cursor = usize::from(text.starts_with('\u{feff}')) * '\u{feff}'.len_utf8();
+
+    loop {
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            cursor += 1;
+        }
+
+        let tail = &text[cursor..];
+        if let Some(after_open) = tail.strip_prefix("<!--") {
+            let Some(close) = after_open.find("-->") else {
+                return Ok(None); // the regular XML parser reports the syntax error
+            };
+            cursor += 4 + close + 3;
+            continue;
+        }
+        if let Some(after_open) = tail.strip_prefix("<?") {
+            let Some(close) = after_open.find("?>") else {
+                return Ok(None); // the regular XML parser reports the syntax error
+            };
+            cursor += 2 + close + 2;
+            continue;
+        }
+        if !tail.starts_with("<!DOCTYPE") {
+            return Ok(None);
+        }
+
+        let start = cursor;
+        cursor += "<!DOCTYPE".len();
+        let mut quote = None;
+        while let Some(&byte) = bytes.get(cursor) {
+            if let Some(delimiter) = quote {
+                if byte == delimiter {
+                    quote = None;
+                }
+            } else {
+                match byte {
+                    b'\'' | b'"' => quote = Some(byte),
+                    b'[' => {
+                        return Err(String::from("SVG internal DTD subsets are not supported"));
+                    }
+                    b'>' => return Ok(Some((start, cursor + 1))),
+                    _ => {}
+                }
+            }
+            cursor += 1;
+        }
+        return Err(String::from("unterminated SVG document type declaration"));
+    }
 }
 
 fn svg_length_px(value: &str) -> Option<f32> {
@@ -355,7 +463,8 @@ pub(crate) fn svg_bytes_ratio_only(bytes: &[u8]) -> Option<f32> {
     }
     let data = bounded_svg_data(bytes).ok()?;
     let text = std::str::from_utf8(&data).ok()?;
-    let doc = resvg::usvg::roxmltree::Document::parse(text).ok()?;
+    let text = svg_without_external_doctype(text).ok()?;
+    let doc = resvg::usvg::roxmltree::Document::parse(text.as_ref()).ok()?;
     let root = doc.root_element();
     if root.tag_name().name() != "svg" {
         return None;
@@ -979,6 +1088,33 @@ mod tests {
         assert_eq!(protocol_info, metadata);
         assert!(protocol.size().width <= cells.width);
         assert!(protocol.size().height <= cells.height);
+    }
+
+    #[test]
+    fn external_svg_doctype_is_accepted_without_loading_the_external_subset() {
+        // XML 1.0 permits the external identifier, but a non-validating image
+        // processor need not fetch it. This is the prologue used by several
+        // long-lived SVG 1.1 authoring tools and website logos.
+        let svg = br##"<?xml version="1.0" encoding="UTF-8"?>
+<!-- a DOCTYPE-looking token in a comment must not confuse the prologue scan -->
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns="http://www.w3.org/2000/svg" width="12px" height="7px"
+     viewBox="0 0 12 7"><rect width="12" height="7" fill="#369"/></svg>"##;
+
+        assert_eq!(info(svg).unwrap().width, 12);
+        assert_eq!(info(svg).unwrap().height, 7);
+        assert_eq!(decode_graphical(svg).unwrap().rgba.len(), 12 * 7 * 4);
+    }
+
+    #[test]
+    fn svg_internal_dtd_subset_remains_disabled() {
+        let svg = br#"<!DOCTYPE svg [<!ENTITY fill "red">]>
+<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4">
+  <rect width="4" height="4" fill="&fill;"/>
+</svg>"#;
+        let error = info(svg).unwrap_err();
+        assert!(error.contains("internal DTD subsets"), "{error}");
     }
 
     #[test]

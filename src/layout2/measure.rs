@@ -25,20 +25,19 @@ use crate::layout2::{NO_NODE, PxRect};
 
 use super::flow::{Frag, FragKind};
 
-/// A cell-quantized rectangle (inclusive-exclusive), the same integer grid the
-/// paint pass stamps into, so a measured box round-trips to the cells that
-/// rendered. `i64` tolerates content that overflows column 0 to the left.
+/// Canonical fragment rectangle in CSS pixels. CSSOM View geometry is read
+/// before any terminal adaptation or device-pixel presentation.
 #[derive(Copy, Clone)]
-struct Cells {
-    x0: i64,
-    y0: i64,
-    x1: i64,
-    y1: i64,
+struct Rect {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
 }
 
-impl Cells {
-    fn union(a: Cells, b: Cells) -> Cells {
-        Cells {
+impl Rect {
+    fn union(a: Rect, b: Rect) -> Rect {
+        Rect {
             x0: a.x0.min(b.x0),
             y0: a.y0.min(b.y0),
             x1: a.x1.max(b.x1),
@@ -47,11 +46,11 @@ impl Cells {
     }
 }
 
-/// Fold a rectangle into a `NodeId → Cells` map (union on collision — an
+/// Fold a rectangle into a `NodeId → Rect` map (union on collision — an
 /// element that generates several fragments reports their bounding box).
-fn add(map: &mut HashMap<NodeId, Cells>, node: NodeId, r: Cells) {
+fn add(map: &mut HashMap<NodeId, Rect>, node: NodeId, r: Rect) {
     map.entry(node)
-        .and_modify(|c| *c = Cells::union(*c, r))
+        .and_modify(|c| *c = Rect::union(*c, r))
         .or_insert(r);
 }
 
@@ -62,49 +61,43 @@ fn add(map: &mut HashMap<NodeId, Cells>, node: NodeId, r: Cells) {
 /// every element id touched (fixed-subtree membership).
 #[derive(Default)]
 struct Own {
-    own: HashMap<NodeId, Cells>,
-    block: HashMap<NodeId, Cells>,
+    own: HashMap<NodeId, Rect>,
+    block: HashMap<NodeId, Rect>,
     nodes: HashSet<NodeId>,
 }
 
-/// Walk a fragment (sub)tree, attributing each fragment's border box to its
-/// generating element and each line piece to its item's element. `cw`/`ch` are
-/// the cell size in px (the same the layout used, so edges snap consistently).
-fn walk(f: &Frag<'_>, cw: f32, ch: f32, o: &mut Own) {
+/// Walk a fragment tree, attributing border boxes and inline piece boxes.
+fn walk(f: &Frag<'_>, o: &mut Own) {
     if f.node != NO_NODE {
         o.nodes.insert(f.node);
         if matches!(f.kind, FragKind::Block) {
-            let r = Cells {
-                x0: (f.x / cw).round() as i64,
-                y0: (f.y / ch).round() as i64,
-                x1: ((f.x + f.w) / cw).round() as i64,
-                y1: ((f.y + f.h) / ch).round() as i64,
+            let r = Rect {
+                x0: f.x,
+                y0: f.y,
+                x1: f.x + f.w,
+                y1: f.y + f.h,
             };
             add(&mut o.block, f.node, r);
             add(&mut o.own, f.node, r);
         }
     }
-    if let FragKind::Line(pieces) = &f.kind {
-        let base_col = (f.x / cw).round() as i64;
-        let top_row = (f.y / ch).round() as i64;
-        for p in pieces {
+    if let FragKind::Line(line) = &f.kind {
+        for p in &line.pieces {
             if p.item.node == NO_NODE {
                 continue;
             }
-            let c0 = base_col + p.col as i64;
-            let r0 = top_row + i64::from(p.row_off);
-            let r = Cells {
-                x0: c0,
-                y0: r0,
-                x1: c0 + i64::from(p.item.width),
-                y1: r0 + i64::from(p.rows.max(1)),
+            let r = Rect {
+                x0: f.x + p.x,
+                y0: f.y + p.y,
+                x1: f.x + p.x + p.box_width,
+                y1: f.y + p.y + p.box_height,
             };
             o.nodes.insert(p.item.node);
             add(&mut o.own, p.item.node, r);
         }
     }
     for c in &f.children {
-        walk(c, cw, ch, o);
+        walk(c, o);
     }
 }
 
@@ -117,10 +110,10 @@ fn walk(f: &Frag<'_>, cw: f32, ch: f32, o: &mut Own) {
 /// scrollable document (fixed boxes do not contribute to scroll overflow).
 fn composed_union(
     dom: &Dom,
-    base: &HashMap<NodeId, Cells>,
+    base: &HashMap<NodeId, Rect>,
     keep: impl Fn(NodeId) -> bool,
-) -> HashMap<NodeId, Cells> {
-    let mut content: HashMap<NodeId, Cells> = base
+) -> HashMap<NodeId, Rect> {
+    let mut content: HashMap<NodeId, Rect> = base
         .iter()
         .filter(|&(&k, _)| keep(k))
         .map(|(&k, &v)| (k, v))
@@ -135,7 +128,7 @@ fn composed_union(
                 continue;
             }
             if let Some(&cr) = content.get(&child) {
-                acc = Some(acc.map_or(cr, |a| Cells::union(a, cr)));
+                acc = Some(acc.map_or(cr, |a| Rect::union(a, cr)));
             }
         }
         if let Some(acc) = acc {
@@ -152,10 +145,8 @@ fn composed_union(
 /// which read this rect, are the scrollable content extent — CSSOM View).
 fn select_into(
     dom: &Dom,
-    content: &HashMap<NodeId, Cells>,
-    block: &HashMap<NodeId, Cells>,
-    cpw: f64,
-    cph: f64,
+    content: &HashMap<NodeId, Rect>,
+    block: &HashMap<NodeId, Rect>,
     out: &mut HashMap<NodeId, PxRect>,
 ) {
     for (&node, &cbox) in content {
@@ -168,47 +159,37 @@ fn select_into(
         out.insert(
             node,
             PxRect {
-                left: c.x0 as f64 * cpw,
-                top: c.y0 as f64 * cph,
-                width: (c.x1 - c.x0) as f64 * cpw,
-                height: (c.y1 - c.y0) as f64 * cph,
+                left: c.x0 as f64,
+                top: c.y0 as f64,
+                width: (c.x1 - c.x0) as f64,
+                height: (c.y1 - c.y0) as f64,
             },
         );
     }
 }
 
 /// Build the `NodeId → PxRect` geometry map from the laid fragment tree (the
-/// in-flow root + the pinned fixed layer). `cpw`/`cph` are the px cell size the
-/// caller wants the output in (the session cell metrics — the same used to lay
-/// the tree, so the round-trip is exact).
-pub(super) fn boxes(
-    dom: &Dom,
-    root: &Frag<'_>,
-    fixed: &[Frag<'_>],
-    cw: f32,
-    ch: f32,
-    cpw: f64,
-    cph: f64,
-) -> HashMap<NodeId, PxRect> {
+/// in-flow root + the pinned fixed layer), directly in CSS pixels.
+pub(super) fn boxes(dom: &Dom, root: &Frag<'_>, fixed: &[Frag<'_>]) -> HashMap<NodeId, PxRect> {
     // In-flow tree: its own boxes never include the fixed layer.
     let mut flow = Own::default();
-    walk(root, cw, ch, &mut flow);
+    walk(root, &mut flow);
 
     // The pinned fixed layer: measured separately so a fixed header never
     // inflates the document's scrollable height (a fixed box is viewport-
     // relative, contributing no scroll overflow — CSS Overflow L3).
     let mut fx = Own::default();
     for f in fixed {
-        walk(f, cw, ch, &mut fx);
+        walk(f, &mut fx);
     }
 
     let mut out: HashMap<NodeId, PxRect> = HashMap::new();
     let flow_content = composed_union(dom, &flow.own, |_| true);
-    select_into(dom, &flow_content, &flow.block, cpw, cph, &mut out);
+    select_into(dom, &flow_content, &flow.block, &mut out);
     if !fx.own.is_empty() {
         let fixed_nodes = fx.nodes;
         let fx_content = composed_union(dom, &fx.own, |id| fixed_nodes.contains(&id));
-        select_into(dom, &fx_content, &fx.block, cpw, cph, &mut out);
+        select_into(dom, &fx_content, &fx.block, &mut out);
     }
     out
 }

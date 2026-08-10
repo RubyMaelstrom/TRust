@@ -100,6 +100,88 @@ pub struct Response {
     pub from_post: bool,
 }
 
+/// HTML inputs shared by graphical frontends. Parsing, SVG rewriting, form
+/// extraction, and URL resolution stay in the browser engine; a frontend only
+/// chooses a CSS-pixel viewport and consumes renderer-neutral paint data.
+pub struct GraphicalDocument {
+    pub dom: crate::dom::Dom,
+    pub base: Url,
+    pub forms: Vec<Form>,
+    pub controls: crate::layout2::ControlMap,
+    pub image_urls: Vec<String>,
+}
+
+pub fn graphical_document(response: &Response) -> Option<GraphicalDocument> {
+    let media = response
+        .content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(media.as_str(), "" | "text/html" | "application/xhtml+xml") {
+        return None;
+    }
+    let html = decode_body(&response.content_type, &response.body);
+    graphical_document_from_html(response, &html, None)
+}
+
+/// Build the graphical presentation from a resident page actor's latest
+/// serialization. Values edited by the frontend are seeded into an equivalent
+/// fresh parse, just as the terminal adapter does on resize/live relayout.
+pub fn graphical_document_from_html(
+    response: &Response,
+    html: &str,
+    seed: Option<&[Form]>,
+) -> Option<GraphicalDocument> {
+    let media = response
+        .content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(media.as_str(), "" | "text/html" | "application/xhtml+xml") {
+        return None;
+    }
+    let mut dom = crate::dom::Dom::parse_document(html);
+    dom.rewrite_inline_svgs(Some(&response.url));
+    let (forms, controls) = extract_forms_arena(&dom, &response.url, seed);
+    let image_urls = collect_image_urls(&dom, &response.url);
+    Some(GraphicalDocument {
+        dom,
+        base: response.url.clone(),
+        forms,
+        controls,
+        image_urls,
+    })
+}
+
+/// Fetch one graphical page image through the same HTTP/referrer/security
+/// policy as terminal subresources. `data:` remains local; `blob:` requires a
+/// live-page blob mirror and is therefore left unresolved by the static
+/// desktop document path.
+pub async fn fetch_graphical_image(page: &Url, source: &str) -> Result<Vec<u8>, String> {
+    if source.starts_with("data:") {
+        return crate::img::decode_data_url(source)
+            .ok_or_else(|| String::from("invalid data image URL"));
+    }
+    if source.starts_with("blob:") {
+        return Err(String::from(
+            "blob image is not present in the static page mirror",
+        ));
+    }
+    let url = Url::parse(source).map_err(|error| format!("invalid image URL: {error}"))?;
+    if !subresource_allowed(page, &url) {
+        return Err(String::from(
+            "image subresource blocked by page-origin policy",
+        ));
+    }
+    let mut request = Request::get(url);
+    set_referrer(&mut request, page);
+    fetch(&request).await.map(|response| response.body)
+}
+
 /// A page kept alive for interaction: commands in, renders out.
 #[derive(Debug)]
 pub struct LivePage {
@@ -1934,7 +2016,7 @@ pub fn set_referrer(req: &mut Request, page: &Url) {
 }
 
 /// Render a response body into a document. `images` maps already-decoded
-/// image URLs to their cell box; pass an empty map on the first parse
+/// image URLs to intrinsic pixels; pass an empty map on the first parse
 /// (the app re-lays-out once its decode pipeline fills it).
 pub fn parse(
     url: &Url,
@@ -1942,6 +2024,21 @@ pub fn parse(
     body: &[u8],
     width: usize,
     viewport_h: usize,
+    images: &crate::layout2::ImageSizes,
+) -> Doc {
+    parse_terminal(url, content_type, body, width, viewport_h, (8, 16), images)
+}
+
+/// Terminal parse entry with explicit font-cell metrics. This is the normal
+/// frontend boundary; [`parse`] is the deterministic 8×16-cell convenience
+/// used by protocol-independent tests and tools.
+pub fn parse_terminal(
+    url: &Url,
+    content_type: &str,
+    body: &[u8],
+    width: usize,
+    viewport_h: usize,
+    cell_px: (u16, u16),
     images: &crate::layout2::ImageSizes,
 ) -> Doc {
     // `parse` is the pre-decode entry (`images` empty, per the doc above), so
@@ -1952,6 +2049,7 @@ pub fn parse(
         body,
         width,
         viewport_h,
+        cell_px,
         None,
         images,
         no_alpha(),
@@ -1978,6 +2076,7 @@ pub fn parse_seeded(
     body: &[u8],
     width: usize,
     viewport_h: usize,
+    cell_px: (u16, u16),
     seed: Option<&[Form]>,
     images: &crate::layout2::ImageSizes,
     // `alpha` = URL→`has_alpha` from the app's decoded cache, threaded to
@@ -2041,7 +2140,7 @@ pub fn parse_seeded(
             let out = crate::layout2::lay_out_document(
                 &dom,
                 url,
-                (width, viewport_h),
+                crate::layout2::TerminalViewport::from_font_pixels(width, viewport_h, cell_px),
                 &forms,
                 &controls,
                 images,
@@ -2166,9 +2265,10 @@ pub struct RegionPatch {
     pub carousels: Vec<crate::layout2::Carousel>,
     /// Absolute http(s) image URLs in the new buffer, to feed the decode pipe.
     pub image_urls: Vec<String>,
-    /// The page's `scrollTop` SIGNAL baked on the boundary (rows), if it pinned
-    /// the scroll this update (a chat re-pinning to bottom); else the app keeps
-    /// the reader's offset. Mirrors `flow_region`'s `data-trust-scroll-top` read.
+    /// The page's CSS-pixel `scrollTop` signal, quantized to terminal rows at
+    /// this adapter boundary, if it pinned the scroll this update (a chat
+    /// re-pinning to bottom); else the app keeps the reader's offset. Mirrors
+    /// `flow_region`'s `data-trust-scroll-top` read.
     pub scroll_top: Option<usize>,
     /// Clip boxes `(live_node, rows, cells)` of every definite-height scroll box
     /// nested in the fragment — the app merges them into `Doc.scroll_clips` so a
@@ -2187,6 +2287,7 @@ pub fn lay_region_patch(
     fragment_html: &[u8],
     content_width: usize,
     viewport: (usize, usize),
+    cell_px: (u16, u16),
     images: &crate::layout2::ImageSizes,
     boundary_node: usize,
 ) -> Option<RegionPatch> {
@@ -2204,7 +2305,9 @@ pub fn lay_region_patch(
     let image_urls = collect_image_urls(&dom, url);
     let scroll_top = dom
         .attr(boundary, "data-trust-scroll-top")
-        .and_then(|s| s.parse::<usize>().ok());
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|px| (px / f32::from(cell_px.1.max(1))).round().max(0.0) as usize);
     let t_parse = t0.elapsed();
     let t1 = std::time::Instant::now();
     // Re-lay the region's content into a fresh buffer, through the SAME engine
@@ -2215,7 +2318,7 @@ pub fn lay_region_patch(
         &dom,
         url,
         content_width,
-        viewport,
+        crate::layout2::TerminalViewport::from_font_pixels(viewport.0, viewport.1, cell_px),
         &controls,
         images,
         boundary,
@@ -2266,14 +2369,17 @@ pub struct SubtreeLaid {
 /// context wrapper carrying its inherited style). `content_width` is the cached
 /// outer band the box fills. Returns `None` when the boundary can't be found
 /// (treat as a resync). Sibling of `lay_region_patch`, scoped to one inline box.
+#[allow(clippy::too_many_arguments)]
 pub fn lay_subtree_patch(
     url: &Url,
     fragment_html: &[u8],
     content_width: usize,
     viewport: (usize, usize),
+    cell_px: (u16, u16),
     images: &crate::layout2::ImageSizes,
     boundary_node: usize,
     sub_box: bool,
+    quantization_phase: (f32, f32),
 ) -> Option<SubtreeLaid> {
     let html = decode_body("text/html; charset=utf-8", fragment_html);
     let mut dom = crate::dom::Dom::parse_document(&html);
@@ -2292,11 +2398,12 @@ pub fn lay_subtree_patch(
         &dom,
         url,
         content_width,
-        viewport,
+        crate::layout2::TerminalViewport::from_font_pixels(viewport.0, viewport.1, cell_px),
         &controls,
         images,
         boundary,
         sub_box,
+        quantization_phase,
     );
     Some(SubtreeLaid {
         height: frag.height,
@@ -2401,6 +2508,18 @@ pub(crate) fn resolve(base: &Url, target: &str) -> Link {
             "finger" | "whois" | "dict" => crate::oneshot::OneShotUrl::parse(joined.as_str())
                 .map(Link::OneShot)
                 .unwrap_or_else(|| Link::External(joined.to_string())),
+            "telnet" | "telnets" => joined.host_str().map_or_else(
+                || Link::External(joined.to_string()),
+                |host| Link::Telnet {
+                    host: host.to_string(),
+                    port: joined.port().unwrap_or(if joined.scheme() == "telnets" {
+                        992
+                    } else {
+                        23
+                    }),
+                    tls: joined.scheme() == "telnets",
+                },
+            ),
             _ => Link::External(joined.to_string()),
         },
         Err(_) => Link::External(target.to_string()),
@@ -2412,7 +2531,7 @@ pub(crate) fn resolve(base: &Url, target: &str) -> Link {
 /// control's `NodeId` to its `(form, field)` indices so the layout can
 /// make those items selectable `Link::Form`s. A form element whose node
 /// is in the map carries its synthetic submit (button-less forms).
-pub(crate) fn extract_forms_arena(
+pub fn extract_forms_arena(
     dom: &crate::dom::Dom,
     base: &Url,
     seed: Option<&[Form]>,
@@ -2496,6 +2615,8 @@ fn walk_forms_arena(
                         name: String::new(),
                         value: String::new(),
                         checked: false,
+                        default_value: String::new(),
+                        default_checked: false,
                         label: String::from("Submit"),
                         kind: FieldKind::Submit,
                         live_node: live_node(dom, child),
@@ -2570,8 +2691,10 @@ fn walk_forms_arena(
                 };
                 forms[form].fields.push(Field {
                     name: String::new(),
+                    default_value: value.clone(),
                     value,
                     checked: false,
+                    default_checked: false,
                     label: contenteditable_placeholder(dom, child),
                     kind: FieldKind::Textarea,
                     live_node: live_node(dom, child),
@@ -2640,7 +2763,23 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
                     };
                     FieldKind::Submit
                 }
-                "button" | "reset" | "file" => return None,
+                "button" => {
+                    label = if value.is_empty() {
+                        String::from("Button")
+                    } else {
+                        value.clone()
+                    };
+                    FieldKind::Button
+                }
+                "reset" => {
+                    label = if value.is_empty() {
+                        String::from("Reset")
+                    } else {
+                        value.clone()
+                    };
+                    FieldKind::Reset
+                }
+                "file" => return None,
                 _ => {
                     label = dom.attr(id, "placeholder").unwrap_or("").to_string();
                     FieldKind::Text
@@ -2649,24 +2788,33 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
         }
         "button" => {
             let ty = dom.attr(id, "type").unwrap_or("").to_ascii_lowercase();
-            if !(ty.is_empty() || ty == "submit") {
-                return None;
-            }
             let text = dom.text_content(id).trim().to_string();
             label = if !text.is_empty() {
                 text
             } else if !value.is_empty() {
                 value.clone()
             } else {
-                String::from("Submit")
+                match ty.as_str() {
+                    "reset" => String::from("Reset"),
+                    "button" => String::from("Button"),
+                    _ => String::from("Submit"),
+                }
             };
-            FieldKind::Submit
+            match ty.as_str() {
+                "reset" => FieldKind::Reset,
+                "button" => FieldKind::Button,
+                "" | "submit" => FieldKind::Submit,
+                _ => return None,
+            }
         }
         "textarea" => {
+            let value = dom.text_content(id);
             return Some(Field {
                 name,
-                value: dom.text_content(id),
+                default_value: value.clone(),
+                value,
                 checked: false,
+                default_checked: false,
                 label,
                 kind: FieldKind::Textarea,
                 live_node: live_node(dom, id),
@@ -2695,8 +2843,10 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
             let value = options[selected.unwrap_or(0)].1.clone();
             return Some(Field {
                 name,
+                default_value: value.clone(),
                 value,
                 checked: false,
+                default_checked: false,
                 label,
                 kind: FieldKind::Select(options),
                 live_node: live_node(dom, id),
@@ -2706,8 +2856,10 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
     };
     Some(Field {
         name,
+        default_value: value.clone(),
         value,
         checked,
+        default_checked: checked,
         label,
         kind,
         live_node: live_node(dom, id),
@@ -2717,6 +2869,26 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphical_image_discovery_is_document_ordered_resolved_and_deduplicated() {
+        let base = Url::parse("https://www.example.test/gallery/index.html").unwrap();
+        let dom = crate::dom::Dom::parse_document(
+            r#"<img src="//cdn.example.test/header.png">
+                <img src="thumbs/one.jpg">
+                <img src="//cdn.example.test/header.png">
+                <video poster="/poster.webp"></video>"#,
+        );
+
+        assert_eq!(
+            collect_image_urls(&dom, &base),
+            vec![
+                String::from("https://cdn.example.test/header.png"),
+                String::from("https://www.example.test/gallery/thumbs/one.jpg"),
+                String::from("https://www.example.test/poster.webp"),
+            ]
+        );
+    }
 
     #[test]
     fn script_and_style_response_metadata_checks_follow_fetch_and_html() {
@@ -5339,23 +5511,14 @@ mod tests {
             if let Ok(r) = fetch(&Request::get(u.clone())).await
                 && let Ok((im, _)) = crate::img::decode(&r.body)
             {
-                // Store the CELL box the real pipeline lays out with (px→cells
-                // via the font size, capped to 80x24 preserving aspect), NOT raw
-                // pixels — raw px made every image read ~hundreds of cells wide
-                // and clamp to `avail`, distorting flex-basis measurement.
-                let nat = ratatui_image::Resize::natural_size(&im, (8, 16).into());
-                let (cw, ch) = (nat.width.max(1) as f32, nat.height.max(1) as f32);
-                let scale = (80.0 / cw).min(24.0 / ch).min(1.0);
-                let w = (cw * scale).round().max(1.0) as u16;
-                let h = (ch * scale).round().max(1.0) as u16;
-                images.insert(u.to_string(), (w, h));
+                images.insert(u.to_string(), (im.width(), im.height()));
             }
         }
         eprintln!("decoded {} images", images.len());
         let rows = crate::layout2::lay_out_document(
             &dom,
             &url,
-            (vp.0 as usize, vp.1 as usize),
+            crate::layout2::TerminalViewport::new(vp.0 as usize, vp.1 as usize, 8.0, 16.0),
             &[],
             &crate::layout2::ControlMap::new(),
             &images,
@@ -5573,8 +5736,18 @@ mod tests {
         let url = parse_url("https://example.com/").unwrap();
         let mut images = crate::layout2::ImageSizes::new();
         images.insert("https://example.com/x.jpg".to_owned(), (10, 5));
-        let laid =
-            lay_subtree_patch(&url, frag.as_bytes(), 200, (200, 64), &images, 42, false).unwrap();
+        let laid = lay_subtree_patch(
+            &url,
+            frag.as_bytes(),
+            200,
+            (200, 64),
+            (8, 16),
+            &images,
+            42,
+            false,
+            (0.0, 0.0),
+        )
+        .unwrap();
         let img_w = laid
             .rows
             .iter()
@@ -5648,7 +5821,9 @@ mod tests {
                     } else {
                         continue;
                     };
-                    images.insert(key, (cw, ch));
+                    // This diagnostic environment variable remains expressed
+                    // in terminal cells; convert once at its terminal boundary.
+                    images.insert(key, (u32::from(cw) * 8, u32::from(ch) * 16));
                 }
             }
         }
@@ -5660,7 +5835,17 @@ mod tests {
             } else {
                 std::collections::HashMap::new()
             };
-        let doc = parse_seeded(&url, "text/html", &html, w, vh, None, &images, &alpha);
+        let doc = parse_seeded(
+            &url,
+            "text/html",
+            &html,
+            w,
+            vh,
+            (8, 16),
+            None,
+            &images,
+            &alpha,
+        );
         let last_nonempty = doc
             .rows
             .iter()
@@ -5678,7 +5863,7 @@ mod tests {
         if let Ok(sub) = std::env::var("TRUST_LAYOUT_MEASURE") {
             let mdom = crate::dom::Dom::parse_document(&decode_body("text/html", &html));
             let (forms2, controls2) = extract_forms_arena(&mdom, &url, None);
-            let boxes = crate::layout2::measure_boxes_and_grid_tracks(
+            let boxes = crate::layout2::measure_boxes_terminal(
                 &mdom,
                 &url,
                 (w, vh),
@@ -7107,7 +7292,6 @@ customElements.define('lit-counter', LitCounter);
             0,
             &Default::default(),
         );
-
         assert_eq!(item(&doc, "Big Title").kind, ItemKind::Heading(1));
         assert!(item(&doc, "Plain paragraph").link.is_none());
 
@@ -7242,6 +7426,7 @@ customElements.define('lit-counter', LitCounter);
             CHAT_PAGE.as_bytes(),
             40,
             0,
+            (8, 16),
             Some(&doc.forms),
             &Default::default(),
             no_alpha(),

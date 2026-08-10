@@ -5,9 +5,17 @@ edition = "2024"
 description = "Telnet in Rust — a GNU-telnet-compatible client and small-net (gopher, TLS) browser with a cyberpunk TUI"
 license = "MIT OR Apache-2.0"
 
+[lib]
+name = "trust"
+path = "src/lib.rs"
+
 [[bin]]
 name = "trust"
 path = "src/main.rs"
+
+[[bin]]
+name = "trust-desktop"
+path = "src/bin/trust-desktop.rs"
 
 [features]
 # `mimalloc` (default on) installs the mimalloc global allocator. Parse and
@@ -24,6 +32,9 @@ default = ["mimalloc"]
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dependencies]
+accesskit = "0.24.1"
+accesskit_winit = { version = "0.33.2", default-features = false, features = ["accesskit_unix", "tokio", "rwh_06"] }
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 boa_engine = { version = "0.21", features = ["annex-b"] }
 # Direct dep for the lazy-parse control surface (`boa_parser::lazy`); the
 # vendored crate is shared with boa_engine via `[patch]` below.
@@ -41,6 +52,17 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 libmudtelnet = "2.0.2"
 mimalloc = { version = "0.1", optional = true }
+# Unicode shaping, font discovery/fallback, bidi, cluster mapping, and line
+# metrics for the canonical CSS-pixel inline formatting context. TRust owns the
+# surrounding CSS and retained-paint contracts; Parley is the font machinery.
+# 0.7 is the newest Parley line compatible with Boa 0.21's ICU4X 2.0 data
+# singleton. Parley 0.8+ requires ICU4X 2.1, whose compiled-data crate cannot
+# coexist in one dependency graph with Boa's pinned 2.0 provider.
+parley = "0.7.0"
+# Vello CPU's retained glyph cache/backend API. Keeping this direct dependency
+# at the thin renderer adapter lets TRust forward variation coordinates and
+# synthetic faces without leaking Glifo into layout/browser contracts.
+glifo = "0.3.0"
 ratatui = "0.30.2"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 # FxHash for the DOM's hot maps (per-epoch caches, rule buckets, winner
@@ -63,7 +85,20 @@ tokio = { version = "1.52.3", features = ["net", "rt-multi-thread", "macros", "i
 tokio-rustls = "0.26.4"
 tui-term = "0.3.4"
 unicode-width = "0.2"
+# Extended grapheme boundaries complete Parley's shaping-cluster data for
+# logical selection (notably emoji ZWJ sequences split by font fallback).
+unicode-segmentation = "1.13.3"
 url = "2.5.8"
+vello_cpu = { version = "0.2.0", default-features = false, features = ["std", "text", "u8_pipeline"] }
+# Accelerated implementation of the same renderer-neutral display list.  Keep
+# this synchronized with Vello CPU/Vello Common: all Vello API use is confined
+# to `render::vello_hybrid`, and CPU remains the reference/fallback backend.
+vello_hybrid = { version = "0.2.0", default-features = false, features = ["std", "text"] }
+vello_common = { version = "0.2.0", default-features = false, features = ["std"] }
+wgpu = { version = "29.0.3", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12", "gles"] }
+vt100 = "0.16.2"
+winit = "0.30.13"
+softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
 # WebAssembly engine. wasmi is a pure-Rust interpreter (the Boa-analog — no
 # v8/C++), so it preserves the pure-Rust-engine ethos. Runtime parses BINARY
 # wasm only (the web ships binary), so the default `wat` feature is dropped;

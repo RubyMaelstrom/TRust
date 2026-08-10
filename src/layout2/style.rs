@@ -12,9 +12,7 @@ use url::Url;
 
 use crate::dom::{Dom, NodeId};
 use crate::layout2::{Emphasis, NO_NODE};
-use crate::layout2::{
-    ItemKind, TextTransform, Units, WhiteSpace, css_is_bold, css_is_italic, css_length_px,
-};
+use crate::layout2::{ItemKind, TextTransform, Units, WhiteSpace, css_is_italic, css_length_px};
 
 use super::value::{Len, Node, Vp};
 
@@ -124,8 +122,8 @@ pub(crate) fn display_of(dom: &Dom, id: NodeId) -> Disp {
 /// The box-model snapshot of one element, in parse-once [`Len`]s (percentages
 /// resolve against the containing block at layout). Border widths are already
 /// used values in px (0 when the side's style is `none`/`hidden`); whether
-/// borders PAINT is a render setting (`set borders`) — their geometry is
-/// always honored, and at terminal cell size a 1px border quantizes to 0.
+/// borders paint is a frontend concern; their canonical geometry is always
+/// honored and retained at fractional CSS-pixel precision.
 #[derive(Clone, Debug)]
 pub(crate) struct BoxStyle {
     pub margin: [Len; 4],
@@ -147,19 +145,20 @@ pub(crate) struct BoxStyle {
     pub z_index: Option<i32>,
     /// The accumulated TRANSLATION of `transform` + the individual
     /// `translate` property, per axis as `(pct-of-own-border-box, px)` —
-    /// the one transform component with an exact cell analogue
-    /// (css-transforms-1; scale/rotate/skew have none and stay identity).
+    /// the transform subset currently represented by the fragment tree
+    /// (css-transforms-1; scale/rotate/skew remain future paint operations).
     pub tx: (f32, f32),
     pub ty: (f32, f32),
     /// Any non-none `transform`/`translate`: a stacking-context AND
     /// containing-block former for out-of-flow descendants (transforms-1 §3)
     /// even when the translation component is zero.
     pub has_transform: bool,
-    /// `opacity` < 1: paints like positioned z:0 — a stacking context.
-    pub opacity_lt1: bool,
-    /// Declares a background (color ≠ transparent, or an image): an OPAQUE
-    /// FILL in the cell compositor — colorless, but it erases what's under
-    /// its border box in paint order (the modal/card-stack semantics).
+    /// Used `opacity`, clamped to the CSS `<alpha-value>` range. Retaining the
+    /// number (rather than the old terminal-only boolean) lets graphical paint
+    /// composite the entire stacking context as one group.
+    pub opacity: f32,
+    /// Declares a painted background (color ≠ transparent, or an image).
+    /// Backends decide how to represent unsupported background-image syntax.
     pub bg: bool,
     /// `float` side (§9.5): the box leaves normal flow and shifts to this edge.
     /// `None` = `float:none`. An out-of-flow box computes `float:none` (§9.7),
@@ -190,7 +189,7 @@ impl BoxStyle {
             tx: (0.0, 0.0),
             ty: (0.0, 0.0),
             has_transform: false,
-            opacity_lt1: false,
+            opacity: 1.0,
             bg: false,
             float: None,
             clear: super::float::Clear::default(),
@@ -283,11 +282,7 @@ impl BoxStyle {
             tx,
             ty,
             has_transform,
-            opacity_lt1: dom
-                .computed_value(id, "opacity")
-                .as_deref()
-                .and_then(parse_alpha)
-                .is_some_and(|a| a < 1.0),
+            opacity: dom.effective_opacity(id),
             bg: declares_background(dom, id),
             // §9.7: an out-of-flow box computes `float:none` (positioning wins).
             float: if Pos::of(dom, id).out_of_flow() {
@@ -308,17 +303,8 @@ impl BoxStyle {
         (self.position.positioned() && self.z_index.is_some())
             || matches!(self.position, Pos::Fixed | Pos::Sticky)
             || self.has_transform
-            || self.opacity_lt1
+            || self.opacity < 1.0
             || (item && self.z_index.is_some())
-    }
-}
-
-/// A CSS `<alpha-value>`: a number or a percentage.
-fn parse_alpha(v: &str) -> Option<f32> {
-    let v = v.trim();
-    match v.strip_suffix('%') {
-        Some(p) => p.trim().parse::<f32>().ok().map(|n| n / 100.0),
-        None => v.parse::<f32>().ok(),
     }
 }
 
@@ -351,115 +337,11 @@ fn declares_background(dom: &Dom, id: NodeId) -> bool {
                 t.as_str(),
                 "none" | "initial" | "inherit" | "unset" | "revert" | "revert-layer"
             )
-            && image_layers_cover(&t)
         {
             return true;
         }
     }
     false
-}
-
-/// Whether a `background-image` value paints an OPAQUE cover: any `url()`
-/// layer (a real image — approximated as a cover, like today's `<img>`
-/// cells), or a gradient that is predominantly opaque. We can't blend, so a
-/// gradient binarizes to the nearest of {see-through, cover} by the MEAN of
-/// its stops' declared alphas: a 0→1 edge fade or a `transparent`→scrim
-/// overlay (mean ≤ 0.5) shows the content beneath it in a browser and must
-/// not erase cells; a mostly-opaque backdrop with a subtle glow stop (Steam's
-/// store-nav radial, mean ≈ 0.7) covers like the browser's effectively-solid
-/// bar. Stop positions are deliberately not weighted in (the documented
-/// approximation — positions may be unresolvable lengths).
-fn image_layers_cover(t: &str) -> bool {
-    split_top_level_commas(t).any(|layer| {
-        let l = layer.trim();
-        if l.starts_with("url(") {
-            return true;
-        }
-        gradient_mean_alpha(l) > 0.5
-    })
-}
-
-/// The mean declared alpha of a gradient's color stops. Stops are the
-/// top-level comma parts of the function args, minus a leading
-/// direction/shape part; `transparent` = 0, a function color's written
-/// alpha, hex/named = opaque.
-fn gradient_mean_alpha(gradient: &str) -> f32 {
-    let Some(open) = gradient.find('(') else {
-        return 1.0; // not a function: keep the old always-cover behavior
-    };
-    let inner = &gradient[open + 1..gradient.rfind(')').unwrap_or(gradient.len())];
-    let mut sum = 0.0f32;
-    let mut n = 0u32;
-    for (i, part) in split_top_level_commas(inner).enumerate() {
-        let p = part.trim();
-        if i == 0 && is_gradient_direction(p) {
-            continue;
-        }
-        if p.is_empty() {
-            continue;
-        }
-        sum += stop_alpha(p);
-        n += 1;
-    }
-    if n == 0 { 1.0 } else { sum / n as f32 }
-}
-
-/// A gradient function's leading direction/shape argument (`to right`,
-/// `45deg`, `circle at center`, the radial size keywords) — not a color stop.
-fn is_gradient_direction(p: &str) -> bool {
-    p.starts_with("to ")
-        || p.starts_with("at ")
-        || p.contains(" at ")
-        || p.starts_with("circle")
-        || p.starts_with("ellipse")
-        || p.starts_with("closest-")
-        || p.starts_with("farthest-")
-        || p.starts_with("from ")
-        || p.split_whitespace().next().is_some_and(|w| {
-            ["deg", "rad", "grad", "turn"]
-                .iter()
-                .any(|u| w.ends_with(u) && w.trim_end_matches(u).parse::<f32>().is_ok())
-        })
-}
-
-/// One color stop's declared alpha: the `transparent` keyword is 0, a
-/// function color carries its written alpha (absent = opaque), anything
-/// else (hex, named color) is opaque.
-fn stop_alpha(stop: &str) -> f32 {
-    if stop.contains("transparent") {
-        return 0.0;
-    }
-    for pre in ["rgb", "hsl", "hwb"] {
-        if let Some(i) = stop.find(pre) {
-            let rest = &stop[i..];
-            if let Some(open) = rest.find('(') {
-                let inner = &rest[open + 1..];
-                let inner = &inner[..inner.find(')').unwrap_or(inner.len())];
-                return color_args_alpha(inner).unwrap_or(1.0).clamp(0.0, 1.0);
-            }
-        }
-    }
-    1.0
-}
-
-/// Split on top-level commas (outside parentheses) — background layers.
-fn split_top_level_commas(t: &str) -> impl Iterator<Item = &str> {
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    let mut out = Vec::new();
-    for (i, c) in t.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                out.push(&t[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    out.push(&t[start..]);
-    out.into_iter()
 }
 
 /// The written ALPHA of a color function's argument list (`0,0,0,.5`,
@@ -709,8 +591,8 @@ fn ua_box(dom: &Dom, id: NodeId, tag: &str, fs: f32) -> ([f32; 4], [f32; 4]) {
 }
 
 /// Horizontal alignment of an IFC's line boxes (CSS Text §7.1). Unlike the
-/// old engine's `Align`, `justify` is carried and honored (inter-word gaps
-/// expand to whole cells; the last line and forced-break lines stay left).
+/// old engine's `Align`, `justify` is carried and honored with fractional
+/// inter-word expansion; the last line and forced-break lines stay left.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Align2 {
     Left,
@@ -778,7 +660,7 @@ pub(crate) enum WordBrk {
 }
 
 /// The inline formatting context inherited down the tree during the box-tree
-/// walk: everything a text run needs to become an `Item`. The cascade-
+/// walk: everything a text run needs to become an inline fragment. The cascade-
 /// inherited pieces (white-space, transform, letter-spacing, emphasis) are
 /// re-read per element through `computed_value` (which already inherits);
 /// what threads MANUALLY is what the cascade doesn't model: the enclosing
@@ -793,21 +675,45 @@ pub(crate) struct InlineStyle {
     pub node: NodeId,
     pub ws: WhiteSpace,
     pub transform: TextTransform,
-    /// `letter-spacing` as whole cells of inter-character gap (sub-cell → 0).
-    pub letter: usize,
+    /// CSS Text spacing in CSS pixels. Parley applies both after shaping and
+    /// bidi resolution, preserving fractional values.
+    pub letter: f32,
+    pub word: f32,
+    pub font_family: String,
+    pub font_size: f32,
+    pub font_weight: f32,
+    pub font_italic: bool,
+    pub line_height: crate::text::CssLineHeight,
+    pub vertical_align: VerticalAlign,
     /// Within-word break opportunities (`overflow-wrap`/`word-break`).
     pub brk: WordBrk,
     /// `word-break: keep-all` — no soft wraps at CJK ideograph boundaries.
     pub keep_all: bool,
-    /// `tab-size` in cells (CSS Text §3; a number is that many advances, a
-    /// length quantizes to cells; initial 8).
-    pub tab: usize,
+    /// `tab-size`: a number of space advances or an absolute CSS-pixel length.
+    pub tab: TabSize,
     pub font_zero: bool,
     /// Paint suppression for this element's text: the sticky opacity chain OR
     /// its own computed `visibility:hidden` (re-clearable per element).
     pub invisible: bool,
     /// The `opacity:0` chain alone — what element children derive from.
     opacity_chain: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TabSize {
+    Spaces(f32),
+    Length(f32),
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum VerticalAlign {
+    #[default]
+    Baseline,
+    Top,
+    Bottom,
+    Middle,
+    /// Positive values raise the inline box relative to the baseline.
+    Shift(f32),
 }
 
 impl InlineStyle {
@@ -819,10 +725,17 @@ impl InlineStyle {
             node: NO_NODE,
             ws: WhiteSpace::Normal,
             transform: TextTransform::None,
-            letter: 0,
+            letter: 0.0,
+            word: 0.0,
+            font_family: String::from("sans-serif"),
+            font_size: crate::dom::FONT_SIZE_INITIAL,
+            font_weight: 400.0,
+            font_italic: false,
+            line_height: crate::text::CssLineHeight::Normal,
+            vertical_align: VerticalAlign::Baseline,
             brk: WordBrk::Normal,
             keep_all: false,
-            tab: 8,
+            tab: TabSize::Spaces(8.0),
             font_zero: false,
             invisible: false,
             opacity_chain: false,
@@ -850,12 +763,20 @@ impl InlineStyle {
             }
             None => {}
         }
-        s.emph.bold = dom
+        s.font_family = dom
+            .computed_value(id, "font-family")
+            .unwrap_or_else(|| s.font_family.clone());
+        s.font_size = dom.font_px(id);
+        s.font_weight = dom
             .computed_value(id, "font-weight")
-            .is_some_and(|w| css_is_bold(&w));
-        s.emph.italic = dom
+            .as_deref()
+            .and_then(crate::layout2::css_font_weight)
+            .unwrap_or(s.font_weight);
+        s.font_italic = dom
             .computed_value(id, "font-style")
             .is_some_and(|v| css_is_italic(&v));
+        s.emph.bold = s.font_weight >= 600.0;
+        s.emph.italic = s.font_italic;
         (s.emph.underline, s.emph.strike) = dom.text_decoration(id);
         s.transform = dom
             .computed_value(id, "text-transform")
@@ -866,7 +787,40 @@ impl InlineStyle {
             .computed_value(id, "letter-spacing")
             .as_deref()
             .and_then(|v| css_length_px(v, u))
-            .map_or(0, |px| (px / u.cell_w).round().max(0.0) as usize);
+            .unwrap_or(0.0);
+        s.word = dom
+            .computed_value(id, "word-spacing")
+            .as_deref()
+            .filter(|value| value.trim() != "normal")
+            .and_then(|value| css_length_px(value, u))
+            .unwrap_or(0.0);
+        s.line_height = dom
+            .computed_value(id, "line-height")
+            .as_deref()
+            .and_then(|value| {
+                let value = value.trim();
+                if value == "normal" {
+                    Some(crate::text::CssLineHeight::Normal)
+                } else if let Ok(number) = value.parse::<f32>() {
+                    Some(crate::text::CssLineHeight::Number(number.max(0.0)))
+                } else {
+                    css_length_px(value, u).map(crate::text::CssLineHeight::Length)
+                }
+            })
+            .unwrap_or(crate::text::CssLineHeight::Normal);
+        // `vertical-align` is not inherited. CSS Inline 3 §4.5 positions the
+        // inline-level box relative to the line box's baseline.
+        s.vertical_align = match dom.computed_value(id, "vertical-align").as_deref() {
+            Some("top") | Some("text-top") => VerticalAlign::Top,
+            Some("bottom") | Some("text-bottom") => VerticalAlign::Bottom,
+            Some("middle") => VerticalAlign::Middle,
+            Some("sub") => VerticalAlign::Shift(-0.2 * s.font_size),
+            Some("super") => VerticalAlign::Shift(0.35 * s.font_size),
+            Some(value) => css_length_px(value, u)
+                .map(VerticalAlign::Shift)
+                .unwrap_or_default(),
+            None => VerticalAlign::Baseline,
+        };
         let wb = dom
             .computed_value(id, "word-break")
             .map(|v| v.trim().to_ascii_lowercase());
@@ -892,12 +846,12 @@ impl InlineStyle {
             .map(str::trim)
             .and_then(|v| {
                 if let Ok(n) = v.parse::<f32>() {
-                    Some(n.max(0.0).round() as usize)
+                    Some(TabSize::Spaces(n.max(0.0)))
                 } else {
-                    css_length_px(v, u).map(|px| (px / u.cell_w).round().max(0.0) as usize)
+                    css_length_px(v, u).map(|px| TabSize::Length(px.max(0.0)))
                 }
             })
-            .unwrap_or(8);
+            .unwrap_or(TabSize::Spaces(8.0));
         s.ws = dom
             .computed_value(id, "white-space")
             .as_deref()
@@ -916,10 +870,24 @@ impl InlineStyle {
     }
 
     /// The sticky `opacity:0` chain alone (a suppressed OUT-OF-FLOW box is
-    /// skipped entirely — no cells, no scrollable extent; `visibility` stays
+    /// skipped entirely — no paint, no scrollable extent; `visibility` stays
     /// re-clearable and lays as a ghost).
     pub fn opacity_suppressed(&self) -> bool {
         self.opacity_chain
+    }
+
+    pub fn text_style(&self) -> crate::text::TextStyle {
+        crate::text::TextStyle {
+            family: self.font_family.clone(),
+            size: self.font_size,
+            weight: self.font_weight,
+            italic: self.font_italic,
+            letter_spacing: self.letter,
+            word_spacing: self.word,
+            line_height: self.line_height,
+            underline: self.emph.underline,
+            strikethrough: self.emph.strike,
+        }
     }
 }
 

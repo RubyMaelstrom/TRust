@@ -9,11 +9,8 @@
 //! nested tables recurse), sizes each row to its tallest cell (§17.5.3), and
 //! places the cells with vertical alignment (§17.5.4).
 //!
-//! Everything is f32 CSS px, quantized to cells only when the fragments reach
-//! the painter — the same discipline as the flex/grid modules. We paint no
-//! cell borders/grid lines (a terminal row is precious; the columns alone
-//! carry the layout, which is the whole point for the ubiquitous
-//! table-as-layout page). A cell's own `background` still fills, because a
+//! Everything is f32 CSS px; only the terminal adapter quantizes the resulting
+//! fragments. A cell's own `background` fills because a
 //! cell is a real fragment; row/row-group backgrounds don't (they generate no
 //! fragment — documented deferral).
 
@@ -420,7 +417,7 @@ impl Flow<'_> {
 
     /// Horizontal border-spacing (px): CSS `border-spacing` if set, else the
     /// HTML `cellspacing` attribute (HTML §15.3.13 maps it to `border-spacing`).
-    /// Default 0 — a terminal's columns are separated by content/cellpadding.
+    /// Default 0; content/cellpadding still separates columns.
     /// Read through the author cascade (`computed_style`); `border-spacing`
     /// isn't a registry-tracked property.
     fn table_border_spacing(&self, table: NodeId) -> f32 {
