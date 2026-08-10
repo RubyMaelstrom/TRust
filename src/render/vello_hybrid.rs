@@ -35,15 +35,23 @@ use super::vello_cpu::{
     vello_stroke,
 };
 use super::{
-    Affine2d, CssRect, DecorationStyle, DisplayCommand, ImageFit, ImageHandle, ImageSampling,
-    PaintBrush, PaintColor, Primitive, RasterBackend, RasterFrame, RendererKind, Scene,
+    Affine2d, CssRect, DecorationStyle, DisplayCommand, ImageFit, ImageHandle, ImageResource,
+    ImageSampling, PaintBrush, PaintColor, Primitive, RasterBackend, RasterFrame, RendererKind,
+    Scene,
 };
 use crate::core::{CssPoint, PhysicalSize};
 
 const GPU_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+// Vello Hybrid 0.2's default image atlas is 4096x4096. Keep uploads within
+// that allocation boundary even on devices advertising larger 2D textures.
+const HYBRID_IMAGE_ATLAS_LIMIT: u32 = 4096;
 
 struct CachedImage {
     source: ImageSource,
+    upload_width: u32,
+    upload_height: u32,
+    // CSS Images 3 §4: natural dimensions drive concrete object sizing. The
+    // backend upload may be downsampled, but these values must remain natural.
     width: u32,
     height: u32,
     last_used_frame: u64,
@@ -102,6 +110,7 @@ impl VelloHybridRenderer {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: Some(&surface),
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|error| format!("no compatible Hybrid adapter: {error}"))?;
@@ -140,6 +149,7 @@ impl VelloHybridRenderer {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: None,
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|error| format!("no headless Hybrid adapter: {error}"))?;
@@ -327,7 +337,7 @@ impl VelloHybridRenderer {
             let hybrid_scene = self.build_scene(scene, &mut encoder)?;
             self.render_to_view(&hybrid_scene, &view, &mut encoder)?;
             self.queue.submit([encoder.finish()]);
-            texture.present();
+            self.queue.present(texture);
             if reconfigure_after {
                 self.configure_surface()?;
             }
@@ -400,7 +410,9 @@ impl VelloHybridRenderer {
         receiver
             .recv_timeout(GPU_WAIT_TIMEOUT)
             .map_err(|error| format!("Hybrid readback callback failed: {error}"))??;
-        let mapped = slice.get_mapped_range();
+        let mapped = slice
+            .get_mapped_range()
+            .map_err(|error| format!("could not access Hybrid readback: {error}"))?;
         self.rgba.clear();
         self.rgba
             .reserve(size.width as usize * size.height as usize * 4);
@@ -802,39 +814,14 @@ impl VelloHybridRenderer {
         if !self.images.contains_key(&handle)
             && let Some(image) = scene.image_store.get(handle)
         {
-            let expected = usize::try_from(image.width)
-                .ok()
-                .and_then(|width| {
-                    usize::try_from(image.height)
-                        .ok()
-                        .and_then(|height| width.checked_mul(height))
-                })
-                .and_then(|pixels| pixels.checked_mul(4));
-            let (Ok(width), Ok(height)) = (u16::try_from(image.width), u16::try_from(image.height))
-            else {
+            let upload_limit = HYBRID_IMAGE_ATLAS_LIMIT
+                .min(self.device.limits().max_texture_dimension_2d)
+                .min(u32::from(u16::MAX));
+            let Some((width, height, pixels)) = hybrid_image_pixels(&image, upload_limit) else {
                 target.set_paint(vello_color(PaintColor::Muted));
                 target.fill_rect(&vello_rect(rect));
                 return Ok(());
             };
-            if width == 0 || height == 0 || expected != Some(image.rgba.len()) {
-                target.set_paint(vello_color(PaintColor::Muted));
-                target.fill_rect(&vello_rect(rect));
-                return Ok(());
-            }
-            let pixels: Vec<PremulRgba8> = image
-                .rgba
-                .chunks_exact(4)
-                .map(|pixel| {
-                    let alpha = u16::from(pixel[3]);
-                    let premul = |component| ((u16::from(component) * alpha) / 255) as u8;
-                    PremulRgba8 {
-                        r: premul(pixel[0]),
-                        g: premul(pixel[1]),
-                        b: premul(pixel[2]),
-                        a: pixel[3],
-                    }
-                })
-                .collect();
             let pixmap = Pixmap::from_parts_with_opacity(pixels, width, height, image.has_alpha);
             let id = self.renderer.upload_image(
                 &mut self.resources,
@@ -847,6 +834,8 @@ impl VelloHybridRenderer {
                 handle,
                 CachedImage {
                     source: ImageSource::opaque_id_with_transparency_hint(id, image.has_alpha),
+                    upload_width: u32::from(width),
+                    upload_height: u32::from(height),
                     width: image.width,
                     height: image.height,
                     last_used_frame: self.frame_id,
@@ -885,7 +874,10 @@ impl VelloHybridRenderer {
         });
         target.set_paint_transform(
             Affine::translate((f64::from(x), f64::from(y)))
-                * Affine::scale_non_uniform(f64::from(scale_x), f64::from(scale_y)),
+                * Affine::scale_non_uniform(
+                    f64::from(drawn_width / image.upload_width as f32),
+                    f64::from(drawn_height / image.upload_height as f32),
+                ),
         );
         if fit == ImageFit::Cover {
             target.push_clip_path(&rect_path(rect));
@@ -1010,6 +1002,75 @@ fn physical_size(width: u32, height: u32) -> PhysicalSize {
     PhysicalSize::new(width, height)
 }
 
+fn bounded_image_dimensions(width: u32, height: u32, limit: u32) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 || limit == 0 {
+        return None;
+    }
+    if width <= limit && height <= limit {
+        return Some((width, height));
+    }
+    if width >= height {
+        let scaled_height =
+            (u64::from(height) * u64::from(limit) + u64::from(width) / 2) / u64::from(width);
+        Some((limit, scaled_height.max(1) as u32))
+    } else {
+        let scaled_width =
+            (u64::from(width) * u64::from(limit) + u64::from(height) / 2) / u64::from(height);
+        Some((scaled_width.max(1) as u32, limit))
+    }
+}
+
+fn hybrid_image_pixels(image: &ImageResource, limit: u32) -> Option<(u16, u16, Vec<PremulRgba8>)> {
+    let expected = usize::try_from(image.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(image.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4));
+    if expected != Some(image.rgba.len()) {
+        return None;
+    }
+    let (upload_width, upload_height) = bounded_image_dimensions(image.width, image.height, limit)?;
+    let pixels = if (upload_width, upload_height) == (image.width, image.height) {
+        premultiply_rgba(&image.rgba)
+    } else {
+        let source = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(
+            image.width,
+            image.height,
+            image.rgba.as_ref(),
+        )?;
+        let resized = image::imageops::resize(
+            &source,
+            upload_width,
+            upload_height,
+            image::imageops::FilterType::Triangle,
+        );
+        premultiply_rgba(resized.as_raw())
+    };
+    Some((
+        u16::try_from(upload_width).ok()?,
+        u16::try_from(upload_height).ok()?,
+        pixels,
+    ))
+}
+
+fn premultiply_rgba(rgba: &[u8]) -> Vec<PremulRgba8> {
+    rgba.chunks_exact(4)
+        .map(|pixel| {
+            let alpha = u16::from(pixel[3]);
+            let premul = |component| ((u16::from(component) * alpha) / 255) as u8;
+            PremulRgba8 {
+                r: premul(pixel[0]),
+                g: premul(pixel[1]),
+                b: premul(pixel[2]),
+                a: pixel[3],
+            }
+        })
+        .collect()
+}
+
 fn set_brush(target: &mut vello_hybrid::Scene, brush: &PaintBrush) {
     match brush {
         PaintBrush::Solid(color) => target.set_paint(vello_color(*color)),
@@ -1104,5 +1165,35 @@ mod tests {
             preferred_surface_format(&[TextureFormat::Bgra8UnormSrgb, TextureFormat::Bgra8Unorm,]),
             Some(TextureFormat::Bgra8Unorm)
         );
+    }
+
+    #[test]
+    fn oversized_images_fit_the_hybrid_atlas_without_changing_aspect_ratio() {
+        assert_eq!(
+            bounded_image_dimensions(3840, 5160, HYBRID_IMAGE_ATLAS_LIMIT),
+            Some((3048, 4096))
+        );
+        assert_eq!(
+            bounded_image_dimensions(8192, 1024, HYBRID_IMAGE_ATLAS_LIMIT),
+            Some((4096, 512))
+        );
+        assert_eq!(
+            bounded_image_dimensions(320, 240, HYBRID_IMAGE_ATLAS_LIMIT),
+            Some((320, 240))
+        );
+    }
+
+    #[test]
+    fn hybrid_upload_resamples_pixels_but_retains_separate_natural_size() {
+        let image = ImageResource {
+            width: 4,
+            height: 2,
+            rgba: Arc::from(vec![255; 4 * 2 * 4]),
+            has_alpha: false,
+        };
+        let (width, height, pixels) = hybrid_image_pixels(&image, 2).unwrap();
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(pixels.len(), 2);
+        assert_eq!((image.width, image.height), (4, 2));
     }
 }

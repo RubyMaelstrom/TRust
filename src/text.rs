@@ -17,8 +17,9 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 
 use parley::{
-    FontContext, FontStack, FontStyle, FontWeight, Layout, LayoutContext, LineHeight, OverflowWrap,
-    PositionedLayoutItem, StyleProperty, TextWrapMode, WordBreakStrength, editing::PlainEditor,
+    FontContext, FontFamily, FontStyle, FontWeight, Layout, LayoutContext, LineHeight,
+    OverflowWrap, PositionedLayoutItem, StyleProperty, TextWrapMode, WordBreak,
+    editing::PlainEditor,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -193,7 +194,7 @@ impl TextEditor {
         editor.set_width(multiline.then_some(width.max(1.0)));
         editor.set_quantize(false);
         let styles = editor.edit_styles();
-        styles.insert(StyleProperty::FontStack(FontStack::Source(
+        styles.insert(StyleProperty::FontFamily(FontFamily::Source(
             style.family.clone().into(),
         )));
         styles.insert(StyleProperty::FontSize(style.size.max(1.0)));
@@ -581,7 +582,7 @@ impl TextSystem {
         let mut builder = self
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, true);
-        builder.push_default(StyleProperty::FontStack(FontStack::Source(
+        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(
             style.family.as_str().into(),
         )));
         builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
@@ -623,7 +624,7 @@ impl TextSystem {
         let mut builder = self
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, true);
-        builder.push_default(StyleProperty::FontStack(FontStack::Source(
+        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(
             style.family.as_str().into(),
         )));
         builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
@@ -643,9 +644,9 @@ impl TextSystem {
             CssLineHeight::Length(px) => LineHeight::Absolute(px.max(0.0)),
         }));
         builder.push_default(StyleProperty::WordBreak(match breaks.word_break {
-            TextWordBreak::Normal => WordBreakStrength::Normal,
-            TextWordBreak::BreakAll => WordBreakStrength::BreakAll,
-            TextWordBreak::KeepAll => WordBreakStrength::KeepAll,
+            TextWordBreak::Normal => WordBreak::Normal,
+            TextWordBreak::BreakAll => WordBreak::BreakAll,
+            TextWordBreak::KeepAll => WordBreak::KeepAll,
         }));
         builder.push_default(StyleProperty::OverflowWrap(match breaks.overflow_wrap {
             TextOverflowWrap::Normal => OverflowWrap::Normal,
@@ -678,7 +679,7 @@ impl TextSystem {
         let mut builder = self
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, true);
-        builder.push_default(StyleProperty::FontStack(FontStack::Source(
+        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(
             style.family.as_str().into(),
         )));
         builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
@@ -693,9 +694,9 @@ impl TextSystem {
         builder.push_default(StyleProperty::LetterSpacing(style.letter_spacing));
         builder.push_default(StyleProperty::WordSpacing(style.word_spacing));
         builder.push_default(StyleProperty::WordBreak(match breaks.word_break {
-            TextWordBreak::Normal => WordBreakStrength::Normal,
-            TextWordBreak::BreakAll => WordBreakStrength::BreakAll,
-            TextWordBreak::KeepAll => WordBreakStrength::KeepAll,
+            TextWordBreak::Normal => WordBreak::Normal,
+            TextWordBreak::BreakAll => WordBreak::BreakAll,
+            TextWordBreak::KeepAll => WordBreak::KeepAll,
         }));
         builder.push_default(StyleProperty::OverflowWrap(match breaks.overflow_wrap {
             TextOverflowWrap::Normal => OverflowWrap::Normal,
