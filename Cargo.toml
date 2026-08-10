@@ -55,10 +55,10 @@ mimalloc = { version = "0.1", optional = true }
 # Unicode shaping, font discovery/fallback, bidi, cluster mapping, and line
 # metrics for the canonical CSS-pixel inline formatting context. TRust owns the
 # surrounding CSS and retained-paint contracts; Parley is the font machinery.
-# 0.7 is the newest Parley line compatible with Boa 0.21's ICU4X 2.0 data
-# singleton. Parley 0.8+ requires ICU4X 2.1, whose compiled-data crate cannot
-# coexist in one dependency graph with Boa's pinned 2.0 provider.
-parley = "0.7.0"
+# Keep the shaping/editor boundary current. Parley 0.11 requires ICU4X 2.1+;
+# TRust's customized Boa 0.21 fork follows upstream Boa's current ICU4X 2.2
+# pins so Cargo resolves one compiled-data provider across both engines.
+parley = "0.11.0"
 # Vello CPU's retained glyph cache/backend API. Keeping this direct dependency
 # at the thin renderer adapter lets TRust forward variation coordinates and
 # synthetic faces without leaking Glifo into layout/browser contracts.
@@ -95,7 +95,7 @@ vello_cpu = { version = "0.2.0", default-features = false, features = ["std", "t
 # to `render::vello_hybrid`, and CPU remains the reference/fallback backend.
 vello_hybrid = { version = "0.2.0", default-features = false, features = ["std", "text"] }
 vello_common = { version = "0.2.0", default-features = false, features = ["std"] }
-wgpu = { version = "29.0.3", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12", "gles"] }
+wgpu = { version = "30.0.0", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12", "gles"] }
 vt100 = "0.16.2"
 winit = "0.30.13"
 softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
@@ -124,6 +124,11 @@ boa_interner = "0.21"
 
 [patch.crates-io]
 crossterm = { path = "vendor/crossterm-0.29.0" }
+# Vello Hybrid 0.2 is the current release, but upstream still pins wgpu 29.
+# TRust carries this source-identical compatibility fork so the desktop uses
+# wgpu 30's panic-safe SurfaceTexture teardown (gfx-rs/wgpu#9678). Keep the
+# renderer changes confined to the fork and drop the patch when Vello updates.
+vello_hybrid = { path = "vendor/vello_hybrid-0.2.0" }
 # TRust's Boa fork. Boa is the only viable pure-Rust JS engine, but it's
 # half-finished and we keep hitting its edges; we vendor it so we can fix
 # the engine itself instead of working around it from js.rs. First fix:
