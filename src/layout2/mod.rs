@@ -1026,6 +1026,38 @@ mod tests {
     }
 
     #[test]
+    fn overflow_wrap_prefers_the_existing_word_boundary_before_emergency_breaks() {
+        // CSS Text 3 §5 and §5.4: `overflow-wrap:break-word` introduces
+        // an arbitrary break only for an otherwise-unbreakable sequence. The
+        // space before a word is already a normal soft-wrap opportunity, so a
+        // word which fits on an empty line moves there intact instead of being
+        // split merely to fill the preceding line's remaining pixels.
+        let style = crate::text::TextStyle::default();
+        let width = crate::text::shape("encyclopedia", &style).advance + 0.1;
+        let layout = lay_graphical(
+            r#"<body style="margin:0"><p style="margin:0;overflow-wrap:break-word">alpha encyclopedia</p></body>"#,
+            width,
+            &HashMap::new(),
+        );
+        assert!(layout.paint.lines.len() >= 2);
+        let first = &layout.paint.lines[0].rect;
+        let first_line: String = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                crate::render::Primitive::GlyphRun { origin, shaped, .. }
+                    if origin.y >= first.y && origin.y < first.y + first.height =>
+                {
+                    Some(shaped.text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(first_line.trim_end(), "alpha");
+    }
+
+    #[test]
     fn word_break_break_all_fills_lines() {
         // `word-break: break-all` breaks between any two characters, so the
         // greedy fill uses the current line before wrapping (CSS Text §5.2):
