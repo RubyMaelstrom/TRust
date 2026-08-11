@@ -122,9 +122,9 @@ impl From<AccessEvent> for DesktopEvent {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum FocusTarget {
-    #[default]
     Page,
     Find,
+    #[default]
     Command,
     Form {
         form: usize,
@@ -488,6 +488,36 @@ fn scroll_container_delta(container: &ScrollContainer, delta: CssPoint) -> (CssP
     (next, residual)
 }
 
+/// Browser-page navigation keys use the same retained CSS-pixel scroll state
+/// as wheel and scrollbar input. A page step leaves a small visual overlap so
+/// readers retain context; arrow keys use the controller's ordinary 40px line
+/// step, and Home/End select the scrolling area's vertical extremes.
+fn viewport_scroll_key_target(
+    key: &Key,
+    current: CssPoint,
+    viewport: CssSize,
+    page: CssSize,
+) -> Option<CssPoint> {
+    let max_x = (page.width - viewport.width).max(0.0);
+    let max_y = (page.height - viewport.height).max(0.0);
+    let x = current.x.clamp(0.0, max_x);
+    let y = current.y.clamp(0.0, max_y);
+    let line_step = 40.0;
+    let page_step = viewport.height.max(1.0) * 0.9;
+    let target = match key {
+        Key::ArrowUp => CssPoint::new(x, (y - line_step).max(0.0)),
+        Key::ArrowDown => CssPoint::new(x, (y + line_step).min(max_y)),
+        Key::ArrowLeft => CssPoint::new((x - line_step).max(0.0), y),
+        Key::ArrowRight => CssPoint::new((x + line_step).min(max_x), y),
+        Key::PageUp => CssPoint::new(x, (y - page_step).max(0.0)),
+        Key::PageDown => CssPoint::new(x, (y + page_step).min(max_y)),
+        Key::Home => CssPoint::new(x, 0.0),
+        Key::End => CssPoint::new(x, max_y),
+        _ => return None,
+    };
+    Some(target)
+}
+
 impl DesktopApp {
     fn new(
         browser: BrowserController,
@@ -517,7 +547,7 @@ impl DesktopApp {
             pointer: CssPoint::default(),
             cursor_icon: CursorIcon::Default,
             modifiers: ModifiersState::empty(),
-            focus: FocusTarget::Page,
+            focus: FocusTarget::default(),
             initial_navigation,
             find: TextEditor::new("", &style, 500.0, false),
             command: TextEditor::new("", &style, 700.0, false),
@@ -1766,6 +1796,32 @@ impl DesktopApp {
         }
     }
 
+    fn handle_http_scroll_key(&mut self, input: &KeyInput) -> bool {
+        if input.state != KeyState::Pressed
+            || input.modifiers.control
+            || input.modifiers.meta
+            || input.modifiers.alt
+            || self.page_layout.is_none()
+        {
+            return false;
+        }
+        let Some(scene) = &self.scene else {
+            return false;
+        };
+        let Some(target) = viewport_scroll_key_target(
+            &input.key,
+            self.browser.interaction().scroll,
+            CssSize::new(scene.content_viewport.width, scene.content_viewport.height),
+            scene.page_size,
+        ) else {
+            return false;
+        };
+        self.cancel_heart_glide();
+        self.keyboard_target = None;
+        self.dispatch(UserAction::SetViewportScroll(target));
+        true
+    }
+
     fn apply_gopherus_position(&mut self, position: GopherusPosition) {
         self.cancel_heart_glide();
         let old_scroll = self.browser.interaction().scroll;
@@ -1896,6 +1952,12 @@ impl DesktopApp {
         if self.focus == FocusTarget::Page
             && self.terminal.is_none()
             && self.handle_gopherus_key(&input)
+        {
+            return;
+        }
+        if self.focus == FocusTarget::Page
+            && self.terminal.is_none()
+            && self.handle_http_scroll_key(&input)
         {
             return;
         }
@@ -3469,6 +3531,10 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             return;
         }
         self.update_metrics(None);
+        // Startup focus is the COMMAND editor. Reapply it after the native
+        // window exists so winit enables text/IME input for the visible entry,
+        // not merely the browser's internal focus enum.
+        self.set_focus(self.focus);
         if let Some(address) = self.initial_navigation.take() {
             self.navigate(address);
         }
@@ -4292,6 +4358,69 @@ mod tests {
         pending = true;
         assert!(consume_pending_redraw(&mut pending));
         assert!(!consume_pending_redraw(&mut pending));
+    }
+
+    #[test]
+    fn desktop_starts_with_the_command_editor_focused() {
+        assert_eq!(FocusTarget::default(), FocusTarget::Command);
+    }
+
+    #[test]
+    fn http_page_navigation_keys_target_the_retained_viewport_scroll() {
+        let viewport = CssSize::new(800.0, 100.0);
+        let page = CssSize::new(1_000.0, 500.0);
+        let current = CssPoint::new(25.0, 200.0);
+        assert_eq!(
+            viewport_scroll_key_target(&Key::PageUp, current, viewport, page),
+            Some(CssPoint::new(25.0, 110.0))
+        );
+        assert_eq!(
+            viewport_scroll_key_target(&Key::PageDown, current, viewport, page),
+            Some(CssPoint::new(25.0, 290.0))
+        );
+        assert_eq!(
+            viewport_scroll_key_target(&Key::Home, current, viewport, page),
+            Some(CssPoint::new(25.0, 0.0))
+        );
+        assert_eq!(
+            viewport_scroll_key_target(&Key::End, current, viewport, page),
+            Some(CssPoint::new(25.0, 400.0))
+        );
+        assert_eq!(
+            viewport_scroll_key_target(&Key::ArrowUp, current, viewport, page),
+            Some(CssPoint::new(25.0, 160.0))
+        );
+        assert_eq!(
+            viewport_scroll_key_target(&Key::ArrowDown, current, viewport, page),
+            Some(CssPoint::new(25.0, 240.0))
+        );
+        assert_eq!(
+            viewport_scroll_key_target(&Key::ArrowLeft, current, viewport, page),
+            Some(CssPoint::new(0.0, 200.0))
+        );
+        assert_eq!(
+            viewport_scroll_key_target(&Key::ArrowRight, current, viewport, page),
+            Some(CssPoint::new(65.0, 200.0))
+        );
+        assert_eq!(
+            viewport_scroll_key_target(&Key::Enter, current, viewport, page),
+            None
+        );
+
+        // Every direction clamps at its corresponding scroll boundary.
+        assert_eq!(
+            viewport_scroll_key_target(&Key::ArrowLeft, CssPoint::new(0.0, 0.0), viewport, page,),
+            Some(CssPoint::new(0.0, 0.0))
+        );
+        assert_eq!(
+            viewport_scroll_key_target(
+                &Key::ArrowRight,
+                CssPoint::new(200.0, 400.0),
+                viewport,
+                page,
+            ),
+            Some(CssPoint::new(200.0, 400.0))
+        );
     }
 
     #[test]
