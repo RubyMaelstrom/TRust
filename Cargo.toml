@@ -189,7 +189,7 @@ ratatui-image = { path = "vendor/ratatui-image-11.0.6" }
 # compile time for speed and size; symbols stripped (panic messages
 # still print, just without a backtrace).
 [profile.release]
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
