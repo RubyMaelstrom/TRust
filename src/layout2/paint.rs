@@ -926,7 +926,8 @@ pub(crate) fn line_row_map(
 }
 
 fn terminal_piece_width(piece: &super::inline::Piece, cell_w: f32, cell_h: f32) -> usize {
-    if piece.item.image.is_some() || (piece.shaped.is_none() && piece.item.text.is_empty()) {
+    let text = terminal_piece_text(piece);
+    if piece.item.image.is_some() || (piece.shaped.is_none() && text.is_empty()) {
         let x0 = (piece.paint_x / cell_w).round();
         let x1 = ((piece.paint_x + piece.paint_width) / cell_w).round();
         let y0 = (piece.paint_y / cell_h).round();
@@ -934,8 +935,19 @@ fn terminal_piece_width(piece: &super::inline::Piece, cell_w: f32, cell_h: f32) 
         let _height = (y1 - y0).max(1.0);
         (x1 - x0).max(1.0) as usize
     } else {
-        display_width(&piece.item.text) + usize::from(piece.space_before)
+        display_width(text) + usize::from(piece.space_before)
     }
+}
+
+/// The terminal presentation is selected only after canonical CSS layout.
+/// Graphical paint and CSSOM continue to consume `item.text`; this adapter may
+/// add character-cell widget punctuation without feeding it back into either.
+fn terminal_piece_text(piece: &super::inline::Piece) -> &str {
+    piece
+        .item
+        .terminal_text
+        .as_deref()
+        .unwrap_or(&piece.item.text)
 }
 
 fn terminal_line_span(
@@ -954,7 +966,10 @@ fn terminal_line_span(
     for piece in &line_fragment.pieces {
         let width = terminal_piece_width(piece, cell_w, cell_h) as i64;
         let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
-        if piece.space_before && piece.item.image.is_none() && !piece.item.text.is_empty() {
+        if piece.space_before
+            && piece.item.image.is_none()
+            && !terminal_piece_text(piece).is_empty()
+        {
             preferred -= 1;
         }
         let mut col = preferred.max(pen);
@@ -1173,7 +1188,7 @@ fn inflow_content(
                     col: 0,
                     width: 0,
                     height: 1,
-                    text: p.item.text.clone(),
+                    text: terminal_piece_text(p).to_string(),
                     kind: p.item.kind,
                     image: p.item.image.clone(),
                     emph: p.item.emph,

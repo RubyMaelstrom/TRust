@@ -30194,7 +30194,10 @@ mod tests {
         }
         let go = first
             .find("id=\"go\"")
-            .and_then(|at| first[..at].rfind("x-trust-js:"))
+            // Native buttons retain their authored CSS-box position. Their
+            // actor marker is metadata on the button itself, after its id,
+            // rather than an invented parent anchor before it.
+            .and_then(|at| first[at..].find("x-trust-js:").map(|i| at + i))
             .map(|i| {
                 first[i + "x-trust-js:".len()..]
                     .split(':')
