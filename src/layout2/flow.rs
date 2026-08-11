@@ -231,6 +231,70 @@ impl<'t> Frag<'t> {
     }
 }
 
+#[derive(Copy, Clone)]
+struct ButtonContentBounds {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+}
+
+impl ButtonContentBounds {
+    fn union(self, other: ButtonContentBounds) -> ButtonContentBounds {
+        ButtonContentBounds {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+}
+
+/// The laid border-box bounds of content participating in HTML's anonymous
+/// button content box. Out-of-flow placeholders do not contribute to the
+/// anonymous box's in-flow size. For a line, use its actual inline boxes (not
+/// the line's full alignment band), so an authored `text-align` offset is not
+/// mistaken for content width and then applied a second time.
+fn button_content_bounds(f: &Frag<'_>) -> Option<ButtonContentBounds> {
+    if matches!(f.kind, FragKind::Oof(..)) {
+        return None;
+    }
+    let mut bounds = match &f.kind {
+        FragKind::Line(line) => {
+            line.pieces
+                .iter()
+                .fold(None::<ButtonContentBounds>, |bounds, piece| {
+                    let rect = ButtonContentBounds {
+                        x0: f.x + piece.x,
+                        y0: f.y + piece.y,
+                        x1: f.x + piece.x + piece.box_width,
+                        y1: f.y + piece.y + piece.box_height,
+                    };
+                    Some(match bounds {
+                        Some(bounds) => bounds.union(rect),
+                        None => rect,
+                    })
+                })
+        }
+        FragKind::Block => Some(ButtonContentBounds {
+            x0: f.x,
+            y0: f.y,
+            x1: f.x + f.w,
+            y1: f.y + f.h,
+        }),
+        FragKind::Oof(..) => None,
+    };
+    for child in &f.children {
+        if let Some(rect) = button_content_bounds(child) {
+            bounds = Some(match bounds {
+                Some(bounds) => bounds.union(rect),
+                None => rect,
+            });
+        }
+    }
+    bounds
+}
+
 /// A containing block's padding-box rectangle in absolute px (§10.1).
 #[derive(Copy, Clone, Debug)]
 struct CbRect {
@@ -1090,6 +1154,15 @@ impl Flow<'_> {
                 }
             }
         }
+        self.center_button_content(
+            b,
+            &mut children,
+            x_border + h.bp_l,
+            y_final + bt,
+            h.content_w,
+            (frag_h - bt - bb).max(0.0),
+            &mut cur.anchors[a0..],
+        );
         self.finish_frag(
             b,
             x_border,
@@ -1287,6 +1360,7 @@ impl Flow<'_> {
                 pieces: vec![Piece::shaped(
                     InlineItem {
                         text: marker.to_string(),
+                        terminal_text: None,
                         kind: crate::layout2::ItemKind::Text,
                         image: None,
                         emph: inl.emph,
@@ -2224,6 +2298,60 @@ impl Flow<'_> {
         (frags, content_h.max(0.0))
     }
 
+    /// Apply WHATWG HTML Rendering §15.5.3's anonymous button content-box
+    /// alignment after the button's used content size is known. The operation
+    /// is shared by normal-flow block/flow-root buttons and atomic inline
+    /// buttons; flex/grid buttons intentionally retain their authored layout.
+    #[allow(clippy::too_many_arguments)]
+    fn center_button_content(
+        &self,
+        b: &BoxNode,
+        children: &mut [Frag<'_>],
+        content_left: f32,
+        content_top: f32,
+        content_w: f32,
+        content_h: f32,
+        anchors: &mut [(NodeId, f32)],
+    ) {
+        let ordinary_button = b.node != NO_NODE
+            && self.dom.tag_name(b.node) == Some("button")
+            && !matches!(
+                self.dom.effective_display(b.node).as_deref(),
+                Some("inline-grid" | "grid" | "inline-flex" | "flex")
+            );
+        if !ordinary_button {
+            return;
+        }
+        let Some(bounds) = children
+            .iter()
+            .filter_map(button_content_bounds)
+            .reduce(ButtonContentBounds::union)
+        else {
+            return;
+        };
+        let used_w = (bounds.x1 - bounds.x0).max(0.0);
+        let used_h = (bounds.y1 - bounds.y0).max(0.0);
+        let dx = if used_w <= content_w {
+            content_left + (content_w - used_w) / 2.0 - bounds.x0
+        } else {
+            0.0
+        };
+        let dy = if used_h <= content_h {
+            content_top + (content_h - used_h) / 2.0 - bounds.y0
+        } else {
+            0.0
+        };
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        for child in children {
+            Self::offset_frag(child, dx, dy);
+        }
+        for anchor in anchors {
+            anchor.1 += dy;
+        }
+    }
+
     /// Lay a flex item at its IMPOSED used content width. A flex item
     /// establishes an independent formatting context (§4): child margins
     /// stay inside (no collapsing across the boundary), and the item's OWN
@@ -2456,7 +2584,20 @@ impl Flow<'_> {
         if let Some(hd) = def_h {
             content_h = hd;
         }
-        let anchors = std::mem::take(&mut cur.anchors);
+        let mut anchors = std::mem::take(&mut cur.anchors);
+
+        // This is button layout, not `text-align`: it centers an image, SVG,
+        // inline-block, or multi-box subtree after flex stretch has supplied
+        // the button's final height.
+        self.center_button_content(
+            b,
+            &mut children,
+            bp_l,
+            bt,
+            content_w,
+            content_h,
+            &mut anchors,
+        );
         (
             Frag {
                 node: b.node,
@@ -2511,6 +2652,7 @@ impl Flow<'_> {
         );
         let item = InlineItem {
             text: String::new(),
+            terminal_text: None,
             kind: crate::layout2::ItemKind::Image,
             image: natural
                 .is_some()

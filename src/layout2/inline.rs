@@ -92,7 +92,15 @@ pub(crate) struct Piece {
 /// terminal adapter constructs those only while quantizing a piece.
 #[derive(Clone, Debug)]
 pub(crate) struct InlineItem {
+    /// Authored/native-control text used by canonical CSS-pixel layout and
+    /// graphical paint.
     pub text: String,
+    /// Character-cell representation used only by `layout2::paint`.
+    ///
+    /// Keeping this separate is the same one-way adapter rule as cell
+    /// quantization: terminal widget punctuation must never affect graphical
+    /// glyphs, flex sizing, wrapping, or CSSOM geometry.
+    pub terminal_text: Option<String>,
     pub kind: ItemKind,
     pub image: Option<String>,
     pub emph: Emphasis,
@@ -781,6 +789,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             vertical_align: ctx.vertical_align,
             item: InlineItem {
                 text: seg.to_string(),
+                terminal_text: None,
                 kind: ctx.kind,
                 image: None,
                 emph: ctx.emph,
@@ -823,7 +832,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 let Some(f) = self.forms.get(*form).and_then(|f| f.fields.get(*field)) else {
                     return;
                 };
-                let label = control_label(
+                let labels = control_labels(
                     self.dom,
                     a.node,
                     f,
@@ -836,10 +845,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     ctx,
                     self.vp,
                 );
-                if label.is_empty() {
+                if labels.visual.is_empty() {
                     return;
                 }
-                let shaped = crate::text::shape(&label, &ctx.text_style());
+                let shaped = crate::text::shape(&labels.visual, &ctx.text_style());
                 let w = shaped.advance;
                 self.place_atom(
                     AtomGeometry {
@@ -851,7 +860,8 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         paint_height: shaped.line_height,
                     },
                     InlineItem {
-                        text: label,
+                        text: labels.visual,
+                        terminal_text: Some(labels.terminal),
                         kind: ItemKind::Form,
                         image: None,
                         emph: Emphasis::default(),
@@ -933,6 +943,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 },
                 InlineItem {
                     text: String::new(),
+                    terminal_text: None,
                     kind: ItemKind::Image,
                     image: natural
                         .is_some()
@@ -1054,6 +1065,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 },
                 InlineItem {
                     text: String::new(),
+                    terminal_text: None,
                     kind: ItemKind::Image,
                     image: Some(poster),
                     emph: Emphasis::default(),
@@ -1161,6 +1173,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             },
             InlineItem {
                 text: String::new(),
+                terminal_text: None,
                 kind: crate::layout2::ItemKind::Text,
                 image: None,
                 emph: Emphasis::default(),
@@ -1534,12 +1547,13 @@ pub(crate) fn media_label(dom: &Dom, video: bool, src_node: Option<NodeId>) -> S
     format!("{glyph} {kind}{quality}")
 }
 
-/// A control's widget label. Editable fields (text/password/textarea) pad
-/// to their used width — CSS `width` (needs a percentage basis; `None`
-/// under an intrinsic-sizing constraint), else the HTML `size`/`cols`
-/// attribute, else the UA default of 20 character advances — so a form's
-/// input boxes read as boxes, exactly as wide as the page asked. The value
-/// is never truncated (typed content outranks the declared width).
+/// A control's widget presentation. WHATWG HTML Rendering §15.5.6 describes
+/// text inputs as inline-block one-line text controls: graphical paint carries
+/// their value/placeholder with no terminal punctuation. Editable fields pad
+/// to their used width — CSS `width` (needs a percentage basis; `None` under an
+/// intrinsic-sizing constraint), else the HTML `size`/`cols` attribute, else
+/// the UA default of 20 character advances. The value is never truncated
+/// (typed content outranks the declared width).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ControlWidthBasis {
     /// A normal layout pass with a definite containing-block width.
@@ -1558,13 +1572,31 @@ pub(crate) fn control_label(
     inline_style: &InlineStyle,
     vp: Vp,
 ) -> String {
-    let mut label = f.row_label();
+    control_labels(dom, node, f, width_basis, cap, inline_style, vp).visual
+}
+
+struct ControlLabels {
+    visual: String,
+    terminal: String,
+}
+
+fn control_labels(
+    dom: &Dom,
+    node: NodeId,
+    f: &crate::doc::Field,
+    width_basis: ControlWidthBasis,
+    cap: f32,
+    inline_style: &InlineStyle,
+    vp: Vp,
+) -> ControlLabels {
+    let mut visual = f.visual_label();
+    let mut terminal = f.row_label();
     use crate::doc::FieldKind;
     if !matches!(
         f.kind,
         FieldKind::Text | FieldKind::Password | FieldKind::Textarea
     ) {
-        return label;
+        return ControlLabels { visual, terminal };
     }
     let u = Units::of(dom, node);
     let css_width = dom
@@ -1593,13 +1625,17 @@ pub(crate) fn control_label(
         crate::text::zero_advance(&text_style) * (attr_ch(attr_name).unwrap_or(20) + 2) as f32
     });
     let target = target.min(cap).max(0.0);
-    let have = crate::text::shape(&label, &text_style).advance;
-    if have < target && label.ends_with(']') {
-        let space = crate::text::shape(" ", &text_style).advance.max(0.01);
-        let pad = " ".repeat(((target - have) / space).ceil() as usize);
-        label.truncate(label.len() - 1);
-        label.push_str(&pad);
-        label.push(']');
+    let space = crate::text::shape(" ", &text_style).advance.max(0.01);
+    let visual_have = crate::text::shape(&visual, &text_style).advance;
+    if visual_have < target {
+        visual.push_str(&" ".repeat(((target - visual_have) / space).ceil() as usize));
     }
-    label
+    let terminal_have = crate::text::shape(&terminal, &text_style).advance;
+    if terminal_have < target && terminal.ends_with(']') {
+        let pad = " ".repeat(((target - terminal_have) / space).ceil() as usize);
+        terminal.truncate(terminal.len() - 1);
+        terminal.push_str(&pad);
+        terminal.push(']');
+    }
+    ControlLabels { visual, terminal }
 }

@@ -2812,8 +2812,7 @@ pub(crate) fn resolve(base: &Url, target: &str) -> Link {
 /// Extract the page's forms from our own arena DOM (the layout path's
 /// source of truth), returning the forms plus a map from each rendering
 /// control's `NodeId` to its `(form, field)` indices so the layout can
-/// make those items selectable `Link::Form`s. A form element whose node
-/// is in the map carries its synthetic submit (button-less forms).
+/// make those items selectable `Link::Form`s.
 pub fn extract_forms_arena(
     dom: &crate::dom::Dom,
     base: &Url,
@@ -2886,26 +2885,11 @@ fn walk_forms_arena(
                 });
                 let form = forms.len() - 1;
                 walk_forms_arena(dom, child, Some(form), base, forms, map, implicit);
-                // A form with no submit control still needs a trigger: a
-                // synthetic submit, surfaced as an item on the form node.
-                if !forms[form].fields.is_empty()
-                    && !forms[form]
-                        .fields
-                        .iter()
-                        .any(|f| f.kind == FieldKind::Submit)
-                {
-                    forms[form].fields.push(Field {
-                        name: String::new(),
-                        value: String::new(),
-                        checked: false,
-                        default_value: String::new(),
-                        default_checked: false,
-                        label: String::from("Submit"),
-                        kind: FieldKind::Submit,
-                        live_node: live_node(dom, child),
-                    });
-                    map.insert(child, (form, forms[form].fields.len() - 1));
-                }
+                // WHATWG HTML §4.10.22.2 defines implicit submission as an
+                // Enter-key algorithm.  It does not create a submit control in
+                // the DOM or rendering tree.  Keeping only authored controls
+                // here prevents a button-less search form from acquiring a
+                // visible `[ Submit ]` flex item.
             }
             Some(tag @ ("input" | "button" | "select" | "textarea")) => {
                 let Some(field) = field_from_arena(dom, child, tag) else {
@@ -8040,7 +8024,7 @@ customElements.define('lit-counter', LitCounter);
     }
 
     #[test]
-    fn forms_without_submit_get_a_synthetic_one() {
+    fn forms_without_submit_do_not_gain_a_rendered_control() {
         let base = Url::parse("http://example.com/").unwrap();
         let html = r#"<form action="/go"><input type="text" name="q"></form>"#;
         let doc = parse(
@@ -8051,7 +8035,8 @@ customElements.define('lit-counter', LitCounter);
             0,
             &Default::default(),
         );
-        assert_eq!(doc.forms[0].fields.last().unwrap().kind, FieldKind::Submit);
-        assert!(has_item(&doc, "[ Submit ]"));
+        assert_eq!(doc.forms[0].fields.len(), 1);
+        assert_eq!(doc.forms[0].fields[0].kind, FieldKind::Text);
+        assert!(!has_item(&doc, "[ Submit ]"));
     }
 }

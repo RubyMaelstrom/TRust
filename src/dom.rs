@@ -3755,22 +3755,7 @@ impl Dom {
                     .attr(n, "type")
                     .is_none_or(|ty| !ty.eq_ignore_ascii_case("hidden")),
                 Some("select" | "textarea") => true,
-                // A button gets a layout form atom only when it has a form
-                // owner.  Keep the accessible-name handle for a formless
-                // icon button, whose visible representation is otherwise
-                // absent from the terminal document.
-                Some("button") => {
-                    let mut parent = self.nodes[n].parent;
-                    let mut owner = false;
-                    while let Some(p) = parent {
-                        if self.tag_name(p) == Some("form") {
-                            owner = true;
-                            break;
-                        }
-                        parent = self.nodes[p].parent;
-                    }
-                    owner
-                }
+                Some("button") => true,
                 _ => false,
             }
         })
@@ -4045,7 +4030,40 @@ impl Dom {
         // `data-trust-node` below and the form walk binds it), so never wrap it
         // as a JsClick — that would make it "follow" instead of "edit" even
         // though rich editors also register click listeners on their root.
-        let wrap = is_click && !is_anchor && !in_anchor && !self.is_contenteditable_host(id);
+        // Native buttons already generate their own CSS box and carry the
+        // actor id below. Wrapping one in an invented anchor changes flex item
+        // identity: the anchor stretches while the button inside remains at
+        // its intrinsic height (YouTube's 40px search control). Keep the button
+        // itself as the flex/grid item; `data-trust-click` supplies the
+        // terminal Link::JsClick compatibility path.
+        // A button already inside an anchor inherits that anchor's activation
+        // surface. Giving it an independent actor marker would recreate the
+        // nested interactive-target ambiguity that avoiding the wrapper was
+        // meant to solve.
+        let direct_button = is_click && tag == "button" && !in_anchor;
+        let wrap = is_click
+            && !is_anchor
+            && !in_anchor
+            && !direct_button
+            && !self.is_contenteditable_host(id);
+        // Some component libraries install an icon's SVG in a later custom-
+        // element reaction.  Until that authored child exists, preserve an
+        // icon-only native button as a native button: its accessible name stays
+        // metadata (AccName §4), while a recognized control action may receive
+        // a compact UA pictogram inside the button's own content box.  Never
+        // place that fallback beside the button, and never synthesize the full
+        // accessible name as visible DOM text.
+        let button_icon_fallback =
+            (direct_button && !self.subtree_has_text(id) && !self.subtree_paints_icon(id))
+                .then(|| {
+                    self.icon_glyph(id).or_else(|| {
+                        self.attr(id, "aria-label")
+                            .or_else(|| self.attr(id, "title"))
+                            .or_else(|| self.attr(id, "value"))
+                            .and_then(|name| icon_glyph_for(&name.trim().to_ascii_lowercase()))
+                    })
+                })
+                .flatten();
         // Whether this element opens an anchor context for its descendants:
         // a real `<a>`, the wrapper we just emitted, or an already-open one.
         let child_in_anchor = in_anchor || is_anchor || is_click;
@@ -4112,6 +4130,14 @@ impl Dom {
         if is_click && is_anchor && self.attr(id, "href").is_none() {
             out.push_str(&format!(" href=\"x-trust-js:{id}:\""));
         }
+        if direct_button {
+            // Retain the established actor-marker encoding as metadata so
+            // snapshot consumers can discover one activation namespace for
+            // both anchors and direct native controls.  A data attribute has
+            // no box-tree effect; unlike the former anchor wrapper it cannot
+            // alter flex/grid item identity.
+            out.push_str(&format!(" data-trust-click=\"x-trust-js:{id}:\""));
+        }
         // The app re-parses this serialized HTML into a fresh layout DOM, so
         // form controls AND vertical scroll containers need an explicit pointer
         // back to the resident page actor's original node ids (form values /
@@ -4165,7 +4191,24 @@ impl Dom {
         }
         out.push('>');
         if !VOID_ELEMENTS.contains(&tag) {
-            if let Some(root) = self.shadow_root(id) {
+            if let Some(glyph) = button_icon_fallback {
+                // This is visual fallback content only; the button's authored
+                // accessible name remains the name. Use an ordinary outline
+                // font and a monochrome glyph rather than a color-emoji font,
+                // whose bitmap/COLR payload is not an SVG/image resource and
+                // therefore has no outline in the retained text display list.
+                // The predicates above prove that the authored subtree has no
+                // text or paintable image/SVG, so replacing it also keeps the
+                // fallback centered instead of laying it beside an empty 24px
+                // component placeholder.
+                out.push_str(
+                    "<span aria-hidden=\"true\" data-trust-ua-icon=\"\" \
+                     style=\"display:inline-block;width:24px;height:24px;font-size:30px;\
+                     font-family:sans-serif;line-height:24px;text-align:center\">",
+                );
+                out.push_str(glyph);
+                out.push_str("</span>");
+            } else if let Some(root) = self.shadow_root(id) {
                 for c in self.child_iter(root) {
                     self.serialize_live_node(c, Some(id), clickable, child_in_anchor, out);
                 }
@@ -8515,7 +8558,10 @@ fn icon_glyph_for(name: &str) -> Option<&'static str> {
         "users" | "user-group" | "people-group" => "👥",
         "heart" | "heart-o" => "♥",
         "comment" | "comments" | "comment-dots" | "message" | "comment-o" => "💬",
-        "search" | "magnifying-glass" => "🔍",
+        // U+2315 has conventional search-icon form and ordinary outline-font
+        // coverage. U+1F50D resolves to color-emoji fonts on common Linux
+        // systems, which is not a drawable monochrome text outline.
+        "search" | "magnifying-glass" => "⌕",
         "upload" | "cloud-upload" | "cloud-arrow-up" | "arrow-up-from-bracket" => "⬆",
         "download" | "cloud-download" | "cloud-arrow-down" | "arrow-down-to-bracket" => "⬇",
         "share" | "share-alt" | "share-nodes" | "arrow-up-from-square" => "↗",
@@ -10900,7 +10946,7 @@ mod tests {
     fn serialize_live_marks_buttons_and_live_anchors() {
         let dom = Dom::parse_document(
             "<body><button id=b>Push</button>\
-             <button id=icon aria-label=menu></button>\
+             <button id=icon aria-label=search></button>\
              <button id=opts><svg class=\"svg-fa svg-fas-fa-ellipsis\"><use href=\"#fas-fa-ellipsis\"></use></svg></button>\
              <span id=dot></span>\
              <a id=plain href='/normal'>plain</a>\
@@ -10913,15 +10959,28 @@ mod tests {
         let hot = dom.get_by_id("hot").unwrap();
         let clickable = std::collections::HashSet::from([b, icon, opts, dot, hot]);
         let html = dom.serialize_live(DOCUMENT, &clickable);
-        // Buttons wrapped; icon-only ones get a readable label.
+        // A native button remains the authored box.  Inventing an anchor
+        // parent would change which box is the flex/grid item (CSS Flexbox
+        // §4) and therefore its used geometry.  The private marker carries
+        // activation semantics without changing the tree.
         assert!(
             html.contains(&format!(
-                "<a href=\"x-trust-js:{b}:\"><button id=\"b\" data-trust-node=\"{b}\">Push</button></a>"
+                "<button id=\"b\" data-trust-click=\"x-trust-js:{b}:\" data-trust-node=\"{b}\">Push</button>"
             )),
             "{html}"
         );
-        assert!(html.contains("[menu]"), "{html}");
-        // A wrapped icon-only button renders the icon GLYPH as its handle (the
+        assert!(
+            html.contains(&format!(
+                "data-trust-click=\"x-trust-js:{icon}:\" data-trust-node=\"{icon}\">"
+            )),
+            "search pictogram belongs to the button content box: {html}"
+        );
+        assert!(html.contains(">⌕</span></button>"), "{html}");
+        assert!(
+            !html.contains("[search]"),
+            "accessible name is metadata: {html}"
+        );
+        // An icon-only button renders the icon GLYPH as its handle (the
         // dominant web icon idiom) — the comment's ⋯ menu — not "·"/"[button]".
         // (An icon-only ANCHOR `<a><svg></a>` is glyphed by the layout instead,
         // see `icon_only_label`, since anchors aren't wrapped.)
@@ -10986,15 +11045,18 @@ mod tests {
             !html.contains("[Start dictation]"),
             "resolved sprite icon must not double its name: {html}"
         );
-        // An UNRESOLVED sprite still renders nothing — the accessible name
-        // remains the control's only visible handle (graceful, as before).
+        // An unresolved sprite with a recognized action receives a compact
+        // UA pictogram inside the button. Its accessible name is not painted.
         assert!(
-            html.contains("[Search]"),
-            "cold sprite keeps its text handle: {html}"
+            html.contains("⌕") && !html.contains("[Search]"),
+            "cold search control gets only a pictogram: {html}"
         );
-        // All four stay wrapped clickables either way.
+        // All four retain direct activation markers either way.
         for id in ids {
-            assert!(html.contains(&format!("x-trust-js:{id}:")), "{html}");
+            assert!(
+                html.contains(&format!("data-trust-node=\"{id}\"")),
+                "{html}"
+            );
         }
     }
 
@@ -11027,12 +11089,8 @@ mod tests {
 
     #[test]
     fn serialize_live_drops_a_clipped_icon_controls_accessible_name() {
-        // A control the author CLIPPED to an icon-sized box (`width` under
-        // `overflow:hidden`) never paints its accessible name — only the icon.
-        // The live serializer must not bracket the `aria-label` of such a
-        // control: Twitch's per-message reply button (`width:3.2rem;
-        // overflow:hidden`) spammed every chat line with "[Click to reply to
-        // @user]". An UN-clipped icon control still surfaces its name.
+        // `aria-label` is an accessible name, not generated visual content,
+        // regardless of clipping. Neither control may acquire bracketed text.
         let dom = Dom::parse_document(
             "<body>\
              <button id=reply aria-label='Click to reply to @user' style='width:3.2rem;height:3.2rem;overflow:hidden'></button>\
@@ -11042,15 +11100,13 @@ mod tests {
         let menu = dom.get_by_id("menu").unwrap();
         let clickable = std::collections::HashSet::from([reply, menu]);
         let html = dom.serialize_live(DOCUMENT, &clickable);
-        // The PAINTED form is the bracketed handle; the raw name still appears in
-        // the preserved `aria-label` attribute, so assert on the bracket.
         assert!(
             !html.contains("[Click to reply"),
             "a clipped accessible name is not surfaced as a label: {html}"
         );
         assert!(
-            html.contains("[Open menu]"),
-            "an un-clipped icon control keeps its accessible name: {html}"
+            !html.contains("[Open menu]"),
+            "an unclipped accessible name is metadata too: {html}"
         );
     }
 
@@ -11060,7 +11116,7 @@ mod tests {
         // aria-label="Play" style="position:absolute;width:100%;height:100%">`
         // click-to-play scrim) paints nothing in a browser — the live serializer
         // must not give it a bracketed handle, which floated "[Play]" over the
-        // player. A normal icon control keeps its name.
+        // player. A normal icon control also keeps its name as metadata only.
         let dom = Dom::parse_document(
             "<body>\
              <button id=scrim aria-label='Play' style='position:absolute;width:100%;height:100%'></button>\
@@ -11075,8 +11131,8 @@ mod tests {
             "a full-bleed scrim is not given a handle label: {html}"
         );
         assert!(
-            html.contains("[Open menu]"),
-            "an ordinary icon control keeps its handle: {html}"
+            !html.contains("[Open menu]"),
+            "an ordinary icon control does not paint its accessible name: {html}"
         );
     }
 

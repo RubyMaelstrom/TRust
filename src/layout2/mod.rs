@@ -1956,7 +1956,7 @@ mod tests {
     #[test]
     fn text_input_pads_to_size_attr_and_default() {
         let layout = lay_graphical(
-            r#"<body style="margin:0"><form action="/s"><input name="q" size="10"><input name="r"></form></body>"#,
+            r#"<body style="margin:0"><form action="/s"><input name="q" placeholder="q" size="10"><input name="r" placeholder="r"></form></body>"#,
             640.0,
             &HashMap::new(),
         );
@@ -1966,14 +1966,14 @@ mod tests {
             .iter()
             .find_map(|primitive| match primitive {
                 crate::render::Primitive::GlyphRun { shaped, .. }
-                    if shaped.text.starts_with("[q") =>
+                    if shaped.text.starts_with('q') =>
                 {
                     Some(shaped)
                 }
                 _ => None,
             })
             .expect("q widget");
-        assert!(q.text.ends_with(']'));
+        assert!(!q.text.ends_with(']'));
         let style = crate::text::TextStyle::default();
         assert!(q.advance >= crate::text::zero_advance(&style) * 12.0);
         let r = layout
@@ -1982,7 +1982,7 @@ mod tests {
             .iter()
             .find_map(|primitive| match primitive {
                 crate::render::Primitive::GlyphRun { shaped, .. }
-                    if shaped.text.starts_with("[r") =>
+                    if shaped.text.starts_with('r') =>
                 {
                     Some(shaped)
                 }
@@ -2012,6 +2012,45 @@ mod tests {
     }
 
     #[test]
+    fn graphical_controls_do_not_paint_terminal_widget_syntax() {
+        // WHATWG HTML form rendering + implicit submission: an input paints
+        // its value/placeholder inside its CSS-sized box. A form without an
+        // authored submit button does not gain one merely because Enter can
+        // submit it. Brackets remain a terminal-only affordance.
+        let html = r#"<body style="margin:0"><form action="/results" style="display:flex;width:320px">
+            <input name="search_query" placeholder="Suchen" style="width:100%">
+        </form></body>"#;
+        let graphics = lay_graphical(html, 400.0, &HashMap::new());
+        let painted: Vec<_> = graphics
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                crate::render::Primitive::GlyphRun { shaped, .. } => Some(shaped.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(painted.iter().any(|text| text.starts_with("Suchen")));
+        assert!(
+            painted
+                .iter()
+                .all(|text| !text.contains('[') && !text.contains(']') && !text.contains("Submit")),
+            "graphical paint leaked terminal/synthetic content: {painted:?}"
+        );
+
+        let terminal = lay_with_forms(html, 60, &HashMap::new());
+        let terminal = terminal_text(&terminal);
+        assert!(
+            terminal.contains("[Suchen"),
+            "terminal affordance retained: {terminal:?}"
+        );
+        assert!(
+            !terminal.contains("Submit"),
+            "no synthetic submit: {terminal:?}"
+        );
+    }
+
+    #[test]
     fn percentage_control_width_is_auto_during_intrinsic_contribution() {
         // CSS Sizing 3 §5.2.1: a percentage size that is cyclic against an
         // intrinsically-sized grid track behaves as auto for the contribution.
@@ -2031,8 +2070,8 @@ mod tests {
             &style::InlineStyle::root(),
             value::Vp { w: 640.0, h: 480.0 },
         );
-        assert!(label.starts_with('['));
-        assert!(label.ends_with(']'));
+        assert!(!label.starts_with('['));
+        assert!(!label.ends_with(']'));
         assert!(
             label.len() < 128,
             "intrinsic percentage width must use the finite UA/size fallback, got {} bytes",
@@ -2487,6 +2526,127 @@ mod tests {
             matches!(&it.link, Some(crate::doc::Link::JsClick { node: 501, .. })),
             "the button's label keeps the wrapping anchor's click-marker link: {:?}",
             it.link
+        );
+    }
+
+    #[test]
+    fn a_direct_live_button_stays_the_flex_item_and_click_target() {
+        // CSS Flexbox §4: every in-flow CHILD is the flex item.  The live
+        // serializer must not invent an anchor parent around a native button:
+        // doing so makes the anchor stretch to the 40px line while the nested
+        // button keeps its intrinsic height.  The marker supplies activation
+        // without introducing another CSS box.
+        let html = r#"<body style="margin:0"><div style="display:flex;width:320px;height:40px">
+            <div style="flex:1">query</div>
+            <button id="search" data-trust-click="x-trust-js:42:" data-trust-node="42" style="box-sizing:border-box;width:64px;padding:0;border:0"><span aria-hidden="true" data-trust-ua-icon="" style="display:inline-block;width:24px;height:24px;font-size:30px;font-family:sans-serif;line-height:24px;text-align:center">⌕</span></button>
+        </div></body>"#;
+        let dom = Dom::parse_document(html);
+        let button = dom.get_by_id("search").expect("search button");
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let graphics = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 600.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let rect = graphics.boxes.get(&button).expect("button box");
+        assert_eq!(rect.height, 40.0, "auto cross-size stretches to the line");
+        let (origin, shaped) = graphics
+            .paint
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                crate::render::Primitive::GlyphRun {
+                    origin,
+                    shaped,
+                    link,
+                    ..
+                } if shaped.text.contains('⌕')
+                    && matches!(link, Some(crate::doc::Link::JsClick { node: 42, .. })) =>
+                {
+                    Some((*origin, shaped))
+                }
+                _ => None,
+            })
+            .expect("the pictogram paints with the live activation target");
+        assert!(
+            ((origin.x + shaped.advance / 2.0) as f64 - (rect.left + rect.width / 2.0)).abs() < 0.1,
+            "HTML button content is centered horizontally"
+        );
+        assert!(
+            ((origin.y + shaped.line_height / 2.0) as f64 - (rect.top + rect.height / 2.0)).abs()
+                < 0.1,
+            "HTML button content is centered vertically after flex stretch"
+        );
+
+        let terminal = lay(html, 40);
+        let (_, item) = find(&terminal, "⌕");
+        assert!(matches!(
+            item.link,
+            Some(crate::doc::Link::JsClick { node: 42, .. })
+        ));
+    }
+
+    #[test]
+    fn overflowing_button_content_stays_at_the_start_edges() {
+        // WHATWG HTML Rendering §15.5.3 centers the anonymous button content
+        // box on an axis only when it does not overflow on that axis.
+        let html = r#"<body style="margin:0"><button id="button" style="box-sizing:border-box;width:40px;height:40px;padding:0;border:0"><span id="content" style="display:inline-block;width:80px;height:60px">wide</span></button></body>"#;
+        let dom = Dom::parse_document(html);
+        let button = dom.get_by_id("button").expect("button");
+        let content = dom.get_by_id("content").expect("content");
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let graphics = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 600.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let button = graphics.boxes.get(&button).expect("button box");
+        let content = graphics.boxes.get(&content).expect("content box");
+        assert_eq!(
+            content.left, button.left,
+            "horizontal overflow starts inline-start"
+        );
+        assert_eq!(
+            content.top, button.top,
+            "vertical overflow starts block-start"
+        );
+    }
+
+    #[test]
+    fn block_button_uses_the_same_anonymous_content_alignment() {
+        // A non-inline, non-flex/grid button behaves as `flow-root`, but HTML's
+        // anonymous button content box still centers its child boxes.
+        let html = r#"<body style="margin:0"><button id="button" style="display:block;box-sizing:border-box;width:100px;height:40px;padding:0;border:0"><span id="content" style="display:inline-block;width:20px;height:10px"></span></button></body>"#;
+        let dom = Dom::parse_document(html);
+        let button = dom.get_by_id("button").expect("button");
+        let content = dom.get_by_id("content").expect("content");
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let graphics = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 600.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let button = graphics.boxes.get(&button).expect("button box");
+        let content = graphics.boxes.get(&content).expect("content box");
+        assert_eq!(
+            content.left + content.width / 2.0,
+            button.left + button.width / 2.0
+        );
+        assert_eq!(
+            content.top + content.height / 2.0,
+            button.top + button.height / 2.0
         );
     }
 

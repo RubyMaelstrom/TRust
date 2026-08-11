@@ -119,6 +119,51 @@ pub struct Field {
 }
 
 impl Field {
+    /// Text painted by a graphical user agent inside the control.
+    ///
+    /// HTML leaves the exact native-control appearance to the user agent, but
+    /// the control's value/placeholder/label is its visual content.  Terminal
+    /// delimiters such as `[` and `]` are deliberately absent here: they are
+    /// an adaptation for a character-cell frontend, not DOM text and therefore
+    /// must not participate in CSS layout or graphical paint.
+    pub fn visual_label(&self) -> String {
+        match &self.kind {
+            FieldKind::Hidden => String::new(),
+            FieldKind::Submit | FieldKind::Button | FieldKind::Reset => {
+                if self.label.is_empty() {
+                    match self.kind {
+                        FieldKind::Reset => String::from("Reset"),
+                        FieldKind::Button => String::from("Button"),
+                        _ => String::from("Submit"),
+                    }
+                } else {
+                    self.label.clone()
+                }
+            }
+            // HTML Rendering §15.5.10: checkbox/radio widgets contain the
+            // control itself, with no implicit label. An authored <label>
+            // remains ordinary DOM content and is laid out separately.
+            FieldKind::Checkbox => (if self.checked { "☑" } else { "☐" }).to_string(),
+            FieldKind::Radio => (if self.checked { "◉" } else { "○" }).to_string(),
+            FieldKind::Select(options) => {
+                let shown = options
+                    .iter()
+                    .find(|(_, value)| *value == self.value)
+                    .map_or(self.value.as_str(), |(label, _)| label.as_str());
+                format!("{shown} ▾")
+            }
+            FieldKind::Password if self.value.is_empty() => self.label.clone(),
+            FieldKind::Password => "•".repeat(self.value.chars().count()),
+            FieldKind::Text | FieldKind::Textarea => {
+                if !self.value.is_empty() {
+                    self.value.clone()
+                } else {
+                    self.label.clone()
+                }
+            }
+        }
+    }
+
     /// The widget row the browser shows for this control. Editable and
     /// select widgets lead with the value/placeholder (like a real browser),
     /// not the form field's `name` — the `name` is internal, redundant with

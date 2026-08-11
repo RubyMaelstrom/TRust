@@ -719,6 +719,23 @@ impl InlineStyle {
                     s.kind = ItemKind::Link;
                 }
             }
+            // The live serializer leaves a native button as the authored
+            // flex/grid item instead of wrapping it in an anchor. Its actor id
+            // is still a frontend-neutral activation target; materialize the
+            // terminal Link only in the inline semantics, without changing
+            // box-tree structure or graphical sizing.
+            Some("button") if dom.attr(id, "data-trust-click").is_some() => {
+                if let Some(node) = dom
+                    .attr(id, "data-trust-node")
+                    .and_then(|value| value.parse().ok())
+                {
+                    s.link = Some(crate::doc::Link::JsClick {
+                        node,
+                        href: String::new(),
+                    });
+                    s.kind = ItemKind::Link;
+                }
+            }
             Some("blockquote") => s.kind = ItemKind::Quote,
             Some("pre") => s.kind = ItemKind::Pre,
             Some(t) => {
