@@ -568,6 +568,22 @@ impl Dom {
         self.touch();
     }
 
+    /// A style-sheet-set mutation rooted at `scope`. Connected style changes
+    /// can restyle arbitrary rendered descendants and therefore remain a full
+    /// invalidation. A disconnected tree has no effect on the rendered
+    /// document (DOM connectedness / HTML style processing), but its CSSOM and
+    /// cascade epoch still change; retain the concrete target so the live-page
+    /// pipeline can discard it as detached. If that tree is later inserted,
+    /// the insertion path independently invalidates the connected sheet set.
+    fn touch_style_at(&mut self, scope: NodeId) {
+        self.style_epoch = self.style_epoch.wrapping_add(1);
+        if self.is_connected(scope) {
+            self.touch();
+        } else {
+            self.touch_content(Some(scope));
+        }
+    }
+
     /// Bump the style epoch when a tree mutation involving `child` (being
     /// appended/inserted under, or detached from, `parent`) can change the
     /// sheet set: the node is — or its subtree contains — a `<style>`/
@@ -582,8 +598,8 @@ impl Dom {
             NodeData::Element { .. } | NodeData::Fragment => self.subtree_has_style(child),
             _ => false,
         };
-        if styled {
-            self.touch_style();
+        if styled && let Some(scope) = parent {
+            self.touch_style_at(scope);
         }
     }
 
@@ -1295,7 +1311,7 @@ impl Dom {
         {
             existing.push_str(text);
             if self.tag_name(parent) == Some("style") {
-                self.touch_style(); // the sheet's text grew
+                self.touch_style_at(parent); // the sheet's text grew
             }
             self.touch_content(Some(parent));
             return;
@@ -1421,7 +1437,7 @@ impl Dom {
                 });
             }
             if sheet_el {
-                self.touch_style();
+                self.touch_style_at(id);
             }
             self.touch_attr(id);
         }
@@ -1437,7 +1453,7 @@ impl Dom {
             // caches — frameworks call it unconditionally per render pass.
             if attrs.len() != before {
                 if sheet_el {
-                    self.touch_style();
+                    self.touch_style_at(id);
                 }
                 self.touch_attr(id);
             }
@@ -1727,11 +1743,11 @@ impl Dom {
     /// So `.slides{opacity:0}` hides, while `.slides.active{animation:fade-in
     /// forwards}` (ending `opacity:1`) shows, with no slideshow-specific code.
     pub fn effective_opacity(&self, id: NodeId) -> f32 {
-        let base = self
-            .cascaded(id, "opacity")
-            .as_deref()
-            .and_then(parse_alpha)
-            .unwrap_or(1.0);
+        // CSS Custom Properties 2 §6: substitution happens at computed-value
+        // time.  Parsing the token stream before resolving `var()` incorrectly
+        // turns values such as `var(--backdrop-opacity, .6)` into opacity 1.
+        let declared = self.computed_value_resolved(id, "opacity");
+        let base = declared.as_deref().and_then(parse_alpha).unwrap_or(1.0);
         // Only a fully transparent base is worth the animation lookup; every
         // non-zero value must survive for group compositing in graphical paint.
         if base > 0.0 {
@@ -2110,6 +2126,20 @@ impl Dom {
     pub fn computed_value_resolved(&self, id: NodeId, name: &str) -> Option<String> {
         self.computed_value(id, name)
             .map(|v| self.resolve_vars(id, &v))
+    }
+
+    /// The resolved value exposed by `getComputedStyle()`.
+    ///
+    /// Internally, `computed_value` uses `None` as a compact signal for an
+    /// undeclared property's initial value, because layout already supplies
+    /// those defaults. CSSOM cannot expose that sentinel: CSS Cascade 5 §4
+    /// assigns every property a specified and computed value, and CSSOM §9
+    /// requires `getComputedStyle()` to return its resolved value. Materialize
+    /// the initial values for the positional/sizing surface implemented by
+    /// TRust so script cannot confuse `""` with a non-`auto` inset.
+    pub fn cssom_resolved_value(&self, id: NodeId, name: &str) -> Option<String> {
+        self.computed_value_resolved(id, name)
+            .or_else(|| cssom_initial_value(name).map(str::to_string))
     }
 
     /// Whether text placed DIRECTLY in this element renders at zero font size —
@@ -2879,7 +2909,7 @@ impl Dom {
             return;
         }
         self.adopted_styles.insert(scope, css.to_string());
-        self.touch_style();
+        self.touch_style_at(scope);
     }
 
     fn is_stylesheet_link(&self, id: NodeId) -> bool {
@@ -2930,7 +2960,7 @@ impl Dom {
                 .find(|(id, h)| !self.external_sheets.contains_key(id) && h == href);
             if let Some(&(id, _)) = hit {
                 self.external_sheets.insert(id, css.clone());
-                self.touch_style();
+                self.touch_style_at(id);
             }
         }
     }
@@ -2944,7 +2974,7 @@ impl Dom {
     /// the same link (a loader may rewrite `href` and re-trigger the load).
     pub fn attach_sheet_to_link(&mut self, id: NodeId, css: String) {
         self.external_sheets.insert(id, css);
-        self.touch_style();
+        self.touch_style_at(id);
     }
 
     /// Attach a shadow root (a fragment) to a host element; rendering
@@ -2958,7 +2988,11 @@ impl Dom {
         let root = self.create_fragment();
         self.shadow_roots.insert(host, root);
         self.shadow_hosts.insert(root, host);
-        self.touch();
+        // Attaching changes only this host's composed contents. Preserve the
+        // host as the mutation target: if it is connected the normal boundary
+        // logic updates it; if it is a custom element being constructed in a
+        // detached framework work tree, no rendered document is invalidated.
+        self.touch_content(Some(host));
         root
     }
 
@@ -3377,8 +3411,10 @@ impl Dom {
                 // A text node's content changed — its PARENT element is the
                 // relayout target (text styling/flow is an element concern).
                 let parent = self.nodes[id].parent;
-                if parent.is_some_and(|p| self.tag_name(p) == Some("style")) {
-                    self.touch_style(); // the sheet's text changed in place
+                if let Some(parent) = parent
+                    && self.tag_name(parent) == Some("style")
+                {
+                    self.touch_style_at(parent); // sheet text changed in place
                 }
                 self.touch_content(parent);
             }
@@ -4187,19 +4223,17 @@ impl Dom {
                 bake.push(';');
             }
         }
-        // `opacity` is not a normally-baked property — a terminal has no alpha
-        // compositing, so a merely-faded element (`opacity:0.5`) renders solid
-        // and its raw value is irrelevant. But a PAINT-SUPPRESSED element
-        // (effective opacity ~0) must survive the re-parse AS suppressed: the JS
-        // pipeline re-parses this HTML with no `<style>`, so bake the resolved
-        // suppression as `opacity:0`. The animation reveal is already folded into
-        // `paint_suppressed` (an `animation-fill-mode:forwards` slide ending
-        // opacity:1 bakes nothing and stays painted), so this can't misfire on
-        // the active slide. The layout reads it back through
-        // `paint_suppressed`/`Ctx.invisible` to paint the box blank while still
-        // reserving its geometry (React virtualized-list placeholders).
-        if self.paint_suppressed(id) {
-            bake.push_str("opacity:0;");
+        // CSS Color 4 §3.3 requires opacity to be applied to the element as a
+        // composited group. The resident DOM owns the external sheets, while a
+        // native frontend re-parses this snapshot without them, so preserve the
+        // exact computed alpha rather than reducing it to a visible/hidden bit.
+        // This also materializes `var()` substitution while custom-property
+        // definitions are still available. `effective_opacity` folds in the
+        // limited fill-mode animation state supported by this engine.
+        if self.cascaded(id, "opacity").is_some() {
+            bake.push_str("opacity:");
+            bake.push_str(&self.effective_opacity(id).to_string());
+            bake.push(';');
         }
         let mut style_done = false;
         for a in attrs {
@@ -5988,9 +6022,9 @@ struct PropDef {
     /// see it; the DIRECT cascaded value is baked and re-parse inheritance
     /// reconstructs the rest, so a `visibility:visible` descendant re-clears it).
     /// `false` for properties consumed only inside the engine and never re-read
-    /// verbatim: `opacity`/`animation*` (opacity is baked SPECIALLY — the
-    /// resolved paint-suppression as `opacity:0`, see `write_attrs` — not its raw
-    /// cascaded value; the animation longhands feed that resolution) and
+    /// verbatim: `opacity`/`animation*` (opacity is baked specially as its
+    /// resolved effective value, see `write_attrs`; the animation longhands
+    /// feed that resolution) and
     /// `content` (baked separately as `data-trust-before`/`data-trust-after`).
     baked: bool,
 }
@@ -6110,6 +6144,10 @@ const PROPS: &[PropDef] = &[
     prop("padding-left", false, true),
     prop("padding-right", false, true),
     prop("text-align", true, true),
+    // CSS Writing Modes 4: direction inherits. It is also observable through
+    // getComputedStyle (overlay-positioning libraries use it to mirror start/
+    // end alignment), even though layout2 does not yet reorder bidi boxes.
+    prop("direction", true, true),
     prop("font-size", true, true),
     prop("font-family", true, true),
     prop("font-weight", true, true),
@@ -6271,6 +6309,26 @@ const PROPS: &[PropDef] = &[
     prop("border-bottom-right-radius", false, true),
     prop("border-bottom-left-radius", false, true),
 ];
+
+/// Initial values which must be materialized at the CSSOM boundary rather
+/// than represented by the engine's internal `None` sentinel. These cover the
+/// complete positioned-box state read by standards-based fitting libraries.
+/// Values come from CSS Positioned Layout 3, CSS Box Sizing 3, CSS2 §8, CSS
+/// Writing Modes 4, and CSS Color 4.
+fn cssom_initial_value(name: &str) -> Option<&'static str> {
+    match name {
+        "position" => Some("static"),
+        "top" | "right" | "bottom" | "left" => Some("auto"),
+        "max-width" | "max-height" => Some("none"),
+        "box-sizing" => Some("content-box"),
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" | "padding-top"
+        | "padding-right" | "padding-bottom" | "padding-left" => Some("0px"),
+        "z-index" => Some("auto"),
+        "direction" => Some("ltr"),
+        "opacity" => Some("1"),
+        _ => None,
+    }
+}
 
 fn is_tracked(name: &str) -> bool {
     // Custom properties (`--foo`) are always stored so `var()` references can
@@ -10252,6 +10310,50 @@ mod tests {
     }
 
     #[test]
+    fn detached_shadow_and_style_construction_keeps_concrete_dirty_targets() {
+        // DOM §4.2.2: a detached custom-element work tree is not connected,
+        // so attaching its shadow root and building scoped styles cannot
+        // invalidate the rendered Document yet. Keep concrete targets for the
+        // actor's connectedness filter. Inserting the finished styled subtree
+        // into the live body must then become a global style invalidation.
+        let mut dom = Dom::parse_document("<body><x-live>light</x-live></body>");
+        let body = dom
+            .descendants(DOCUMENT)
+            .find(|&id| dom.tag_name(id) == Some("body"))
+            .unwrap();
+        let live = dom
+            .descendants(DOCUMENT)
+            .find(|&id| dom.tag_name(id) == Some("x-live"))
+            .unwrap();
+        let _ = dom.take_dirty_targets();
+
+        dom.attach_shadow(live);
+        assert_eq!(
+            dom.take_dirty_targets(),
+            Some(vec![(live, DirtyKind::Content)]),
+            "a connected host is a scoped content mutation, not unattributed"
+        );
+
+        let detached = dom.create_element("x-work");
+        let root = dom.attach_shadow(detached);
+        let style = dom.create_element("style");
+        dom.append(root, style);
+        dom.set_text(style, ":host{display:block}");
+        let targets = dom
+            .take_dirty_targets()
+            .expect("detached style construction remains attributed");
+        assert!(!targets.is_empty());
+        assert!(targets.iter().all(|(id, _)| !dom.is_connected(*id)));
+
+        dom.append(body, detached);
+        assert_eq!(
+            dom.take_dirty_targets(),
+            None,
+            "insertion connects the scoped sheet and can restyle live content"
+        );
+    }
+
+    #[test]
     fn computed_value_memo_follows_mutations() {
         // The memo is epoch-keyed: changing an ancestor's class re-resolves an
         // inherited value rather than serving a stale cache hit.
@@ -11845,7 +11947,8 @@ mod tests {
         // parser used to fail on it and default to fully opaque.
         let dom = Dom::parse_document(
             "<head><style>.z{opacity:0%}.h{opacity:50%}</style></head>\
-             <body><div id=z class=z>a</div><div id=h class=h>b</div></body>",
+             <body><div id=z class=z>a</div><div id=h class=h>b</div>\
+             <div style=\"opacity:.4\"><span id=i style=\"opacity:inherit\">c</span></div></body>",
         );
         assert!(
             dom.paint_suppressed(dom.get_by_id("z").unwrap()),
@@ -11854,6 +11957,46 @@ mod tests {
         assert!(
             !dom.paint_suppressed(dom.get_by_id("h").unwrap()),
             "50% still paints"
+        );
+        assert!(
+            (dom.effective_opacity(dom.get_by_id("i").unwrap()) - 0.4).abs() < f32::EPSILON,
+            "the CSS-wide inherit keyword uses the parent's computed alpha"
+        );
+    }
+
+    #[test]
+    fn shadow_host_opacity_resolves_vars_and_survives_live_serialization() {
+        // CSS Custom Properties 2 §6 substitutes var() at computed-value
+        // time, including fallbacks. CSS Color 4 §3.3 then retains the
+        // resulting alpha for group compositing. Live serialization must carry
+        // that computed value across the stylesheet-less frontend boundary.
+        let mut dom = Dom::parse_document(
+            "<body><overlay-backdrop id=b class=opened></overlay-backdrop></body>",
+        );
+        let backdrop = dom.get_by_id("b").unwrap();
+        let root = dom.attach_shadow(backdrop);
+        let style = dom.create_element("style");
+        let css = dom.create_text(
+            ":host { opacity: 0 } \
+             :host(.opened) { opacity: var(--overlay-backdrop-opacity, .6) }",
+        );
+        dom.append(style, css);
+        dom.append(root, style);
+
+        assert_eq!(
+            dom.computed_style(backdrop, "opacity").as_deref(),
+            Some("var(--overlay-backdrop-opacity, .6)"),
+            "the cascade retains the custom-property token stream"
+        );
+        assert!((dom.effective_opacity(backdrop) - 0.6).abs() < f32::EPSILON);
+
+        let html = dom.serialize_live(DOCUMENT, &std::collections::HashSet::new());
+        assert!(html.contains("opacity:0.6;"), "{html}");
+        let reparsed = Dom::parse_document(&html);
+        let reparsed_backdrop = reparsed.get_by_id("b").unwrap();
+        assert!(
+            (reparsed.effective_opacity(reparsed_backdrop) - 0.6).abs() < f32::EPSILON,
+            "the native frontend receives the same compositing alpha: {html}"
         );
     }
 

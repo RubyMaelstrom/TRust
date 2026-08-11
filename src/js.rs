@@ -28,7 +28,15 @@ pub const WALL_BUDGET: Duration = Duration::from_secs(60);
 /// Cumulative *execution* time a page's scripts get before we stop
 /// launching more. Measures compute, not wall clock (the wire is async
 /// and free), so a slow server can't starve a fast page of its scripts.
-pub const COMPUTE_BUDGET: Duration = Duration::from_secs(30);
+// YouTube's current 10.7 MiB application bundle is a useful upper-bound
+// canary: on the supported aarch64 desktop it needs about 40 s of JS CPU, then
+// less than a second of parser-ordered bootstrap scripts to bind the supplied
+// renderer data. A 30 s launch gate let the one already-running script finish
+// but then skipped that entire ordered tail and DOMContentLoaded, producing a
+// permanently empty application shell. Keep the independent 60 s wall limit
+// and per-evaluation instruction limit as the hard resource bounds, while
+// giving standards-mandated script execution enough cumulative CPU to finish.
+pub const COMPUTE_BUDGET: Duration = Duration::from_secs(50);
 
 /// Diagnostic-only extension for exceptionally large applications. The normal
 /// page limit remains [`COMPUTE_BUDGET`]; a manual diagnostic may set
@@ -346,37 +354,43 @@ pub fn page_context() -> Context {
     page_context_with(None).0
 }
 
+#[derive(Clone, Copy)]
+struct ClockAnchor {
+    epoch_ms: f64,
+    monotonic: Instant,
+}
+
 thread_local! {
-    /// The page's virtual clock as an absolute epoch time (ms) — the prelude's
-    /// `__epoch0 + timers.now`, mirrored Rust-side by the `__clock_set` syscall
-    /// from the three `timers.now` writers (tick/tickTo). `None` ⇒ real system
-    /// time: the state before the prelude anchors its epoch, and on threads
-    /// that never run a page. Thread-local because a context (and its Boa
-    /// clock) is owned by exactly one thread — the trust-js actor thread, a
-    /// worker's thread, or a test thread; `page_context_with` resets it.
-    static VIRTUAL_EPOCH_MS: Cell<Option<f64>> = const { Cell::new(None) };
+    /// The page clock's last virtual-time anchor. Between explicit timer-clock
+    /// advances the clock continues from the host's monotonic clock: High
+    /// Resolution Time §2.1 requires web clocks to count real elapsed time, and
+    /// freezing Date/performance within one synchronous callback makes a
+    /// deadline loop (`while (performance.now() < end)`) non-terminating.
+    /// `None` means real system time before the prelude anchors a fresh realm.
+    static PAGE_CLOCK_ANCHOR: Cell<Option<ClockAnchor>> = const { Cell::new(None) };
 }
 
 /// Boa's `Date` clock, virtual-time-backed: `new Date()` and the native
 /// `Date.now()` read the SAME clock the prelude's timers advance, so the two
 /// can't diverge during a fast-forward settle (before this, `Date.now()` was
 /// overridden in JS to track `timers.now` while `new Date()` kept reading the
-/// real host clock — a page comparing them saw time run backwards). The JS
-/// override is gone: this is the single time source for the whole Date
-/// surface. (The known "clock doesn't advance within one synchronous block"
-/// limitation is about WHEN `timers.now` moves, and is unchanged — see the
-/// prelude's clock comment.)
+/// real host clock — a page comparing them saw time run backwards). The clock
+/// advances monotonically from its last virtual anchor even while one callback
+/// is running, as both ECMAScript time and High Resolution Time require.
 #[derive(Debug)]
 struct PageClock;
 
 impl boa_engine::context::Clock for PageClock {
     fn now(&self) -> boa_engine::context::time::JsInstant {
-        let ms = VIRTUAL_EPOCH_MS.get().unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as f64
-        });
+        let ms = PAGE_CLOCK_ANCHOR.get().map_or_else(
+            || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as f64
+            },
+            |anchor| anchor.epoch_ms + anchor.monotonic.elapsed().as_secs_f64() * 1000.0,
+        );
         let ms = ms.max(0.0); // JsInstant is epoch-relative and non-negative
         boa_engine::context::time::JsInstant::new(
             (ms / 1000.0) as u64,
@@ -392,7 +406,10 @@ fn sys_clock_set(_: &JsValue, args: &[JsValue], _ctx: &mut Context) -> JsResult<
     if let Some(ms) = args.first().and_then(JsValue::as_number)
         && ms.is_finite()
     {
-        VIRTUAL_EPOCH_MS.set(Some(ms));
+        PAGE_CLOCK_ANCHOR.set(Some(ClockAnchor {
+            epoch_ms: ms,
+            monotonic: Instant::now(),
+        }));
     }
     Ok(JsValue::undefined())
 }
@@ -405,7 +422,7 @@ fn page_context_with(loader: Option<Rc<WebModuleLoader>>) -> (Context, Rc<PageHo
     // A fresh page starts on the REAL clock; the prelude anchors its virtual
     // epoch once its timer clock exists (reused threads would otherwise leak
     // the previous page's frozen time into the new page's prelude boot).
-    VIRTUAL_EPOCH_MS.set(None);
+    PAGE_CLOCK_ANCHOR.set(None);
     let mut ctx = match loader {
         Some(loader) => Context::builder()
             .module_loader(loader)
@@ -849,7 +866,34 @@ pub fn run_script(
     budget: &Budget,
     outcome: &mut Outcome,
 ) {
-    if budget.exhausted() || outcome.elapsed >= compute_budget() {
+    run_script_task(ctx, name, source, budget, outcome, true);
+}
+
+/// Run source as a browser-owned task which HTML requires independently of
+/// whether the document's author-script launch allowance has just been spent.
+/// The page-wide wall deadline and Boa's recursion/stack/loop limits still
+/// apply. In particular, HTML "the end" queues DOMContentLoaded and load tasks;
+/// they are not optional trailing author scripts that a cumulative script gate
+/// may silently discard.
+fn run_browser_task(
+    ctx: &mut Context,
+    name: &str,
+    source: &[u8],
+    budget: &Budget,
+    outcome: &mut Outcome,
+) {
+    run_script_task(ctx, name, source, budget, outcome, false);
+}
+
+fn run_script_task(
+    ctx: &mut Context,
+    name: &str,
+    source: &[u8],
+    budget: &Budget,
+    outcome: &mut Outcome,
+    enforce_compute_budget: bool,
+) {
+    if budget.exhausted() || (enforce_compute_budget && outcome.elapsed >= compute_budget()) {
         outcome
             .errors
             .push(format!("{name}: skipped, page JS budget exhausted"));
@@ -1635,6 +1679,15 @@ pub type WebStorage = std::sync::Arc<
 type FetchResult = Option<(u16, String, Vec<u8>, String)>;
 /// Channel a background fetch task posts its `(promise id, result)` back on.
 type FetchSender = tokio::sync::mpsc::Sender<(usize, FetchResult)>;
+/// Host pieces needed to turn a resident-page fetch into a later networking
+/// task without retaining any GC-managed value across threads.
+type BackgroundFetchContext = (
+    usize,
+    FetchSender,
+    tokio::runtime::Handle,
+    std::sync::Arc<crate::http::PageCache>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+);
 
 /// Web Workers (HTML §"Workers"). A `Worker` is a second JS engine running on
 /// its own dedicated `trust-worker-N` OS thread (Boa's `Context` is `!Send`, so
@@ -1696,21 +1749,20 @@ struct PageNet {
     page: url::Url,
     budget: Rc<Budget>,
     fetched: std::cell::Cell<usize>,
-    /// True once the page is past load, handling interactive dispatches. While
-    /// false (load) a `fetch()` runs as a Boa async job awaited to quiescence,
-    /// so first paint / the one-shot `transform` snapshot includes the data.
-    /// Once true (dispatch/at-rest) a `fetch()` instead runs as a BACKGROUND
-    /// task that posts its result back via `fetch_events` (see
-    /// `sys_http_fetch_async`) — the dispatch returns immediately and the page
-    /// re-renders when the reply arrives, so a slow request (an LLM reply) can't
-    /// freeze the live engine. (`fetch_events` is only present on the resident
-    /// actor; `transform` leaves it None and always awaits.)
+    /// True while handling live lifecycle/interactive tasks. It controls the
+    /// dispatch budget extension for requests initiated by those tasks. The
+    /// resident actor always routes async fetches through `fetch_events`, even
+    /// during initial scripts; `transform` has no sender and awaits instead.
     dispatch: std::cell::Cell<bool>,
     /// Background-fetch result channel + id counter (resident actor only). A
     /// dispatch/at-rest `fetch()` spawns a task that sends `(id, result)` here;
     /// the actor settles promise `id` and re-renders.
     fetch_events: Option<FetchSender>,
     next_fetch_id: std::cell::Cell<usize>,
+    /// Resident requests whose networking task has not posted its result yet.
+    /// The initial actor classification keeps an otherwise inert document live
+    /// while this is nonzero, so an async-only page can receive its result.
+    pending_fetches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// The shared subresource cache, so the page's own `fetch()` can join
     /// an in-flight/done request for a chunk we already have.
     cache: std::sync::Arc<crate::http::PageCache>,
@@ -2698,7 +2750,7 @@ fn sys_computed_style(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
     let dom = page_dom(ctx);
     let d = dom.borrow();
     Ok(
-        match arg_node(&d, args, 0).and_then(|id| d.computed_value_resolved(id, &name)) {
+        match arg_node(&d, args, 0).and_then(|id| d.cssom_resolved_value(id, &name)) {
             Some(v) => str_value(&v),
             None => JsValue::null(),
         },
@@ -3508,29 +3560,25 @@ fn sys_http_fetch(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
 /// WITHOUT blocking the JS thread, so many in-flight requests overlap
 /// (Boa's job executor polls them concurrently). This is the whole
 /// reason `Promise.all([fetch(a), fetch(b)])` now runs in parallel.
-/// If this `fetch()` should run as a BACKGROUND task — past load, on the
-/// resident actor (`net.dispatch` set AND a `fetch_events` sender present) —
-/// allocate its promise id and hand back the channel + runtime to spawn the
-/// request off the JS thread. `None` ⇒ run it as an awaited Boa job (during
-/// load, or in the one-shot `transform`, where the result must be in hand
-/// before serialize).
-fn bg_fetch_ctx(
-    ctx: &Context,
-) -> Option<(
-    usize,
-    FetchSender,
-    tokio::runtime::Handle,
-    std::sync::Arc<crate::http::PageCache>,
-)> {
+/// If this `fetch()` belongs to a resident actor, allocate its promise id and
+/// hand back the channel + runtime needed to run the request off the JS thread.
+/// Fetch's response processing is a later networking task even when the request
+/// starts in an initial script; blocking the parser/lifecycle task until the
+/// wire completes both violates that ordering and freezes first paint. `None`
+/// means the one-shot `transform`, which has no actor to deliver a later task.
+fn bg_fetch_ctx(ctx: &Context) -> Option<BackgroundFetchContext> {
     let host = ctx.realm().host_defined();
     let net = host.get::<PageNet>()?;
-    if !net.dispatch.get() {
-        return None;
-    }
     let tx = net.fetch_events.clone()?;
     let id = net.next_fetch_id.get();
     net.next_fetch_id.set(id + 1);
-    Some((id, tx, net.handle.clone(), net.cache.clone()))
+    Some((
+        id,
+        tx,
+        net.handle.clone(),
+        net.cache.clone(),
+        net.pending_fetches.clone(),
+    ))
 }
 
 fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -3541,13 +3589,14 @@ fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
     // `(id, result)`, which the actor settles + re-renders (see
     // `dispatch_fetch_done`). The promise is created by `__trust.bgFetch(id)`,
     // resolved later by `settleFetch`.
-    if let Some((id, tx, handle, cache)) = bg_fetch_ctx(ctx) {
+    if let Some((id, tx, handle, cache, pending)) = bg_fetch_ctx(ctx) {
         // GET dedup: join the cache's single in-flight/done request (no cap spend).
         if method == "GET"
             && body.is_none()
             && let Some(shared) = peek_page_cache(ctx, &url_arg)
         {
             phase(&format!("src: PAGE-CACHE-BG {url_arg}"));
+            pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cache.spawn(&handle, async move {
                 let out = shared.await.ok().map(|c| {
                     (
@@ -3575,6 +3624,7 @@ fn sys_http_fetch_async(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
             }
             Some((_handle, request)) => {
                 phase(&format!("src: PAGE-ASYNC-BG {}", request.url));
+                pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 cache.spawn(&handle, async move {
                     let out = crate::http::fetch(&request).await.ok().map(|r| {
                         (
@@ -6453,6 +6503,7 @@ fn load_page(
                 dispatch: std::cell::Cell::new(false),
                 fetch_events: fetch_events.clone(),
                 next_fetch_id: std::cell::Cell::new(1),
+                pending_fetches: Default::default(),
                 cache: env.cache.clone(),
             });
         }
@@ -6779,7 +6830,7 @@ fn load_page(
         // unchanged.
         phase("scripts done; DOMContentLoaded");
         dump_vm_profile("scripts");
-        run_script(
+        run_browser_task(
             &mut ctx,
             "DOMContentLoaded",
             b"__trust.readyState = \"interactive\"; __trust.hydrateFrames(); __trust.fire(document, \"DOMContentLoaded\", true);",
@@ -6818,7 +6869,7 @@ fn settle_page(page: &mut LoadedPage) {
         phase("settle start");
         settle(&mut page.ctx, &page.budget, MAX_TICKS, &mut page.outcome);
         phase("settle done");
-        run_script(
+        run_browser_task(
             &mut page.ctx,
             "load",
             b"__trust.readyState = \"complete\"; __trust.fire(window, \"load\", false);",
@@ -6846,6 +6897,54 @@ fn settle_page(page: &mut LoadedPage) {
         phase("load done");
     }
 
+    finish_page_lifecycle(page);
+}
+
+/// Complete the live document's browser-owned lifecycle tasks without
+/// synchronously draining author timer tasks.
+///
+/// HTML's event loop runs one task and then performs a microtask checkpoint;
+/// timers queued by DOMContentLoaded/load are later tasks, not part of either
+/// lifecycle task. In particular, a framework scheduler may have dozens of
+/// due `setTimeout(0)` tasks. Draining those here made the resident page actor
+/// unavailable for many seconds on YouTube even though the first shell had
+/// already painted. The at-rest actor loop executes those tasks one turn at a
+/// time and gives app commands priority between turns.
+fn complete_live_lifecycle(page: &mut LoadedPage) {
+    if !page.outcome.panicked {
+        // Fetches started by load handlers are ordinary post-load networking;
+        // they do not delay the load event. Route them through the resident
+        // actor before dispatching load so their promises settle on later
+        // networking tasks rather than blocking this task to wire completion.
+        if let Some(net) = page.ctx.realm().host_defined().get::<PageNet>() {
+            net.dispatch.set(true);
+        }
+        phase("load task start");
+        run_browser_task(
+            &mut page.ctx,
+            "load",
+            b"__trust.readyState = \"complete\"; __trust.fire(window, \"load\", false);",
+            &page.budget,
+            &mut page.outcome,
+        );
+        // HTML event loop: perform the task's microtask checkpoint, but do not
+        // consume timer or networking tasks queued by the handler.
+        run_microtasks_into(&mut page.ctx, &mut page.outcome);
+        // Resize/IntersectionObserver delivery is part of "update the
+        // rendering", which follows the task's microtask checkpoint. It is not
+        // an author timer task and must be reflected in the next paint.
+        run_intersections(page);
+        // Image load events are also queued tasks. Discover them now so the
+        // at-rest loop has a deadline to wake for, but leave delivery to that
+        // loop instead of folding it into this lifecycle task.
+        schedule_image_loads(&mut page.ctx, &mut page.outcome);
+        phase("load task done");
+    }
+
+    finish_page_lifecycle(page);
+}
+
+fn finish_page_lifecycle(page: &mut LoadedPage) {
     drain_js_side(&mut page.ctx, &mut page.outcome);
     drain_rejections(&page.hooks, &mut page.outcome);
     phase(&format!(
@@ -6871,15 +6970,15 @@ fn settle_page(page: &mut LoadedPage) {
         .host_defined()
         .get::<PageNet>()
         .map_or(0, |n| n.fetched.get());
-    // Which JS functions burned the settle phase (under TRUST_JS_PROFILE) — the
-    // settle is where a data-driven SPA spends its seconds, and the load_page
-    // dumps only cover up to DOMContentLoaded, so without this the dominant
-    // phase is unsampled. Pairs with the phase split below.
+    // Which JS functions burned the post-DOMContentLoaded phase (under
+    // TRUST_JS_PROFILE). The one-shot path settles to a snapshot here; a live
+    // page only completes its lifecycle tasks and leaves later tasks to the
+    // resident event loop.
     dump_vm_profile("settle");
     // Step 1 decision-gate output: the whole-load parse/compile/execute split
     // (under TRUST_JS_PHASE). `page.started` was stamped at load start, so this
-    // is the full load+settle wall — including this page's settle execution,
-    // which `engine_profile` (one bundle in isolation) can't see.
+    // is the full initial lifecycle wall. Later live-page tasks are intentionally
+    // absent; `engine_profile` (one bundle in isolation) cannot see those.
     report_phases(page.started.elapsed());
     // Lazy-parse sizing gate (under TRUST_FN_CENSUS): of this page's own
     // compiled functions, how many never ran this boot.
@@ -6980,13 +7079,12 @@ fn settle(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Ou
     }
 }
 
-/// Fire every timer due by `abs_ms` (a REAL wall-clock deadline, in `timers.now`
-/// units) and drain the microtasks/fetches their callbacks schedule, to
-/// quiescence. The at-rest analog of `settle`: where `settle` FAST-FORWARDS
-/// virtual time (load/dispatch — drain due work ASAP), this advances to a real
-/// deadline so a 1s interval fires once per real second. Bounded by the per-
-/// wake budget + `max_ticks`; a 0-delay timer a callback schedules (now due by
-/// `abs_ms`) is caught on the next pass.
+/// Fire timer tasks due by `abs_ms` (a real monotonic deadline in page-clock
+/// units), draining the microtask checkpoint after each. The JS `tickTo`
+/// primitive deliberately returns after ONE timer task: HTML timers queue
+/// tasks, and combining an overdue set into one uninterruptible batch loses the
+/// event-loop boundary which keeps a heavy page responsive. `max_ticks` permits
+/// dispatch callers to drain several turns; the at-rest loop passes one.
 fn settle_to(
     ctx: &mut Context,
     budget: &Budget,
@@ -6996,8 +7094,8 @@ fn settle_to(
 ) {
     let mut ticks = 0;
     loop {
-        // `tickTo` fires due timer callbacks synchronously (page JS), so time it
-        // into the execute bucket like the `tick` call in `settle` does — and
+        // `tickTo` fires one due timer callback synchronously (page JS), so time
+        // it into the execute bucket like the `tick` call in `settle` does — and
         // guard it identically (a VM panic in an at-rest timer callback must
         // degrade the page, not unwind the actor).
         let t = phase_begin();
@@ -7025,6 +7123,18 @@ fn settle_to(
 /// neighbours). Bounded so a pathological load handler can't loop forever.
 const IMG_LOAD_PASSES: usize = 3;
 
+/// Discover images whose synthetic `load` event should be queued. Delivery is
+/// deliberately separate: HTML places each resource event on a task source,
+/// so merely discovering an image must not synchronously run its listener.
+fn schedule_image_loads(ctx: &mut Context, outcome: &mut Outcome) -> f64 {
+    let t = phase_begin();
+    let scheduled = guarded_call_trust(ctx, "scanImageLoads", &[], "image load scan", outcome)
+        .and_then(|v| v.as_number())
+        .unwrap_or(0.0);
+    phase_end(Phase::Execute, t);
+    scheduled
+}
+
 /// Schedule synthetic `<img>` `load` events for anything waiting on one, then
 /// settle so the handlers run, repeating a few passes to catch images those
 /// handlers insert (see `trust.scanImageLoads`). The reveal-on-load idiom would
@@ -7033,11 +7143,7 @@ const IMG_LOAD_PASSES: usize = 3;
 /// where nothing listens for `load`.
 fn settle_image_loads(ctx: &mut Context, budget: &Budget, max_ticks: usize, outcome: &mut Outcome) {
     for _ in 0..IMG_LOAD_PASSES {
-        let t = phase_begin();
-        let scheduled = guarded_call_trust(ctx, "scanImageLoads", &[], "image load scan", outcome)
-            .and_then(|v| v.as_number())
-            .unwrap_or(0.0);
-        phase_end(Phase::Execute, t);
+        let scheduled = schedule_image_loads(ctx, outcome);
         if scheduled < 1.0 || outcome.panicked {
             break;
         }
@@ -7060,6 +7166,21 @@ fn run_microtasks_into(ctx: &mut Context, outcome: &mut Outcome) {
             ));
             outcome.panicked = true;
         }
+    }
+}
+
+/// Finish one browser event-loop task for a resident page.
+///
+/// WHATWG HTML §8.1.7.3 runs one selected task and then performs a microtask
+/// checkpoint. A timer or synthetic image-resource event queued by that task
+/// remains a later task. Keeping this boundary is both observable (a Promise
+/// reaction precedes `setTimeout(0)`) and essential to input responsiveness:
+/// draining the timer queue here lets an ordinary scroll/click monopolize the
+/// page actor with unrelated framework scheduler work.
+fn checkpoint_live_task(page: &mut LoadedPage) {
+    run_microtasks_into(&mut page.ctx, &mut page.outcome);
+    if !page.outcome.panicked {
+        schedule_image_loads(&mut page.ctx, &mut page.outcome);
     }
 }
 
@@ -7481,16 +7602,13 @@ const DISPATCH_BUDGET: Duration = Duration::from_secs(1);
 /// with EVERY model; still bounded so a hung server can't hold the page forever
 /// (the user can also Esc). The wait parks on the reactor — no idle CPU.
 const DISPATCH_NET_GRACE: Duration = Duration::from_secs(300);
-/// Settle ticks allowed after a dispatch (load-time settle uses MAX_TICKS).
-const DISPATCH_TICKS: usize = 50;
 /// Max deliver→settle passes in `run_intersections`'s observer loop. A
 /// responsive grid usually converges in 2 (deliver the real container width →
 /// it re-renders more cards → deliver the cards' new size, which it ignores).
 /// Bounded so a callback that resizes on every delivery degrades, not hangs.
 const OBSERVER_DELIVERY_PASSES: usize = 6;
-/// Settle ticks per AT-REST wake (the idle `timer_wake` loop). Unlike a dispatch
-/// — which settles a click's whole cascade to completion (`DISPATCH_TICKS`) — an
-/// at-rest wake fires ONE generation of due timers (one event-loop "task"), drains
+/// Settle ticks per AT-REST wake (the idle `timer_wake` loop). An at-rest wake
+/// fires ONE generation of due timers (one event-loop "task"), drains
 /// the microtask checkpoint, and returns to the sleep. A callback that re-arms a
 /// 0-delay timer (React's scheduler MessageChannel loop; an Apollo poll that never
 /// settles because its data is gated behind a bot wall) therefore advances at the
@@ -8059,6 +8177,7 @@ fn run_worker(
             dispatch: std::cell::Cell::new(false),
             fetch_events: None,
             next_fetch_id: std::cell::Cell::new(1),
+            pending_fetches: Default::default(),
             cache: std::sync::Arc::new(crate::http::PageCache::with_task_scope(tasks)),
         });
     }
@@ -8296,24 +8415,7 @@ fn dispatch_worker_in(page: &mut LoadedPage, id: usize, event: WorkerOut) {
             return;
         }
     }
-    let mut dispatch_outcome = Outcome::default();
-    settle(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    settle_image_loads(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    page.outcome.errors.extend(dispatch_outcome.errors);
-    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
-    // scheduled) must reach the caller's Trouble/exit path, not vanish with
-    // the scratch outcome.
-    page.outcome.panicked |= dispatch_outcome.panicked;
+    checkpoint_live_task(page);
 }
 
 /// Spawn the forwarder relaying a page's inbound WebSocket events into the
@@ -8401,16 +8503,10 @@ fn page_actor(
     // the moment the app drops the page. The WS forwarder holds only a weak one.
     drop(cmd_self);
     // First paint: if the interactive shell is already a live page (has
-    // clickables), emit it NOW — before `settle_page` drains background
-    // network. A data-driven SPA (e.g. archive.org, which then serially
-    // paginates ~14 collection requests) shows its chrome immediately
-    // instead of blocking first paint on every background fetch. For a
-    // page with no post-interactive work the shell == the settled render,
-    // so this is a harmless duplicate; for a static article (no
-    // clickables) we skip it and fall through to the Static path.
-    // `settle_page` below fires the page's due-now load/init timers for this
-    // first settle; any ongoing timers (a slideshow, a poller, a rAF chain)
-    // keep advancing at their real time in the at-rest wake loop further down.
+    // clickables), emit it now. Async networking, load-handler work, and author
+    // timer tasks continue through the resident event loop; none delays this
+    // shell. A static article skips the early duplicate and falls through to
+    // the inert-page classification below.
     let (shell, _, shell_clickable) = extract_live(&mut page);
     // Seed the render-dedup baseline from the shell (the settle path below
     // overwrites it when it re-extracts), so a `painted_live && !changed` page —
@@ -8437,7 +8533,7 @@ fn page_actor(
         return; // app dropped the handle while we painted the shell
     }
     // We've consumed the current DOM into the shell render; clear the
-    // dirty bit so we can tell whether the settle below actually changes
+    // dirty bit so we can tell whether the lifecycle tasks below actually change
     // anything. A page with no background work settles to the SAME DOM —
     // we then skip the redundant second emit, so non-network pages emit
     // exactly one load render (the shell), preserving the existing actor
@@ -8466,13 +8562,15 @@ fn page_actor(
         }
     }
 
-    // Drain the rest of the lifecycle (background network + timers).
-    settle_page(&mut page);
+    // Complete DOMContentLoaded/load as their own event-loop tasks. Author
+    // timers and post-load networking remain queued for the resident loop,
+    // which processes one task per turn and prioritizes user input between
+    // turns (WHATWG HTML, event loops / processing model).
+    complete_live_lifecycle(&mut page);
     page.outcome.elapsed = page.started.elapsed();
     let changed = page.dom.borrow_mut().take_dirty();
-    // An async DOMContentLoaded/load handler can reach requestSubmit() while
-    // settle_page drains its promise continuation. Keep the intent until after
-    // the settled DOM has been serialized.
+    // A DOMContentLoaded/load handler can reach requestSubmit(). Keep the intent
+    // until after the lifecycle DOM has been serialized.
     let pending_form_submit = take_form_submit(&mut page);
     if painted_live && !changed {
         // Shell already reflects the settled page; nothing new to send.
@@ -8494,6 +8592,9 @@ fn page_actor(
         // actor must be alive to deliver. (The actor owns the worker handles —
         // exiting here would drop and terminate them.)
         let has_workers = page_has_workers(&page);
+        // A document whose only dynamic work is an initial fetch/XHR must stay
+        // alive until the networking task resolves its promise.
+        let has_pending_fetches = page_pending_fetches(&page) > 0;
         // A page listening for the pointer (hover-type listeners) or styling by
         // it (`:hover` rules that can change the RENDER — tracked properties)
         // stays live to receive `PageCmd::Hover`; dropping the engine here
@@ -8506,6 +8607,7 @@ fn page_actor(
             && !has_timers
             && !has_scroll_work
             && !has_workers
+            && !has_pending_fetches
             && !has_hover_work
             && pending_form_submit.is_none()
         {
@@ -8920,8 +9022,8 @@ fn page_actor(
 }
 
 /// Deliver a WebSocket event to page JS (fire `open`/`message`/`close` on the
-/// JS `WebSocket`), then settle — same shape as a click/form dispatch. A frame
-/// is just an event; a streamed token mutates the DOM and re-renders.
+/// JS `WebSocket`), then perform its microtask checkpoint. A frame is one event
+/// loop task; a streamed token mutates the DOM and re-renders.
 fn dispatch_ws_in(page: &mut LoadedPage, id: usize, event: crate::ws::WsIn) {
     prepare_dispatch(page);
     let call = match event {
@@ -8963,29 +9065,12 @@ fn dispatch_ws_in(page: &mut LoadedPage, id: usize, event: crate::ws::WsIn) {
             return;
         }
     }
-    let mut dispatch_outcome = Outcome::default();
-    settle(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    settle_image_loads(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    page.outcome.errors.extend(dispatch_outcome.errors);
-    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
-    // scheduled) must reach the caller's Trouble/exit path, not vanish with
-    // the scratch outcome.
-    page.outcome.panicked |= dispatch_outcome.panicked;
+    checkpoint_live_task(page);
 }
 
 /// Apply a viewport scroll (CSS px, document origin) to the live page: update
 /// `window.scrollY`, fire the `scroll` event, and re-run IntersectionObserver
-/// (all inside `__trust.setScroll`), then settle. A site's own scroll handler /
+/// (all inside `__trust.setScroll`), then perform its microtask checkpoint. A site's own scroll handler /
 /// IO sentinel then issues its load-more `fetch()` (which runs off the JS
 /// thread, posting back as a background fetch), and the appended content
 /// re-renders. Same shape as `dispatch_ws_in`.
@@ -9023,30 +9108,13 @@ fn dispatch_scroll_in(page: &mut LoadedPage, x: f64, y: f64) {
             .unwrap_or_default();
         eprintln!("DIAGSCROLLIN req_y={y:.0} engine[scrollY scrollH innerH]={s}");
     }
-    let mut dispatch_outcome = Outcome::default();
-    settle(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    settle_image_loads(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    page.outcome.errors.extend(dispatch_outcome.errors);
-    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
-    // scheduled) must reach the caller's Trouble/exit path, not vanish with
-    // the scratch outcome.
-    page.outcome.panicked |= dispatch_outcome.panicked;
+    checkpoint_live_task(page);
 }
 
 /// The terminal's pointer came to rest on a new element (or none): dispatch the
 /// Pointer Events transition sequence from the old hover target to `node` and
-/// move the cascade's `:hover` chain (both inside `__trust.hover`), then
-/// settle. A stale `node` (detached since the snapshot the app hit-test ran
+/// move the cascade's `:hover` chain (both inside `__trust.hover`), then run
+/// the task's microtask checkpoint. A stale `node` (detached since the snapshot the app hit-test ran
 /// against — routine on re-rendering pages) degrades to a hover-clear, never an
 /// error. Same shape as `dispatch_scroll_in`.
 fn dispatch_hover_in(page: &mut LoadedPage, node: Option<usize>, x: f64, y: f64) {
@@ -9068,29 +9136,13 @@ fn dispatch_hover_in(page: &mut LoadedPage, node: Option<usize>, x: f64, y: f64)
         page.outcome.panicked = true;
         return;
     }
-    let mut dispatch_outcome = Outcome::default();
-    settle(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    settle_image_loads(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    page.outcome.errors.extend(dispatch_outcome.errors);
-    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
-    // scheduled) must reach the caller's Trouble/exit path, not vanish with
-    // the scratch outcome.
-    page.outcome.panicked |= dispatch_outcome.panicked;
+    checkpoint_live_task(page);
 }
 
 /// The terminal wheel/page scrolled an inner-scroll region: write its new
 /// `scrollTop`/`scrollLeft` (px) back into the live element (CSSOM View — the
-/// region→page write-back) and fire the element's `scroll` event, then settle.
+/// region→page write-back) and fire the element's `scroll` event, then run its
+/// microtask checkpoint.
 /// A page that conditionally pins to the bottom runs its scroll handler here and
 /// learns the user scrolled up, so it stops following. Shaped like a dispatch: a
 /// handler that mutates re-renders (`Updated`), else it settles silently. The
@@ -9126,18 +9178,7 @@ fn dispatch_set_scroll_in(
     page.outcome.errors.extend(scroll_outcome.errors);
     page.outcome.panicked |= scroll_outcome.panicked;
     if !page.outcome.panicked {
-        let mut dispatch_outcome = Outcome::default();
-        settle(
-            &mut page.ctx,
-            &page.budget,
-            DISPATCH_TICKS,
-            &mut dispatch_outcome,
-        );
-        page.outcome.errors.extend(dispatch_outcome.errors);
-        // A panic during the settle (a Boa bug in a timer/microtask the dispatch
-        // scheduled) must reach the caller's Trouble/exit path, not vanish with
-        // the scratch outcome.
-        page.outcome.panicked |= dispatch_outcome.panicked;
+        checkpoint_live_task(page);
         drain_js_side(&mut page.ctx, &mut page.outcome);
     }
     finish_dispatch(page, evts)
@@ -9153,8 +9194,8 @@ fn dispatch_set_scroll_in(
 /// Edge-triggered + geometry-cached: a no-op (no settle) unless it delivered
 /// entries, so a page with no observers / no geometry change pays one cheap eval.
 /// The browser's "update the rendering" observer step: deliver ResizeObserver
-/// then IntersectionObserver notifications against the CURRENT layout, and drain
-/// the work their callbacks schedule. Both are edge-triggered (a no-op unless a
+/// then IntersectionObserver notifications against the CURRENT layout, and run
+/// the microtasks their callbacks schedule. Both are edge-triggered (a no-op unless a
 /// target's size / intersection state actually changed), so a page with no
 /// observers pays one cheap eval each.
 ///
@@ -9199,12 +9240,10 @@ fn run_intersections(page: &mut LoadedPage) {
         if resized + intersected <= 0.0 {
             break;
         }
-        settle(
-            &mut page.ctx,
-            &page.budget,
-            DISPATCH_TICKS,
-            &mut page.outcome,
-        );
+        // Observer callbacks run in the rendering update. Their promise jobs
+        // reach the associated microtask checkpoint, but a setTimeout they arm
+        // remains a later event-loop task.
+        run_microtasks_into(&mut page.ctx, &mut page.outcome);
     }
 }
 
@@ -9293,7 +9332,7 @@ fn send_scroll_events(
     true
 }
 
-/// An at-rest timer deadline elapsed: fire the timers due by `real_now` (ms),
+/// An at-rest timer deadline elapsed: fire one timer task due by `real_now` (ms),
 /// drain, and re-render if the DOM changed — the same shape as a user dispatch,
 /// but a CLEAN tick (no mutation, no error, no navigation) emits NOTHING. A
 /// timer fire isn't an interaction, so there is no app busy-state to clear with
@@ -9329,14 +9368,12 @@ fn timer_wake(
     );
     let d_settle = t.map(|t| t.elapsed().as_millis());
     // A timer may swap in a fresh <img> (a JS slideshow advancing) whose reveal
-    // waits on a `load` event a headless DOM never fires — same as a dispatch.
+    // waits on a `load` event a headless DOM never fires. Queue those resource
+    // tasks, but do not execute another task in this turn: HTML's event loop
+    // performs one task followed by its microtask checkpoint before returning
+    // to task selection.
     let t = mark();
-    settle_image_loads(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut page.outcome,
-    );
+    schedule_image_loads(&mut page.ctx, &mut page.outcome);
     let d_imgload = t.map(|t| t.elapsed().as_millis());
     let t = mark();
     drain_js_side(&mut page.ctx, &mut page.outcome);
@@ -9395,7 +9432,28 @@ fn timer_wake(
     true
 }
 
-/// A background fetch (a dispatch/at-rest `fetch()` whose request ran OFF the
+fn page_pending_fetches(page: &LoadedPage) -> usize {
+    page.ctx
+        .realm()
+        .host_defined()
+        .get::<PageNet>()
+        .map_or(0, |net| {
+            net.pending_fetches
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+}
+
+fn note_background_fetch_done(page: &LoadedPage) {
+    if let Some(net) = page.ctx.realm().host_defined().get::<PageNet>() {
+        let _ = net.pending_fetches.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |n| Some(n.saturating_sub(1)),
+        );
+    }
+}
+
+/// A background fetch (a resident-page `fetch()` whose request ran OFF the
 /// JS thread so the dispatch didn't block on the wire) completed: settle its JS
 /// promise with the result and drain the `.then` reactions, then re-render if
 /// the DOM changed. Shaped like a dispatch, but a resolution that mutates
@@ -9407,22 +9465,19 @@ fn dispatch_fetch_done(
     id: usize,
     result: FetchResult,
 ) -> bool {
+    note_background_fetch_done(page);
     prepare_dispatch(page);
     let value = fetch_result_value(&mut page.ctx, result);
     settle_bg_fetch(&mut page.ctx, id, value);
-    settle(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut page.outcome,
-    );
-    // The `.then` may swap in an image whose reveal waits on a `load` event.
-    settle_image_loads(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut page.outcome,
-    );
+    // Fetch response processing is one networking task followed by a
+    // microtask checkpoint (Fetch + HTML event-loop processing model). Promise
+    // reactions run now; timers they schedule remain distinct later tasks.
+    // Draining those timers here let one YouTube guide response pull 50
+    // framework scheduler turns into an uninterruptible ~17-second burst.
+    run_microtasks_into(&mut page.ctx, &mut page.outcome);
+    // The promise reactions may mount images. Queue their resource-event tasks
+    // without executing another task in this networking turn.
+    schedule_image_loads(&mut page.ctx, &mut page.outcome);
     drain_js_side(&mut page.ctx, &mut page.outcome);
     if page.outcome.panicked {
         let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
@@ -9700,27 +9755,7 @@ fn dispatch_form_set_in(page: &mut LoadedPage, node: usize, value: &str, checked
         page.outcome.panicked = true;
         return;
     }
-    let mut dispatch_outcome = Outcome::default();
-    settle(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    // An interaction can mount images that reveal on `load` (clicking a
-    // thumbnail opens a lightbox slide); fire their loads and settle the
-    // reveal handlers so the image shows in this same dispatch.
-    settle_image_loads(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    page.outcome.errors.extend(dispatch_outcome.errors);
-    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
-    // scheduled) must reach the caller's Trouble/exit path, not vanish with
-    // the scratch outcome.
-    page.outcome.panicked |= dispatch_outcome.panicked;
+    checkpoint_live_task(page);
 }
 
 fn dispatch_submit_in(page: &mut LoadedPage, form: usize, submitter: Option<usize>) -> bool {
@@ -9745,27 +9780,7 @@ fn dispatch_submit_in(page: &mut LoadedPage, form: usize, submitter: Option<usiz
             return true;
         }
     };
-    let mut dispatch_outcome = Outcome::default();
-    settle(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    // An interaction can mount images that reveal on `load` (clicking a
-    // thumbnail opens a lightbox slide); fire their loads and settle the
-    // reveal handlers so the image shows in this same dispatch.
-    settle_image_loads(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    page.outcome.errors.extend(dispatch_outcome.errors);
-    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
-    // scheduled) must reach the caller's Trouble/exit path, not vanish with
-    // the scratch outcome.
-    page.outcome.panicked |= dispatch_outcome.panicked;
+    checkpoint_live_task(page);
     prevented
 }
 
@@ -10111,6 +10126,23 @@ fn emit_dirty_render(
     evts: &tokio::sync::mpsc::Sender<PageEvt>,
 ) -> Option<bool> {
     let mut targets = page.dom.borrow_mut().take_dirty_targets();
+    // DOM §4.2.2 defines a node as connected only when its shadow-including
+    // root is a Document. Mutations in a detached template/work buffer are
+    // observable to script, but cannot change the rendered document until that
+    // subtree is inserted. Reactive renderers routinely build and animate such
+    // buffers (YouTube mutates ~11 detached nodes every frame). Drop those
+    // targets BEFORE patch selection/full serialization; an insertion into the
+    // live tree records its connected parent separately and renders the whole
+    // completed subtree. A mixed cycle retains every connected mutation.
+    if let Some(ts) = targets.as_mut() {
+        let dom = page.dom.borrow();
+        if !retain_connected_dirty_targets(&dom, ts) {
+            if diag_patch() {
+                eprintln!("DIAGPATCH INERT all targets detached");
+            }
+            return None;
+        }
+    }
     // Paint-relevance filter (INCREMENTAL_LAYOUT_PLAN.md): drop ATTR mutations
     // that cannot change a single painted cell — an out-of-flow subtree that
     // paints nothing (Twitch's decorative `highlight__progress-bar` animates its
@@ -10179,6 +10211,16 @@ fn emit_dirty_render(
         evts.blocking_send(PageEvt::Updated { html: out, outcome })
             .is_ok(),
     )
+}
+
+/// Remove mutations whose target is outside the connected document tree.
+/// Returns whether any render-relevant target remains.
+fn retain_connected_dirty_targets(
+    dom: &crate::dom::Dom,
+    targets: &mut Vec<(crate::dom::NodeId, crate::dom::DirtyKind)>,
+) -> bool {
+    targets.retain(|(node, _)| dom.is_connected(*node));
+    !targets.is_empty()
 }
 
 /// The patch path (INCREMENTAL_LAYOUT_PLAN.md §12c W1): serialize ONLY each dirty
@@ -10286,12 +10328,7 @@ fn confined_boundaries(
     }
     let mut set: Vec<(crate::dom::NodeId, BoundaryTier)> = Vec::new();
     for &(node, kind) in targets {
-        // A mutation on a DETACHED subtree (createElement + set content, before
-        // appendChild) is invisible until inserted — skip it. The insertion that
-        // connects it records the container, whose patch captures the content.
-        if !dom.is_connected(node) {
-            continue;
-        }
+        debug_assert!(dom.is_connected(node));
         // A live scroll region wins first (its content lives in a side buffer):
         // Tier 1 / `Size`, buffer swap. Otherwise the nearest INLINE IFC boundary
         // the app has cached: Tier 2 / `WidthStable`, `Doc.rows` splice.
@@ -10376,8 +10413,8 @@ fn confined_boundaries(
             set.push((b, tier));
         }
     }
-    // All targets were detached (no visible change to attribute) — fall back to
-    // the full path (this is unreachable when extract_changed reported a change).
+    // `emit_dirty_render` removed detached targets before reaching this
+    // function, so a non-empty input always maps at least one connected node.
     (!set.is_empty()).then_some(set)
 }
 
@@ -10499,27 +10536,7 @@ fn dispatch_click_in(page: &mut LoadedPage, node: usize) -> Option<String> {
         page.outcome.panicked = true;
         return None;
     }
-    let mut dispatch_outcome = Outcome::default();
-    settle(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    // An interaction can mount images that reveal on `load` (clicking a
-    // thumbnail opens a lightbox slide); fire their loads and settle the
-    // reveal handlers so the image shows in this same dispatch.
-    settle_image_loads(
-        &mut page.ctx,
-        &page.budget,
-        DISPATCH_TICKS,
-        &mut dispatch_outcome,
-    );
-    page.outcome.errors.extend(dispatch_outcome.errors);
-    // A panic during the settle (a Boa bug in a timer/microtask the dispatch
-    // scheduled) must reach the caller's Trouble/exit path, not vanish with
-    // the scratch outcome.
-    page.outcome.panicked |= dispatch_outcome.panicked;
+    checkpoint_live_task(page);
 
     if prevented {
         return None;
@@ -10670,11 +10687,11 @@ const PRELUDE: &str = r##"
     g.__trust = trust;
 
     // --- the virtual clock ---
-    // The engine's single virtual clock (ms since page start): timers schedule
-    // against it, `performance.now()` reads it, the Event constructor stamps
-    // `timeStamp` from it, and the RUST-side Date clock mirrors it through
-    // `__clock_set` so `new Date()` and `Date.now()` agree with it too (see
-    // the clock comment in the timers section below for the full model).
+    // The engine's timer clock (ms since page start). Explicit timer advances
+    // update `timers.now`; between them the Rust Date clock keeps counting host
+    // monotonic time. `currentTime()` joins those sources so performance.now(),
+    // event timestamps, and newly scheduled timer deadlines never freeze while
+    // synchronous JavaScript is executing (High Resolution Time §§2.1, 7.1).
     // Declared up here because the Event class, defined early, reads it.
     const timers = { q: [], now: 0, seq: 1 };
     // The absolute epoch the virtual clock is anchored to — the REAL host
@@ -10685,6 +10702,10 @@ const PRELUDE: &str = r##"
         ? function () { __clock_set(__epoch0 + timers.now); }
         : function () {};
     __clockSync();
+    function currentTime() {
+        const elapsed = Date.now() - __epoch0;
+        return Math.max(timers.now, Number.isFinite(elapsed) ? elapsed : timers.now);
+    }
 
     // --- node wrappers, identity-cached so wrap(id) === wrap(id) ---
     const W = new Map();
@@ -10899,10 +10920,9 @@ const PRELUDE: &str = r##"
             // CustomEvent.detail (and UIEvent.detail) default to null, not
             // undefined, when not supplied.
             this.detail = opts && "detail" in opts ? opts.detail : null;
-            // DOM §2.2: the creation time, relative to the time origin — i.e.
-            // `performance.now()`, which is the virtual clock (was a constant
-            // 0; rate-limiters diffing event timestamps saw no time pass).
-            this.timeStamp = timers.now;
+            // DOM §2.2: creation time relative to the time origin. This is the
+            // current monotonic clock, not merely the last timer checkpoint.
+            this.timeStamp = currentTime();
             // Per-interface EventInit members (MouseEventInit.clientX,
             // KeyboardEventInit.key, MessageEventInit.data, …) become event
             // properties. We don't model each interface's dictionary, so copy
@@ -15884,9 +15904,9 @@ const PRELUDE: &str = r##"
             // queues an initial observation with the current size).
             this.__targets.push({ el: el, lastW: -1, lastH: -1 });
             if (RO.indexOf(this) < 0) RO.push(this);
-            // Report the initial size on a macrotask (the settle drain runs it);
-            // `updateResizes` at the end of the load settle then re-delivers the
-            // FINAL size once the DOM has finished building.
+            // Report the initial size on a later task. The live event loop runs
+            // that task after the current lifecycle/author task; one-shot
+            // snapshots drain it while producing their eventual state.
             g.setTimeout(() => trust.updateResizes(), 0);
         }
         unobserve(el) {
@@ -16353,7 +16373,7 @@ const PRELUDE: &str = r##"
         if (typeof fn !== "function") return 0;
         const id = timers.seq++;
         const args = Array.prototype.slice.call(arguments, 2);
-        timers.q.push({ id, at: timers.now + Math.max(0, Number(d) || 0), fn, every: null, args });
+        timers.q.push({ id, at: currentTime() + Math.max(0, Number(d) || 0), fn, every: null, args });
         return id;
     };
     g.setInterval = function (fn, d) {
@@ -16361,11 +16381,11 @@ const PRELUDE: &str = r##"
         const id = timers.seq++;
         const every = Math.max(4, Number(d) || 4);
         const args = Array.prototype.slice.call(arguments, 2);
-        timers.q.push({ id, at: timers.now + every, fn, every, args });
+        timers.q.push({ id, at: currentTime() + every, fn, every, args });
         return id;
     };
     g.clearTimeout = g.clearInterval = (id) => { timers.q = timers.q.filter((t) => t.id !== id); };
-    g.requestAnimationFrame = (fn) => g.setTimeout(() => fn(timers.now), 16);
+    g.requestAnimationFrame = (fn) => g.setTimeout(() => fn(currentTime()), 16);
     g.cancelAnimationFrame = g.clearTimeout;
     // Background fetch (dispatch/at-rest, resident actor): the request runs OFF
     // the JS thread so the dispatch doesn't block on the wire. `bgFetch(id)`
@@ -16430,7 +16450,7 @@ const PRELUDE: &str = r##"
         // The settle primitive. Two modes, set by `trust.oneShot`:
         //
         // LIVE (oneShot=false, the actor/production path): fire only ONE-SHOT
-        // timers ALREADY DUE at the current instant (`at <= timers.now`) —
+        // timers ALREADY DUE at the current monotonic instant —
         // deferred-init `setTimeout(0)` and 0-delay cascades. It does NOT
         // fast-forward virtual time, so `requestAnimationFrame` (now+16),
         // `setInterval`, and `setTimeout(_, N>0)` are LEFT PENDING and fire at
@@ -16445,62 +16465,55 @@ const PRELUDE: &str = r##"
         // virtual time to it, draining the page to its eventual rendered state
         // (rAF-deferred content, delayed timeouts). Intervals are still skipped
         // (`every !== null`) so a snapshot doesn't show a jumped counter.
-        const limit = trust.oneShot ? timers.now + 1000 : timers.now;
+        const observedNow = currentTime();
+        const limit = trust.oneShot ? observedNow + 1000 : observedNow;
         let best = null;
         for (const t of timers.q) {
             if (t.every === null && t.at <= limit && (!best || t.at < best.at)) best = t;
         }
         if (!best) return false;
         timers.q.splice(timers.q.indexOf(best), 1);
-        timers.now = Math.max(timers.now, best.at); // a no-op in LIVE mode (best.at <= now)
+        timers.now = Math.max(timers.now, trust.oneShot ? best.at : observedNow);
         __clockSync();
         try { best.fn.apply(undefined, best.args || []); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         return true;
     };
     // At REST (not the load/dispatch fast-forward settle above), the actor
-    // advances time by the REAL wall clock and fires every timer due by `absMs`
-    // ONCE. `nextDeadline` is the absolute deadline the actor sleeps until;
+    // advances time by the REAL wall clock and fires the earliest timer task
+    // due by `absMs`. HTML timers queue tasks; each task gets its own microtask
+    // checkpoint/event-loop turn, so a large overdue set must not execute as
+    // one uninterruptible callback batch. `nextDeadline` is the absolute
+    // deadline the actor sleeps until;
     // `now` anchors the wall-clock delta it measures forward from. A re-armed
     // interval re-queues at `absMs + every` (NOT `at + every`), so a long pause
     // never fires a catch-up burst — one tick per real period, like a browser's
-    // background coalescing. The due set is SNAPSHOTTED up front so a callback
-    // that schedules another already-due timer isn't swept into THIS pass (the
-    // actor's `settle_to` loop catches it next), and a `clearTimeout` mid-batch
-    // is honored (the entry is gone from `q`, so `indexOf` skips it).
-    trust.now = () => timers.now;
+    // background coalescing.
+    trust.now = () => currentTime();
     trust.nextDeadline = function () {
         let best = null;
         for (const t of timers.q) if (best === null || t.at < best) best = t.at;
         return best;
     };
     trust.tickTo = function (absMs) {
-        absMs = Math.max(timers.now, absMs);
-        const due = timers.q.filter((t) => t.at <= absMs).sort((a, b) => a.at - b.at || a.id - b.id);
-        for (const t of due) {
-            const i = timers.q.indexOf(t);
-            if (i < 0) continue; // cleared by an earlier callback in this batch
-            timers.q.splice(i, 1);
-            timers.now = Math.max(timers.now, t.at);
+        absMs = Math.max(currentTime(), absMs);
+        let task = null;
+        for (const t of timers.q) {
+            if (t.at <= absMs && (!task || t.at < task.at || (t.at === task.at && t.id < task.id))) task = t;
+        }
+        if (task) {
+            timers.q.splice(timers.q.indexOf(task), 1);
+            timers.now = absMs;
             __clockSync();
-            if (t.every !== null) timers.q.push({ id: t.id, at: absMs + t.every, fn: t.fn, every: t.every, args: t.args });
-            try { t.fn.apply(undefined, t.args || []); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+            if (task.every !== null) timers.q.push({ id: task.id, at: absMs + task.every, fn: task.fn, every: task.every, args: task.args });
+            try { task.fn.apply(undefined, task.args || []); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         }
         timers.now = absMs;
         __clockSync();
-        return due.length;
+        return task ? 1 : 0;
     };
-    // The clocks track `timers.now`, the engine's single virtual clock, not the
-    // host wall clock directly. During the load/dispatch settle `timers.now`
-    // FAST-FORWARDS (firing due one-shots) while the real wall clock barely
-    // moves in that microsecond burst — so a wall-clock `Date.now()` would make
-    // a click-driven animation (jQuery's `.slideUp`/`.fadeOut`, Humble's
-    // "Dismiss banner") see ~0 elapsed and never finish (the banner never slid
-    // away). At REST the actor advances `timers.now` to the real monotonic clock
-    // (see the wake loop), so reading time off `timers.now` is correct in BOTH
-    // phases: fast-forwarded during settle, real-time at rest. `Date.now()`
-    // keeps a realistic absolute base (`__epoch0`, anchored at prelude boot —
-    // see the top of the prelude) so timestamps still look real;
-    // `performance.now()` is the elapsed virtual time.
+    // The clocks share the page time origin. Explicit fast-forward advances
+    // `timers.now`; between checkpoints PageClock continues from host monotonic
+    // time, so deadline-based synchronous work can yield normally.
     //
     // The WHOLE Date surface follows this clock: the old JS-side
     // `Date.now = () => __epoch0 + timers.now` override is gone — `__clockSync`
@@ -16510,15 +16523,7 @@ const PRELUDE: &str = r##"
     // the REAL host clock while `Date.now()` was fast-forwarded — a page
     // comparing them (or diffing two `new Date()`s across a settle) saw time
     // stand still or run backwards.
-    //
-    // KNOWN LIMITATION (YouTube, deferred to a focused effort): this clock does
-    // NOT advance within a single SYNCHRONOUS block — only between ticks. A
-    // time-budget chunking loop (`while (Date.now() < start + ~13ms) chunk()`,
-    // as YouTube's render scheduler / React's scheduler use) therefore never
-    // sees its deadline and won't yield. Making the LIVE-mode clock real fixes
-    // that but needs careful cross-site verification (load-time code that bails
-    // on a `performance.now()` threshold), so it's a separate task — not landed.
-    g.performance.now = () => timers.now;
+    g.performance.now = () => currentTime();
 
     // --- console into the outcome's ring ---
     const log = (level) => (...a) => {
@@ -17723,10 +17728,10 @@ const PRELUDE: &str = r##"
     // the captured body once (lenient — we don't throw on re-read, unlike the
     // spec, to avoid breaking defensive double-reads).
     const __bodyMethods = {
-        text() { this.bodyUsed = true; return Promise.resolve(__bodyText(this.__body) || ""); },
-        json() { this.bodyUsed = true; try { return Promise.resolve(JSON.parse(__bodyText(this.__body) || "")); } catch (e) { return Promise.reject(e); } },
+        text() { this.__bodyUsed = true; return Promise.resolve(__bodyText(this.__body) || ""); },
+        json() { this.__bodyUsed = true; try { return Promise.resolve(JSON.parse(__bodyText(this.__body) || "")); } catch (e) { return Promise.reject(e); } },
         arrayBuffer() {
-            this.bodyUsed = true;
+            this.__bodyUsed = true;
             // `__bytes` (set on fetched responses) is the byte-EXACT body; only a
             // response built in JS from a text body falls back to UTF-8 bytes.
             const bin = this.__bytes != null ? this.__bytes : utf8Binary(__bodyText(this.__body) || "");
@@ -17735,7 +17740,7 @@ const PRELUDE: &str = r##"
             return Promise.resolve(buf);
         },
         blob() {
-            this.bodyUsed = true;
+            this.__bodyUsed = true;
             const t = (this.headers && this.headers.get && this.headers.get("content-type")) || "";
             const body = this.__bytes != null ? this.__bytes : (__bodyText(this.__body) || "");
             return Promise.resolve(new g.Blob([body], { type: t || "" }));
@@ -17749,27 +17754,43 @@ const PRELUDE: &str = r##"
         constructor(input, init) {
             init = init || {};
             const fromReq = input instanceof Request;
-            // A Request copies its already-resolved url; a string/URL input is
-            // resolved against the document base URL (Fetch §"Request": parse
-            // input with the base URL = the settings object's API base URL).
-            this.url = fromReq ? input.url
+            // Fetch §5.4: a Request input contributes its associated internal
+            // request, not reads of its public Web IDL attributes. Keep every
+            // request field in an internal slot and expose readonly prototype
+            // accessors below. An author may shadow `request.url`/`method`/body
+            // with own properties; cloning/fetch must still copy these slots.
+            this.__url = fromReq ? input.__url
                 : resolveURL(String((input && input.url !== undefined) ? input.url : input));
-            this.method = String(init.method || (fromReq ? input.method : null) || "GET").toUpperCase();
-            this.headers = new Headers(init.headers !== undefined ? init.headers : (fromReq ? input.headers : undefined));
+            this.__method = String(init.method || (fromReq ? input.__method : null) || "GET").toUpperCase();
+            this.__headers = new Headers(init.headers !== undefined ? init.headers : (fromReq ? input.__headers : undefined));
             this.__body = init.body !== undefined ? init.body : (fromReq ? input.__body : null);
-            this.credentials = init.credentials || (fromReq ? input.credentials : "same-origin");
-            this.mode = init.mode || (fromReq ? input.mode : "cors");
-            this.cache = init.cache || (fromReq ? input.cache : "default");
-            this.redirect = init.redirect || (fromReq ? input.redirect : "follow");
-            this.referrer = init.referrer !== undefined ? init.referrer : (fromReq ? input.referrer : "about:client");
-            this.referrerPolicy = init.referrerPolicy || (fromReq ? input.referrerPolicy : "");
-            this.integrity = init.integrity || (fromReq ? input.integrity : "");
-            this.keepalive = init.keepalive !== undefined ? !!init.keepalive : (fromReq ? input.keepalive : false);
-            this.signal = init.signal || (fromReq ? input.signal : null);
-            this.destination = "";
-            this.bodyUsed = false;
-            this.body = null; // no ReadableStream
+            this.__credentials = init.credentials || (fromReq ? input.__credentials : "same-origin");
+            this.__mode = init.mode || (fromReq ? input.__mode : "cors");
+            this.__cache = init.cache || (fromReq ? input.__cache : "default");
+            this.__redirect = init.redirect || (fromReq ? input.__redirect : "follow");
+            this.__referrer = init.referrer !== undefined ? init.referrer : (fromReq ? input.__referrer : "about:client");
+            this.__referrerPolicy = init.referrerPolicy || (fromReq ? input.__referrerPolicy : "");
+            this.__integrity = init.integrity || (fromReq ? input.__integrity : "");
+            this.__keepalive = init.keepalive !== undefined ? !!init.keepalive : (fromReq ? input.__keepalive : false);
+            this.__signal = init.signal || (fromReq ? input.__signal : null);
+            this.__destination = "";
+            this.__bodyUsed = false;
         }
+        get url() { return this.__url; }
+        get method() { return this.__method; }
+        get headers() { return this.__headers; }
+        get credentials() { return this.__credentials; }
+        get mode() { return this.__mode; }
+        get cache() { return this.__cache; }
+        get redirect() { return this.__redirect; }
+        get referrer() { return this.__referrer; }
+        get referrerPolicy() { return this.__referrerPolicy; }
+        get integrity() { return this.__integrity; }
+        get keepalive() { return this.__keepalive; }
+        get signal() { return this.__signal; }
+        get destination() { return this.__destination; }
+        get bodyUsed() { return this.__bodyUsed; }
+        get body() { return null; } // no request ReadableStream yet
         clone() { return new Request(this); }
     }
     Object.assign(Request.prototype, __bodyMethods);
@@ -17786,9 +17807,10 @@ const PRELUDE: &str = r##"
             this.url = init.url ? String(init.url) : "";
             this.redirected = false;
             this.type = "default";
-            this.bodyUsed = false;
+            this.__bodyUsed = false;
             this.__bodyStream = undefined;
         }
+        get bodyUsed() { return this.__bodyUsed; }
         // The response body as a ReadableStream (lazy + cached). Streaming
         // consumers read `response.body.getReader()` — Open WebUI reads chat
         // completions (SSE) exactly this way; a null body made `getReader()`
@@ -18273,14 +18295,17 @@ const PRELUDE: &str = r##"
             // Normalize input+init into a Request (input may be a URL string,
             // a Request, or a URL object).
             const req = new Request(input, init);
-            const url = req.url;
+            // Operate on the associated request, never on shadowable public
+            // attributes (Fetch §5.6 step 3). YouTube intentionally shadows
+            // these getters as a platform-integrity probe.
+            const url = req.__url;
             // AbortSignal (Fetch §"abort fetch"): an already-aborted signal
             // rejects immediately with its reason; an abort while in flight
             // wins the race below. The wire request itself isn't torn down —
             // it completes into a dropped promise — but the OBSERVABLE
             // contract (the rejection, and stale responses never reaching
             // .then) is the part pages depend on (abort-and-retype search).
-            const sig = req.signal;
+            const sig = req.__signal;
             const abortReason = () => (sig && sig.reason !== undefined && sig.reason !== null)
                 ? sig.reason : new DOMException("The operation was aborted.", "AbortError");
             if (sig && sig.aborted) return Promise.reject(abortReason());
@@ -18321,9 +18346,9 @@ const PRELUDE: &str = r##"
             const isFD = req.__body instanceof g.FormData && Array.isArray(req.__body.__entries);
             const enc = isFD ? __formDataWire(req.__body) : null;
             const body = isFD ? enc.wire : __bodyWire(req.__body);
-            const ctype = req.headers.get("content-type")
+            const ctype = req.__headers.get("content-type")
                 || (isFD ? enc.type : __bodyType(req.__body));
-            return raceAbort(__http_fetch_async(url, req.method, body, ctype, __hdrBlob(req.headers.__h)).then(function (r) {
+            return raceAbort(__http_fetch_async(url, req.__method, body, ctype, __hdrBlob(req.__headers.__h)).then(function (r) {
                 if (!r) throw new TypeError("fetch failed or blocked: " + url);
                 const status = r[0], respCType = r[1], text = r[2];
                 // All response headers (pages read out-of-band API results —
@@ -23046,6 +23071,15 @@ mod tests {
             }).then((t) => { out.text = t; });
             fetch("data:application/octet-stream;base64,/wBB").then((r) => r.arrayBuffer())
                 .then((b) => { out.bytes = Array.from(new Uint8Array(b)).join(","); });
+            // Fetch 5.4/5.6: Request input is copied from its associated
+            // internal request, never by reading shadowable public getters.
+            // This is YouTube's exact Request-integrity probe shape.
+            const probe = new Request("data:application/json;base64," + btoa('{"probe":7}'));
+            Object.defineProperty(probe, "url", { get() { return "https://example.com/wrong"; } });
+            Object.defineProperty(probe, "method", { get() { return "POST"; } });
+            Object.defineProperty(probe, "bodyUsed", { get() { return true; } });
+            Object.defineProperty(probe, "body", { get() { return new ReadableStream(); } });
+            fetch(probe).then((r) => r.json()).then((v) => { out.internalRequest = v.probe; });
             const x = new XMLHttpRequest();
             x.open("GET", "data:text/plain,hello%20x+y", false);
             x.send();
@@ -23066,6 +23100,7 @@ mod tests {
         assert_eq!(s(&mut ctx, b"out.ct"), "text/plain");
         assert_eq!(s(&mut ctx, b"out.text"), "hi");
         assert_eq!(s(&mut ctx, b"out.bytes"), "255,0,65");
+        assert_eq!(s(&mut ctx, b"String(out.internalRequest)"), "7");
         // `+` stays literal in data: URLs (the Instagram trap).
         assert_eq!(s(&mut ctx, b"out.xhr"), "200:hello x+y");
     }
@@ -23399,7 +23434,7 @@ mod tests {
             br##"
             globalThis.out = {};
             const t0 = Date.now();
-            out.anchored = new Date().getTime() === t0;
+            out.anchorDelta = new Date().getTime() - t0;
             __trust.oneShot = true;
             setTimeout(() => {
                 out.nowDelta = Date.now() - t0;
@@ -23419,10 +23454,95 @@ mod tests {
                 .unwrap()
                 .to_std_string_escaped()
         };
-        assert_eq!(s(&mut ctx, b"String(out.anchored)"), "true");
-        assert_eq!(s(&mut ctx, b"String(out.nowDelta)"), "600");
-        assert_eq!(s(&mut ctx, b"String(out.dateDelta)"), "600");
-        assert_eq!(s(&mut ctx, b"String(out.ts)"), "600");
+        assert_eq!(
+            s(
+                &mut ctx,
+                b"String(out.anchorDelta >= 0 && out.anchorDelta < 100)"
+            ),
+            "true"
+        );
+        // A one-shot snapshot advances by AT LEAST the requested 600ms. The
+        // host monotonic clock keeps running during and between reads, so a
+        // preempted test may legitimately observe more than exactly 600ms.
+        assert_eq!(
+            s(
+                &mut ctx,
+                b"String(out.nowDelta >= 600 && out.nowDelta < 3000)"
+            ),
+            "true"
+        );
+        assert_eq!(
+            s(
+                &mut ctx,
+                b"String(out.dateDelta >= out.nowDelta && out.dateDelta - out.nowDelta < 100)"
+            ),
+            "true"
+        );
+        assert_eq!(
+            s(
+                &mut ctx,
+                b"String(out.ts >= out.dateDelta && out.ts - out.dateDelta < 100)"
+            ),
+            "true"
+        );
+    }
+
+    #[test]
+    fn page_clocks_advance_synchronously_and_timer_tasks_get_separate_turns() {
+        // High Resolution Time §§2.1/7.1: performance.now() uses a monotonic
+        // clock which keeps counting while script runs. YouTube's scheduler
+        // budgets a rendering slice with exactly this loop shape; a frozen
+        // clock made the slice run until Boa's loop guard instead of yielding.
+        // HTML timers queue tasks, so tickTo must expose one callback per turn
+        // (and therefore a microtask checkpoint between overdue callbacks).
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "monotonic-clock.js",
+            br##"
+            globalThis.out = {};
+            const p0 = performance.now();
+            while (performance.now() - p0 < 4) {}
+            out.performanceDelta = performance.now() - p0;
+            const d0 = Date.now();
+            while (Date.now() - d0 < 4) {}
+            out.dateDelta = Date.now() - d0;
+            out.eventTime = new Event("after-work").timeStamp;
+
+            const order = [];
+            setTimeout(() => order.push(1), 0);
+            setTimeout(() => order.push(2), 0);
+            out.firstCount = __trust.tickTo(__trust.now() + 100);
+            out.afterFirst = order.join(",");
+            out.secondCount = __trust.tickTo(__trust.now() + 100);
+            out.afterSecond = order.join(",");
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let n = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .as_number()
+                .unwrap()
+        };
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert!(n(&mut ctx, b"out.performanceDelta") >= 4.0);
+        assert!(n(&mut ctx, b"out.dateDelta") >= 4.0);
+        assert!(n(&mut ctx, b"out.eventTime") >= 8.0);
+        assert_eq!(n(&mut ctx, b"out.firstCount"), 1.0);
+        assert_eq!(s(&mut ctx, b"out.afterFirst"), "1");
+        assert_eq!(n(&mut ctx, b"out.secondCount"), 1.0);
+        assert_eq!(s(&mut ctx, b"out.afterSecond"), "1,2");
     }
 
     #[test]
@@ -24914,6 +25034,67 @@ mod tests {
     }
 
     #[test]
+    fn a_live_event_runs_microtasks_but_leaves_timers_for_a_later_task() {
+        // WHATWG HTML §8.1.7.3: after one selected task completes, perform a
+        // microtask checkpoint; do not also execute timer tasks it queued. This
+        // is observable ordering, and prevents a click/scroll from pulling an
+        // unrelated framework scheduler chain into one uninterruptible turn.
+        let (handle, mut events) = live(
+            r##"<body><button id=b>go</button><p id=o>initial</p><script>
+            document.getElementById('b').onclick = function () {
+                var out = document.getElementById('o');
+                out.textContent = 'sync';
+                Promise.resolve().then(function () { out.textContent += '|microtask'; });
+                setTimeout(function () { out.textContent += '|timer'; }, 0);
+            };
+            </script></body>"##,
+        );
+        let initial = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => break html,
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected the initial live render, got {other:?}"),
+            }
+        };
+        let button = initial
+            .split("x-trust-js:")
+            .nth(1)
+            .and_then(|rest| rest.split(':').next())
+            .expect("click marker")
+            .parse::<usize>()
+            .unwrap();
+
+        handle.cmds.blocking_send(PageCmd::Click(button)).unwrap();
+        let dispatch_render = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => break html,
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected the click render, got {other:?}"),
+            }
+        };
+        assert!(
+            dispatch_render.contains("sync|microtask"),
+            "the checkpoint must run Promise reactions: {dispatch_render}"
+        );
+        assert!(
+            !dispatch_render.contains("|timer"),
+            "a timer is a later event-loop task: {dispatch_render}"
+        );
+
+        let timer_render = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) if html.contains("|timer") => break html,
+                Some(PageEvt::Updated { .. } | PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected the later timer render, got {other:?}"),
+            }
+        };
+        assert!(
+            timer_render.contains("sync|microtask|timer"),
+            "{timer_render}"
+        );
+    }
+
+    #[test]
     fn decoded_image_sizes_update_geometry_and_rerun_intersections() {
         // PageCmd::ImageSizes: the app's decoded intrinsic sizes reach the
         // actor's measure pass, so the geometry page JS reads matches the page
@@ -25469,13 +25650,10 @@ mod tests {
         // A perpetual `setTimeout(0)` re-arm chain — the shape React's scheduler
         // takes (its MessageChannel posts route through our `setTimeout(0)`), and
         // the shape a never-settling poll takes when its data is gated behind a
-        // bot wall (Twitch). It fast-forwards during the load settle (to ~MAX_TICKS)
-        // and then continues AT REST. Each at-rest wake must fire ONE generation
-        // (`REST_TICKS`), not drain the re-arming chain dozens of times per wake —
-        // the latter pegged a CPU core on any page that never reaches a fixpoint,
-        // because `settle_to` would re-fire the due-now timer up to `DISPATCH_TICKS`
-        // times in a SINGLE wake. So the counter climbs by a SMALL step between
-        // consecutive at-rest renders, not ~50.
+        // bot wall (Twitch). The synchronous call paints COUNT=1; every queued
+        // continuation must then run AT REST, one task per wake (`REST_TICKS`).
+        // Draining the chain during live-page initialization made a framework's
+        // first user-input opportunity wait behind hundreds of author tasks.
         let (_handle, mut events) = live(
             r##"<body><div id="n">COUNT=0</div><script>
             var n = 0;
@@ -25506,17 +25684,19 @@ mod tests {
             counts.len() >= 4,
             "expected several at-rest renders, got {counts:?}"
         );
-        // The chain advances (it's alive), but the STEADY at-rest increment per
-        // render is one generation per wake. Skip the first delta — it spans the
-        // load→rest handoff (the load fast-forwarded the chain to ~MAX_TICKS).
+        assert_eq!(
+            counts[0], 1,
+            "live lifecycle tasks must yield before timer tasks: {counts:?}"
+        );
+        // The chain advances (it's alive), one generation per at-rest turn.
         let deltas: Vec<u64> = counts.windows(2).map(|w| w[1] - w[0]).collect();
         assert!(
             counts.last().unwrap() > counts.first().unwrap(),
             "the chain must keep advancing at rest: {counts:?}"
         );
         assert!(
-            deltas[1..].iter().all(|&d| d <= 4),
-            "each at-rest wake fires ~one generation (REST_TICKS), not ~DISPATCH_TICKS: deltas {deltas:?}"
+            deltas.iter().all(|&d| d <= 4),
+            "each at-rest wake fires ~one generation (REST_TICKS), not a task batch: deltas {deltas:?}"
         );
     }
 
@@ -25633,9 +25813,8 @@ mod tests {
     fn request_animation_frame_runs_at_rest() {
         // A rAF chain (each frame schedules the next) is a one-shot setTimeout
         // driven by the same wake loop; it must keep firing at rest with a
-        // monotonic timestamp, so the frame counter climbs. (rAF chains DO
-        // fast-forward during the load settle — a documented deviation — so the
-        // first render may already be well above 0; we assert it CLIMBS.)
+        // monotonic timestamp, so the frame counter climbs after the initial
+        // live lifecycle tasks have yielded.
         let (_handle, mut events) = live(
             r##"<body><div id="f">FRAME=0</div><script>
             var n = 0;
@@ -25713,9 +25892,9 @@ mod tests {
 
     #[test]
     fn a_timer_can_navigate_at_rest() {
-        // `setTimeout(() => location.href = …)` — a JS meta-refresh. The 1100ms
-        // delay clears the load settle's 1000ms fast-forward window, so it fires
-        // at REST (proving the timer wake routes script navigation), not at load.
+        // `setTimeout(() => location.href = …)` — a JS meta-refresh. It fires at
+        // REST (proving the timer wake routes script navigation), not as part of
+        // DOMContentLoaded/load.
         let (_handle, mut events) = live(
             r##"<body><p>redirecting…</p><script>
             setTimeout(function () { location.href = '/next'; }, 1100);
@@ -28059,6 +28238,31 @@ mod tests {
     }
 
     #[test]
+    fn detached_dirty_targets_do_not_reach_the_render_pipeline() {
+        // DOM §4.2.2: only a node whose shadow-including root is a Document is
+        // connected. Frameworks may freely mutate detached template/work
+        // trees; those mutations cannot affect this document's rendering until
+        // insertion. Filter the detached target, but retain a connected target
+        // from the same mutation cycle so real work is never lost.
+        let mut dom = Dom::parse_document("<body><div id=live></div></body>");
+        let live = dom.get_by_id("live").unwrap();
+        let detached = dom.create_element("div");
+        assert!(!dom.is_connected(detached));
+        assert!(dom.is_connected(live));
+
+        let mut detached_only = vec![(detached, crate::dom::DirtyKind::Attr)];
+        assert!(!retain_connected_dirty_targets(&dom, &mut detached_only));
+        assert!(detached_only.is_empty());
+
+        let mut mixed = vec![
+            (detached, crate::dom::DirtyKind::Content),
+            (live, crate::dom::DirtyKind::Attr),
+        ];
+        assert!(retain_connected_dirty_targets(&dom, &mut mixed));
+        assert_eq!(mixed, vec![(live, crate::dom::DirtyKind::Attr)]);
+    }
+
+    #[test]
     fn an_alt_only_mutation_does_not_re_render() {
         // A click that changes ONLY a non-rendered attribute — an image's `alt`
         // text, which Twitch rotates a co-streamer's name through every second —
@@ -30091,6 +30295,36 @@ mod tests {
     }
 
     #[test]
+    fn get_computed_style_materializes_positioned_box_initial_values() {
+        // CSS Cascade 5 §4 gives every property a specified/computed value;
+        // CSSOM §9 exposes the resolved value, not an internal "unset"
+        // sentinel. A fitting library distinguishes the initial `auto` insets
+        // from authored coordinates before assigning fixed positioning.
+        let (out, outcome) = page(
+            "<body><div id=d></div><script>\
+               var d = document.getElementById('d');\
+               var s = getComputedStyle(d);\
+               var vertically = s.top !== 'auto' ? 'top' : s.bottom !== 'auto' ? 'bottom' : '';\
+               var horizontally = s.left !== 'auto' ? 'left' : s.right !== 'auto' ? 'right' : '';\
+               d.setAttribute('data-initials', [s.position,s.top,s.right,s.bottom,s.left,s.maxWidth,s.maxHeight,s.boxSizing,s.marginTop,s.direction,s.opacity].join('|'));\
+               if (!vertically) { d.style.position='fixed'; d.style.top='0px'; }\
+               if (!horizontally) { d.style.position='fixed'; d.style.left='0px'; }\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(
+                "data-initials=\"static|auto|auto|auto|auto|none|none|content-box|0px|ltr|1\""
+            ),
+            "CSSOM exposed the specified initial values: {out}"
+        );
+        assert!(
+            out.contains("style=\"position: fixed; top: 0px; left: 0px;"),
+            "an ordinary fitting algorithm can now establish a fixed box: {out}"
+        );
+    }
+
+    #[test]
     fn media_queries_apply_at_the_viewport_width() {
         // bare() viewport = 80 cols × 8px = 640px wide. A max-width:768px
         // block matches (hides); a min-width:1000px block doesn't (kept).
@@ -31355,6 +31589,48 @@ mod tests {
         // sync first; the microtask drains before DOMContentLoaded; timers
         // run in virtual-time order (10 before 50, nested at 15); load last.
         assert!(out.contains("sync|micro|dcl|t10|nested|t50|load|"), "{out}");
+    }
+
+    #[test]
+    fn required_browser_lifecycle_task_survives_spent_author_script_budget() {
+        // HTML "the end" queues DOMContentLoaded/load as browser tasks after
+        // parser-ordered scripts. Spending the cumulative allowance prevents
+        // another author script from launching, but must not suppress those
+        // required lifecycle tasks while the page's wall deadline is live.
+        let mut ctx = page_context();
+        let budget = Budget::new(WALL_BUDGET);
+
+        let mut author = Outcome {
+            elapsed: compute_budget(),
+            ..Outcome::default()
+        };
+        run_script(
+            &mut ctx,
+            "author-tail",
+            b"globalThis.__author_tail_ran = true;",
+            &budget,
+            &mut author,
+        );
+        assert!(author.errors.iter().any(|e| e.contains("budget exhausted")));
+
+        let mut lifecycle = Outcome {
+            elapsed: compute_budget(),
+            ..Outcome::default()
+        };
+        run_browser_task(
+            &mut ctx,
+            "DOMContentLoaded",
+            b"globalThis.__required_task_ran = true;",
+            &budget,
+            &mut lifecycle,
+        );
+        assert!(lifecycle.errors.is_empty(), "{:?}", lifecycle.errors);
+        let ran = ctx
+            .eval(Source::from_bytes(
+                "globalThis.__required_task_ran === true",
+            ))
+            .unwrap();
+        assert!(ran.to_boolean());
     }
 
     #[test]
