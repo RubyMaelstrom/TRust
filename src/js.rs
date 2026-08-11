@@ -13837,7 +13837,36 @@ const PRELUDE: &str = r##"
             return { name: n, localName: n, nodeName: n, namespaceURI: null, prefix: null, specified: true, ownerElement: null, value: "", nodeValue: "" };
         }
         createAttributeNS(_ns, n) { const a = this.createAttribute(String(n)); return a; }
-        importNode(n, deep) { return n.cloneNode(!!deep); }
+        // DOM §4.5 `importNode`: clone into THIS document and use its custom
+        // element registry as the fallback registry. Template contents belong
+        // to an inert template document, so this is observably different from
+        // `template.content.cloneNode(true)`: import queues upgrade reactions
+        // for defined descendants and invokes them before returning to author
+        // script ([CEReactions]). Polymer stamps imported templates, binds
+        // object properties to the detached custom elements, then inserts the
+        // fragment; postponing upgrade until insertion lets those own properties
+        // shadow the component's reactive prototype setters forever.
+        importNode(n, options) {
+            if (!n || typeof n.__id !== "number")
+                throw new TypeError("Failed to execute 'importNode': parameter 1 is not of type 'Node'");
+            if (n.nodeType === 9 || n instanceof ShadowRoot)
+                throw new DOMException("Documents and shadow roots cannot be imported", "NotSupportedError");
+            let subtree = false;
+            if (typeof options === "boolean") subtree = options;
+            else if (options && typeof options === "object") {
+                subtree = !options.selfOnly;
+                const registry = options.customElementRegistry;
+                if (registry !== undefined && registry !== null && registry !== customElements)
+                    throw new DOMException("Unsupported custom element registry", "NotSupportedError");
+            }
+            const clone = n.cloneNode(subtree);
+            // `cloneNode` has completed the whole subtree now, matching the
+            // clone algorithm's reaction boundary: constructors run in tree
+            // order, against the complete clone, but connectedCallback waits
+            // until the still-detached result is inserted.
+            if (CE.defs.size) ceScan(clone);
+            return clone;
+        }
         createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
         createNodeIterator(root, whatToShow) { return new NodeIterator(root, whatToShow); }
         createDocumentFragment() { return wrap(__dom_create_fragment()); }
@@ -28881,6 +28910,44 @@ mod tests {
         // All four instances upgraded+connected, in document (pre-)order — the
         // shadow instance (#3) sits at its host's tree position.
         assert!(out.contains(">1234<"), "expected log 1234, got: {out}");
+    }
+
+    #[test]
+    fn import_node_upgrades_defined_custom_elements_before_returning() {
+        // DOM §4.5 `importNode` passes the importing document and its custom
+        // element registry into "clone a node". Creating each defined clone
+        // therefore queues an upgrade reaction, and [CEReactions] invokes the
+        // constructors after the complete clone but BEFORE importNode returns.
+        // Template binders depend on that ordering: assigning `.data` to the
+        // detached imported element must hit its reactive prototype setter,
+        // not create an own property that shadows the setter at insertion.
+        let (out, outcome) = page(
+            "<body><template id=t><reactive-card></reactive-card></template>\
+             <p id=state></p><script>\
+             let constructed = 0, connected = 0;\
+             class ReactiveCard extends HTMLElement {\
+               constructor() { super(); constructed++; this._data = 'default'; }\
+               set data(value) { this._data = value; }\
+               get data() { return this._data; }\
+               connectedCallback() { connected++; this.textContent = this._data; }\
+             }\
+             customElements.define('reactive-card', ReactiveCard);\
+             const fragment = document.importNode(\
+               document.getElementById('t').content, true);\
+             const card = fragment.firstElementChild;\
+             document.getElementById('state').textContent =\
+               (card instanceof ReactiveCard) + ':' + constructed + ':' + connected\
+               + ':' + Object.prototype.hasOwnProperty.call(card, 'data');\
+             card.data = 'Bound before insertion';\
+             document.body.appendChild(fragment);\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(">true:1:0:false<"),
+            "import must upgrade, but not connect, before returning: {out}"
+        );
+        assert!(out.contains(">Bound before insertion<"), "{out}");
     }
 
     #[test]
