@@ -616,6 +616,38 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // CSS Text's break opportunities and emergency-wrap rules remain
             // authoritative in `first_line_end` for that overflow case.
             let break_style = self.break_style(ctx);
+            let emergency_wrap = matches!(
+                break_style.overflow_wrap,
+                crate::text::TextOverflowWrap::Anywhere | crate::text::TextOverflowWrap::BreakWord
+            );
+            if break_style.wrap
+                && emergency_wrap
+                && may_wrap
+                && full.advance > avail
+                && self.pen > self.line_start
+            {
+                // CSS Text 3 §5/§5.4: overflow wrapping adds an
+                // arbitrary opportunity only when there is no otherwise-
+                // acceptable break point in the line. Test this word with
+                // overflow wrapping disabled first: a UAX #14 opportunity
+                // inside it (for example after punctuation) may still fill
+                // the current line, but absent one the preceding collapsible
+                // space wins and the intact word moves to a fresh line.
+                let normal_cut = crate::text::first_line_end(
+                    rest,
+                    &ctx.text_style(),
+                    avail,
+                    crate::text::TextBreakStyle {
+                        overflow_wrap: crate::text::TextOverflowWrap::Normal,
+                        ..break_style
+                    },
+                );
+                if normal_cut == 0 || normal_cut == rest.len() {
+                    self.soft_break();
+                    spaced = false;
+                    continue;
+                }
+            }
             // Under normal/keep-all breaking an ASCII identifier contains no
             // internal soft-wrap opportunity. This covers common class/tag
             // labels without asking Parley to rediscover that fact under the
