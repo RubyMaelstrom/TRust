@@ -484,8 +484,17 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // content fragment at the resolved position.
             Inline::AtomBox(b) => self.place_atom_box(b.node, ctx),
             Inline::Box { node, style, kids } => {
-                let inner = InlineStyle::derive(self.dom, *node, ctx, self.base);
-                self.marks.push((*node, self.lines.len()));
+                // Generated ::before/::after inline boxes have no DOM node;
+                // their inherited text context is the originating element's
+                // surrounding context and their own box model is in `style`.
+                let inner = if *node == crate::layout2::NO_NODE {
+                    ctx.clone()
+                } else {
+                    InlineStyle::derive(self.dom, *node, ctx, self.base)
+                };
+                if *node != crate::layout2::NO_NODE {
+                    self.marks.push((*node, self.lines.len()));
+                }
                 self.pending_gap_px += self.edge_px(style, LEFT);
                 for k in kids {
                     self.walk(k, &inner);
