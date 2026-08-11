@@ -1049,10 +1049,19 @@ impl BrowserController {
                 changed
             }
             PageEvt::Scrolled { node, top, left } => {
-                self.interaction
-                    .nested_scroll
-                    .insert(node, CssPoint::new(left as f32, top as f32));
-                true
+                let position = CssPoint::new(left as f32, top as f32);
+                let changed = self.interaction.nested_scroll.get(&node) != Some(&position);
+                self.interaction.nested_scroll.insert(node, position);
+                // Programmatic CSSOM scrolling arrives without an HTML
+                // mutation. Native graphical frontends cache the display list,
+                // whose nested-scroll transform is baked at extraction time,
+                // so advance the render revision exactly when the offset moves.
+                // (Wheel input updates its retained display list directly and
+                // does not travel through this page-originated event.)
+                if changed && let Some(page) = &mut self.current {
+                    page.revision = page.revision.wrapping_add(1);
+                }
+                changed
             }
             PageEvt::SubmitDefault => {
                 if let Some((form, submitter)) = self.pending_live_submit.take() {
@@ -1428,6 +1437,44 @@ mod tests {
         assert!(browser.handle_page_event(crate::js::PageEvt::Settled));
         assert_eq!(browser.snapshot().status, "Ready");
         assert!(!browser.handle_page_event(crate::js::PageEvt::Settled));
+    }
+
+    #[test]
+    fn page_originated_horizontal_scroll_invalidates_the_cached_display_list() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        browser.current = Some(BrowserPage {
+            target: Link::Http(url::Url::parse("https://example.com/").unwrap()),
+            fallback_http: false,
+            document: FetchedDocument::Internal(Vec::new()),
+            status: String::from("Ready"),
+            rendered_html: Some(String::from("<div data-trust-node=17></div>")),
+            revision: 7,
+        });
+
+        assert!(browser.handle_page_event(crate::js::PageEvt::Scrolled {
+            node: 17,
+            top: 0.0,
+            left: 100.0,
+        }));
+        assert_eq!(browser.current.as_ref().unwrap().revision, 8);
+        assert_eq!(
+            browser.interaction().nested_scroll.get(&17),
+            Some(&CssPoint::new(100.0, 0.0))
+        );
+
+        // A duplicate notification changes no pixels and must not churn the
+        // retained desktop layout cache.
+        assert!(!browser.handle_page_event(crate::js::PageEvt::Scrolled {
+            node: 17,
+            top: 0.0,
+            left: 100.0,
+        }));
+        assert_eq!(browser.current.as_ref().unwrap().revision, 8);
     }
 
     #[test]

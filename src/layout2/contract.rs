@@ -374,6 +374,9 @@ pub struct FixedItem {
 pub struct Carousel {
     pub start: usize,
     pub end: usize,
+    /// Resident page actor node for this scrolling box. The app uses it to
+    /// apply page-originated CSSOM `scrollLeft` writes to the retained strip.
+    pub live_node: Option<usize>,
     /// On-screen band the strip is clipped to (cells).
     pub left: u16,
     pub right: u16,
@@ -395,6 +398,10 @@ pub struct Carousel {
     /// strip scrolls FREELY (by a fraction of the band), never forcing an
     /// alignment the page didn't ask for.
     pub snap: bool,
+    /// The author requested `scrollbar-width:none`. CSS Scrollbars Styling 1
+    /// §3 requires hiding the scrollbar without disabling other scrolling
+    /// mechanisms, so terminal input still operates this carousel.
+    pub hide_scrollbar: bool,
 }
 
 /// One image layer of an alpha-composited overlap group (LAYOUT_OVERHAUL_PLAN.md

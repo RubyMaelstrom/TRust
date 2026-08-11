@@ -1441,6 +1441,9 @@ struct FItem<'t> {
     m: [f32; 4],
     auto: [bool; 4],
     bp_main: f32,
+    /// Border + padding in the cross axis. Flex stretch determines a used
+    /// BORDER-box cross size; `item_frag` consumes a CONTENT-box size.
+    bp_cross: f32,
     align: AlignItem,
     /// The item's definite content height, when its `height` resolves
     /// (row: the cross size; column: the specified-size suggestion).
@@ -1632,6 +1635,23 @@ impl Flow<'_> {
             // own note (border-box basis 0 with padding ⇒ negative inner
             // base, corrected by the §9.7 clamp).
             let to_content = |v: f32| if s.border_box { v - bp_main } else { v };
+            // CSS Sizing 3 §3.2: intrinsic sizing keywords on min/max-width
+            // use the corresponding CONTENT size directly (box-sizing does
+            // not transform it). fit-content clamps the stretch-fit size
+            // between the item's min- and max-content sizes.
+            let intrinsic_main = |l: &Len| -> Option<f32> {
+                match l {
+                    Len::MinContent => Some(self.intrinsic_w(it, IMode::Min, inl)),
+                    Len::MaxContent => Some(self.intrinsic_w(it, IMode::Max, inl)),
+                    Len::FitContent => {
+                        let min = self.intrinsic_w(it, IMode::Min, inl);
+                        let max = self.intrinsic_w(it, IMode::Max, inl).max(min);
+                        let stretch = (content_w - m[LEFT] - m[RIGHT] - bp_main).max(0.0);
+                        Some(stretch.clamp(min, max))
+                    }
+                    _ => None,
+                }
+            };
             let width_def = s.width.resolve(Some(content_w)).map(to_content);
             let base = match &basis {
                 Len::Auto => width_def,
@@ -1642,9 +1662,8 @@ impl Flow<'_> {
             .unwrap_or_else(|| self.intrinsic_w(it, IMode::Max, inl));
             let max_main = match &s.max_width {
                 Len::None => f32::INFINITY,
-                l => l
-                    .resolve(Some(content_w))
-                    .map(to_content)
+                l => intrinsic_main(l)
+                    .or_else(|| l.resolve(Some(content_w)).map(to_content))
                     .map(|v| v.max(0.0))
                     .unwrap_or(f32::INFINITY),
             };
@@ -1663,9 +1682,8 @@ impl Flow<'_> {
                         v.min(max_main)
                     }
                 }
-                l => l
-                    .resolve(Some(content_w))
-                    .map(to_content)
+                l => intrinsic_main(l)
+                    .or_else(|| l.resolve(Some(content_w)).map(to_content))
                     .map(|v| v.max(0.0))
                     .unwrap_or(0.0),
             };
@@ -1707,6 +1725,7 @@ impl Flow<'_> {
                 m,
                 auto,
                 bp_main,
+                bp_cross: bp_v,
                 align,
                 def_h,
                 cross_auto: matches!(s.height, Len::Auto),
@@ -1850,7 +1869,13 @@ impl Flow<'_> {
                     && !fi[i].auto[TOP]
                     && !fi[i].auto[BOTTOM]
                 {
-                    let stretched = (cross - fi[i].m[TOP] - fi[i].m[BOTTOM]).max(0.0);
+                    // Flexbox §8.3 makes the item's margin-box cross size
+                    // match the line. Convert that resulting border-box size
+                    // to the content-box height expected by `item_frag`;
+                    // otherwise vertical padding is added a second time and
+                    // the stretched child overflows its card.
+                    let stretched =
+                        (cross - fi[i].m[TOP] - fi[i].m[BOTTOM] - fi[i].bp_cross).max(0.0);
                     let used = calcs[i].target.max(0.0);
                     let (frag2, anc2) =
                         self.item_frag(fi[i].b, used, content_w, Some(stretched), inl);
@@ -2028,6 +2053,7 @@ impl Flow<'_> {
                 m,
                 auto,
                 bp_main,
+                bp_cross,
                 align,
                 def_h,
                 cross_auto,

@@ -4211,24 +4211,61 @@ impl App {
         }
     }
 
-    /// Apply a page-initiated inner-scroll write (`PageEvt::Scrolled`): move the
-    /// region whose live node matches to the page's `scrollTop` (px → rows,
-    /// clamped) — a cheap re-blit, no re-parse. The page dictated this offset, so
-    /// mark it `voffset_from_page` (a subsequent re-layout keeps it).
-    fn apply_region_scroll(&mut self, node: usize, top: f64) {
+    /// Apply a page-initiated inner-scroll write (`PageEvt::Scrolled`) to the
+    /// matching retained vertical region and/or horizontal carousel. CSS pixels
+    /// quantize to terminal rows/columns exactly here, then clamp to the
+    /// scrolling area — a cheap re-blit with no re-parse.
+    fn apply_inner_scroll(&mut self, node: usize, top: f64, left: f64) {
         let cell_h = f64::from(self.picker.font_size().height.max(1));
+        let cell_w = f64::from(self.picker.font_size().width.max(1));
         let rows = (top / cell_h).round().max(0.0) as usize;
+        let cols = (left / cell_w).round().max(0.0) as u16;
         let Some(g) = self.browser.as_mut() else {
             return;
         };
-        for rg in g.doc.regions.iter_mut() {
-            if rg.live_node == Some(node) {
-                rg.voffset = rows.min(rg.max_voffset());
-                rg.voffset_from_page = true;
-                // Keep the write-back dedup in sync so a wheel right after a
-                // page pin still re-sends (the page owns this value now).
-                self.region_scroll_sent.insert(node, rg.voffset);
+
+        fn apply(
+            carousels: &mut [crate::layout2::Carousel],
+            regions: &mut [crate::layout2::Region],
+            node: usize,
+            rows: usize,
+            cols: u16,
+            region_offset: &mut Option<usize>,
+        ) {
+            for carousel in carousels {
+                if carousel.live_node == Some(node) {
+                    carousel.offset = cols.min(carousel.max_offset());
+                }
             }
+            for region in regions {
+                if region.live_node == Some(node) {
+                    region.voffset = rows.min(region.max_voffset());
+                    region.voffset_from_page = true;
+                    *region_offset = Some(region.voffset);
+                }
+                apply(
+                    &mut region.carousels,
+                    &mut region.regions,
+                    node,
+                    rows,
+                    cols,
+                    region_offset,
+                );
+            }
+        }
+        let mut region_offset = None;
+        apply(
+            &mut g.doc.carousels,
+            &mut g.doc.regions,
+            node,
+            rows,
+            cols,
+            &mut region_offset,
+        );
+        // Keep the write-back dedup in sync so a wheel right after a page pin
+        // still re-sends (the page owns this value now).
+        if let Some(offset) = region_offset {
+            self.region_scroll_sent.insert(node, offset);
         }
     }
 
@@ -4384,8 +4421,9 @@ impl App {
         let mut submit_nodes: Option<(usize, Option<usize>, Option<crate::js::FormSubmission>)> =
             None;
         // Page-initiated inner-scroll writes (CSSOM View) without a DOM mutation:
-        // applied AFTER any content update so they land on the new regions.
-        let mut scrolled: Vec<(usize, f64)> = Vec::new();
+        // applied AFTER any content update so they land on the new scrolling
+        // boxes. Values are `(actor, scrollTop, scrollLeft)` in CSS pixels.
+        let mut scrolled: Vec<(usize, f64, f64)> = Vec::new();
         let mut pending = Some(evt);
         let mut drains = 0u32;
         loop {
@@ -4411,9 +4449,9 @@ impl App {
                 }
                 Some(PageEvt::Trouble(errors)) => trouble.extend(errors),
                 Some(PageEvt::Settled) => tally_evt(3),
-                Some(PageEvt::Scrolled { node, top, .. }) => {
+                Some(PageEvt::Scrolled { node, top, left }) => {
                     tally_evt(2);
-                    scrolled.push((node, top));
+                    scrolled.push((node, top, left));
                 }
                 Some(PageEvt::SubmitDefault) => submit_default = true,
                 Some(PageEvt::SubmitForm {
@@ -4464,8 +4502,8 @@ impl App {
         // Page-initiated scroll writes (a chat pinning to bottom) re-window the
         // region cheaply — after any content update, so they target the new
         // regions. Latest write per node wins (the loop preserves order).
-        for (node, top) in scrolled {
-            self.apply_region_scroll(node, top);
+        for (node, top, left) in scrolled {
+            self.apply_inner_scroll(node, top, left);
         }
         // A same-document fragment scroll (`#anchor` link inside the live page),
         // applied after any content update so it resolves against the new doc.
@@ -7497,13 +7535,12 @@ async fn load_one_image(
         return None;
     }
     let raw: std::sync::Arc<[u8]> = resp.body.into();
-    // Record an EXTERNAL SVG's ratio-only ratio (a `viewBox` with no intrinsic
-    // width/height) so replaced sizing can apply CSS 2.1 §10.3.2 rule 3 to it —
-    // layout can't read an external SVG's markup the way it reads a `data:` one.
-    if let Some(ratio) = crate::img::svg_bytes_ratio_only(&raw) {
-        crate::img::note_svg_ratio_only(url, ratio);
-    }
     let (intrinsic, has_alpha) = decoded_intrinsic(raw.clone()).await?;
+    // SVG 2 §8.12: a viewBox supplies an intrinsic ratio, but auto/percentage
+    // root dimensions do not supply intrinsic dimensions. Publish that
+    // distinction only after a successful decode, before layout receives the
+    // decoder's concrete fallback bitmap dimensions.
+    crate::img::record_svg_intrinsic_metadata(url, &raw);
     Some(DecodedImage {
         raw,
         intrinsic,
@@ -9203,14 +9240,36 @@ mod tests {
     fn apply_region_scroll_windows_the_region_from_the_page_signal() {
         let mut app = region_app_with_node(None);
         let cell_h = f64::from(app.picker.font_size().height);
-        app.apply_region_scroll(99, 5.0 * cell_h);
+        app.apply_inner_scroll(99, 5.0 * cell_h, 0.0);
         let rg = &app.browser.as_ref().unwrap().doc.regions[0];
         assert_eq!(rg.voffset, 5);
         assert!(rg.voffset_from_page);
         // A pin past the bottom clamps (CSSOM View).
-        app.apply_region_scroll(99, 9999.0 * cell_h);
+        app.apply_inner_scroll(99, 9999.0 * cell_h, 0.0);
         let rg = &app.browser.as_ref().unwrap().doc.regions[0];
         assert_eq!(rg.voffset, rg.max_voffset(), "clamped to the bottom");
+    }
+
+    #[test]
+    fn apply_inner_scroll_moves_a_live_horizontal_carousel() {
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (80, 10);
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let html = r#"<body style="margin:0"><div data-trust-node="77" style="display:flex;overflow-x:auto;width:80px"><div style="flex:0 0 80px">one</div><div style="flex:0 0 80px">two</div><div style="flex:0 0 80px">three</div></div></body>"#;
+        app.navigate_to(crate::http::parse(
+            &url,
+            "text/html",
+            html.as_bytes(),
+            80,
+            10,
+            &Default::default(),
+        ));
+        let cell_w = f64::from(app.picker.font_size().width);
+        app.apply_inner_scroll(77, 0.0, 10.0 * cell_w);
+        let carousel = &app.browser.as_ref().unwrap().doc.carousels[0];
+        assert_eq!(carousel.live_node, Some(77));
+        assert_eq!(carousel.offset, 10, "CSS scrollLeft quantizes to cells");
     }
 
     #[test]

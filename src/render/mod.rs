@@ -611,6 +611,14 @@ impl Scene {
                 let DisplayCommand::HitRegion(region) = primitive else {
                     return None;
                 };
+                // Paint emits geometry regions for ordinary boxes as well as
+                // actionable content. Hit testing must continue through a
+                // topmost decorative/anonymous region to the first semantic
+                // target beneath it; filtering only after this method returns
+                // made text/pseudo/SVG paint over a button swallow its click.
+                if region.link.is_none() && region.actor.is_none() {
+                    return None;
+                }
                 let state = states.get(index)?.as_ref()?;
                 point_in_interaction_state(point, state)
                     .then(|| state.transform.inverse())
@@ -1966,6 +1974,36 @@ mod tests {
                 .is_none(),
             "the active page clip must constrain hit testing"
         );
+    }
+
+    #[test]
+    fn decorative_hit_region_does_not_mask_the_button_beneath_it() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(800, 600), ScaleFactor::default());
+        let mut scene = desktop_shell(viewport, &snapshot());
+        let mut page = PagePaint::default();
+        let rect = CssRect::new(10.0, 10.0, 40.0, 30.0);
+        page.primitives.push(DisplayCommand::HitRegion(HitRegion {
+            rect,
+            node: 7,
+            actor: Some(42),
+            link: None,
+        }));
+        // A later-painted anonymous glyph/SVG box has geometry but no semantic
+        // identity. The button remains the pointer target through that paint.
+        page.primitives.push(DisplayCommand::HitRegion(HitRegion {
+            rect,
+            node: crate::layout2::NO_NODE,
+            actor: None,
+            link: None,
+        }));
+        scene.append_page(&page, CssPoint::default());
+
+        let point = CssPoint::new(20.0, scene.content_viewport.y + 20.0);
+        let hit = scene
+            .page_hit_at(point)
+            .expect("button should remain hittable");
+        assert_eq!((hit.node, hit.actor), (7, Some(42)));
     }
 
     #[test]

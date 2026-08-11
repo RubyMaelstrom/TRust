@@ -2905,6 +2905,18 @@ fn walk_forms_arena(
                 let Some(field) = field_from_arena(dom, child, tag) else {
                     continue;
                 };
+                // WHATWG HTML §4.10.6 says that a <button> is labeled by
+                // its CONTENTS, and Rendering §15.5.3 makes those child boxes
+                // the anonymous button content box. A button with no form
+                // owner therefore must not be turned into our synthetic form
+                // atom: doing so discards an icon-only button's <img>/<svg>
+                // child and paints "[ Button ]" instead. Living pages route
+                // such controls through their x-trust-js click-marker wrapper;
+                // leaving the element unmapped lets normal button layout paint
+                // its authored children inside that clickable wrapper.
+                if current.is_none() && tag == "button" {
+                    continue;
+                }
                 // A formless submit control (a bare <button>/<input type=submit>
                 // with no form owner) has nothing to submit — its onClick is the
                 // whole interaction, so leave it to the JsClick stub path rather
@@ -5965,7 +5977,7 @@ mod tests {
             }
         }
         // TRUST_DIAG_CLICK=<nodeid>: dispatch a click to that live node and drain
-        // events, to see whether it navigates / re-renders / errors (temporary).
+        // events, to see whether it navigates / re-renders / errors.
         if let Ok(nstr) = std::env::var("TRUST_DIAG_CLICK")
             && let Some(live) = response.live.as_mut()
         {

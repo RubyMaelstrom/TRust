@@ -256,6 +256,23 @@ pub fn decode_graphical(bytes: &[u8]) -> Result<crate::render::ImageResource, St
     })
 }
 
+/// Decode a fetched HTML/CSS image and publish the intrinsic metadata that
+/// layout cannot obtain from an external resource URL alone.
+///
+/// SVG 2 §8.12 requires an outer `viewBox` to provide an intrinsic aspect
+/// ratio while `auto`/percentage root dimensions provide no intrinsic width
+/// or height. Keeping that distinction beside the decoded resource prevents
+/// the SVG renderer's concrete fallback bitmap size from masquerading as an
+/// intrinsic size during the subsequent CSS replaced-element layout pass.
+pub fn decode_graphical_for_source(
+    source: &str,
+    bytes: &[u8],
+) -> Result<crate::render::ImageResource, String> {
+    let image = decode_graphical(bytes)?;
+    record_svg_intrinsic_metadata(source, bytes);
+    Ok(image)
+}
+
 fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
     let format =
         image::guess_format(bytes).map_err(|_| String::from("unrecognized image format"))?;
@@ -448,7 +465,7 @@ fn view_box_ratio(value: &str) -> Option<f32> {
 }
 
 /// The intrinsic RATIO of an SVG that has an intrinsic ratio but NO intrinsic
-/// width or height (referenced with only a `viewBox`) — the CSS 2.1
+/// width or height (referenced with only a `viewBox`) — the CSS 2.2
 /// §10.3.2/§10.6.2 "rule 3" case. `None` when the bytes are not SVG, when the
 /// root carries a real intrinsic width/height (a genuine intrinsic SIZE — the
 /// decoder's natural dimensions handle that), or when there is no ratio.
@@ -494,22 +511,27 @@ pub(crate) fn svg_url_ratio_only(src: &str) -> Option<f32> {
 /// Process-global cache of EXTERNAL image URLs whose SVG is ratio-only (a
 /// `viewBox` but no intrinsic width/height — §10.3.2 rule 3). An SVG's intrinsic
 /// ratio is a property of the resource, not the page, so it is keyed by URL and
-/// shared across the session like the connection pool. Populated by the image
-/// loader on decode (`note_svg_ratio_only`); read by replaced sizing
+/// shared across the session like the connection pool. Refreshed by the image
+/// loader on decode (`record_svg_intrinsic_metadata`); read by replaced sizing
 /// (`svg_ratio_only_get`) for `<img>` elements whose markup layout can't see
 /// (only `data:` SVGs are read inline via `svg_url_ratio_only`).
 static SVG_RATIO_ONLY: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, f32>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Record that the resource at `url` is a ratio-only SVG (intrinsic ratio,
-/// no intrinsic size). Called by the image loader once per decoded resource.
-pub(crate) fn note_svg_ratio_only(url: &str, ratio: f32) {
-    if ratio.is_finite() && ratio > 0.0 {
-        SVG_RATIO_ONLY
-            .lock()
-            .unwrap()
-            .insert(url.to_string(), ratio);
+/// Refresh the external-resource metadata after a successful decode. A URL
+/// can be revalidated to different bytes, so a now-dimensioned SVG or raster
+/// image must also clear an older ratio-only entry for the same URL.
+pub(crate) fn record_svg_intrinsic_metadata(url: &str, bytes: &[u8]) {
+    let ratio = svg_bytes_ratio_only(bytes);
+    let mut ratios = SVG_RATIO_ONLY.lock().unwrap();
+    match ratio {
+        Some(ratio) if ratio.is_finite() && ratio > 0.0 => {
+            ratios.insert(url.to_string(), ratio);
+        }
+        _ => {
+            ratios.remove(url);
+        }
     }
 }
 
@@ -1186,6 +1208,21 @@ mod tests {
         let url = "data:image/svg+xml,%3csvg%20viewBox='0%200%20300%20300'%3e%3c/svg%3e";
         assert_eq!(svg_url_ratio_only(url), Some(1.0));
         assert_eq!(svg_url_ratio_only("data:image/png;base64,iVBOR"), None);
+    }
+
+    #[test]
+    fn graphical_source_decode_records_and_refreshes_svg_intrinsic_metadata() {
+        let source = "https://images.example/ratio-only-regression.svg";
+        let ratio_only = br#"<svg viewBox="0 0 300 150" xmlns="http://www.w3.org/2000/svg"/>"#;
+        let decoded = decode_graphical_for_source(source, ratio_only).unwrap();
+        assert_eq!((decoded.width, decoded.height), (300, 150));
+        assert_eq!(svg_ratio_only_get(source), Some(2.0));
+
+        // Revalidation may change the resource at a stable URL. Definite root
+        // dimensions are real SVG intrinsic dimensions and must remove the
+        // old ratio-only classification.
+        decode_graphical_for_source(source, &sample_svg()).unwrap();
+        assert_eq!(svg_ratio_only_get(source), None);
     }
 
     #[test]

@@ -424,6 +424,11 @@ fn paint_carousel(
     stops.sort_unstable();
     stops.dedup();
     let snap = inline_snaps && !stops.is_empty();
+    let hide_scrollbar = matches!(
+        dom.computed_value_resolved(f.node, "scrollbar-width")
+            .as_deref(),
+        Some("none")
+    );
     // Composite the strip at the current-FRAME columns (`ox`), rows relative to
     // the band top (`oy`), wide enough to keep every card's full columns — so
     // the strip items land at frame columns `band_left + strip_x` for the
@@ -437,16 +442,29 @@ fn paint_carousel(
     f.children.clear();
     let end = start_row + strip.len();
     splices.push((start_row, strip));
+    let live_node = dom
+        .attr(f.node, "data-trust-node")
+        .and_then(|s| s.parse().ok());
+    let max_offset = strip_w.saturating_sub(scrollport);
+    let offset = dom
+        .attr(f.node, "data-trust-scroll-left")
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map_or(0, |px| {
+            ((px / cw).round().max(0.0) as usize).min(max_offset)
+        });
     carousels.push(Carousel {
         start: start_row,
         end,
+        live_node,
         left: band_left.min(u16::MAX as usize) as u16,
         right: (band_left + scrollport).min(u16::MAX as usize) as u16,
         width: strip_w.min(u16::MAX as usize) as u16,
         stops,
-        offset: 0,
+        offset: offset.min(u16::MAX as usize) as u16,
         frame_right: None,
         snap,
+        hide_scrollbar,
     });
 }
 
