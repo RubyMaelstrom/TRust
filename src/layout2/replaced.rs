@@ -96,7 +96,7 @@ pub(crate) fn size(
     } else {
         attr("height")
     };
-    // CSS 2.1 §10.3.2 "rule 3"/§10.6.2: a replaced element with an intrinsic
+    // CSS 2.2 §10.3.2/§10.6.2: a replaced element with an intrinsic
     // ratio but NO intrinsic width or height (an SVG referenced with only a
     // `viewBox`), sized auto/auto, takes its width from the block constraint
     // equation — the containing block's available width — not the decoder's

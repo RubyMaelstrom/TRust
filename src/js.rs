@@ -1829,13 +1829,15 @@ unsafe impl boa_engine::gc::Trace for PageBlobs {
 /// The geometry cache: the DOM epoch it was built for, each element's pixel box
 /// keyed by node, and (layout2 only) each grid container's used track sizes in
 /// px `(columns, rows)` — the CSSOM resolved value for `grid-template-columns`/
-/// `-rows`. ONE layout pass fills both, reused until the next mutation. Stale
+/// `-rows` — and each scroll container's scrolling-area rectangle. ONE layout
+/// pass fills all three, reused until the next mutation. Stale
 /// (epoch mismatch) entries rebuild lazily on the next `__dom_rect`/
 /// `__dom_computed` read — free for pages that never measure.
 type GeomCache = (
     u64,
     std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
     std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
+    std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
 );
 
 /// Backing for the JS geometry APIs (`getBoundingClientRect`, `offset*`/
@@ -2352,6 +2354,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_contains", 2, sys_contains),
         ("__dom_set_hover", 1, sys_set_hover),
         ("__dom_children", 1, sys_children),
+        ("__dom_slot_assigned", 1, sys_slot_assigned),
         ("__dom_next", 1, sys_next),
         ("__dom_prev", 1, sys_prev),
         ("__dom_node_type", 1, sys_node_type),
@@ -2589,6 +2592,20 @@ fn sys_children(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
     Ok(ids_array(ids, ctx))
 }
 
+/// `HTMLSlotElement.assignedNodes()` backing. WHATWG DOM §4.2.2.3 finds the
+/// host's light-DOM slottables whose names select this slot; fallback children
+/// are handled by the IDL method only when `{ flatten: true }` is requested.
+fn sys_slot_assigned(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let ids = {
+        let d = dom.borrow();
+        arg_node(&d, args, 0)
+            .map(|id| d.slot_assigned_nodes(id))
+            .unwrap_or_default()
+    };
+    Ok(ids_array(ids, ctx))
+}
+
 fn sys_next(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let dom = page_dom(ctx);
     let d = dom.borrow();
@@ -2772,7 +2789,7 @@ fn ensure_geom_cache(ctx: &mut Context) -> Option<Rc<RefCell<GeomCache>>> {
         // JS geometry reads the same engine that laid the page out
         // (LAYOUT_OVERHAUL_PLAN.md P7): the boxes come straight off the fragment
         // tree AND one pass yields the used grid track sizes.
-        let (boxes, tracks) = crate::layout2::measure_boxes_css(
+        let (boxes, tracks, scrolling_areas) = crate::layout2::measure_boxes_css(
             &d,
             &base,
             viewport,
@@ -2782,6 +2799,7 @@ fn ensure_geom_cache(ctx: &mut Context) -> Option<Rc<RefCell<GeomCache>>> {
         );
         c.1 = boxes;
         c.2 = tracks;
+        c.3 = scrolling_areas;
         c.0 = epoch;
     }
     drop(c);
@@ -2845,14 +2863,29 @@ fn sys_rect(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
 /// prelude getter then falls back to the element's measured rect); an unset
 /// position reads `0` (CSSOM scroll origin is the top).
 fn sys_scroll_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let which = arg_id(args, 1).unwrap_or(0) as u8;
+    // CSSOM View §6: scrollWidth/scrollHeight are the dimensions of the
+    // scrolling area, not aliases for the element's border box.
+    let scrolling_area = if matches!(which, 2 | 3) {
+        let cache = ensure_geom_cache(ctx);
+        let id = {
+            let dom = page_dom(ctx);
+            let d = dom.borrow();
+            arg_node(&d, args, 0)
+        };
+        cache.and_then(|cache| id.and_then(|id| cache.borrow().3.get(&id).copied()))
+    } else {
+        None
+    };
     let dom = page_dom(ctx);
     let d = dom.borrow();
     let Some(id) = arg_node(&d, args, 0) else {
         return Ok(JsValue::null());
     };
-    let which = arg_id(args, 1).unwrap_or(0) as u8;
     Ok(match d.scroll_metric(id, which) {
         Some(v) => JsValue::from(v),
+        None if which == 2 => scrolling_area.map_or(JsValue::null(), |r| JsValue::from(r.height)),
+        None if which == 3 => scrolling_area.map_or(JsValue::null(), |r| JsValue::from(r.width)),
         None => JsValue::null(),
     })
 }
@@ -2865,12 +2898,11 @@ fn sys_scroll_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
     let dom = page_dom(ctx);
     let mut d = dom.borrow_mut();
     let Some(id) = arg_node(&d, args, 0) else {
-        return Ok(JsValue::undefined());
+        return Ok(JsValue::from(false));
     };
     let top = args.get(1).and_then(JsValue::as_number).unwrap_or(0.0);
     let left = args.get(2).and_then(JsValue::as_number).unwrap_or(0.0);
-    d.set_scroll_pos(id, top, left, true);
-    Ok(JsValue::undefined())
+    Ok(JsValue::from(d.set_scroll_pos(id, top, left, true)))
 }
 
 fn sys_remove_attr(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -6474,6 +6506,7 @@ fn load_page(
                     u64::MAX,
                     std::collections::HashMap::new(),
                     std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
                 ))),
                 images: Rc::new(RefCell::new(crate::layout2::ImageSizes::new())),
             });
@@ -9220,9 +9253,11 @@ fn finish_dispatch_render(
     let scrolls = page.dom.borrow_mut().take_scroll_changes();
     let dirty = page.dom.borrow_mut().take_dirty();
     if dirty && let Some(ok) = emit_dirty_render(page, evts) {
-        // The Updated/Patched's baked `data-trust-scroll-top` carries every
-        // region's scroll position, so the cheap `Scrolled` events are redundant.
-        return ok;
+        // A render serializes vertical region offsets, but horizontal CSSOM
+        // offsets are frontend state too. Always deliver the authoritative
+        // Scrolled records after the mutation render; this also covers a script
+        // that mutates the DOM and calls scrollBy in the same event turn.
+        return ok && send_scroll_events(&scrolls, evts);
     }
     // No visible content change: deliver any pure-scroll writes cheaply (the app
     // re-windows the region without a re-parse). This is the chat-pin path when a
@@ -12041,13 +12076,14 @@ const PRELUDE: &str = r##"
         get textContent() { return __dom_text(this.__id); }
         set textContent(v) {
             v = v === null || v === undefined ? "" : String(v);
-            if (!MO.length) { __dom_set_text(this.__id, v); return; }
+            if (!MO.length) { __dom_set_text(this.__id, v); slotQueueCheck(this); return; }
             const t = this.nodeType;
             if (t === 3 || t === 8) { const old = __dom_text(this.__id); __dom_set_text(this.__id, v); moCharData(this, old); return; }
             // On an element, textContent replaces all children with one text node.
             const removed = this.childNodes;
             __dom_set_text(this.__id, v);
             moChildBulk(this, removed, this.childNodes);
+            slotQueueCheck(this);
         }
         get nodeValue() { const t = this.nodeType; return t === 3 || t === 8 ? __dom_text(this.__id) : null; }
         set nodeValue(v) {
@@ -12086,6 +12122,7 @@ const PRELUDE: &str = r##"
             // Pre-insertion validity (WHATWG DOM §4.2.3): the syscall refuses
             // (returns false, unmutated) when `c` is an inclusive ancestor.
             if (!__dom_append(this.__id, c.__id)) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            slotQueueCheck(this);
             if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
@@ -12097,6 +12134,7 @@ const PRELUDE: &str = r##"
         insertBefore(c, ref) {
             if (c && c.nodeType === 11 && !c.__host) { for (const k of c.childNodes) this.insertBefore(k, ref); return c; }
             if (!__dom_insert_before(this.__id, c.__id, ref ? ref.__id : null)) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            slotQueueCheck(this);
             if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
             maybeRunScript(c);
@@ -12105,7 +12143,7 @@ const PRELUDE: &str = r##"
             else if (c.__trustLN === "iframe" || c.__trustLN === "frame") maybeProcessInsertedFrame(c, this);
             return c;
         }
-        removeChild(c) { if (c.__trustLN === "base") baseHrefCache = null; if (MO.length) moChildRemove(this, c); if (CE.defs.size) ceDisconnect(c); __dom_detach(c.__id); return c; }
+        removeChild(c) { if (c.__trustLN === "base") baseHrefCache = null; if (MO.length) moChildRemove(this, c); if (CE.defs.size) ceDisconnect(c); __dom_detach(c.__id); slotQueueCheck(this); return c; }
         replaceChild(n, old) {
             const prev = old.previousSibling, next = old.nextSibling;
             // Validity (WHATWG DOM §4.2.3) before any side effect: the insert
@@ -12113,6 +12151,7 @@ const PRELUDE: &str = r##"
             if (!__dom_insert_before(this.__id, n.__id, old.__id)) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
             if (CE.defs.size) ceDisconnect(old);
             __dom_detach(old.__id);
+            slotQueueCheck(this);
             if (MO.length) moNotify({ type: "childList", target: this, addedNodes: [n],
                 removedNodes: [old], previousSibling: prev, nextSibling: next });
             if (CE.defs.size) ceScan(n);
@@ -12122,7 +12161,7 @@ const PRELUDE: &str = r##"
             else if (n.__trustLN === "iframe" || n.__trustLN === "frame") maybeProcessInsertedFrame(n, this);
             return old;
         }
-        remove() { if (this.__trustLN === "base") baseHrefCache = null; const p = this.parentNode; if (p && MO.length) moChildRemove(p, this); if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); }
+        remove() { if (this.__trustLN === "base") baseHrefCache = null; const p = this.parentNode; if (p && MO.length) moChildRemove(p, this); if (CE.defs.size) ceDisconnect(this); __dom_detach(this.__id); slotQueueCheck(p); }
         append(...ns) { for (const n of ns) this.appendChild(n && typeof n === "object" ? n : g.document.createTextNode(String(n))); }
         prepend(...ns) { const f = this.firstChild; for (const n of ns) this.insertBefore(n && typeof n === "object" ? n : g.document.createTextNode(String(n)), f); }
         // The ChildNode mixin: lit's svg templates go through
@@ -12376,6 +12415,49 @@ const PRELUDE: &str = r##"
     // target inherits this prototype so the `instanceof` check holds.
     const DOMStringMap = function () { throw new TypeError("Illegal constructor"); };
 
+    // CSSOM View §6 queues element scroll notifications on the event loop; it
+    // does not dispatch them synchronously from `scrollLeft`/`scrollBy`. Keep
+    // one task per scrolling box so two-axis writes in one operation coalesce,
+    // and resolve every scroll Promise after the instant scroll completes.
+    // TRust may perform `smooth` instantly (CSSOM View explicitly conditions
+    // smooth animation on whether the UA honors the behavior), but completion
+    // and event ordering remain the same.
+    const PENDING_ELEMENT_SCROLLS = new Map();
+    function queueElementScroll(el, resolve) {
+        let pending = PENDING_ELEMENT_SCROLLS.get(el.__id);
+        if (pending) {
+            if (resolve) pending.resolvers.push(resolve);
+            return;
+        }
+        pending = { element: el, resolvers: resolve ? [resolve] : [] };
+        PENDING_ELEMENT_SCROLLS.set(el.__id, pending);
+        g.setTimeout(function () {
+            // Delete first: a scroll handler may initiate a distinct scroll,
+            // which must receive a later task rather than being lost here.
+            PENDING_ELEMENT_SCROLLS.delete(el.__id);
+            trust.fireElementScroll(el.__id);
+            try { dispatch(el, new Event("scrollend"), false); }
+            catch (e) { trust.errors.push("element scrollend handler: " + ((e && e.message) || e)); }
+            for (const done of pending.resolvers) {
+                try { done(); } catch (e) {}
+            }
+        }, 0);
+    }
+
+    function normalizedScrollNumber(v) {
+        v = +v;
+        return isFinite(v) ? v : 0;
+    }
+
+    function checkedScrollBehavior(options) {
+        const behavior = options && options.behavior !== undefined
+            ? String(options.behavior) : "auto";
+        if (behavior !== "auto" && behavior !== "instant" && behavior !== "smooth") {
+            throw new TypeError("Invalid ScrollBehavior value: " + behavior);
+        }
+        return behavior;
+    }
+
     class Element extends Node {
         // nodeType and the tag are IMMUTABLE for a node: `wrap()` already
         // dispatched this class BY node type, and an element's local name never
@@ -12434,30 +12516,37 @@ const PRELUDE: &str = r##"
         }
         setAttribute(n, v) {
             n = String(n); v = String(v);
+            const lower = n.toLowerCase();
             // HTMLScriptElement's force-async flag is cleared whenever its
             // async content attribute is added. Removing it later must not
             // restore force-async (HTML "prepare the script element").
-            if (n.toLowerCase() === "async" && this.localName === "script") this.__trustForceAsync = false;
+            if (lower === "async" && this.localName === "script") this.__trustForceAsync = false;
             const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             __dom_set_attr(this.__id, n, v);
             this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
             this.__attrMapStale = true; // the cached NamedNodeMap rebuilds lazily
             if (n === "href" && this.localName === "base") baseHrefCache = null;
-            ceAttrChanged(this, n.toLowerCase(), old, v);
+            ceAttrChanged(this, lower, old, v);
             if (MO.length) moAttr(this, n, old);
+            // DOM §4.2.2.4: changing a light child's `slot`, or a slot's
+            // `name`, can change the assigned-node lists and must signal the
+            // affected slots at the next microtask checkpoint.
+            if (lower === "slot" || (lower === "name" && this.localName === "slot")) slotQueueCheck(this.parentNode || this);
             // Changing src/srcdoc re-runs "process the iframe attributes".
             if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") processIframeAttributes(this); }
         }
         setAttributeNS(_, n, v) { this.setAttribute(n, v); }
         removeAttribute(n) {
             n = String(n);
+            const lower = n.toLowerCase();
             const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             __dom_remove_attr(this.__id, n);
             this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
             this.__attrMapStale = true; // the cached NamedNodeMap rebuilds lazily
             if (n === "href" && this.localName === "base") baseHrefCache = null;
-            ceAttrChanged(this, n.toLowerCase(), old, null);
+            ceAttrChanged(this, lower, old, null);
             if (MO.length) moAttr(this, n, old);
+            if (lower === "slot" || (lower === "name" && this.localName === "slot")) slotQueueCheck(this.parentNode || this);
             // Removing src/srcdoc re-runs "process the iframe attributes".
             if (n === "src" || n === "srcdoc") { const ln = this.localName; if (ln === "iframe" || ln === "frame") processIframeAttributes(this); }
         }
@@ -12580,11 +12669,12 @@ const PRELUDE: &str = r##"
         // owning interfaces (HTMLInputElement, HTMLAnchorElement, …) below.
         get innerHTML() { return __dom_inner_html(this.__id); }
         set innerHTML(v) {
-            if (!MO.length) { __dom_set_inner_html(this.__id, String(v)); if (CE.defs.size) ceScan(this); return; }
+            if (!MO.length) { __dom_set_inner_html(this.__id, String(v)); if (CE.defs.size) ceScan(this); slotQueueCheck(this); return; }
             const removed = this.childNodes;
             __dom_set_inner_html(this.__id, String(v));
             moChildBulk(this, removed, this.childNodes);
             if (CE.defs.size) ceScan(this);
+            slotQueueCheck(this);
         }
         // `content` (<template>/<meta>) and `contentDocument`/`contentWindow`
         // (<iframe>/<frame>) moved to their owning interfaces below. A generic
@@ -12756,16 +12846,94 @@ const PRELUDE: &str = r##"
         // dict. `scrollIntoView()` scrolls each ancestor scroll container so this
         // element is visible (the recursive CSSOM scroll). The root element /
         // scrollingElement still mirrors the page scroll (the terminal owns it).
-        scrollTo(x, y) {
-            const o = (x && typeof x === "object") ? x : { left: x, top: y };
-            if (o.left !== undefined && o.left !== null) this.scrollLeft = +o.left || 0;
-            if (o.top !== undefined && o.top !== null) this.scrollTop = +o.top || 0;
+        __snapInlinePosition(natural, direction) {
+            // CSS Scroll Snap 1 §6: an inline-axis snap container selects a
+            // valid descendant snap area's alignment position after a scroll.
+            // The exact selection algorithm is deliberately UA-defined; use
+            // the nearest candidate to the intended endpoint, while respecting
+            // the intended direction of relative (`scrollBy`) operations.
+            let type = "";
+            try { type = String(g.getComputedStyle(this).getPropertyValue("scroll-snap-type") || "").toLowerCase(); }
+            catch (e) { return natural; }
+            const typeParts = type.trim().split(/\s+/);
+            if (typeParts[0] !== "x" && typeParts[0] !== "inline" && typeParts[0] !== "both") return natural;
+
+            const current = this.scrollLeft;
+            const max = Math.max(0, this.scrollWidth - this.clientWidth);
+            const box = this.__rect();
+            const candidates = [];
+            let descendants;
+            try { descendants = this.querySelectorAll("*"); } catch (e) { return natural; }
+            // A snap area can be a light-DOM child assigned through a slot in
+            // the scroller's shadow tree (Archive's carousel is exactly this
+            // standard composed-tree shape). `querySelectorAll` intentionally
+            // does not pierce that boundary, so include each slot's flattened
+            // assignments when collecting descendant snap areas.
+            const areas = descendants.slice();
+            for (const node of descendants) {
+                if (node.localName !== "slot" || typeof node.assignedElements !== "function") continue;
+                try { areas.push.apply(areas, node.assignedElements({ flatten: true })); }
+                catch (e) {}
+            }
+            for (const area of areas) {
+                let align = "";
+                try { align = String(g.getComputedStyle(area).getPropertyValue("scroll-snap-align") || "").trim().toLowerCase(); }
+                catch (e) { continue; }
+                const parts = align.split(/\s+/);
+                // One value applies to both axes; with two values the second is
+                // the inline-axis alignment used by an x/inline container.
+                const inline = parts.length > 1 ? parts[1] : parts[0];
+                if (inline !== "start" && inline !== "center" && inline !== "end") continue;
+                const r = area.__rect();
+                let candidate = r.left - box.left;
+                if (inline === "center") candidate += r.width / 2 - this.clientWidth / 2;
+                else if (inline === "end") candidate += r.width - this.clientWidth;
+                candidate = Math.max(0, Math.min(max, candidate));
+                if (direction > 0 && candidate + 0.01 < current) continue;
+                if (direction < 0 && candidate - 0.01 > current) continue;
+                candidates.push(candidate);
+            }
+            if (!candidates.length) return natural;
+            let best = candidates[0], distance = Math.abs(best - natural);
+            for (let i = 1; i < candidates.length; i++) {
+                const d = Math.abs(candidates[i] - natural);
+                if (d < distance) { best = candidates[i]; distance = d; }
+            }
+            return best;
         }
-        scroll(x, y) { this.scrollTo(x, y); }
+        __scrollToOptions(options, direction) {
+            checkedScrollBehavior(options);
+            let left = options.left === undefined ? this.scrollLeft : normalizedScrollNumber(options.left);
+            let top = options.top === undefined ? this.scrollTop : normalizedScrollNumber(options.top);
+            if (this.localName === "html") {
+                g.scrollTo(left, top);
+                return Promise.resolve();
+            }
+            const maxLeft = Math.max(0, this.scrollWidth - this.clientWidth);
+            const maxTop = Math.max(0, this.scrollHeight - this.clientHeight);
+            left = Math.max(0, Math.min(maxLeft, left));
+            top = Math.max(0, Math.min(maxTop, top));
+            left = this.__snapInlinePosition(left, direction || 0);
+            const changed = __dom_scroll_set(this.__id, top, left);
+            if (!changed) return Promise.resolve();
+            const self = this;
+            return new Promise(function (resolve) { queueElementScroll(self, resolve); });
+        }
+        scrollTo(x, y) {
+            const options = (x !== null && typeof x === "object") ? x : { left: x, top: y };
+            return this.__scrollToOptions(options, 0);
+        }
+        scroll(x, y) { return this.scrollTo(x, y); }
         scrollBy(x, y) {
-            const o = (x && typeof x === "object") ? x : { left: x, top: y };
-            this.scrollLeft = this.scrollLeft + (+o.left || 0);
-            this.scrollTop = this.scrollTop + (+o.top || 0);
+            const options = (x !== null && typeof x === "object")
+                ? { left: x.left, top: x.top, behavior: x.behavior }
+                : { left: x, top: y };
+            checkedScrollBehavior(options);
+            const dx = options.left === undefined ? 0 : normalizedScrollNumber(options.left);
+            const dy = options.top === undefined ? 0 : normalizedScrollNumber(options.top);
+            options.left = this.scrollLeft + dx;
+            options.top = this.scrollTop + dy;
+            return this.__scrollToOptions(options, dx > 0 ? 1 : (dx < 0 ? -1 : 0));
         }
         scrollIntoView(arg) {
             // Boolean legacy: true ⇒ align top ("start"), false ⇒ bottom ("end").
@@ -12889,22 +13057,24 @@ const PRELUDE: &str = r##"
             return __dom_scroll_get(this.__id, 0) || 0;
         }
         set scrollTop(v) {
-            v = +v; if (!isFinite(v)) v = 0;
+            v = normalizedScrollNumber(v);
             if (this.localName === "html") { g.scrollTo(g.scrollX || 0, v); return; }
             const max = Math.max(0, this.scrollHeight - this.clientHeight);
             if (v < 0) v = 0; else if (v > max) v = max;
-            __dom_scroll_set(this.__id, v, this.scrollLeft);
+            if (__dom_scroll_set(this.__id, v, this.scrollLeft)) queueElementScroll(this);
         }
         get scrollLeft() {
             if (this.localName === "html") return g.scrollX || 0;
             return __dom_scroll_get(this.__id, 1) || 0;
         }
         set scrollLeft(v) {
-            v = +v; if (!isFinite(v)) v = 0;
+            v = normalizedScrollNumber(v);
             if (this.localName === "html") { g.scrollTo(v, g.scrollY || 0); return; }
             const max = Math.max(0, this.scrollWidth - this.clientWidth);
             if (v < 0) v = 0; else if (v > max) v = max;
-            __dom_scroll_set(this.__id, this.scrollTop, v);
+            const direction = v > this.scrollLeft ? 1 : (v < this.scrollLeft ? -1 : 0);
+            v = this.__snapInlinePosition(v, direction);
+            if (__dom_scroll_set(this.__id, this.scrollTop, v)) queueElementScroll(this);
         }
     }
 
@@ -13108,6 +13278,14 @@ const PRELUDE: &str = r##"
     installConstraintValidation(HTMLTextAreaElement);
     // Interfaces whose simple reflected attributes are installed below.
     class HTMLButtonElement extends HTMLElement {}
+    class HTMLSlotElement extends HTMLElement {
+        assignedNodes(options) {
+            return slotAssignedNodes(this, !!(options && options.flatten));
+        }
+        assignedElements(options) {
+            return this.assignedNodes(options).filter((node) => node.nodeType === 1);
+        }
+    }
     // HTML §the-script-element. Keep this interface complete rather than
     // scattering script behavior across generic Element reflectors. The
     // force-async state is an internal flag: parser-created scripts begin
@@ -13961,10 +14139,64 @@ const PRELUDE: &str = r##"
         set innerHTML(v) {
             __dom_set_inner_html(this.__id, String(v));
             if (CE.defs.size) ceScan(this);
+            slotQueueCheck(this);
         }
         get adoptedStyleSheets() { return this.__adopted || (this.__adopted = []); }
         set adoptedStyleSheets(v) { this.__adopted = v; adoptedSync(this); }
         getElementById(i) { const r = this.querySelectorAll("[id]"); for (const e of r) if (e.id === String(i)) return e; return null; }
+    }
+
+    // WHATWG DOM §4.2.2.3 "Finding slots and slottables". Direct assignment is
+    // computed by the arena so it follows tree order and the host/shadow-root
+    // relationship exactly. The optional flattening step recursively substitutes
+    // nested slots and uses fallback children only when a slot has no assignment.
+    function slotAssignedNodes(slot, flatten) {
+        let nodes = __dom_slot_assigned(slot.__id).map(wrap);
+        if (!flatten) return nodes;
+        if (!nodes.length) nodes = slot.childNodes;
+        const result = [];
+        for (const node of nodes) {
+            if (node && node.localName === "slot" && rootOfNode(node) instanceof ShadowRoot) {
+                result.push(...slotAssignedNodes(node, true));
+            } else {
+                result.push(node);
+            }
+        }
+        return result;
+    }
+
+    let slotCheckQueued = false;
+    const slotCheckRoots = [];
+    function slotAffectedRoot(node) {
+        if (!node) return null;
+        if (node instanceof ShadowRoot) return node;
+        const root = rootOfNode(node);
+        if (root instanceof ShadowRoot) return root;
+        // A light-tree mutation affects the shadow root attached to its host.
+        return node.__sr || null;
+    }
+    function slotQueueCheck(node) {
+        const root = slotAffectedRoot(node);
+        if (!root) return;
+        if (!slotCheckRoots.includes(root)) slotCheckRoots.push(root);
+        if (slotCheckQueued) return;
+        slotCheckQueued = true;
+        Promise.resolve().then(slotFlushChecks);
+    }
+    function slotFlushChecks() {
+        slotCheckQueued = false;
+        const roots = slotCheckRoots.splice(0);
+        const changed = [];
+        for (const root of roots) {
+            for (const slot of root.querySelectorAll("slot")) {
+                const signature = __dom_slot_assigned(slot.__id).join(",");
+                const previous = slot.__trustSlotSignature === undefined ? "" : slot.__trustSlotSignature;
+                slot.__trustSlotSignature = signature;
+                if (signature !== previous) changed.push(slot);
+            }
+        }
+        // `slotchange` bubbles but is not composed (DOM §4.2.2.4).
+        for (const slot of changed) slot.dispatchEvent(new Event("slotchange", { bubbles: true }));
     }
 
     // --- the custom elements registry ---
@@ -14480,6 +14712,7 @@ const PRELUDE: &str = r##"
     g.HTMLTextAreaElement = HTMLTextAreaElement; g.HTMLFormElement = HTMLFormElement;
     g.HTMLAnchorElement = HTMLAnchorElement; g.HTMLImageElement = HTMLImageElement;
     g.HTMLScriptElement = HTMLScriptElement; g.HTMLButtonElement = HTMLButtonElement;
+    g.HTMLSlotElement = HTMLSlotElement;
     // The per-interface classes with specialized bodies (defined after Element).
     // These must be registered BEFORE the generic interface-zoo loop below so its
     // `if (!g[__cn])` guard keeps them (rather than overwriting with empty ones).
@@ -15989,7 +16222,7 @@ const PRELUDE: &str = r##"
     }
     installEventHandlers(g, g.addEventListener, g.removeEventListener, [
         "load", "unload", "beforeunload", "pageshow", "pagehide",
-        "resize", "scroll", "hashchange", "popstate", "message",
+        "resize", "scroll", "scrollend", "hashchange", "popstate", "message",
         "error", "online", "offline", "focus", "blur", "languagechange",
     ]);
     // GlobalEventHandlers on* IDL attributes on Document and Element (they
@@ -16029,7 +16262,7 @@ const PRELUDE: &str = r##"
         "input", "beforeinput", "change", "submit", "reset", "invalid",
         "focus", "blur", "focusin", "focusout",
         "select", "selectionchange",
-        "scroll", "load", "error", "abort", "loadstart", "loadend", "progress",
+        "scroll", "scrollend", "load", "error", "abort", "loadstart", "loadend", "progress",
         "drag", "dragstart", "dragend", "dragenter", "dragleave", "dragover", "drop",
         "pointerdown", "pointerup", "pointermove", "pointerover", "pointerout",
         "pointerenter", "pointerleave", "pointercancel", "gotpointercapture", "lostpointercapture",
@@ -28338,6 +28571,43 @@ mod tests {
     }
 
     #[test]
+    fn slotchange_drives_named_shadow_slot_carousel() {
+        // WHATWG DOM §4.2.2.3/4: inserting the initial default slot assigns
+        // the host's light children, queues one bubbling/non-composed
+        // `slotchange`, and exposes those children through assignedElements().
+        // Web-component carousels use that callback to name their slides.
+        let (out, outcome) = page(
+            "<body><x-carousel id=c><a>One</a><a>Two</a></x-carousel><script>\
+             const host = document.getElementById('c');\
+             const root = host.attachShadow({ mode: 'open' });\
+             const initial = document.createElement('slot');\
+             initial.addEventListener('slotchange', (event) => {\
+               const items = initial.assignedElements();\
+               document.body.setAttribute('data-slotchange',\
+                 event.bubbles + ':' + event.composed + ':' + items.length);\
+               root.innerHTML = '<ul><li><slot name=slide-0></slot></li>' +\
+                 '<li><slot name=slide-1></slot></li></ul>';\
+               items.forEach((item, index) => item.slot = 'slide-' + index);\
+             });\
+             root.appendChild(initial);\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("data-slotchange=\"true:false:2\""),
+            "slotchange or assignedElements regressed: {out}"
+        );
+        assert!(
+            out.contains("<li><a slot=\"slide-0\">One</a></li>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<li><a slot=\"slide-1\">Two</a></li>"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn a_custom_element_defined_after_insertion_into_shadow_upgrades() {
         // archive.org's router renders the page component into a shadow
         // tree BEFORE its module defines it; define()'s catch-up upgrade
@@ -28728,6 +28998,164 @@ mod tests {
             out.contains("8 123.5 45.25 123.5 45.25"),
             "geometry should preserve the real CSS-pixel box, got: {out}"
         );
+    }
+
+    #[test]
+    fn scroll_width_is_scrolling_area_not_border_box() {
+        // CSSOM View §6: getBoundingClientRect()/clientWidth report the
+        // element's 320px box, while scrollWidth reports the full 720px flex
+        // strip. Components use this comparison to show carousel controls.
+        let (out, outcome) = page(
+            r##"<body><div id=strip style="display:flex;width:320px;overflow-x:scroll">
+              <div style="min-width:max-content"><div style="width:240px">one</div></div>
+              <div style="min-width:max-content"><div style="width:240px">two</div></div>
+              <div style="min-width:max-content"><div style="width:240px">three</div></div>
+            </div><p id=out></p><script>
+            var s = document.getElementById('strip');
+            document.getElementById('out').textContent =
+              [s.getBoundingClientRect().width, s.clientWidth, s.scrollWidth].join('|');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains(">320|320|720<"), "{out}");
+    }
+
+    #[test]
+    fn scroll_by_moves_a_snapping_element_and_queues_scroll_events() {
+        // CSSOM View §6 + CSS Scroll Snap 1 §§4/6, end to end. This is the
+        // standards-shaped interaction used by archive.org's basic-carousel:
+        // an arrow calls scrollBy(clientWidth), the x/mandatory strip selects
+        // the nearest start snap position, the app receives the new horizontal
+        // offset, and the element's async scroll/scrollend handlers run. The
+        // modern API also returns the completion Promise from "perform a
+        // scroll" rather than undefined.
+        fn id_after(html: &str, marker: &str) -> usize {
+            let start = html
+                .find(marker)
+                .unwrap_or_else(|| panic!("marker {marker} not in {html}"))
+                + marker.len();
+            html[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap()
+        }
+        fn next_render(events: &mut tokio::sync::mpsc::Receiver<PageEvt>) -> String {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match events.try_recv() {
+                    Ok(PageEvt::Updated { html, .. }) | Ok(PageEvt::Static { html, .. }) => {
+                        return html;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+            panic!("no render received");
+        }
+
+        let html = r##"<body>
+          <div id=host>
+            <div slot=slide-0>one</div>
+            <div slot=slide-1>two</div>
+            <div slot=slide-2>three</div>
+          </div>
+          <p id=out>idle</p>
+          <a href="#" onclick="window.scrollPromise=window.strip.scrollBy({left:window.strip.clientWidth,behavior:'smooth'});return false">next</a>
+          <a href="#" onclick="window.scrollPromise=window.strip.scrollBy({left:-window.strip.clientWidth,behavior:'smooth'});return false">previous</a>
+          <script>
+            var root=document.getElementById('host').attachShadow({mode:'open'});
+            root.innerHTML='<div id="strip" style="display:flex;width:90px;overflow-x:scroll;scroll-snap-type:x mandatory">'+
+              '<div style="flex:0 0 100px;scroll-snap-align:start"><slot name="slide-0"></slot></div>'+
+              '<div style="flex:0 0 100px;scroll-snap-align:start"><slot name="slide-1"></slot></div>'+
+              '<div style="flex:0 0 100px;scroll-snap-align:start"><slot name="slide-2"></slot></div></div>';
+            window.strip=root.getElementById('strip');
+            var ends=0;
+            document.getElementById('out').textContent='initial='+strip.clientWidth+'/'+strip.scrollWidth+'/'+root.querySelectorAll('slot').length;
+            strip.addEventListener('scroll',function(){
+              document.getElementById('out').textContent='scroll='+strip.scrollLeft+' promise='+(!!scrollPromise&&typeof scrollPromise.then==='function')+' ends='+ends;
+            });
+            strip.addEventListener('scrollend',function(){
+              ends++; document.getElementById('out').textContent='scroll='+strip.scrollLeft+' promise='+(!!scrollPromise&&typeof scrollPromise.then==='function')+' ends='+ends;
+            });
+          </script>
+        </body>"##;
+        let (handle, mut events) =
+            spawn_page(html.to_string(), PageEnv::bare("https://example.com/"));
+        let first = next_render(&mut events);
+        assert!(
+            first.contains("initial=90/300/3"),
+            "slotted strip should expose its 90px scrollport and 300px scrolling area: {first}"
+        );
+        let strip_at = first
+            .find("id=\"strip\"")
+            .unwrap_or_else(|| panic!("strip not serialized: {first}"));
+        let strip_node = id_after(&first[strip_at..], "data-trust-node=\"");
+        let next_marker = first.find("x-trust-js:").unwrap();
+        let next_id = id_after(&first[next_marker..], "x-trust-js:");
+        let previous_id = id_after(&first[next_marker + "x-trust-js:".len()..], "x-trust-js:");
+
+        handle.cmds.blocking_send(PageCmd::Click(next_id)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut moved = false;
+        let mut rendered = None;
+        while std::time::Instant::now() < deadline && (!moved || rendered.is_none()) {
+            match events.try_recv() {
+                Ok(PageEvt::Scrolled { node, top, left }) => {
+                    assert_eq!(node, strip_node);
+                    assert_eq!(top, 0.0);
+                    assert_eq!(left, 100.0, "90px intended endpoint snaps to 100px");
+                    moved = true;
+                }
+                Ok(PageEvt::Updated { html, .. }) | Ok(PageEvt::Static { html, .. }) => {
+                    if html.contains("scroll=100 promise=true ends=1") {
+                        rendered = Some(html);
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(moved, "scrollBy did not emit the horizontal Scrolled state");
+        assert!(
+            rendered.is_some(),
+            "queued scroll/scrollend events or completion Promise semantics failed"
+        );
+
+        handle
+            .cmds
+            .blocking_send(PageCmd::Click(previous_id))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut returned = false;
+        let mut rerendered = false;
+        while std::time::Instant::now() < deadline && (!returned || !rerendered) {
+            match events.try_recv() {
+                Ok(PageEvt::Scrolled { node, top, left }) => {
+                    assert_eq!(node, strip_node);
+                    assert_eq!((top, left), (0.0, 0.0));
+                    returned = true;
+                }
+                Ok(PageEvt::Updated { html, .. }) | Ok(PageEvt::Static { html, .. }) => {
+                    rerendered |= html.contains("scroll=0 promise=true ends=2");
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
+        drop(handle);
+        assert!(returned, "the previous arrow did not restore scrollLeft=0");
+        assert!(rerendered, "the reverse scroll events did not rerender");
     }
 
     #[test]

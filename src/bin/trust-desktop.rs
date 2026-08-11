@@ -636,10 +636,13 @@ impl DesktopApp {
             let task = self.runtime.spawn(async move {
                 let result = match trust::http::fetch_graphical_image(&page, &source).await {
                     Ok(bytes) => {
-                        tokio::task::spawn_blocking(move || trust::img::decode_graphical(&bytes))
-                            .await
-                            .map_err(|error| format!("image decode task failed: {error}"))
-                            .and_then(|result| result)
+                        let decode_source = source.clone();
+                        tokio::task::spawn_blocking(move || {
+                            trust::img::decode_graphical_for_source(&decode_source, &bytes)
+                        })
+                        .await
+                        .map_err(|error| format!("image decode task failed: {error}"))
+                        .and_then(|result| result)
                     }
                     Err(error) => Err(error),
                 };

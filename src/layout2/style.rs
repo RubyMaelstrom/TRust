@@ -202,13 +202,13 @@ impl BoxStyle {
         let tag = dom.tag_name(id).unwrap_or("");
         let (ua_margin, ua_padding) = ua_box(dom, id, tag, u.fs);
         let (has_transform, tx, ty) = transform_translation(dom, id, u, vp);
+        // CSS Custom Properties §3: substitute var() references at computed-
+        // value time, before the typed layout snapshot parses lengths. Feeding
+        // raw `var(--x)` into Len made a valid declaration silently fall back
+        // to `auto` (and could leak an intrinsic probe width into layout).
+        let cv = |prop: &str| dom.computed_value_resolved(id, prop);
         let side = |prop: &str, i: usize, ua: [f32; 4]| -> Len {
-            Len::parse_or(
-                dom.computed_value(id, prop).as_deref(),
-                u,
-                vp,
-                Len::px(ua[i]),
-            )
+            Len::parse_or(cv(prop).as_deref(), u, vp, Len::px(ua[i]))
         };
         BoxStyle {
             margin: [
@@ -229,56 +229,21 @@ impl BoxStyle {
                 border_side(dom, id, "bottom", u),
                 border_side(dom, id, "left", u),
             ],
-            width: Len::parse_or(dom.computed_value(id, "width").as_deref(), u, vp, Len::Auto),
-            min_width: Len::parse_or(
-                dom.computed_value(id, "min-width").as_deref(),
-                u,
-                vp,
-                Len::Auto,
-            ),
-            max_width: Len::parse_or(
-                dom.computed_value(id, "max-width").as_deref(),
-                u,
-                vp,
-                Len::None,
-            ),
-            height: Len::parse_or(
-                dom.computed_value(id, "height").as_deref(),
-                u,
-                vp,
-                Len::Auto,
-            ),
-            min_height: Len::parse_or(
-                dom.computed_value(id, "min-height").as_deref(),
-                u,
-                vp,
-                Len::Auto,
-            ),
-            max_height: Len::parse_or(
-                dom.computed_value(id, "max-height").as_deref(),
-                u,
-                vp,
-                Len::None,
-            ),
-            border_box: matches!(
-                dom.computed_value(id, "box-sizing").as_deref(),
-                Some("border-box")
-            ),
+            width: Len::parse_or(cv("width").as_deref(), u, vp, Len::Auto),
+            min_width: Len::parse_or(cv("min-width").as_deref(), u, vp, Len::Auto),
+            max_width: Len::parse_or(cv("max-width").as_deref(), u, vp, Len::None),
+            height: Len::parse_or(cv("height").as_deref(), u, vp, Len::Auto),
+            min_height: Len::parse_or(cv("min-height").as_deref(), u, vp, Len::Auto),
+            max_height: Len::parse_or(cv("max-height").as_deref(), u, vp, Len::None),
+            border_box: matches!(cv("box-sizing").as_deref(), Some("border-box")),
             position: Pos::of(dom, id),
             inset: [
-                Len::parse_or(dom.computed_value(id, "top").as_deref(), u, vp, Len::Auto),
-                Len::parse_or(dom.computed_value(id, "right").as_deref(), u, vp, Len::Auto),
-                Len::parse_or(
-                    dom.computed_value(id, "bottom").as_deref(),
-                    u,
-                    vp,
-                    Len::Auto,
-                ),
-                Len::parse_or(dom.computed_value(id, "left").as_deref(), u, vp, Len::Auto),
+                Len::parse_or(cv("top").as_deref(), u, vp, Len::Auto),
+                Len::parse_or(cv("right").as_deref(), u, vp, Len::Auto),
+                Len::parse_or(cv("bottom").as_deref(), u, vp, Len::Auto),
+                Len::parse_or(cv("left").as_deref(), u, vp, Len::Auto),
             ],
-            z_index: dom
-                .computed_value(id, "z-index")
-                .and_then(|v| v.trim().parse::<i32>().ok()),
+            z_index: cv("z-index").and_then(|v| v.trim().parse::<i32>().ok()),
             tx,
             ty,
             has_transform,

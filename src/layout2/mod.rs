@@ -213,7 +213,7 @@ pub fn lay_out_graphical(
     };
     let (frag, flow_bottom, _anchors, fixed) = flow.layout(&root);
     let flow_done = started.elapsed();
-    let boxes = measure::boxes(dom, &frag, &fixed);
+    let (boxes, _scrolling_areas) = measure::boxes(dom, &frag, &fixed);
     let measure_done = started.elapsed();
     let paint = graphics::paint(dom, base, &frag, &fixed, flow_bottom, vp.w, vp.h);
     if trace {
@@ -391,7 +391,7 @@ pub fn measure_boxes_terminal(
     // fragment geometry returned below never sees cells.
     let cell_w = f32::from(cell_px.0.max(1));
     let cell_h = f32::from(cell_px.1.max(1));
-    measure_boxes_css(
+    let (boxes, tracks, _scrolling_areas) = measure_boxes_css(
         dom,
         base,
         Viewport::new(
@@ -401,7 +401,8 @@ pub fn measure_boxes_terminal(
         forms,
         controls,
         images,
-    )
+    );
+    (boxes, tracks)
 }
 
 /// CSSOM geometry pass for a native CSS-pixel viewport. Returned rectangles
@@ -417,13 +418,14 @@ pub fn measure_boxes_css(
 ) -> (
     HashMap<NodeId, PxRect>,
     HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
+    HashMap<NodeId, PxRect>,
 ) {
     let vp = Vp {
         w: viewport.width,
         h: viewport.height,
     };
     let Some(root) = tree::build(dom, base, controls, forms, vp) else {
-        return (HashMap::new(), HashMap::new());
+        return (HashMap::new(), HashMap::new(), HashMap::new());
     };
     let flow = Flow {
         dom,
@@ -435,8 +437,8 @@ pub fn measure_boxes_css(
         grid_tracks: Default::default(),
     };
     let (frag, _flow_bottom, _anchors, fixed) = flow.layout(&root);
-    let boxes = measure::boxes(dom, &frag, &fixed);
-    (boxes, flow.grid_tracks.into_inner())
+    let (boxes, scrolling_areas) = measure::boxes(dom, &frag, &fixed);
+    (boxes, flow.grid_tracks.into_inner(), scrolling_areas)
 }
 
 /// Lay one INLINE relayout-boundary subtree (a block-filling IFC box, NOT a
@@ -1599,7 +1601,10 @@ mod tests {
         // loader records its ratio by URL as it decodes it, and replaced sizing
         // reads that cache to apply rule 3. Unique URL — the cache is global.
         let url = "http://e.com/l2-ratio-only-icon-test.svg";
-        crate::img::note_svg_ratio_only(url, 1.0);
+        crate::img::record_svg_intrinsic_metadata(
+            url,
+            br#"<svg viewBox="0 0 300 300" xmlns="http://www.w3.org/2000/svg"/>"#,
+        );
         let mut images = HashMap::new();
         images.insert(url.to_string(), (152u32, 144u32));
         let out = lay_images(
@@ -2000,6 +2005,50 @@ mod tests {
             label.len() < 128,
             "intrinsic percentage width must use the finite UA/size fallback, got {} bytes",
             label.len()
+        );
+    }
+
+    #[test]
+    fn formless_icon_button_paints_its_sized_svg_child() {
+        // WHATWG HTML §4.10.6/Rendering §15.5.3: a <button> is labeled by
+        // its contents, whose child boxes form the anonymous button content
+        // box. This is the archive.org search-control shape: a formless live
+        // type=button containing only a ratio-only SVG image. Treating it as
+        // a synthetic form control discarded the <img> and emitted
+        // "[ Button ]"; the authored 18px square must paint and retain the
+        // live click-marker link instead.
+        let svg = "data:image/svg+xml,%3csvg%20viewBox='0%200%20100%20100'%20xmlns='http://www.w3.org/2000/svg'%3e%3cpath%20d='M0%200h100v100H0z'/%3e%3c/svg%3e";
+        let html = format!(
+            r#"<body style="margin:0"><a href="x-trust-js:42:"><button type="button" aria-label="Search" style="display:flex"><img src="{svg}" alt="" style="width:18px;height:18px"></button></a></body>"#
+        );
+        let mut images = ImageSizes::new();
+        images.insert(svg.to_string(), (150, 150));
+        let out = lay_graphical(&html, 320.0, &images);
+        assert!(
+            !out.paint.primitives.iter().any(|primitive| matches!(
+                primitive,
+                crate::render::Primitive::GlyphRun { shaped, .. }
+                    if shaped.text.contains("[ Button ]")
+            )),
+            "the button's children, not a synthetic label, are its content"
+        );
+        let (rect, link) = out
+            .paint
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                crate::render::Primitive::Image { rect, link, .. } => Some((*rect, link)),
+                _ => None,
+            })
+            .expect("the button's SVG image paints");
+        assert_eq!(
+            (rect.width, rect.height),
+            (18.0, 18.0),
+            "desktop geometry keeps the authored CSS size, not the SVG default object size"
+        );
+        assert!(
+            matches!(link, Some(crate::doc::Link::JsClick { node: 42, .. })),
+            "the painted icon inherits the living button's activation link"
         );
     }
 
@@ -2451,6 +2500,29 @@ mod tests {
             x.col > 0,
             "the neighbor starts after the proportional min-content word"
         );
+    }
+
+    #[test]
+    fn flex_item_min_width_max_content_prevents_slide_shrinking() {
+        // CSS Sizing 3 §3.2 + Flexbox §9.2: the hypothetical main size is
+        // clamped by the USED min-width. `max-content` therefore keeps each
+        // carousel slide at its 240px intrinsic width even when the scroll
+        // container is narrower than all slides combined.
+        let out = lay(
+            r#"<body style="margin:0"><div style="display:flex;width:320px;overflow-x:scroll">
+                <div style="min-width:max-content"><div style="width:240px">one</div></div>
+                <div style="min-width:max-content"><div style="width:240px">two</div></div>
+                <div style="min-width:max-content"><div style="width:240px">three</div></div>
+               </div></body>"#,
+            80,
+        );
+        let (_, one) = find(&out, "one");
+        let (_, two) = find(&out, "two");
+        let (_, three) = find(&out, "three");
+        assert_eq!(one.col, 0);
+        assert_eq!(two.col, 30, "the second 240px slide must not shrink");
+        assert_eq!(three.col, 60, "overflow retains the third full-width slide");
+        assert_eq!(out.carousels.len(), 1, "overflow creates one scroll region");
     }
 
     #[test]
@@ -4085,13 +4157,15 @@ mod tests {
         // snap to those positions (CSS Scroll Snap 1). Here align:start ⇒ the
         // stops are the card leading edges.
         let out = lay(
-            r#"<body style="margin:0"><div style="display:flex;overflow-x:auto;width:80px;margin:0;scroll-snap-type:x mandatory"><div style="flex:0 0 auto;width:40px;scroll-snap-align:start">C1</div><div style="flex:0 0 auto;width:40px;scroll-snap-align:start">C2</div><div style="flex:0 0 auto;width:40px;scroll-snap-align:start">C3</div></div></body>"#,
+            r#"<body style="margin:0"><div data-trust-node="42" data-trust-scroll-left="40" style="display:flex;overflow-x:auto;width:80px;margin:0;scroll-snap-type:x mandatory"><div style="flex:0 0 auto;width:40px;scroll-snap-align:start">C1</div><div style="flex:0 0 auto;width:40px;scroll-snap-align:start">C2</div><div style="flex:0 0 auto;width:40px;scroll-snap-align:start">C3</div></div></body>"#,
             40,
         );
         assert_eq!(out.carousels.len(), 1);
         let c = &out.carousels[0];
         assert!(c.snap, "the page declared scroll-snap-type: x mandatory");
         assert_eq!(c.stops, vec![0, 5, 10], "card leading edges (align:start)");
+        assert_eq!(c.live_node, Some(42), "live actor id round-trips");
+        assert_eq!(c.offset, 5, "40 CSS px quantizes once to five cells");
     }
 
     #[test]
@@ -4107,6 +4181,23 @@ mod tests {
         assert!(
             absent(&out, "‹") && absent(&out, "›"),
             "no synthesised chrome"
+        );
+    }
+
+    #[test]
+    fn scrollbar_width_none_hides_terminal_chrome_without_disabling_scroll() {
+        // CSS Scrollbars Styling 1 §3: `none` displays no scrollbar, while
+        // the element remains scrollable through script, wheel, and keys.
+        let out = lay(
+            r#"<body style="margin:0"><div style="display:flex;overflow-x:scroll;scrollbar-width:none;width:80px"><div style="flex:0 0 auto;width:80px">C1</div><div style="flex:0 0 auto;width:80px">C2</div></div></body>"#,
+            40,
+        );
+        assert_eq!(out.carousels.len(), 1);
+        let carousel = &out.carousels[0];
+        assert!(carousel.hide_scrollbar, "terminal UI must not draw a rail");
+        assert!(
+            carousel.max_offset() > 0,
+            "hiding chrome must not disable scrolling"
         );
     }
 
@@ -4771,6 +4862,121 @@ mod tests {
     }
 
     #[test]
+    fn graphical_scrollport_clips_shadow_tree_content() {
+        // CSS Overflow 3 §2.3: a scroll container's visual viewport is its
+        // padding box. DOM §4.2.2 attaches a shadow tree through its host, so
+        // that clip continues across the shadow boundary. Previously the host
+        // card was clipped but its shadow image/text escaped the carousel.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><div id="strip" style="width:100px;height:60px;overflow-x:scroll"><x-card id="card" style="display:block;width:240px;height:60px"></x-card></div></body>"#,
+        );
+        let card = node_by_id(&dom, "card");
+        let shadow = dom.attach_shadow(card);
+        let inner = dom.create_element("div");
+        dom.set_attr(inner, "style", "width:240px;height:60px");
+        dom.append(shadow, inner);
+        dom.append_text(inner, "shadow overflow");
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let mut clips = Vec::new();
+        let mut active_at_text = Vec::new();
+        for command in &layout.paint.primitives {
+            match command {
+                crate::render::DisplayCommand::PushClip(shape) => clips.push(shape.clone()),
+                crate::render::DisplayCommand::PopClip => {
+                    clips.pop();
+                }
+                crate::render::DisplayCommand::GlyphRun { shaped, .. }
+                    if shaped.text.contains("shadow overflow") =>
+                {
+                    active_at_text = clips.clone();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            active_at_text.iter().any(|shape| matches!(
+                shape,
+                crate::render::PaintShape::Rect(rect)
+                    if (rect.width - 100.0).abs() < 0.01 && (rect.height - 60.0).abs() < 0.01
+            )),
+            "shadow content must paint through the 100×60px scrollport clip: {active_at_text:?}"
+        );
+    }
+
+    #[test]
+    fn outer_shadow_context_fixes_nested_tile_height_and_stretches_icon_inside() {
+        // Archive.org's exact nested-component pattern: the outer shadow tree
+        // fixes the custom-element card at 60px; its inner :host rule supplies
+        // a 100% default plus the flex presentation. The outer normal height
+        // wins by CSS Cascade 5 §6.1, then Flexbox §9.4 stretches the icon
+        // only through the card's inner cross size.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><outer-carousel id="outer"></outer-carousel></body>"#,
+        );
+        let outer = node_by_id(&dom, "outer");
+        let outer_root = dom.attach_shadow(outer);
+        let outer_style = dom.create_element("style");
+        dom.append_text(
+            outer_style,
+            "onboarding-tile{box-sizing:border-box;width:240px;height:60px}",
+        );
+        dom.append(outer_root, outer_style);
+        let tile = dom.create_element("onboarding-tile");
+        dom.append(outer_root, tile);
+
+        let tile_root = dom.attach_shadow(tile);
+        let tile_style = dom.create_element("style");
+        dom.append_text(
+            tile_style,
+            ":host{display:flex;align-items:stretch;height:100%;border:2px solid #678}#icon{flex:0 0 60px;padding:5px;background:#def}#icon>img{width:100%;height:100%}#body{flex:1 1 auto;display:flex;align-items:center;padding:5px}",
+        );
+        dom.append(tile_root, tile_style);
+        let icon = dom.create_element("div");
+        dom.set_attr(icon, "id", "icon");
+        let image = dom.create_element("img");
+        dom.set_attr(
+            image,
+            "src",
+            "data:image/svg+xml,%3Csvg viewBox='0 0 100 100' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M0 0h100v100H0z'/%3E%3C/svg%3E",
+        );
+        dom.append(icon, image);
+        dom.append(tile_root, icon);
+        let body = dom.create_element("div");
+        dom.set_attr(body, "id", "body");
+        dom.append_text(body, "How to search the archive");
+        dom.append(tile_root, body);
+
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let tile_rect = layout.boxes.get(&tile).expect("tile border box");
+        let icon_rect = layout.boxes.get(&icon).expect("icon flex item");
+        assert!((tile_rect.height - 60.0).abs() < 0.01, "{tile_rect:?}");
+        assert!(
+            icon_rect.top >= tile_rect.top + 2.0 - 0.01
+                && icon_rect.top + icon_rect.height
+                    <= tile_rect.top + tile_rect.height - 2.0 + 0.01,
+            "stretched icon stays inside the tile padding box: tile={tile_rect:?} icon={icon_rect:?}"
+        );
+    }
+
+    #[test]
     fn geometry_composes_the_shadow_tree() {
         // measure_boxes lays the LIVE ARENA (real shadow roots), not the
         // pre-flattened Doc.raw the main render uses. Without composing the
@@ -4855,10 +5061,11 @@ mod tests {
     }
 
     #[test]
-    fn geometry_scroll_container_reports_content_extent_not_clientheight() {
-        // A definite-height overflow:auto box reports its CONTENT height (so
-        // scrollHeight, which reads this rect, is the scrollable extent), while
-        // clientHeight is pushed separately by the app.
+    fn geometry_scroll_container_keeps_its_border_box() {
+        // CSSOM View §6 keeps getBoundingClientRect distinct from scrollHeight:
+        // a definite-height overflow:auto box reports its own 32px border box.
+        // The separate scrolling-area map (covered through the JS CSSOM test)
+        // carries the 192px scrollHeight.
         let (dom, boxes) = measure(
             r#"<body style="margin:0"><div id="sc" style="height:32px;overflow-y:auto">
                  <div style="height:192px">tall content</div>
@@ -4869,9 +5076,54 @@ mod tests {
         let sc = rect(&dom, &boxes, "sc");
         assert_eq!(sc.top, 0.0);
         assert_eq!(
-            sc.height, 192.0,
-            "reports the 192px content extent (12 cells), not the 32px clip box"
+            sc.height, 32.0,
+            "getBoundingClientRect reports the 32px box, not its 192px scrolling area"
         );
+    }
+
+    #[test]
+    fn geometry_resolves_custom_properties_before_intrinsic_flex_sizing() {
+        // CSS Custom Properties §3: var() substitution happens at computed-
+        // value time, before CSS Sizing §5.2 intrinsic contributions and
+        // Flexbox §9.2 clamp a flex item's hypothetical main size. This is the
+        // shape used by web-component carousels: a max-content slide contains
+        // a definite-width tile, whose icon itself is percentage-sized. If the
+        // tile's var()-backed width reaches layout unresolved, the percentage
+        // image consumes the intrinsic probe's 10,000,000px sentinel and makes
+        // scrollWidth enormous.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0;--tile-width:240px;--tile-gap:10px">
+                 <div id="sc" style="display:flex;width:320px;overflow-x:scroll;gap:var(--tile-gap)">
+                   <div id="one" style="min-width:max-content">
+                     <div style="display:flex;width:var(--tile-width)">
+                       <div><img src="https://e.com/i.png" style="width:100%"></div><div>one</div>
+                     </div>
+                   </div>
+                   <div id="two" style="min-width:max-content">
+                     <div style="display:flex;width:var(--tile-width)">
+                       <div><img src="https://e.com/i.png" style="width:100%"></div><div>two</div>
+                     </div>
+                   </div>
+                 </div>
+               </body>"#,
+        );
+        let base = Url::parse("https://e.com/").unwrap();
+        let mut images = ImageSizes::new();
+        images.insert("https://e.com/i.png".to_string(), (100, 100));
+        let (boxes, _, scrolling) = measure_boxes_css(
+            &dom,
+            &base,
+            Viewport::new(800.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &images,
+        );
+        let one = rect(&dom, &boxes, "one");
+        let two = rect(&dom, &boxes, "two");
+        assert!((one.width - 240.0).abs() < 0.01, "first slide: {one:?}");
+        assert!((two.left - 250.0).abs() < 0.01, "second slide: {two:?}");
+        let sc = scrolling.get(&node_by_id(&dom, "sc")).unwrap();
+        assert!((sc.width - 490.0).abs() < 0.25, "scrolling area: {sc:?}");
     }
 
     #[test]

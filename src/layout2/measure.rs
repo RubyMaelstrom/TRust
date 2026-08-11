@@ -1,22 +1,19 @@
 //! JS geometry from fragments (LAYOUT_OVERHAUL_PLAN.md, P7).
 //!
-//! `getBoundingClientRect`, `offset*`/`client*`, `scrollHeight`, and the
-//! IntersectionObserver/ResizeObserver machinery all read one map:
-//! `NodeId → PxRect` (border box in CSS px). The old engine reconstructed it
+//! `getBoundingClientRect`, `offset*`/`client*`, and the observer machinery
+//! read a `NodeId → PxRect` border-box map in CSS px. `scrollHeight` and
+//! `scrollWidth` read a separate scrolling-area map, because CSSOM View gives
+//! those APIs different geometry. The old engine reconstructed both
 //! from *painted cells* plus a stack of heuristics (`element_tops` for empty
 //! sentinels, `declared_boxes` floors, `clip_heights` caps). layout2 has REAL
 //! stored geometry, so the map falls out of the fragment tree directly — the
 //! plan's promise that "JS geometry reads the fragment tree, *more* accurate
 //! than today".
 //!
-//! The single accommodation to CSSOM View: `scrollHeight`/`scrollWidth` read
-//! the element's `__dom_rect` height/width (there is no separate stored value —
-//! see `Dom::scroll_metric`), so a scroll container and the root element report
-//! their CONTENT extent, while every ordinary block reports its own border box
-//! (spec `getBoundingClientRect`). A composed-tree ancestor union supplies the
-//! content extent and aggregates inline ancestors, empty containers, and shadow
-//! hosts, exactly as the old engine's cell union did — but keyed off honest
-//! fragment boxes.
+//! A composed-tree ancestor union supplies each scrolling area's content extent
+//! and aggregates inline ancestors, empty containers, and shadow hosts, exactly
+//! as the old engine's cell union did—but without replacing the border box that
+//! `getBoundingClientRect()` must report.
 
 use std::collections::{HashMap, HashSet};
 
@@ -138,24 +135,20 @@ fn composed_union(
     content
 }
 
-/// Select each node's reported box from the composed union `content` and the
-/// own block boxes: an ordinary block reports its OWN border box (spec
-/// `getBoundingClientRect`); a scroll container or the root element (`html`/
-/// `body`) reports the content-tall union (so `scrollHeight`/`scrollWidth`,
-/// which read this rect, are the scrollable content extent — CSSOM View).
+/// Select each node's border box and, independently, any scrolling-area extent.
+/// CSSOM View §6 requires `getBoundingClientRect()` to keep the element's own
+/// box while `scrollWidth`/`scrollHeight` return the size of its scrolling area.
 fn select_into(
     dom: &Dom,
     content: &HashMap<NodeId, Rect>,
     block: &HashMap<NodeId, Rect>,
     out: &mut HashMap<NodeId, PxRect>,
+    scroll: &mut HashMap<NodeId, PxRect>,
 ) {
     for (&node, &cbox) in content {
-        let own_box = block.get(&node);
-        let extend = own_box.is_none()
-            || dom.is_scroll_container(node)
-            || dom.is_hscroll_container(node)
-            || matches!(dom.tag_name(node), Some("html" | "body"));
-        let c = if extend { cbox } else { *own_box.unwrap() };
+        // Non-block elements (inline wrappers and shadow hosts without their
+        // own generated block) use the union of their generated pieces.
+        let c = block.get(&node).copied().unwrap_or(cbox);
         out.insert(
             node,
             PxRect {
@@ -165,12 +158,30 @@ fn select_into(
                 height: (c.y1 - c.y0) as f64,
             },
         );
+        if dom.is_scroll_container(node)
+            || dom.is_hscroll_container(node)
+            || matches!(dom.tag_name(node), Some("html" | "body"))
+        {
+            scroll.insert(
+                node,
+                PxRect {
+                    left: cbox.x0 as f64,
+                    top: cbox.y0 as f64,
+                    width: (cbox.x1 - cbox.x0) as f64,
+                    height: (cbox.y1 - cbox.y0) as f64,
+                },
+            );
+        }
     }
 }
 
 /// Build the `NodeId → PxRect` geometry map from the laid fragment tree (the
 /// in-flow root + the pinned fixed layer), directly in CSS pixels.
-pub(super) fn boxes(dom: &Dom, root: &Frag<'_>, fixed: &[Frag<'_>]) -> HashMap<NodeId, PxRect> {
+pub(super) fn boxes(
+    dom: &Dom,
+    root: &Frag<'_>,
+    fixed: &[Frag<'_>],
+) -> (HashMap<NodeId, PxRect>, HashMap<NodeId, PxRect>) {
     // In-flow tree: its own boxes never include the fixed layer.
     let mut flow = Own::default();
     walk(root, &mut flow);
@@ -184,12 +195,13 @@ pub(super) fn boxes(dom: &Dom, root: &Frag<'_>, fixed: &[Frag<'_>]) -> HashMap<N
     }
 
     let mut out: HashMap<NodeId, PxRect> = HashMap::new();
+    let mut scroll: HashMap<NodeId, PxRect> = HashMap::new();
     let flow_content = composed_union(dom, &flow.own, |_| true);
-    select_into(dom, &flow_content, &flow.block, &mut out);
+    select_into(dom, &flow_content, &flow.block, &mut out, &mut scroll);
     if !fx.own.is_empty() {
         let fixed_nodes = fx.nodes;
         let fx_content = composed_union(dom, &fx.own, |id| fixed_nodes.contains(&id));
-        select_into(dom, &fx_content, &fx.block, &mut out);
+        select_into(dom, &fx_content, &fx.block, &mut out, &mut scroll);
     }
-    out
+    (out, scroll)
 }

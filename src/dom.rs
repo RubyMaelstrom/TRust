@@ -941,8 +941,9 @@ impl Dom {
     /// 4=clientHeight, 5=clientWidth. Position (0/1) defaults to 0; the clip box
     /// (4/5) is `None` until the app has pushed it (`set_scroll_geom`), so the
     /// getter falls back to the element's rect. `scrollHeight`/`scrollWidth`
-    /// (2/3) are deliberately ALWAYS `None` here — they read the actor's fresh
-    /// `__dom_rect` (current content) instead, never a lagging pushed value.
+    /// (2/3) are deliberately always `None` here: the JS geometry cache reads
+    /// their fresh scrolling-area extents from the same fragment pass that
+    /// supplies the border box, never from lagging frontend state.
     pub fn scroll_metric(&self, id: NodeId, which: u8) -> Option<f64> {
         let sb = self.scroll_state.get(&id);
         match which {
@@ -954,29 +955,31 @@ impl Dom {
         }
     }
 
-    /// Set a scroll position (px). The caller (the `scrollTop` setter) has
-    /// already clamped to `[0, scrollHeight − clientHeight]` per CSSOM View.
+    /// Set a scroll position (px). The CSSOM View binding has already clamped
+    /// it to the element's scrolling area.
     /// `record` (a page-JS write) queues a `Scrolled` delivery so the app
-    /// re-windows the region cheaply; the wheel write-back passes `record=false`
-    /// (the app already moved its own voffset). NEVER sets the dirty bit — a
+    /// re-windows the scrolling box cheaply; the frontend write-back passes
+    /// `record=false` (it already moved its retained offset). This applies to
+    /// BOTH axes: graphical horizontal scrollers do not participate in the
+    /// terminal-only `RegionGeom` round trip. NEVER sets the dirty bit — a
     /// scroll paints no content of its own; the position rides the next serialize
-    /// (baked) and the `Scrolled` channel.
-    pub fn set_scroll_pos(&mut self, id: NodeId, top: f64, left: f64, record: bool) {
+    /// (baked) and the `Scrolled` channel. Returns whether the position changed,
+    /// which the CSSOM View binding uses to queue `scroll`/`scrollend`.
+    pub fn set_scroll_pos(&mut self, id: NodeId, top: f64, left: f64, record: bool) -> bool {
         let sb = self.scroll_state.entry(id).or_default();
         let changed = sb.top != top || sb.left != left;
         sb.top = top;
         sb.left = left;
-        // Only an element the app has MEASURED as a scroll region (geometry
-        // present) can move a window — record just those for the cheap path.
-        if record && changed && sb.client_h.is_some() {
+        if record && changed {
             self.scroll_changes.push((id, top, left));
         }
+        changed
     }
 
     /// Store the app-measured CLIP box (px) for a scroll region — the viewport
     /// height/width the `clientHeight`/`clientWidth` getters report. (Pure
-    /// measurement backing: no dirty, no scroll record. `scrollHeight` is NOT
-    /// stored — it reads the fresh `__dom_rect`; see `ScrollBox`.)
+    /// measurement backing: no dirty, no scroll record. The scrolling-area
+    /// dimensions remain actor-owned fragment geometry; see `ScrollBox`.)
     pub fn set_scroll_geom(&mut self, id: NodeId, client_h: f64, client_w: f64) {
         let sb = self.scroll_state.entry(id).or_default();
         sb.client_h = Some(client_h);
@@ -1867,6 +1870,7 @@ impl Dom {
     /// value the serializer bakes.
     pub fn computed_style(&self, id: NodeId, prop: &str) -> Option<String> {
         self.cascaded(id, prop)
+            .and_then(|value| self.resolve_pending_shorthand(id, prop, &value))
     }
 
     /// True when an ATTRIBUTE mutation on `node` cannot change a single painted
@@ -2076,7 +2080,9 @@ impl Dom {
                 .parent
                 .and_then(|p| self.computed_value(p, name))
         };
-        let author = self.cascaded(id, name);
+        let author = self
+            .cascaded(id, name)
+            .and_then(|value| self.resolve_pending_shorthand(id, name, &value));
         let v = match author.as_deref().and_then(wide_keyword) {
             Some(WideKeyword::Inherit) => parent_computed(),
             Some(WideKeyword::Initial) => None,
@@ -2349,13 +2355,15 @@ impl Dom {
                 };
                 for (pk, pv) in expand_box_shorthand(&k, &v) {
                     // Element-attached: the inline flag outranks the layer
-                    // component, so the (unlayered) encoding is inert.
+                    // component, so the (unlayered) encoding is inert. This
+                    // declaration belongs to the element's OUTER tree context.
                     // (Inline styles can't target a pseudo-element.)
                     consider_into(
                         &mut elem,
                         &pk,
                         (
                             important,
+                            !important,
                             true,
                             encode_layer(&[], important),
                             (0, 0, 0),
@@ -2381,7 +2389,14 @@ impl Dom {
                     consider_into(
                         target,
                         pk,
-                        (*imp, false, r.layer_key(*imp), r.specificity, r.order),
+                        (
+                            *imp,
+                            !*imp,
+                            false,
+                            r.layer_key(*imp),
+                            r.specificity,
+                            r.order,
+                        ),
                         v,
                     );
                 }
@@ -2403,7 +2418,7 @@ impl Dom {
                     consider_into(
                         &mut elem,
                         pk,
-                        (*imp, false, r.layer_key(*imp), r.specificity, r.order),
+                        (*imp, *imp, false, r.layer_key(*imp), r.specificity, r.order),
                         v,
                     );
                 }
@@ -2452,6 +2467,21 @@ impl Dom {
     fn resolve_vars(&self, id: NodeId, value: &str) -> String {
         self.substitute_vars(id, value, &mut Vec::new())
             .unwrap_or_default()
+    }
+
+    /// Resolve a shorthand that contains `var()` only after custom-property
+    /// substitution, then extract this longhand from the resulting shorthand.
+    /// CSS Variables §3 makes such shorthands pending-substitution values at
+    /// parse time: expanding `background:var(--nav-bg)` before substitution
+    /// incorrectly resets `background-color` to transparent.
+    fn resolve_pending_shorthand(&self, id: NodeId, name: &str, value: &str) -> Option<String> {
+        let Some(raw) = value.strip_prefix(PENDING_BACKGROUND_SHORTHAND) else {
+            return Some(value.to_owned());
+        };
+        let substituted = self.substitute_vars(id, raw, &mut Vec::new())?;
+        expand_background(&substituted)
+            .into_iter()
+            .find_map(|(longhand, value)| (longhand == name).then_some(value))
     }
 
     /// The computed value of custom property `name` on `id`, with its own
@@ -4051,6 +4081,7 @@ impl Dom {
         // back to the resident page actor's original node ids (form values /
         // the region's scroll position round-trip by it).
         let is_scroll = self.is_scroll_container(id);
+        let is_hscroll = self.is_hscroll_container(id);
         // Bake the actor node id on every element the app re-correlates after a
         // re-parse: form controls + vertical scroll containers (values / region
         // scroll round-trip by it) AND every independent-formatting-context
@@ -4062,6 +4093,7 @@ impl Dom {
         if matches!(tag, "form" | "input" | "button" | "select" | "textarea")
             || self.is_contenteditable_host(id)
             || is_scroll
+            || is_hscroll
             || self.establishes_independent_formatting_context(id)
         {
             out.push_str(&format!(" data-trust-node=\"{id}\""));
@@ -4085,6 +4117,15 @@ impl Dom {
             && sb.top >= 1.0
         {
             out.push_str(&format!(" data-trust-scroll-top=\"{}\"", sb.top));
+        }
+        // The horizontal half of the same CSSOM state. This lets the retained
+        // terminal carousel seed its strip offset after a mutation render; the
+        // graphical frontend keeps the unquantized value in InteractionState.
+        if is_hscroll
+            && let Some(sb) = self.scroll_state.get(&id)
+            && sb.left >= 1.0
+        {
+            out.push_str(&format!(" data-trust-scroll-left=\"{}\"", sb.left));
         }
         out.push('>');
         if !VOID_ELEMENTS.contains(&tag) {
@@ -4124,7 +4165,10 @@ impl Dom {
         // suppression, Phase 2) so the re-parse paints it blank.
         let mut bake = String::new();
         for prop in PROPS.iter().filter(|p| p.baked).map(|p| p.name) {
-            if let Some(v) = self.cascaded(id, prop) {
+            if let Some(v) = self
+                .cascaded(id, prop)
+                .and_then(|value| self.resolve_pending_shorthand(id, prop, &value))
+            {
                 if prop == "display" && v == "none" {
                     continue;
                 }
@@ -6940,6 +6984,8 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     vec![(prop.to_string(), value.to_string())]
 }
 
+const PENDING_BACKGROUND_SHORTHAND: &str = "\0trust-pending-background:";
+
 /// `background` shorthand → retained graphical longhands. This is deliberately
 /// conservative: image/color grammar is preserved exactly, while repeat,
 /// attachment and boxes are recognized from their closed keyword sets. An
@@ -6952,6 +6998,26 @@ fn expand_background(value: &str) -> Vec<(String, String)> {
     // The raw shorthand rides along: it's untracked (sheets filter it), but
     // the inline-style path stores untracked props for getComputedStyle.
     let mut out = vec![("background".to_string(), v.to_string())];
+    // CSS Variables §3: a shorthand containing var() cannot be parsed into
+    // longhands until computed-value time. Preserve the complete token stream
+    // on each longhand; `resolve_pending_shorthand` substitutes first and then
+    // runs this parser again. This also preserves shorthand reset semantics.
+    if v.contains("var(") {
+        let pending = format!("{PENDING_BACKGROUND_SHORTHAND}{v}");
+        for name in [
+            "background-color",
+            "background-image",
+            "background-repeat",
+            "background-position",
+            "background-size",
+            "background-origin",
+            "background-clip",
+            "background-attachment",
+        ] {
+            out.push((name.to_string(), pending.clone()));
+        }
+        return out;
+    }
     // CSS-wide keywords apply to every longhand of the shorthand.
     if matches!(
         v.to_ascii_lowercase().as_str(),
@@ -7258,13 +7324,15 @@ impl StyleRule {
     }
 }
 
-/// (!important, inline, layer, specificity, source order): the cascade key;
-/// lexicographic max wins. `layer` is the importance-adjusted cascade-layer
-/// encoding (`encode_layer`); it sits AFTER the inline flag because
-/// element-attached styles outrank layers (css-cascade-5 §6.1 sorts
-/// "Element-Attached Styles" before "Layers"), and BEFORE specificity
-/// (layers beat specificity — the point of the feature).
-type CascadeKey = (bool, bool, u64, (u32, u32, u32), usize);
+/// (!important, context, inline, layer, specificity, source order): the
+/// cascade key; lexicographic max wins. `context` implements CSS Cascade 5
+/// §6.1: outer wins for normal declarations, inner wins for important ones.
+/// `layer` is the importance-adjusted cascade-layer encoding (`encode_layer`);
+/// it sits AFTER context and the inline flag because encapsulation context is
+/// sorted before element-attached styles, and element-attached styles before
+/// layers (CSS Cascade 5 §6.1), and BEFORE specificity (layers beat
+/// specificity — the point of the feature).
+type CascadeKey = (bool, bool, bool, u64, (u32, u32, u32), usize);
 
 /// Rules bucketed by tree scope: DOCUMENT for the light DOM, the shadow
 /// fragment for each shadow tree. Shadow sheets never leak out;
@@ -9764,6 +9832,42 @@ mod tests {
     }
 
     #[test]
+    fn shadow_host_cascade_orders_encapsulation_context_before_specificity() {
+        // CSS Cascade 5 §6.1: for a host receiving declarations from its
+        // outer and inner tree contexts, normal declarations from the OUTER
+        // context win, while important declarations from the INNER context
+        // win. Archive.org relies on this ordering: an outer component fixes
+        // <onboarding-tile> at 60px while the tile's own :host default says
+        // height:100%.
+        let mut dom = Dom::parse_document("<body><outer-box id=outer></outer-box></body>");
+        let outer = dom.get_by_id("outer").unwrap();
+        let outer_root = dom.attach_shadow(outer);
+        let outer_style = dom.create_element("style");
+        let outer_css = dom.create_text("inner-tile { height:60px; width:60px !important; }");
+        dom.append(outer_style, outer_css);
+        dom.append(outer_root, outer_style);
+        let tile = dom.create_element("inner-tile");
+        dom.append(outer_root, tile);
+
+        let tile_root = dom.attach_shadow(tile);
+        let tile_style = dom.create_element("style");
+        let tile_css = dom.create_text(":host { height:100%; width:20px !important; }");
+        dom.append(tile_style, tile_css);
+        dom.append(tile_root, tile_style);
+
+        assert_eq!(
+            dom.computed_value(tile, "height").as_deref(),
+            Some("60px"),
+            "normal outer-context declaration wins before specificity/source order"
+        );
+        assert_eq!(
+            dom.computed_value(tile, "width").as_deref(),
+            Some("20px"),
+            "important inner-context declaration wins"
+        );
+    }
+
+    #[test]
     fn css_cascade_follows_mutations() {
         // The cached index rebuilds on the mutation epoch: class
         // toggles genuinely show and re-hide.
@@ -10603,18 +10707,38 @@ mod tests {
     }
 
     #[test]
-    fn set_scroll_geom_stores_the_clip_box_and_gates_scroll_records() {
-        // The app pushes the CLIP box; a page scrollTop write is recorded for the
-        // cheap `Scrolled` channel only once geometry is known (the app has
-        // measured this as a region). scrollHeight (`which=2`) is deliberately NOT
-        // stored — it reads the fresh `__dom_rect`.
+    fn a_horizontal_scroll_container_bakes_its_actor_and_scroll_left() {
+        let mut dom = Dom::parse_document(
+            "<body><div id=s style='overflow-x:auto;width:96px'><p>x</p></div></body>",
+        );
+        let s = dom.get_by_id("s").unwrap();
+        assert!(dom.is_hscroll_container(s));
+        dom.set_scroll_pos(s, 0.0, 40.5, true);
+        let html = dom.serialize_live(DOCUMENT, &std::collections::HashSet::new());
+        assert!(
+            html.contains(&format!("data-trust-node=\"{s}\"")),
+            "horizontal scroller carries its actor id: {html}"
+        );
+        assert!(
+            html.contains("data-trust-scroll-left=\"40.5\""),
+            "scrollLeft survives the live snapshot in CSS pixels: {html}"
+        );
+    }
+
+    #[test]
+    fn scroll_writes_are_recorded_on_both_axes_without_region_geometry() {
+        // CSSOM View scroll state belongs to every scrolling box. Graphical
+        // horizontal scrollers do not receive the terminal's RegionGeom
+        // message, so a changed scrollLeft must be recorded before any pushed
+        // clip geometry exists. scrollHeight (`which=2`) is deliberately NOT
+        // stored — it reads the fresh fragment scrolling area.
         let mut dom = Dom::parse_document("<body><div id=s style='overflow-y:auto'></div></body>");
         let s = dom.get_by_id("s").unwrap();
-        // No geometry yet ⇒ a scroll write isn't recorded.
-        dom.set_scroll_pos(s, 50.0, 0.0, true);
-        assert!(
-            dom.take_scroll_changes().is_empty(),
-            "no record before the app measured the region"
+        assert!(dom.set_scroll_pos(s, 0.0, 50.0, true));
+        assert_eq!(
+            dom.take_scroll_changes(),
+            vec![(s, 0.0, 50.0)],
+            "horizontal scrolling is observable without RegionGeom"
         );
         dom.set_scroll_geom(s, 100.0, 80.0);
         assert_eq!(dom.scroll_metric(s, 4), Some(100.0), "clientHeight stored");
@@ -10624,11 +10748,16 @@ mod tests {
             None,
             "scrollHeight is read from the rect, never stored"
         );
-        dom.set_scroll_pos(s, 70.0, 0.0, true);
+        assert!(dom.set_scroll_pos(s, 70.0, 50.0, true));
         assert_eq!(
             dom.take_scroll_changes(),
-            vec![(s, 70.0, 0.0)],
-            "a scroll write records once the region is measured"
+            vec![(s, 70.0, 50.0)],
+            "vertical scrolling remains observable after geometry is pushed"
+        );
+        assert!(!dom.set_scroll_pos(s, 70.0, 50.0, true));
+        assert!(
+            dom.take_scroll_changes().is_empty(),
+            "a no-op queues nothing"
         );
     }
 
@@ -10963,6 +11092,39 @@ mod tests {
             dom.serialize(c).contains("min-width:8rem"),
             ":root-defined --cell resolves"
         );
+    }
+
+    #[test]
+    fn background_shorthand_waits_for_custom_property_substitution() {
+        // CSS Variables §3: when a shorthand contains var(), its longhands
+        // receive a pending-substitution value. Parsing the shorthand before
+        // substitution would mistake this declaration for an omitted color and
+        // reset it to transparent (archive.org's white logo on a white nav).
+        let mut dom = Dom::parse_document("<body><ia-nav id=host></ia-nav></body>");
+        let host = dom.get_by_id("host").unwrap();
+        let root = dom.attach_shadow(host);
+        let style = dom.create_element("style");
+        let css = dom.create_text(
+            ":host{--grey13:#222;--primaryNavBg:var(--grey13)}\
+             nav{background:var(--primaryNavBg)}",
+        );
+        dom.append(style, css);
+        dom.append(root, style);
+        let nav = dom.create_element("nav");
+        dom.append(root, nav);
+
+        assert_eq!(
+            dom.computed_style(nav, "background-color").as_deref(),
+            Some("#222")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(nav, "background-color")
+                .as_deref(),
+            Some("#222")
+        );
+        let html = dom.serialize(host);
+        assert!(html.contains("background-color:#222"), "{html}");
+        assert!(!html.contains("background-color:transparent"), "{html}");
     }
 
     #[test]

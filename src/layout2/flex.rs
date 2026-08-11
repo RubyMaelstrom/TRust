@@ -66,11 +66,12 @@ pub(crate) enum AlignContent {
 
 /// Read a container's flex style.
 pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexStyle {
+    // CSS Custom Properties §3: flex longhands and their shorthand/gap values
+    // are consumed after var() substitution, just like the box-size snapshot.
+    let cv = |prop: &str| dom.computed_value_resolved(id, prop);
     // flex-direction / flex-wrap, with `flex-flow` as their shorthand.
-    let flow = dom.computed_value(id, "flex-flow").unwrap_or_default();
-    let dir = dom
-        .computed_value(id, "flex-direction")
-        .unwrap_or_else(|| flow.clone());
+    let flow = cv("flex-flow").unwrap_or_default();
+    let dir = cv("flex-direction").unwrap_or_else(|| flow.clone());
     let dir = dir.to_ascii_lowercase();
     let (row, reverse) = if dir.contains("column-reverse") {
         (false, true)
@@ -81,8 +82,7 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
     } else {
         (true, false)
     };
-    let wrap_v = dom
-        .computed_value(id, "flex-wrap")
+    let wrap_v = cv("flex-wrap")
         .unwrap_or_else(|| flow.clone())
         .to_ascii_lowercase();
     let (wrap, wrap_reverse) = if wrap_v.contains("wrap-reverse") {
@@ -92,8 +92,7 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
     } else {
         (wrap_v.contains("wrap"), false)
     };
-    let justify = match dom
-        .computed_value(id, "justify-content")
+    let justify = match cv("justify-content")
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
@@ -107,13 +106,10 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
         _ => Justify::Start,
     };
     let align_items = align_item_from(
-        dom.computed_value(id, "align-items")
-            .as_deref()
-            .unwrap_or(""),
+        cv("align-items").as_deref().unwrap_or(""),
         AlignItem::Stretch,
     );
-    let align_content = match dom
-        .computed_value(id, "align-content")
+    let align_content = match cv("align-content")
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
@@ -129,7 +125,7 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
     };
     // `gap` is the `<row-gap> <column-gap>` shorthand; longhands win.
     let (short_row, short_col) = {
-        let g = dom.computed_value(id, "gap").unwrap_or_default();
+        let g = cv("gap").unwrap_or_default();
         let mut parts = g.split_whitespace();
         let a = parts.next().map(str::to_string);
         let b = parts.next().map(str::to_string).or_else(|| a.clone());
@@ -140,8 +136,8 @@ pub(crate) fn container_style(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> FlexSt
             .and_then(|v| Len::parse(&v, u, vp))
             .unwrap_or(Len::px(0.0))
     };
-    let row_gap = parse_gap(dom.computed_value(id, "row-gap"), short_row);
-    let col_gap = parse_gap(dom.computed_value(id, "column-gap"), short_col);
+    let row_gap = parse_gap(cv("row-gap"), short_row);
+    let col_gap = parse_gap(cv("column-gap"), short_col);
     let (gap_main, gap_cross) = if row {
         (col_gap, row_gap)
     } else {
@@ -179,7 +175,8 @@ pub(crate) fn item_flex(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> (f32, f32, L
     // auto; one number = <grow> 1 0; number number = <grow> <shrink> 0;
     // a width alone = 1 1 <basis>.
     let (mut grow, mut shrink, mut basis) = (0.0f32, 1.0f32, Len::Auto);
-    if let Some(sh) = dom.computed_value(id, "flex") {
+    let cv = |prop: &str| dom.computed_value_resolved(id, prop);
+    if let Some(sh) = cv("flex") {
         let sh = sh.trim().to_ascii_lowercase();
         match sh.as_str() {
             "none" => (grow, shrink, basis) = (0.0, 0.0, Len::Auto),
@@ -209,19 +206,13 @@ pub(crate) fn item_flex(dom: &Dom, id: NodeId, u: Units, vp: Vp) -> (f32, f32, L
             }
         }
     }
-    if let Some(g) = dom
-        .computed_value(id, "flex-grow")
-        .and_then(|v| v.trim().parse::<f32>().ok())
-    {
+    if let Some(g) = cv("flex-grow").and_then(|v| v.trim().parse::<f32>().ok()) {
         grow = g;
     }
-    if let Some(s) = dom
-        .computed_value(id, "flex-shrink")
-        .and_then(|v| v.trim().parse::<f32>().ok())
-    {
+    if let Some(s) = cv("flex-shrink").and_then(|v| v.trim().parse::<f32>().ok()) {
         shrink = s;
     }
-    if let Some(bv) = dom.computed_value(id, "flex-basis") {
+    if let Some(bv) = cv("flex-basis") {
         let bv = bv.trim();
         if bv.eq_ignore_ascii_case("content") {
             basis = Len::MaxContent; // §9.2.3: treat content as max-content

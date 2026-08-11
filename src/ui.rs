@@ -944,7 +944,9 @@ fn render_carousel_scrollbars(
 ) -> Vec<crate::app::CarouselTrack> {
     let mut tracks = Vec::new();
     for (ci, c) in g.doc.carousels.iter().enumerate() {
-        if c.max_offset() == 0 || c.end == 0 {
+        // CSS Scrollbars Styling 1 §3: `scrollbar-width:none` suppresses
+        // the visual scrollbar but does not affect scrolling by other means.
+        if c.hide_scrollbar || c.max_offset() == 0 || c.end == 0 {
             continue; // nothing to scroll to
         }
         // Draw the bar on the row just BELOW the band (doc row `end`), clipped

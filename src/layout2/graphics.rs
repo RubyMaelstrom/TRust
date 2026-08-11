@@ -111,7 +111,12 @@ impl<'a> Builder<'a> {
             return 0;
         }
         let mut chain = Vec::new();
-        let mut current = self.dom.node(node).parent;
+        // CSS Overflow 3 §2.3 clips the contents of a scroll container to
+        // its scrollport.  A shadow tree is attached to the light tree through
+        // its host (DOM §4.2.2), so paint ancestry must cross that boundary:
+        // otherwise a custom element's host box is clipped but the image/text
+        // painted by its shadow tree escapes the same scrollport.
+        let mut current = self.dom.parent_composed(node);
         while let Some(id) = current {
             if !matches!(self.dom.tag_name(id), Some("html" | "body"))
                 && let Some(container) = self
@@ -122,7 +127,7 @@ impl<'a> Builder<'a> {
             {
                 chain.push(container);
             }
-            current = self.dom.node(id).parent;
+            current = self.dom.parent_composed(id);
         }
         chain.reverse();
         for container in &chain {
@@ -418,6 +423,15 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
             }
             let node = piece.item.node;
             let style_node = piece.item.style_node;
+            // Line boxes are anonymous (`NO_NODE`), but their pieces retain
+            // the generating DOM node. Use that node for the scrollport chain
+            // so inline text/replaced content inside a shadow tree receives
+            // the same clip and scroll transform as element fragments.
+            let piece_scroll_depth = if fragment.node == NO_NODE {
+                builder.push_scroll_ancestors(node)
+            } else {
+                0
+            };
             let clip = builder.effective_clip(node, fragment.clip);
             if let Some(shaped) = &piece.shaped {
                 let origin = CssPoint::new(fragment.x + piece.x, fragment.y + piece.y);
@@ -475,6 +489,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
                     link: piece.item.link.clone(),
                 }));
             }
+            builder.pop_scroll_ancestors(piece_scroll_depth);
         }
     }
     if fragment_clip.is_some() {
