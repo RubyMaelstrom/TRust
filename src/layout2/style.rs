@@ -10,7 +10,7 @@
 
 use url::Url;
 
-use crate::dom::{Dom, NodeId};
+use crate::dom::{Dom, NodeId, PseudoEl};
 use crate::layout2::{Emphasis, NO_NODE};
 use crate::layout2::{ItemKind, TextTransform, Units, WhiteSpace, css_is_italic, css_length_px};
 
@@ -256,6 +256,148 @@ impl BoxStyle {
                 super::float::float_side(dom, id)
             },
             clear: super::float::clear_of(dom, id),
+        }
+    }
+
+    /// Snapshot a generated `::before`/`::after` box. CSS Pseudo 4 §4 makes
+    /// these fully styleable boxes which inherit from their originating
+    /// element. `Dom::pseudo_layout_value` supplies that computed-value model
+    /// from either the live cascade or the declarations baked into a serialized
+    /// live snapshot.
+    pub fn of_pseudo(dom: &Dom, id: NodeId, which: PseudoEl, vp: Vp) -> BoxStyle {
+        let u = Units::of(dom, id);
+        let cv = |prop: &str| dom.pseudo_layout_value(id, which, prop);
+        let len = |prop: &str, default: Len| Len::parse_or(cv(prop).as_deref(), u, vp, default);
+        let border = |side: &str| match cv(&format!("border-{side}-style"))
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("none" | "hidden") => 0.0,
+            _ => match cv(&format!("border-{side}-width"))
+                .as_deref()
+                .map(str::trim)
+            {
+                None | Some("medium") => 3.0,
+                Some("thin") => 1.0,
+                Some("thick") => 5.0,
+                Some(width) => css_length_px(width, u).unwrap_or(3.0).max(0.0),
+            },
+        };
+        let position = match cv("position").as_deref().map(str::trim) {
+            Some("relative") => Pos::Relative,
+            Some("absolute") => Pos::Absolute,
+            Some("fixed") => Pos::Fixed,
+            Some("sticky" | "-webkit-sticky") => Pos::Sticky,
+            _ => Pos::Static,
+        };
+        let float = if position.out_of_flow() {
+            None
+        } else {
+            match cv("float")
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("left" | "inline-start") => Some(super::float::Side::Left),
+                Some("right" | "inline-end") => Some(super::float::Side::Right),
+                _ => None,
+            }
+        };
+        let clear = match cv("clear")
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("left" | "inline-start") => super::float::Clear {
+                left: true,
+                right: false,
+            },
+            Some("right" | "inline-end") => super::float::Clear {
+                left: false,
+                right: true,
+            },
+            Some("both") => super::float::Clear {
+                left: true,
+                right: true,
+            },
+            _ => super::float::Clear::default(),
+        };
+        let bg = |prop: &str| {
+            cv(prop).is_some_and(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                !value.is_empty()
+                    && !matches!(
+                        value.as_str(),
+                        "none"
+                            | "transparent"
+                            | "initial"
+                            | "inherit"
+                            | "unset"
+                            | "revert"
+                            | "revert-layer"
+                            | "rgba(0, 0, 0, 0)"
+                    )
+            })
+        };
+        BoxStyle {
+            margin: [
+                len("margin-top", Len::px(0.0)),
+                len("margin-right", Len::px(0.0)),
+                len("margin-bottom", Len::px(0.0)),
+                len("margin-left", Len::px(0.0)),
+            ],
+            padding: [
+                len("padding-top", Len::px(0.0)),
+                len("padding-right", Len::px(0.0)),
+                len("padding-bottom", Len::px(0.0)),
+                len("padding-left", Len::px(0.0)),
+            ],
+            border: [
+                border("top"),
+                border("right"),
+                border("bottom"),
+                border("left"),
+            ],
+            width: len("width", Len::Auto),
+            min_width: len("min-width", Len::Auto),
+            max_width: len("max-width", Len::None),
+            height: len("height", Len::Auto),
+            min_height: len("min-height", Len::Auto),
+            max_height: len("max-height", Len::None),
+            border_box: matches!(cv("box-sizing").as_deref(), Some("border-box")),
+            position,
+            inset: [
+                len("top", Len::Auto),
+                len("right", Len::Auto),
+                len("bottom", Len::Auto),
+                len("left", Len::Auto),
+            ],
+            z_index: cv("z-index").and_then(|value| value.trim().parse().ok()),
+            // Translation of generated boxes is a paint-only extension of the
+            // same model; keep the geometry standards-correct at the declared
+            // box position until pseudo transforms join the compositor.
+            tx: (0.0, 0.0),
+            ty: (0.0, 0.0),
+            has_transform: cv("transform")
+                .as_deref()
+                .is_some_and(|value| !matches!(value.trim(), "" | "none")),
+            opacity: cv("opacity")
+                .as_deref()
+                .and_then(|value| {
+                    let value = value.trim();
+                    if let Some(percent) = value.strip_suffix('%') {
+                        percent.trim().parse::<f32>().ok().map(|n| n / 100.0)
+                    } else {
+                        value.parse::<f32>().ok()
+                    }
+                })
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0),
+            bg: bg("background-color") || bg("background-image"),
+            float,
+            clear,
         }
     }
 

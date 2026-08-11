@@ -2647,6 +2647,58 @@ impl Dom {
         self.cascaded_maps(id).pseudo(which).get(prop).cloned()
     }
 
+    /// The layout-facing computed value on a generated `::before`/`::after`
+    /// box. Tree-abiding pseudo-elements inherit from their originating
+    /// element (CSS Pseudo 4 §4), while non-inherited properties take their
+    /// initial value unless a pseudo rule declares them. During live rendering
+    /// the resident arena's stylesheets are baked away; in that re-parsed arena
+    /// the equivalent declarations ride `data-trust-*-style`.
+    pub(crate) fn pseudo_layout_value(
+        &self,
+        id: NodeId,
+        which: PseudoEl,
+        prop: &str,
+    ) -> Option<String> {
+        let direct = self
+            .pseudo_style(id, which, prop)
+            .or_else(|| self.baked_pseudo_value(id, which, prop));
+        let inherited = prop_index(prop).is_some_and(|i| PROPS[i].inherited);
+        let inherited_value = || self.computed_value_resolved(id, prop);
+        match direct.as_deref().and_then(wide_keyword) {
+            Some(WideKeyword::Inherit) => inherited_value(),
+            Some(WideKeyword::Initial) => None,
+            Some(WideKeyword::Unset) => inherited.then(inherited_value).flatten(),
+            Some(WideKeyword::Revert) => inherited.then(inherited_value).flatten(),
+            None => direct
+                .map(|value| self.resolve_vars(id, &value))
+                .or_else(|| inherited.then(inherited_value).flatten()),
+        }
+    }
+
+    /// Recover one declaration from the serialized pseudo style. The value was
+    /// produced by `baked_pseudo_style` from the same parsed declaration model;
+    /// parsing it through `parse_decl`/`expand_box_shorthand` keeps semicolons,
+    /// `!important`, and shorthand expansion consistent with ordinary inline
+    /// style instead of inventing a second CSS parser.
+    fn baked_pseudo_value(&self, id: NodeId, which: PseudoEl, prop: &str) -> Option<String> {
+        let attr = match which {
+            PseudoEl::Before => "data-trust-before-style",
+            PseudoEl::After => "data-trust-after-style",
+        };
+        let mut found = None;
+        for decl in self.attr(id, attr)?.split(';') {
+            let Some((name, value, _important)) = parse_decl(decl) else {
+                continue;
+            };
+            for (name, value) in expand_box_shorthand(&name, &value) {
+                if name == prop {
+                    found = Some(value);
+                }
+            }
+        }
+        found
+    }
+
     /// Whether `id` carries the clearfix idiom — a `::before`/`::after`
     /// pseudo-element that `clear`s floats (`.clearfix`, Bootstrap's `.row`,
     /// `.group`, …). Such a block CONTAINS its descendant floats (the universal
@@ -2712,7 +2764,11 @@ impl Dom {
             }
             return None;
         }
-        (!out.is_empty()).then_some(out)
+        // An empty <string> is still a valid content list. CSS Content 3 §2
+        // distinguishes it from `none`: `content:""` creates an empty but fully
+        // styleable pseudo box (the ubiquitous percentage-padding aspect-ratio
+        // box), while `none` inhibits pseudo-element generation altogether.
+        Some(out)
     }
 
     /// The root of a node's tree: DOCUMENT for the light DOM, the
@@ -4315,6 +4371,27 @@ impl Dom {
                 out.push_str("=\"");
                 out.push_str(&escape_attr(&t));
                 out.push('"');
+
+                // CSS Pseudo 4 §4.1: ::before/::after are fully styleable
+                // child boxes. The layout arena re-parses this snapshot without
+                // the resident document's stylesheets, so preserve the pseudo's
+                // own box declarations just as `bake` above preserves the
+                // originating element's declarations. This is load-bearing for
+                // `content:"";display:block;padding-top:56.25%` ratio boxes:
+                // retaining the empty content but losing its padding would still
+                // collapse the box and its absolutely positioned children.
+                let pseudo_style = self.baked_pseudo_style(id, which);
+                if !pseudo_style.is_empty() {
+                    let style_attr = match which {
+                        PseudoEl::Before => "data-trust-before-style",
+                        PseudoEl::After => "data-trust-after-style",
+                    };
+                    out.push(' ');
+                    out.push_str(style_attr);
+                    out.push_str("=\"");
+                    out.push_str(&escape_attr(&pseudo_style));
+                    out.push('"');
+                }
             }
         }
         // Bake the clearfix signal for the same reason: the layout re-parses
@@ -4325,6 +4402,36 @@ impl Dom {
         if self.has_clearing_pseudo(id) {
             out.push_str(" data-trust-clearfix=\"\"");
         }
+    }
+
+    /// Serialize the pseudo-element's own tracked declarations for the
+    /// stylesheet-free layout snapshot. Only declarations targeting the
+    /// pseudo are emitted; inherited values continue to flow from the
+    /// originating element in the box tree.
+    fn baked_pseudo_style(&self, id: NodeId, which: PseudoEl) -> String {
+        let mut out = String::new();
+        for prop in PROPS.iter().filter(|p| p.baked).map(|p| p.name) {
+            let Some(raw) = self.pseudo_style(id, which, prop) else {
+                continue;
+            };
+            let value = self.resolve_vars(id, &raw);
+            if value.trim().is_empty() {
+                continue;
+            }
+            out.push_str(prop);
+            out.push(':');
+            out.push_str(&value);
+            out.push(';');
+        }
+        if let Some(raw) = self.pseudo_style(id, which, "opacity") {
+            let value = self.resolve_vars(id, &raw);
+            if !value.trim().is_empty() {
+                out.push_str("opacity:");
+                out.push_str(&value);
+                out.push(';');
+            }
+        }
+        out
     }
 
     /// Non-element serialization shared between the plain and live
@@ -12151,6 +12258,32 @@ mod tests {
         assert_eq!(
             dom.pseudo_content(by("ab"), PseudoEl::Before).as_deref(),
             Some("ab")
+        );
+    }
+
+    #[test]
+    fn empty_generated_content_and_its_box_style_survive_serialization() {
+        // The native layout arena re-parses a stylesheet-free live snapshot.
+        // Preserve both halves of CSS Pseudo 4 §4.1 box generation: the
+        // empty (but non-`none`) content list and the pseudo's own declarations.
+        let dom = Dom::parse_document(
+            r#"<head><style>
+               #thumb::before{content:"";display:block;width:100%;padding-top:56.25%}
+               </style></head><body><div id=thumb></div></body>"#,
+        );
+        let thumb = dom.get_by_id("thumb").unwrap();
+        assert_eq!(
+            dom.pseudo_content(thumb, PseudoEl::Before).as_deref(),
+            Some("")
+        );
+        let html = dom.serialize(DOCUMENT);
+        assert!(html.contains("data-trust-before=\"\""), "{html}");
+        assert!(
+            html.contains("data-trust-before-style=\"")
+                && html.contains("display:block;")
+                && html.contains("padding-top:56.25%;")
+                && html.contains("width:100%;"),
+            "{html}"
         );
     }
 

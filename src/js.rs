@@ -29707,6 +29707,34 @@ mod tests {
     }
 
     #[test]
+    fn intersection_observer_sees_an_empty_generated_ratio_box() {
+        // CSS Pseudo 4 §4.1 / CSS Content 3 §2: content:"" creates a
+        // styleable box. CSS Box 4 §4: its vertical 56.25% padding resolves
+        // against the 320px containing-block width, making the observed target
+        // 180px tall. Media lazy-loaders gate source assignment on precisely
+        // this positive IntersectionObserver geometry.
+        let (out, outcome) = page(
+            r##"<head><style>
+            #thumb{width:320px}
+            #thumb::before{content:"";display:block;width:100%;padding-top:56.25%}
+            </style></head><body style="margin:0">
+            <div id=thumb></div><div id=out></div><script>
+            new IntersectionObserver(function (entries) {
+                var e = entries[0];
+                document.getElementById('out').textContent =
+                    [e.isIntersecting, e.boundingClientRect.width,
+                     e.boundingClientRect.height, e.intersectionRect.height].join(' ');
+            }).observe(document.getElementById('thumb'));
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("true 320 180 180"),
+            "generated ratio box must supply real IO geometry: {out}"
+        );
+    }
+
+    #[test]
     fn a_below_fold_target_with_a_box_is_not_intersecting_at_load() {
         // Honest viewport intersection for a target that HAS a laid-out box: a
         // boxed element far below the fold reports `isIntersecting:false`, ratio 0

@@ -2916,8 +2916,9 @@ impl Flow<'_> {
                 // painting, not box generation or pointer targeting. This
                 // narrow exception preserves the old invisible-media
                 // optimization while keeping semantic transparent controls.
-                if (ctx.opacity_suppressed() || self.dom.paint_suppressed(b.node))
-                    && !self.dom.subtree_has_point_hit_target(b.node)
+                let pseudo = b.node == NO_NODE;
+                if (ctx.opacity_suppressed() || (!pseudo && self.dom.paint_suppressed(b.node)))
+                    && (pseudo || !self.dom.subtree_has_point_hit_target(b.node))
                 {
                     continue;
                 }
@@ -3674,7 +3675,11 @@ pub(super) fn collect_floats<'t>(
         match i {
             Inline::Float(b) => out.push((b, ctx.clone())),
             Inline::Box { node, kids, .. } => {
-                let inner = InlineStyle::derive(dom, *node, ctx, base);
+                let inner = if *node == NO_NODE {
+                    ctx.clone()
+                } else {
+                    InlineStyle::derive(dom, *node, ctx, base)
+                };
                 collect_floats(dom, base, kids, &inner, out);
             }
             _ => {}
@@ -3702,7 +3707,11 @@ pub(super) fn collect_atom_boxes<'t>(
         match i {
             Inline::AtomBox(b) => out.push((b, ctx.clone())),
             Inline::Box { node, kids, .. } => {
-                let inner = InlineStyle::derive(dom, *node, ctx, base);
+                let inner = if *node == NO_NODE {
+                    ctx.clone()
+                } else {
+                    InlineStyle::derive(dom, *node, ctx, base)
+                };
                 collect_atom_boxes(dom, base, kids, &inner, out);
             }
             _ => {}

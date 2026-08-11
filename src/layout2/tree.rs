@@ -799,28 +799,86 @@ impl Builder<'_> {
             None => self.dom.children(id),
         };
         let mut out = self.build_child_list(&child_ids, closed_details);
-        // Generated content (CSS 2.1 §12.1): the `::before`/`::after` boxes
-        // are the element's first/last children. The text arrives baked as
-        // `data-trust-before`/`-after` (the layout dom re-parses `Doc.raw`
-        // without `<style>`), or straight from the cascade when this dom
-        // still holds its sheets (direct layouts, tests).
-        if let Some(t) = self.pseudo_text(id, PseudoEl::Before, "data-trust-before") {
-            out.insert(0, Built::Inline(Inline::Text(t)));
+        // CSS Pseudo 4 §4.1: generated `::before`/`::after` boxes are the
+        // originating element's first/last children. `content:""` still
+        // creates a fully styleable EMPTY box; dropping it loses percentage
+        // padding aspect-ratio reservations and collapses abspos descendants.
+        // Live snapshots bake content + pseudo declarations into data attrs;
+        // direct layouts read the same values from the resident cascade.
+        if let Some(pseudo) = self.pseudo(id, PseudoEl::Before, "data-trust-before") {
+            out.insert(0, pseudo);
         }
-        if let Some(t) = self.pseudo_text(id, PseudoEl::After, "data-trust-after") {
-            out.push(Built::Inline(Inline::Text(t)));
+        if let Some(pseudo) = self.pseudo(id, PseudoEl::After, "data-trust-after") {
+            out.push(pseudo);
         }
         out
     }
 
-    /// An element's generated-content text for one pseudo, if any: the baked
-    /// serializer attribute, else the live cascade.
-    fn pseudo_text(&self, id: NodeId, which: PseudoEl, attr: &str) -> Option<String> {
-        let t = match self.dom.attr(id, attr) {
-            Some(t) => t.to_string(),
+    /// Build one generated-content pseudo as a real child box. Pseudo boxes do
+    /// not have DOM node identities, so their fragments use `NO_NODE`; their
+    /// originating element remains the inheritance source in
+    /// `pseudo_layout_value` and the surrounding inline context.
+    fn pseudo(&self, id: NodeId, which: PseudoEl, attr: &str) -> Option<Built> {
+        let text = match self.dom.attr(id, attr) {
+            Some(text) => text.to_string(),
             None => self.dom.pseudo_content(id, which)?,
         };
-        (!t.is_empty()).then_some(t)
+        let display = self
+            .dom
+            .pseudo_layout_value(id, which, "display")
+            .unwrap_or_else(|| "inline".to_string());
+        let display = display.trim().to_ascii_lowercase();
+        if display == "none" {
+            return None;
+        }
+        if display == "contents" {
+            return (!text.is_empty()).then_some(Built::Inline(Inline::Text(text)));
+        }
+
+        let style = BoxStyle::of_pseudo(self.dom, id, which, self.vp);
+        let kids: Vec<Inline> = (!text.is_empty())
+            .then_some(Inline::Text(text))
+            .into_iter()
+            .collect();
+        let block_level = matches!(
+            display.as_str(),
+            "block" | "flow-root" | "list-item" | "flex" | "grid" | "table"
+        );
+        if style.position.out_of_flow() || style.float.is_some() || block_level {
+            let b = BoxNode {
+                node: crate::layout2::NO_NODE,
+                style,
+                content: Content::Inlines(kids),
+                marker: None,
+                marker_inside: false,
+                oof: Vec::new(),
+            };
+            if b.style.position.out_of_flow() {
+                return Some(Built::Inline(Inline::OutOfFlow(Box::new(b))));
+            }
+            if b.style.float.is_some() {
+                return Some(Built::Inline(Inline::Float(Box::new(b))));
+            }
+            return Some(Built::Block(Box::new(b)));
+        }
+        if matches!(
+            display.as_str(),
+            "inline-block" | "inline-flex" | "inline-grid" | "inline-table"
+        ) {
+            return Some(Built::Inline(Inline::AtomBox(Box::new(BoxNode {
+                node: crate::layout2::NO_NODE,
+                style,
+                content: Content::Inlines(kids),
+                marker: None,
+                marker_inside: false,
+                oof: Vec::new(),
+            }))));
+        }
+        Some(Built::Inline(Inline::Box {
+            node: crate::layout2::NO_NODE,
+            style: Box::new(style),
+            kids,
+        }))
     }
 
     /// Build a list of child node ids into box-level `Built`s: text runs become

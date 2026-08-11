@@ -1187,6 +1187,29 @@ mod tests {
     }
 
     #[test]
+    fn empty_generated_block_reserves_percentage_padding_height() {
+        // CSS Pseudo 4 §4.1 + CSS Content 3 §2: content:"" generates an
+        // empty, fully styleable ::before box (only `none` inhibits it). CSS
+        // Box 4 §4 then resolves vertical percentage padding against the
+        // containing block's width. This is the standard ratio-box idiom used
+        // by lazy-loaded media thumbnails: 320 * 56.25% = 180 CSS px.
+        let (dom, boxes) = measure(
+            r#"<head><style>
+               #thumb::before{content:"";display:block;width:100%;padding-top:56.25%}
+               </style></head><body style="margin:0">
+               <div id=thumb style="width:320px"></div>
+               <p id=next style="margin:0">next</p></body>"#,
+            80,
+            24,
+        );
+        let thumb = rect(&dom, &boxes, "thumb");
+        let next = rect(&dom, &boxes, "next");
+        assert!((thumb.width - 320.0).abs() < 0.01, "thumb={thumb:?}");
+        assert!((thumb.height - 180.0).abs() < 0.01, "thumb={thumb:?}");
+        assert!(next.top >= 180.0, "next={next:?}, thumb={thumb:?}");
+    }
+
+    #[test]
     fn tab_size_sets_preserved_tab_stops() {
         let style = crate::text::TextStyle::default();
         let space = crate::text::shape(" ", &style).advance;
