@@ -41,6 +41,7 @@ pub mod http;
 pub mod img;
 pub mod js;
 pub mod layout2;
+mod locale;
 pub mod media;
 pub mod oneshot;
 pub mod telnet;

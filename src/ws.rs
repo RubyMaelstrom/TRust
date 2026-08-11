@@ -259,8 +259,10 @@ async fn handshake(
          Sec-WebSocket-Key: {key}\r\n\
          Sec-WebSocket-Version: 13\r\n\
          User-Agent: {ua}\r\n\
+         Accept-Language: {accept_language}\r\n\
          Origin: {origin}\r\n",
         ua = crate::http::USER_AGENT,
+        accept_language = crate::locale::ACCEPT_LANGUAGE,
     );
     if let Some(c) = cookie.filter(|c| !c.is_empty()) {
         req.push_str(&format!("Cookie: {c}\r\n"));
@@ -497,5 +499,45 @@ mod tests {
         assert_eq!(code, 1000);
         assert_eq!(reason, "bye");
         assert_eq!(parse_close(&[]).0, 1005);
+    }
+
+    #[tokio::test]
+    async fn opening_handshake_sends_the_browser_language_preferences() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+            }
+            let _ = head_tx.send(String::from_utf8_lossy(&request).into_owned());
+            socket
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\n\
+                      Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let url = url::Url::parse(&format!("ws://127.0.0.1:{port}/socket")).unwrap();
+        let transport = handshake(&url, "http://example.test", None).await.unwrap();
+        drop(transport);
+        let head = head_rx.await.unwrap();
+        assert!(
+            head.contains("Accept-Language: en-US,en;q=0.9\r\n"),
+            "WebSocket Fetch handshake omitted the language preference: {head}"
+        );
+        assert_eq!(head.matches("Accept-Language:").count(), 1);
+        server.await.unwrap();
     }
 }

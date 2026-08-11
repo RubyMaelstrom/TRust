@@ -6570,8 +6570,11 @@ fn load_page(
     // CSS-pixel viewport from the real terminal: cols/rows times the
     // terminal's cell pixel size (the picker's font size; 8x16 nominal).
     let cfg = format!(
-        "globalThis.__trust_cfg = {{ url: \"{}\", ua: \"TRust/0.1\", width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {} }};",
+        "globalThis.__trust_cfg = {{ url: \"{}\", ua: \"TRust/0.1\", language: \"{}\", languages: [\"{}\", \"{}\"], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {} }};",
         esc_js(page_url),
+        crate::locale::LANGUAGE,
+        crate::locale::LANGUAGES[0],
+        crate::locale::LANGUAGES[1],
         viewport_css.width,
         viewport_css.height,
         env.device_pixel_ratio,
@@ -7734,7 +7737,7 @@ fn worker_prelude() -> &'static str {
 const WORKER_SCOPE: &str = r##"
 (function () {
     var g = globalThis;
-    var cfg = g.__worker_cfg || { id: 0, name: "", url: "about:blank", hwc: 8 };
+    var cfg = g.__worker_cfg || { id: 0, name: "", url: "about:blank", language: "en-US", languages: ["en-US", "en"], hwc: 8 };
     function errStr(where, e) { return where + ": " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : ""); }
 
     // --- the real-time event-loop core (driven by the Rust worker thread) ---
@@ -7868,9 +7871,12 @@ const WORKER_SCOPE: &str = r##"
     g.location = { href: lp[0], protocol: lp[1], host: lp[2], hostname: lp[3], port: lp[4], pathname: lp[5], search: lp[6], hash: lp[7], origin: lp[8], toString: function () { return lp[0]; } };
 
     // --- navigator (WorkerNavigator), the same honest values as the page ---
+    // WHATWG HTML §NavigatorLanguage: languages is a stable FrozenArray and
+    // language is its first (most-preferred) entry.
+    var navigatorLanguages = Object.freeze((cfg.languages || ["en-US", "en"]).slice());
     g.navigator = {
         userAgent: "TRust/0.1", appName: "Netscape", appCodeName: "Mozilla", product: "Gecko", productSub: "20100101",
-        platform: "Linux", vendor: "", vendorSub: "", language: "en-US", languages: ["en-US", "en"], onLine: true,
+        platform: "Linux", vendor: "", vendorSub: "", language: cfg.language || navigatorLanguages[0], languages: navigatorLanguages, onLine: true,
         hardwareConcurrency: cfg.hwc || 8, maxTouchPoints: 0
     };
 
@@ -8183,9 +8189,12 @@ fn run_worker(
     }
     let mut outcome = Outcome::default();
     let cfg = format!(
-        "globalThis.__worker_cfg = {{ id: {id}, name: {}, url: {}, hwc: {} }};",
+        "globalThis.__worker_cfg = {{ id: {id}, name: {}, url: {}, language: \"{}\", languages: [\"{}\", \"{}\"], hwc: {} }};",
         js_string(&name),
         js_string(script_url.as_str()),
+        crate::locale::LANGUAGE,
+        crate::locale::LANGUAGES[0],
+        crate::locale::LANGUAGES[1],
         // navigator.hardwareConcurrency: the real host core count, same honest
         // value the page reports (the WORKER_SCOPE default of 8 was standing in
         // because this was never passed).
@@ -10682,7 +10691,7 @@ const PRELUDE: &str = r##"
 (function () {
     "use strict";
     const g = globalThis;
-    const cfg = g.__trust_cfg || { url: "about:blank", ua: "TRust/0.1", width: 640, height: 384 };
+    const cfg = g.__trust_cfg || { url: "about:blank", ua: "TRust/0.1", language: "en-US", languages: ["en-US", "en"], width: 640, height: 384 };
     const trust = { errors: [], logs: [], readyState: "loading" };
     g.__trust = trust;
 
@@ -15201,13 +15210,16 @@ const PRELUDE: &str = r##"
     // holds and `Window.prototype` reads resolve. The own properties set
     // above are unaffected by the reparent; guard in case the global is frozen.
     try { Object.setPrototypeOf(g, Window.prototype); } catch (e) { /* frozen global */ }
+    // WHATWG HTML §NavigatorLanguage: languages is a stable FrozenArray and
+    // language is its first (most-preferred) entry.
+    const navigatorLanguages = Object.freeze((cfg.languages || ["en-US", "en"]).slice());
     g.navigator = {
         // Real browsers report a region-qualified BCP-47 tag (Chrome/Firefox
         // default to "en-US"), not a bare "en". Language detectors key off
         // this: Open WebUI's i18n loads exactly the detected tag, and its
         // bundle ships "en-US" (no bare "en"), so a bare "en" missed the map
         // and rejected the translation load.
-        userAgent: cfg.ua, language: "en-US", languages: ["en-US", "en"],
+        userAgent: cfg.ua, language: cfg.language || navigatorLanguages[0], languages: navigatorLanguages,
         platform: "Linux", cookieEnabled: true, onLine: true,
         plugins: [], mimeTypes: [], webdriver: false,
         // Spec-mandated Navigator members (HTML §"Client identification" /
@@ -16905,6 +16917,10 @@ const PRELUDE: &str = r##"
     // resolvedOptions/supportedLocalesOf exist so feature-detection
     // passes and pages stop taking polyfill/error paths.
     {
+        // ECMA-402 §DefaultLocale recommends matching navigator.language in a
+        // browser environment. This is the one default every Intl constructor
+        // below reports when no explicit supported locale was requested.
+        const defaultLocale = (g.navigator && g.navigator.language) || cfg.language || "en-US";
         const localeList = (l) => (l === undefined ? [] : Array.isArray(l) ? Array.from(l) : [l]).map(String);
         const supEn = (l) => localeList(l).filter((s) => /^en($|-)/i.test(s));
         const grouped = (s) => {
@@ -16944,7 +16960,7 @@ const PRELUDE: &str = r##"
             formatToParts(n) { return [{ type: "literal", value: this.format(n) }]; }
             resolvedOptions() {
                 const o = this.__o;
-                return Object.assign({ locale: "en-US", numberingSystem: "latn", notation: "standard", style: "decimal", useGrouping: o.useGrouping === false ? false : "auto", minimumIntegerDigits: 1 }, o);
+                return Object.assign({ locale: defaultLocale, numberingSystem: "latn", notation: "standard", style: "decimal", useGrouping: o.useGrouping === false ? false : "auto", minimumIntegerDigits: 1 }, o);
             }
             static supportedLocalesOf(l) { return supEn(l); }
         }
@@ -16965,7 +16981,7 @@ const PRELUDE: &str = r##"
                 return date;
             }
             formatToParts(d) { return [{ type: "literal", value: this.format(d) }]; }
-            resolvedOptions() { return Object.assign({ locale: "en-US", calendar: "gregory", numberingSystem: "latn", timeZone: "UTC" }, this.__o); }
+            resolvedOptions() { return Object.assign({ locale: defaultLocale, calendar: "gregory", numberingSystem: "latn", timeZone: "UTC" }, this.__o); }
             static supportedLocalesOf(l) { return supEn(l); }
         }
         class Collator {
@@ -16985,19 +17001,19 @@ const PRELUDE: &str = r##"
                     return a < b ? -1 : a > b ? 1 : 0;
                 };
             }
-            resolvedOptions() { return Object.assign({ locale: "en-US", usage: "sort", sensitivity: "variant", numeric: false }, this.__o); }
+            resolvedOptions() { return Object.assign({ locale: defaultLocale, usage: "sort", sensitivity: "variant", numeric: false }, this.__o); }
             static supportedLocalesOf(l) { return supEn(l); }
         }
         class DisplayNames {
             constructor(locales, options) { this.__o = options || {}; }
             of(code) { return String(code); }
-            resolvedOptions() { return Object.assign({ locale: "en-US", style: "long", fallback: "code" }, this.__o); }
+            resolvedOptions() { return Object.assign({ locale: defaultLocale, style: "long", fallback: "code" }, this.__o); }
             static supportedLocalesOf(l) { return supEn(l); }
         }
         class PluralRules {
             constructor(locales, options) { this.__o = options || {}; }
             select(n) { return Number(n) === 1 ? "one" : "other"; }
-            resolvedOptions() { return Object.assign({ locale: "en-US", type: "cardinal", pluralCategories: ["one", "other"] }, this.__o); }
+            resolvedOptions() { return Object.assign({ locale: defaultLocale, type: "cardinal", pluralCategories: ["one", "other"] }, this.__o); }
             static supportedLocalesOf(l) { return supEn(l); }
         }
         class RelativeTimeFormat {
@@ -17009,7 +17025,7 @@ const PRELUDE: &str = r##"
                 return v < 0 ? n + " " + u + " ago" : "in " + n + " " + u;
             }
             formatToParts(v, unit) { return [{ type: "literal", value: this.format(v, unit) }]; }
-            resolvedOptions() { return Object.assign({ locale: "en-US", numeric: "always", style: "long" }, this.__o); }
+            resolvedOptions() { return Object.assign({ locale: defaultLocale, numeric: "always", style: "long" }, this.__o); }
             static supportedLocalesOf(l) { return supEn(l); }
         }
         // Intl.Locale (ECMA-402): parse a Unicode BCP-47 locale identifier
@@ -17244,7 +17260,7 @@ const PRELUDE: &str = r##"
                     throw new RangeError("Value " + gran + " out of range for Intl.Segmenter options property granularity");
                 this.__gran = gran;
                 const loc = Array.isArray(locales) ? locales[0] : locales;
-                this.__locale = loc ? String(loc) : "en";
+                this.__locale = loc ? String(loc) : defaultLocale;
             }
             resolvedOptions() { return { locale: this.__locale, granularity: this.__gran }; }
             segment(input) { return new Segments(String(input), this.__gran); }
@@ -26357,7 +26373,8 @@ mod tests {
                         setTimeout(function () {\
                           self.postMessage({ win: typeof window, doc: typeof document,\
                             sg: (self === globalThis), imp: typeof importScripts,\
-                            hwc: navigator.hardwareConcurrency, t: 'fired' });\
+                            hwc: navigator.hardwareConcurrency, lang: navigator.language,\
+                            langs: navigator.languages.join(','), frozen: Object.isFrozen(navigator.languages), t: 'fired' });\
                         }, 30);\
                       };"
                     .to_vec()
@@ -26371,7 +26388,8 @@ mod tests {
             "<body><pre id=o></pre><script>\
              var w = new Worker('http://127.0.0.1:{port}/w.js');\
              w.onmessage = function (e) {{ var d = e.data; document.getElementById('o').textContent = \
-               'SCOPE win=' + d.win + ' doc=' + d.doc + ' sg=' + d.sg + ' imp=' + d.imp + ' hwc=' + (typeof d.hwc) + ' t=' + d.t; }};\
+               'SCOPE win=' + d.win + ' doc=' + d.doc + ' sg=' + d.sg + ' imp=' + d.imp + ' hwc=' + (typeof d.hwc) +\
+               ' lang=' + d.lang + ' langs=' + d.langs + ' frozen=' + d.frozen + ' t=' + d.t; }};\
              w.postMessage('go');\
              </script></body>"
         );
@@ -26398,7 +26416,7 @@ mod tests {
         drop(handle);
         assert!(
             got.contains(
-                "SCOPE win=undefined doc=undefined sg=true imp=function hwc=number t=fired"
+                "SCOPE win=undefined doc=undefined sg=true imp=function hwc=number lang=en-US langs=en-US,en frozen=true t=fired"
             ),
             "worker scope/timer invariants: {got}"
         );
@@ -32133,6 +32151,40 @@ mod tests {
         assert!(
             out.contains("FR=function|true|false|true|true|true|[object FinalizationRegistry]"),
             "FinalizationRegistry shape: {out}"
+        );
+    }
+
+    #[test]
+    fn language_preferences_match_http_and_intl_defaults() {
+        // HTML §NavigatorLanguage requires the preferred tag first and a
+        // stable FrozenArray. ECMA-402 §DefaultLocale recommends that a
+        // browser's default Intl locale match navigator.language.
+        let (out, outcome) = page(
+            r##"<body><pre id=o></pre><script>
+            const languages = navigator.languages;
+            const intlLocales = [
+                new Intl.NumberFormat().resolvedOptions().locale,
+                new Intl.DateTimeFormat().resolvedOptions().locale,
+                new Intl.Collator().resolvedOptions().locale,
+                new Intl.DisplayNames(undefined, { type: "language" }).resolvedOptions().locale,
+                new Intl.PluralRules().resolvedOptions().locale,
+                new Intl.RelativeTimeFormat().resolvedOptions().locale,
+                new Intl.Segmenter().resolvedOptions().locale,
+            ];
+            document.getElementById('o').textContent = [
+                navigator.language === "en-US",
+                JSON.stringify(languages) === '["en-US","en"]',
+                languages[0] === navigator.language,
+                navigator.languages === languages,
+                Object.isFrozen(languages),
+                intlLocales.every(locale => locale === navigator.language),
+            ].join(' ');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("true true true true true true"),
+            "locale surfaces disagree: {out}"
         );
     }
 
