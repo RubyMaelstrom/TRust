@@ -29,6 +29,7 @@ struct CachedImage {
     source: ImageSource,
     width: u32,
     height: u32,
+    revision: u64,
     last_used_frame: u64,
 }
 
@@ -419,6 +420,19 @@ impl VelloCpuRenderer {
         fit: ImageFit,
         sampling: ImageSampling,
     ) -> Result<(), String> {
+        let store_revision = scene.image_store.revision(handle);
+        let changed = self
+            .images
+            .get(&handle)
+            .is_some_and(|image| store_revision.is_some_and(|revision| revision != image.revision));
+        if changed
+            && let Some(CachedImage {
+                source: ImageSource::OpaqueId { id, .. },
+                ..
+            }) = self.images.remove(&handle)
+        {
+            self.resources.destroy_image(id);
+        }
         if !self.images.contains_key(&handle) && self.images.len() >= MAX_REGISTERED_IMAGES {
             let victim = self
                 .images
@@ -443,6 +457,7 @@ impl VelloCpuRenderer {
             }
         }
         if !self.images.contains_key(&handle)
+            && let Some(revision) = store_revision
             && let Some(image) = scene.image_store.get(handle)
         {
             let expected = usize::try_from(image.width)
@@ -491,6 +506,7 @@ impl VelloCpuRenderer {
                     source: ImageSource::opaque_id_with_transparency_hint(id, image.has_alpha),
                     width: image.width,
                     height: image.height,
+                    revision,
                     last_used_frame: self.frame_id,
                 },
             );
@@ -996,6 +1012,56 @@ mod tests {
         }
         renderer.render(&scene).unwrap();
         assert_eq!(renderer.images.len(), 1);
+    }
+
+    #[test]
+    fn stable_image_handle_reuploads_only_after_store_content_changes() {
+        let snapshot = BrowserSnapshot {
+            address: String::new(),
+            status: String::new(),
+            loading: false,
+            can_go_back: false,
+            can_go_forward: false,
+            focused: false,
+            viewport: CssSize::new(40.0, 40.0),
+            page_revision: 0,
+        };
+        let mut scene = desktop_shell(
+            ViewportMetrics::from_physical(PhysicalSize::new(40, 40), ScaleFactor::new(1.0)),
+            &snapshot,
+        );
+        let handle = ImageHandle(101);
+        let resource = |rgba| ImageResource {
+            width: 1,
+            height: 1,
+            rgba: Arc::from(rgba),
+            has_alpha: false,
+        };
+        scene.image_store.insert(handle, resource([255, 0, 0, 255]));
+        scene.primitives.push(DisplayCommand::Image {
+            rect: CssRect::new(1.0, 1.0, 10.0, 10.0),
+            handle,
+            source_rect: None,
+            fit: ImageFit::Fill,
+            sampling: ImageSampling::Nearest,
+            clip: None,
+            node: 1,
+            link: None,
+        });
+
+        let mut renderer = VelloCpuRenderer::new();
+        renderer.render(&scene).unwrap();
+        let first = renderer.images[&handle].revision;
+        renderer.render(&scene).unwrap();
+        assert_eq!(renderer.images[&handle].revision, first);
+
+        scene.image_store.insert(handle, resource([0, 0, 255, 255]));
+        renderer.render(&scene).unwrap();
+        assert_ne!(renderer.images[&handle].revision, first);
+        assert_eq!(
+            renderer.images[&handle].revision,
+            scene.image_store.revision(handle).unwrap()
+        );
     }
 
     #[test]

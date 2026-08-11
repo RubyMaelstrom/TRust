@@ -54,6 +54,7 @@ struct CachedImage {
     // backend upload may be downsampled, but these values must remain natural.
     width: u32,
     height: u32,
+    revision: u64,
     last_used_frame: u64,
 }
 
@@ -792,6 +793,20 @@ impl VelloHybridRenderer {
         fit: ImageFit,
         sampling: ImageSampling,
     ) -> Result<(), String> {
+        let store_revision = scene.image_store.revision(handle);
+        let changed = self
+            .images
+            .get(&handle)
+            .is_some_and(|image| store_revision.is_some_and(|revision| revision != image.revision));
+        if changed
+            && let Some(CachedImage {
+                source: ImageSource::OpaqueId { id, .. },
+                ..
+            }) = self.images.remove(&handle)
+        {
+            self.renderer
+                .destroy_image(&mut self.resources, encoder, id);
+        }
         if !self.images.contains_key(&handle) && self.images.len() >= MAX_REGISTERED_IMAGES {
             let victim = self
                 .images
@@ -817,6 +832,7 @@ impl VelloHybridRenderer {
             }
         }
         if !self.images.contains_key(&handle)
+            && let Some(revision) = store_revision
             && let Some(image) = scene.image_store.get(handle)
         {
             let upload_limit = HYBRID_IMAGE_ATLAS_LIMIT
@@ -843,6 +859,7 @@ impl VelloHybridRenderer {
                     upload_height: u32::from(height),
                     width: image.width,
                     height: image.height,
+                    revision,
                     last_used_frame: self.frame_id,
                 },
             );

@@ -4,7 +4,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::num::NonZeroU32;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use accesskit::{
@@ -46,6 +47,22 @@ const ACCESS_ROOT: AccessNodeId = AccessNodeId(0);
 const ACCESS_FIND: AccessNodeId = AccessNodeId(6);
 const ACCESS_COMMAND: AccessNodeId = AccessNodeId(7);
 const IMAGE_FETCH_CONCURRENCY: usize = 8;
+/// Encoded animation sources are much smaller than decoded frame sequences,
+/// but remain attacker-controlled cache data. Keep this document-local pool
+/// bounded independently of the 256 MiB current-frame `ImageStore`.
+const MAX_ANIMATION_SOURCES: usize = 512;
+const MAX_ANIMATION_SOURCE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_ACTIVE_ANIMATIONS: usize = 128;
+const MAX_ACTIVE_ANIMATION_WORKING_BYTES: usize = 256 * 1024 * 1024;
+/// GIF permits a zero delay, APNG allows viewers to impose a reasonable lower
+/// bound, and WebP explicitly makes zero/very-short duration handling an
+/// implementation choice. Ten milliseconds preserves 100 fps content while
+/// preventing a malformed zero-delay stream from becoming an idle spin.
+const MIN_ANIMATION_FRAME_DELAY: Duration = Duration::from_millis(10);
+/// Preserve absolute frame deadlines (PNG 3 §11.3.6.2) but cap one overdue
+/// catch-up burst so an expensive/corrupt animation cannot monopolize the one
+/// shared worker and starve other visible images.
+const MAX_ANIMATION_CATCH_UP_FRAMES: usize = 8;
 /// Coalesce a slow image stream into an occasional progressive relayout. A
 /// fast page bypasses this timer and relayouts as soon as its whole request set
 /// reaches available/broken state. Full CSS layout can be substantially more
@@ -104,14 +121,468 @@ enum DesktopEvent {
         image_epoch: u64,
         handle: ImageHandle,
         source: String,
-        result: Result<ImageResource, String>,
+        result: Result<trust::img::DecodedGraphicalImage, String>,
     },
     ImagesReady {
         generation: u64,
         image_epoch: u64,
     },
+    AnimationWake,
     Access(AccessEvent),
     Telnet(trust::telnet::Event),
+}
+
+#[derive(Default)]
+struct AnimationSourceStore {
+    entries: HashMap<ImageHandle, trust::img::GraphicalAnimation>,
+    order: VecDeque<ImageHandle>,
+    bytes: usize,
+}
+
+impl AnimationSourceStore {
+    fn insert(
+        &mut self,
+        handle: ImageHandle,
+        source: trust::img::GraphicalAnimation,
+    ) -> Vec<ImageHandle> {
+        if let Some(old) = self.entries.remove(&handle) {
+            self.bytes = self.bytes.saturating_sub(old.encoded_len());
+            self.order.retain(|candidate| *candidate != handle);
+        }
+        self.bytes = self.bytes.saturating_add(source.encoded_len());
+        self.entries.insert(handle, source);
+        self.order.push_back(handle);
+
+        let mut evicted = Vec::new();
+        while self.entries.len() > MAX_ANIMATION_SOURCES || self.bytes > MAX_ANIMATION_SOURCE_BYTES
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(old.encoded_len());
+                evicted.push(oldest);
+            }
+        }
+        evicted
+    }
+
+    fn contains(&self, handle: ImageHandle) -> bool {
+        self.entries.contains_key(&handle)
+    }
+
+    fn remove(&mut self, handle: ImageHandle) -> Option<trust::img::GraphicalAnimation> {
+        let source = self.entries.remove(&handle)?;
+        self.bytes = self.bytes.saturating_sub(source.encoded_len());
+        self.order.retain(|candidate| *candidate != handle);
+        Some(source)
+    }
+
+    fn touch_visible(&mut self, handles: &HashSet<ImageHandle>) {
+        let mut handles: Vec<_> = handles
+            .iter()
+            .copied()
+            .filter(|handle| self.entries.contains_key(handle))
+            .collect();
+        handles.sort_unstable_by_key(|handle| handle.0);
+        for handle in handles {
+            self.order.retain(|candidate| *candidate != handle);
+            self.order.push_back(handle);
+        }
+    }
+
+    fn bounded_active_handles(
+        &self,
+        visible: &HashSet<ImageHandle>,
+        images: &ImageStore,
+    ) -> HashSet<ImageHandle> {
+        let mut active = HashSet::new();
+        let mut working_bytes = 0usize;
+        for handle in self.order.iter().rev().copied() {
+            let Some(source) = self.entries.get(&handle) else {
+                continue;
+            };
+            let bytes = source.decoder_working_set_bytes();
+            if visible.contains(&handle)
+                && images.contains(handle)
+                && active.len() < MAX_ACTIVE_ANIMATIONS
+                && working_bytes.saturating_add(bytes) <= MAX_ACTIVE_ANIMATION_WORKING_BYTES
+            {
+                working_bytes = working_bytes.saturating_add(bytes);
+                active.insert(handle);
+            }
+        }
+        active
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+}
+
+enum AnimationCommand {
+    Reset {
+        generation: u64,
+        image_epoch: u64,
+    },
+    Register {
+        generation: u64,
+        image_epoch: u64,
+        handle: ImageHandle,
+        source: trust::img::GraphicalAnimation,
+    },
+    Unregister(ImageHandle),
+    SetActive {
+        generation: u64,
+        image_epoch: u64,
+        handles: HashSet<ImageHandle>,
+    },
+    Shutdown,
+}
+
+struct AnimationUpdate {
+    generation: u64,
+    image_epoch: u64,
+    handle: ImageHandle,
+    result: Result<ImageResource, String>,
+}
+
+#[derive(Default)]
+struct AnimationOutput {
+    latest: HashMap<ImageHandle, AnimationUpdate>,
+    wake_pending: bool,
+}
+
+struct AnimationPlayer {
+    commands: mpsc::Sender<AnimationCommand>,
+    output: Arc<Mutex<AnimationOutput>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl AnimationPlayer {
+    fn new(proxy: EventLoopProxy<DesktopEvent>) -> Self {
+        let (commands, receiver) = mpsc::channel();
+        let output = Arc::new(Mutex::new(AnimationOutput::default()));
+        let worker_output = Arc::clone(&output);
+        let thread = std::thread::Builder::new()
+            .name(String::from("trust-image-animation"))
+            .spawn(move || animation_worker(receiver, worker_output, proxy))
+            .ok();
+        Self {
+            commands,
+            output,
+            thread,
+        }
+    }
+
+    fn reset(&self, generation: u64, image_epoch: u64) {
+        let _ = self.commands.send(AnimationCommand::Reset {
+            generation,
+            image_epoch,
+        });
+    }
+
+    fn register(
+        &self,
+        generation: u64,
+        image_epoch: u64,
+        handle: ImageHandle,
+        source: trust::img::GraphicalAnimation,
+    ) {
+        let _ = self.commands.send(AnimationCommand::Register {
+            generation,
+            image_epoch,
+            handle,
+            source,
+        });
+    }
+
+    fn unregister(&self, handle: ImageHandle) {
+        let _ = self.commands.send(AnimationCommand::Unregister(handle));
+    }
+
+    fn set_active(&self, generation: u64, image_epoch: u64, handles: HashSet<ImageHandle>) {
+        let _ = self.commands.send(AnimationCommand::SetActive {
+            generation,
+            image_epoch,
+            handles,
+        });
+    }
+
+    fn drain(&self) -> Vec<AnimationUpdate> {
+        let mut output = self.output.lock().expect("animation output poisoned");
+        output.wake_pending = false;
+        output.latest.drain().map(|(_, update)| update).collect()
+    }
+}
+
+impl Drop for AnimationPlayer {
+    fn drop(&mut self) {
+        let _ = self.commands.send(AnimationCommand::Shutdown);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct WorkerAnimation {
+    source: trust::img::GraphicalAnimation,
+    decoder: Option<trust::img::GraphicalAnimationDecoder>,
+    loop_count: Option<trust::img::AnimationLoopCount>,
+    plays_completed: u32,
+    deadline: Option<Instant>,
+    active: bool,
+    started_once: bool,
+    finished: bool,
+    last_delay: Duration,
+}
+
+impl WorkerAnimation {
+    fn new(source: trust::img::GraphicalAnimation) -> Self {
+        Self {
+            source,
+            decoder: None,
+            loop_count: None,
+            plays_completed: 0,
+            deadline: None,
+            active: false,
+            started_once: false,
+            finished: false,
+            last_delay: MIN_ANIMATION_FRAME_DELAY,
+        }
+    }
+
+    fn can_start_play(&self) -> bool {
+        match self.loop_count {
+            None | Some(trust::img::AnimationLoopCount::Infinite) => true,
+            Some(trust::img::AnimationLoopCount::Finite(count)) => self.plays_completed < count,
+        }
+    }
+
+    fn start_play(&mut self, now: Instant) -> Result<Option<ImageResource>, String> {
+        if !self.can_start_play() {
+            self.finished = true;
+            self.deadline = None;
+            return Ok(None);
+        }
+        let mut decoder = self.source.decoder()?;
+        if self.loop_count.is_none() {
+            self.loop_count = Some(decoder.loop_count());
+        }
+        if !self.can_start_play() {
+            self.finished = true;
+            return Ok(None);
+        }
+        let Some(first) = decoder.next_frame()? else {
+            self.finished = true;
+            return Ok(None);
+        };
+        self.last_delay = animation_frame_delay(first.delay);
+        self.deadline = Some(now + self.last_delay);
+        self.decoder = Some(decoder);
+        let publish = self.started_once.then_some(first.image);
+        self.started_once = true;
+        Ok(publish)
+    }
+
+    fn activate(&mut self, now: Instant) -> Result<Option<ImageResource>, String> {
+        if self.active || self.finished {
+            return Ok(None);
+        }
+        self.active = true;
+        self.start_play(now)
+    }
+
+    fn deactivate(&mut self) {
+        self.active = false;
+        self.deadline = None;
+        // Sequential decoders retain logical-canvas buffers. Releasing them is
+        // what keeps a long, image-heavy document cheap while it is off-screen.
+        self.decoder = None;
+    }
+
+    fn advance(&mut self, now: Instant) -> Result<Option<ImageResource>, String> {
+        let frame_started = self.deadline.unwrap_or(now);
+        let next = match self.decoder.as_mut() {
+            Some(decoder) => decoder.next_frame()?,
+            None => return Ok(None),
+        };
+        if let Some(frame) = next {
+            self.last_delay = animation_frame_delay(frame.delay);
+            self.deadline = self.deadline.map(|deadline| deadline + self.last_delay);
+            return Ok(Some(frame.image));
+        }
+        self.decoder = None;
+        self.plays_completed = self.plays_completed.saturating_add(1);
+        self.start_play(frame_started)
+    }
+}
+
+fn animation_frame_delay(delay: Duration) -> Duration {
+    delay.max(MIN_ANIMATION_FRAME_DELAY)
+}
+
+fn publish_animation_update(
+    output: &Arc<Mutex<AnimationOutput>>,
+    proxy: &EventLoopProxy<DesktopEvent>,
+    update: AnimationUpdate,
+) -> bool {
+    let wake = {
+        let mut output = output.lock().expect("animation output poisoned");
+        output.latest.insert(update.handle, update);
+        if output.wake_pending {
+            false
+        } else {
+            output.wake_pending = true;
+            true
+        }
+    };
+    !wake || proxy.send_event(DesktopEvent::AnimationWake).is_ok()
+}
+
+fn animation_worker(
+    commands: mpsc::Receiver<AnimationCommand>,
+    output: Arc<Mutex<AnimationOutput>>,
+    proxy: EventLoopProxy<DesktopEvent>,
+) {
+    let mut generation = 0;
+    let mut image_epoch = 0;
+    let mut animations: HashMap<ImageHandle, WorkerAnimation> = HashMap::new();
+
+    loop {
+        let now = Instant::now();
+        let due: Vec<_> = animations
+            .iter()
+            .filter_map(|(handle, animation)| {
+                animation
+                    .deadline
+                    .filter(|deadline| *deadline <= now)
+                    .map(|_| *handle)
+            })
+            .collect();
+        for handle in due {
+            let Some(animation) = animations.get_mut(&handle) else {
+                continue;
+            };
+            let mut latest = None;
+            let mut error = None;
+            for _ in 0..MAX_ANIMATION_CATCH_UP_FRAMES {
+                if animation.deadline.is_none_or(|deadline| deadline > now) {
+                    break;
+                }
+                match animation.advance(now) {
+                    Ok(frame) => latest = frame.or(latest),
+                    Err(reason) => {
+                        animation.finished = true;
+                        animation.deactivate();
+                        error = Some(reason);
+                        break;
+                    }
+                }
+            }
+            if animation.deadline.is_some_and(|deadline| deadline <= now) {
+                // We decoded enough to preserve disposal state but are still
+                // behind. Re-anchor rather than spin through an unbounded
+                // backlog; subsequent frame spacing remains source-accurate.
+                animation.deadline = Some(now + animation.last_delay);
+            }
+            let result = error.map_or_else(|| latest.map(Ok), |reason| Some(Err(reason)));
+            if let Some(result) = result
+                && !publish_animation_update(
+                    &output,
+                    &proxy,
+                    AnimationUpdate {
+                        generation,
+                        image_epoch,
+                        handle,
+                        result,
+                    },
+                )
+            {
+                return;
+            }
+        }
+
+        let timeout = animations
+            .values()
+            .filter_map(|animation| animation.deadline)
+            .min()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let command = match timeout {
+            Some(timeout) => match commands.recv_timeout(timeout) {
+                Ok(command) => Some(command),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            },
+            None => match commands.recv() {
+                Ok(command) => Some(command),
+                Err(_) => return,
+            },
+        };
+        let Some(command) = command else {
+            continue;
+        };
+        match command {
+            AnimationCommand::Reset {
+                generation: next_generation,
+                image_epoch: next_epoch,
+            } => {
+                generation = next_generation;
+                image_epoch = next_epoch;
+                animations.clear();
+                let mut pending = output.lock().expect("animation output poisoned");
+                pending.latest.clear();
+            }
+            AnimationCommand::Register {
+                generation: candidate_generation,
+                image_epoch: candidate_epoch,
+                handle,
+                source,
+            } if candidate_generation == generation && candidate_epoch == image_epoch => {
+                animations.insert(handle, WorkerAnimation::new(source));
+            }
+            AnimationCommand::Register { .. } => {}
+            AnimationCommand::Unregister(handle) => {
+                animations.remove(&handle);
+            }
+            AnimationCommand::SetActive {
+                generation: candidate_generation,
+                image_epoch: candidate_epoch,
+                handles,
+            } if candidate_generation == generation && candidate_epoch == image_epoch => {
+                let now = Instant::now();
+                for (handle, animation) in &mut animations {
+                    if handles.contains(handle) {
+                        let result = match animation.activate(now) {
+                            Ok(Some(image)) => Some(Ok(image)),
+                            Ok(None) => None,
+                            Err(reason) => Some(Err(reason)),
+                        };
+                        if let Some(result) = result
+                            && !publish_animation_update(
+                                &output,
+                                &proxy,
+                                AnimationUpdate {
+                                    generation,
+                                    image_epoch,
+                                    handle: *handle,
+                                    result,
+                                },
+                            )
+                        {
+                            return;
+                        }
+                    } else {
+                        animation.deactivate();
+                    }
+                }
+            }
+            AnimationCommand::SetActive { .. } => {}
+            AnimationCommand::Shutdown => return,
+        }
+    }
 }
 
 impl From<AccessEvent> for DesktopEvent {
@@ -139,6 +610,14 @@ struct PageLayoutCache {
     device_pixel_ratio: f32,
     document: trust::http::GraphicalDocument,
     layout: trust::layout2::GraphicalLayout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ImageScheduleKey {
+    generation: u64,
+    revision: u64,
+    scroll: CssPoint,
+    viewport: CssSize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -442,6 +921,11 @@ struct DesktopApp {
     image_tasks: HashMap<ImageHandle, tokio::task::JoinHandle<()>>,
     image_flush_scheduled: bool,
     decoded_images_pending_layout: bool,
+    animation_sources: AnimationSourceStore,
+    animations: AnimationPlayer,
+    active_animations: HashSet<ImageHandle>,
+    image_schedule_key: Option<ImageScheduleKey>,
+    window_focused: bool,
     hovered_actor: Option<usize>,
     link_preview: String,
     selection: Option<TextSelection>,
@@ -531,6 +1015,7 @@ impl DesktopApp {
         if let Err(error) = ensure_embedded_heart_assets(&image_store) {
             eprintln!("trust-desktop: heart assets unavailable: {error}");
         }
+        let animations = AnimationPlayer::new(event_proxy.clone());
         Self {
             browser,
             renderer: None,
@@ -564,6 +1049,11 @@ impl DesktopApp {
             image_tasks: HashMap::new(),
             image_flush_scheduled: false,
             decoded_images_pending_layout: false,
+            animation_sources: AnimationSourceStore::default(),
+            animations,
+            active_animations: HashSet::new(),
+            image_schedule_key: None,
+            window_focused: true,
             hovered_actor: None,
             link_preview: String::new(),
             selection: None,
@@ -600,6 +1090,14 @@ impl DesktopApp {
         }
         let image_epoch = self.image_loads.epoch();
         for request in requests {
+            if self.image_loads.completed.contains(&request.handle)
+                && self.image_store.contains(request.handle)
+            {
+                if visible_retries.contains(&request.handle) {
+                    let _ = self.image_store.get(request.handle);
+                }
+                continue;
+            }
             if let Some(image) = self.image_store.get(request.handle) {
                 if self.image_loads.mark_cached(request.handle)
                     && self.image_sizes.get(&request.source) != Some(&(image.width, image.height))
@@ -633,6 +1131,10 @@ impl DesktopApp {
         // full decoded gallery would pin its high-water after navigation.
         self.image_store.clear();
         self.image_sizes.clear();
+        self.animation_sources.clear();
+        self.active_animations.clear();
+        self.image_schedule_key = None;
+        self.animations.reset(generation, self.image_loads.epoch());
         for (_, task) in self.image_tasks.drain() {
             task.abort();
         }
@@ -654,6 +1156,11 @@ impl DesktopApp {
         }
         self.image_flush_scheduled = false;
         self.decoded_images_pending_layout = false;
+        self.animation_sources.clear();
+        self.active_animations.clear();
+        self.image_schedule_key = None;
+        self.animations
+            .reset(self.browser.document_generation(), self.image_loads.epoch());
     }
 
     fn pump_image_loads(&mut self, generation: u64, image_epoch: u64, page: &url::Url) {
@@ -668,7 +1175,7 @@ impl DesktopApp {
                     Ok(bytes) => {
                         let decode_source = source.clone();
                         tokio::task::spawn_blocking(move || {
-                            trust::img::decode_graphical_for_source(&decode_source, &bytes)
+                            trust::img::decode_graphical_image_for_source(&decode_source, bytes)
                         })
                         .await
                         .map_err(|error| format!("image decode task failed: {error}"))
@@ -721,6 +1228,32 @@ impl DesktopApp {
         self.redraw_pending = true;
         if let Some(window) = &self.window {
             window.request_redraw();
+        }
+    }
+
+    fn set_active_animations(&mut self, handles: HashSet<ImageHandle>) {
+        if self.active_animations == handles {
+            return;
+        }
+        self.active_animations = handles.clone();
+        self.animations.set_active(
+            self.browser.document_generation(),
+            self.image_loads.epoch(),
+            handles,
+        );
+    }
+
+    fn handle_decoded_image_evictions(&mut self, evicted: Vec<ImageHandle>) {
+        if evicted.is_empty() {
+            return;
+        }
+        self.image_schedule_key = None;
+        for handle in evicted {
+            if self.animation_sources.remove(handle).is_some() {
+                self.animations.unregister(handle);
+            }
+            self.image_loads.retry_evicted(handle);
+            self.active_animations.remove(&handle);
         }
     }
 
@@ -1344,10 +1877,30 @@ impl DesktopApp {
 
         let generation = self.browser.document_generation();
         if let Some(page) = &self.page_layout {
-            let base = page.document.base.clone();
-            let (requests, visible_retries) =
-                scheduled_page_images(page, self.browser.interaction().scroll, page_viewport);
-            self.request_page_images(generation, &base, &requests, &visible_retries);
+            let key = ImageScheduleKey {
+                generation,
+                revision: page.revision,
+                scroll: self.browser.interaction().scroll,
+                viewport: page_viewport,
+            };
+            if self.image_schedule_key != Some(key) {
+                let base = page.document.base.clone();
+                let (requests, visible_retries) =
+                    scheduled_page_images(page, key.scroll, page_viewport);
+                self.request_page_images(generation, &base, &requests, &visible_retries);
+                self.animation_sources.touch_visible(&visible_retries);
+                let active_animations = if self.window_focused {
+                    self.animation_sources
+                        .bounded_active_handles(&visible_retries, &self.image_store)
+                } else {
+                    HashSet::new()
+                };
+                self.set_active_animations(active_animations);
+                self.image_schedule_key = Some(key);
+            }
+        } else {
+            self.set_active_animations(HashSet::new());
+            self.image_schedule_key = None;
         }
         if let Some(terminal) = &mut self.terminal {
             let line_mode = !terminal.char_mode();
@@ -3472,6 +4025,8 @@ impl DesktopApp {
 impl ApplicationHandler<DesktopEvent> for DesktopApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Wait);
+        self.window_focused = true;
+        self.image_schedule_key = None;
         if self.window.is_none() {
             let attributes = Window::default_attributes()
                 .with_title("TRust")
@@ -3546,6 +4101,8 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.window_focused = false;
+        self.set_active_animations(HashSet::new());
         if let Some(DesktopRenderer::Hybrid(renderer)) = &mut self.renderer {
             renderer.suspend();
         }
@@ -3595,9 +4152,32 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 }
                 self.image_tasks.remove(&handle);
                 match result {
-                    Ok(image) => {
+                    Ok(decoded) => {
+                        let trust::img::DecodedGraphicalImage { image, animation } = decoded;
                         self.image_sizes.insert(source, (image.width, image.height));
-                        self.image_store.insert(handle, image);
+                        let evicted = self.image_store.insert(handle, image);
+                        self.handle_decoded_image_evictions(evicted);
+                        if let Some(animation) = animation
+                            && self.image_store.contains(handle)
+                        {
+                            let worker_source = animation.clone();
+                            let evicted = self.animation_sources.insert(handle, animation);
+                            for old in evicted {
+                                self.animations.unregister(old);
+                                self.image_store.remove(old);
+                                self.image_loads.retry_evicted(old);
+                                self.active_animations.remove(&old);
+                                self.image_schedule_key = None;
+                            }
+                            if self.animation_sources.contains(handle) {
+                                self.animations.register(
+                                    generation,
+                                    image_epoch,
+                                    handle,
+                                    worker_source,
+                                );
+                            }
+                        }
                         self.decoded_images_pending_layout = true;
                     }
                     Err(error) => {
@@ -3642,7 +4222,50 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.decoded_images_pending_layout = false;
                 self.browser.send_image_sizes(&self.image_sizes);
                 self.relayout_cached_page();
+                self.image_schedule_key = None;
                 self.request_redraw();
+            }
+            DesktopEvent::AnimationWake => {
+                let mut redraw = false;
+                for update in self.animations.drain() {
+                    if update.generation != self.browser.document_generation()
+                        || !self
+                            .image_loads
+                            .accepts(update.generation, update.image_epoch)
+                        || !self.animation_sources.contains(update.handle)
+                    {
+                        continue;
+                    }
+                    match update.result {
+                        Ok(image) if self.image_store.contains(update.handle) => {
+                            let evicted = self.image_store.insert(update.handle, image);
+                            self.handle_decoded_image_evictions(evicted);
+                            redraw = true;
+                        }
+                        Ok(_) => {
+                            // The decoded-frame LRU evicted this image. Stop
+                            // producing invisible frames; the ordinary visible
+                            // retry path can fetch/decode it again if needed.
+                            self.animation_sources.remove(update.handle);
+                            self.animations.unregister(update.handle);
+                            self.image_loads.retry_evicted(update.handle);
+                            self.image_schedule_key = None;
+                            redraw = true;
+                        }
+                        Err(error) => {
+                            if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
+                                eprintln!("desktop: animation frame failed: {error}");
+                            }
+                            // Graceful degradation: retain the last complete
+                            // canvas as a static image and release source data.
+                            self.animation_sources.remove(update.handle);
+                            self.animations.unregister(update.handle);
+                        }
+                    }
+                }
+                if redraw {
+                    self.request_redraw();
+                }
             }
             DesktopEvent::Access(event) => match event.window_event {
                 accesskit_winit::WindowEvent::InitialTreeRequested => {
@@ -3760,9 +4383,14 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 }
             }
             WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
                 if !focused {
                     self.composing = false;
                     self.selecting = false;
+                    self.set_active_animations(HashSet::new());
+                } else {
+                    self.image_schedule_key = None;
+                    self.request_redraw();
                 }
                 self.dispatch(UserAction::Focus(focused));
             }
@@ -4555,6 +5183,130 @@ mod tests {
             handle: ImageHandle::for_source(&source),
             source,
         }
+    }
+
+    fn animated_gif_source(repeat: image::codecs::gif::Repeat) -> trust::img::GraphicalAnimation {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new_with_speed(&mut bytes, 30);
+            encoder.set_repeat(repeat).unwrap();
+            for (color, delay) in [([255, 0, 0, 255], 20), ([0, 0, 255, 255], 30)] {
+                encoder
+                    .encode_frame(image::Frame::from_parts(
+                        image::RgbaImage::from_pixel(1, 1, image::Rgba(color)),
+                        0,
+                        0,
+                        image::Delay::from_numer_denom_ms(delay, 1),
+                    ))
+                    .unwrap();
+            }
+        }
+        trust::img::decode_graphical_image_for_source("https://e.test/a.gif", bytes)
+            .unwrap()
+            .animation
+            .unwrap()
+    }
+
+    #[test]
+    fn animation_player_obeys_frame_deadlines_and_stops_on_the_final_finite_frame() {
+        let source = animated_gif_source(image::codecs::gif::Repeat::Finite(2));
+        let mut animation = WorkerAnimation::new(source);
+        let started = Instant::now();
+        assert!(animation.activate(started).unwrap().is_none());
+        assert_eq!(
+            animation.deadline,
+            Some(started + Duration::from_millis(20))
+        );
+
+        let second = animation
+            .advance(started + Duration::from_millis(20))
+            .unwrap()
+            .unwrap();
+        assert_eq!(&second.rgba[..4], &[0, 0, 255, 255]);
+        assert_eq!(
+            animation.deadline,
+            Some(started + Duration::from_millis(50))
+        );
+
+        let restarted = animation
+            .advance(started + Duration::from_millis(50))
+            .unwrap()
+            .unwrap();
+        assert_eq!(&restarted.rgba[..4], &[255, 0, 0, 255]);
+        animation
+            .advance(started + Duration::from_millis(70))
+            .unwrap()
+            .unwrap();
+        assert!(
+            animation
+                .advance(started + Duration::from_millis(100))
+                .unwrap()
+                .is_none()
+        );
+        assert!(animation.finished);
+        assert!(animation.deadline.is_none());
+    }
+
+    #[test]
+    fn inactive_animations_release_decoder_canvases_and_zero_delays_are_bounded() {
+        let source = animated_gif_source(image::codecs::gif::Repeat::Finite(1));
+        let mut animation = WorkerAnimation::new(source);
+        animation.activate(Instant::now()).unwrap();
+        assert!(animation.decoder.is_some());
+        animation.deactivate();
+        assert!(animation.decoder.is_none());
+        assert!(animation.deadline.is_none());
+        let restarted = animation.activate(Instant::now()).unwrap().unwrap();
+        assert_eq!(&restarted.rgba[..4], &[255, 0, 0, 255]);
+        assert!(animation.advance(Instant::now()).unwrap().is_some());
+        assert!(animation.advance(Instant::now()).unwrap().is_none());
+        assert!(
+            animation.finished,
+            "an aborted play must not consume the loop"
+        );
+        assert_eq!(
+            animation_frame_delay(Duration::ZERO),
+            MIN_ANIMATION_FRAME_DELAY
+        );
+        assert_eq!(
+            animation_frame_delay(Duration::from_millis(125)),
+            Duration::from_millis(125)
+        );
+    }
+
+    #[test]
+    fn compressed_animation_sources_have_a_bounded_lru() {
+        let source = animated_gif_source(image::codecs::gif::Repeat::Infinite);
+        let mut store = AnimationSourceStore::default();
+        let mut evicted = Vec::new();
+        for index in 0..=MAX_ANIMATION_SOURCES {
+            evicted.extend(store.insert(ImageHandle(index as u64), source.clone()));
+        }
+        assert_eq!(store.entries.len(), MAX_ANIMATION_SOURCES);
+        assert_eq!(evicted, vec![ImageHandle(0)]);
+        assert!(!store.contains(ImageHandle(0)));
+        assert!(store.contains(ImageHandle(MAX_ANIMATION_SOURCES as u64)));
+
+        let images = ImageStore::default();
+        let visible: HashSet<_> = (1..=MAX_ACTIVE_ANIMATIONS + 1)
+            .map(|index| ImageHandle(index as u64))
+            .collect();
+        for handle in &visible {
+            images.insert(
+                *handle,
+                ImageResource {
+                    width: 1,
+                    height: 1,
+                    rgba: Arc::from([0, 0, 0, 255]),
+                    has_alpha: false,
+                },
+            );
+        }
+        store.touch_visible(&visible);
+        assert_eq!(
+            store.bounded_active_handles(&visible, &images).len(),
+            MAX_ACTIVE_ANIMATIONS
+        );
     }
 
     #[test]

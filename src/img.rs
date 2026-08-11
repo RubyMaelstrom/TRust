@@ -10,8 +10,9 @@
 use std::borrow::Cow;
 use std::io::Read as _;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use image::DynamicImage;
+use image::{AnimationDecoder as _, DynamicImage, ImageDecoder as _};
 use ratatui::layout::Size;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
@@ -42,6 +43,103 @@ pub struct ImageInfo {
     /// stay a separate, cheap opaque overwrite. SVG is silhouette-tinted to a
     /// fully opaque duotone, so it reports `false`.
     pub has_alpha: bool,
+}
+
+/// Compressed source for a raster animation.  The desktop keeps this bounded
+/// separately from its one-current-frame decoded image cache, and constructs a
+/// sequential decoder only while the image is visible.  Keeping the encoded
+/// source instead of every full-canvas frame is important for GIF/APNG/WebP:
+/// their disposal algorithms can make every returned frame canvas-sized even
+/// when the source changes only a few pixels.
+#[derive(Clone, Debug)]
+pub struct GraphicalAnimation {
+    bytes: Arc<[u8]>,
+    format: AnimatedRasterFormat,
+    loop_count_override: Option<AnimationLoopCount>,
+    canvas_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnimatedRasterFormat {
+    Gif,
+    Png,
+    WebP,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimationLoopCount {
+    Infinite,
+    Finite(u32),
+}
+
+impl GraphicalAnimation {
+    pub fn encoded_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Conservative persistent decoder-canvas estimate. GIF/APNG disposal can
+    /// require a current and previous canvas in addition to the emitted frame.
+    pub fn decoder_working_set_bytes(&self) -> usize {
+        self.canvas_bytes.saturating_mul(3)
+    }
+
+    /// Start one play at its first frame.  Format decoders implement the
+    /// normative logical-canvas blend/disposal algorithms; callers only own
+    /// presentation timing and loop restarts.
+    pub fn decoder(&self) -> Result<GraphicalAnimationDecoder, String> {
+        animation_decoder(
+            self.format,
+            Arc::clone(&self.bytes),
+            self.loop_count_override,
+        )
+    }
+}
+
+/// The first display frame and, for a genuine multi-frame resource, its
+/// restartable compressed animation source.
+#[derive(Debug)]
+pub struct DecodedGraphicalImage {
+    pub image: crate::render::ImageResource,
+    pub animation: Option<GraphicalAnimation>,
+}
+
+pub struct GraphicalAnimationFrame {
+    pub image: crate::render::ImageResource,
+    /// How long this frame is displayed before advancing to the next one.
+    pub delay: Duration,
+}
+
+/// A single sequential play. `image::Frames` deliberately erases `Send`; the
+/// desktop constructs and owns this value exclusively on its one animation
+/// worker thread.
+pub struct GraphicalAnimationDecoder {
+    frames: image::Frames<'static>,
+    loop_count: AnimationLoopCount,
+}
+
+impl GraphicalAnimationDecoder {
+    pub fn loop_count(&self) -> AnimationLoopCount {
+        self.loop_count
+    }
+
+    pub fn next_frame(&mut self) -> Result<Option<GraphicalAnimationFrame>, String> {
+        let Some(frame) = self.frames.next() else {
+            return Ok(None);
+        };
+        let frame = frame.map_err(|error| format!("animation decode: {error}"))?;
+        let delay = frame.delay().into();
+        let rgba = frame.into_buffer();
+        let has_alpha = rgba.pixels().any(|pixel| pixel[3] < 255);
+        Ok(Some(GraphicalAnimationFrame {
+            image: crate::render::ImageResource {
+                width: rgba.width(),
+                height: rgba.height(),
+                rgba: Arc::from(rgba.into_raw()),
+                has_alpha,
+            },
+            delay,
+        }))
+    }
 }
 
 /// Whether `image` has any genuinely transparent pixel. A color type without an
@@ -273,6 +371,289 @@ pub fn decode_graphical_for_source(
     Ok(image)
 }
 
+/// Decode the first presentation frame and retain a restartable source when
+/// the resource has at least two frames. This is the desktop `<img>` path;
+/// terminal protocols intentionally continue to use the static first frame
+/// because updating sixel/Kitty encodings would require a different renderer
+/// contract.
+///
+/// HTML §4.8.4.3 says image resources should honor their animation. GIF89a
+/// §23, PNG 3 §11.3.6, and the WebP Container Specification's “Animation” and
+/// “Canvas Assembly from Frames” sections define per-frame delay and logical
+/// canvas disposal. The `image` format decoders implement that assembly and
+/// yield complete straight-alpha canvases, which keeps this layer from
+/// accidentally reinterpreting format-specific disposal state.
+pub fn decode_graphical_image_for_source(
+    source: &str,
+    bytes: Vec<u8>,
+) -> Result<DecodedGraphicalImage, String> {
+    let bytes: Arc<[u8]> = Arc::from(bytes);
+    let animated_format = image::guess_format(&bytes)
+        .ok()
+        .and_then(animated_raster_format);
+    if let Some(format) = animated_format {
+        let mut animation = GraphicalAnimation {
+            bytes: Arc::clone(&bytes),
+            format,
+            // GIF89a ends at its Trailer and defines no looping control. The
+            // widespread NETSCAPE application extension is optional; in its
+            // absence the standards-correct play count is one. `image` cannot
+            // distinguish absent from its zero/infinite sentinel, so retain
+            // the distinction from the parsed data stream here.
+            loop_count_override: (format == AnimatedRasterFormat::Gif)
+                .then(|| gif_loop_count(bytes.as_ref())),
+            canvas_bytes: 0,
+        };
+        if animation_declared(format, Arc::clone(&animation.bytes))?
+            && let Ok(mut decoder) = animation.decoder()
+            && let Ok(Some(first)) = decoder.next_frame()
+        {
+            // A one-frame GIF/APNG is still a useful static image, but keeping
+            // its compressed source and waking the scheduler can never change
+            // the presentation. Peek once and retain only genuine animations.
+            let animation = match decoder.next_frame() {
+                Ok(Some(_)) => {
+                    animation.canvas_bytes = first.image.rgba.len();
+                    Some(animation)
+                }
+                Ok(None) | Err(_) => None,
+            };
+            record_svg_intrinsic_metadata(source, &bytes);
+            return Ok(DecodedGraphicalImage {
+                image: first.image,
+                animation,
+            });
+        }
+    }
+
+    let image = decode_graphical_for_source(source, bytes.as_ref())?;
+    Ok(DecodedGraphicalImage {
+        image,
+        animation: None,
+    })
+}
+
+fn animated_raster_format(format: image::ImageFormat) -> Option<AnimatedRasterFormat> {
+    match format {
+        image::ImageFormat::Gif => Some(AnimatedRasterFormat::Gif),
+        image::ImageFormat::Png => Some(AnimatedRasterFormat::Png),
+        image::ImageFormat::WebP => Some(AnimatedRasterFormat::WebP),
+        _ => None,
+    }
+}
+
+fn raster_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DIMENSION);
+    limits.max_image_height = Some(MAX_DIMENSION);
+    limits
+}
+
+fn animation_declared(format: AnimatedRasterFormat, bytes: Arc<[u8]>) -> Result<bool, String> {
+    let cursor = std::io::Cursor::new(bytes);
+    match format {
+        // GIF89a has no stream-level animation bit. Multiple table-based image
+        // blocks are the animation, so the bounded frame peek above decides.
+        AnimatedRasterFormat::Gif => Ok(true),
+        AnimatedRasterFormat::Png => {
+            let decoder = image::codecs::png::PngDecoder::with_limits(cursor, raster_limits())
+                .map_err(|error| format!("PNG animation header: {error}"))?;
+            decoder
+                .is_apng()
+                .map_err(|error| format!("PNG animation header: {error}"))
+        }
+        AnimatedRasterFormat::WebP => {
+            let decoder = image::codecs::webp::WebPDecoder::new(cursor)
+                .map_err(|error| format!("WebP animation header: {error}"))?;
+            let (width, height) = decoder.dimensions();
+            if width > MAX_DIMENSION || height > MAX_DIMENSION {
+                return Err(format!(
+                    "image dimensions {width}x{height} exceed {MAX_DIMENSION}px cap"
+                ));
+            }
+            Ok(decoder.has_animation())
+        }
+    }
+}
+
+fn animation_loop_count(loop_count: image::metadata::LoopCount) -> AnimationLoopCount {
+    match loop_count {
+        image::metadata::LoopCount::Infinite => AnimationLoopCount::Infinite,
+        image::metadata::LoopCount::Finite(count) => AnimationLoopCount::Finite(count.get()),
+    }
+}
+
+/// Read the de-facto NETSCAPE/ANIMEXTS loop application extension without
+/// searching arbitrary compressed image bytes for a magic substring. GIF89a
+/// §26 makes application data a properly framed extension; walking those
+/// blocks also lets absence retain the base format's one-pass behavior.
+fn gif_loop_count(bytes: &[u8]) -> AnimationLoopCount {
+    fn skip_sub_blocks(bytes: &[u8], position: &mut usize) -> bool {
+        loop {
+            let Some(&length) = bytes.get(*position) else {
+                return false;
+            };
+            *position += 1;
+            if length == 0 {
+                return true;
+            }
+            let Some(next) = position.checked_add(usize::from(length)) else {
+                return false;
+            };
+            if next > bytes.len() {
+                return false;
+            }
+            *position = next;
+        }
+    }
+
+    if bytes.len() < 13 || !matches!(&bytes[..6], b"GIF87a" | b"GIF89a") {
+        return AnimationLoopCount::Finite(1);
+    }
+    let packed = bytes[10];
+    let global_table = if packed & 0x80 != 0 {
+        3usize << (usize::from(packed & 0x07) + 1)
+    } else {
+        0
+    };
+    let Some(mut position) = 13usize.checked_add(global_table) else {
+        return AnimationLoopCount::Finite(1);
+    };
+
+    while let Some(&marker) = bytes.get(position) {
+        position += 1;
+        match marker {
+            0x3b => break, // Trailer
+            0x2c => {
+                // Image Descriptor, optional local color table, LZW code size,
+                // then data sub-blocks.
+                let Some(descriptor_end) = position.checked_add(9) else {
+                    break;
+                };
+                if descriptor_end > bytes.len() {
+                    break;
+                }
+                let image_packed = bytes[position + 8];
+                position = descriptor_end;
+                if image_packed & 0x80 != 0 {
+                    let table = 3usize << (usize::from(image_packed & 0x07) + 1);
+                    let Some(next) = position.checked_add(table) else {
+                        break;
+                    };
+                    position = next;
+                }
+                if position >= bytes.len() {
+                    break;
+                }
+                position += 1;
+                if !skip_sub_blocks(bytes, &mut position) {
+                    break;
+                }
+            }
+            0x21 => {
+                let Some(&label) = bytes.get(position) else {
+                    break;
+                };
+                position += 1;
+                if label != 0xff {
+                    if !skip_sub_blocks(bytes, &mut position) {
+                        break;
+                    }
+                    continue;
+                }
+
+                let Some(&identifier_len) = bytes.get(position) else {
+                    break;
+                };
+                position += 1;
+                let Some(identifier_end) = position.checked_add(usize::from(identifier_len)) else {
+                    break;
+                };
+                let Some(identifier) = bytes.get(position..identifier_end) else {
+                    break;
+                };
+                position = identifier_end;
+                let recognized = matches!(identifier, b"NETSCAPE2.0" | b"ANIMEXTS1.0");
+                while let Some(&length) = bytes.get(position) {
+                    position += 1;
+                    if length == 0 {
+                        break;
+                    }
+                    let Some(end) = position.checked_add(usize::from(length)) else {
+                        return AnimationLoopCount::Finite(1);
+                    };
+                    let Some(data) = bytes.get(position..end) else {
+                        return AnimationLoopCount::Finite(1);
+                    };
+                    if recognized && data.len() >= 3 && data[0] == 1 {
+                        let count = u16::from_le_bytes([data[1], data[2]]);
+                        return if count == 0 {
+                            AnimationLoopCount::Infinite
+                        } else {
+                            AnimationLoopCount::Finite(u32::from(count))
+                        };
+                    }
+                    position = end;
+                }
+            }
+            _ => break,
+        }
+    }
+    AnimationLoopCount::Finite(1)
+}
+
+fn animation_decoder(
+    format: AnimatedRasterFormat,
+    bytes: Arc<[u8]>,
+    loop_count_override: Option<AnimationLoopCount>,
+) -> Result<GraphicalAnimationDecoder, String> {
+    match format {
+        AnimatedRasterFormat::Gif => {
+            let mut decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
+                .map_err(|error| format!("GIF animation header: {error}"))?;
+            decoder
+                .set_limits(raster_limits())
+                .map_err(|error| format!("GIF animation limits: {error}"))?;
+            let loop_count =
+                loop_count_override.unwrap_or_else(|| animation_loop_count(decoder.loop_count()));
+            Ok(GraphicalAnimationDecoder {
+                frames: decoder.into_frames(),
+                loop_count,
+            })
+        }
+        AnimatedRasterFormat::Png => {
+            let decoder = image::codecs::png::PngDecoder::with_limits(
+                std::io::Cursor::new(bytes),
+                raster_limits(),
+            )
+            .map_err(|error| format!("PNG animation header: {error}"))?;
+            let decoder = decoder
+                .apng()
+                .map_err(|error| format!("PNG animation: {error}"))?;
+            let loop_count = animation_loop_count(decoder.loop_count());
+            Ok(GraphicalAnimationDecoder {
+                frames: decoder.into_frames(),
+                loop_count,
+            })
+        }
+        AnimatedRasterFormat::WebP => {
+            let decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes))
+                .map_err(|error| format!("WebP animation header: {error}"))?;
+            let (width, height) = decoder.dimensions();
+            if width > MAX_DIMENSION || height > MAX_DIMENSION {
+                return Err(format!(
+                    "image dimensions {width}x{height} exceed {MAX_DIMENSION}px cap"
+                ));
+            }
+            let loop_count = animation_loop_count(decoder.loop_count());
+            Ok(GraphicalAnimationDecoder {
+                frames: decoder.into_frames(),
+                loop_count,
+            })
+        }
+    }
+}
+
 fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
     let format =
         image::guess_format(bytes).map_err(|_| String::from("unrecognized image format"))?;
@@ -280,10 +661,7 @@ fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_DIMENSION);
-    limits.max_image_height = Some(MAX_DIMENSION);
-    reader.limits(limits);
+    reader.limits(raster_limits());
     let image = reader.decode().map_err(|e| format!("decode: {e}"))?;
     Ok((image, mime))
 }
@@ -972,6 +1350,152 @@ mod tests {
     use super::*;
     use image::GenericImageView as _;
 
+    fn gif_frames(repeat: Option<image::codecs::gif::Repeat>, frame_count: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new_with_speed(&mut bytes, 30);
+            if let Some(repeat) = repeat {
+                encoder.set_repeat(repeat).unwrap();
+            }
+            for index in 0..frame_count {
+                let color = if index % 2 == 0 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                };
+                encoder
+                    .encode_frame(image::Frame::from_parts(
+                        image::RgbaImage::from_pixel(2, 1, image::Rgba(color)),
+                        0,
+                        0,
+                        image::Delay::from_numer_denom_ms(20 + index as u32 * 10, 1),
+                    ))
+                    .unwrap();
+            }
+        }
+        bytes
+    }
+
+    fn push_riff_chunk(bytes: &mut Vec<u8>, name: &[u8; 4], payload: &[u8]) {
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        if !payload.len().is_multiple_of(2) {
+            bytes.push(0);
+        }
+    }
+
+    fn push_u24_le(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes()[..3]);
+    }
+
+    /// Assemble two independently encoded VP8L frames using the WebP
+    /// Container Specification's VP8X/ANIM/ANMF layout. Keeping the fixture
+    /// generated makes every asserted timing/loop byte visible in this test.
+    fn animated_webp() -> Vec<u8> {
+        fn still(color: [u8; 4]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(2, 1, image::Rgba(color)))
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::WebP,
+                )
+                .unwrap();
+            bytes
+        }
+
+        let mut body = b"WEBP".to_vec();
+        let mut vp8x = vec![0x02, 0, 0, 0]; // animation flag + reserved bytes
+        push_u24_le(&mut vp8x, 1); // canvas width minus one
+        push_u24_le(&mut vp8x, 0); // canvas height minus one
+        push_riff_chunk(&mut body, b"VP8X", &vp8x);
+        let mut anim = vec![0, 0, 0, 0]; // transparent-black BGRA hint
+        anim.extend_from_slice(&2u16.to_le_bytes());
+        push_riff_chunk(&mut body, b"ANIM", &anim);
+        for (color, delay) in [([255, 0, 0, 255], 15), ([0, 0, 255, 255], 25)] {
+            let frame = still(color);
+            let mut anmf = Vec::new();
+            push_u24_le(&mut anmf, 0); // x / 2
+            push_u24_le(&mut anmf, 0); // y / 2
+            push_u24_le(&mut anmf, 1); // width minus one
+            push_u24_le(&mut anmf, 0); // height minus one
+            push_u24_le(&mut anmf, delay);
+            anmf.push(0); // alpha blend, retain canvas
+            anmf.extend_from_slice(&frame[12..]);
+            push_riff_chunk(&mut body, b"ANMF", &anmf);
+        }
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    fn png_crc(name: &[u8; 4], payload: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in name.iter().chain(payload) {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+
+    fn push_png_chunk(bytes: &mut Vec<u8>, name: &[u8; 4], payload: &[u8]) {
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(&png_crc(name, payload).to_be_bytes());
+    }
+
+    /// Minimal two-frame RGBA APNG following PNG 3 §11.3.6. The first frame
+    /// is the default image and both frames cover the complete 2×1 canvas.
+    fn animated_png() -> Vec<u8> {
+        use std::io::Write as _;
+
+        fn compressed_scanline(color: [u8; 4]) -> Vec<u8> {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(&[0]).unwrap(); // PNG filter type None
+            encoder.write_all(&color).unwrap();
+            encoder.write_all(&color).unwrap();
+            encoder.finish().unwrap()
+        }
+
+        fn frame_control(sequence: u32, delay: u16) -> Vec<u8> {
+            let mut control = Vec::new();
+            control.extend_from_slice(&sequence.to_be_bytes());
+            control.extend_from_slice(&2u32.to_be_bytes());
+            control.extend_from_slice(&1u32.to_be_bytes());
+            control.extend_from_slice(&0u32.to_be_bytes());
+            control.extend_from_slice(&0u32.to_be_bytes());
+            control.extend_from_slice(&delay.to_be_bytes());
+            control.extend_from_slice(&100u16.to_be_bytes());
+            control.push(0); // APNG_DISPOSE_OP_NONE
+            control.push(0); // APNG_BLEND_OP_SOURCE
+            control
+        }
+
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&2u32.to_be_bytes());
+        ihdr.extend_from_slice(&1u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // RGBA8
+        push_png_chunk(&mut bytes, b"IHDR", &ihdr);
+        let mut actl = Vec::new();
+        actl.extend_from_slice(&2u32.to_be_bytes());
+        actl.extend_from_slice(&2u32.to_be_bytes());
+        push_png_chunk(&mut bytes, b"acTL", &actl);
+        push_png_chunk(&mut bytes, b"fcTL", &frame_control(0, 2));
+        push_png_chunk(&mut bytes, b"IDAT", &compressed_scanline([255, 0, 0, 255]));
+        push_png_chunk(&mut bytes, b"fcTL", &frame_control(1, 3));
+        let mut fdat = 2u32.to_be_bytes().to_vec();
+        fdat.extend_from_slice(&compressed_scanline([0, 0, 255, 255]));
+        push_png_chunk(&mut bytes, b"fdAT", &fdat);
+        push_png_chunk(&mut bytes, b"IEND", &[]);
+        bytes
+    }
+
     fn sample_svg() -> Vec<u8> {
         br##"<?xml version="1.0"?>
             <svg xmlns="http://www.w3.org/2000/svg"
@@ -1278,6 +1802,75 @@ mod tests {
 
         assert!(sniff(b"<html>not pixels</html>").is_none());
         assert!(decode(b"<html>not pixels</html>").is_err());
+    }
+
+    #[test]
+    fn graphical_gif_animation_streams_composited_frames_and_exact_delays() {
+        let bytes = gif_frames(Some(image::codecs::gif::Repeat::Infinite), 2);
+        let decoded = decode_graphical_image_for_source("https://e.test/a.gif", bytes.clone())
+            .expect("animated GIF");
+        assert_eq!((decoded.image.width, decoded.image.height), (2, 1));
+        assert!(decoded.image.rgba[0] > 250 && decoded.image.rgba[2] < 5);
+
+        let animation = decoded.animation.expect("two frames are animated");
+        assert_eq!(animation.encoded_len(), bytes.len());
+        let mut frames = animation.decoder().unwrap();
+        assert_eq!(frames.loop_count(), AnimationLoopCount::Infinite);
+        let first = frames.next_frame().unwrap().unwrap();
+        let second = frames.next_frame().unwrap().unwrap();
+        assert_eq!(first.delay, Duration::from_millis(20));
+        assert_eq!(second.delay, Duration::from_millis(30));
+        assert_eq!(&first.image.rgba[..4], &[255, 0, 0, 255]);
+        assert!(second.image.rgba[2] > 250 && second.image.rgba[0] < 5);
+        assert!(frames.next_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn gif_without_loop_extension_plays_once_and_one_frame_gif_stays_static() {
+        let decoded =
+            decode_graphical_image_for_source("https://e.test/once.gif", gif_frames(None, 2))
+                .unwrap();
+        assert_eq!(
+            decoded.animation.unwrap().decoder().unwrap().loop_count(),
+            AnimationLoopCount::Finite(1),
+            "GIF89a's Trailer ends the stream when no application loop extension exists"
+        );
+
+        let still = decode_graphical_image_for_source(
+            "https://e.test/still.gif",
+            gif_frames(Some(image::codecs::gif::Repeat::Infinite), 1),
+        )
+        .unwrap();
+        assert!(still.animation.is_none());
+        assert_eq!(&still.image.rgba[..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn graphical_webp_animation_honors_container_loop_and_millisecond_delays() {
+        let decoded =
+            decode_graphical_image_for_source("https://e.test/a.webp", animated_webp()).unwrap();
+        assert!(decoded.image.rgba[0] > 250 && decoded.image.rgba[2] < 5);
+        let mut frames = decoded.animation.unwrap().decoder().unwrap();
+        assert_eq!(frames.loop_count(), AnimationLoopCount::Finite(2));
+        let first = frames.next_frame().unwrap().unwrap();
+        let second = frames.next_frame().unwrap().unwrap();
+        assert_eq!(first.delay, Duration::from_millis(15));
+        assert_eq!(second.delay, Duration::from_millis(25));
+        assert!(second.image.rgba[2] > 250 && second.image.rgba[0] < 5);
+    }
+
+    #[test]
+    fn graphical_apng_animation_honors_num_plays_and_fractional_delays() {
+        let decoded =
+            decode_graphical_image_for_source("https://e.test/a.png", animated_png()).unwrap();
+        assert_eq!(&decoded.image.rgba[..4], &[255, 0, 0, 255]);
+        let mut frames = decoded.animation.unwrap().decoder().unwrap();
+        assert_eq!(frames.loop_count(), AnimationLoopCount::Finite(2));
+        let first = frames.next_frame().unwrap().unwrap();
+        let second = frames.next_frame().unwrap().unwrap();
+        assert_eq!(first.delay, Duration::from_millis(20));
+        assert_eq!(second.delay, Duration::from_millis(30));
+        assert_eq!(&second.image.rgba[..4], &[0, 0, 255, 255]);
     }
 
     #[test]

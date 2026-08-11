@@ -256,37 +256,54 @@ const MAX_IMAGE_RESOURCE_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct ImageStoreState {
-    entries: HashMap<ImageHandle, ImageResource>,
+    entries: HashMap<ImageHandle, StoredImageResource>,
     order: VecDeque<ImageHandle>,
     bytes: usize,
+    next_revision: u64,
+}
+
+#[derive(Debug)]
+struct StoredImageResource {
+    image: ImageResource,
+    /// Monotonic content identity. Animation replaces pixels under the stable
+    /// layout handle; retained backends compare this cheap integer and upload
+    /// only when a frame actually changes.
+    revision: u64,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ImageStore(Arc<RwLock<ImageStoreState>>);
 
 impl ImageStore {
-    pub fn insert(&self, handle: ImageHandle, image: ImageResource) {
+    pub fn insert(&self, handle: ImageHandle, image: ImageResource) -> Vec<ImageHandle> {
         let mut store = self.0.write().expect("image store poisoned");
         if let Some(old) = store.entries.remove(&handle) {
-            store.bytes = store.bytes.saturating_sub(old.rgba.len());
+            store.bytes = store.bytes.saturating_sub(old.image.rgba.len());
             store.order.retain(|candidate| *candidate != handle);
         }
+        store.next_revision = store.next_revision.wrapping_add(1).max(1);
+        let revision = store.next_revision;
         store.bytes = store.bytes.saturating_add(image.rgba.len());
-        store.entries.insert(handle, image);
+        store
+            .entries
+            .insert(handle, StoredImageResource { image, revision });
         store.order.push_back(handle);
+        let mut evicted = Vec::new();
         while store.entries.len() > MAX_IMAGE_RESOURCES || store.bytes > MAX_IMAGE_RESOURCE_BYTES {
             let Some(oldest) = store.order.pop_front() else {
                 break;
             };
             if let Some(old) = store.entries.remove(&oldest) {
-                store.bytes = store.bytes.saturating_sub(old.rgba.len());
+                store.bytes = store.bytes.saturating_sub(old.image.rgba.len());
+                evicted.push(oldest);
             }
         }
+        evicted
     }
 
     pub fn get(&self, handle: ImageHandle) -> Option<ImageResource> {
         let mut store = self.0.write().expect("image store poisoned");
-        let image = store.entries.get(&handle).cloned();
+        let image = store.entries.get(&handle).map(|entry| entry.image.clone());
         if image.is_some() {
             // Explicit LRU ownership: the shared decoded store is touched by
             // display-list construction/backends, while each backend owns its
@@ -295,6 +312,15 @@ impl ImageStore {
             store.order.push_back(handle);
         }
         image
+    }
+
+    pub(crate) fn revision(&self, handle: ImageHandle) -> Option<u64> {
+        self.0
+            .read()
+            .expect("image store poisoned")
+            .entries
+            .get(&handle)
+            .map(|entry| entry.revision)
     }
 
     pub fn contains(&self, handle: ImageHandle) -> bool {
@@ -311,6 +337,14 @@ impl ImageStore {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn remove(&self, handle: ImageHandle) -> Option<ImageResource> {
+        let mut store = self.0.write().expect("image store poisoned");
+        let old = store.entries.remove(&handle)?;
+        store.bytes = store.bytes.saturating_sub(old.image.rgba.len());
+        store.order.retain(|candidate| *candidate != handle);
+        Some(old.image)
     }
 
     pub fn clear(&self) {
@@ -2080,5 +2114,29 @@ mod tests {
         assert!(store.contains(ImageHandle(0)));
         assert!(!store.contains(ImageHandle(1)));
         assert!(store.contains(ImageHandle(MAX_IMAGE_RESOURCES as u64)));
+    }
+
+    #[test]
+    fn replacing_pixels_under_a_stable_image_handle_advances_its_revision() {
+        let store = ImageStore::default();
+        let handle = ImageHandle(42);
+        let image = |red| ImageResource {
+            width: 1,
+            height: 1,
+            rgba: Arc::from([red, 0, 0, 255]),
+            has_alpha: false,
+        };
+        store.insert(handle, image(10));
+        let first = store.revision(handle).unwrap();
+        assert!(store.get(handle).is_some());
+        assert_eq!(
+            store.revision(handle),
+            Some(first),
+            "an LRU touch is not a mutation"
+        );
+        store.insert(handle, image(20));
+        assert_ne!(store.revision(handle), Some(first));
+        assert_eq!(store.remove(handle).unwrap().rgba[0], 20);
+        assert_eq!(store.revision(handle), None);
     }
 }
