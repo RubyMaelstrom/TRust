@@ -1006,6 +1006,19 @@ impl BrowserController {
         use crate::js::PageEvt;
         match event {
             PageEvt::Updated { html, outcome } | PageEvt::Static { html, outcome } => {
+                // The native frontends do not pass through `App`, so mirror its
+                // gated live-render diagnostic here. Keeping this at the shared
+                // controller boundary captures the exact authoritative HTML
+                // that every graphical frontend is about to lay out.
+                if let Some(dir) = std::env::var_os("TRUST_DUMP_RAW") {
+                    static DUMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let sequence = DUMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let _ = std::fs::write(
+                        std::path::Path::new(&dir).join(format!("render_{sequence:06}.html")),
+                        &html,
+                    );
+                }
                 if let Some(page) = &mut self.current {
                     page.rendered_html = Some(html);
                     page.revision = page.revision.wrapping_add(1);

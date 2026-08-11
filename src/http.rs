@@ -1106,6 +1106,12 @@ async fn exchange(
             content_type,
             payload.len()
         ));
+    } else if matches!(request.method.as_str(), "POST" | "PUT") {
+        // Fetch, "HTTP-network-or-cache fetch": a null-body POST or PUT has a
+        // Content-Length value of 0. This is semantically distinct from
+        // omitting framing for a GET/HEAD (RFC 9110 §8.6), and some HTTP/1.1
+        // gateways correctly answer an unframed POST with 411 Length Required.
+        head.push_str("Content-Length: 0\r\n");
     }
     // Page-supplied headers (X-Requested-With — which servers read as
     // `$request->ajax()` — Authorization, X-CSRF-TOKEN, …), minus the managed
@@ -3999,13 +4005,30 @@ mod tests {
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
         let started = std::time::Instant::now();
-        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let elapsed = started.elapsed();
         let peak = peak.load(Relaxed);
         eprintln!(
             "page_fetches_run_concurrently: {N} fetches @ {DELAY_MS}ms, peak in-flight {peak}, took {elapsed:?}"
         );
-        let body = String::from_utf8_lossy(&response.body);
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        if !body.contains(&format!("got {N}")) {
+            let live = response
+                .live
+                .as_mut()
+                .expect("pending fetch group keeps the page live");
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, .. })) => {
+                        body = html;
+                        if body.contains(&format!("got {N}")) {
+                            break;
+                        }
+                    }
+                    other => panic!("expected Promise.all render, got {other:?}"),
+                }
+            }
+        }
         assert!(
             body.contains(&format!("got {N}")),
             "all fetches resolved: {body}"
@@ -4018,8 +4041,9 @@ mod tests {
     }
 
     // Response headers reach page JS, and binary bodies stay byte-exact,
-    // through BOTH fetch paths — the load-time one (`response_to_array`) and
-    // the live-actor background one (`fetch_result_value`) — plus the XHR
+    // through BOTH response builders — the one-shot/awaited path
+    // (`response_to_array`) and the resident-actor networking-task path
+    // (`fetch_result_value`) — plus the XHR
     // `responseType='arraybuffer'` reader. Steam's QR login needs all of it:
     // its WebAPI transport reads the EResult from the `x-eresult` response
     // header and protobuf-decodes the body from `arrayBuffer()`. The
@@ -4105,9 +4129,9 @@ mod tests {
             .live
             .take()
             .expect("a live page (it has a listener)");
-        // The XHR's deferred `__finish` (a setTimeout(0) scheduled mid-settle)
-        // can land after the load settle's last tick; the actor fires it AT
-        // REST. Drain until the load-path result text shows up.
+        // The XHR's deferred `__finish` is a setTimeout(0), so the actor fires
+        // it as a later event-loop task. Drain until the initial request result
+        // text shows up.
         let mut latest = body.clone();
         async fn wait_for(live: &mut LivePage, latest: &mut String, needle: &str) {
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -4299,8 +4323,25 @@ mod tests {
         });
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
-        let body = String::from_utf8_lossy(&response.body);
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        if !body.contains("r=200") {
+            let live = response
+                .live
+                .as_mut()
+                .expect("streaming fetch keeps the page live");
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, .. })) => {
+                        body = html;
+                        if body.contains("r=200") {
+                            break;
+                        }
+                    }
+                    other => panic!("expected instantiateStreaming render, got {other:?}"),
+                }
+            }
+        }
         assert!(body.contains("r=200"), "instantiateStreaming ran: {body}");
         server.abort();
     }
@@ -4766,8 +4807,25 @@ mod tests {
         // Page 1: fetch + JSON render; the private-space probe rejects.
         let url = parse_url(&format!("http://127.0.0.1:{port}/page1")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), (8, 16), storage.clone()).await;
-        let body = String::from_utf8_lossy(&response.body);
+        let mut response = execute_js(response, (80, 24), (8, 16), storage.clone()).await;
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        if !body.contains("fetched trust") {
+            let live = response
+                .live
+                .as_mut()
+                .expect("initial fetch keeps page live");
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, .. })) => {
+                        body = html;
+                        if body.contains("fetched trust") {
+                            break;
+                        }
+                    }
+                    other => panic!("expected fetch render, got {other:?}"),
+                }
+            }
+        }
         assert!(body.contains("fetched trust"), "{body}");
         assert!(body.contains(">blocked<"), "{body}");
         let outcome = response.js.expect("outcome");
@@ -4777,8 +4835,22 @@ mod tests {
         // Page 2: async XHR POST + storage written by page 1.
         let url = parse_url(&format!("http://127.0.0.1:{port}/page2")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), (8, 16), storage.clone()).await;
-        let body = String::from_utf8_lossy(&response.body);
+        let mut response = execute_js(response, (80, 24), (8, 16), storage.clone()).await;
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        if !body.contains("pong / page1") {
+            let live = response.live.as_mut().expect("initial XHR keeps page live");
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, .. })) => {
+                        body = html;
+                        if body.contains("pong / page1") {
+                            break;
+                        }
+                    }
+                    other => panic!("expected XHR render, got {other:?}"),
+                }
+            }
+        }
         assert!(body.contains("pong / page1"), "{body}");
         server.abort();
     }
@@ -7033,6 +7105,13 @@ customElements.define('lit-counter', LitCounter);
                     assert!(text.contains("Content-Type: application/x-www-form-urlencoded"));
                     assert!(text.ends_with("k=v&x=y"), "body arrived: {text:?}");
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nposted ok".to_vec()
+                } else if text.starts_with("POST /empty ") || text.starts_with("PUT /empty ") {
+                    assert!(
+                        text.lines()
+                            .any(|line| line.eq_ignore_ascii_case("Content-Length: 0")),
+                        "null-body POST/PUT needs explicit zero framing: {text:?}"
+                    );
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()
                 } else {
                     b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
                 };
@@ -7086,6 +7165,22 @@ customElements.define('lit-counter', LitCounter);
             response.from_post,
             "a direct 2xx off the POST is a POST result"
         );
+
+        // Fetch's HTTP-network algorithm and RFC 9110 §8.6 require explicit
+        // zero framing for a null-body POST/PUT. YouTube's JSON API rejects an
+        // unframed empty POST with 411 before its application sees it.
+        for method in ["POST", "PUT"] {
+            let url = Url::parse(&format!("http://127.0.0.1:{port}/empty")).unwrap();
+            let request = Request {
+                method: method.into(),
+                url,
+                body: None,
+                headers: Vec::new(),
+            };
+            let response = fetch(&request).await.unwrap();
+            assert_eq!(response.status, 200, "{method} null body was accepted");
+            assert_eq!(response.body, b"ok");
+        }
 
         // Post/Redirect/Get: the 303 hop lands on a GET, so the final page
         // is refetchable — NOT marked as a POST result.
