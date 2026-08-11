@@ -1067,8 +1067,9 @@ async fn exchange(
     };
     // Headers we manage ourselves — a page-supplied copy is ignored so we
     // never emit a duplicate or let a page spoof transport/identity headers.
-    // `accept` is the exception: a page (XHR/fetch) may legitimately ask for
-    // `application/json`, so its value overrides our HTML default.
+    // `accept` and `accept-language` are the exceptions: Fetch supplies the
+    // UA defaults only when the request's header list does not already contain
+    // those names, so a page-authored value overrides our defaults.
     const MANAGED: &[&str] = &[
         "host",
         "user-agent",
@@ -1077,17 +1078,26 @@ async fn exchange(
         "connection",
         "cookie",
         "accept-encoding",
+        "accept-language",
     ];
     let page_accept = request
         .headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("accept"))
+        .filter(|(_, v)| !v.contains(['\r', '\n']))
+        .map(|(_, v)| v.as_str());
+    let page_accept_language = request
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("accept-language"))
+        .filter(|(_, v)| !v.contains(['\r', '\n']))
         .map(|(_, v)| v.as_str());
     let mut head = format!(
         "{} {} HTTP/1.1\r\n\
          Host: {}\r\n\
          User-Agent: {}\r\n\
          Accept: {}\r\n\
+         Accept-Language: {}\r\n\
          Accept-Encoding: identity\r\n\
          Connection: keep-alive\r\n",
         request.method,
@@ -1095,6 +1105,7 @@ async fn exchange(
         host_header,
         USER_AGENT,
         page_accept.unwrap_or("text/html, text/*;q=0.8, */*;q=0.1"),
+        page_accept_language.unwrap_or(crate::locale::ACCEPT_LANGUAGE),
     );
     let cookie = cookies_for_request(url);
     if !cookie.is_empty() {
@@ -7074,6 +7085,7 @@ customElements.define('lit-counter', LitCounter);
                     b"HTTP/1.1 302 Found\r\nLocation: /new\r\n\r\n".to_vec()
                 } else if text.starts_with("GET /new ") {
                     assert!(text.contains("User-Agent: TRust/0.1"));
+                    assert!(text.contains("Accept-Language: en-US,en;q=0.9\r\n"));
                     assert!(text.contains("Connection: keep-alive"));
                     // Chunked HTML with a link.
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
@@ -7514,6 +7526,7 @@ customElements.define('lit-counter', LitCounter);
                 ("X-Requested-With".into(), "XMLHttpRequest".into()),
                 ("Authorization".into(), "Bearer tok".into()),
                 ("Accept".into(), "application/json".into()),
+                ("Accept-Language".into(), "fr-CA,fr;q=0.8".into()),
                 ("Host".into(), "evil.example".into()),
                 ("Cookie".into(), "spoof=1".into()),
             ],
@@ -7538,6 +7551,15 @@ customElements.define('lit-counter', LitCounter);
             head.matches("Accept:").count(),
             1,
             "no duplicate Accept header: {head}"
+        );
+        assert!(
+            head.contains("Accept-Language: fr-CA,fr;q=0.8"),
+            "page Accept-Language overrides the UA default: {head}"
+        );
+        assert_eq!(
+            head.matches("Accept-Language:").count(),
+            1,
+            "no duplicate Accept-Language header: {head}"
         );
         assert!(
             !head.contains("evil.example"),
