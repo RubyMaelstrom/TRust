@@ -154,7 +154,7 @@ mod tests {
     use super::*;
     use crate::render::{
         CssRect, DisplayCommand, ImageFit, ImageHandle, ImageResource, ImageSampling, PaintBrush,
-        PaintColor, PaintShape,
+        PaintColor, PaintShape, raster_damage,
     };
 
     const FIXTURE: &str = r#"
@@ -434,6 +434,47 @@ mod tests {
             difference.fraction_over_tolerance < 0.08,
             "backend semantic difference was {difference:?}"
         );
+    }
+
+    #[test]
+    fn hybrid_damage_crop_matches_the_same_area_of_a_full_frame() {
+        let metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(96, 64), ScaleFactor::default());
+        let scene = Scene {
+            viewport: metrics,
+            primitives: vec![
+                DisplayCommand::FillRect {
+                    rect: CssRect::new(0.0, 0.0, 96.0, 64.0),
+                    color: PaintColor::Rgba(240, 240, 240, 255),
+                },
+                DisplayCommand::FillRect {
+                    rect: CssRect::new(17.0, 13.0, 31.0, 23.0),
+                    color: PaintColor::Rgba(15, 80, 220, 255),
+                },
+            ],
+            controls: Vec::new(),
+            content_viewport: CssRect::new(0.0, 0.0, 96.0, 64.0),
+            image_store: ImageStore::default(),
+            page_scroll_containers: Vec::new(),
+            page_size: CssSize::new(96.0, 64.0),
+        };
+        let damage = raster_damage(&scene, CssRect::new(14.0, 10.0, 38.0, 30.0)).unwrap();
+        let Ok(mut hybrid) = futures::executor::block_on(
+            crate::render::vello_hybrid::VelloHybridRenderer::new_headless(),
+        ) else {
+            return;
+        };
+        let full = hybrid.render_rgba(&scene).unwrap();
+        let crop = hybrid.render_rgba(&damage.scene).unwrap();
+        for row in 0..crop.size.height as usize {
+            let full_start =
+                ((damage.y as usize + row) * full.size.width as usize + damage.x as usize) * 4;
+            let crop_start = row * crop.size.width as usize * 4;
+            assert_eq!(
+                &crop.pixels[crop_start..crop_start + crop.size.width as usize * 4],
+                &full.pixels[full_start..full_start + crop.size.width as usize * 4],
+            );
+        }
     }
 
     #[test]

@@ -103,7 +103,7 @@ pub(crate) enum FragKind<'t> {
     Oof(&'t BoxNode, Box<InlineStyle>),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct LineFrag {
     pub pieces: Vec<Piece>,
     pub width: f32,
@@ -111,6 +111,36 @@ pub(crate) struct LineFrag {
     pub baseline: f32,
     pub ascent: f32,
     pub descent: f32,
+}
+
+/// Strip the transient box-tree references from a completed fragment tree so
+/// graphical paint can be replayed against updated computed styles without
+/// repeating box construction or flow layout. `Oof` placeholders must have
+/// been resolved by the positioned post-pass; encountering one makes retained
+/// repaint unavailable and preserves the ordinary full-layout fallback.
+pub(super) fn retain_for_paint(fragment: &Frag<'_>) -> Option<Frag<'static>> {
+    let kind = match &fragment.kind {
+        FragKind::Block => FragKind::Block,
+        FragKind::Line(line) => FragKind::Line(line.clone()),
+        FragKind::Oof(_, _) => return None,
+    };
+    let children = fragment
+        .children
+        .iter()
+        .map(retain_for_paint)
+        .collect::<Option<Vec<_>>>()?;
+    Some(Frag {
+        node: fragment.node,
+        x: fragment.x,
+        y: fragment.y,
+        w: fragment.w,
+        h: fragment.h,
+        border: fragment.border,
+        paint: fragment.paint,
+        clip: fragment.clip,
+        kind,
+        children,
+    })
 }
 
 /// The painter-facing summary of a box's stacking/positioning style

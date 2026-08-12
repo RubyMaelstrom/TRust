@@ -224,6 +224,11 @@ pub struct Dom {
     /// is load-bearing for incremental-layout boundary sparsity and
     /// scroll-region correlation, so hover hosts must not carry it.
     hover_hosts: std::collections::HashSet<NodeId>,
+    /// Selector subjects of paint-only hover rules. These receive a separate
+    /// presentation marker so graphical frontends can update baked paint style
+    /// in place without treating ordinary inline/flex elements as relayout
+    /// boundaries.
+    paint_patch_hosts: std::collections::HashSet<NodeId>,
     /// The live `:hover` chain: the committed hover target + its composed
     /// ancestors (empty at rest / no pointer). Consulted by selector matching
     /// (`Compound.hover`); moved by `set_hover_chain`, which bumps the epoch
@@ -244,6 +249,11 @@ pub struct Dom {
 pub enum DirtyKind {
     /// A childList or text-content change: the content INSIDE a node changed.
     Content,
+    /// A style transition whose changed declarations are paint/hit-test only.
+    /// Its own border box cannot move, so a frontend that retained its fragment
+    /// geometry may patch the selector subject itself. Other consumers walk to
+    /// their ordinary safe layout boundary or use the full fallback.
+    Paint,
     /// An attribute change: the element's own styling/box may have changed.
     Attr,
 }
@@ -399,6 +409,7 @@ impl Dom {
             dirty_nodes: Vec::new(),
             dirty_attributed: true,
             hover_hosts: std::collections::HashSet::new(),
+            paint_patch_hosts: std::collections::HashSet::new(),
             hover_chain: FxHashSet::default(),
             popover_open: FxHashSet::default(),
         };
@@ -414,6 +425,20 @@ impl Dom {
         self.hover_hosts = hosts;
     }
 
+    /// Replace the paint-only selector-subject marker set used by live
+    /// serialization. Like hover hit-test markers, this is presentation
+    /// metadata and must not dirty the canonical DOM.
+    pub fn set_paint_patch_hosts(&mut self, hosts: std::collections::HashSet<NodeId>) {
+        self.paint_patch_hosts = hosts;
+    }
+
+    /// Extend paint markers for a newly serialized incremental boundary while
+    /// retaining the document-wide markers established by the last full
+    /// snapshot.
+    pub fn extend_paint_patch_hosts(&mut self, hosts: impl IntoIterator<Item = NodeId>) {
+        self.paint_patch_hosts.extend(hosts);
+    }
+
     /// Whether no element holds a hover-type listener (the auto-Static gate:
     /// a hover-only page must keep its engine).
     pub fn hover_hosts_is_empty(&self) -> bool {
@@ -427,14 +452,15 @@ impl Dom {
         !self.style_index().hover_probes.is_empty()
     }
 
-    /// The elements a render-affecting `:hover` rule could match (the style
-    /// index's non-any probes) — pure-CSS hover targets like `.menu` of
+    /// The elements a render-affecting `:hover` rule could match — pure-CSS
+    /// hover targets like `.menu` of
     /// `.menu:hover .drop{display:block}`. They carry no listener, so the
     /// listener registry can't name them; the serializer still needs to mark
     /// them (`data-trust-hover`) or the app can never resolve a pointer cell
-    /// to them and the chain never moves there. Any-element probes (`:hover`
-    /// nested in logical pseudos) are skipped — marking everything is
-    /// marking nothing.
+    /// to them and the chain never moves there. A selector whose hover is
+    /// nested in a logical/relational pseudo has an any-element probe; in that
+    /// standards-required case every rendered candidate is marked because
+    /// omitting the designated element would be a false negative.
     pub fn hover_css_candidates(&self) -> Vec<NodeId> {
         self.hover_css_candidates_in(&[DOCUMENT])
     }
@@ -447,7 +473,7 @@ impl Dom {
     /// walk per patch.
     pub fn hover_css_candidates_in(&self, roots: &[NodeId]) -> Vec<NodeId> {
         let idx = self.style_index();
-        let probes: Vec<&HoverProbe> = idx.hover_probes.iter().filter(|p| !p.any).collect();
+        let probes: Vec<&HoverProbe> = idx.hover_probes.iter().collect();
         if probes.is_empty() {
             return Vec::new();
         }
@@ -462,15 +488,56 @@ impl Dom {
         out
     }
 
-    /// Move the live `:hover` chain to `target` + its composed ancestors
-    /// (`None`/stale target clears it). Returns whether the move can change
-    /// the RENDER: some element whose hover state flips is a candidate for a
-    /// hover-dependent rule with render-affecting declarations. Affected ⇒
-    /// bump the epoch (the per-element match/cascade memos invalidate lazily)
-    /// and mark dirty-UNATTRIBUTED via `touch` — a chain change can restyle
-    /// arbitrary descendants (`.menu:hover .dropdown`), so no incremental
-    /// patch is sound. A no-op or non-affecting move (color-only `:hover`
-    /// rules — the common web) costs no epoch, no dirty, no relayout.
+    /// Plausible selector subjects of paint-only `:hover` rules, restricted to
+    /// rendered subtrees. RuleBuckets uses the selector's rightmost compound,
+    /// so common `.menu`, `#id`, and element subjects stay sparse while
+    /// universal/attribute-only selectors conservatively mark every candidate.
+    pub fn hover_paint_subject_candidates_in(&self, roots: &[NodeId]) -> Vec<NodeId> {
+        let index = self.style_index();
+        let mut out = Vec::new();
+        for &root in roots {
+            for id in std::iter::once(root).chain(self.composed_descendants(root)) {
+                if self.tag_name(id).is_none() {
+                    continue;
+                }
+                let scope = self.tree_scope(id);
+                let (Some(rules), Some(buckets)) =
+                    (index.scopes.get(&scope), index.hover_buckets.get(&scope))
+                else {
+                    continue;
+                };
+                let mut candidates = Vec::new();
+                buckets.candidates(self, id, &mut candidates);
+                if candidates
+                    .into_iter()
+                    .any(|rule| rule_is_paint_only(&rules[rule as usize]))
+                {
+                    out.push(id);
+                }
+            }
+        }
+        // `:host(:hover)` subjects live outside their stylesheet scope and do
+        // not enter its ordinary rightmost buckets.
+        for (&host, &scope) in &self.shadow_roots {
+            if roots.iter().any(|&root| {
+                root == crate::dom::DOCUMENT
+                    || root == host
+                    || self.composed_descendants(root).contains(&host)
+            }) && index.scopes.get(&scope).is_some_and(|rules| {
+                rules.iter().any(|rule| {
+                    rule_is_paint_only(rule)
+                        && rule_uses_hover(rule)
+                        && matches!(rule.selector.0.as_slice(), [(_, compound)] if compound.host)
+                })
+            }) {
+                out.push(host);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Set/clear an element's popover SHOWING state (HTML §the popover
     /// attribute). Bumps the main epoch on change — the UA hide rule and
     /// `:popover-open` both read this, so hidden/match memos must refresh —
@@ -488,28 +555,213 @@ impl Dom {
         }
     }
 
+    /// Move the live `:hover` state to `target`, its flat-tree ancestors, and
+    /// any HTML labeled controls whose labels consequently match `:hover`.
+    ///
+    /// Selectors 4 §9.1 makes `:hover` match the designated element and its
+    /// flat-tree ancestors, while the selector containing it can have a
+    /// different subject (`.menu:hover .dropdown`, `li:has(a:hover)`, …).
+    /// Consequently the dirty nodes are the selector SUBJECTS whose match
+    /// result changes, not merely the elements entering/leaving the chain.
+    /// We compare only hover-dependent rules from the normal rightmost-key
+    /// rule buckets. The epoch advances once for the complete transition and
+    /// every changed subject is recorded as an attributed style/box mutation;
+    /// the existing safe-boundary logic remains the patch-vs-full authority.
     pub fn set_hover_chain(&mut self, target: Option<NodeId>) -> bool {
         let mut chain: FxHashSet<NodeId> = FxHashSet::default();
         let mut cur = target.filter(|&t| self.is_valid(t));
         while let Some(c) = cur {
             chain.insert(c);
-            cur = self.parent_composed(c);
+            cur = self.parent_flat(c);
         }
+        // HTML §pseudo-classes adds the labeled control itself when a matching
+        // label is hovered. It explicitly does NOT make the control designated,
+        // so the control's ancestors are not added (the standard's `span#b`
+        // counterexample relies on this distinction).
+        let labeled_controls: Vec<_> = chain
+            .iter()
+            .copied()
+            .filter(|&node| self.tag_name(node) == Some("label"))
+            .filter_map(|label| self.labeled_control(label))
+            .collect();
+        chain.extend(labeled_controls);
         if chain == self.hover_chain {
             return false;
         }
-        let affected = {
-            let idx = self.style_index();
-            !idx.hover_probes.is_empty()
-                && chain
-                    .symmetric_difference(&self.hover_chain)
-                    .any(|&e| idx.hover_probes.iter().any(|p| p.could_match(self, e)))
-        };
-        self.hover_chain = chain;
-        if affected {
-            self.touch();
+        let index = self.style_index();
+        if index.hover_probes.is_empty() {
+            self.hover_chain = chain;
+            return false;
         }
-        affected
+        if !chain
+            .symmetric_difference(&self.hover_chain)
+            .any(|&element| {
+                index
+                    .hover_probes
+                    .iter()
+                    .any(|probe| probe.could_match(self, element))
+            })
+        {
+            // The designated element still changes for DOM `matches(:hover)`,
+            // but no render-affecting hover-bearing compound can observe this
+            // transition. Avoid even the subject-bucket walk.
+            self.hover_chain = chain;
+            return false;
+        }
+
+        // Snapshot OLD selector applicability. RuleBuckets keeps this
+        // proportional to plausible subjects rather than elements × all rules.
+        type HoverMatchSnapshot = (NodeId, NodeId, Vec<(u32, bool)>);
+        let mut old: Vec<HoverMatchSnapshot> = Vec::new();
+        for id in self.composed_descendants(DOCUMENT) {
+            if self.tag_name(id).is_none() {
+                continue;
+            }
+            let scope = self.tree_scope(id);
+            let (Some(rules), Some(buckets)) =
+                (index.scopes.get(&scope), index.hover_buckets.get(&scope))
+            else {
+                continue;
+            };
+            let mut candidates = Vec::new();
+            buckets.candidates(self, id, &mut candidates);
+            if candidates.is_empty() {
+                continue;
+            }
+            old.push((
+                id,
+                scope,
+                candidates
+                    .into_iter()
+                    .map(|ri| {
+                        (
+                            ri,
+                            self.matches_complex(id, &rules[ri as usize].selector.0, None),
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+
+        // `:host(:hover)` is matched in a shadow scope against a subject that
+        // lives outside it, so it cannot enter the ordinary buckets above.
+        let mut old_hosts: Vec<HoverMatchSnapshot> = Vec::new();
+        for (&host, &scope) in &self.shadow_roots {
+            let Some(rules) = index.scopes.get(&scope) else {
+                continue;
+            };
+            let matches: Vec<_> = rules
+                .iter()
+                .enumerate()
+                .filter(|(_, rule)| rule_affects_render(rule) && rule_uses_hover(rule))
+                .filter(|(_, rule)| {
+                    matches!(rule.selector.0.as_slice(), [(_, compound)] if compound.host)
+                })
+                .map(|(ri, rule)| (ri as u32, self.host_rule_matches(host, rule)))
+                .collect();
+            if !matches.is_empty() {
+                old_hosts.push((host, scope, matches));
+            }
+        }
+
+        self.hover_chain = chain;
+
+        let mut changed: FxHashMap<NodeId, DirtyKind> = FxHashMap::default();
+        for (id, scope, prior) in old {
+            let rules = &index.scopes[&scope];
+            let mut kind = None;
+            for (ri, was) in prior {
+                let rule = &rules[ri as usize];
+                if was != self.matches_complex(id, &rule.selector.0, None) {
+                    let this = if rule_is_paint_only(rule) {
+                        DirtyKind::Paint
+                    } else {
+                        DirtyKind::Attr
+                    };
+                    if this == DirtyKind::Attr {
+                        kind = Some(this);
+                        break;
+                    }
+                    kind = Some(this);
+                }
+            }
+            if let Some(kind) = kind {
+                changed.insert(id, kind);
+            }
+        }
+        for (host, scope, prior) in old_hosts {
+            let rules = &index.scopes[&scope];
+            let mut kind = None;
+            for (ri, was) in prior {
+                let rule = &rules[ri as usize];
+                if was != self.host_rule_matches(host, rule) {
+                    let this = if rule_is_paint_only(rule) {
+                        DirtyKind::Paint
+                    } else {
+                        DirtyKind::Attr
+                    };
+                    if this == DirtyKind::Attr {
+                        kind = Some(this);
+                        break;
+                    }
+                    kind = Some(this);
+                }
+            }
+            if let Some(kind) = kind {
+                changed
+                    .entry(host)
+                    .and_modify(|old| {
+                        if kind == DirtyKind::Attr {
+                            *old = kind;
+                        }
+                    })
+                    .or_insert(kind);
+            }
+        }
+        if changed.is_empty() {
+            return false;
+        }
+        self.mark();
+        self.dirty_nodes.extend(changed);
+        true
+    }
+
+    /// Parent in CSS Scoping's flattened element tree. Shadow-root children
+    /// are associated with the host, and a slottable is associated with the
+    /// first matching `<slot>` in its parent's shadow tree.
+    fn parent_flat(&self, id: NodeId) -> Option<NodeId> {
+        if let Some(slot) = self.assigned_slot(id) {
+            return Some(slot);
+        }
+        let parent = self.nodes[id].parent?;
+        self.shadow_hosts.get(&parent).copied().or(Some(parent))
+    }
+
+    fn assigned_slot(&self, id: NodeId) -> Option<NodeId> {
+        let host = self.nodes[id].parent?;
+        let shadow = self.shadow_root(host)?;
+        let wanted = self.attr(id, "slot").unwrap_or("").trim();
+        self.descendants(shadow).find(|&candidate| {
+            self.tag_name(candidate) == Some("slot")
+                && self.attr(candidate, "name").unwrap_or("").trim() == wanted
+        })
+    }
+
+    fn labeled_control(&self, label: NodeId) -> Option<NodeId> {
+        let labelable = |node| match self.tag_name(node) {
+            Some("button" | "meter" | "output" | "progress" | "select" | "textarea") => true,
+            Some("input") => !self
+                .attr(node, "type")
+                .is_some_and(|ty| ty.eq_ignore_ascii_case("hidden")),
+            _ => false,
+        };
+        if let Some(target) = self.attr(label, "for") {
+            let scope = self.tree_scope(label);
+            return self
+                .descendants(scope)
+                .find(|&node| self.attr(node, "id") == Some(target) && labelable(node));
+        }
+        self.descendants(label).find(|&node| labelable(node))
     }
 
     /// True when anything mutated since the last call; resets the flag.
@@ -657,7 +909,7 @@ impl Dom {
         live_regions: &std::collections::HashSet<NodeId>,
     ) -> Option<NodeId> {
         let mut cur = match kind {
-            DirtyKind::Content => Some(node),
+            DirtyKind::Content | DirtyKind::Paint => Some(node),
             DirtyKind::Attr => self.parent_composed(node),
         };
         while let Some(c) = cur {
@@ -775,7 +1027,7 @@ impl Dom {
     /// itself may be the boundary.
     pub fn relayout_boundary_general(&self, node: NodeId, kind: DirtyKind) -> Option<NodeId> {
         let mut cur = match kind {
-            DirtyKind::Content => Some(node),
+            DirtyKind::Content | DirtyKind::Paint => Some(node),
             DirtyKind::Attr => self.parent_composed(node),
         };
         while let Some(c) = cur {
@@ -804,11 +1056,13 @@ impl Dom {
         cached: &std::collections::HashSet<usize>,
     ) -> Option<NodeId> {
         let mut cur = match kind {
-            DirtyKind::Content => Some(node),
+            DirtyKind::Content | DirtyKind::Paint => Some(node),
             DirtyKind::Attr => self.parent_composed(node),
         };
         while let Some(c) = cur {
-            if cached.contains(&c) && self.establishes_independent_formatting_context(c) {
+            if cached.contains(&c)
+                && (kind == DirtyKind::Paint || self.establishes_independent_formatting_context(c))
+            {
                 return Some(c);
             }
             cur = self.parent_composed(c);
@@ -2865,22 +3119,28 @@ impl Dom {
             .values()
             .flatten()
             .any(|r| r.decls.iter().any(|(k, _)| k == "opacity"));
-        // The hover probes: only rules that could change what we PAINT under a
-        // moved hover chain. Untracked-only declarations (color — nothing the
-        // terminal renders) build no probe, so `set_hover_chain`
-        // short-circuits to "unaffected" on the common color-only web.
-        // Backgrounds ARE tracked (the cell compositor paints opaque fills), so
-        // `is_tracked` covers them — a hover background costs a relayout.
+        // The hover probes: only rules that could change what we paint under a
+        // moved hover chain. Graphical paint properties such as `color` are in
+        // the tracked registry too; they invalidate retained paint even when
+        // terminal-cell geometry happens not to change.
         index.hover_probes = index
             .scopes
             .values()
             .flatten()
-            .filter(|r| {
-                r.decls
-                    .iter()
-                    .any(|(k, _)| k == "content" || k.starts_with("--") || is_tracked(k))
-            })
+            .filter(|r| rule_affects_render(r))
             .flat_map(hover_probes_of)
+            .collect();
+        index.hover_buckets = index
+            .scopes
+            .iter()
+            .map(|(scope, rules)| {
+                (
+                    *scope,
+                    RuleBuckets::build_where(rules, |rule| {
+                        rule_affects_render(rule) && rule_uses_hover(rule)
+                    }),
+                )
+            })
             .collect();
         // Build the rightmost-key buckets so `matched_rules` tests only
         // candidate rules per element instead of the whole scope.
@@ -3673,10 +3933,18 @@ impl Dom {
     /// image-URL collection and layout. This is the first slice of inline-SVG
     /// support: a static snapshot of self-contained vector markup.
     pub fn rewrite_inline_svgs(&mut self, base: Option<&url::Url>) {
+        self.rewrite_inline_svgs_in(DOCUMENT, base);
+    }
+
+    /// `rewrite_inline_svgs` restricted to one retained subtree. Incremental
+    /// graphical patches have already rewritten every unaffected sibling, so
+    /// revisiting the complete document would turn a local style response into
+    /// document-sized work.
+    pub fn rewrite_inline_svgs_in(&mut self, root: NodeId, base: Option<&url::Url>) {
         // Materialize the candidate list first: the loop MUTATES the tree
         // (insert/detach), which can't overlap the lazy descendants walk.
-        let svgs: Vec<NodeId> = self
-            .descendants(DOCUMENT)
+        let svgs: Vec<NodeId> = std::iter::once(root)
+            .chain(self.descendants(root))
             .filter(|&id| self.tag_name(id) == Some("svg"))
             .collect();
         for id in svgs {
@@ -4225,6 +4493,13 @@ impl Dom {
         // should hear the pointer.
         if self.hover_hosts.contains(&id) {
             out.push_str(&format!(" data-trust-hover=\"{id}\""));
+        }
+        // Paint-only hover selector subjects are correlated independently of
+        // layout boundaries. Their box geometry does not change, so a native
+        // frontend may copy freshly baked paint declarations onto its retained
+        // presentation node and replay paint over existing fragments.
+        if self.paint_patch_hosts.contains(&id) {
+            out.push_str(&format!(" data-trust-paint-node=\"{id}\""));
         }
         // A scroll container's current `scrollTop` signal (CSSOM View) rides the
         // HTML in CSS pixels so it survives the live snapshot/re-parse exactly
@@ -7565,10 +7840,12 @@ struct StyleIndex {
     /// change the RENDER (a `PROPS`-tracked property, generated `content`, or
     /// a custom property — which can feed a tracked one via `var()`).
     /// `set_hover_chain` tests the elements whose hover state flips against
-    /// these to decide whether a hover move needs a restyle at all. Color-only
-    /// `:hover` rules (the overwhelming majority of the web) build NO probes,
-    /// so hovering across such pages is free.
+    /// these to decide whether a hover move needs a restyle at all.
     hover_probes: Vec<HoverProbe>,
+    /// Render-affecting hover rules indexed by their selector subjects
+    /// (rightmost compounds). `set_hover_chain` compares their old/new match
+    /// state to attribute invalidation to the subjects that actually changed.
+    hover_buckets: FxHashMap<NodeId, RuleBuckets>,
 }
 
 /// A cheap could-match test for the compound that carries a `:hover` — the
@@ -7622,9 +7899,62 @@ fn compound_has_nested_hover(c: &Compound) -> bool {
                     .any(|(_, cc)| cc.hover || compound_has_nested_hover(cc))
             })
         })
+        || c.has.iter().flatten().any(|arg| {
+            arg.complex
+                .0
+                .iter()
+                .any(|(_, inner)| inner.hover || compound_has_nested_hover(inner))
+        })
+        || c.structural.iter().any(|structural| match structural {
+            Structural::Nth { of: Some(of), .. } => of.iter().any(|complex| {
+                complex
+                    .0
+                    .iter()
+                    .any(|(_, inner)| inner.hover || compound_has_nested_hover(inner))
+            }),
+            _ => false,
+        })
         || c.host_inner
             .as_deref()
             .is_some_and(|h| h.hover || compound_has_nested_hover(h))
+}
+
+fn rule_uses_hover(rule: &StyleRule) -> bool {
+    rule.selector
+        .0
+        .iter()
+        .any(|(_, c)| c.hover || compound_has_nested_hover(c))
+}
+
+fn rule_affects_render(rule: &StyleRule) -> bool {
+    rule.decls
+        .iter()
+        .any(|(k, _)| k == "content" || k.starts_with("--") || is_tracked(k))
+}
+
+/// Whether changing this rule can only change pixels or pointer eligibility,
+/// never box construction, intrinsic measurement, normal-flow geometry, or
+/// stacking order. This deliberately small allow-list makes a hover restyle
+/// eligible to start boundary selection at the selector subject itself. Any
+/// unknown property, custom property, generated content, transform, opacity,
+/// or z-order effect keeps the conservative `Attr` path.
+fn rule_is_paint_only(rule: &StyleRule) -> bool {
+    rule.decls.iter().all(|(name, _)| {
+        matches!(
+            name.as_str(),
+            "color"
+                | "visibility"
+                | "cursor"
+                | "pointer-events"
+                | "interactivity"
+                | "image-rendering"
+                | "text-shadow"
+                | "box-shadow"
+        ) || name.starts_with("background-")
+            || name.starts_with("text-decoration")
+            || name.ends_with("-color")
+            || name.ends_with("-radius")
+    })
 }
 
 /// The hover probes of one rule: one per compound in its complex selector
@@ -7667,8 +7997,15 @@ struct RuleBuckets {
 
 impl RuleBuckets {
     fn build(rules: &[StyleRule]) -> Self {
+        Self::build_where(rules, |_| true)
+    }
+
+    fn build_where(rules: &[StyleRule], keep: impl Fn(&StyleRule) -> bool) -> Self {
         let mut b = RuleBuckets::default();
         for (i, r) in rules.iter().enumerate() {
+            if !keep(r) {
+                continue;
+            }
             let i = i as u32;
             // The subject (rightmost) compound decides the bucket; the most
             // selective key present wins (id > first class > tag).
@@ -7686,6 +8023,29 @@ impl RuleBuckets {
             }
         }
         b
+    }
+
+    fn candidates(&self, dom: &Dom, id: NodeId, out: &mut Vec<u32>) {
+        out.extend(self.universal.iter().copied());
+        if let Some(value) = dom.attr(id, "id")
+            && let Some(indices) = self.by_id.get(value)
+        {
+            out.extend(indices.iter().copied());
+        }
+        if let Some(classes) = dom.attr(id, "class") {
+            for class in classes.split_ascii_whitespace() {
+                if let Some(indices) = self.by_class.get(class) {
+                    out.extend(indices.iter().copied());
+                }
+            }
+        }
+        if let Some(tag) = dom.tag_name(id)
+            && let Some(indices) = self.by_tag.get(tag)
+        {
+            out.extend(indices.iter().copied());
+        }
+        out.sort_unstable();
+        out.dedup();
     }
 }
 
@@ -12726,6 +13086,181 @@ mod tests {
         );
         assert!(dom.take_dirty(), "affected hover move marks the page dirty");
         assert!(dom.is_hidden(c));
+    }
+
+    #[test]
+    fn hover_invalidation_names_changed_selector_subjects() {
+        let mut dom = Dom::parse_document(
+            "<head><style>\
+             .row:hover{letter-spacing:2px}\
+             .menu:hover .drop{display:none}\
+             </style></head>\
+             <body><section id=m class=menu><p id=r class=row>x</p>\
+             <p id=s class=row>y</p><p id=d class=drop>z</p></section></body>",
+        );
+        let m = dom.get_by_id("m").unwrap();
+        let r = dom.get_by_id("r").unwrap();
+        let s = dom.get_by_id("s").unwrap();
+        let d = dom.get_by_id("d").unwrap();
+        let _ = dom.take_dirty();
+        let _ = dom.take_dirty_targets();
+
+        assert!(dom.set_hover_chain(Some(r)));
+        let dirty = dom.take_dirty_targets().expect("hover stays attributed");
+        let nodes: FxHashSet<_> = dirty.into_iter().map(|(node, _)| node).collect();
+        assert_eq!(nodes, FxHashSet::from_iter([r, d]));
+        assert!(
+            !nodes.contains(&m),
+            "the :hover carrier is not the rule subject"
+        );
+
+        // Moving between children leaves the ancestor-hovered dropdown rule
+        // matched. Only the two `.row:hover` subjects change applicability.
+        assert!(dom.set_hover_chain(Some(s)));
+        let dirty = dom.take_dirty_targets().expect("hover stays attributed");
+        let nodes: FxHashSet<_> = dirty.into_iter().map(|(node, _)| node).collect();
+        assert_eq!(nodes, FxHashSet::from_iter([r, s]));
+        assert!(!nodes.contains(&d));
+    }
+
+    #[test]
+    fn hover_invalidation_distinguishes_paint_from_layout_changes() {
+        let mut dom = Dom::parse_document(
+            "<head><style>\
+             #carrier:hover + #paint{background-color:red;color:white}\
+             #carrier:hover ~ #layout{display:none}\
+             </style></head><body><div id=carrier>x</div>\
+             <section id=paint>paint</section><section id=layout>layout</section></body>",
+        );
+        let carrier = dom.get_by_id("carrier").unwrap();
+        let paint = dom.get_by_id("paint").unwrap();
+        let layout = dom.get_by_id("layout").unwrap();
+        let _ = dom.take_dirty();
+        let _ = dom.take_dirty_targets();
+
+        assert!(dom.set_hover_chain(Some(carrier)));
+        let dirty: FxHashMap<_, _> = dom
+            .take_dirty_targets()
+            .expect("hover stays attributed")
+            .into_iter()
+            .collect();
+        assert_eq!(dirty.get(&paint), Some(&DirtyKind::Paint));
+        assert_eq!(dirty.get(&layout), Some(&DirtyKind::Attr));
+    }
+
+    #[test]
+    fn hover_invalidation_tracks_relational_and_logical_selectors() {
+        let mut dom = Dom::parse_document(
+            "<head><style>\
+             li:has(a:hover) .flyout{display:block}\
+             button:not(:hover){color:gray}\
+             .missing .carrier:hover .never{display:block}\
+             </style></head>\
+             <body><li><a id=link href=x>link</a><span id=f class=flyout>x</span></li>\
+             <button id=b>button</button><div id=c class=carrier><i class=never>x</i></div>\
+             </body>",
+        );
+        let link = dom.get_by_id("link").unwrap();
+        let flyout = dom.get_by_id("f").unwrap();
+        let button = dom.get_by_id("b").unwrap();
+        let carrier = dom.get_by_id("c").unwrap();
+        let _ = dom.take_dirty();
+        let _ = dom.take_dirty_targets();
+
+        assert!(dom.set_hover_chain(Some(link)));
+        let dirty = dom
+            .take_dirty_targets()
+            .expect(":has hover stays attributed");
+        assert!(dirty.iter().any(|(node, _)| *node == flyout));
+
+        assert!(dom.set_hover_chain(Some(button)));
+        let dirty = dom
+            .take_dirty_targets()
+            .expect(":not hover stays attributed");
+        assert!(dirty.iter().any(|(node, _)| *node == button));
+
+        // A carrier probe alone is insufficient: the complete selector never
+        // matches, so moving onto it must not schedule any rendering work.
+        assert!(dom.set_hover_chain(None));
+        let _ = dom.take_dirty();
+        let _ = dom.take_dirty_targets();
+        assert!(!dom.set_hover_chain(Some(carrier)));
+        assert!(!dom.take_dirty());
+        assert_eq!(dom.take_dirty_targets(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn logical_hover_marks_every_possible_designated_element() {
+        let dom = Dom::parse_document(
+            "<head><style>:is(:hover){color:red}</style></head>\
+             <body><p id=plain>target</p></body>",
+        );
+        let plain = dom.get_by_id("plain").unwrap();
+        assert!(
+            dom.hover_css_candidates().contains(&plain),
+            "a logical :hover cannot omit an otherwise-unremarkable hit target"
+        );
+    }
+
+    #[test]
+    fn hover_follows_flat_tree_slot_ancestry() {
+        let mut dom = Dom::parse_document(
+            "<head><style>#host:hover{color:red}</style></head>\
+             <body><x-box id=host><span id=light>slotted</span></x-box></body>",
+        );
+        let host = dom.get_by_id("host").unwrap();
+        let light = dom.get_by_id("light").unwrap();
+        let shadow = dom.attach_shadow(host);
+        let style = dom.create_element("style");
+        let css = dom.create_text("slot:hover{background:blue}");
+        dom.append(style, css);
+        dom.append(shadow, style);
+        let slot = dom.create_element("slot");
+        dom.append(shadow, slot);
+        let _ = dom.take_dirty();
+        let _ = dom.take_dirty_targets();
+
+        assert!(dom.set_hover_chain(Some(light)));
+        let dirty: FxHashSet<_> = dom
+            .take_dirty_targets()
+            .unwrap()
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect();
+        assert!(
+            dirty.contains(&slot),
+            "the assigned slot is a flat ancestor"
+        );
+        assert!(dirty.contains(&host), "the shadow host is a flat ancestor");
+    }
+
+    #[test]
+    fn hover_adds_labeled_control_without_its_ancestors() {
+        let mut dom = Dom::parse_document(
+            "<head><style>label:hover{color:red}#b:hover{color:red}#c:hover{color:red}</style></head>\
+             <body><p><label for=c id=l><input id=a></label>\
+             <span id=b><input id=c></span></p></body>",
+        );
+        let a = dom.get_by_id("a").unwrap();
+        let b = dom.get_by_id("b").unwrap();
+        let c = dom.get_by_id("c").unwrap();
+        let label = dom.get_by_id("l").unwrap();
+        let _ = dom.take_dirty();
+        let _ = dom.take_dirty_targets();
+
+        assert!(dom.set_hover_chain(Some(a)));
+        let dirty: FxHashSet<_> = dom
+            .take_dirty_targets()
+            .unwrap()
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect();
+        assert!(dirty.contains(&label));
+        assert!(dirty.contains(&c), "HTML's labeled control also matches");
+        assert!(
+            !dirty.contains(&b),
+            "the control is not designated, so its ancestors do not match"
+        );
     }
 
     #[test]

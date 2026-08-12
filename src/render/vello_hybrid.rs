@@ -37,7 +37,7 @@ use super::vello_cpu::{
 use super::{
     Affine2d, CssRect, DecorationStyle, DisplayCommand, ImageFit, ImageHandle, ImageResource,
     ImageSampling, PaintBrush, PaintColor, Primitive, RasterBackend, RasterFrame, RendererKind,
-    Scene, is_desktop_heart_image_handle,
+    Scene, is_desktop_heart_image_handle, raster_damage,
 };
 use crate::core::{CssPoint, PhysicalSize};
 
@@ -66,6 +66,12 @@ struct HeadlessTarget {
     size: PhysicalSize,
 }
 
+struct WindowTarget {
+    texture: wgpu::Texture,
+    view: TextureView,
+    size: PhysicalSize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PresentOutcome {
     Presented,
@@ -90,6 +96,10 @@ pub struct VelloHybridRenderer {
     images: HashMap<ImageHandle, CachedImage>,
     frame_id: u64,
     headless: Option<HeadlessTarget>,
+    window_target: Option<WindowTarget>,
+    damage_target: Option<WindowTarget>,
+    retained_window_valid: bool,
+    surface_copy_dst: bool,
     rgba: Vec<u8>,
     presented: Vec<u32>,
     device_failure: Arc<Mutex<Option<String>>>,
@@ -125,6 +135,10 @@ impl VelloHybridRenderer {
         config.format = format;
         config.present_mode = wgpu::PresentMode::AutoVsync;
         config.desired_maximum_frame_latency = 2;
+        let surface_copy_dst = capabilities.usages.contains(wgpu::TextureUsages::COPY_DST);
+        if surface_copy_dst {
+            config.usage |= wgpu::TextureUsages::COPY_DST;
+        }
         if !size.is_empty() {
             surface.configure(&device, &config);
         }
@@ -138,6 +152,7 @@ impl VelloHybridRenderer {
             Some(surface),
             Some(config),
             Some(window),
+            surface_copy_dst,
         )
     }
 
@@ -165,6 +180,7 @@ impl VelloHybridRenderer {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -179,6 +195,7 @@ impl VelloHybridRenderer {
         surface: Option<wgpu::Surface<'static>>,
         surface_config: Option<SurfaceConfiguration>,
         window: Option<Arc<Window>>,
+        surface_copy_dst: bool,
     ) -> Result<Self, String> {
         ensure_device_size(&device, size)?;
         let (renderer, resources) = vello_hybrid::Renderer::new(
@@ -216,6 +233,10 @@ impl VelloHybridRenderer {
             images: HashMap::new(),
             frame_id: 0,
             headless: None,
+            window_target: None,
+            damage_target: None,
+            retained_window_valid: false,
+            surface_copy_dst,
             rgba: Vec::new(),
             presented: Vec::new(),
             device_failure: failure,
@@ -232,6 +253,11 @@ impl VelloHybridRenderer {
     }
 
     pub fn resize(&mut self, size: PhysicalSize) -> Result<(), String> {
+        if self.size != size {
+            self.window_target = None;
+            self.damage_target = None;
+            self.retained_window_valid = false;
+        }
         self.size = size;
         self.headless = None;
         if size.is_empty() {
@@ -253,6 +279,7 @@ impl VelloHybridRenderer {
     /// native surface cannot remain alive while suspended.
     pub fn suspend(&mut self) {
         self.surface = None;
+        self.retained_window_valid = false;
     }
 
     pub fn resume(&mut self, window: Arc<Window>) -> Result<(), String> {
@@ -268,11 +295,17 @@ impl VelloHybridRenderer {
                 self.format
             ));
         }
-        if let Some(config) = &self.surface_config
-            && !self.size.is_empty()
-        {
-            surface.configure(&self.device, config);
+        self.surface_copy_dst = capabilities.usages.contains(wgpu::TextureUsages::COPY_DST);
+        if let Some(config) = &mut self.surface_config {
+            config.usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+            if self.surface_copy_dst {
+                config.usage |= wgpu::TextureUsages::COPY_DST;
+            }
+            if !self.size.is_empty() {
+                surface.configure(&self.device, config);
+            }
         }
+        self.retained_window_valid = false;
         self.surface = Some(surface);
         Ok(())
     }
@@ -280,7 +313,20 @@ impl VelloHybridRenderer {
     /// Render directly into the swapchain. Surface timeout/occlusion is a
     /// skipped frame, not a renderer failure and not a redraw spin.
     pub fn present(&mut self, scene: &Scene) -> Result<PresentOutcome, String> {
-        match catch_unwind(AssertUnwindSafe(|| self.present_inner(scene))) {
+        self.present_damage(scene, None)
+    }
+
+    /// Present a complete scene while rasterizing only `damage` when a valid
+    /// retained window texture exists. The full target is still copied to the
+    /// swapchain because desktop compositors own exposure; only Vello's paint,
+    /// glyph, image, and filter work is narrowed. Unsupported surface-copy
+    /// capabilities and invalid retained contents automatically repaint fully.
+    pub fn present_damage(
+        &mut self,
+        scene: &Scene,
+        damage: Option<CssRect>,
+    ) -> Result<PresentOutcome, String> {
+        match catch_unwind(AssertUnwindSafe(|| self.present_inner(scene, damage))) {
             Ok(result) => result,
             Err(payload) => Err(format!(
                 "Vello Hybrid panicked while rendering: {}",
@@ -289,7 +335,11 @@ impl VelloHybridRenderer {
         }
     }
 
-    fn present_inner(&mut self, scene: &Scene) -> Result<PresentOutcome, String> {
+    fn present_inner(
+        &mut self,
+        scene: &Scene,
+        damage: Option<CssRect>,
+    ) -> Result<PresentOutcome, String> {
         self.check_device()?;
         self.resize(scene.viewport.physical)?;
         if self.size.is_empty() {
@@ -335,10 +385,76 @@ impl VelloHybridRenderer {
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("TRust Vello Hybrid frame"),
                 });
-            let hybrid_scene = self.build_scene(scene, &mut encoder)?;
-            self.render_to_view(&hybrid_scene, &view, &mut encoder)?;
+            if self.surface_copy_dst {
+                self.ensure_window_target(self.size);
+                let partial = damage
+                    .filter(|_| self.retained_window_valid)
+                    .and_then(|rect| raster_damage(scene, rect));
+                if let Some(damage) = partial {
+                    let damage_size = damage.scene.viewport.physical;
+                    self.ensure_damage_target(damage_size);
+                    let damage_view = self.damage_target.as_ref().unwrap().view.clone();
+                    let hybrid_scene = self.build_scene(&damage.scene, &mut encoder)?;
+                    self.render_to_view(&hybrid_scene, &damage_view, &mut encoder)?;
+                    let damage_target = self.damage_target.as_ref().unwrap();
+                    let window_target = self.window_target.as_ref().unwrap();
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &damage_target.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &window_target.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: damage.x,
+                                y: damage.y,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: damage_size.width,
+                            height: damage_size.height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                } else {
+                    let target_view = self.window_target.as_ref().unwrap().view.clone();
+                    let hybrid_scene = self.build_scene(scene, &mut encoder)?;
+                    self.render_to_view(&hybrid_scene, &target_view, &mut encoder)?;
+                }
+                let window_target = self.window_target.as_ref().unwrap();
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &window_target.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: self.size.width,
+                        height: self.size.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            } else {
+                let hybrid_scene = self.build_scene(scene, &mut encoder)?;
+                self.render_to_view(&hybrid_scene, &view, &mut encoder)?;
+            }
             self.queue.submit([encoder.finish()]);
             self.queue.present(texture);
+            if self.surface_copy_dst {
+                self.retained_window_valid = true;
+            }
             if reconfigure_after {
                 self.configure_surface()?;
             }
@@ -346,6 +462,67 @@ impl VelloHybridRenderer {
             return Ok(PresentOutcome::Presented);
         }
         Err(String::from("could not acquire Hybrid surface"))
+    }
+
+    fn ensure_window_target(&mut self, size: PhysicalSize) {
+        if self
+            .window_target
+            .as_ref()
+            .is_some_and(|target| target.size == size)
+        {
+            return;
+        }
+        self.window_target = Some(self.create_window_target(
+            "TRust Hybrid retained window",
+            size,
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+        ));
+        self.retained_window_valid = false;
+    }
+
+    fn ensure_damage_target(&mut self, size: PhysicalSize) {
+        if self
+            .damage_target
+            .as_ref()
+            .is_some_and(|target| target.size == size)
+        {
+            return;
+        }
+        self.damage_target = Some(self.create_window_target(
+            "TRust Hybrid damage",
+            size,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        ));
+    }
+
+    fn create_window_target(
+        &self,
+        label: &'static str,
+        size: PhysicalSize,
+        usage: wgpu::TextureUsages,
+    ) -> WindowTarget {
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: size.width,
+                height: size.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        WindowTarget {
+            texture,
+            view,
+            size,
+        }
     }
 
     pub fn render_rgba(&mut self, scene: &Scene) -> Result<OwnedRgbaFrame, String> {
@@ -517,7 +694,6 @@ impl VelloHybridRenderer {
             .map_err(|_| format!("framebuffer width {} exceeds Vello limit", size.width))?;
         let height = u16::try_from(size.height)
             .map_err(|_| format!("framebuffer height {} exceeds Vello limit", size.height))?;
-        self.size = size;
         self.frame_id = self.frame_id.wrapping_add(1);
         let live_images: HashSet<_> = scene
             .primitives
