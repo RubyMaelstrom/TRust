@@ -1971,6 +1971,11 @@ impl DesktopApp {
                     &mut cache.layout,
                     &cache.document.dom,
                     &cache.document.base,
+                    &image_sizes_for_layout(
+                        &self.image_sizes,
+                        &self.image_loads.failed,
+                        &cache.document.image_urls,
+                    ),
                 )
             {
                 needs_full_layout = true;
@@ -5544,6 +5549,7 @@ mod tests {
             &mut cache.layout,
             &cache.document.dom,
             &cache.document.base,
+            &trust::layout2::ImageSizes::new(),
         ));
         assert_eq!(cache.layout.boxes, old_boxes);
         let mut new_scene = desktop_chrome(metrics, &snapshot, &ChromeModel::default());

@@ -19,12 +19,14 @@ use crate::render::{
     StickyConstraint, StrokeStyle, TextDecorationPaint, TopLayerEntry,
 };
 
+use super::ImageSizes;
 use super::NO_NODE;
 use super::flow::{Clip, Frag, FragKind, TopFrag};
 
 struct Builder<'a> {
     dom: &'a Dom,
     base: &'a Url,
+    images: &'a ImageSizes,
     /// Finite extent used when a CSS clip is unbounded on one axis. CSS
     /// Overflow L3 §3 defines that axis as unclipped; display-list paths,
     /// unlike CSS clip edges, cannot contain ±∞, so the extent must cover the
@@ -48,6 +50,7 @@ impl<'a> Builder<'a> {
     fn new(
         dom: &'a Dom,
         base: &'a Url,
+        images: &'a ImageSizes,
         root: &Frag<'_>,
         fixed: &[Frag<'_>],
         top_layer: &[TopFrag<'_>],
@@ -56,6 +59,7 @@ impl<'a> Builder<'a> {
         let mut this = Self {
             dom,
             base,
+            images,
             clip_extent: paint_extent(root, fixed, top_layer, flow_bottom),
             commands: Vec::new(),
             lines: Vec::new(),
@@ -275,6 +279,7 @@ impl<'a> Builder<'a> {
 pub(super) fn paint(
     dom: &Dom,
     base: &Url,
+    images: &ImageSizes,
     root: &Frag<'_>,
     fixed: &[Frag<'_>],
     top_layer: &[TopFrag<'_>],
@@ -286,7 +291,7 @@ pub(super) fn paint(
     Vec<super::GraphicalPatchBoundary>,
     Vec<super::GraphicalBoundary>,
 ) {
-    let mut builder = Builder::new(dom, base, root, fixed, top_layer, flow_bottom);
+    let mut builder = Builder::new(dom, base, images, root, fixed, top_layer, flow_bottom);
     build_sc(root, &mut builder);
     // v1 graphical patch segments cover document-flow primitives. Fixed-layer
     // ranges live in separate vectors and need a layer discriminator before
@@ -767,38 +772,367 @@ fn paint_background_images(fragment: &Frag<'_>, shape: PaintShape, builder: &mut
     else {
         return;
     };
-    let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+    let border_box = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+    let padding_box = padding_box_with_style(fragment);
+    let content_box = content_box_with_style(builder.dom, fragment, padding_box);
+    let clip_value = builder
+        .dom
+        .computed_value(fragment.node, "background-clip")
+        .unwrap_or_else(|| "border-box".into());
+    let origin_value = builder
+        .dom
+        .computed_value(fragment.node, "background-origin")
+        .unwrap_or_else(|| "padding-box".into());
+    let clip_layers = split_top_level(&clip_value, ',');
+    let origin_layers = split_top_level(&origin_value, ',');
+    let repeat_value = builder
+        .dom
+        .computed_value(fragment.node, "background-repeat")
+        .unwrap_or_else(|| "repeat".into());
+    let position_value = builder
+        .dom
+        .computed_value(fragment.node, "background-position")
+        .unwrap_or_else(|| "0% 0%".into());
+    let size_value = builder
+        .dom
+        .computed_value(fragment.node, "background-size")
+        .unwrap_or_else(|| "auto auto".into());
+    let repeat_layers = split_top_level(&repeat_value, ',');
+    let position_layers = split_top_level(&position_value, ',');
+    let size_layers = split_top_level(&size_value, ',');
+    let images = split_top_level(&value, ',');
     // CSS Backgrounds paints the first listed layer closest to the viewer, so
     // emit in reverse order after the background color.
-    for layer in split_top_level(&value, ',').into_iter().rev() {
+    for (index, layer) in images.iter().enumerate().rev() {
         let layer = layer.trim();
         if layer.eq_ignore_ascii_case("none") || layer.is_empty() {
             continue;
         }
-        if let Some(brush) = parse_gradient(layer, rect) {
+        if let Some(brush) = parse_gradient(layer, border_box) {
             builder.commands.push(DisplayCommand::Fill {
                 shape: shape.clone(),
                 brush,
             });
         } else if let Some(url) = css_url(layer) {
             let source = resolve_image_source(builder.base, &url);
-            let handle = builder.image(source);
+            let handle = builder.image(source.clone());
+            let origin = layer_value(&origin_layers, index, "padding-box");
+            let positioning = background_box(origin, border_box, padding_box, content_box);
+            let clip = background_box(
+                layer_value(&clip_layers, index, "border-box"),
+                border_box,
+                padding_box,
+                content_box,
+            );
+            let repeat = parse_background_repeat(layer_value(&repeat_layers, index, "repeat"));
+            let position = layer_value(&position_layers, index, "0% 0%");
+            let size = layer_value(&size_layers, index, "auto auto");
+            let natural = builder
+                .images
+                .get(&source)
+                .copied()
+                .filter(|(w, h)| *w > 0 && *h > 0 && *w != u32::MAX && *h != u32::MAX)
+                .map(|(w, h)| (w as f32, h as f32))
+                .unwrap_or((300.0, 150.0));
+            let (mut tile_w, mut tile_h) = background_size(size, natural, positioning);
+            if !tile_w.is_finite() || !tile_h.is_finite() || tile_w <= 0.0 || tile_h <= 0.0 {
+                continue;
+            }
+            let (mut start_x, mut start_y) =
+                background_position(position, positioning, (tile_w, tile_h));
+            let mut repeat = repeat;
+            if matches!(repeat, BackgroundRepeat::Round) {
+                let nx = (positioning.width / tile_w).round().max(1.0);
+                let ny = (positioning.height / tile_h).round().max(1.0);
+                tile_w = positioning.width / nx;
+                tile_h = positioning.height / ny;
+                (start_x, start_y) = background_position(position, positioning, (tile_w, tile_h));
+                repeat = BackgroundRepeat::Repeat;
+            }
+            if matches!(repeat, BackgroundRepeat::Space) {
+                // `space` preserves the intrinsic tile size and distributes
+                // the remaining space between complete tiles. If only one
+                // tile fits on an axis, CSS falls back to no-repeat there.
+                let nx = (positioning.width / tile_w).floor() as usize;
+                let ny = (positioning.height / tile_h).floor() as usize;
+                paint_spaced_background(
+                    builder,
+                    clip,
+                    fragment.node,
+                    handle,
+                    positioning,
+                    (tile_w, tile_h),
+                    (start_x, start_y),
+                    nx,
+                    ny,
+                );
+                continue;
+            }
             builder
                 .commands
-                .push(DisplayCommand::PushClip(shape.clone()));
-            builder.commands.push(DisplayCommand::Image {
-                rect,
-                handle,
-                source_rect: None,
-                fit: ImageFit::Cover,
-                sampling: ImageSampling::Smooth,
-                clip: None,
-                node: fragment.node,
-                link: None,
-            });
+                .push(DisplayCommand::PushClip(background_clip_shape(
+                    clip, &shape, border_box,
+                )));
+            // CSS Backgrounds 3 §§2.4 and 2.6: size and position the image
+            // first, then repeat it as needed to cover the painting area.
+            let x_repeat = matches!(repeat, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatX);
+            let y_repeat = matches!(repeat, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatY);
+            if !x_repeat {
+                start_x += positioning.x;
+            }
+            if !y_repeat {
+                start_y += positioning.y;
+            }
+            let x0 = if x_repeat {
+                let absolute_start = positioning.x + start_x;
+                positioning.x + (absolute_start - positioning.x).rem_euclid(tile_w) - tile_w
+            } else {
+                start_x
+            };
+            let y0 = if y_repeat {
+                let absolute_start = positioning.y + start_y;
+                positioning.y + (absolute_start - positioning.y).rem_euclid(tile_h) - tile_h
+            } else {
+                start_y
+            };
+            let x_end = clip.x + clip.width;
+            let y_end = clip.y + clip.height;
+            let mut y = y0;
+            let mut count = 0usize;
+            while y < y_end && count < 4096 {
+                let mut x = x0;
+                let mut x_count = 0usize;
+                while x < x_end && x_count < 4096 {
+                    let tile = CssRect::new(x, y, tile_w, tile_h);
+                    builder.commands.push(DisplayCommand::Image {
+                        rect: tile,
+                        handle,
+                        source_rect: None,
+                        fit: ImageFit::None,
+                        sampling: ImageSampling::Smooth,
+                        clip: None,
+                        node: fragment.node,
+                        link: None,
+                    });
+                    if !x_repeat {
+                        break;
+                    }
+                    x += tile_w;
+                    x_count += 1;
+                }
+                if !y_repeat {
+                    break;
+                }
+                y += tile_h;
+                count += 1;
+            }
             builder.commands.push(DisplayCommand::PopClip);
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundRepeat {
+    Repeat,
+    RepeatX,
+    RepeatY,
+    NoRepeat,
+    Space,
+    Round,
+}
+
+fn parse_background_repeat(value: &str) -> BackgroundRepeat {
+    let tokens = split_ws(value);
+    if tokens.len() > 1 {
+        let first = tokens[0].to_ascii_lowercase();
+        let second = tokens[1].to_ascii_lowercase();
+        return match (first.as_str(), second.as_str()) {
+            ("repeat", "no-repeat") => BackgroundRepeat::RepeatX,
+            ("no-repeat", "repeat") => BackgroundRepeat::RepeatY,
+            ("no-repeat", "no-repeat") => BackgroundRepeat::NoRepeat,
+            ("space", "space") => BackgroundRepeat::Space,
+            ("round", "round") => BackgroundRepeat::Round,
+            _ => BackgroundRepeat::Repeat,
+        };
+    }
+    match tokens
+        .first()
+        .map(|token| token.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("no-repeat") => BackgroundRepeat::NoRepeat,
+        Some("repeat-x") => BackgroundRepeat::RepeatX,
+        Some("repeat-y") => BackgroundRepeat::RepeatY,
+        Some("space") => BackgroundRepeat::Space,
+        Some("round") => BackgroundRepeat::Round,
+        _ => BackgroundRepeat::Repeat,
+    }
+}
+
+fn layer_value<'a>(layers: &[&'a str], index: usize, default: &'a str) -> &'a str {
+    if layers.is_empty() {
+        default
+    } else {
+        layers[index % layers.len()].trim()
+    }
+}
+
+fn background_box(value: &str, border: CssRect, padding: CssRect, content: CssRect) -> CssRect {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "content-box" => content,
+        "padding-box" => padding,
+        _ => border,
+    }
+}
+
+fn padding_box_with_style(fragment: &Frag<'_>) -> CssRect {
+    let [top, right, bottom, left] = fragment.border;
+    CssRect::new(
+        fragment.x + left,
+        fragment.y + top,
+        (fragment.w - left - right).max(0.0),
+        (fragment.h - top - bottom).max(0.0),
+    )
+}
+
+fn content_box_with_style(dom: &Dom, fragment: &Frag<'_>, padding: CssRect) -> CssRect {
+    let width_basis = padding.width.max(0.0);
+    let pad = ["top", "right", "bottom", "left"].map(|side| {
+        dom.computed_value(fragment.node, &format!("padding-{side}"))
+            .as_deref()
+            .and_then(|value| transform_length(value, width_basis))
+            .unwrap_or(0.0)
+            .max(0.0)
+    });
+    CssRect::new(
+        padding.x + pad[3],
+        padding.y + pad[0],
+        (padding.width - pad[1] - pad[3]).max(0.0),
+        (padding.height - pad[0] - pad[2]).max(0.0),
+    )
+}
+
+fn background_size(value: &str, natural: (f32, f32), area: CssRect) -> (f32, f32) {
+    let tokens = split_ws(value);
+    if tokens
+        .first()
+        .is_some_and(|token| token.eq_ignore_ascii_case("cover"))
+    {
+        let scale = (area.width / natural.0).max(area.height / natural.1);
+        return (natural.0 * scale, natural.1 * scale);
+    }
+    if tokens
+        .first()
+        .is_some_and(|token| token.eq_ignore_ascii_case("contain"))
+    {
+        let scale = (area.width / natural.0).min(area.height / natural.1);
+        return (natural.0 * scale, natural.1 * scale);
+    }
+    let width = tokens
+        .first()
+        .and_then(|token| background_length(token, area.width));
+    let height = tokens
+        .get(1)
+        .and_then(|token| background_length(token, area.height));
+    match (width, height) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => (w, natural.1 * w / natural.0),
+        (None, Some(h)) => (natural.0 * h / natural.1, h),
+        _ => natural,
+    }
+}
+
+fn background_length(value: &str, basis: f32) -> Option<f32> {
+    if value.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    transform_length(value, basis).map(|value| value.max(0.01))
+}
+
+fn background_position(value: &str, area: CssRect, image: (f32, f32)) -> (f32, f32) {
+    let tokens = split_ws(value);
+    let (x, y) = match tokens.as_slice() {
+        [] => ("0%", "0%"),
+        [one] if matches!(one.to_ascii_lowercase().as_str(), "top" | "bottom") => ("50%", *one),
+        [one] => (*one, "50%"),
+        [x, y, ..] => (*x, *y),
+    };
+    (
+        background_position_component(x, area.width, image.0, false),
+        background_position_component(y, area.height, image.1, true),
+    )
+}
+
+fn background_position_component(value: &str, area: f32, image: f32, vertical: bool) -> f32 {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "left" if !vertical => 0.0,
+        "top" if vertical => 0.0,
+        "center" => (area - image) / 2.0,
+        "right" if !vertical => area - image,
+        "bottom" if vertical => area - image,
+        other => {
+            if let Some(percent) = other.strip_suffix('%').and_then(|v| v.parse::<f32>().ok()) {
+                (area - image) * percent / 100.0
+            } else {
+                px(other).unwrap_or(0.0)
+            }
+        }
+    }
+}
+
+fn background_clip_shape(clip: CssRect, original: &PaintShape, border: CssRect) -> PaintShape {
+    if clip == border {
+        original.clone()
+    } else {
+        PaintShape::Rect(clip)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_spaced_background(
+    builder: &mut Builder<'_>,
+    clip: CssRect,
+    node: NodeId,
+    handle: ImageHandle,
+    area: CssRect,
+    tile: (f32, f32),
+    start: (f32, f32),
+    nx: usize,
+    ny: usize,
+) {
+    builder
+        .commands
+        .push(DisplayCommand::PushClip(PaintShape::Rect(clip)));
+    let (tile_w, tile_h) = tile;
+    let gap_x = if nx > 1 {
+        (area.width - nx as f32 * tile_w) / (nx - 1) as f32
+    } else {
+        0.0
+    };
+    let gap_y = if ny > 1 {
+        (area.height - ny as f32 * tile_h) / (ny - 1) as f32
+    } else {
+        0.0
+    };
+    let y_count = ny.clamp(1, 4096);
+    let x_count = nx.clamp(1, 4096);
+    for row in 0..y_count {
+        for col in 0..x_count {
+            let x = area.x + start.0 + col as f32 * (tile_w + gap_x);
+            let y = area.y + start.1 + row as f32 * (tile_h + gap_y);
+            builder.commands.push(DisplayCommand::Image {
+                rect: CssRect::new(x, y, tile_w, tile_h),
+                handle,
+                source_rect: None,
+                fit: ImageFit::None,
+                sampling: ImageSampling::Smooth,
+                clip: None,
+                node,
+                link: None,
+            });
+        }
+    }
+    builder.commands.push(DisplayCommand::PopClip);
 }
 
 /// CSS Backgrounds and Borders §6: background first, then border. Uniform
