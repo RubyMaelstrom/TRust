@@ -798,14 +798,64 @@ impl VelloHybridRenderer {
             .images
             .get(&handle)
             .is_some_and(|image| store_revision.is_some_and(|revision| revision != image.revision));
-        if changed
-            && let Some(CachedImage {
-                source: ImageSource::OpaqueId { id, .. },
-                ..
-            }) = self.images.remove(&handle)
-        {
-            self.renderer
-                .destroy_image(&mut self.resources, encoder, id);
+        let mut stale = None;
+        if changed {
+            let replacement =
+                store_revision
+                    .zip(scene.image_store.get(handle))
+                    .and_then(|(revision, image)| {
+                        let upload_limit = HYBRID_IMAGE_ATLAS_LIMIT
+                            .min(self.device.limits().max_texture_dimension_2d)
+                            .min(u32::from(u16::MAX));
+                        hybrid_image_pixels(&image, upload_limit)
+                            .map(|(width, height, pixels)| (revision, image, width, height, pixels))
+                    });
+            let updated_in_place =
+                if let Some((revision, image, width, height, pixels)) = replacement {
+                    let cached_id = self.images.get(&handle).and_then(|cached| {
+                        if (cached.upload_width, cached.upload_height)
+                            != (u32::from(width), u32::from(height))
+                        {
+                            return None;
+                        }
+                        match cached.source {
+                            ImageSource::OpaqueId { id, .. } => Some(id),
+                            _ => None,
+                        }
+                    });
+                    if let Some(id) = cached_id {
+                        let pixmap =
+                            Pixmap::from_parts_with_opacity(pixels, width, height, image.has_alpha);
+                        if self.renderer.update_image(
+                            &self.resources,
+                            &self.device,
+                            &self.queue,
+                            encoder,
+                            id,
+                            &pixmap,
+                        ) {
+                            let cached = self.images.get_mut(&handle).unwrap();
+                            cached.width = image.width;
+                            cached.height = image.height;
+                            cached.revision = revision;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+            if !updated_in_place {
+                // Keep the old allocation occupied until the replacement has
+                // been allocated, so its queued clear cannot target a reused
+                // atlas slot. Animated formats retain one canvas size and take
+                // the in-place path above; this is the general size-change
+                // fallback.
+                stale = self.images.remove(&handle);
+            }
         }
         if !self.images.contains_key(&handle) && self.images.len() >= MAX_REGISTERED_IMAGES {
             let victim = self
@@ -863,6 +913,14 @@ impl VelloHybridRenderer {
                     last_used_frame: self.frame_id,
                 },
             );
+        }
+        if let Some(CachedImage {
+            source: ImageSource::OpaqueId { id, .. },
+            ..
+        }) = stale
+        {
+            self.renderer
+                .destroy_image(&mut self.resources, encoder, id);
         }
         let Some(image) = self.images.get_mut(&handle) else {
             target.set_paint(vello_color(PaintColor::Muted));

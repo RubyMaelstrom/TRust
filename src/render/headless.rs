@@ -437,6 +437,64 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_reuploads_reinserted_stable_image_handle_without_erasing_it() {
+        // WebGPU §19.2 places writeTexture() and submit() work on the same
+        // queue timeline. Replacing animation pixels must not enqueue an atlas
+        // clear after the replacement write when an allocation is reused.
+        let metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(32, 32), ScaleFactor::default());
+        let store = ImageStore::default();
+        let handle = ImageHandle::for_source("test:stable-animation-handle");
+        let image = |rgba| super::super::ImageResource {
+            width: 1,
+            height: 1,
+            rgba: std::sync::Arc::from(rgba),
+            has_alpha: false,
+        };
+        store.insert(handle, image([255, 0, 0, 255]));
+        let scene = Scene {
+            viewport: metrics,
+            primitives: vec![DisplayCommand::Image {
+                rect: CssRect::new(0.0, 0.0, 32.0, 32.0),
+                handle,
+                source_rect: None,
+                fit: ImageFit::Fill,
+                sampling: ImageSampling::Nearest,
+                clip: None,
+                node: 0,
+                link: None,
+            }],
+            controls: Vec::new(),
+            content_viewport: CssRect::new(0.0, 0.0, 32.0, 32.0),
+            image_store: store.clone(),
+            page_scroll_containers: Vec::new(),
+            page_size: CssSize::new(32.0, 32.0),
+        };
+
+        let Ok(mut hybrid) = futures::executor::block_on(
+            crate::render::vello_hybrid::VelloHybridRenderer::new_headless(),
+        ) else {
+            return;
+        };
+        let first = hybrid.render_rgba(&scene).unwrap();
+        assert_eq!(
+            &first.pixels[16 * 32 * 4 + 16 * 4..][..4],
+            &[255, 0, 0, 255]
+        );
+
+        // Navigation clears document-local decoded resources, then restores
+        // embedded UI images under their stable handles. Animation frames use
+        // the same stable-handle replacement path without the clear().
+        store.clear();
+        store.insert(handle, image([0, 255, 0, 255]));
+        let second = hybrid.render_rgba(&scene).unwrap();
+        assert_eq!(
+            &second.pixels[16 * 32 * 4 + 16 * 4..][..4],
+            &[0, 255, 0, 255]
+        );
+    }
+
+    #[test]
     fn nested_scroll_and_sticky_metadata_stays_in_css_pixels() {
         let base = Url::parse("https://example.test/").unwrap();
         let dom = crate::dom::Dom::parse_document(
