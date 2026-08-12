@@ -863,7 +863,10 @@ fn splice_graphical_boundary(
     ) else {
         return false;
     };
-    if !patch.paint.fixed_under_primitives.is_empty() || !patch.paint.fixed_primitives.is_empty() {
+    if !patch.paint.fixed_under_primitives.is_empty()
+        || !patch.paint.fixed_primitives.is_empty()
+        || !patch.paint.top_layer.is_empty()
+    {
         return false;
     }
     let Some(new_outer) = patch
@@ -1035,6 +1038,13 @@ fn scheduled_page_images(
         .fixed_under_primitives
         .iter()
         .chain(page.layout.paint.fixed_primitives.iter())
+        .chain(
+            page.layout
+                .paint
+                .top_layer
+                .iter()
+                .flat_map(|entry| entry.primitives.iter()),
+        )
     {
         if let trust::render::DisplayCommand::Image { handle, .. } = command {
             visible.insert(*handle);
@@ -5636,6 +5646,7 @@ mod tests {
             cache.layout.paint.fixed_primitives,
             expected.paint.fixed_primitives
         );
+        assert_eq!(cache.layout.paint.top_layer, expected.paint.top_layer);
         assert_eq!(
             cache.layout.paint.scroll_containers,
             expected.paint.scroll_containers

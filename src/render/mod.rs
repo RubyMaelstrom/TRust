@@ -503,6 +503,16 @@ pub enum DisplayCommand {
 /// the permanent display command rather than creating a second paint model.
 pub type Primitive = DisplayCommand;
 
+/// One entry in the document's ordered top layer. Entries cannot be flattened
+/// into separate absolute/fixed lists: CSS Positioned Layout paints the
+/// ordered set as a whole, so an absolute entry may appear between two fixed
+/// entries (or vice versa).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopLayerEntry {
+    pub fixed: bool,
+    pub primitives: Vec<Primitive>,
+}
+
 /// A canonical line box in document CSS pixels. This is deliberately kept
 /// beside the display list: selection and hit testing need the real baseline
 /// and typographic extents even when a line has no visible glyphs.
@@ -531,6 +541,10 @@ pub struct PagePaint {
     pub fixed_under_primitives: Vec<Primitive>,
     /// Viewport-fixed commands are composed after the scrolled document list.
     pub fixed_primitives: Vec<Primitive>,
+    /// Document top-layer entries, in the specification's ordered-set order.
+    /// Absolute entries retain document scrolling; fixed entries are viewport-
+    /// pinned. Every entry paints after the root stacking context.
+    pub top_layer: Vec<TopLayerEntry>,
     pub image_requests: Vec<ImageRequest>,
     pub scroll_containers: Vec<ScrollContainer>,
     pub sticky_constraints: Vec<StickyConstraint>,
@@ -1245,6 +1259,23 @@ impl Scene {
                     self.content_viewport.y,
                 )));
             self.append_sticky_commands(&page.fixed_primitives, page, CssPoint::default());
+            self.primitives.push(Primitive::PopTransform);
+        }
+        // Top-layer boxes are painted after the document's root stacking
+        // context. Absolute entries use document coordinates; fixed entries
+        // use viewport coordinates, but both escape ancestor clips/transforms.
+        for entry in &page.top_layer {
+            let entry_scroll = if entry.fixed {
+                CssPoint::default()
+            } else {
+                scroll
+            };
+            self.primitives
+                .push(Primitive::PushTransform(Affine2d::translate(
+                    self.content_viewport.x - entry_scroll.x,
+                    self.content_viewport.y - entry_scroll.y,
+                )));
+            self.append_sticky_commands(&entry.primitives, page, entry_scroll);
             self.primitives.push(Primitive::PopTransform);
         }
         self.primitives.push(Primitive::PopClip);

@@ -16,11 +16,11 @@ use crate::render::{
     Affine2d, BlendMode, CompositingLayer, CornerRadii, CssRect, DecorationStyle, DisplayCommand,
     GradientStop, HitRegion, ImageFit, ImageHandle, ImageRequest, ImageSampling, LineCap,
     PagePaint, PaintBrush, PaintColor, PaintLine, PaintShape, PathElement, ScrollContainer,
-    StickyConstraint, StrokeStyle, TextDecorationPaint,
+    StickyConstraint, StrokeStyle, TextDecorationPaint, TopLayerEntry,
 };
 
 use super::NO_NODE;
-use super::flow::{Clip, Frag, FragKind};
+use super::flow::{Clip, Frag, FragKind, TopFrag};
 
 struct Builder<'a> {
     dom: &'a Dom,
@@ -50,12 +50,13 @@ impl<'a> Builder<'a> {
         base: &'a Url,
         root: &Frag<'_>,
         fixed: &[Frag<'_>],
+        top_layer: &[TopFrag<'_>],
         flow_bottom: f32,
     ) -> Self {
         let mut this = Self {
             dom,
             base,
-            clip_extent: paint_extent(root, fixed, flow_bottom),
+            clip_extent: paint_extent(root, fixed, top_layer, flow_bottom),
             commands: Vec::new(),
             lines: Vec::new(),
             image_requests: Vec::new(),
@@ -69,6 +70,10 @@ impl<'a> Builder<'a> {
         this.collect_scroll_containers(root);
         this.collect_patch_boundaries(root);
         this.collect_sticky(root);
+        for top in top_layer {
+            this.collect_scroll_containers(&top.fragment);
+            this.collect_sticky(&top.fragment);
+        }
         this
     }
 
@@ -266,11 +271,13 @@ impl<'a> Builder<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn paint(
     dom: &Dom,
     base: &Url,
     root: &Frag<'_>,
     fixed: &[Frag<'_>],
+    top_layer: &[TopFrag<'_>],
     flow_bottom: f32,
     viewport_w: f32,
     viewport_h: f32,
@@ -279,7 +286,7 @@ pub(super) fn paint(
     Vec<super::GraphicalPatchBoundary>,
     Vec<super::GraphicalBoundary>,
 ) {
-    let mut builder = Builder::new(dom, base, root, fixed, flow_bottom);
+    let mut builder = Builder::new(dom, base, root, fixed, top_layer, flow_bottom);
     build_sc(root, &mut builder);
     // v1 graphical patch segments cover document-flow primitives. Fixed-layer
     // ranges live in separate vectors and need a layer discriminator before
@@ -303,6 +310,18 @@ pub(super) fn paint(
             fixed_primitives.extend(commands);
         }
     }
+    // CSS Positioned Layout 4 §3: each top-layer entry paints as its own
+    // stacking context after the document, in ordered-set order. Its fragment
+    // was laid against the ICB and carries no DOM-ancestor clipping.
+    let mut top_layer_entries = Vec::new();
+    for top in top_layer {
+        let start = builder.commands.len();
+        build_sc(&top.fragment, &mut builder);
+        top_layer_entries.push(TopLayerEntry {
+            fixed: top.fixed,
+            primitives: builder.commands.split_off(start),
+        });
+    }
     let paint = PagePaint {
         width: (root.x + root.w).max(0.0),
         height: root.max_bottom().max(flow_bottom).max(0.0),
@@ -311,6 +330,7 @@ pub(super) fn paint(
         primitives,
         fixed_under_primitives,
         fixed_primitives,
+        top_layer: top_layer_entries,
         image_requests: builder.image_requests,
         scroll_containers: builder.scroll_containers,
         sticky_constraints: builder.sticky_constraints,
@@ -1320,7 +1340,12 @@ fn subtree_extent(fragment: &Frag<'_>) -> (f32, f32) {
 /// overflow-hidden probes do not turn an unbounded display-list clip into a
 /// huge raster path. The viewport compositor still supplies the final screen
 /// clip; this extent only replaces CSS's conceptual unbounded axis.
-fn paint_extent(root: &Frag<'_>, fixed: &[Frag<'_>], flow_bottom: f32) -> CssRect {
+fn paint_extent(
+    root: &Frag<'_>,
+    fixed: &[Frag<'_>],
+    top_layer: &[TopFrag<'_>],
+    flow_bottom: f32,
+) -> CssRect {
     let mut bounds = (
         0.0_f32,
         0.0_f32,
@@ -1369,6 +1394,9 @@ fn paint_extent(root: &Frag<'_>, fixed: &[Frag<'_>], flow_bottom: f32) -> CssRec
     visit(root, &mut bounds);
     for fragment in fixed {
         visit(fragment, &mut bounds);
+    }
+    for top in top_layer {
+        visit(&top.fragment, &mut bounds);
     }
     CssRect::new(
         bounds.0,
