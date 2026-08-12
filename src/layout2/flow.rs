@@ -20,7 +20,7 @@ use url::Url;
 
 use crate::doc::Form;
 use crate::dom::{Dom, NodeId};
-use crate::layout2::{ImageSizes, NO_NODE};
+use crate::layout2::{Emphasis, ImageSizes, NO_NODE};
 
 use super::flex::{
     AlignContent, AlignItem, FlexCalc, align_content_offsets, align_item_from, container_style,
@@ -835,6 +835,9 @@ impl Flow<'_> {
                         // line boxes shortened beside them.
                         let content_top_y = cur.preview();
                         let marker = (b.marker_inside).then_some(b.marker.as_deref()).flatten();
+                        let marker_image = (b.marker_inside)
+                            .then_some(b.marker_image.as_deref())
+                            .flatten();
                         let laid = self.lay_inlines(
                             inls,
                             content_x,
@@ -844,6 +847,7 @@ impl Flow<'_> {
                             block_align(self.dom, style_node),
                             self.indent_px(style_node, h.content_w),
                             marker,
+                            marker_image,
                             &inl,
                             cfc,
                         );
@@ -1127,10 +1131,16 @@ impl Flow<'_> {
         }
 
         // ---- the ::marker (outside position) ----
-        if let Some(m) = &b.marker
-            && !b.marker_inside
-        {
-            children.push(self.marker_frag(m, &inl, content_x, &children, y_border, bt));
+        if !b.marker_inside && (b.marker.is_some() || b.marker_image.is_some()) {
+            children.push(self.marker_frag(
+                b.marker.as_deref(),
+                b.marker_image.as_deref(),
+                &inl,
+                content_x,
+                &children,
+                y_border,
+                bt,
+            ));
         }
 
         // ---- bottom edge / used height (§10.6.3, §10.7, §8.3.1) ----
@@ -1395,9 +1405,11 @@ impl Flow<'_> {
     /// The outside `::marker` of a list item: right-aligned against the
     /// content edge, on the first line box (CSS Lists — the marker sits in
     /// the gutter the UA list padding provides).
+    #[allow(clippy::too_many_arguments)]
     fn marker_frag(
         &self,
-        marker: &str,
+        marker: Option<&str>,
+        marker_image: Option<&str>,
         inl: &InlineStyle,
         content_x: f32,
         children: &[Frag<'_>],
@@ -1421,10 +1433,82 @@ impl Flow<'_> {
         let y = first_line_y(children)
             .or(y_border.map(|yb| yb + bt))
             .unwrap_or(0.0);
-        let shaped = crate::text::shape(marker, &inl.text_style());
-        let w = shaped.advance;
-        let h = shaped.line_height;
-        let baseline = shaped.baseline;
+        let (pieces, w, h, baseline) = if let Some(source) = marker_image {
+            // CSS Lists 3 §3.2 represents a list-style-image marker as an
+            // anonymous inline replaced element followed by one U+0020. With
+            // no intrinsic dimensions available yet, CSS Images 3's default
+            // object size is one em square; the image decode pass can trigger
+            // a later layout with its natural dimensions.
+            let size = inl.font_size.max(0.0);
+            let image = Piece::boxed(
+                InlineItem {
+                    text: String::new(),
+                    terminal_text: None,
+                    kind: crate::layout2::ItemKind::Image,
+                    image: Some(source.to_string()),
+                    emph: Emphasis::default(),
+                    style_node: inl.node,
+                    node: NO_NODE,
+                    link: None,
+                    crop: false,
+                    pixelated: false,
+                    invisible: inl.invisible,
+                },
+                size,
+                size,
+                0.0,
+                0.0,
+                size,
+                size,
+            );
+            let space = crate::text::shape(" ", &inl.text_style());
+            let mut space_piece = Piece::shaped(
+                InlineItem {
+                    text: " ".to_string(),
+                    terminal_text: None,
+                    kind: crate::layout2::ItemKind::Text,
+                    image: None,
+                    emph: inl.emph,
+                    style_node: inl.node,
+                    node: NO_NODE,
+                    link: None,
+                    crop: false,
+                    pixelated: false,
+                    invisible: inl.invisible,
+                },
+                space.clone(),
+            );
+            space_piece.x = size;
+            (
+                vec![image, space_piece],
+                size + space.advance,
+                size.max(space.line_height),
+                size,
+            )
+        } else {
+            let marker = marker.unwrap_or_default();
+            let shaped = crate::text::shape(marker, &inl.text_style());
+            let w = shaped.advance;
+            let h = shaped.line_height;
+            let baseline = shaped.baseline;
+            let piece = Piece::shaped(
+                InlineItem {
+                    text: marker.to_string(),
+                    terminal_text: None,
+                    kind: crate::layout2::ItemKind::Text,
+                    image: None,
+                    emph: inl.emph,
+                    style_node: inl.node,
+                    node: NO_NODE,
+                    link: None,
+                    crop: false,
+                    pixelated: false,
+                    invisible: inl.invisible,
+                },
+                shaped,
+            );
+            (vec![piece], w, h, baseline)
+        };
         let x = (content_x - w).max(0.0);
         Frag {
             node: NO_NODE,
@@ -1436,22 +1520,7 @@ impl Flow<'_> {
             paint: PaintFlags::default(),
             clip: None,
             kind: FragKind::Line(LineFrag {
-                pieces: vec![Piece::shaped(
-                    InlineItem {
-                        text: marker.to_string(),
-                        terminal_text: None,
-                        kind: crate::layout2::ItemKind::Text,
-                        image: None,
-                        emph: inl.emph,
-                        style_node: inl.node,
-                        node: NO_NODE,
-                        link: None,
-                        crop: false,
-                        pixelated: false,
-                        invisible: inl.invisible,
-                    },
-                    shaped,
-                )],
+                pieces,
                 width: w,
                 height: h,
                 baseline,
@@ -2489,6 +2558,9 @@ impl Flow<'_> {
                     block_align(self.dom, style_node),
                     self.indent_px(style_node, content_w),
                     (b.marker_inside).then_some(b.marker.as_deref()).flatten(),
+                    (b.marker_inside)
+                        .then_some(b.marker_image.as_deref())
+                        .flatten(),
                     &inl,
                     &mut own_fc,
                 );
@@ -3428,6 +3500,7 @@ impl Flow<'_> {
         align: super::style::Align2,
         indent_px: f32,
         marker: Option<&str>,
+        marker_image: Option<&str>,
         inl: &InlineStyle,
         fc: &mut FloatCtx,
     ) -> InlineLaid<'t> {
@@ -3479,6 +3552,11 @@ impl Flow<'_> {
             }),
             &atom_sizes,
         );
+        if let Some(source) = marker_image {
+            let mut mctx = inl.clone();
+            mctx.kind = crate::layout2::ItemKind::Image;
+            ifc.marker_image(source, &mctx);
+        }
         if let Some(m) = marker {
             let mut mctx = inl.clone();
             mctx.kind = crate::layout2::ItemKind::Text;
@@ -3648,7 +3726,10 @@ impl Flow<'_> {
                     cb_h,
                     block_align(self.dom, b.node),
                     self.indent_px(b.node, col_w),
-                    None,
+                    (b.marker_inside).then_some(b.marker.as_deref()).flatten(),
+                    (b.marker_inside)
+                        .then_some(b.marker_image.as_deref())
+                        .flatten(),
                     inl,
                     &mut sub_fc,
                 );
