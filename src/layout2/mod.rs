@@ -5396,6 +5396,42 @@ mod tests {
     }
 
     #[test]
+    fn graphical_root_background_paints_the_canvas_edges() {
+        let dom = Dom::parse_document(
+            r#"<html style="margin:0;background-color:#ffaaaa;background-image:url('/tile.webp')"><body style="margin:8px;background:transparent"><div style="height:20px"></div></body></html>"#,
+        );
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut images = HashMap::new();
+        images.insert("https://example.test/tile.webp".to_string(), (16, 12));
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(64.0, 64.0),
+            &[],
+            &HashMap::new(),
+            &images,
+        );
+        assert!(layout.paint.background.is_some());
+        assert!(matches!(
+            layout.paint.primitives.first(),
+            Some(crate::render::DisplayCommand::PushClip(
+                crate::render::PaintShape::Rect(rect)
+            )) if (rect.width - 64.0).abs() < 0.01 && (rect.height - 64.0).abs() < 0.01
+        ));
+        let tiles = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                crate::render::DisplayCommand::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(tiles.iter().any(|rect| rect.y <= 0.0));
+        assert!(tiles.iter().any(|rect| rect.y + rect.height >= 64.0));
+    }
+
+    #[test]
     fn graphical_atomic_boundary_patch_matches_full_appendix_e_paint() {
         let mut dom = Dom::parse_document(
             r#"<body style="margin:0"><section id="box" data-trust-node="42" style="display:flow-root;position:relative;z-index:1;width:240px;height:48px"><span id="label" style="color:red">menu</span></section><p>after</p></body>"#,

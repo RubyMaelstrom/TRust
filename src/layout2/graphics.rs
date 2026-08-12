@@ -292,6 +292,22 @@ pub(super) fn paint(
     Vec<super::GraphicalBoundary>,
 ) {
     let mut builder = Builder::new(dom, base, images, root, fixed, top_layer, flow_bottom);
+    // CSS Backgrounds 3 §2.11.1: the root background becomes the canvas
+    // background. Its image positioning area is still the root box, but its
+    // painting area is the complete canvas, including the margins around a
+    // centered body and any viewport space below the document.
+    let root_background = if root.node != NO_NODE && dom.document_element() == Some(root.node) {
+        let canvas = CssRect::new(
+            0.0,
+            0.0,
+            viewport_w.max(root.x + root.w).max(1.0),
+            viewport_h.max(flow_bottom).max(root.max_bottom()).max(1.0),
+        );
+        paint_background_images(root, PaintShape::Rect(canvas), &mut builder, Some(canvas));
+        background_color(dom, root.node).filter(|color| !color.is_transparent())
+    } else {
+        None
+    };
     build_sc(root, &mut builder);
     // v1 graphical patch segments cover document-flow primitives. Fixed-layer
     // ranges live in separate vectors and need a layer discriminator before
@@ -330,7 +346,7 @@ pub(super) fn paint(
     let paint = PagePaint {
         width: (root.x + root.w).max(0.0),
         height: root.max_bottom().max(flow_bottom).max(0.0),
-        background: None,
+        background: root_background,
         lines: builder.lines,
         primitives,
         fixed_under_primitives,
@@ -537,15 +553,18 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
         let radii = border_radii(builder.dom, fragment.node, rect);
         let shape = rounded_shape(rect, radii);
         paint_box_shadows(builder.dom, fragment.node, &shape, builder);
-        if let Some(color) = background_color(builder.dom, fragment.node)
-            && !color.is_transparent()
-        {
-            builder.commands.push(DisplayCommand::Fill {
-                shape: shape.clone(),
-                brush: PaintBrush::Solid(color),
-            });
+        let is_root = builder.dom.document_element() == Some(fragment.node);
+        if !is_root {
+            if let Some(color) = background_color(builder.dom, fragment.node)
+                && !color.is_transparent()
+            {
+                builder.commands.push(DisplayCommand::Fill {
+                    shape: shape.clone(),
+                    brush: PaintBrush::Solid(color),
+                });
+            }
+            paint_background_images(fragment, shape.clone(), builder, None);
         }
-        paint_background_images(fragment, shape.clone(), builder);
         paint_borders(fragment, radii, builder);
         if builder.dom.point_hit_testable(fragment.node) {
             builder.commands.push(DisplayCommand::HitRegion(HitRegion {
@@ -765,7 +784,12 @@ fn paint_transform(fragment: &Frag<'_>, builder: &Builder<'_>) -> Option<Affine2
     (!corrected.is_identity()).then_some(corrected)
 }
 
-fn paint_background_images(fragment: &Frag<'_>, shape: PaintShape, builder: &mut Builder<'_>) {
+fn paint_background_images(
+    fragment: &Frag<'_>,
+    shape: PaintShape,
+    builder: &mut Builder<'_>,
+    canvas: Option<CssRect>,
+) {
     let Some(value) = builder
         .dom
         .computed_value(fragment.node, "background-image")
@@ -818,12 +842,14 @@ fn paint_background_images(fragment: &Frag<'_>, shape: PaintShape, builder: &mut
             let handle = builder.image(source.clone());
             let origin = layer_value(&origin_layers, index, "padding-box");
             let positioning = background_box(origin, border_box, padding_box, content_box);
-            let clip = background_box(
-                layer_value(&clip_layers, index, "border-box"),
-                border_box,
-                padding_box,
-                content_box,
-            );
+            let clip = canvas.unwrap_or_else(|| {
+                background_box(
+                    layer_value(&clip_layers, index, "border-box"),
+                    border_box,
+                    padding_box,
+                    content_box,
+                )
+            });
             let repeat = parse_background_repeat(layer_value(&repeat_layers, index, "repeat"));
             let position = layer_value(&position_layers, index, "0% 0%");
             let size = layer_value(&size_layers, index, "auto auto");
