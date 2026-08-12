@@ -264,13 +264,19 @@ fn graphical_paint_cache(
 /// transforms, opacity, or stacking order. The painter still queries the
 /// updated presentation DOM for colors, backgrounds, borders, shadows,
 /// decoration, object fit, and hit-test metadata.
-pub fn repaint_graphical(layout: &mut GraphicalLayout, dom: &Dom, base: &Url) -> bool {
+pub fn repaint_graphical(
+    layout: &mut GraphicalLayout,
+    dom: &Dom,
+    base: &Url,
+    images: &ImageSizes,
+) -> bool {
     let Some(cache) = &layout.paint_cache else {
         return false;
     };
     let (paint, patch_boundaries, boundaries) = graphics::paint(
         dom,
         base,
+        images,
         &cache.root,
         &cache.fixed,
         &cache.top_layer,
@@ -346,6 +352,7 @@ pub fn lay_out_graphical(
     let (paint, patch_boundaries, boundaries) = graphics::paint(
         dom,
         base,
+        images,
         &frag,
         &fixed,
         &top_layer,
@@ -427,6 +434,7 @@ pub fn lay_graphical_subtree(
     let (paint, patch_boundaries, boundaries) = graphics::paint(
         dom,
         base,
+        images,
         &frag,
         &fixed,
         &top_layer,
@@ -5303,7 +5311,12 @@ mod tests {
             "color:blue;background-color:#eef;text-decoration-color:green",
         );
 
-        assert!(repaint_graphical(&mut retained, &dom, &base));
+        assert!(repaint_graphical(
+            &mut retained,
+            &dom,
+            &base,
+            &HashMap::new(),
+        ));
         let full = lay_out_graphical(&dom, &base, viewport, &[], &HashMap::new(), &HashMap::new());
         assert_eq!(retained.boxes, original_boxes);
         assert_eq!(retained.boxes, full.boxes);
@@ -5328,7 +5341,12 @@ mod tests {
             "style",
             "visibility:visible;pointer-events:auto;text-decoration-line:underline",
         );
-        assert!(repaint_graphical(&mut retained, &dom, &base));
+        assert!(repaint_graphical(
+            &mut retained,
+            &dom,
+            &base,
+            &HashMap::new(),
+        ));
         let full = lay_out_graphical(&dom, &base, viewport, &[], &HashMap::new(), &HashMap::new());
         assert_eq!(retained.paint.primitives, full.paint.primitives);
         assert!(retained.paint.primitives.iter().any(|command| matches!(
@@ -5339,6 +5357,42 @@ mod tests {
             command,
             crate::render::DisplayCommand::HitRegion(region) if region.actor == Some(42)
         )));
+    }
+
+    #[test]
+    fn graphical_background_images_use_intrinsic_size_and_repeat() {
+        let dom = Dom::parse_document(
+            r#"<html style="margin:0;background-image:url('/tile.webp');background-repeat:repeat"><body style="margin:0;background:transparent"><div style="height:36px"></div></body></html>"#,
+        );
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut images = HashMap::new();
+        images.insert("https://example.test/tile.webp".to_string(), (16, 12));
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(64.0, 36.0),
+            &[],
+            &HashMap::new(),
+            &images,
+        );
+        let tiles = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                crate::render::DisplayCommand::Image { rect, .. } => Some(*rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            tiles.len() >= 12,
+            "background should be tiled across the box"
+        );
+        assert!(
+            tiles.iter().all(|rect| {
+                (rect.width - 16.0).abs() < 0.01 && (rect.height - 12.0).abs() < 0.01
+            })
+        );
     }
 
     #[test]

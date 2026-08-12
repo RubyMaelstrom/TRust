@@ -269,7 +269,10 @@ fn subtree_has_image_metadata(dom: &crate::dom::Dom, root: usize) -> bool {
             matches!(
                 dom.tag_name(node),
                 Some("img" | "picture" | "source" | "video" | "audio" | "meta" | "svg")
-            )
+            ) || ["background-image", "list-style-image"]
+                .into_iter()
+                .filter_map(|property| dom.computed_value(node, property))
+                .any(|value| !css_image_sources(&value).is_empty())
         })
 }
 
@@ -2825,8 +2828,9 @@ pub fn lay_subtree_patch(
     })
 }
 
-/// The absolute http(s) URLs of every `<img src>` in document order,
-/// de-duplicated (the decode pipeline fetches each once).
+/// The absolute image URLs referenced by replaced elements and CSS image
+/// properties, de-duplicated in document order (the decode pipeline fetches
+/// each once).
 struct CollectedImages {
     all: Vec<String>,
     eager: Vec<String>,
@@ -2889,6 +2893,29 @@ fn collect_image_urls(
             }
         }
     }
+    // CSS image-valued properties participate in the same fetch/discovery
+    // pipeline as replaced elements. In particular, the initial value of
+    // `background-repeat` is `repeat`, so a background image must be available
+    // before the first paint rather than waiting for a later display-list
+    // rebuild (CSS Backgrounds 3 §§2.1, 2.3).
+    for id in dom.descendants(crate::dom::DOCUMENT) {
+        for property in ["background-image", "list-style-image"] {
+            let Some(value) = dom.computed_value(id, property) else {
+                continue;
+            };
+            for source in css_image_sources(&value) {
+                let Some(url) = resolve_css_image_source(base, &source) else {
+                    continue;
+                };
+                if !urls.contains(&url) {
+                    urls.push(url.clone());
+                }
+                if !eager.contains(&url) {
+                    eager.push(url);
+                }
+            }
+        }
+    }
     // A `<video>` whose source is MSE/blob (no `src`/`<source>`/`poster` — every
     // modern streaming player) renders as a "play in mpv" representation; give
     // it a preview frame from the page's standard Open Graph image so the
@@ -2930,6 +2957,37 @@ fn collect_image_urls(
         all: urls,
         eager,
         lazy_handles,
+    }
+}
+
+fn css_image_sources(value: &str) -> Vec<String> {
+    let lower = value.to_ascii_lowercase();
+    let mut sources = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = lower[cursor..].find("url(") {
+        let open = cursor + relative + 4;
+        let Some(close) = value[open..].find(')') else {
+            break;
+        };
+        let source = value[open..open + close]
+            .trim()
+            .trim_matches(['\'', '"'])
+            .to_string();
+        if !source.is_empty() {
+            sources.push(source);
+        }
+        cursor = open + close + 1;
+    }
+    sources
+}
+
+fn resolve_css_image_source(base: &Url, source: &str) -> Option<String> {
+    if source.starts_with("data:") || source.starts_with("blob:") {
+        return Some(source.to_string());
+    }
+    match resolve(base, source) {
+        Link::Http(url) => Some(url.to_string()),
+        _ => None,
     }
 }
 
@@ -3314,6 +3372,29 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovers_css_background_image_urls_for_eager_fetch() {
+        let base = Url::parse("https://example.test/path/").unwrap();
+        let document = parse(
+            &base,
+            "text/html",
+            br#"<html style="background-image:url('/images/strawbackground.webp')"><body><ul style="list-style-image:url('/images/HeartDot.png')"><li>x</li></ul></body></html>"#,
+            80,
+            24,
+            &Default::default(),
+        );
+        assert!(
+            document
+                .image_urls
+                .contains(&"https://example.test/images/strawbackground.webp".to_string())
+        );
+        assert!(
+            document
+                .image_urls
+                .contains(&"https://example.test/images/HeartDot.png".to_string())
+        );
+    }
 
     #[test]
     fn graphical_paint_patch_updates_styles_without_replacing_nodes_or_values() {
