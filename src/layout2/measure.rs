@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use crate::dom::{DOCUMENT, Dom, NodeId};
 use crate::layout2::{NO_NODE, PxRect};
 
-use super::flow::{Frag, FragKind};
+use super::flow::{Frag, FragKind, TopFrag};
 
 /// Canonical fragment rectangle in CSS pixels. CSSOM View geometry is read
 /// before any terminal adaptation or device-pixel presentation.
@@ -181,6 +181,7 @@ pub(super) fn boxes(
     dom: &Dom,
     root: &Frag<'_>,
     fixed: &[Frag<'_>],
+    top_layer: &[TopFrag<'_>],
 ) -> (HashMap<NodeId, PxRect>, HashMap<NodeId, PxRect>) {
     // In-flow tree: its own boxes never include the fixed layer.
     let mut flow = Own::default();
@@ -192,6 +193,11 @@ pub(super) fn boxes(
     let mut fx = Own::default();
     for f in fixed {
         walk(f, &mut fx);
+    }
+    // Top-layer boxes do not inflate the document scroll area, but CSSOM View
+    // still reports their actual ICB-relative border boxes.
+    for top in top_layer {
+        walk(&top.fragment, &mut fx);
     }
 
     let mut out: HashMap<NodeId, PxRect> = HashMap::new();

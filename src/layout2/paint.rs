@@ -45,7 +45,7 @@ use crate::layout2::{
 /// `x-trust-composite:` URL → the layers the app alpha-blends into that box.
 pub(crate) type Composites = HashMap<String, Vec<CompositeLayer>>;
 
-use super::flow::{Clip, Frag, FragKind};
+use super::flow::{Clip, Frag, FragKind, TopFrag};
 use super::style::{BOTTOM, LEFT, RIGHT, TOP};
 
 static BORDERS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -86,6 +86,7 @@ pub(crate) fn paint(
     base: &url::Url,
     root: &mut Frag<'_>,
     fixed: &[Frag<'_>],
+    top_layer: &[TopFrag<'_>],
     flow_bottom: f32,
     anchors: &[(NodeId, f32)],
     viewport: (usize, usize),
@@ -189,7 +190,7 @@ pub(crate) fn paint(
     let mut order: Vec<usize> = (0..fixed.len()).collect();
     order.sort_by_key(|&i| fixed[i].paint.z.unwrap_or(0));
     let vp_rows = viewport.1;
-    let fixed_items = order
+    let mut fixed_items: Vec<FixedItem> = order
         .into_iter()
         .filter_map(|i| {
             let f = &fixed[i];
@@ -222,6 +223,33 @@ pub(crate) fn paint(
             })
         })
         .collect();
+    // Top-layer entries paint after the root stacking context and ordinary
+    // fixed layer. Terminal overlays are viewport-addressed; the graphical
+    // display list additionally distinguishes absolute from fixed scrolling.
+    for top in top_layer {
+        let f = &top.fragment;
+        let col = ((f.x / cell_w).round() as i64).max(0) as usize;
+        let mut row = ((f.y / cell_h).round() as i64).max(0) as usize;
+        if vp_rows > 0 {
+            row = row.min(vp_rows.saturating_sub(1));
+        }
+        let mut ops = Vec::new();
+        let top_cols = cols.saturating_sub(col).max(1);
+        let line_rows = line_row_map(f, f.x, f.y, cell_w, cell_h, top_cols);
+        build_sc(
+            dom, f, &mut ops, cell_w, cell_h, f.x, f.y, &links, &line_rows,
+        );
+        let brows = composite(ops, top_cols, alpha, &mut composites);
+        if !brows.iter().all(|r| r.items.is_empty()) {
+            fixed_items.push(FixedItem {
+                col: col.min(u16::MAX as usize) as u16,
+                row: row.min(u16::MAX as usize) as u16,
+                rows: brows,
+                z: i32::MAX,
+                under_document: false,
+            });
+        }
+    }
     PaintOut {
         rows,
         anchor_rows,

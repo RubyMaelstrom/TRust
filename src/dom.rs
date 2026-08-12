@@ -217,13 +217,21 @@ pub struct Dom {
     /// style/viewport change, or a mutator that can't name its node) — then the
     /// app must do a full relayout, never a patch. Reset to true on take.
     dirty_attributed: bool,
-    /// Elements holding hover-type listeners (computed by the actor's
-    /// `hover_set` before each serialize): the serializer bakes
-    /// `data-trust-hover` on them so the app can resolve a hovered cell back
-    /// to an actor node. Deliberately a DEDICATED attribute — `data-trust-node`
-    /// is load-bearing for incremental-layout boundary sparsity and
-    /// scroll-region correlation, so hover hosts must not carry it.
+    /// Actor nodes eligible for pointer hit correlation (computed by the
+    /// actor's `hover_set` before each serialize): CSS-only pages keep sparse
+    /// selector candidates; pages exposing pointer/mouse boundary events carry
+    /// every element so target and relatedTarget remain exact. The serializer
+    /// bakes `data-trust-hover` on them. Deliberately a DEDICATED attribute —
+    /// `data-trust-node` is load-bearing for incremental-layout boundary
+    /// sparsity and scroll-region correlation, so hit targets must not carry it.
     hover_hosts: std::collections::HashSet<NodeId>,
+    /// Whether `hover_hosts` names every rendered element rather than only CSS
+    /// hover candidates. UI Events requires the actual hit-test target (and
+    /// `relatedTarget`) even when that element has no listener of its own, so
+    /// any page with pointer/mouse boundary listeners uses complete markers.
+    /// Kept separately because a CSS-only `:hover` page can retain its sparse
+    /// candidate set without losing observable event targets.
+    hover_hits_complete: bool,
     /// Selector subjects of paint-only hover rules. These receive a separate
     /// presentation marker so graphical frontends can update baked paint style
     /// in place without treating ordinary inline/flex elements as relayout
@@ -241,6 +249,10 @@ pub struct Dom {
     /// pseudo-class. A removed node's stale entry is harmless (the id stops
     /// rendering with the node).
     popover_open: FxHashSet<NodeId>,
+    /// Top-layer order for showing popovers. CSS Positioned Layout 4 §3 uses
+    /// an ordered set and paints its last element on top; a hash-set alone
+    /// loses that observable order when more than one manual popover is open.
+    popover_order: Vec<NodeId>,
 }
 
 /// The kind of DOM mutation, for incremental-layout boundary mapping. See
@@ -409,9 +421,11 @@ impl Dom {
             dirty_nodes: Vec::new(),
             dirty_attributed: true,
             hover_hosts: std::collections::HashSet::new(),
+            hover_hits_complete: false,
             paint_patch_hosts: std::collections::HashSet::new(),
             hover_chain: FxHashSet::default(),
             popover_open: FxHashSet::default(),
+            popover_order: Vec::new(),
         };
         dom.new_node(NodeData::Document);
         dom
@@ -421,8 +435,15 @@ impl Dom {
     /// serializer marks with `data-trust-hover`. Refreshed by the actor
     /// wherever the clickable set is refreshed — a pure marking input, so it
     /// deliberately does NOT touch the dirty bit or the epoch.
-    pub fn set_hover_hosts(&mut self, hosts: std::collections::HashSet<NodeId>) {
+    pub fn set_hover_hosts(&mut self, hosts: std::collections::HashSet<NodeId>, complete: bool) {
         self.hover_hosts = hosts;
+        self.hover_hits_complete = complete;
+    }
+
+    /// Whether the last live snapshot carried exact actor ids on every
+    /// element for standards-correct pointer boundary event targeting.
+    pub fn hover_hits_complete(&self) -> bool {
+        self.hover_hits_complete
     }
 
     /// Replace the paint-only selector-subject marker set used by live
@@ -546,13 +567,40 @@ impl Dom {
     /// is unchanged.
     pub fn set_popover_open(&mut self, id: NodeId, open: bool) {
         let changed = if open {
-            self.popover_open.insert(id)
+            let inserted = self.popover_open.insert(id);
+            if inserted {
+                self.popover_order.push(id);
+            }
+            inserted
         } else {
-            self.popover_open.remove(&id)
+            let removed = self.popover_open.remove(&id);
+            if removed {
+                self.popover_order.retain(|&node| node != id);
+            }
+            removed
         };
         if changed {
             self.touch();
         }
+    }
+
+    /// Whether this element is currently in the document's popover top layer.
+    /// Live arenas own the state directly; serialized presentation arenas carry
+    /// the internal order marker because open state is not an HTML attribute.
+    pub fn is_popover_showing(&self, id: NodeId) -> bool {
+        self.popover_open.contains(&id) || self.attr(id, "data-trust-popover-open").is_some()
+    }
+
+    /// Stable position in the document top layer, used by the painter. The
+    /// presentation marker transports the actor arena's ordered-set index.
+    pub fn popover_top_layer_order(&self, id: NodeId) -> Option<usize> {
+        self.popover_order
+            .iter()
+            .position(|&node| node == id)
+            .or_else(|| {
+                self.attr(id, "data-trust-popover-open")
+                    .and_then(|value| value.parse().ok())
+            })
     }
 
     /// Move the live `:hover` state to `target`, its flat-tree ancestors, and
@@ -1773,15 +1821,12 @@ impl Dom {
         {
             return true;
         }
-        // UA rule `[popover]:not(:popover-open) { display:none }` (HTML §the
-        // popover attribute): a popover renders only while SHOWN
-        // (`showPopover()` / a `popovertarget` button). Same origin ordering
-        // as the dialog rule above — an author `display` (a tooltip lib's
-        // inline `display:flex`) wins over the UA sheet.
-        if !self.popover_open.contains(&id)
-            && self.attr(id, "popover").is_some()
-            && self.cascaded(id, "display").is_none()
-        {
+        // HTML Popover: hidePopover removes the element from the top layer AND
+        // applies display:none. This is visibility state, not an ordinary UA
+        // declaration which author `display:block` can override. Tooltip
+        // libraries commonly retain that inline display while hidden; allowing
+        // it to win resurrects every closed menu in the presentation snapshot.
+        if !self.is_popover_showing(id) && self.attr(id, "popover").is_some() {
             return true;
         }
         // `display:none` generates NO box (the element and subtree occupy no
@@ -4501,6 +4546,13 @@ impl Dom {
         if self.paint_patch_hosts.contains(&id) {
             out.push_str(&format!(" data-trust-paint-node=\"{id}\""));
         }
+        // Popover visibility/top-layer membership is DOM state, not reflected
+        // by the `popover` content attribute. Carry its ordered-set position
+        // into the presentation DOM so layout can generate the box as a root
+        // sibling and paint it after the document (CSS Position 4 §3).
+        if let Some(order) = self.popover_top_layer_order(id) {
+            out.push_str(&format!(" data-trust-popover-open=\"{order}\""));
+        }
         // A scroll container's current `scrollTop` signal (CSSOM View) rides the
         // HTML in CSS pixels so it survives the live snapshot/re-parse exactly
         // like a baked form value. A terminal consumer quantizes this value only
@@ -4929,7 +4981,7 @@ impl Dom {
         }
         // Live `:popover-open`: the element's popover is currently showing.
         // `set_popover_open` bumps the epoch, so the match memos stay fresh.
-        if c.popover_open && !self.popover_open.contains(&id) {
+        if c.popover_open && !self.is_popover_showing(id) {
             return false;
         }
         let Some(tag) = self.tag_name(id) else {

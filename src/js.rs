@@ -7473,6 +7473,19 @@ pub enum PageCmd {
     DevicePixelRatio(f32),
 }
 
+/// Latest native pointer hit delivered through the page actor's coalescing
+/// hover lane. Pointer boundary state is a latest-value signal rather than
+/// ordinary queued work: if the bounded command queue is saturated, dropping
+/// the transition can leave `:hover` and `mouseleave` stuck indefinitely.
+/// A watch channel keeps exactly one pending value, so it is bounded while the
+/// actor still observes the final target required by Pointer Events.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PageHover {
+    node: Option<usize>,
+    x: f64,
+    y: f64,
+}
+
 /// Which kind of retained boundary a patch targets. Paint patches preserve all
 /// geometry; size boundaries preserve both outer dimensions; width-stable
 /// boundaries may change height but cannot alter their containing width.
@@ -7576,21 +7589,43 @@ pub enum PageEvt {
 #[derive(Debug)]
 pub struct PageHandle {
     pub cmds: tokio::sync::mpsc::Sender<PageCmd>,
+    state: Box<PageHandleState>,
+}
+
+#[derive(Debug)]
+struct PageHandleState {
+    hover: Option<tokio::sync::watch::Sender<PageHover>>,
     cache: std::sync::Arc<crate::http::PageCache>,
 }
 
 impl PageHandle {
+    /// Publish the newest pointer hit without blocking the UI thread and
+    /// without losing mouseout/mouseleave when the ordinary command queue is
+    /// full. `watch` coalesces unsampled intermediate motion but always keeps
+    /// the final boundary target, matching Pointer Events' allowance to
+    /// coalesce motion while preserving the effective pointer position.
+    pub fn send_hover(&self, node: Option<usize>, x: f64, y: f64) -> bool {
+        let hover = PageHover { node, x, y };
+        self.state.hover.as_ref().map_or_else(
+            || self.cmds.try_send(PageCmd::Hover { node, x, y }).is_ok(),
+            |sender| sender.send(hover).is_ok(),
+        )
+    }
+
     /// Freeze the document: cancel its fetch group before dropping the command
     /// sender lets the resident actor, workers, sockets and timers wind down.
     pub fn retire(&self) {
-        self.cache.cancel();
+        self.state.cache.cancel();
     }
 
     #[cfg(test)]
     pub(crate) fn from_test_sender(cmds: tokio::sync::mpsc::Sender<PageCmd>) -> Self {
         Self {
             cmds,
-            cache: Default::default(),
+            state: Box::new(PageHandleState {
+                hover: None,
+                cache: Default::default(),
+            }),
         }
     }
 }
@@ -7649,6 +7684,7 @@ const WAKE_FLOOR: Duration = Duration::from_millis(66);
 /// sleep elapsing.
 enum Wake {
     Cmd(Option<PageCmd>),
+    Hover(Option<PageHover>),
     Fetch(Option<(usize, FetchResult)>),
     Timer,
 }
@@ -7671,6 +7707,11 @@ pub fn spawn_page(
 ) -> (PageHandle, tokio::sync::mpsc::Receiver<PageEvt>) {
     let cache = env.cache.clone();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+    let (hover_tx, hover_rx) = tokio::sync::watch::channel(PageHover {
+        node: None,
+        x: 0.0,
+        y: 0.0,
+    });
     let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(16);
     // The actor keeps a clone of its own command sender so a WebSocket task can
     // post inbound frames back as `PageCmd::Ws` (see `setup_page_ws`).
@@ -7679,7 +7720,7 @@ pub fn spawn_page(
         .name(String::from("trust-page"))
         .stack_size(PAGE_STACK)
         .spawn(move || {
-            page_actor(html, env, cmd_rx, evt_tx, cmd_self);
+            page_actor(html, env, cmd_rx, hover_rx, evt_tx, cmd_self);
             // `page_actor` has returned, so the Context + DOM arena have dropped
             // and this thread's whole JS heap is freed back to its (about-to-be-
             // abandoned) mimalloc heap. Purge it to the OS NOW — on the owning
@@ -7699,7 +7740,10 @@ pub fn spawn_page(
     (
         PageHandle {
             cmds: cmd_tx,
-            cache,
+            state: Box::new(PageHandleState {
+                hover: Some(hover_tx),
+                cache,
+            }),
         },
         evt_rx,
     )
@@ -8472,6 +8516,7 @@ fn page_actor(
     html: String,
     env: PageEnv,
     mut cmds: tokio::sync::mpsc::Receiver<PageCmd>,
+    mut hover: tokio::sync::watch::Receiver<PageHover>,
     evts: tokio::sync::mpsc::Sender<PageEvt>,
     cmd_self: tokio::sync::mpsc::Sender<PageCmd>,
 ) {
@@ -8691,9 +8736,11 @@ fn page_actor(
             .map(|at| Duration::from_millis((at - now_virt).max(0.0) as u64).max(WAKE_FLOOR));
         let wake = rt.block_on(async {
             tokio::select! {
-                // Bias to commands so a user click is never starved by a busy
-                // animation's frame timer.
+                // Pointer boundary state is a bounded latest-value lane. Give
+                // it priority over ordinary queued commands so an exit cannot
+                // remain stuck behind page bookkeeping or a busy animation.
                 biased;
+                changed = hover.changed() => Wake::Hover(changed.ok().map(|()| *hover.borrow_and_update())),
                 cmd = cmds.recv() => Wake::Cmd(cmd),
                 // A background fetch completed — settle its promise and re-render.
                 done = fetch_rx.recv() => Wake::Fetch(done),
@@ -8701,6 +8748,12 @@ fn page_actor(
             }
         });
         let cmd = match wake {
+            Wake::Hover(Some(hover)) => PageCmd::Hover {
+                node: hover.node,
+                x: hover.x,
+                y: hover.y,
+            },
+            Wake::Hover(None) => break, // app dropped the handle
             Wake::Cmd(Some(cmd)) => cmd,
             Wake::Cmd(None) => break, // app dropped the handle
             Wake::Fetch(Some((id, result))) => {
@@ -9926,26 +9979,18 @@ const HOVER_ATTRS: &[&str] = &[
     "onpointermove",
 ];
 
-/// The hover-target set the serializer marks (`data-trust-hover`), from three
-/// sources:
-///  1. Elements holding any hover-type listener (the prelude registry, via
-///     `__trust.hoverables()`) or bearing a hover `on*` attribute — PLUS
-///     their whole composed subtrees: a delegation container's descendants
-///     are its real targets (`e.target.closest('.row')` must see the ROW,
-///     not the container the listener sits on — the live smoke caught
-///     delegated rows resolving to the container without this).
-///  2. Elements a render-affecting `:hover` RULE could match (the style
-///     index's hover probes): a pure-CSS dropdown (`.menu:hover .drop`) has
-///     no listener at all, but `.menu` must still be a nameable hover target
-///     or the cascade's chain can never reach it. Selectors with no narrower
-///     safe probe (for example `:is(:hover)`) mark every possible designated
-///     element; completeness is required for correct hit testing.
+/// The pointer target set the serializer marks (`data-trust-hover`). If any
+/// pointer/mouse boundary listener or `on*` attribute is observable, every
+/// element is marked: Pointer Events and UI Events require the actual topmost
+/// hit as Event.target and the other endpoint as relatedTarget, including
+/// ordinary elements with no listener. That also gives delegated listeners the
+/// descendant target expected by `event.target.closest(...)`.
 ///
-/// NO cursor heuristics; html/body excluded (document-level delegation is
-/// reached by bubbling from whatever target the app resolves). Stored on the
-/// Dom so `serialize_live` bakes the marker — refreshed wherever the
-/// clickable set is.
-fn hover_set(page: &mut LoadedPage) -> std::collections::HashSet<usize> {
+/// A CSS-only page retains the narrower render-affecting `:hover` candidate
+/// set from the style index. A pure-CSS dropdown still names `.menu`, while a
+/// selector with no safe narrow probe (for example `:is(:hover)`) marks every
+/// possible designated element. No cursor heuristics are involved.
+fn hover_set(page: &mut LoadedPage) -> (std::collections::HashSet<usize>, bool) {
     let mut hosts = listener_ids(page, b"__trust.hoverables().join(\",\")");
     let dom = page.dom.borrow();
     for d in dom.composed_descendants(crate::dom::DOCUMENT) {
@@ -9953,13 +9998,23 @@ fn hover_set(page: &mut LoadedPage) -> std::collections::HashSet<usize> {
             hosts.insert(d);
         }
     }
-    let mut marked = hosts.clone();
-    for &h in &hosts {
-        marked.extend(dom.composed_descendants(h));
-    }
-    marked.extend(dom.hover_css_candidates());
-    marked.retain(|&h| !matches!(dom.tag_name(h), None | Some("html" | "body")));
-    marked
+    let complete = !hosts.is_empty();
+    let mut marked: std::collections::HashSet<usize> = if complete {
+        // Pointer Events/UI Events target the topmost hit-tested element, not
+        // merely an element that happens to own a listener. `mouseout` and
+        // `mouseleave` also expose the element being entered as relatedTarget.
+        // Preserve actor identity on every element whenever those events are
+        // observable; otherwise containment-based mouseleave shims (jQuery's
+        // included) can receive null or a listener ancestor and stay open.
+        dom.composed_descendants(crate::dom::DOCUMENT)
+            .into_iter()
+            .filter(|&node| dom.tag_name(node).is_some())
+            .collect()
+    } else {
+        dom.hover_css_candidates().into_iter().collect()
+    };
+    marked.retain(|&node| dom.tag_name(node).is_some());
+    (marked, complete)
 }
 
 /// `clickable_set` RESTRICTED to the given subtrees — the incremental patch
@@ -10062,14 +10117,42 @@ fn self_or_ancestor_hover_host(
     result
 }
 
-/// `hover_set` RESTRICTED to the given subtrees (the patch path's marker
-/// input; see `clickable_set_scoped`). Marks the same nodes the full set
-/// would inside the boundaries: hover hosts and everything under one (the
-/// host may sit ABOVE the boundary — the memoized ancestor walk finds it),
-/// plus the CSS hover-probe candidates, scoped in dom.rs.
-fn hover_set_scoped(page: &mut LoadedPage, roots: &[usize]) -> std::collections::HashSet<usize> {
+/// `hover_set` restricted to patch subtrees. Once exact event hit testing is
+/// active, every in-scope element stays marked. A CSS-only page keeps its
+/// selector candidates. `None` requests one full snapshot when a newly-added
+/// listener promotes the document from sparse to complete hit metadata.
+fn hover_set_scoped(
+    page: &mut LoadedPage,
+    roots: &[usize],
+) -> Option<(std::collections::HashSet<usize>, bool)> {
     let reg = listener_ids(page, b"__trust.hoverables().join(\",\")");
     let dom = page.dom.borrow();
+    let inline_in_scope = roots.iter().copied().any(|root| {
+        std::iter::once(root)
+            .chain(dom.composed_descendants(root))
+            .any(|node| {
+                HOVER_ATTRS
+                    .iter()
+                    .any(|attr| dom.attr(node, attr).is_some())
+            })
+    });
+    let complete = dom.hover_hits_complete() || !reg.is_empty() || inline_in_scope;
+    // Promoting from sparse CSS candidates to exact event targets changes
+    // presentation metadata across the whole document. A subtree patch cannot
+    // safely install those ids outside its roots, so request the existing full
+    // snapshot fallback once; subsequent patches remain local.
+    if complete && !dom.hover_hits_complete() {
+        return None;
+    }
+    if complete {
+        let marked = roots
+            .iter()
+            .copied()
+            .flat_map(|root| std::iter::once(root).chain(dom.composed_descendants(root)))
+            .filter(|&node| dom.tag_name(node).is_some())
+            .collect();
+        return Some((marked, true));
+    }
     let mut marked: std::collections::HashSet<usize> =
         dom.hover_css_candidates_in(roots).into_iter().collect();
     let mut memo: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
@@ -10080,8 +10163,8 @@ fn hover_set_scoped(page: &mut LoadedPage, roots: &[usize]) -> std::collections:
             }
         }
     }
-    marked.retain(|&h| !matches!(dom.tag_name(h), None | Some("html" | "body")));
-    marked
+    marked.retain(|&node| dom.tag_name(node).is_some());
+    Some((marked, false))
 }
 
 /// Serialize the WHOLE live document for interaction (the full-path / fallback
@@ -10089,14 +10172,14 @@ fn hover_set_scoped(page: &mut LoadedPage, roots: &[usize]) -> std::collections:
 /// the clickable set + whether the page has any interaction.
 fn extract_live(page: &mut LoadedPage) -> (String, std::collections::HashSet<usize>, bool) {
     let (clickable, has_any) = clickable_set(page);
-    let hover = hover_set(page);
+    let (hover, complete_hover_hits) = hover_set(page);
     let paint = page
         .dom
         .borrow()
         .hover_paint_subject_candidates_in(&[crate::dom::DOCUMENT]);
     {
         let mut dom = page.dom.borrow_mut();
-        dom.set_hover_hosts(hover);
+        dom.set_hover_hosts(hover, complete_hover_hits);
         dom.set_paint_patch_hosts(paint.into_iter().collect());
     }
     let dom = page.dom.borrow();
@@ -10267,14 +10350,26 @@ fn emit_boundary_patches(
     // serialize, so the scoped hover set stored here can never leak into one).
     let boundary_nodes: Vec<usize> = boundaries.iter().map(|&(n, _)| n).collect();
     let clickable = clickable_set_scoped(page, &boundary_nodes);
-    let hover = hover_set_scoped(page, &boundary_nodes);
+    let Some((hover, complete_hover_hits)) = hover_set_scoped(page, &boundary_nodes) else {
+        // A newly observable mouse/pointer boundary listener requires exact
+        // actor ids on every element for Event.target/relatedTarget. Installing
+        // document-wide hit metadata through a local subtree patch would leave
+        // the retained frontend inconsistent, so take the always-correct full
+        // snapshot once and return to incremental patches afterward.
+        let (out, _clickable, outcome) = extract_changed(page)?;
+        page.boundary_render.clear();
+        return Some(
+            evts.blocking_send(PageEvt::Updated { html: out, outcome })
+                .is_ok(),
+        );
+    };
     let paint = page
         .dom
         .borrow()
         .hover_paint_subject_candidates_in(&boundary_nodes);
     {
         let mut dom = page.dom.borrow_mut();
-        dom.set_hover_hosts(hover);
+        dom.set_hover_hosts(hover, complete_hover_hits);
         dom.extend_paint_patch_hosts(paint);
     }
     let t = std::time::Instant::now();
@@ -22145,7 +22240,7 @@ mod tests {
         let dom = Rc::new(RefCell::new(Dom::parse_document(
             r#"<html><head><style>#tip:popover-open{text-transform:uppercase}</style></head><body>
             <button id="btn" popovertarget="tip">help</button>
-            <div id="tip" popover>tooltip text</div>
+            <div id="tip" popover style="display:block">tooltip text</div>
             <div id="man" popover="manual">manual pop</div>
             <div id="veto" popover>veto pop</div>
             </body></html>"#,
@@ -22164,7 +22259,7 @@ mod tests {
         let at_rest = dom.borrow().serialize(DOCUMENT);
         assert!(
             !at_rest.contains("tooltip text"),
-            "closed popover hidden: {at_rest}"
+            "closed popover hidden despite author display: {at_rest}"
         );
 
         let budget = Budget::new(WALL_BUDGET);
@@ -22267,6 +22362,22 @@ mod tests {
             !shown.contains("manual pop"),
             "closed popover hidden: {shown}"
         );
+        // SHOWING state is not reflected by an HTML content attribute. The
+        // live presentation snapshot must nevertheless transport top-layer
+        // membership across its parse boundary; otherwise author
+        // `display:block` resurrects a hidden tooltip or an open tooltip is
+        // laid out under its former DOM parent.
+        let live = dom
+            .borrow()
+            .serialize_live(DOCUMENT, &std::collections::HashSet::new());
+        assert!(
+            live.contains("data-trust-popover-open=\"0\""),
+            "open popover carries top-layer order: {live}"
+        );
+        let presentation = Dom::parse_document(&live);
+        let presentation_tip = presentation.get_by_id("tip").expect("serialized #tip");
+        assert!(presentation.is_popover_showing(presentation_tip));
+        assert!(!presentation.is_hidden(presentation_tip));
     }
 
     /// HTMLDialogElement (HTML §4.11.4): show/showModal/close/requestClose,
@@ -25041,6 +25152,26 @@ mod tests {
         )
     }
 
+    fn hover_actor_for_id(html: &str, id: &str) -> usize {
+        let id_attr = format!("id=\"{id}\"");
+        let id_at = html.find(&id_attr).expect("element id serialized");
+        let tag_start = html[..id_at].rfind('<').expect("element start tag");
+        let tag_end = html[id_at..]
+            .find('>')
+            .map(|offset| id_at + offset)
+            .expect("element end tag");
+        let tag = &html[tag_start..=tag_end];
+        let marker = tag
+            .find("data-trust-hover=\"")
+            .expect("element has an exact hover actor marker");
+        tag[marker + "data-trust-hover=\"".len()..]
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
     #[test]
     fn a_click_driven_animation_completes_at_rest() {
         // Humble's "Dismiss banner" steps a `Date.now()`/`requestAnimationFrame`
@@ -25824,6 +25955,48 @@ mod tests {
             later > first,
             "the interval must keep ticking at rest: first={first} later={later}"
         );
+    }
+
+    #[test]
+    fn an_interval_does_not_starve_a_later_timeout() {
+        // HTML §8.7 gives independently scheduled timers their own timer tasks.
+        // A short animation interval must not keep a later one-shot callback
+        // from becoming runnable; tooltip fade effects depend on this ordering.
+        let (_handle, mut events) = live(
+            r##"<body><div id="out">waiting</div><script>
+            setTimeout(function () {
+                setInterval(function () {}, 13);
+                setTimeout(function () {
+                    document.getElementById('out').textContent = 'done';
+                }, 200);
+            }, 0);
+            </script></body>"##,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(PageEvt::Updated { html, .. }) => {
+                    if html.contains("done") {
+                        saw_done = true;
+                        break;
+                    }
+                }
+                Ok(PageEvt::Patched { patches, .. }) => {
+                    if patches.iter().any(|patch| patch.html.contains("done")) {
+                        saw_done = true;
+                        break;
+                    }
+                }
+                Ok(PageEvt::Settled | PageEvt::Trouble(_)) => {}
+                Ok(other) => panic!("unexpected event: {other:?}"),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("timer page ended early: {err}"),
+            }
+        }
+        assert!(saw_done, "the interval starved the later timeout");
     }
 
     #[test]
@@ -28105,6 +28278,75 @@ mod tests {
     }
 
     #[test]
+    fn mouseleave_closes_again_with_the_real_related_target() {
+        // Pointer Events/UI Events: the new topmost hit is relatedTarget even
+        // when it owns no listener. Steam's jQuery mouseleave shim uses that
+        // value for containment before hiding its menu, so limiting actor ids
+        // to listener hosts can leave a tooltip permanently open.
+        let (handle, mut events) = live(
+            "<body><div id=menu>closed</div><main id=outside>outside</main><script>\
+             var menu = document.getElementById('menu');\
+             menu.addEventListener('mouseenter', function () { menu.textContent = 'OPEN'; });\
+             menu.addEventListener('mouseleave', function (e) {\
+               menu.textContent = 'CLOSED:' + (e.relatedTarget && e.relatedTarget.id);\
+             });</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("hover-listener page must remain live");
+        };
+        let menu = hover_actor_for_id(&html, "menu");
+        let outside = hover_actor_for_id(&html, "outside");
+        assert_ne!(menu, outside, "hit-tested elements keep exact actor ids");
+
+        assert!(handle.send_hover(Some(menu), 4.0, 4.0));
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("mouseenter should open the menu");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(html.contains("OPEN"), "{html}");
+
+        assert!(handle.send_hover(Some(outside), 200.0, 100.0));
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("mouseleave should close the menu");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(html.contains("CLOSED:outside"), "{html}");
+    }
+
+    #[test]
+    fn hover_delivery_bypasses_a_saturated_command_queue() {
+        // The old `try_send(PageCmd::Hover)` silently dropped mouseout when
+        // sixteen layout/image/bookkeeping commands filled the actor queue.
+        // The frontend still remembered `None`, so it never retried and the
+        // page stayed hovered forever. The latest-value lane is independently
+        // bounded and must remain writable while that queue is full.
+        let (cmds, mut queued) = tokio::sync::mpsc::channel(1);
+        cmds.try_send(PageCmd::LiveRegions(vec![1])).unwrap();
+        let (hover_tx, mut hover_rx) = tokio::sync::watch::channel(PageHover {
+            node: None,
+            x: 0.0,
+            y: 0.0,
+        });
+        let handle = PageHandle {
+            cmds,
+            state: Box::new(PageHandleState {
+                hover: Some(hover_tx),
+                cache: Default::default(),
+            }),
+        };
+
+        assert!(handle.send_hover(Some(42), 12.0, 34.0));
+        assert!(hover_rx.has_changed().unwrap());
+        let hover = *hover_rx.borrow_and_update();
+        assert_eq!(hover.node, Some(42));
+        assert_eq!((hover.x, hover.y), (12.0, 34.0));
+        assert!(matches!(
+            queued.try_recv(),
+            Ok(PageCmd::LiveRegions(nodes)) if nodes == vec![1]
+        ));
+    }
+
+    #[test]
     fn a_hover_only_page_stays_live_and_hover_dispatch_rerenders() {
         // A page whose ONLY listener is a hover type must keep its engine
         // (the auto-Static gate counts hover work), be marked with the
@@ -28120,15 +28362,10 @@ mod tests {
         let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
             panic!("hover-only page must stay live (Updated, not Static)");
         };
+        let hot = hover_actor_for_id(&html, "hot");
         let at = html
-            .find("data-trust-hover=\"")
+            .find(&format!("data-trust-hover=\"{hot}\""))
             .expect("hover host marked with data-trust-hover");
-        let hot: usize = html[at + "data-trust-hover=\"".len()..]
-            .split('"')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
         let hot_tag = {
             let tag_start = html[..at].rfind('<').unwrap();
             &html[tag_start..html[tag_start..].find('>').unwrap() + tag_start]
@@ -28439,15 +28676,7 @@ mod tests {
         let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
             panic!("hover-listener page stays live");
         };
-        let at = html
-            .find("data-trust-hover=\"")
-            .expect("capsule marked as hover host");
-        let cap: usize = html[at + "data-trust-hover=\"".len()..]
-            .split('"')
-            .next()
-            .unwrap()
-            .parse()
-            .unwrap();
+        let cap = hover_actor_for_id(&html, "cap");
         handle
             .cmds
             .blocking_send(PageCmd::Hover {

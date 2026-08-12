@@ -186,6 +186,7 @@ pub struct GraphicalLayout {
 struct GraphicalPaintCache {
     root: flow::Frag<'static>,
     fixed: Vec<flow::Frag<'static>>,
+    top_layer: Vec<flow::TopFrag<'static>>,
     flow_bottom: f32,
     viewport: Viewport,
 }
@@ -232,6 +233,7 @@ fn graphical_paint_boundaries(
 fn graphical_paint_cache(
     root: &flow::Frag<'_>,
     fixed: &[flow::Frag<'_>],
+    top_layer: &[flow::TopFrag<'_>],
     flow_bottom: f32,
     viewport: Viewport,
 ) -> Option<GraphicalPaintCache> {
@@ -240,6 +242,16 @@ fn graphical_paint_cache(
         fixed: fixed
             .iter()
             .map(flow::retain_for_paint)
+            .collect::<Option<Vec<_>>>()?,
+        top_layer: top_layer
+            .iter()
+            .map(|top| {
+                Some(flow::TopFrag {
+                    fragment: flow::retain_for_paint(&top.fragment)?,
+                    fixed: top.fixed,
+                    order: top.order,
+                })
+            })
             .collect::<Option<Vec<_>>>()?,
         flow_bottom,
         viewport,
@@ -261,6 +273,7 @@ pub fn repaint_graphical(layout: &mut GraphicalLayout, dom: &Dom, base: &Url) ->
         base,
         &cache.root,
         &cache.fixed,
+        &cache.top_layer,
         cache.flow_bottom,
         cache.viewport.width,
         cache.viewport.height,
@@ -303,6 +316,7 @@ pub fn lay_out_graphical(
                 primitives: Vec::new(),
                 fixed_under_primitives: Vec::new(),
                 fixed_primitives: Vec::new(),
+                top_layer: Vec::new(),
                 image_requests: Vec::new(),
                 scroll_containers: Vec::new(),
                 sticky_constraints: Vec::new(),
@@ -325,14 +339,22 @@ pub fn lay_out_graphical(
         imemo: Default::default(),
         grid_tracks: Default::default(),
     };
-    let (frag, flow_bottom, _anchors, fixed) = flow.layout(&root);
+    let (frag, flow_bottom, _anchors, fixed, top_layer) = flow.layout(&root);
     let flow_done = started.elapsed();
-    let (boxes, _scrolling_areas) = measure::boxes(dom, &frag, &fixed);
+    let (boxes, _scrolling_areas) = measure::boxes(dom, &frag, &fixed, &top_layer);
     let measure_done = started.elapsed();
-    let (paint, patch_boundaries, boundaries) =
-        graphics::paint(dom, base, &frag, &fixed, flow_bottom, vp.w, vp.h);
+    let (paint, patch_boundaries, boundaries) = graphics::paint(
+        dom,
+        base,
+        &frag,
+        &fixed,
+        &top_layer,
+        flow_bottom,
+        vp.w,
+        vp.h,
+    );
     let paint_boundaries = graphical_paint_boundaries(dom, &boxes);
-    let paint_cache = graphical_paint_cache(&frag, &fixed, flow_bottom, viewport);
+    let paint_cache = graphical_paint_cache(&frag, &fixed, &top_layer, flow_bottom, viewport);
     if trace {
         eprintln!(
             "layout: tree={:?} flow={:?} measure={:?} paint={:?} total={:?}",
@@ -389,7 +411,7 @@ pub fn lay_graphical_subtree(
         imemo: Default::default(),
         grid_tracks: Default::default(),
     };
-    let (mut frag, mut flow_bottom, mut anchors, mut fixed) = flow.layout(&root);
+    let (mut frag, mut flow_bottom, mut anchors, mut fixed, mut top_layer) = flow.layout(&root);
     Flow::offset_frag(&mut frag, rect.x, rect.y);
     for (_, y) in &mut anchors {
         *y += rect.y;
@@ -397,13 +419,17 @@ pub fn lay_graphical_subtree(
     for fragment in &mut fixed {
         Flow::offset_frag(fragment, rect.x, rect.y);
     }
+    for top in &mut top_layer {
+        Flow::offset_frag(&mut top.fragment, rect.x, rect.y);
+    }
     flow_bottom += rect.y;
-    let (boxes, _scrolling_areas) = measure::boxes(dom, &frag, &fixed);
+    let (boxes, _scrolling_areas) = measure::boxes(dom, &frag, &fixed, &top_layer);
     let (paint, patch_boundaries, boundaries) = graphics::paint(
         dom,
         base,
         &frag,
         &fixed,
+        &top_layer,
         flow_bottom,
         viewport.width,
         viewport.height,
@@ -412,6 +438,7 @@ pub fn lay_graphical_subtree(
     let paint_cache = graphical_paint_cache(
         &frag,
         &fixed,
+        &top_layer,
         flow_bottom,
         Viewport::new(viewport.width, viewport.height),
     );
@@ -499,7 +526,7 @@ pub fn lay_out_document(
         imemo: Default::default(),
         grid_tracks: Default::default(),
     };
-    let (mut frag, flow_bottom, anchors, fixed) = flow.layout(&root);
+    let (mut frag, flow_bottom, anchors, fixed, top_layer) = flow.layout(&root);
     // Incremental-layout boundaries — collected from the fragment tree BEFORE
     // paint extracts scroll regions (which empty their frags), then filtered to
     // drop any overlapping a region/carousel band (that content is NOT pure
@@ -510,6 +537,7 @@ pub fn lay_out_document(
         base,
         &mut frag,
         &fixed,
+        &top_layer,
         flow_bottom,
         &anchors,
         (cols, viewport.rows),
@@ -629,8 +657,8 @@ pub fn measure_boxes_css(
         imemo: Default::default(),
         grid_tracks: Default::default(),
     };
-    let (frag, _flow_bottom, _anchors, fixed) = flow.layout(&root);
-    let (boxes, scrolling_areas) = measure::boxes(dom, &frag, &fixed);
+    let (frag, _flow_bottom, _anchors, fixed, top_layer) = flow.layout(&root);
+    let (boxes, scrolling_areas) = measure::boxes(dom, &frag, &fixed, &top_layer);
     (boxes, flow.grid_tracks.into_inner(), scrolling_areas)
 }
 
@@ -690,7 +718,7 @@ pub fn lay_subtree_fragment(
         imemo: Default::default(),
         grid_tracks: Default::default(),
     };
-    let (mut frag, mut flow_bottom, mut anchors, mut fixed) = flow.layout(&root);
+    let (mut frag, mut flow_bottom, mut anchors, mut fixed, mut top_layer) = flow.layout(&root);
     // A standalone patch still quantizes at the full document's original
     // sub-cell phase. Otherwise proportional line heights make the same CSS
     // fragment snap to a different row when re-laid at origin (0,0).
@@ -703,6 +731,9 @@ pub fn lay_subtree_fragment(
     for fragment in &mut fixed {
         Flow::offset_frag(fragment, phase_x, phase_y);
     }
+    for top in &mut top_layer {
+        Flow::offset_frag(&mut top.fragment, phase_x, phase_y);
+    }
     flow_bottom += phase_y;
     // v1 subtree-patch cut: an inline boundary re-lay does NOT alpha-composite
     // transparent image overlaps (empty alpha ⇒ no grouping); they reappear on
@@ -712,6 +743,7 @@ pub fn lay_subtree_fragment(
         base,
         &mut frag,
         &fixed,
+        &top_layer,
         flow_bottom,
         &anchors,
         (cols, viewport.rows),
@@ -789,7 +821,7 @@ pub fn lay_region_fragment(
         imemo: Default::default(),
         grid_tracks: Default::default(),
     };
-    let (mut frag, _flow_bottom, _anchors, _fixed) = flow.layout(&root);
+    let (mut frag, _flow_bottom, _anchors, _fixed, _top_layer) = flow.layout(&root);
     terminal::region_buffer(dom, base, &mut frag, cell_w, cell_h)
 }
 
@@ -5154,6 +5186,67 @@ mod tests {
         assert!((rect.left - 3.75).abs() < 0.01, "{rect:?}");
         assert!((rect.width - 37.5).abs() < 0.01, "{rect:?}");
         assert!((rect.height - 22.25).abs() < 0.01, "{rect:?}");
+    }
+
+    #[test]
+    fn graphical_popover_uses_the_icb_and_top_layer() {
+        // HTML popovers participate in CSS Positioned Layout's top layer. An
+        // absolute popover is a root sibling for containing-block and clipping
+        // purposes: the positioned/overflow-hidden DOM parent must neither add
+        // its offset nor clip the menu. Steam's supernav computes document-
+        // space left/top before showPopover(), which exposed both mistakes.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0">
+            <div style="position:relative;margin-left:300px;width:100px;height:20px;overflow:hidden">
+              <div id="tip" popover="manual" data-trust-popover-open="0" data-trust-hover="17"
+                   style="display:block;position:absolute;left:120px;top:40px;width:80px;height:30px;background:red">TIP</div>
+            </div>
+            <div style="position:fixed;z-index:999999;left:0;top:0">ordinary overlay</div>
+            <div popover="manual" data-trust-popover-open="1" data-trust-hover="18"
+                 style="display:block;position:fixed;left:10px;top:10px">SECOND</div>
+            </body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(800.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let tip = node_by_id(&dom, "tip");
+        let tip_rect = layout.boxes.get(&tip).expect("popover box");
+        assert!((tip_rect.left - 120.0).abs() < 0.01, "{tip_rect:?}");
+        assert!((tip_rect.top - 40.0).abs() < 0.01, "{tip_rect:?}");
+        assert_eq!(
+            layout
+                .paint
+                .top_layer
+                .iter()
+                .map(|entry| entry.fixed)
+                .collect::<Vec<_>>(),
+            vec![false, true],
+            "absolute and fixed entries retain one shared top-layer order"
+        );
+        assert!(
+            layout.paint.primitives.iter().all(|command| !matches!(
+                command,
+                crate::render::DisplayCommand::HitRegion(region) if region.actor == Some(17)
+            )),
+            "top-layer commands must not remain in document paint"
+        );
+        assert!(
+            layout
+                .paint
+                .top_layer
+                .iter()
+                .flat_map(|entry| &entry.primitives)
+                .any(|command| matches!(command,
+                    crate::render::DisplayCommand::HitRegion(region) if region.actor == Some(17)
+                )),
+            "popover paints in the dedicated post-document layer"
+        );
     }
 
     #[test]

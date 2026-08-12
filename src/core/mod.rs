@@ -758,11 +758,9 @@ impl BrowserController {
             // resolves to a semantic link or actor before crossing this API.
             UserAction::Activate(link) => self.activate(link),
             UserAction::PageHover { actor, position } => {
-                self.send_live(crate::js::PageCmd::Hover {
-                    node: actor,
-                    x: f64::from(position.x),
-                    y: f64::from(position.y),
-                });
+                if let Some(handle) = &self.live_page {
+                    handle.send_hover(actor, f64::from(position.x), f64::from(position.y));
+                }
                 false
             }
             UserAction::SetFormValue {

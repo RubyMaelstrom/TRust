@@ -63,6 +63,16 @@ pub(crate) struct Frag<'t> {
     pub children: Vec<Frag<'t>>,
 }
 
+/// A box promoted into the document top layer. CSS Positioned Layout 4 §3
+/// lays it as a sibling of the root against the initial containing block and
+/// paints top-layer entries after the document in ordered-set order.
+#[derive(Debug)]
+pub(crate) struct TopFrag<'t> {
+    pub fragment: Frag<'t>,
+    pub fixed: bool,
+    pub order: usize,
+}
+
 /// A clip rectangle in absolute CSS px. Each axis is independent — an
 /// unclipped axis carries ±∞ bounds so intersection is a component-wise
 /// max-of-lows / min-of-highs. The clip established by a scroll container is
@@ -434,12 +444,18 @@ impl Flow<'_> {
     /// in px (paint finalizes the document height post-extraction), the flow
     /// positions of paint-less inline elements (anchor targets), and the laid
     /// `position:fixed` boxes (viewport coordinates — the pinned layer,
-    /// painted separately).
+    /// painted separately), and boxes promoted to the document top layer.
     #[allow(clippy::type_complexity)]
     pub fn layout<'t>(
         &self,
         root: &'t BoxNode,
-    ) -> (Frag<'t>, f32, Vec<(NodeId, f32)>, Vec<Frag<'t>>) {
+    ) -> (
+        Frag<'t>,
+        f32,
+        Vec<(NodeId, f32)>,
+        Vec<Frag<'t>>,
+        Vec<TopFrag<'t>>,
+    ) {
         let mut cur = Cursor::default();
         let inl = InlineStyle::root();
         // §8.3.1: margins of the root element's box do not collapse. Its top
@@ -472,6 +488,7 @@ impl Flow<'_> {
             h: self.vp.h.max(0.0),
         };
         let mut fixed: Vec<Frag<'t>> = Vec::new();
+        let mut top_layer: Vec<TopFrag<'t>> = Vec::new();
         self.resolve_oof(
             &mut frag,
             icb,
@@ -479,6 +496,7 @@ impl Flow<'_> {
             icb,
             &mut anchors,
             &mut fixed,
+            &mut top_layer,
             None,
             None,
             None,
@@ -537,6 +555,7 @@ impl Flow<'_> {
                 icb,
                 &mut Vec::new(),
                 &mut fixed,
+                &mut top_layer,
                 None,
                 None,
                 None,
@@ -544,12 +563,42 @@ impl Flow<'_> {
             fixed[fi] = f;
             fi += 1;
         }
+        let mut ti = 0;
+        while ti < top_layer.len() {
+            // A promoted top-layer box is a root sibling for containing-block,
+            // clipping and paint purposes. Resolve its own positioned subtree
+            // with no DOM-ancestor clip; nested showing popovers peel into the
+            // same ordered top-layer vector.
+            let mut top = std::mem::replace(
+                &mut top_layer[ti],
+                TopFrag {
+                    fragment: Frag::empty(),
+                    fixed: false,
+                    order: 0,
+                },
+            );
+            self.resolve_oof(
+                &mut top.fragment,
+                icb,
+                None,
+                icb,
+                &mut Vec::new(),
+                &mut fixed,
+                &mut top_layer,
+                None,
+                None,
+                None,
+            );
+            top_layer[ti] = top;
+            ti += 1;
+        }
+        top_layer.sort_by_key(|top| top.order);
         // Return the in-flow bottom (trailing collapsed margins included);
         // paint computes the final document height as `max_bottom ∪ flow_bottom`
         // AFTER scroll-region extraction has emptied any region frags (so an
         // extracted region contributes its reserved band height, not the full
         // height of its scrolled-away content).
-        (frag, flow_bottom.max(0.0), anchors, fixed)
+        (frag, flow_bottom.max(0.0), anchors, fixed, top_layer)
     }
 
     /// Lay one block-level box. `cb_x`/`cb_w` are the containing block's
@@ -2865,6 +2914,7 @@ impl Flow<'_> {
         icb: CbRect,
         anchors: &mut Vec<(NodeId, f32)>,
         fixed_out: &mut Vec<Frag<'t>>,
+        top_layer_out: &mut Vec<TopFrag<'t>>,
         own_clip: Option<Clip>,
         abs_clip: Option<Clip>,
         fixed_clip: Option<Clip>,
@@ -2953,13 +3003,27 @@ impl Flow<'_> {
                     continue;
                 }
                 let fixed = b.style.position == Pos::Fixed;
-                let pinned = fixed && child_fixed.is_none();
-                let cb = if fixed {
+                let top_layer = b.node != NO_NODE && self.dom.is_popover_showing(b.node);
+                let pinned = fixed && child_fixed.is_none() && !top_layer;
+                // CSS Positioned Layout 4 §3: top-layer boxes generate as root
+                // siblings and use the initial containing block, regardless of
+                // positioned/transformed DOM ancestors.
+                let cb = if top_layer {
+                    icb
+                } else if fixed {
                     child_fixed.unwrap_or(icb)
                 } else {
                     child_abs
                 };
                 let (laid, anc) = self.lay_oof(b, cb, (x0 - cb.x, y0 - cb.y), &ctx);
+                if top_layer {
+                    top_layer_out.push(TopFrag {
+                        fragment: laid,
+                        fixed,
+                        order: self.dom.popover_top_layer_order(b.node).unwrap_or(0),
+                    });
+                    continue;
+                }
                 if pinned {
                     // Pinned-layer content scrolls with the viewport, not the
                     // document — its anchors can't be doc scroll targets. It is
@@ -2988,6 +3052,7 @@ impl Flow<'_> {
                 icb,
                 anchors,
                 fixed_out,
+                top_layer_out,
                 child_own_clip,
                 child_abs_clip,
                 child_fixed_clip,
