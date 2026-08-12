@@ -535,6 +535,45 @@ impl Renderer {
         )
     }
 
+    /// Replace the pixels of an existing image without releasing its atlas
+    /// allocation. Returns `false` if the image is missing or its upload
+    /// dimensions changed.
+    ///
+    /// `Pixmap` uploads use `Queue::write_texture`, while `destroy_image`
+    /// records an atlas clear in `encoder`. WebGPU schedules both operations
+    /// on the queue timeline in issue order, so destroying, reallocating the
+    /// same slot, and uploading before submitting `encoder` would clear the
+    /// replacement pixels. Same-sized animation frames should update their
+    /// retained allocation directly instead.
+    pub fn update_image<T: AtlasWriter>(
+        &mut self,
+        resources: &Resources,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut CommandEncoder,
+        image_id: vello_common::paint::ImageId,
+        writer: &T,
+    ) -> bool {
+        let Some(resource) = resources.image_cache.get(image_id) else {
+            return false;
+        };
+        if u32::from(resource.width) != writer.width()
+            || u32::from(resource.height) != writer.height()
+        {
+            return false;
+        }
+        self.write_to_atlas(
+            &resources.image_cache,
+            device,
+            queue,
+            encoder,
+            image_id,
+            writer,
+            None,
+        );
+        true
+    }
+
     pub(crate) fn upload_image_with<T: AtlasWriter>(
         &mut self,
         image_cache: &mut ImageCache,
