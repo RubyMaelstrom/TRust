@@ -11,6 +11,7 @@
 //! leading as font metrics used by line layout. Parley's system `FontContext`
 //! and shaped runs implement those two pieces of machinery.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
@@ -194,9 +195,8 @@ impl TextEditor {
         editor.set_width(multiline.then_some(width.max(1.0)));
         editor.set_quantize(false);
         let styles = editor.edit_styles();
-        styles.insert(StyleProperty::FontFamily(FontFamily::Source(
-            style.family.clone().into(),
-        )));
+        let family = font_family_source(&style.family).into_owned();
+        styles.insert(StyleProperty::FontFamily(FontFamily::Source(family.into())));
         styles.insert(StyleProperty::FontSize(style.size.max(1.0)));
         styles.insert(StyleProperty::FontWeight(FontWeight::new(
             style.weight.clamp(1.0, 1000.0),
@@ -527,6 +527,35 @@ struct CachedShape {
     bytes: usize,
 }
 
+/// CSS Fonts 4 §2.1 treats the value as a prioritized list and recommends a
+/// generic family as the final alternative when named faces are unavailable.
+fn font_family_source(family: &str) -> Cow<'_, str> {
+    if family.trim().is_empty() {
+        Cow::Borrowed("sans-serif")
+    } else if family.split(',').any(|candidate| {
+        matches!(
+            candidate.trim().to_ascii_lowercase().as_str(),
+            "serif"
+                | "sans-serif"
+                | "monospace"
+                | "cursive"
+                | "fantasy"
+                | "system-ui"
+                | "ui-serif"
+                | "ui-sans-serif"
+                | "ui-monospace"
+                | "ui-rounded"
+                | "math"
+                | "emoji"
+                | "fangsong"
+        )
+    }) {
+        Cow::Borrowed(family)
+    } else {
+        Cow::Owned(format!("{family}, sans-serif"))
+    }
+}
+
 impl TextSystem {
     fn new() -> Self {
         Self {
@@ -582,9 +611,8 @@ impl TextSystem {
         let mut builder = self
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, true);
-        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(
-            style.family.as_str().into(),
-        )));
+        let family = font_family_source(&style.family);
+        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family)));
         builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
         builder.push_default(StyleProperty::FontWeight(FontWeight::new(
             style.weight.clamp(1.0, 1000.0),
@@ -624,9 +652,8 @@ impl TextSystem {
         let mut builder = self
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, true);
-        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(
-            style.family.as_str().into(),
-        )));
+        let family = font_family_source(&style.family);
+        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family)));
         builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
         builder.push_default(StyleProperty::FontWeight(FontWeight::new(
             style.weight.clamp(1.0, 1000.0),
@@ -679,9 +706,8 @@ impl TextSystem {
         let mut builder = self
             .layouts
             .ranged_builder(&mut self.fonts, text, 1.0, true);
-        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(
-            style.family.as_str().into(),
-        )));
+        let family = font_family_source(&style.family);
+        builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family)));
         builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
         builder.push_default(StyleProperty::FontWeight(FontWeight::new(
             style.weight.clamp(1.0, 1000.0),
@@ -912,6 +938,16 @@ mod tests {
         assert!(!shaped.runs.is_empty());
         assert!(shaped.runs.iter().all(|run| !run.glyphs.is_empty()));
         assert!(shaped.advance > 0.0);
+    }
+
+    #[test]
+    fn custom_family_lists_get_a_generic_fallback_without_overriding_generics() {
+        assert_eq!(
+            font_family_source("faustina,faustina-fallback").as_ref(),
+            "faustina,faustina-fallback, sans-serif"
+        );
+        assert_eq!(font_family_source("serif").as_ref(), "serif");
+        assert_eq!(font_family_source("").as_ref(), "sans-serif");
     }
 
     #[test]

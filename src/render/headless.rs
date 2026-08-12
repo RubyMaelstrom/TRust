@@ -218,6 +218,26 @@ mod tests {
     }
 
     #[test]
+    fn custom_web_font_fallback_rasterizes_ascii_digits() {
+        let base = Url::parse("https://example.test/").unwrap();
+        let frame = render_html(
+            "<style>body{margin:0;background:#111;color:#eee;font:700 32px faustina,faustina-fallback}</style><div>0123456789 $1.4 8/11/2026</div><div style='font:600 12px exo\\ 2,exo\\ 2-fallback'>BETH MOLE 2.5 8/11/2026 44</div>",
+            &base,
+            CssSize::new(600.0, 80.0),
+        )
+        .unwrap();
+        let non_background = frame
+            .pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[0] > 40 || pixel[1] > 40 || pixel[2] > 40)
+            .count();
+        assert!(
+            non_background > 1000,
+            "ASCII digits disappeared from a custom-family fallback"
+        );
+    }
+
+    #[test]
     fn one_axis_overflow_clip_stays_finite_and_rasterizes() {
         // CSS Overflow L3 allows overflow-x:hidden with the y axis left
         // unbounded. The display-list boundary must materialize that axis as
