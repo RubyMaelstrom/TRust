@@ -6439,9 +6439,11 @@ fn load_page(
             .filter(|(_, _, ty, node)| !(is_classic(ty) && d.attr(*node, "nomodule").is_some()))
             .collect()
     };
-    if scripts.is_empty() {
-        // No JS ran: the original bytes stand (so <noscript> content
-        // still renders, as it should).
+    if scripts.is_empty() && !dom.borrow().hover_css_affects_rendering() {
+        // No JS and no live selector state: the original bytes stand. A pure
+        // CSS `:hover` page is NOT inert—Selectors 4 §9.1 requires its styles
+        // to track the pointing device—so it keeps this resident DOM even
+        // without an author script.
         return Err(outcome);
     }
 
@@ -7471,11 +7473,16 @@ pub enum PageCmd {
     DevicePixelRatio(f32),
 }
 
-/// Which kind of relayout boundary a patch targets (INCREMENTAL_LAYOUT_PLAN.md
-/// §2). v1 emits only `Size` (scroll regions — content-independent outer box,
-/// in-place swap); `WidthStable` (Tier 2: relayout + shift) is reserved.
+/// Which kind of retained boundary a patch targets. Paint patches preserve all
+/// geometry; size boundaries preserve both outer dimensions; width-stable
+/// boundaries may change height but cannot alter their containing width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoundaryTier {
+    /// Paint-only style invalidation: box geometry and Appendix-E state are
+    /// unchanged. Graphical frontends update baked presentation style in place
+    /// and replay paint over retained fragments; other frontends may use their
+    /// ordinary correct relayout fallback.
+    Paint,
     /// Size-contained: the boundary's outer box (incl. height) is unchanged, so
     /// the splice touches only its buffer/range — nothing outside moves.
     Size,
@@ -7484,13 +7491,13 @@ pub enum BoundaryTier {
     WidthStable,
 }
 
-/// One targeted incremental-layout patch: a relayout boundary's freshly
-/// serialized subtree (with its inherited context materialized,
-/// INCREMENTAL_LAYOUT_PLAN.md §4a). The app re-lays ONLY this subtree.
+/// One targeted retained-render patch: a boundary's freshly serialized subtree
+/// with its inherited context materialized. A paint consumer copies baked
+/// paint style in place; a layout consumer re-lays only this subtree.
 #[derive(Debug)]
 pub struct SubtreePatch {
-    /// The boundary's arena node id (baked as `data-trust-node`) — the app maps
-    /// it to the live `Region` to swap.
+    /// The actor arena node id, baked as `data-trust-paint-node` for paint-only
+    /// subjects or `data-trust-node` for layout/region boundaries.
     pub node: usize,
     /// `Dom::serialize_patch` output: the boundary inside a context wrapper.
     pub html: String,
@@ -9930,10 +9937,9 @@ const HOVER_ATTRS: &[&str] = &[
 ///  2. Elements a render-affecting `:hover` RULE could match (the style
 ///     index's hover probes): a pure-CSS dropdown (`.menu:hover .drop`) has
 ///     no listener at all, but `.menu` must still be a nameable hover target
-///     or the cascade's chain can never reach it. (Any-element probes —
-///     `:hover` nested in `:is()`/`:not()` — are skipped here: marking the
-///     whole document isn't a marker. Such rules still restyle when the
-///     chain moves via targets named by other means.)
+///     or the cascade's chain can never reach it. Selectors with no narrower
+///     safe probe (for example `:is(:hover)`) mark every possible designated
+///     element; completeness is required for correct hit testing.
 ///
 /// NO cursor heuristics; html/body excluded (document-level delegation is
 /// reached by bubbling from whatever target the app resolves). Stored on the
@@ -10084,7 +10090,15 @@ fn hover_set_scoped(page: &mut LoadedPage, roots: &[usize]) -> std::collections:
 fn extract_live(page: &mut LoadedPage) -> (String, std::collections::HashSet<usize>, bool) {
     let (clickable, has_any) = clickable_set(page);
     let hover = hover_set(page);
-    page.dom.borrow_mut().set_hover_hosts(hover);
+    let paint = page
+        .dom
+        .borrow()
+        .hover_paint_subject_candidates_in(&[crate::dom::DOCUMENT]);
+    {
+        let mut dom = page.dom.borrow_mut();
+        dom.set_hover_hosts(hover);
+        dom.set_paint_patch_hosts(paint.into_iter().collect());
+    }
     let dom = page.dom.borrow();
     let ser_t = Instant::now();
     let html = dom.serialize_live(crate::dom::DOCUMENT, &clickable);
@@ -10254,7 +10268,15 @@ fn emit_boundary_patches(
     let boundary_nodes: Vec<usize> = boundaries.iter().map(|&(n, _)| n).collect();
     let clickable = clickable_set_scoped(page, &boundary_nodes);
     let hover = hover_set_scoped(page, &boundary_nodes);
-    page.dom.borrow_mut().set_hover_hosts(hover);
+    let paint = page
+        .dom
+        .borrow()
+        .hover_paint_subject_candidates_in(&boundary_nodes);
+    {
+        let mut dom = page.dom.borrow_mut();
+        dom.set_hover_hosts(hover);
+        dom.extend_paint_patch_hosts(paint);
+    }
     let t = std::time::Instant::now();
     let mut total_bytes = 0usize;
     let mut patches: Vec<SubtreePatch> = Vec::new();
@@ -10349,7 +10371,16 @@ fn confined_boundaries(
             // its enclosing cached section — so a deep mutation patches that
             // section instead of forcing a whole-document render.
             dom.nearest_cached_boundary(node, kind, live_boundaries)
-                .map(|g| (g, BoundaryTier::WidthStable))
+                .map(|g| {
+                    (
+                        g,
+                        if kind == crate::dom::DirtyKind::Paint {
+                            BoundaryTier::Paint
+                        } else {
+                            BoundaryTier::WidthStable
+                        },
+                    )
+                })
         };
         let (b, tier) = match boundary {
             Some(bt) => bt,
@@ -10386,7 +10417,7 @@ fn confined_boundaries(
                 return None;
             }
         };
-        if !patchable_boundary(dom, b) {
+        if tier != BoundaryTier::Paint && !patchable_boundary(dom, b) {
             if diag_patch() {
                 let off = dom.composed_descendants(b).into_iter().find(|&d| {
                     matches!(dom.tag_name(d), Some("input" | "select" | "textarea"))
@@ -28149,6 +28180,176 @@ mod tests {
             Some(PageEvt::Settled) => {}
             other => panic!("stale hover id should settle silently, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pure_css_hover_emits_an_attributed_boundary_patch() {
+        let (handle, mut events) = live(
+            "<head><style>#hot:hover .drop{color:red}</style></head>\
+             <body><section id=hot style=display:flow-root>\
+             <span class=drop>menu</span></section></body>",
+        );
+        let html = match events.blocking_recv() {
+            Some(PageEvt::Updated { html, .. }) => html,
+            other => panic!("CSS-hover page must remain live, got {other:?}"),
+        };
+        let at = html
+            .find("data-trust-hover=\"")
+            .expect("pure CSS hover carrier is hit-testable");
+        let hot: usize = html[at + "data-trust-hover=\"".len()..]
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            html.contains(&format!("data-trust-node=\"{hot}\"")),
+            "the flow-root is a correlatable layout boundary"
+        );
+        handle
+            .cmds
+            .blocking_send(PageCmd::LiveBoundaries(vec![hot]))
+            .unwrap();
+        handle
+            .cmds
+            .blocking_send(PageCmd::Hover {
+                node: Some(hot),
+                x: 4.0,
+                y: 8.0,
+            })
+            .unwrap();
+
+        let Some(PageEvt::Patched { patches, outcome }) = events.blocking_recv() else {
+            panic!("contained pure CSS hover should patch, not full-resync");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].node, hot);
+        assert_eq!(patches[0].tier, BoundaryTier::Paint);
+        assert!(patches[0].html.contains("color:red"));
+    }
+
+    #[test]
+    fn paint_only_sibling_hover_patches_the_selector_subject_itself() {
+        // The element designated by :hover need not be the selector subject.
+        // Paint-only declarations cannot move the subject's border box, so its
+        // own IFC is a valid boundary instead of forcing a body-wide update.
+        let (handle, mut events) = live(
+            "<head><style>#hot:hover + #menu{background-color:red;color:white}</style></head>\
+             <body><div id=hot>hover</div>\
+             <section id=menu style='display:flow-root;position:relative;z-index:1'>menu</section></body>",
+        );
+        let html = match events.blocking_recv() {
+            Some(PageEvt::Updated { html, .. }) => html,
+            other => panic!("CSS-hover page must remain live, got {other:?}"),
+        };
+        let hot_marker = html
+            .find("data-trust-hover=\"")
+            .expect("the :hover carrier must be hit-testable");
+        let hot: usize = html[hot_marker + "data-trust-hover=\"".len()..]
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let menu_start = html.find("id=\"menu\"").expect("menu serialized");
+        let menu_tail = &html[menu_start..];
+        let menu_marker = menu_tail
+            .find("data-trust-node=\"")
+            .expect("flow-root subject is a graphical boundary");
+        let menu: usize = menu_tail[menu_marker + "data-trust-node=\"".len()..]
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_ne!(hot, menu, "carrier and selector subject are distinct");
+
+        handle
+            .cmds
+            .blocking_send(PageCmd::LiveBoundaries(vec![menu]))
+            .unwrap();
+        handle
+            .cmds
+            .blocking_send(PageCmd::Hover {
+                node: Some(hot),
+                x: 4.0,
+                y: 8.0,
+            })
+            .unwrap();
+
+        let Some(PageEvt::Patched { patches, outcome }) = events.blocking_recv() else {
+            panic!("paint-only sibling hover should patch its own IFC");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].node, menu);
+        assert_eq!(patches[0].tier, BoundaryTier::Paint);
+        assert!(patches[0].html.contains("background-color:red"));
+        assert!(patches[0].html.contains("color:white"));
+    }
+
+    #[test]
+    fn ordinary_inline_hover_emits_a_direct_paint_patch() {
+        let (handle, mut events) = live(
+            "<head><style>a:hover{color:red;text-decoration-color:blue}</style></head>\
+             <body><a href='/next'>ordinary link</a></body>",
+        );
+        let html = match events.blocking_recv() {
+            Some(PageEvt::Updated { html, .. }) => html,
+            other => panic!("CSS-hover page must remain live, got {other:?}"),
+        };
+        let marker = html
+            .find("data-trust-paint-node=\"")
+            .expect("paint-only selector subject must be correlatable");
+        let subject: usize = html[marker + "data-trust-paint-node=\"".len()..]
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            html.contains(&format!("data-trust-hover=\"{subject}\"")),
+            "the same inline link carries the hover hit-test marker"
+        );
+        handle
+            .cmds
+            .blocking_send(PageCmd::LiveBoundaries(vec![subject]))
+            .unwrap();
+        handle
+            .cmds
+            .blocking_send(PageCmd::Hover {
+                node: Some(subject),
+                x: 4.0,
+                y: 8.0,
+            })
+            .unwrap();
+
+        let Some(PageEvt::Patched { patches, outcome }) = events.blocking_recv() else {
+            panic!("inline paint-only hover must not serialize the full document");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].node, subject);
+        assert_eq!(patches[0].tier, BoundaryTier::Paint);
+        assert!(patches[0].html.contains("color:red"));
+
+        handle
+            .cmds
+            .blocking_send(PageCmd::Hover {
+                node: None,
+                x: 100.0,
+                y: 80.0,
+            })
+            .unwrap();
+        let Some(PageEvt::Patched { patches, outcome }) = events.blocking_recv() else {
+            panic!("mouseleave must commit a direct paint patch too");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].node, subject);
+        assert_eq!(patches[0].tier, BoundaryTier::Paint);
+        assert!(!patches[0].html.contains("color:red"));
     }
 
     #[test]

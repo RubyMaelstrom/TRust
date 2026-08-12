@@ -329,6 +329,11 @@ pub struct BrowserPage {
     /// Latest full serialization from the resident page actor. `None` means
     /// the response body is still authoritative.
     rendered_html: Option<String>,
+    /// Revision of the latest complete actor serialization. Targeted patches
+    /// advance `revision` but not this value, allowing graphical frontends to
+    /// update their retained presentation DOM instead of reparsing stale HTML.
+    rendered_revision: u64,
+    pending_patches: Vec<crate::js::SubtreePatch>,
     revision: u64,
 }
 
@@ -343,6 +348,10 @@ impl BrowserPage {
 
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub fn rendered_revision(&self) -> u64 {
+        self.rendered_revision
     }
 
     pub fn target(&self) -> &Link {
@@ -437,6 +446,8 @@ pub struct BrowserController {
     viewport: CssSize,
     device_pixel_ratio: f32,
     interaction: InteractionState,
+    live_regions: Vec<usize>,
+    live_boundaries: Vec<usize>,
 }
 
 impl BrowserController {
@@ -466,6 +477,8 @@ impl BrowserController {
             viewport,
             device_pixel_ratio: 1.0,
             interaction: InteractionState::default(),
+            live_regions: Vec::new(),
+            live_boundaries: Vec::new(),
         }
     }
 
@@ -490,6 +503,44 @@ impl BrowserController {
 
     pub fn current_page(&self) -> Option<&BrowserPage> {
         self.current.as_ref()
+    }
+
+    /// Drain graphical subtree patches queued since the frontend last updated
+    /// its retained presentation DOM. A full `Updated` clears this queue.
+    pub fn take_page_patches(&mut self) -> Vec<crate::js::SubtreePatch> {
+        self.current
+            .as_mut()
+            .map_or_else(Vec::new, |page| std::mem::take(&mut page.pending_patches))
+    }
+
+    /// Publish the graphical layout boundaries the resident actor may target.
+    /// Values are actor arena ids baked as `data-trust-node`. Duplicate layouts
+    /// are free; only a changed set crosses the actor channel.
+    pub fn set_live_layout_boundaries(
+        &mut self,
+        mut regions: Vec<usize>,
+        mut boundaries: Vec<usize>,
+    ) {
+        regions.sort_unstable();
+        regions.dedup();
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        if regions != self.live_regions
+            && self.send_live(crate::js::PageCmd::LiveRegions(regions.clone()))
+        {
+            self.live_regions = regions;
+        }
+        if boundaries != self.live_boundaries
+            && self.send_live(crate::js::PageCmd::LiveBoundaries(boundaries.clone()))
+        {
+            self.live_boundaries = boundaries;
+        }
+    }
+
+    /// Ask the resident page actor for the always-correct complete snapshot.
+    /// Used when a native frontend cannot prove a queued patch safe.
+    pub fn request_live_resync(&self) {
+        self.send_live(crate::js::PageCmd::Resync);
     }
 
     /// Identity of the committed document. It changes only when a replacement
@@ -897,8 +948,12 @@ impl BrowserController {
                     fallback_http: pending.fallback_http,
                     document,
                     rendered_html: None,
+                    rendered_revision: 0,
+                    pending_patches: Vec::new(),
                     revision: 1,
                 };
+                self.live_regions.clear();
+                self.live_boundaries.clear();
                 self.status = page.status.clone();
                 let old = self.current.replace(page);
                 self.document_generation = generation;
@@ -958,10 +1013,10 @@ impl BrowserController {
         true
     }
 
-    fn send_live(&self, command: crate::js::PageCmd) {
-        if let Some(handle) = &self.live_page {
-            let _ = handle.cmds.try_send(command);
-        }
+    fn send_live(&self, command: crate::js::PageCmd) -> bool {
+        self.live_page
+            .as_ref()
+            .is_some_and(|handle| handle.cmds.try_send(command).is_ok())
     }
 
     fn drop_live_page(&mut self) {
@@ -1022,6 +1077,8 @@ impl BrowserController {
                 if let Some(page) = &mut self.current {
                     page.rendered_html = Some(html);
                     page.revision = page.revision.wrapping_add(1);
+                    page.rendered_revision = page.revision;
+                    page.pending_patches.clear();
                 }
                 self.status = if outcome.errors.is_empty() {
                     String::from("Page updated · JS")
@@ -1030,15 +1087,22 @@ impl BrowserController {
                 };
                 true
             }
-            PageEvt::Patched { outcome, .. } => {
-                // Incremental splicing is a terminal optimization. The
-                // graphical fragment tree requests a full serialization so a
-                // single authoritative Appendix-E display list is rebuilt.
-                self.send_live(crate::js::PageCmd::Resync);
+            PageEvt::Patched { patches, outcome } => {
+                // Preserve the actor's attributed subtree updates for the
+                // graphical frontend. Newest-per-boundary wins; a later full
+                // Updated clears the queue. The frontend requests Resync only
+                // if its retained presentation DOM cannot apply one safely.
+                if let Some(page) = &mut self.current {
+                    for patch in patches {
+                        page.pending_patches.retain(|old| old.node != patch.node);
+                        page.pending_patches.push(patch);
+                    }
+                    page.revision = page.revision.wrapping_add(1);
+                }
                 if !outcome.errors.is_empty() {
                     self.status = format!("Page JS:{}", outcome.errors.len());
                 }
-                false
+                true
             }
             PageEvt::Navigate(address) => self.begin_address(&address, NavigationIntent::New),
             PageEvt::ScrollToFragment(fragment) => {
@@ -1466,6 +1530,8 @@ mod tests {
             document: FetchedDocument::Internal(Vec::new()),
             status: String::from("Ready"),
             rendered_html: Some(String::from("<div data-trust-node=17></div>")),
+            rendered_revision: 7,
+            pending_patches: Vec::new(),
             revision: 7,
         });
 
@@ -1488,6 +1554,42 @@ mod tests {
             left: 100.0,
         }));
         assert_eq!(browser.current.as_ref().unwrap().revision, 8);
+    }
+
+    #[test]
+    fn graphical_controller_queues_incremental_page_patches() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        browser.current = Some(BrowserPage {
+            target: Link::Http(url::Url::parse("https://example.com/").unwrap()),
+            fallback_http: false,
+            document: FetchedDocument::Internal(Vec::new()),
+            status: String::from("Ready"),
+            rendered_html: Some(String::from("<div data-trust-node=17>old</div>")),
+            rendered_revision: 7,
+            pending_patches: Vec::new(),
+            revision: 7,
+        });
+        let patch = crate::js::SubtreePatch {
+            node: 17,
+            html: String::from("<div><div data-trust-node=17>new</div></div>"),
+            tier: crate::js::BoundaryTier::WidthStable,
+        };
+
+        assert!(browser.handle_page_event(crate::js::PageEvt::Patched {
+            patches: vec![patch],
+            outcome: crate::js::Outcome::default(),
+        }));
+        assert_eq!(browser.current.as_ref().unwrap().revision, 8);
+        assert_eq!(browser.current.as_ref().unwrap().rendered_revision, 7);
+        let queued = browser.take_page_patches();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].node, 17);
+        assert!(browser.take_page_patches().is_empty());
     }
 
     #[test]

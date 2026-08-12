@@ -165,6 +165,116 @@ pub struct GraphicalLayout {
     pub paint: crate::render::PagePaint,
     pub boxes: HashMap<NodeId, PxRect>,
     pub grid_tracks: HashMap<NodeId, (Vec<f32>, Vec<f32>)>,
+    /// Actor ids of every laid independent formatting context that can safely
+    /// be serialized as a width-stable subtree patch. Not every such boundary
+    /// is independently spliceable in paint order; `boundaries` is the strict
+    /// atomic subset. The frontend can still apply a non-atomic patch to its
+    /// retained document and run the ordinary full graphical layout without a
+    /// whole-document actor serialization or parse.
+    pub patch_boundaries: Vec<GraphicalPatchBoundary>,
+    /// Paint-only hover selector subjects correlated to actor nodes. Their
+    /// geometry remains valid when the actor emits a `BoundaryTier::Paint`
+    /// patch, so graphical paint can be replayed without box-tree or flow work.
+    pub paint_boundaries: Vec<GraphicalPaintBoundary>,
+    /// Layout-contained boxes that are also atomic CSS stacking contexts.
+    /// Their Appendix-E command ranges can be replaced independently when the
+    /// actor emits a subtree patch and the outer border box stays unchanged.
+    pub boundaries: Vec<GraphicalBoundary>,
+    paint_cache: Option<GraphicalPaintCache>,
+}
+
+struct GraphicalPaintCache {
+    root: flow::Frag<'static>,
+    fixed: Vec<flow::Frag<'static>>,
+    flow_bottom: f32,
+    viewport: Viewport,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphicalBoundary {
+    pub actor: usize,
+    pub node: NodeId,
+    pub rect: crate::render::CssRect,
+    pub commands: std::ops::Range<usize>,
+    pub lines: std::ops::Range<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphicalPatchBoundary {
+    pub actor: usize,
+    pub node: NodeId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphicalPaintBoundary {
+    pub actor: usize,
+    pub node: NodeId,
+}
+
+fn graphical_paint_boundaries(
+    dom: &Dom,
+    boxes: &HashMap<NodeId, PxRect>,
+) -> Vec<GraphicalPaintBoundary> {
+    let mut boundaries = dom
+        .descendants(crate::dom::DOCUMENT)
+        .filter(|node| boxes.contains_key(node))
+        .filter_map(|node| {
+            dom.attr(node, "data-trust-paint-node")
+                .and_then(|actor| actor.parse().ok())
+                .map(|actor| GraphicalPaintBoundary { actor, node })
+        })
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable_by_key(|boundary| (boundary.actor, boundary.node));
+    boundaries.dedup_by_key(|boundary| boundary.actor);
+    boundaries
+}
+
+fn graphical_paint_cache(
+    root: &flow::Frag<'_>,
+    fixed: &[flow::Frag<'_>],
+    flow_bottom: f32,
+    viewport: Viewport,
+) -> Option<GraphicalPaintCache> {
+    Some(GraphicalPaintCache {
+        root: flow::retain_for_paint(root)?,
+        fixed: fixed
+            .iter()
+            .map(flow::retain_for_paint)
+            .collect::<Option<Vec<_>>>()?,
+        flow_bottom,
+        viewport,
+    })
+}
+
+/// Rebuild only Appendix-E paint commands from retained CSS-pixel fragments.
+/// This is valid for `BoundaryTier::Paint`: the actor has proven that changed
+/// declarations cannot affect box construction, intrinsic sizes, flow,
+/// transforms, opacity, or stacking order. The painter still queries the
+/// updated presentation DOM for colors, backgrounds, borders, shadows,
+/// decoration, object fit, and hit-test metadata.
+pub fn repaint_graphical(layout: &mut GraphicalLayout, dom: &Dom, base: &Url) -> bool {
+    let Some(cache) = &layout.paint_cache else {
+        return false;
+    };
+    let (paint, patch_boundaries, boundaries) = graphics::paint(
+        dom,
+        base,
+        &cache.root,
+        &cache.fixed,
+        cache.flow_bottom,
+        cache.viewport.width,
+        cache.viewport.height,
+    );
+    layout.paint = paint;
+    layout.patch_boundaries = patch_boundaries;
+    layout.boundaries = boundaries;
+    true
+}
+
+/// A structural subtree transplant changes presentation-arena node ids, so a
+/// fragment cache made against the prior tree must not be replayed.
+pub fn invalidate_graphical_paint_cache(layout: &mut GraphicalLayout) {
+    layout.paint_cache = None;
 }
 
 /// Lay HTML out for a graphical viewport expressed in CSS pixels. OS device
@@ -199,6 +309,10 @@ pub fn lay_out_graphical(
             },
             boxes: HashMap::new(),
             grid_tracks: HashMap::new(),
+            patch_boundaries: Vec::new(),
+            paint_boundaries: Vec::new(),
+            boundaries: Vec::new(),
+            paint_cache: None,
         };
     };
     let tree_done = started.elapsed();
@@ -215,7 +329,10 @@ pub fn lay_out_graphical(
     let flow_done = started.elapsed();
     let (boxes, _scrolling_areas) = measure::boxes(dom, &frag, &fixed);
     let measure_done = started.elapsed();
-    let paint = graphics::paint(dom, base, &frag, &fixed, flow_bottom, vp.w, vp.h);
+    let (paint, patch_boundaries, boundaries) =
+        graphics::paint(dom, base, &frag, &fixed, flow_bottom, vp.w, vp.h);
+    let paint_boundaries = graphical_paint_boundaries(dom, &boxes);
+    let paint_cache = graphical_paint_cache(&frag, &fixed, flow_bottom, viewport);
     if trace {
         eprintln!(
             "layout: tree={:?} flow={:?} measure={:?} paint={:?} total={:?}",
@@ -230,7 +347,83 @@ pub fn lay_out_graphical(
         paint,
         boxes,
         grid_tracks: flow.grid_tracks.into_inner(),
+        patch_boundaries,
+        paint_boundaries,
+        boundaries,
+        paint_cache,
     }
+}
+
+/// Re-lay one retained graphical patch boundary at its existing border-box
+/// origin and width. The caller may splice the result only when the returned
+/// boundary's complete outer rect equals the cached rect; otherwise parent flow
+/// geometry changed and a full layout is required.
+///
+/// Like [`lay_subtree_fragment`], the boundary's own margins are suppressed:
+/// they live outside its cached border box. CSS 2.2 Appendix E paint extraction
+/// is the same `graphics::paint` pass as a full page, so an atomic stacking
+/// context yields an equivalent replacement command segment.
+#[allow(clippy::too_many_arguments)]
+pub fn lay_graphical_subtree(
+    dom: &Dom,
+    base: &Url,
+    boundary: NodeId,
+    rect: crate::render::CssRect,
+    viewport: Viewport,
+    forms: &[Form],
+    controls: &ControlMap,
+    images: &ImageSizes,
+) -> Option<GraphicalLayout> {
+    let vp = Vp {
+        w: rect.width.max(1.0),
+        h: viewport.height,
+    };
+    let mut root = tree::build_at(dom, base, controls, forms, vp, boundary)?;
+    root.style.margin = std::array::from_fn(|_| value::Len::px(0.0));
+    let flow = Flow {
+        dom,
+        base,
+        forms,
+        images,
+        vp,
+        imemo: Default::default(),
+        grid_tracks: Default::default(),
+    };
+    let (mut frag, mut flow_bottom, mut anchors, mut fixed) = flow.layout(&root);
+    Flow::offset_frag(&mut frag, rect.x, rect.y);
+    for (_, y) in &mut anchors {
+        *y += rect.y;
+    }
+    for fragment in &mut fixed {
+        Flow::offset_frag(fragment, rect.x, rect.y);
+    }
+    flow_bottom += rect.y;
+    let (boxes, _scrolling_areas) = measure::boxes(dom, &frag, &fixed);
+    let (paint, patch_boundaries, boundaries) = graphics::paint(
+        dom,
+        base,
+        &frag,
+        &fixed,
+        flow_bottom,
+        viewport.width,
+        viewport.height,
+    );
+    let paint_boundaries = graphical_paint_boundaries(dom, &boxes);
+    let paint_cache = graphical_paint_cache(
+        &frag,
+        &fixed,
+        flow_bottom,
+        Viewport::new(viewport.width, viewport.height),
+    );
+    Some(GraphicalLayout {
+        paint,
+        boxes,
+        grid_tracks: flow.grid_tracks.into_inner(),
+        patch_boundaries,
+        paint_boundaries,
+        boundaries,
+        paint_cache,
+    })
 }
 
 /// What the engine hands back to `http::parse_seeded`. Carousels, regions,
@@ -4961,6 +5154,147 @@ mod tests {
         assert!((rect.left - 3.75).abs() < 0.01, "{rect:?}");
         assert!((rect.width - 37.5).abs() < 0.01, "{rect:?}");
         assert!((rect.height - 22.25).abs() < 0.01, "{rect:?}");
+    }
+
+    #[test]
+    fn graphical_paint_replay_matches_full_layout_without_changing_geometry() {
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><a id="link" data-trust-paint-node="42" style="color:red;background-color:#fee">paint me</a><p>stable sibling</p></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let viewport = Viewport::new(640.0, 480.0);
+        let mut retained =
+            lay_out_graphical(&dom, &base, viewport, &[], &HashMap::new(), &HashMap::new());
+        assert_eq!(retained.paint_boundaries.len(), 1);
+        assert_eq!(retained.paint_boundaries[0].actor, 42);
+        let original_boxes = retained.boxes.clone();
+        let link = node_by_id(&dom, "link");
+        dom.set_attr(
+            link,
+            "style",
+            "color:blue;background-color:#eef;text-decoration-color:green",
+        );
+
+        assert!(repaint_graphical(&mut retained, &dom, &base));
+        let full = lay_out_graphical(&dom, &base, viewport, &[], &HashMap::new(), &HashMap::new());
+        assert_eq!(retained.boxes, original_boxes);
+        assert_eq!(retained.boxes, full.boxes);
+        assert_eq!(retained.paint.primitives, full.paint.primitives);
+        assert_eq!(retained.paint.lines, full.paint.lines);
+        assert_eq!(retained.paint.image_requests, full.paint.image_requests);
+        assert_eq!(retained.boundaries, full.boundaries);
+    }
+
+    #[test]
+    fn graphical_paint_replay_updates_visibility_and_pointer_eligibility() {
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><a id="link" href="/next" data-trust-hover="42" data-trust-paint-node="42" style="visibility:hidden;pointer-events:none">paint me</a></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let viewport = Viewport::new(320.0, 200.0);
+        let mut retained =
+            lay_out_graphical(&dom, &base, viewport, &[], &HashMap::new(), &HashMap::new());
+        let link = node_by_id(&dom, "link");
+        dom.set_attr(
+            link,
+            "style",
+            "visibility:visible;pointer-events:auto;text-decoration-line:underline",
+        );
+        assert!(repaint_graphical(&mut retained, &dom, &base));
+        let full = lay_out_graphical(&dom, &base, viewport, &[], &HashMap::new(), &HashMap::new());
+        assert_eq!(retained.paint.primitives, full.paint.primitives);
+        assert!(retained.paint.primitives.iter().any(|command| matches!(
+            command,
+            crate::render::DisplayCommand::GlyphRun { shaped, .. } if shaped.underline
+        )));
+        assert!(retained.paint.primitives.iter().any(|command| matches!(
+            command,
+            crate::render::DisplayCommand::HitRegion(region) if region.actor == Some(42)
+        )));
+    }
+
+    #[test]
+    fn graphical_atomic_boundary_patch_matches_full_appendix_e_paint() {
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><section id="box" data-trust-node="42" style="display:flow-root;position:relative;z-index:1;width:240px;height:48px"><span id="label" style="color:red">menu</span></section><p>after</p></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let viewport = Viewport::new(640.0, 480.0);
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let before = lay_out_graphical(&dom, &base, viewport, &forms, &controls, &HashMap::new());
+        let cached = before
+            .boundaries
+            .iter()
+            .find(|boundary| boundary.actor == 42)
+            .expect("flow-root stacking context is an atomic boundary")
+            .clone();
+
+        let label = node_by_id(&dom, "label");
+        dom.set_attr(label, "style", "color:blue;background-color:#eee");
+        let partial = lay_graphical_subtree(
+            &dom,
+            &base,
+            node_by_id(&dom, "box"),
+            cached.rect,
+            viewport,
+            &forms,
+            &controls,
+            &HashMap::new(),
+        )
+        .expect("subtree lays");
+        let after = lay_out_graphical(&dom, &base, viewport, &forms, &controls, &HashMap::new());
+        let full_boundary = after
+            .boundaries
+            .iter()
+            .find(|boundary| boundary.actor == 42)
+            .unwrap();
+        let partial_boundary = partial
+            .boundaries
+            .iter()
+            .find(|boundary| boundary.actor == 42)
+            .unwrap();
+        assert_eq!(partial_boundary.rect, full_boundary.rect);
+        assert_eq!(
+            partial.paint.primitives,
+            after.paint.primitives[full_boundary.commands.clone()],
+            "standalone subtree paint is byte-equivalent to the full Appendix-E segment"
+        );
+        assert_eq!(
+            partial.paint.lines,
+            after.paint.lines[full_boundary.lines.clone()]
+        );
+    }
+
+    #[test]
+    fn graphical_ifc_marker_does_not_capture_unrelated_hover() {
+        let dom = Dom::parse_document(
+            r#"<body><div id="ifc" data-trust-node="41" style="display:flow-root">plain</div><div id="hot" data-trust-node="42" data-trust-hover="42" style="display:flow-root">hover</div></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(640.0, 480.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let ifc = node_by_id(&dom, "ifc");
+        let hot = node_by_id(&dom, "hot");
+        let actor_for = |node| {
+            layout
+                .paint
+                .primitives
+                .iter()
+                .find_map(|command| match command {
+                    crate::render::DisplayCommand::HitRegion(region) if region.node == node => {
+                        Some(region.actor)
+                    }
+                    _ => None,
+                })
+        };
+        assert_eq!(actor_for(ifc), Some(None));
+        assert_eq!(actor_for(hot), Some(Some(42)));
     }
 
     #[test]

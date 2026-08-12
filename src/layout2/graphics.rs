@@ -36,6 +36,8 @@ struct Builder<'a> {
     image_handles: HashSet<ImageHandle>,
     scroll_containers: Vec<ScrollContainer>,
     sticky_constraints: Vec<StickyConstraint>,
+    patch_boundaries: Vec<super::GraphicalPatchBoundary>,
+    boundaries: Vec<super::GraphicalBoundary>,
     /// Absolute overflow clips already active in the display list. A clip
     /// inherited from outside a transformed stacking context must be pushed
     /// before that transform and retained for the context's descendants.
@@ -60,9 +62,12 @@ impl<'a> Builder<'a> {
             image_handles: HashSet::new(),
             scroll_containers: Vec::new(),
             sticky_constraints: Vec::new(),
+            patch_boundaries: Vec::new(),
+            boundaries: Vec::new(),
             hard_clips: Vec::new(),
         };
         this.collect_scroll_containers(root);
+        this.collect_patch_boundaries(root);
         this.collect_sticky(root);
         this
     }
@@ -181,7 +186,10 @@ impl<'a> Builder<'a> {
             let (right, bottom) = subtree_extent(fragment);
             self.scroll_containers.push(ScrollContainer {
                 node: fragment.node,
-                actor: interaction_actor(self.dom, fragment.node),
+                actor: self
+                    .dom
+                    .attr(fragment.node, "data-trust-node")
+                    .and_then(|value| value.parse().ok()),
                 viewport,
                 content: CssSize::new(
                     (right - viewport.x).max(viewport.width),
@@ -197,6 +205,28 @@ impl<'a> Builder<'a> {
         }
         for child in &fragment.children {
             self.collect_scroll_containers(child);
+        }
+    }
+
+    fn collect_patch_boundaries(&mut self, fragment: &Frag<'_>) {
+        if fragment.node != NO_NODE
+            && !self.dom.is_scroll_container(fragment.node)
+            && !self.dom.is_hscroll_container(fragment.node)
+            && self
+                .dom
+                .establishes_independent_formatting_context(fragment.node)
+            && let Some(actor) = self
+                .dom
+                .attr(fragment.node, "data-trust-node")
+                .and_then(|value| value.parse().ok())
+        {
+            self.patch_boundaries.push(super::GraphicalPatchBoundary {
+                actor,
+                node: fragment.node,
+            });
+        }
+        for child in &fragment.children {
+            self.collect_patch_boundaries(child);
         }
     }
 
@@ -244,9 +274,20 @@ pub(super) fn paint(
     flow_bottom: f32,
     viewport_w: f32,
     viewport_h: f32,
-) -> PagePaint {
+) -> (
+    PagePaint,
+    Vec<super::GraphicalPatchBoundary>,
+    Vec<super::GraphicalBoundary>,
+) {
     let mut builder = Builder::new(dom, base, root, fixed, flow_bottom);
     build_sc(root, &mut builder);
+    // v1 graphical patch segments cover document-flow primitives. Fixed-layer
+    // ranges live in separate vectors and need a layer discriminator before
+    // they can participate; do not publish ambiguous offsets.
+    let boundaries = std::mem::take(&mut builder.boundaries);
+    let mut patch_boundaries = std::mem::take(&mut builder.patch_boundaries);
+    patch_boundaries.sort_unstable_by_key(|boundary| (boundary.actor, boundary.node));
+    patch_boundaries.dedup_by_key(|boundary| boundary.actor);
     let primitives = std::mem::take(&mut builder.commands);
     let mut fixed: Vec<_> = fixed.iter().collect();
     fixed.sort_by_key(|fragment| fragment.paint.z.unwrap_or(0));
@@ -262,7 +303,7 @@ pub(super) fn paint(
             fixed_primitives.extend(commands);
         }
     }
-    PagePaint {
+    let paint = PagePaint {
         width: (root.x + root.w).max(0.0),
         height: root.max_bottom().max(flow_bottom).max(0.0),
         background: None,
@@ -273,13 +314,17 @@ pub(super) fn paint(
         image_requests: builder.image_requests,
         scroll_containers: builder.scroll_containers,
         sticky_constraints: builder.sticky_constraints,
-    }
+    };
+    (paint, patch_boundaries, boundaries)
 }
 
 /// CSS 2.2 Appendix E order for one real stacking context. Opacity and
 /// transforms wrap the context atomically, as required by CSS Color and CSS
 /// Transforms; children never observe a renderer-specific layer object.
 fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
+    let boundary_start = builder.commands.len();
+    let boundary_line_start = builder.lines.len();
+    let boundary = graphical_boundary(fragment, builder);
     let sticky = builder
         .sticky_constraints
         .iter()
@@ -343,6 +388,45 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
     if sticky.is_some() {
         builder.commands.push(DisplayCommand::EndSticky);
     }
+    if let Some((actor, node, rect)) = boundary {
+        builder.boundaries.push(super::GraphicalBoundary {
+            actor,
+            node,
+            rect,
+            commands: boundary_start..builder.commands.len(),
+            lines: boundary_line_start..builder.lines.len(),
+        });
+    }
+}
+
+/// A graphical patch range must be atomic in CSS 2.2 Appendix-E order and its
+/// interior layout must not affect outside layout. A real stacking context is
+/// atomic for paint; an independent formatting context provides the layout
+/// boundary. Anything less stays on the full-layout fallback.
+fn graphical_boundary(
+    fragment: &Frag<'_>,
+    builder: &Builder<'_>,
+) -> Option<(usize, NodeId, CssRect)> {
+    if fragment.node == NO_NODE
+        || !fragment.paint.sc
+        || !builder
+            .dom
+            .establishes_independent_formatting_context(fragment.node)
+        || builder.dom.is_scroll_container(fragment.node)
+        || builder.dom.is_hscroll_container(fragment.node)
+    {
+        return None;
+    }
+    let actor = builder
+        .dom
+        .attr(fragment.node, "data-trust-node")?
+        .parse()
+        .ok()?;
+    Some((
+        actor,
+        fragment.node,
+        CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h),
+    ))
 }
 
 fn build_pseudo(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
@@ -438,12 +522,14 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
         }
         paint_background_images(fragment, shape.clone(), builder);
         paint_borders(fragment, radii, builder);
-        builder.commands.push(DisplayCommand::HitRegion(HitRegion {
-            rect,
-            node: fragment.node,
-            actor: interaction_actor(builder.dom, fragment.node),
-            link: None,
-        }));
+        if builder.dom.point_hit_testable(fragment.node) {
+            builder.commands.push(DisplayCommand::HitRegion(HitRegion {
+                rect,
+                node: fragment.node,
+                actor: interaction_actor(builder.dom, fragment.node),
+                link: None,
+            }));
+        }
     }
     if let FragKind::Line(line) = &fragment.kind {
         builder.lines.push(PaintLine {
@@ -453,11 +539,15 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
             descent: line.descent,
         });
         for piece in &line.pieces {
-            if piece.item.invisible {
-                continue;
-            }
             let node = piece.item.node;
             let style_node = piece.item.style_node;
+            if if style_node == NO_NODE {
+                piece.item.invisible
+            } else {
+                builder.dom.visibility_hidden(style_node)
+            } {
+                continue;
+            }
             // Line boxes are anonymous (`NO_NODE`), but their pieces retain
             // the generating DOM node. Use that node for the scrollport chain
             // so inline text/replaced content inside a shadow tree receives
@@ -471,6 +561,12 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
             if let Some(shaped) = &piece.shaped {
                 let origin = CssPoint::new(fragment.x + piece.x, fragment.y + piece.y);
                 let color = text_color(builder.dom, style_node, piece.item.link.is_some());
+                let mut shaped = shaped.clone();
+                if style_node != NO_NODE {
+                    let (underline, strikethrough) = builder.dom.text_decoration(style_node);
+                    shaped.underline = underline;
+                    shaped.strikethrough = strikethrough;
+                }
                 let decoration = TextDecorationPaint {
                     color: decoration_color(builder.dom, style_node).unwrap_or(color),
                     style: decoration_style(builder.dom, style_node),
@@ -484,12 +580,14 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
                     node,
                     link: piece.item.link.clone(),
                 });
-                builder.commands.push(DisplayCommand::HitRegion(HitRegion {
-                    rect: CssRect::new(origin.x, origin.y, shaped.advance, shaped.line_height),
-                    node,
-                    actor: interaction_actor(builder.dom, node),
-                    link: piece.item.link.clone(),
-                }));
+                if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
+                    builder.commands.push(DisplayCommand::HitRegion(HitRegion {
+                        rect: CssRect::new(origin.x, origin.y, shaped.advance, shaped.line_height),
+                        node,
+                        actor: interaction_actor(builder.dom, node),
+                        link: piece.item.link.clone(),
+                    }));
+                }
             } else if let Some(source) = &piece.item.image {
                 let source = resolve_image_source(builder.base, source);
                 let handle = builder.image(source);
@@ -508,7 +606,22 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
                     } else {
                         ImageFit::Contain
                     },
-                    sampling: if piece.item.pixelated {
+                    sampling: if if style_node == NO_NODE {
+                        piece.item.pixelated
+                    } else {
+                        matches!(
+                            builder
+                                .dom
+                                .computed_value(style_node, "image-rendering")
+                                .as_deref(),
+                            Some(
+                                "pixelated"
+                                    | "crisp-edges"
+                                    | "-moz-crisp-edges"
+                                    | "-webkit-optimize-contrast"
+                            )
+                        )
+                    } {
                         ImageSampling::Nearest
                     } else {
                         ImageSampling::Smooth
@@ -517,12 +630,14 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
                     node,
                     link: piece.item.link.clone(),
                 });
-                builder.commands.push(DisplayCommand::HitRegion(HitRegion {
-                    rect,
-                    node,
-                    actor: interaction_actor(builder.dom, node),
-                    link: piece.item.link.clone(),
-                }));
+                if style_node == NO_NODE || builder.dom.point_hit_testable(style_node) {
+                    builder.commands.push(DisplayCommand::HitRegion(HitRegion {
+                        rect,
+                        node,
+                        actor: interaction_actor(builder.dom, node),
+                        link: piece.item.link.clone(),
+                    }));
+                }
             }
             builder.pop_scroll_ancestors(piece_scroll_depth);
         }
@@ -544,7 +659,23 @@ fn interaction_actor(dom: &Dom, node: NodeId) -> Option<usize> {
     while let Some(node) = current {
         if let Some(actor) = dom
             .attr(node, "data-trust-hover")
-            .or_else(|| dom.attr(node, "data-trust-node"))
+            .and_then(|value| value.parse().ok())
+        {
+            return Some(actor);
+        }
+        if let Some(marker) = dom.attr(node, "data-trust-click")
+            && let Some(actor) = marker
+                .strip_prefix("x-trust-js:")
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|value| value.parse().ok())
+        {
+            return Some(actor);
+        }
+        if matches!(
+            dom.tag_name(node),
+            Some("form" | "input" | "button" | "select" | "textarea")
+        ) && let Some(actor) = dom
+            .attr(node, "data-trust-node")
             .and_then(|value| value.parse().ok())
         {
             return Some(actor);

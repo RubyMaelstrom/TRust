@@ -323,6 +323,17 @@ impl ImageStore {
             .map(|entry| entry.revision)
     }
 
+    /// Monotonic identity for the decoded contents of the whole store.
+    ///
+    /// A `Scene` intentionally shares its image store with the frontend, so a
+    /// retained old scene cannot discover image changes by comparing the two
+    /// `ImageStore` handles. Frontends use this generation to reject partial
+    /// raster damage whenever an image (including an animation frame) changed
+    /// since the last presentation.
+    pub fn generation(&self) -> u64 {
+        self.0.read().expect("image store poisoned").next_revision
+    }
+
     pub fn contains(&self, handle: ImageHandle) -> bool {
         self.0
             .read()
@@ -589,6 +600,326 @@ pub struct Scene {
     pub image_store: ImageStore,
     pub page_scroll_containers: Vec<ScrollContainer>,
     pub page_size: CssSize,
+}
+
+/// A conservative raster-only crop of a complete [`Scene`]. The display list
+/// remains complete and is translated beneath a smaller physical target, so
+/// normal transform/clip/paint ordering is preserved while backend culling
+/// avoids constructing work outside the damaged rectangle.
+#[derive(Clone, Debug)]
+pub struct RasterDamage {
+    pub scene: Scene,
+    pub x: u32,
+    pub y: u32,
+}
+
+/// Result of comparing two renderer-neutral display lists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SceneDamage {
+    /// The rasterized commands are identical.
+    Unchanged,
+    /// Only ordinary paint commands changed within this conservative bound.
+    Partial(CssRect),
+    /// Stateful paint ordering or viewport geometry changed; repaint fully.
+    Full,
+}
+
+/// Compute damage for a retained scene without weakening CSS painting order.
+///
+/// CSS 2.2 Appendix E, CSS Transforms, and CSS Overflow make transforms,
+/// clips, and compositing scopes stateful. A change to any such command is
+/// therefore a full-frame fallback. When only leaf paint commands differ, we
+/// replay both complete lists to recover their active transforms and clips,
+/// then union the old and new painted bounds. Removed paint is included so
+/// stale pixels are always cleared by the replacement crop.
+pub fn scene_damage(old: &Scene, new: &Scene) -> SceneDamage {
+    if old.viewport != new.viewport {
+        return SceneDamage::Full;
+    }
+    let prefix = old
+        .primitives
+        .iter()
+        .zip(&new.primitives)
+        .take_while(|(old, new)| old == new)
+        .count();
+    if prefix == old.primitives.len() && prefix == new.primitives.len() {
+        return SceneDamage::Unchanged;
+    }
+    let suffix = old.primitives[prefix..]
+        .iter()
+        .rev()
+        .zip(new.primitives[prefix..].iter().rev())
+        .take_while(|(old, new)| old == new)
+        .count();
+    let old_changed = prefix..old.primitives.len() - suffix;
+    let new_changed = prefix..new.primitives.len() - suffix;
+    if old.primitives[old_changed.clone()]
+        .iter()
+        .chain(&new.primitives[new_changed.clone()])
+        .any(command_changes_paint_state)
+    {
+        return SceneDamage::Full;
+    }
+    let Some(old_bounds) = changed_command_bounds(old, old_changed) else {
+        return SceneDamage::Full;
+    };
+    let Some(new_bounds) = changed_command_bounds(new, new_changed) else {
+        return SceneDamage::Full;
+    };
+    let bounds = match (old_bounds, new_bounds) {
+        (Some(old), Some(new)) => union_rect(old, new),
+        (Some(bounds), None) | (None, Some(bounds)) => bounds,
+        (None, None) => return SceneDamage::Unchanged,
+    };
+    // Cover antialiasing, synthetic font skew/emboldening, and backend filter
+    // kernels at the integer damage edge. Command-specific effects are already
+    // included below; this is the final device-independent safety gutter.
+    let bounds = expand_rect(bounds, 2.0);
+    intersect_css_rect(
+        bounds,
+        CssRect::new(0.0, 0.0, new.viewport.css.width, new.viewport.css.height),
+    )
+    .map_or(SceneDamage::Unchanged, SceneDamage::Partial)
+}
+
+/// Quantize a logical damage rectangle outward exactly once and create the
+/// smaller scene a raster backend can paint into a retained full-size target.
+pub fn raster_damage(scene: &Scene, rect: CssRect) -> Option<RasterDamage> {
+    let viewport = CssRect::new(
+        0.0,
+        0.0,
+        scene.viewport.css.width,
+        scene.viewport.css.height,
+    );
+    let rect = intersect_css_rect(rect, viewport)?;
+    let scale = scene.viewport.scale_factor.get() as f32;
+    let left = (rect.x * scale).floor().max(0.0) as u32;
+    let top = (rect.y * scale).floor().max(0.0) as u32;
+    let right = ((rect.x + rect.width) * scale)
+        .ceil()
+        .min(scene.viewport.physical.width as f32) as u32;
+    let bottom = ((rect.y + rect.height) * scale)
+        .ceil()
+        .min(scene.viewport.physical.height as f32) as u32;
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let physical = PhysicalSize::new(right - left, bottom - top);
+    let metrics = ViewportMetrics::from_physical(physical, scene.viewport.scale_factor);
+    let origin = CssPoint::new(left as f32 / scale, top as f32 / scale);
+    let mut primitives = Vec::with_capacity(scene.primitives.len() + 2);
+    primitives.push(DisplayCommand::PushTransform(Affine2d::translate(
+        -origin.x, -origin.y,
+    )));
+    primitives.extend(scene.primitives.iter().cloned());
+    primitives.push(DisplayCommand::PopTransform);
+    Some(RasterDamage {
+        scene: Scene {
+            viewport: metrics,
+            primitives,
+            controls: Vec::new(),
+            content_viewport: scene.content_viewport.translate(-origin.x, -origin.y),
+            image_store: scene.image_store.clone(),
+            page_scroll_containers: Vec::new(),
+            page_size: scene.page_size,
+        },
+        x: left,
+        y: top,
+    })
+}
+
+fn command_changes_paint_state(command: &DisplayCommand) -> bool {
+    matches!(
+        command,
+        DisplayCommand::PushClip(_)
+            | DisplayCommand::PopClip
+            | DisplayCommand::PushTransform(_)
+            | DisplayCommand::PopTransform
+            | DisplayCommand::PushLayer(_)
+            | DisplayCommand::PopLayer
+            | DisplayCommand::BeginSticky(_)
+            | DisplayCommand::EndSticky
+    )
+}
+
+fn changed_command_bounds(
+    scene: &Scene,
+    changed: std::ops::Range<usize>,
+) -> Option<Option<CssRect>> {
+    let mut transforms = vec![Affine2d::IDENTITY];
+    let mut clips = vec![CssRect::new(
+        0.0,
+        0.0,
+        scene.viewport.css.width,
+        scene.viewport.css.height,
+    )];
+    let mut bounds = None;
+    for (index, command) in scene.primitives.iter().enumerate() {
+        let transform = *transforms.last()?;
+        let clip = *clips.last()?;
+        if changed.contains(&index)
+            && let Some(command_bounds) = leaf_command_bounds(command)
+        {
+            let command_bounds = transformed_css_bounds(command_bounds, transform);
+            if let Some(visible) = intersect_css_rect(command_bounds, clip) {
+                bounds = Some(bounds.map_or(visible, |old| union_rect(old, visible)));
+            }
+        }
+        match command {
+            DisplayCommand::PushTransform(next) => transforms.push(transform.then(*next)),
+            DisplayCommand::PopTransform => {
+                if transforms.len() == 1 {
+                    return None;
+                }
+                transforms.pop();
+            }
+            DisplayCommand::PushClip(shape) => {
+                let shape = shape_css_bounds(shape)?;
+                let transformed = transformed_css_bounds(shape, transform);
+                clips.push(intersect_css_rect(clip, transformed).unwrap_or_default());
+            }
+            DisplayCommand::PopClip => {
+                if clips.len() == 1 {
+                    return None;
+                }
+                clips.pop();
+            }
+            _ => {}
+        }
+    }
+    if transforms.len() != 1 || clips.len() != 1 {
+        return None;
+    }
+    Some(bounds)
+}
+
+fn leaf_command_bounds(command: &DisplayCommand) -> Option<CssRect> {
+    match command {
+        DisplayCommand::Fill { shape, .. } => shape_css_bounds(shape),
+        DisplayCommand::Stroke { shape, style, .. } => {
+            shape_css_bounds(shape).map(|rect| expand_rect(rect, style.width.max(0.0) / 2.0))
+        }
+        DisplayCommand::Shadow {
+            shape,
+            offset,
+            blur_radius,
+            spread,
+            inset,
+            ..
+        } => shape_css_bounds(shape).map(|rect| {
+            if *inset {
+                rect
+            } else {
+                expand_rect(
+                    rect.translate(offset.x, offset.y),
+                    spread.abs() + blur_radius.max(0.0) * 2.0,
+                )
+            }
+        }),
+        DisplayCommand::FillRect { rect, .. } => Some(*rect),
+        DisplayCommand::FillPolygon { points, .. } => css_point_bounds(points.iter().copied()),
+        DisplayCommand::GlyphRun {
+            origin,
+            shaped,
+            clip,
+            ..
+        } => {
+            let overflow = shaped.line_height.max(1.0);
+            let glyphs = CssRect::new(
+                origin.x - overflow,
+                origin.y - overflow,
+                shaped.advance.max(1.0) + overflow * 2.0,
+                shaped.line_height.max(1.0) + overflow * 2.0,
+            );
+            clip.and_then(|clip| intersect_css_rect(glyphs, clip))
+                .or_else(|| clip.is_none().then_some(glyphs))
+        }
+        DisplayCommand::Image { rect, clip, .. } => clip
+            .and_then(|clip| intersect_css_rect(*rect, clip))
+            .or_else(|| clip.is_none().then_some(*rect)),
+        DisplayCommand::HitRegion(_)
+        | DisplayCommand::PushClip(_)
+        | DisplayCommand::PopClip
+        | DisplayCommand::PushTransform(_)
+        | DisplayCommand::PopTransform
+        | DisplayCommand::PushLayer(_)
+        | DisplayCommand::PopLayer
+        | DisplayCommand::BeginSticky(_)
+        | DisplayCommand::EndSticky => None,
+    }
+}
+
+fn shape_css_bounds(shape: &PaintShape) -> Option<CssRect> {
+    match shape {
+        PaintShape::Rect(rect) | PaintShape::RoundedRect { rect, .. } => Some(*rect),
+        PaintShape::Path(elements) => css_point_bounds(elements.iter().flat_map(|element| {
+            match element {
+                PathElement::MoveTo(point) | PathElement::LineTo(point) => {
+                    [Some(*point), None, None]
+                }
+                PathElement::QuadTo(a, b) => [Some(*a), Some(*b), None],
+                PathElement::CurveTo(a, b, c) => [Some(*a), Some(*b), Some(*c)],
+                PathElement::Close => [None, None, None],
+            }
+            .into_iter()
+            .flatten()
+        })),
+    }
+}
+
+fn css_point_bounds(points: impl Iterator<Item = CssPoint>) -> Option<CssRect> {
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut any = false;
+    for point in points {
+        any = true;
+        min_x = min_x.min(point.x);
+        min_y = min_y.min(point.y);
+        max_x = max_x.max(point.x);
+        max_y = max_y.max(point.y);
+    }
+    any.then(|| CssRect::new(min_x, min_y, max_x - min_x, max_y - min_y))
+}
+
+fn transformed_css_bounds(rect: CssRect, transform: Affine2d) -> CssRect {
+    css_point_bounds(
+        [
+            CssPoint::new(rect.x, rect.y),
+            CssPoint::new(rect.x + rect.width, rect.y),
+            CssPoint::new(rect.x, rect.y + rect.height),
+            CssPoint::new(rect.x + rect.width, rect.y + rect.height),
+        ]
+        .into_iter()
+        .map(|point| transform.map_point(point)),
+    )
+    .unwrap_or_default()
+}
+
+fn intersect_css_rect(a: CssRect, b: CssRect) -> Option<CssRect> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = (a.x + a.width).min(b.x + b.width);
+    let bottom = (a.y + a.height).min(b.y + b.height);
+    (right > left && bottom > top).then(|| CssRect::new(left, top, right - left, bottom - top))
+}
+
+fn union_rect(a: CssRect, b: CssRect) -> CssRect {
+    let left = a.x.min(b.x);
+    let top = a.y.min(b.y);
+    let right = (a.x + a.width).max(b.x + b.width);
+    let bottom = (a.y + a.height).max(b.y + b.height);
+    CssRect::new(left, top, right - left, bottom - top)
+}
+
+fn expand_rect(rect: CssRect, amount: f32) -> CssRect {
+    CssRect::new(
+        rect.x - amount,
+        rect.y - amount,
+        rect.width + amount * 2.0,
+        rect.height + amount * 2.0,
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1832,6 +2163,90 @@ mod tests {
             viewport: CssSize::new(800.0, 600.0),
             page_revision: 0,
         }
+    }
+
+    #[test]
+    fn leaf_paint_change_produces_transformed_clipped_damage() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
+        let mut old = desktop_shell(viewport, &snapshot());
+        old.primitives
+            .push(DisplayCommand::PushClip(PaintShape::Rect(CssRect::new(
+                20.0, 10.0, 40.0, 40.0,
+            ))));
+        old.primitives
+            .push(DisplayCommand::PushTransform(Affine2d::translate(
+                10.0, 5.0,
+            )));
+        old.primitives.push(DisplayCommand::FillRect {
+            rect: CssRect::new(15.0, 10.0, 50.0, 20.0),
+            color: PaintColor::Rgba(10, 20, 30, 255),
+        });
+        old.primitives.push(DisplayCommand::PopTransform);
+        old.primitives.push(DisplayCommand::PopClip);
+        let mut new = old.clone();
+        let DisplayCommand::FillRect { color, .. } = &mut new.primitives[3] else {
+            panic!("expected test fill")
+        };
+        *color = PaintColor::Rgba(30, 20, 10, 255);
+
+        assert_eq!(
+            scene_damage(&old, &new),
+            SceneDamage::Partial(CssRect::new(23.0, 13.0, 39.0, 24.0))
+        );
+    }
+
+    #[test]
+    fn stateful_display_list_change_requires_full_damage() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
+        let mut old = desktop_shell(viewport, &snapshot());
+        old.primitives
+            .push(DisplayCommand::PushTransform(Affine2d::translate(
+                10.0, 5.0,
+            )));
+        old.primitives.push(DisplayCommand::FillRect {
+            rect: CssRect::new(0.0, 0.0, 20.0, 20.0),
+            color: PaintColor::Accent,
+        });
+        old.primitives.push(DisplayCommand::PopTransform);
+        let mut new = old.clone();
+        new.primitives[1] = DisplayCommand::PushTransform(Affine2d::translate(11.0, 5.0));
+        assert_eq!(scene_damage(&old, &new), SceneDamage::Full);
+    }
+
+    #[test]
+    fn raster_damage_quantizes_outward_at_device_scale() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(400, 240), ScaleFactor::new(2.0));
+        let scene = desktop_shell(viewport, &snapshot());
+        let damage = raster_damage(&scene, CssRect::new(10.25, 5.25, 20.1, 10.1)).unwrap();
+        assert_eq!((damage.x, damage.y), (20, 10));
+        assert_eq!(damage.scene.viewport.physical, PhysicalSize::new(41, 21));
+        assert!(matches!(
+            damage.scene.primitives.first(),
+            Some(DisplayCommand::PushTransform(transform))
+                if *transform == Affine2d::translate(-10.0, -5.0)
+        ));
+    }
+
+    #[test]
+    fn image_store_generation_changes_with_replaced_pixels() {
+        let store = ImageStore::default();
+        let handle = ImageHandle(7);
+        assert_eq!(store.generation(), 0);
+        for value in [1, 2] {
+            store.insert(
+                handle,
+                ImageResource {
+                    width: 1,
+                    height: 1,
+                    rgba: Arc::from([value, value, value, 255]),
+                    has_alpha: false,
+                },
+            );
+        }
+        assert_eq!(store.generation(), 2);
     }
 
     #[test]

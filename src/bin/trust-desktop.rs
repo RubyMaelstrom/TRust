@@ -27,10 +27,10 @@ use trust::render::vello_hybrid::{PresentOutcome, VelloHybridRenderer};
 use trust::render::{
     ChromeModel, ControlId, CssRect, DisplayCommand, EditorVisual, HeartVisual, ImageHandle,
     ImageResource, ImageStore, PageHit, PaintBrush, PaintColor, PaintShape, RasterBackend,
-    RendererKind, RendererPreference, Scene, ScrollContainer, ScrollbarAxis, StrokeStyle,
-    TextSelection, desktop_chrome, desktop_heart_image_handle, horizontal_heart_track,
-    paint_desktop_overlay, paint_text_editor, scrollbar_fraction, scrollbar_position,
-    scrollbar_track_fraction, vertical_heart_track,
+    RendererKind, RendererPreference, Scene, SceneDamage, ScrollContainer, ScrollbarAxis,
+    StrokeStyle, TextSelection, desktop_chrome, desktop_heart_image_handle, horizontal_heart_track,
+    paint_desktop_overlay, paint_text_editor, raster_damage, scene_damage, scrollbar_fraction,
+    scrollbar_position, scrollbar_track_fraction, vertical_heart_track,
 };
 use trust::text::{TextEditor, TextStyle};
 use winit::application::ApplicationHandler;
@@ -606,6 +606,7 @@ enum FocusTarget {
 struct PageLayoutCache {
     generation: u64,
     revision: u64,
+    rendered_revision: u64,
     viewport: CssSize,
     device_pixel_ratio: f32,
     document: trust::http::GraphicalDocument,
@@ -735,6 +736,256 @@ impl ImageLoadScheduler {
     fn retry_evicted(&mut self, handle: ImageHandle) {
         self.completed.remove(&handle);
     }
+}
+
+fn apply_graphical_scroll_state(
+    document: &mut trust::http::GraphicalDocument,
+    interaction: &trust::core::InteractionState,
+) {
+    for node in document
+        .dom
+        .descendants(trust::dom::DOCUMENT)
+        .collect::<Vec<_>>()
+    {
+        let Some(actor) = document
+            .dom
+            .attr(node, "data-trust-node")
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if let Some(offset) = interaction.nested_scroll.get(&actor) {
+            document
+                .dom
+                .set_scroll_pos(node, f64::from(offset.y), f64::from(offset.x), false);
+        }
+    }
+}
+
+/// Actor ids of graphical boundaries currently represented by retained
+/// geometry. Scroll containers are Tier `Size`, independent formatting
+/// contexts are Tier `WidthStable`, and paint-only hover selector subjects are
+/// Tier `Paint`. Publishing only laid, correlated nodes is the graphical
+/// counterpart of terminal `Doc.regions`/`Doc.boundaries`.
+fn graphical_live_boundaries(
+    _document: &trust::http::GraphicalDocument,
+    layout: &trust::layout2::GraphicalLayout,
+) -> (Vec<usize>, Vec<usize>) {
+    let regions: Vec<usize> = layout
+        .paint
+        .scroll_containers
+        .iter()
+        .filter_map(|container| container.actor)
+        .collect();
+    let mut boundaries = layout
+        .patch_boundaries
+        .iter()
+        .map(|boundary| boundary.actor)
+        .chain(
+            layout
+                .paint_boundaries
+                .iter()
+                .map(|boundary| boundary.actor),
+        )
+        .collect::<Vec<_>>();
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    (regions, boundaries)
+}
+
+fn same_css_rect(a: CssRect, b: CssRect) -> bool {
+    // Layout is deterministic in CSS pixels. Permit only accumulated float
+    // noise, never a visually meaningful geometry change that parent flow
+    // would need to observe.
+    const EPSILON: f32 = 0.01;
+    (a.x - b.x).abs() <= EPSILON
+        && (a.y - b.y).abs() <= EPSILON
+        && (a.width - b.width).abs() <= EPSILON
+        && (a.height - b.height).abs() <= EPSILON
+}
+
+/// Replace one atomic Appendix-E command segment after its retained DOM subtree
+/// has been transplanted. Returning false means the optimization could not be
+/// proven safe (changed outer geometry, fixed descendants, missing segment);
+/// the caller then runs the ordinary full graphical layout on the already-
+/// updated retained DOM.
+fn splice_graphical_boundary(
+    cache: &mut PageLayoutCache,
+    old: trust::layout2::GraphicalBoundary,
+    old_nodes: &HashSet<usize>,
+    viewport: trust::layout2::Viewport,
+    images: &trust::layout2::ImageSizes,
+) -> bool {
+    let actor_key = old.actor.to_string();
+    let Some(new_node) = cache
+        .document
+        .dom
+        .descendants(trust::dom::DOCUMENT)
+        .find(|&node| cache.document.dom.attr(node, "data-trust-node") == Some(actor_key.as_str()))
+    else {
+        return false;
+    };
+    // The full display-list segment carries clips/translations established by
+    // overflow ancestors. A standalone subtree does not have their fragment
+    // geometry, so it cannot reproduce those commands yet. Keep this case on
+    // the retained-document full-layout fallback instead of splicing a subtly
+    // different clip stack.
+    let mut ancestor = cache.document.dom.parent_composed(new_node);
+    while let Some(node) = ancestor {
+        if !matches!(cache.document.dom.tag_name(node), Some("html" | "body"))
+            && ["overflow", "overflow-x", "overflow-y"]
+                .into_iter()
+                .filter_map(|property| cache.document.dom.computed_value(node, property))
+                .flat_map(|value| {
+                    value
+                        .split_ascii_whitespace()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .any(|value| value != "visible")
+        {
+            return false;
+        }
+        ancestor = cache.document.dom.parent_composed(node);
+    }
+    let new_nodes: HashSet<_> = std::iter::once(new_node)
+        .chain(cache.document.dom.descendants(new_node))
+        .collect();
+    let Some(mut patch) = trust::layout2::lay_graphical_subtree(
+        &cache.document.dom,
+        &cache.document.base,
+        new_node,
+        old.rect,
+        viewport,
+        &cache.document.forms,
+        &cache.document.controls,
+        images,
+    ) else {
+        return false;
+    };
+    if !patch.paint.fixed_under_primitives.is_empty() || !patch.paint.fixed_primitives.is_empty() {
+        return false;
+    }
+    let Some(new_outer) = patch
+        .boundaries
+        .iter()
+        .find(|boundary| boundary.actor == old.actor)
+    else {
+        return false;
+    };
+    if !same_css_rect(old.rect, new_outer.rect) {
+        return false;
+    }
+
+    let old_commands = old.commands.end - old.commands.start;
+    let new_commands = patch.paint.primitives.len();
+    let command_delta = new_commands as isize - old_commands as isize;
+    let old_lines = old.lines.end - old.lines.start;
+    let new_lines = patch.paint.lines.len();
+    let line_delta = new_lines as isize - old_lines as isize;
+
+    cache
+        .layout
+        .paint
+        .primitives
+        .splice(old.commands.clone(), patch.paint.primitives.drain(..));
+    cache
+        .layout
+        .paint
+        .lines
+        .splice(old.lines.clone(), patch.paint.lines.drain(..));
+
+    let shift_range =
+        |range: &mut std::ops::Range<usize>, replaced: &std::ops::Range<usize>, delta: isize| {
+            if range.start >= replaced.end {
+                range.start = range.start.saturating_add_signed(delta);
+                range.end = range.end.saturating_add_signed(delta);
+            } else if range.start < replaced.start && range.end >= replaced.end {
+                range.end = range.end.saturating_add_signed(delta);
+            }
+        };
+    cache.layout.boundaries.retain_mut(|boundary| {
+        if old_nodes.contains(&boundary.node) {
+            return false;
+        }
+        shift_range(&mut boundary.commands, &old.commands, command_delta);
+        shift_range(&mut boundary.lines, &old.lines, line_delta);
+        true
+    });
+    for mut boundary in patch.boundaries {
+        boundary.commands.start += old.commands.start;
+        boundary.commands.end += old.commands.start;
+        boundary.lines.start += old.lines.start;
+        boundary.lines.end += old.lines.start;
+        cache.layout.boundaries.push(boundary);
+    }
+
+    cache
+        .layout
+        .boxes
+        .retain(|node, _| !old_nodes.contains(node));
+    cache.layout.boxes.extend(
+        patch
+            .boxes
+            .into_iter()
+            .filter(|(node, _)| new_nodes.contains(node)),
+    );
+    cache
+        .layout
+        .grid_tracks
+        .retain(|node, _| !old_nodes.contains(node));
+    cache.layout.grid_tracks.extend(
+        patch
+            .grid_tracks
+            .into_iter()
+            .filter(|(node, _)| new_nodes.contains(node)),
+    );
+    cache
+        .layout
+        .patch_boundaries
+        .retain(|boundary| !old_nodes.contains(&boundary.node));
+    cache.layout.patch_boundaries.extend(patch.patch_boundaries);
+    cache
+        .layout
+        .paint_boundaries
+        .retain(|boundary| !old_nodes.contains(&boundary.node));
+    cache.layout.paint_boundaries.extend(patch.paint_boundaries);
+    cache
+        .layout
+        .paint
+        .scroll_containers
+        .retain(|container| !old_nodes.contains(&container.node));
+    cache
+        .layout
+        .paint
+        .scroll_containers
+        .extend(patch.paint.scroll_containers);
+    cache
+        .layout
+        .paint
+        .sticky_constraints
+        .retain(|constraint| !old_nodes.contains(&constraint.node));
+    cache
+        .layout
+        .paint
+        .sticky_constraints
+        .extend(patch.paint.sticky_constraints);
+    let mut handles: HashSet<_> = cache
+        .layout
+        .paint
+        .image_requests
+        .iter()
+        .map(|request| request.handle)
+        .collect();
+    cache.layout.paint.image_requests.extend(
+        patch
+            .paint
+            .image_requests
+            .into_iter()
+            .filter(|request| handles.insert(request.handle)),
+    );
+    trust::layout2::invalidate_graphical_paint_cache(&mut cache.layout);
+    true
 }
 
 fn image_sizes_for_layout(
@@ -874,8 +1125,56 @@ impl TerminalSession {
     }
 }
 
+struct CpuDesktopRenderer {
+    raster: Box<VelloCpuRenderer>,
+    retained: Vec<u32>,
+    size: PhysicalSize,
+    valid: bool,
+}
+
+impl CpuDesktopRenderer {
+    fn new() -> Self {
+        Self {
+            raster: Box::new(VelloCpuRenderer::new()),
+            retained: Vec::new(),
+            size: PhysicalSize::new(0, 0),
+            valid: false,
+        }
+    }
+
+    fn render(&mut self, scene: &Scene, damage: Option<CssRect>) -> Result<&[u32], String> {
+        let size = scene.viewport.physical;
+        if self.size != size {
+            self.size = size;
+            self.retained
+                .resize(size.width as usize * size.height as usize, 0);
+            self.valid = false;
+        }
+        if self.valid
+            && let Some(damage) = damage.and_then(|rect| raster_damage(scene, rect))
+        {
+            let frame = self.raster.render(&damage.scene)?;
+            let source_width = frame.size.width as usize;
+            let target_width = size.width as usize;
+            let start_x = damage.x as usize;
+            let start_y = damage.y as usize;
+            for row in 0..frame.size.height as usize {
+                let source = row * source_width..(row + 1) * source_width;
+                let target_start = (start_y + row) * target_width + start_x;
+                self.retained[target_start..target_start + source_width]
+                    .copy_from_slice(&frame.pixels[source]);
+            }
+        } else {
+            let frame = self.raster.render(scene)?;
+            self.retained.copy_from_slice(frame.pixels);
+            self.valid = true;
+        }
+        Ok(&self.retained)
+    }
+}
+
 enum DesktopRenderer {
-    Cpu(Box<VelloCpuRenderer>),
+    Cpu(CpuDesktopRenderer),
     Hybrid(Box<VelloHybridRenderer>),
 }
 
@@ -949,6 +1248,13 @@ struct DesktopApp {
     /// after a present. Only browser/UI invalidation is allowed to consume CPU
     /// and build a new frame; this latch prevents an idle presentation loop.
     redraw_pending: bool,
+    /// ImageStore is shared by old/new scenes, so retain its scalar generation
+    /// at presentation time to prevent partial raster damage across decoded or
+    /// animated pixel changes.
+    presented_image_generation: u64,
+    /// Native surface recreation/exposure can require a present even when the
+    /// renderer-neutral scene is byte-identical to the last one.
+    force_full_raster: bool,
 }
 
 /// Apply a wheel delta to the deepest scroll container and return the portion
@@ -1074,6 +1380,8 @@ impl DesktopApp {
             loading_started: None,
             chrome_tick_scheduled: false,
             redraw_pending: false,
+            presented_image_generation: 0,
+            force_full_raster: true,
         }
     }
 
@@ -1542,25 +1850,160 @@ impl DesktopApp {
         }
     }
 
-    fn ensure_page_layout(&mut self, viewport: CssSize) {
+    /// Ensure the retained graphical page matches the actor. `true` means this
+    /// draw changed only independently spliceable paint segments and is
+    /// therefore eligible for renderer-neutral damage comparison.
+    fn ensure_page_layout(&mut self, viewport: CssSize) -> bool {
         let device_pixel_ratio = self.metrics.scale_factor.get() as f32;
         let generation = self.browser.document_generation();
-        let revision = self.browser.snapshot().page_revision;
+        let (revision, rendered_revision) = self
+            .browser
+            .current_page()
+            .map_or((0, 0), |page| (page.revision(), page.rendered_revision()));
         let current_http_url = self.browser.current_page().and_then(|page| {
             let FetchedDocument::Http(response) = &page.document else {
                 return None;
             };
-            Some(&response.url)
+            Some(response.url.clone())
         });
+        let patches = self.browser.take_page_patches();
         let current = self.page_layout.as_ref().is_some_and(|cache| {
             cache.generation == generation
                 && cache.revision == revision
                 && cache.viewport == viewport
                 && cache.device_pixel_ratio == device_pixel_ratio
-                && current_http_url == Some(&cache.document.base)
+                && current_http_url.as_ref() == Some(&cache.document.base)
         });
         if current {
-            return;
+            return false;
+        }
+
+        // Apply actor-produced boundary snapshots directly to the retained
+        // presentation DOM. This removes the old Patch→Resync→whole serialize→
+        // whole parse round trip. Full graphical layout is still the correctness
+        // oracle at this stage; paint-segment replacement can narrow that work
+        // independently. Any unsafe/missing target keeps the last good pixels
+        // and requests the actor's always-correct full snapshot.
+        let can_retain = self.page_layout.as_ref().is_some_and(|cache| {
+            cache.generation == generation
+                && cache.rendered_revision == rendered_revision
+                && cache.viewport == viewport
+                && cache.device_pixel_ratio == device_pixel_ratio
+                && current_http_url.as_ref() == Some(&cache.document.base)
+        });
+        if can_retain
+            && (!patches.is_empty() || self.page_layout.as_ref().unwrap().revision != revision)
+        {
+            let mut cache = self.page_layout.take().unwrap();
+            let css_viewport = trust::layout2::Viewport::new(viewport.width, viewport.height);
+            // A revision with no DOM patches is a page-originated nested-scroll
+            // write; its transforms are cheap but currently rebuilt together.
+            let mut needs_full_layout = patches.is_empty();
+            let mut all_spliced = !patches.is_empty();
+            let mut needs_repaint = false;
+            for patch in &patches {
+                if patch.tier == trust::js::BoundaryTier::Paint {
+                    if !cache
+                        .document
+                        .apply_subtree_patch(patch, css_viewport, device_pixel_ratio)
+                    {
+                        self.page_layout = Some(cache);
+                        self.browser.request_live_resync();
+                        return false;
+                    }
+                    needs_repaint = true;
+                    continue;
+                }
+                let old_boundary = cache
+                    .layout
+                    .boundaries
+                    .iter()
+                    .find(|boundary| boundary.actor == patch.node)
+                    .cloned();
+                let old_nodes: HashSet<usize> =
+                    old_boundary.as_ref().map_or_else(HashSet::new, |boundary| {
+                        std::iter::once(boundary.node)
+                            .chain(cache.document.dom.descendants(boundary.node))
+                            .collect()
+                    });
+                if !cache
+                    .document
+                    .apply_subtree_patch(patch, css_viewport, device_pixel_ratio)
+                {
+                    self.page_layout = Some(cache);
+                    self.browser.request_live_resync();
+                    return false;
+                }
+                if !needs_full_layout {
+                    let image_sizes = image_sizes_for_layout(
+                        &self.image_sizes,
+                        &self.image_loads.failed,
+                        &cache.document.image_urls,
+                    );
+                    let failed = old_boundary.is_none_or(|boundary| {
+                        !splice_graphical_boundary(
+                            &mut cache,
+                            boundary,
+                            &old_nodes,
+                            css_viewport,
+                            &image_sizes,
+                        )
+                    });
+                    needs_full_layout = failed;
+                    all_spliced &= !failed;
+                } else {
+                    all_spliced = false;
+                }
+            }
+            if needs_repaint
+                && !needs_full_layout
+                && !trust::layout2::repaint_graphical(
+                    &mut cache.layout,
+                    &cache.document.dom,
+                    &cache.document.base,
+                )
+            {
+                needs_full_layout = true;
+                all_spliced = false;
+            }
+            apply_graphical_scroll_state(&mut cache.document, self.browser.interaction());
+            self.sync_image_document(generation, &cache.document.base);
+            let requests = cache
+                .document
+                .eager_image_urls
+                .iter()
+                .map(|source| trust::render::ImageRequest {
+                    handle: ImageHandle::for_source(source),
+                    source: source.clone(),
+                })
+                .collect::<Vec<_>>();
+            self.request_page_images(generation, &cache.document.base, &requests, &HashSet::new());
+            let image_sizes = image_sizes_for_layout(
+                &self.image_sizes,
+                &self.image_loads.failed,
+                &cache.document.image_urls,
+            );
+            if needs_full_layout {
+                cache.layout = trust::layout2::lay_out_graphical(
+                    &cache.document.dom,
+                    &cache.document.base,
+                    css_viewport,
+                    &cache.document.forms,
+                    &cache.document.controls,
+                    &image_sizes,
+                );
+            }
+            cache.revision = revision;
+            let live = graphical_live_boundaries(&cache.document, &cache.layout);
+            self.page_layout = Some(cache);
+            self.browser.set_live_layout_boundaries(live.0, live.1);
+            return all_spliced && !needs_full_layout;
+        }
+        if !patches.is_empty() {
+            // Resize/navigation can invalidate the mirror just as a patch lands.
+            // Do not paint stale full HTML over a newer actor state.
+            self.browser.request_live_resync();
+            return false;
         }
         let seed = self
             .page_layout
@@ -1645,12 +2088,17 @@ impl DesktopApp {
             PageLayoutCache {
                 generation,
                 revision,
+                rendered_revision,
                 viewport,
                 device_pixel_ratio,
                 document,
                 layout,
             }
         });
+        if let Some(cache) = &self.page_layout {
+            let live = graphical_live_boundaries(&cache.document, &cache.layout);
+            self.browser.set_live_layout_boundaries(live.0, live.1);
+        }
         if self.page_layout.is_none() {
             let fresh = self
                 .protocol_page
@@ -1714,6 +2162,7 @@ impl DesktopApp {
         } else {
             self.protocol_page = None;
         }
+        false
     }
 
     fn relayout_cached_page(&mut self) {
@@ -1749,7 +2198,7 @@ impl DesktopApp {
             .ok_or_else(|| String::from("desktop window is unavailable"))?;
         match self.renderer_preference {
             RendererPreference::Cpu => {
-                self.renderer = Some(DesktopRenderer::Cpu(Box::new(VelloCpuRenderer::new())));
+                self.renderer = Some(DesktopRenderer::Cpu(CpuDesktopRenderer::new()));
                 self.ensure_software_surface()?;
             }
             RendererPreference::Hybrid | RendererPreference::Auto => {
@@ -1766,8 +2215,7 @@ impl DesktopApp {
                     }
                     Err(error) if self.renderer_preference == RendererPreference::Auto => {
                         eprintln!("trust-desktop: Hybrid unavailable ({error}); using Vello CPU");
-                        self.renderer =
-                            Some(DesktopRenderer::Cpu(Box::new(VelloCpuRenderer::new())));
+                        self.renderer = Some(DesktopRenderer::Cpu(CpuDesktopRenderer::new()));
                         self.ensure_software_surface()?;
                     }
                     Err(error) => return Err(error),
@@ -1794,22 +2242,23 @@ impl DesktopApp {
         Ok(())
     }
 
-    fn present_scene(&mut self, scene: &Scene) -> Result<(), String> {
+    fn present_scene(&mut self, scene: &Scene, damage: Option<CssRect>) -> Result<bool, String> {
         let hybrid_result = match self.renderer.as_mut() {
-            Some(DesktopRenderer::Hybrid(renderer)) => Some(renderer.present(scene)),
+            Some(DesktopRenderer::Hybrid(renderer)) => Some(renderer.present_damage(scene, damage)),
             Some(DesktopRenderer::Cpu(_)) => None,
             None => return Err(String::from("desktop renderer is not initialized")),
         };
         if let Some(result) = hybrid_result {
             match result {
-                Ok(PresentOutcome::Presented | PresentOutcome::Skipped) => return Ok(()),
+                Ok(PresentOutcome::Presented) => return Ok(true),
+                Ok(PresentOutcome::Skipped) => return Ok(false),
                 Err(error) => {
                     // A malformed resource, device loss, or evolving Hybrid
                     // implementation must not tear down the browser. Drop all
                     // GPU-owned state and repaint this same display list using
                     // the independent CPU reference backend.
                     eprintln!("trust-desktop: Hybrid failed ({error}); switching to Vello CPU");
-                    self.renderer = Some(DesktopRenderer::Cpu(Box::new(VelloCpuRenderer::new())));
+                    self.renderer = Some(DesktopRenderer::Cpu(CpuDesktopRenderer::new()));
                     self.ensure_software_surface()?;
                 }
             }
@@ -1820,27 +2269,30 @@ impl DesktopApp {
         let Some(DesktopRenderer::Cpu(renderer)) = renderer else {
             return Err(String::from("software fallback renderer is unavailable"));
         };
-        let frame = renderer.render(scene)?;
+        let pixels = renderer.render(scene, damage)?;
         let surface = surface
             .as_mut()
             .ok_or_else(|| String::from("desktop software surface is not available"))?;
-        let width = NonZeroU32::new(frame.size.width)
+        let width = NonZeroU32::new(scene.viewport.physical.width)
             .ok_or_else(|| String::from("zero-width desktop surface"))?;
-        let height = NonZeroU32::new(frame.size.height)
+        let height = NonZeroU32::new(scene.viewport.physical.height)
             .ok_or_else(|| String::from("zero-height desktop surface"))?;
         surface
             .resize(width, height)
             .map_err(|error| error.to_string())?;
         let mut buffer = surface.buffer_mut().map_err(|error| error.to_string())?;
-        if buffer.len() != frame.pixels.len() {
+        if buffer.len() != pixels.len() {
             return Err(format!(
                 "presentation buffer has {} pixels, renderer produced {}",
                 buffer.len(),
-                frame.pixels.len()
+                pixels.len()
             ));
         }
-        buffer.copy_from_slice(frame.pixels);
-        buffer.present().map_err(|error| error.to_string())
+        buffer.copy_from_slice(pixels);
+        buffer
+            .present()
+            .map(|()| true)
+            .map_err(|error| error.to_string())
     }
 
     fn draw(&mut self) -> Result<(), String> {
@@ -1856,12 +2308,15 @@ impl DesktopApp {
             initial_scene.content_viewport.width,
             initial_scene.content_viewport.height,
         );
-        if self.terminal.is_none() {
-            self.ensure_page_layout(page_viewport);
+        let layout_patch = if self.terminal.is_none() {
+            let eligible = self.ensure_page_layout(page_viewport);
             // A fragment request can arrive before the matching layout exists.
             // Apply it now that the committed document's boxes are available.
             self.scroll_to_fragment();
-        }
+            eligible
+        } else {
+            false
+        };
         if trace {
             eprintln!("desktop: layout + chrome {:?}", frame_started.elapsed());
         }
@@ -1990,14 +2445,32 @@ impl DesktopApp {
             );
         }
 
-        self.present_scene(&scene)?;
+        let image_generation = self.image_store.generation();
+        let damage = if !self.force_full_raster
+            && image_generation == self.presented_image_generation
+            && let Some(previous) = &self.scene
+        {
+            scene_damage(previous, &scene)
+        } else {
+            SceneDamage::Full
+        };
+        let presented = match damage {
+            SceneDamage::Unchanged => true,
+            SceneDamage::Partial(rect) => self.present_scene(&scene, Some(rect))?,
+            SceneDamage::Full => self.present_scene(&scene, None)?,
+        };
+        self.force_full_raster = !presented;
+        self.presented_image_generation = image_generation;
         if trace {
             let renderer = self
                 .renderer
                 .as_ref()
                 .map(|renderer| renderer.kind().name())
                 .unwrap_or("uninitialized");
-            eprintln!("desktop: raster ({renderer}) {:?}", frame_started.elapsed());
+            eprintln!(
+                "desktop: raster ({renderer}) {:?} layout_patch={layout_patch} damage={damage:?}",
+                frame_started.elapsed()
+            );
         }
         if let Some(window) = &self.window {
             let title = if snapshot.address.is_empty() {
@@ -4024,6 +4497,7 @@ impl DesktopApp {
 
 impl ApplicationHandler<DesktopEvent> for DesktopApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.force_full_raster = true;
         event_loop.set_control_flow(ControlFlow::Wait);
         self.window_focused = true;
         self.image_schedule_key = None;
@@ -4073,7 +4547,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 eprintln!(
                     "trust-desktop: could not resume Hybrid ({error}); switching to Vello CPU"
                 );
-                self.renderer = Some(DesktopRenderer::Cpu(Box::new(VelloCpuRenderer::new())));
+                self.renderer = Some(DesktopRenderer::Cpu(CpuDesktopRenderer::new()));
                 if let Err(error) = self.ensure_software_surface() {
                     eprintln!("trust-desktop: CPU fallback unavailable: {error}");
                     event_loop.exit();
@@ -4101,6 +4575,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.force_full_raster = true;
         self.window_focused = false;
         self.set_active_animations(HashSet::new());
         if let Some(DesktopRenderer::Hybrid(renderer)) = &mut self.renderer {
@@ -4949,6 +5424,126 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cpu_damage_raster_matches_a_fresh_full_frame() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(160, 100), ScaleFactor::default());
+        let old = Scene {
+            viewport,
+            primitives: vec![
+                DisplayCommand::FillRect {
+                    rect: CssRect::new(0.0, 0.0, 160.0, 100.0),
+                    color: PaintColor::Window,
+                },
+                DisplayCommand::FillRect {
+                    rect: CssRect::new(20.0, 20.0, 40.0, 30.0),
+                    color: PaintColor::Rgba(200, 10, 10, 255),
+                },
+            ],
+            controls: Vec::new(),
+            content_viewport: CssRect::new(0.0, 0.0, 160.0, 100.0),
+            image_store: ImageStore::default(),
+            page_scroll_containers: Vec::new(),
+            page_size: CssSize::new(160.0, 100.0),
+        };
+        let mut new = old.clone();
+        let DisplayCommand::FillRect { color, .. } = &mut new.primitives[1] else {
+            unreachable!()
+        };
+        *color = PaintColor::Rgba(10, 10, 200, 255);
+        let SceneDamage::Partial(damage) = scene_damage(&old, &new) else {
+            panic!("leaf fill must be damage eligible")
+        };
+
+        let mut retained = CpuDesktopRenderer::new();
+        retained.render(&old, None).unwrap();
+        let partial = retained.render(&new, Some(damage)).unwrap().to_vec();
+        let mut reference = CpuDesktopRenderer::new();
+        let full = reference.render(&new, None).unwrap().to_vec();
+        assert_eq!(partial, full);
+    }
+
+    fn graphical_cache(html: &str) -> PageLayoutCache {
+        let base = url::Url::parse("https://example.test/").unwrap();
+        let viewport = trust::layout2::Viewport::new(640.0, 480.0);
+        let mut dom = trust::dom::Dom::parse_document(html);
+        dom.set_doc_url(Some(base.clone()));
+        dom.set_viewport_px(viewport.width, viewport.height);
+        dom.set_device_pixel_ratio(1.0);
+        let (forms, controls) = trust::http::extract_forms_arena(&dom, &base, None);
+        let document = trust::http::GraphicalDocument {
+            dom,
+            base,
+            forms,
+            controls,
+            image_urls: Vec::new(),
+            eager_image_urls: Vec::new(),
+            lazy_image_handles: HashSet::new(),
+        };
+        let layout = trust::layout2::lay_out_graphical(
+            &document.dom,
+            &document.base,
+            viewport,
+            &document.forms,
+            &document.controls,
+            &HashMap::new(),
+        );
+        PageLayoutCache {
+            generation: 1,
+            revision: 1,
+            rendered_revision: 1,
+            viewport: CssSize::new(viewport.width, viewport.height),
+            device_pixel_ratio: 1.0,
+            document,
+            layout,
+        }
+    }
+
+    #[test]
+    fn inline_paint_patch_reuses_graphical_geometry_and_yields_local_damage() {
+        let mut cache = graphical_cache(
+            r#"<body style="margin:0"><a data-trust-hover="42" data-trust-paint-node="42" style="color:red">hover link</a><p>stable sibling</p></body>"#,
+        );
+        let (_, live) = graphical_live_boundaries(&cache.document, &cache.layout);
+        assert!(live.contains(&42));
+        let metrics =
+            ViewportMetrics::from_physical(PhysicalSize::new(640, 480), ScaleFactor::default());
+        let snapshot = trust::core::BrowserSnapshot {
+            address: String::new(),
+            status: String::new(),
+            loading: false,
+            can_go_back: false,
+            can_go_forward: false,
+            focused: false,
+            viewport: CssSize::new(640.0, 480.0),
+            page_revision: 1,
+        };
+        let mut old_scene = desktop_chrome(metrics, &snapshot, &ChromeModel::default());
+        old_scene.append_page(&cache.layout.paint, CssPoint::default());
+        let old_boxes = cache.layout.boxes.clone();
+        let patch = trust::js::SubtreePatch {
+            node: 42,
+            html: String::from(
+                r#"<div><a data-trust-hover="42" data-trust-paint-node="42" style="color:blue">hover link</a></div>"#,
+            ),
+            tier: trust::js::BoundaryTier::Paint,
+        };
+        let viewport = trust::layout2::Viewport::new(640.0, 480.0);
+        assert!(cache.document.apply_subtree_patch(&patch, viewport, 1.0));
+        assert!(trust::layout2::repaint_graphical(
+            &mut cache.layout,
+            &cache.document.dom,
+            &cache.document.base,
+        ));
+        assert_eq!(cache.layout.boxes, old_boxes);
+        let mut new_scene = desktop_chrome(metrics, &snapshot, &ChromeModel::default());
+        new_scene.append_page(&cache.layout.paint, CssPoint::default());
+        assert!(matches!(
+            scene_damage(&old_scene, &new_scene),
+            SceneDamage::Partial(_)
+        ));
+    }
+
     fn protocol_line(y: f32, linked: bool) -> trust::render::documents::ProtocolLine {
         trust::render::documents::ProtocolLine {
             rect: CssRect::new(0.0, y, 100.0, 20.0),
@@ -4977,6 +5572,121 @@ mod tests {
             RendererPreference::Cpu
         );
         assert!(parse_desktop_args([String::from("--renderer=nope")]).is_err());
+    }
+
+    #[test]
+    fn graphical_boundary_splice_is_equivalent_to_a_full_layout() {
+        let mut cache = graphical_cache(
+            r#"<body style="margin:0">
+               <div>before</div>
+               <section data-trust-node="42" style="display:flow-root;position:relative;z-index:1;width:240px;height:64px">
+                 <span style="color:red">menu</span>
+                 <aside data-trust-node="43" style="display:flow-root;position:relative;z-index:2;width:80px;height:20px">nested</aside>
+               </section>
+               <footer data-trust-node="44" style="display:flow-root;position:relative;z-index:1;width:200px;height:32px">after</footer>
+               </body>"#,
+        );
+        let old = cache
+            .layout
+            .boundaries
+            .iter()
+            .find(|boundary| boundary.actor == 42)
+            .unwrap()
+            .clone();
+        let old_nodes: HashSet<_> = std::iter::once(old.node)
+            .chain(cache.document.dom.descendants(old.node))
+            .collect();
+        let patch = trust::js::SubtreePatch {
+            node: 42,
+            html: String::from(
+                r#"<div style="font-size:16px"><section data-trust-node="42" style="display:flow-root;position:relative;z-index:1;width:240px;height:64px;background:#eef">
+                   <span style="color:blue">menu</span>
+                   <aside data-trust-node="43" style="display:flow-root;position:relative;z-index:2;width:80px;height:20px">nested changed</aside>
+                   </section></div>"#,
+            ),
+            tier: trust::js::BoundaryTier::WidthStable,
+        };
+        let viewport = trust::layout2::Viewport::new(640.0, 480.0);
+        assert!(cache.document.apply_subtree_patch(&patch, viewport, 1.0));
+        let expected = trust::layout2::lay_out_graphical(
+            &cache.document.dom,
+            &cache.document.base,
+            viewport,
+            &cache.document.forms,
+            &cache.document.controls,
+            &HashMap::new(),
+        );
+        assert!(splice_graphical_boundary(
+            &mut cache,
+            old,
+            &old_nodes,
+            viewport,
+            &HashMap::new(),
+        ));
+
+        assert_eq!(cache.layout.paint.width, expected.paint.width);
+        assert_eq!(cache.layout.paint.height, expected.paint.height);
+        assert_eq!(cache.layout.paint.primitives, expected.paint.primitives);
+        assert_eq!(cache.layout.paint.lines, expected.paint.lines);
+        assert_eq!(
+            cache.layout.paint.fixed_under_primitives,
+            expected.paint.fixed_under_primitives
+        );
+        assert_eq!(
+            cache.layout.paint.fixed_primitives,
+            expected.paint.fixed_primitives
+        );
+        assert_eq!(
+            cache.layout.paint.scroll_containers,
+            expected.paint.scroll_containers
+        );
+        assert_eq!(
+            cache.layout.paint.sticky_constraints,
+            expected.paint.sticky_constraints
+        );
+        assert_eq!(cache.layout.boxes, expected.boxes);
+        assert_eq!(cache.layout.grid_tracks, expected.grid_tracks);
+
+        let mut actual_segments = cache.layout.boundaries.clone();
+        let mut expected_segments = expected.boundaries.clone();
+        actual_segments.sort_by_key(|boundary| boundary.actor);
+        expected_segments.sort_by_key(|boundary| boundary.actor);
+        assert_eq!(actual_segments, expected_segments);
+        let mut actual_patch = cache.layout.patch_boundaries.clone();
+        let mut expected_patch = expected.patch_boundaries.clone();
+        actual_patch.sort_by_key(|boundary| boundary.actor);
+        expected_patch.sort_by_key(|boundary| boundary.actor);
+        assert_eq!(actual_patch, expected_patch);
+    }
+
+    #[test]
+    fn graphical_boundary_splice_rejects_changed_outer_geometry() {
+        let mut cache = graphical_cache(
+            r#"<body style="margin:0"><section data-trust-node="42" style="display:flow-root;position:relative;z-index:1;width:240px;height:64px">menu</section></body>"#,
+        );
+        let old = cache
+            .layout
+            .boundaries
+            .iter()
+            .find(|boundary| boundary.actor == 42)
+            .unwrap()
+            .clone();
+        let old_nodes: HashSet<_> = std::iter::once(old.node)
+            .chain(cache.document.dom.descendants(old.node))
+            .collect();
+        let patch = trust::js::SubtreePatch {
+            node: 42,
+            html: String::from(
+                r#"<div><section data-trust-node="42" style="display:flow-root;position:relative;z-index:1;width:240px;height:96px">larger menu</section></div>"#,
+            ),
+            tier: trust::js::BoundaryTier::WidthStable,
+        };
+        let viewport = trust::layout2::Viewport::new(640.0, 480.0);
+        assert!(cache.document.apply_subtree_patch(&patch, viewport, 1.0));
+        assert!(
+            !splice_graphical_boundary(&mut cache, old, &old_nodes, viewport, &HashMap::new(),),
+            "a parent-flow geometry change must use the full-layout oracle"
+        );
     }
 
     #[test]

@@ -54,7 +54,7 @@ pub(crate) struct OofMark<'t> {
 
 /// One placed inline item in CSS pixels. Shaped text is retained so paint does
 /// not repeat font selection or shaping.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Piece {
     pub x: f32,
     pub y: f32,

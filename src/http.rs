@@ -118,6 +118,161 @@ pub struct GraphicalDocument {
     pub lazy_image_handles: std::collections::HashSet<crate::render::ImageHandle>,
 }
 
+impl GraphicalDocument {
+    /// Apply one actor-produced incremental boundary snapshot to the retained
+    /// graphical presentation DOM. The actor remains the canonical DOM; this
+    /// arena is only the frontend's parsed presentation mirror.
+    ///
+    /// Paint-tier snapshots copy baked paint declarations onto existing nodes,
+    /// preserving form state and fragment identity. Structural tiers preserve
+    /// WHATWG DOM's pre-insert/remove ordering by inserting the replacement
+    /// immediately before the old boundary and then detaching the old subtree.
+    /// `Dom::serialize_patch` materializes inherited cascade on a wrapper for
+    /// standalone layout; only the boundary itself is installed.
+    pub fn apply_subtree_patch(
+        &mut self,
+        patch: &crate::js::SubtreePatch,
+        viewport: crate::layout2::Viewport,
+        device_pixel_ratio: f32,
+    ) -> bool {
+        if patch.tier == crate::js::BoundaryTier::Paint {
+            return self.apply_paint_patch(patch);
+        }
+        let key = patch.node.to_string();
+        let Some(old) = self
+            .dom
+            .descendants(crate::dom::DOCUMENT)
+            .find(|&id| self.dom.attr(id, "data-trust-node") == Some(key.as_str()))
+        else {
+            return false;
+        };
+        let Some(parent) = self.dom.parent_composed(old) else {
+            return false;
+        };
+        let refresh_forms = subtree_has_form_metadata(&self.dom, old);
+        let refresh_images = subtree_has_image_metadata(&self.dom, old);
+
+        let roots = self.dom.parse_fragment_into("body", &patch.html);
+        let replacement = roots.iter().find_map(|&root| {
+            std::iter::once(root)
+                .chain(self.dom.descendants(root))
+                .find(|&id| self.dom.attr(id, "data-trust-node") == Some(key.as_str()))
+        });
+        let Some(replacement) = replacement else {
+            return false;
+        };
+
+        self.dom.insert_before(parent, replacement, Some(old));
+        self.dom.detach(old);
+        self.dom.set_doc_url(Some(self.base.clone()));
+        self.dom.set_viewport_px(viewport.width, viewport.height);
+        self.dom.set_device_pixel_ratio(device_pixel_ratio);
+        let refresh_forms = refresh_forms || subtree_has_form_metadata(&self.dom, replacement);
+        let refresh_images = refresh_images || subtree_has_image_metadata(&self.dom, replacement);
+        self.dom
+            .rewrite_inline_svgs_in(replacement, Some(&self.base));
+
+        // A general subtree patch may add/remove controls and images. Refresh
+        // only when the old or new boundary actually contains relevant nodes;
+        // the dominant :hover patch changes style on menu text and therefore
+        // does no document-wide form/image scan. Seed form state so a genuine
+        // control patch cannot erase the user's current edits.
+        if refresh_forms {
+            let (forms, controls) = extract_forms_arena(&self.dom, &self.base, Some(&self.forms));
+            self.forms = forms;
+            self.controls = controls;
+        }
+        if refresh_images {
+            let images = collect_image_urls(&self.dom, &self.base, viewport, device_pixel_ratio);
+            self.image_urls = images.all;
+            self.eager_image_urls = images.eager;
+            self.lazy_image_handles = images.lazy_handles;
+        }
+        true
+    }
+
+    /// Apply a paint-only actor snapshot without replacing presentation nodes.
+    /// Geometry fragments and native form state remain valid because the actor
+    /// classifies this tier only from a declaration allow-list that excludes
+    /// layout, generated content, transforms, opacity, and stacking changes.
+    fn apply_paint_patch(&mut self, patch: &crate::js::SubtreePatch) -> bool {
+        const PAINT_ATTRS: &[&str] = &[
+            "style",
+            "data-trust-before",
+            "data-trust-before-style",
+            "data-trust-after",
+            "data-trust-after-style",
+        ];
+        let key = patch.node.to_string();
+        let actor_node = |dom: &crate::dom::Dom, id| {
+            dom.attr(id, "data-trust-paint-node") == Some(key.as_str())
+                || dom.attr(id, "data-trust-node") == Some(key.as_str())
+        };
+        let Some(old) = self
+            .dom
+            .descendants(crate::dom::DOCUMENT)
+            .find(|&id| actor_node(&self.dom, id))
+        else {
+            return false;
+        };
+        let fresh = crate::dom::Dom::parse_document(&patch.html);
+        let Some(new) = fresh
+            .descendants(crate::dom::DOCUMENT)
+            .find(|&id| actor_node(&fresh, id))
+        else {
+            return false;
+        };
+        let old_nodes = std::iter::once(old)
+            .chain(self.dom.descendants(old))
+            .filter(|&id| self.dom.tag_name(id).is_some())
+            .collect::<Vec<_>>();
+        let new_nodes = std::iter::once(new)
+            .chain(fresh.descendants(new))
+            .filter(|&id| fresh.tag_name(id).is_some())
+            .collect::<Vec<_>>();
+        if old_nodes.len() != new_nodes.len()
+            || old_nodes
+                .iter()
+                .zip(&new_nodes)
+                .any(|(&old, &new)| self.dom.tag_name(old) != fresh.tag_name(new))
+        {
+            return false;
+        }
+        for (old, new) in old_nodes.into_iter().zip(new_nodes) {
+            for attr in PAINT_ATTRS {
+                if let Some(value) = fresh.attr(new, attr).map(str::to_owned) {
+                    self.dom.set_attr(old, attr, &value);
+                } else {
+                    self.dom.remove_attr(old, attr);
+                }
+            }
+        }
+        true
+    }
+}
+
+fn subtree_has_form_metadata(dom: &crate::dom::Dom, root: usize) -> bool {
+    std::iter::once(root)
+        .chain(dom.descendants(root))
+        .any(|node| {
+            matches!(
+                dom.tag_name(node),
+                Some("form" | "input" | "button" | "select" | "textarea" | "option")
+            ) || dom.is_contenteditable_host(node)
+        })
+}
+
+fn subtree_has_image_metadata(dom: &crate::dom::Dom, root: usize) -> bool {
+    std::iter::once(root)
+        .chain(dom.descendants(root))
+        .any(|node| {
+            matches!(
+                dom.tag_name(node),
+                Some("img" | "picture" | "source" | "video" | "audio" | "meta" | "svg")
+            )
+        })
+}
+
 pub fn graphical_document(response: &Response) -> Option<GraphicalDocument> {
     graphical_document_for_environment(response, crate::layout2::Viewport::new(960.0, 558.0), 1.0)
 }
@@ -3159,6 +3314,137 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphical_paint_patch_updates_styles_without_replacing_nodes_or_values() {
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<body><a data-trust-paint-node="42" style="color:red"><span style="color:red">link</span><input name="q" value="typed"></a></body>"#,
+        );
+        dom.set_doc_url(Some(base.clone()));
+        let old = dom
+            .descendants(crate::dom::DOCUMENT)
+            .find(|&node| dom.attr(node, "data-trust-paint-node") == Some("42"))
+            .unwrap();
+        let input = dom
+            .descendants(old)
+            .find(|&node| dom.tag_name(node) == Some("input"))
+            .unwrap();
+        let (forms, controls) = extract_forms_arena(&dom, &base, None);
+        let mut document = GraphicalDocument {
+            dom,
+            base,
+            forms,
+            controls,
+            image_urls: Vec::new(),
+            eager_image_urls: Vec::new(),
+            lazy_image_handles: Default::default(),
+        };
+        let patch = crate::js::SubtreePatch {
+            node: 42,
+            html: String::from(
+                r#"<div><a data-trust-paint-node="42" style="color:blue"><span style="color:blue">link</span><input name="q" value="server-default"></a></div>"#,
+            ),
+            tier: crate::js::BoundaryTier::Paint,
+        };
+
+        assert!(document.apply_subtree_patch(
+            &patch,
+            crate::layout2::Viewport::new(800.0, 600.0),
+            1.0,
+        ));
+        assert_eq!(document.dom.attr(old, "style"), Some("color:blue"));
+        assert_eq!(document.dom.attr(input, "value"), Some("typed"));
+        assert_eq!(document.dom.text_content(old), "link");
+    }
+
+    #[test]
+    fn graphical_document_applies_an_actor_subtree_patch_in_place() {
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<body><div id="before">before</div><section data-trust-node="42"><b>old</b></section><div id="after">after</div></body>"#,
+        );
+        dom.set_doc_url(Some(base.clone()));
+        let (forms, controls) = extract_forms_arena(&dom, &base, None);
+        let mut document = GraphicalDocument {
+            dom,
+            base,
+            forms,
+            controls,
+            image_urls: Vec::new(),
+            eager_image_urls: Vec::new(),
+            lazy_image_handles: Default::default(),
+        };
+        let patch = crate::js::SubtreePatch {
+            node: 42,
+            html: String::from(
+                r#"<div style="color:green"><section data-trust-node="42"><b>new</b></section></div>"#,
+            ),
+            tier: crate::js::BoundaryTier::WidthStable,
+        };
+
+        assert!(document.apply_subtree_patch(
+            &patch,
+            crate::layout2::Viewport::new(800.0, 600.0),
+            1.0,
+        ));
+        let text = document.dom.text_content(crate::dom::DOCUMENT);
+        assert!(text.contains("before"));
+        assert!(text.contains("new"));
+        assert!(text.contains("after"));
+        assert!(!text.contains("old"));
+        assert_eq!(
+            document
+                .dom
+                .descendants(crate::dom::DOCUMENT)
+                .filter(|&id| document.dom.attr(id, "data-trust-node") == Some("42"))
+                .count(),
+            1,
+            "the old boundary is detached and the replacement is unique"
+        );
+    }
+
+    #[test]
+    fn graphical_subtree_patch_refreshes_new_controls_and_images() {
+        let base = Url::parse("https://example.test/page/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<body><section data-trust-node="42">old</section></body>"#,
+        );
+        dom.set_doc_url(Some(base.clone()));
+        let (forms, controls) = extract_forms_arena(&dom, &base, None);
+        let mut document = GraphicalDocument {
+            dom,
+            base,
+            forms,
+            controls,
+            image_urls: Vec::new(),
+            eager_image_urls: Vec::new(),
+            lazy_image_handles: Default::default(),
+        };
+        let patch = crate::js::SubtreePatch {
+            node: 42,
+            html: String::from(
+                r#"<div><section data-trust-node="42"><input data-trust-node="43" name="q"><img src="photo.webp"></section></div>"#,
+            ),
+            tier: crate::js::BoundaryTier::WidthStable,
+        };
+
+        assert!(document.apply_subtree_patch(
+            &patch,
+            crate::layout2::Viewport::new(800.0, 600.0),
+            1.0,
+        ));
+        assert_eq!(
+            document.forms.len(),
+            1,
+            "the formless input remains editable"
+        );
+        assert!(document.controls.values().any(|indices| *indices == (0, 0)));
+        assert_eq!(
+            document.image_urls,
+            vec![String::from("https://example.test/page/photo.webp")]
+        );
+    }
 
     #[test]
     fn graphical_image_discovery_is_document_ordered_resolved_and_deduplicated() {
