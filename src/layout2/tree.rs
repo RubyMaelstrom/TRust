@@ -106,6 +106,10 @@ pub(crate) struct BoxNode {
     /// The `::marker` text of a `list-item`, pre-formatted (counters are
     /// document-order state, so they resolve here, not at layout).
     pub marker: Option<String>,
+    /// `list-style-image` source for the anonymous marker replaced element.
+    /// The source remains in authored URL form; paint resolves it against the
+    /// page base exactly like an `<img>` source.
+    pub marker_image: Option<String>,
     /// `list-style-position: inside` — the marker joins the IFC as leading
     /// text instead of sitting in the gutter.
     pub marker_inside: bool,
@@ -219,6 +223,7 @@ pub(crate) fn build(
             style: BoxStyle::of(dom, root, vp),
             content: Content::Inlines(vec![inl]),
             marker: None,
+            marker_image: None,
             marker_inside: false,
             oof: Vec::new(),
         }),
@@ -255,6 +260,7 @@ pub(crate) fn build_at(
             style: BoxStyle::of(dom, boundary, vp),
             content: Content::Inlines(vec![inl]),
             marker: None,
+            marker_image: None,
             marker_inside: false,
             oof: Vec::new(),
         }),
@@ -386,6 +392,7 @@ impl Builder<'_> {
                     style: BoxStyle::of(self.dom, id, self.vp),
                     content: Content::Atomic(Atom { node: id, kind }),
                     marker: None,
+                    marker_image: None,
                     marker_inside: false,
                     oof: Vec::new(),
                 },
@@ -407,6 +414,7 @@ impl Builder<'_> {
                     style: BoxStyle::of(self.dom, id, self.vp),
                     content: Content::Atomic(Atom { node: id, kind }),
                     marker: None,
+                    marker_image: None,
                     marker_inside: false,
                     oof: Vec::new(),
                 },
@@ -472,6 +480,7 @@ impl Builder<'_> {
                     BoxStyle::of(self.dom, id, self.vp),
                     kids,
                     None,
+                    None,
                     false,
                 )));
             }
@@ -501,6 +510,7 @@ impl Builder<'_> {
                         id,
                         BoxStyle::of(self.dom, id, self.vp),
                         kids,
+                        None,
                         None,
                         false,
                     )))
@@ -594,6 +604,7 @@ impl Builder<'_> {
                     style: BoxStyle::of(self.dom, id, self.vp),
                     content: Content::Atomic(atom),
                     marker: None,
+                    marker_image: None,
                     marker_inside: false,
                     oof: Vec::new(),
                 }))
@@ -611,10 +622,10 @@ impl Builder<'_> {
         if list {
             self.lists.push(self.list_counter(id, tag));
         }
-        let (marker, inside) = if disp == Disp::ListItem {
+        let (marker, marker_image, inside) = if disp == Disp::ListItem {
             self.marker(id)
         } else {
-            (None, false)
+            (None, None, false)
         };
         let kids = self.children(id);
         if list {
@@ -631,6 +642,7 @@ impl Builder<'_> {
                     Content::Grid(its)
                 },
                 marker,
+                marker_image,
                 marker_inside: inside,
                 oof,
             };
@@ -640,6 +652,7 @@ impl Builder<'_> {
             BoxStyle::of(self.dom, id, self.vp),
             kids,
             marker,
+            marker_image,
             inside,
         )
     }
@@ -660,6 +673,7 @@ impl Builder<'_> {
                     style: BoxStyle::anonymous(),
                     content: Content::Inlines(std::mem::take(run)),
                     marker: None,
+                    marker_image: None,
                     marker_inside: false,
                     oof: Vec::new(),
                 });
@@ -687,6 +701,7 @@ impl Builder<'_> {
                         style: *style,
                         content: Content::Inlines(kids),
                         marker: None,
+                        marker_image: None,
                         marker_inside: false,
                         oof: Vec::new(),
                     });
@@ -698,6 +713,7 @@ impl Builder<'_> {
                         style: BoxStyle::of(self.dom, a.node, self.vp),
                         content: Content::Atomic(a),
                         marker: None,
+                        marker_image: None,
                         marker_inside: false,
                         oof: Vec::new(),
                     });
@@ -744,7 +760,7 @@ impl Builder<'_> {
     }
 
     /// The formatted `::marker` for a list item, advancing the counter.
-    fn marker(&mut self, id: NodeId) -> (Option<String>, bool) {
+    fn marker(&mut self, id: NodeId) -> (Option<String>, Option<String>, bool) {
         if let Some(v) = self
             .dom
             .attr(id, "value")
@@ -761,18 +777,42 @@ impl Builder<'_> {
             }
             None => 1,
         };
+        let image = self
+            .dom
+            .computed_value_resolved(id, "list-style-image")
+            .and_then(|value| Self::list_style_image_url(&value));
         let kind = self
             .dom
             .computed_value(id, "list-style-type")
             .unwrap_or_else(|| "disc".to_string());
-        let text = format_list_marker(kind.trim(), n);
+        // CSS Lists 3 §3.2: a valid list-style-image replaces the type marker
+        // and is followed by one U+0020 space. If no usable image is present,
+        // retain the ordinary counter marker as the fallback.
+        let text = image
+            .as_ref()
+            .map(|_| " ".to_string())
+            .unwrap_or_else(|| format_list_marker(kind.trim(), n));
         let inside = matches!(
             self.dom
                 .computed_value(id, "list-style-position")
                 .as_deref(),
             Some("inside")
         );
-        ((!text.is_empty()).then_some(text), inside)
+        ((!text.is_empty()).then_some(text), image, inside)
+    }
+
+    /// Extract a URL image from a computed `list-style-image`. CSS Lists also
+    /// permits other `<image>` functions; those are left to the normal marker
+    /// fallback until the graphical image pipeline can rasterize them.
+    fn list_style_image_url(value: &str) -> Option<String> {
+        let value = value.trim();
+        let open = value.find('(')?;
+        let close = value.rfind(')')?;
+        if close <= open || !value[..open].trim().eq_ignore_ascii_case("url") {
+            return None;
+        }
+        let source = value[open + 1..close].trim().trim_matches(['\'', '"']);
+        (!source.is_empty()).then(|| source.to_string())
     }
 
     /// Build the box-level children of `id`, flattening `display:contents`
@@ -850,6 +890,7 @@ impl Builder<'_> {
                 style,
                 content: Content::Inlines(kids),
                 marker: None,
+                marker_image: None,
                 marker_inside: false,
                 oof: Vec::new(),
             };
@@ -870,6 +911,7 @@ impl Builder<'_> {
                 style,
                 content: Content::Inlines(kids),
                 marker: None,
+                marker_image: None,
                 marker_inside: false,
                 oof: Vec::new(),
             }))));
@@ -920,6 +962,7 @@ impl Builder<'_> {
         style: BoxStyle,
         kids: Vec<Built>,
         marker: Option<String>,
+        marker_image: Option<String>,
         marker_inside: bool,
     ) -> BoxNode {
         let any_block = kids.iter().any(Built::is_block);
@@ -936,6 +979,7 @@ impl Builder<'_> {
                 style,
                 content: Content::Inlines(inlines),
                 marker,
+                marker_image,
                 marker_inside,
                 oof: Vec::new(),
             };
@@ -949,6 +993,7 @@ impl Builder<'_> {
                     style: BoxStyle::anonymous(),
                     content: Content::Inlines(std::mem::take(run)),
                     marker: None,
+                    marker_image: None,
                     marker_inside: false,
                     oof: Vec::new(),
                 });
@@ -972,6 +1017,7 @@ impl Builder<'_> {
             style,
             content: Content::Blocks(blocks),
             marker,
+            marker_image,
             marker_inside,
             oof: Vec::new(),
         }
@@ -1044,6 +1090,7 @@ impl Builder<'_> {
                 fixed_layout,
             })),
             marker: None,
+            marker_image: None,
             marker_inside: false,
             oof: Vec::new(),
         }

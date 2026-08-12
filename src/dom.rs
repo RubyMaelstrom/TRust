@@ -6581,6 +6581,7 @@ const INHERITED_LAYOUT_PROPS: &[&str] = &[
     "letter-spacing",
     "word-spacing",
     "list-style-type",
+    "list-style-image",
     "list-style-position",
     "text-indent",
     "text-decoration-color",
@@ -6654,6 +6655,9 @@ const PROPS: &[PropDef] = &[
     // values in layout2 and retains unknown values as baseline.
     prop("vertical-align", false, true),
     prop("list-style-type", true, true),
+    // CSS Lists 3 §3.3: list-style-image is inherited and must survive the
+    // stylesheet-free live-page snapshot used by layout2.
+    prop("list-style-image", true, true),
     prop("list-style-position", true, true),
     prop("text-indent", true, true),
     prop("text-decoration", false, true),
@@ -6802,6 +6806,9 @@ fn cssom_initial_value(name: &str) -> Option<&'static str> {
         | "padding-right" | "padding-bottom" | "padding-left" => Some("0px"),
         "z-index" => Some("auto"),
         "direction" => Some("ltr"),
+        "list-style-image" => Some("none"),
+        "list-style-position" => Some("outside"),
+        "list-style-type" => Some("disc"),
         "opacity" => Some("1"),
         _ => None,
     }
@@ -7500,21 +7507,27 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
     if prop == "background" {
         return expand_background(value);
     }
-    // `list-style: <type> || <position> || <image>` — we track the type and
-    // position keywords (a bare `none` counts as the type, per the shorthand
-    // grammar; the image and any URL are ignored).
+    // `list-style: <position> || <image> || <type>` (CSS Lists 3 §3.6).
+    // Every omitted component resets to its initial value; in particular an
+    // image from an earlier declaration must not survive a later shorthand.
     if prop == "list-style" {
-        let mut out = Vec::new();
-        if let Some(t) = list_style_shorthand_type(value) {
-            out.push(("list-style-type".to_string(), t.to_string()));
+        if wide_keyword(value).is_some() {
+            return ["list-style-type", "list-style-image", "list-style-position"]
+                .into_iter()
+                .map(|name| (name.to_string(), value.to_string()))
+                .collect();
         }
-        if let Some(p) = value
-            .split_whitespace()
-            .find(|t| matches!(*t, "inside" | "outside"))
-        {
-            out.push(("list-style-position".to_string(), p.to_string()));
-        }
-        return out;
+        let image = list_style_shorthand_image(value).unwrap_or("none");
+        let position = split_top_level_ws(value)
+            .into_iter()
+            .find(|t| matches!(t.to_ascii_lowercase().as_str(), "inside" | "outside"))
+            .unwrap_or("outside");
+        let kind = list_style_shorthand_type(value).unwrap_or("disc");
+        return vec![
+            ("list-style-type".to_string(), kind.to_string()),
+            ("list-style-image".to_string(), image.to_string()),
+            ("list-style-position".to_string(), position.to_string()),
+        ];
     }
     vec![(prop.to_string(), value.to_string())]
 }
@@ -7829,7 +7842,27 @@ fn list_style_shorthand_type(value: &str) -> Option<&str> {
         "lower-roman",
         "upper-roman",
     ];
-    value.split_whitespace().find(|t| TYPES.contains(t))
+    split_top_level_ws(value)
+        .into_iter()
+        .find(|t| TYPES.contains(&t.to_ascii_lowercase().as_str()))
+}
+
+/// The `<image>` component inside a `list-style` shorthand. CSS Lists permits
+/// any CSS image function; the graphical marker path currently paints URL
+/// images and safely ignores other image functions until their raster source
+/// is available.
+fn list_style_shorthand_image(value: &str) -> Option<&str> {
+    split_top_level_ws(value).into_iter().find(|token| {
+        let lower = token.to_ascii_lowercase();
+        lower == "none"
+            || lower.starts_with("url(")
+            || lower.starts_with("image(")
+            || lower.starts_with("cross-fade(")
+            || lower.starts_with("element(")
+            || lower.starts_with("linear-gradient(")
+            || lower.starts_with("radial-gradient(")
+            || lower.starts_with("conic-gradient(")
+    })
 }
 
 /// One parsed rule, holding its tracked declarations (`(prop, (important,
@@ -8101,9 +8134,10 @@ impl RuleBuckets {
     }
 }
 
-/// Parse one `prop: value [!important]` declaration. The value is
-/// lowercased (keyword props), EXCEPT `content`, whose text is
-/// case-significant (`content:"Read more"`).
+/// Parse one `prop: value [!important]` declaration. CSS keywords are ASCII
+/// case-insensitive, but strings and URL payloads are not: lowercasing a URL
+/// here changes the resource identity on case-sensitive servers (for example
+/// `/images/HeartDot.png`). Preserve those tokens while normalizing the rest.
 fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
     let (k, v) = decl.split_once(':')?;
     let k = k.trim().to_ascii_lowercase();
@@ -8116,9 +8150,48 @@ fn parse_decl(decl: &str) -> Option<(String, String, bool)> {
     let value = if k == "content" {
         v.to_string()
     } else {
-        v.to_ascii_lowercase()
+        normalize_css_value(v)
     };
     Some((k, value, important))
+}
+
+fn normalize_css_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut quote = None;
+    let mut chars = value.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if let Some(q) = quote {
+            out.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(c, '\'' | '"') {
+            quote = Some(c);
+            out.push(c);
+            continue;
+        }
+        // Preserve the complete url() token, including an unquoted path,
+        // while keyword-normalizing the surrounding declaration.
+        if value[i..].len() >= 4 && value[i..i + 4].eq_ignore_ascii_case("url(") {
+            out.push_str(&value[i..i + 4]);
+            // The iterator has consumed only the leading `u`; consume the
+            // `r`, `l`, and opening parenthesis already copied above.
+            chars.next();
+            chars.next();
+            chars.next();
+            for (_, inner) in chars.by_ref() {
+                out.push(inner);
+                if inner == ')' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
 }
 
 /// The pseudo-element a rule's subject (last compound) targets, if any.
@@ -13758,6 +13831,32 @@ mod tests {
             dom.computed_value(id("cap"), "caption-side").as_deref(),
             Some("bottom"),
             "caption-side inherits from the table to the caption"
+        );
+    }
+
+    #[test]
+    fn list_style_image_is_inherited_and_shorthand_preserves_image() {
+        let dom = Dom::parse_document(
+            "<head><style>ul{list-style-image:url('/images/HeartDot.png')}\
+             .shorthand{list-style:url('/images/HeartDot.png') inside}</style></head>\
+             <body><ul id=u><li id=li>heart</li></ul>\
+             <ul id=s class=shorthand><li id=sl>heart</li></ul></body>",
+        );
+        let id = |s: &str| dom.get_by_id(s).unwrap();
+        assert_eq!(
+            dom.computed_value(id("li"), "list-style-image").as_deref(),
+            Some("url('/images/HeartDot.png')"),
+            "list-style-image is inherited by list items"
+        );
+        assert_eq!(
+            dom.computed_value(id("sl"), "list-style-image").as_deref(),
+            Some("url('/images/HeartDot.png')"),
+            "the list-style shorthand retains its image component"
+        );
+        assert_eq!(
+            dom.computed_value(id("sl"), "list-style-position")
+                .as_deref(),
+            Some("inside")
         );
     }
 
