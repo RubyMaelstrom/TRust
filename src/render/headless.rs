@@ -267,6 +267,44 @@ mod tests {
     }
 
     #[test]
+    fn transformed_descendant_remains_inside_ancestor_overflow_clip() {
+        // CSS Overflow 3 §3.1 + CSS Transforms 1 §2: a transformed
+        // element is painted as a layer in its parent stacking context, where
+        // the parent's overflow clip must still clip that layer. Applying the
+        // absolute ancestor clip inside the child transform rotates the clip
+        // a second time and lets carousel artwork escape its container.
+        let base = Url::parse("https://example.test/").unwrap();
+        let html = r#"
+            <style>
+              html, body { margin:0; background:#fff }
+              #clip { position:absolute; left:40px; top:40px; width:80px;
+                      height:60px; overflow:hidden; background:#00f }
+              #moving { width:120px; height:120px; background:#f00;
+                        transform:rotate(25deg) }
+            </style>
+            <div id="clip"><div id="moving"></div></div>
+        "#;
+        let frame = render_html(html, &base, CssSize::new(180.0, 140.0)).unwrap();
+        let mut red_pixels = 0;
+        for (index, pixel) in frame.pixels.chunks_exact(4).enumerate() {
+            if pixel != [255, 0, 0, 255] {
+                continue;
+            }
+            red_pixels += 1;
+            let x = index % 180;
+            let y = index / 180;
+            assert!(
+                (40..120).contains(&x) && (40..100).contains(&y),
+                "transformed descendant escaped overflow clip at ({x}, {y})"
+            );
+        }
+        assert!(
+            red_pixels > 0,
+            "the transformed descendant was over-clipped"
+        );
+    }
+
+    #[test]
     fn fixed_viewport_backdrop_paints_under_later_positioned_content() {
         // CSS Positioned Layout §2.2 + CSS 2.1 Appendix E §E.2: a fixed
         // backdrop remains viewport-pinned, but a later z-index:auto positioned

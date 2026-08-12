@@ -36,6 +36,10 @@ struct Builder<'a> {
     image_handles: HashSet<ImageHandle>,
     scroll_containers: Vec<ScrollContainer>,
     sticky_constraints: Vec<StickyConstraint>,
+    /// Absolute overflow clips already active in the display list. A clip
+    /// inherited from outside a transformed stacking context must be pushed
+    /// before that transform and retained for the context's descendants.
+    hard_clips: Vec<CssRect>,
 }
 
 impl<'a> Builder<'a> {
@@ -56,6 +60,7 @@ impl<'a> Builder<'a> {
             image_handles: HashSet::new(),
             scroll_containers: Vec::new(),
             sticky_constraints: Vec::new(),
+            hard_clips: Vec::new(),
         };
         this.collect_scroll_containers(root);
         this.collect_sticky(root);
@@ -104,6 +109,21 @@ impl<'a> Builder<'a> {
             extent_bottom
         };
         CssRect::new(x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0))
+    }
+
+    fn push_hard_clip(&mut self, clip: CssRect) -> bool {
+        if self.hard_clips.last() == Some(&clip) {
+            return false;
+        }
+        self.commands
+            .push(DisplayCommand::PushClip(PaintShape::Rect(clip)));
+        self.hard_clips.push(clip);
+        true
+    }
+
+    fn pop_hard_clip(&mut self) {
+        self.commands.push(DisplayCommand::PopClip);
+        self.hard_clips.pop();
     }
 
     fn push_scroll_ancestors(&mut self, node: NodeId) -> usize {
@@ -270,7 +290,23 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
             .commands
             .push(DisplayCommand::BeginSticky(constraint.clone()));
     }
-    let transformed = push_transform(fragment, builder);
+    let transform = paint_transform(fragment, builder);
+    // CSS Overflow 3 §3.1 requires hidden overflow to clip descendants,
+    // while CSS Transforms 1 §2 paints a transformed element's layer in its
+    // parent stacking context. `Frag::clip` is already in absolute parent
+    // coordinates, so establish it before the child's transform; pushing it
+    // afterwards would transform the ancestor clip a second time.
+    let context_clip = transform
+        .and_then(|_| builder.ancestor_clip(fragment.node, fragment.clip))
+        .is_some_and(|clip| builder.push_hard_clip(clip));
+    let transformed = if let Some(transform) = transform {
+        builder
+            .commands
+            .push(DisplayCommand::PushTransform(transform));
+        true
+    } else {
+        false
+    };
     let layered = push_layer(fragment, builder);
     paint_fragment(fragment, builder);
     let mut negative = Vec::new();
@@ -300,6 +336,9 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
     }
     if transformed {
         builder.commands.push(DisplayCommand::PopTransform);
+    }
+    if context_clip {
+        builder.pop_hard_clip();
     }
     if sticky.is_some() {
         builder.commands.push(DisplayCommand::EndSticky);
@@ -383,11 +422,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
     }
     let scroll_depth = builder.push_scroll_ancestors(fragment.node);
     let fragment_clip = builder.ancestor_clip(fragment.node, fragment.clip);
-    if let Some(clip) = fragment_clip {
-        builder
-            .commands
-            .push(DisplayCommand::PushClip(PaintShape::Rect(clip)));
-    }
+    let pushed_fragment_clip = fragment_clip.is_some_and(|clip| builder.push_hard_clip(clip));
     let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
     if fragment.node != NO_NODE && fragment.w > 0.0 && fragment.h > 0.0 {
         let radii = border_radii(builder.dom, fragment.node, rect);
@@ -492,8 +527,8 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
             builder.pop_scroll_ancestors(piece_scroll_depth);
         }
     }
-    if fragment_clip.is_some() {
-        builder.commands.push(DisplayCommand::PopClip);
+    if pushed_fragment_clip {
+        builder.pop_hard_clip();
     }
     builder.pop_scroll_ancestors(scroll_depth);
 }
@@ -552,20 +587,18 @@ fn push_layer(fragment: &Frag<'_>, builder: &mut Builder<'_>) -> bool {
     }
 }
 
-fn push_transform(fragment: &Frag<'_>, builder: &mut Builder<'_>) -> bool {
+fn paint_transform(fragment: &Frag<'_>, builder: &Builder<'_>) -> Option<Affine2d> {
     if fragment.node == NO_NODE {
-        return false;
+        return None;
     }
-    let Some((matrix, layout_translation)) = element_transform(
+    let (matrix, layout_translation) = element_transform(
         builder.dom,
         fragment.node,
         fragment.w,
         fragment.h,
         fragment.x,
         fragment.y,
-    ) else {
-        return false;
-    };
+    )?;
     // Phase 2 retained translated fragment coordinates for terminal output.
     // Undo that already-applied translation inside the graphical transform so
     // the desktop path sees CSS's complete matrix exactly once.
@@ -573,14 +606,7 @@ fn push_transform(fragment: &Frag<'_>, builder: &mut Builder<'_>) -> bool {
         -layout_translation.x,
         -layout_translation.y,
     ));
-    if corrected.is_identity() {
-        false
-    } else {
-        builder
-            .commands
-            .push(DisplayCommand::PushTransform(corrected));
-        true
-    }
+    (!corrected.is_identity()).then_some(corrected)
 }
 
 fn paint_background_images(fragment: &Frag<'_>, shape: PaintShape, builder: &mut Builder<'_>) {
