@@ -3516,6 +3516,7 @@ impl Flow<'_> {
                 side: pf.side,
                 mw: pf.mw,
                 mh: pf.mh,
+                clear: fb.style.clear,
             });
             prelaid.push(Some(pf));
         }
