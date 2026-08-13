@@ -5432,6 +5432,60 @@ mod tests {
     }
 
     #[test]
+    fn graphical_body_background_propagates_to_the_canvas() {
+        // CSS Backgrounds 3 §2.11.2: an HTML body's background is propagated
+        // to the canvas when the root background is transparent and none. The
+        // canvas fill must therefore remain present below a document whose
+        // content is taller than the initial viewport, instead of falling back
+        // to the renderer's white surface after scrolling.
+        let dom = Dom::parse_document(
+            r#"<html style="background:transparent"><head></head><body style="margin:0;background-color:#232323"><div style="height:1200px"></div></body></html>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 480.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            layout.paint.background,
+            Some(crate::render::PaintColor::Rgba(35, 35, 35, 255))
+        );
+        assert!(layout.paint.height >= 1200.0);
+    }
+
+    #[test]
+    fn propagated_body_background_is_not_painted_again_on_the_body_box() {
+        let dom = Dom::parse_document(
+            r#"<html style="background:transparent"><body style="margin:0;background-image:url('/tile.webp');background-repeat:no-repeat"><div style="height:1200px"></div></body></html>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let mut images = HashMap::new();
+        images.insert("http://e.com/tile.webp".to_string(), (16, 12));
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 480.0),
+            &[],
+            &HashMap::new(),
+            &images,
+        );
+        let tiles = layout
+            .paint
+            .primitives
+            .iter()
+            .filter(|command| matches!(command, crate::render::DisplayCommand::Image { .. }))
+            .count();
+        assert_eq!(
+            tiles, 1,
+            "the propagated body image must have one canvas paint"
+        );
+    }
+
+    #[test]
     fn graphical_atomic_boundary_patch_matches_full_appendix_e_paint() {
         let mut dom = Dom::parse_document(
             r#"<body style="margin:0"><section id="box" data-trust-node="42" style="display:flow-root;position:relative;z-index:1;width:240px;height:48px"><span id="label" style="color:red">menu</span></section><p>after</p></body>"#,
