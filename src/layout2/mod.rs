@@ -6462,6 +6462,56 @@ mod tests {
     }
 
     #[test]
+    fn clear_on_float_drops_below_the_entire_previous_shelf() {
+        // CSS 2.2 §9.5.2 adds constraint #10 for a floated box with `clear`:
+        // its outer top must be below every earlier float on the cleared side.
+        // Bootstrap-style album grids rely on this on every sixth child. If
+        // the constraint is ignored, a shorter sixth column leaves room beside
+        // a taller earlier column and produces the site's recurring 6/2/6 rows.
+        let html = r#"
+            <style>
+              #albums { width: 1320px }
+              .album { float: left; width: 220px; height: 100px }
+              #a4 { height: 130px }
+              .album:nth-child(6n + 1) { clear: left }
+            </style>
+            <body style="margin:0"><div id="albums">
+              <div id="a1" class="album"></div><div id="a2" class="album"></div>
+              <div id="a3" class="album"></div><div id="a4" class="album"></div>
+              <div id="a5" class="album"></div><div id="a6" class="album"></div>
+              <div id="a7" class="album"></div><div id="a8" class="album"></div>
+              <div id="a9" class="album"></div><div id="a10" class="album"></div>
+              <div id="a11" class="album"></div><div id="a12" class="album"></div>
+              <div id="a13" class="album"></div>
+            </div></body>
+        "#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 1320.0, &HashMap::new());
+        let rect = |id: &str| {
+            let node = dom.get_by_id(id).unwrap();
+            layout.boxes.get(&node).copied().unwrap_or_else(|| {
+                panic!("missing graphical box for #{id}");
+            })
+        };
+        let a4 = rect("a4");
+        let a7 = rect("a7");
+        let a8 = rect("a8");
+        let a13 = rect("a13");
+        assert!(
+            a7.top >= a4.top + a4.height - 0.01,
+            "clear:left float starts below the tallest previous float: a4={a4:?}, a7={a7:?}"
+        );
+        assert!(
+            (a8.top - a7.top).abs() < 0.01,
+            "the cleared shelf remains a six-column row: a7={a7:?}, a8={a8:?}"
+        );
+        assert!(
+            a13.top >= a7.top + a7.height - 0.01,
+            "the next clear:left float starts below the complete second shelf: a7={a7:?}, a13={a13:?}"
+        );
+    }
+
+    #[test]
     fn left_and_right_float_frame_the_text_between() {
         // A left float and a right float on the same band; text fills the gap
         // between them (§9.5.1 rule 3 — a left float's right edge stays left of

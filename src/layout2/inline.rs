@@ -435,7 +435,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         else {
             return;
         };
-        let (x, y) = fc.place(fb.side, fb.mw, fb.mh, top_min, cb_l, cb_r);
+        let (x, y) = fc.place(fb, top_min, cb_l, cb_r);
         self.placements.push(FloatPlace { index: idx, x, y });
         if leading {
             // The current (empty) line's edges just moved — re-query the band.

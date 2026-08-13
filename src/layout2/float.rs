@@ -173,18 +173,29 @@ impl FloatCtx {
     /// (§9.5.1 rules 2/3/4/5/6/7/8/9): scan the candidate shelf tops (the given
     /// minimum plus every existing float's bottom), and take the first where the
     /// float fits the band left after existing same-side floats and without
-    /// crossing an opposite float. Returns the placed margin-box top-left. When
-    /// nothing fits (a float wider than any open band), it lands at the lowest
-    /// shelf and overflows its containing block as CSS permits.
-    pub fn place(
-        &mut self,
-        side: Side,
-        w: f32,
-        h: f32,
-        top_min: f32,
-        cb_l: f32,
-        cb_r: f32,
-    ) -> (f32, f32) {
+    /// crossing an opposite float. A float's own `clear` adds the §9.5.2
+    /// constraint that its outer top must be below the lowest earlier float on
+    /// the cleared side; this is distinct from clearance on an in-flow block.
+    /// Returns the placed margin-box top-left. When nothing fits (a float wider
+    /// than any open band), it lands at the lowest shelf and overflows its
+    /// containing block as CSS permits.
+    pub fn place(&mut self, float: FloatBox, top_min: f32, cb_l: f32, cb_r: f32) -> (f32, f32) {
+        // CSS 2.2 §9.5.2 adds constraint #10 when `clear` is applied to a
+        // floated box: its top outer edge must be below all earlier floats on
+        // the named side(s). `y` is the margin-box top in this context, so the
+        // existing float bottom is exactly the required lower bound.
+        let clear_min = self.clear_y(float.clear);
+        // Rule 5 also forbids a later float from starting above the outer top
+        // of an earlier float. This matters when a cleared float has moved to
+        // a lower shelf: the following, uncleared float must not backtrack to
+        // an earlier shelf beside the old row.
+        let prior_top = self
+            .lefts
+            .iter()
+            .chain(self.rights.iter())
+            .map(|f| f.y0)
+            .fold(f32::MIN, f32::max);
+        let top_min = top_min.max(clear_min).max(prior_top);
         // Candidate shelf tops: the minimum, plus each float bottom below it
         // (moving down past a float can only widen the band). Sorted ascending
         // and de-duplicated; "as high as possible" takes the first that fits.
@@ -199,26 +210,26 @@ impl FloatCtx {
 
         let mut best_y = top_min;
         for &y in &shelves {
-            let (li, ri) = self.band(y, h);
+            let (li, ri) = self.band(y, float.mh);
             let l = cb_l.max(li);
             let r = cb_r.min(ri);
             best_y = y;
-            if r - l >= w {
-                let x = match side {
+            if r - l >= float.mw {
+                let x = match float.side {
                     Side::Left => l,
-                    Side::Right => r - w,
+                    Side::Right => r - float.mw,
                 };
-                self.push(side, x, y, w, h);
+                self.push(float.side, x, y, float.mw, float.mh);
                 return (x, y);
             }
         }
         // Overflow fallback: the lowest shelf, flush to the containing-block
         // edge (§9.5.1 rule 7 — a float must be as far to the side as possible).
-        let x = match side {
+        let x = match float.side {
             Side::Left => cb_l,
-            Side::Right => (cb_r - w).max(cb_l),
+            Side::Right => (cb_r - float.mw).max(cb_l),
         };
-        self.push(side, x, best_y, w, h);
+        self.push(float.side, x, best_y, float.mw, float.mh);
         (x, best_y)
     }
 
@@ -280,6 +291,7 @@ pub(crate) struct FloatBox {
     pub side: Side,
     pub mw: f32,
     pub mh: f32,
+    pub clear: Clear,
 }
 
 /// A resolved float placement returned from the IFC: which pre-laid float
