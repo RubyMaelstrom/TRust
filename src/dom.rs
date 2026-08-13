@@ -938,6 +938,36 @@ impl Dom {
         attributed.then_some(nodes)
     }
 
+    /// Whether a concrete mutation target can affect rendered boxes or paint.
+    ///
+    /// CSS Display 3 §2/§2.5 says `display:none` omits an element's entire
+    /// subtree from the box tree, so ordinary child-list/text churn below it
+    /// needs no frontend render notification. Attribute and style-transition
+    /// targets remain conservative: the mutation may itself reveal/remove a
+    /// box, or alter a selector subject outside the omitted subtree.
+    ///
+    /// `:has()` and `:empty` can make a content mutation below an omitted box
+    /// change an ancestor or following-sibling selector subject. Suppression is
+    /// disabled when either occurs in the active sheet set; the always-correct
+    /// render path wins over this optimization.
+    ///
+    /// This filters only frontend rendering work. The DOM mutation, epoch,
+    /// JavaScript state, and MutationObserver delivery have already occurred
+    /// and remain observable as required by DOM §4.3.
+    pub fn dirty_target_can_render(&self, node: NodeId, kind: DirtyKind) -> bool {
+        if kind != DirtyKind::Content {
+            return true;
+        }
+        let mut current = Some(node);
+        while let Some(id) = current {
+            if self.subtree_omitted_from_box_tree(id) {
+                return self.style_index().boxless_content_may_escape;
+            }
+            current = self.parent_flat(id);
+        }
+        true
+    }
+
     /// The nearest LIVE scroll-region ancestor (the Tier-1 relayout boundary,
     /// INCREMENTAL_LAYOUT_PLAN.md §4b) a mutation at `node` is confined to —
     /// `None` when none encloses it (the change reaches non-region content ⇒ full
@@ -1942,6 +1972,44 @@ impl Dom {
         // out-of-flow → reserves no space, and paints blank → can't cover the
         // active one). See `paint_suppressed`.
         false
+    }
+
+    /// Whether an authored CSS/HTML state omits this element and all descendants
+    /// from the box tree. Keep this narrower than [`Self::is_hidden`]: UA-hidden
+    /// metadata/resource elements can affect the document outside their own
+    /// boxes, while clipped screen-reader text and other visual suppression
+    /// heuristics are not `display:none` at all.
+    fn subtree_omitted_from_box_tree(&self, id: NodeId) -> bool {
+        let Some(tag) = self.tag_name(id) else {
+            return false;
+        };
+        // These elements can update stylesheet/document/browser state despite
+        // having no principal CSS box (notably `<title>` and sheet-bearing
+        // elements). Never infer render-inertness from their display value.
+        if matches!(
+            tag,
+            "base" | "head" | "link" | "meta" | "script" | "style" | "title"
+        ) {
+            return false;
+        }
+        if self.attr(id, "hidden").is_some()
+            || self.cascaded(id, "display").as_deref() == Some("none")
+        {
+            return true;
+        }
+        // HTML's UA default for a closed dialog is display:none. Preserve the
+        // existing author override behavior until origins are represented in
+        // the cascade proper.
+        if self.tag_name(id) == Some("dialog")
+            && self.attr(id, "open").is_none()
+            && self.cascaded(id, "display").is_none()
+        {
+            return true;
+        }
+        // A non-showing popover is in the UA's display:none state regardless
+        // of a retained inline display declaration; showing state is separate
+        // from the content attribute and author cascade.
+        !self.is_popover_showing(id) && self.attr(id, "popover").is_some()
     }
 
     /// Whether the element's own PAINT is suppressed by an effective
@@ -3187,6 +3255,11 @@ impl Dom {
                 )
             })
             .collect();
+        index.boxless_content_may_escape = index
+            .scopes
+            .values()
+            .flatten()
+            .any(|rule| complex_has_boxless_content_dependency(&rule.selector));
         // Build the rightmost-key buckets so `matched_rules` tests only
         // candidate rules per element instead of the whole scope.
         index.buckets = index
@@ -5463,6 +5536,39 @@ fn compound_uses_has(c: &Compound) -> bool {
             .iter()
             .any(|(g, _)| g.iter().any(|cx| complex_uses_has(&cx.0)))
         || c.host_inner.as_deref().is_some_and(compound_uses_has)
+}
+
+/// Whether changing the child/text content of a boxless element could change a
+/// selector subject outside that element. `:has()` is relational by definition;
+/// `:empty` can escape through a following combinator (`.x:empty + .y`). The
+/// suppression gate is deliberately document-conservative: a false positive
+/// costs a render, while a false negative leaves stale pixels.
+fn complex_has_boxless_content_dependency(complex: &Complex) -> bool {
+    complex
+        .0
+        .iter()
+        .any(|(_, compound)| compound_has_boxless_content_dependency(compound))
+}
+
+fn compound_has_boxless_content_dependency(compound: &Compound) -> bool {
+    !compound.has.is_empty()
+        || compound
+            .structural
+            .iter()
+            .any(|state| matches!(state, Structural::Empty))
+        || compound
+            .nots
+            .iter()
+            .flatten()
+            .any(compound_has_boxless_content_dependency)
+        || compound
+            .selects
+            .iter()
+            .any(|(group, _)| group.iter().any(complex_has_boxless_content_dependency))
+        || compound
+            .host_inner
+            .as_deref()
+            .is_some_and(compound_has_boxless_content_dependency)
 }
 
 /// The outcome of resolving a custom property's value during `var()`
@@ -7931,6 +8037,12 @@ struct StyleIndex {
     /// (rightmost compounds). `set_hover_chain` compares their old/new match
     /// state to attribute invalidation to the subjects that actually changed.
     hover_buckets: FxHashMap<NodeId, RuleBuckets>,
+    /// A child-list/text mutation inside `display:none` can nevertheless
+    /// change a rendered selector subject through `:has()` or through
+    /// `:empty` combined with an outside combinator. Conservatively disable
+    /// boxless-content suppression whenever the active sheet set contains
+    /// either dependency.
+    boxless_content_may_escape: bool,
 }
 
 /// A cheap could-match test for the compound that carries a `:hover` — the
@@ -10945,6 +11057,68 @@ mod tests {
         // A global (unattributed) stylesheet change forces a full relayout.
         dom.set_adopted_styles(DOCUMENT, "div{font-weight:bold}");
         assert_eq!(dom.take_dirty_targets(), None);
+    }
+
+    #[test]
+    fn boxless_subtrees_suppress_only_render_notifications_they_cannot_affect() {
+        // CSS Display 3 §2/§2.5: display:none omits the entire subtree from the
+        // box tree. DOM §4.3 still observes these mutations; this predicate is
+        // consulted only after script and observer delivery, at render emit.
+        let dom = Dom::parse_document(
+            r#"<html><head id=head><title id=title>x</title></head><body>
+               <div id=none style="display:none"><span id=child>x</span></div>
+               <div id=contents style="display:contents"><span id=shown>x</span></div>
+               <div id=visibility style="visibility:hidden"><span id=painted>x</span></div>
+               <p id=visible>x</p></body></html>"#,
+        );
+        let head = dom.get_by_id("head").unwrap();
+        let title = dom.get_by_id("title").unwrap();
+        let none = dom.get_by_id("none").unwrap();
+        let child = dom.get_by_id("child").unwrap();
+        let shown = dom.get_by_id("shown").unwrap();
+        let painted = dom.get_by_id("painted").unwrap();
+        let visible = dom.get_by_id("visible").unwrap();
+
+        assert!(
+            dom.dirty_target_can_render(head, DirtyKind::Content),
+            "UA-hidden metadata can affect styles and document state"
+        );
+        assert!(dom.dirty_target_can_render(title, DirtyKind::Attr));
+        assert!(!dom.dirty_target_can_render(none, DirtyKind::Content));
+        assert!(!dom.dirty_target_can_render(child, DirtyKind::Content));
+        assert!(
+            dom.dirty_target_can_render(child, DirtyKind::Attr),
+            "attribute changes remain conservative"
+        );
+        assert!(
+            dom.dirty_target_can_render(none, DirtyKind::Attr),
+            "an attribute on the omitted element may reveal it"
+        );
+        assert!(
+            dom.dirty_target_can_render(shown, DirtyKind::Content),
+            "display:contents hoists descendants rather than omitting them"
+        );
+        assert!(
+            dom.dirty_target_can_render(painted, DirtyKind::Content),
+            "visibility:hidden retains boxes and can be cleared by a descendant"
+        );
+        assert!(dom.dirty_target_can_render(visible, DirtyKind::Content));
+    }
+
+    #[test]
+    fn relational_selectors_disable_boxless_content_suppression() {
+        // Selectors 4 §4.5/§14.2: content below a boxless element can still
+        // change an outside subject through :has() or :empty + a combinator.
+        let dom = Dom::parse_document(
+            r#"<head><style>
+               body:has(#hidden .new) #a { color:red }
+               #hidden:empty + #b { color:blue }
+               </style></head><body>
+               <div id=hidden style="display:none"></div><p id=b>b</p><p id=a>a</p>
+               </body>"#,
+        );
+        let hidden = dom.get_by_id("hidden").unwrap();
+        assert!(dom.dirty_target_can_render(hidden, DirtyKind::Content));
     }
 
     #[test]

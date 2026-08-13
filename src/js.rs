@@ -10249,6 +10249,23 @@ fn emit_dirty_render(
             return None;
         }
     }
+    // CSS Display 3 §2/§2.5: a `display:none` element and its descendants
+    // generate no boxes. Preserve every DOM mutation and MutationObserver
+    // delivery, but do not serialize, lay out, or paint a cycle whose remaining
+    // concrete targets are all trapped beneath such an omitted subtree. A later
+    // revealing mutation targets the omitted element itself and remains
+    // conservative, so its complete current contents render at that point.
+    if let Some(ts) = targets.as_mut() {
+        let dom = page.dom.borrow();
+        ts.retain(|(node, kind)| dom.dirty_target_can_render(*node, *kind));
+        if ts.is_empty() {
+            drop(dom);
+            if diag_patch() {
+                eprintln!("DIAGPATCH INERT all targets outside the box tree");
+            }
+            return None;
+        }
+    }
     // Paint-relevance filter (INCREMENTAL_LAYOUT_PLAN.md): drop ATTR mutations
     // that cannot change a single painted cell — an out-of-flow subtree that
     // paints nothing (Twitch's decorative `highlight__progress-bar` animates its
@@ -28737,6 +28754,66 @@ mod tests {
         ];
         assert!(retain_connected_dirty_targets(&dom, &mut mixed));
         assert_eq!(mixed, vec![(live, crate::dom::DirtyKind::Attr)]);
+    }
+
+    #[test]
+    fn boxless_mutation_notifies_observers_without_rendering_until_revealed() {
+        // DOM mutations and MutationObserver delivery remain complete inside a
+        // display:none subtree. CSS Display only lets us suppress the frontend
+        // render notification; revealing the subtree must expose the fully
+        // updated DOM, including the observer's work.
+        let (handle, mut events) = live(
+            r#"<body>
+               <button id=mutate>mutate</button><button id=reveal>reveal</button>
+               <div id=hidden style="display:none"><span id=target>old</span></div>
+               <script>
+               var hidden = document.getElementById('hidden');
+               var target = document.getElementById('target');
+               new MutationObserver(function () {
+                   target.setAttribute('data-observed', 'yes');
+               }).observe(target, {childList:true, subtree:true, characterData:true});
+               document.getElementById('mutate').addEventListener('click', function () {
+                   target.textContent = 'new';
+               });
+               document.getElementById('reveal').addEventListener('click', function () {
+                   hidden.style.display = 'block';
+               });
+               </script></body>"#,
+        );
+        let html = match events.blocking_recv() {
+            Some(PageEvt::Updated { html, .. }) => html,
+            other => panic!("expected initial live render, got {other:?}"),
+        };
+        assert!(
+            !html.contains("id=\"target\""),
+            "hidden subtree leaked: {html}"
+        );
+        let ids: Vec<usize> = html
+            .split("x-trust-js:")
+            .skip(1)
+            .map(|tail| tail.split(':').next().unwrap().parse().unwrap())
+            .collect();
+        assert!(ids.len() >= 2, "mutate/reveal click markers: {html}");
+
+        handle.cmds.blocking_send(PageCmd::Click(ids[0])).unwrap();
+        match events.blocking_recv() {
+            Some(PageEvt::Settled) => {}
+            other => panic!("boxless mutation must not render, got {other:?}"),
+        }
+
+        handle.cmds.blocking_send(PageCmd::Click(ids[1])).unwrap();
+        let html = match events.blocking_recv() {
+            Some(PageEvt::Updated { html, .. }) => html,
+            other => panic!("revealing mutation must render, got {other:?}"),
+        };
+        assert!(
+            html.contains(">new</span>"),
+            "updated hidden content lost: {html}"
+        );
+        assert!(
+            html.contains("data-observed=\"yes\""),
+            "MutationObserver did not run before suppression: {html}"
+        );
     }
 
     #[test]
