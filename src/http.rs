@@ -1758,10 +1758,30 @@ pub async fn execute_js_for_device(
         return response;
     }
     let html = decode_body(&response.content_type, &response.body);
-    // Cheap pre-filter: no script tag, no engine spin-up — but still bake the
-    // page's CSS so a script-less page lays out per its stylesheets.
+    // Keep the cheap CSS-only path for inert documents, but do not classify a
+    // script-less document that uses `:hover` as inert. Selectors 4 §9.1
+    // requires that user-action pseudo-class to track the pointing device even
+    // when there is no author script. The resident page actor already owns the
+    // canonical DOM and its incremental hover invalidation; the old shortcut
+    // dropped that actor before desktop/terminal hit testing could dispatch a
+    // hover, leaving links permanently at their rest color.
+    let mut prefetched_sheets = None;
     if !html.to_ascii_lowercase().contains("<script") {
-        return css_only(response, viewport, cell_px).await;
+        let sheets = fetch_page_sheets(&html, &response.url).await;
+        let has_rendering_hover = {
+            let mut probe = crate::js::css_prepare(&html, viewport, cell_px);
+            probe.attach_external_sheets(&sheets);
+            probe.hover_css_affects_rendering()
+        };
+        if !has_rendering_hover {
+            return css_only_with_sheets(response, viewport, cell_px, sheets).await;
+        }
+        // The actor needs the fetched sheets, and re-fetching them here would
+        // add latency precisely on a first-paint interaction path. Leave the
+        // original HTML untouched (the actor's DOM/frame lifecycle remains the
+        // source of truth); script-less iframe loading retains its established
+        // CSS-only behavior when no hover state is present.
+        prefetched_sheets = Some(sheets);
     }
     // All subresources — classic scripts, stylesheets, and the module
     // graph the page announces up front (modulepreload + module entry
@@ -1772,23 +1792,25 @@ pub async fn execute_js_for_device(
         Sheet,
         Preload,
     }
-    let jobs: Vec<(Kind, String)> = crate::js::external_scripts(&html)
+    let mut jobs: Vec<(Kind, String)> = crate::js::external_scripts(&html)
         .into_iter()
         .take(MAX_PAGE_SCRIPTS)
         .map(|s| (Kind::Script, s))
-        .chain(
+        .collect();
+    if prefetched_sheets.is_none() {
+        jobs.extend(
             crate::js::external_stylesheets(&html)
                 .into_iter()
                 .take(MAX_PAGE_SHEETS)
                 .map(|s| (Kind::Sheet, s)),
-        )
-        .chain(
-            crate::js::module_preloads(&html)
-                .into_iter()
-                .take(MAX_PAGE_PRELOADS)
-                .map(|s| (Kind::Preload, s)),
-        )
-        .collect();
+        );
+    }
+    jobs.extend(
+        crate::js::module_preloads(&html)
+            .into_iter()
+            .take(MAX_PAGE_PRELOADS)
+            .map(|s| (Kind::Preload, s)),
+    );
     if std::env::var_os("TRUST_NET_TRACE").is_some() {
         eprintln!(
             "js : @{:>6}ms prefetch start ({} subresources)",
@@ -1836,7 +1858,7 @@ pub async fn execute_js_for_device(
     // share it from here on (no chunk is downloaded twice).
     let cache = std::sync::Arc::new(PageCache::default());
     let mut externals = Vec::new();
-    let mut sheets = Vec::new();
+    let mut sheets = prefetched_sheets.unwrap_or_default();
     for (kind, raw, resolved, resp) in results {
         match kind {
             Kind::Script => {
@@ -2030,11 +2052,7 @@ async fn fetch_page_sheets(html: &str, base: &Url) -> Vec<(String, String)> {
 /// every page JS won't transform — no `<script>`, `set js off`, and the
 /// `execute_js` load-timeout/early-exit fallback — so the page still lays out
 /// per its own CSS instead of UA defaults (see `crate::js::css_bake`).
-pub async fn css_only(
-    mut response: Response,
-    viewport: (u16, u16),
-    cell_px: (u16, u16),
-) -> Response {
+pub async fn css_only(response: Response, viewport: (u16, u16), cell_px: (u16, u16)) -> Response {
     let media = response
         .content_type
         .split(';')
@@ -2047,6 +2065,20 @@ pub async fn css_only(
     }
     let html = decode_body(&response.content_type, &response.body);
     let sheets = fetch_page_sheets(&html, &response.url).await;
+    css_only_with_sheets(response, viewport, cell_px, sheets).await
+}
+
+/// Complete the script-less CSS path after its stylesheet fetches are already
+/// available. Keeping this separate lets a CSS-only page that contains a
+/// render-affecting `:hover` rule promote to the resident actor without
+/// downloading every stylesheet a second time.
+async fn css_only_with_sheets(
+    mut response: Response,
+    viewport: (u16, u16),
+    cell_px: (u16, u16),
+    sheets: Vec<(String, String)>,
+) -> Response {
+    let html = decode_body(&response.content_type, &response.body);
     fetch_svg_sprite_sheets(&html, &response.url).await;
     // The frame documents are fetched up front into a url→content map (Dom is
     // not `Send`, so it must never cross an `.await`), then installed into the
@@ -4011,6 +4043,78 @@ mod tests {
             "relative link not resolved against the frame url: {body}"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn scriptless_css_hover_keeps_a_live_page_for_pointer_restyle() {
+        // A stylesheet-only document still has observable user-action state.
+        // It must not take the inert css_only shortcut, otherwise `a:hover`
+        // can never receive the pointer transition.
+        let url = parse_url("https://example.test/").unwrap();
+        let response = Response {
+            url,
+            status: 200,
+            content_type: String::from("text/html"),
+            headers: Vec::new(),
+            body: br#"<html><head><style>
+                a { color: #ff6666 }
+                a:hover { color: #ff8888 }
+            </style></head><body><a href="/post">post</a></body></html>"#
+                .to_vec(),
+            js: None,
+            blobs: None,
+            live: None,
+            challenge: None,
+            from_post: false,
+        };
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let initial = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(
+            response.live.is_some(),
+            "CSS hover page became static: {initial}"
+        );
+        assert!(
+            initial.contains("color:#ff6666"),
+            "initial link color: {initial}"
+        );
+        let mut live = response.live.take().unwrap();
+        let marker = initial
+            .split("data-trust-hover=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert!(live.handle.send_hover(Some(marker), 4.0, 8.0));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut hovered = None;
+        while tokio::time::Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, live.events.recv()).await {
+                Ok(Some(crate::js::PageEvt::Patched { patches, .. })) => {
+                    if patches
+                        .iter()
+                        .any(|patch| patch.html.contains("color:#ff8888"))
+                    {
+                        hovered = Some(true);
+                        break;
+                    }
+                }
+                Ok(Some(crate::js::PageEvt::Updated { html, .. })) => {
+                    if html.contains("color:#ff8888") {
+                        hovered = Some(true);
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        assert_eq!(
+            hovered,
+            Some(true),
+            "hover color never reached the live page"
+        );
     }
 
     // Parallel parse (Step 5a): TWO external classic scripts trip the parse

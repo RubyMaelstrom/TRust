@@ -13214,6 +13214,37 @@ mod tests {
     }
 
     #[test]
+    fn hover_bakes_external_style_color_for_graphical_snapshot() {
+        // Ruby's House uses an external sheet with an inherited body color,
+        // a link color, and a paint-only a:hover color.  A native presentation
+        // DOM has no live stylesheet actor, so the live serializer must bake
+        // the winning color for both states into the snapshot.
+        let mut dom = Dom::parse_document(
+            "<head><link rel=stylesheet href=style.css></head>\
+             <body><ul><li><a id=l href=/post>post</a></li></ul></body>",
+        );
+        let link = dom.get_by_id("l").unwrap();
+        dom.attach_external_sheets(&[(
+            String::from("style.css"),
+            String::from(
+                "body{color:black}a{color:#FF6666;font-weight:bold}a:hover{color:#FF8888}",
+            ),
+        )]);
+        let idle = dom.serialize_live(DOCUMENT, &std::collections::HashSet::new());
+        assert!(idle.contains("color:#ff6666"), "idle link color: {idle}");
+        assert!(dom.set_hover_chain(Some(link)));
+        let hovered = dom.serialize_live(DOCUMENT, &std::collections::HashSet::new());
+        assert!(
+            hovered.contains("color:#ff8888"),
+            "hovered link color: {hovered}"
+        );
+        assert!(
+            !hovered.contains("color:#ff6666"),
+            "stale link color: {hovered}"
+        );
+    }
+
+    #[test]
     fn hover_invalidation_names_changed_selector_subjects() {
         let mut dom = Dom::parse_document(
             "<head><style>\
