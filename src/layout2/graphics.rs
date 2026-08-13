@@ -292,10 +292,12 @@ pub(super) fn paint(
     Vec<super::GraphicalBoundary>,
 ) {
     let mut builder = Builder::new(dom, base, images, root, fixed, top_layer, flow_bottom);
-    // CSS Backgrounds 3 §2.11.1: the root background becomes the canvas
-    // background. Its image positioning area is still the root box, but its
-    // painting area is the complete canvas, including the margins around a
-    // centered body and any viewport space below the document.
+    // CSS Backgrounds 3 §§2.11.1–2: the root background becomes the canvas
+    // background. For HTML, when the root has its initial transparent/none
+    // background, the first BODY child's computed background is propagated to
+    // the canvas instead. Its image positioning area remains the root box,
+    // while its painting area is the complete canvas, including the margins
+    // around a centered body and any viewport space below the document.
     let root_background = if root.node != NO_NODE && dom.document_element() == Some(root.node) {
         let canvas = CssRect::new(
             0.0,
@@ -303,8 +305,15 @@ pub(super) fn paint(
             viewport_w.max(root.x + root.w).max(1.0),
             viewport_h.max(flow_bottom).max(root.max_bottom()).max(1.0),
         );
-        paint_background_images(root, PaintShape::Rect(canvas), &mut builder, Some(canvas));
-        background_color(dom, root.node).filter(|color| !color.is_transparent())
+        let style_node = canvas_background_node(dom, root.node);
+        paint_background_images_for_node(
+            root,
+            style_node,
+            PaintShape::Rect(canvas),
+            &mut builder,
+            Some(canvas),
+        );
+        background_color(dom, style_node).filter(|color| !color.is_transparent())
     } else {
         None
     };
@@ -554,7 +563,11 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
         let shape = rounded_shape(rect, radii);
         paint_box_shadows(builder.dom, fragment.node, &shape, builder);
         let is_root = builder.dom.document_element() == Some(fragment.node);
-        if !is_root {
+        let is_canvas_body = builder
+            .dom
+            .document_element()
+            .is_some_and(|root| canvas_background_node(builder.dom, root) == fragment.node);
+        if !is_root && !is_canvas_body {
             if let Some(color) = background_color(builder.dom, fragment.node)
                 && !color.is_transparent()
             {
@@ -790,10 +803,42 @@ fn paint_background_images(
     builder: &mut Builder<'_>,
     canvas: Option<CssRect>,
 ) {
-    let Some(value) = builder
-        .dom
-        .computed_value(fragment.node, "background-image")
-    else {
+    paint_background_images_for_node(fragment, fragment.node, shape, builder, canvas);
+}
+
+/// Return the element whose computed background is propagated to the canvas.
+///
+/// CSS Backgrounds 3 §2.11.2 gives HTML a special case: if the root's
+/// `background-image` is `none` and its `background-color` is transparent, the
+/// first direct `body` child supplies the canvas background. The body's used
+/// background values are then treated as if they were specified on the root;
+/// callers therefore use the root fragment for geometry while reading style
+/// from this returned node.
+fn canvas_background_node(dom: &Dom, root: NodeId) -> NodeId {
+    let root_image = dom
+        .computed_value(root, "background-image")
+        .is_some_and(|value| !value.trim().eq_ignore_ascii_case("none"));
+    let root_color = background_color(dom, root);
+    if root_image || root_color.is_some_and(|color| !color.is_transparent()) {
+        return root;
+    }
+    dom.children(root)
+        .into_iter()
+        .find(|&child| {
+            dom.tag_name(child) == Some("body")
+                && dom.computed_value(child, "display").as_deref() != Some("none")
+        })
+        .unwrap_or(root)
+}
+
+fn paint_background_images_for_node(
+    fragment: &Frag<'_>,
+    style_node: NodeId,
+    shape: PaintShape,
+    builder: &mut Builder<'_>,
+    canvas: Option<CssRect>,
+) {
+    let Some(value) = builder.dom.computed_value(style_node, "background-image") else {
         return;
     };
     let border_box = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
@@ -801,25 +846,25 @@ fn paint_background_images(
     let content_box = content_box_with_style(builder.dom, fragment, padding_box);
     let clip_value = builder
         .dom
-        .computed_value(fragment.node, "background-clip")
+        .computed_value(style_node, "background-clip")
         .unwrap_or_else(|| "border-box".into());
     let origin_value = builder
         .dom
-        .computed_value(fragment.node, "background-origin")
+        .computed_value(style_node, "background-origin")
         .unwrap_or_else(|| "padding-box".into());
     let clip_layers = split_top_level(&clip_value, ',');
     let origin_layers = split_top_level(&origin_value, ',');
     let repeat_value = builder
         .dom
-        .computed_value(fragment.node, "background-repeat")
+        .computed_value(style_node, "background-repeat")
         .unwrap_or_else(|| "repeat".into());
     let position_value = builder
         .dom
-        .computed_value(fragment.node, "background-position")
+        .computed_value(style_node, "background-position")
         .unwrap_or_else(|| "0% 0%".into());
     let size_value = builder
         .dom
-        .computed_value(fragment.node, "background-size")
+        .computed_value(style_node, "background-size")
         .unwrap_or_else(|| "auto auto".into());
     let repeat_layers = split_top_level(&repeat_value, ',');
     let position_layers = split_top_level(&position_value, ',');
@@ -884,7 +929,7 @@ fn paint_background_images(
                 paint_spaced_background(
                     builder,
                     clip,
-                    fragment.node,
+                    style_node,
                     handle,
                     positioning,
                     (tile_w, tile_h),
@@ -937,7 +982,7 @@ fn paint_background_images(
                         fit: ImageFit::None,
                         sampling: ImageSampling::Smooth,
                         clip: None,
-                        node: fragment.node,
+                        node: style_node,
                         link: None,
                     });
                     if !x_repeat {
