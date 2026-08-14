@@ -5267,6 +5267,75 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn an_injected_external_module_is_fetched_evaluated_and_fires_load() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req);
+                    let reply: Vec<u8> = if text.starts_with("GET /page ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                          <body><pre id=out>before</pre><script>\
+                          var s=document.createElement('script');\
+                          s.type='module'; s.src='/gallery.js';\
+                          s.onload=function(){document.body.setAttribute('data-module-load','yes');};\
+                          s.onerror=function(){document.body.setAttribute('data-module-load','no');};\
+                          document.body.appendChild(s);\
+                          </script></body>"
+                            .to_vec()
+                    } else if text.starts_with("GET /gallery.js ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n\
+                          document.getElementById('out').textContent='module-ran'; export {};"
+                            .to_vec()
+                    } else {
+                        b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n".to_vec()
+                    };
+                    let _ = sock.write_all(&reply).await;
+                });
+            }
+        });
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        if !body.contains("module-ran") {
+            if let Some(live) = response.live.as_mut() {
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(5), live.events.recv()).await {
+                        Ok(Some(crate::js::PageEvt::Updated { html, .. }))
+                        | Ok(Some(crate::js::PageEvt::Static { html, .. })) => {
+                            body = html;
+                            if body.contains("module-ran") {
+                                break;
+                            }
+                        }
+                        other => panic!("expected injected module render, got {other:?}"),
+                    }
+                }
+            }
+        }
+        assert!(body.contains("module-ran"), "external module ran: {body}");
+        assert!(
+            body.contains(r#"data-module-load="yes""#),
+            "module load fired: {body}"
+        );
+        server.abort();
+    }
+
     // A dynamically injected `<script src>` whose fetch returns a NON-OK status
     // (a 404'd webpack chunk, served — as CDNs do — with an HTML error page)
     // must fire `error`, NOT execute its body. Running the 404 HTML as JS was a

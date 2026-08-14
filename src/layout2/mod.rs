@@ -5898,6 +5898,78 @@ mod tests {
     }
 
     #[test]
+    fn nested_carousel_slot_keeps_gallery_pages_in_one_contained_viewport() {
+        // HTML §4.12.4's flattened slot assignment is what keeps a gallery's
+        // light-DOM pages inside the nested faceplate carousel viewport. This
+        // mirrors Reddit's gallery-carousel → faceplate-carousel forwarding
+        // chain: three portrait pages must share one 700×540 viewport instead
+        // of becoming three normal-flow blocks and tripling the post height.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><x-gallery id="gallery" style="display:block;width:700px;height:540px;overflow:hidden"><ul style="display:flex;width:100%;height:100%;margin:0;padding:0"><li slot="page-1" style="display:flex;flex:0 0 100%;width:100%;height:100%;justify-content:center"><img id="one" src="one.jpg" width="3024" height="4032" style="width:100%;height:100%;object-fit:contain"></li><li slot="page-2" style="display:flex;flex:0 0 100%;width:100%;height:100%;justify-content:center"><img id="two" src="two.jpg" width="3024" height="4032" style="width:100%;height:100%;object-fit:contain"></li><li slot="page-3" style="display:flex;flex:0 0 100%;width:100%;height:100%;justify-content:center"><img id="three" src="three.jpg" width="3024" height="4032" style="width:100%;height:100%;object-fit:contain"></li></ul></x-gallery></body>"#,
+        );
+        let gallery = node_by_id(&dom, "gallery");
+        let gallery_shadow = dom.attach_shadow(gallery);
+        let wrapper = dom.create_element("div");
+        dom.set_attr(
+            wrapper,
+            "style",
+            "display:block;width:100%;height:100%;position:relative",
+        );
+        dom.append(gallery_shadow, wrapper);
+        let faceplate = dom.create_element("faceplate-carousel");
+        dom.set_attr(
+            faceplate,
+            "style",
+            "display:flex;position:relative;width:inherit;max-height:540px",
+        );
+        dom.append(wrapper, faceplate);
+        let gallery_slot = dom.create_element("slot");
+        dom.append(faceplate, gallery_slot);
+        let faceplate_shadow = dom.attach_shadow(faceplate);
+        let container = dom.create_element("div");
+        dom.set_attr(
+            container,
+            "style",
+            "display:flex;height:auto;align-items:center;position:relative;width:100%",
+        );
+        dom.append(faceplate_shadow, container);
+        let window = dom.create_element("div");
+        dom.set_attr(
+            window,
+            "style",
+            "position:relative;overflow:hidden;display:flex;flex-direction:column;height:100%;flex:1",
+        );
+        dom.append(container, window);
+        let list = dom.create_element("div");
+        dom.set_attr(
+            list,
+            "style",
+            "height:100%;overflow:hidden;position:relative",
+        );
+        dom.append(window, list);
+        let faceplate_slot = dom.create_element("slot");
+        dom.append(list, faceplate_slot);
+
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(700.0, 540.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let gallery_box = layout.boxes.get(&gallery).expect("gallery box");
+        assert!((gallery_box.height - 540.0).abs() < 0.01, "{gallery_box:?}");
+        for id in ["one", "two", "three"] {
+            let image = node_by_id(&dom, id);
+            let rect = layout.boxes.get(&image).expect("slotted image box");
+            assert!((rect.height - 540.0).abs() < 0.01, "{id}: {rect:?}");
+            assert!((rect.width - 700.0).abs() < 0.01, "{id}: {rect:?}");
+        }
+    }
+
+    #[test]
     fn outer_shadow_context_fixes_nested_tile_height_and_stretches_icon_inside() {
         // Archive.org's exact nested-component pattern: the outer shadow tree
         // fixes the custom-element card at 60px; its inner :host rule supplies
