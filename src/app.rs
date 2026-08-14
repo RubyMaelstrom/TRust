@@ -2735,10 +2735,12 @@ impl App {
                     body.into_bytes(),
                 )),
                 headers: Vec::new(),
+                fetch_metadata: None,
             };
             if let Some(page) = &referrer {
                 http::set_referrer(&mut request, page);
             }
+            http::set_navigation_metadata(&mut request, referrer.as_ref());
             let result = match http::fetch(&request).await {
                 Ok(response) => Ok(Payload::Http(Box::new(if js_on {
                     http::execute_js(response, viewport, cell_px, storage).await
@@ -7471,6 +7473,7 @@ async fn load_one_image(
     // and most boorus, plenty of others) hotlink-protect and 302/403 a
     // refererless request to a placeholder instead of the file.
     let mut req = http::Request::get(parsed);
+    http::set_image_accept(&mut req);
     http::set_referrer(&mut req, page);
     let resp = http::fetch(&req).await.ok()?;
     if resp.status != 200 || resp.body.is_empty() {

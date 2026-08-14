@@ -264,6 +264,9 @@ async fn handshake(
         ua = crate::http::USER_AGENT,
         accept_language = crate::locale::ACCEPT_LANGUAGE,
     );
+    if crate::http::GLOBAL_PRIVACY_CONTROL {
+        req.push_str("Sec-GPC: 1\r\n");
+    }
     if let Some(c) = cookie.filter(|c| !c.is_empty()) {
         req.push_str(&format!("Cookie: {c}\r\n"));
     }
@@ -538,6 +541,11 @@ mod tests {
             "WebSocket Fetch handshake omitted the language preference: {head}"
         );
         assert_eq!(head.matches("Accept-Language:").count(), 1);
+        assert!(
+            head.contains("Sec-GPC: 1\r\n"),
+            "WebSocket HTTP handshake omitted the GPC preference: {head}"
+        );
+        assert_eq!(head.matches("Sec-GPC:").count(), 1);
         server.await.unwrap();
     }
 }

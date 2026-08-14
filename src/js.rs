@@ -3490,6 +3490,7 @@ fn page_net_prepare(
         url: resolved,
         body,
         headers,
+        fetch_metadata: None,
     };
     // A document-initiated request carries the page's Referer (browser
     // default policy) unless the page set one itself.
@@ -6632,7 +6633,7 @@ fn load_page(
     // CSS-pixel viewport from the real terminal: cols/rows times the
     // terminal's cell pixel size (the picker's font size; 8x16 nominal).
     let cfg = format!(
-        "globalThis.__trust_cfg = {{ url: \"{}\", ua: \"TRust/0.1\", language: \"{}\", languages: [\"{}\", \"{}\"], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {} }};",
+        "globalThis.__trust_cfg = {{ url: \"{}\", ua: \"TRust/0.1\", language: \"{}\", languages: [\"{}\", \"{}\"], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {} }};",
         esc_js(page_url),
         crate::locale::LANGUAGE,
         crate::locale::LANGUAGES[0],
@@ -6645,6 +6646,7 @@ fn load_page(
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8),
+        crate::http::GLOBAL_PRIVACY_CONTROL,
     );
     // TRust lazy parsing (default on; `TRUST_NO_LAZY_PARSE` disables): enable
     // body-skip-at-parse and deferred compilation on this page thread before any
@@ -8013,11 +8015,17 @@ const WORKER_SCOPE: &str = r##"
     // WHATWG HTML §NavigatorLanguage: languages is a stable FrozenArray and
     // language is its first (most-preferred) entry.
     var navigatorLanguages = Object.freeze((cfg.languages || ["en-US", "en"]).slice());
+    // GPC §3.2–§3.4: WorkerNavigator exposes the same top-level preference.
+    var navigatorGpc = cfg.globalPrivacyControl !== false;
     g.navigator = {
         userAgent: "TRust/0.1", appName: "Netscape", appCodeName: "Mozilla", product: "Gecko", productSub: "20100101",
         platform: "Linux", vendor: "", vendorSub: "", language: cfg.language || navigatorLanguages[0], languages: navigatorLanguages, onLine: true,
         hardwareConcurrency: cfg.hwc || 8, maxTouchPoints: 0
     };
+    Object.defineProperty(g.navigator, "globalPrivacyControl", {
+        configurable: true, enumerable: true,
+        get: function () { return navigatorGpc; }
+    });
 
     // --- atob / btoa ---
     var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -8328,7 +8336,7 @@ fn run_worker(
     }
     let mut outcome = Outcome::default();
     let cfg = format!(
-        "globalThis.__worker_cfg = {{ id: {id}, name: {}, url: {}, language: \"{}\", languages: [\"{}\", \"{}\"], hwc: {} }};",
+        "globalThis.__worker_cfg = {{ id: {id}, name: {}, url: {}, language: \"{}\", languages: [\"{}\", \"{}\"], hwc: {}, globalPrivacyControl: {} }};",
         js_string(&name),
         js_string(script_url.as_str()),
         crate::locale::LANGUAGE,
@@ -8340,6 +8348,7 @@ fn run_worker(
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(8),
+        crate::http::GLOBAL_PRIVACY_CONTROL,
     );
     run_script(
         &mut ctx,
@@ -15687,6 +15696,10 @@ const PRELUDE: &str = r##"
     // WHATWG HTML §NavigatorLanguage: languages is a stable FrozenArray and
     // language is its first (most-preferred) entry.
     const navigatorLanguages = Object.freeze((cfg.languages || ["en-US", "en"]).slice());
+    // GPC §3.2–§3.4: cache the user preference for this top-level navigation;
+    // the read-only DOM property must agree with the Sec-GPC header sent by
+    // the user agent for that navigation.
+    const navigatorGpc = cfg.globalPrivacyControl !== false;
     g.navigator = {
         // Real browsers report a region-qualified BCP-47 tag (Chrome/Firefox
         // default to "en-US"), not a bare "en". Language detectors key off
@@ -15747,6 +15760,10 @@ const PRELUDE: &str = r##"
             },
         },
     };
+    Object.defineProperty(g.navigator, "globalPrivacyControl", {
+        configurable: true, enumerable: true,
+        get() { return navigatorGpc; },
+    });
     g.screen = { width: cfg.width, height: cfg.height, availWidth: cfg.width, availHeight: cfg.height, colorDepth: 24, pixelDepth: 24 };
     g.innerWidth = cfg.width; g.innerHeight = cfg.height;
     g.outerWidth = cfg.width; g.outerHeight = cfg.height;
@@ -33189,6 +33206,29 @@ mod tests {
         assert!(
             out.contains("true true true true true true"),
             "locale surfaces disagree: {out}"
+        );
+    }
+
+    #[test]
+    fn global_privacy_control_is_enabled_and_read_only() {
+        // W3C GPC §3.3–§3.4: the DOM preference is the boolean counterpart of
+        // the user-agent's `Sec-GPC: 1` signal and cannot be changed by page
+        // script.
+        let (out, outcome) = page(
+            r#"<body><pre id=o></pre><script>
+            const before = navigator.globalPrivacyControl;
+            navigator.globalPrivacyControl = false;
+            document.getElementById('o').textContent = [
+                before === true,
+                navigator.globalPrivacyControl === true,
+                Object.getOwnPropertyDescriptor(navigator, 'globalPrivacyControl').set === undefined,
+            ].join(' ');
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("true true true"),
+            "GPC DOM preference is not stable: {out}"
         );
     }
 

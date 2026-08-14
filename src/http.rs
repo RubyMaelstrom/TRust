@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt as _;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use url::Url;
+use url::{Host, Url};
 
 use crate::doc::{Doc, DocLine, Field, FieldKind, Form, FormMethod, Kind, Link};
 use crate::tls;
@@ -38,6 +38,19 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_REDIRECTS: usize = 10;
 pub(crate) const USER_AGENT: &str = "TRust/0.1";
 
+/// Global Privacy Control is enabled for this user agent. The W3C GPC
+/// specification (§3.1–§3.3) requires the opt-out signal to be expressed on
+/// every HTTP request when enabled, while JavaScript observes the same choice
+/// through `navigator.globalPrivacyControl`.
+pub(crate) const GLOBAL_PRIVACY_CONTROL: bool = true;
+
+/// Fetch's default `Accept` value for requests whose destination is `image`.
+/// Keep this separate from the document default used by [`exchange`]: an
+/// image request must advertise an image destination so content-negotiating
+/// CDNs return image bytes rather than an HTML fallback. (Fetch Standard,
+/// "HTTP-network-or-cache fetch", step 5.)
+pub const IMAGE_ACCEPT: &str = "image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5";
+
 /// An HTTP request as the app sees it: method plus optional body.
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -50,6 +63,24 @@ pub struct Request {
     /// `Accept`, etc. Managed headers (Host/Cookie/Content-Length/…) are NOT
     /// taken from here; see `exchange`. Empty for normal navigations.
     pub headers: Vec<(String, String)>,
+    /// User-agent-owned Fetch Metadata context. It is kept apart from the
+    /// page header list so JavaScript cannot forge `Sec-Fetch-*` values.
+    pub(crate) fetch_metadata: Option<FetchMetadata>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FetchSite {
+    None,
+    SameOrigin,
+    CrossSite,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FetchMetadata {
+    pub(crate) destination: &'static str,
+    pub(crate) mode: &'static str,
+    pub(crate) site: FetchSite,
+    pub(crate) user_activation: bool,
 }
 
 impl Request {
@@ -59,6 +90,7 @@ impl Request {
             url,
             body: None,
             headers: Vec::new(),
+            fetch_metadata: None,
         }
     }
 }
@@ -331,6 +363,7 @@ pub async fn fetch_graphical_image(page: &Url, source: &str) -> Result<Vec<u8>, 
         ));
     }
     let mut request = Request::get(url);
+    set_image_accept(&mut request);
     set_referrer(&mut request, page);
     fetch(&request).await.map(|response| response.body)
 }
@@ -610,7 +643,22 @@ pub fn parse_url(s: &str) -> Option<Url> {
 /// connection-level `Err` triggers the retry, and if the retry also fails
 /// the ORIGINAL https error is reported.
 pub async fn fetch_web_default(url: &Url) -> Result<Response, String> {
-    let first = fetch(&Request::get(url.clone())).await;
+    fetch_web_default_with_referrer(url, None).await
+}
+
+/// Variant of [`fetch_web_default`] for a link activated from an existing
+/// document. Keeping the referrer in this adapter means both the HTTPS
+/// attempt and its HTTP fallback carry the same navigation context.
+pub async fn fetch_web_default_with_referrer(
+    url: &Url,
+    referrer: Option<&Url>,
+) -> Result<Response, String> {
+    let mut first_request = Request::get(url.clone());
+    set_navigation_metadata(&mut first_request, referrer);
+    if let Some(source) = referrer {
+        set_referrer(&mut first_request, source);
+    }
+    let first = fetch(&first_request).await;
     if first.is_ok() || url.scheme() != "https" {
         return first;
     }
@@ -618,7 +666,12 @@ pub async fn fetch_web_default(url: &Url) -> Result<Response, String> {
     let Some(http_url) = parse_url(&http_str) else {
         return first;
     };
-    match fetch(&Request::get(http_url)).await {
+    let mut fallback_request = Request::get(http_url);
+    set_navigation_metadata(&mut fallback_request, referrer);
+    if let Some(source) = referrer {
+        set_referrer(&mut fallback_request, source);
+    }
+    match fetch(&fallback_request).await {
         Ok(response) => Ok(response),
         Err(_) => first,
     }
@@ -689,6 +742,7 @@ async fn fetch_redirecting(request: &Request) -> Result<Response, String> {
             "http" | "https" => {}
             other => return Err(format!("redirect leaves the web: {other}://")),
         }
+        update_navigation_metadata_for_redirect(&mut request, &target);
         // Referrer policy is per hop: re-evaluate the carried `Referer` against
         // the new target the way a browser does — never leak an https URL onto
         // an http (downgraded) hop, reduce a cross-origin hop to an origin.
@@ -1189,6 +1243,12 @@ async fn exchange(
         "cookie",
         "accept-encoding",
         "accept-language",
+        "sec-gpc",
+        "sec-fetch-dest",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-user",
+        "upgrade-insecure-requests",
     ];
     let page_accept = request
         .headers
@@ -1217,6 +1277,36 @@ async fn exchange(
         page_accept.unwrap_or("text/html, text/*;q=0.8, */*;q=0.1"),
         page_accept_language.unwrap_or(crate::locale::ACCEPT_LANGUAGE),
     );
+    if GLOBAL_PRIVACY_CONTROL {
+        // GPC §3.3: the field value is exactly the single character `1`.
+        // It is user-agent-owned, so a page-supplied Sec-GPC is filtered by
+        // MANAGED below and can neither override nor duplicate this field.
+        head.push_str("Sec-GPC: 1\r\n");
+    }
+    // Fetch Metadata request headers are user-agent-owned. They describe a
+    // real navigation context and are therefore not accepted from the page's
+    // mutable header list (Fetch Metadata Request Headers, §3).
+    if let Some(metadata) = request
+        .fetch_metadata
+        .filter(|_| potentially_trustworthy(url))
+    {
+        let site = match metadata.site {
+            FetchSite::None => "none",
+            FetchSite::SameOrigin => "same-origin",
+            FetchSite::CrossSite => "cross-site",
+        };
+        head.push_str(&format!(
+            "Sec-Fetch-Dest: {}\r\nSec-Fetch-Mode: {}\r\nSec-Fetch-Site: {site}\r\n",
+            metadata.destination, metadata.mode,
+        ));
+        if metadata.user_activation {
+            head.push_str("Sec-Fetch-User: ?1\r\n");
+        }
+        // UIR §3.2.1: advertise support for secure navigations. TRust does
+        // not yet maintain an HSTS preload list, so this applies to every
+        // trustworthy top-level navigation.
+        head.push_str("Upgrade-Insecure-Requests: 1\r\n");
+    }
     let cookie = cookies_for_request(url);
     if !cookie.is_empty() {
         head.push_str(&format!("Cookie: {cookie}\r\n"));
@@ -2412,6 +2502,61 @@ fn same_origin(a: &Url, b: &Url) -> bool {
         && a.port_or_known_default() == b.port_or_known_default()
 }
 
+/// A URL is potentially trustworthy when it uses authenticated transport or
+/// is a local development endpoint. This is the gate used by Fetch Metadata's
+/// integration algorithm; ordinary `http:` origins must not receive the
+/// `Sec-Fetch-*` family merely because a page supplied a navigation context.
+fn potentially_trustworthy(url: &Url) -> bool {
+    match url.scheme() {
+        "https" | "wss" => true,
+        "http" => match url.host() {
+            Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+            Some(Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// Fetch Metadata sends a `Sec-Fetch-Site` value on every redirect hop. A
+/// direct user navigation remains `none`; otherwise a redirect to another
+/// origin can never become *more* trusted than the chain already was. Without
+/// a public-suffix database we can prove same-origin transitions exactly and
+/// conservatively classify every other transition as cross-site.
+fn update_navigation_metadata_for_redirect(request: &mut Request, target: &Url) {
+    let crosses_origin = !same_origin(&request.url, target);
+    let Some(metadata) = request.fetch_metadata.as_mut() else {
+        return;
+    };
+    if metadata.site != FetchSite::None && crosses_origin {
+        metadata.site = FetchSite::CrossSite;
+    }
+}
+
+/// Mark a request as a top-level, user-activated document navigation. Fetch
+/// Metadata is deliberately represented outside `Request::headers`, because
+/// `Sec-Fetch-*` are forbidden request-header names for page JavaScript.
+///
+/// The initial address-bar navigation has no referrer (`none`). A navigation
+/// from the current document is same-origin when its origin matches; other
+/// origins are conservatively cross-site. (The distinction matters to Reddit
+/// and other CSRF defenses, while a full public-suffix database is outside
+/// this small client.)
+pub fn set_navigation_metadata(req: &mut Request, referrer: Option<&Url>) {
+    let site = match referrer {
+        None => FetchSite::None,
+        Some(source) if same_origin(source, &req.url) => FetchSite::SameOrigin,
+        Some(_) => FetchSite::CrossSite,
+    };
+    req.fetch_metadata = Some(FetchMetadata {
+        destination: "document",
+        mode: "navigate",
+        site,
+        user_activation: true,
+    });
+}
+
 /// The `Referer` value to send when the document at `page` requests
 /// `target`, under the browser default referrer policy
 /// (`strict-origin-when-cross-origin`):
@@ -2457,6 +2602,21 @@ pub fn set_referrer(req: &mut Request, page: &Url) {
     if let Some(referer) = referrer_for(page, &req.url) {
         req.headers.push((String::from("Referer"), referer));
     }
+}
+
+/// Set Fetch's image-destination `Accept` default on an image subresource.
+/// Preserve an existing value so a future caller that intentionally supplied
+/// an image-specific preference still controls content negotiation.
+pub fn set_image_accept(req: &mut Request) {
+    if req
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("accept"))
+    {
+        return;
+    }
+    req.headers
+        .push((String::from("Accept"), String::from(IMAGE_ACCEPT)));
 }
 
 /// Render a response body into a document. `images` maps already-decoded
@@ -7601,6 +7761,64 @@ customElements.define('lit-counter', LitCounter);
     }
 
     #[tokio::test]
+    async fn image_subresource_uses_image_destination_accept() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap2 = captured.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 2048];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            *cap2.lock().unwrap() = String::from_utf8_lossy(&req).into_owned();
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\nPNG",
+                )
+                .await;
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/thumb.png")).unwrap();
+        let mut request = Request::get(url);
+        set_image_accept(&mut request);
+        let response = fetch(&request).await.unwrap();
+        assert_eq!(response.content_type, "image/png");
+        assert_eq!(response.body, b"PNG");
+        server.abort();
+
+        let head = captured.lock().unwrap().clone();
+        assert!(
+            head.contains(&format!("Accept: {IMAGE_ACCEPT}")),
+            "image destination Accept reaches the wire: {head}"
+        );
+        assert_eq!(head.matches("Accept:").count(), 1);
+
+        // An explicitly selected image representation remains authoritative.
+        let mut explicit = Request::get(parse_url("https://example.test/x.webp").unwrap());
+        explicit
+            .headers
+            .push((String::from("accept"), String::from("image/avif")));
+        set_image_accept(&mut explicit);
+        assert_eq!(
+            explicit
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("accept"))
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["image/avif"]
+        );
+    }
+
+    #[tokio::test]
     async fn a_referer_is_re_evaluated_across_a_cross_origin_redirect() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         // Referrer policy is per hop. A same-origin request carries the FULL
@@ -7861,6 +8079,7 @@ customElements.define('lit-counter', LitCounter);
                 b"k=v&x=y".to_vec(),
             )),
             headers: Vec::new(),
+            fetch_metadata: None,
         };
         let response = fetch(&request).await.unwrap();
         assert_eq!(response.status, 200);
@@ -7880,6 +8099,7 @@ customElements.define('lit-counter', LitCounter);
                 url,
                 body: None,
                 headers: Vec::new(),
+                fetch_metadata: None,
             };
             let response = fetch(&request).await.unwrap();
             assert_eq!(response.status, 200, "{method} null body was accepted");
@@ -7897,6 +8117,7 @@ customElements.define('lit-counter', LitCounter);
                 b"k=v".to_vec(),
             )),
             headers: Vec::new(),
+            fetch_metadata: None,
         };
         let response = fetch(&request).await.unwrap();
         assert_eq!(response.status, 200);
@@ -8187,6 +8408,7 @@ customElements.define('lit-counter', LitCounter);
             url,
             body: Some((String::from("text/plain"), b"hi".to_vec())),
             headers: Vec::new(),
+            fetch_metadata: None,
         };
         let resp = fetch(&request).await.unwrap();
         assert_eq!(resp.body, b"ok");
@@ -8237,7 +8459,11 @@ customElements.define('lit-counter', LitCounter);
                 ("Accept-Language".into(), "fr-CA,fr;q=0.8".into()),
                 ("Host".into(), "evil.example".into()),
                 ("Cookie".into(), "spoof=1".into()),
+                ("Sec-GPC".into(), "0".into()),
+                ("Sec-Fetch-Site".into(), "none".into()),
+                ("Upgrade-Insecure-Requests".into(), "0".into()),
             ],
+            fetch_metadata: None,
         };
         let resp = fetch(&request).await.unwrap();
         assert_eq!(resp.body, b"ok");
@@ -8270,12 +8496,120 @@ customElements.define('lit-counter', LitCounter);
             "no duplicate Accept-Language header: {head}"
         );
         assert!(
+            head.contains("Sec-GPC: 1\r\n"),
+            "the user-agent GPC preference reaches the wire: {head}"
+        );
+        assert_eq!(head.matches("Sec-GPC:").count(), 1);
+        assert!(
             !head.contains("evil.example"),
             "Host cannot be spoofed: {head}"
         );
         assert!(
+            !head.contains("Sec-Fetch-Site:"),
+            "Fetch Metadata cannot be forged by page headers: {head}"
+        );
+        assert!(
+            !head.contains("Upgrade-Insecure-Requests:"),
+            "UIR cannot be forged by page headers: {head}"
+        );
+        assert!(
             !head.contains("spoof=1"),
             "Cookie cannot be spoofed: {head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_accept_language_reaches_the_wire() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 2048];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = head_tx.send(String::from_utf8_lossy(&req).into_owned());
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        });
+
+        // A normal navigation has no page-authored Accept-Language; the
+        // Fetch user-agent default must be emitted exactly once.
+        let url = parse_url(&format!("http://127.0.0.1:{port}/reddit")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        assert_eq!(response.body, b"ok");
+        let head = head_rx.await.unwrap();
+        assert!(
+            head.contains(&format!(
+                "Accept-Language: {}\r\n",
+                crate::locale::ACCEPT_LANGUAGE
+            )),
+            "default language preference reaches the wire: {head}"
+        );
+        assert_eq!(head.matches("Accept-Language:").count(), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn top_level_navigation_metadata_reaches_the_wire() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (head_tx, head_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 2048];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = head_tx.send(String::from_utf8_lossy(&req).into_owned());
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await;
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let mut request = Request::get(url.clone());
+        set_navigation_metadata(&mut request, None);
+        let response = fetch(&request).await.unwrap();
+        assert_eq!(response.body, b"ok");
+        let head = head_rx.await.unwrap();
+        for expected in [
+            "Sec-Fetch-Dest: document\r\n",
+            "Sec-Fetch-Mode: navigate\r\n",
+            "Sec-Fetch-Site: none\r\n",
+            "Sec-Fetch-User: ?1\r\n",
+            "Upgrade-Insecure-Requests: 1\r\n",
+        ] {
+            assert!(
+                head.contains(expected),
+                "{expected:?} reaches the wire: {head}"
+            );
+            assert_eq!(head.matches(expected.trim_end()).count(), 1);
+        }
+        server.await.unwrap();
+
+        // A page cannot smuggle a forged Fetch Metadata value through the
+        // ordinary header list; only the user-agent context controls it.
+        let same_origin = Url::parse(&format!("http://127.0.0.1:{port}/from")).unwrap();
+        let mut same_origin_request = Request::get(same_origin.clone());
+        set_navigation_metadata(&mut same_origin_request, Some(&same_origin));
+        assert_eq!(
+            same_origin_request.fetch_metadata.map(|m| m.site),
+            Some(FetchSite::SameOrigin)
         );
     }
 
