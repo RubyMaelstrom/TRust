@@ -2923,6 +2923,27 @@ impl Dom {
                 }
             }
         }
+        // CSS Shadow 1 §3.2.4: `::slotted()` is an alias for the flattened
+        // element assigned to a slot; it does not create a box of its own.
+        // The light-DOM element still receives the declaration in its own
+        // cascade map, with the shadow-tree encapsulation context preserved.
+        for &(scope, ri) in &index.slotted_rules {
+            let Some(rules) = index.scopes.get(&scope) else {
+                continue;
+            };
+            let r = &rules[ri as usize];
+            if !self.slotted_rule_matches(id, scope, r) {
+                continue;
+            }
+            for (pk, (imp, v)) in &r.decls {
+                consider_into(
+                    &mut elem,
+                    pk,
+                    (*imp, *imp, false, r.layer_key(*imp), r.specificity, r.order),
+                    v,
+                );
+            }
+        }
         // `:host` rules: a shadow root's own stylesheet styles ITS host element
         // (CSS Scoping §3.3) via `:host`/`:host(<compound>)`. The host lives in
         // the parent tree, so these aren't in its matched set — pull them from
@@ -2951,6 +2972,28 @@ impl Dom {
             before: strip(before),
             after: strip(after),
         }
+    }
+
+    /// Match a `::slotted(<compound-selector>)` rule against a light-DOM
+    /// element. The pseudo-element's originating element is the slot; a
+    /// selector prefix (for example `slot::slotted(*)`) therefore matches the
+    /// slot, while the argument matches the flattened assigned element.
+    fn slotted_rule_matches(&self, id: NodeId, scope: NodeId, rule: &StyleRule) -> bool {
+        let parts = &rule.selector.0;
+        let Some((_, subject)) = parts.last() else {
+            return false;
+        };
+        let Some(inner) = subject.slotted.as_deref() else {
+            return false;
+        };
+        if !self.matches_compound(id, inner, None) {
+            return false;
+        }
+        self.descendants(scope).any(|slot| {
+            self.tag_name(slot) == Some("slot")
+                && self.flat_assigned_slot_nodes(slot).contains(&id)
+                && (parts.len() == 1 || self.matches_complex(slot, &parts[..parts.len() - 1], None))
+        })
     }
 
     /// Whether a shadow-scope rule is a `:host`/`:host(<compound>)` rule that
@@ -3391,6 +3434,24 @@ impl Dom {
             .iter()
             .map(|(scope, rules)| (*scope, RuleBuckets::build(rules)))
             .collect();
+        // CSS Shadow 1 §3.2.4: `::slotted()` rules are evaluated in a
+        // shadow-tree stylesheet but apply to the flattened nodes assigned to
+        // the originating slot, not to an element in that stylesheet's own
+        // tree. Keep a sparse cross-tree index so ordinary matched-rule
+        // lookup remains scoped and hot.
+        index.slotted_rules = index
+            .scopes
+            .iter()
+            .flat_map(|(scope, rules)| {
+                rules.iter().enumerate().filter_map(move |(ri, rule)| {
+                    rule.selector
+                        .0
+                        .last()
+                        .and_then(|(_, c)| c.slotted.as_ref())
+                        .map(|_| (*scope, ri as u32))
+                })
+            })
+            .collect();
         index
     }
 
@@ -3655,8 +3716,8 @@ impl Dom {
     /// light `<tr>`s) is composed like a browser, not read as empty. `children`
     /// (light-only) and `composed_children` (light + shadow, no slot projection)
     /// are the wrong tools there. Unlike the box-tree `tree::children`, which
-    /// hoists a `<slot>` transparently at the element level, this projects one
-    /// level of slots directly so classification sees the assigned nodes.
+    /// hoists a `<slot>` transparently at the element level, this recursively
+    /// flattens forwarding slots so classification sees the assigned nodes.
     pub fn flat_children(&self, id: NodeId) -> Vec<NodeId> {
         let base = match self.shadow_root(id) {
             Some(shadow) => self.children(shadow),
@@ -3668,7 +3729,7 @@ impl Dom {
         let mut out = Vec::with_capacity(base.len());
         for c in base {
             if self.tag_name(c) == Some("slot") {
-                let assigned = self.slot_assigned_nodes(c);
+                let assigned = self.flat_slot_nodes(c);
                 if assigned.is_empty() {
                     out.extend(self.children(c)); // the slot's fallback content
                 } else {
@@ -3728,6 +3789,54 @@ impl Dom {
         self.child_iter(host)
             .filter(|&c| self.attr(c, "slot").unwrap_or("").trim() == want)
             .collect()
+    }
+
+    /// Return the flattened slottables represented by `slot`. HTML's
+    /// `assignedNodes({ flatten: true })` recursively substitutes a slot's
+    /// assigned nodes (or fallback children) whenever another `<slot>` is
+    /// encountered. Rendering crosses this forwarding pattern frequently:
+    /// Reddit's gallery forwards its light-DOM pages through a gallery slot
+    /// and then through the nested faceplate carousel slot. A one-level
+    /// projection leaves the forwarding `<slot>` as an empty box and drops
+    /// the images from both the serializer and the box tree.
+    pub fn flat_slot_nodes(&self, slot: NodeId) -> Vec<NodeId> {
+        fn flatten(dom: &Dom, id: NodeId, out: &mut Vec<NodeId>) {
+            if dom.tag_name(id) == Some("slot") {
+                let assigned = dom.slot_assigned_nodes(id);
+                let source = if assigned.is_empty() {
+                    dom.children(id)
+                } else {
+                    assigned
+                };
+                for child in source {
+                    flatten(dom, child, out);
+                }
+            } else {
+                out.push(id);
+            }
+        }
+
+        let mut out = Vec::new();
+        flatten(self, slot, &mut out);
+        out
+    }
+
+    /// Flatten only nodes that are actually assigned to `slot`, excluding
+    /// fallback children. `::slotted()` represents assigned slottables, not a
+    /// slot's fallback content (CSS Shadow 1 §3.2.4).
+    fn flat_assigned_slot_nodes(&self, slot: NodeId) -> Vec<NodeId> {
+        fn flatten(dom: &Dom, id: NodeId, out: &mut Vec<NodeId>) {
+            if dom.tag_name(id) == Some("slot") {
+                for child in dom.slot_assigned_nodes(id) {
+                    flatten(dom, child, out);
+                }
+            } else {
+                out.push(id);
+            }
+        }
+        let mut out = Vec::new();
+        flatten(self, slot, &mut out);
+        out
     }
 
     /// Composed-tree element ids whose tag is `name`, in document (pre-)order,
@@ -4670,7 +4779,13 @@ impl Dom {
                             self.serialize_node_inner(c, host, keep_template, out);
                         }
                     } else {
-                        for c in assigned {
+                        for c in assigned.into_iter().flat_map(|c| {
+                            if self.tag_name(c) == Some("slot") {
+                                self.flat_slot_nodes(c)
+                            } else {
+                                vec![c]
+                            }
+                        }) {
                             self.serialize_node_inner(c, None, keep_template, out);
                         }
                     }
@@ -4763,7 +4878,13 @@ impl Dom {
                     self.serialize_live_node(c, host, clickable, in_anchor, out);
                 }
             } else {
-                for c in assigned {
+                for c in assigned.into_iter().flat_map(|c| {
+                    if self.tag_name(c) == Some("slot") {
+                        self.flat_slot_nodes(c)
+                    } else {
+                        vec![c]
+                    }
+                }) {
                     self.serialize_live_node(c, None, clickable, in_anchor, out);
                 }
             }
@@ -5350,6 +5471,12 @@ impl Dom {
         // these rules are scoped to — it's matched specially in `cascaded`
         // (`host_rule_matches`), never against in-scope elements here.
         if c.host {
+            return false;
+        }
+        // `::slotted()` is matched by `slotted_rule_matches` against the
+        // assigned light-DOM node and its originating slot; it is not a
+        // normal selector on either tree's ordinary element walk.
+        if c.slotted.is_some() {
             return false;
         }
         // `:scope` matches only the query root (None in the cascade → never).
@@ -5988,6 +6115,10 @@ struct Compound {
     /// the host must additionally match (`:host(.theme-dark)`).
     host: bool,
     host_inner: Option<Box<Compound>>,
+    /// `::slotted(<compound>)` (CSS Shadow 1 §3.2.4): the pseudo-element is
+    /// represented by the originating slot, while its argument selects the
+    /// flattened light-DOM element receiving the declarations.
+    slotted: Option<Box<Compound>>,
     /// `::before`/`::after`: the rule targets a generated-content box on
     /// the matched element, NOT the element itself. The element-property
     /// cascade skips these; `pseudo_content` consults only these.
@@ -6264,6 +6395,7 @@ impl Compound {
             && !self.scope
             && !self.root
             && !self.host
+            && self.slotted.is_none()
             && self.structural.is_empty()
             && self.states.is_empty()
             && self.pseudo.is_none()
@@ -6312,6 +6444,10 @@ impl Compound {
         if let Some(inner) = &self.host_inner {
             let hs = inner.spec();
             s = (s.0 + hs.0, s.1 + hs.1, s.2 + hs.2);
+        }
+        if let Some(inner) = &self.slotted {
+            let ss = inner.spec();
+            s = (s.0 + ss.0, s.1 + ss.1, s.2 + ss.2);
         }
         s
     }
@@ -6727,6 +6863,20 @@ fn parse_compound(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<Co
                         }
                     }
                     compound.has.push(group);
+                } else if name == "slotted" {
+                    // CSS Shadow 1 §3.2.4: the argument is exactly one
+                    // compound selector. The pseudo-element itself is an
+                    // alias for the flattened slottables, so its declarations
+                    // are applied by the shadow-aware cascade rather than by
+                    // ordinary in-tree selector matching.
+                    let raw = arg?;
+                    let mut ic = raw.trim().chars().peekable();
+                    let inner = parse_compound(&mut ic)?;
+                    if inner.is_empty() || ic.peek().is_some() {
+                        return None;
+                    }
+                    compound.slotted = Some(Box::new(inner));
+                    compound.pseudos += 1;
                 } else if name == "before" || name == "after" {
                     // Generated-content pseudo-element: the compound still
                     // matches the element (tag/class parts), but the rule
@@ -8330,6 +8480,10 @@ struct StyleIndex {
     /// element only tests rules that could possibly match it (see
     /// `matched_rules`). Parallel to `scopes`; values index into it.
     buckets: FxHashMap<NodeId, RuleBuckets>,
+    /// `(shadow-root, rule-index)` entries for `::slotted()` selectors. These
+    /// rules are consulted while cascading a light-DOM element assigned to a
+    /// slot in the corresponding shadow tree.
+    slotted_rules: Vec<(NodeId, u32)>,
     /// `@keyframes <name>` → the animation's END opacity (the `to`/`100%`
     /// keyframe), for honoring an `animation-fill-mode:forwards` reveal/hide.
     /// Only opacity is extracted (the one keyframe property visibility needs).
@@ -11000,6 +11154,38 @@ mod tests {
             dom.computed_style(inner, "display").as_deref(),
             Some("none")
         );
+    }
+
+    #[test]
+    fn slotted_shadow_rules_style_flattened_assigned_elements() {
+        // CSS Shadow 1 §3.2.4: ::slotted() is an alias for the flattened
+        // elements assigned to its originating slot. It must not style
+        // fallback content, an unassigned sibling, or a deeper descendant.
+        let mut dom = Dom::parse_document(
+            "<body><x-strip><ul id=list><li id=one>one</li></ul></x-strip><p id=outside>outside</p></body>",
+        );
+        let host = dom
+            .descendants(DOCUMENT)
+            .find(|&id| dom.tag_name(id) == Some("x-strip"))
+            .unwrap();
+        let list = dom.get_by_id("list").unwrap();
+        let outside = dom.get_by_id("outside").unwrap();
+        let shadow = dom.attach_shadow(host);
+        let style = dom.create_element("style");
+        let css = dom.create_text(
+            "::slotted(:not([slot])){display:grid;grid-auto-flow:column} ::slotted(ul){height:100%}",
+        );
+        dom.append(style, css);
+        dom.append(shadow, style);
+        let slot = dom.create_element("slot");
+        dom.append(shadow, slot);
+
+        assert_eq!(dom.computed_style(list, "display").as_deref(), Some("grid"));
+        assert_eq!(
+            dom.computed_style(list, "grid-auto-flow").as_deref(),
+            Some("column")
+        );
+        assert_eq!(dom.computed_style(outside, "display"), None);
     }
 
     #[test]

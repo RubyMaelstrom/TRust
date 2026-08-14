@@ -243,6 +243,11 @@ impl Outcome {
 struct PageJobExecutor {
     promise_jobs: RefCell<VecDeque<PromiseJob>>,
     async_jobs: RefCell<VecDeque<NativeAsyncJob>>,
+    /// Module-script fetches are later HTML tasks. Keep them out of the
+    /// parser's ordinary host-job checkpoint so a resident page can paint its
+    /// shell while a code-split component graph downloads. Once the actor is
+    /// servicing host work normally, these join the same async group.
+    deferred_module_jobs: RefCell<VecDeque<NativeAsyncJob>>,
     other_jobs: RefCell<VecDeque<Job>>,
 }
 
@@ -250,7 +255,23 @@ impl PageJobExecutor {
     fn clear(&self) {
         self.promise_jobs.borrow_mut().clear();
         self.async_jobs.borrow_mut().clear();
+        self.deferred_module_jobs.borrow_mut().clear();
         self.other_jobs.borrow_mut().clear();
+    }
+
+    /// Whether a later host task is waiting to be serviced. The live page
+    /// actor uses this to wake after the parser returns without draining an
+    /// asynchronously inserted module's whole network graph in the parser
+    /// task itself.
+    fn has_pending_jobs(&self) -> bool {
+        !self.promise_jobs.borrow().is_empty()
+            || !self.async_jobs.borrow().is_empty()
+            || !self.deferred_module_jobs.borrow().is_empty()
+            || !self.other_jobs.borrow().is_empty()
+    }
+
+    fn enqueue_deferred_module(&self, job: NativeAsyncJob) {
+        self.deferred_module_jobs.borrow_mut().push_back(job);
     }
 
     /// Perform the HTML microtask checkpoint that is part of cleaning up after
@@ -278,6 +299,74 @@ impl PageJobExecutor {
             phase_end(Phase::Execute, exec_t);
         }
     }
+    async fn run_jobs_async_mode(
+        self: Rc<Self>,
+        context: &RefCell<&mut Context>,
+        include_deferred_modules: bool,
+    ) -> JsResult<()> {
+        use futures::stream::StreamExt as _;
+        let mut group = futures::stream::FuturesUnordered::new();
+        loop {
+            for job in std::mem::take(&mut *self.async_jobs.borrow_mut()) {
+                group.push(job.call(context));
+            }
+            if include_deferred_modules {
+                for job in std::mem::take(&mut *self.deferred_module_jobs.borrow_mut()) {
+                    group.push(job.call(context));
+                }
+            }
+            let exec_t = phase_begin();
+            let promise = std::mem::take(&mut *self.promise_jobs.borrow_mut());
+            let other = std::mem::take(&mut *self.other_jobs.borrow_mut());
+            let ran_sync = !promise.is_empty() || !other.is_empty();
+            for job in promise {
+                if let Err(err) = job.call(&mut context.borrow_mut()) {
+                    self.clear();
+                    return Err(err);
+                }
+            }
+            for job in other {
+                let r = match job {
+                    Job::TimeoutJob(t) => t.call(&mut context.borrow_mut()),
+                    Job::GenericJob(g) => g.call(&mut context.borrow_mut()),
+                    Job::PromiseJob(p) => p.call(&mut context.borrow_mut()),
+                    Job::AsyncJob(a) => {
+                        group.push(a.call(context));
+                        Ok(JsValue::undefined())
+                    }
+                    _ => Ok(JsValue::undefined()),
+                };
+                if let Err(err) = r {
+                    self.clear();
+                    return Err(err);
+                }
+            }
+            phase_end(Phase::Execute, exec_t);
+            let deferred_empty =
+                !include_deferred_modules || self.deferred_module_jobs.borrow().is_empty();
+            if self.async_jobs.borrow().is_empty()
+                && deferred_empty
+                && !ran_sync
+                && group.is_empty()
+            {
+                break;
+            }
+            if ran_sync
+                || !self.async_jobs.borrow().is_empty()
+                || (include_deferred_modules && !self.deferred_module_jobs.borrow().is_empty())
+            {
+                continue;
+            }
+            phase(&format!("job park ({} in flight)", group.len()));
+            if let Some(Err(err)) = group.next().await {
+                self.clear();
+                return Err(err);
+            }
+            phase(&format!("job wake ({} left)", group.len()));
+            context.borrow_mut().clear_kept_objects();
+        }
+        Ok(())
+    }
 }
 
 impl JobExecutor for PageJobExecutor {
@@ -301,67 +390,7 @@ impl JobExecutor for PageJobExecutor {
     where
         Self: Sized,
     {
-        use futures::stream::StreamExt as _;
-        let mut group = futures::stream::FuturesUnordered::new();
-        loop {
-            // Newly enqueued fetches join the concurrently-polled set.
-            for job in std::mem::take(&mut *self.async_jobs.borrow_mut()) {
-                group.push(job.call(context));
-            }
-            // Drain every synchronous job that's ready now. These run to
-            // completion one at a time (spec: one job at a time) and may
-            // enqueue more jobs (a settled fetch enqueues its `.then`s).
-            // The phase profiler times THIS synchronous drain as "execute" —
-            // the `group.next().await` park below (network wait) is left out,
-            // so the bucket is real VM CPU, not wire time.
-            let exec_t = phase_begin();
-            let promise = std::mem::take(&mut *self.promise_jobs.borrow_mut());
-            let other = std::mem::take(&mut *self.other_jobs.borrow_mut());
-            let ran_sync = !promise.is_empty() || !other.is_empty();
-            for job in promise {
-                if let Err(err) = job.call(&mut context.borrow_mut()) {
-                    self.clear();
-                    return Err(err);
-                }
-            }
-            for job in other {
-                let r = match job {
-                    Job::TimeoutJob(t) => t.call(&mut context.borrow_mut()),
-                    Job::GenericJob(g) => g.call(&mut context.borrow_mut()),
-                    Job::PromiseJob(p) => p.call(&mut context.borrow_mut()),
-                    Job::AsyncJob(a) => {
-                        group.push(a.call(context));
-                        Ok(JsValue::undefined())
-                    }
-                    _ => Ok(JsValue::undefined()), // Job is #[non_exhaustive]
-                };
-                if let Err(err) = r {
-                    self.clear();
-                    return Err(err);
-                }
-            }
-            phase_end(Phase::Execute, exec_t);
-            // Everything drained and nothing in flight: quiescent.
-            if self.async_jobs.borrow().is_empty() && !ran_sync && group.is_empty() {
-                break;
-            }
-            // Fresh jobs appeared while we worked: service them before
-            // parking, so we never sleep with runnable work pending.
-            if ran_sync || !self.async_jobs.borrow().is_empty() {
-                continue;
-            }
-            // Park until the next in-flight fetch resolves. The reactor
-            // wakes us — no spin, no idle CPU. Its completion enqueues the
-            // promise `.then` jobs we'll run on the next turn.
-            phase(&format!("job park ({} in flight)", group.len()));
-            if let Some(Err(err)) = group.next().await {
-                self.clear();
-                return Err(err);
-            }
-            phase(&format!("job wake ({} left)", group.len()));
-            context.borrow_mut().clear_kept_objects();
-        }
-        Ok(())
+        self.run_jobs_async_mode(context, true).await
     }
 }
 
@@ -2423,6 +2452,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_owner_document", 1, sys_owner_document),
         ("__dom_adopt", 2, sys_adopt),
         ("__dom_parent", 1, sys_parent),
+        ("__dom_is_connected", 1, sys_is_connected),
         ("__dom_contains", 2, sys_contains),
         ("__dom_set_hover", 1, sys_set_hover),
         ("__dom_children", 1, sys_children),
@@ -2639,6 +2669,17 @@ fn sys_parent(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
     Ok(id_value(
         arg_node(&d, args, 0).and_then(|id| d.node(id).parent),
     ))
+}
+
+/// `__dom_is_connected(id)` implements the DOM `Node.isConnected` shadow-
+/// including-root check in the arena. Keeping this walk next to the arena's
+/// parent pointers avoids depending on JS wrapper identity (and crosses a
+/// shadow root through its host, as required by the DOM Standard).
+fn sys_is_connected(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let d = dom.borrow();
+    let connected = arg_node(&d, args, 0).is_some_and(|id| d.is_connected(id));
+    Ok(JsValue::from(connected))
 }
 
 /// `__dom_contains(a, b)` → is `a` a STRICT ancestor of `b`? The subtree
@@ -5368,14 +5409,16 @@ fn sys_wasm_table_grow(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRe
 /// payment/embed widgets, A/B tools). A real browser fetches+executes such a
 /// script; TRust never did, so a runtime-injected dependency silently never
 /// loaded — pixiv's login injects `recaptcha/enterprise.js` then polls
-/// `window.grecaptcha` forever, so the submit hung. Classic scripts only
-/// (the prelude already gates type + first-insertion): a `src` is fetched
-/// then evaluated, inline text is evaluated, and a `load`/`error` event fires
-/// on the element for code that waits on `script.onload`. The fetch reuses
-/// the same cap-/`subresource_allowed`-gated async job `fetch()` uses, so it
-/// overlaps with other work and can't pivot to private address space.
+/// `window.grecaptcha` forever, so the submit hung. Classic and module scripts
+/// (the prelude gates type + first-insertion): a `src` is fetched then
+/// evaluated, inline text is evaluated, and a `load`/`error` event fires on
+/// the element for code that waits on `script.onload`. The fetch reuses the
+/// same cap-/`subresource_allowed`-gated async job `fetch()` uses, so it
+/// overlaps with other work and can't pivot to private address space. Module
+/// scripts use the page's real module loader; code-split custom elements are
+/// commonly installed by appending `<script type=module>` after the document.
 fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let (node_id, src, text) = {
+    let (node_id, src, text, module) = {
         let dom = page_dom(ctx);
         let d = dom.borrow();
         let Some(id) = arg_node(&d, args, 0) else {
@@ -5385,8 +5428,14 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
             id,
             d.attr(id, "src").map(str::to_string),
             d.text_content(id),
+            d.attr(id, "type")
+                .is_some_and(|ty| ty.trim().eq_ignore_ascii_case("module")),
         )
     };
+    if module {
+        enqueue_injected_module(ctx, node_id, src, text);
+        return Ok(JsValue::undefined());
+    }
     match src {
         // A `data:` src decodes inline — no network, exactly like a parse-time
         // `data:` classic script (the Instagram bootloader path). Routing it
@@ -5478,6 +5527,168 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
         _ => {}
     }
     Ok(JsValue::undefined())
+}
+
+/// Queue an inserted module script's fetch/evaluate steps. HTML's "prepare
+/// the script element" algorithm treats a dynamically inserted module as an
+/// asynchronous module graph, rather than as a classic `eval`; using the
+/// same `WebModuleLoader` as parser-created modules preserves URL resolution,
+/// module identity, static imports, and `import.meta`.
+fn enqueue_injected_module(ctx: &mut Context, node_id: usize, src: Option<String>, text: String) {
+    if let Some(src) = src.filter(|s| !s.trim().is_empty()) {
+        if src.trim_start().starts_with("data:") {
+            match crate::img::decode_data_url(src.trim()) {
+                Some(body) => enqueue_injected_module_body(ctx, node_id, body, src),
+                None => fire_script_event(ctx, node_id, "error"),
+            }
+            return;
+        }
+        match page_net_prepare(ctx, &src, String::from("GET"), None, vec![]) {
+            None => fire_script_event(ctx, node_id, "error"),
+            Some((_handle, request)) => {
+                phase(&format!("src: INJECT-MODULE {}", request.url));
+                let name = request.url.to_string();
+                let realm = ctx.realm().clone();
+                let job = NativeAsyncJob::with_realm(
+                    async move |cell: &RefCell<&mut Context>| {
+                        let result = crate::http::fetch(&request).await;
+                        let mut guard = cell.borrow_mut();
+                        match result {
+                            Ok(resp)
+                                if crate::http::module_script_response_allowed(
+                                    resp.status,
+                                    &resp.content_type,
+                                ) =>
+                            {
+                                let body = crate::http::decode_body(&resp.content_type, &resp.body);
+                                queue_module_evaluation(
+                                    &mut guard,
+                                    node_id,
+                                    body.as_bytes(),
+                                    &name,
+                                );
+                            }
+                            _ => fire_script_event(&mut guard, node_id, "error"),
+                        }
+                        Ok(JsValue::undefined())
+                    },
+                    realm,
+                );
+                enqueue_deferred_module_job(ctx, job);
+            }
+        }
+    } else if !text.trim().is_empty() {
+        let base = ctx
+            .realm()
+            .host_defined()
+            .get::<PageNet>()
+            .map(|net| net.page.to_string())
+            .unwrap_or_else(|| String::from("about:blank"));
+        enqueue_injected_module_body(ctx, node_id, text.into_bytes(), base);
+    } else {
+        // An empty module still completes successfully and fires load.
+        fire_script_event(ctx, node_id, "load");
+    }
+}
+
+fn enqueue_injected_module_body(ctx: &mut Context, node_id: usize, body: Vec<u8>, path: String) {
+    let realm = ctx.realm().clone();
+    let job = NativeAsyncJob::with_realm(
+        async move |cell: &RefCell<&mut Context>| {
+            let mut guard = cell.borrow_mut();
+            queue_module_evaluation(&mut guard, node_id, &body, &path);
+            Ok(JsValue::undefined())
+        },
+        realm,
+    );
+    enqueue_deferred_module_job(ctx, job);
+}
+
+fn enqueue_deferred_module_job(ctx: &mut Context, job: NativeAsyncJob) {
+    if let Some(executor) = ctx.downcast_job_executor::<PageJobExecutor>() {
+        executor.enqueue_deferred_module(job);
+    } else {
+        // The production page realm always installs PageJobExecutor. Keep the
+        // fallback faithful for small embedders/tests that use Boa's default
+        // executor rather than silently dropping a dynamically inserted module.
+        ctx.enqueue_job(job.into());
+    }
+}
+
+/// Parse and start a dynamically inserted module while the current host task
+/// owns the context. The module's evaluation promise remains in Boa's job
+/// queue; its reactions fire the element's load/error event only after the
+/// complete graph has linked and evaluated.
+fn queue_module_evaluation(ctx: &mut Context, node_id: usize, source: &[u8], path: &str) {
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        boa_engine::Module::parse(
+            Source::from_bytes(source).with_path(std::path::Path::new(path)),
+            None,
+            ctx,
+        )
+    }));
+    let module = match parsed {
+        Ok(Ok(module)) => module,
+        Ok(Err(err)) => {
+            push_injected_error(ctx, format!("module {path}: {err}"));
+            fire_script_event(ctx, node_id, "error");
+            return;
+        }
+        Err(_) => {
+            push_injected_error(ctx, format!("module {path}: engine panic (Boa bug)"));
+            fire_script_event(ctx, node_id, "error");
+            return;
+        }
+    };
+    if let Some(loader) = ctx.downcast_module_loader::<WebModuleLoader>() {
+        loader
+            .modules
+            .borrow_mut()
+            .insert(path.to_string(), module.clone());
+    }
+    let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        module.load_link_evaluate(ctx)
+    }));
+    let promise = match evaluated {
+        Ok(promise) => promise,
+        Err(_) => {
+            push_injected_error(ctx, format!("module {path}: engine panic (Boa bug)"));
+            fire_script_event(ctx, node_id, "error");
+            return;
+        }
+    };
+    let load = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args, node_id: &usize, ctx| {
+            fire_script_event(ctx, *node_id, "load");
+            Ok(JsValue::undefined())
+        },
+        node_id,
+    )
+    .to_js_function(ctx.realm());
+    let reject = NativeFunction::from_copy_closure_with_captures(
+        |_this, args, capture: &(usize, String), ctx| {
+            let reason = args
+                .first()
+                .map(|value| describe_rejection(value, ctx))
+                .unwrap_or_else(|| String::from("module evaluation rejected"));
+            push_injected_error(ctx, format!("module {}: {reason}", capture.1));
+            fire_script_event(ctx, capture.0, "error");
+            Ok(JsValue::undefined())
+        },
+        (node_id, path.to_string()),
+    )
+    .to_js_function(ctx.realm());
+    let _ = promise.then(Some(load), Some(reject), ctx);
+}
+
+fn push_injected_error(ctx: &mut Context, message: String) {
+    let escaped = message
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    let _ = ctx.eval(Source::from_bytes(
+        format!("__trust.errors.push(\"{escaped}\")").as_bytes(),
+    ));
 }
 
 /// `__dom_load_injected_stylesheet(nodeId)` — a `<link rel=stylesheet>` that
@@ -6147,6 +6358,49 @@ impl boa_engine::module::ModuleLoader for WebModuleLoader {
         context: &RefCell<&mut Context>,
     ) -> JsResult<boa_engine::Module> {
         let spec = specifier.to_std_string_lossy();
+        // Blob URLs are valid module fetch targets.  Reddit's streaming module
+        // loader downloads a concat response, slices it into Blob objects, and
+        // evaluates each slice with `import(blob:...)`.  The page's JS blob
+        // store is authoritative; `PageBlobs` is its byte-exact mirror for the
+        // non-JS resource pipeline, so reuse those bytes here rather than
+        // treating the opaque URL as an HTTP specifier (HTML module script
+        // fetch + File API blob URL store).
+        if spec.starts_with("blob:") {
+            if let Some(cached) = self.modules.borrow().get(&spec) {
+                return Ok(cached.clone());
+            }
+            let bytes = context
+                .borrow()
+                .realm()
+                .host_defined()
+                .get::<PageBlobs>()
+                .and_then(|blobs| {
+                    blobs
+                        .0
+                        .lock()
+                        .ok()
+                        .and_then(|map| map.get(&spec).map(|(bytes, _)| bytes.clone()))
+                })
+                .ok_or_else(|| {
+                    boa_engine::JsNativeError::typ()
+                        .with_message(format!("module blob URL not found: {spec}"))
+                })?;
+            let module = {
+                let mut ctx = context.borrow_mut();
+                let t = phase_begin();
+                let m = boa_engine::Module::parse(
+                    Source::from_bytes(&bytes).with_path(std::path::Path::new(&spec)),
+                    None,
+                    &mut ctx,
+                )?;
+                phase_end(Phase::Parse, t);
+                m
+            };
+            self.modules
+                .borrow_mut()
+                .insert(spec.clone(), module.clone());
+            return Ok(module);
+        }
         // `data:` URL modules (RFC 2397): decode the body inline — no network,
         // no shared cache. Vite's modern-browser probe STATICALLY imports
         // `data:text/javascript,if(!import.meta.resolve)throw…` to feature-test;
@@ -6789,7 +7043,17 @@ fn load_page(
                 if outcome.panicked {
                     break;
                 }
-                run_jobs_into(&mut ctx, &budget, &mut outcome);
+                // A dynamically inserted module is an asynchronous script
+                // task (HTML §8.1.7.3, "prepare the script element"), not
+                // work that the resident parser task must drain to network
+                // quiescence. Classic injected resources still settle here;
+                // the deferred module queue is serviced by the actor after
+                // its shell paint. One-shot transforms include all queues.
+                if fetch_events.is_none() {
+                    run_jobs_into(&mut ctx, &budget, &mut outcome);
+                } else {
+                    run_parser_jobs_into(&mut ctx, &budget, &mut outcome);
+                }
             }
             phase(&format!(
                 "script[{i}] done +{}ms",
@@ -6899,7 +7163,15 @@ fn load_page(
             break;
         }
         replace_current_script(&mut ctx, old_current_script);
-        run_jobs_into(&mut ctx, &budget, &mut outcome);
+        // Keep the resident parser task bounded. Inserted module jobs are
+        // later tasks in the HTML event loop; classic inserted resources still
+        // settle before the shell. One-shot callers retain the historical
+        // quiescent drain before serialization.
+        if fetch_events.is_none() {
+            run_jobs_into(&mut ctx, &budget, &mut outcome);
+        } else {
+            run_parser_jobs_into(&mut ctx, &budget, &mut outcome);
+        }
         phase(&format!(
             "script[{i}] done +{}ms",
             script_started.elapsed().as_millis()
@@ -7200,7 +7472,11 @@ fn settle_to(
         .and_then(|v| v.as_number())
         .unwrap_or(0.0);
         phase_end(Phase::Execute, t);
-        run_jobs_into(ctx, budget, outcome);
+        // A timer task gets its microtask checkpoint, but dynamically inserted
+        // module fetches are later host tasks. Keep the deferred module lane
+        // out of this checkpoint so the actor can select that task separately
+        // (HTML §8.1.7.3).
+        run_parser_jobs_into(ctx, budget, outcome);
         ticks += 1;
         if fired < 1.0 || budget.exhausted() || ticks >= max_ticks || outcome.panicked {
             break;
@@ -7283,6 +7559,23 @@ fn checkpoint_live_task(page: &mut LoadedPage) {
 /// keep whatever the DOM already holds. No-net pages take the plain
 /// synchronous path (no runtime needed).
 fn run_jobs_into(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
+    run_jobs_into_mode(ctx, budget, outcome, true);
+}
+
+/// Parser-task checkpoint for a resident page. Classic inserted scripts and
+/// their ordinary fetches are allowed to finish so existing loader semantics
+/// stay observable before first paint; dynamically inserted module entry fetches
+/// remain later HTML tasks in the executor's deferred queue.
+fn run_parser_jobs_into(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
+    run_jobs_into_mode(ctx, budget, outcome, false);
+}
+
+fn run_jobs_into_mode(
+    ctx: &mut Context,
+    budget: &Budget,
+    outcome: &mut Outcome,
+    include_deferred_modules: bool,
+) {
     let handle = ctx
         .realm()
         .host_defined()
@@ -7303,7 +7596,7 @@ fn run_jobs_into(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
             (Some(handle), Some(exec)) => {
                 let cell = RefCell::new(ctx);
                 handle.block_on(async {
-                    let fut = exec.run_jobs_async(&cell);
+                    let fut = exec.run_jobs_async_mode(&cell, include_deferred_modules);
                     tokio::pin!(fut);
                     // Drive the job loop until it finishes (all promises + fetches
                     // settled) or the budget deadline passes. The deadline is
@@ -7325,6 +7618,9 @@ fn run_jobs_into(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
                     }
                 })
             }
+            (None, Some(exec)) => futures::executor::block_on(
+                exec.run_jobs_async_mode(&RefCell::new(ctx), include_deferred_modules),
+            ),
             _ => ctx.run_jobs(),
         }
     }));
@@ -7381,6 +7677,19 @@ fn drain_js_side(ctx: &mut Context, outcome: &mut Outcome) {
                 .map(String::from),
         );
     }
+}
+
+/// Run the DOM-wide custom-element upgrade algorithm at a host-task boundary.
+///
+/// The normal insertion hooks call `ceScan` as each subtree is attached, but a
+/// module can construct a subtree through parser/template/adoption paths while
+/// its definition is being evaluated.  HTML's `CustomElementRegistry.upgrade()`
+/// is the general reconciliation operation for that case (HTML
+/// §4.13.6.3); invoking it after a module task's microtask checkpoint keeps the
+/// live DOM and the custom-element reactions in sync without making layout or
+/// painting a second source of DOM semantics.
+fn reconcile_custom_elements(ctx: &mut Context) {
+    let _ = ctx.eval(Source::from_bytes(b"customElements.upgrade(document)"));
 }
 
 /// Run a page's scripts against a real DOM and return the post-JS HTML
@@ -8751,6 +9060,10 @@ fn page_actor(
         // rest. Only a truly inert page (no interaction AND no scheduled work)
         // takes the Static fast-exit and drops the engine (articles hold none).
         let has_timers = js_next_deadline(&mut page).is_some();
+        // Dynamically inserted module/style/resource work is queued as host
+        // jobs. It must keep the resident actor alive even when the page has
+        // no visible controls or author timers yet.
+        let has_pending_jobs = page_has_pending_jobs(&page);
         // A page with IO observers / scroll listeners stays live to receive
         // scroll, even with no clickables or timers (see `js_has_scroll_work`).
         let has_scroll_work = js_has_scroll_work(&mut page);
@@ -8772,6 +9085,7 @@ fn page_actor(
         if !has_clickables
             && !painted_live
             && !has_timers
+            && !has_pending_jobs
             && !has_scroll_work
             && !has_workers
             && !has_pending_fetches
@@ -8844,18 +9158,49 @@ fn page_actor(
     // still honored, and the clock stays monotonic.
     let clock_wall = std::time::Instant::now();
     let mut clock_virt = js_now(&mut page);
+    // When both lanes are runnable, alternate a timer task with one queued
+    // host task.  The HTML event-loop processing model leaves task-source
+    // selection implementation-defined, but it must not let a deferred module
+    // fetch hide a due timer forever (or let a zero-delay timer chain hide the
+    // module fetch).  This bit records that the last turn chose the timer.
+    let mut prefer_host_turn = false;
+    let mut last_timer_wake: Option<std::time::Instant> = None;
     loop {
         let elapsed = clock_wall.elapsed().as_millis() as f64;
         let now_virt = (clock_virt + elapsed).max(js_now(&mut page));
         clock_virt = now_virt - elapsed;
-        let sleep_dur = js_next_deadline(&mut page)
-            .map(|at| Duration::from_millis((at - now_virt).max(0.0) as u64).max(WAKE_FLOOR));
+        // A dynamically prepared module/resource is a later HTML task. Give it
+        // an explicit turn before frontend command traffic can keep winning the
+        // biased select forever; otherwise a stream of geometry/scroll updates
+        // can starve the deferred queue and leave a custom element permanently
+        // unupgraded. The task itself parks on its network future, so this is a
+        // single handoff, not an idle spin.
+        let timer_due = js_next_deadline(&mut page).is_some_and(|at| at <= now_virt);
+        let pending_host_jobs = page_has_pending_jobs(&page);
+        let service_host_jobs = pending_host_jobs && (!timer_due || prefer_host_turn);
+        // Hover/command traffic must not win the biased select forever when a
+        // timer is due. After a timer turn, retain the normal frame floor so a
+        // zero-delay chain cannot busy-loop; once that floor expires, take the
+        // timer turn explicitly, then alternate with any host task.
+        let timer_floor_ready = last_timer_wake.is_none_or(|at| at.elapsed() >= WAKE_FLOOR);
+        let service_due_timer =
+            timer_due && timer_floor_ready && (!prefer_host_turn || !pending_host_jobs);
+        let sleep_floor =
+            last_timer_wake.map_or(WAKE_FLOOR, |at| WAKE_FLOOR.saturating_sub(at.elapsed()));
+        let sleep_dur = if service_host_jobs {
+            Some(WAKE_FLOOR)
+        } else {
+            js_next_deadline(&mut page)
+                .map(|at| Duration::from_millis((at - now_virt).max(0.0) as u64).max(sleep_floor))
+        };
         let wake = rt.block_on(async {
             tokio::select! {
                 // Pointer boundary state is a bounded latest-value lane. Give
                 // it priority over ordinary queued commands so an exit cannot
                 // remain stuck behind page bookkeeping or a busy animation.
                 biased;
+                () = std::future::ready(()), if service_host_jobs => Wake::Timer,
+                () = std::future::ready(()), if service_due_timer => Wake::Timer,
                 changed = hover.changed() => Wake::Hover(changed.ok().map(|()| *hover.borrow_and_update())),
                 cmd = cmds.recv() => Wake::Cmd(cmd),
                 // A background fetch completed — settle its promise and re-render.
@@ -8882,10 +9227,28 @@ fn page_actor(
             // gone; nothing more to do.
             Wake::Fetch(None) => continue,
             Wake::Timer => {
+                // A dynamically inserted script/module is a later HTML host
+                // task.  The actor uses the same wake lane for that work as
+                // for timer deadlines, but it must not fall through to
+                // `timer_wake`: that function only runs an author timer and
+                // would leave the module fetch/evaluation queue untouched
+                // forever (Reddit's SML carousel dependencies are one such
+                // graph).  Service the queued host task as its own event turn
+                // and let the next select choose a due timer separately.
                 let real_now = clock_virt + clock_wall.elapsed().as_millis() as f64;
+                let timer_due = js_next_deadline(&mut page).is_some_and(|at| at <= real_now);
+                if page_has_pending_jobs(&page) && (!timer_due || prefer_host_turn) {
+                    if !host_task_wake(&mut page, &evts) {
+                        break;
+                    }
+                    prefer_host_turn = false;
+                    continue;
+                }
                 if !timer_wake(&mut page, &evts, real_now) {
                     break;
                 }
+                last_timer_wake = Some(std::time::Instant::now());
+                prefer_host_turn = true;
                 continue;
             }
         };
@@ -9648,6 +10011,37 @@ fn timer_wake(
     true
 }
 
+/// Run one queued networking/module host task for a resident page.
+///
+/// Dynamically inserted `<script>` elements are HTML tasks, not timer
+/// callbacks.  Their fetches and module-evaluation jobs live in
+/// [`PageJobExecutor`]; after the task completes the browser performs the
+/// microtask checkpoint and an update-the-rendering step.  Keep that boundary
+/// explicit so a module graph can upgrade custom elements and trigger exactly
+/// one authoritative render without accidentally consuming an unrelated due
+/// timer in the same turn (HTML §8.1.7.3).
+fn host_task_wake(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
+    prepare_dispatch(page);
+    run_jobs_into(&mut page.ctx, &page.budget, &mut page.outcome);
+    reconcile_custom_elements(&mut page.ctx);
+    run_microtasks_into(&mut page.ctx, &mut page.outcome);
+    // Module factories commonly stamp image elements or style-bearing shadow
+    // trees.  Queue their resource tasks for a later turn after the job's
+    // microtasks, matching the normal HTML task ordering.
+    schedule_image_loads(&mut page.ctx, &mut page.outcome);
+    drain_js_side(&mut page.ctx, &mut page.outcome);
+    if page.outcome.panicked {
+        let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+        return false;
+    }
+    // A connectedCallback/module factory may have changed an observed target;
+    // update intersections before serializing the task's render.
+    if !finish_dispatch_render(page, evts, false) {
+        return false;
+    }
+    true
+}
+
 fn page_pending_fetches(page: &LoadedPage) -> usize {
     page.ctx
         .realm()
@@ -9792,6 +10186,18 @@ fn js_next_deadline(page: &mut LoadedPage) -> Option<f64> {
         return None;
     }
     v.as_number()
+}
+
+/// Whether the page actor has host work that is not represented by an author
+/// timer. In particular, dynamically inserted module scripts enqueue a fetch
+/// and a module-evaluation promise; waking for those jobs follows the HTML
+/// event-loop task boundary instead of parking forever with no timer deadline.
+fn page_has_pending_jobs(page: &LoadedPage) -> bool {
+    let pending = page
+        .ctx
+        .downcast_job_executor::<PageJobExecutor>()
+        .is_some_and(|executor| executor.has_pending_jobs());
+    pending
 }
 
 /// Does the page have scroll-driven work — an `IntersectionObserver` or a
@@ -11109,6 +11515,11 @@ const PRELUDE: &str = r##"
     // event timestamps, and newly scheduled timer deadlines never freeze while
     // synchronous JavaScript is executing (High Resolution Time §§2.1, 7.1).
     // Declared up here because the Event class, defined early, reads it.
+    // Timer task selection is implementation-defined at the event-loop task
+    // source boundary (HTML §8.6). `turn` gives a newer due timeout a bounded
+    // opportunity when a page has accumulated a long overdue telemetry/timer
+    // backlog; otherwise a code-split module's debounce can wait behind stale
+    // tasks forever while the actor deliberately runs one task per frame.
     const timers = { q: [], now: 0, seq: 1 };
     // The absolute epoch the virtual clock is anchored to — the REAL host
     // time at prelude boot (the Rust clock answers real time until the first
@@ -11152,14 +11563,14 @@ const PRELUDE: &str = r##"
     // (HTML "prepare a script") — the universal SDK-loader idiom
     // `document.body.appendChild(scriptEl)` (reCAPTCHA, lazy analytics, embeds).
     // Tracked so re-insertion never re-runs it (the spec's "already started"
-    // flag). Classic scripts only; a non-JS `type` is left inert. Scripts
+    // flag). Classic and module scripts run; a non-JS `type` is left inert. Scripts
     // parsed from innerHTML do NOT execute (spec), so this only fires for
     // genuine element-node insertion through appendChild/insertBefore.
     const SCRIPTS_STARTED = new Set();
     function maybeRunScript(node) {
         if (!node || node.localName !== "script" || SCRIPTS_STARTED.has(node.__id)) return;
         const ty = (node.getAttribute("type") || "").trim().toLowerCase();
-        if (ty && ty !== "text/javascript" && ty !== "application/javascript" && ty !== "text/ecmascript") return;
+        if (ty && ty !== "text/javascript" && ty !== "application/javascript" && ty !== "text/ecmascript" && ty !== "module") return;
         // A classic script carrying `nomodule` is skipped: it exists only for
         // user agents WITHOUT module support, and we run module scripts (HTML
         // §"prepare the script element"). Letting it run loads the legacy
@@ -12547,14 +12958,7 @@ const PRELUDE: &str = r##"
         // indistinguishable from a no-op.
         get ownerDocument() { return wrap(__dom_owner_document(this.__id)); }
         get isConnected() {
-            let n = this;
-            for (;;) {
-                const p = n.parentNode;
-                if (p) { n = p; continue; }
-                if (n === g.document) return true;
-                if (n.__host) { n = n.__host; continue; } // shadow hop
-                return false;
-            }
+            return !!__dom_is_connected(this.__id);
         }
         getRootNode() { let n = this; while (n.parentNode) n = n.parentNode; return n; }
         // Document.adoptNode is defined on Document, below.  Keeping the
@@ -12686,10 +13090,6 @@ const PRELUDE: &str = r##"
         // EventTarget.prototype now (Node extends EventTarget, per spec). Keeping
         // them solely there means a polyfill that augments EventTarget.prototype
         // (ShadyDOM's `__shady_*` accessors) is visible on every node too.
-        querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
-        querySelectorAll(s) { return __dom_query(this.__id, String(s), false).map(wrap); }
-        getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
-        getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
     }
     Node.ELEMENT_NODE = 1; Node.TEXT_NODE = 3; Node.COMMENT_NODE = 8;
     Node.DOCUMENT_NODE = 9; Node.DOCUMENT_FRAGMENT_NODE = 11;
@@ -12901,6 +13301,15 @@ const PRELUDE: &str = r##"
     }
 
     class Element extends Node {
+        // DOM Standard ParentNode: selector methods are exposed on Element,
+        // Document, and DocumentFragment—not on CharacterData/Text nodes.
+        // Keeping these off Node is observable (`"querySelectorAll" in text`
+        // is false) and prevents code that tests for ParentNode from treating
+        // an inserted text node as an element.
+        querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
+        querySelectorAll(s) { return __dom_query(this.__id, String(s), false).map(wrap); }
+        getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
+        getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
         // nodeType and the tag are IMMUTABLE for a node: `wrap()` already
         // dispatched this class BY node type, and an element's local name never
         // changes. So return a constant nodeType (no `__dom_node_type` syscall)
@@ -14307,6 +14716,13 @@ const PRELUDE: &str = r##"
             if (CE.defs.size) ceScan(clone);
             return clone;
         }
+        // DOM Standard ParentNode methods. Document used to inherit these
+        // from Node; keep its own implementation now that CharacterData no
+        // longer exposes selector methods.
+        querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
+        querySelectorAll(s) { return __dom_query(this.__id, String(s), false).map(wrap); }
+        getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
+        getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
         createTreeWalker(root, whatToShow, filter) { return new TreeWalker(root, whatToShow, filter); }
         createNodeIterator(root, whatToShow) { return new NodeIterator(root, whatToShow); }
         createDocumentFragment() { return wrap(__dom_create_fragment()); }
@@ -14427,7 +14843,15 @@ const PRELUDE: &str = r##"
         hasFocus() { return true; }
     }
 
-    class DocumentFragment extends Node { get nodeType() { return 11; } get nodeName() { return "#document-fragment"; } get [Symbol.toStringTag]() { return "DocumentFragment"; } }
+    class DocumentFragment extends Node {
+        get nodeType() { return 11; }
+        get nodeName() { return "#document-fragment"; }
+        get [Symbol.toStringTag]() { return "DocumentFragment"; }
+        querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
+        querySelectorAll(s) { return __dom_query(this.__id, String(s), false).map(wrap); }
+        getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
+        getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
+    }
     class Comment extends CharacterData { get nodeType() { return 8; } get nodeName() { return "#comment"; } get [Symbol.toStringTag]() { return "Comment"; } }
     // Lit walks comment markers with one of these.
     // A spec-faithful DOM TreeWalker (https://dom.spec.whatwg.org/#interface-treewalker).
@@ -14642,6 +15066,10 @@ const PRELUDE: &str = r##"
         get adoptedStyleSheets() { return this.__adopted || (this.__adopted = []); }
         set adoptedStyleSheets(v) { this.__adopted = v; adoptedSync(this); }
         getElementById(i) { const r = this.querySelectorAll("[id]"); for (const e of r) if (e.id === String(i)) return e; return null; }
+        querySelector(s) { const r = __dom_query(this.__id, String(s), true); return r.length ? wrap(r[0]) : null; }
+        querySelectorAll(s) { return __dom_query(this.__id, String(s), false).map(wrap); }
+        getElementsByTagName(t) { return this.querySelectorAll(String(t)); }
+        getElementsByClassName(c) { return this.querySelectorAll(String(c).trim().split(/\s+/).map((x) => "." + x).join("")); }
     }
 
     // WHATWG DOM §4.2.2.3 "Finding slots and slottables". Direct assignment is
@@ -14771,6 +15199,18 @@ const PRELUDE: &str = r##"
         const ids = __dom_upgrade_candidates(g.document.__id, name);
         for (let i = 0; i < ids.length; i++) upgradeElement(wrap(ids[i]), ctor);
     }
+    // A definition can arrive while the parser/module task is still attaching
+    // the document subtree.  The upgrade itself is synchronous, but the
+    // connected reaction is delivered at the custom-element reactions
+    // microtask checkpoint; retry the already-upgraded candidates there so a
+    // transiently-disconnected instance is not left with an empty shadow root.
+    function ceConnectName(name) {
+        const ids = __dom_upgrade_candidates(g.document.__id, name);
+        for (let i = 0; i < ids.length; i++) {
+            const el = wrap(ids[i]);
+            if (el.__ceUpgraded) maybeConnect(el);
+        }
+    }
     function ceDisconnect(node) {
         if (!node || typeof node !== "object") return;
         if (node.__ceConnected && typeof node.disconnectedCallback === "function") {
@@ -14797,6 +15237,7 @@ const PRELUDE: &str = r##"
             CE.defs.set(name, ctor);
             CE.tags.set(ctor, name);
             ceUpgradeName(name, ctor);
+            Promise.resolve().then(() => ceConnectName(name));
             const w = CE.waiting.get(name);
             if (w) { CE.waiting.delete(name); w.resolve(ctor); }
         },
@@ -17001,7 +17442,10 @@ const PRELUDE: &str = r##"
         absMs = Math.max(currentTime(), absMs);
         let task = null;
         for (const t of timers.q) {
-            if (t.at <= absMs && (!task || t.at < task.at || (t.at === task.at && t.id < task.id))) task = t;
+            if (t.at > absMs) continue;
+            if (!task || t.at < task.at || (t.at === task.at && t.id < task.id)) {
+                task = t;
+            }
         }
         if (task) {
             timers.q.splice(timers.q.indexOf(task), 1);
@@ -24816,6 +25260,31 @@ mod tests {
     }
 
     #[test]
+    fn parent_node_selector_methods_are_not_exposed_on_text_nodes() {
+        // DOM Standard ParentNode: querySelector/querySelectorAll and the
+        // getElementsBy* methods belong to Element, Document, and
+        // DocumentFragment. CharacterData (including Text) must not expose
+        // them; libraries use this distinction while processing mutation
+        // records containing both elements and text nodes.
+        let (out, outcome) = page(
+            r#"<body><pre id=o></pre><script>
+                const text = document.createTextNode('x');
+                const element = document.createElement('div');
+                const fragment = document.createDocumentFragment();
+                document.getElementById('o').textContent = [
+                    'querySelectorAll' in text,
+                    'getElementsByTagName' in text,
+                    'getElementsByClassName' in text,
+                    typeof element.querySelectorAll,
+                    typeof fragment.querySelectorAll
+                ].join('|');
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("false|false|false|function|function"), "{out}");
+    }
+
+    #[test]
     fn contextual_of_can_name_a_strict_lexical_binding() {
         // ECMAScript reserves `of` only in contextual grammar positions (most
         // visibly as the separator in `for (x of y)`). It remains a valid
@@ -29736,6 +30205,44 @@ mod tests {
     }
 
     #[test]
+    fn nested_shadow_slots_flatten_forwarded_gallery_pages() {
+        // HTML §4.12.4: assignedNodes({flatten:true}) recursively replaces
+        // slot elements with their assigned nodes. A gallery-carousel uses
+        // exactly this forwarding shape: its shadow slot feeds a nested
+        // faceplate-carousel slot, while the actual image pages remain light
+        // children of the outer host. The serializer must retain those pages
+        // for the presentation adapter instead of emitting an empty `<slot>`.
+        let (out, outcome) = page(
+            r##"<body><gallery-carousel>
+              <ul><li slot="page-1"><img src="one.webp" width="4" height="3"></li>
+                  <li slot="page-2"><img src="two.webp" width="4" height="3"></li></ul>
+            </gallery-carousel><script>
+              class FaceplateCarousel extends HTMLElement {
+                constructor() { super(); this.attachShadow({mode:'open'}); }
+                connectedCallback() { this.shadowRoot.innerHTML = '<div><slot></slot></div>'; }
+              }
+              class GalleryCarousel extends HTMLElement {
+                constructor() { super(); this.attachShadow({mode:'open'}); }
+                connectedCallback() {
+                  this.shadowRoot.innerHTML = '<faceplate-carousel><slot></slot></faceplate-carousel>';
+                }
+              }
+              customElements.define('faceplate-carousel', FaceplateCarousel);
+              customElements.define('gallery-carousel', GalleryCarousel);
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        assert!(
+            out.contains("one.webp") && out.contains("two.webp"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("<slot"),
+            "forwarding slots must not replace pages: {out}"
+        );
+    }
+
+    #[test]
     fn slotchange_drives_named_shadow_slot_carousel() {
         // WHATWG DOM §4.2.2.3/4: inserting the initial default slot assigns
         // the host's light children, queues one bubbling/non-composed
@@ -31670,6 +32177,132 @@ mod tests {
              </script></body>",
         );
         assert!(out2.contains(">1<"), "ran once, not twice: {out2}");
+    }
+
+    #[test]
+    fn an_injected_inline_module_executes_and_fires_load() {
+        // HTML's dynamically prepared module-script path is distinct from a
+        // classic eval: it must parse/evaluate through the page module loader
+        // before resolving the element's load event. Code-split custom-element
+        // bundles (including Reddit's carousel) use this exact pattern.
+        let (out, outcome) = page(
+            r#"<body><pre id=o>before</pre><script>
+            const s = document.createElement('script');
+            s.type = 'module';
+            s.textContent = "document.getElementById('o').textContent='module-ran';";
+            s.addEventListener('load', () => document.body.setAttribute('data-module-load', 'yes'));
+            s.addEventListener('error', () => document.body.setAttribute('data-module-load', 'no'));
+            document.body.appendChild(s);
+            </script></body>"#,
+        );
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains(">module-ran<"), "{out}");
+        assert!(out.contains(r#"data-module-load="yes""#), "{out}");
+    }
+
+    #[test]
+    fn an_injected_module_upgrades_a_connected_custom_element() {
+        // Code-split component bundles define their element after the server
+        // rendered host is already in the document. The definition and the
+        // connection reaction must both run on the module task, otherwise its
+        // light-DOM fallback remains laid out as a stack of slides.
+        let (out, outcome) = page(
+            r#"<body><x-gallery></x-gallery><script>
+            const s = document.createElement('script');
+            s.type = 'module';
+            s.textContent = `class XGallery extends HTMLElement {
+              constructor() { super(); this.attachShadow({mode:'open'}); }
+              connectedCallback() { this.shadowRoot.innerHTML = '<span>gallery-ready</span>'; }
+            }
+            customElements.define('x-gallery', XGallery);`;
+            document.body.appendChild(s);
+            </script></body>"#,
+        );
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        assert!(out.contains("gallery-ready"), "{out}");
+    }
+
+    #[test]
+    fn parser_elements_report_connected_to_the_document() {
+        let (out, outcome) = page(
+            r#"<body><div id="probe"><span></span></div><script>
+            const d = document.getElementById('probe');
+            document.body.setAttribute('data-connected', [
+              document.isConnected, document.documentElement.isConnected,
+              document.body.isConnected, d.isConnected, d.firstElementChild.isConnected
+            ].join(','));
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        assert!(
+            out.contains(r#"data-connected="true,true,true,true,true""#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn node_is_connected_crosses_shadow_roots_but_not_detached_nodes() {
+        let (out, outcome) = page(
+            r#"<body><div id=host></div><script>
+            const host = document.getElementById('host');
+            const root = host.attachShadow({ mode: 'open' });
+            const shadowChild = document.createElement('span');
+            const detached = document.createElement('i');
+            root.appendChild(shadowChild);
+            document.body.setAttribute('data-connected', [
+              host.isConnected, root.isConnected, shadowChild.isConnected,
+              detached.isConnected
+            ].join(','));
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        assert!(
+            out.contains(r#"data-connected="true,true,true,false""#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_live_page_services_an_injected_module_after_first_paint() {
+        let (handle, mut events) = live(
+            r#"<body><pre id=o>before</pre><script>
+            const s = document.createElement('script');
+            s.type = 'module';
+            s.textContent = "document.getElementById('o').textContent='module-ran';";
+            document.body.appendChild(s);
+            </script></body>"#,
+        );
+        let mut saw_first = false;
+        let mut saw_module = false;
+        for _ in 0..8 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => {
+                    if html.contains(">before<") {
+                        saw_first = true;
+                    }
+                    if html.contains(">module-ran<") {
+                        saw_module = true;
+                        break;
+                    }
+                }
+                Some(PageEvt::Static { html, .. }) => {
+                    if html.contains(">module-ran<") {
+                        saw_module = true;
+                        break;
+                    }
+                }
+                Some(PageEvt::Settled) => {}
+                other => panic!("unexpected page event: {other:?}"),
+            }
+        }
+        drop(handle);
+        assert!(
+            saw_first,
+            "resident actor should paint before async module work"
+        );
+        assert!(saw_module, "resident actor should service the module task");
     }
 
     #[test]

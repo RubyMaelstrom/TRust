@@ -375,7 +375,7 @@ impl Builder<'_> {
         // `<slot>` outside any shadow tree has no host, so `slot_assigned_nodes`
         // is empty and it falls back to its own children.
         if tag == "slot" {
-            let assigned = self.dom.slot_assigned_nodes(id);
+            let assigned = self.dom.flat_slot_nodes(id);
             let kids = if assigned.is_empty() {
                 self.children(id)
             } else {
