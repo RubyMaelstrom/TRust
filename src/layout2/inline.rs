@@ -102,6 +102,10 @@ pub(crate) struct InlineItem {
     /// glyphs, flex sizing, wrapping, or CSSOM geometry.
     pub terminal_text: Option<String>,
     pub kind: ItemKind,
+    /// Source retained for graphical resource scheduling while decoded pixels
+    /// are still unavailable. The terminal adapter intentionally ignores it
+    /// and leaves a dimensioned pending image box blank.
+    pub graphical_image: Option<String>,
     pub image: Option<String>,
     pub emph: Emphasis,
     /// Element whose computed style supplies paint values for this item.
@@ -588,6 +592,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 text: String::new(),
                 terminal_text: None,
                 kind: ItemKind::Image,
+                graphical_image: None,
                 image: Some(source.to_string()),
                 emph: Emphasis::default(),
                 style_node: ctx.node,
@@ -835,6 +840,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 text: seg.to_string(),
                 terminal_text: None,
                 kind: ctx.kind,
+                graphical_image: None,
                 image: None,
                 emph: ctx.emph,
                 style_node: ctx.node,
@@ -907,6 +913,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                         text: labels.visual,
                         terminal_text: Some(labels.terminal),
                         kind: ItemKind::Form,
+                        graphical_image: None,
                         image: None,
                         emph: Emphasis::default(),
                         style_node: a.node,
@@ -971,7 +978,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             self.vp,
         ) {
             let pixelated = matches!(
-                self.dom.computed_value(node, "image-rendering").as_deref(),
+                self.dom
+                    .computed_value_resolved(node, "image-rendering")
+                    .as_deref(),
                 Some(
                     "pixelated" | "crisp-edges" | "-moz-crisp-edges" | "-webkit-optimize-contrast"
                 )
@@ -989,9 +998,16 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     text: String::new(),
                     terminal_text: None,
                     kind: ItemKind::Image,
+                    // Graphical paint owns an image request as soon as the
+                    // replaced box has a valid source. Decoded availability is
+                    // kept separate so the terminal adapter still paints its
+                    // pending box blank.
+                    graphical_image: url.map(str::to_string),
                     image: natural
                         .is_some()
-                        .then(|| url.unwrap_or_default().to_string()),
+                        .then_some(url)
+                        .flatten()
+                        .map(str::to_string),
                     emph: Emphasis::default(),
                     style_node: node,
                     node,
@@ -1041,7 +1057,9 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let invisible = ctx.invisible || own_suppressed;
         if invisible
             && matches!(
-                self.dom.computed_value(node, "position").as_deref(),
+                self.dom
+                    .computed_value_resolved(node, "position")
+                    .as_deref(),
                 Some("absolute" | "fixed")
             )
         {
@@ -1111,6 +1129,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     text: String::new(),
                     terminal_text: None,
                     kind: ItemKind::Image,
+                    graphical_image: None,
                     image: Some(poster),
                     emph: Emphasis::default(),
                     style_node: node,
@@ -1219,6 +1238,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 text: String::new(),
                 terminal_text: None,
                 kind: crate::layout2::ItemKind::Text,
+                graphical_image: None,
                 image: None,
                 emph: Emphasis::default(),
                 style_node: node,
@@ -1452,7 +1472,7 @@ pub(super) fn poster_media_target(
     // image can be the custom overlay that paints over the native poster; this
     // O(1) gate keeps the structural media scan off every normal `<img>` path.
     if !matches!(
-        dom.computed_value(image, "position").as_deref(),
+        dom.computed_value_resolved(image, "position").as_deref(),
         Some("absolute" | "fixed")
     ) {
         return None;
@@ -1462,7 +1482,8 @@ pub(super) fn poster_media_target(
         _ => return None,
     };
     let videos: Vec<_> = dom
-        .descendants(crate::dom::DOCUMENT)
+        .flat_descendants(crate::dom::DOCUMENT)
+        .into_iter()
         .filter(|&id| dom.tag_name(id) == Some("video"))
         .filter(|&id| {
             dom.attr(id, "poster")
@@ -1644,7 +1665,7 @@ fn control_labels(
     }
     let u = Units::of(dom, node);
     let css_width = dom
-        .computed_value(node, "width")
+        .computed_value_resolved(node, "width")
         .and_then(|v| Len::parse(&v, u, vp))
         .and_then(|l| {
             l.resolve(match width_basis {

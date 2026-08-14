@@ -24,10 +24,13 @@ use super::flow::{Frag, FragKind};
 /// Whether `node` is a v1 inline relayout boundary: a baked block-filling IFC
 /// container. The cheap `data-trust-node` gate runs first (only boundaries carry
 /// it), so the cascade queries below touch the sparse baked set, not every box.
-fn is_boundary(dom: &Dom, node: NodeId) -> Option<usize> {
-    let id = dom
-        .attr(node, "data-trust-node")
-        .and_then(|s| s.parse::<usize>().ok())?;
+pub(super) fn boundary_actor(dom: &Dom, node: NodeId) -> Option<usize> {
+    let id = if dom.render_live() {
+        node
+    } else {
+        dom.attr(node, "data-trust-node")
+            .and_then(|s| s.parse::<usize>().ok())?
+    };
     // A block-filling IFC: flex/grid/flow-root, NOT a scroll/clip viewport (the
     // region path owns those), in normal flow, and NOT a flex/grid ITEM (its
     // width is content-dependent — the parent sizes it).
@@ -54,7 +57,12 @@ fn is_boundary(dom: &Dom, node: NodeId) -> Option<usize> {
 /// Walk the fragment tree, emitting a `BoundaryBox` for every v1 inline boundary.
 /// Called BEFORE paint extracts scroll regions (so the geometry is intact);
 /// `mod.rs` then drops any boundary whose rows overlap a region/carousel band.
-pub(super) fn collect(dom: &Dom, root: &Frag<'_>, cw: f32, ch: f32) -> Vec<BoundaryBox> {
+pub(super) fn collect(
+    dom: &super::terminal::TerminalPaintModel,
+    root: &Frag<'_>,
+    cw: f32,
+    ch: f32,
+) -> Vec<BoundaryBox> {
     let mut out = Vec::new();
     let columns = (root.w / cw).round().max(1.0) as usize;
     let line_rows = super::terminal::line_row_map(root, 0.0, 0.0, cw, ch, columns);
@@ -63,7 +71,7 @@ pub(super) fn collect(dom: &Dom, root: &Frag<'_>, cw: f32, ch: f32) -> Vec<Bound
 }
 
 fn walk(
-    dom: &Dom,
+    dom: &super::terminal::TerminalPaintModel,
     f: &Frag<'_>,
     cw: f32,
     ch: f32,
@@ -72,7 +80,7 @@ fn walk(
 ) {
     if f.node != crate::layout2::NO_NODE
         && matches!(f.kind, FragKind::Block)
-        && let Some(node) = is_boundary(dom, f.node)
+        && let Some(node) = dom.boundary_actor(f.node)
     {
         let mut row0 = (f.y / ch).round().max(0.0) as usize;
         let mut row1 = ((f.y + f.h) / ch).round().max(0.0) as usize;

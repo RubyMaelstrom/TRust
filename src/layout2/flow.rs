@@ -36,7 +36,7 @@ use super::value::{Len, Vp};
 /// One laid-out fragment: a border-box rect in absolute px, plus content.
 /// `'t` is the box tree (out-of-flow placeholders reference their box until
 /// the positioned post-pass replaces them).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Frag<'t> {
     /// The generating element (`NO_NODE` for anonymous boxes/line boxes).
     pub node: NodeId,
@@ -66,7 +66,7 @@ pub(crate) struct Frag<'t> {
 /// A box promoted into the document top layer. CSS Positioned Layout 4 §3
 /// lays it as a sibling of the root against the initial containing block and
 /// paints top-layer entries after the document in ordered-set order.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct TopFrag<'t> {
     pub fragment: Frag<'t>,
     pub fixed: bool,
@@ -100,7 +100,7 @@ impl Clip {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum FragKind<'t> {
     Block,
     /// A line box with retained typographic metrics in CSS pixels.
@@ -1132,7 +1132,7 @@ impl Flow<'_> {
 
         // ---- the ::marker (outside position) ----
         if !b.marker_inside && (b.marker.is_some() || b.marker_image.is_some()) {
-            children.push(self.marker_frag(
+            let marker = self.marker_frag(
                 b.marker.as_deref(),
                 b.marker_image.as_deref(),
                 &inl,
@@ -1140,7 +1140,14 @@ impl Flow<'_> {
                 &children,
                 y_border,
                 bt,
-            ));
+            );
+            // CSS Lists 3 §3.1 defines ::marker as the list item's first
+            // child, before ::before and principal content. Preserve that
+            // painting order too. At the terminal boundary a sub-cell marker
+            // separator can quantize onto the content's first cell; painting
+            // the real first child first lets the later content own that cell
+            // instead of losing its leading character.
+            children.insert(0, marker);
         }
 
         // ---- bottom edge / used height (§10.6.3, §10.7, §8.3.1) ----
@@ -1445,6 +1452,7 @@ impl Flow<'_> {
                     text: String::new(),
                     terminal_text: None,
                     kind: crate::layout2::ItemKind::Image,
+                    graphical_image: None,
                     image: Some(source.to_string()),
                     emph: Emphasis::default(),
                     style_node: inl.node,
@@ -1467,6 +1475,7 @@ impl Flow<'_> {
                     text: " ".to_string(),
                     terminal_text: None,
                     kind: crate::layout2::ItemKind::Text,
+                    graphical_image: None,
                     image: None,
                     emph: inl.emph,
                     style_node: inl.node,
@@ -1496,6 +1505,7 @@ impl Flow<'_> {
                     text: marker.to_string(),
                     terminal_text: None,
                     kind: crate::layout2::ItemKind::Text,
+                    graphical_image: None,
                     image: None,
                     emph: inl.emph,
                     style_node: inl.node,
@@ -1646,7 +1656,7 @@ impl Flow<'_> {
         }
         let u = crate::layout2::Units::of(self.dom, node);
         self.dom
-            .computed_value(node, "text-indent")
+            .computed_value_resolved(node, "text-indent")
             .and_then(|v| Len::parse(&v, u, self.vp))
             .and_then(|l| l.resolve(Some(content_w)))
             .unwrap_or(0.0)
@@ -2798,16 +2808,24 @@ impl Flow<'_> {
         let r =
             super::replaced::apply_fit(self.dom, node, natural, content_w.max(1.0), box_h.max(1.0));
         let pixelated = matches!(
-            self.dom.computed_value(node, "image-rendering").as_deref(),
+            self.dom
+                .computed_value_resolved(node, "image-rendering")
+                .as_deref(),
             Some("pixelated" | "crisp-edges" | "-moz-crisp-edges" | "-webkit-optimize-contrast")
         );
         let item = InlineItem {
             text: String::new(),
             terminal_text: None,
             kind: crate::layout2::ItemKind::Image,
+            // Replaced content with a source remains a graphical resource
+            // while pending; intrinsic availability controls both sizing and
+            // whether the terminal's decoded-pixel field is populated.
+            graphical_image: url.map(str::to_string),
             image: natural
                 .is_some()
-                .then(|| url.unwrap_or_default().to_string()),
+                .then_some(url)
+                .flatten()
+                .map(str::to_string),
             emph: crate::layout2::Emphasis::default(),
             style_node: node,
             node,
@@ -2858,7 +2876,7 @@ impl Flow<'_> {
         }
         align_item_from(
             self.dom
-                .computed_value(node, "align-self")
+                .computed_value_resolved(node, "align-self")
                 .as_deref()
                 .unwrap_or(""),
             container,
@@ -2870,7 +2888,7 @@ impl Flow<'_> {
             return 0;
         }
         self.dom
-            .computed_value(node, "order")
+            .computed_value_resolved(node, "order")
             .and_then(|v| v.trim().parse::<i32>().ok())
             .unwrap_or(0)
     }
@@ -2882,7 +2900,7 @@ impl Flow<'_> {
         }
         for prop in ["overflow-x", "overflow-y", "overflow"] {
             if matches!(
-                self.dom.computed_value(node, prop).as_deref(),
+                self.dom.computed_value_resolved(node, prop).as_deref(),
                 Some("hidden" | "auto" | "scroll" | "overlay")
             ) {
                 return true;
@@ -2929,7 +2947,7 @@ impl Flow<'_> {
         }
         let clips =
             |v: Option<String>| matches!(v.as_deref().map(str::trim), Some("hidden" | "clip"));
-        let (sx, sy) = match self.dom.computed_value(id, "overflow") {
+        let (sx, sy) = match self.dom.computed_value_resolved(id, "overflow") {
             Some(sh) => {
                 let mut t = sh.split_whitespace();
                 let x = t.next().map(str::to_string);
@@ -2938,8 +2956,8 @@ impl Flow<'_> {
             }
             None => (None, None),
         };
-        let ox = self.dom.computed_value(id, "overflow-x").or(sx);
-        let oy = self.dom.computed_value(id, "overflow-y").or(sy);
+        let ox = self.dom.computed_value_resolved(id, "overflow-x").or(sx);
+        let oy = self.dom.computed_value_resolved(id, "overflow-y").or(sy);
         (clips(ox), clips(oy))
     }
 
@@ -3358,10 +3376,14 @@ impl Flow<'_> {
         // values. In particular, unlike hidden, `overflow:clip` does *not*
         // establish an independent formatting context.
         for prop in ["overflow-x", "overflow-y", "overflow"] {
-            if self.dom.computed_value(b.node, prop).is_some_and(|v| {
-                v.split_whitespace()
-                    .any(|v| matches!(v, "hidden" | "auto" | "scroll" | "overlay"))
-            }) {
+            if self
+                .dom
+                .computed_value_resolved(b.node, prop)
+                .is_some_and(|v| {
+                    v.split_whitespace()
+                        .any(|v| matches!(v, "hidden" | "auto" | "scroll" | "overlay"))
+                })
+            {
                 return true;
             }
         }
@@ -3643,12 +3665,12 @@ impl Flow<'_> {
         let vunits = crate::layout2::Units::of(self.dom, id);
         let count = self
             .dom
-            .computed_value(id, "column-count")
+            .computed_value_resolved(id, "column-count")
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&c| c > 0);
         let width = self
             .dom
-            .computed_value(id, "column-width")
+            .computed_value_resolved(id, "column-width")
             .filter(|v| !v.trim().eq_ignore_ascii_case("auto"))
             .and_then(|v| Len::parse(v.trim(), vunits, self.vp))
             .and_then(|l| l.resolve(None))
@@ -3659,7 +3681,7 @@ impl Flow<'_> {
         // `column-gap: normal` = 1em; a length/percentage resolves against U.
         let gap = match self
             .dom
-            .computed_value(id, "column-gap")
+            .computed_value_resolved(id, "column-gap")
             .as_deref()
             .map(str::trim)
         {

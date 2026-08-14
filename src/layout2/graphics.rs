@@ -150,7 +150,7 @@ impl<'a> Builder<'a> {
         // its host (DOM §4.2.2), so paint ancestry must cross that boundary:
         // otherwise a custom element's host box is clipped but the image/text
         // painted by its shadow tree escapes the same scrollport.
-        let mut current = self.dom.parent_composed(node);
+        let mut current = self.dom.parent_flat(node);
         while let Some(id) = current {
             if !matches!(self.dom.tag_name(id), Some("html" | "body"))
                 && let Some(container) = self
@@ -161,7 +161,7 @@ impl<'a> Builder<'a> {
             {
                 chain.push(container);
             }
-            current = self.dom.parent_composed(id);
+            current = self.dom.parent_flat(id);
         }
         chain.reverse();
         for container in &chain {
@@ -195,10 +195,13 @@ impl<'a> Builder<'a> {
             let (right, bottom) = subtree_extent(fragment);
             self.scroll_containers.push(ScrollContainer {
                 node: fragment.node,
-                actor: self
-                    .dom
-                    .attr(fragment.node, "data-trust-node")
-                    .and_then(|value| value.parse().ok()),
+                actor: if self.dom.render_live() {
+                    Some(fragment.node)
+                } else {
+                    self.dom
+                        .attr(fragment.node, "data-trust-node")
+                        .and_then(|value| value.parse().ok())
+                },
                 viewport,
                 content: CssSize::new(
                     (right - viewport.x).max(viewport.width),
@@ -224,10 +227,13 @@ impl<'a> Builder<'a> {
             && self
                 .dom
                 .establishes_independent_formatting_context(fragment.node)
-            && let Some(actor) = self
-                .dom
-                .attr(fragment.node, "data-trust-node")
-                .and_then(|value| value.parse().ok())
+            && let Some(actor) = if self.dom.render_live() {
+                Some(fragment.node)
+            } else {
+                self.dom
+                    .attr(fragment.node, "data-trust-node")
+                    .and_then(|value| value.parse().ok())
+            }
         {
             self.patch_boundaries.push(super::GraphicalPatchBoundary {
                 actor,
@@ -243,19 +249,19 @@ impl<'a> Builder<'a> {
         if fragment.node != NO_NODE
             && matches!(
                 self.dom
-                    .computed_value(fragment.node, "position")
+                    .computed_value_resolved(fragment.node, "position")
                     .as_deref(),
                 Some("sticky" | "-webkit-sticky")
             )
         {
-            let mut parent = self.dom.node(fragment.node).parent;
+            let mut parent = self.dom.parent_flat(fragment.node);
             let mut container = None;
             while let Some(node) = parent {
                 if self.dom.is_scroll_container(node) || self.dom.is_hscroll_container(node) {
                     container = Some(node);
                     break;
                 }
-                parent = self.dom.node(node).parent;
+                parent = self.dom.parent_flat(node);
             }
             self.sticky_constraints.push(StickyConstraint {
                 node: fragment.node,
@@ -263,7 +269,7 @@ impl<'a> Builder<'a> {
                 container,
                 insets: ["top", "right", "bottom", "left"].map(|side| {
                     self.dom
-                        .computed_value(fragment.node, side)
+                        .computed_value_resolved(fragment.node, side)
                         .as_deref()
                         .and_then(px)
                 }),
@@ -467,11 +473,15 @@ fn graphical_boundary(
     {
         return None;
     }
-    let actor = builder
-        .dom
-        .attr(fragment.node, "data-trust-node")?
-        .parse()
-        .ok()?;
+    let actor = if builder.dom.render_live() {
+        fragment.node
+    } else {
+        builder
+            .dom
+            .attr(fragment.node, "data-trust-node")?
+            .parse()
+            .ok()?
+    };
     Some((
         actor,
         fragment.node,
@@ -645,7 +655,12 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
                         link: piece.item.link.clone(),
                     }));
                 }
-            } else if let Some(source) = &piece.item.image {
+            } else if let Some(source) = piece
+                .item
+                .graphical_image
+                .as_ref()
+                .or(piece.item.image.as_ref())
+            {
                 let source = resolve_image_source(builder.base, source);
                 let handle = builder.image(source);
                 let rect = CssRect::new(
@@ -669,7 +684,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
                         matches!(
                             builder
                                 .dom
-                                .computed_value(style_node, "image-rendering")
+                                .computed_value_resolved(style_node, "image-rendering")
                                 .as_deref(),
                             Some(
                                 "pixelated"
@@ -711,6 +726,12 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
 fn interaction_actor(dom: &Dom, node: NodeId) -> Option<usize> {
     if node == NO_NODE {
         return None;
+    }
+    if dom.render_live() {
+        // Layout and hit testing address the canonical arena directly. The
+        // exact painted node is the Pointer Events target; dispatch/default
+        // activation then follows the DOM event path inside the actor.
+        return Some(node);
     }
     let mut current = Some(node);
     while let Some(node) = current {
@@ -758,7 +779,7 @@ fn push_layer(fragment: &Frag<'_>, builder: &mut Builder<'_>) -> bool {
     let opacity = fragment.paint.opacity.clamp(0.0, 1.0);
     let blend = builder
         .dom
-        .computed_value(fragment.node, "mix-blend-mode")
+        .computed_value_resolved(fragment.node, "mix-blend-mode")
         .as_deref()
         .map(blend_mode)
         .unwrap_or_default();
@@ -816,7 +837,7 @@ fn paint_background_images(
 /// from this returned node.
 fn canvas_background_node(dom: &Dom, root: NodeId) -> NodeId {
     let root_image = dom
-        .computed_value(root, "background-image")
+        .computed_value_resolved(root, "background-image")
         .is_some_and(|value| !value.trim().eq_ignore_ascii_case("none"));
     let root_color = background_color(dom, root);
     if root_image || root_color.is_some_and(|color| !color.is_transparent()) {
@@ -826,7 +847,7 @@ fn canvas_background_node(dom: &Dom, root: NodeId) -> NodeId {
         .into_iter()
         .find(|&child| {
             dom.tag_name(child) == Some("body")
-                && dom.computed_value(child, "display").as_deref() != Some("none")
+                && dom.computed_value_resolved(child, "display").as_deref() != Some("none")
         })
         .unwrap_or(root)
 }
@@ -838,7 +859,10 @@ fn paint_background_images_for_node(
     builder: &mut Builder<'_>,
     canvas: Option<CssRect>,
 ) {
-    let Some(value) = builder.dom.computed_value(style_node, "background-image") else {
+    let Some(value) = builder
+        .dom
+        .computed_value_resolved(style_node, "background-image")
+    else {
         return;
     };
     let border_box = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
@@ -846,25 +870,25 @@ fn paint_background_images_for_node(
     let content_box = content_box_with_style(builder.dom, fragment, padding_box);
     let clip_value = builder
         .dom
-        .computed_value(style_node, "background-clip")
+        .computed_value_resolved(style_node, "background-clip")
         .unwrap_or_else(|| "border-box".into());
     let origin_value = builder
         .dom
-        .computed_value(style_node, "background-origin")
+        .computed_value_resolved(style_node, "background-origin")
         .unwrap_or_else(|| "padding-box".into());
     let clip_layers = split_top_level(&clip_value, ',');
     let origin_layers = split_top_level(&origin_value, ',');
     let repeat_value = builder
         .dom
-        .computed_value(style_node, "background-repeat")
+        .computed_value_resolved(style_node, "background-repeat")
         .unwrap_or_else(|| "repeat".into());
     let position_value = builder
         .dom
-        .computed_value(style_node, "background-position")
+        .computed_value_resolved(style_node, "background-position")
         .unwrap_or_else(|| "0% 0%".into());
     let size_value = builder
         .dom
-        .computed_value(style_node, "background-size")
+        .computed_value_resolved(style_node, "background-size")
         .unwrap_or_else(|| "auto auto".into());
     let repeat_layers = split_top_level(&repeat_value, ',');
     let position_layers = split_top_level(&position_value, ',');
@@ -1069,7 +1093,7 @@ fn padding_box_with_style(fragment: &Frag<'_>) -> CssRect {
 fn content_box_with_style(dom: &Dom, fragment: &Frag<'_>, padding: CssRect) -> CssRect {
     let width_basis = padding.width.max(0.0);
     let pad = ["top", "right", "bottom", "left"].map(|side| {
-        dom.computed_value(fragment.node, &format!("padding-{side}"))
+        dom.computed_value_resolved(fragment.node, &format!("padding-{side}"))
             .as_deref()
             .and_then(|value| transform_length(value, width_basis))
             .unwrap_or(0.0)
@@ -1218,7 +1242,7 @@ fn paint_borders(fragment: &Frag<'_>, radii: CornerRadii, builder: &mut Builder<
     let styles = ["top", "right", "bottom", "left"].map(|side| {
         builder
             .dom
-            .computed_value(node, &format!("border-{side}-style"))
+            .computed_value_resolved(node, &format!("border-{side}-style"))
             .unwrap_or_else(|| "none".into())
     });
     let colors = ["top", "right", "bottom", "left"].map(|side| {
@@ -1281,7 +1305,7 @@ fn paint_borders(fragment: &Frag<'_>, radii: CornerRadii, builder: &mut Builder<
 }
 
 fn paint_box_shadows(dom: &Dom, node: NodeId, shape: &PaintShape, builder: &mut Builder<'_>) {
-    let Some(value) = dom.computed_value(node, "box-shadow") else {
+    let Some(value) = dom.computed_value_resolved(node, "box-shadow") else {
         return;
     };
     for shadow in split_top_level(&value, ',') {
@@ -1334,7 +1358,7 @@ fn border_radii(dom: &Dom, node: NodeId, rect: CssRect) -> CornerRadii {
     ];
     let mut corners = [(0.0, 0.0); 4];
     for (index, name) in names.into_iter().enumerate() {
-        let Some(value) = dom.computed_value(node, name) else {
+        let Some(value) = dom.computed_value_resolved(node, name) else {
             continue;
         };
         let parts = split_ws(&value);
@@ -1473,10 +1497,10 @@ fn element_transform(
     y: f32,
 ) -> Option<(Affine2d, CssPoint)> {
     let transform = dom
-        .computed_value(node, "transform")
+        .computed_value_resolved(node, "transform")
         .unwrap_or_else(|| "none".into());
     let translate = dom
-        .computed_value(node, "translate")
+        .computed_value_resolved(node, "translate")
         .unwrap_or_else(|| "none".into());
     if transform.trim().eq_ignore_ascii_case("none")
         && translate.trim().eq_ignore_ascii_case("none")
@@ -1559,7 +1583,7 @@ fn element_transform(
         }
     }
     let origin = dom
-        .computed_value(node, "transform-origin")
+        .computed_value_resolved(node, "transform-origin")
         .unwrap_or_else(|| "50% 50%".into());
     let parts = split_ws(&origin);
     let ox =
@@ -1654,7 +1678,7 @@ fn resolve_image_source(base: &Url, source: &str) -> String {
 }
 
 fn background_color(dom: &Dom, node: NodeId) -> Option<PaintColor> {
-    dom.computed_value(node, "background-color")
+    dom.computed_value_resolved(node, "background-color")
         .as_deref()
         .and_then(|value| resolve_color(dom, node, value))
 }
@@ -1662,7 +1686,7 @@ fn background_color(dom: &Dom, node: NodeId) -> Option<PaintColor> {
 fn text_color(dom: &Dom, node: NodeId, link: bool) -> PaintColor {
     if node != NO_NODE
         && let Some(color) = dom
-            .computed_value(node, "color")
+            .computed_value_resolved(node, "color")
             .as_deref()
             .and_then(|value| resolve_color(dom, node, value))
     {
@@ -1678,7 +1702,7 @@ fn text_color(dom: &Dom, node: NodeId, link: bool) -> PaintColor {
 fn resolve_color(dom: &Dom, node: NodeId, value: &str) -> Option<PaintColor> {
     if value.trim().eq_ignore_ascii_case("currentcolor") {
         return dom
-            .computed_value(node, "color")
+            .computed_value_resolved(node, "color")
             .filter(|color| !color.trim().eq_ignore_ascii_case("currentcolor"))
             .as_deref()
             .and_then(PaintColor::parse_css);
@@ -1687,7 +1711,7 @@ fn resolve_color(dom: &Dom, node: NodeId, value: &str) -> Option<PaintColor> {
 }
 
 fn border_color(dom: &Dom, node: NodeId, side: &str) -> Option<PaintColor> {
-    dom.computed_value(node, &format!("border-{side}-color"))
+    dom.computed_value_resolved(node, &format!("border-{side}-color"))
         .as_deref()
         .and_then(|value| resolve_color(dom, node, value))
 }
@@ -1696,7 +1720,7 @@ fn decoration_color(dom: &Dom, node: NodeId) -> Option<PaintColor> {
     if node == NO_NODE {
         return None;
     }
-    dom.computed_value(node, "text-decoration-color")
+    dom.computed_value_resolved(node, "text-decoration-color")
         .as_deref()
         .and_then(|value| resolve_color(dom, node, value))
 }
@@ -1706,7 +1730,7 @@ fn decoration_style(dom: &Dom, node: NodeId) -> DecorationStyle {
         return DecorationStyle::Solid;
     }
     match dom
-        .computed_value(node, "text-decoration-style")
+        .computed_value_resolved(node, "text-decoration-style")
         .as_deref()
         .map(str::trim)
     {

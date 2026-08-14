@@ -40,7 +40,11 @@ pub(crate) enum Pos {
 
 impl Pos {
     pub fn of(dom: &Dom, id: NodeId) -> Pos {
-        match dom.computed_value(id, "position").as_deref().map(str::trim) {
+        match dom
+            .computed_value_resolved(id, "position")
+            .as_deref()
+            .map(str::trim)
+        {
             Some("relative") => Pos::Relative,
             Some("absolute") => Pos::Absolute,
             Some("fixed") => Pos::Fixed,
@@ -419,7 +423,7 @@ impl BoxStyle {
 /// that isn't fully transparent, or any background-image. (The `background`
 /// shorthand was expanded into these longhands by the cascade.)
 fn declares_background(dom: &Dom, id: NodeId) -> bool {
-    if let Some(c) = dom.computed_value(id, "background-color") {
+    if let Some(c) = dom.computed_value_resolved(id, "background-color") {
         let t = c.trim().to_ascii_lowercase();
         if !t.is_empty()
             && !matches!(
@@ -437,7 +441,7 @@ fn declares_background(dom: &Dom, id: NodeId) -> bool {
             return true;
         }
     }
-    if let Some(i) = dom.computed_value(id, "background-image") {
+    if let Some(i) = dom.computed_value_resolved(id, "background-image") {
         let t = i.trim().to_ascii_lowercase();
         if !t.is_empty()
             && !matches!(
@@ -514,7 +518,7 @@ fn transform_translation(
             }
         }
     };
-    if let Some(t) = dom.computed_value(id, "transform") {
+    if let Some(t) = dom.computed_value_resolved(id, "transform") {
         let t = t.trim();
         if !t.is_empty()
             && !t.eq_ignore_ascii_case("none")
@@ -569,7 +573,7 @@ fn transform_translation(
         }
     }
     // The individual `translate: x y?` property (css-transforms-2).
-    if let Some(t) = dom.computed_value(id, "translate") {
+    if let Some(t) = dom.computed_value_resolved(id, "translate") {
         let t = t.trim();
         if !t.is_empty() && !t.eq_ignore_ascii_case("none") {
             has = true;
@@ -637,14 +641,14 @@ fn parse_transform_list(t: &str) -> Option<Vec<(String, Vec<String>)>> {
 /// the initial width).
 fn border_side(dom: &Dom, id: NodeId, side: &str, u: Units) -> f32 {
     match dom
-        .computed_value(id, &format!("border-{side}-style"))
+        .computed_value_resolved(id, &format!("border-{side}-style"))
         .as_deref()
     {
         Some("none") | Some("hidden") | None => return 0.0,
         _ => {}
     }
     match dom
-        .computed_value(id, &format!("border-{side}-width"))
+        .computed_value_resolved(id, &format!("border-{side}-width"))
         .as_deref()
         .map(str::trim)
     {
@@ -716,7 +720,7 @@ pub(crate) fn block_align(dom: &Dom, id: NodeId) -> Align2 {
     if id == NO_NODE {
         return Align2::Left;
     }
-    if let Some(v) = dom.computed_value(id, "text-align")
+    if let Some(v) = dom.computed_value_resolved(id, "text-align")
         && let Some(a) = align_from_css(&v)
     {
         return a;
@@ -857,16 +861,32 @@ impl InlineStyle {
         match dom.tag_name(id) {
             Some("a") => {
                 if let Some(href) = dom.attr(id, "href") {
-                    s.link = Some(crate::http::resolve(base, href));
+                    s.link = Some(if dom.render_clickable(id) {
+                        crate::doc::Link::JsClick {
+                            node: id,
+                            href: href.to_string(),
+                        }
+                    } else {
+                        crate::http::resolve(base, href)
+                    });
                     s.kind = ItemKind::Link;
                 }
             }
-            // The live serializer leaves a native button as the authored
-            // flex/grid item instead of wrapping it in an anchor. Its actor id
-            // is still a frontend-neutral activation target; materialize the
-            // terminal Link only in the inline semantics, without changing
-            // box-tree structure or graphical sizing.
-            Some("button") if dom.attr(id, "data-trust-click").is_some() => {
+            // A resident actor supplies activation identity out-of-band. Keep
+            // the authored box tree intact and attach the action to its inline
+            // semantics; no synthetic anchor or `data-trust-*` attribute is
+            // needed in a reparsed presentation DOM.
+            Some(_) if dom.render_clickable(id) => {
+                s.link = Some(crate::doc::Link::JsClick {
+                    node: id,
+                    href: String::new(),
+                });
+                s.kind = ItemKind::Link;
+            }
+            // Transitional compatibility for stored/history documents made by
+            // the former serialization boundary. New direct layouts never
+            // need these attributes, but old snapshots remain renderable.
+            Some(_) if dom.attr(id, "data-trust-click").is_some() => {
                 if let Some(node) = dom
                     .attr(id, "data-trust-node")
                     .and_then(|value| value.parse().ok())
@@ -888,38 +908,38 @@ impl InlineStyle {
             None => {}
         }
         s.font_family = dom
-            .computed_value(id, "font-family")
+            .computed_value_resolved(id, "font-family")
             .unwrap_or_else(|| s.font_family.clone());
         s.font_size = dom.font_px(id);
         s.font_weight = dom
-            .computed_value(id, "font-weight")
+            .computed_value_resolved(id, "font-weight")
             .as_deref()
             .and_then(crate::layout2::css_font_weight)
             .unwrap_or(s.font_weight);
         s.font_italic = dom
-            .computed_value(id, "font-style")
+            .computed_value_resolved(id, "font-style")
             .is_some_and(|v| css_is_italic(&v));
         s.emph.bold = s.font_weight >= 600.0;
         s.emph.italic = s.font_italic;
         (s.emph.underline, s.emph.strike) = dom.text_decoration(id);
         s.transform = dom
-            .computed_value(id, "text-transform")
+            .computed_value_resolved(id, "text-transform")
             .as_deref()
             .and_then(TextTransform::from_css)
             .unwrap_or(TextTransform::None);
         s.letter = dom
-            .computed_value(id, "letter-spacing")
+            .computed_value_resolved(id, "letter-spacing")
             .as_deref()
             .and_then(|v| css_length_px(v, u))
             .unwrap_or(0.0);
         s.word = dom
-            .computed_value(id, "word-spacing")
+            .computed_value_resolved(id, "word-spacing")
             .as_deref()
             .filter(|value| value.trim() != "normal")
             .and_then(|value| css_length_px(value, u))
             .unwrap_or(0.0);
         s.line_height = dom
-            .computed_value(id, "line-height")
+            .computed_value_resolved(id, "line-height")
             .as_deref()
             .and_then(|value| {
                 let value = value.trim();
@@ -934,7 +954,7 @@ impl InlineStyle {
             .unwrap_or(crate::text::CssLineHeight::Normal);
         // `vertical-align` is not inherited. CSS Inline 3 §4.5 positions the
         // inline-level box relative to the line box's baseline.
-        s.vertical_align = match dom.computed_value(id, "vertical-align").as_deref() {
+        s.vertical_align = match dom.computed_value_resolved(id, "vertical-align").as_deref() {
             Some("top") | Some("text-top") => VerticalAlign::Top,
             Some("bottom") | Some("text-bottom") => VerticalAlign::Bottom,
             Some("middle") => VerticalAlign::Middle,
@@ -946,7 +966,7 @@ impl InlineStyle {
             None => VerticalAlign::Baseline,
         };
         let wb = dom
-            .computed_value(id, "word-break")
+            .computed_value_resolved(id, "word-break")
             .map(|v| v.trim().to_ascii_lowercase());
         s.keep_all = wb.as_deref() == Some("keep-all");
         s.brk = match wb.as_deref() {
@@ -955,7 +975,7 @@ impl InlineStyle {
             // to `normal` + `overflow-wrap: anywhere` behavior.
             Some("break-word") => WordBrk::Anywhere,
             _ => match dom
-                .computed_value(id, "overflow-wrap")
+                .computed_value_resolved(id, "overflow-wrap")
                 .as_deref()
                 .map(str::trim)
             {
@@ -965,7 +985,7 @@ impl InlineStyle {
             },
         };
         s.tab = dom
-            .computed_value(id, "tab-size")
+            .computed_value_resolved(id, "tab-size")
             .as_deref()
             .map(str::trim)
             .and_then(|v| {
@@ -977,12 +997,13 @@ impl InlineStyle {
             })
             .unwrap_or(TabSize::Spaces(8.0));
         s.ws = dom
-            .computed_value(id, "white-space")
+            .computed_value_resolved(id, "white-space")
             .as_deref()
             .and_then(WhiteSpace::from_css)
             .unwrap_or(WhiteSpace::Normal)
             .with_longhands(
-                dom.computed_value(id, "white-space-collapse").as_deref(),
+                dom.computed_value_resolved(id, "white-space-collapse")
+                    .as_deref(),
                 nowrap_longhand(dom, id),
             );
         if let Some(zero) = dom.font_size_zero(id) {
@@ -1019,7 +1040,11 @@ impl InlineStyle {
 /// shorthand) as a nowrap override for `WhiteSpace::with_longhands`.
 fn nowrap_longhand(dom: &Dom, id: NodeId) -> Option<bool> {
     for prop in ["text-wrap-mode", "text-wrap"] {
-        match dom.computed_value(id, prop).as_deref().map(str::trim) {
+        match dom
+            .computed_value_resolved(id, prop)
+            .as_deref()
+            .map(str::trim)
+        {
             Some("nowrap") => return Some(true),
             Some("wrap") | Some("balance") | Some("pretty") | Some("stable") => {
                 return Some(false);

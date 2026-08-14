@@ -68,6 +68,27 @@ impl SemanticTree {
     pub const ROOT: u64 = 1;
     pub const DOM_BASE: u64 = 1_000;
 
+    /// Compare actor-derived semantic content while excluding focus bookkeeping.
+    /// Native frontends own their current focus target and apply it when they
+    /// build the platform accessibility update; an otherwise inert DOM click
+    /// must not masquerade as a new page presentation solely because the
+    /// actor's internal `activeElement` moved.
+    pub(crate) fn content_eq(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.nodes.len() == other.nodes.len()
+            && self.nodes.iter().zip(&other.nodes).all(|(left, right)| {
+                left.id == right.id
+                    && left.dom_node == right.dom_node
+                    && left.role == right.role
+                    && left.name == right.name
+                    && left.value == right.value
+                    && left.bounds == right.bounds
+                    && left.children == right.children
+                    && left.actions == right.actions
+                    && left.checked == right.checked
+            })
+    }
+
     pub fn for_document(
         dom: &Dom,
         boxes: &HashMap<NodeId, PxRect>,
@@ -77,7 +98,7 @@ impl SemanticTree {
     ) -> Self {
         let mut nodes = Vec::new();
         let root_children = dom
-            .children(DOCUMENT)
+            .flat_children(DOCUMENT)
             .into_iter()
             .filter_map(|node| semantic_id(dom, boxes, node))
             .collect();
@@ -93,7 +114,7 @@ impl SemanticTree {
             focused: focused == Some(DOCUMENT),
             checked: None,
         });
-        for node in dom.descendants(DOCUMENT) {
+        for node in dom.flat_descendants(DOCUMENT) {
             let Some(bounds) = boxes.get(&node).copied() else {
                 continue;
             };
@@ -131,15 +152,25 @@ impl SemanticTree {
                 actions.push(Action::SetSelection);
             }
             let children = dom
-                .children(node)
+                .flat_children(node)
                 .into_iter()
                 .filter_map(|child| semantic_id(dom, boxes, child))
                 .collect();
+            // WAI-ARIA 1.2 §5.2.8.6 makes the generic role name-prohibited.
+            // In particular, do not flatten an html/body/div container's whole
+            // DOM subtree into a name: that leaks display:none and script text
+            // into accessibility metadata. Meaningful descendants remain
+            // represented by their own semantic nodes.
+            let name = if role == Role::Generic {
+                String::new()
+            } else {
+                accessible_name(dom, node, field.map(|field| field.label.as_str()))
+            };
             nodes.push(SemanticNode {
                 id: Self::DOM_BASE + node as u64,
                 dom_node: Some(node),
                 role,
-                name: accessible_name(dom, node, field.map(|field| field.label.as_str())),
+                name,
                 value: field.and_then(|field| match field.kind {
                     FieldKind::Password => Some(String::new()),
                     FieldKind::Hidden => None,

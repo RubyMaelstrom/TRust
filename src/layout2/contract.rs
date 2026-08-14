@@ -194,15 +194,15 @@ impl Units {
     pub(crate) fn of(dom: &Dom, id: NodeId) -> Units {
         let fs = dom.font_px(id);
         let family = dom
-            .computed_value(id, "font-family")
+            .computed_value_resolved(id, "font-family")
             .unwrap_or_else(|| String::from("sans-serif"));
         let weight = dom
-            .computed_value(id, "font-weight")
+            .computed_value_resolved(id, "font-weight")
             .as_deref()
             .and_then(css_font_weight)
             .unwrap_or(400.0);
         let italic = dom
-            .computed_value(id, "font-style")
+            .computed_value_resolved(id, "font-style")
             .is_some_and(|value| css_is_italic(&value));
         let ch = crate::text::zero_advance(&crate::text::TextStyle {
             family,
@@ -1251,7 +1251,8 @@ pub(crate) fn structured_media_for(
     }
     let media_tag = if video { "video" } else { "audio" };
     let peer_media: Vec<_> = dom
-        .descendants(crate::dom::DOCUMENT)
+        .flat_descendants(crate::dom::DOCUMENT)
+        .into_iter()
         .filter(|&id| dom.tag_name(id) == Some(media_tag))
         .collect();
     let mut ancestor = Some(media);

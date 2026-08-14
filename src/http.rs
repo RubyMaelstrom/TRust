@@ -76,6 +76,9 @@ pub struct Response {
     /// results from here (Steam's WebAPI puts the EResult in `x-eresult`).
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Typed canonical-DOM → CSS-pixel output for HTML. Once present, neither
+    /// terminal nor desktop may parse `body` into a presentation DOM.
+    pub rendered: Option<Box<RenderedPage>>,
     /// What the page's JavaScript did, when `execute_js` ran it.
     pub js: Option<crate::js::Outcome>,
     /// The page's `blob:` URL byte mirror, when JS ran (see `js::BlobMap`).
@@ -99,195 +102,145 @@ pub struct Response {
     /// is never evicted from the trail.
     pub from_post: bool,
 }
-
-/// HTML inputs shared by graphical frontends. Parsing, SVG rewriting, form
-/// extraction, and URL resolution stay in the browser engine; a frontend only
-/// chooses a CSS-pixel viewport and consumes renderer-neutral paint data.
-pub struct GraphicalDocument {
-    pub dom: crate::dom::Dom,
-    pub base: Url,
+#[derive(Debug)]
+pub struct RenderedPage {
+    pub layout: std::sync::Arc<crate::layout2::PixelLayout>,
+    pub viewport: crate::layout2::Viewport,
+    pub device_pixel_ratio: f32,
     pub forms: Vec<Form>,
     pub controls: crate::layout2::ControlMap,
     pub image_urls: Vec<String>,
-    /// Selected sources whose `img` is not in HTML's Lazy state, plus posters
-    /// and page-level previews. These retain the existing eager overlap with
-    /// layout; lazy sources wait for the frontend's viewport prefetch band.
     pub eager_image_urls: Vec<String>,
-    /// A source is lazy only when every `img` selecting it is lazy. Shared
-    /// eager/lazy URLs are eager, matching the eager request's stronger need.
     pub lazy_image_handles: std::collections::HashSet<crate::render::ImageHandle>,
+    /// Composed-tree ancestry and named-fragment geometry needed for native
+    /// interaction. These are resolved facts, not a second mutable DOM.
+    pub parents: std::collections::HashMap<crate::dom::NodeId, crate::dom::NodeId>,
+    pub fragment_y: std::collections::HashMap<String, f32>,
+    pub semantics: crate::accessibility::SemanticTree,
+    /// Layout node ids are the resident actor's canonical arena ids. Static
+    /// snapshots leave this false because there is no actor to receive input.
+    pub direct_actor_nodes: bool,
 }
 
-impl GraphicalDocument {
-    /// Apply one actor-produced incremental boundary snapshot to the retained
-    /// graphical presentation DOM. The actor remains the canonical DOM; this
-    /// arena is only the frontend's parsed presentation mirror.
-    ///
-    /// Paint-tier snapshots copy baked paint declarations onto existing nodes,
-    /// preserving form state and fragment identity. Structural tiers preserve
-    /// WHATWG DOM's pre-insert/remove ordering by inserting the replacement
-    /// immediately before the old boundary and then detaching the old subtree.
-    /// `Dom::serialize_patch` materializes inherited cascade on a wrapper for
-    /// standalone layout; only the boundary itself is installed.
-    pub fn apply_subtree_patch(
-        &mut self,
-        patch: &crate::js::SubtreePatch,
-        viewport: crate::layout2::Viewport,
-        device_pixel_ratio: f32,
-    ) -> bool {
-        if patch.tier == crate::js::BoundaryTier::Paint {
-            return self.apply_paint_patch(patch);
+impl Clone for RenderedPage {
+    fn clone(&self) -> Self {
+        Self {
+            layout: self.layout.clone(),
+            viewport: self.viewport,
+            device_pixel_ratio: self.device_pixel_ratio,
+            forms: self.forms.clone(),
+            controls: self.controls.clone(),
+            image_urls: self.image_urls.clone(),
+            eager_image_urls: self.eager_image_urls.clone(),
+            lazy_image_handles: self.lazy_image_handles.clone(),
+            parents: self.parents.clone(),
+            fragment_y: self.fragment_y.clone(),
+            semantics: self.semantics.clone(),
+            direct_actor_nodes: self.direct_actor_nodes,
         }
-        let key = patch.node.to_string();
-        let Some(old) = self
-            .dom
-            .descendants(crate::dom::DOCUMENT)
-            .find(|&id| self.dom.attr(id, "data-trust-node") == Some(key.as_str()))
-        else {
-            return false;
-        };
-        let Some(parent) = self.dom.parent_composed(old) else {
-            return false;
-        };
-        let refresh_forms = subtree_has_form_metadata(&self.dom, old);
-        let refresh_images = subtree_has_image_metadata(&self.dom, old);
-
-        let roots = self.dom.parse_fragment_into("body", &patch.html);
-        let replacement = roots.iter().find_map(|&root| {
-            std::iter::once(root)
-                .chain(self.dom.descendants(root))
-                .find(|&id| self.dom.attr(id, "data-trust-node") == Some(key.as_str()))
-        });
-        let Some(replacement) = replacement else {
-            return false;
-        };
-
-        self.dom.insert_before(parent, replacement, Some(old));
-        self.dom.detach(old);
-        self.dom.set_doc_url(Some(self.base.clone()));
-        self.dom.set_viewport_px(viewport.width, viewport.height);
-        self.dom.set_device_pixel_ratio(device_pixel_ratio);
-        let refresh_forms = refresh_forms || subtree_has_form_metadata(&self.dom, replacement);
-        let refresh_images = refresh_images || subtree_has_image_metadata(&self.dom, replacement);
-        self.dom
-            .rewrite_inline_svgs_in(replacement, Some(&self.base));
-
-        // A general subtree patch may add/remove controls and images. Refresh
-        // only when the old or new boundary actually contains relevant nodes;
-        // the dominant :hover patch changes style on menu text and therefore
-        // does no document-wide form/image scan. Seed form state so a genuine
-        // control patch cannot erase the user's current edits.
-        if refresh_forms {
-            let (forms, controls) = extract_forms_arena(&self.dom, &self.base, Some(&self.forms));
-            self.forms = forms;
-            self.controls = controls;
-        }
-        if refresh_images {
-            let images = collect_image_urls(&self.dom, &self.base, viewport, device_pixel_ratio);
-            self.image_urls = images.all;
-            self.eager_image_urls = images.eager;
-            self.lazy_image_handles = images.lazy_handles;
-        }
-        true
     }
+}
 
-    /// Apply a paint-only actor snapshot without replacing presentation nodes.
-    /// Geometry fragments and native form state remain valid because the actor
-    /// classifies this tier only from a declaration allow-list that excludes
-    /// layout, generated content, transforms, opacity, and stacking changes.
-    fn apply_paint_patch(&mut self, patch: &crate::js::SubtreePatch) -> bool {
-        const PAINT_ATTRS: &[&str] = &[
-            "style",
-            "data-trust-before",
-            "data-trust-before-style",
-            "data-trust-after",
-            "data-trust-after-style",
-        ];
-        let key = patch.node.to_string();
-        let actor_node = |dom: &crate::dom::Dom, id| {
-            dom.attr(id, "data-trust-paint-node") == Some(key.as_str())
-                || dom.attr(id, "data-trust-node") == Some(key.as_str())
-        };
-        let Some(old) = self
-            .dom
-            .descendants(crate::dom::DOCUMENT)
-            .find(|&id| actor_node(&self.dom, id))
-        else {
-            return false;
-        };
-        let fresh = crate::dom::Dom::parse_document(&patch.html);
-        let Some(new) = fresh
-            .descendants(crate::dom::DOCUMENT)
-            .find(|&id| actor_node(&fresh, id))
-        else {
-            return false;
-        };
-        let old_nodes = std::iter::once(old)
-            .chain(self.dom.descendants(old))
-            .filter(|&id| self.dom.tag_name(id).is_some())
-            .collect::<Vec<_>>();
-        let new_nodes = std::iter::once(new)
-            .chain(fresh.descendants(new))
-            .filter(|&id| fresh.tag_name(id).is_some())
-            .collect::<Vec<_>>();
-        if old_nodes.len() != new_nodes.len()
-            || old_nodes
-                .iter()
-                .zip(&new_nodes)
-                .any(|(&old, &new)| self.dom.tag_name(old) != fresh.tag_name(new))
-        {
-            return false;
-        }
-        for (old, new) in old_nodes.into_iter().zip(new_nodes) {
-            for attr in PAINT_ATTRS {
-                if let Some(value) = fresh.attr(new, attr).map(str::to_owned) {
-                    self.dom.set_attr(old, attr, &value);
-                } else {
-                    self.dom.remove_attr(old, attr);
-                }
+impl RenderedPage {
+    /// Render dedup compares the frontend-neutral product rather than an HTML
+    /// serialization. The retained fragment cache is an adapter detail; the
+    /// display list and resource/form metadata are the observable result.
+    pub fn visually_eq(&self, other: &Self) -> bool {
+        self.layout.presentation_eq(&other.layout)
+            && self.viewport == other.viewport
+            && self.device_pixel_ratio == other.device_pixel_ratio
+            && self.forms == other.forms
+            && self.controls == other.controls
+            && self.image_urls == other.image_urls
+            && self.eager_image_urls == other.eager_image_urls
+            && self.lazy_image_handles == other.lazy_image_handles
+            && self.parents == other.parents
+            && self.fragment_y == other.fragment_y
+            && self.semantics.content_eq(&other.semantics)
+            && self.direct_actor_nodes == other.direct_actor_nodes
+    }
+}
+
+/// CSS Display 3's document/flat-tree → box-tree → canvas pipeline, performed
+/// once against the canonical DOM. Frontends consume the returned pixel layout
+/// directly or quantize it through `layout2::adapt_terminal`.
+pub fn render_arena(
+    dom: &crate::dom::Dom,
+    base: &Url,
+    viewport: crate::layout2::Viewport,
+    device_pixel_ratio: f32,
+    seed: Option<&[Form]>,
+    images: &crate::layout2::ImageSizes,
+) -> RenderedPage {
+    let (forms, controls) = extract_forms_arena(dom, base, seed);
+    let resources = collect_image_urls(dom, base, viewport, device_pixel_ratio);
+    let layout = crate::layout2::lay_out_graphical(dom, base, viewport, &forms, &controls, images);
+    // The desktop adapter needs ancestry only for nodes participating in the
+    // measured presentation. Retaining every DOM edge made mutations inside a
+    // display:none subtree look like frontend changes even though CSS Display
+    // generates no boxes for them. Include each measured node's complete
+    // flat-tree ancestor chain so display:contents, slots, and shadow hosts
+    // agree with the ancestry of the boxes the frontend actually paints.
+    let mut parents = std::collections::HashMap::new();
+    for &node in layout.boxes.keys() {
+        let mut child = node;
+        while let Some(parent) = dom.parent_flat(child) {
+            if parents.insert(child, parent).is_some() {
+                break;
             }
+            child = parent;
         }
-        true
+    }
+    let mut fragment_y = std::collections::HashMap::new();
+    for node in dom.flat_descendants(crate::dom::DOCUMENT) {
+        let Some(rect) = layout.boxes.get(&node) else {
+            continue;
+        };
+        if let Some(id) = dom.attr(node, "id").filter(|id| !id.is_empty()) {
+            fragment_y.entry(id.to_string()).or_insert(rect.top as f32);
+        }
+        if dom.tag_name(node) == Some("a")
+            && let Some(name) = dom.attr(node, "name").filter(|name| !name.is_empty())
+        {
+            fragment_y
+                .entry(name.to_string())
+                .or_insert(rect.top as f32);
+        }
+    }
+    let semantics = crate::accessibility::SemanticTree::for_document(
+        dom,
+        &layout.boxes,
+        &forms,
+        &controls,
+        None,
+    );
+    RenderedPage {
+        layout: std::sync::Arc::new(layout),
+        viewport,
+        device_pixel_ratio,
+        forms,
+        controls,
+        image_urls: resources.all,
+        eager_image_urls: resources.eager,
+        lazy_image_handles: resources.lazy_handles,
+        parents,
+        fragment_y,
+        semantics,
+        direct_actor_nodes: dom.render_live(),
     }
 }
 
-fn subtree_has_form_metadata(dom: &crate::dom::Dom, root: usize) -> bool {
-    std::iter::once(root)
-        .chain(dom.descendants(root))
-        .any(|node| {
-            matches!(
-                dom.tag_name(node),
-                Some("form" | "input" | "button" | "select" | "textarea" | "option")
-            ) || dom.is_contenteditable_host(node)
-        })
-}
-
-fn subtree_has_image_metadata(dom: &crate::dom::Dom, root: usize) -> bool {
-    std::iter::once(root)
-        .chain(dom.descendants(root))
-        .any(|node| {
-            matches!(
-                dom.tag_name(node),
-                Some("img" | "picture" | "source" | "video" | "audio" | "meta" | "svg")
-            ) || ["background-image", "list-style-image"]
-                .into_iter()
-                .filter_map(|property| dom.computed_value(node, property))
-                .any(|value| !css_image_sources(&value).is_empty())
-        })
-}
-
-pub fn graphical_document(response: &Response) -> Option<GraphicalDocument> {
-    graphical_document_for_environment(response, crate::layout2::Viewport::new(960.0, 558.0), 1.0)
-}
-
-/// Parse a graphical document for the frontend's real responsive-image
-/// environment. CSS layout stays in CSS pixels; the device scale is used only
-/// by HTML's source-candidate selection.
-pub fn graphical_document_for_environment(
+/// Rebuild a static HTML snapshot for a changed native environment. The DOM is
+/// transient and remains inside the shared browser engine; callers receive the
+/// same typed pixel contract as a resident actor and never retain or inspect a
+/// presentation tree.
+pub fn render_html_for_environment(
     response: &Response,
     viewport: crate::layout2::Viewport,
     device_pixel_ratio: f32,
-) -> Option<GraphicalDocument> {
+    seed: Option<&[Form]>,
+    images: &crate::layout2::ImageSizes,
+) -> Option<RenderedPage> {
     let media = response
         .content_type
         .split(';')
@@ -299,71 +252,68 @@ pub fn graphical_document_for_environment(
         return None;
     }
     let html = decode_body(&response.content_type, &response.body);
-    graphical_document_from_html_for_environment(
-        response,
-        &html,
-        None,
-        viewport,
-        device_pixel_ratio,
-    )
-}
-
-/// Build the graphical presentation from a resident page actor's latest
-/// serialization. Values edited by the frontend are seeded into an equivalent
-/// fresh parse, just as the terminal adapter does on resize/live relayout.
-pub fn graphical_document_from_html(
-    response: &Response,
-    html: &str,
-    seed: Option<&[Form]>,
-) -> Option<GraphicalDocument> {
-    graphical_document_from_html_for_environment(
-        response,
-        html,
-        seed,
-        crate::layout2::Viewport::new(960.0, 558.0),
-        1.0,
-    )
-}
-
-pub fn graphical_document_from_html_for_environment(
-    response: &Response,
-    html: &str,
-    seed: Option<&[Form]>,
-    viewport: crate::layout2::Viewport,
-    device_pixel_ratio: f32,
-) -> Option<GraphicalDocument> {
-    let media = response
-        .content_type
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    if !matches!(media.as_str(), "" | "text/html" | "application/xhtml+xml") {
-        return None;
-    }
-    let mut dom = crate::dom::Dom::parse_document(html);
-    dom.set_doc_url(Some(response.url.clone()));
+    let base = base_with_doc_base(&html, &response.url);
+    let mut dom = crate::dom::Dom::parse_document(&html);
+    dom.set_doc_url(Some(base.clone()));
     dom.set_viewport_px(viewport.width, viewport.height);
     dom.set_device_pixel_ratio(device_pixel_ratio);
-    dom.rewrite_inline_svgs(Some(&response.url));
-    let (forms, controls) = extract_forms_arena(&dom, &response.url, seed);
-    let images = collect_image_urls(&dom, &response.url, viewport, device_pixel_ratio);
-    Some(GraphicalDocument {
-        dom,
-        base: response.url.clone(),
-        forms,
-        controls,
-        image_urls: images.all,
-        eager_image_urls: images.eager,
-        lazy_image_handles: images.lazy_handles,
-    })
+    dom.rewrite_inline_svgs(Some(&base));
+    Some(render_arena(
+        &dom,
+        &base,
+        viewport,
+        device_pixel_ratio,
+        seed,
+        images,
+    ))
 }
 
-/// Fetch one graphical page image through the same HTTP/referrer/security
-/// policy as terminal subresources. `data:` remains local; `blob:` requires a
-/// live-page blob mirror and is therefore left unresolved by the static
-/// desktop document path.
+/// The terminal frontend's deliberately small adapter over the shared pixel
+/// layout. No HTML is parsed here: layout has already consumed the canonical
+/// DOM, and this function performs only the CSS-pixel-to-cell quantization plus
+/// packaging in the protocol-neutral [`Doc`] presentation contract.
+pub fn adapt_rendered_terminal(
+    url: &Url,
+    content_type: &str,
+    raw: Vec<u8>,
+    rendered: RenderedPage,
+    viewport: crate::layout2::TerminalViewport,
+    alpha: &std::collections::HashMap<String, bool>,
+) -> Doc {
+    let output = crate::layout2::adapt_terminal(&rendered.layout, viewport, alpha);
+    let hover_ids = if rendered.direct_actor_nodes {
+        rendered
+            .layout
+            .boxes
+            .keys()
+            .copied()
+            .map(|node| (node, node))
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+    Doc {
+        url: Link::Http(url.clone()),
+        lines: Vec::new(),
+        raw,
+        wrapped_to: viewport.columns,
+        cp437: false,
+        meta: Some(content_type.to_string()),
+        forms: rendered.forms,
+        rows: output.rows,
+        image_urls: rendered.image_urls,
+        blobs: None,
+        carousels: output.carousels,
+        fixed: output.fixed,
+        regions: output.regions,
+        scroll_clips: output.scroll_clips,
+        boundaries: output.boundaries,
+        hover_ids,
+        anchor_rows: output.anchor_rows,
+        composites: output.composites,
+    }
+}
+
 pub async fn fetch_graphical_image(page: &Url, source: &str) -> Result<Vec<u8>, String> {
     if source.starts_with("data:") {
         return crate::img::decode_data_url(source)
@@ -1170,6 +1120,7 @@ fn finish_response(
             content_type: location,
             headers: Vec::new(),
             body: Vec::new(),
+            rendered: None,
             js: None,
             blobs: None,
             live: None,
@@ -1193,6 +1144,7 @@ fn finish_response(
         content_type,
         headers: header_pairs,
         body,
+        rendered: None,
         js: None,
         blobs: None,
         live: None,
@@ -1774,7 +1726,8 @@ pub async fn execute_js_for_device(
             probe.hover_css_affects_rendering()
         };
         if !has_rendering_hover {
-            return css_only_with_sheets(response, viewport, cell_px, sheets).await;
+            return css_only_with_sheets(response, viewport, cell_px, device_pixel_ratio, sheets)
+                .await;
         }
         // The actor needs the fetched sheets, and re-fetching them here would
         // add latency precisely on a first-paint interaction path. Leave the
@@ -1791,6 +1744,7 @@ pub async fn execute_js_for_device(
         Script,
         Sheet,
         Preload,
+        Sprite,
     }
     let mut jobs: Vec<(Kind, String)> = crate::js::external_scripts(&html)
         .into_iter()
@@ -1810,6 +1764,16 @@ pub async fn execute_js_for_device(
             .into_iter()
             .take(MAX_PAGE_PRELOADS)
             .map(|s| (Kind::Preload, s)),
+    );
+    // SVG 2 §5.6 processes external `<use>` references as external resource
+    // documents. Fetch authored sheets in the same parallel first-paint batch
+    // as scripts/styles; script-created references are handled by the resident
+    // actor before it derives a subsequent PixelLayout.
+    jobs.extend(
+        crate::js::sprite_use_sheets(&html)
+            .into_iter()
+            .take(MAX_PAGE_SHEETS)
+            .map(|s| (Kind::Sprite, s)),
     );
     if std::env::var_os("TRUST_NET_TRACE").is_some() {
         eprintln!(
@@ -1912,6 +1876,14 @@ pub async fn execute_js_for_device(
                     );
                 }
             }
+            Kind::Sprite => {
+                if let (Some(url), Some(r)) = (resolved, resp)
+                    && (200..300).contains(&r.status)
+                {
+                    let text = decode_body(&r.content_type, &r.body);
+                    crate::dom::prime_sprite_sheet(url.as_str(), &text);
+                }
+            }
         }
     }
     // Created HERE so it outlives the engine: the app hangs it on the Doc
@@ -1959,22 +1931,33 @@ pub async fn execute_js_for_device(
             trace_ms()
         );
     }
-    let (out, outcome, live) = match first {
-        Ok(Some(crate::js::PageEvt::Static { html, outcome })) => (html, outcome, None),
-        Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
-            (html, outcome, Some(LivePage { handle, events }))
+    let (out, rendered, outcome, live) = match first {
+        Ok(Some(crate::js::PageEvt::Static { html, mut outcome })) => {
+            let Some(rendered) = outcome.rendered.take() else {
+                return css_only_for_device(response, viewport, cell_px, device_pixel_ratio).await;
+            };
+            (html, rendered, outcome, None)
+        }
+        Ok(Some(crate::js::PageEvt::Updated { html, mut outcome })) => {
+            let Some(rendered) = outcome.rendered.take() else {
+                return css_only_for_device(response, viewport, cell_px, device_pixel_ratio).await;
+            };
+            (html, rendered, outcome, Some(LivePage { handle, events }))
         }
         // Died, hung, or spoke out of turn (most often: the page's JS is too
         // slow to first-paint within the timeout — a big GitHub code file).
         // Fall back to a CSS-only render so it still lays out per its own
         // stylesheets (flex gutter, collapsed menus) instead of UA defaults.
-        _ => return css_only(response, viewport, cell_px).await,
+        _ => return css_only_for_device(response, viewport, cell_px, device_pixel_ratio).await,
     };
-    fetch_svg_sprite_sheets(&out, &response.url).await;
-    response.body = out.into_bytes();
-    // The serializer emits UTF-8 regardless of the original charset;
-    // re-parses (resize re-wraps) must read it as such.
-    response.content_type = String::from("text/html; charset=utf-8");
+    // Keep source bytes for diagnostics/history. Presentation uses `rendered`
+    // directly, so neither frontend reparses this body. Tests and an explicit
+    // TRUST_DUMP_RAW run retain the actor serialization for inspection.
+    if !out.is_empty() {
+        response.body = out.into_bytes();
+        response.content_type = String::from("text/html; charset=utf-8");
+    }
+    response.rendered = Some(rendered);
     response.js = Some(outcome);
     response.live = live;
     response
@@ -1986,16 +1969,17 @@ pub async fn execute_js_for_device(
 /// scripts/sheets — and prime the process-global cache; the layout's
 /// `rewrite_inline_svgs` then inlines the used symbol so it rasterizes like any
 /// inline vector. Cheap-guarded: a page with no `<use>` pays one substring
-/// check. Resolved against the PAGE url so the cache key matches the one
-/// `parse_seeded`'s `rewrite_inline_svgs` computes.
-async fn fetch_svg_sprite_sheets(html: &str, page_url: &Url) {
+/// check. SVG 2 URL reference processing uses the document base URL; the SSRF
+/// policy remains anchored to the actual page URL.
+async fn fetch_svg_sprite_sheets(html: &str, document_base: &Url, page_url: &Url) {
     if !html.contains("<use") {
         return;
     }
     futures::stream::iter(crate::js::sprite_use_sheets(html).into_iter().map(|raw| {
+        let document_base = document_base.clone();
         let page_url = page_url.clone();
         async move {
-            let Some(abs) = page_url
+            let Some(abs) = document_base
                 .join(&raw)
                 .ok()
                 .filter(|u| matches!(u.scheme(), "http" | "https"))
@@ -2006,7 +1990,9 @@ async fn fetch_svg_sprite_sheets(html: &str, page_url: &Url) {
             if crate::dom::sprite_sheet_cached(abs.as_str()) {
                 return;
             }
-            if let Ok(r) = fetch(&Request::get(abs.clone())).await {
+            if let Ok(r) = fetch(&Request::get(abs.clone())).await
+                && (200..300).contains(&r.status)
+            {
                 let text = decode_body(&r.content_type, &r.body);
                 crate::dom::prime_sprite_sheet(abs.as_str(), &text);
             }
@@ -2053,6 +2039,15 @@ async fn fetch_page_sheets(html: &str, base: &Url) -> Vec<(String, String)> {
 /// `execute_js` load-timeout/early-exit fallback — so the page still lays out
 /// per its own CSS instead of UA defaults (see `crate::js::css_bake`).
 pub async fn css_only(response: Response, viewport: (u16, u16), cell_px: (u16, u16)) -> Response {
+    css_only_for_device(response, viewport, cell_px, 1.0).await
+}
+
+async fn css_only_for_device(
+    response: Response,
+    viewport: (u16, u16),
+    cell_px: (u16, u16),
+    device_pixel_ratio: f32,
+) -> Response {
     let media = response
         .content_type
         .split(';')
@@ -2065,7 +2060,7 @@ pub async fn css_only(response: Response, viewport: (u16, u16), cell_px: (u16, u
     }
     let html = decode_body(&response.content_type, &response.body);
     let sheets = fetch_page_sheets(&html, &response.url).await;
-    css_only_with_sheets(response, viewport, cell_px, sheets).await
+    css_only_with_sheets(response, viewport, cell_px, device_pixel_ratio, sheets).await
 }
 
 /// Complete the script-less CSS path after its stylesheet fetches are already
@@ -2076,20 +2071,43 @@ async fn css_only_with_sheets(
     mut response: Response,
     viewport: (u16, u16),
     cell_px: (u16, u16),
+    device_pixel_ratio: f32,
     sheets: Vec<(String, String)>,
 ) -> Response {
     let html = decode_body(&response.content_type, &response.body);
-    fetch_svg_sprite_sheets(&html, &response.url).await;
+    let base = base_with_doc_base(&html, &response.url);
+    fetch_svg_sprite_sheets(&html, &base, &response.url).await;
     // The frame documents are fetched up front into a url→content map (Dom is
     // not `Send`, so it must never cross an `.await`), then installed into the
     // real arena synchronously.
-    let base = base_with_doc_base(&html, &response.url);
     let frames = prefetch_frame_documents(&html, &base, &response.url).await;
     let mut dom = crate::js::css_prepare(&html, viewport, cell_px);
     if !frames.is_empty() {
         install_page_frames(&mut dom, &response.url, &frames);
     }
-    response.body = crate::js::css_finish(dom, &sheets).into_bytes();
+    if !sheets.is_empty() {
+        dom.attach_external_sheets(&sheets);
+    }
+    dom.set_doc_url(Some(base.clone()));
+    dom.set_device_pixel_ratio(device_pixel_ratio);
+    dom.rewrite_inline_svgs(Some(&base));
+    let css_viewport = crate::layout2::TerminalViewport::from_font_pixels(
+        usize::from(viewport.0),
+        usize::from(viewport.1),
+        cell_px,
+    )
+    .css_viewport();
+    response.rendered = Some(Box::new(render_arena(
+        &dom,
+        &base,
+        css_viewport,
+        device_pixel_ratio,
+        None,
+        &crate::layout2::ImageSizes::new(),
+    )));
+    // Retain a baked source snapshot for history/diagnostics only. Frontends
+    // consume `response.rendered` and never parse this presentation copy.
+    response.body = dom.serialize(crate::dom::DOCUMENT).into_bytes();
     response.content_type = String::from("text/html; charset=utf-8");
     response
 }
@@ -2113,7 +2131,7 @@ fn strip_fragment(u: &str) -> &str {
 /// exists (the prefetch phase needs it too).
 fn base_with_doc_base(html: &str, doc_url: &Url) -> Url {
     let dom = crate::dom::Dom::parse_document(html);
-    for id in dom.descendants(crate::dom::DOCUMENT) {
+    for id in dom.flat_descendants(crate::dom::DOCUMENT) {
         if dom.tag_name(id) == Some("base")
             && let Some(href) = dom.attr(id, "href")
             && let Ok(u) = doc_url.join(href.trim())
@@ -2156,7 +2174,7 @@ fn scan_frame_sources(
     let dom = crate::dom::Dom::parse_document(html);
     let mut srcs = Vec::new();
     let mut srcdocs = Vec::new();
-    for id in dom.descendants(crate::dom::DOCUMENT) {
+    for id in dom.flat_descendants(crate::dom::DOCUMENT) {
         match dom.tag_name(id) {
             Some("iframe") | Some("frame") => {}
             _ => continue,
@@ -2863,13 +2881,13 @@ pub fn lay_subtree_patch(
 /// The absolute image URLs referenced by replaced elements and CSS image
 /// properties, de-duplicated in document order (the decode pipeline fetches
 /// each once).
-struct CollectedImages {
-    all: Vec<String>,
-    eager: Vec<String>,
-    lazy_handles: std::collections::HashSet<crate::render::ImageHandle>,
+pub(crate) struct CollectedImages {
+    pub(crate) all: Vec<String>,
+    pub(crate) eager: Vec<String>,
+    pub(crate) lazy_handles: std::collections::HashSet<crate::render::ImageHandle>,
 }
 
-fn collect_image_urls(
+pub(crate) fn collect_image_urls(
     dom: &crate::dom::Dom,
     base: &Url,
     viewport: crate::layout2::Viewport,
@@ -2878,13 +2896,17 @@ fn collect_image_urls(
     let mut urls = Vec::new();
     let mut eager = Vec::new();
     let mut lazy_handles = std::collections::HashSet::new();
-    for id in dom.descendants(crate::dom::DOCUMENT) {
+    for id in dom.flat_descendants(crate::dom::DOCUMENT) {
         // `<img src>` and `<video poster>` (the poster renders as the video's
         // clickable thumbnail) both feed the decode pipeline.
         let selected = (dom.tag_name(id) == Some("img"))
             .then(|| crate::responsive_image::select(dom, id, base, viewport, device_pixel_ratio))
             .flatten()
             .filter(crate::responsive_image::loadable_source);
+        let svg = (dom.tag_name(id) == Some("svg"))
+            .then(|| dom.svg_image_data(id, Some(base)))
+            .flatten()
+            .map(|(source, _)| source);
         let poster = (dom.tag_name(id) == Some("video"))
             .then(|| dom.attr(id, "poster"))
             .flatten()
@@ -2893,6 +2915,7 @@ fn collect_image_urls(
         let Some(src) = selected
             .as_ref()
             .map(|selected| selected.source.as_str())
+            .or(svg.as_deref())
             .or(poster)
         else {
             continue;
@@ -2930,9 +2953,9 @@ fn collect_image_urls(
     // `background-repeat` is `repeat`, so a background image must be available
     // before the first paint rather than waiting for a later display-list
     // rebuild (CSS Backgrounds 3 §§2.1, 2.3).
-    for id in dom.descendants(crate::dom::DOCUMENT) {
+    for id in dom.flat_descendants(crate::dom::DOCUMENT) {
         for property in ["background-image", "list-style-image"] {
-            let Some(value) = dom.computed_value(id, property) else {
+            let Some(value) = dom.computed_value_resolved(id, property) else {
                 continue;
             };
             for source in css_image_sources(&value) {
@@ -2959,7 +2982,7 @@ fn collect_image_urls(
     // stays a bare text line forever.
     let mut has_video = false;
     let mut has_media = false;
-    for id in dom.descendants(crate::dom::DOCUMENT) {
+    for id in dom.flat_descendants(crate::dom::DOCUMENT) {
         match dom.tag_name(id) {
             Some("video") => {
                 has_video = true;
@@ -3123,7 +3146,7 @@ fn walk_forms_arena(
     map: &mut std::collections::HashMap<usize, (usize, usize)>,
     implicit: &mut Option<usize>,
 ) {
-    for child in dom.children(id) {
+    for child in dom.flat_children(id) {
         match dom.tag_name(child) {
             Some("form") => {
                 let method = match dom.attr(child, "method") {
@@ -3274,7 +3297,11 @@ fn contenteditable_placeholder(dom: &crate::dom::Dom, id: usize) -> String {
 /// Build a `Field` from an arena control element (mirrors `field_from`
 /// but over our own DOM), or `None` for controls we drop.
 fn live_node(dom: &crate::dom::Dom, id: usize) -> Option<usize> {
-    dom.attr(id, "data-trust-node")?.parse().ok()
+    if dom.render_live() {
+        Some(id)
+    } else {
+        dom.attr(id, "data-trust-node")?.parse().ok()
+    }
 }
 
 fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field> {
@@ -3427,138 +3454,6 @@ mod tests {
                 .contains(&"https://example.test/images/HeartDot.png".to_string())
         );
     }
-
-    #[test]
-    fn graphical_paint_patch_updates_styles_without_replacing_nodes_or_values() {
-        let base = Url::parse("https://example.test/").unwrap();
-        let mut dom = crate::dom::Dom::parse_document(
-            r#"<body><a data-trust-paint-node="42" style="color:red"><span style="color:red">link</span><input name="q" value="typed"></a></body>"#,
-        );
-        dom.set_doc_url(Some(base.clone()));
-        let old = dom
-            .descendants(crate::dom::DOCUMENT)
-            .find(|&node| dom.attr(node, "data-trust-paint-node") == Some("42"))
-            .unwrap();
-        let input = dom
-            .descendants(old)
-            .find(|&node| dom.tag_name(node) == Some("input"))
-            .unwrap();
-        let (forms, controls) = extract_forms_arena(&dom, &base, None);
-        let mut document = GraphicalDocument {
-            dom,
-            base,
-            forms,
-            controls,
-            image_urls: Vec::new(),
-            eager_image_urls: Vec::new(),
-            lazy_image_handles: Default::default(),
-        };
-        let patch = crate::js::SubtreePatch {
-            node: 42,
-            html: String::from(
-                r#"<div><a data-trust-paint-node="42" style="color:blue"><span style="color:blue">link</span><input name="q" value="server-default"></a></div>"#,
-            ),
-            tier: crate::js::BoundaryTier::Paint,
-        };
-
-        assert!(document.apply_subtree_patch(
-            &patch,
-            crate::layout2::Viewport::new(800.0, 600.0),
-            1.0,
-        ));
-        assert_eq!(document.dom.attr(old, "style"), Some("color:blue"));
-        assert_eq!(document.dom.attr(input, "value"), Some("typed"));
-        assert_eq!(document.dom.text_content(old), "link");
-    }
-
-    #[test]
-    fn graphical_document_applies_an_actor_subtree_patch_in_place() {
-        let base = Url::parse("https://example.test/").unwrap();
-        let mut dom = crate::dom::Dom::parse_document(
-            r#"<body><div id="before">before</div><section data-trust-node="42"><b>old</b></section><div id="after">after</div></body>"#,
-        );
-        dom.set_doc_url(Some(base.clone()));
-        let (forms, controls) = extract_forms_arena(&dom, &base, None);
-        let mut document = GraphicalDocument {
-            dom,
-            base,
-            forms,
-            controls,
-            image_urls: Vec::new(),
-            eager_image_urls: Vec::new(),
-            lazy_image_handles: Default::default(),
-        };
-        let patch = crate::js::SubtreePatch {
-            node: 42,
-            html: String::from(
-                r#"<div style="color:green"><section data-trust-node="42"><b>new</b></section></div>"#,
-            ),
-            tier: crate::js::BoundaryTier::WidthStable,
-        };
-
-        assert!(document.apply_subtree_patch(
-            &patch,
-            crate::layout2::Viewport::new(800.0, 600.0),
-            1.0,
-        ));
-        let text = document.dom.text_content(crate::dom::DOCUMENT);
-        assert!(text.contains("before"));
-        assert!(text.contains("new"));
-        assert!(text.contains("after"));
-        assert!(!text.contains("old"));
-        assert_eq!(
-            document
-                .dom
-                .descendants(crate::dom::DOCUMENT)
-                .filter(|&id| document.dom.attr(id, "data-trust-node") == Some("42"))
-                .count(),
-            1,
-            "the old boundary is detached and the replacement is unique"
-        );
-    }
-
-    #[test]
-    fn graphical_subtree_patch_refreshes_new_controls_and_images() {
-        let base = Url::parse("https://example.test/page/").unwrap();
-        let mut dom = crate::dom::Dom::parse_document(
-            r#"<body><section data-trust-node="42">old</section></body>"#,
-        );
-        dom.set_doc_url(Some(base.clone()));
-        let (forms, controls) = extract_forms_arena(&dom, &base, None);
-        let mut document = GraphicalDocument {
-            dom,
-            base,
-            forms,
-            controls,
-            image_urls: Vec::new(),
-            eager_image_urls: Vec::new(),
-            lazy_image_handles: Default::default(),
-        };
-        let patch = crate::js::SubtreePatch {
-            node: 42,
-            html: String::from(
-                r#"<div><section data-trust-node="42"><input data-trust-node="43" name="q"><img src="photo.webp"></section></div>"#,
-            ),
-            tier: crate::js::BoundaryTier::WidthStable,
-        };
-
-        assert!(document.apply_subtree_patch(
-            &patch,
-            crate::layout2::Viewport::new(800.0, 600.0),
-            1.0,
-        ));
-        assert_eq!(
-            document.forms.len(),
-            1,
-            "the formless input remains editable"
-        );
-        assert!(document.controls.values().any(|indices| *indices == (0, 0)));
-        assert_eq!(
-            document.image_urls,
-            vec![String::from("https://example.test/page/photo.webp")]
-        );
-    }
-
     #[test]
     fn graphical_image_discovery_is_document_ordered_resolved_and_deduplicated() {
         let base = Url::parse("https://www.example.test/gallery/index.html").unwrap();
@@ -3583,6 +3478,63 @@ mod tests {
                 String::from("https://www.example.test/poster.webp"),
             ]
         );
+    }
+
+    #[test]
+    fn canonical_render_discovers_shadow_controls_images_and_flat_ancestry() {
+        // CSS Shadow 1 §4.1 makes the flattened tree the input to box
+        // construction. The typed presentation metadata must use the same
+        // tree or web-component search fields and resources disappear even
+        // though layout paints their surrounding component.
+        let base = Url::parse("https://www.example.test/app/").unwrap();
+        let mut dom =
+            crate::dom::Dom::parse_document("<body><search-box id=host></search-box></body>");
+        let host = dom.get_by_id("host").unwrap();
+        let shadow = dom.attach_shadow(host);
+        let panel = dom.create_element("div");
+        dom.set_attr(
+            panel,
+            "style",
+            "--panel-art:url('panel.png');background-image:var(--panel-art)",
+        );
+        dom.append(shadow, panel);
+        let input = dom.create_element("input");
+        dom.set_attr(input, "name", "q");
+        dom.set_attr(input, "placeholder", "Search");
+        dom.append(panel, input);
+        let image = dom.create_element("img");
+        dom.set_attr(image, "src", "glass.png");
+        dom.set_attr(image, "width", "16");
+        dom.set_attr(image, "height", "16");
+        dom.append(panel, image);
+
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(800.0, 600.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        assert!(
+            rendered.controls.contains_key(&input),
+            "shadow input is editable"
+        );
+        assert!(
+            rendered
+                .image_urls
+                .contains(&"https://www.example.test/app/glass.png".into())
+        );
+        assert!(
+            rendered
+                .image_urls
+                .contains(&"https://www.example.test/app/panel.png".into())
+        );
+        assert_eq!(rendered.parents.get(&input), Some(&panel));
+        assert_eq!(rendered.parents.get(&panel), Some(&host));
+        assert!(rendered.semantics.nodes.iter().any(|node| {
+            node.dom_node == Some(input) && node.role == crate::accessibility::Role::TextInput
+        }));
     }
 
     #[test]
@@ -3618,6 +3570,236 @@ mod tests {
                     "https://www.example.test/gallery/medium-960.webp"
                 ))
         );
+    }
+
+    #[test]
+    fn canonical_pixel_layout_drives_graphical_and_terminal_adapters() {
+        // CSS Display 3 box-tree generation happens once against the resident
+        // DOM. Desktop reads `layout.paint`; terminal quantizes the retained
+        // fragments, and both keep the canonical actor node identity without a
+        // data-trust-* serialization/reparse bridge.
+        let base = Url::parse("https://example.test/page").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<body><a href="/next">next</a><input name="q" value="typed"></body>"#,
+        );
+        let anchor = dom
+            .descendants(crate::dom::DOCUMENT)
+            .find(|&node| dom.tag_name(node) == Some("a"))
+            .unwrap();
+        dom.set_doc_url(Some(base.clone()));
+        dom.set_viewport_px(640.0, 384.0);
+        dom.set_render_clickables([anchor].into_iter().collect(), true);
+
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(640.0, 384.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        assert!(rendered.direct_actor_nodes);
+        assert!(rendered.layout.boxes.contains_key(&anchor));
+        assert!(rendered.layout.paint.primitives.iter().any(|primitive| {
+            matches!(
+                primitive,
+                crate::render::DisplayCommand::HitRegion(hit)
+                    if hit.node == anchor && hit.actor == Some(anchor)
+            )
+        }));
+
+        let doc = adapt_rendered_terminal(
+            &base,
+            "text/html",
+            Vec::new(),
+            rendered,
+            crate::layout2::TerminalViewport::new(80, 24, 8.0, 16.0),
+            &Default::default(),
+        );
+        assert_eq!(doc.hover_ids.get(&anchor), Some(&anchor));
+        assert!(doc.rows.iter().flat_map(|row| &row.items).any(|item| {
+            matches!(item.link, Some(Link::JsClick { node, .. }) if node == anchor)
+        }));
+    }
+
+    #[test]
+    fn direct_live_layout_retains_generated_search_and_svg_icon_handles() {
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r##"<body><button id=search aria-label=Search></button>
+                 <button id=menu aria-label=Options><svg class="svg-fa"><use href="#fa-ellipsis"></use></svg></button>
+                 <span id=label aria-label="Open filters"></span></body>"##,
+        );
+        let search = dom.get_by_id("search").unwrap();
+        let menu = dom.get_by_id("menu").unwrap();
+        let label = dom.get_by_id("label").unwrap();
+        dom.set_render_clickables([search, menu, label].into_iter().collect(), true);
+
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(640.0, 480.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        let glyphs = rendered
+            .layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun { shaped, .. } => {
+                    Some(shaped.text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            glyphs.contains('⌕'),
+            "search placeholder paints: {glyphs:?}"
+        );
+        assert!(
+            glyphs.contains('⋯'),
+            "SVG menu placeholder paints: {glyphs:?}"
+        );
+        assert!(
+            glyphs.contains("[Open filters]"),
+            "named empty activation paints: {glyphs:?}"
+        );
+    }
+
+    #[test]
+    fn direct_shadow_svg_emits_an_image_command_before_decode() {
+        // SVG 2 §5.1 makes an outermost inline SVG a replaced element in an
+        // HTML/CSS layout. A declared box must retain its paint resource while
+        // intrinsic image data is pending; URL discovery alone is not paint.
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document("<body><x-logo id=h></x-logo></body>");
+        let host = dom.get_by_id("h").unwrap();
+        let shadow = dom.attach_shadow(host);
+        let svg = dom.create_element("svg");
+        dom.set_attr(svg, "width", "24");
+        dom.set_attr(svg, "height", "24");
+        dom.set_attr(svg, "viewBox", "0 0 24 24");
+        let path = dom.create_element("path");
+        dom.set_attr(path, "d", "M1 1h22v22H1z");
+        dom.append(svg, path);
+        dom.append(shadow, svg);
+
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(640.0, 480.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        let source = rendered
+            .image_urls
+            .iter()
+            .find(|source| source.starts_with("data:image/svg+xml"))
+            .expect("shadow SVG is a discovered resource");
+        assert!(
+            rendered
+                .layout
+                .paint
+                .image_requests
+                .iter()
+                .any(|request| request.source == *source)
+        );
+        assert!(rendered.layout.paint.primitives.iter().any(|command| {
+            matches!(command, crate::render::DisplayCommand::Image { node, .. } if *node == svg)
+        }));
+    }
+
+    #[test]
+    fn canonical_direct_render_preserves_legacy_presentation_semantics() {
+        // Migration oracle: the removed serializer used to materialize shadow
+        // content, resolved CSS variables, controls, backgrounds, and empty
+        // clickable handles into a second DOM. The canonical path must retain
+        // those observable products without retaining that second authority.
+        let base = Url::parse("https://example.test/app/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<html><body><x-search id="host"></x-search></body></html>"#,
+        );
+        dom.set_doc_url(Some(base.clone()));
+        dom.set_viewport_px(640.0, 480.0);
+        let host = dom.get_by_id("host").unwrap();
+        let shadow = dom.attach_shadow(host);
+        let style = dom.create_element("style");
+        dom.append_text(
+            style,
+            ":host{--surface:#243447;--art:url('surface.png');display:block;background-color:var(--surface);background-image:var(--art)}",
+        );
+        dom.append(shadow, style);
+        let input = dom.create_element("input");
+        dom.set_attr(input, "name", "q");
+        dom.set_attr(input, "placeholder", "Search archive");
+        dom.append(shadow, input);
+        let button = dom.create_element("button");
+        dom.set_attr(button, "aria-label", "Search");
+        dom.append(shadow, button);
+        let clickables = std::collections::HashSet::from([button]);
+        dom.set_render_clickables(clickables.clone(), true);
+
+        let direct = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(640.0, 480.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        let snapshot = dom.serialize_live(crate::dom::DOCUMENT, &clickables);
+        let mut legacy = crate::dom::Dom::parse_document(&snapshot);
+        legacy.set_doc_url(Some(base.clone()));
+        legacy.set_viewport_px(640.0, 480.0);
+        let serialized = render_arena(
+            &legacy,
+            &base,
+            crate::layout2::Viewport::new(640.0, 480.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+
+        let paint_text = |rendered: &RenderedPage| {
+            rendered
+                .layout
+                .paint
+                .primitives
+                .iter()
+                .filter_map(|command| match command {
+                    crate::render::DisplayCommand::GlyphRun { shaped, .. } => {
+                        Some(shaped.text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+        assert_eq!(direct.forms.len(), serialized.forms.len());
+        assert_eq!(direct.forms[0].fields[0].name, "q");
+        assert_eq!(direct.image_urls, serialized.image_urls);
+        assert!(paint_text(&direct).contains('⌕'));
+        assert!(paint_text(&serialized).contains('⌕'));
+        let surface = crate::render::PaintColor::Rgba(36, 52, 71, 255);
+        for rendered in [&direct, &serialized] {
+            assert!(
+                rendered
+                    .layout
+                    .paint
+                    .primitives
+                    .iter()
+                    .any(|command| matches!(
+                        command,
+                        crate::render::DisplayCommand::Fill {
+                            brush: crate::render::PaintBrush::Solid(color),
+                            ..
+                        } if *color == surface
+                    ))
+            );
+        }
     }
 
     #[test]
@@ -3784,6 +3966,60 @@ mod tests {
         assert_eq!(response.content_type, "text/html; charset=utf-8");
         let outcome = response.js.expect("outcome recorded");
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn script_created_external_svg_use_is_loaded_before_canonical_layout() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&req);
+                    let reply: &[u8] = if request.starts_with("GET /page ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                          <head><base href='/assets/'></head><body><script>\
+                          document.body.innerHTML='<svg width=24 height=24><use href=\"icons.svg#mark\"></use></svg>';\
+                          </script></body>"
+                    } else if request.starts_with("GET /assets/icons.svg ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml\r\nConnection: close\r\n\r\n\
+                          <svg xmlns='http://www.w3.org/2000/svg'><symbol id='mark' viewBox='0 0 24 24'>\
+                          <path d='M1 1h22v22H1z'/></symbol></svg>"
+                    } else {
+                        b"HTTP/1.1 404 Nope\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    let _ = sock.write_all(reply).await;
+                });
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let rendered = response
+            .rendered
+            .expect("actor produced a typed pixel layout");
+        assert!(
+            rendered
+                .image_urls
+                .iter()
+                .any(|source| source.starts_with("data:image/svg+xml")),
+            "the actor resolved the script-created external symbol into its canonical image list"
+        );
         server.abort();
     }
 
@@ -4061,6 +4297,7 @@ mod tests {
                 a:hover { color: #ff8888 }
             </style></head><body><a href="/post">post</a></body></html>"#
                 .to_vec(),
+            rendered: None,
             js: None,
             blobs: None,
             live: None,

@@ -60,7 +60,7 @@ pub(crate) fn size(
     } = image;
     let u = Units::of(dom, node);
     let css = |prop: &str, basis: Option<f32>| {
-        dom.computed_value(node, prop)
+        dom.computed_value_resolved(node, prop)
             .and_then(|v| Len::parse(&v, u, vp))
             .and_then(|l| l.resolve(basis))
             .filter(|&v| v >= 0.0)
@@ -160,7 +160,7 @@ pub(crate) fn size(
     // auto one through the ratio.
     let min_w = css("min-width", cb_w).unwrap_or(0.0);
     let max_w = match dom
-        .computed_value(node, "max-width")
+        .computed_value_resolved(node, "max-width")
         .and_then(|v| Len::parse(&v, u, vp))
     {
         Some(Len::None) | None => f32::INFINITY,
@@ -169,7 +169,7 @@ pub(crate) fn size(
     .max(min_w);
     let min_h = css("min-height", cb_h).unwrap_or(0.0);
     let max_h = match dom
-        .computed_value(node, "max-height")
+        .computed_value_resolved(node, "max-height")
         .and_then(|v| Len::parse(&v, u, vp))
     {
         Some(Len::None) | None => f32::INFINITY,
@@ -216,7 +216,7 @@ pub(crate) fn apply_fit(
     box_h: f32,
 ) -> Replaced {
     let fit = dom
-        .computed_value(node, "object-fit")
+        .computed_value_resolved(node, "object-fit")
         .map(|v| v.trim().to_ascii_lowercase());
     let mut out = Replaced {
         box_w,
@@ -272,7 +272,7 @@ pub(crate) fn ratio_of(
             _ => None,
         })
         .or_else(|| {
-            dom.computed_value(node, "aspect-ratio")
+            dom.computed_value_resolved(node, "aspect-ratio")
                 .as_deref()
                 .and_then(parse_ratio)
         })

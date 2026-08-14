@@ -1103,7 +1103,7 @@ impl Flow<'_> {
         use super::flex::AlignItem;
         let node = b.node;
         let u = Units::of(self.dom, node);
-        let cv = |p: &str| self.dom.computed_value(node, p);
+        let cv = |p: &str| self.dom.computed_value_resolved(node, p);
 
         // Gaps: `gap` = <row-gap> <column-gap>; longhands win.
         let (short_row, short_col) = {
@@ -1179,7 +1179,7 @@ impl Flow<'_> {
                     if it.node == NO_NODE {
                         None
                     } else {
-                        self.dom.computed_value(it.node, p)
+                        self.dom.computed_value_resolved(it.node, p)
                     }
                 };
                 // grid-area: row-start / col-start / row-end / col-end with
@@ -1375,7 +1375,7 @@ impl Flow<'_> {
                 if it.node == NO_NODE {
                     None
                 } else {
-                    self.dom.computed_value(it.node, pn)
+                    self.dom.computed_value_resolved(it.node, pn)
                 }
             };
             let justify = self_align(icv("justify-self").as_deref(), justify_items);

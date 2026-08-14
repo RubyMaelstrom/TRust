@@ -161,6 +161,7 @@ fn contains_css_percentage(value: &str) -> bool {
 
 /// Canonical graphical result: a CSS-pixel display list plus the same fragment
 /// geometry consumed by CSSOM View. No terminal or device-pixel types occur.
+#[derive(Clone, Debug)]
 pub struct GraphicalLayout {
     pub paint: crate::render::PagePaint,
     pub boxes: HashMap<NodeId, PxRect>,
@@ -183,12 +184,34 @@ pub struct GraphicalLayout {
     paint_cache: Option<GraphicalPaintCache>,
 }
 
+#[derive(Clone, Debug)]
 struct GraphicalPaintCache {
     root: flow::Frag<'static>,
     fixed: Vec<flow::Frag<'static>>,
     top_layer: Vec<flow::TopFrag<'static>>,
     flow_bottom: f32,
     viewport: Viewport,
+    anchors: Vec<(NodeId, f32)>,
+    terminal: terminal::TerminalPaintModel,
+}
+
+/// The single shared CSS-pixel layout product. The historical name remains as
+/// a compatibility alias while callers migrate: graphical frontends consume
+/// `paint` directly, and the terminal frontend invokes [`adapt_terminal`] on
+/// the retained CSS-pixel fragments. Neither frontend reparses HTML.
+pub type PixelLayout = GraphicalLayout;
+
+impl GraphicalLayout {
+    pub(crate) fn presentation_eq(&self, other: &Self) -> bool {
+        self.paint == other.paint
+            && self.boxes == other.boxes
+            && self.grid_tracks == other.grid_tracks
+            && self.patch_boundaries == other.patch_boundaries
+            && self.paint_boundaries == other.paint_boundaries
+            && self.boundaries == other.boundaries
+            && self.paint_cache.as_ref().map(|cache| &cache.terminal)
+                == other.paint_cache.as_ref().map(|cache| &cache.terminal)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -217,12 +240,17 @@ fn graphical_paint_boundaries(
     boxes: &HashMap<NodeId, PxRect>,
 ) -> Vec<GraphicalPaintBoundary> {
     let mut boundaries = dom
-        .descendants(crate::dom::DOCUMENT)
+        .flat_descendants(crate::dom::DOCUMENT)
+        .into_iter()
         .filter(|node| boxes.contains_key(node))
         .filter_map(|node| {
-            dom.attr(node, "data-trust-paint-node")
-                .and_then(|actor| actor.parse().ok())
-                .map(|actor| GraphicalPaintBoundary { actor, node })
+            if dom.render_live() && dom.paint_patch_host(node) {
+                Some(node)
+            } else {
+                dom.attr(node, "data-trust-paint-node")
+                    .and_then(|actor| actor.parse().ok())
+            }
+            .map(|actor| GraphicalPaintBoundary { actor, node })
         })
         .collect::<Vec<_>>();
     boundaries.sort_unstable_by_key(|boundary| (boundary.actor, boundary.node));
@@ -236,6 +264,8 @@ fn graphical_paint_cache(
     top_layer: &[flow::TopFrag<'_>],
     flow_bottom: f32,
     viewport: Viewport,
+    anchors: &[(NodeId, f32)],
+    terminal: terminal::TerminalPaintModel,
 ) -> Option<GraphicalPaintCache> {
     Some(GraphicalPaintCache {
         root: flow::retain_for_paint(root)?,
@@ -255,6 +285,8 @@ fn graphical_paint_cache(
             .collect::<Option<Vec<_>>>()?,
         flow_bottom,
         viewport,
+        anchors: anchors.to_vec(),
+        terminal,
     })
 }
 
@@ -262,7 +294,7 @@ fn graphical_paint_cache(
 /// This is valid for `BoundaryTier::Paint`: the actor has proven that changed
 /// declarations cannot affect box construction, intrinsic sizes, flow,
 /// transforms, opacity, or stacking order. The painter still queries the
-/// updated presentation DOM for colors, backgrounds, borders, shadows,
+/// updated canonical DOM for colors, backgrounds, borders, shadows,
 /// decoration, object fit, and hit-test metadata.
 pub fn repaint_graphical(
     layout: &mut GraphicalLayout,
@@ -287,6 +319,10 @@ pub fn repaint_graphical(
     layout.paint = paint;
     layout.patch_boundaries = patch_boundaries;
     layout.boundaries = boundaries;
+    if let Some(cache) = &mut layout.paint_cache {
+        cache.terminal = terminal::TerminalPaintModel::from_dom(dom, base);
+        cache.terminal.capture_page_media(dom, base, images);
+    }
     true
 }
 
@@ -345,7 +381,7 @@ pub fn lay_out_graphical(
         imemo: Default::default(),
         grid_tracks: Default::default(),
     };
-    let (frag, flow_bottom, _anchors, fixed, top_layer) = flow.layout(&root);
+    let (frag, flow_bottom, anchors, fixed, top_layer) = flow.layout(&root);
     let flow_done = started.elapsed();
     let (boxes, _scrolling_areas) = measure::boxes(dom, &frag, &fixed, &top_layer);
     let measure_done = started.elapsed();
@@ -361,7 +397,17 @@ pub fn lay_out_graphical(
         vp.h,
     );
     let paint_boundaries = graphical_paint_boundaries(dom, &boxes);
-    let paint_cache = graphical_paint_cache(&frag, &fixed, &top_layer, flow_bottom, viewport);
+    let mut terminal_model = terminal::TerminalPaintModel::from_dom(dom, base);
+    terminal_model.capture_page_media(dom, base, images);
+    let paint_cache = graphical_paint_cache(
+        &frag,
+        &fixed,
+        &top_layer,
+        flow_bottom,
+        viewport,
+        &anchors,
+        terminal_model,
+    );
     if trace {
         eprintln!(
             "layout: tree={:?} flow={:?} measure={:?} paint={:?} total={:?}",
@@ -380,6 +426,64 @@ pub fn lay_out_graphical(
         paint_boundaries,
         boundaries,
         paint_cache,
+    }
+}
+
+/// Quantize one already-laid CSS-pixel page into the terminal compatibility
+/// contract. This is the only terminal adapter boundary: it clones retained
+/// fragments because scroll-region extraction windows/empties its working
+/// copy, while the canonical pixel layout remains reusable by other adapters
+/// and by repaint.
+pub fn adapt_terminal(
+    layout: &PixelLayout,
+    viewport: TerminalViewport,
+    alpha: &HashMap<String, bool>,
+) -> Output {
+    let Some(cache) = &layout.paint_cache else {
+        return Output {
+            rows: Vec::new(),
+            anchor_rows: HashMap::new(),
+            fixed: Vec::new(),
+            regions: Vec::new(),
+            carousels: Vec::new(),
+            scroll_clips: Vec::new(),
+            boundaries: Vec::new(),
+            composites: HashMap::new(),
+        };
+    };
+    let mut root = cache.root.clone();
+    let fixed = cache.fixed.clone();
+    let top_layer = cache.top_layer.clone();
+    let candidates = boundary::collect(
+        &cache.terminal,
+        &root,
+        viewport.cell_width,
+        viewport.cell_height,
+    );
+    let out = terminal::paint(
+        &cache.terminal,
+        &mut root,
+        &fixed,
+        &top_layer,
+        cache.flow_bottom,
+        &cache.anchors,
+        (viewport.columns, viewport.rows),
+        viewport.cell_width,
+        viewport.cell_height,
+        alpha,
+    );
+    let boundaries = filter_boundaries(candidates, &out.regions, &out.carousels);
+    let mut rows = out.rows;
+    page_media_fallback(&cache.terminal, viewport.columns, &mut rows);
+    Output {
+        rows,
+        anchor_rows: out.anchor_rows,
+        fixed: out.fixed,
+        regions: out.regions,
+        carousels: out.carousels,
+        scroll_clips: out.scroll_clips,
+        boundaries,
+        composites: out.composites,
     }
 }
 
@@ -449,6 +553,8 @@ pub fn lay_graphical_subtree(
         &top_layer,
         flow_bottom,
         Viewport::new(viewport.width, viewport.height),
+        &anchors,
+        terminal::TerminalPaintModel::from_dom(dom, base),
     );
     Some(GraphicalLayout {
         paint,
@@ -505,66 +611,9 @@ pub fn lay_out_document(
     // compositor groups only image overlaps where an upper image is transparent.
     alpha: &HashMap<String, bool>,
 ) -> Output {
-    let cols = viewport.columns;
-    let cell_w = viewport.cell_width;
-    let cell_h = viewport.cell_height;
     let css = viewport.css_viewport();
-    let vp = Vp {
-        w: css.width,
-        h: css.height, // 0 when unknown — vh stays unresolved
-    };
-    let Some(root) = tree::build(dom, base, controls, forms, vp) else {
-        return Output {
-            rows: Vec::new(),
-            anchor_rows: HashMap::new(),
-            fixed: Vec::new(),
-            regions: Vec::new(),
-            carousels: Vec::new(),
-            scroll_clips: Vec::new(),
-            boundaries: Vec::new(),
-            composites: HashMap::new(),
-        };
-    };
-    let flow = Flow {
-        dom,
-        base,
-        forms,
-        images,
-        vp,
-        imemo: Default::default(),
-        grid_tracks: Default::default(),
-    };
-    let (mut frag, flow_bottom, anchors, fixed, top_layer) = flow.layout(&root);
-    // Incremental-layout boundaries — collected from the fragment tree BEFORE
-    // paint extracts scroll regions (which empty their frags), then filtered to
-    // drop any overlapping a region/carousel band (that content is NOT pure
-    // `Doc.rows` — it lives in a side buffer/strip the splice can't touch).
-    let candidates = boundary::collect(dom, &frag, cell_w, cell_h);
-    let mut out = terminal::paint(
-        dom,
-        base,
-        &mut frag,
-        &fixed,
-        &top_layer,
-        flow_bottom,
-        &anchors,
-        (cols, viewport.rows),
-        cell_w,
-        cell_h,
-        alpha,
-    );
-    let boundaries = filter_boundaries(candidates, &out.regions, &out.carousels);
-    page_media_fallback(dom, base, images, cols, &mut out.rows);
-    Output {
-        rows: out.rows,
-        anchor_rows: out.anchor_rows,
-        fixed: out.fixed,
-        regions: out.regions,
-        carousels: out.carousels,
-        scroll_clips: out.scroll_clips,
-        boundaries,
-        composites: out.composites,
-    }
+    let pixel = lay_out_graphical(dom, base, css, forms, controls, images);
+    adapt_terminal(&pixel, viewport, alpha)
 }
 
 /// Drop any candidate boundary whose row span overlaps a scroll region or
@@ -746,9 +795,9 @@ pub fn lay_subtree_fragment(
     // v1 subtree-patch cut: an inline boundary re-lay does NOT alpha-composite
     // transparent image overlaps (empty alpha ⇒ no grouping); they reappear on
     // the next full render, matching the region-patch v1 cut.
+    let terminal_model = terminal::TerminalPaintModel::from_dom(dom, base);
     let mut out = terminal::paint(
-        dom,
-        base,
+        &terminal_model,
         &mut frag,
         &fixed,
         &top_layer,
@@ -839,40 +888,23 @@ pub fn lay_region_fragment(
 /// because yt-dlp can resolve the page itself (the Twitch watch-page fix —
 /// the player never mounts without MSE). The page's og:image preview IS the
 /// link once decoded; the text affordance stands in until then.
-fn page_media_fallback(
-    dom: &Dom,
-    base: &Url,
-    images: &ImageSizes,
-    cols: usize,
-    rows: &mut Vec<Row>,
-) {
-    use crate::doc::Link;
+fn page_media_fallback(model: &terminal::TerminalPaintModel, cols: usize, rows: &mut Vec<Row>) {
     use crate::layout2::{Emphasis, Item, ItemKind, NO_NODE, display_width};
-    if dom
-        .descendants(crate::dom::DOCUMENT)
-        .any(|id| matches!(dom.tag_name(id), Some("video" | "audio")))
-        || !crate::layout2::page_declares_video(dom)
-    {
+    let Some((target, poster)) = model.page_media() else {
         return;
-    }
-    let target = crate::layout2::unique_structured_media(dom, base, true)
-        .map(|m| m.target)
-        .unwrap_or_else(|| base.clone());
-    let link = Some(Link::Media(target));
-    let poster = crate::layout2::page_preview_image(dom, base).and_then(|p| {
-        crate::responsive_image::density_corrected_size(images.get(&p), 1.0).map(|(w, h)| (p, w, h))
-    });
+    };
+    let link = Some(target.clone());
     let item = match poster {
         Some((url, iw, ih)) => {
-            let w = (iw as usize).min(cols).max(1) as u16;
-            let h = (ih * f32::from(w) / iw).max(1.0) as u16;
+            let w = (*iw as usize).min(cols).max(1) as u16;
+            let h = (*ih * f32::from(w) / *iw).max(1.0) as u16;
             Item {
                 col: 0,
                 width: w,
                 height: h,
                 text: String::new(),
                 kind: ItemKind::Image,
-                image: Some(url),
+                image: Some(url.clone()),
                 emph: Emphasis::default(),
                 node: NO_NODE,
                 link,
@@ -1735,6 +1767,40 @@ mod tests {
                     if shaped.text.contains("heart")
             )),
             "list content remains alongside the anonymous marker image"
+        );
+    }
+
+    #[test]
+    fn outside_image_marker_keeps_its_absolute_resource_and_the_first_text_cell() {
+        // rubymaelstrom.com: the 15px marker box and body/list percentages hit
+        // an adverse cell phase at 100 columns. The marker's trailing U+0020
+        // used to paint after the principal text in that shared cell, turning
+        // "20 February" into "0 February"; its relative URL also missed the
+        // decoded cache even though the resource had been fetched.
+        let out = lay(
+            r#"<style>
+                body { box-sizing:border-box; font-size:15px; width:65vw;
+                       padding:20px; border:3px ridge;
+                       margin-left:17.5vw; margin-right:17.5vw }
+                ul { list-style-image:url('/images/HeartDot.png') }
+               </style>
+               <body><ul><li><a href="/post">20 February, 2026</a></li></ul></body>"#,
+            100,
+        );
+        let (row, text) = find(&out, "20 February, 2026");
+        assert_eq!(text.text, "20 February, 2026");
+        let marker = out.rows[row]
+            .items
+            .iter()
+            .find(|item| item.image.is_some())
+            .expect("outside image marker");
+        assert_eq!(
+            marker.image.as_deref(),
+            Some("http://e.com/images/HeartDot.png")
+        );
+        assert!(
+            usize::from(marker.col + marker.width) <= usize::from(text.col),
+            "terminal marker must end before the principal text: marker={marker:?} text={text:?}"
         );
     }
 
@@ -5458,6 +5524,49 @@ mod tests {
     }
 
     #[test]
+    fn graphical_background_paint_resolves_custom_properties_directly() {
+        // CSS Custom Properties §3 substitutes var() at computed-value time.
+        // The former presentation serializer performed that substitution while
+        // baking styles; canonical direct paint must consume the same resolved
+        // values without relying on a serialization side effect.
+        let dom = Dom::parse_document(
+            r#"<html style="--canvas:#121820;--panel:#334455;--art:url('/panel.png');background-color:var(--canvas)">
+               <body style="margin:0"><div id="panel" style="width:80px;height:40px;background-color:var(--panel);background-image:var(--art);background-repeat:no-repeat"></div></body></html>"#,
+        );
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut images = HashMap::new();
+        images.insert("https://example.test/panel.png".to_string(), (20, 10));
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 200.0),
+            &[],
+            &HashMap::new(),
+            &images,
+        );
+        assert_eq!(
+            layout.paint.background,
+            Some(crate::render::PaintColor::Rgba(18, 24, 32, 255))
+        );
+        assert!(layout.paint.primitives.iter().any(|command| matches!(
+            command,
+            crate::render::DisplayCommand::Fill {
+                brush: crate::render::PaintBrush::Solid(crate::render::PaintColor::Rgba(
+                    51, 68, 85, 255
+                )),
+                ..
+            }
+        )));
+        assert!(
+            layout
+                .paint
+                .image_requests
+                .iter()
+                .any(|request| { request.source == "https://example.test/panel.png" })
+        );
+    }
+
+    #[test]
     fn propagated_body_background_is_not_painted_again_on_the_body_box() {
         let dom = Dom::parse_document(
             r#"<html style="background:transparent"><body style="margin:0;background-image:url('/tile.webp');background-repeat:no-repeat"><div style="height:1200px"></div></body></html>"#,
@@ -5731,6 +5840,60 @@ mod tests {
                     if (rect.width - 100.0).abs() < 0.01 && (rect.height - 60.0).abs() < 0.01
             )),
             "shadow content must paint through the 100×60px scrollport clip: {active_at_text:?}"
+        );
+    }
+
+    #[test]
+    fn graphical_scrollport_clips_slotted_carousel_content() {
+        // CSS Shadow 1 §4.1 makes an assigned node a child of its slot for
+        // post-selector CSS operations. A composed-DOM ancestry walk jumps
+        // from the card straight to the host and misses the shadow scroller
+        // surrounding the slot, allowing archive-style carousel cards to
+        // paint outside their scrollport.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><x-strip id="host"><x-card id="card" style="display:block;width:240px;height:60px">slotted overflow</x-card></x-strip></body>"#,
+        );
+        let host = node_by_id(&dom, "host");
+        let shadow = dom.attach_shadow(host);
+        let strip = dom.create_element("div");
+        dom.set_attr(strip, "style", "width:100px;height:60px;overflow-x:scroll");
+        dom.append(shadow, strip);
+        let slot = dom.create_element("slot");
+        dom.append(strip, slot);
+
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let mut clips = Vec::new();
+        let mut active_at_text = Vec::new();
+        for command in &layout.paint.primitives {
+            match command {
+                crate::render::DisplayCommand::PushClip(shape) => clips.push(shape.clone()),
+                crate::render::DisplayCommand::PopClip => {
+                    clips.pop();
+                }
+                crate::render::DisplayCommand::GlyphRun { shaped, .. }
+                    if shaped.text.contains("slotted overflow") =>
+                {
+                    active_at_text = clips.clone();
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            active_at_text.iter().any(|shape| matches!(
+                shape,
+                crate::render::PaintShape::Rect(rect)
+                    if (rect.width - 100.0).abs() < 0.01 && (rect.height - 60.0).abs() < 0.01
+            )),
+            "slotted card must remain inside the 100×60px carousel: {active_at_text:?}"
         );
     }
 

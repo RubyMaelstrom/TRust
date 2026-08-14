@@ -45,7 +45,7 @@ impl Clear {
 /// checks positioning first, so this need not.
 pub(crate) fn float_side(dom: &Dom, id: NodeId) -> Option<Side> {
     match dom
-        .computed_value(id, "float")
+        .computed_value_resolved(id, "float")
         .as_deref()
         .map(str::trim)
         .map(str::to_ascii_lowercase)
@@ -61,7 +61,7 @@ pub(crate) fn float_side(dom: &Dom, id: NodeId) -> Option<Side> {
 /// (LTR), same as `float_side`.
 pub(crate) fn clear_of(dom: &Dom, id: NodeId) -> Clear {
     match dom
-        .computed_value(id, "clear")
+        .computed_value_resolved(id, "clear")
         .as_deref()
         .map(str::trim)
         .map(str::to_ascii_lowercase)
