@@ -1264,12 +1264,13 @@ pub async fn fetch_protocol(
         Link::Gemini(url) => gemini::fetch(url).await.map(FetchedDocument::Gemini),
         Link::Http(url) => {
             let response = if fallback_http {
-                http::fetch_web_default(url).await
+                http::fetch_web_default_with_referrer(url, referrer).await
             } else {
                 let mut request = http::Request::get(url.clone());
                 if let Some(referrer) = referrer {
                     http::set_referrer(&mut request, referrer);
                 }
+                http::set_navigation_metadata(&mut request, referrer);
                 http::fetch(&request).await
             }?;
             Ok(FetchedDocument::Http(Box::new(response)))
@@ -1302,18 +1303,21 @@ async fn fetch_protocol_interactive(
                     body.into_bytes(),
                 )),
                 headers: Vec::new(),
+                fetch_metadata: None,
             };
             if let Some(referrer) = referrer {
                 http::set_referrer(&mut request, referrer);
             }
+            http::set_navigation_metadata(&mut request, referrer);
             http::fetch(&request).await?
         } else if fallback_http {
-            http::fetch_web_default(url).await?
+            http::fetch_web_default_with_referrer(url, referrer).await?
         } else {
             let mut request = http::Request::get(url.clone());
             if let Some(referrer) = referrer {
                 http::set_referrer(&mut request, referrer);
             }
+            http::set_navigation_metadata(&mut request, referrer);
             http::fetch(&request).await?
         };
         // The legacy API accepts a terminal viewport and cell size. A one-pixel
