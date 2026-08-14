@@ -237,6 +237,15 @@ pub struct Dom {
     /// in place without treating ordinary inline/flex elements as relayout
     /// boundaries.
     paint_patch_hosts: std::collections::HashSet<NodeId>,
+    /// Frontend-neutral activation targets for the current render. This is
+    /// actor-owned rendering metadata, not an HTML attribute: direct layout
+    /// consumes it without serializing `data-trust-*` markers into a second
+    /// DOM. A target in this set routes activation through the resident page
+    /// actor so the HTML event/default-action algorithms run before navigation.
+    render_clickables: std::collections::HashSet<NodeId>,
+    /// Whether this DOM currently backs a resident page actor. Static layouts
+    /// retain ordinary links/forms but do not manufacture actor commands.
+    render_live: bool,
     /// The live `:hover` chain: the committed hover target + its composed
     /// ancestors (empty at rest / no pointer). Consulted by selector matching
     /// (`Compound.hover`); moved by `set_hover_chain`, which bumps the epoch
@@ -423,6 +432,8 @@ impl Dom {
             hover_hosts: std::collections::HashSet::new(),
             hover_hits_complete: false,
             paint_patch_hosts: std::collections::HashSet::new(),
+            render_clickables: std::collections::HashSet::new(),
+            render_live: false,
             hover_chain: FxHashSet::default(),
             popover_open: FxHashSet::default(),
             popover_order: Vec::new(),
@@ -451,6 +462,31 @@ impl Dom {
     /// metadata and must not dirty the canonical DOM.
     pub fn set_paint_patch_hosts(&mut self, hosts: std::collections::HashSet<NodeId>) {
         self.paint_patch_hosts = hosts;
+    }
+
+    pub fn paint_patch_host(&self, id: NodeId) -> bool {
+        self.paint_patch_hosts.contains(&id)
+    }
+
+    /// Install the actor's current activation set for direct box-tree layout.
+    /// This does not mutate the document and therefore does not advance either
+    /// DOM epoch. The set replaces the historical `data-trust-click` transport
+    /// that was baked into serialized presentation markup.
+    pub fn set_render_clickables(
+        &mut self,
+        clickables: std::collections::HashSet<NodeId>,
+        live: bool,
+    ) {
+        self.render_clickables = clickables;
+        self.render_live = live;
+    }
+
+    pub fn render_clickable(&self, id: NodeId) -> bool {
+        self.render_live && self.render_clickables.contains(&id)
+    }
+
+    pub fn render_live(&self) -> bool {
+        self.render_live
     }
 
     /// Extend paint markers for a newly serialized incremental boundary while
@@ -777,12 +813,26 @@ impl Dom {
     /// Parent in CSS Scoping's flattened element tree. Shadow-root children
     /// are associated with the host, and a slottable is associated with the
     /// first matching `<slot>` in its parent's shadow tree.
-    fn parent_flat(&self, id: NodeId) -> Option<NodeId> {
+    pub(crate) fn parent_flat(&self, id: NodeId) -> Option<NodeId> {
         if let Some(slot) = self.assigned_slot(id) {
             return Some(slot);
         }
         let parent = self.nodes[id].parent?;
         self.shadow_hosts.get(&parent).copied().or(Some(parent))
+    }
+
+    /// Whether `id` is below an element omitted from CSS Display's flat-tree
+    /// box construction. Presentation snapshots use this to avoid retaining
+    /// adapter metadata for nodes that cannot occur in any layout fragment.
+    pub(crate) fn omitted_from_flat_box_tree(&self, id: NodeId) -> bool {
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if self.tag_name(node).is_some() && self.is_hidden(node) {
+                return true;
+            }
+            current = self.parent_flat(node);
+        }
+        false
     }
 
     fn assigned_slot(&self, id: NodeId) -> Option<NodeId> {
@@ -3555,6 +3605,26 @@ impl Dom {
         out
     }
 
+    /// Pre-order walk of the flattened rendered tree, excluding `root`.
+    ///
+    /// CSS Shadow 1 §4.1 uses the flattened element tree for inheritance
+    /// and box construction after selector matching. Presentation metadata
+    /// (controls, image requests, accessibility children, and native hit-test
+    /// ancestry) must walk that same tree: a light-DOM walk loses shadow
+    /// content, while a composed walk also visits unassigned light children
+    /// that generate no boxes.
+    pub(crate) fn flat_descendants(&self, root: NodeId) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack = self.flat_children(root);
+        stack.reverse();
+        while let Some(id) = stack.pop() {
+            out.push(id);
+            let children = self.flat_children(id);
+            stack.extend(children.into_iter().rev());
+        }
+        out
+    }
+
     /// The light-DOM nodes assigned to a `<slot>` (HTML §4.8.2 slot
     /// assignment): the slot's shadow HOST's children whose `slot=` attribute
     /// matches this slot's `name` (the default slot is `name=""`/absent, where
@@ -3809,7 +3879,11 @@ impl Dom {
     fn subtree_has_text(&self, id: NodeId) -> bool {
         let non_ws =
             |d: &NodeData| matches!(d, NodeData::Text(t) if !t.chars().all(char::is_whitespace));
-        non_ws(&self.nodes[id].data) || self.descendants(id).any(|d| non_ws(&self.nodes[d].data))
+        non_ws(&self.nodes[id].data)
+            || self
+                .flat_descendants(id)
+                .into_iter()
+                .any(|d| non_ws(&self.nodes[d].data))
     }
 
     /// The terminal glyph for an icon element/subtree — the dominant web icon
@@ -3820,7 +3894,7 @@ impl Dom {
     /// and its descendants for the first recognizable name. `None` when nothing
     /// matches (a non-icon `<svg>` — a D3 chart, a logo — stays unrendered).
     pub fn icon_glyph(&self, id: NodeId) -> Option<&'static str> {
-        for n in std::iter::once(id).chain(self.descendants(id)) {
+        for n in std::iter::once(id).chain(self.flat_descendants(id)) {
             for attr in ["class", "href", "xlink:href"] {
                 if let Some(v) = self.attr(n, attr) {
                     for tok in v.split(|c: char| c.is_whitespace()) {
@@ -4077,22 +4151,7 @@ impl Dom {
             // symbol; otherwise the svg's OWN inline geometry. An svg with
             // neither (an unfetched sprite, an empty svg) is left untouched and
             // renders nothing, exactly as before.
-            let svg = if let Some((file, frag)) = self.svg_sprite_ref(id) {
-                let Some(markup) = base
-                    .and_then(|b| b.join(&file).ok())
-                    .and_then(|abs| sprite_symbol_svg(abs.as_str(), &frag))
-                else {
-                    continue;
-                };
-                markup
-            } else if self.svg_is_renderable(id) {
-                let mut svg = self.serialize(id);
-                // resvg needs the namespace; an inline <svg> in HTML may omit it.
-                if !svg.contains("xmlns") {
-                    svg = svg.replacen("<svg", r#"<svg xmlns="http://www.w3.org/2000/svg""#, 1);
-                }
-                svg
-            } else {
+            let Some(svg) = self.svg_render_markup(id, base) else {
                 continue;
             };
             let name = self.svg_accessible_name(id);
@@ -4127,6 +4186,93 @@ impl Dom {
         }
     }
 
+    /// Return the renderer-neutral image source and accessible fallback for an
+    /// inline SVG without altering the DOM tree. Direct layout uses the SVG
+    /// element itself as the replaced element, preserving its CSS box and node
+    /// identity while the ordinary image pipeline rasterizes this data URL.
+    ///
+    /// CSS Display constructs a box tree from the document/flat tree; it does
+    /// not require replacing source nodes with HTML `<img>` elements. The old
+    /// presentation-DOM path performed that replacement only because it had
+    /// already committed to a serialize/reparse handoff.
+    pub fn svg_image_data(&self, id: NodeId, base: Option<&url::Url>) -> Option<(String, String)> {
+        if self.tag_name(id) != Some("svg") || self.ancestor_is_svg(id) || self.is_hidden(id) {
+            return None;
+        }
+        let svg = self.svg_render_markup(id, base)?;
+        Some((crate::img::svg_data_url(&svg), self.svg_accessible_name(id)))
+    }
+
+    /// Resolve the SVG 2 §5.6 `use` instance tree into self-contained markup
+    /// for the image decoder. External references use the fetched sprite table;
+    /// a same-tree `#fragment` target outside the outer `<svg>` is injected into
+    /// that SVG's `<defs>` so the authored `<use>` resolves without changing
+    /// the canonical DOM.
+    fn svg_render_markup(&self, id: NodeId, base: Option<&url::Url>) -> Option<String> {
+        let mut svg = if let Some((file, frag)) = self.svg_sprite_ref(id) {
+            base.and_then(|b| b.join(&file).ok())
+                .and_then(|abs| sprite_symbol_svg(abs.as_str(), &frag))?
+        } else if let Some(target) = self.local_svg_use_target(id) {
+            let mut outer = self.serialize(id);
+            if !self.descendants(id).any(|node| node == target) {
+                let open = outer.find('>')? + 1;
+                let definition = format!("<defs>{}</defs>", self.serialize(target));
+                outer.insert_str(open, &definition);
+            }
+            outer
+        } else if self.svg_is_renderable(id) {
+            self.serialize(id)
+        } else {
+            return None;
+        };
+        // resvg needs the namespace; inline SVG in HTML may omit it.
+        if !svg.contains("xmlns") {
+            svg = svg.replacen("<svg", r#"<svg xmlns="http://www.w3.org/2000/svg""#, 1);
+        }
+        Some(svg)
+    }
+
+    /// The first resolvable same-tree fragment referenced by a descendant
+    /// `<use>`. SVG 2 reference lookup is tree-scoped: a shadow tree must not
+    /// capture an equal id from the outer document.
+    fn local_svg_use_target(&self, id: NodeId) -> Option<NodeId> {
+        let scope = self.tree_scope(id);
+        self.descendants(id).find_map(|use_node| {
+            if self.tag_name(use_node) != Some("use") {
+                return None;
+            }
+            let fragment = self
+                .attr(use_node, "href")
+                .or_else(|| self.attr(use_node, "xlink:href"))?
+                .trim()
+                .strip_prefix('#')?;
+            (!fragment.is_empty()).then_some(())?;
+            std::iter::once(scope)
+                .chain(self.descendants(scope))
+                .find(|&candidate| {
+                    self.attr(candidate, "id") == Some(fragment)
+                        && matches!(
+                            self.tag_name(candidate),
+                            Some(
+                                "svg"
+                                    | "symbol"
+                                    | "g"
+                                    | "path"
+                                    | "rect"
+                                    | "circle"
+                                    | "ellipse"
+                                    | "line"
+                                    | "polyline"
+                                    | "polygon"
+                                    | "text"
+                                    | "image"
+                                    | "use"
+                            )
+                        )
+                })
+        })
+    }
+
     /// A paintable inline SVG: not hidden, and carrying real vector geometry
     /// that resvg can render on its own (not just a `<use>` sprite reference,
     /// whose target lives in another element we don't serialize with it).
@@ -4158,7 +4304,7 @@ impl Dom {
                 .and_then(|b| b.join(&file).ok())
                 .is_some_and(|abs| sprite_has_symbol(abs.as_str(), &frag));
         }
-        self.svg_is_renderable(id)
+        self.local_svg_use_target(id).is_some() || self.svg_is_renderable(id)
     }
 
     /// Whether the subtree under `id` (inclusive) will PAINT an icon in the
@@ -4168,7 +4314,7 @@ impl Dom {
     /// selectable content (and its `alt` still carries the accessible name).
     fn subtree_paints_icon(&self, id: NodeId) -> bool {
         std::iter::once(id)
-            .chain(self.descendants(id))
+            .chain(self.flat_descendants(id))
             .any(|n| match self.tag_name(n) {
                 Some("img") => {
                     self.attr(n, "src").is_some_and(|s| !s.trim().is_empty()) && !self.is_hidden(n)
@@ -4188,19 +4334,70 @@ impl Dom {
     /// for submission but have no rendered widget, so they do not count here.
     /// (HTML Standard §4.10; Accessible Name and Description Computation §4.)
     fn subtree_paints_native_control(&self, id: NodeId) -> bool {
-        std::iter::once(id).chain(self.descendants(id)).any(|n| {
-            if self.is_hidden(n) {
-                return false;
+        std::iter::once(id)
+            .chain(self.flat_descendants(id))
+            .any(|n| {
+                if self.is_hidden(n) {
+                    return false;
+                }
+                match self.tag_name(n) {
+                    Some("input") => self
+                        .attr(n, "type")
+                        .is_none_or(|ty| !ty.eq_ignore_ascii_case("hidden")),
+                    Some("select" | "textarea") => true,
+                    Some("button") => true,
+                    _ => false,
+                }
+            })
+    }
+
+    /// Browser-generated visible content retained by the direct box-tree path
+    /// for an otherwise empty living activation surface.
+    ///
+    /// This is the DOM-owned replacement for `serialize_live_node`'s former
+    /// synthetic markup. It does not mutate the document or its accessible
+    /// name; layout generates an anonymous UA box from the returned text.
+    pub(crate) fn render_clickable_fallback(&self, id: NodeId) -> Option<String> {
+        if !self.render_clickable(id) || self.is_contenteditable_host(id) {
+            return None;
+        }
+        let mut ancestor = self.parent_flat(id);
+        while let Some(node) = ancestor {
+            if self.tag_name(node) == Some("a") || self.render_clickable(node) {
+                return None;
             }
-            match self.tag_name(n) {
-                Some("input") => self
-                    .attr(n, "type")
-                    .is_none_or(|ty| !ty.eq_ignore_ascii_case("hidden")),
-                Some("select" | "textarea") => true,
-                Some("button") => true,
-                _ => false,
+            ancestor = self.parent_flat(node);
+        }
+        if self.tag_name(id) == Some("button") {
+            if self.subtree_has_text(id) || self.subtree_paints_icon(id) {
+                return None;
             }
-        })
+            return self
+                .icon_glyph(id)
+                .or_else(|| {
+                    self.attr(id, "aria-label")
+                        .or_else(|| self.attr(id, "title"))
+                        .or_else(|| self.attr(id, "value"))
+                        .and_then(|name| icon_glyph_for(&name.trim().to_ascii_lowercase()))
+                })
+                .map(str::to_string);
+        }
+        if self.tag_name(id) == Some("a")
+            || self.subtree_has_text(id)
+            || self.subtree_paints_icon(id)
+            || self.subtree_paints_native_control(id)
+        {
+            return None;
+        }
+        if let Some(glyph) = self.icon_glyph(id) {
+            return Some(glyph.to_string());
+        }
+        self.attr(id, "aria-label")
+            .or_else(|| self.attr(id, "title"))
+            .or_else(|| self.attr(id, "value"))
+            .filter(|label| !self.name_is_clipped_out(id, label))
+            .filter(|_| !self.is_overlay_scrim(id))
+            .map(|label| format!("[{label}]"))
     }
 
     /// If this `<svg>`'s geometry lives in an EXTERNAL sprite sheet — a
@@ -4229,6 +4426,43 @@ impl Dom {
             }
         }
         None
+    }
+
+    /// Absolute external SVG documents referenced by connected `<use>`
+    /// elements, in document order. SVG 2 §5.6 requires an external `use`
+    /// reference to be processed when the element becomes connected (and when
+    /// its href changes); callers use this list to fetch the immutable source
+    /// document before deriving the next pixel layout. Resolution uses the
+    /// document base URL, including HTML's first `<base href>`.
+    pub fn external_svg_use_sheets(&self, base: &url::Url) -> Vec<url::Url> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for id in self.flat_descendants(DOCUMENT) {
+            if self.tag_name(id) != Some("use") {
+                continue;
+            }
+            let Some(href) = self
+                .attr(id, "href")
+                .or_else(|| self.attr(id, "xlink:href"))
+                .map(str::trim)
+                .filter(|href| !href.is_empty())
+            else {
+                continue;
+            };
+            let Some((file, fragment)) = href.split_once('#') else {
+                continue;
+            };
+            if file.is_empty() || fragment.is_empty() {
+                continue;
+            }
+            let Some(url) = base.join(file).ok() else {
+                continue;
+            };
+            if seen.insert(url.to_string()) {
+                out.push(url);
+            }
+        }
+        out
     }
 
     /// Whether a node sits inside a non-rendered SVG container (`<defs>` and
@@ -9999,6 +10233,37 @@ mod tests {
     }
 
     #[test]
+    fn flat_walk_uses_shadow_contents_and_slot_assignment() {
+        // CSS Shadow 1 §4.1: after selector matching, CSS operates on the
+        // flattened tree. The host's unassigned light child is absent, while
+        // the assigned child occupies the slot's position in tree order.
+        let mut dom = Dom::parse_document(
+            "<body><x-host id=h><p id=assigned slot=main>A</p><p id=unassigned>U</p></x-host></body>",
+        );
+        let host = dom.get_by_id("h").unwrap();
+        let assigned = dom.get_by_id("assigned").unwrap();
+        let unassigned = dom.get_by_id("unassigned").unwrap();
+        let root = dom.attach_shadow(host);
+        let before = dom.create_element("span");
+        dom.set_attr(before, "id", "before");
+        dom.append(root, before);
+        let slot = dom.create_element("slot");
+        dom.set_attr(slot, "name", "main");
+        dom.append(root, slot);
+        let after = dom.create_element("span");
+        dom.set_attr(after, "id", "after");
+        dom.append(root, after);
+
+        let flat = dom.flat_descendants(DOCUMENT);
+        let positions = |id| flat.iter().position(|candidate| *candidate == id).unwrap();
+        assert!(positions(before) < positions(assigned));
+        assert!(positions(assigned) < positions(after));
+        assert!(!flat.contains(&unassigned));
+        assert_eq!(dom.parent_flat(assigned), Some(slot));
+        assert_eq!(dom.parent_flat(slot), Some(host));
+    }
+
+    #[test]
     fn parses_and_serializes_a_document() {
         let dom = Dom::parse_document(
             "<html><head><title>T</title></head><body><p id=a>hi <b>there</b></p></body></html>",
@@ -10170,6 +10435,27 @@ mod tests {
             .filter(|&d| dom.tag_name(d) == Some("svg"))
             .count();
         assert_eq!(svgs, 2);
+    }
+
+    #[test]
+    fn same_tree_svg_use_resolves_a_symbol_outside_the_outer_svg() {
+        // SVG 2 §5.6: a same-tree fragment creates a read-only instance of
+        // the referenced element. Icon sheets commonly place hidden symbols
+        // in one SVG and paint them from a later `<svg><use href=#...>`.
+        let dom = Dom::parse_document(
+            r##"<body><svg style="display:none"><symbol id="search" viewBox="0 0 24 24"><path d="M1 1h22v22H1z"/></symbol></svg>
+                 <button><svg id="icon" width="24" height="24"><use href="#search"/></svg></button></body>"##,
+        );
+        let icon = dom.get_by_id("icon").unwrap();
+        let (source, _) = dom
+            .svg_image_data(icon, None)
+            .expect("local use is paintable");
+        let markup = String::from_utf8(crate::img::decode_data_url(&source).unwrap()).unwrap();
+        assert!(markup.contains("<defs>"), "{markup}");
+        assert!(markup.contains("M1 1h22v22H1z"), "{markup}");
+        let (raster, _) = crate::img::decode(&crate::img::decode_data_url(&source).unwrap())
+            .expect("resolved use rasterizes");
+        assert!(raster.to_rgba8().pixels().any(|pixel| pixel[3] > 0));
     }
 
     #[test]

@@ -526,7 +526,7 @@ pub struct PaintLine {
 
 /// Renderer-neutral page display list in document CSS pixels. Device scaling
 /// is applied only by the backend; terminal cells never enter this structure.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PagePaint {
     pub width: f32,
     pub height: f32,

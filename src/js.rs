@@ -183,7 +183,7 @@ impl Budget {
 /// What a page's scripts did, for the status bar (`· JS:n!`) and
 /// `app.notice`: per-script failures are collected, never fatal — a
 /// broken script renders a partial page, not a blank one.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct Outcome {
     pub errors: Vec<String>,
     pub elapsed: Duration,
@@ -196,6 +196,24 @@ pub struct Outcome {
     pub fetches: usize,
     /// Captured console.* output, for tests and debugging.
     pub console: Vec<String>,
+    /// Typed presentation payload for a render event. Kept in the existing
+    /// event envelope so the public event shape and its extensive actor tests
+    /// remain stable while frontends stop consuming `html`.
+    pub(crate) rendered: Option<Box<crate::http::RenderedPage>>,
+}
+
+impl std::fmt::Debug for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Outcome")
+            .field("errors", &self.errors)
+            .field("elapsed", &self.elapsed)
+            .field("modules_skipped", &self.modules_skipped)
+            .field("panicked", &self.panicked)
+            .field("fetches", &self.fetches)
+            .field("console", &self.console)
+            .field("rendered", &self.rendered.is_some())
+            .finish()
+    }
 }
 
 impl Outcome {
@@ -6358,16 +6376,17 @@ struct LoadedPage {
     started: Instant,
     page_url: Option<url::Url>,
     hooks: Rc<PageHooks>,
-    /// The render-canonical form (`render_canonical`) of the last `Updated` we
-    /// emitted, for render dedup. The actor re-serializes on every dirty wake but
-    /// must NOT emit an Updated unless what we PAINT changed — else the app
-    /// re-parses + re-lays-out its whole doc (a ~1s UI freeze) for a change that
-    /// paints nothing: a mutation to a dropped element (`<style>`, hidden
-    /// subtree) OR to a non-rendered attribute (`alt`/`class`/`title`/`aria-*` —
-    /// Twitch rotates a co-streamer's name in a loaded avatar's `alt` text every
-    /// second). Serializing + canonicalizing to compare is cheap (~ms); the
-    /// app-side layout this skips is what froze the UI.
-    last_render: Option<String>,
+    /// The last frontend-neutral render emitted by this actor. Keeping an
+    /// `Arc`-backed copy is cheap and lets render dedup compare the actual typed
+    /// paint/resource product instead of serializing the DOM to HTML merely to
+    /// compare strings.
+    last_render: Option<crate::http::RenderedPage>,
+    /// Preserve the actor tests' diagnostic-DOM event contract without making
+    /// production serialize or hand HTML to either frontend. Some tests assert
+    /// non-painting state (for example a `data-*` mutation) through `Updated`;
+    /// the typed presentation is correctly unchanged in that case.
+    #[cfg(test)]
+    last_diagnostic_render: Option<String>,
     /// The clipped scroll-region nodes the app confirmed it laid out
     /// (`PageCmd::LiveRegions`). A mutation is patched only when confined to one
     /// of these (INCREMENTAL_LAYOUT_PLAN.md §4b) — everything else takes the full
@@ -6389,6 +6408,10 @@ struct LoadedPage {
     /// (the app re-laid everything, so every baseline is moot) and pruned of
     /// boundaries that left the tree.
     boundary_render: std::collections::HashMap<usize, String>,
+    /// Viewport, density, and decoded intrinsic-size changes can alter the box
+    /// tree without mutating DOM content. They still require a fresh canonical
+    /// pixel layout for both frontend adapters.
+    render_environment_dirty: bool,
 }
 
 /// Parse, run scripts, fire lifecycle, settle. Err(outcome) means
@@ -6470,6 +6493,11 @@ fn load_page(
         }
         b
     };
+    // `Dom::doc_url` is the serializer/layout fallback for relative resource
+    // references, so it follows HTML's document base URL rather than merely
+    // the response URL. The actual response URL remains in `page_url`/PageNet
+    // for origin and subresource-policy decisions.
+    dom.borrow_mut().set_doc_url(base_url.clone());
     let loader = Rc::new(WebModuleLoader {
         page: base_url.clone(),
         modules: RefCell::new(std::collections::HashMap::new()),
@@ -6550,7 +6578,7 @@ fn load_page(
         // box APIs. Needs an absolute base to resolve hrefs during layout; if
         // the page URL didn't parse, `__dom_rect` is simply absent and the
         // getters keep their viewport-box fallback.
-        if let Some(base) = parsed_url.clone() {
+        if let Some(base) = base_url.clone() {
             host.insert(PageGeom {
                 base,
                 viewport: std::cell::Cell::new(viewport_css),
@@ -6856,9 +6884,12 @@ fn load_page(
         page_url: parsed_url,
         hooks,
         last_render: None,
+        #[cfg(test)]
+        last_diagnostic_render: None,
         live_regions: std::collections::HashSet::new(),
         live_boundaries: std::collections::HashSet::new(),
         boundary_render: std::collections::HashMap::new(),
+        render_environment_dirty: false,
     })
 }
 
@@ -7429,10 +7460,9 @@ pub enum PageCmd {
     /// stops following (CSSOM View — the region→page write-back).
     SetScroll { node: usize, top: f64, left: f64 },
     /// The app couldn't apply an incremental `Patched` (the boundary wasn't a
-    /// live region, or a verify failed) — re-emit the WHOLE document as a full
-    /// `Updated` so the app resyncs. The downgrade path
-    /// (INCREMENTAL_LAYOUT_PLAN.md §7); unreachable when the boundary predicate
-    /// is correct.
+    /// live region, or a verify failed) — re-emit the complete typed layout as
+    /// an `Updated`. Kept for the legacy patch-protocol conformance tests; the
+    /// production actor already emits complete typed layouts.
     Resync,
     /// The current set of CLIPPED scroll-region nodes (by `data-trust-node`) the
     /// app has laid out. The actor patches a mutation ONLY when it's confined to
@@ -7532,11 +7562,16 @@ pub struct FormSubmission {
 #[derive(Debug)]
 pub enum PageEvt {
     /// A render of a page that stays alive for interaction.
-    Updated { html: String, outcome: Outcome },
-    /// Targeted incremental re-render: re-lay ONLY these relayout boundaries,
-    /// leaving the rest of the document untouched (INCREMENTAL_LAYOUT_PLAN.md).
-    /// The app applies each via `patch_live_doc`, falling back to a `Resync`
-    /// request if any can't be applied.
+    Updated {
+        /// Transitional diagnostic/test serialization. Production consumers
+        /// must use `rendered`; this string is never reparsed by a frontend.
+        html: String,
+        outcome: Outcome,
+    },
+    /// Legacy targeted-render event retained for patch-protocol conformance
+    /// tests. Production sends a complete actor-derived typed layout; a future
+    /// incremental implementation must splice typed fragments inside the actor
+    /// rather than hand serialized DOM subtrees to a frontend.
     Patched {
         patches: Vec<SubtreePatch>,
         outcome: Outcome,
@@ -8568,12 +8603,16 @@ fn page_actor(
     // timer tasks continue through the resident event loop; none delays this
     // shell. A static article skips the early duplicate and falls through to
     // the inert-page classification below.
-    let (shell, _, shell_clickable) = extract_live(&mut page);
+    let (shell, shell_rendered, _, shell_clickable) = extract_live(&mut page);
     // Seed the render-dedup baseline from the shell (the settle path below
     // overwrites it when it re-extracts), so a `painted_live && !changed` page —
     // which emits ONLY this shell — still has a baseline and the first dispatch
     // dedups a no-paint change (see `extract_changed`/`last_render`).
-    page.last_render = Some(render_canonical(&shell));
+    page.last_render = Some(shell_rendered.clone());
+    #[cfg(test)]
+    {
+        page.last_diagnostic_render = Some(render_canonical(&shell));
+    }
     // The shell render reports wall-clock elapsed for the status bar, but
     // we must NOT write that back onto `page.outcome.elapsed`: that field
     // is the cumulative-COMPUTE accumulator `run_script`'s budget gate
@@ -8583,6 +8622,7 @@ fn page_actor(
     // its load handlers never ran. Stamp the CLONE we send instead.
     let mut shell_outcome = page.outcome.clone();
     shell_outcome.elapsed = page.started.elapsed();
+    shell_outcome.rendered = Some(Box::new(shell_rendered));
     let painted_live = shell_clickable
         && evts
             .blocking_send(PageEvt::Updated {
@@ -8636,10 +8676,14 @@ fn page_actor(
     if painted_live && !changed {
         // Shell already reflects the settled page; nothing new to send.
     } else {
-        let (out, _, has_clickables) = extract_live(&mut page);
+        let (mut out, mut rendered, _, has_clickables) = extract_live(&mut page);
         // Seed the render-dedup baseline so the at-rest loop skips re-emitting a
         // render that paints the same (see `extract_changed`/`last_render`).
-        page.last_render = Some(render_canonical(&out));
+        page.last_render = Some(rendered.clone());
+        #[cfg(test)]
+        {
+            page.last_diagnostic_render = Some(render_canonical(&out));
+        }
         // A page with pending timers (a JS slideshow, a poller, a rAF chain)
         // stays LIVE even with no clickables/forms — its own clock drives it at
         // rest. Only a truly inert page (no interaction AND no scheduled work)
@@ -8662,7 +8706,7 @@ fn page_actor(
         // would kill hover on exactly the pages the feature targets.
         let has_hover_work = !page.dom.borrow().hover_hosts_is_empty()
             || page.dom.borrow().hover_css_affects_rendering();
-        let outcome = std::mem::take(&mut page.outcome);
+        let mut outcome = std::mem::take(&mut page.outcome);
         if !has_clickables
             && !painted_live
             && !has_timers
@@ -8672,9 +8716,19 @@ fn page_actor(
             && !has_hover_work
             && pending_form_submit.is_none()
         {
+            // The engine is about to exit. Retain one baked source snapshot so
+            // a later static resize/image reflow can run the shared transient
+            // DOM→PixelLayout routine without reviving Boa or asking either
+            // frontend to own a DOM mirror.
+            if out.is_empty() {
+                out = page.dom.borrow().serialize(crate::dom::DOCUMENT);
+            }
+            rendered.direct_actor_nodes = false;
+            outcome.rendered = Some(Box::new(rendered));
             let _ = evts.blocking_send(PageEvt::Static { html: out, outcome });
             return;
         }
+        outcome.rendered = Some(Box::new(rendered));
         if evts
             .blocking_send(PageEvt::Updated { html: out, outcome })
             .is_err()
@@ -8953,15 +9007,19 @@ fn page_actor(
                 }
             }
             PageCmd::Resync => {
-                // The app couldn't apply a patch — re-emit the WHOLE document so
-                // it resyncs (INCREMENTAL_LAYOUT_PLAN.md §7). Force the render
-                // (bypass the dedup): the app explicitly asked for full state.
-                let (out, _, _) = extract_live(&mut page);
-                page.last_render = Some(render_canonical(&out));
+                // Force a complete typed render (bypass dedup): the caller
+                // explicitly asked for the actor's full current state.
+                let (out, rendered, _, _) = extract_live(&mut page);
+                page.last_render = Some(rendered.clone());
+                #[cfg(test)]
+                {
+                    page.last_diagnostic_render = Some(render_canonical(&out));
+                }
                 // A full resync re-lays everything; drop the per-boundary
                 // patch baselines (repopulated lazily on the next patch).
                 page.boundary_render.clear();
-                let outcome = std::mem::take(&mut page.outcome);
+                let mut outcome = std::mem::take(&mut page.outcome);
+                outcome.rendered = Some(Box::new(rendered));
                 if evts
                     .blocking_send(PageEvt::Updated { html: out, outcome })
                     .is_err()
@@ -8999,6 +9057,7 @@ fn page_actor(
                     }
                 }
                 if changed {
+                    page.render_environment_dirty = true;
                     // New geometry is a rendering update: re-observe
                     // intersections (finish_dispatch runs updateIntersections
                     // before rendering; an image that grew an article can move
@@ -9020,17 +9079,20 @@ fn page_actor(
                 // cascade uses the same viewport, so media queries re-evaluate.
                 let viewport = crate::layout2::Viewport::new(viewport.width, viewport.height);
                 let mut accepted = false;
+                let mut changed = false;
                 {
                     let host = page.ctx.realm().host_defined();
                     if let Some(geom) = host.get::<PageGeom>() {
                         if geom.viewport.get() != viewport {
                             geom.viewport.set(viewport);
                             geom.cache.borrow_mut().0 = u64::MAX;
+                            changed = true;
                         }
                         accepted = true;
                     }
                 }
                 if accepted {
+                    page.render_environment_dirty |= changed;
                     page.dom
                         .borrow_mut()
                         .set_viewport_px(viewport.width, viewport.height);
@@ -9071,19 +9133,32 @@ fn page_actor(
                 } else {
                     1.0
                 };
+                let mut changed = false;
                 {
                     let host = page.ctx.realm().host_defined();
-                    if let Some(geom) = host.get::<PageGeom>() {
+                    if let Some(geom) = host.get::<PageGeom>()
+                        && geom.device_pixel_ratio.get() != ratio
+                    {
                         geom.device_pixel_ratio.set(ratio);
                         geom.cache.borrow_mut().0 = u64::MAX;
+                        changed = true;
                     }
                 }
+                page.render_environment_dirty |= changed;
+                if !changed {
+                    continue;
+                }
+                prepare_dispatch(&mut page);
                 page.dom.borrow_mut().set_device_pixel_ratio(ratio);
                 let call = format!("globalThis.devicePixelRatio={ratio}");
                 if let Err(error) = page.ctx.eval(Source::from_bytes(call.as_bytes())) {
                     page.outcome
                         .errors
                         .push(format!("devicePixelRatio: {error}"));
+                }
+                drain_js_side(&mut page.ctx, &mut page.outcome);
+                if !finish_dispatch(&mut page, &evts) {
+                    return;
                 }
             }
         }
@@ -9361,10 +9436,20 @@ fn finish_dispatch_render(
     let scrolls = page.dom.borrow_mut().take_scroll_changes();
     let dirty = page.dom.borrow_mut().take_dirty();
     if dirty && let Some(ok) = emit_dirty_render(page, evts) {
+        page.render_environment_dirty = false;
         // A render serializes vertical region offsets, but horizontal CSSOM
         // offsets are frontend state too. Always deliver the authoritative
         // Scrolled records after the mutation render; this also covers a script
         // that mutates the DOM and calls scrollBy in the same event turn.
+        return ok && send_scroll_events(&scrolls, evts);
+    }
+    if std::mem::take(&mut page.render_environment_dirty)
+        && let Some((html, rendered, _clickable, mut outcome)) = extract_changed(page)
+    {
+        outcome.rendered = Some(Box::new(rendered));
+        let ok = evts
+            .blocking_send(PageEvt::Updated { html, outcome })
+            .is_ok();
         return ok && send_scroll_events(&scrolls, evts);
     }
     // No visible content change: deliver any pure-scroll writes cheaply (the app
@@ -10028,6 +10113,7 @@ fn hover_set(page: &mut LoadedPage) -> (std::collections::HashSet<usize>, bool) 
 /// holding an interactive is still demoted — an out-of-scope interactive can't
 /// affect an in-scope node, because ancestors of anything outside the boundary
 /// subtree never pass through it.
+#[cfg(test)]
 fn clickable_set_scoped(
     page: &mut LoadedPage,
     roots: &[usize],
@@ -10089,6 +10175,7 @@ fn clickable_set_scoped(
 /// Memoized "this node, or a composed ancestor of it, is a hover host" — the
 /// upward half of the scoped hover set. Each parent-chain segment is resolved
 /// once (the memo), so a subtree scan stays ~linear.
+#[cfg(test)]
 fn self_or_ancestor_hover_host(
     dom: &crate::dom::Dom,
     reg: &std::collections::HashSet<usize>,
@@ -10121,6 +10208,7 @@ fn self_or_ancestor_hover_host(
 /// active, every in-scope element stays marked. A CSS-only page keeps its
 /// selector candidates. `None` requests one full snapshot when a newly-added
 /// listener promotes the document from sparse to complete hit metadata.
+#[cfg(test)]
 fn hover_set_scoped(
     page: &mut LoadedPage,
     roots: &[usize],
@@ -10167,10 +10255,87 @@ fn hover_set_scoped(
     Some((marked, false))
 }
 
-/// Serialize the WHOLE live document for interaction (the full-path / fallback
-/// render), marking clickables computed by `clickable_set`. Returns the HTML +
-/// the clickable set + whether the page has any interaction.
-fn extract_live(page: &mut LoadedPage) -> (String, std::collections::HashSet<usize>, bool) {
+/// Build the frontend-neutral render directly from the resident actor's arena.
+/// The diagnostic HTML remains temporarily available to tests and
+/// `TRUST_DUMP_RAW`, but no frontend reparses it.
+fn prime_page_svg_sprites(page: &LoadedPage, base: &url::Url) {
+    // SVG 2 §5.6 makes an external `<use>` reference an external resource
+    // document. Keep that resource processing with the canonical actor: this
+    // also catches a `<use>` inserted by script after the HTTP prefetch scan,
+    // without asking either frontend to serialize or inspect the DOM.
+    let urls = page.dom.borrow().external_svg_use_sheets(base);
+    for url in urls {
+        if crate::dom::sprite_sheet_cached(url.as_str()) {
+            continue;
+        }
+        let Some((handle, fetch)) = ({
+            let host = page.ctx.realm().host_defined();
+            let Some(net) = host.get::<PageNet>() else {
+                return;
+            };
+            if !matches!(url.scheme(), "http" | "https")
+                || !crate::http::subresource_allowed(&net.page, &url)
+                || net.budget.exhausted()
+            {
+                None
+            } else if let Some(fetch) = net.cache.peek(&url) {
+                Some((net.handle.clone(), fetch))
+            } else if net.fetched.get() >= MAX_PAGE_FETCHES {
+                None
+            } else {
+                net.fetched.set(net.fetched.get() + 1);
+                Some((
+                    net.handle.clone(),
+                    net.cache.fetch(&net.handle, url.clone()),
+                ))
+            }
+        }) else {
+            continue;
+        };
+        let Some(response) = crate::http::PageCache::block_on_fetch(Some(&handle), fetch) else {
+            continue;
+        };
+        if (200..300).contains(&response.status) {
+            let text = crate::http::decode_body(&response.content_type, &response.body);
+            crate::dom::prime_sprite_sheet(url.as_str(), &text);
+        }
+    }
+}
+
+fn extract_live(
+    page: &mut LoadedPage,
+) -> (
+    String,
+    crate::http::RenderedPage,
+    std::collections::HashSet<usize>,
+    bool,
+) {
+    let (base, viewport, device_pixel_ratio, images) = {
+        let host = page.ctx.realm().host_defined();
+        host.get::<PageGeom>()
+            .map(|geom| {
+                (
+                    geom.base.clone(),
+                    geom.viewport.get(),
+                    geom.device_pixel_ratio.get(),
+                    geom.images.borrow().clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                let base = page
+                    .page_url
+                    .clone()
+                    .unwrap_or_else(|| url::Url::parse("about:blank").unwrap());
+                let (width, height) = page.dom.borrow().viewport_px();
+                (
+                    base,
+                    crate::layout2::Viewport::new(width, height),
+                    page.dom.borrow().device_pixel_ratio(),
+                    crate::layout2::ImageSizes::new(),
+                )
+            })
+    };
+    prime_page_svg_sprites(page, &base);
     let (clickable, has_any) = clickable_set(page);
     let (hover, complete_hover_hits) = hover_set(page);
     let paint = page
@@ -10181,44 +10346,67 @@ fn extract_live(page: &mut LoadedPage) -> (String, std::collections::HashSet<usi
         let mut dom = page.dom.borrow_mut();
         dom.set_hover_hosts(hover, complete_hover_hits);
         dom.set_paint_patch_hosts(paint.into_iter().collect());
+        dom.set_render_clickables(clickable.clone(), true);
     }
-    let dom = page.dom.borrow();
-    let ser_t = Instant::now();
-    let html = dom.serialize_live(crate::dom::DOCUMENT, &clickable);
-    phase(&format!(
-        "extract_live: serialize_live +{}ms",
-        ser_t.elapsed().as_millis()
-    ));
-    drop(dom);
-    // Extraction itself is not a page mutation; also drain the incremental
-    // dirty-target set so this full serialize CONSUMES it and the next dispatch's
-    // patch decision starts from a clean slate (INCREMENTAL_LAYOUT_PLAN.md §5).
+    let rendered = {
+        let dom = page.dom.borrow();
+        crate::http::render_arena(&dom, &base, viewport, device_pixel_ratio, None, &images)
+    };
+    // Keep actor-level DOM assertions readable while the migration removes
+    // string-shaped presentation state from production consumers. Outside
+    // tests, serialize only when the explicit raw-render diagnostic is active.
+    let html = if cfg!(test) || std::env::var_os("TRUST_DUMP_RAW").is_some() {
+        page.dom
+            .borrow()
+            .serialize_live(crate::dom::DOCUMENT, &clickable)
+    } else {
+        String::new()
+    };
+    // Extraction itself is not a page mutation. Drain the incremental dirty
+    // targets because this complete typed layout consumes them and the next
+    // dispatch must start from a clean change set.
     {
         let mut d = page.dom.borrow_mut();
         let _ = d.take_dirty();
         let _ = d.take_dirty_targets();
     }
-    (html, clickable, has_any)
+    (html, rendered, clickable, has_any)
 }
 
-/// Serialize the live DOM and return the snapshot + drained outcome ONLY when
-/// what we PAINT changed since the last emit (`render_canonical` vs
-/// `page.last_render`). A mutation confined to a non-rendered element (`<style>`,
-/// `<head>`, a `display:none`/hidden subtree) OR a non-rendered attribute
-/// (`alt`/`class`/`title`/`aria-*`) yields the same canonical render — `None`
-/// then, and the caller treats the tick as a no-op (no Updated,
-/// so the app never re-lays-out for a change that paints nothing). Serializing
-/// to compare is cheap; the app-side layout this skips is what froze the UI.
+/// Derive the live DOM's typed presentation and return it only when an
+/// observable frontend-neutral result changed. Mutations confined to boxless
+/// or disconnected content compare equal and emit no `Updated`. Test builds
+/// additionally retain a diagnostic serialization so DOM-oriented actor tests
+/// can observe non-painting state without restoring a production HTML handoff.
 fn extract_changed(
     page: &mut LoadedPage,
-) -> Option<(String, std::collections::HashSet<usize>, Outcome)> {
-    let (out, clickable, _) = extract_live(page);
-    let canon = render_canonical(&out);
-    if page.last_render.as_deref() == Some(canon.as_str()) {
+) -> Option<(
+    String,
+    crate::http::RenderedPage,
+    std::collections::HashSet<usize>,
+    Outcome,
+)> {
+    let (html, rendered, clickable, _) = extract_live(page);
+    let presentation_unchanged = page
+        .last_render
+        .as_ref()
+        .is_some_and(|previous| previous.visually_eq(&rendered));
+    #[cfg(test)]
+    let diagnostic_unchanged = page
+        .last_diagnostic_render
+        .as_deref()
+        .is_some_and(|previous| previous == render_canonical(&html));
+    #[cfg(not(test))]
+    let diagnostic_unchanged = true;
+    if presentation_unchanged && diagnostic_unchanged {
         return None;
     }
-    page.last_render = Some(canon);
-    Some((out, clickable, std::mem::take(&mut page.outcome)))
+    page.last_render = Some(rendered.clone());
+    #[cfg(test)]
+    {
+        page.last_diagnostic_render = Some(render_canonical(&html));
+    }
+    Some((html, rendered, clickable, std::mem::take(&mut page.outcome)))
 }
 
 /// Deliver a real (visible) DOM change and send the event: a targeted `Patched`
@@ -10298,6 +10486,11 @@ fn emit_dirty_render(
     // whole-doc serialize (~13.7ms on a 462KB chat, growing) on EVERY dirty
     // cycle, patch path or not — half the live-page CPU peg. Now that cost is
     // paid only on the genuine full path.
+    // Legacy patch-protocol conformance tests remain while their focused
+    // algorithms are retired. Production never serializes a boundary for a
+    // frontend: it emits the complete typed PixelLayout below. A future
+    // incremental optimization must splice typed fragments inside the actor.
+    #[cfg(test)]
     if !no_incremental() {
         let boundaries = {
             let dom = page.dom.borrow();
@@ -10312,9 +10505,8 @@ fn emit_dirty_render(
             return emit_boundary_patches(page, evts, boundaries, n_targets);
         }
     }
-    // FULL PATH: whole-doc serialize + canonical dedup (the no-op detection that
-    // drops an `alt`/`class` rotation on a NON-boundary node) → `Updated`. Keeps
-    // `last_render` coherent (its only consumer is the next full-path dedup).
+    // COMPLETE PATH: canonical DOM → typed PixelLayout + presentation dedup →
+    // `Updated`. Production does not serialize or hand a DOM to a frontend.
     let t_extract = std::time::Instant::now();
     let changed = extract_changed(page);
     if diag_patch() {
@@ -10325,13 +10517,14 @@ fn emit_dirty_render(
             n_targets
         );
     }
-    let (out, _clickable, outcome) = changed?;
+    let (html, rendered, _clickable, mut outcome) = changed?;
+    outcome.rendered = Some(Box::new(rendered));
     // A full render resyncs every boundary (the app re-laid the whole document),
     // so the per-boundary baselines are moot — clear them; the next patch
     // repopulates lazily.
     page.boundary_render.clear();
     Some(
-        evts.blocking_send(PageEvt::Updated { html: out, outcome })
+        evts.blocking_send(PageEvt::Updated { html, outcome })
             .is_ok(),
     )
 }
@@ -10354,6 +10547,7 @@ fn retain_connected_dirty_targets(
 /// emits nothing (`None`), exactly as the whole-doc dedup did on the old path.
 /// The clickable set is computed cheaply (no whole-doc serialize) for the
 /// subtree markers.
+#[cfg(test)]
 fn emit_boundary_patches(
     page: &mut LoadedPage,
     evts: &tokio::sync::mpsc::Sender<PageEvt>,
@@ -10373,7 +10567,8 @@ fn emit_boundary_patches(
         // document-wide hit metadata through a local subtree patch would leave
         // the retained frontend inconsistent, so take the always-correct full
         // snapshot once and return to incremental patches afterward.
-        let (out, _clickable, outcome) = extract_changed(page)?;
+        let (out, rendered, _clickable, mut outcome) = extract_changed(page)?;
+        outcome.rendered = Some(Box::new(rendered));
         page.boundary_render.clear();
         return Some(
             evts.blocking_send(PageEvt::Updated { html: out, outcome })
@@ -10431,7 +10626,10 @@ fn emit_boundary_patches(
     if patches.is_empty() {
         return None; // nothing painted — caller continues to scroll/errors/settled
     }
-    let outcome = std::mem::take(&mut page.outcome);
+    let (_html, rendered, _clickable, _) = extract_live(page);
+    page.last_render = Some(rendered.clone());
+    let mut outcome = std::mem::take(&mut page.outcome);
+    outcome.rendered = Some(Box::new(rendered));
     Some(
         evts.blocking_send(PageEvt::Patched { patches, outcome })
             .is_ok(),
@@ -10451,6 +10649,7 @@ fn diag_patch() -> bool {
 /// inline IFC boundary (`WidthStable`, `Doc.rows` splice). The region path is
 /// tried first (a mutation inside a region must rebuild the region buffer, not
 /// patch an inner card whose rows live in that buffer).
+#[cfg(test)]
 fn confined_boundaries(
     dom: &crate::dom::Dom,
     live_regions: &std::collections::HashSet<usize>,
@@ -10583,6 +10782,7 @@ fn confined_boundaries(
 /// reply `<button>`, patch instead of full-reparsing the ~1.4MB document per
 /// message.) Otherwise the caller falls back to a full relayout (always
 /// correct).
+#[cfg(test)]
 fn patchable_boundary(dom: &crate::dom::Dom, b: crate::dom::NodeId) -> bool {
     let mut cur = dom.parent_composed(b);
     while let Some(c) = cur {
@@ -10599,6 +10799,7 @@ fn patchable_boundary(dom: &crate::dom::Dom, b: crate::dom::NodeId) -> bool {
 
 /// The incremental-layout kill switch (INCREMENTAL_LAYOUT_PLAN.md §9):
 /// `TRUST_NO_INCREMENTAL_LAYOUT` forces the full path (A/B + escape hatch).
+#[cfg(test)]
 fn no_incremental() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("TRUST_NO_INCREMENTAL_LAYOUT").is_some())
@@ -10623,6 +10824,7 @@ fn no_incremental() -> bool {
 /// tag; a raw `"` inside a tag always delimits a value (attr values escape `"`),
 /// so `>` inside a quoted value doesn't close the tag; comments are copied
 /// opaquely (their content is raw — Lit markers can hold anything).
+#[cfg(test)]
 fn render_canonical(html: &str) -> String {
     // Byte-scan for ` name="…"` and drop the non-rendered attributes
     // (`class`/`alt`/`title`/`aria-*`) so a mutation touching only them doesn't
@@ -28817,21 +29019,23 @@ mod tests {
     }
 
     #[test]
-    fn an_alt_only_mutation_does_not_re_render() {
-        // A click that changes ONLY a non-rendered attribute — an image's `alt`
-        // text, which Twitch rotates a co-streamer's name through every second —
-        // must NOT re-render: `render_canonical` drops `alt`, so what we paint is
-        // unchanged and the actor SETTLES instead of emitting an Updated (which
-        // would re-parse + re-lay-out the whole doc — the CPU spin / 1s freeze).
+    fn an_alt_mutation_updates_unavailable_image_fallback_and_semantics() {
+        // WHATWG HTML `img` says a non-empty `alt` is the image's textual
+        // equivalent/replacement. The canonical actor must therefore refresh
+        // accessibility metadata when it changes. Because this test supplies no
+        // decoded image, HTML Rendering also uses that text as the unavailable
+        // image's visual replacement. This no longer triggers a frontend parse:
+        // Updated carries the already-built typed presentation product.
         let (handle, mut events) = live(
             "<body><img id=av src=\"/a.png\" alt=\"Alpha\"><div id=hit></div><script>\
              document.getElementById('hit').addEventListener('click', function () {\
                document.getElementById('av').setAttribute('alt', 'Beta');\
              });</script></body>",
         );
-        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+        let Some(PageEvt::Updated { html, mut outcome }) = events.blocking_recv() else {
             panic!("expected first Updated");
         };
+        let before = outcome.rendered.take().expect("initial typed render");
         let at = html.find("id=\"hit\"").expect("hit div present");
         let hit: usize = html[..at]
             .rfind("x-trust-js:")
@@ -28845,8 +29049,40 @@ mod tests {
             .expect("hit marker");
         handle.cmds.blocking_send(PageCmd::Click(hit)).unwrap();
         match events.blocking_recv() {
-            Some(PageEvt::Settled) => {}
-            other => panic!("an alt-only change must only settle, got {other:?}"),
+            Some(PageEvt::Updated { mut outcome, .. }) => {
+                let after = outcome.rendered.take().expect("updated typed render");
+                assert!(
+                    before
+                        .layout
+                        .paint
+                        .primitives
+                        .iter()
+                        .any(|command| matches!(
+                            command,
+                            crate::render::DisplayCommand::GlyphRun { shaped, .. }
+                                if shaped.text == "Alpha"
+                        )),
+                    "initial unavailable-image fallback uses its textual equivalent"
+                );
+                assert!(
+                    after.layout.paint.primitives.iter().any(|command| matches!(
+                        command,
+                        crate::render::DisplayCommand::GlyphRun { shaped, .. }
+                            if shaped.text == "Beta"
+                    )),
+                    "updated textual equivalent reaches unavailable-image paint"
+                );
+                assert!(
+                    after
+                        .semantics
+                        .nodes
+                        .iter()
+                        .any(|node| node.role == crate::accessibility::Role::Image
+                            && node.name == "Beta"),
+                    "new textual equivalent reaches accessibility metadata"
+                );
+            }
+            other => panic!("an alt-only change must refresh semantics, got {other:?}"),
         }
     }
 

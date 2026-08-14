@@ -325,8 +325,8 @@ impl Built {
 /// `<svg>` was already rewritten to `<img data:…>` by `rewrite_inline_svgs`;
 /// what remains here has no terminal rendering.
 const SKIP: &[&str] = &[
-    "base", "canvas", "head", "iframe", "link", "math", "meta", "noscript", "object", "script",
-    "style", "svg", "template", "title", "wbr", "area", "map", "datalist",
+    "base", "canvas", "head", "link", "math", "meta", "noscript", "object", "script", "style",
+    "template", "title", "wbr", "area", "map", "datalist",
 ];
 
 struct Builder<'a> {
@@ -348,6 +348,15 @@ impl Builder<'_> {
         let Some(tag) = self.dom.tag_name(id) else {
             return Built::Skip;
         };
+        // A realized same-origin nested document is already part of the
+        // canonical arena. Project its body into the CSS box tree directly;
+        // the historical serializer wrapped these children in a synthetic div
+        // solely to survive HTML's iframe RAWTEXT reparse rules.
+        if matches!(tag, "iframe" | "frame") {
+            return self.dom.frame_body(id).map_or(Built::Skip, |body| {
+                Built::Block(Box::new(self.container(body, Disp::Block)))
+            });
+        }
         if SKIP.contains(&tag) {
             return Built::Skip;
         }
@@ -377,6 +386,24 @@ impl Builder<'_> {
         // Replaced elements are atomic regardless of their content model.
         if tag == "br" {
             return Built::Inline(Inline::Br);
+        }
+        // Inline SVG is a replaced box whose pixels come from the shared image
+        // pipeline. Keep the SVG node and its computed box intact; direct
+        // layout no longer mutates a presentation clone into an `<img>`.
+        if tag == "svg" {
+            let Some((source, alt)) = self.dom.svg_image_data(id, Some(self.base)) else {
+                return Built::Skip;
+            };
+            return self.atom(
+                id,
+                disp,
+                AtomKind::Img {
+                    url: Some(source),
+                    density: 1.0,
+                    dimension_source: id,
+                    alt,
+                },
+            );
         }
         let rep = self.replaced(id, tag);
         if matches!(rep, Replaced::Skip) {
@@ -458,7 +485,7 @@ impl Builder<'_> {
         if matches!(disp, Disp::Block | Disp::ListItem | Disp::Flex | Disp::Grid)
             && self
                 .dom
-                .computed_value(id, "height")
+                .computed_value_resolved(id, "height")
                 .as_deref()
                 .map(str::trim)
                 .and_then(|v| css_length_px(v, Units::of(self.dom, id)))
@@ -780,10 +807,21 @@ impl Builder<'_> {
         let image = self
             .dom
             .computed_value_resolved(id, "list-style-image")
-            .and_then(|value| Self::list_style_image_url(&value));
+            .and_then(|value| Self::list_style_image_url(&value))
+            .map(|source| {
+                // CSS Values 4 §4.5 gives URL values a base-dependent absolute
+                // identity. Resolve it with the presentation base supplied to
+                // layout, as ordinary replaced images are: graphical paint
+                // used to fix this downstream, but the terminal decoded-image
+                // cache has no URL base and therefore could never find a
+                // relative marker image.
+                self.base
+                    .join(&source)
+                    .map_or(source, |url| url.to_string())
+            });
         let kind = self
             .dom
-            .computed_value(id, "list-style-type")
+            .computed_value_resolved(id, "list-style-type")
             .unwrap_or_else(|| "disc".to_string());
         // CSS Lists 3 §3.2: a valid list-style-image replaces the type marker
         // and is followed by one U+0020 space. If no usable image is present,
@@ -794,7 +832,7 @@ impl Builder<'_> {
             .unwrap_or_else(|| format_list_marker(kind.trim(), n));
         let inside = matches!(
             self.dom
-                .computed_value(id, "list-style-position")
+                .computed_value_resolved(id, "list-style-position")
                 .as_deref(),
             Some("inside")
         );
@@ -839,6 +877,12 @@ impl Builder<'_> {
             None => self.dom.children(id),
         };
         let mut out = self.build_child_list(&child_ids, closed_details);
+        // Living pages used to gain these compact handles as synthetic HTML
+        // during serialization. Direct layout keeps the canonical DOM intact
+        // and generates the equivalent anonymous UA content in the box tree.
+        if let Some(text) = self.dom.render_clickable_fallback(id) {
+            out.insert(0, Built::Inline(Inline::Text(text)));
+        }
         // CSS Pseudo 4 §4.1: generated `::before`/`::after` boxes are the
         // originating element's first/last children. `content:""` still
         // creates a fully styleable EMPTY box; dropping it loses percentage
@@ -1035,7 +1079,7 @@ impl Builder<'_> {
         let style = BoxStyle::of(self.dom, id, self.vp);
         let fixed_layout = self
             .dom
-            .computed_value(id, "table-layout")
+            .computed_value_resolved(id, "table-layout")
             .is_some_and(|v| v.trim().eq_ignore_ascii_case("fixed"));
 
         // Captions (§17.4): `table-caption` children render as block boxes
@@ -1048,7 +1092,7 @@ impl Builder<'_> {
             }
             let bottom = self
                 .dom
-                .computed_value(c, "caption-side")
+                .computed_value_resolved(c, "caption-side")
                 .as_deref()
                 .map(str::trim)
                 == Some("bottom");

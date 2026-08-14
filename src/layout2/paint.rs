@@ -48,6 +48,215 @@ pub(crate) type Composites = HashMap<String, Vec<CompositeLayer>>;
 use super::flow::{Clip, Frag, FragKind, TopFrag};
 use super::style::{BOTTOM, LEFT, RIGHT, TOP};
 
+type TerminalPageMedia = (Link, Option<(String, f32, f32)>);
+
+/// Immutable paint metadata captured from the canonical DOM at the end of the
+/// shared CSS-pixel layout pass. It is deliberately not a DOM mirror: no tree
+/// mutation, selector matching, cascade, or HTML attributes are reconstructed.
+/// The terminal adapter receives only the already-resolved facts it needs to
+/// quantize the retained pixel fragments into cells.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct TerminalPaintModel {
+    nodes: Vec<TerminalNodePaint>,
+    links: HashMap<NodeId, Link>,
+    page_media: Option<TerminalPageMedia>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TerminalNodePaint {
+    tag: Option<String>,
+    id: Option<String>,
+    anchor_name: Option<String>,
+    vertical_scroll: bool,
+    horizontal_scroll: bool,
+    principal_scroll: bool,
+    point_hit_subtree: bool,
+    background_covers: bool,
+    scrollbar_hidden: bool,
+    inline_snap: bool,
+    snap_align: Option<String>,
+    live_node: Option<usize>,
+    boundary_actor: Option<usize>,
+    scroll_top: Option<f32>,
+    scroll_left: Option<f32>,
+}
+
+impl TerminalPaintModel {
+    pub(crate) fn from_dom(dom: &Dom, base: &url::Url) -> Self {
+        let mut links = HashMap::new();
+        let mut nodes = Vec::with_capacity(dom.node_count());
+        for node in 0..dom.node_count() {
+            // CSS Display 3 §2: descendants of a display:none/otherwise
+            // suppressed flat-tree element generate no boxes. Keep their actor
+            // state in the canonical DOM, but do not let newly-created hidden
+            // nodes make the retained terminal adapter appear to have changed.
+            if !dom.is_connected(node) || dom.omitted_from_flat_box_tree(node) {
+                nodes.push(TerminalNodePaint::default());
+                continue;
+            }
+            let tag = dom.tag_name(node).map(str::to_string);
+            let point_hit = dom.point_hit_testable(node);
+            if point_hit {
+                if dom.render_clickable(node) {
+                    links.insert(
+                        node,
+                        Link::JsClick {
+                            node,
+                            href: dom.attr(node, "href").unwrap_or("").to_string(),
+                        },
+                    );
+                } else if tag.as_deref() == Some("a")
+                    && let Some(href) = dom.attr(node, "href")
+                {
+                    links.insert(node, crate::http::resolve(base, href));
+                } else if matches!(tag.as_deref(), Some("video" | "audio"))
+                    && let Some(target) = super::inline::media_target(dom, base, node)
+                {
+                    links.insert(node, Link::Media(target));
+                }
+            }
+            let inline_snap = dom
+                .computed_value_resolved(node, "scroll-snap-type")
+                .is_some_and(|value| {
+                    matches!(
+                        value
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("none")
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "x" | "inline" | "both"
+                    )
+                });
+            let live_node = if dom.render_live() {
+                Some(node)
+            } else {
+                dom.attr(node, "data-trust-node")
+                    .and_then(|value| value.parse().ok())
+            };
+            nodes.push(TerminalNodePaint {
+                tag,
+                id: dom
+                    .attr(node, "id")
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string),
+                anchor_name: dom
+                    .attr(node, "name")
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string),
+                vertical_scroll: dom.is_scroll_container(node),
+                horizontal_scroll: dom.is_hscroll_container(node),
+                principal_scroll: dom.is_principal_scroller(node),
+                point_hit_subtree: dom.subtree_has_point_hit_target(node),
+                background_covers: terminal_background_covers_dom(dom, node),
+                scrollbar_hidden: matches!(
+                    dom.computed_value_resolved(node, "scrollbar-width")
+                        .as_deref(),
+                    Some("none")
+                ),
+                inline_snap,
+                snap_align: dom
+                    .computed_value_resolved(node, "scroll-snap-align")
+                    .and_then(|value| value.split_whitespace().last().map(str::to_ascii_lowercase)),
+                live_node,
+                boundary_actor: super::boundary::boundary_actor(dom, node),
+                scroll_top: dom
+                    .attr(node, "data-trust-scroll-top")
+                    .and_then(|value| value.parse().ok())
+                    .or_else(|| {
+                        dom.render_live()
+                            .then(|| dom.scroll_metric(node, 0).map(|value| value as f32))
+                            .flatten()
+                    }),
+                scroll_left: dom
+                    .attr(node, "data-trust-scroll-left")
+                    .and_then(|value| value.parse().ok())
+                    .or_else(|| {
+                        dom.render_live()
+                            .then(|| dom.scroll_metric(node, 1).map(|value| value as f32))
+                            .flatten()
+                    }),
+            });
+        }
+        while nodes
+            .last()
+            .is_some_and(|node| *node == TerminalNodePaint::default())
+        {
+            nodes.pop();
+        }
+        Self {
+            nodes,
+            links,
+            page_media: None,
+        }
+    }
+
+    pub(crate) fn capture_page_media(
+        &mut self,
+        dom: &Dom,
+        base: &url::Url,
+        images: &super::ImageSizes,
+    ) {
+        if dom
+            .flat_descendants(crate::dom::DOCUMENT)
+            .into_iter()
+            .any(|id| matches!(dom.tag_name(id), Some("video" | "audio")))
+            || !super::page_declares_video(dom)
+        {
+            self.page_media = None;
+            return;
+        }
+        let target = super::unique_structured_media(dom, base, true)
+            .map(|media| media.target)
+            .unwrap_or_else(|| base.clone());
+        let poster = super::page_preview_image(dom, base).and_then(|source| {
+            crate::responsive_image::density_corrected_size(images.get(&source), 1.0)
+                .map(|(width, height)| (source, width, height))
+        });
+        self.page_media = Some((Link::Media(target), poster));
+    }
+
+    pub(crate) fn page_media(&self) -> Option<&TerminalPageMedia> {
+        self.page_media.as_ref()
+    }
+
+    fn node(&self, node: NodeId) -> Option<&TerminalNodePaint> {
+        self.nodes.get(node)
+    }
+
+    fn tag_name(&self, node: NodeId) -> Option<&str> {
+        self.node(node)?.tag.as_deref()
+    }
+
+    fn is_scroll_container(&self, node: NodeId) -> bool {
+        self.node(node).is_some_and(|node| node.vertical_scroll)
+    }
+
+    fn is_hscroll_container(&self, node: NodeId) -> bool {
+        self.node(node).is_some_and(|node| node.horizontal_scroll)
+    }
+
+    fn is_principal_scroller(&self, node: NodeId) -> bool {
+        self.node(node).is_some_and(|node| node.principal_scroll)
+    }
+
+    fn live_node(&self, node: NodeId) -> Option<usize> {
+        self.node(node)?.live_node
+    }
+
+    pub(super) fn boundary_actor(&self, node: NodeId) -> Option<usize> {
+        self.node(node)?.boundary_actor
+    }
+
+    fn scroll_top(&self, node: NodeId) -> Option<f32> {
+        self.node(node)?.scroll_top
+    }
+
+    fn scroll_left(&self, node: NodeId) -> Option<f32> {
+        self.node(node)?.scroll_left
+    }
+}
+
 static BORDERS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_borders_enabled(on: bool) {
@@ -82,8 +291,7 @@ pub(crate) struct PaintOut {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint(
-    dom: &Dom,
-    base: &url::Url,
+    dom: &TerminalPaintModel,
     root: &mut Frag<'_>,
     fixed: &[Frag<'_>],
     top_layer: &[TopFrag<'_>],
@@ -97,7 +305,7 @@ pub(crate) fn paint(
     alpha: &HashMap<String, bool>,
 ) -> PaintOut {
     let cols = viewport.0;
-    let links = interaction_links(dom, base);
+    let links = &dom.links;
     // The overlap-composite side-table, filled by every `composite` call below
     // (main pass, scroll-region buffers, carousel strips, the fixed layer).
     let mut composites: Composites = HashMap::new();
@@ -122,7 +330,7 @@ pub(crate) fn paint(
         &mut carousels,
         &mut scroll_clips,
         &mut splices,
-        &links,
+        links,
         alpha,
         &mut composites,
     );
@@ -132,7 +340,7 @@ pub(crate) fn paint(
     let mut ops = Vec::new();
     let line_rows = line_row_map(root, 0.0, 0.0, cell_w, cell_h, cols);
     build_sc(
-        dom, root, &mut ops, cell_w, cell_h, 0.0, 0.0, &links, &line_rows,
+        dom, root, &mut ops, cell_w, cell_h, 0.0, 0.0, links, &line_rows,
     );
     let mut rows = composite(ops, cols, alpha, &mut composites);
     // Splice each carousel's strip rows over its (now-blank) band — the strip
@@ -175,11 +383,11 @@ pub(crate) fn paint(
             .or_insert(row);
     };
     for (&node, &row) in &node_rows {
-        if let Some(id) = dom.attr(node, "id").filter(|v| !v.is_empty()) {
+        if let Some(id) = dom.node(node).and_then(|node| node.id.as_deref()) {
             note(id, row);
         }
         if dom.tag_name(node) == Some("a")
-            && let Some(name) = dom.attr(node, "name").filter(|v| !v.is_empty())
+            && let Some(name) = dom.node(node).and_then(|node| node.anchor_name.as_deref())
         {
             note(name, row);
         }
@@ -203,7 +411,7 @@ pub(crate) fn paint(
             let fixed_cols = cols.saturating_sub(col).max(1);
             let line_rows = line_row_map(f, f.x, f.y, cell_w, cell_h, fixed_cols);
             build_sc(
-                dom, f, &mut ops, cell_w, cell_h, f.x, f.y, &links, &line_rows,
+                dom, f, &mut ops, cell_w, cell_h, f.x, f.y, links, &line_rows,
             );
             let brows = composite(ops, fixed_cols, alpha, &mut composites);
             if brows.iter().all(|r| r.items.is_empty()) {
@@ -214,12 +422,12 @@ pub(crate) fn paint(
                 row: row.min(u16::MAX as usize) as u16,
                 rows: brows,
                 z: f.paint.z.unwrap_or(0),
-                under_document: super::flow::fixed_backdrop(
-                    dom,
-                    f,
-                    cols as f32 * cell_w,
-                    vp_rows as f32 * cell_h,
-                ),
+                under_document: f.paint.z.is_none()
+                    && f.x <= 0.5
+                    && f.y <= 0.5
+                    && f.w + 0.5 >= cols as f32 * cell_w
+                    && f.h + 0.5 >= vp_rows as f32 * cell_h
+                    && !dom.node(f.node).is_some_and(|node| node.point_hit_subtree),
             })
         })
         .collect();
@@ -237,7 +445,7 @@ pub(crate) fn paint(
         let top_cols = cols.saturating_sub(col).max(1);
         let line_rows = line_row_map(f, f.x, f.y, cell_w, cell_h, top_cols);
         build_sc(
-            dom, f, &mut ops, cell_w, cell_h, f.x, f.y, &links, &line_rows,
+            dom, f, &mut ops, cell_w, cell_h, f.x, f.y, links, &line_rows,
         );
         let brows = composite(ops, top_cols, alpha, &mut composites);
         if !brows.iter().all(|r| r.items.is_empty()) {
@@ -279,7 +487,7 @@ pub(crate) fn paint(
 /// come out relative to the buffer it lives in.
 #[allow(clippy::too_many_arguments)]
 fn extract_scrollers(
-    dom: &Dom,
+    dom: &TerminalPaintModel,
     f: &mut Frag<'_>,
     cw: f32,
     ch: f32,
@@ -348,7 +556,7 @@ fn extract_scrollers(
 /// Whether `f` is a horizontal scroll strip: an `overflow-x: auto|scroll`
 /// element (CSS Overflow L3 §2) whose content overflows its padding box to the
 /// right (there is scrollable overflow to window). Not the document root.
-fn is_carousel(dom: &Dom, f: &Frag<'_>, cw: f32) -> bool {
+fn is_carousel(dom: &TerminalPaintModel, f: &Frag<'_>, cw: f32) -> bool {
     if f.node == NO_NODE || matches!(dom.tag_name(f.node), Some("html" | "body")) {
         return false;
     }
@@ -394,7 +602,7 @@ fn content_right_px(f: &Frag<'_>, _cw: f32) -> f32 {
 /// Otherwise it scrolls freely. No guessed card sizing.
 #[allow(clippy::too_many_arguments)]
 fn paint_carousel(
-    dom: &Dom,
+    dom: &TerminalPaintModel,
     f: &mut Frag<'_>,
     cw: f32,
     ch: f32,
@@ -421,26 +629,13 @@ fn paint_carousel(
     // Snapping: only when the container declares an inline-axis scroll-snap-type
     // (x / inline / both). Its snap positions come from the cards' own
     // scroll-snap-align.
-    let inline_snaps = dom
-        .computed_value(f.node, "scroll-snap-type")
-        .is_some_and(|v| {
-            matches!(
-                v.split_whitespace()
-                    .next()
-                    .unwrap_or("none")
-                    .to_ascii_lowercase()
-                    .as_str(),
-                "x" | "inline" | "both"
-            )
-        });
+    let inline_snaps = dom.node(f.node).is_some_and(|node| node.inline_snap);
     let sp = scrollport as f32;
     let mut stops: Vec<u16> = Vec::new();
     for c in f.children.iter().filter(|c| c.w > 0.0 && c.node != NO_NODE) {
         let left = (c.x - pad_x) / cw;
         let right = (c.x + c.w - pad_x) / cw;
-        let align = dom
-            .computed_value(c.node, "scroll-snap-align")
-            .and_then(|s| s.split_whitespace().last().map(str::to_ascii_lowercase));
+        let align = dom.node(c.node).and_then(|node| node.snap_align.clone());
         let stop = match align.as_deref() {
             Some("start") => left,
             Some("center") => (left + right) / 2.0 - sp / 2.0,
@@ -452,11 +647,7 @@ fn paint_carousel(
     stops.sort_unstable();
     stops.dedup();
     let snap = inline_snaps && !stops.is_empty();
-    let hide_scrollbar = matches!(
-        dom.computed_value_resolved(f.node, "scrollbar-width")
-            .as_deref(),
-        Some("none")
-    );
+    let hide_scrollbar = dom.node(f.node).is_some_and(|node| node.scrollbar_hidden);
     // Composite the strip at the current-FRAME columns (`ox`), rows relative to
     // the band top (`oy`), wide enough to keep every card's full columns — so
     // the strip items land at frame columns `band_left + strip_x` for the
@@ -470,13 +661,10 @@ fn paint_carousel(
     f.children.clear();
     let end = start_row + strip.len();
     splices.push((start_row, strip));
-    let live_node = dom
-        .attr(f.node, "data-trust-node")
-        .and_then(|s| s.parse().ok());
+    let live_node = dom.live_node(f.node);
     let max_offset = strip_w.saturating_sub(scrollport);
     let offset = dom
-        .attr(f.node, "data-trust-scroll-left")
-        .and_then(|s| s.parse::<f32>().ok())
+        .scroll_left(f.node)
         .filter(|v| v.is_finite() && *v >= 0.0)
         .map_or(0, |px| {
             ((px / cw).round().max(0.0) as usize).min(max_offset)
@@ -516,6 +704,7 @@ pub(crate) fn region_buffer(
     cw: f32,
     ch: f32,
 ) -> RegionBuffer {
+    let model = TerminalPaintModel::from_dom(dom, base);
     let mut scroll_clips = Vec::new();
     // v1 region-patch cut: the incremental region re-lay does NOT alpha-composite
     // transparent image overlaps (empty alpha ⇒ no grouping) — such overlaps in a
@@ -523,25 +712,23 @@ pub(crate) fn region_buffer(
     // correct, matching the other P7 region-patch v1 cuts.
     let no_alpha: HashMap<String, bool> = HashMap::new();
     let mut composites: Composites = HashMap::new();
-    let links = interaction_links(dom, base);
+    let links = &model.links;
     let rg = paint_region(
-        dom,
+        &model,
         root,
         cw,
         ch,
         0.0,
         0.0,
         &mut scroll_clips,
-        &links,
+        links,
         &no_alpha,
         &mut composites,
     );
     // `paint_region` pushed this region's OWN clientHeight into `scroll_clips`
     // (its `live_node`); the app already knows this region's geometry, so drop
     // the self entry and keep only the NESTED scrollers' clips.
-    let self_node: Option<usize> = dom
-        .attr(root.node, "data-trust-node")
-        .and_then(|s| s.parse().ok());
+    let self_node = model.live_node(root.node);
     scroll_clips.retain(|&(n, _, _)| Some(n) != self_node);
     (rg.buffer, rg.carousels, scroll_clips)
 }
@@ -559,7 +746,7 @@ pub(crate) fn region_buffer(
 /// descendant — however many, however deep — is its own bounded region,
 /// scrolled independently (hover + wheel), same as a real browser's own
 /// nested scrollports.
-fn is_scroll_region(dom: &Dom, f: &Frag<'_>) -> bool {
+fn is_scroll_region(dom: &TerminalPaintModel, f: &Frag<'_>) -> bool {
     if f.node == NO_NODE || matches!(dom.tag_name(f.node), Some("html" | "body")) {
         return false;
     }
@@ -587,7 +774,7 @@ fn is_scroll_region(dom: &Dom, f: &Frag<'_>) -> bool {
 /// `ox`/`oy` = the frame this region lives in (0,0 at the document level).
 #[allow(clippy::too_many_arguments)]
 fn paint_region(
-    dom: &Dom,
+    dom: &TerminalPaintModel,
     f: &mut Frag<'_>,
     cw: f32,
     ch: f32,
@@ -652,13 +839,10 @@ fn paint_region(
     // terminal adapter converts it to rows here, then clamps it to
     // [0, scrollHeight − clientHeight] (CSSOM View). Its `data-trust-node`
     // correlates the region with the live actor for geometry round-trips.
-    let live_node: Option<usize> = dom
-        .attr(f.node, "data-trust-node")
-        .and_then(|s| s.parse().ok());
+    let live_node = dom.live_node(f.node);
     let max_voffset = content_h.saturating_sub(height);
     let signal = dom
-        .attr(f.node, "data-trust-scroll-top")
-        .and_then(|s| s.parse::<f32>().ok())
+        .scroll_top(f.node)
         .filter(|v| v.is_finite() && *v >= 0.0)
         .map(|px| (px / ch).round().max(0.0) as usize);
     let voffset = signal.map_or(0, |r| r.min(max_voffset));
@@ -815,29 +999,6 @@ enum Op {
 /// activation target merely because it has geometry. Live JS clickables have
 /// already been serialized as `x-trust-js:` anchors, so the same rule covers
 /// native hyperlinks and page-script activation.
-fn interaction_links(dom: &Dom, base: &url::Url) -> HashMap<NodeId, Link> {
-    let mut out = HashMap::new();
-    for node in 0..dom.node_count() {
-        if dom.tag_name(node) == Some("a")
-            && let Some(href) = dom.attr(node, "href")
-            && dom.point_hit_testable(node)
-        {
-            out.insert(node, crate::http::resolve(base, href));
-        }
-        // HTML §4.8.8: a user agent unable to render video may represent the
-        // element as a link to an external playback utility. The generated
-        // VIDEO border box is therefore an activation surface of its own,
-        // independent of custom-player buttons painted over the media tech.
-        if matches!(dom.tag_name(node), Some("video" | "audio"))
-            && dom.point_hit_testable(node)
-            && let Some(target) = super::inline::media_target(dom, base, node)
-        {
-            out.insert(node, Link::Media(target));
-        }
-    }
-    out
-}
-
 /// Append a non-painting hit-test display-list entry for this element's
 /// generated border box. `display:none` never reaches the fragment tree;
 /// visibility, inertness and pointer-events are the remaining eligibility
@@ -1016,7 +1177,7 @@ fn terminal_line_span(
 /// box-relative coordinates).
 #[allow(clippy::too_many_arguments)]
 fn build_sc(
-    dom: &Dom,
+    dom: &TerminalPaintModel,
     f: &Frag<'_>,
     ops: &mut Vec<Op>,
     cw: f32,
@@ -1068,7 +1229,7 @@ fn build_sc(
 /// into the enclosing real stacking context (E.2 step 8).
 #[allow(clippy::too_many_arguments)]
 fn build_pseudo(
-    dom: &Dom,
+    dom: &TerminalPaintModel,
     f: &Frag<'_>,
     ops: &mut Vec<Op>,
     cw: f32,
@@ -1094,7 +1255,7 @@ fn build_pseudo(
 /// normal positioned/SC path (its `sc`/`positioned` flag wins).
 #[allow(clippy::too_many_arguments)]
 fn build_floats(
-    dom: &Dom,
+    dom: &TerminalPaintModel,
     f: &Frag<'_>,
     ops: &mut Vec<Op>,
     cw: f32,
@@ -1152,7 +1313,7 @@ fn collect_positioned<'f, 't>(
 /// Floats paint as a unit in step 5 (`build_floats`), so they're skipped here.
 #[allow(clippy::too_many_arguments)]
 fn inflow_bgs(
-    dom: &Dom,
+    dom: &TerminalPaintModel,
     f: &Frag<'_>,
     ops: &mut Vec<Op>,
     cw: f32,
@@ -1308,11 +1469,11 @@ fn quantize_item(item: &mut Item, piece: &super::inline::Piece, cw: f32, ch: f32
 /// terminal cannot alpha-blend arbitrary CSS image/gradient layers, so its
 /// historical binary cover approximation is deliberately quarantined here,
 /// after layout and immediately before cell compositing.
-fn terminal_background_covers(dom: &Dom, node: NodeId) -> bool {
+fn terminal_background_covers_dom(dom: &Dom, node: NodeId) -> bool {
     if node == NO_NODE {
         return false;
     }
-    if let Some(color) = dom.computed_value(node, "background-color") {
+    if let Some(color) = dom.computed_value_resolved(node, "background-color") {
         let color = color.trim().to_ascii_lowercase();
         if !color.is_empty()
             && !matches!(
@@ -1330,7 +1491,7 @@ fn terminal_background_covers(dom: &Dom, node: NodeId) -> bool {
             return true;
         }
     }
-    let Some(image) = dom.computed_value(node, "background-image") else {
+    let Some(image) = dom.computed_value_resolved(node, "background-image") else {
         return false;
     };
     let image = image.trim().to_ascii_lowercase();
@@ -1450,13 +1611,25 @@ fn zero_alpha_color(color: &str) -> bool {
 }
 
 /// The opaque background fill of a fragment's border box, when it has one.
-fn fill_op(dom: &Dom, f: &Frag<'_>, ops: &mut Vec<Op>, cw: f32, ch: f32, ox: f32, oy: f32) {
+fn fill_op(
+    dom: &TerminalPaintModel,
+    f: &Frag<'_>,
+    ops: &mut Vec<Op>,
+    cw: f32,
+    ch: f32,
+    ox: f32,
+    oy: f32,
+) {
     let row0 = ((f.y - oy) / ch).round() as i64;
     let row1 = ((f.y - oy + f.h) / ch).round() as i64;
     let col0 = ((f.x - ox) / cw).round() as i64;
     let col1 = ((f.x - ox + f.w) / cw).round() as i64;
     let clip = clip_cells(f.clip, ox, oy, cw, ch);
-    if f.paint.bg && terminal_background_covers(dom, f.node) && row1 > row0 && col1 > col0 {
+    if f.paint.bg
+        && dom.node(f.node).is_some_and(|node| node.background_covers)
+        && row1 > row0
+        && col1 > col0
+    {
         ops.push(Op::Fill {
             row0,
             row1,

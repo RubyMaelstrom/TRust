@@ -314,7 +314,7 @@ impl HistoryEntry {
 pub enum FetchedDocument {
     Gopher(Vec<u8>),
     Gemini(gemini::Response),
-    Http(http::Response),
+    Http(Box<http::Response>),
     OneShot(Vec<u8>),
     /// A trusted, in-process Gemtext document such as `about:help`.
     Internal(Vec<u8>),
@@ -326,14 +326,12 @@ pub struct BrowserPage {
     fallback_http: bool,
     pub document: FetchedDocument,
     pub status: String,
-    /// Latest full serialization from the resident page actor. `None` means
-    /// the response body is still authoritative.
-    rendered_html: Option<String>,
-    /// Revision of the latest complete actor serialization. Targeted patches
-    /// advance `revision` but not this value, allowing graphical frontends to
-    /// update their retained presentation DOM instead of reparsing stale HTML.
+    /// Latest canonical actor render. Native frontends consume this typed
+    /// CSS-pixel product directly; it is the presentation authority.
+    rendered: Option<http::RenderedPage>,
+    /// Revision of the latest complete typed actor render. Pure interaction
+    /// transforms can advance `revision` without replacing this pixel product.
     rendered_revision: u64,
-    pending_patches: Vec<crate::js::SubtreePatch>,
     revision: u64,
 }
 
@@ -342,8 +340,11 @@ impl BrowserPage {
         self.target.to_string()
     }
 
-    pub fn rendered_html(&self) -> Option<&str> {
-        self.rendered_html.as_deref()
+    pub fn rendered_page(&self) -> Option<&http::RenderedPage> {
+        self.rendered.as_ref().or(match &self.document {
+            FetchedDocument::Http(response) => response.rendered.as_deref(),
+            _ => None,
+        })
     }
 
     pub fn revision(&self) -> u64 {
@@ -505,17 +506,14 @@ impl BrowserController {
         self.current.as_ref()
     }
 
-    /// Drain graphical subtree patches queued since the frontend last updated
-    /// its retained presentation DOM. A full `Updated` clears this queue.
-    pub fn take_page_patches(&mut self) -> Vec<crate::js::SubtreePatch> {
-        self.current
-            .as_mut()
-            .map_or_else(Vec::new, |page| std::mem::take(&mut page.pending_patches))
+    pub fn page_is_live(&self) -> bool {
+        self.live_page.is_some()
     }
 
-    /// Publish the graphical layout boundaries the resident actor may target.
-    /// Values are actor arena ids baked as `data-trust-node`. Duplicate layouts
-    /// are free; only a changed set crosses the actor channel.
+    /// Publish graphical layout boundaries the resident actor may target.
+    /// Values are canonical actor arena ids carried directly by the typed
+    /// layout. Duplicate layouts are free; only a changed set crosses the
+    /// actor channel.
     pub fn set_live_layout_boundaries(
         &mut self,
         mut regions: Vec<usize>,
@@ -537,8 +535,8 @@ impl BrowserController {
         }
     }
 
-    /// Ask the resident page actor for the always-correct complete snapshot.
-    /// Used when a native frontend cannot prove a queued patch safe.
+    /// Ask the resident page actor for the always-correct complete typed render.
+    /// Retained for compatibility with the legacy patch protocol.
     pub fn request_live_resync(&self) {
         self.send_live(crate::js::PageCmd::Resync);
     }
@@ -940,14 +938,17 @@ impl BrowserController {
                     FetchedDocument::Http(response) => response.live.take(),
                     _ => None,
                 };
+                let initial_rendered = match &document {
+                    FetchedDocument::Http(response) => response.rendered.as_deref().cloned(),
+                    _ => None,
+                };
                 let page = BrowserPage {
                     status: fetched_status(&pending.target, &document),
                     target: pending.target.clone(),
                     fallback_http: pending.fallback_http,
                     document,
-                    rendered_html: None,
-                    rendered_revision: 0,
-                    pending_patches: Vec::new(),
+                    rendered: initial_rendered.clone(),
+                    rendered_revision: u64::from(initial_rendered.is_some()),
                     revision: 1,
                 };
                 self.live_regions.clear();
@@ -1058,7 +1059,7 @@ impl BrowserController {
     fn handle_page_event(&mut self, event: crate::js::PageEvt) -> bool {
         use crate::js::PageEvt;
         match event {
-            PageEvt::Updated { html, outcome } | PageEvt::Static { html, outcome } => {
+            PageEvt::Updated { html, mut outcome } => {
                 // The native frontends do not pass through `App`, so mirror its
                 // gated live-render diagnostic here. Keeping this at the shared
                 // controller boundary captures the exact authoritative HTML
@@ -1073,10 +1074,11 @@ impl BrowserController {
                     );
                 }
                 if let Some(page) = &mut self.current {
-                    page.rendered_html = Some(html);
+                    if let Some(rendered) = outcome.rendered.take() {
+                        page.rendered = Some(*rendered);
+                    }
                     page.revision = page.revision.wrapping_add(1);
                     page.rendered_revision = page.revision;
-                    page.pending_patches.clear();
                 }
                 self.status = if outcome.errors.is_empty() {
                     String::from("Page updated · JS")
@@ -1085,17 +1087,44 @@ impl BrowserController {
                 };
                 true
             }
-            PageEvt::Patched { patches, outcome } => {
-                // Preserve the actor's attributed subtree updates for the
-                // graphical frontend. Newest-per-boundary wins; a later full
-                // Updated clears the queue. The frontend requests Resync only
-                // if its retained presentation DOM cannot apply one safely.
+            PageEvt::Static { html, mut outcome } => {
                 if let Some(page) = &mut self.current {
-                    for patch in patches {
-                        page.pending_patches.retain(|old| old.node != patch.node);
-                        page.pending_patches.push(patch);
+                    // The actor has classified this document as inert and is
+                    // about to exit.  Preserve its settled serialization as
+                    // the static document source: later viewport/image
+                    // reflows must not resurrect the server's pre-script DOM.
+                    // This remains a presentation snapshot, never a second
+                    // mutable DOM authority.
+                    if let FetchedDocument::Http(response) = &mut page.document {
+                        response.body = html.into_bytes();
+                    }
+                    if let Some(rendered) = outcome.rendered.take() {
+                        page.rendered = Some(*rendered);
                     }
                     page.revision = page.revision.wrapping_add(1);
+                    page.rendered_revision = page.revision;
+                }
+                self.drop_live_page();
+                self.status = if outcome.errors.is_empty() {
+                    String::from("Page updated · JS")
+                } else {
+                    format!("Page updated · JS:{}", outcome.errors.len())
+                };
+                true
+            }
+            PageEvt::Patched {
+                patches,
+                mut outcome,
+            } => {
+                let _ = patches;
+                if let Some(page) = &mut self.current {
+                    if let Some(rendered) = outcome.rendered.take() {
+                        page.rendered = Some(*rendered);
+                        page.revision = page.revision.wrapping_add(1);
+                        page.rendered_revision = page.revision;
+                    } else {
+                        page.revision = page.revision.wrapping_add(1);
+                    }
                 }
                 if !outcome.errors.is_empty() {
                     self.status = format!("Page JS:{}", outcome.errors.len());
@@ -1243,7 +1272,7 @@ pub async fn fetch_protocol(
                 }
                 http::fetch(&request).await
             }?;
-            Ok(FetchedDocument::Http(response))
+            Ok(FetchedDocument::Http(Box::new(response)))
         }
         Link::OneShot(url) => oneshot::fetch(url).await.map(FetchedDocument::OneShot),
         Link::Telnet { .. } => Err(String::from("terminal target requires a frontend VT view")),
@@ -1302,7 +1331,7 @@ async fn fetch_protocol_interactive(
             storage,
         )
         .await;
-        Ok(FetchedDocument::Http(response))
+        Ok(FetchedDocument::Http(Box::new(response)))
     } else {
         fetch_protocol(target, fallback_http, referrer).await
     }
@@ -1515,6 +1544,49 @@ mod tests {
     }
 
     #[test]
+    fn static_actor_event_retains_the_settled_document_source() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        browser.current = Some(BrowserPage {
+            target: Link::Http(url::Url::parse("https://example.com/").unwrap()),
+            fallback_http: false,
+            document: FetchedDocument::Http(Box::new(crate::http::Response {
+                url: url::Url::parse("https://example.com/").unwrap(),
+                status: 200,
+                content_type: String::from("text/html"),
+                headers: Vec::new(),
+                body: b"<p>server source</p>".to_vec(),
+                rendered: None,
+                js: None,
+                blobs: None,
+                live: None,
+                challenge: None,
+                from_post: false,
+            })),
+            status: String::from("Ready"),
+            rendered: None,
+            rendered_revision: 1,
+            revision: 1,
+        });
+
+        assert!(browser.handle_page_event(crate::js::PageEvt::Static {
+            html: String::from("<html><body><p>settled DOM</p></body></html>"),
+            outcome: Default::default(),
+        }));
+        let FetchedDocument::Http(response) = &browser.current.as_ref().unwrap().document else {
+            panic!("expected HTTP document");
+        };
+        assert_eq!(
+            response.body,
+            b"<html><body><p>settled DOM</p></body></html>"
+        );
+    }
+
+    #[test]
     fn page_originated_horizontal_scroll_invalidates_the_cached_display_list() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1527,9 +1599,8 @@ mod tests {
             fallback_http: false,
             document: FetchedDocument::Internal(Vec::new()),
             status: String::from("Ready"),
-            rendered_html: Some(String::from("<div data-trust-node=17></div>")),
+            rendered: None,
             rendered_revision: 7,
-            pending_patches: Vec::new(),
             revision: 7,
         });
 
@@ -1552,42 +1623,6 @@ mod tests {
             left: 100.0,
         }));
         assert_eq!(browser.current.as_ref().unwrap().revision, 8);
-    }
-
-    #[test]
-    fn graphical_controller_queues_incremental_page_patches() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let mut browser =
-            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
-        browser.current = Some(BrowserPage {
-            target: Link::Http(url::Url::parse("https://example.com/").unwrap()),
-            fallback_http: false,
-            document: FetchedDocument::Internal(Vec::new()),
-            status: String::from("Ready"),
-            rendered_html: Some(String::from("<div data-trust-node=17>old</div>")),
-            rendered_revision: 7,
-            pending_patches: Vec::new(),
-            revision: 7,
-        });
-        let patch = crate::js::SubtreePatch {
-            node: 17,
-            html: String::from("<div><div data-trust-node=17>new</div></div>"),
-            tier: crate::js::BoundaryTier::WidthStable,
-        };
-
-        assert!(browser.handle_page_event(crate::js::PageEvt::Patched {
-            patches: vec![patch],
-            outcome: crate::js::Outcome::default(),
-        }));
-        assert_eq!(browser.current.as_ref().unwrap().revision, 8);
-        assert_eq!(browser.current.as_ref().unwrap().rendered_revision, 7);
-        let queued = browser.take_page_patches();
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].node, 17);
-        assert!(browser.take_page_patches().is_empty());
     }
 
     #[test]
