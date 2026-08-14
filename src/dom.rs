@@ -34,12 +34,27 @@ pub enum NodeData {
     },
 }
 
+/// Failure modes of `Document.adoptNode`, kept distinct so the JS binding can
+/// expose the DOM-mandated exception names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptError {
+    TargetNotDocument,
+    InvalidNode,
+    Document,
+    ShadowRoot,
+}
+
 pub struct Node {
     pub parent: Option<NodeId>,
     pub first_child: Option<NodeId>,
     pub last_child: Option<NodeId>,
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
+    /// The node document that owns this node.  Keeping this explicitly in the
+    /// arena matters for detached `DOMParser` documents: once a subtree is
+    /// adopted, its owner document changes even while the subtree remains
+    /// detached (DOM Standard §4.5).
+    pub owner_document: NodeId,
     pub data: NodeData,
 }
 
@@ -1552,6 +1567,7 @@ impl Dom {
             last_child: None,
             prev_sibling: None,
             next_sibling: None,
+            owner_document: DOCUMENT,
             data,
         });
         self.nodes.len() - 1
@@ -1559,6 +1575,38 @@ impl Dom {
 
     pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id]
+    }
+
+    /// Change the node document for a whole shadow-including subtree.  The
+    /// arena keeps template contents and shadow roots in side structures, so
+    /// they are included explicitly rather than relying only on parent links.
+    fn set_owner_document_subtree(&mut self, root: NodeId, document: NodeId) {
+        if !self.is_valid(root) {
+            return;
+        }
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            self.nodes[id].owner_document = document;
+            stack.extend(self.child_iter(id));
+            let template_contents = match &self.nodes[id].data {
+                NodeData::Element {
+                    template_contents: Some(contents),
+                    ..
+                } => Some(*contents),
+                _ => None,
+            };
+            if let Some(contents) = template_contents {
+                stack.push(contents);
+            }
+            if let Some(&shadow) = self.shadow_roots.get(&id) {
+                stack.push(shadow);
+            }
+        }
+    }
+
+    /// The document that owns `id` (DOM §4.5's *node document*).
+    pub fn owner_document(&self, id: NodeId) -> Option<NodeId> {
+        self.is_valid(id).then_some(self.nodes[id].owner_document)
     }
 
     pub fn is_valid(&self, id: NodeId) -> bool {
@@ -1629,6 +1677,7 @@ impl Dom {
     }
 
     pub fn append(&mut self, parent: NodeId, child: NodeId) {
+        let owner_document = self.nodes[parent].owner_document;
         self.detach(child);
         self.note_tree_style_mutation(Some(parent), child);
         let old_last = self.nodes[parent].last_child;
@@ -1640,6 +1689,7 @@ impl Dom {
             self.nodes[parent].first_child = Some(child);
         }
         self.nodes[parent].last_child = Some(child);
+        self.set_owner_document_subtree(child, owner_document);
         self.touch_content(Some(parent));
     }
 
@@ -1672,6 +1722,7 @@ impl Dom {
         } else {
             reference
         };
+        let owner_document = self.nodes[parent].owner_document;
         self.detach(child);
         self.note_tree_style_mutation(Some(parent), child);
         let prev = self.nodes[reference].prev_sibling;
@@ -1683,7 +1734,30 @@ impl Dom {
             Some(prev) => self.nodes[prev].next_sibling = Some(child),
             None => self.nodes[parent].first_child = Some(child),
         }
+        self.set_owner_document_subtree(child, owner_document);
         self.touch_content(Some(parent));
+    }
+
+    /// Implement the DOM Standard's adopt algorithm (DOM §4.5): remove the
+    /// node from its old parent, then retarget the node document for the whole
+    /// shadow-including subtree.  The caller supplies the target `Document`.
+    pub fn adopt_node(&mut self, document: NodeId, id: NodeId) -> Result<NodeId, AdoptError> {
+        if !self.is_valid(document) || !matches!(self.nodes[document].data, NodeData::Document) {
+            return Err(AdoptError::TargetNotDocument);
+        }
+        if !self.is_valid(id) {
+            return Err(AdoptError::InvalidNode);
+        }
+        if matches!(self.nodes[id].data, NodeData::Document) {
+            return Err(AdoptError::Document);
+        }
+        if self.shadow_hosts.contains_key(&id) {
+            return Err(AdoptError::ShadowRoot);
+        }
+        let old_document = self.nodes[id].owner_document;
+        self.detach(id);
+        self.set_owner_document_subtree(id, document);
+        Ok(old_document)
     }
 
     /// Append text, merging into a trailing text node like a parser would.
@@ -3470,6 +3544,8 @@ impl Dom {
             return root;
         }
         let root = self.create_fragment();
+        let owner_document = self.nodes[host].owner_document;
+        self.set_owner_document_subtree(root, owner_document);
         self.shadow_roots.insert(host, root);
         self.shadow_hosts.insert(root, host);
         // Attaching changes only this host's composed contents. Preserve the
@@ -4023,6 +4099,7 @@ impl Dom {
     pub fn parse_document_into(&mut self, html: &str) -> NodeId {
         let src = Dom::parse_document(html);
         let doc = self.new_node(NodeData::Document);
+        self.nodes[doc].owner_document = doc;
         for c in src.child_iter(DOCUMENT) {
             let cc = self.transplant(&src, c);
             self.append(doc, cc);

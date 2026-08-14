@@ -15,7 +15,7 @@ use boa_engine::job::{Job, JobExecutor, NativeAsyncJob, PromiseJob};
 use boa_engine::object::builtins::{JsArray, JsPromise};
 use boa_engine::{Context, JsResult, JsString, JsValue, NativeFunction, Source};
 
-use crate::dom::{DOCUMENT, Dom, SelectorList};
+use crate::dom::{AdoptError, DOCUMENT, Dom, SelectorList};
 
 /// Wall-clock deadline for a whole page load, NETWORK-INCLUSIVE. Since
 /// page fetches now run asynchronously (they no longer block the JS
@@ -2420,6 +2420,8 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_append", 2, sys_append),
         ("__dom_insert_before", 3, sys_insert_before),
         ("__dom_detach", 1, sys_detach),
+        ("__dom_owner_document", 1, sys_owner_document),
+        ("__dom_adopt", 2, sys_adopt),
         ("__dom_parent", 1, sys_parent),
         ("__dom_contains", 2, sys_contains),
         ("__dom_set_hover", 1, sys_set_hover),
@@ -2599,6 +2601,36 @@ fn sys_detach(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
         d.detach(id);
     }
     Ok(JsValue::undefined())
+}
+
+fn sys_owner_document(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let d = dom.borrow();
+    Ok(id_value(
+        arg_node(&d, args, 0).and_then(|id| d.owner_document(id)),
+    ))
+}
+
+/// `__dom_adopt(document, node)` implements the tree/owner-document portion
+/// of `Document.adoptNode`; the JS binding supplies the Web-exposed exception
+/// names and custom-element callback queueing.
+fn sys_adopt(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let mut d = dom.borrow_mut();
+    let Some(document) = arg_node(&d, args, 0) else {
+        return Ok(JsValue::from(-1));
+    };
+    let Some(node) = arg_node(&d, args, 1) else {
+        return Ok(JsValue::from(-2));
+    };
+    let result = d.adopt_node(document, node);
+    Ok(match result {
+        Ok(old_document) => JsValue::from(old_document as f64),
+        Err(AdoptError::TargetNotDocument) => JsValue::from(-3),
+        Err(AdoptError::InvalidNode) => JsValue::from(-2),
+        Err(AdoptError::Document) => JsValue::from(-4),
+        Err(AdoptError::ShadowRoot) => JsValue::from(-5),
+    })
 }
 
 fn sys_parent(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -6674,6 +6706,27 @@ fn load_page(
             // (importmap, json, ...) still skip.
             if type_attr.as_deref().is_some_and(|t| t.trim() == "module") {
                 match src {
+                    Some(src) if src.starts_with("data:") => {
+                        // HTML's external module-script processing fetches any
+                        // valid URL, including `data:`.  Fetch §6 defines the
+                        // percent/base64 decoding; use the same decoder as
+                        // imported data modules and classic data scripts.
+                        let name = format!("data-module#{}", i + 1);
+                        match crate::img::decode_data_url(src) {
+                            Some(body) => run_module(
+                                &mut ctx,
+                                &name,
+                                &body,
+                                src,
+                                &budget,
+                                &mut outcome,
+                                Some((&loader, src)),
+                            ),
+                            None => outcome
+                                .errors
+                                .push(format!("{name}: cannot decode data: URL")),
+                        }
+                    }
                     Some(src) => {
                         // Load the entry module THROUGH the loader via a
                         // synthetic importer (register) — do NOT let Boa
@@ -12479,7 +12532,11 @@ const PRELUDE: &str = r##"
         // safe custom-element property (pass through); the leaked `data` made it
         // sanitize ytd-* renderers' `.data` object to its innocuous sentinel, so
         // the whole search-results tree never received its data and stayed empty.
-        get ownerDocument() { return g.document; }
+        // Node.ownerDocument is the arena's explicit node document.  This is
+        // observable for DOMParser trees before and after adoptNode; returning
+        // the live document for every node made cross-document adoption
+        // indistinguishable from a no-op.
+        get ownerDocument() { return wrap(__dom_owner_document(this.__id)); }
         get isConnected() {
             let n = this;
             for (;;) {
@@ -12491,6 +12548,8 @@ const PRELUDE: &str = r##"
             }
         }
         getRootNode() { let n = this; while (n.parentNode) n = n.parentNode; return n; }
+        // Document.adoptNode is defined on Document, below.  Keeping the
+        // operation there preserves the DOM's target-document semantics.
         appendChild(c) {
             if (c && c.nodeType === 11 && !c.__host) { for (const k of c.childNodes) this.appendChild(k); return c; }
             // Pre-insertion validity (WHATWG DOM §4.2.3): the syscall refuses
@@ -14143,6 +14202,33 @@ const PRELUDE: &str = r##"
                 },
             };
         }
+        // DOM Standard §4.5: adoptNode removes a node from its old parent,
+        // changes the node document for its entire shadow-including subtree,
+        // and returns the very same node object.  The Rust arena performs the
+        // pointer/owner-document transition; this layer exposes the specified
+        // exceptions and invokes custom-element adoptedCallback steps.
+        adoptNode(node) {
+            if (!(this instanceof Document)) {
+                throw new TypeError("Illegal invocation");
+            }
+            if (!(node instanceof Node)) {
+                throw new TypeError("Failed to execute 'adoptNode': parameter 1 is not of type 'Node'");
+            }
+            if (node.nodeType === 9) {
+                throw new DOMException("The node is a document", "NotSupportedError");
+            }
+            if (node instanceof ShadowRoot) {
+                throw new DOMException("The node is a shadow root", "HierarchyRequestError");
+            }
+            const oldId = __dom_adopt(this.__id, node.__id);
+            if (oldId === -3) throw new TypeError("Illegal invocation");
+            if (oldId === -4) throw new DOMException("The node is a document", "NotSupportedError");
+            if (oldId === -5) throw new DOMException("The node is a shadow root", "HierarchyRequestError");
+            if (oldId < 0) throw new TypeError("The node is not valid");
+            const oldDocument = wrap(oldId);
+            if (oldDocument !== this) ceAdopt(node, oldDocument, this);
+            return node;
+        }
         get forms() { return this.querySelectorAll("form"); }
         get links() { return this.querySelectorAll("a[href]"); }
         get images() { return this.querySelectorAll("img"); }
@@ -14645,6 +14731,20 @@ const PRELUDE: &str = r##"
             const el = wrap(ids[i]);
             const ctor = CE.defs.get(el.localName);
             if (ctor) { upgradeElement(el, ctor); maybeConnect(el); }
+        }
+    }
+    function ceAdopt(node, oldDocument, newDocument) {
+        if (!node || oldDocument === newDocument || !CE.defs.size) return;
+        // `__dom_ce_candidates` follows the shadow-including tree and returns
+        // only custom-element candidates, matching the adoption algorithm's
+        // callback walk without wrapping every ordinary descendant.
+        const ids = __dom_ce_candidates(node.__id);
+        for (let i = 0; i < ids.length; i++) {
+            const el = wrap(ids[i]);
+            if (el.__ceUpgraded && typeof el.adoptedCallback === "function") {
+                try { el.adoptedCallback(oldDocument, newDocument); }
+                catch (e) { trust.errors.push("adoptedCallback: " + ((e && e.message) || e)); }
+            }
         }
     }
     // define()'s catch-up upgrade, but shadow-piercing: an element
@@ -25093,6 +25193,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn document_adopt_node_moves_subtrees_and_updates_owner_document() {
+        let (out, outcome) = page(
+            r##"<body><pre id="out"></pre><script>
+                const parsed = new DOMParser().parseFromString(
+                    '<div id="adopted"><span>child</span></div>', 'text/html');
+                const node = parsed.body.firstElementChild;
+                const before = node.ownerDocument === parsed && node.parentNode === parsed.body;
+                const returned = document.adoptNode(node);
+                const detached = node.parentNode === null;
+                const owner = node.ownerDocument === document
+                    && node.firstElementChild.ownerDocument === document;
+                document.body.appendChild(returned);
+                document.getElementById('out').textContent =
+                    [before, detached, owner, returned === node, node.textContent].join('|');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("true|true|true|true|child"), "{out}");
+    }
+
+    #[test]
+    fn document_adopt_node_runs_adopted_callback_and_rejects_special_nodes() {
+        let (out, outcome) = page(
+            r##"<body><pre id="out"></pre><script>
+                const parsed = new DOMParser().parseFromString('', 'text/html');
+                let callback = '';
+                class AdoptedThing extends HTMLElement {
+                    adoptedCallback(oldDocument, newDocument) {
+                        callback = (oldDocument === parsed) + '|' + (newDocument === document);
+                    }
+                }
+                customElements.define('adopted-thing', AdoptedThing);
+                const custom = parsed.createElement('adopted-thing');
+                parsed.body.appendChild(custom);
+                document.adoptNode(custom);
+                let documentError = '', shadowError = '';
+                try { document.adoptNode(document); }
+                catch (e) { documentError = e.name; }
+                try {
+                    const host = document.createElement('div');
+                    document.adoptNode(host.attachShadow({mode: 'open'}));
+                } catch (e) { shadowError = e.name; }
+                document.getElementById('out').textContent =
+                    [callback, documentError, shadowError].join('|');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("true|true|NotSupportedError|HierarchyRequestError"),
+            "{out}"
+        );
+    }
+
     // ---- CSSOM surface: CSS.supports, <style>.sheet, on* handlers ----
 
     #[test]
@@ -32608,6 +32762,18 @@ mod tests {
         let (out, outcome) = page(&html);
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("data-ran+plain"), "{out}");
+    }
+
+    #[test]
+    fn a_data_url_module_entry_runs_inline() {
+        let (out, outcome) = page(
+            "<body><pre id=o></pre>\
+             <script type=module src=\"data:text/javascript,document.getElementById('o').textContent='module-data'\"></script>\
+             </body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.modules_skipped, 0);
+        assert!(out.contains("module-data"), "{out}");
     }
 
     #[test]
