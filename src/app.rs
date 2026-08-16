@@ -1485,7 +1485,15 @@ impl App {
     /// one. Returns whether an interactive target was hit.
     fn browser_mouse_hover(&mut self, col: u16, row: u16) -> bool {
         match self.browser.as_ref() {
-            Some(g) if g.doc.laid_out() => self.http_mouse_hover(col, row),
+            // A modal/top-layer or fixed-only document can have no scrolling
+            // rows at all. Its pinned controls are still painted and must use
+            // the HTTP/layout hit-test path; routing such a page through the
+            // line-model gopher hit-test made visible consent/dialog buttons
+            // inert (UI Events click targeting and HTML activation do not
+            // depend on document height).
+            Some(g) if g.doc.laid_out() || !g.doc.fixed.is_empty() => {
+                self.http_mouse_hover(col, row)
+            }
             Some(_) => self.gopher_mouse_hover(col, row),
             None => false,
         }
@@ -2385,15 +2393,15 @@ impl App {
             // A bare URL — or a bare hostname/IP — opens directly, as if
             // `open` had been typed (the address-bar habit). A schemeless
             // host with no port becomes https (falling back to http).
-            Some(target) if target.contains("://") || looks_like_host(target) => {
+            Some(target) if crate::command::looks_like_address(target) => {
                 let port = parts.next().and_then(parse_port);
                 self.dispatch_open(target, port);
             }
-            // TODO for GNU telnet parity: full set/unset, display,
-            // logout, z (suspend), ! (shell escape).
-            Some(other) => {
-                self.status =
-                    format!("unknown command: {other} (help lists commands — or just type a URL)")
+            // Address-bar fallback: once command and URL/address recognition
+            // have both failed, search the complete entered line.
+            Some(_) => {
+                let target = crate::command::search_url(line.trim());
+                self.dispatch_open(&target, None);
             }
         }
     }
@@ -4336,7 +4344,7 @@ impl App {
             crate::js::Outcome,
         )> = None;
         let mut trouble: Vec<String> = Vec::new();
-        let mut navigate: Option<String> = None;
+        let mut navigate: Option<(String, bool)> = None;
         // A same-document fragment scroll the page requested; applied AFTER the
         // render below so it targets the freshly-rendered doc's `anchor_rows`.
         // Newest wins.
@@ -4389,7 +4397,8 @@ impl App {
                 }) => {
                     submit_nodes = Some((form, submitter, submission));
                 }
-                Some(PageEvt::Navigate(url)) => navigate = Some(url),
+                Some(PageEvt::Navigate(url)) => navigate = Some((url, false)),
+                Some(PageEvt::Replace(url)) => navigate = Some((url, true)),
                 Some(PageEvt::ScrollToFragment(frag)) => scroll_fragment = Some(frag),
                 None => break,
             }
@@ -4456,9 +4465,11 @@ impl App {
                 self.submit_form_static(form, field);
             }
         }
-        if let Some(url) = navigate {
-            // An un-prevented click on a live anchor: a real navigation, so it
-            // carries the page's Referer like any followed link.
+        if let Some((url, replace)) = navigate {
+            // A script navigation carries the page's Referer like any followed
+            // link. Location.replace additionally swaps the result into the
+            // current history slot rather than retaining the intermediary.
+            self.replace_nav = replace;
             self.navigate_from_page(&url);
         }
         (full_replace, drains)
@@ -7261,13 +7272,6 @@ impl App {
 /// Resolve a port argument: a number, or a well-known service name —
 /// GNU telnet's getservbyname, in miniature.
 pub use crate::command::parse_port;
-
-/// Whether a bare console token looks like a web host/address — a dotted
-/// name (`example.com`, `192.168.0.1`), `host:port`, or `localhost` — so it
-/// opens as if `open` had been typed. Conservative on purpose: real command
-/// typos (no dot, no `localhost`) still fall through to the usage hint.
-/// Tokens are whitespace-split, so they never contain spaces.
-use crate::command::looks_like_host;
 
 /// Split a trailing `:port` off a host string, the way users write
 /// telnet targets (`isharmud.com:23`). Hosts with more than one colon
@@ -11419,6 +11423,91 @@ mod tests {
         app
     }
 
+    #[tokio::test]
+    async fn fixed_only_live_button_click_uses_layout_hit_testing() {
+        let html = r#"
+          <style>html,body{margin:0}#overlay{position:fixed;left:0;top:0;width:480px;height:160px;background:#111;color:white}button{display:block;margin:24px;width:240px;height:40px}</style>
+          <div id="overlay"><button id="ok">Accept All</button></div>
+          <script>
+            document.getElementById('ok').addEventListener('click', () => {
+              document.getElementById('overlay').remove();
+              document.body.setAttribute('data-done', 'yes');
+            });
+          </script>"#;
+        let mut app = live_form_app(html).await;
+        app.mode = super::Mode::Session;
+        app.last_content_area = ratatui::layout::Rect::new(0, 0, 60, 10);
+        let fixed = app.browser.as_ref().unwrap().doc.fixed.clone();
+        let target = fixed
+            .iter()
+            .enumerate()
+            .find_map(|(fi, f)| {
+                f.rows.iter().enumerate().find_map(|(r, row)| {
+                    row.items.iter().enumerate().find_map(|(i, it)| {
+                        it.text
+                            .contains("Accept All")
+                            .then_some((fi, r, i, it.col, it.width))
+                    })
+                })
+            })
+            .expect("accept fixed item");
+        let (_fi, r, _i, col, width) = target;
+        let x = col + width.max(1) / 2;
+        let y = r as u16;
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            x,
+            y,
+        ));
+        assert!(app.page_busy);
+        drain_page_event(&mut app).await;
+        assert!(app.browser.as_ref().unwrap().doc.fixed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fixed_nested_action_button_hides_its_dialog() {
+        let html = r#"
+          <style>html,body{margin:0}#sheet{position:fixed;left:0;top:0;width:480px;height:160px;background:#111;color:white}button{display:block;margin:24px;width:240px;height:40px}</style>
+          <div id="sheet"><button id="ok"><span>Accept All<ac-call></ac-call></span></button></div>
+          <script>
+            class AcCall extends HTMLElement {
+              connectedCallback() {
+                const trigger = this.parentElement && this.parentElement.closest('button');
+                trigger.addEventListener('click', () => document.querySelector('#sheet').hide());
+                this.remove();
+              }
+            }
+            customElements.define('ac-call', AcCall);
+            document.querySelector('#sheet').hide = function() { this.remove(); };
+          </script>"#;
+        let mut app = live_form_app(html).await;
+        app.mode = super::Mode::Session;
+        app.last_content_area = ratatui::layout::Rect::new(0, 0, 60, 10);
+        let fixed = app.browser.as_ref().unwrap().doc.fixed.clone();
+        let target = fixed
+            .iter()
+            .enumerate()
+            .find_map(|(fi, f)| {
+                f.rows.iter().enumerate().find_map(|(r, row)| {
+                    row.items.iter().enumerate().find_map(|(i, it)| {
+                        it.text
+                            .contains("Accept All")
+                            .then_some((fi, r, i, it.col, it.width))
+                    })
+                })
+            })
+            .expect("nested accept button");
+        let (_fi, r, _i, col, width) = target;
+        app.on_mouse_event(mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            col + width.max(1) / 2,
+            r as u16,
+        ));
+        assert!(app.page_busy);
+        drain_page_event(&mut app).await;
+        assert!(app.browser.as_ref().unwrap().doc.fixed.is_empty());
+    }
+
     async fn drain_page_event(app: &mut super::App) {
         let evt = app
             .page_rx
@@ -12557,7 +12646,7 @@ mod tests {
 
     #[test]
     fn host_like_tokens_are_recognized() {
-        use super::looks_like_host;
+        use crate::command::looks_like_host;
         assert!(looks_like_host("example.com"));
         assert!(looks_like_host("www.rubymaelstrom.com"));
         assert!(looks_like_host("192.168.0.1"));
@@ -12623,7 +12712,7 @@ mod tests {
         );
 
         // The same hostname typed WITHOUT `open` (the address-bar habit)
-        // opens too; a non-host typo still falls through to the usage hint.
+        // opens too; non-address text becomes a DuckDuckGo Lite search.
         app.execute_command("duckduckgo.com").await;
         assert!(
             app.status.starts_with("Fetching https://duckduckgo.com/"),
@@ -12632,7 +12721,31 @@ mod tests {
         );
         app.execute_command("notacommand").await;
         assert!(
-            app.status.starts_with("unknown command"),
+            app.status
+                .starts_with("Fetching https://lite.duckduckgo.com/lite?q=notacommand"),
+            "got: {}",
+            app.status
+        );
+        app.execute_command("rust browser & terminal").await;
+        assert!(
+            app.status.starts_with(
+                "Fetching https://lite.duckduckgo.com/lite?q=rust+browser+%26+terminal"
+            ),
+            "got: {}",
+            app.status
+        );
+    }
+
+    #[tokio::test]
+    async fn script_location_replace_marks_terminal_navigation_as_replacement() {
+        let mut app = super::App::new(None, 23);
+        app.on_page_evt_inner(crate::js::PageEvt::Replace(String::from(
+            "http://127.0.0.1:9/destination",
+        )));
+        assert!(app.replace_nav);
+        assert!(
+            app.status
+                .starts_with("Fetching http://127.0.0.1:9/destination"),
             "got: {}",
             app.status
         );

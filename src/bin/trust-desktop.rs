@@ -3172,7 +3172,7 @@ impl DesktopApp {
                 self.close_command();
                 self.navigate(address);
             }
-            _ if verb.contains("://") || trust::command::looks_like_host(&verb) => {
+            _ if trust::command::looks_like_address(&verb) => {
                 let target = match parts.next() {
                     Some(value) => match trust::command::parse_port(value) {
                         Some(port) => command_target(&verb, Some(port)),
@@ -3187,9 +3187,11 @@ impl DesktopApp {
                 self.close_command();
                 self.navigate(target);
             }
-            _ => self.browser.set_status(format!(
-                "unknown command: {verb} (help lists commands — or type a URL)"
-            )),
+            _ => {
+                let target = trust::command::search_url(command);
+                self.close_command();
+                self.navigate(target);
+            }
         }
     }
 
