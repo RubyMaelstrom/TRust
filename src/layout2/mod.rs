@@ -5219,6 +5219,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn modal_auto_height_flex_chain_does_not_collapse_content() {
+        let html = r#"<body style="margin:0"><div style="display:flex;align-items:center;justify-content:center;position:fixed;inset:0"><div style="display:flex;flex-direction:column;width:fit-content;max-width:calc(100% - 32px);max-height:calc(100% - 32px)"><div style="display:flex;flex-direction:column;align-items:center;height:100%;position:relative;box-sizing:border-box;max-height:inherit;min-height:inherit;overflow:auto"><div style="box-sizing:border-box;padding:16px;width:100%;display:flex;flex-direction:column;flex:1 1;overflow-y:auto;overflow-x:hidden"><div style="display:flex;flex-direction:column;min-height:0;flex-shrink:1;flex-grow:0;overflow:auto"><div style="display:block;padding:4px 0">Let us know your cookie preferences and why cookies are used.</div></div></div><div style="display:flex;flex-direction:column;width:100%;padding:16px;gap:8px"><button>Reject Optional Cookies</button><button>Accept All</button></div></div></div></div></body>"#;
+        let out = lay(html, 40);
+        let text = out
+            .fixed
+            .iter()
+            .flat_map(|fixed| fixed.rows.iter())
+            .flat_map(|row| row.items.iter())
+            .map(|item| item.text.as_str())
+            .chain(
+                out.rows
+                    .iter()
+                    .flat_map(|row| row.items.iter())
+                    .map(|item| item.text.as_str()),
+            )
+            .collect::<String>();
+        assert!(text.contains("Let us know"), "{text:?}");
+        assert!(text.contains("Accept All"), "{text:?}");
+    }
+
     // ---- P7: JS geometry from fragments (measure::boxes) --------------------
     // Cells are the nominal 8×16 px; measured rects report the same integer
     // cell grid the paint pass stamps, × cell px.

@@ -363,6 +363,7 @@ impl BrowserPage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NavigationIntent {
     New,
+    Replace,
     Reload,
     Back,
     Forward,
@@ -963,7 +964,7 @@ impl BrowserController {
                         }
                         self.forward.clear();
                     }
-                    NavigationIntent::Reload => {}
+                    NavigationIntent::Replace | NavigationIntent::Reload => {}
                     NavigationIntent::Back => {
                         let _ = self.back.pop();
                         if let Some(old) = old {
@@ -1132,6 +1133,7 @@ impl BrowserController {
                 true
             }
             PageEvt::Navigate(address) => self.begin_address(&address, NavigationIntent::New),
+            PageEvt::Replace(address) => self.begin_address(&address, NavigationIntent::Replace),
             PageEvt::ScrollToFragment(fragment) => {
                 self.pending_fragment = Some(fragment);
                 true
@@ -1736,17 +1738,31 @@ mod tests {
         assert!(browser.snapshot().can_go_back);
         assert!(!browser.snapshot().can_go_forward);
 
+        // Location.replace() commits the destination in the current slot: the
+        // replaced intermediary never grows the back trail.
+        arrive(
+            &mut browser,
+            3,
+            target("replacement.example"),
+            NavigationIntent::Replace,
+        );
+        assert_eq!(browser.back.len(), 1);
+        assert_eq!(
+            browser.current_page().unwrap().address(),
+            "gopher://replacement.example/1"
+        );
+
         // Merely beginning travel leaves the trail intact; successful arrival
         // is the commit point, matching the terminal browser's failure-safe
         // history behavior.
         browser.pending = Some(PendingNavigation {
-            generation: 3,
+            generation: 4,
             target: target("one.example"),
             fallback_http: false,
             intent: NavigationIntent::Back,
         });
         assert!(browser.snapshot().can_go_back);
-        assert!(browser.finish_fetch(3, Ok(FetchedDocument::Gopher(vec![3]))));
+        assert!(browser.finish_fetch(4, Ok(FetchedDocument::Gopher(vec![4]))));
         assert!(!browser.snapshot().can_go_back);
         assert!(browser.snapshot().can_go_forward);
         assert_eq!(

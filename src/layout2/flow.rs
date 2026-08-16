@@ -2310,7 +2310,6 @@ impl Flow<'_> {
         for r in &lines {
             let n = r.len();
             let gaps = gap_main * n.saturating_sub(1) as f32;
-            let sum_hypo: f32 = r.clone().map(|i| outer[i]).sum();
             // §9.2/§9.7: flexing distributes the container's INNER MAIN SIZE —
             // its used height. When `height` is auto but `min-height` is definite
             // (the full-height app shell: `min-h-full`/`min-h-screen` wrapping a
@@ -2321,8 +2320,28 @@ impl Flow<'_> {
             // never fills a min-height container and bottom-anchored content
             // (`margin-top:auto`, a trailing footer) never reaches the bottom.
             let (min_main_c, max_main_c) = main_clamp;
+            // An auto-height column is intrinsically sized from the items'
+            // max-content block contributions, not from their flex bases.
+            // This matters for the common `flex: 1 1` (zero flex basis)
+            // scroll-content idiom: with no definite free-space constraint,
+            // §9.2/§9.9.1 size the container to the content before §9.7
+            // distributes any resulting free space. Using flex hypothetical
+            // sizes here made a zero-basis, scroll-container item contribute zero and
+            // collapsed all of its descendants (including modal headers and
+            // close controls) while leaving a non-flexing footer visible.
+            let auto_content_outer: f32 = r
+                .clone()
+                .map(|i| {
+                    let natural = fi[i]
+                        .frag
+                        .as_ref()
+                        .map(|frag| (frag.h - fi[i].bp_main).max(0.0))
+                        .unwrap_or(0.0);
+                    natural + calcs[i].mbp
+                })
+                .sum();
             let avail = def_ch
-                .unwrap_or(sum_hypo + gaps)
+                .unwrap_or(auto_content_outer + gaps)
                 .clamp(min_main_c, max_main_c.max(min_main_c));
             let inner = avail - gaps;
             resolve_flexible_lengths(inner, &mut calcs[r.clone()]);

@@ -59,10 +59,12 @@ current Vello-specific limitations.
 
 **TAB** or **Ctrl+]** opens the `trust>` command prompt from anywhere; in line
 mode plain **Esc** works too. You can skip `open` entirely — typing
-`gemini://gem.sdf.org` at the prompt just goes there.
+`gemini://gem.sdf.org` at the prompt just goes there. Text that is neither a
+command nor an address searches DuckDuckGo Lite.
 
 | Command | Effect |
 |---|---|
+| `<search terms>` | search DuckDuckGo Lite (any text that is not a command or address) |
 | `website.com` | with no port defaults to opening using http. If you include a port that isn't one of the standard protocol ports, it assumes telnet. http://website.com:2323 for http w/port, gemini://website.com for gemini sites, etc |
 | `open <host> [port]` | connect — URLs pick their protocol, `host:port` works, ports can be service names; `telnets://` (or port 992) is telnet over TLS |
 | `post <url> [body]` | HTTP POST, form-urlencoded |

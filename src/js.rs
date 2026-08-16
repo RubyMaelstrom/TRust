@@ -2465,6 +2465,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_get_attr", 2, sys_get_attr),
         ("__dom_computed", 2, sys_computed_style),
         ("__image_current_src", 1, sys_image_current_src),
+        ("__image_complete", 1, sys_image_complete),
         ("__match_media", 1, sys_match_media),
         ("__dom_rect", 1, sys_rect),
         ("__dom_scroll_get", 2, sys_scroll_get),
@@ -2897,6 +2898,57 @@ fn sys_image_current_src(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> Js
         crate::responsive_image::select(&d, id, &base, viewport, density)
             .map_or_else(|| str_value(""), |selected| str_value(&selected.source)),
     )
+}
+
+/// `HTMLImageElement.complete` backing.  The HTML Standard reports true for
+/// an omitted/empty source and for a current request that is completely
+/// available (or broken with no pending replacement).  TRust's image bytes
+/// are fetched and decoded by the frontend render pipeline rather than by the
+/// page actor, so data URLs are the requests whose availability is observable
+/// synchronously here.  In particular, lazy-image libraries use a transparent
+/// data-URL `srcset` placeholder as an already-complete request before
+/// promoting their `data-srcset` candidates; returning `undefined` here makes
+/// those libraries skip their unveil step entirely.
+fn sys_image_complete(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let dom = page_dom(ctx);
+    let d = dom.borrow();
+    let Some(id) = arg_node(&d, args, 0) else {
+        return Ok(JsValue::from(false));
+    };
+    let src = d.attr(id, "src").unwrap_or("").trim();
+    let srcset = d.attr(id, "srcset").unwrap_or("").trim();
+    if src.is_empty() && srcset.is_empty() {
+        return Ok(JsValue::from(true));
+    }
+    let environment = {
+        let host = ctx.realm().host_defined();
+        host.get::<PageGeom>().map(|geom| {
+            (
+                geom.base.clone(),
+                geom.viewport.get(),
+                geom.device_pixel_ratio.get(),
+            )
+        })
+    };
+    let base = environment
+        .as_ref()
+        .map(|(base, _, _)| base.clone())
+        .or_else(|| d.doc_url().cloned());
+    let Some(base) = base else {
+        return Ok(JsValue::from(false));
+    };
+    let (viewport, density) = environment
+        .map(|(_, viewport, density)| (viewport, density))
+        .unwrap_or_else(|| {
+            let (width, height) = d.viewport_px();
+            (
+                crate::layout2::Viewport::new(width, height),
+                d.device_pixel_ratio(),
+            )
+        });
+    let complete = crate::responsive_image::select(&d, id, &base, viewport, density)
+        .is_some_and(|selected| selected.source.starts_with("data:"));
+    Ok(JsValue::from(complete))
 }
 
 /// Geometry backing for `getBoundingClientRect`/`offset*`/`client*` and the
@@ -7946,6 +7998,9 @@ pub enum PageEvt {
     /// An un-prevented click on a live anchor: the app navigates
     /// (absolute URL, already resolved against the page).
     Navigate(String),
+    /// A script called `Location.replace()`: navigate without retaining the
+    /// current document in session history.
+    Replace(String),
     /// A same-document fragment scroll the page requested (`location.href = "#x"`
     /// / `location.hash = …`): the app scrolls the view to the element with this
     /// `id`/`<a name>` (empty = the top). The live engine has no scroll model, so
@@ -9039,6 +9094,14 @@ fn page_actor(
     // which processes one task per turn and prioritizes user input between
     // turns (WHATWG HTML, event loops / processing model).
     complete_live_lifecycle(&mut page);
+    // Location-object navigation is asynchronous with respect to the running
+    // script, but it must not disappear when the document otherwise classifies
+    // as inert. In particular, a parsing/DOMContentLoaded/load script can call
+    // `location.replace()` before this actor reaches its Static fast-exit.
+    if let Some((url, replace)) = take_script_navigation(&mut page) {
+        let _ = evts.blocking_send(navigation_event(url, replace));
+        return;
+    }
     page.outcome.elapsed = page.started.elapsed();
     let changed = page.dom.borrow_mut().take_dirty();
     // A DOMContentLoaded/load handler can reach requestSubmit(). Keep the intent
@@ -9256,8 +9319,10 @@ fn page_actor(
             PageCmd::Click(node) => {
                 let nav = dispatch_click_in(&mut page, node);
                 drain_js_side(&mut page.ctx, &mut page.outcome);
-                if let Some(url) = take_script_navigation(&mut page).or(nav) {
-                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                if let Some((url, replace)) =
+                    take_script_navigation(&mut page).or_else(|| nav.map(|url| (url, false)))
+                {
+                    if evts.blocking_send(navigation_event(url, replace)).is_err() {
                         return;
                     }
                     continue; // app decides; we stay alive until dropped
@@ -9295,8 +9360,8 @@ fn page_actor(
             } => {
                 dispatch_form_set_in(&mut page, node, &value, checked);
                 drain_js_side(&mut page.ctx, &mut page.outcome);
-                if let Some(url) = take_script_navigation(&mut page) {
-                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                if let Some((url, replace)) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(navigation_event(url, replace)).is_err() {
                         return;
                     }
                     continue;
@@ -9313,8 +9378,8 @@ fn page_actor(
                         .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
                     return;
                 }
-                if let Some(url) = take_script_navigation(&mut page) {
-                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                if let Some((url, replace)) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(navigation_event(url, replace)).is_err() {
                         return;
                     }
                     continue;
@@ -9337,8 +9402,8 @@ fn page_actor(
                         .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
                     return;
                 }
-                if let Some(url) = take_script_navigation(&mut page) {
-                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                if let Some((url, replace)) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(navigation_event(url, replace)).is_err() {
                         return;
                     }
                     continue;
@@ -9357,8 +9422,8 @@ fn page_actor(
                         .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
                     return;
                 }
-                if let Some(url) = take_script_navigation(&mut page) {
-                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                if let Some((url, replace)) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(navigation_event(url, replace)).is_err() {
                         return;
                     }
                     continue;
@@ -9379,8 +9444,8 @@ fn page_actor(
                 }
                 // A scroll handler may navigate (rare, but e.g. a router) — honour
                 // it the same way a click does.
-                if let Some(url) = take_script_navigation(&mut page) {
-                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                if let Some((url, replace)) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(navigation_event(url, replace)).is_err() {
                         return;
                     }
                     continue;
@@ -9402,8 +9467,8 @@ fn page_actor(
                 }
                 // A hover handler may navigate (a hover-triggered router
                 // prefetch that commits) — honour it like a click does.
-                if let Some(url) = take_script_navigation(&mut page) {
-                    if evts.blocking_send(PageEvt::Navigate(url)).is_err() {
+                if let Some((url, replace)) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(navigation_event(url, replace)).is_err() {
                         return;
                     }
                     continue;
@@ -9971,8 +10036,8 @@ fn timer_wake(
         return false;
     }
     // A `setTimeout(() => location.href = …)` redirect/refresh fires at rest too.
-    if let Some(url) = take_script_navigation(page) {
-        return evts.blocking_send(PageEvt::Navigate(url)).is_ok();
+    if let Some((url, replace)) = take_script_navigation(page) {
+        return evts.blocking_send(navigation_event(url, replace)).is_ok();
     }
     let scrolls = page.dom.borrow_mut().take_scroll_changes();
     let dirty = page.dom.borrow_mut().take_dirty();
@@ -10104,8 +10169,8 @@ fn dispatch_fetch_done(
         let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
         return false;
     }
-    if let Some(url) = take_script_navigation(page) {
-        return evts.blocking_send(PageEvt::Navigate(url)).is_ok();
+    if let Some((url, replace)) = take_script_navigation(page) {
+        return evts.blocking_send(navigation_event(url, replace)).is_ok();
     }
     if page.dom.borrow_mut().take_dirty()
         && let Some(ok) = emit_dirty_render(page, evts)
@@ -10238,14 +10303,26 @@ fn take_scroll_fragment(page: &mut LoadedPage) -> Option<String> {
     Some(v.to_string(&mut page.ctx).ok()?.to_std_string_lossy())
 }
 
-fn take_script_navigation(page: &mut LoadedPage) -> Option<String> {
+fn take_script_navigation(page: &mut LoadedPage) -> Option<(String, bool)> {
+    let replace = call_trust(&mut page.ctx, "navigationReplaces", &[])
+        .ok()
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false);
     let v = call_trust(&mut page.ctx, "takeNavigation", &[]).ok()?;
     if v.is_null_or_undefined() {
         return None;
     }
     let s = v.to_string(&mut page.ctx).ok()?.to_std_string_lossy();
     let trimmed = s.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    (!trimmed.is_empty()).then(|| (trimmed.to_string(), replace))
+}
+
+fn navigation_event(url: String, replace: bool) -> PageEvt {
+    if replace {
+        PageEvt::Replace(url)
+    } else {
+        PageEvt::Navigate(url)
+    }
 }
 
 /// After a click, whether it triggered an UN-PREVENTED form submit (a click
@@ -14249,6 +14326,7 @@ const PRELUDE: &str = r##"
     }
     class HTMLImageElement extends HTMLElement {
         get currentSrc() { return __image_current_src(this.__id); }
+        get complete() { return __image_complete(this.__id); }
     }
     // HTMLHyperlinkElementUtils (the create-an-<a>-to-parse-URLs trick;
     // router-slot reads m.pathname) lives on <a> and <area>; href + the URL
@@ -16050,7 +16128,7 @@ const PRELUDE: &str = r##"
         ev.oldURL = oldURL; ev.newURL = newURL;
         dispatch(g, ev, false);
     };
-    const navigateLoc = (u, hashOnly) => {
+    const navigateLoc = (u, hashOnly, replace) => {
         if (u === undefined || u === null) return;
         const p = __url_parse(String(u), locState.href);
         if (!p) return;
@@ -16067,6 +16145,7 @@ const PRELUDE: &str = r##"
             trust.scrollFragment = locState.hash ? locState.hash.slice(1) : "";
         } else if (!hashOnly) {
             trust.navigation = p[0];
+            trust.navigationReplace = !!replace;
         }
     };
     const updateLoc = (u) => {
@@ -16110,8 +16189,8 @@ const PRELUDE: &str = r##"
         get hash() { return locState.hash; }, set hash(v) { const h = String(v); navigateLoc(withoutHash(locState.href) + (h && h[0] === "#" ? h : (h ? "#" + h : "")), true); },
         get origin() { return locState.origin; },
         assign(u) { navigateLoc(u, false); },
-        replace(u) { navigateLoc(u, false); },
-        reload() { trust.navigation = locState.href; },
+        replace(u) { navigateLoc(u, false, true); },
+        reload() { trust.navigation = locState.href; trust.navigationReplace = false; },
         toString() { return locState.href; },
     };
     Object.defineProperty(g, "location", {
@@ -16119,7 +16198,12 @@ const PRELUDE: &str = r##"
         get() { return loc; },
         set(v) { navigateLoc(v, false); },
     });
-    trust.takeNavigation = function () { const n = trust.navigation || null; trust.navigation = null; return n; };
+    trust.navigationReplaces = function () { return !!trust.navigationReplace; };
+    trust.takeNavigation = function () {
+        const n = trust.navigation || null;
+        trust.navigation = null; trust.navigationReplace = false;
+        return n;
+    };
     // The pending same-document fragment scroll (see `navigateLoc`). `undefined`
     // (no signal) → null; a string (possibly `""` for the top) → that target.
     trust.takeScrollFragment = function () { const f = trust.scrollFragment; trust.scrollFragment = undefined; return f === undefined ? null : f; };
@@ -29802,6 +29886,25 @@ mod tests {
     }
 
     #[test]
+    fn load_time_parent_location_replace_navigates_before_static_exit() {
+        // DuckDuckGo Lite's outbound redirect document has this exact shape.
+        // HTML Location.replace() must initiate a replacement navigation even
+        // though the otherwise inert document has no controls or timers.
+        let (_handle, mut events) = live(
+            r#"<html><head><meta name='referrer' content='origin'></head><body>
+            <script language='JavaScript'>window.parent.location.replace("https://destination.example/path?q=1");</script>
+            <noscript><meta http-equiv='refresh' content="0;URL=https://destination.example/path?q=1"></noscript>
+            </body></html>"#,
+        );
+        match events.blocking_recv() {
+            Some(PageEvt::Replace(url)) => {
+                assert_eq!(url, "https://destination.example/path?q=1");
+            }
+            other => panic!("expected replacement navigation, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn script_location_href_assignment_navigates_after_form_input() {
         let (handle, mut events) = live(
             r##"<body><form><input name=q></form><script>
@@ -30202,6 +30305,51 @@ mod tests {
             }
             other => panic!("expected Updated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn custom_action_listener_invokes_dialog_method_on_click() {
+        let (handle, mut events) = live(
+            r##"<body><rpl-dialog-sheet id="consent-sheet"><button id="b"><span>Accept
+             <ac-call></ac-call></span></button></rpl-dialog-sheet><script>
+             class AcCall extends HTMLElement {
+               connectedCallback() {
+                 const parent = this.parentElement;
+                 const trigger = parent && parent.matches('button') ? parent
+                   : parent && parent.parentElement;
+                 trigger.addEventListener('click', () => {
+                   document.querySelector('#consent-sheet').hide();
+                 });
+                 this.remove();
+               }
+             }
+             class RplDialogSheet extends HTMLElement {
+               hide() { this.setAttribute('hidden', ''); }
+             }
+             customElements.define('ac-call', AcCall);
+             customElements.define('rpl-dialog-sheet', RplDialogSheet);
+             </script></body>"##,
+        );
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("expected initial Updated");
+        };
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        let button = html
+            .split("x-trust-js:")
+            .nth(1)
+            .and_then(|r| r.split(':').next())
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        handle.cmds.blocking_send(PageCmd::Click(button)).unwrap();
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("expected click Updated");
+        };
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        // The live serializer omits disconnected/hidden elements from the
+        // presentation snapshot; the important observable is that the host
+        // no longer survives in the rendered tree after its action runs.
+        assert!(!html.contains("consent-sheet"), "{html}");
     }
 
     #[test]
@@ -31945,6 +32093,39 @@ mod tests {
         );
         assert!(out.contains("data-dpr=\"2\""), "{out}");
         assert!(!out.contains("data-current=\"https://example.com/gallery/giant-fallback.webp\""));
+    }
+
+    #[test]
+    fn image_complete_allows_lazy_srcset_placeholder_to_unveil() {
+        let (out, outcome) = transform(
+            r#"<body><img id=hero class=lazyload src="fallback.jpg"
+              srcset="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%271%27%20height%3D%271%27%3E%3C/svg%3E"
+              data-srcset="real.jpg 1x" data-sizes="auto"><script>
+              var img = document.getElementById('hero');
+              img.setAttribute('data-complete', String(img.complete));
+              if (img.complete) img.setAttribute('srcset', img.getAttribute('data-srcset'));
+            </script></body>"#,
+            &PageEnv::bare("https://example.com/gallery/page"),
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("data-complete=\"true\""), "{out}");
+        assert!(out.contains("srcset=\"real.jpg 1x\""), "{out}");
+    }
+
+    #[test]
+    fn image_placeholder_keeps_declared_geometry_available_to_lazy_loader() {
+        let (out, outcome) = transform(
+            r#"<body><img id=hero width=100 height=100 class=lazyload src="fallback.jpg"
+              srcset="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20width%3D%271%27%20height%3D%271%27%3E%3C/svg%3E"
+              data-srcset="real.jpg 1x" data-sizes="auto"><script>
+              var img = document.getElementById('hero');
+              var r = img.getBoundingClientRect();
+              img.setAttribute('data-rect', String(r.width) + 'x' + String(r.height));
+            </script></body>"#,
+            &PageEnv::bare("https://example.com/gallery/page"),
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("data-rect=\"100x100\""), "{out}");
     }
 
     #[test]

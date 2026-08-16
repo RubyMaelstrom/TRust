@@ -8,6 +8,8 @@
 
 pub(crate) const HISTORY_CAP: usize = 500;
 
+const SEARCH_ENDPOINT: &str = "https://lite.duckduckgo.com/lite";
+
 /// In-memory entry history for a TRust input surface. Never persisted.
 #[derive(Default)]
 pub struct History {
@@ -101,6 +103,43 @@ pub fn looks_like_host(value: &str) -> bool {
     host == "localhost" || (host.contains('.') && !host.starts_with('.') && !host.ends_with('.'))
 }
 
+/// Whether a token starts with a syntactically valid URL scheme.
+///
+/// This mirrors the WHATWG URL Standard's scheme start/scheme states: an
+/// ASCII letter, followed by ASCII alphanumerics or `+`, `-`, `.`, then `:`.
+fn has_url_scheme(value: &str) -> bool {
+    let Some((scheme, _)) = value.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// Whether a bare COMMAND token should be handled as an address instead of a
+/// search query.
+pub fn looks_like_address(value: &str) -> bool {
+    has_url_scheme(value) || looks_like_host(value)
+}
+
+/// Build the DuckDuckGo Lite URL used when a COMMAND line is neither a
+/// recognized command nor an address.
+///
+/// `Url::query_pairs_mut` implements the WHATWG URL Standard's
+/// `application/x-www-form-urlencoded` serializer (URL Standard §5.2), so
+/// spaces become `+` and reserved/non-ASCII input is UTF-8 percent-encoded.
+pub fn search_url(query: &str) -> String {
+    let mut url = url::Url::parse(SEARCH_ENDPOINT).expect("static search endpoint is a valid URL");
+    url.query_pairs_mut()
+        .append_pair("q", query)
+        // DuckDuckGo documents `kd=-1` as its Redirect: Off setting. Asking
+        // the provider for direct result URLs avoids an unnecessary tracking-
+        // protection hop while retaining normal URL navigation semantics.
+        // https://duckduckgo.com/duckduckgo-help-pages/settings/params
+        .append_pair("kd", "-1");
+    url.into()
+}
+
 /// Split a trailing numeric `:port` from a non-IPv6 host.
 pub fn split_host_port(value: &str) -> (&str, Option<u16>) {
     if let Some((host, port)) = value.rsplit_once(':')
@@ -120,6 +159,7 @@ pub const HELP_PAGE: &str = "\
 
 Tab or Ctrl-] toggles the command console; Enter runs a line.
 A bare URL or hostname opens directly, like an address bar.
+Anything else searches DuckDuckGo Lite.
 
 ## Commands
 
@@ -202,10 +242,27 @@ mod tests {
         assert!(looks_like_host("example.com"));
         assert!(looks_like_host("localhost:8080"));
         assert!(!looks_like_host("reload"));
+        assert!(looks_like_address("https://example.com/path"));
+        assert!(looks_like_address("mailto:user@example.com"));
+        assert!(looks_like_address("web+demo:value"));
+        assert!(!looks_like_address("rust ownership"));
+        assert!(!looks_like_address("1invalid:value"));
         assert_eq!(parse_port("gemini"), Some(1965));
         assert_eq!(
             split_host_port("example.com:2323"),
             ("example.com", Some(2323))
+        );
+    }
+
+    #[test]
+    fn search_query_uses_urlencoded_utf8_form_serialization() {
+        assert_eq!(
+            search_url("rust & web/日本"),
+            "https://lite.duckduckgo.com/lite?q=rust+%26+web%2F%E6%97%A5%E6%9C%AC&kd=-1"
+        );
+        assert_eq!(
+            search_url("100% fun + useful"),
+            "https://lite.duckduckgo.com/lite?q=100%25+fun+%2B+useful&kd=-1"
         );
     }
 }
