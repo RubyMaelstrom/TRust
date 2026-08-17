@@ -13311,7 +13311,11 @@ const PRELUDE: &str = r##"
         item(i) { return this.__get()[i] ?? null; }
         supports(token) {
             if (!this.__supported) throw new TypeError("DOMTokenList has no supported tokens");
-            return this.__supported.includes(String(token));
+            // DOM §interface-DOMTokenList: supported-token matching first
+            // ASCII-lowercases the argument. The supported-token lists below
+            // are ASCII-lowercase, as are the HTML link-type keywords.
+            return this.__supported.includes(String(token).replace(/[A-Z]/g, (c) =>
+                String.fromCharCode(c.charCodeAt(0) + 0x20)));
         }
         get length() { return this.__get().length; }
         get value() { return this.__el.getAttribute(this.__attr) || ""; }
@@ -13322,6 +13326,136 @@ const PRELUDE: &str = r##"
         values() { return this.__get().values(); }
         entries() { return this.__get().entries(); }
         [Symbol.iterator]() { return this.__get()[Symbol.iterator](); }
+    }
+
+    // HTML §4.2.4 (the link element) and §4.6.2 (hyperlink elements) define
+    // the supported-token sets for relList. Keep these lists limited to
+    // processing TRust actually implements: relList.supports() is a feature
+    // probe, so reporting an unimplemented link type as supported is as wrong
+    // as omitting relList entirely. The arrays are private and shared by all
+    // same-kind elements; DOMTokenList still owns the live rel attribute.
+    const LINK_REL_SUPPORTED = [
+        "dns-prefetch", "modulepreload", "preconnect", "prefetch", "preload", "stylesheet",
+    ];
+    const HYPERLINK_REL_SUPPORTED = ["noopener", "noreferrer", "opener"];
+    function relListFor(element, supported) {
+        return element.__trustRelList
+            || (element.__trustRelList = new DOMTokenList(element, "rel", supported));
+    }
+
+    // CSS Font Loading Module Level 3 §§2–3.  The terminal compositor owns
+    // font selection and does not rasterize web-font files, but the platform
+    // objects still have to exist: sites use document.fonts as a readiness
+    // gate before mounting their real view.  Keep the FontFace/FontFaceSet
+    // object model and setlike behavior; URL-backed faces remain unloaded
+    // until explicitly loaded, and an explicit load resolves with terminal
+    // fallback metrics rather than blocking the page forever on an unusable
+    // font resource.
+    class FontFace {
+        constructor(family, source, descriptors) {
+            this.family = String(family);
+            this.__source = source;
+            this.__status = "unloaded";
+            this.__sets = new Set();
+            this.__resolveLoaded = null;
+            this.__rejectLoaded = null;
+            this.__loaded = new Promise((resolve, reject) => {
+                this.__resolveLoaded = resolve;
+                this.__rejectLoaded = reject;
+            });
+            descriptors = descriptors || {};
+            this.style = descriptors.style === undefined ? "normal" : String(descriptors.style);
+            this.weight = descriptors.weight === undefined ? "normal" : String(descriptors.weight);
+            this.stretch = descriptors.stretch === undefined
+                ? (descriptors.width === undefined ? "normal" : String(descriptors.width))
+                : String(descriptors.stretch);
+            this.width = this.stretch;
+            this.unicodeRange = descriptors.unicodeRange === undefined
+                ? "U+0-10FFFF" : String(descriptors.unicodeRange);
+            this.variant = descriptors.variant === undefined ? "normal" : String(descriptors.variant);
+            this.featureSettings = descriptors.featureSettings === undefined
+                ? "normal" : String(descriptors.featureSettings);
+            this.variationSettings = descriptors.variationSettings === undefined
+                ? "normal" : String(descriptors.variationSettings);
+            this.display = descriptors.display === undefined ? "auto" : String(descriptors.display);
+            this.ascentOverride = descriptors.ascentOverride === undefined
+                ? "normal" : String(descriptors.ascentOverride);
+            this.descentOverride = descriptors.descentOverride === undefined
+                ? "normal" : String(descriptors.descentOverride);
+            this.lineGapOverride = descriptors.lineGapOverride === undefined
+                ? "normal" : String(descriptors.lineGapOverride);
+        }
+        get status() { return this.__status; }
+        get loaded() { return this.__loaded; }
+        load() {
+            if (this.__status === "unloaded") {
+                this.__status = "loading";
+                // No web-font rasterizer is present in the terminal backend.
+                // Complete the API operation with the fallback face so callers
+                // waiting on FontFace.loaded do not strand the application.
+                this.__status = "loaded";
+                for (const set of this.__sets) set.__fontLoaded(this);
+                this.__resolveLoaded(this);
+            }
+            return this.__loaded;
+        }
+    }
+    class FontFaceSetLoadEvent extends Event {
+        constructor(type, init) {
+            super(type, init);
+            this.fontfaces = Object.freeze((init && init.fontfaces || []).slice());
+        }
+    }
+    class FontFaceSet extends EventTarget {
+        constructor(initialFaces) {
+            super();
+            this.__faces = new Set();
+            this.onloading = null;
+            this.onloadingdone = null;
+            this.onloadingerror = null;
+            this.__ready = Promise.resolve(this);
+            for (const face of initialFaces || []) this.add(face);
+        }
+        add(font) {
+            if (!(font instanceof FontFace)) throw new TypeError("FontFaceSet.add: argument is not a FontFace");
+            if (!this.__faces.has(font)) {
+                this.__faces.add(font);
+                font.__sets.add(this);
+                if (font.status === "loading") this.__status = "loading";
+            }
+            return this;
+        }
+        delete(font) {
+            if (!this.__faces.delete(font)) return false;
+            if (font.__sets) font.__sets.delete(this);
+            return true;
+        }
+        clear() {
+            for (const font of this.__faces) if (font.__sets) font.__sets.delete(this);
+            this.__faces.clear();
+        }
+        has(font) { return this.__faces.has(font); }
+        get size() { return this.__faces.size; }
+        entries() { return Array.from(this.__faces, (font) => [font, font])[Symbol.iterator](); }
+        keys() { return this.__faces.keys(); }
+        values() { return this.__faces.values(); }
+        forEach(callback, thisArg) {
+            this.__faces.forEach((font) => callback.call(thisArg, font, font, this));
+        }
+        [Symbol.iterator]() { return this.values(); }
+        get status() { return this.__status || "loaded"; }
+        get ready() { return this.__ready; }
+        load(_font, _text) {
+            return Promise.all(Array.from(this.__faces, (font) => font.load()))
+                .then(() => Array.from(this.__faces));
+        }
+        check(_font, _text) {
+            return Array.from(this.__faces).every((font) => font.status === "loaded");
+        }
+        __fontLoaded(_font) {
+            this.__status = "loaded";
+        }
+        get [Symbol.toStringTag]() { return "FontFaceSet"; }
     }
 
     // `element.dataset` is a DOMStringMap (https://html.spec.whatwg.org/#domstringmap).
@@ -13452,7 +13586,12 @@ const PRELUDE: &str = r##"
             const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             __dom_set_attr(this.__id, n, v);
             this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
-            this.__attrMapStale = true; // the cached NamedNodeMap rebuilds lazily
+            // DOM §4.9.1: NamedNodeMap is a live collection. Refresh the
+            // existing [SameObject] map synchronously so a caller holding
+            // `const attrs = el.attributes` observes this write immediately,
+            // including while it is iterating the map.
+            this.__attrMapStale = true;
+            if (this.__attrMap) void this.attributes;
             if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, lower, old, v);
             if (MO.length) moAttr(this, n, old);
@@ -13470,7 +13609,12 @@ const PRELUDE: &str = r##"
             const old = (this.__ceUpgraded || MO.length) ? this.getAttribute(n) : null;
             __dom_remove_attr(this.__id, n);
             this.__ac = undefined; // attrs changed: drop the read cache (see getAttribute)
-            this.__attrMapStale = true; // the cached NamedNodeMap rebuilds lazily
+            // DOM §4.9.1 requires the same live-list behavior for removals.
+            // FAST's standards-based template compiler removes marker Attrs
+            // while walking `element.attributes`, so deferring this refresh
+            // leaves the remaining bindings unprocessed.
+            this.__attrMapStale = true;
+            if (this.__attrMap) void this.attributes;
             if (n === "href" && this.localName === "base") baseHrefCache = null;
             ceAttrChanged(this, lower, old, null);
             if (MO.length) moAttr(this, n, old);
@@ -13506,10 +13650,10 @@ const PRELUDE: &str = r##"
         // (Alpine's DOM morph does `Array.from(el.attributes)` — undefined
         // here threw ToObject and aborted danbooru's whole render).
         // [SameObject] per spec: ONE map per element, identity-stable across
-        // accesses; its contents rebuild lazily after an attribute write
+        // accesses; its contents refresh in place after every attribute write
         // (`__attrMapStale` rides the same set/removeAttribute funnels that
-        // drop the `getAttribute` read cache), so an unchanged element pays
-        // one property read per access instead of a snapshot rebuild.
+        // drop the `getAttribute` read cache), preserving live-list behavior
+        // for existing references as required by the DOM Standard.
         get attributes() {
             // Plain loop + snapshot values + `this`-based methods: NO
             // closure capturing a block-scoped local invoked from a native
@@ -14331,8 +14475,14 @@ const PRELUDE: &str = r##"
     // HTMLHyperlinkElementUtils (the create-an-<a>-to-parse-URLs trick;
     // router-slot reads m.pathname) lives on <a> and <area>; href + the URL
     // components are installed via installUrlParts below.
-    class HTMLAnchorElement extends HTMLElement {}
-    class HTMLAreaElement extends HTMLElement {}
+    class HTMLAnchorElement extends HTMLElement {
+        get relList() { return relListFor(this, HYPERLINK_REL_SUPPORTED); }
+        set relList(v) { this.relList.value = String(v); }
+    }
+    class HTMLAreaElement extends HTMLElement {
+        get relList() { return relListFor(this, HYPERLINK_REL_SUPPORTED); }
+        set relList(v) { this.relList.value = String(v); }
+    }
     // contentDocument/contentWindow (the nested browsing context) on <iframe>/
     // <frame>; installed below so both share one body.
     class HTMLIFrameElement extends HTMLElement {}
@@ -14361,6 +14511,10 @@ const PRELUDE: &str = r##"
         }
     }
     class HTMLLinkElement extends HTMLElement {
+        // HTML §4.2.4: SameObject DOMTokenList reflecting the rel attribute.
+        // MSN uses this for feature detection before initializing its app.
+        get relList() { return relListFor(this, LINK_REL_SUPPORTED); }
+        set relList(v) { this.relList.value = String(v); }
         get sheet() { return null; }
     }
     // <dialog> (HTML §4.11.4). We implement the observable method/event surface;
@@ -14635,6 +14789,10 @@ const PRELUDE: &str = r##"
         get body() { return this.querySelector("body"); }
         get head() { return this.querySelector("head"); }
         get readyState() { return trust.readyState; }
+        // CSS Font Loading Module Level 3 §4.2: a document's font source is a
+        // stable FontFaceSet.  Its setlike collection is independent per
+        // Document, including detached documents created by DOMParser.
+        get fonts() { return this.__fonts || (this.__fonts = new FontFaceSet()); }
         get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
         // HTML §the title element: setting with no <title> CREATES one in the
         // head (the old setter silently dropped the write); no head → no-op.
@@ -15718,6 +15876,8 @@ const PRELUDE: &str = r##"
     g.TransitionEvent = TransitionEvent; g.ClipboardEvent = ClipboardEvent;
     g.PageTransitionEvent = PageTransitionEvent; g.CloseEvent = CloseEvent;
     g.ToggleEvent = ToggleEvent;
+    g.FontFace = FontFace; g.FontFaceSet = FontFaceSet;
+    g.FontFaceSetLoadEvent = FontFaceSetLoadEvent;
     g.ShadowRoot = ShadowRoot;
     g.TreeWalker = TreeWalker;
     g.NodeIterator = NodeIterator;
@@ -33282,6 +33442,107 @@ mod tests {
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("SCRIPT-IDL-OK"), "{out}");
+    }
+
+    #[test]
+    fn rel_list_reflects_link_and_hyperlink_relationships() {
+        // HTML §4.2.4/§4.6.2: relList is a SameObject, live DOMTokenList
+        // reflecting rel. DOM §interface-DOMTokenList requires supports() to
+        // ASCII-lowercase its argument and to return false for tokens the UA
+        // does not implement. MSN probes compression-dictionary on a newly
+        // created link before it mounts its application; a missing relList
+        // turns that feature probe into a TypeError and leaves the page blank.
+        let (out, outcome) = page(
+            r#"<body><pre id=o></pre><script>
+            var link = document.createElement('link');
+            link.rel = 'stylesheet preload';
+            var anchor = document.createElement('a');
+            anchor.rel = 'noopener';
+            var area = document.createElement('area');
+            area.rel = 'noreferrer';
+            var classSupportsThrows = false;
+            try { document.body.classList.supports('anything'); }
+            catch (e) { classSupportsThrows = e instanceof TypeError; }
+            var same = link.relList === link.relList;
+            var reflected = link.relList instanceof DOMTokenList
+                && link.relList.value === 'stylesheet preload'
+                && link.relList.contains('stylesheet')
+                && link.relList.supports('STYLESheet')
+                && link.relList.supports('PRELOAD')
+                && !link.relList.supports('compression-dictionary');
+            link.relList = 'prefetch';
+            var forwards = link.rel === 'prefetch' && link.relList.length === 1;
+            var hyperlinks = anchor.relList.supports('NOOPENER')
+                && area.relList.supports('noreferrer')
+                && !anchor.relList.supports('stylesheet');
+            document.getElementById('o').textContent =
+                same && reflected && forwards && hyperlinks && classSupportsThrows
+                    ? 'RELLIST-OK' : 'RELLIST-BAD';
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("RELLIST-OK"), "{out}");
+    }
+
+    #[test]
+    fn document_fonts_exposes_css_font_loading_objects() {
+        // CSS Font Loading Module Level 3 §§2–3: Document.fonts is a stable
+        // FontFaceSet, FontFaceSet.add() is setlike and chainable, and a
+        // FontFace exposes its descriptor/status/loaded surface. MSN calls
+        // this API before it loads its article view bundles.
+        let (out, outcome) = page(
+            r#"<body><pre id=o></pre><script>
+            var fonts = document.fonts;
+            var face = new FontFace('TRust Test', 'url(test.woff2)', { weight: '700' });
+            var same = fonts === document.fonts && fonts instanceof FontFaceSet;
+            var added = fonts.add(face) === fonts && fonts.has(face) && fonts.size === 1;
+            var shape = face instanceof FontFace && face.status === 'unloaded'
+                && face.weight === '700' && face.loaded instanceof Promise
+                && fonts.status === 'loaded' && fonts.ready === fonts.ready
+                && !fonts.check('700 12px "TRust Test"');
+            face.load();
+            var loaded = face.status === 'loaded' && fonts.check('700 12px "TRust Test"');
+            var removed = fonts.delete(face) && !fonts.has(face) && fonts.size === 0;
+            document.getElementById('o').textContent =
+                same && added && shape && loaded && removed ? 'FONTS-OK' : 'FONTS-BAD';
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("FONTS-OK"), "{out}");
+    }
+
+    #[test]
+    fn namednodemap_is_live_during_attribute_mutation() {
+        // DOM §4.9.1: NamedNodeMap is a [SameObject] live collection. In
+        // particular, removing an Attr must immediately shift the entries
+        // visible through an existing reference. FAST's template compiler
+        // relies on this while removing binding markers during its walk.
+        let (out, outcome) = page(
+            r#"<body><pre id=o></pre><script>
+            var el = document.createElement('div');
+            el.setAttribute('a', '1');
+            el.setAttribute('b', '2');
+            el.setAttribute('c', '3');
+            var attrs = el.attributes;
+            var same = attrs === el.attributes;
+            var seen = '';
+            for (var i = 0, n = attrs.length; i < n; i++) {
+                seen += attrs[i].name;
+                el.removeAttributeNode(attrs[i]);
+                i--; n--;
+            }
+            var removed = attrs.length === 0;
+            el.setAttribute('new-name', 'value');
+            var added = attrs.length === 1
+                && attrs[0].name === 'new-name'
+                && attrs.getNamedItem('new-name') === attrs[0];
+            document.getElementById('o').textContent =
+                same && seen === 'abc' && removed && added
+                    ? 'NAMEDNODEMAP-OK' : 'NAMEDNODEMAP-BAD:' + seen;
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("NAMEDNODEMAP-OK"), "{out}");
     }
 
     #[test]
