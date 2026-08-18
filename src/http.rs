@@ -5312,19 +5312,19 @@ mod tests {
         let response = fetch(&Request::get(url)).await.unwrap();
         let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
         let mut body = String::from_utf8_lossy(&response.body).into_owned();
-        if !body.contains("module-ran") {
-            if let Some(live) = response.live.as_mut() {
-                loop {
-                    match tokio::time::timeout(Duration::from_secs(5), live.events.recv()).await {
-                        Ok(Some(crate::js::PageEvt::Updated { html, .. }))
-                        | Ok(Some(crate::js::PageEvt::Static { html, .. })) => {
-                            body = html;
-                            if body.contains("module-ran") {
-                                break;
-                            }
+        if !body.contains("module-ran")
+            && let Some(live) = response.live.as_mut()
+        {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, .. }))
+                    | Ok(Some(crate::js::PageEvt::Static { html, .. })) => {
+                        body = html;
+                        if body.contains("module-ran") {
+                            break;
                         }
-                        other => panic!("expected injected module render, got {other:?}"),
                     }
+                    other => panic!("expected injected module render, got {other:?}"),
                 }
             }
         }
