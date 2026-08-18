@@ -12469,6 +12469,28 @@ const PRELUDE: &str = r##"
         const ev = syntheticClickEvent();
         dispatch(t, ev, false);
         if (ev.defaultPrevented) return true;
+        // HTML §4.11.2: the first <summary> child of a <details> element has
+        // activation behavior that toggles the parent's boolean `open`
+        // attribute. This is a default action of the click, so it must run
+        // after bubbling listeners (which may cancel it), just like the
+        // submit-control actions below.
+        if (t.localName === "summary") {
+            const parent = t.parentElement;
+            if (parent && parent.localName === "details") {
+                let firstSummary = null;
+                for (const child of parent.children) {
+                    if (child.localName === "summary") {
+                        firstSummary = child;
+                        break;
+                    }
+                }
+                if (firstSummary === t) {
+                    if (parent.hasAttribute("open")) parent.removeAttribute("open");
+                    else parent.setAttribute("open", "");
+                    return true;
+                }
+            }
+        }
         // Popover invoker (HTML §popover target attributes): activating a
         // button with `popovertarget` toggles/shows/hides the target popover
         // — the no-JS popover idiom works in live pages.
@@ -15960,6 +15982,7 @@ const PRELUDE: &str = r##"
         "HTMLTextAreaElement", "HTMLLinkElement"], "disabled", reflectBoolDesc);
     reflectOn(["HTMLAnchorElement", "HTMLAreaElement", "HTMLLinkElement",
         "HTMLBaseElement"], "href", reflectUrlDesc);
+    reflectOn(["HTMLDetailsElement"], "open", reflectBoolDesc);
     // `rel` is a reflected DOMString IDL attribute; without it `link.rel =
     // "stylesheet"` (set as a property, as webpack's mini-css loader does) never
     // reached `getAttribute("rel")`, so the sheet wasn't recognized.
@@ -29262,6 +29285,68 @@ mod tests {
             panic!("expected Updated after second click");
         };
         assert!(!html.contains("panel payload"), "{html}");
+    }
+
+    #[test]
+    fn live_click_toggles_details_open_state() {
+        let (handle, mut events) = live(
+            "<body><details id=d><summary>question</summary><p>answer</p></details>\
+             <script>void 0;</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("expected first Updated");
+        };
+        let summary = html
+            .find("<summary")
+            .and_then(|at| html[..at].rfind("x-trust-js:"))
+            .and_then(|at| {
+                html[at + "x-trust-js:".len()..]
+                    .split(':')
+                    .next()
+                    .and_then(|id| id.parse::<usize>().ok())
+            })
+            .expect("summary click marker");
+
+        handle.cmds.blocking_send(PageCmd::Click(summary)).unwrap();
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("expected Updated after opening details");
+        };
+        assert!(html.contains("<details id=\"d\" open"), "{html}");
+        assert!(html.contains("answer"), "{html}");
+
+        handle.cmds.blocking_send(PageCmd::Click(summary)).unwrap();
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("expected Updated after closing details");
+        };
+        assert!(!html.contains("<details id=\"d\" open"), "{html}");
+    }
+
+    #[test]
+    fn canceled_summary_click_does_not_toggle_details() {
+        let (handle, mut events) = live(
+            "<body><details id=d><summary id=s>question</summary><p>answer</p></details>\
+             <script>document.getElementById('s').addEventListener('click', e => e.preventDefault());</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("expected first Updated");
+        };
+        let summary = html
+            .find("id=\"s\"")
+            .and_then(|at| html[..at].rfind("x-trust-js:"))
+            .and_then(|at| {
+                html[at + "x-trust-js:".len()..]
+                    .split(':')
+                    .next()
+                    .and_then(|id| id.parse::<usize>().ok())
+            })
+            .expect("summary click marker");
+
+        handle.cmds.blocking_send(PageCmd::Click(summary)).unwrap();
+        match events.blocking_recv() {
+            Some(PageEvt::Settled) => {}
+            other => panic!("canceled click should not render, got {other:?}"),
+        }
+        assert!(!html.contains("<details id=\"d\" open"), "{html}");
     }
 
     #[test]
