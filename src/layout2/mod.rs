@@ -1264,6 +1264,106 @@ mod tests {
     }
 
     #[test]
+    fn quantized_table_cell_text_does_not_cross_sibling_cell() {
+        // The proportional line fits inside the 80% cell, but its Unicode
+        // display-cell width is a couple of cells wider after terminal
+        // adaptation. The terminal presentation must keep that quantization
+        // overhang inside the cell instead of painting over the 20% sibling.
+        // This is the same nested-table boundary used by CSS 2.1 §17.5.2;
+        // the cell's default overflow is still visible for genuine CSS
+        // overflow, covered by `overlong_word_overflows_and_clips_at_viewport`.
+        let story_text = "i".repeat(100);
+        let html = format!(
+            r#"<body style="margin:0"><table style="width:980px;table-layout:auto"><tr>
+                <td style="width:80%;padding:6px;vertical-align:top"><p style="margin:0;font-size:15px">{story_text}</p></td>
+                <td style="width:20%;padding:6px;vertical-align:top"><div style="margin-top:16px">SIDE PANEL</div></td>
+            </tr></table></body>"#
+        );
+        let out = lay(&html, 120);
+        let (story_row, story) = find(&out, "iiii");
+        let (side_row, side) = find(&out, "SIDE PANEL");
+        assert!(
+            story_row < side_row,
+            "the boundary marker is below the story"
+        );
+        assert!(
+            story.col as usize + story.width as usize <= side.col as usize,
+            "main-cell item {:?} crosses into sibling at column {}",
+            story,
+            side.col
+        );
+        let story_cells: usize = out
+            .rows
+            .iter()
+            .flat_map(|row| &row.items)
+            .map(|item| item.text.chars().filter(|&ch| ch == 'i').count())
+            .sum();
+        assert_eq!(
+            story_cells,
+            story_text.len(),
+            "terminal reflow must preserve text"
+        );
+    }
+
+    #[test]
+    fn terminal_reflow_continues_across_soft_css_line_boxes() {
+        // CSS Text 3 §5 distinguishes soft-wrap opportunities from forced
+        // breaks. A proportional CSS line box can end at the cell edge while
+        // its terminal-cell equivalent still has room on the continuation
+        // row; the next soft-wrapped line must use that room as part of the
+        // same paragraph.
+        let html = r#"<body style="margin:0"><table style="width:980px;table-layout:auto"><tr>
+            <td style="width:80%;padding:6px;vertical-align:top"><p style="margin:0;font-size:15px">
+                As I mentioned above, there are several editions of Helwan Linux, though each edition appears to be for a separate version (or generation) of the distribution. For version 5.0 I found just one edition, Developer, which ships with the Cinnamon desktop.
+            </p></td>
+            <td style="width:20%;padding:6px;vertical-align:top">SIDE PANEL</td>
+        </tr></table></body>"#;
+        let out = lay(html, 120);
+        let be_row = out
+            .rows
+            .iter()
+            .map(row_text)
+            .find(|text| text.split_whitespace().any(|word| word == "be"))
+            .expect("the paragraph contains be");
+        assert!(
+            be_row.contains("be for a separate"),
+            "soft-wrapped continuation restarted a terminal row: {be_row:?}"
+        );
+        let edition_row = out
+            .rows
+            .iter()
+            .map(row_text)
+            .find(|text| text.contains("edition,"))
+            .expect("the paragraph contains edition,");
+        assert!(
+            edition_row.contains("edition, Developer"),
+            "the next soft-wrapped line was not packed into its available row: {edition_row:?}"
+        );
+    }
+
+    #[test]
+    fn sidebar_viewport_clipping_does_not_add_main_flow_rows() {
+        // The sidebar's containing block extends a little beyond the terminal
+        // viewport. Its right-edge clipping must not be mistaken for a second
+        // line in the shared row allocator; CSS 2.1 §10.8 line boxes remain
+        // vertically adjacent in the main cell.
+        let out = lay(
+            r#"<body style="margin:0"><table style="width:980px;table-layout:auto"><tr>
+                <td style="width:80%;padding:6px;vertical-align:top">
+                    <p style="margin:0;line-height:16px">main line one</p><p style="margin:0;line-height:16px">main line two</p>
+                </td>
+                <td style="width:20%;padding:6px;vertical-align:top">
+                    <p style="margin:0">PrivacyGuard Laptops</p><p style="margin:0">another sidebar line</p>
+                </td>
+            </tr></table></body>"#,
+            120,
+        );
+        let (first_row, _) = find(&out, "main line one");
+        let (second_row, _) = find(&out, "main line two");
+        assert_eq!(second_row, first_row + 1, "sidebar clipping inserted a row");
+    }
+
+    #[test]
     fn overflow_wrap_breaks_an_overflowing_word() {
         // Under `normal` an unbreakable word overflows the line whole (the
         // output clips it at the viewport edge; nothing lands on row 1)…

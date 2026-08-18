@@ -121,6 +121,10 @@ pub(crate) struct LineFrag {
     pub baseline: f32,
     pub ascent: f32,
     pub descent: f32,
+    /// Whether this line ended at a forced break. Soft wraps are only
+    /// canonical line-box boundaries; the terminal adapter may reflow them
+    /// again after CSS pixels are quantized to display cells.
+    pub forced: bool,
 }
 
 /// Strip the transient box-tree references from a completed fragment tree so
@@ -1392,6 +1396,7 @@ impl Flow<'_> {
                 baseline: line.baseline,
                 ascent: line.ascent,
                 descent: line.descent,
+                forced: line.forced,
             };
             out.push(Frag {
                 node: NO_NODE,
@@ -1536,6 +1541,7 @@ impl Flow<'_> {
                 baseline,
                 ascent: baseline,
                 descent: (h - baseline).max(0.0),
+                forced: false,
             }),
             children: Vec::new(),
         }
@@ -2874,6 +2880,7 @@ impl Flow<'_> {
                 baseline: r.box_h,
                 ascent: r.box_h,
                 descent: 0.0,
+                forced: false,
             }),
             children: Vec::new(),
         }

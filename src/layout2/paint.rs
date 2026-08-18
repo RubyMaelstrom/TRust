@@ -1037,8 +1037,15 @@ fn hit_op(
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TerminalLinePlacement {
     pub row: i64,
+    pub end_row: i64,
+    pub joins_previous: bool,
     columns: usize,
     continuation_col: i64,
+    /// The canonical line fits inside its containing block, so terminal
+    /// quantization must not let its display-cell approximation cross that
+    /// block's right edge. `None` preserves genuine CSS overflow (for example
+    /// an unbreakable word in an `overflow:visible` block).
+    clip_right: Option<i64>,
 }
 
 pub(crate) fn line_row_map(
@@ -1049,34 +1056,137 @@ pub(crate) fn line_row_map(
     cell_h: f32,
     columns: usize,
 ) -> HashMap<usize, TerminalLinePlacement> {
+    #[derive(Clone, Copy)]
+    struct LineEntry<'a, 'tree> {
+        line: &'a Frag<'tree>,
+        positioned: bool,
+        containing_right: Option<f32>,
+        parent: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct FlowState {
+        preferred_row: i64,
+        css_y: f32,
+        row: i64,
+        span: i64,
+        end_col: i64,
+        right: Option<i64>,
+        forced: bool,
+        reflowed: bool,
+    }
+
     fn collect<'a, 'tree>(
         fragment: &'a Frag<'tree>,
         positioned: bool,
-        lines: &mut Vec<(&'a Frag<'tree>, bool)>,
+        containing_right: Option<f32>,
+        parent: usize,
+        lines: &mut Vec<LineEntry<'a, 'tree>>,
     ) {
         if matches!(fragment.kind, FragKind::Line(_)) {
-            lines.push((fragment, positioned));
+            lines.push(LineEntry {
+                line: fragment,
+                positioned,
+                containing_right,
+                parent,
+            });
         }
+        // The retained fragment contract exposes the border-box edge (not the
+        // resolved padding shorthand). It is the safe terminal boundary: it
+        // preserves text that still fits through a fractional border/padding
+        // quantization while preventing a line from entering the next box.
+        let child_containing_right = Some(fragment.x + fragment.w);
         for child in &fragment.children {
-            collect(child, positioned || child.paint.positioned, lines);
+            collect(
+                child,
+                positioned || child.paint.positioned,
+                child_containing_right,
+                std::ptr::from_ref(fragment) as usize,
+                lines,
+            );
         }
     }
 
     let mut lines = Vec::new();
-    collect(root, false, &mut lines);
-    lines.sort_by(|(left, _), (right, _)| {
-        left.y
-            .total_cmp(&right.y)
-            .then_with(|| left.x.total_cmp(&right.x))
+    collect(
+        root,
+        false,
+        None,
+        std::ptr::from_ref(root) as usize,
+        &mut lines,
+    );
+    lines.sort_by(|left, right| {
+        left.line
+            .y
+            .total_cmp(&right.line.y)
+            .then_with(|| left.line.x.total_cmp(&right.line.x))
     });
     let mut map = HashMap::with_capacity(lines.len());
     let mut previous_y: Option<f32> = None;
     let mut previous_row = i64::MIN;
-    let mut next_row = i64::MIN;
-    for (line, positioned) in lines {
+    // A terminal reflowed line reserves additional rows only in its own
+    // containing-cell band. Sibling table cells are independent inline
+    // formatting contexts; their line boxes may have slightly different CSS
+    // y coordinates, but a sidebar's extra row must not push the main cell's
+    // following line down. The quantized containing edge is the retained
+    // terminal identity of that band, while `None` represents the root flow.
+    let mut next_row_by_band: HashMap<Option<i64>, i64> = HashMap::new();
+    let mut last_band_parent: HashMap<Option<i64>, usize> = HashMap::new();
+    let mut flow_states: HashMap<usize, FlowState> = HashMap::new();
+    for entry in lines {
+        let line = entry.line;
+        let positioned = entry.positioned;
+        let containing_right = entry.containing_right;
         let preferred = ((line.y - oy) / cell_h).round() as i64;
         let line_start = ((line.x - ox) / cell_w).round().max(0.0) as i64;
-        let span = terminal_line_span(line, ox, cell_w, cell_h, columns, line_start);
+        // CSS line breaking has already proved that this line fits inside its
+        // containing block. Keep the containing edge as an adaptation hint:
+        // quantization overrun inside the viewport is terminal-side reflow,
+        // while an edge beyond the viewport is ordinary viewport clipping.
+        let clip_right = containing_right.and_then(|right| {
+            let FragKind::Line(line_fragment) = &line.kind else {
+                return None;
+            };
+            (line.x + line_fragment.width <= right + 0.01)
+                // A partially intersected terminal cell remains part of the
+                // containing border box; ceil the right edge so fractional
+                // padding/border geometry does not delete the final glyph.
+                .then(|| ((right - ox) / cell_w).ceil() as i64)
+        });
+        let band = containing_right.map(|right| ((right - ox) / cell_w).ceil() as i64);
+        let reflow_right =
+            clip_right.filter(|right| *right > line_start && *right <= columns as i64);
+        let previous_flow = flow_states.get(&entry.parent).copied();
+        let can_continue = previous_flow.is_some_and(|state| {
+            let canonical_step = preferred - state.preferred_row;
+            !state.forced
+                && state.reflowed
+                && reflow_right == state.right
+                && canonical_step <= 2
+                && (line.y - state.css_y) <= cell_h * 1.25
+                // Rejoin only when the predecessor actually needed a
+                // terminal continuation row. A canonical line that already
+                // fits its terminal band remains a normal line boundary;
+                // this preserves the viewport's ordinary paragraph wrapping.
+                && state.span > 1
+                && state.end_col < state.right.unwrap_or(i64::MAX)
+        });
+        let carry_row = can_continue.then(|| {
+            let state = previous_flow.expect("can_continue implies a flow state");
+            state.row + state.span - 1
+        });
+        let mut band_floor = next_row_by_band.get(&band).copied().unwrap_or(i64::MIN);
+        if can_continue
+            && previous_flow.is_some_and(|state| {
+                state.row + state.span == band_floor
+                    && last_band_parent.get(&band) == Some(&entry.parent)
+            })
+        {
+            // This is the same flow's previous reservation. Its final row may
+            // still have room for the next canonical soft-wrapped line, so do
+            // not mistake that reservation for a sibling.
+            band_floor = i64::MIN;
+        }
         let vertically_clipped_away = line.clip.is_some_and(|clip| {
             ((clip.y0 - oy) / cell_h).round() as i64 >= ((clip.y1 - oy) / cell_h).round() as i64
         });
@@ -1085,8 +1195,11 @@ pub(crate) fn line_row_map(
                 std::ptr::from_ref(line) as usize,
                 TerminalLinePlacement {
                     row: preferred,
+                    end_row: preferred,
+                    joins_previous: false,
                     columns,
                     continuation_col: line_start,
+                    clip_right,
                 },
             );
             continue;
@@ -1094,22 +1207,57 @@ pub(crate) fn line_row_map(
         let same_band = previous_y.is_some_and(|y| (line.y - y).abs() <= 0.01);
         let row = if same_band {
             previous_row
-        } else if previous_row == i64::MIN {
-            preferred
+        } else if let Some(carry_row) = carry_row {
+            carry_row.max(band_floor)
         } else {
-            preferred.max(next_row)
+            preferred.max(band_floor)
+        };
+        let start_col = if carry_row.is_some_and(|carry| carry == row) {
+            previous_flow
+                .expect("carry row implies a flow state")
+                .end_col
+        } else {
+            line_start
+        };
+        let joins_previous = carry_row.is_some_and(|carry| carry == row);
+        let (span, end_col) = if let Some(right) = reflow_right {
+            terminal_line_extent(line, ox, cell_w, cell_h, right, line_start, start_col)
+        } else {
+            (
+                terminal_line_span(line, ox, cell_w, cell_h, columns, line_start, clip_right),
+                line_start,
+            )
         };
         map.insert(
             std::ptr::from_ref(line) as usize,
             TerminalLinePlacement {
                 row,
+                end_row: row + span.max(1) - 1,
+                joins_previous,
                 columns,
                 continuation_col: line_start,
+                clip_right,
             },
         );
         previous_y = Some(line.y);
         previous_row = row;
-        next_row = next_row.max(row + span.max(1));
+        let next_row = next_row_by_band.entry(band).or_insert(i64::MIN);
+        *next_row = (*next_row).max(row + span.max(1));
+        last_band_parent.insert(band, entry.parent);
+        let forced = matches!(&line.kind, FragKind::Line(line) if line.forced);
+        flow_states.insert(
+            entry.parent,
+            FlowState {
+                preferred_row: preferred,
+                css_y: line.y,
+                row,
+                span: span.max(1),
+                end_col,
+                right: reflow_right,
+                forced,
+                reflowed: reflow_right.is_some(),
+            },
+        );
     }
     map
 }
@@ -1124,7 +1272,7 @@ fn terminal_piece_width(piece: &super::inline::Piece, cell_w: f32, cell_h: f32) 
         let _height = (y1 - y0).max(1.0);
         (x1 - x0).max(1.0) as usize
     } else {
-        display_width(text) + usize::from(piece.space_before)
+        display_width(&terminal_piece_text_with_space(piece))
     }
 }
 
@@ -1139,21 +1287,85 @@ fn terminal_piece_text(piece: &super::inline::Piece) -> &str {
         .unwrap_or(&piece.item.text)
 }
 
-fn terminal_line_span(
+fn terminal_piece_text_with_space(piece: &super::inline::Piece) -> String {
+    let mut text = terminal_piece_text(piece).to_owned();
+    if piece.space_before && piece.item.image.is_none() && !text.is_empty() {
+        text.insert(0, ' ');
+    }
+    text
+}
+
+/// Split a terminal text item at a display-cell boundary. Prefer the last
+/// whitespace in the fitting prefix so a quantization-only reflow does not
+/// cut an otherwise intact word; if there is no such boundary, make an
+/// emergency character split and let the compositor handle wide glyphs.
+fn terminal_text_chunk(text: &str, max_cells: usize) -> (String, String) {
+    if max_cells == 0 {
+        return (String::new(), text.to_owned());
+    }
+    if display_width(text) <= max_cells {
+        return (text.to_owned(), String::new());
+    }
+    let mut prefix = truncate_to_width(text, max_cells);
+    if prefix.is_empty() {
+        let Some(first) = text.chars().next() else {
+            return (String::new(), String::new());
+        };
+        prefix.push(first);
+    } else {
+        let break_at = prefix
+            .char_indices()
+            .filter(|(index, ch)| *index > 0 && ch.is_whitespace())
+            .map(|(index, ch)| index + ch.len_utf8())
+            .next_back();
+        if let Some(end) = break_at {
+            prefix.truncate(end);
+            // CSS Text's collapsible whitespace is the soft-wrap
+            // opportunity, not painted content at the end of the line.
+            // Consume it from the continuation while leaving no trailing
+            // terminal cell behind.
+            let consumed = display_width(&prefix);
+            let visible = prefix.trim_end_matches(char::is_whitespace).to_owned();
+            return (visible, drop_cells(text, consumed));
+        } else if text
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_whitespace())
+        {
+            // A collapsed leading gap cannot be painted by itself at the end
+            // of a terminal row. Move the word to the continuation; callers
+            // use the empty prefix as the signal to drop this gap at the new
+            // row's inline start.
+            let leading_end = text
+                .char_indices()
+                .find(|(_, character)| !character.is_whitespace())
+                .map_or(text.len(), |(index, _)| index);
+            return (String::new(), text[leading_end..].to_owned());
+        }
+    }
+    let used = display_width(&prefix);
+    (prefix, drop_cells(text, used))
+}
+
+/// Simulate a terminal reflow inside one canonical containing-cell band.
+/// `start_col` lets a soft-wrapped CSS line continue in the final terminal row
+/// of its predecessor. The returned end column is used to carry the next line
+/// without treating a proportional CSS line-box boundary as a forced break.
+fn terminal_line_extent(
     line: &Frag<'_>,
     ox: f32,
     cell_w: f32,
     cell_h: f32,
-    columns: usize,
+    right: i64,
     continuation_col: i64,
-) -> i64 {
+    start_col: i64,
+) -> (i64, i64) {
     let FragKind::Line(line_fragment) = &line.kind else {
-        return 1;
+        return (1, start_col);
     };
-    let mut row_offset = 0i64;
-    let mut pen = continuation_col;
+    let mut rows = 1i64;
+    let mut pen = start_col;
     for piece in &line_fragment.pieces {
-        let width = terminal_piece_width(piece, cell_w, cell_h) as i64;
         let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
         if piece.space_before
             && piece.item.image.is_none()
@@ -1161,13 +1373,174 @@ fn terminal_line_span(
         {
             preferred -= 1;
         }
+        let mut remaining_text = (!piece.item.image.is_some()
+            && !terminal_piece_text(piece).is_empty())
+        .then(|| terminal_piece_text_with_space(piece));
+        let mut remaining = remaining_text.as_deref().map_or_else(
+            || terminal_piece_width(piece, cell_w, cell_h),
+            display_width,
+        );
         let mut col = preferred.max(pen);
-        if columns > 0 && col > continuation_col && col + width > columns as i64 {
-            row_offset += 1;
-            pen = continuation_col;
-            col = pen;
+        while remaining > 0 {
+            if col >= right {
+                rows += 1;
+                pen = continuation_col;
+                col = continuation_col;
+                continue;
+            }
+            let available = (right - col) as usize;
+            if let Some(text) = remaining_text.as_deref() {
+                let (prefix, rest) = terminal_text_chunk(text, available);
+                let used = display_width(&prefix);
+                if used == 0 {
+                    remaining_text = (!rest.is_empty()).then_some(rest);
+                    remaining = remaining_text.as_deref().map_or(0, display_width);
+                    rows += 1;
+                    pen = continuation_col;
+                    col = continuation_col;
+                    continue;
+                }
+                remaining_text = (!rest.is_empty()).then_some(rest);
+                remaining = remaining_text.as_deref().map_or(0, display_width);
+                pen = col + used as i64;
+                if remaining > 0 {
+                    rows += 1;
+                    pen = continuation_col;
+                    col = continuation_col;
+                }
+            } else {
+                let width = remaining as i64;
+                if width > available as i64 && col > continuation_col {
+                    rows += 1;
+                    pen = continuation_col;
+                    col = continuation_col;
+                } else {
+                    pen = col + width;
+                    remaining = 0;
+                }
+            }
         }
-        pen = col + width;
+    }
+    (rows, pen)
+}
+
+fn terminal_line_span(
+    line: &Frag<'_>,
+    ox: f32,
+    cell_w: f32,
+    cell_h: f32,
+    columns: usize,
+    continuation_col: i64,
+    clip_right: Option<i64>,
+) -> i64 {
+    let FragKind::Line(line_fragment) = &line.kind else {
+        return 1;
+    };
+
+    // A line that fits its containing block but whose quantized edge remains
+    // beyond the viewport is clipped by the compositor, not wrapped. This is
+    // what keeps an off-screen sidebar from reserving phantom rows for the
+    // main flow. A containing edge at or inside the viewport can require
+    // terminal-side reflow.
+    let Some(right) =
+        clip_right.filter(|right| *right > continuation_col && *right <= columns as i64)
+    else {
+        if clip_right.is_some() {
+            return 1;
+        }
+        let mut row_offset = 0i64;
+        let mut pen = continuation_col;
+        for piece in &line_fragment.pieces {
+            let width = terminal_piece_width(piece, cell_w, cell_h) as i64;
+            let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
+            if piece.space_before
+                && piece.item.image.is_none()
+                && !terminal_piece_text(piece).is_empty()
+            {
+                preferred -= 1;
+            }
+            let col = preferred.max(pen);
+            if columns > 0 && col > continuation_col && col + width > columns as i64 {
+                row_offset += 1;
+                pen = continuation_col;
+            } else {
+                pen = col + width;
+            }
+        }
+        return row_offset + 1;
+    };
+
+    let mut row_offset = 0i64;
+    let mut pen = continuation_col;
+    for piece in &line_fragment.pieces {
+        let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
+        if piece.space_before
+            && piece.item.image.is_none()
+            && !terminal_piece_text(piece).is_empty()
+        {
+            preferred -= 1;
+        }
+        let mut remaining_text = (!piece.item.image.is_some()
+            && !terminal_piece_text(piece).is_empty())
+        .then(|| terminal_piece_text_with_space(piece));
+        let mut remaining = remaining_text.as_deref().map_or_else(
+            || terminal_piece_width(piece, cell_w, cell_h),
+            display_width,
+        );
+        let mut col = if row_offset > 0 {
+            continuation_col
+        } else {
+            preferred.max(pen)
+        };
+        while remaining > 0 {
+            if col >= right {
+                row_offset += 1;
+                pen = continuation_col;
+                col = continuation_col;
+                continue;
+            }
+            let available = (right - col) as usize;
+            if available == 0 {
+                row_offset += 1;
+                pen = continuation_col;
+                col = continuation_col;
+                continue;
+            }
+            if let Some(text) = remaining_text.as_deref() {
+                let (prefix, rest) = terminal_text_chunk(text, available);
+                let used = display_width(&prefix);
+                if used == 0 {
+                    remaining_text = (!rest.is_empty()).then_some(rest);
+                    remaining = remaining_text.as_deref().map_or(0, display_width);
+                    row_offset += 1;
+                    pen = continuation_col;
+                    col = continuation_col;
+                    continue;
+                }
+                remaining_text = (!rest.is_empty()).then_some(rest);
+                remaining = remaining_text.as_deref().map_or(0, display_width);
+                pen = col + used as i64;
+                if remaining > 0 {
+                    row_offset += 1;
+                    pen = continuation_col;
+                    col = continuation_col;
+                }
+            } else {
+                // Atomic inline boxes remain unbreakable. A box that starts
+                // inside the cell may move to the continuation row; one that
+                // starts at the cell edge retains the CSS overflow behavior
+                // and is clipped by the containing edge.
+                let width = remaining as i64;
+                if width > available as i64 && col > continuation_col {
+                    row_offset += 1;
+                    pen = continuation_col;
+                    col = continuation_col;
+                } else {
+                    pen = col + width;
+                    remaining = 0;
+                }
+            }
+        }
     }
     row_offset + 1
 }
@@ -1348,8 +1721,15 @@ fn inflow_content(
     links: &HashMap<NodeId, Link>,
     line_rows: &HashMap<usize, TerminalLinePlacement>,
 ) {
+    // Keep the terminal pen across adjacent canonical line boxes in one
+    // block's inline formatting context. CSS Text's soft-wrap line boxes are
+    // not forced breaks, so a line that was split for proportional CSS
+    // metrics may continue into the same terminal row after quantization.
+    let mut row_pens: HashMap<i64, i64> = HashMap::new();
+    let mut previous_line: Option<(i64, bool)> = None;
     for c in &f.children {
         if c.paint.sc || c.paint.positioned || c.paint.float {
+            previous_line = None;
             continue;
         }
         if !matches!(c.kind, FragKind::Block) {
@@ -1363,8 +1743,24 @@ fn inflow_content(
             // origin, then advance it past the preceding adapted piece on the
             // same terminal row. This never feeds back into line breaking or
             // fragment geometry.
-            let mut row_pens: HashMap<i64, i64> = HashMap::new();
-            let mut wrap_offset = 0i64;
+            let placement = line_rows
+                .get(&(std::ptr::from_ref(c) as usize))
+                .copied()
+                .unwrap_or(TerminalLinePlacement {
+                    row: ((c.y - oy) / ch).round() as i64,
+                    end_row: ((c.y - oy) / ch).round() as i64,
+                    joins_previous: false,
+                    columns: usize::MAX,
+                    continuation_col: ((c.x - ox) / cw).round() as i64,
+                    clip_right: None,
+                });
+            let joins_soft_line_on_same_row = placement.joins_previous
+                && previous_line
+                    .is_some_and(|(end_row, forced)| !forced && end_row == placement.row);
+            let mut first_text_item = true;
+            if !placement.joins_previous {
+                row_pens.clear();
+            }
             for p in &line.pieces {
                 let mut item_x = c.x + p.x + p.paint_x;
                 // A terminal row has no typographic baseline. Anchor adapted
@@ -1395,52 +1791,126 @@ fn inflow_content(
                     item.width = item.width.saturating_add(1);
                     item_x -= cw;
                 }
+                if joins_soft_line_on_same_row
+                    && first_text_item
+                    && item.image.is_none()
+                    && !item.text.is_empty()
+                    && !p.space_before
+                {
+                    // CSS Text drops the collapsible whitespace at a soft line
+                    // break. If this adapter rejoins that line on the same
+                    // terminal row, restore the one collapsed gap at the new
+                    // row position.
+                    item.text.insert(0, ' ');
+                    item.width = item.width.saturating_add(1);
+                }
+                if item.image.is_none() && !item.text.is_empty() {
+                    first_text_item = false;
+                }
                 let clip = if item.image.is_none() && !item.text.is_empty() && item.height <= 1 {
                     text_item_clip_cells(c.clip, item_y, ox, oy, cw, ch)
                 } else {
                     clip_cells(c.clip, ox, oy, cw, ch)
                 };
-                let placement = line_rows
-                    .get(&(std::ptr::from_ref(c) as usize))
-                    .copied()
-                    .unwrap_or(TerminalLinePlacement {
-                        row: ((c.y - oy) / ch).round() as i64,
-                        columns: usize::MAX,
-                        continuation_col: ((c.x - ox) / cw).round() as i64,
-                    });
                 let baseline_offset = if item.image.is_some() {
                     0
                 } else {
                     (p.y / ch).round() as i64
                 };
-                let mut row =
-                    placement.row + baseline_offset + (p.paint_y / ch).round() as i64 + wrap_offset;
-                let mut preferred_col = if wrap_offset > 0 {
-                    placement.continuation_col
-                } else {
-                    ((item_x - ox) / cw).round() as i64
-                };
-                let mut pen = *row_pens.entry(row).or_insert(preferred_col);
-                let mut col = preferred_col.max(pen);
-                if placement.columns != usize::MAX
-                    && col > placement.continuation_col
-                    && col + i64::from(item.width) > placement.columns as i64
-                {
-                    wrap_offset += 1;
-                    row += 1;
-                    preferred_col = placement.continuation_col;
-                    pen = *row_pens.entry(row).or_insert(preferred_col);
-                    col = preferred_col.max(pen);
-                }
-                let pen = row_pens.entry(row).or_insert(col);
-                *pen = col + i64::from(item.width);
-                ops.push(Op::Item {
-                    row,
-                    col,
-                    item,
-                    clip,
+                let mut row = placement.row + baseline_offset + (p.paint_y / ch).round() as i64;
+                let mut preferred_col = ((item_x - ox) / cw).round() as i64;
+                let reflow_right = placement.clip_right.filter(|right| {
+                    *right > placement.continuation_col && *right <= placement.columns as i64
                 });
+                let text_reflow = reflow_right.is_some()
+                    && item.image.is_none()
+                    && !item.text.is_empty()
+                    && item.height <= 1;
+                loop {
+                    let pen = *row_pens.entry(row).or_insert(preferred_col);
+                    let col = preferred_col.max(pen);
+
+                    if let Some(right) = reflow_right {
+                        if col >= right {
+                            row += 1;
+                            preferred_col = placement.continuation_col;
+                            continue;
+                        }
+                        let available = (right - col) as usize;
+                        if text_reflow && item.width as usize > available {
+                            let (prefix, rest) = terminal_text_chunk(&item.text, available);
+                            let used = display_width(&prefix);
+                            if used == 0 {
+                                let next_row = row + 1;
+                                let gap_has_following_text = row_pens
+                                    .get(&next_row)
+                                    .is_some_and(|pen| *pen > placement.continuation_col);
+                                if !gap_has_following_text {
+                                    item.text = rest;
+                                    item.width =
+                                        display_width(&item.text).min(u16::MAX as usize) as u16;
+                                }
+                                row += 1;
+                                preferred_col = placement.continuation_col;
+                                continue;
+                            }
+                            let mut chunk = item.clone();
+                            chunk.text = prefix;
+                            chunk.width = used.min(u16::MAX as usize) as u16;
+                            let mut chunk_clip = clip;
+                            chunk_clip.c1 = chunk_clip.c1.min(right);
+                            row_pens.insert(row, col + used as i64);
+                            ops.push(Op::Item {
+                                row,
+                                col,
+                                item: chunk,
+                                clip: chunk_clip,
+                            });
+                            if rest.is_empty() {
+                                break;
+                            }
+                            item.text = rest;
+                            item.width = display_width(&item.text).min(u16::MAX as usize) as u16;
+                            row += 1;
+                            preferred_col = placement.continuation_col;
+                            continue;
+                        }
+                        if !text_reflow
+                            && col > placement.continuation_col
+                            && col + i64::from(item.width) > right
+                        {
+                            row += 1;
+                            preferred_col = placement.continuation_col;
+                            continue;
+                        }
+                    } else if placement.clip_right.is_none()
+                        && placement.columns != usize::MAX
+                        && col > placement.continuation_col
+                        && col + i64::from(item.width) > placement.columns as i64
+                    {
+                        row += 1;
+                        preferred_col = placement.continuation_col;
+                        continue;
+                    }
+
+                    let pen = row_pens.entry(row).or_insert(col);
+                    *pen = col + i64::from(item.width);
+                    let mut item_clip = clip;
+                    if let Some(right) = placement.clip_right {
+                        item_clip.c1 = item_clip.c1.min(right);
+                    }
+                    ops.push(Op::Item {
+                        row,
+                        col,
+                        item,
+                        clip: item_clip,
+                    });
+                    break;
+                }
             }
+            previous_line = Some((placement.end_row, line.forced));
+        } else {
+            previous_line = None;
         }
         inflow_content(c, ops, cw, ch, ox, oy, links, line_rows);
     }
