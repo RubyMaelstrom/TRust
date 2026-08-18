@@ -1775,6 +1775,12 @@ struct WorkerLaunch {
     script_url: url::Url,
     kind: WorkerKind,
     name: String,
+    /// A script fetched from the page's same-partition Blob URL store. The
+    /// HTML Worker algorithm fetches `blob:` URLs through the File API store,
+    /// rather than through the HTTP client. `None` keeps the normal HTTP(S)
+    /// fetch path.
+    script_body: Option<Vec<u8>>,
+    secure_context: bool,
 }
 
 /// Channel the worker threads post `(worker id, WorkerOut)` back on; the page
@@ -2330,15 +2336,47 @@ fn wasm_err(kind: &str, msg: &str, ctx: &mut Context) -> JsValue {
     JsArray::from_iter([str_value(kind), str_value(msg)], ctx).into()
 }
 
-/// Read a `BufferSource` syscall argument — an `ArrayBuffer` the prelude has
-/// normalized from the page's `BufferSource` — into owned bytes, exactly (the
-/// latin1-string body path used elsewhere would corrupt bytes ≥ 0x80 via UTF-8
-/// re-encoding, so wasm bytes must come through an `ArrayBuffer`). `None` if the
-/// argument is not an `ArrayBuffer` or it is detached.
-fn arg_wasm_bytes(args: &[JsValue], i: usize) -> Option<Vec<u8>> {
+/// Read an `ArrayBuffer` syscall argument into owned bytes exactly. The
+/// latin1-string body path used elsewhere would corrupt bytes ≥ 0x80 via
+/// UTF-8 re-encoding, so binary APIs pass an `ArrayBuffer` across this seam.
+/// `None` means that the argument is not an `ArrayBuffer` or is detached.
+fn arg_array_buffer_bytes(args: &[JsValue], i: usize) -> Option<Vec<u8>> {
     let obj = args.get(i)?.as_object()?.clone();
     let ab = boa_engine::object::builtins::JsArrayBuffer::from_object(obj).ok()?;
     Some(ab.data()?.to_vec())
+}
+
+/// Read any Web Crypto `BufferSource` without first copying a typed-array view
+/// through JavaScript. The resulting owned slice is exact for ArrayBuffer,
+/// TypedArray, and DataView inputs, including non-zero view offsets.
+fn arg_buffer_source_bytes(args: &[JsValue], i: usize, ctx: &mut Context) -> Option<Vec<u8>> {
+    let obj = args.get(i)?.as_object()?.clone();
+    if let Ok(ab) = boa_engine::object::builtins::JsArrayBuffer::from_object(obj.clone()) {
+        return Some(ab.data()?.to_vec());
+    }
+    let (buffer, offset, length) =
+        if let Ok(view) = boa_engine::object::builtins::JsTypedArray::from_object(obj.clone()) {
+            (
+                view.buffer(ctx).ok()?.as_object()?.clone(),
+                view.byte_offset(ctx).ok()?,
+                view.byte_length(ctx).ok()?,
+            )
+        } else if let Ok(view) = boa_engine::object::builtins::JsDataView::from_object(obj) {
+            (
+                view.buffer(ctx).ok()?.as_object()?.clone(),
+                view.byte_offset(ctx).ok()? as usize,
+                view.byte_length(ctx).ok()? as usize,
+            )
+        } else {
+            return None;
+        };
+    let ab = boa_engine::object::builtins::JsArrayBuffer::from_object(buffer).ok()?;
+    let end = offset.checked_add(length)?;
+    Some(ab.data()?.get(offset..end)?.to_vec())
+}
+
+fn arg_wasm_bytes(args: &[JsValue], i: usize) -> Option<Vec<u8>> {
+    arg_array_buffer_bytes(args, i)
 }
 
 /// A non-negative integer id argument (module/instance/etc.), or `None`.
@@ -2514,11 +2552,13 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__storage_key", 2, sys_storage_key),
         ("__storage_len", 1, sys_storage_len),
         ("__blob_mirror", 3, sys_blob_mirror),
+        ("__crypto_sha256_digest", 1, sys_crypto_sha256_digest),
+        ("__text_encode", 1, sys_text_encode),
         ("__dom_popover", 2, sys_dom_popover),
         ("__ws_open", 2, sys_ws_open),
         ("__ws_send", 3, sys_ws_send),
         ("__ws_close", 3, sys_ws_close),
-        ("__worker_spawn", 3, sys_worker_spawn),
+        ("__worker_spawn", 4, sys_worker_spawn),
         ("__worker_post", 2, sys_worker_post),
         ("__worker_terminate", 1, sys_worker_terminate),
         ("__worker_self_post", 1, sys_worker_self_post),
@@ -3888,6 +3928,34 @@ fn sys_blob_mirror(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
     Ok(JsValue::undefined())
 }
 
+/// `__crypto_sha256_digest(arrayBuffer)` — native SHA-256 for WebCrypto's
+/// digest implementation. The syscall settles the Promise itself, keeping
+/// the standards-visible asynchronous `SubtleCrypto.digest()` contract while
+/// avoiding an extra interpreted `Promise.resolve()` call for this hot path.
+fn sys_crypto_sha256_digest(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    use sha2::Digest as _;
+    let input = arg_buffer_source_bytes(args, 0, ctx).unwrap_or_default();
+    let digest = sha2::Sha256::digest(&input);
+    let block = boa_engine::object::builtins::AlignedVec::from_iter(0, digest.iter().copied());
+    let output = boa_engine::object::builtins::JsArrayBuffer::from_byte_block(block, ctx)?;
+    Ok(JsPromise::resolve(JsValue::from(output), ctx).into())
+}
+
+/// `__text_encode(string)` — the UTF-8 core used by both Window and Worker
+/// `TextEncoder` implementations. Rust's string conversion performs the
+/// Encoding Standard's replacement of lone UTF-16 surrogates, while the
+/// returned typed array preserves the exact UTF-8 bytes for Web Crypto.
+fn sys_text_encode(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let text = args
+        .first()
+        .map(|value| value.to_string(ctx))
+        .transpose()?
+        .map(|value| value.to_std_string_lossy())
+        .unwrap_or_default();
+    let encoded = boa_engine::object::builtins::JsUint8Array::from_iter(text.into_bytes(), ctx)?;
+    Ok(encoded.into())
+}
+
 /// `__ws_open(url, protocols)` → a socket id (>0), or -1 if WebSockets aren't
 /// available here / the URL is bad / the target is blocked. Spawns the
 /// connection task (`ws::connect`); inbound frames + open/close arrive as
@@ -3993,9 +4061,31 @@ fn sys_ws_close(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
 // `self.postMessage`/`close` (running on the worker thread) call
 // `__worker_self_post`/`__worker_self_close` against its `WorkerSelf` host.
 
-/// `__worker_spawn(scriptURL, type, name)` → a worker id (>0), or -1 if workers
-/// aren't available here (no-net / one-shot transform), the URL is bad/blocked,
-/// or the per-page cap is reached. Spawns a dedicated `trust-worker-N` thread.
+/// Secure Contexts §3.1/§3.2: HTTPS/WSS, loopback HTTP, localhost, and file
+/// origins are potentially trustworthy. A Blob URL inherits the trust of the
+/// environment that created it, so callers handle that case with the owner's
+/// URL rather than asking the URL parser to treat `blob:` as an origin.
+fn potentially_trustworthy_url(url: &url::Url) -> bool {
+    match url.scheme() {
+        "https" | "wss" | "file" => true,
+        "http" => url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .strip_suffix(".localhost")
+                    .is_some_and(|prefix| !prefix.is_empty())
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }),
+        _ => false,
+    }
+}
+
+/// `__worker_spawn(scriptURL, type, name, blobSource)` → a worker id (>0), or
+/// -1 if workers aren't available here (no-net / one-shot transform), the URL
+/// is bad/blocked, or the per-page cap is reached. Spawns a dedicated
+/// `trust-worker-N` thread. `blobSource` is the active same-partition Blob URL
+/// entry, represented as a latin1 byte string; HTTP(S) workers pass null.
 fn sys_worker_spawn(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let url_arg = match args.first() {
         Some(v) => v.to_string(ctx)?.to_std_string_lossy(),
@@ -4009,6 +4099,14 @@ fn sys_worker_spawn(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
         Some(v) if !v.is_null_or_undefined() => v.to_string(ctx)?.to_std_string_lossy(),
         _ => String::new(),
     };
+    // The page-side Worker constructor resolves an active Blob URL through the
+    // authoritative JS store and passes its byte-exact source here. Keeping
+    // this as an explicit argument also means a revoked URL cannot be revived
+    // from the renderer's intentionally-retained image mirror.
+    let script_body = args
+        .get(3)
+        .filter(|v| !v.is_null_or_undefined())
+        .map(|v| arg_bytes_latin1(v, ctx));
     let host = ctx.realm().host_defined();
     let Some(workers) = host.get::<PageWorkers>() else {
         return Ok(JsValue::new(-1)); // no-net page / one-shot transform / nested worker
@@ -4016,12 +4114,19 @@ fn sys_worker_spawn(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
     let Ok(resolved) = workers.page.join(&url_arg) else {
         return Ok(JsValue::new(-1));
     };
-    if !matches!(resolved.scheme(), "http" | "https") {
-        return Ok(JsValue::new(-1)); // blob:/data: worker scripts not supported in v1
+    if !matches!(resolved.scheme(), "http" | "https" | "blob") {
+        return Ok(JsValue::new(-1));
     }
-    if !crate::http::subresource_allowed(&workers.page, &resolved) {
+    if resolved.scheme() == "blob" && script_body.is_none() {
+        // The JS-side Blob URL store no longer contains this entry (normally
+        // because URL.revokeObjectURL() ran before construction completed).
+        return Ok(JsValue::new(-1));
+    }
+    if resolved.scheme() != "blob" && !crate::http::subresource_allowed(&workers.page, &resolved) {
         return Ok(JsValue::new(-1)); // SSRF guard, same as fetch
     }
+    let secure_context = potentially_trustworthy_url(&workers.page)
+        && (resolved.scheme() == "blob" || potentially_trustworthy_url(&resolved));
     if workers.workers.borrow().len() >= MAX_WORKERS {
         return Ok(JsValue::new(-1));
     }
@@ -4036,6 +4141,8 @@ fn sys_worker_spawn(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
         script_url: resolved,
         kind,
         name,
+        script_body,
+        secure_context,
     };
     // The worker runs on its OWN 64MB-stack OS thread (Boa's parser recurses on
     // the native stack; same reason the page thread is wide). Named `trust-*` so
@@ -6939,7 +7046,7 @@ fn load_page(
     // CSS-pixel viewport from the real terminal: cols/rows times the
     // terminal's cell pixel size (the picker's font size; 8x16 nominal).
     let cfg = format!(
-        "globalThis.__trust_cfg = {{ url: \"{}\", ua: \"TRust/0.1\", language: \"{}\", languages: [\"{}\", \"{}\"], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {} }};",
+        "globalThis.__trust_cfg = {{ url: \"{}\", ua: \"TRust/0.1\", language: \"{}\", languages: [\"{}\", \"{}\"], width: {}, height: {}, devicePixelRatio: {}, hardwareConcurrency: {}, globalPrivacyControl: {}, secureContext: {} }};",
         esc_js(page_url),
         crate::locale::LANGUAGE,
         crate::locale::LANGUAGES[0],
@@ -6953,6 +7060,7 @@ fn load_page(
             .map(|n| n.get())
             .unwrap_or(8),
         crate::http::GLOBAL_PRIVACY_CONTROL,
+        parsed_url.as_ref().is_some_and(potentially_trustworthy_url),
     );
     // TRust lazy parsing (default on; `TRUST_NO_LAZY_PARSE` disables): enable
     // body-skip-at-parse and deferred compilation on this page thread before any
@@ -8214,6 +8322,13 @@ fn worker_prelude() -> &'static str {
             .and_then(|(_, rest)| rest.split_once("/*__SC_CODEC_END__*/"))
             .map(|(c, _)| c)
             .unwrap_or("");
+        // The Web Crypto block is self-contained after wrapping it in its own
+        // global scope, so Window and Worker share the same digest behavior.
+        let crypto = PRELUDE
+            .split_once("/*__CRYPTO_BEGIN__*/")
+            .and_then(|(_, rest)| rest.split_once("/*__CRYPTO_END__*/"))
+            .map(|(c, _)| format!("(function(g) {{\n{c}\n}})(globalThis);"))
+            .unwrap_or_default();
         // The WebAssembly block is self-contained (takes its own `g`), so the
         // worker reuses it verbatim — wasm runs inside a Worker too.
         let wasm = PRELUDE
@@ -8229,7 +8344,7 @@ fn worker_prelude() -> &'static str {
             .and_then(|(_, rest)| rest.split_once("/*__URLPATTERN_END__*/"))
             .map(|(c, _)| c)
             .unwrap_or("");
-        format!("{codec}\n{WORKER_SCOPE}\n{urlpattern}\n{wasm}")
+        format!("{codec}\n{WORKER_SCOPE}\n{crypto}\n{urlpattern}\n{wasm}")
     })
     .as_str()
 }
@@ -8374,6 +8489,12 @@ const WORKER_SCOPE: &str = r##"
     // --- location (WorkerLocation) ---
     var lp = __url_parse(cfg.url, null) || [cfg.url, "", "", "", "", "/", "", "", "", "", ""];
     g.location = { href: lp[0], protocol: lp[1], host: lp[2], hostname: lp[3], port: lp[4], pathname: lp[5], search: lp[6], hash: lp[7], origin: lp[8], toString: function () { return lp[0]; } };
+    // Secure Contexts §1.3: a dedicated worker inherits the owner's secure
+    // context when its script URL is potentially trustworthy. Rust computes
+    // that relationship, including Blob URL inheritance, at construction.
+    Object.defineProperty(g, "isSecureContext", {
+        configurable: true, enumerable: true, value: !!cfg.secureContext, writable: false,
+    });
 
     // --- navigator (WorkerNavigator), the same honest values as the page ---
     // WHATWG HTML §NavigatorLanguage: languages is a stable FrozenArray and
@@ -8422,15 +8543,7 @@ const WORKER_SCOPE: &str = r##"
     function TextEncoder() {}
     TextEncoder.prototype.encoding = "utf-8";
     TextEncoder.prototype.encode = function (s) {
-        s = String(s === undefined ? "" : s); var bytes = [];
-        for (var i = 0; i < s.length; i++) {
-            var c = s.charCodeAt(i);
-            if (c < 0x80) bytes.push(c);
-            else if (c < 0x800) bytes.push(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
-            else if (c >= 0xD800 && c <= 0xDBFF) { var c2 = s.charCodeAt(++i); var cp = 0x10000 + ((c & 0x3FF) << 10) + (c2 & 0x3FF); bytes.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F)); }
-            else bytes.push(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
-        }
-        return new Uint8Array(bytes);
+        return __text_encode(String(s === undefined ? "" : s));
     };
     function TextDecoder(label) { this.encoding = (label || "utf-8").toLowerCase(); this.fatal = false; }
     TextDecoder.prototype.decode = function (buf) {
@@ -8663,6 +8776,8 @@ fn run_worker(
         script_url,
         kind,
         name,
+        script_body,
+        secure_context,
     } = launch;
     let _ = kind; // v1 loads a module worker's entry as a classic script (fast-follow)
     let (mut ctx, _hooks) = page_context_with(None);
@@ -8700,7 +8815,7 @@ fn run_worker(
     }
     let mut outcome = Outcome::default();
     let cfg = format!(
-        "globalThis.__worker_cfg = {{ id: {id}, name: {}, url: {}, language: \"{}\", languages: [\"{}\", \"{}\"], hwc: {}, globalPrivacyControl: {} }};",
+        "globalThis.__worker_cfg = {{ id: {id}, name: {}, url: {}, language: \"{}\", languages: [\"{}\", \"{}\"], hwc: {}, globalPrivacyControl: {}, secureContext: {} }};",
         js_string(&name),
         js_string(script_url.as_str()),
         crate::locale::LANGUAGE,
@@ -8713,6 +8828,7 @@ fn run_worker(
             .map(|n| n.get())
             .unwrap_or(8),
         crate::http::GLOBAL_PRIVACY_CONTROL,
+        secure_context,
     );
     run_script(
         &mut ctx,
@@ -8735,28 +8851,32 @@ fn run_worker(
     // Fetch the worker's script (HTML "run a worker": fetch the classic script,
     // then run it). A non-2xx / failed fetch fires `error` on the page-side
     // Worker and the thread exits — the worker never starts.
-    let script = match page_net_fetch(
-        &mut ctx,
-        script_url.as_str(),
-        String::from("GET"),
-        None,
-        Vec::new(),
-    ) {
-        Some(resp)
-            if crate::http::classic_script_response_allowed(
-                resp.status,
-                &resp.content_type,
-                &resp.headers,
-            ) =>
-        {
-            String::from_utf8_lossy(&resp.body).into_owned()
-        }
-        _ => {
-            let _ = to_page.try_send((
-                id,
-                WorkerOut::Error(format!("worker script failed to load: {script_url}")),
-            ));
-            return;
+    let script = if let Some(body) = script_body {
+        String::from_utf8_lossy(&body).into_owned()
+    } else {
+        match page_net_fetch(
+            &mut ctx,
+            script_url.as_str(),
+            String::from("GET"),
+            None,
+            Vec::new(),
+        ) {
+            Some(resp)
+                if crate::http::classic_script_response_allowed(
+                    resp.status,
+                    &resp.content_type,
+                    &resp.headers,
+                ) =>
+            {
+                String::from_utf8_lossy(&resp.body).into_owned()
+            }
+            _ => {
+                let _ = to_page.try_send((
+                    id,
+                    WorkerOut::Error(format!("worker script failed to load: {script_url}")),
+                ));
+                return;
+            }
         }
     };
     run_script(
@@ -10258,11 +10378,9 @@ fn js_next_deadline(page: &mut LoadedPage) -> Option<f64> {
 /// and a module-evaluation promise; waking for those jobs follows the HTML
 /// event-loop task boundary instead of parking forever with no timer deadline.
 fn page_has_pending_jobs(page: &LoadedPage) -> bool {
-    let pending = page
-        .ctx
+    page.ctx
         .downcast_job_executor::<PageJobExecutor>()
-        .is_some_and(|executor| executor.has_pending_jobs());
-    pending
+        .is_some_and(|executor| executor.has_pending_jobs())
 }
 
 /// Does the page have scroll-driven work — an `IntersectionObserver` or a
@@ -16381,6 +16499,19 @@ const PRELUDE: &str = r##"
         get() { return loc; },
         set(v) { navigateLoc(v, false); },
     });
+    // Secure Contexts §3.1–§3.2: the Rust loader supplies the result for
+    // network documents; this fallback keeps hand-built test contexts honest
+    // for HTTPS, file, and loopback HTTP URLs. Blob URLs inherit the owner's
+    // result in the Worker configuration below.
+    const secureContext = cfg.secureContext !== undefined ? !!cfg.secureContext :
+        (locState.protocol === "https:" || locState.protocol === "wss:" || locState.protocol === "file:" ||
+         (locState.protocol === "http:" &&
+          (locState.hostname.toLowerCase() === "localhost" ||
+           locState.hostname.toLowerCase().endsWith(".localhost") ||
+           /^127(?:\.\d{1,3}){3}$/.test(locState.hostname) || locState.hostname === "::1")));
+    Object.defineProperty(g, "isSecureContext", {
+        configurable: true, enumerable: true, value: secureContext, writable: false,
+    });
     trust.navigationReplaces = function () { return !!trust.navigationReplace; };
     trust.takeNavigation = function () {
         const n = trust.navigation || null;
@@ -17170,6 +17301,7 @@ const PRELUDE: &str = r##"
     g.requestIdleCallback = (fn) => g.setTimeout(() => fn({ didTimeout: false, timeRemaining: () => 50 }), 0);
     g.cancelIdleCallback = (id) => g.clearTimeout(id);
 
+    /*__CRYPTO_BEGIN__*/
     // --- crypto: getRandomValues + randomUUID + subtle.digest ---
     // No CSPRNG here (text browser, no entropy source): random values
     // are Math.random-derived — fine for request ids / cache keys, NOT
@@ -17183,6 +17315,11 @@ const PRELUDE: &str = r##"
         if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
         return new Uint8Array(0);
     };
+    // Keep the WebCrypto BufferSource as an ArrayBuffer across the host seam.
+    // The interpreted fallback algorithms still operate on Uint8Array values,
+    // but SHA-256 is the hot path for proof-of-work and must not encode/decode
+    // every input and digest through a JS string.
+    const __nativeSha256 = (data) => __crypto_sha256_digest(data);
     const __shaPad = (bytes) => {
         const ml = bytes.length * 8;
         const total = (bytes.length + 1 + 8 + 63) & ~63;
@@ -17335,15 +17472,16 @@ const PRELUDE: &str = r##"
         subtle: {
             digest(algo, data) {
                 const name = (typeof algo === "string" ? algo : (algo && algo.name) || "").toUpperCase();
+                if (name === "SHA-256") return __nativeSha256(data);
                 const bytes = __cryptoBytes(data);
                 if (name === "SHA-1") return Promise.resolve(__sha1(bytes).buffer);
-                if (name === "SHA-256") return Promise.resolve(__sha256(bytes).buffer);
                 if (name === "SHA-384") return Promise.resolve(__sha384(bytes).buffer);
                 if (name === "SHA-512") return Promise.resolve(__sha512(bytes).buffer);
                 return Promise.reject(new Error("Unsupported digest algorithm: " + name));
             },
         },
     };
+    /*__CRYPTO_END__*/
 
     // DOMException — a real constructor (extends Error). core-js's
     // DOMException polyfill does `getBuiltIn("DOMException").prototype`
@@ -17780,15 +17918,7 @@ const PRELUDE: &str = r##"
     g.TextEncoder = class TextEncoder {
         get encoding() { return "utf-8"; }
         encode(s) {
-            const bytes = [];
-            for (const ch of String(s === undefined ? "" : s)) {
-                const c = ch.codePointAt(0);
-                if (c < 0x80) bytes.push(c);
-                else if (c < 0x800) bytes.push(0xc0 | (c >> 6), 0x80 | (c & 63));
-                else if (c < 0x10000) bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-                else bytes.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-            }
-            return new Uint8Array(bytes);
+            return __text_encode(String(s === undefined ? "" : s));
         }
     };
     g.TextDecoder = class TextDecoder {
@@ -19423,7 +19553,18 @@ const PRELUDE: &str = r##"
             this.onmessage = null; this.onmessageerror = null; this.onerror = null;
             let href = String(url);
             try { href = new g.URL(href, g.location.href).href; } catch (e) {}
-            this.__id = __worker_spawn(href, type, name);
+            // HTML's Worker constructor fetches Blob URLs from the File API
+            // Blob URL Store. The store is authoritative in this realm; pass
+            // an active entry's byte string to the Rust worker launcher rather
+            // than asking the HTTP client to dereference a `blob:` URL. This
+            // also makes a revoked URL fail closed because __resolveBlobURL()
+            // returns null after URL.revokeObjectURL().
+            let blobSource = null;
+            if (href.slice(0, 5) === "blob:") {
+                const entry = __resolveBlobURL(href);
+                if (entry) blobSource = entry.bytes;
+            }
+            this.__id = __worker_spawn(href, type, name, blobSource);
             if (this.__id > 0) trust.workers[this.__id] = this;
         }
         postMessage(message, _transfer) {
@@ -27351,7 +27492,7 @@ mod tests {
         );
         let mut env = PageEnv::bare(&format!("http://127.0.0.1:{port}/"));
         env.net = Some(rt.handle().clone());
-        let (handle, mut events) = spawn_page(html, env);
+        let (handle, mut events) = spawn_page(html.to_string(), env);
 
         // Poll (not blocking_recv) so a stuck worker can't hang the suite.
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -27375,6 +27516,57 @@ mod tests {
         assert!(
             got.contains("GOT pong=42 who=echo items=41+x"),
             "worker round-trip failed: {got}"
+        );
+    }
+
+    /// A dedicated worker created from an active File API Blob URL must run
+    /// the Blob URL Store's script bytes, just like an HTTP worker runs its
+    /// fetched response. This is the browser pattern used by Anubis' fast
+    /// proof-of-work challenge: fetch a worker source, wrap it in a Blob, and
+    /// construct `new Worker(URL.createObjectURL(blob))`.
+    #[test]
+    fn a_blob_url_worker_runs_its_store_script() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let html = r#"<body><pre id=o></pre><script>
+            const source = "self.onmessage = function (e) { crypto.subtle.digest('SHA-256', new TextEncoder().encode(e.data)).then(function (hash) { self.postMessage('BLOB:' + e.data + ':' + new Uint8Array(hash).length); }); };";
+            const blob = new Blob([source], { type: 'text/javascript' });
+            const url = URL.createObjectURL(blob);
+            const w = new Worker(url);
+            // Revocation after construction must not invalidate the fetch that
+            // has already started; future dereferences remain revoked.
+            URL.revokeObjectURL(url);
+            w.onmessage = function (e) { document.getElementById('o').textContent = e.data; };
+            w.onerror = function (e) { document.getElementById('o').textContent = 'ERR ' + e.message; };
+            w.postMessage('ok');
+        </script></body>"#;
+        let mut env = PageEnv::bare("https://example.com/");
+        env.net = Some(rt.handle().clone());
+        let (handle, mut events) = spawn_page(html.to_string(), env);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut got = String::new();
+        while std::time::Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(PageEvt::Updated { html, .. }) | Ok(PageEvt::Static { html, .. }) => {
+                    got = html;
+                    if got.contains("BLOB:ok:32") || got.contains("ERR ") {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        drop(handle);
+        assert!(
+            got.contains("BLOB:ok:32"),
+            "Blob URL worker did not run its source: {got}"
         );
     }
 
