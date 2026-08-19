@@ -21,7 +21,9 @@ use crate::render::{
 
 use super::ImageSizes;
 use super::NO_NODE;
+use super::Units;
 use super::flow::{Clip, Frag, FragKind, TopFrag};
+use super::style::{Outline, OutlineStyle, outline_of};
 
 struct Builder<'a> {
     dom: &'a Dom,
@@ -578,6 +580,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
             .document_element()
             .is_some_and(|root| canvas_background_node(builder.dom, root) == fragment.node);
         if !is_root && !is_canvas_body {
+            paint_native_control_surface(fragment, radii, builder);
             if let Some(color) = background_color(builder.dom, fragment.node)
                 && !color.is_transparent()
             {
@@ -711,13 +714,186 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
                     }));
                 }
             }
+            if matches!(piece.item.kind, super::ItemKind::Form) && style_node != NO_NODE {
+                paint_outline_box(
+                    builder,
+                    style_node,
+                    CssRect::new(
+                        fragment.x + piece.x,
+                        fragment.y + piece.y,
+                        piece.box_width,
+                        piece.box_height,
+                    ),
+                    outline_of(builder.dom, style_node, Units::of(builder.dom, style_node)),
+                );
+            }
             builder.pop_scroll_ancestors(piece_scroll_depth);
         }
+    }
+    if fragment.node != NO_NODE && fragment.w > 0.0 && fragment.h > 0.0 {
+        paint_outline(fragment, builder);
     }
     if pushed_fragment_clip {
         builder.pop_hard_clip();
     }
     builder.pop_scroll_ancestors(scroll_depth);
+}
+
+/// HTML Rendering §15.5 permits a user agent to supply a native appearance for
+/// form controls. CSS UI's `appearance:auto` is the opt-in/default state; an
+/// author-requested `appearance:none`, an explicit background, or an explicit
+/// border leaves the authored paint in charge. The graphical frontend needs a
+/// real surface for native text/button widgets because terminal brackets are
+/// intentionally emitted only by the terminal adapter.
+fn paint_native_control_surface(
+    fragment: &Frag<'_>,
+    radii: CornerRadii,
+    builder: &mut Builder<'_>,
+) {
+    let node = fragment.node;
+    let is_control = matches!(builder.dom.tag_name(node), Some("button" | "textarea"))
+        || (builder.dom.tag_name(node) == Some("input")
+            && !builder
+                .dom
+                .attr(node, "type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")))
+        || builder.dom.is_contenteditable_host(node);
+    if !is_control
+        || builder
+            .dom
+            .computed_value_resolved(node, "appearance")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("none"))
+        || builder
+            .dom
+            .computed_value_resolved(node, "-webkit-appearance")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("none"))
+    {
+        return;
+    }
+
+    let background_declared = builder
+        .dom
+        .computed_value_resolved(node, "background-color")
+        .is_some()
+        || builder
+            .dom
+            .computed_value_resolved(node, "background-image")
+            .is_some();
+    let border_declared = ["top", "right", "bottom", "left"].into_iter().any(|side| {
+        builder
+            .dom
+            .computed_value_resolved(node, &format!("border-{side}-style"))
+            .is_some()
+    });
+    let foreground = text_color(builder.dom, node, false);
+    let light_foreground = paint_color_is_light(foreground);
+    let surface = if light_foreground {
+        PaintColor::Rgba(31, 34, 38, 255)
+    } else {
+        PaintColor::Rgba(255, 255, 255, 255)
+    };
+    let edge = if light_foreground {
+        PaintColor::Rgba(125, 130, 138, 255)
+    } else {
+        PaintColor::Rgba(118, 118, 118, 255)
+    };
+    let rect = CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h);
+    if !background_declared {
+        builder.commands.push(DisplayCommand::Fill {
+            shape: rounded_shape(rect, radii),
+            brush: PaintBrush::Solid(surface),
+        });
+    }
+    if !border_declared {
+        builder.commands.push(DisplayCommand::Stroke {
+            shape: rounded_shape(
+                CssRect::new(
+                    rect.x + 0.5,
+                    rect.y + 0.5,
+                    (rect.width - 1.0).max(0.0),
+                    (rect.height - 1.0).max(0.0),
+                ),
+                radii,
+            ),
+            brush: PaintBrush::Solid(edge),
+            style: StrokeStyle::solid(1.0),
+        });
+    }
+}
+
+fn paint_color_is_light(color: PaintColor) -> bool {
+    let (r, g, b) = match color {
+        PaintColor::Rgba(r, g, b, _) => (r, g, b),
+        PaintColor::Foreground | PaintColor::Content | PaintColor::Window => (220, 220, 220),
+        _ => (30, 30, 30),
+    };
+    (u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) >= 128_000
+}
+
+/// Paint a CSS Basic User Interface 4 §3 outline. Unlike a border, the
+/// outline is outside the border edge and does not affect layout. The
+/// outline's exact stacking is intentionally UA-defined; emitting it at the
+/// end of this fragment's paint keeps it visible over the fragment's own text
+/// while preserving the surrounding Appendix E traversal.
+fn paint_outline(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
+    paint_outline_box(
+        builder,
+        fragment.node,
+        CssRect::new(fragment.x, fragment.y, fragment.w, fragment.h),
+        fragment.paint.outline,
+    );
+}
+
+fn paint_outline_box(
+    builder: &mut Builder<'_>,
+    node: NodeId,
+    border_box: CssRect,
+    outline: Outline,
+) {
+    if !outline.paints() || matches!(outline.style, OutlineStyle::Auto) {
+        return;
+    }
+    let width = outline.width;
+    let grow = outline.offset + width / 2.0;
+    let rect = CssRect::new(
+        border_box.x - grow,
+        border_box.y - grow,
+        border_box.width + grow * 2.0,
+        border_box.height + grow * 2.0,
+    );
+    let base_radii = border_radii(builder.dom, node, border_box);
+    let radii = CornerRadii {
+        corners: base_radii.corners.map(|(x, y)| (x + grow, y + grow)),
+    };
+    let color = builder
+        .dom
+        .computed_value_resolved(node, "outline-color")
+        .and_then(|value| {
+            if value.trim().eq_ignore_ascii_case("currentcolor") {
+                Some(text_color(builder.dom, node, false))
+            } else {
+                PaintColor::parse_css(&value)
+            }
+        })
+        .unwrap_or_else(|| text_color(builder.dom, node, false));
+    builder.commands.push(DisplayCommand::Stroke {
+        shape: rounded_shape(rect, radii),
+        brush: PaintBrush::Solid(color),
+        style: match outline.style {
+            OutlineStyle::Dotted => {
+                let mut style = StrokeStyle::solid(width);
+                style.dash = vec![0.0, width * 2.0];
+                style.cap = LineCap::Round;
+                style
+            }
+            OutlineStyle::Dashed => {
+                let mut style = StrokeStyle::solid(width);
+                style.dash = vec![width * 3.0, width * 2.0];
+                style
+            }
+            _ => StrokeStyle::solid(width),
+        },
+    });
 }
 
 /// The resident page actor serializes its own node identity into presentation

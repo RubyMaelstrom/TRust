@@ -5,6 +5,7 @@
 //! those spaces distinct; only a frontend renderer applies [`ScaleFactor`].
 //! See CSSOM View §4 and CSS Values and Units §6.2.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc;
 
@@ -242,6 +243,12 @@ pub enum UserAction {
         value: String,
         checked: Option<bool>,
     },
+    /// Deliver a native keydown to the focused live DOM node. The resident
+    /// actor reports whether page script canceled its default action.
+    PageKey {
+        node: usize,
+        input: KeyInput,
+    },
     /// Submit through the live actor first, falling back to HTML's native
     /// application/x-www-form-urlencoded submission when not canceled.
     SubmitForm {
@@ -439,6 +446,9 @@ pub struct BrowserController {
     live_task: Option<JoinHandle<()>>,
     live_page: Option<crate::js::PageHandle>,
     pending_live_submit: Option<(crate::doc::Form, Option<usize>)>,
+    /// Default-action results for keyboard events delivered to the resident
+    /// page. Native frontends consume these after the actor runs `keydown`.
+    page_key_defaults: VecDeque<bool>,
     pending_fragment: Option<String>,
     storage: crate::js::WebStorage,
     external_address: Option<String>,
@@ -470,6 +480,7 @@ impl BrowserController {
             live_task: None,
             live_page: None,
             pending_live_submit: None,
+            page_key_defaults: VecDeque::new(),
             pending_fragment: None,
             storage: Default::default(),
             external_address: None,
@@ -509,6 +520,13 @@ impl BrowserController {
 
     pub fn page_is_live(&self) -> bool {
         self.live_page.is_some()
+    }
+
+    /// Take the next resident-page keyboard default result. `true` means the
+    /// page canceled `keydown`; `false` lets the native frontend run the
+    /// corresponding editing or implicit-submission default.
+    pub fn take_page_key_default(&mut self) -> Option<bool> {
+        self.page_key_defaults.pop_front()
     }
 
     /// Publish graphical layout boundaries the resident actor may target.
@@ -776,6 +794,10 @@ impl BrowserController {
                 }
                 true
             }
+            UserAction::PageKey { node, input } => {
+                self.send_live(crate::js::PageCmd::Key { node, input });
+                false
+            }
             UserAction::SubmitForm { form, submitter } => {
                 let form_node = form.live_node;
                 let submitter_node = submitter
@@ -1024,6 +1046,7 @@ impl BrowserController {
             page.retire();
         }
         self.pending_live_submit = None;
+        self.page_key_defaults.clear();
         if let Some(task) = self.live_task.take() {
             task.abort();
         }
@@ -1153,6 +1176,10 @@ impl BrowserController {
                 let changed = self.status != "Ready";
                 self.status = String::from("Ready");
                 changed
+            }
+            PageEvt::KeyDefault { prevented } => {
+                self.page_key_defaults.push_back(prevented);
+                false
             }
             PageEvt::Scrolled { node, top, left } => {
                 let position = CssPoint::new(left as f32, top as f32);

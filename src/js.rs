@@ -7935,6 +7935,13 @@ pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
 pub enum PageCmd {
     /// Dispatch a click on this arena node.
     Click(usize),
+    /// Dispatch a cancelable UI Events `keydown` at this live DOM node. The
+    /// native frontend applies the editing/form default only after the actor
+    /// reports whether page script canceled the event.
+    Key {
+        node: usize,
+        input: crate::core::KeyInput,
+    },
     /// Set a form control's value in the live DOM, then fire input/change.
     SetValue {
         node: usize,
@@ -8119,6 +8126,10 @@ pub enum PageEvt {
     Trouble(Vec<String>),
     /// A dispatch settled without a renderable mutation.
     Settled,
+    /// Result of a native `keydown` dispatch. `prevented` is the event's
+    /// `defaultPrevented` flag; the frontend owns the corresponding editing
+    /// or implicit-submission default action.
+    KeyDefault { prevented: bool },
     /// A page-initiated inner-scroll write (CSSOM View, Phase 3): the page set
     /// `element.scrollTop` (a chat pinning to bottom) on a scroll-region element
     /// without otherwise mutating the DOM. The app re-windows that region (by
@@ -9473,6 +9484,51 @@ fn page_actor(
                     return;
                 }
             }
+            PageCmd::Key { node, input } => {
+                let prevented = dispatch_key_in(&mut page, node, &input);
+                drain_js_side(&mut page.ctx, &mut page.outcome);
+                if page.outcome.panicked {
+                    let _ = evts
+                        .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+                    return;
+                }
+                if let Some((url, replace)) = take_script_navigation(&mut page) {
+                    if evts.blocking_send(navigation_event(url, replace)).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                // A page key handler may activate a submit button (for
+                // example a chat editor's Enter handler calls `button.click()`).
+                // The key dispatch marks that synthetic activation as user-key
+                // work, so it follows the same native form path as a pointer
+                // click and does not also receive the editor's default newline.
+                if let Some((form, submitter, submission)) = take_click_submit(&mut page) {
+                    if !finish_dispatch_render(&mut page, &evts, false) {
+                        return;
+                    }
+                    if evts
+                        .blocking_send(PageEvt::SubmitForm {
+                            form,
+                            submitter: Some(submitter),
+                            submission,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                if !finish_dispatch(&mut page, &evts) {
+                    return;
+                }
+                if evts
+                    .blocking_send(PageEvt::KeyDefault { prevented })
+                    .is_err()
+                {
+                    return;
+                }
+            }
             PageCmd::SetValue {
                 node,
                 value,
@@ -10573,6 +10629,79 @@ fn dispatch_form_set_in(page: &mut LoadedPage, node: usize, value: &str, checked
         return;
     }
     checkpoint_live_task(page);
+}
+
+/// Dispatch the UI Events `keydown` at the focused live node. The event is
+/// deliberately delivered before the native frontend performs editing: page
+/// code such as a rich-text editor or chat composer may cancel the default and
+/// activate its own submit control. UI Events defines the key/modifier fields;
+/// HTML's editing and implicit-submission defaults remain on the frontend side
+/// after this cancelable dispatch.
+fn dispatch_key_in(page: &mut LoadedPage, node: usize, input: &crate::core::KeyInput) -> bool {
+    prepare_dispatch(page);
+    let key = match &input.key {
+        crate::core::Key::Character(value) => value.clone(),
+        crate::core::Key::Enter => String::from("Enter"),
+        crate::core::Key::Escape => String::from("Escape"),
+        crate::core::Key::Backspace => String::from("Backspace"),
+        crate::core::Key::Delete => String::from("Delete"),
+        crate::core::Key::Tab => String::from("Tab"),
+        crate::core::Key::ArrowLeft => String::from("ArrowLeft"),
+        crate::core::Key::ArrowRight => String::from("ArrowRight"),
+        crate::core::Key::ArrowUp => String::from("ArrowUp"),
+        crate::core::Key::ArrowDown => String::from("ArrowDown"),
+        crate::core::Key::Home => String::from("Home"),
+        crate::core::Key::End => String::from("End"),
+        crate::core::Key::PageUp => String::from("PageUp"),
+        crate::core::Key::PageDown => String::from("PageDown"),
+        crate::core::Key::Other(value) => value.clone(),
+    };
+    let code = match &input.key {
+        crate::core::Key::Character(value) if value.len() == 1 => {
+            format!("Key{}", value.to_ascii_uppercase())
+        }
+        crate::core::Key::Character(_) => String::new(),
+        crate::core::Key::Enter => String::from("Enter"),
+        crate::core::Key::Escape => String::from("Escape"),
+        crate::core::Key::Backspace => String::from("Backspace"),
+        crate::core::Key::Delete => String::from("Delete"),
+        crate::core::Key::Tab => String::from("Tab"),
+        crate::core::Key::ArrowLeft => String::from("ArrowLeft"),
+        crate::core::Key::ArrowRight => String::from("ArrowRight"),
+        crate::core::Key::ArrowUp => String::from("ArrowUp"),
+        crate::core::Key::ArrowDown => String::from("ArrowDown"),
+        crate::core::Key::Home => String::from("Home"),
+        crate::core::Key::End => String::from("End"),
+        crate::core::Key::PageUp => String::from("PageUp"),
+        crate::core::Key::PageDown => String::from("PageDown"),
+        crate::core::Key::Other(value) => value.clone(),
+    };
+    let mut key_outcome = Outcome::default();
+    let prevented = guarded_call_trust(
+        &mut page.ctx,
+        "key",
+        &[
+            JsValue::from(node as f64),
+            str_value(&key),
+            str_value(&code),
+            JsValue::from(input.repeat),
+            JsValue::from(input.composing),
+            JsValue::from(input.modifiers.shift),
+            JsValue::from(input.modifiers.control),
+            JsValue::from(input.modifiers.alt),
+            JsValue::from(input.modifiers.meta),
+        ],
+        "keydown",
+        &mut key_outcome,
+    )
+    .is_some_and(|value| value.to_boolean());
+    page.outcome.errors.extend(key_outcome.errors);
+    if key_outcome.panicked {
+        page.outcome.panicked = true;
+        return true;
+    }
+    checkpoint_live_task(page);
+    prevented
 }
 
 fn dispatch_submit_in(page: &mut LoadedPage, form: usize, submitter: Option<usize>) -> bool {
@@ -12648,7 +12777,7 @@ const PRELUDE: &str = r##"
                 const sev = new Event("submit", { bubbles: true, cancelable: true });
                 sev.submitter = btn;
                 dispatch(form, sev, false);
-                if (record) trust.lastClickSubmit = { form: form.__id, submitter: btn.__id, prevented: sev.defaultPrevented };
+                if (record || trust.keyDispatch) trust.lastClickSubmit = { form: form.__id, submitter: btn.__id, prevented: sev.defaultPrevented };
                 if (!sev.defaultPrevented) handleDialogSubmission(form, btn);
                 return sev.defaultPrevented;
             }
@@ -12657,6 +12786,32 @@ const PRELUDE: &str = r##"
     }
     trust.click = function (id) {
         return activateClick(wrap(id), true);
+    };
+    // UI Events §3.5: a native keydown is a cancelable event dispatched at
+    // the focused element before the user agent performs its default editing
+    // action. Keep a short-lived user-key activation flag so a page handler
+    // that calls `sendButton.click()` is still observable by the actor as the
+    // submit default of this key, while ordinary script `.click()` calls keep
+    // their non-user semantics.
+    trust.key = function (id, key, code, repeat, composing, shift, ctrl, alt, meta) {
+        const t = wrap(id);
+        if (!t) return false;
+        trust.lastClickSubmit = null;
+        trust.keyDispatch = true;
+        let prevented = false;
+        try {
+            const ev = new KeyboardEvent("keydown", {
+                bubbles: true, cancelable: true, composed: true, view: g,
+                key: String(key || ""), code: String(code || ""),
+                repeat: !!repeat, isComposing: !!composing,
+                shiftKey: !!shift, ctrlKey: !!ctrl, altKey: !!alt, metaKey: !!meta,
+            });
+            dispatch(t, ev, false);
+            prevented = ev.defaultPrevented;
+        } finally {
+            trust.keyDispatch = false;
+        }
+        return prevented;
     };
     // Fire a load/error event on an injected <script> (and its on<type>
     // handler), for loaders that wait on `script.onload` instead of polling.
@@ -29159,6 +29314,62 @@ mod tests {
             }
         };
         assert!(html2.contains("submitted:Go"), "{html2}");
+    }
+
+    #[test]
+    fn live_keydown_can_cancel_editing_and_activate_a_submitter() {
+        // UI Events keydown reaches the focused editing host before the
+        // frontend's default editing action. A chat-style handler can cancel
+        // Enter and activate its authored Send button; the submit event must
+        // retain that button as `event.submitter`.
+        let (handle, mut events) = live(
+            "<body><form id=f><div id=e contenteditable=true></div>\
+             <button id=send type=submit>Send</button><p id=out>idle</p></form>\
+             <script>\
+             const e = document.getElementById('e');\
+             const f = document.getElementById('f');\
+             const out = document.getElementById('out');\
+             e.addEventListener('keydown', ev => {\
+               ev.preventDefault();\
+               f.addEventListener('submit', se => {\
+                 se.preventDefault();\
+                 out.textContent = ev.key + ':' + se.submitter.id;\
+               }, { once: true });\
+               document.getElementById('send').click();\
+             });\
+             </script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("live editor should keep the actor resident");
+        };
+        let editor = live_node_after(&html, "contenteditable");
+        handle
+            .cmds
+            .blocking_send(PageCmd::Key {
+                node: editor,
+                input: crate::core::KeyInput {
+                    key: crate::core::Key::Enter,
+                    state: crate::core::KeyState::Pressed,
+                    modifiers: crate::core::Modifiers::default(),
+                    repeat: false,
+                    composing: false,
+                },
+            })
+            .unwrap();
+        let mut updated = false;
+        let mut default_prevented = None;
+        while !updated || default_prevented.is_none() {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => {
+                    updated = true;
+                    assert!(html.contains("Enter:send"), "{html}");
+                }
+                Some(PageEvt::KeyDefault { prevented }) => default_prevented = Some(prevented),
+                Some(PageEvt::Settled) => {}
+                other => panic!("expected keydown dispatch completion, got {other:?}"),
+            }
+        }
+        assert_eq!(default_prevented, Some(true));
     }
 
     #[test]

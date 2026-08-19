@@ -3830,6 +3830,141 @@ mod tests {
     }
 
     #[test]
+    fn live_form_buttons_keep_authored_content_in_both_frontends() {
+        // HTML Rendering §15.5.3: a button's child boxes are its anonymous
+        // button content. A live form also commonly contains a contenteditable
+        // editor plus several icon buttons; treating those buttons as static
+        // form atoms throws their content away and paints one synthetic
+        // "Button" label for each of them.
+        let base = Url::parse("https://example.test/chat").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r#"<body><form style="border:1px solid #888">
+                 <div id="editor" contenteditable="true" aria-placeholder="Message"></div>
+                 <button id="attach" type="button"><span>Attach</span></button>
+                 <button id="send" type="submit"><span>Send</span></button>
+               </form></body>"#,
+        );
+        let attach = dom.get_by_id("attach").unwrap();
+        let send = dom.get_by_id("send").unwrap();
+        dom.set_render_clickables([attach, send].into_iter().collect(), true);
+
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(640.0, 480.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        assert!(rendered.controls.contains_key(&attach));
+        assert!(rendered.controls.contains_key(&send));
+        let glyphs = rendered
+            .layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|command| match command {
+                crate::render::DisplayCommand::GlyphRun { shaped, .. } => {
+                    Some(shaped.text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            glyphs.contains("Attach"),
+            "authored button content: {glyphs:?}"
+        );
+        assert!(
+            glyphs.contains("Send"),
+            "authored button content: {glyphs:?}"
+        );
+        assert!(
+            !glyphs.contains("Button"),
+            "synthetic button leaked: {glyphs:?}"
+        );
+
+        let terminal = adapt_rendered_terminal(
+            &base,
+            "text/html",
+            Vec::new(),
+            rendered,
+            crate::layout2::TerminalViewport::new(80, 24, 8.0, 16.0),
+            &Default::default(),
+        );
+        let terminal_text = terminal
+            .rows
+            .iter()
+            .flat_map(|row| row.items.iter())
+            .map(|item| item.text.as_str())
+            .collect::<String>();
+        assert!(terminal_text.contains("Attach"));
+        assert!(terminal_text.contains("Send"));
+        assert!(!terminal_text.contains("Button"));
+    }
+
+    #[test]
+    fn graphical_live_chat_controls_have_visible_native_surfaces_and_icon_pixels() {
+        // HTML Rendering §15.5 allows native control appearance. The
+        // graphical path must provide that appearance independently of the
+        // terminal-only bracket affordance, including for a contenteditable
+        // editor synthesized as a textarea-like live control.
+        let base = Url::parse("https://chatgpt.com/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r##"<html><body style="margin:0;background:#000;color:#fff"><form>
+                <div id="editor" contenteditable="true" aria-placeholder="Message"></div>
+                <button id="send" type="submit" aria-label="Send">
+                    <svg viewBox="0 0 24 24"><path fill="currentColor" d="M3 20 21 12 3 4v6l12 2-12 2v6Z"/></svg>
+                </button>
+            </form></body></html>"##,
+        );
+        let send = dom.get_by_id("send").unwrap();
+        dom.set_render_clickables([send].into_iter().collect(), true);
+        let rendered = render_arena(
+            &dom,
+            &base,
+            crate::layout2::Viewport::new(640.0, 480.0),
+            1.0,
+            None,
+            &Default::default(),
+        );
+        let surfaces = rendered
+            .layout
+            .paint
+            .primitives
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    crate::render::DisplayCommand::Fill {
+                        brush: crate::render::PaintBrush::Solid(crate::render::PaintColor::Rgba(
+                            31, 34, 38, 255
+                        )),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert!(surfaces >= 2, "editor and button need native surfaces");
+        let source = rendered
+            .image_urls
+            .iter()
+            .find(|source| source.starts_with("data:image/svg+xml"))
+            .expect("Send SVG enters desktop image discovery");
+        let bytes = crate::img::decode_data_url(source).unwrap();
+        let markup = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            markup.contains("#fff"),
+            "currentColor was not resolved: {markup}"
+        );
+        let (image, _) = crate::img::decode(&bytes).expect("Send SVG decodes for desktop");
+        assert!(
+            image.to_rgba8().pixels().any(|pixel| {
+                pixel[0] > 220 && pixel[1] > 220 && pixel[2] > 220 && pixel[3] > 0
+            })
+        );
+    }
+
+    #[test]
     fn direct_shadow_svg_emits_an_image_command_before_decode() {
         // SVG 2 §5.1 makes an outermost inline SVG a replaced element in an
         // HTML/CSS layout. A declared box must retain its paint resource while

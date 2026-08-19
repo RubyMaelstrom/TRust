@@ -29,7 +29,7 @@ use super::flex::{
 use super::float::{FloatBox, FloatCtx, Side};
 use super::inline::{AtomBoxSize, FloatEnv, Ifc, InlineItem, LineOut, OofMark, Piece};
 use super::intrinsic::IMode;
-use super::style::{BOTTOM, BoxStyle, InlineStyle, LEFT, Pos, RIGHT, TOP, block_align};
+use super::style::{BOTTOM, BoxStyle, InlineStyle, LEFT, Outline, Pos, RIGHT, TOP, block_align};
 use super::tree::{Atom, AtomKind, BoxNode, Content, Inline};
 use super::value::{Len, Vp};
 
@@ -172,6 +172,9 @@ pub(crate) struct PaintFlags {
     pub opacity: f32,
     /// Paints a background over the border box in display-list order.
     pub bg: bool,
+    /// CSS UI 4 §3 outline decoration. Unlike `border`, this is paint-only and
+    /// does not affect the fragment's used geometry.
+    pub outline: Outline,
     /// Containing block for absolutely positioned descendants (§10.1:
     /// positioned; transforms-1 §3: any transform).
     pub cb_abs: bool,
@@ -193,6 +196,7 @@ impl Default for PaintFlags {
             z: None,
             opacity: 1.0,
             bg: false,
+            outline: Outline::NONE,
             cb_abs: false,
             cb_fixed: false,
             float: false,
@@ -229,6 +233,7 @@ pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
         z: s.z_index,
         opacity: s.opacity,
         bg: s.bg,
+        outline: s.outline,
         cb_abs: s.position.positioned() || s.has_transform,
         cb_fixed: s.has_transform,
         // Set on the laid float fragment by `lay_inlines`, not from style

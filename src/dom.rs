@@ -4303,8 +4303,10 @@ impl Dom {
     /// Replace each renderable inline `<svg>` with an `<img>` whose `src` is the
     /// SVG as a `data:` URL, so the existing image pipeline decodes, sizes,
     /// caches, and silhouette-tints it — a vector icon/logo becomes a rendered
-    /// glyph rather than its accessible-name text. SVG colors are NOT honored
-    /// (same call as dropping HTML/CSS color); the recolor happens at encode.
+    /// glyph rather than its accessible-name text. `currentColor` is resolved
+    /// from the SVG element's computed CSS color before the graphical image
+    /// path sees the source; the terminal encoder may still apply its own
+    /// silhouette tint after that.
     /// Non-renderable SVG (a `<use>`-only sprite instance, or a hidden
     /// `<symbol>`/`<defs>` container) is left untouched, keeping the existing
     /// icon-glyph / accessible-name fallback. Runs once per DOM build, before
@@ -4354,6 +4356,7 @@ impl Dom {
             let w_attr = self.attr(id, "width").map(str::to_string);
             let h_attr = self.attr(id, "height").map(str::to_string);
             let img = self.create_element("img");
+            let svg = self.resolve_svg_current_color(id, svg);
             self.set_attr(img, "src", &crate::img::svg_data_url(&svg));
             if !name.is_empty() {
                 self.set_attr(img, "alt", &name);
@@ -4386,7 +4389,43 @@ impl Dom {
             return None;
         }
         let svg = self.svg_render_markup(id, base)?;
-        Some((crate::img::svg_data_url(&svg), self.svg_accessible_name(id)))
+        Some((
+            crate::img::svg_data_url(&self.resolve_svg_current_color(id, svg)),
+            self.svg_accessible_name(id),
+        ))
+    }
+
+    /// SVG's `currentColor` is the computed CSS `color` of the element, not a
+    /// renderer theme. The desktop image pipeline rasterizes the serialized
+    /// SVG without the terminal's silhouette pass, so carry the resolved
+    /// color into the resource itself (CSS Color 4 and SVG 2 paint servers).
+    ///
+    /// A missing `color` declaration reaches the CSS initial value, black;
+    /// that is also the SVG initial `fill` color. The markup produced here is
+    /// self-contained, so the serialized resource must carry the used value
+    /// while preserving descendant-specific `color` declarations.
+    fn resolve_svg_current_color(&self, id: NodeId, svg: String) -> String {
+        replace_css_current_color(&svg, &self.svg_used_color(id))
+    }
+
+    /// Resolve the used `color` value for an SVG element. CSS Color 4 §15.5
+    /// keeps `currentcolor` as a keyword on the `color` property itself; its
+    /// used value is the inherited color, so walk ancestors when the computed
+    /// value is still that keyword.
+    fn svg_used_color(&self, id: NodeId) -> String {
+        let mut current = Some(id);
+        loop {
+            let Some(node) = current else {
+                return String::from("black");
+            };
+            if let Some(value) = self
+                .computed_value_resolved(node, "color")
+                .filter(|value| !value.trim().eq_ignore_ascii_case("currentcolor"))
+            {
+                return value;
+            }
+            current = self.nodes[node].parent;
+        }
     }
 
     /// Resolve the SVG 2 §5.6 `use` instance tree into self-contained markup
@@ -4407,7 +4446,7 @@ impl Dom {
             }
             outer
         } else if self.svg_is_renderable(id) {
-            self.serialize(id)
+            self.serialize_svg_for_image(id)
         } else {
             return None;
         };
@@ -4416,6 +4455,61 @@ impl Dom {
             svg = svg.replacen("<svg", r#"<svg xmlns="http://www.w3.org/2000/svg""#, 1);
         }
         Some(svg)
+    }
+
+    /// Serialize an inline SVG while resolving `currentColor` per element.
+    /// The ordinary HTML serializer intentionally drops `<style>` elements;
+    /// this small SVG serializer keeps their text and applies the same
+    /// computed-color substitution to each element's authored/baked attrs.
+    fn serialize_svg_for_image(&self, root: NodeId) -> String {
+        let mut out = String::new();
+        self.serialize_svg_node_for_image(root, &mut out);
+        out
+    }
+
+    fn serialize_svg_node_for_image(&self, id: NodeId, out: &mut String) {
+        match &self.nodes[id].data {
+            NodeData::Document | NodeData::Fragment => {
+                for child in self.child_iter(id) {
+                    self.serialize_svg_node_for_image(child, out);
+                }
+            }
+            NodeData::Doctype => {}
+            NodeData::Comment(text) => {
+                out.push_str("<!--");
+                out.push_str(&text.replace("--", "- -"));
+                out.push_str("-->");
+            }
+            NodeData::Text(text) => out.push_str(&escape_text(text)),
+            NodeData::Element { name, attrs, .. } => {
+                let tag = name.local.as_ref();
+                if matches!(tag, "script" | "noscript" | "template")
+                    || (tag != "style" && self.is_hidden(id))
+                {
+                    return;
+                }
+                let color = self.svg_used_color(id);
+                let mut serialized_attrs = String::new();
+                self.write_attrs(
+                    id,
+                    attrs,
+                    &mut |_, value| Some(replace_css_current_color(value, &color)),
+                    &mut serialized_attrs,
+                );
+                out.push('<');
+                out.push_str(tag);
+                out.push_str(&replace_css_current_color(&serialized_attrs, &color));
+                out.push('>');
+                if !VOID_ELEMENTS.contains(&tag) {
+                    for child in self.child_iter(id) {
+                        self.serialize_svg_node_for_image(child, out);
+                    }
+                    out.push_str("</");
+                    out.push_str(tag);
+                    out.push('>');
+                }
+            }
+        }
     }
 
     /// The first resolvable same-tree fragment referenced by a descendant
@@ -5893,6 +5987,33 @@ fn escape_attr(s: &str) -> Cow<'_, str> {
     )
 }
 
+/// Replace the CSS color `currentcolor` keyword without touching a longer
+/// identifier that merely contains the same bytes. CSS identifiers are ASCII
+/// case-insensitive here; the surrounding SVG markup remains byte-for-byte
+/// unchanged.
+fn replace_css_current_color(input: &str, replacement: &str) -> String {
+    const NEEDLE: &str = "currentcolor";
+    let lower = input.to_ascii_lowercase();
+    let is_ident = |byte: Option<u8>| {
+        byte.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    };
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0;
+    for (start, _) in lower.match_indices(NEEDLE) {
+        let end = start + NEEDLE.len();
+        if is_ident(lower.as_bytes().get(start.wrapping_sub(1)).copied())
+            || is_ident(lower.as_bytes().get(end).copied())
+        {
+            continue;
+        }
+        out.push_str(&input[cursor..start]);
+        out.push_str(replacement);
+        cursor = end;
+    }
+    out.push_str(&input[cursor..]);
+    out
+}
+
 // ---- Selector subset ------------------------------------------------
 
 /// The workhorse selector grammar: `tag`, `*`, `#id`, `.class` (CSS ident
@@ -6585,9 +6706,9 @@ fn sprite_has_symbol(abs_url: &str, frag: &str) -> bool {
 /// Turn each into a STANDALONE `<svg viewBox>` carrying that symbol's own
 /// geometry + the shape-affecting presentation attrs (`fill`/`fill-rule`/
 /// `clip-rule`) — no width/height, so the replacement `<img>`'s CSS box drives
-/// the used size (CSS 2.1 §10.3.2 rule 3, ratio-only). `currentColor` is
-/// resolved to a solid so stroke/fill outline icons still produce coverage for
-/// the silhouette tint (the icon's own colors are flattened either way).
+/// the used size (CSS 2.1 §10.3.2 rule 3, ratio-only). Preserve `currentColor`
+/// until the referencing SVG element's computed color is available; the
+/// graphical and terminal paths then make their own final paint choice.
 fn build_sprite_symbols(text: &str) -> FxHashMap<String, String> {
     let dom = Dom::parse_document(text);
     let mut out = FxHashMap::default();
@@ -6613,8 +6734,7 @@ fn build_sprite_symbols(text: &str) -> FxHashMap<String, String> {
         }
         let svg = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="{vb}"{pres}>{inner}</svg>"#
-        )
-        .replace("currentColor", "#000");
+        );
         out.insert(frag.to_string(), svg);
     }
     out
@@ -7356,6 +7476,14 @@ const PROPS: &[PropDef] = &[
     prop("border-top-right-radius", false, true),
     prop("border-bottom-right-radius", false, true),
     prop("border-bottom-left-radius", false, true),
+    // CSS Basic User Interface 4 §3: outlines are paint-only decorations and
+    // therefore do not enter the box model. Keep the shorthand tracked for
+    // @supports and expand it to these longhands before cascade resolution.
+    prop("outline", false, true),
+    prop("outline-width", false, true),
+    prop("outline-style", false, true),
+    prop("outline-color", false, true),
+    prop("outline-offset", false, true),
 ];
 
 /// Initial values which must be materialized at the CSSOM boundary rather
@@ -7766,6 +7894,25 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             Some(w.unwrap_or("medium")),
             Some(s.unwrap_or("none")),
             Some(c.unwrap_or("currentcolor")),
+        );
+    }
+    // CSS Basic User Interface 4 §3.1: `outline` has the same unordered
+    // width/style/color grammar as `border`, but its omitted longhands reset
+    // to the outline initials (medium/none/auto) and it also admits `auto` as
+    // a style. `outline-offset` is intentionally separate and is not part of
+    // this shorthand.
+    if prop == "outline" {
+        if wide_keyword(value).is_some() {
+            return outline_longhands(Some(value), Some(value), Some(value));
+        }
+        let (w, s, c) = parse_outline_shorthand(value);
+        if w.is_none() && s.is_none() && c.is_none() {
+            return Vec::new();
+        }
+        return outline_longhands(
+            Some(w.unwrap_or("medium")),
+            Some(s.unwrap_or("none")),
+            Some(c.unwrap_or("auto")),
         );
     }
     // `grid-gap`/`grid-row-gap`/`grid-column-gap`: the deprecated aliases of
@@ -8370,6 +8517,47 @@ fn parse_border_shorthand(value: &str) -> (Option<&str>, Option<&str>, Option<&s
         }
     }
     (width, style, color)
+}
+
+fn parse_outline_shorthand(value: &str) -> (Option<&str>, Option<&str>, Option<&str>) {
+    const STYLES: &[&str] = &[
+        "auto", "none", "hidden", "solid", "dashed", "dotted", "double", "groove", "ridge",
+        "inset", "outset",
+    ];
+    let mut width = None;
+    let mut style = None;
+    let mut color = None;
+    for tok in split_value_tokens(value) {
+        if STYLES.contains(&tok) {
+            style = Some(tok);
+        } else if tok == "thin"
+            || tok == "medium"
+            || tok == "thick"
+            || tok.starts_with(|c: char| c.is_ascii_digit() || c == '.' || c == '-')
+        {
+            width = Some(tok);
+        } else if tok.eq_ignore_ascii_case("currentcolor")
+            || tok.eq_ignore_ascii_case("transparent")
+            || tok.parse::<svgtypes::Color>().is_ok()
+            || tok.starts_with("hsl(")
+            || tok.starts_with("hwb(")
+            || tok.starts_with("color(")
+        {
+            color = Some(tok);
+        }
+    }
+    (width, style, color)
+}
+
+fn outline_longhands(w: Option<&str>, s: Option<&str>, c: Option<&str>) -> Vec<(String, String)> {
+    [
+        ("outline-width", w),
+        ("outline-style", s),
+        ("outline-color", c),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.map(|value| (name.to_string(), value.to_string())))
+    .collect()
 }
 
 fn border_longhands(
@@ -10666,6 +10854,43 @@ mod tests {
             .filter(|&d| dom.tag_name(d) == Some("svg"))
             .count();
         assert_eq!(svgs, 2);
+    }
+
+    #[test]
+    fn inline_svg_current_color_is_materialized_for_graphical_paint() {
+        // CSS Color 4 defines `currentColor` from the element's computed
+        // `color`; the desktop rasterizer has no DOM/CSS context once it gets
+        // the image bytes, so the resource must carry that resolved value.
+        let dom = Dom::parse_document(
+            r#"<body style="color:#f5f5f5"><svg id="send" viewBox="0 0 10 10">
+                <path fill="currentColor" d="M0 0h10v10H0z"/>
+                <g style="color:#e22"><path fill="currentColor" d="M0 0h5v10H0z"/></g>
+            </svg></body>"#,
+        );
+        let svg = dom.get_by_id("send").unwrap();
+        let (source, _) = dom
+            .svg_image_data(svg, None)
+            .expect("inline SVG is a graphical image");
+        let markup = String::from_utf8(crate::img::decode_data_url(&source).unwrap()).unwrap();
+        assert!(
+            markup.contains("fill=\"#f5f5f5\""),
+            "resolved color missing: {markup}"
+        );
+        assert!(
+            markup.contains("fill=\"#e22\""),
+            "descendant color missing: {markup}"
+        );
+        let (image, _) = crate::img::decode(&crate::img::decode_data_url(&source).unwrap())
+            .expect("materialized SVG rasterizes");
+        assert!(image.to_rgba8().pixels().any(|pixel| {
+            pixel[0] >= 240 && pixel[1] >= 240 && pixel[2] >= 240 && pixel[3] > 0
+        }));
+        assert!(
+            image
+                .to_rgba8()
+                .pixels()
+                .any(|pixel| { pixel[0] >= 200 && pixel[1] < 80 && pixel[2] < 80 && pixel[3] > 0 })
+        );
     }
 
     #[test]

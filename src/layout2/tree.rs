@@ -592,6 +592,14 @@ impl Builder<'_> {
                     .and_then(|f| f.fields.get(field))
                     .is_some_and(|f| f.kind != FieldKind::Hidden)
             });
+            // HTML Rendering §15.5.3 puts a button's authored child boxes in
+            // its anonymous button content box. Live pages retain the real
+            // form field for submission semantics, but the canonical box tree
+            // must flow those authored children instead of replacing them
+            // with the terminal adapter's synthetic "Button" atom label.
+            if tag == "button" && self.dom.render_live() {
+                return Replaced::No;
+            }
             match mapped {
                 Some((form, field)) => return Replaced::Atom(AtomKind::Control { form, field }),
                 // An unmapped input/select has no widget to draw; an
