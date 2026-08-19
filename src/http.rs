@@ -120,12 +120,11 @@ pub struct Response {
     /// The living page behind this response, when its JS left
     /// something to interact with.
     pub live: Option<LivePage>,
-    /// Set when the response is a bot-mitigation interstitial (AWS WAF,
-    /// Cloudflare, …) rather than the real page — a short human-readable
-    /// label like `"AWS WAF (challenge)"`. These walls serve a JS
-    /// proof-of-work / fingerprint challenge a non-browser client can't
-    /// pass, so what we render is an empty shell; the label lets the UI
-    /// say so instead of showing a blank page. See `detect_challenge`.
+    /// Set when response headers identify a bot-mitigation challenge (AWS WAF,
+    /// Cloudflare, …), with a short human-readable label such as
+    /// `"AWS WAF (challenge)"`. This is metadata for the status line only: the
+    /// body still enters the HTML/JS pipeline so a browser-capable challenge
+    /// can execute or present its user interaction. See `detect_challenge`.
     pub challenge: Option<String>,
     /// The FINAL hop of this exchange was a POST (a 2xx straight off the
     /// POST, with no redirect). A Post/Redirect/Get flow ends on a GET, so
@@ -1122,13 +1121,11 @@ async fn fetch_once(request: &Request) -> Result<Response, String> {
 
 /// Build the Response and return a still-healthy connection to the
 /// pool.
-/// Recognise a bot-mitigation interstitial from response headers. Walls
-/// like AWS WAF and Cloudflare answer a normal request with a JS challenge
-/// page (proof-of-work + browser fingerprint) instead of the real content;
-/// a non-browser client can't pass it, so the body we'd render is an empty
-/// shell. Detecting it from the response header — host-agnostic, no
-/// site-sniffing — lets the UI tell the user what happened rather than
-/// showing a blank page. Returns a short label, e.g. `"AWS WAF (challenge)"`.
+/// Recognise a bot-mitigation challenge from response headers. AWS WAF and
+/// Cloudflare use these headers to describe a challenge response; detecting
+/// them is host-agnostic metadata, not a decision that the browser cannot
+/// continue. The body is still rendered and its scripts are still attempted.
+/// Returns a short label, e.g. `"AWS WAF (challenge)"`.
 fn detect_challenge(headers: &Headers) -> Option<String> {
     // AWS WAF: `x-amzn-waf-action: challenge|captcha|block` (HTTP 202/405).
     // `allow` is the pass-through value — not a wall.

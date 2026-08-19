@@ -337,7 +337,7 @@ mod tests {
               .backdrop { position:fixed; inset:0; background:#112233 }
               #app { position:relative; width:240px; height:180px; background:#f00 }
             </style>
-            <div class="backdrop"></div><div id="app"></div>
+            <div class="backdrop"><a href="/credit">credit</a></div><div id="app"></div>
         "#;
         let dom = crate::dom::Dom::parse_document(html);
         let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
