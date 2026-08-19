@@ -204,13 +204,14 @@ impl Default for PaintFlags {
     }
 }
 
-/// Whether a pinned fixed fragment is a decorative viewport backdrop rather
-/// than an interactive overlay. CSS Positioned Layout §2.2 makes fixed boxes
-/// stacking contexts, while CSS 2.1 Appendix E §E.2 orders `z-index:auto`
-/// siblings in tree order. A full-viewport, non-interactive backdrop therefore
-/// belongs below later page content even though it remains viewport-pinned.
+/// Whether a pinned fixed fragment is a viewport backdrop. CSS Positioned
+/// Layout §2.2 makes fixed boxes stacking contexts, while CSS 2.1 Appendix E
+/// §E.2 places an auto-z-index backdrop below later positive-z-index content.
+/// Keep the backdrop's semantic hit regions in the underlay: a descendant
+/// remains targetable wherever later page paint does not cover it, but it no
+/// longer swallows controls painted above the backdrop.
 pub(super) fn fixed_backdrop(
-    dom: &Dom,
+    _dom: &Dom,
     fragment: &Frag<'_>,
     viewport_w: f32,
     viewport_h: f32,
@@ -220,7 +221,6 @@ pub(super) fn fixed_backdrop(
         && fragment.y <= 0.5
         && fragment.w + 0.5 >= viewport_w
         && fragment.h + 0.5 >= viewport_h
-        && !dom.subtree_has_point_hit_target(fragment.node)
 }
 
 /// Derive the paint flags from a box style. `item` = the box is a flex/grid

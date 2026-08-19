@@ -695,6 +695,23 @@ impl DesktopPageAdapter {
     }
 }
 
+fn form_target_for_node(
+    mut node: usize,
+    controls: &trust::layout2::ControlMap,
+    parents: &HashMap<usize, usize>,
+) -> Option<(usize, usize)> {
+    loop {
+        if let Some(target) = controls.get(&node).copied() {
+            return Some(target);
+        }
+        let parent = parents.get(&node).copied()?;
+        if parent == node {
+            return None;
+        }
+        node = parent;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ImageScheduleKey {
     generation: u64,
@@ -3400,12 +3417,12 @@ impl DesktopApp {
                     return None;
                 };
                 controls.iter().position(|candidate| {
-                    matches!(candidate.link, Some(Link::Form { form: candidate_form, field: candidate_field }) if (candidate_form, candidate_field) == (form, field))
+                    self.form_target_for_hit(candidate) == Some((form, field))
                 })
             })
             .map_or(0, |index| index + 1);
         let target = controls[current % controls.len()].clone();
-        if let Some(Link::Form { form, field }) = target.link {
+        if let Some((form, field)) = self.form_target_for_hit(&target) {
             self.keyboard_target = None;
             self.focus_form(form, field);
             return;
@@ -3420,6 +3437,16 @@ impl DesktopApp {
             .unwrap_or_default();
         self.keyboard_target = Some(target);
         self.request_redraw();
+    }
+
+    /// Resolve a graphical hit to the nearest native form control. A real
+    /// control may produce both a border-box hit and an inline label/glyph
+    /// hit; either must enter the same form interaction path. The terminal
+    /// adapter already carries `Link::Form` on its item, while the graphical
+    /// border-box hit intentionally carries only the canonical actor node.
+    fn form_target_for_hit(&self, hit: &trust::render::PageHit) -> Option<(usize, usize)> {
+        let page = self.page_layout.as_ref()?;
+        form_target_for_node(hit.node, &page.document.controls, &page.document.parents)
     }
 
     fn scroll_page_target_into_view(&mut self, node: usize, rect: CssRect) {
@@ -4018,7 +4045,9 @@ impl DesktopApp {
                     if let (Some(pressed), Some(released)) = (self.pressed_hit.take(), released)
                         && same_page_target(&pressed, &released)
                     {
-                        if let Some(link) = released.link {
+                        if let Some((form, field)) = self.form_target_for_hit(&released) {
+                            self.activate_form_control(form, field);
+                        } else if let Some(link) = released.link {
                             self.activate_link(link);
                         } else if let Some(actor) = released.actor {
                             self.dispatch(UserAction::Activate(Link::JsClick {
@@ -5280,6 +5309,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphical_form_hit_walks_from_border_or_label_to_control() {
+        let controls = HashMap::from([(7usize, (2usize, 3usize))]);
+        let parents = HashMap::from([(42usize, 7usize), (7usize, 1usize)]);
+        assert_eq!(form_target_for_node(42, &controls, &parents), Some((2, 3)));
+        assert_eq!(form_target_for_node(99, &controls, &parents), None);
+    }
 
     #[test]
     fn cpu_damage_raster_matches_a_fresh_full_frame() {

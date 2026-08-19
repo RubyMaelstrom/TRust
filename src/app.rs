@@ -3444,19 +3444,12 @@ impl App {
     /// code always lands in the status bar.
     fn on_http_response(&mut self, mut response: http::Response, width: usize) {
         let live = response.live.take();
-        // A bot-mitigation interstitial (AWS WAF / Cloudflare): the request
-        // got a JS proof-of-work challenge, not the real page, so anything we
-        // render is an empty shell. Don't navigate into the blank shell —
-        // keep the prior page and say plainly why nothing loaded.
-        if let Some(label) = response.challenge.take() {
-            drop(live);
-            self.status = format!(
-                "{}: bot wall ({label}) — the real page is gated behind a challenge TRust can't pass.",
-                response.url
-            );
-            self.notice = true;
-            return;
-        }
+        // A challenge response is still a normal HTML navigation. Its body
+        // may contain the provider's browser challenge, an interactive
+        // CAPTCHA, or the real page after the resident JS actor completes the
+        // proof. Keep it in the ordinary rendering path so the browser gets a
+        // chance to execute and display the challenge instead of declaring it
+        // impossible before the page has run.
         let media = response
             .content_type
             .split(';')
@@ -3536,11 +3529,16 @@ impl App {
             Some(_) => String::from(" · JS"),
             None => String::new(),
         };
+        let challenge_note = response
+            .challenge
+            .as_deref()
+            .map(|label| format!(" · {label}"))
+            .unwrap_or_default();
         self.status = if response.status == 200 {
-            format!("{} — {media}{js_note}", response.url)
+            format!("{} — {media}{js_note}{challenge_note}", response.url)
         } else {
             format!(
-                "{} — HTTP {} ({media}){js_note}",
+                "{} — HTTP {} ({media}){js_note}{challenge_note}",
                 response.url, response.status
             )
         };
@@ -11371,7 +11369,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bot_challenge_surfaces_a_notice_without_navigating() {
+    fn a_bot_challenge_remains_a_renderable_navigation() {
         let mut app = super::App::new(None, 23);
         app.last_inner = (80, 10);
         let response = crate::http::Response {
@@ -11389,14 +11387,15 @@ mod tests {
             from_post: false,
         };
         app.on_http_response(response, 60);
-        assert!(app.notice, "the wall is surfaced as a persistent notice");
         assert!(
-            app.browser.is_none(),
-            "we don't navigate into the blank challenge shell"
+            app.browser.is_some(),
+            "the challenge body remains renderable"
         );
         assert!(
-            app.status.contains("bot wall") && app.status.contains("AWS WAF (challenge)"),
-            "status explains the wall: {}",
+            app.status.contains("HTTP 202")
+                && app.status.contains("AWS WAF (challenge)")
+                && !app.status.contains("can't pass"),
+            "status keeps the challenge actionable: {}",
             app.status
         );
     }
