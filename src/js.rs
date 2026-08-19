@@ -25823,6 +25823,54 @@ mod tests {
     }
 
     #[test]
+    fn bytecode_optimizations_preserve_order_and_loop_results() {
+        let (out, outcome) = page(
+            r#"<body><pre id=o></pre><script>
+                const order = [];
+                function left() { order.push('left'); return { valueOf() { order.push('coerce-left'); return 1; } }; }
+                function right() { order.push('right'); return 2; }
+              function loopResult() {
+                  let i = 0;
+                  let sum = 0;
+                  while (i < 3) {
+                      if (i < 2) sum += i;
+                        i++;
+                    }
+                    do { sum++; } while (sum < 4);
+                  for (let j = 0; j < 2; j++) sum += j;
+                  return sum;
+              }
+              function relationalBranches() {
+                  let result = '';
+                  if (1 <= 1) result += 'le';
+                  if (2 > 1) result += 'gt';
+                  if (2 >= 2) result += 'ge';
+                  return result;
+              }
+              function argumentResult() {
+                  let value = 7;
+                  const array = [value, value + 1, ...[value + 2]];
+                  const called = (function(a, b, c) { return a + b + c; })(value, value + 1, ...[value + 2]);
+                  return array.join(',') + '|' + called;
+                }
+                const branch = left() < right() ? 'yes' : 'no';
+              document.getElementById('o').textContent = [
+                  order.join(','), branch, loopResult(), relationalBranches(), argumentResult()
+              ].join('|');
+            </script></body>"#,
+        );
+        assert!(
+            outcome.errors.is_empty(),
+            "page JS errors: {:?}",
+            outcome.errors
+        );
+        assert!(
+            out.contains("left,right,coerce-left|yes|5|legtge|7,8,9|24"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn parent_node_selector_methods_are_not_exposed_on_text_nodes() {
         // DOM Standard ParentNode: querySelector/querySelectorAll and the
         // getElementsBy* methods belong to Element, Document, and

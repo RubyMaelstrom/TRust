@@ -36,7 +36,12 @@ use boa_ast::{
         Call, Identifier, New, Optional, OptionalOperationKind,
         access::{PropertyAccess, PropertyAccessField},
         literal::ObjectMethodDefinition,
-        operator::{assign::AssignTarget, update::UpdateTarget},
+        operator::{
+            Binary,
+            assign::AssignTarget,
+            binary::{BinaryOp, RelationalOp},
+            update::UpdateTarget,
+        },
     },
     function::{
         ArrowFunction, AsyncArrowFunction, AsyncFunctionDeclaration, AsyncFunctionExpression,
@@ -1087,6 +1092,67 @@ impl<'ctx> ByteCompiler<'ctx> {
         Label { index }
     }
 
+    /// Compile a condition and emit its false branch.
+    ///
+    /// Relational comparisons use a fused comparison-and-branch opcode. This
+    /// preserves the specification's left-to-right evaluation order while
+    /// removing the intermediate boolean register and one VM dispatch.
+    pub(crate) fn compile_condition_and_branch(&mut self, condition: &Expression) -> Label {
+        if let Expression::Binary(binary) = condition.flatten()
+            && let BinaryOp::Relational(op) = binary.op()
+            && let Some(label) = self.try_fused_comparison_branch(op, binary)
+        {
+            return label;
+        }
+
+        let value = self.register_allocator.alloc();
+        self.compile_expr(condition, &value);
+        let label = self.jump_if_false(&value);
+        self.register_allocator.dealloc(value);
+        label
+    }
+
+    fn try_fused_comparison_branch(
+        &mut self,
+        op: RelationalOp,
+        binary: &Binary,
+    ) -> Option<Label> {
+        let emit = match op {
+            RelationalOp::LessThan => ByteCodeEmitter::emit_jump_if_not_less_than,
+            RelationalOp::LessThanOrEqual => {
+                ByteCodeEmitter::emit_jump_if_not_less_than_or_equal
+            }
+            RelationalOp::GreaterThan => ByteCodeEmitter::emit_jump_if_not_greater_than,
+            RelationalOp::GreaterThanOrEqual => {
+                ByteCodeEmitter::emit_jump_if_not_greater_than_or_equal
+            }
+            _ => return None,
+        };
+        let mut label_index = Self::DUMMY_ADDRESS;
+        self.compile_expr_operand(binary.lhs(), |compiler, lhs| {
+            compiler.compile_expr_operand(binary.rhs(), |compiler, rhs| {
+                label_index = compiler.next_opcode_location();
+                emit(&mut compiler.bytecode, Self::DUMMY_ADDRESS, lhs, rhs);
+            });
+        });
+        Some(Label { index: label_index })
+    }
+
+    /// Generate the common `if`/`else` control-flow pattern from a condition.
+    pub(crate) fn compile_if_else(
+        &mut self,
+        condition: &Expression,
+        true_case: impl FnOnce(&mut ByteCompiler<'_>),
+        false_case: impl FnOnce(&mut ByteCompiler<'_>),
+    ) {
+        let jump_false = self.compile_condition_and_branch(condition);
+        true_case(self);
+        let jump_to_end = self.jump();
+        self.patch_jump(jump_false);
+        false_case(self);
+        self.patch_jump(jump_to_end);
+    }
+
     pub(crate) fn jump_if_null_or_undefined(&mut self, value: &Register) -> Label {
         let index = self.next_opcode_location();
         self.bytecode
@@ -1416,6 +1482,40 @@ impl<'ctx> ByteCompiler<'ctx> {
         self.compile_expr_impl(expr, dst);
     }
 
+    /// Compile an expression and provide the register containing its result.
+    ///
+    /// Local bindings already have a persistent register. Reusing that register
+    /// avoids emitting a `Move` into a temporary register when an expression is
+    /// immediately consumed by another instruction. All other expressions use a
+    /// temporary register whose lifetime covers the callback.
+    pub(crate) fn compile_expr_operand(
+        &mut self,
+        expr: &Expression,
+        inner_fn: impl FnOnce(&mut Self, VaryingOperand),
+    ) {
+        if let Expression::Identifier(name) = expr {
+            let name = self.resolve_identifier_expect(*name);
+            let binding = self.lexical_scope.get_identifier_reference(name);
+            if let BindingKind::Local(Some(local_reg)) = self.get_binding(&binding) {
+                inner_fn(self, local_reg.into());
+                return;
+            }
+        }
+
+        let register = self.register_allocator.alloc();
+        self.compile_expr(expr, &register);
+        let operand = register.variable();
+        inner_fn(self, operand);
+        self.register_allocator.dealloc(register);
+    }
+
+    /// Compile an expression directly onto the argument stack.
+    pub(crate) fn compile_expr_to_stack(&mut self, expr: &Expression) {
+        self.compile_expr_operand(expr, |compiler, operand| {
+            compiler.bytecode.emit_push_from_register(operand);
+        });
+    }
+
     /// Compile a property access expression, prepending `this` to the property value in the stack.
     ///
     /// This compiles the access in a way that the state of the stack after executing the property
@@ -1603,33 +1703,33 @@ impl<'ctx> ByteCompiler<'ctx> {
 
                 if contains_spread {
                     let array = self.register_allocator.alloc();
-                    let value = self.register_allocator.alloc();
-
-                    self.bytecode.emit_push_new_array(array.variable());
+                    let array_op = array.variable();
+                    self.bytecode.emit_push_new_array(array_op);
 
                     for arg in args {
-                        self.compile_expr(arg, &value);
-                        if let Expression::Spread(_) = arg {
+                        if let Expression::Spread(spread) = arg {
+                            let value = self.register_allocator.alloc();
+                            self.compile_expr(spread.target(), &value);
                             self.bytecode.emit_get_iterator(value.variable());
-                            self.bytecode.emit_push_iterator_to_array(array.variable());
+                            self.bytecode.emit_push_iterator_to_array(array_op);
+                            self.register_allocator.dealloc(value);
                         } else {
-                            self.bytecode
-                                .emit_push_value_to_array(value.variable(), array.variable());
+                            self.compile_expr_operand(arg, |compiler, operand| {
+                                compiler
+                                    .bytecode
+                                    .emit_push_value_to_array(operand, array_op);
+                            });
                         }
                     }
 
                     self.push_from_register(&array);
 
-                    self.register_allocator.dealloc(value);
                     self.register_allocator.dealloc(array);
 
                     self.bytecode.emit_call_spread();
                 } else {
                     for arg in args {
-                        let value = self.register_allocator.alloc();
-                        self.compile_expr(arg, &value);
-                        self.push_from_register(&value);
-                        self.register_allocator.dealloc(value);
+                        self.compile_expr_to_stack(arg);
                     }
                     self.bytecode.emit_call((args.len() as u32).into());
                 }
@@ -2110,40 +2210,37 @@ impl<'ctx> ByteCompiler<'ctx> {
 
         if contains_spread {
             let array = compiler.register_allocator.alloc();
-            let value = compiler.register_allocator.alloc();
-
-            compiler.bytecode.emit_push_new_array(array.variable());
+            let array_op = array.variable();
+            compiler.bytecode.emit_push_new_array(array_op);
 
             for arg in call.args() {
                 if iife_call && matches!(arg.flatten(), Expression::FunctionExpression(_)) {
                     compiler.eager_next_function = true;
                 }
-                compiler.compile_expr(arg, &value);
-                if let Expression::Spread(_) = arg {
+                if let Expression::Spread(spread) = arg {
+                    let value = compiler.register_allocator.alloc();
+                    compiler.compile_expr(spread.target(), &value);
                     compiler.bytecode.emit_get_iterator(value.variable());
-                    compiler
-                        .bytecode
-                        .emit_push_iterator_to_array(array.variable());
+                    compiler.bytecode.emit_push_iterator_to_array(array_op);
+                    compiler.register_allocator.dealloc(value);
                 } else {
-                    compiler
-                        .bytecode
-                        .emit_push_value_to_array(value.variable(), array.variable());
+                    compiler.compile_expr_operand(arg, |compiler, operand| {
+                        compiler
+                            .bytecode
+                            .emit_push_value_to_array(operand, array_op);
+                    });
                 }
             }
 
             compiler.push_from_register(&array);
 
             compiler.register_allocator.dealloc(array);
-            compiler.register_allocator.dealloc(value);
         } else {
             for arg in call.args() {
                 if iife_call && matches!(arg.flatten(), Expression::FunctionExpression(_)) {
                     compiler.eager_next_function = true;
                 }
-                let value = compiler.register_allocator.alloc();
-                compiler.compile_expr(arg, &value);
-                compiler.push_from_register(&value);
-                compiler.register_allocator.dealloc(value);
+                compiler.compile_expr_to_stack(arg);
             }
         }
 
