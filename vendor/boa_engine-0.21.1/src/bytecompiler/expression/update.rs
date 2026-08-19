@@ -1,4 +1,6 @@
-use crate::bytecompiler::{Access, BindingAccessOpcode, ByteCompiler, Register, ToJsString};
+use crate::bytecompiler::{
+    Access, BindingAccessOpcode, BindingKind, ByteCompiler, Register, ToJsString,
+};
 use boa_ast::{
     expression::{
         access::{PropertyAccess, PropertyAccessField},
@@ -27,6 +29,36 @@ impl ByteCompiler<'_> {
                     .get_identifier_reference(name.clone());
                 let is_lexical = binding.is_lexical();
                 let index = compiler.get_binding(&binding);
+
+                // Avoid the temporary result and write-back moves for local
+                // bindings. Inc/Dec writes the source value before the new
+                // result, so using the same register for source and destination
+                // is safe for post-increment/decrement.
+                if is_lexical
+                    && compiler
+                        .lexical_scope
+                        .set_mutable_binding(name.clone())
+                        .is_ok()
+                    && let BindingKind::Local(Some(local_reg)) = &index
+                {
+                    let local = (*local_reg).into();
+                    if post {
+                        compiler.bytecode.emit_move(dst.variable(), local);
+                        if increment {
+                            compiler.bytecode.emit_inc(local, local);
+                        } else {
+                            compiler.bytecode.emit_dec(local, local);
+                        }
+                    } else {
+                        if increment {
+                            compiler.bytecode.emit_inc(dst.variable(), local);
+                        } else {
+                            compiler.bytecode.emit_dec(dst.variable(), local);
+                        }
+                        compiler.bytecode.emit_move(local, dst.variable());
+                    }
+                    return;
+                }
 
                 if is_lexical {
                     compiler.emit_binding_access(BindingAccessOpcode::GetName, &index, dst);

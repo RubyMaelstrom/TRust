@@ -42,13 +42,11 @@ impl ByteCompiler<'_> {
     }
 
     fn compile_conditional(&mut self, op: &Conditional, dst: &Register) {
-        self.compile_expr(op.condition(), dst);
-        let jelse = self.jump_if_false(dst);
-        self.compile_expr(op.if_true(), dst);
-        let exit = self.jump();
-        self.patch_jump(jelse);
-        self.compile_expr(op.if_false(), dst);
-        self.patch_jump(exit);
+        self.compile_if_else(
+            op.condition(),
+            |compiler| compiler.compile_expr(op.if_true(), dst),
+            |compiler| compiler.compile_expr(op.if_false(), dst),
+        );
     }
 
     fn compile_template_literal(&mut self, template_literal: &TemplateLiteral, dst: &Register) {
@@ -101,25 +99,28 @@ impl ByteCompiler<'_> {
             Expression::PropertyAccess(access) => self.access_get(Access::Property { access }, dst),
             Expression::Conditional(op) => self.compile_conditional(op, dst),
             Expression::ArrayLiteral(literal) => {
-                let value = self.register_allocator.alloc();
-
-                self.bytecode.emit_push_new_array(dst.variable());
+                let dst_op = dst.variable();
+                self.bytecode.emit_push_new_array(dst_op);
 
                 for element in literal.as_ref() {
-                    if let Some(element) = element {
-                        self.compile_expr(element, &value);
-                        if let Expression::Spread(_) = element {
+                    match element {
+                        Some(Expression::Spread(spread)) => {
+                            let value = self.register_allocator.alloc();
+                            self.compile_expr(spread.target(), &value);
                             self.bytecode.emit_get_iterator(value.variable());
-                            self.bytecode.emit_push_iterator_to_array(dst.variable());
-                        } else {
-                            self.bytecode
-                                .emit_push_value_to_array(value.variable(), dst.variable());
+                            self.bytecode.emit_push_iterator_to_array(dst_op);
+                            self.register_allocator.dealloc(value);
                         }
-                    } else {
-                        self.bytecode.emit_push_elision_to_array(dst.variable());
+                        Some(element) => {
+                            self.compile_expr_operand(element, |compiler, operand| {
+                                compiler.bytecode.emit_push_value_to_array(operand, dst_op);
+                            });
+                        }
+                        None => {
+                            self.bytecode.emit_push_elision_to_array(dst_op);
+                        }
                     }
                 }
-                self.register_allocator.dealloc(value);
             }
             Expression::This(_this) => self.access_get(Access::This, dst),
             Expression::Spread(spread) => self.compile_expr(spread.target(), dst),

@@ -1,5 +1,5 @@
 use crate::{
-    Context,
+    Context, JsResult,
     vm::opcode::{Operation, VaryingOperand},
 };
 use thin_vec::ThinVec;
@@ -115,6 +115,42 @@ impl Operation for JumpIfNullOrUndefined {
     const INSTRUCTION: &'static str = "INST - JumpIfNullOrUndefined";
     const COST: u8 = 1;
 }
+
+macro_rules! fused_relational_jump {
+    ($name:ident, $method:ident, $display:literal) => {
+        #[doc = concat!("Fused `", $display, "` comparison and conditional jump.")]
+        #[derive(Debug, Clone, Copy)]
+        pub(crate) struct $name;
+
+        impl $name {
+            #[inline(always)]
+            pub(crate) fn operation(
+                (address, lhs, rhs): (u32, VaryingOperand, VaryingOperand),
+                context: &mut Context,
+            ) -> JsResult<()> {
+                // The comparison may perform JavaScript coercions and call user
+                // code, so retain the ECMAScript left-to-right operand order.
+                let lhs = context.vm.get_register(lhs.into()).clone();
+                let rhs = context.vm.get_register(rhs.into()).clone();
+                if !lhs.$method(&rhs, context)? {
+                    context.vm.frame_mut().pc = address;
+                }
+                Ok(())
+            }
+        }
+
+        impl Operation for $name {
+            const NAME: &'static str = stringify!($name);
+            const INSTRUCTION: &'static str = concat!("INST - ", stringify!($name));
+            const COST: u8 = 2;
+        }
+    };
+}
+
+fused_relational_jump!(JumpIfNotLessThan, lt, "<");
+fused_relational_jump!(JumpIfNotLessThanOrEqual, le, "<=");
+fused_relational_jump!(JumpIfNotGreaterThan, gt, ">");
+fused_relational_jump!(JumpIfNotGreaterThanOrEqual, ge, ">=");
 
 /// `JumpTable` implements the Opcode Operation for `Opcode::JumpTable`
 ///
