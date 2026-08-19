@@ -19,6 +19,8 @@ use html5ever::{Attribute, ParseOpts, QualName, ns};
 
 pub type NodeId = usize;
 
+type SerializationCache = (u64, FxHashMap<(NodeId, u8), String>);
+
 pub enum NodeData {
     Document,
     /// A document fragment: template contents, fragment-parse roots.
@@ -199,6 +201,11 @@ pub struct Dom {
     /// numeric composition walks ancestors, so it's cached like the other
     /// per-element cascade reads.
     font_cache: RefCell<NodeCache<f32>>,
+    /// Repeated DOM string getters (textContent/innerHTML/outerHTML) can be
+    /// hot in framework render loops. Cache each completed value only for the
+    /// current DOM epoch; the next tree/attribute/text mutation drops the map
+    /// wholesale, so old page-sized strings are not retained forever.
+    serialization_cache: RefCell<SerializationCache>,
     /// The CSS-pixel viewport used to evaluate `@media` queries when the
     /// cascade is built; `(0, 0)` = unknown
     /// (width/height queries then conservatively don't match, as if skipped).
@@ -437,6 +444,7 @@ impl Dom {
             cascaded_cache: RefCell::new(NodeCache::default()),
             hidden_cache: RefCell::new(NodeCache::default()),
             font_cache: RefCell::new(NodeCache::default()),
+            serialization_cache: RefCell::new((u64::MAX, FxHashMap::default())),
             viewport_px: (0.0, 0.0),
             device_pixel_ratio: 1.0,
             scroll_state: FxHashMap::default(),
@@ -4044,6 +4052,10 @@ impl Dom {
     }
 
     pub fn text_content(&self, id: NodeId) -> String {
+        self.cached_string(id, 0, || self.text_content_uncached(id))
+    }
+
+    fn text_content_uncached(&self, id: NodeId) -> String {
         let mut out = String::new();
         if let NodeData::Text(t) = &self.nodes[id].data {
             return t.clone();
@@ -4054,6 +4066,30 @@ impl Dom {
             }
         }
         out
+    }
+
+    /// Cache a DOM string getter for one mutation epoch. `build` runs without
+    /// the cache borrowed, which keeps nested reads in the serializer legal.
+    /// The copied return value is still required by the JS boundary; this
+    /// removes the more expensive tree walk/serialization on repeated reads.
+    fn cached_string(&self, id: NodeId, kind: u8, build: impl FnOnce() -> String) -> String {
+        let epoch = self.epoch;
+        if let Some(value) = {
+            let cache = self.serialization_cache.borrow();
+            (cache.0 == epoch)
+                .then(|| cache.1.get(&(id, kind)).cloned())
+                .flatten()
+        } {
+            return value;
+        }
+        let value = build();
+        let mut cache = self.serialization_cache.borrow_mut();
+        if cache.0 != epoch {
+            cache.0 = epoch;
+            cache.1.clear();
+        }
+        cache.1.insert((id, kind), value.clone());
+        value
     }
 
     /// Whether the subtree under `id` (inclusive for a text node) contains
@@ -4285,19 +4321,23 @@ impl Dom {
     /// compiler reads `el.outerHTML`) need the template content present; the
     /// layout/`Doc.raw` `serialize` keeps dropping it (inert, not laid out).
     pub fn serialize_js(&self, root: NodeId) -> String {
-        let mut out = String::new();
-        self.serialize_node_inner(root, None, true, &mut out);
-        out
+        self.cached_string(root, 2, || {
+            let mut out = String::new();
+            self.serialize_node_inner(root, None, true, &mut out);
+            out
+        })
     }
 
     /// JS-facing `innerHTML`: preserves `<template>` content (single caller is
     /// `sys_inner_html`). See `serialize_js`.
     pub fn inner_html(&self, id: NodeId) -> String {
-        let mut out = String::new();
-        for c in self.child_iter(self.content_target(id)) {
-            self.serialize_node_inner(c, None, true, &mut out);
-        }
-        out
+        self.cached_string(id, 1, || {
+            let mut out = String::new();
+            for c in self.child_iter(self.content_target(id)) {
+                self.serialize_node_inner(c, None, true, &mut out);
+            }
+            out
+        })
     }
 
     /// Replace each renderable inline `<svg>` with an `<img>` whose `src` is the
