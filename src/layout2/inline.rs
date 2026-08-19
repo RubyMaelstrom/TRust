@@ -450,10 +450,36 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// Lay the IFC's content. `root` is the block container's own inline
     /// context (text directly under the block uses it).
     pub fn run(&mut self, content: &'t [Inline], root: &InlineStyle) {
+        let root = self.form_context(root.node, root);
         self.strut = crate::text::shape(" ", &root.text_style());
         for inl in content {
-            self.walk(inl, root);
+            self.walk(inl, &root);
         }
+    }
+
+    /// Preserve the semantic form activation target while flowing a live
+    /// button's authored child boxes. The button must not become a synthetic
+    /// control atom, but its text/icon items still need the same `Link::Form`
+    /// target that the terminal form interaction path uses for submission.
+    fn form_context(&self, node: NodeId, parent: &InlineStyle) -> InlineStyle {
+        let mut context = if node == NO_NODE {
+            parent.clone()
+        } else {
+            InlineStyle::derive(self.dom, node, parent, self.base)
+        };
+        if let Some((form, field)) = self.forms.iter().enumerate().find_map(|(form, form_data)| {
+            form_data
+                .fields
+                .iter()
+                .enumerate()
+                .find_map(|(field, field_data)| {
+                    (field_data.live_node == Some(node)).then_some((form, field))
+                })
+        }) {
+            context.kind = ItemKind::Form;
+            context.link = Some(Link::Form { form, field });
+        }
+        context
     }
 
     fn walk(&mut self, inl: &'t Inline, ctx: &InlineStyle) {
@@ -494,7 +520,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 let inner = if *node == crate::layout2::NO_NODE {
                     ctx.clone()
                 } else {
-                    InlineStyle::derive(self.dom, *node, ctx, self.base)
+                    self.form_context(*node, ctx)
                 };
                 if *node != crate::layout2::NO_NODE {
                     self.marks.push((*node, self.lines.len()));

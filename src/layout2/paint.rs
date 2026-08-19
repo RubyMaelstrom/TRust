@@ -46,7 +46,7 @@ use crate::layout2::{
 pub(crate) type Composites = HashMap<String, Vec<CompositeLayer>>;
 
 use super::flow::{Clip, Frag, FragKind, TopFrag};
-use super::style::{BOTTOM, LEFT, RIGHT, TOP};
+use super::style::{BOTTOM, LEFT, Outline, OutlineStyle, RIGHT, TOP, outline_of};
 
 type TerminalPageMedia = (Link, Option<(String, f32, f32)>);
 
@@ -79,6 +79,7 @@ struct TerminalNodePaint {
     boundary_actor: Option<usize>,
     scroll_top: Option<f32>,
     scroll_left: Option<f32>,
+    outline: Outline,
 }
 
 impl TerminalPaintModel {
@@ -176,6 +177,7 @@ impl TerminalPaintModel {
                             .then(|| dom.scroll_metric(node, 1).map(|value| value as f32))
                             .flatten()
                     }),
+                outline: outline_of(dom, node, super::Units::of(dom, node)),
             });
         }
         while nodes
@@ -254,6 +256,12 @@ impl TerminalPaintModel {
 
     fn scroll_left(&self, node: NodeId) -> Option<f32> {
         self.node(node)?.scroll_left
+    }
+
+    fn outline(&self, node: NodeId) -> Outline {
+        self.node(node)
+            .map(|node| node.outline)
+            .unwrap_or(Outline::NONE)
     }
 }
 
@@ -1581,7 +1589,7 @@ fn build_sc(
     // pseudo stacking context.
     build_floats(dom, f, ops, cw, ch, ox, oy, links, line_rows);
     // E.2 step 7: in-flow, non-positioned inline content, tree order.
-    inflow_content(f, ops, cw, ch, ox, oy, links, line_rows);
+    inflow_content(dom, f, ops, cw, ch, ox, oy, links, line_rows);
     // E.2 step 8: z:auto positioned (pseudo) and z:0 SCs, one merged
     // tree-order list.
     for (c, is_sc) in zero {
@@ -1616,7 +1624,7 @@ fn build_pseudo(
     fill_op(dom, f, ops, cw, ch, ox, oy);
     inflow_bgs(dom, f, ops, cw, ch, ox, oy, links, line_rows);
     build_floats(dom, f, ops, cw, ch, ox, oy, links, line_rows);
-    inflow_content(f, ops, cw, ch, ox, oy, links, line_rows);
+    inflow_content(dom, f, ops, cw, ch, ox, oy, links, line_rows);
 }
 
 /// Appendix E step 5: paint every non-positioned float in `f`'s subtree, in
@@ -1647,7 +1655,7 @@ fn build_floats(
             fill_op(dom, c, ops, cw, ch, ox, oy);
             inflow_bgs(dom, c, ops, cw, ch, ox, oy, links, line_rows);
             build_floats(dom, c, ops, cw, ch, ox, oy, links, line_rows);
-            inflow_content(c, ops, cw, ch, ox, oy, links, line_rows);
+            inflow_content(dom, c, ops, cw, ch, ox, oy, links, line_rows);
         } else {
             build_floats(dom, c, ops, cw, ch, ox, oy, links, line_rows);
         }
@@ -1712,6 +1720,7 @@ fn inflow_bgs(
 /// paint as a unit in step 5 (`build_floats`), so they're skipped here.
 #[allow(clippy::too_many_arguments)]
 fn inflow_content(
+    dom: &TerminalPaintModel,
     f: &Frag<'_>,
     ops: &mut Vec<Op>,
     cw: f32,
@@ -1905,6 +1914,20 @@ fn inflow_content(
                         item,
                         clip: item_clip,
                     });
+                    if p.item.kind == ItemKind::Form && p.item.style_node != NO_NODE {
+                        push_outline_cells(
+                            ops,
+                            dom.outline(p.item.style_node),
+                            row,
+                            col,
+                            ((p.box_width / cw).round() as i64).max(1),
+                            ((p.box_height / ch).round() as i64).max(1),
+                            cw,
+                            ch,
+                            item_clip,
+                            p.item.node,
+                        );
+                    }
                     break;
                 }
             }
@@ -1912,7 +1935,7 @@ fn inflow_content(
         } else {
             previous_line = None;
         }
-        inflow_content(c, ops, cw, ch, ox, oy, links, line_rows);
+        inflow_content(dom, c, ops, cw, ch, ox, oy, links, line_rows);
     }
 }
 
@@ -2108,15 +2131,68 @@ fn fill_op(
             clip,
         });
     }
-    if !BORDERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-        || f.border.iter().all(|width| *width <= 0.0)
-        || row1 <= row0
-        || col1 <= col0
+    if BORDERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        && !f.border.iter().all(|width| *width <= 0.0)
+        && row1 > row0
+        && col1 > col0
     {
-        return;
+        let horizontal = "─".repeat((col1 - col0) as usize);
+        if f.border[TOP] > 0.0 {
+            ops.push(Op::Item {
+                row: row0,
+                col: col0,
+                item: border_item(f.node, horizontal.clone()),
+                clip,
+            });
+        }
+        if f.border[BOTTOM] > 0.0 {
+            ops.push(Op::Item {
+                row: row1 - 1,
+                col: col0,
+                item: border_item(f.node, horizontal),
+                clip,
+            });
+        }
+        for row in row0..row1 {
+            if f.border[LEFT] > 0.0 {
+                ops.push(Op::Item {
+                    row,
+                    col: col0,
+                    item: border_item(f.node, String::from("│")),
+                    clip,
+                });
+            }
+            if f.border[RIGHT] > 0.0 {
+                ops.push(Op::Item {
+                    row,
+                    col: col1 - 1,
+                    item: border_item(f.node, String::from("│")),
+                    clip,
+                });
+            }
+        }
     }
-    let horizontal = "─".repeat((col1 - col0) as usize);
-    let border_item = |text: String| Item {
+    // CSS UI 4 §3 outlines are always a paint decoration, even when TRust's
+    // optional terminal border chrome is disabled. Quantize the outside edge
+    // at the same single px→cell boundary as every other paint operation.
+    push_outline_box(
+        ops,
+        f.paint.outline,
+        f.x,
+        f.y,
+        f.w,
+        f.h,
+        ox,
+        oy,
+        cw,
+        ch,
+        clip,
+        f.node,
+    );
+}
+
+fn border_item(node: NodeId, text: String) -> Item {
+    Item {
         col: 0,
         width: display_width(&text).min(u16::MAX as usize) as u16,
         height: 1,
@@ -2124,45 +2200,121 @@ fn fill_op(
         kind: ItemKind::Border,
         image: None,
         emph: Emphasis::default(),
-        node: f.node,
+        node,
         link: None,
         crop: false,
         pixelated: false,
         invisible: false,
-    };
-    if f.border[TOP] > 0.0 {
-        ops.push(Op::Item {
-            row: row0,
-            col: col0,
-            item: border_item(horizontal.clone()),
-            clip,
-        });
     }
-    if f.border[BOTTOM] > 0.0 {
-        ops.push(Op::Item {
-            row: row1 - 1,
-            col: col0,
-            item: border_item(horizontal),
-            clip,
-        });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_outline_box(
+    ops: &mut Vec<Op>,
+    outline: Outline,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    ox: f32,
+    oy: f32,
+    cw: f32,
+    ch: f32,
+    clip: ClipCells,
+    node: NodeId,
+) {
+    if !outline.paints() || matches!(outline.style, OutlineStyle::Auto) {
+        return;
     }
+    let grow = outline.offset + outline.width;
+    let row0 = ((y - oy - grow) / ch).round() as i64;
+    let row1 = ((y - oy + h + grow) / ch).round() as i64;
+    let col0 = ((x - ox - grow) / cw).round() as i64;
+    let col1 = ((x - ox + w + grow) / cw).round() as i64;
+    if row1 <= row0 || col1 <= col0 {
+        return;
+    }
+    let horizontal = "─".repeat((col1 - col0) as usize);
+    ops.push(Op::Item {
+        row: row0,
+        col: col0,
+        item: border_item(node, horizontal.clone()),
+        clip,
+    });
+    ops.push(Op::Item {
+        row: row1 - 1,
+        col: col0,
+        item: border_item(node, horizontal),
+        clip,
+    });
     for row in row0..row1 {
-        if f.border[LEFT] > 0.0 {
-            ops.push(Op::Item {
-                row,
-                col: col0,
-                item: border_item(String::from("│")),
-                clip,
-            });
-        }
-        if f.border[RIGHT] > 0.0 {
-            ops.push(Op::Item {
-                row,
-                col: col1 - 1,
-                item: border_item(String::from("│")),
-                clip,
-            });
-        }
+        ops.push(Op::Item {
+            row,
+            col: col0,
+            item: border_item(node, String::from("│")),
+            clip,
+        });
+        ops.push(Op::Item {
+            row,
+            col: col1 - 1,
+            item: border_item(node, String::from("│")),
+            clip,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_outline_cells(
+    ops: &mut Vec<Op>,
+    outline: Outline,
+    row: i64,
+    col: i64,
+    width: i64,
+    height: i64,
+    cw: f32,
+    ch: f32,
+    clip: ClipCells,
+    node: NodeId,
+) {
+    if !outline.paints() || matches!(outline.style, OutlineStyle::Auto) {
+        return;
+    }
+    let grow = outline.offset + outline.width;
+    let grow_rows = ((grow / ch).round() as i64).max(1);
+    let grow_cols = ((grow / cw).round() as i64).max(1);
+    let row0 = row - grow_rows;
+    let row1 = row + height + grow_rows;
+    let col0 = col - grow_cols;
+    let col1 = col + width + grow_cols;
+    if row1 <= row0 || col1 <= col0 {
+        return;
+    }
+    let horizontal = "─".repeat((col1 - col0) as usize);
+    ops.push(Op::Item {
+        row: row0,
+        col: col0,
+        item: border_item(node, horizontal.clone()),
+        clip,
+    });
+    ops.push(Op::Item {
+        row: row1 - 1,
+        col: col0,
+        item: border_item(node, horizontal),
+        clip,
+    });
+    for row in row0..row1 {
+        ops.push(Op::Item {
+            row,
+            col: col0,
+            item: border_item(node, String::from("│")),
+            clip,
+        });
+        ops.push(Op::Item {
+            row,
+            col: col1 - 1,
+            item: border_item(node, String::from("│")),
+            clip,
+        });
     }
 }
 

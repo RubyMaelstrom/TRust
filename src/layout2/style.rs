@@ -22,6 +22,43 @@ pub(crate) const RIGHT: usize = 1;
 pub(crate) const BOTTOM: usize = 2;
 pub(crate) const LEFT: usize = 3;
 
+/// The CSS UI outline decoration retained with a fragment. Outlines are
+/// paint-only: unlike borders they do not participate in sizing or flow.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Outline {
+    pub width: f32,
+    pub offset: f32,
+    pub style: OutlineStyle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum OutlineStyle {
+    #[default]
+    None,
+    Hidden,
+    Solid,
+    Dashed,
+    Dotted,
+    Double,
+    Groove,
+    Ridge,
+    Inset,
+    Outset,
+    Auto,
+}
+
+impl Outline {
+    pub const NONE: Self = Self {
+        width: 0.0,
+        offset: 0.0,
+        style: OutlineStyle::None,
+    };
+
+    pub fn paints(self) -> bool {
+        self.width > 0.0 && !matches!(self.style, OutlineStyle::None | OutlineStyle::Hidden)
+    }
+}
+
 /// The positioning scheme (CSS 2.1 §9.3.1; css-position-3 adds `sticky`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Pos {
@@ -133,6 +170,7 @@ pub(crate) struct BoxStyle {
     pub margin: [Len; 4],
     pub padding: [Len; 4],
     pub border: [f32; 4],
+    pub outline: Outline,
     pub width: Len,
     pub min_width: Len,
     pub max_width: Len,
@@ -180,6 +218,7 @@ impl BoxStyle {
             margin: [Len::px(0.0), Len::px(0.0), Len::px(0.0), Len::px(0.0)],
             padding: [Len::px(0.0), Len::px(0.0), Len::px(0.0), Len::px(0.0)],
             border: [0.0; 4],
+            outline: Outline::NONE,
             width: Len::Auto,
             min_width: Len::Auto,
             max_width: Len::None,
@@ -233,6 +272,7 @@ impl BoxStyle {
                 border_side(dom, id, "bottom", u),
                 border_side(dom, id, "left", u),
             ],
+            outline: outline_of(dom, id, u),
             width: Len::parse_or(cv("width").as_deref(), u, vp, Len::Auto),
             min_width: Len::parse_or(cv("min-width").as_deref(), u, vp, Len::Auto),
             max_width: Len::parse_or(cv("max-width").as_deref(), u, vp, Len::None),
@@ -364,6 +404,7 @@ impl BoxStyle {
                 border("bottom"),
                 border("left"),
             ],
+            outline: Outline::NONE,
             width: len("width", Len::Auto),
             min_width: len("min-width", Len::Auto),
             max_width: len("max-width", Len::None),
@@ -656,6 +697,48 @@ fn border_side(dom: &Dom, id: NodeId, side: &str, u: Units) -> f32 {
         Some("thin") => 1.0,
         Some("thick") => 5.0,
         Some(w) => css_length_px(w, u).unwrap_or(3.0).max(0.0),
+    }
+}
+
+pub(crate) fn outline_of(dom: &Dom, id: NodeId, u: Units) -> Outline {
+    let style = match dom
+        .computed_value_resolved(id, "outline-style")
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("hidden") => OutlineStyle::Hidden,
+        Some("solid") => OutlineStyle::Solid,
+        Some("dashed") => OutlineStyle::Dashed,
+        Some("dotted") => OutlineStyle::Dotted,
+        Some("double") => OutlineStyle::Double,
+        Some("groove") => OutlineStyle::Groove,
+        Some("ridge") => OutlineStyle::Ridge,
+        Some("inset") => OutlineStyle::Inset,
+        Some("outset") => OutlineStyle::Outset,
+        Some("auto") => OutlineStyle::Auto,
+        _ => OutlineStyle::None,
+    };
+    let width = match dom
+        .computed_value_resolved(id, "outline-width")
+        .as_deref()
+        .map(str::trim)
+    {
+        None | Some("medium") => 3.0,
+        Some("thin") => 1.0,
+        Some("thick") => 5.0,
+        Some(w) => css_length_px(w, u).unwrap_or(3.0).max(0.0),
+    };
+    let offset = dom
+        .computed_value_resolved(id, "outline-offset")
+        .as_deref()
+        .and_then(|value| css_length_px(value, u))
+        .unwrap_or(0.0);
+    Outline {
+        width,
+        offset,
+        style,
     }
 }
 

@@ -2508,6 +2508,37 @@ mod tests {
     }
 
     #[test]
+    fn css_outline_paints_without_changing_control_layout() {
+        // CSS UI 4 §3: outlines are drawn over/around the box, contribute only
+        // to ink overflow, and must not consume layout space. The graphical
+        // path retains the authored color; the terminal adapter expresses the
+        // same paint-only decoration as box-drawing chrome even when ordinary
+        // CSS borders are disabled.
+        let html = r#"<body style="margin:0"><input name="q" value="text"
+            style="width:80px;outline:2px solid #ff0000;outline-offset:2px"></body>"#;
+        let graphics = lay_graphical(html, 320.0, &HashMap::new());
+        assert!(graphics.paint.primitives.iter().any(|primitive| matches!(
+            primitive,
+            crate::render::DisplayCommand::Stroke {
+                brush: crate::render::PaintBrush::Solid(crate::render::PaintColor::Rgba(
+                    255, 0, 0, 255
+                )),
+                style,
+                ..
+            } if (style.width - 2.0).abs() < 0.01
+        )));
+        let terminal = lay_with_forms(html, 40, &HashMap::new());
+        assert!(
+            terminal
+                .rows
+                .iter()
+                .flat_map(|row| row.items.iter())
+                .any(|item| item.kind == ItemKind::Border),
+            "outline should remain visible in the terminal adapter"
+        );
+    }
+
+    #[test]
     fn percentage_control_width_is_auto_during_intrinsic_contribution() {
         // CSS Sizing 3 §5.2.1: a percentage size that is cyclic against an
         // intrinsically-sized grid track behaves as auto for the contribution.

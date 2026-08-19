@@ -603,6 +603,16 @@ enum FocusTarget {
     },
 }
 
+/// A key whose DOM `keydown` is running in the resident page. The native
+/// editing/default action waits for the actor's `PageEvt::KeyDefault`, so page
+/// script can cancel Enter for rich editors and chat composers.
+#[derive(Clone, Debug)]
+struct PendingPageKey {
+    form: usize,
+    field: usize,
+    input: KeyInput,
+}
+
 struct PageLayoutCache {
     generation: u64,
     revision: u64,
@@ -1111,6 +1121,7 @@ struct DesktopApp {
     clipboard: Option<arboard::Clipboard>,
     exit_requested: bool,
     terminal: Option<TerminalSession>,
+    pending_page_keys: VecDeque<PendingPageKey>,
     keyboard_target: Option<PageHit>,
     pressed_hit: Option<PageHit>,
     pressed_control: Option<ControlId>,
@@ -1248,6 +1259,7 @@ impl DesktopApp {
             clipboard: arboard::Clipboard::new().ok(),
             exit_requested: false,
             terminal: None,
+            pending_page_keys: VecDeque::new(),
             keyboard_target: None,
             pressed_hit: None,
             pressed_control: None,
@@ -1574,6 +1586,7 @@ impl DesktopApp {
         }
         if leaves_keyboard_target {
             self.keyboard_target = None;
+            self.pending_page_keys.clear();
         }
         let outcome = self.browser.handle_action(action);
         if outcome.loading_retired {
@@ -1595,6 +1608,97 @@ impl DesktopApp {
             self.browser.set_status("Stopped loading page resources.");
         }
         self.request_redraw();
+    }
+
+    /// Apply the user-agent default for a live-page key after its cancelable
+    /// `keydown` has completed in the resident actor. HTML Editing APIs leave
+    /// editing-host insertion to the user agent; HTML §4.10.22.2 defines the
+    /// Enter implicit-submission path for single-line text controls.
+    fn apply_page_key_defaults(&mut self) {
+        while let Some(prevented) = self.browser.take_page_key_default() {
+            let Some(pending) = self.pending_page_keys.pop_front() else {
+                continue;
+            };
+            if prevented
+                || self.focus
+                    != (FocusTarget::Form {
+                        form: pending.form,
+                        field: pending.field,
+                    })
+            {
+                continue;
+            }
+            let kind = self
+                .page_layout
+                .as_ref()
+                .and_then(|page| page.document.forms.get(pending.form))
+                .and_then(|form| form.fields.get(pending.field))
+                .map(|field| field.kind.clone());
+            match kind {
+                Some(FieldKind::Text | FieldKind::Password) => {
+                    self.finish_text_edit();
+                    self.submit_form_default(pending.form);
+                }
+                Some(FieldKind::Textarea)
+                    if self
+                        .form_editor
+                        .as_mut()
+                        .is_some_and(|editor| editor.handle_key(&pending.input)) =>
+                {
+                    self.finish_text_edit();
+                    self.request_redraw();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Activate a form's HTML default button for an un-canceled Enter on a
+    /// single-line live text control. A live submit button is clicked so its
+    /// page handlers and `SubmitEvent.submitter` observe the standard default
+    /// action; static forms retain the existing native submission path.
+    fn submit_form_default(&mut self, form_index: usize) {
+        let Some(form) = self
+            .page_layout
+            .as_ref()
+            .and_then(|page| page.document.forms.get(form_index))
+            .cloned()
+        else {
+            return;
+        };
+        let submitter = form
+            .fields
+            .iter()
+            .position(|field| field.kind == FieldKind::Submit);
+        if let Some(field) = submitter
+            .and_then(|index| form.fields.get(index))
+            .and_then(|field| field.live_node)
+        {
+            self.dispatch(UserAction::Activate(Link::JsClick {
+                node: field,
+                href: String::new(),
+            }));
+        } else {
+            self.dispatch(UserAction::SubmitForm { form, submitter });
+        }
+        self.set_focus(FocusTarget::Page);
+    }
+
+    /// Drain the shared controller and then release any native key defaults
+    /// that the resident actor returned. A navigation retires the old key
+    /// queue along with the old page.
+    fn process_browser_events(&mut self) -> trust::core::ActionOutcome {
+        let outcome = self.browser.process_async_events();
+        if outcome.loading_retired {
+            let had_pending_key = !self.pending_page_keys.is_empty();
+            self.pending_page_keys.clear();
+            if had_pending_key {
+                self.set_focus(FocusTarget::Page);
+            }
+            self.retire_page_loading();
+        }
+        self.apply_page_key_defaults();
+        outcome
     }
 
     fn navigate(&mut self, address: String) {
@@ -2595,6 +2699,39 @@ impl DesktopApp {
         true
     }
 
+    /// Send Enter through the resident page before the desktop editor applies
+    /// its local default. This is the path that lets contenteditable chat
+    /// composers cancel the default newline and activate their authored Send
+    /// button, while ordinary uncanceled contenteditable Enter still inserts a
+    /// newline when the actor reports that default is allowed.
+    fn dispatch_live_form_key(&mut self, input: &KeyInput) -> bool {
+        let FocusTarget::Form { form, field } = self.focus else {
+            return false;
+        };
+        let node = self
+            .page_layout
+            .as_ref()
+            .and_then(|page| page.document.forms.get(form))
+            .and_then(|form| form.fields.get(field))
+            .and_then(|field| field.live_node);
+        let Some(node) = node else {
+            return false;
+        };
+        // The text edit must reach the actor before its keydown, so a page
+        // handler reading the editor's value sees the latest native input.
+        self.finish_text_edit();
+        self.pending_page_keys.push_back(PendingPageKey {
+            form,
+            field,
+            input: input.clone(),
+        });
+        self.dispatch(UserAction::PageKey {
+            node,
+            input: input.clone(),
+        });
+        true
+    }
+
     fn apply_gopherus_position(&mut self, position: GopherusPosition) {
         self.cancel_heart_glide();
         let old_scroll = self.browser.interaction().scroll;
@@ -2732,6 +2869,9 @@ impl DesktopApp {
             && self.terminal.is_none()
             && self.handle_http_scroll_key(&input)
         {
+            return;
+        }
+        if pressed && input.key == Key::Enter && self.dispatch_live_form_key(&input) {
             return;
         }
         if pressed {
@@ -4282,10 +4422,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
         if let Some(address) = self.initial_navigation.take() {
             self.navigate(address);
         }
-        let outcome = self.browser.process_async_events();
-        if outcome.loading_retired {
-            self.retire_page_loading();
-        }
+        let _outcome = self.process_browser_events();
         self.request_redraw();
     }
 
@@ -4302,10 +4439,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DesktopEvent) {
         match event {
             DesktopEvent::BrowserWake => {
-                let outcome = self.browser.process_async_events();
-                if outcome.loading_retired {
-                    self.retire_page_loading();
-                }
+                let outcome = self.process_browser_events();
                 if std::env::var_os("TRUST_DESKTOP_TRACE").is_some() {
                     eprintln!(
                         "desktop: browser wake changed={} retired={}",
