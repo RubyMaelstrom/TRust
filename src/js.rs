@@ -5600,11 +5600,21 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
                 .is_some_and(|ty| ty.trim().eq_ignore_ascii_case("module")),
         )
     };
+    // A dynamically inserted script may live in a frame whose document base is
+    // different from the top-level page. The JS helper preserves the raw DOM
+    // attribute while returning the URL used by Fetch.
+    let frame_src = ctx
+        .eval(Source::from_bytes(
+            format!("__trust.resourceURL({node_id})").as_bytes(),
+        ))
+        .ok()
+        .and_then(|v| v.as_string().map(|s| s.to_std_string_lossy()))
+        .filter(|s| !s.is_empty());
     if module {
-        enqueue_injected_module(ctx, node_id, src, text);
+        enqueue_injected_module(ctx, node_id, frame_src.or(src), text);
         return Ok(JsValue::undefined());
     }
-    match src {
+    match frame_src.or(src) {
         // A `data:` src decodes inline — no network, exactly like a parse-time
         // `data:` classic script (the Instagram bootloader path). Routing it
         // through the net-prepare below rejected the non-http(s) scheme and
@@ -5889,7 +5899,15 @@ fn sys_load_injected_stylesheet(
         };
         (id, d.attr(id, "href").map(str::to_string))
     };
-    let Some(href) = href.filter(|h| !h.trim().is_empty()) else {
+    let href = ctx
+        .eval(Source::from_bytes(
+            format!("__trust.resourceURL({node_id})").as_bytes(),
+        ))
+        .ok()
+        .and_then(|v| v.as_string().map(|s| s.to_std_string_lossy()))
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| href.filter(|h| !h.trim().is_empty()));
+    let Some(href) = href else {
         return Ok(JsValue::undefined());
     };
     match page_net_prepare(ctx, &href, String::from("GET"), None, vec![]) {
@@ -5977,10 +5995,18 @@ fn eval_injected_classic(
     name: &str,
     source: &[u8],
 ) -> JsResult<()> {
+    // Dynamically inserted scripts inherit the settings object of their
+    // nearest navigable. Enter the corresponding scoped child Window for the
+    // whole script-cleanup checkpoint; this also makes Promise jobs created by
+    // the script observe the right document before the checkpoint completes.
+    let _ = ctx.eval(Source::from_bytes(
+        format!("__trust.bindFrameForNode({node_id})").as_bytes(),
+    ));
     let old_current_script = replace_current_script(ctx, Some(node_id));
     eval_injected(ctx, name, source);
     let checkpoint = microtask_checkpoint(ctx);
     replace_current_script(ctx, old_current_script);
+    let _ = ctx.eval(Source::from_bytes(b"__trust.restoreFrame()"));
     checkpoint
 }
 
@@ -5989,8 +6015,12 @@ fn eval_injected_classic(
 fn fire_script_event(ctx: &mut Context, node_id: usize, ty: &str) {
     let t = Instant::now();
     let _ = ctx.eval(Source::from_bytes(
+        format!("__trust.bindFrameForNode({node_id})").as_bytes(),
+    ));
+    let _ = ctx.eval(Source::from_bytes(
         format!("__trust.scriptEvent({node_id}, \"{ty}\")").as_bytes(),
     ));
+    let _ = ctx.eval(Source::from_bytes(b"__trust.restoreFrame()"));
     let ms = t.elapsed().as_millis();
     if ms > 50 {
         phase(&format!("script {ty} event node {node_id} +{ms}ms"));
@@ -11962,7 +11992,14 @@ const PRELUDE: &str = r##"
     // is hoisted alongside the other iframe helpers below.)
     function maybeProcessInsertedFrame(frame, parent) {
         if (!parent.isConnected) return;
-        try { processIframeAttributes(frame); } catch (e) {}
+        try {
+            processIframeAttributes(frame);
+            // The insertion path may have realized the child document through
+            // a parser/framework adapter before the normal frame load task.
+            // Re-run the stylesheet link processing after navigation; the
+            // per-link started flag makes this idempotent.
+            loadFrameStyles(frame);
+        } catch (e) {}
     }
 
     // The document base URL: <base href> when present (archive.org sets
@@ -12048,7 +12085,12 @@ const PRELUDE: &str = r##"
         const t = String(type);
         const l = lsFor(target, t);
         if (lsFind(l, fn, o.capture) >= 0) return;
-        const entry = { fn: fn, capture: o.capture, once: o.once, removed: false };
+        // A single Boa realm hosts the page and its inline-rendered nested
+        // documents. Remember the document whose global was current when the
+        // listener was registered; dispatch restores that document before
+        // invoking the callback.
+        const entry = { fn: fn, capture: o.capture, once: o.once, removed: false,
+                        frame: trust.__activeFrame || null };
         // Entries are pushed HERE only, so `l`/`l.fns`/`l.caps` stay aligned.
         if (!l.fns) { l.fns = []; l.caps = []; l.capN = 0; }
         l.push(entry); l.fns.push(fn); l.caps.push(o.capture);
@@ -12241,7 +12283,8 @@ const PRELUDE: &str = r##"
             let fn = null;
             try { fn = new Function("event", src); }
             catch (e) { trust.errors.push("on" + type + " compile: " + ((e && e.message) || e)); }
-            cache[type] = { src: src, fn: fn };
+            cache[type] = { src: src, fn: fn,
+                            frame: trust.__activeFrame || frameOwnerForNode(cur) || null };
             return fn;
         }
         return slot.fn;
@@ -12256,7 +12299,12 @@ const PRELUDE: &str = r##"
         if (phase !== 1) {
             const af = attrHandler(cur, ev.type);
             if (af) {
-                try { if (af.call(cur, ev) === false) ev.preventDefault(); }
+                const afSlot = cur.__onCache && cur.__onCache[ev.type];
+                try {
+                    const result = runInFrame(afSlot && afSlot.frame,
+                                              () => af.call(cur, ev));
+                    if (result === false) ev.preventDefault();
+                }
                 catch (e) { trust.errors.push("on" + ev.type + ": " + ((e && e.message) || e)); }
                 if (ev.__stopNow) return;
             }
@@ -12276,12 +12324,20 @@ const PRELUDE: &str = r##"
         if (phase === 3 && capN === list.length) return;
         for (const entry of list.slice()) {
             if (entry.removed) continue;
+            // `window` is one Boa object for all scoped navigables, but HTML
+            // delivers a MessageEvent only to the Window whose postMessage
+            // target was addressed. Without this filter, every child frame's
+            // message listener also saw top-window traffic and reCAPTCHA
+            // interpreted an unrelated message as its own protocol payload.
+            if (cur === g && ev.__windowTargetSet && entry.frame !== ev.__frameTarget) continue;
             if (phase === 1 && !entry.capture) continue;
             if (phase === 3 && entry.capture) continue;
             if (entry.once) removeL(cur, ev.type, entry.fn, { capture: entry.capture });
             try {
-                if (typeof entry.fn === "function") entry.fn.call(cur, ev);
-                else entry.fn.handleEvent(ev);
+                runInFrame(entry.frame, () => {
+                    if (typeof entry.fn === "function") entry.fn.call(cur, ev);
+                    else entry.fn.handleEvent(ev);
+                });
             }
             catch (e) { trust.errors.push(ev.type + " handler: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
             if (ev.__stopNow) break;
@@ -12480,16 +12536,12 @@ const PRELUDE: &str = r##"
     // --- iframe processing: HTML "process the iframe attributes" ----------
     // An <iframe>/<frame> renders its nested document INLINE (the serializer
     // rewrites the frame + its realized content into a <div data-trust-frame>;
-    // see dom.rs `frame_body`). Standards-faithful within the terminal: the
-    // content navigable's document is fetched (src) or taken from the markup
-    // (srcdoc), parsed as a REAL document, and its relative URLs are resolved
-    // against the frame's own base. Deliberate, medium-forced deviations (her
-    // calls): NO border or scrollbar chrome — the frame flows into the page's
-    // single scroll; and the nested document's OWN scripts do NOT run (TRust
-    // has one Boa realm per page, and a separate realm per nested navigable is
-    // future engine work) — so a frame's HTML+CSS render but its in-frame JS
-    // is inert. Cross-origin frames still RENDER but are not script-accessible
-    // from the parent (`contentDocument` → null, per spec's origin check).
+    // see dom.rs `frame_body`). The content navigable's document is fetched
+    // (src) or taken from the markup (srcdoc), parsed as a REAL document, and
+    // its relative URLs are resolved against the frame's own base. A frame's
+    // parser scripts now execute in the scoped child Window above; its
+    // cross-origin parent access is still restricted (`contentDocument` → null
+    // from the parent, per the HTML same-origin check).
     function stripFragment(u) { const i = u.indexOf("#"); return i < 0 ? u : u.slice(0, i); }
     // A frame URL is same-origin with the page (about:blank/about:srcdoc
     // inherit the parent origin, so they count as same-origin).
@@ -12520,13 +12572,28 @@ const PRELUDE: &str = r##"
     // handlers attached during the current turn still observe it (same shape
     // as the synthetic image-load pass).
     function fireFrameLoad(frame) {
-        setTimeout(function () { try { dispatch(frame, new Event("load"), false); } catch (e) {} }, 0);
+        setTimeout(function () {
+            // The nested document's Window also receives its load event. The
+            // iframe element's load below is a separate parent-document event;
+            // both are observable and child bootstraps commonly wait on the
+            // former before creating their interactive surface.
+            try { runInFrame(frame, function () { dispatch(g, new Event("load"), false); }); } catch (e) {}
+            try { dispatch(frame, new Event("load"), false); } catch (e) {}
+        }, 0);
     }
     // Install markup as the frame's content navigable, then process any frames
     // nested inside it (bounded by the circular guard + the page fetch cap).
     function loadFrameMarkup(frame, markup, base, frameUrl) {
         frame.__frameUrl = frameUrl;
+        frame.__trustParentWindow = undefined;
+        frame.__trustTopWindow = undefined;
         __dom_load_frame(frame.__id, String(markup == null ? "" : markup), base);
+        runFrameScripts(frame);
+        // Stylesheet links are fetched after parser scripts begin. The
+        // nested script may itself create the challenge DOM; delaying this
+        // optional resource task keeps a stylesheet failure from aborting the
+        // content navigable before its required script runs.
+        loadFrameStyles(frame);
         hydrateFramesIn(frame);
     }
     // "Process the iframe attributes". The initialInsertion / re-process cases
@@ -12581,7 +12648,10 @@ const PRELUDE: &str = r##"
         let frames;
         try { frames = root.querySelectorAll("iframe, frame"); } catch (e) { return 0; }
         for (let i = 0; i < frames.length; i++) {
-            try { processIframeAttributes(frames[i]); } catch (e) {}
+            try {
+                processIframeAttributes(frames[i]);
+                loadFrameStyles(frames[i]);
+            } catch (e) {}
         }
         return frames.length;
     }
@@ -14045,12 +14115,22 @@ const PRELUDE: &str = r##"
         // owning interfaces (HTMLInputElement, HTMLAnchorElement, …) below.
         get innerHTML() { return __dom_inner_html(this.__id); }
         set innerHTML(v) {
-            if (!MO.length) { __dom_set_inner_html(this.__id, String(v)); if (CE.defs.size) ceScan(this); slotQueueCheck(this); return; }
+            if (!MO.length) {
+                __dom_set_inner_html(this.__id, String(v));
+                if (CE.defs.size) ceScan(this);
+                slotQueueCheck(this);
+                // HTML §4.8.6: innerHTML insertion still processes iframe
+                // attributes and starts each newly inserted nested navigable.
+                // Script elements remain inert under the fragment parser.
+                hydrateFramesIn(this);
+                return;
+            }
             const removed = this.childNodes;
             __dom_set_inner_html(this.__id, String(v));
             moChildBulk(this, removed, this.childNodes);
             if (CE.defs.size) ceScan(this);
             slotQueueCheck(this);
+            hydrateFramesIn(this);
         }
         // `content` (<template>/<meta>) and `contentDocument`/`contentWindow`
         // (<iframe>/<frame>) moved to their owning interfaces below. A generic
@@ -14094,6 +14174,7 @@ const PRELUDE: &str = r##"
             if (!MO.length || !container) {
                 __dom_insert_adjacent(this.__id, p, String(h));
                 if (CE.defs.size) { const par = this.parentNode; ceScan(par || this); }
+                hydrateFramesIn(container || this);
                 return;
             }
             const before = new Set(container.childNodes.map((k) => k.__id));
@@ -14101,6 +14182,7 @@ const PRELUDE: &str = r##"
             const added = container.childNodes.filter((k) => !before.has(k.__id));
             moChildBulk(container, [], added);
             if (CE.defs.size) { const par = this.parentNode; ceScan(par || this); }
+            hydrateFramesIn(container);
         }
         insertAdjacentElement(p, el) {
             const pos = String(p).toLowerCase();
@@ -14985,10 +15067,26 @@ const PRELUDE: &str = r##"
                         get document() { return frame.contentDocument; },
                         get location() {
                             const u = frame.__frameUrl;
-                            return { href: u && u !== "about:srcdoc" ? u : "about:blank", replace() {}, assign() {} };
+                            const href = u && u !== "about:srcdoc" ? u : "about:blank";
+                            const parsed = __url_parse(href, g.location.href);
+                            return {
+                                href: href,
+                                origin: parsed ? parsed[8] : "null",
+                                replace(v) { try { frame.setAttribute("src", String(v)); processIframeAttributes(frame); } catch (e) {} },
+                                assign(v) { try { frame.setAttribute("src", String(v)); processIframeAttributes(frame); } catch (e) {} },
+                            };
                         },
                         parent: g, top: g, frames: g, frameElement: this,
-                        postMessage() {}, focus() {}, blur() {},
+                        // Parent code may address a child browsing context
+                        // through WindowProxy.postMessage. Route the task to
+                        // the child's scoped global rather than dropping it;
+                        // reCAPTCHA's anchor protocol depends on this.
+                        postMessage(message, targetOrigin, transfer) {
+                            postMessageToFrame(frame, message, g,
+                                transferPorts(targetOrigin, transfer), g.location.origin,
+                                frame.__trustParentWindow || g);
+                        },
+                        focus() {}, blur() {},
                         addEventListener() {}, removeEventListener() {},
                     };
                     // A same-origin frame's contentWindow is a real Window with
@@ -15343,35 +15441,43 @@ const PRELUDE: &str = r##"
                 const c = kids[i];
                 if (c.nodeType === 1 && c.localName === "html") return c;
             }
-            const html = document.createElement("html");
-            html.appendChild(document.createElement("head"));
-            html.appendChild(document.createElement("body"));
+            const rootDocument = wrap(0);
+            const html = rootDocument.createElement("html");
+            html.appendChild(rootDocument.createElement("head"));
+            html.appendChild(rootDocument.createElement("body"));
             this.__frame.appendChild(html);
             return html;
         }
         get head() { return this.documentElement.querySelector("head") || this.documentElement; }
         get body() { return this.documentElement.querySelector("body") || this.documentElement; }
-        get defaultView() { return this.__frame.contentWindow; }
+        get defaultView() { return trust.__activeFrame === this.__frame ? g : this.__frame.contentWindow; }
         get readyState() { return "complete"; }
         get cookie() { return ""; }
         set cookie(_v) {}
         get title() { const t = this.querySelector("title"); return t ? t.textContent : ""; }
         set title(v) { let t = this.querySelector("title"); if (!t) { t = this.createElement("title"); this.head.appendChild(t); } t.textContent = String(v); }
-        get location() { return this.__frame.contentWindow.location; }
-        get implementation() { return document.implementation; }
+        get location() { return trust.__activeFrame === this.__frame ? g.location : this.__frame.contentWindow.location; }
+        get URL() { return this.location.href; }
+        get documentURI() { return this.location.href; }
+        get implementation() { return wrap(0).implementation; }
         get [Symbol.toStringTag]() { return "HTMLDocument"; }
         open() { const b = this.body; while (b.firstChild) b.removeChild(b.firstChild); return this; }
         write(s) { this.body.insertAdjacentHTML("beforeend", String(s)); }
         writeln(s) { this.write(s + "\n"); }
         close() {}
-        createElement(t) { return document.createElement(t); }
-        createElementNS(_n, t) { return document.createElement(t); }
-        createTextNode(s) { return document.createTextNode(s); }
-        createComment(s) { return document.createComment(s); }
-        createAttribute(n) { return document.createAttribute(n); }
-        createAttributeNS(ns, n) { return document.createAttributeNS(ns, n); }
-        createDocumentFragment() { return document.createDocumentFragment(); }
-        createEvent(t) { return document.createEvent(t); }
+        // These constructors must route to the canonical top document. While
+        // a child scope is active, the bare `document` binding is THIS
+        // FrameDocument; delegating through it would recurse forever on the
+        // first `document.createElement()` (reCAPTCHA creates its checkbox
+        // subtree this way).
+        createElement(t) { return wrap(0).createElement(t); }
+        createElementNS(_n, t) { return wrap(0).createElement(t); }
+        createTextNode(s) { return wrap(0).createTextNode(s); }
+        createComment(s) { return wrap(0).createComment(s); }
+        createAttribute(n) { return wrap(0).createAttribute(n); }
+        createAttributeNS(ns, n) { return wrap(0).createAttributeNS(ns, n); }
+        createDocumentFragment() { return wrap(0).createDocumentFragment(); }
+        createEvent(t) { return wrap(0).createEvent(t); }
         createRange() { return new Range(); }
         getElementById(i) { return this.documentElement.querySelector('[id="' + String(i).replace(/"/g, '\\"') + '"]'); }
         getElementsByTagName(t) { return this.documentElement.getElementsByTagName(t); }
@@ -15379,8 +15485,312 @@ const PRELUDE: &str = r##"
         getElementsByName(n) { return this.documentElement.querySelectorAll('[name="' + String(n).replace(/"/g, '\\"') + '"]'); }
         querySelector(s) { return this.documentElement.querySelector(s); }
         querySelectorAll(s) { return this.documentElement.querySelectorAll(s); }
-        addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
+        addEventListener(type, fn, options) { addL(this, type, fn, options); }
+        removeEventListener(type, fn, options) { removeL(this, type, fn, options); }
+        dispatchEvent(ev) { return dispatch(this, ev, false); }
         hasFocus() { return true; }
+    }
+
+    // A nested document has its own browsing-context global in HTML, and a
+    // cross-origin child still executes its own scripts. TRust keeps one Boa
+    // realm for the page actor, so emulate the per-navigable global with a
+    // short-lived execution scope. Parent script access remains protected by
+    // the restricted WindowProxy below: it exposes messaging and navigation,
+    // but never the parent's document or arbitrary globals.
+    let topFrameState = null;
+    function frameOwnerForNode(node) {
+        let n = node;
+        while (n && n.parentNode) {
+            const p = n.parentNode;
+            if (p.localName === "iframe" || p.localName === "frame") return p;
+            n = p;
+        }
+        return null;
+    }
+    function frameURLFor(frame) {
+        return frame && frame.__frameUrl ? String(frame.__frameUrl) : "about:blank";
+    }
+    function frameBaseURL(frame) {
+        const parentURL = frameURLFor(frame);
+        let base = parentURL;
+        try {
+            const b = new FrameDocument(frame).querySelector("base[href]");
+            if (b) {
+                const p = __url_parse(b.getAttribute("href") || "", parentURL);
+                if (p) base = p[0];
+            }
+        } catch (e) {}
+        return base;
+    }
+    function frameResourceURL(node) {
+        if (!node) return "";
+        const raw = node.getAttribute("src") || node.getAttribute("href") || "";
+        if (!String(raw).trim()) return "";
+        const owner = frameOwnerForNode(node);
+        const base = owner ? frameBaseURL(owner) : baseHref();
+        const p = __url_parse(raw, base);
+        return p ? p[0] : raw;
+    }
+    trust.resourceURL = function (nodeId) { return frameResourceURL(wrap(nodeId)); };
+
+    function makeFrameLocation(frame, parentLocation) {
+        const raw = frameURLFor(frame);
+        const inherited = raw === "about:srcdoc" || raw === "about:blank";
+        const parsed = __url_parse(inherited ? parentLocation.href : raw, parentLocation.href) ||
+            [raw, "", "", "", "", "/", "", "", "", "", ""];
+        const state = parsed.slice();
+        if (inherited) state[0] = raw;
+        return {
+            get href() { return state[0]; },
+            get protocol() { return state[1]; }, get host() { return state[2]; },
+            get hostname() { return state[3]; }, get port() { return state[4]; },
+            get pathname() { return state[5]; }, get search() { return state[6]; },
+            get hash() { return state[7]; },
+            get origin() { return inherited ? parentLocation.origin : state[8]; },
+            assign(v) { try { frame.setAttribute("src", String(v)); processIframeAttributes(frame); } catch (e) {} },
+            replace(v) { try { frame.setAttribute("src", String(v)); processIframeAttributes(frame); } catch (e) {} },
+            reload() { try { frame.__loadedSrc = undefined; processIframeAttributes(frame); } catch (e) {} },
+            toString() { return state[0]; },
+        };
+    }
+    function frameParentFrame(frame) {
+        return frame ? frameOwnerForNode(frame) : null;
+    }
+    function frameLocationObject(frame, fallback) {
+        return frame ? frame.contentWindow.location : fallback;
+    }
+    function frameSameOriginWithParent(frame, parentLocation) {
+        const raw = frameURLFor(frame);
+        const inherited = raw === "about:srcdoc" || raw === "about:blank";
+        const href = parentLocation && parentLocation.href || g.location.href;
+        const child = __url_parse(inherited ? href : raw, href);
+        const parent = __url_parse(href, href);
+        return !!(child && parent && child[8] === parent[8]);
+    }
+    // A WindowProxy's target is fixed by the browsing context it represents.
+    // The same Boa object is used for every scoped Window, so these facades
+    // preserve the important distinction for nested frames: `parent` targets
+    // the immediate containing frame, while `top` targets the page window.
+    function makeParentWindow(parentLocation, child, sameOrigin, targetFrame, topWindow) {
+        const parent = {};
+        parent.postMessage = function (message, targetOrigin, transfer) {
+            // MessageEvent.source is the child's WindowProxy, never the
+            // iframe Element. reCAPTCHA inspects that object while validating
+            // its handshake; passing the element made its source probe read
+            // an absent value and throw on Object/URL conversion.
+            postMessageToFrame(targetFrame || null, message, child && child.contentWindow,
+                transferPorts(targetOrigin, transfer), g.location.origin);
+        };
+        parent.location = frameLocationObject(targetFrame, parentLocation);
+        parent.closed = false; parent.length = 0; parent.opener = null;
+        // Same-origin child code may read the parent's document. The
+        // cross-origin case deliberately omits it, matching WindowProxy's
+        // restricted property surface.
+        if (sameOrigin) parent.document = targetFrame ? new FrameDocument(targetFrame) :
+            (topFrameState && topFrameState.document) || wrap(0);
+        const nextParent = targetFrame && frameParentFrame(targetFrame);
+        parent.parent = nextParent
+            ? makeParentWindow(frameLocationObject(nextParent, parentLocation), targetFrame,
+                frameSameOriginWithParent(targetFrame, frameLocationObject(nextParent, parentLocation)),
+                nextParent, topWindow)
+            : (targetFrame ? (topWindow || parent) : parent);
+        parent.top = topWindow || parent; parent.window = parent;
+        parent.self = parent; parent.frames = parent;
+        try { Object.defineProperty(parent, Symbol.toStringTag, { value: "Window" }); } catch (e) {}
+        return parent;
+    }
+    // HTML web messaging transfers MessagePorts in the MessageEvent. The
+    // reCAPTCHA bootstrap uses the legacy `postMessage(data, [port])` overload
+    // to establish its RPC channel; silently dropping that list leaves
+    // `event.ports[0]` undefined and the child aborts while opening the
+    // challenge. Preserve the transferable port object (the page actor has
+    // one realm, so detaching the sender-side identity would only make the
+    // emulation less useful without adding observable value here).
+    function transferPorts(second, third) {
+        const list = Array.isArray(second) ? second : (Array.isArray(third) ? third : []);
+        return list.filter((port) => port && typeof port.postMessage === "function" &&
+            typeof port.start === "function");
+    }
+    function postMessageToFrame(frame, message, source, ports, origin, receiverSource) {
+        setTimeout(function () {
+            runInFrame(frame, function () {
+                // A transferred MessagePort is owned by the receiving
+                // navigable for subsequent callbacks. The object remains
+                // identity-preserving in this one-realm implementation, but
+                // its callback scope must move with the transfer.
+                for (const port of ports || []) {
+                    if (port && typeof port === "object") port.__frame = frame || null;
+                }
+                const ev = new MessageEvent("message", {
+                    data: message, origin: origin || "", source: receiverSource || source || g,
+                    ports: ports || [],
+                });
+                ev.__windowTargetSet = true; ev.__frameTarget = frame || null;
+                g.dispatchEvent(ev);
+            });
+        }, 0);
+    }
+    function postMessageToTop(message, source, ports, origin) {
+        setTimeout(function () {
+            runInFrame(null, function () {
+                const ev = new MessageEvent("message", {
+                    data: message, origin: origin || "", source: source || g,
+                    ports: ports || [],
+                });
+                ev.__windowTargetSet = true; ev.__frameTarget = null;
+                g.dispatchEvent(ev);
+            });
+        }, 0);
+    }
+    function captureFrameState() {
+        return {
+            document: g.document,
+            location: Object.getOwnPropertyDescriptor(g, "location"),
+            parent: g.parent, top: g.top, frames: g.frames, frameElement: g.frameElement,
+            name: g.name, cfgUrl: g.__trust_cfg && g.__trust_cfg.url,
+            innerWidth: g.innerWidth, innerHeight: g.innerHeight,
+            pageXOffset: g.pageXOffset, pageYOffset: g.pageYOffset,
+            scrollX: g.scrollX, scrollY: g.scrollY, base: baseHrefCache,
+        };
+    }
+    function restoreFrameState(state) {
+        g.document = state.document;
+        if (state.location) Object.defineProperty(g, "location", state.location);
+        g.parent = state.parent; g.top = state.top; g.frames = state.frames;
+        g.frameElement = state.frameElement; g.name = state.name;
+        if (g.__trust_cfg) g.__trust_cfg.url = state.cfgUrl;
+        g.innerWidth = state.innerWidth; g.innerHeight = state.innerHeight;
+        g.pageXOffset = state.pageXOffset; g.pageYOffset = state.pageYOffset;
+        g.scrollX = state.scrollX; g.scrollY = state.scrollY;
+        baseHrefCache = state.base;
+    }
+    function enterFrame(frame) {
+        const token = { state: captureFrameState(), active: trust.__activeFrame || null };
+        if (trust.__activeFrame === frame) return token;
+        if (!frame) {
+            if (!topFrameState) topFrameState = token.state;
+            restoreFrameState(topFrameState);
+            trust.__activeFrame = null;
+            return token;
+        }
+        if (!topFrameState && !trust.__activeFrame) topFrameState = token.state;
+        const parentFrame = frameParentFrame(frame);
+        const parentLocation = frameLocationObject(parentFrame, g.location);
+        const topLocation = topFrameState && topFrameState.location
+            ? topFrameState.location.get.call(g) : g.location;
+        const url = frameURLFor(frame);
+        const sameOrigin = frameSameOriginWithParent(frame, parentLocation);
+        const frameLocation = makeFrameLocation(frame, parentLocation);
+        Object.defineProperty(g, "location", {
+            configurable: true, enumerable: true,
+            get() { return frameLocation; },
+            set(v) { frameLocation.assign(v); },
+        });
+        g.document = new FrameDocument(frame);
+        const topWindow = frame.__trustTopWindow || makeParentWindow(topLocation, frame,
+            frameSameOriginWithParent(frame, topLocation), null, null);
+        const parent = parentFrame
+            ? frame.__trustParentWindow || makeParentWindow(parentLocation, frame, sameOrigin, parentFrame, topWindow)
+            : topWindow;
+        frame.__trustTopWindow = topWindow;
+        frame.__trustParentWindow = parent;
+        g.parent = parent; g.top = topWindow; g.frames = sameOrigin ? g : parent;
+        g.frameElement = frame; g.name = frame.getAttribute("name") || "";
+        if (g.__trust_cfg) g.__trust_cfg.url = url;
+        baseHrefCache = null;
+        trust.__activeFrame = frame;
+        return token;
+    }
+    function leaveFrame(token) {
+        if (!token) return;
+        restoreFrameState(token.state);
+        trust.__activeFrame = token.active;
+    }
+    function runInFrame(frame, fn) {
+        const token = enterFrame(frame || null);
+        try { return fn(); } finally { leaveFrame(token); }
+    }
+    trust.__activeFrame = null;
+    trust.bindFrameForNode = function (nodeId) {
+        const node = wrap(nodeId);
+        const frame = frameOwnerForNode(node);
+        // Top-level injected scripts already execute in the canonical page
+        // scope. Avoid pushing/restoring a synthetic null-frame token here:
+        // the token captures the live Window state and can otherwise restore
+        // a stale document after the host async job returns. Only nested
+        // navigables need an explicit scope switch.
+        if (!frame) return;
+        (trust.__frameBindings || (trust.__frameBindings = [])).push(enterFrame(frame));
+    };
+    trust.restoreFrame = function () {
+        const stack = trust.__frameBindings;
+        if (stack && stack.length) leaveFrame(stack.pop());
+    };
+
+    function loadFrameStyles(frame) {
+        runInFrame(frame, function () {
+            let links;
+            try { links = new FrameDocument(frame).querySelectorAll("link"); } catch (e) { return; }
+            for (const link of links) {
+                try { maybeLoadStylesheet(link); } catch (e) {}
+            }
+        });
+    }
+    // HTML's classic-script fetch checks the response status and, when
+    // `nosniff` is present, its JavaScript MIME essence. The page prelude's
+    // worker loader has the same rule, but frame parser scripts use this local
+    // helper because they execute synchronously while the nested document is
+    // being installed.
+    function frameClassicScriptResponseOK(response) {
+        if (!response || response[0] < 200 || response[0] >= 300) return false;
+        const lines = String(response[4] || "").split("\n");
+        let nosniff = false;
+        for (let i = 0; i + 1 < lines.length; i += 2) {
+            if (lines[i].toLowerCase() === "x-content-type-options") {
+                nosniff = lines[i + 1].split(",", 1)[0].trim().toLowerCase() === "nosniff";
+                break;
+            }
+        }
+        if (!nosniff) return true;
+        return /^(application|text)\/(java|ecma)script(?:$|;)/i.test(String(response[1] || "").trim());
+    }
+    function runFrameScripts(frame) {
+        runInFrame(frame, function () {
+            let scripts;
+            try { scripts = new FrameDocument(frame).querySelectorAll("script"); } catch (e) { return; }
+            for (const script of scripts) {
+                if (frameOwnerForNode(script) !== frame || SCRIPTS_STARTED.has(script.__id)) continue;
+                const ty = (script.getAttribute("type") || "").trim().toLowerCase();
+                if (ty && ty !== "text/javascript" && ty !== "application/javascript" &&
+                    ty !== "text/ecmascript") continue;
+                if (script.hasAttribute("nomodule")) continue;
+                SCRIPTS_STARTED.add(script.__id);
+                let source = script.textContent || "";
+                const src = script.getAttribute("src");
+                try {
+                    if (src) {
+                        const url = frameResourceURL(script);
+                        const response = __http_fetch(url, "GET", null, null, null);
+                        if (!frameClassicScriptResponseOK(response)) {
+                            trust.errors.push("frame script " + url + ": network error");
+                            continue;
+                        }
+                        source = response[2] || "";
+                    }
+                    const old = trust.currentScript;
+                    trust.currentScript = script.__id;
+                    try { (0, eval)(source); }
+                    catch (e) { trust.errors.push("frame script: " + ((e && e.message) || e)); }
+                    trust.currentScript = old;
+                } catch (e) {
+                    trust.errors.push("frame script: " + ((e && e.message) || e));
+                }
+            }
+            // The parser-created document reaches interactive after its parser
+            // scripts. Fire the child document event before the parent iframe's
+            // load task, matching HTML's nested-document lifecycle ordering.
+            try { dispatch(g.document, new Event("DOMContentLoaded"), false); } catch (e) {}
+        });
     }
 
     class DocumentFragment extends Node {
@@ -17739,20 +18149,16 @@ const PRELUDE: &str = r##"
     // messaging). With no foreign frames the only valid target is ourselves, so
     // we deliver `message` to our own window ASYNCHRONOUSLY (a task) as a
     // `MessageEvent` carrying data/origin/source — exactly the observable spec
-    // behaviour a single-window page sees. `targetOrigin`/`transfer` are
-    // accepted and ignored (no cross-origin gate, nothing to transfer). A
-    // structured-clone is approximated as identity. Pages post to themselves to
+    // behaviour a single-window page sees. `targetOrigin` is accepted and the
+    // transferable MessagePort list is preserved; a structured clone is still
+    // approximated as identity. Pages post to themselves to
     // defer work or hand off across a microtask boundary (Steam's focus-restore
     // handshake posts `"FocusRestoreReady"` and listens for it); a missing
     // `window.postMessage` was an uncaught TypeError in that timer.
-    g.postMessage = function (message) {
-        setTimeout(function () {
-            g.dispatchEvent(new MessageEvent("message", {
-                data: message,
-                origin: (g.location && g.location.origin) || "",
-                source: g,
-            }));
-        }, 0);
+    g.postMessage = function (message, targetOrigin, transfer) {
+        const targetFrame = trust.__activeFrame || null;
+        postMessageToFrame(targetFrame, message, g, transferPorts(targetOrigin, transfer),
+            g.location.origin);
     };
     // `on<event>` IDL attributes (window.onload = fn). Standard semantics:
     // the attribute is backed by an event listener, so the existing
@@ -17910,7 +18316,8 @@ const PRELUDE: &str = r##"
         if (typeof fn !== "function") return 0;
         const id = timers.seq++;
         const args = Array.prototype.slice.call(arguments, 2);
-        timers.q.push({ id, at: currentTime() + Math.max(0, Number(d) || 0), fn, every: null, args });
+        timers.q.push({ id, at: currentTime() + Math.max(0, Number(d) || 0), fn, every: null, args,
+                        frame: trust.__activeFrame || null });
         return id;
     };
     g.setInterval = function (fn, d) {
@@ -17918,7 +18325,8 @@ const PRELUDE: &str = r##"
         const id = timers.seq++;
         const every = Math.max(4, Number(d) || 4);
         const args = Array.prototype.slice.call(arguments, 2);
-        timers.q.push({ id, at: currentTime() + every, fn, every, args });
+        timers.q.push({ id, at: currentTime() + every, fn, every, args,
+                        frame: trust.__activeFrame || null });
         return id;
     };
     g.clearTimeout = g.clearInterval = (id) => { timers.q = timers.q.filter((t) => t.id !== id); };
@@ -18012,7 +18420,9 @@ const PRELUDE: &str = r##"
         timers.q.splice(timers.q.indexOf(best), 1);
         timers.now = Math.max(timers.now, trust.oneShot ? best.at : observedNow);
         __clockSync();
-        try { best.fn.apply(undefined, best.args || []); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+        try {
+            runInFrame(best.frame, () => best.fn.apply(undefined, best.args || []));
+        } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         return true;
     };
     // At REST (not the load/dispatch fast-forward settle above), the actor
@@ -18044,8 +18454,10 @@ const PRELUDE: &str = r##"
             timers.q.splice(timers.q.indexOf(task), 1);
             timers.now = absMs;
             __clockSync();
-            if (task.every !== null) timers.q.push({ id: task.id, at: absMs + task.every, fn: task.fn, every: task.every, args: task.args });
-            try { task.fn.apply(undefined, task.args || []); } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
+            if (task.every !== null) timers.q.push({ id: task.id, at: absMs + task.every, fn: task.fn, every: task.every, args: task.args, frame: task.frame });
+            try {
+                runInFrame(task.frame, () => task.fn.apply(undefined, task.args || []));
+            } catch (e) { trust.errors.push("timer: " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : "")); }
         }
         timers.now = absMs;
         __clockSync();
@@ -19419,14 +19831,24 @@ const PRELUDE: &str = r##"
     // channel's port to post a macrotask to themselves. We deliver across the
     // pair on a virtual-time timer (a macrotask), which is exactly that role.
     class MessagePort extends EventTarget {
-        constructor() { super(); this.onmessage = null; this.__other = null; }
+        constructor() {
+            super(); this.onmessage = null; this.__other = null;
+            this.__frame = trust.__activeFrame || null;
+        }
         postMessage(data) {
             const other = this.__other;
             if (!other) return;
+            const senderFrame = this.__frame;
+            const targetFrame = other.__frame;
             g.setTimeout(() => {
-                const ev = new Event("message"); ev.data = data;
-                if (typeof other.onmessage === "function") { try { other.onmessage.call(other, ev); } catch (e) {} }
-                other.dispatchEvent(ev);
+                runInFrame(targetFrame || null, function () {
+                    const ev = new Event("message"); ev.data = data;
+                    if (typeof other.onmessage === "function") {
+                        try { other.onmessage.call(other, ev); }
+                        catch (e) { trust.errors.push("message port: " + ((e && e.message) || e)); }
+                    }
+                    other.dispatchEvent(ev);
+                });
             }, 0);
         }
         start() {} close() { this.__other = null; }
@@ -32028,6 +32450,30 @@ mod tests {
         assert!(
             out.contains("SANDBOXED CONTENT"),
             "srcdoc content missing: {out}"
+        );
+    }
+
+    #[test]
+    fn iframe_srcdoc_executes_in_frame_scope() {
+        // HTML creates a nested browsing context for srcdoc, and scripts in
+        // that context execute even when the parent is cross-origin. This
+        // regression covers the reCAPTCHA shape: the child script sees its
+        // own document and can register a listener/timer, while the parent
+        // document remains the visible top-level document after execution.
+        let (out, outcome) = page(
+            r##"<body><div id=top>top</div><iframe srcdoc="<p id=child>before</p><script>var made=document.createElement('span'); made.textContent='|made'; document.getElementById('child').appendChild(made); document.getElementById('child').addEventListener('click',function(){this.textContent+='|clicked'}); var ch=new MessageChannel(); ch.port1.onmessage=function(e){document.getElementById('child').textContent+='|port'+e.data}; window.addEventListener('message',function(e){if(e.data && e.data.kind==='self') document.getElementById('child').textContent+='|self'; if(e.data && e.data.kind==='port' && e.ports[0]) e.ports[0].postMessage('ok'); if(e.data && e.data.kind==='deliver'){document.getElementById('child').textContent+='|down'; if(e.ports[0]) e.ports[0].postMessage('reply')}}); parent.postMessage({kind:'up'},'*'); window.postMessage({kind:'self'},'*'); window.postMessage({kind:'port'},'*',[ch.port2]); document.getElementById('child').dispatchEvent(new Event('click')); setTimeout(function(){document.getElementById('child').textContent+='|timer'},0)</script>"></iframe><script>window.addEventListener('message',function(e){if(e.data && e.data.kind==='up') document.getElementById('top').textContent+='|got-up'}); var f=document.querySelector('iframe'), up=new MessageChannel(), topEl=document.getElementById('top'); up.port1.onmessage=function(){topEl.textContent+='|reply'}; setTimeout(function(){f.contentWindow.postMessage({kind:'deliver'},'*',[up.port2])},0); void 0</script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("before|made|clicked")
+                && out.contains("|self")
+                && out.contains("|portok")
+                && out.contains("|timer"),
+            "frame script did not run: {out}"
+        );
+        assert!(
+            out.contains("|got-up") && out.contains("|down") && out.contains("|reply"),
+            "top document was not restored: {out}"
         );
     }
 
