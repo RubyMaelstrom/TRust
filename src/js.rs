@@ -2418,8 +2418,17 @@ fn arg_node(dom: &Dom, args: &[JsValue], i: usize) -> Option<usize> {
 
 fn arg_str(args: &[JsValue], i: usize, ctx: &mut Context) -> String {
     args.get(i)
-        .and_then(|v| v.to_string(ctx).ok())
-        .map(|s| s.to_std_string_lossy())
+        .and_then(|v| {
+            // Web IDL string arguments from the prelude are already JS
+            // strings.  ToString on a primitive string is identity-preserving
+            // (ECMAScript ToString), so skip Boa's generic conversion path in
+            // that overwhelmingly common case.  Non-strings still use the
+            // full coercion path because user objects can run observable
+            // `toString`/`Symbol.toPrimitive` code.
+            v.as_string()
+                .map(|s| s.to_std_string_lossy())
+                .or_else(|| v.to_string(ctx).ok().map(|s| s.to_std_string_lossy()))
+        })
         .unwrap_or_default()
 }
 
@@ -16950,6 +16959,9 @@ const PRELUDE: &str = r##"
     // "Object already borrowed". Arrays have no such finalizer.
     const MO = [];               // live observers (each with a per-observer record queue)
     const MO_EMPTY = Object.freeze([]); // shared empty addedNodes/removedNodes (frozen ⇒ safe to share)
+    let moHasChildList = false;
+    let moHasAttributes = false;
+    let moHasCharacterData = false;
     let moQueued = false;        // a delivery microtask is already scheduled
     let moChain = 0;             // consecutive delivery turns without the queue going quiet
     let moDisabled = false;      // tripped if an observer-feeds-observer loop runs away
@@ -16964,6 +16976,19 @@ const PRELUDE: &str = r##"
         if (moQueued || moDisabled) return;
         moQueued = true;
         Promise.resolve().then(moDeliver);
+    }
+    function moRecomputeKinds() {
+        moHasChildList = moHasAttributes = moHasCharacterData = false;
+        for (let i = 0; i < MO.length; i++) {
+            const regs = MO[i].__targets;
+            for (let j = 0; j < regs.length; j++) {
+                const r = regs[j];
+                moHasChildList = moHasChildList || r.childList;
+                moHasAttributes = moHasAttributes || r.attributes;
+                moHasCharacterData = moHasCharacterData || r.characterData;
+                if (moHasChildList && moHasAttributes && moHasCharacterData) return;
+            }
+        }
     }
     function moDeliver() {
         moQueued = false;
@@ -17020,6 +17045,7 @@ const PRELUDE: &str = r##"
         // and the inner loop is per (observer × registration), so re-comparing
         // the `rec.type` string each iteration was the bulk of its cost.
         const isCL = rec.type === "childList", isAttr = rec.type === "attributes";
+        let matchedAny = false;
         for (let i = 0; i < MO.length; i++) {
             const o = MO[i], regs = o.__targets;
             let matched = false, wantOld = false;
@@ -17040,6 +17066,7 @@ const PRELUDE: &str = r##"
                     (!isCL && !isAttr && opts.characterDataOldValue)) { wantOld = true; break; }
             }
             if (!matched) continue;
+            matchedAny = true;
             if (rec.__sib !== undefined && !sibDone) {
                 sibDone = true;
                 const s = rec.__sib;
@@ -17058,13 +17085,17 @@ const PRELUDE: &str = r##"
                 oldValue: wantOld ? (rec.oldValue === undefined ? null : rec.oldValue) : null,
             });
         }
-        moEnqueue();
+        // DOM Standard §4.3.2 queues the mutation-observer microtask when a
+        // record is actually queued. An observer registry can be non-empty
+        // while every registration filters out this mutation; avoid creating
+        // a needless Promise reaction in that case.
+        if (matchedAny) moEnqueue();
     }
 
     // Emission helpers used by the mutation wrappers. Each bails on the
     // zero-observer fast path before touching the DOM for siblings/oldValue.
     function moChildInsert(parent, node) {        // call AFTER the insert
-        if (!MO.length) return;
+        if (!MO.length || !moHasChildList) return;
         // `__sib: node` defers prev/next-sibling capture into moNotify (resolved
         // only if some observer matches — see there). Was: eager
         // `previousSibling: node.previousSibling, …`, 2 syscalls + 2 wraps on
@@ -17072,19 +17103,19 @@ const PRELUDE: &str = r##"
         moNotify({ type: "childList", target: parent, addedNodes: [node], __sib: node });
     }
     function moChildRemove(parent, node) {        // call BEFORE the detach
-        if (!MO.length) return;
+        if (!MO.length || !moHasChildList) return;
         moNotify({ type: "childList", target: parent, removedNodes: [node], __sib: node });
     }
     function moChildBulk(target, removed, added) { // innerHTML / textContent / insertAdjacentHTML
-        if (!MO.length) return;
+        if (!MO.length || !moHasChildList) return;
         moNotify({ type: "childList", target, addedNodes: added, removedNodes: removed });
     }
     function moAttr(target, name, oldValue) {
-        if (!MO.length) return;
+        if (!MO.length || !moHasAttributes) return;
         moNotify({ type: "attributes", target, attributeName: name, oldValue });
     }
     function moCharData(target, oldValue) {
-        if (!MO.length) return;
+        if (!MO.length || !moHasCharacterData) return;
         moNotify({ type: "characterData", target, oldValue });
     }
 
@@ -17129,12 +17160,14 @@ const PRELUDE: &str = r##"
             }
             if (!replaced) this.__targets.push(reg);
             if (MO.indexOf(this) < 0) MO.push(this);
+            moRecomputeKinds();
         }
         disconnect() {
             this.__targets = [];
             this.__records = [];
             const i = MO.indexOf(this);
             if (i >= 0) MO.splice(i, 1);
+            moRecomputeKinds();
         }
         takeRecords() { const r = this.__records; this.__records = []; return r; }
     };
@@ -20763,6 +20796,10 @@ mod tests {
         // setup script -> ()  (registers the observers under test)
         let scenarios: &[(&str, &str)] = &[
             ("no observers (raw appendChild)", ""),
+            (
+                "1 unrelated observer (attributes)",
+                "new MutationObserver(function(){}).observe(root,{attributes:true});",
+            ),
             (
                 "1 direct observer (childList)",
                 "new MutationObserver(function(){}).observe(root,{childList:true});",
@@ -25893,6 +25930,30 @@ mod tests {
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("false|false|false|function|function"), "{out}");
+    }
+
+    #[test]
+    fn dom_string_getters_cache_only_within_one_mutation_epoch() {
+        // DOM/HTML serialization getters return the current tree state. A
+        // repeated read may reuse an immutable value, but a text or attribute
+        // mutation must make the next read observe the new state.
+        let (out, outcome) = page(
+            r#"<body><div id=a><span>old</span></div><pre id=o></pre><script>
+                const a = document.getElementById('a');
+                const first = [a.textContent, a.innerHTML, a.outerHTML].join('~');
+                const repeat = [a.textContent, a.innerHTML, a.outerHTML].join('~');
+                a.firstChild.textContent = 'new';
+                const second = [a.textContent, a.innerHTML, a.outerHTML].join('~');
+                a.setAttribute('data-state', 'updated');
+                const third = [a.textContent, a.innerHTML, a.outerHTML].join('~');
+                document.getElementById('o').textContent = [
+                    first === repeat, first.includes('old'), second.includes('new'),
+                    !second.includes('old'), third.includes('data-state="updated"')
+                ].join('|');
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("true|true|true|true|true"), "{out}");
     }
 
     #[test]
@@ -32406,6 +32467,25 @@ mod tests {
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("childList:+1-0 childList:+0-1"), "{out}");
+    }
+
+    #[test]
+    fn mutation_observer_ignores_unmatched_mutation_without_delivery() {
+        // A registered observer is not enough to queue the compound
+        // microtask: the DOM algorithm queues it only after an interested
+        // registration receives a record. This also covers the fast path that
+        // avoids Promise allocation for unrelated mutation categories.
+        let (out, outcome) = page(
+            r#"<body><div id=t></div><pre id=o></pre><script>
+                const t = document.getElementById('t');
+                let fired = 0;
+                new MutationObserver(() => fired++).observe(t, { attributes: true });
+                t.appendChild(document.createElement('span'));
+                document.getElementById('o').textContent = 'fired=' + fired;
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("fired=0"), "{out}");
     }
 
     #[test]
