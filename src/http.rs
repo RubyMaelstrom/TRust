@@ -4506,6 +4506,82 @@ mod tests {
         server.abort();
     }
 
+    // A nested browsing context owns its own stylesheet set (HTML iframe
+    // navigable + CSS Cascade tree scope).  Its link must still be obtained
+    // and applied to the projected frame body; otherwise controls such as
+    // reCAPTCHA's checkbox retain only their inline defaults and paint with
+    // no visible border or hit-sized box.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn execute_js_applies_a_stylesheet_loaded_inside_an_iframe() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 2048];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req);
+                    let reply: &[u8] = if text.starts_with("GET /page ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                          <body><div id=host></div><script>\
+                          document.body.addEventListener('click',function(){});\
+                          document.getElementById('host').innerHTML=\
+                          '<iframe src=\"/frame\"></iframe>';</script></body>"
+                    } else if text.starts_with("GET /frame ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n\
+                          <html><head><link rel=\"stylesheet\" href=\"/frame.css\"></head>\
+                          <body><div class=box>FRAME CONTROL</div></body></html>"
+                    } else if text.starts_with("GET /frame.css ") {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nConnection: close\r\n\r\n\
+                          .box{display:block;width:160px;height:24px;border:3px solid red}"
+                    } else {
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    let _ = sock.write_all(reply).await;
+                });
+            }
+        });
+
+        let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let response = fetch(&Request::get(url)).await.unwrap();
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut latest = String::from_utf8_lossy(&response.body).into_owned();
+        assert!(
+            response.live.is_some(),
+            "iframe stylesheet regression needs the live JS path"
+        );
+        if let Some(mut live) = response.live.take() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while !latest.contains("width:160px") && std::time::Instant::now() < deadline {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(left, live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, outcome })) => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        latest = html;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        assert!(
+            latest.contains("width:160px") && latest.contains("border-top-width:3px"),
+            "stylesheet inside iframe was not applied: {latest}"
+        );
+        server.abort();
+    }
+
     // A SCRIPT-LESS page (the `css_only` path) loads its frames too: `srcdoc`
     // inline, a `src` document fetched + flowed inline (relative link resolved
     // against the frame url), and a frame NESTED inside the fetched document is
