@@ -8939,7 +8939,14 @@ fn normalize_css_value(value: &str) -> String {
         }
         // Preserve the complete url() token, including an unquoted path,
         // while keyword-normalizing the surrounding declaration.
-        if value[i..].len() >= 4 && value[i..i + 4].eq_ignore_ascii_case("url(") {
+        // `i` is a UTF-8 boundary, but `i + 4` is not necessarily one: CSS
+        // values are Unicode code-point streams, and a three-byte code point
+        // can straddle that byte offset. CSS Syntax tokenization must inspect
+        // code points without ever slicing through their UTF-8 encoding.
+        if value
+            .get(i..i.saturating_add(4))
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case("url("))
+        {
             out.push_str(&value[i..i + 4]);
             // The iterator has consumed only the leading `u`; consume the
             // `r`, `l`, and opening parenthesis already copied above.
@@ -10598,6 +10605,20 @@ mod tests {
             "unknown at-rule dropped: {json}"
         );
         assert!(!json.contains(r#"["z","1"]"#), "{json}");
+    }
+
+    #[test]
+    fn css_value_normalization_never_slices_through_unicode() {
+        // CSS Syntax tokenization consumes Unicode code points, not arbitrary
+        // UTF-8 byte ranges. The old URL look-ahead could end inside a
+        // multi-byte code point and panic while a live page was measuring a
+        // resized element; the resulting panic was misreported as a
+        // ResizeObserver/Boa failure.
+        let (name, value, important) =
+            parse_decl("background: hello xyz” URL(Icon.PNG) !important").unwrap();
+        assert_eq!(name, "background");
+        assert_eq!(value, "hello xyz” URL(Icon.PNG)");
+        assert!(important);
     }
 
     #[test]

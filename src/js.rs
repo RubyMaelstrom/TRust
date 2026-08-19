@@ -28803,6 +28803,31 @@ mod tests {
     }
 
     #[test]
+    fn resize_observer_layout_survives_unicode_css_values() {
+        // ChatGPT's composer can add a style value containing Unicode before a
+        // URL while its ResizeObserver is delivering a post-submit layout.
+        // CSS parsing must remain on the page's normal error-recovery path;
+        // it must not panic in a UTF-8 byte slice and look like a Boa failure.
+        let env = PageEnv::bare("https://example.com/");
+        let html = r#"<body><div id=box style="width:100px;height:10px"></div>
+            <div id=out>no</div><script>
+            const box = document.getElementById('box');
+            const out = document.getElementById('out');
+            new ResizeObserver(() => {
+                box.style.setProperty('background', 'hello xyz” URL(Icon.PNG)');
+                out.textContent = 'ok';
+            }).observe(box);
+            </script></body>"#;
+        let (out, outcome) = transform(html, &env);
+        assert!(!outcome.panicked, "engine panicked: {:?}", outcome.errors);
+        assert!(outcome.errors.is_empty(), "errors: {:?}", outcome.errors);
+        assert!(
+            out.contains("ok"),
+            "observer callback did not complete: {out}"
+        );
+    }
+
+    #[test]
     fn resize_observer_redelivers_when_the_observed_box_changes_size() {
         // The active-engine invariant: a ResizeObserver fires AGAIN when its
         // target's size changes, not just once at observe(). This is what lets a
