@@ -111,6 +111,11 @@ pub(crate) enum FragKind<'t> {
     /// replaces it with the laid box. Carries the inline context the box
     /// inherits (by DOM tree, not by containing block).
     Oof(&'t BoxNode, Box<InlineStyle>),
+    /// Marker retained at the original tree position of a viewport-fixed box.
+    /// The laid fragment lives in the flow's fixed list; graphical paint
+    /// resolves this marker there so fixed positioning remains viewport-pinned
+    /// without losing CSS Appendix E tree order.
+    Fixed(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +142,7 @@ pub(super) fn retain_for_paint(fragment: &Frag<'_>) -> Option<Frag<'static>> {
         FragKind::Block => FragKind::Block,
         FragKind::Line(line) => FragKind::Line(line.clone()),
         FragKind::Oof(_, _) => return None,
+        FragKind::Fixed(index) => FragKind::Fixed(*index),
     };
     let children = fragment
         .children
@@ -331,7 +337,7 @@ fn button_content_bounds(f: &Frag<'_>) -> Option<ButtonContentBounds> {
             x1: f.x + f.w,
             y1: f.y + f.h,
         }),
-        FragKind::Oof(..) => None,
+        FragKind::Oof(..) | FragKind::Fixed(_) => None,
     };
     for child in &f.children {
         if let Some(rect) = button_content_bounds(child) {
@@ -542,6 +548,7 @@ impl Flow<'_> {
                         FragKind::Block => "B",
                         FragKind::Line(_) => "L",
                         FragKind::Oof(..) => "OOF",
+                        FragKind::Fixed(_) => "FIXED",
                     },
                     indent = depth * 2
                 );
@@ -1439,7 +1446,7 @@ impl Flow<'_> {
                 let y = match &f.kind {
                     FragKind::Line(_) => Some(f.y),
                     FragKind::Block => first_line_y(&f.children),
-                    FragKind::Oof(..) => None,
+                    FragKind::Oof(..) | FragKind::Fixed(_) => None,
                 };
                 if let Some(y) = y {
                     best = Some(best.map_or(y, |b: f32| b.min(y)));
@@ -3150,7 +3157,35 @@ impl Flow<'_> {
                     // document — its anchors can't be doc scroll targets. It is
                     // clipped only by the viewport, so it resolves with no
                     // ambient clip in `layout`'s separate pinned-layer pass.
+                    // Keep a zero-sized marker at the original tree position
+                    // as well. The graphical painter uses it to interleave the
+                    // viewport-pinned stacking context with normal positioned
+                    // siblings; the terminal painter continues to consume the
+                    // separate fixed list.
+                    let fixed_index = fixed_out.len();
+                    let paint = laid.paint;
                     fixed_out.push(laid);
+                    f.children.insert(
+                        i,
+                        Frag {
+                            node: NO_NODE,
+                            x: 0.0,
+                            y: 0.0,
+                            w: 0.0,
+                            h: 0.0,
+                            border: [0.0; 4],
+                            paint: PaintFlags {
+                                positioned: true,
+                                sc: true,
+                                z: paint.z,
+                                ..PaintFlags::default()
+                            },
+                            clip: None,
+                            kind: FragKind::Fixed(fixed_index),
+                            children: Vec::new(),
+                        },
+                    );
+                    i += 1;
                     continue;
                 }
                 anchors.extend(anc);

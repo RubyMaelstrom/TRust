@@ -403,6 +403,15 @@ pub(crate) fn paint(
     // The pinned layer: each fixed box paints through the same pipeline into
     // its own position-independent row buffer, at its viewport position.
     // Stable stack-level sort: the renderer draws the vec in order.
+    //
+    // A fixed box cannot simply be appended after `rows`: CSS Positioned
+    // Layout §2.2 and CSS 2.1 Appendix E §E.2 place fixed stacking contexts
+    // in the same stacking-context order as their tree-positioned siblings.
+    // Keep the pinned geometry separate so it remains viewport-addressed, but
+    // mark a zero/auto-level fixed box as an under-document layer when a later
+    // ordinary positioned sibling paints above it. This is the terminal
+    // compositor equivalent of the graphical painter's fixed marker.
+    let fixed_under = fixed_under_document(root, fixed.len());
     let mut order: Vec<usize> = (0..fixed.len()).collect();
     order.sort_by_key(|&i| fixed[i].paint.z.unwrap_or(0));
     let vp_rows = viewport.1;
@@ -430,12 +439,7 @@ pub(crate) fn paint(
                 row: row.min(u16::MAX as usize) as u16,
                 rows: brows,
                 z: f.paint.z.unwrap_or(0),
-                under_document: f.paint.z.is_none()
-                    && f.x <= 0.5
-                    && f.y <= 0.5
-                    && f.w + 0.5 >= cols as f32 * cell_w
-                    && f.h + 0.5 >= vp_rows as f32 * cell_h
-                    && !dom.node(f.node).is_some_and(|node| node.point_hit_subtree),
+                under_document: fixed_under.get(i).copied().unwrap_or(false),
             })
         })
         .collect();
@@ -475,6 +479,45 @@ pub(crate) fn paint(
         carousels,
         composites,
     }
+}
+
+/// Decide which pinned fixed stacking contexts must be composited before the
+/// scrolling document rows. The row renderer keeps fixed geometry in a
+/// viewport-pinned buffer, but CSS still orders a fixed box at its marker's
+/// position in the containing stacking context. In particular, a fixed
+/// `z-index:auto/0` box before a later positioned sibling paints below that
+/// sibling; it is not an always-on-top layer merely because its coordinates
+/// are viewport-relative.
+fn fixed_under_document(root: &Frag<'_>, fixed_len: usize) -> Vec<bool> {
+    let mut under = vec![false; fixed_len];
+    let mut negative = Vec::new();
+    let mut zero = Vec::new();
+    let mut positive = Vec::new();
+    collect_positioned(root, &mut negative, &mut zero, &mut positive);
+
+    for child in negative {
+        if let FragKind::Fixed(index) = child.kind {
+            if let Some(slot) = under.get_mut(index) {
+                *slot = true;
+            }
+        }
+    }
+
+    let later_positive_positioned = positive
+        .iter()
+        .any(|child| !matches!(child.kind, FragKind::Fixed(_)));
+    for (position, (child, _)) in zero.iter().enumerate() {
+        let FragKind::Fixed(index) = child.kind else {
+            continue;
+        };
+        let later_zero_positioned = zero[position + 1..]
+            .iter()
+            .any(|(later, _)| !matches!(later.kind, FragKind::Fixed(_)));
+        if let Some(slot) = under.get_mut(index) {
+            *slot = later_zero_positioned || later_positive_positioned;
+        }
+    }
+    under
 }
 
 // ---------------------------------------------------------------------------

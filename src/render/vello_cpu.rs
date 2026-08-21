@@ -200,7 +200,10 @@ impl VelloCpuRenderer {
                     None,
                 ),
                 DisplayCommand::PopLayer => self.context.pop_layer(),
-                DisplayCommand::BeginSticky(_) | DisplayCommand::EndSticky => {
+                DisplayCommand::BeginSticky(_)
+                | DisplayCommand::EndSticky
+                | DisplayCommand::BeginFixed
+                | DisplayCommand::EndFixed => {
                     // Scene composition resolves these to Push/PopTransform.
                 }
                 DisplayCommand::Shadow {
