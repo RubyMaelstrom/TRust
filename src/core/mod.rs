@@ -669,15 +669,24 @@ impl BrowserController {
         self.pending_fragment.take()
     }
 
-    pub fn send_image_sizes(&self, sizes: &crate::layout2::ImageSizes) {
+    /// Queue the decoded intrinsic-size map for the resident page. The native
+    /// frontend calls this from an event loop and must never block; a full
+    /// command queue is therefore a normal retry condition, not a successful
+    /// delivery. This mirrors the terminal frontend's `image_sizes_sent`
+    /// acknowledgement discipline and keeps CSSOM/layout geometry convergent
+    /// with the decoded image resources (CSSOM View + HTML image update).
+    pub fn send_image_sizes(&self, sizes: &crate::layout2::ImageSizes) -> bool {
         let Some(handle) = &self.live_page else {
-            return;
+            return false;
         };
         let values = sizes
             .iter()
             .map(|(source, size)| (source.clone(), *size))
             .collect();
-        let _ = handle.cmds.try_send(crate::js::PageCmd::ImageSizes(values));
+        handle
+            .cmds
+            .try_send(crate::js::PageCmd::ImageSizes(values))
+            .is_ok()
     }
 
     pub fn handle_action(&mut self, action: UserAction) -> ActionOutcome {
@@ -1574,6 +1583,31 @@ mod tests {
         assert!(browser.handle_page_event(crate::js::PageEvt::Settled));
         assert_eq!(browser.snapshot().status, "Ready");
         assert!(!browser.handle_page_event(crate::js::PageEvt::Settled));
+    }
+
+    #[test]
+    fn image_size_delivery_reports_a_full_page_queue_for_retry() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(crate::js::PageCmd::Click(0)).unwrap();
+        browser.live_page = Some(crate::js::PageHandle::from_test_sender(tx));
+        let sizes = crate::layout2::ImageSizes::from([(
+            String::from("https://example.test/hero.jpg"),
+            (640, 360),
+        )]);
+
+        assert!(!browser.send_image_sizes(&sizes));
+        assert!(matches!(rx.try_recv(), Ok(crate::js::PageCmd::Click(0))));
+        assert!(browser.send_image_sizes(&sizes));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::js::PageCmd::ImageSizes(_))
+        ));
     }
 
     #[test]
