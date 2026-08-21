@@ -7199,7 +7199,13 @@ mod tests {
                 }
             }
         }
-        let mut response = fetch(&Request::get(url)).await.unwrap();
+        // The diagnostic exercises a top-level address-bar navigation, not a
+        // page `fetch()`. Preserve Fetch Metadata so servers that vary their
+        // SSR response by navigation context (HTML Fetch Metadata §2) see the
+        // same request shape as the real frontend.
+        let mut navigation = Request::get(url.clone());
+        set_navigation_metadata(&mut navigation, None);
+        let mut response = fetch(&navigation).await.unwrap();
         // TRUST_DIAG_INJECT=<file>: splice a probe <script> at the very top of
         // <head> so it runs before the page's own scripts (mirror-harness style).
         if let Ok(inj) = std::env::var("TRUST_DIAG_INJECT") {

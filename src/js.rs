@@ -243,6 +243,11 @@ impl Outcome {
 struct PageJobExecutor {
     promise_jobs: RefCell<VecDeque<PromiseJob>>,
     async_jobs: RefCell<VecDeque<NativeAsyncJob>>,
+    /// Dynamically prepared classic scripts are their own HTML resource
+    /// tasks. Keep them separate from author `fetch()` jobs: the document's
+    /// `load` event waits for a prepared script's result, but not for an
+    /// arbitrary page fetch started by DOMContentLoaded.
+    script_jobs: RefCell<VecDeque<NativeAsyncJob>>,
     /// Module-script fetches are later HTML tasks. Keep them out of the
     /// parser's ordinary host-job checkpoint so a resident page can paint its
     /// shell while a code-split component graph downloads. Once the actor is
@@ -255,6 +260,7 @@ impl PageJobExecutor {
     fn clear(&self) {
         self.promise_jobs.borrow_mut().clear();
         self.async_jobs.borrow_mut().clear();
+        self.script_jobs.borrow_mut().clear();
         self.deferred_module_jobs.borrow_mut().clear();
         self.other_jobs.borrow_mut().clear();
     }
@@ -266,8 +272,17 @@ impl PageJobExecutor {
     fn has_pending_jobs(&self) -> bool {
         !self.promise_jobs.borrow().is_empty()
             || !self.async_jobs.borrow().is_empty()
+            || !self.script_jobs.borrow().is_empty()
             || !self.deferred_module_jobs.borrow().is_empty()
             || !self.other_jobs.borrow().is_empty()
+    }
+
+    fn has_load_blockers(&self) -> bool {
+        !self.script_jobs.borrow().is_empty() || !self.deferred_module_jobs.borrow().is_empty()
+    }
+
+    fn enqueue_script(&self, job: NativeAsyncJob) {
+        self.script_jobs.borrow_mut().push_back(job);
     }
 
     fn enqueue_deferred_module(&self, job: NativeAsyncJob) {
@@ -307,6 +322,9 @@ impl PageJobExecutor {
         use futures::stream::StreamExt as _;
         let mut group = futures::stream::FuturesUnordered::new();
         loop {
+            for job in std::mem::take(&mut *self.script_jobs.borrow_mut()) {
+                group.push(job.call(context));
+            }
             for job in std::mem::take(&mut *self.async_jobs.borrow_mut()) {
                 group.push(job.call(context));
             }
@@ -342,9 +360,11 @@ impl PageJobExecutor {
                 }
             }
             phase_end(Phase::Execute, exec_t);
+            let script_empty = self.script_jobs.borrow().is_empty();
             let deferred_empty =
                 !include_deferred_modules || self.deferred_module_jobs.borrow().is_empty();
             if self.async_jobs.borrow().is_empty()
+                && script_empty
                 && deferred_empty
                 && !ran_sync
                 && group.is_empty()
@@ -353,6 +373,7 @@ impl PageJobExecutor {
             }
             if ran_sync
                 || !self.async_jobs.borrow().is_empty()
+                || !script_empty
                 || (include_deferred_modules && !self.deferred_module_jobs.borrow().is_empty())
             {
                 continue;
@@ -363,6 +384,75 @@ impl PageJobExecutor {
                 return Err(err);
             }
             phase(&format!("job wake ({} left)", group.len()));
+            context.borrow_mut().clear_kept_objects();
+        }
+        Ok(())
+    }
+
+    /// Run only the resource tasks that can delay the document's `load`
+    /// event. Author `fetch()` jobs stay parked in `async_jobs`, because the
+    /// HTML event loop does not make an arbitrary Fetch promise a load-event
+    /// blocker. Dynamic classic scripts live in `script_jobs`; dynamic module
+    /// entry fetches live in `deferred_module_jobs` and their evaluation/load
+    /// reactions arrive through `promise_jobs`.
+    async fn run_load_blocking_jobs(
+        self: Rc<Self>,
+        context: &RefCell<&mut Context>,
+    ) -> JsResult<()> {
+        use futures::stream::StreamExt as _;
+        let mut group = futures::stream::FuturesUnordered::new();
+        loop {
+            for job in std::mem::take(&mut *self.script_jobs.borrow_mut()) {
+                group.push(job.call(context));
+            }
+            for job in std::mem::take(&mut *self.deferred_module_jobs.borrow_mut()) {
+                group.push(job.call(context));
+            }
+
+            let exec_t = phase_begin();
+            let promise = std::mem::take(&mut *self.promise_jobs.borrow_mut());
+            let other = std::mem::take(&mut *self.other_jobs.borrow_mut());
+            let ran_sync = !promise.is_empty() || !other.is_empty();
+            for job in promise {
+                if let Err(err) = job.call(&mut context.borrow_mut()) {
+                    self.clear();
+                    return Err(err);
+                }
+            }
+            for job in other {
+                let r = match job {
+                    Job::TimeoutJob(t) => t.call(&mut context.borrow_mut()),
+                    Job::GenericJob(g) => g.call(&mut context.borrow_mut()),
+                    Job::PromiseJob(p) => p.call(&mut context.borrow_mut()),
+                    // A resource callback may start an ordinary page fetch.
+                    // It belongs to the later networking task lane and must
+                    // not turn that fetch into a load-event blocker.
+                    Job::AsyncJob(a) => {
+                        self.async_jobs.borrow_mut().push_back(a);
+                        Ok(JsValue::undefined())
+                    }
+                    _ => Ok(JsValue::undefined()),
+                };
+                if let Err(err) = r {
+                    self.clear();
+                    return Err(err);
+                }
+            }
+            phase_end(Phase::Execute, exec_t);
+
+            let no_new_blockers = self.script_jobs.borrow().is_empty()
+                && self.deferred_module_jobs.borrow().is_empty();
+            if no_new_blockers && !ran_sync && group.is_empty() {
+                break;
+            }
+            if ran_sync || !no_new_blockers {
+                continue;
+            }
+            phase(&format!("load-blocker park ({} in flight)", group.len()));
+            if let Some(Err(err)) = group.next().await {
+                self.clear();
+                return Err(err);
+            }
             context.borrow_mut().clear_kept_objects();
         }
         Ok(())
@@ -5632,7 +5722,7 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
                         },
                         realm,
                     );
-                    ctx.enqueue_job(job.into());
+                    enqueue_script_job(ctx, job);
                 }
                 None => fire_script_event(ctx, node_id, "error"),
             }
@@ -5684,7 +5774,7 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
                         },
                         realm,
                     );
-                    ctx.enqueue_job(job.into());
+                    enqueue_script_job(ctx, job);
                 }
             }
         }
@@ -5700,7 +5790,7 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
                 },
                 realm,
             );
-            ctx.enqueue_job(job.into());
+            enqueue_script_job(ctx, job);
         }
         _ => {}
     }
@@ -5780,6 +5870,16 @@ fn enqueue_injected_module_body(ctx: &mut Context, node_id: usize, body: Vec<u8>
         realm,
     );
     enqueue_deferred_module_job(ctx, job);
+}
+
+fn enqueue_script_job(ctx: &mut Context, job: NativeAsyncJob) {
+    if let Some(executor) = ctx.downcast_job_executor::<PageJobExecutor>() {
+        executor.enqueue_script(job);
+    } else {
+        // Small embedders/tests that use Boa's default executor have no
+        // resident lifecycle to coordinate, so retain the ordinary fallback.
+        ctx.enqueue_job(job.into());
+    }
 }
 
 fn enqueue_deferred_module_job(ctx: &mut Context, job: NativeAsyncJob) {
@@ -7474,6 +7574,14 @@ fn settle_page(page: &mut LoadedPage) {
 /// time and gives app commands priority between turns.
 fn complete_live_lifecycle(page: &mut LoadedPage) {
     if !page.outcome.panicked {
+        // HTML §4.12.1.1: a dynamically prepared script keeps its preparation-
+        // time document's load event delayed until its result is ready. Run
+        // only that resource lane here; ordinary page fetches remain later
+        // networking tasks and do not hold up load. This still happens after
+        // the shell paint, so a slow async bundle cannot hide first paint.
+        phase("load blockers start");
+        run_load_blockers_into(&mut page.ctx, &page.budget, &mut page.outcome);
+        phase("load blockers done");
         // Fetches started by load handlers are ordinary post-load networking;
         // they do not delay the load event. Route them through the resident
         // actor before dispatching load so their promises settle on later
@@ -7714,6 +7822,51 @@ fn settle_image_loads(ctx: &mut Context, budget: &Budget, max_ticks: usize, outc
             break;
         }
         settle(ctx, budget, max_ticks, outcome);
+    }
+}
+
+/// Drain only dynamically prepared script tasks before firing the document's
+/// `load` event. This preserves the first shell paint and leaves ordinary
+/// page-fetch jobs in the later networking lane, while implementing the HTML
+/// Standard's `delaying the load event` state for prepared scripts.
+fn run_load_blockers_into(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
+    let handle = ctx
+        .realm()
+        .host_defined()
+        .get::<PageNet>()
+        .map(|n| n.handle.clone());
+    let exec = ctx.downcast_job_executor::<PageJobExecutor>();
+    let Some(exec) = exec else { return };
+    let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match handle {
+        Some(handle) => {
+            let cell = RefCell::new(ctx);
+            handle.block_on(async {
+                let fut = exec.run_load_blocking_jobs(&cell);
+                tokio::pin!(fut);
+                loop {
+                    let remaining = budget.remaining();
+                    if remaining.is_zero() {
+                        break Ok(());
+                    }
+                    let slice = remaining.min(Duration::from_millis(200));
+                    match tokio::time::timeout(slice, &mut fut).await {
+                        Ok(result) => break result,
+                        Err(_) => continue,
+                    }
+                }
+            })
+        }
+        None => futures::executor::block_on(exec.run_load_blocking_jobs(&RefCell::new(ctx))),
+    }));
+    match drained {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => outcome.errors.push(format!("load-blocking task: {err}")),
+        Err(_) => {
+            outcome.errors.push(String::from(
+                "load-blocking task: engine panic (Boa bug) — page JS halted",
+            ));
+            outcome.panicked = true;
+        }
     }
 }
 
@@ -9195,11 +9348,13 @@ fn page_actor(
     // the moment the app drops the page. The WS forwarder holds only a weak one.
     drop(cmd_self);
     // First paint: if the interactive shell is already a live page (has
-    // clickables), emit it now. Async networking, load-handler work, and author
-    // timer tasks continue through the resident event loop; none delays this
-    // shell. A static article skips the early duplicate and falls through to
-    // the inert-page classification below.
+    // clickables), or if a prepared script is waiting to delay `load`, emit it
+    // now. Async networking, load-handler work, and author timer tasks continue
+    // through the resident event loop; none delays this shell. A static article
+    // without pending script resources skips the early duplicate and falls
+    // through to the inert-page classification below.
     let (shell, shell_rendered, _, shell_clickable) = extract_live(&mut page);
+    let shell_has_load_blockers = page_has_load_blockers(&page);
     // Seed the render-dedup baseline from the shell (the settle path below
     // overwrites it when it re-extracts), so a `painted_live && !changed` page —
     // which emits ONLY this shell — still has a baseline and the first dispatch
@@ -9219,14 +9374,15 @@ fn page_actor(
     let mut shell_outcome = page.outcome.clone();
     shell_outcome.elapsed = page.started.elapsed();
     shell_outcome.rendered = Some(Box::new(shell_rendered));
-    let painted_live = shell_clickable
+    let shell_sent = (shell_clickable || shell_has_load_blockers)
         && evts
             .blocking_send(PageEvt::Updated {
                 html: shell,
                 outcome: shell_outcome,
             })
             .is_ok();
-    if shell_clickable && !painted_live {
+    let painted_live = shell_clickable && shell_sent;
+    if (shell_clickable || shell_has_load_blockers) && !shell_sent {
         return; // app dropped the handle while we painted the shell
     }
     // We've consumed the current DOM into the shell render; clear the
@@ -9244,7 +9400,7 @@ fn page_actor(
     // counts every load error twice (a single load error showed as `· JS:2!`).
     // Errors that arise DURING settle accumulate fresh and are reported once.
     // (Console is left cumulative — it's a diagnostic channel, not a count.)
-    if painted_live {
+    if shell_sent {
         page.outcome.errors.clear();
         // requestSubmit() may have run synchronously during parsing or
         // DOMContentLoaded. Emit it only after the first paint; its entry list
@@ -10485,6 +10641,12 @@ fn page_has_pending_jobs(page: &LoadedPage) -> bool {
     page.ctx
         .downcast_job_executor::<PageJobExecutor>()
         .is_some_and(|executor| executor.has_pending_jobs())
+}
+
+fn page_has_load_blockers(page: &LoadedPage) -> bool {
+    page.ctx
+        .downcast_job_executor::<PageJobExecutor>()
+        .is_some_and(|executor| executor.has_load_blockers())
 }
 
 /// Does the page have scroll-driven work — an `IntersectionObserver` or a
@@ -12581,7 +12743,7 @@ const PRELUDE: &str = r##"
     // handlers attached during the current turn still observe it (same shape
     // as the synthetic image-load pass).
     function fireFrameLoad(frame) {
-        setTimeout(function () {
+        __queue_message_task(function () {
             // The nested document's Window also receives its load event. The
             // iframe element's load below is a separate parent-document event;
             // both are observable and child bootstraps commonly wait on the
@@ -15621,7 +15783,7 @@ const PRELUDE: &str = r##"
             typeof port.start === "function");
     }
     function postMessageToFrame(frame, message, source, ports, origin, receiverSource) {
-        setTimeout(function () {
+        __queue_message_task(function () {
             runInFrame(frame, function () {
                 // A transferred MessagePort is owned by the receiving
                 // navigable for subsequent callbacks. The object remains
@@ -15640,7 +15802,7 @@ const PRELUDE: &str = r##"
         }, 0);
     }
     function postMessageToTop(message, source, ports, origin) {
-        setTimeout(function () {
+        __queue_message_task(function () {
             runInFrame(null, function () {
                 const ev = new MessageEvent("message", {
                     data: message, origin: origin || "", source: source || g,
@@ -18329,6 +18491,11 @@ const PRELUDE: &str = r##"
                         frame: trust.__activeFrame || null });
         return id;
     };
+    // HTML §9.4.4 gives each MessagePort its own port-message task source.
+    // Capture TRust's native timer enqueue operation before page code can
+    // replace window.setTimeout: timer shims must not disable MessageChannel,
+    // which is how React and other schedulers deliver independent tasks.
+    const __queue_message_task = g.setTimeout;
     g.setInterval = function (fn, d) {
         if (typeof fn !== "function") return 0;
         const id = timers.seq++;
@@ -19849,7 +20016,7 @@ const PRELUDE: &str = r##"
             if (!other) return;
             const senderFrame = this.__frame;
             const targetFrame = other.__frame;
-            g.setTimeout(() => {
+            __queue_message_task(() => {
                 runInFrame(targetFrame || null, function () {
                     const ev = new Event("message"); ev.data = data;
                     if (typeof other.onmessage === "function") {
@@ -19894,7 +20061,7 @@ const PRELUDE: &str = r##"
             const list = BC.get(this.name) || [];
             for (const ch of list.slice()) {
                 if (ch === this || ch.__closed) continue;
-                g.setTimeout(() => {
+                __queue_message_task(() => {
                     if (ch.__closed) return;
                     const ev = new MessageEvent("message", {
                         data: message,
@@ -23807,6 +23974,56 @@ mod tests {
         assert_eq!(s(&mut ctx, b"out.type"), "message");
         assert_eq!(s(&mut ctx, b"String(out.isMessageEvent)"), "true");
         assert_eq!(s(&mut ctx, b"String(out.selfSource)"), "true");
+    }
+
+    #[test]
+    fn message_port_task_survives_a_page_timer_replacement() {
+        // HTML §9.4.4 gives every MessagePort its own port-message task
+        // source. A page may replace window.setTimeout (Instagram does this
+        // during bootstrap), but that must not disable MessageChannel.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom.clone()));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        let cfg = r#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#;
+        ctx.eval(Source::from_bytes(cfg.as_bytes())).unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "message-port-timer-shim.js",
+            br##"
+            globalThis.out = "";
+            var channel = new MessageChannel();
+            channel.port1.onmessage = function (event) { out = event.data; };
+            window.setTimeout = function () { throw new Error("page timer shim"); };
+            channel.port2.postMessage("scheduler turn");
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(
+            ctx.eval(Source::from_bytes(b"out"))
+                .unwrap()
+                .to_string(&mut ctx)
+                .unwrap()
+                .to_std_string_escaped(),
+            "scheduler turn"
+        );
     }
 
     #[test]
@@ -33740,6 +33957,55 @@ mod tests {
             "resident actor should paint before async module work"
         );
         assert!(saw_module, "resident actor should service the module task");
+    }
+
+    #[test]
+    fn a_live_dynamic_script_completes_before_window_load() {
+        // HTML §4.12.1.1 marks a connected dynamically prepared script as
+        // delaying the preparation-time document's load event until its
+        // result is ready. The resident actor may paint the shell first, but
+        // it must not dispatch window.load ahead of that script task.
+        let (handle, mut events) = live(
+            r#"<body><pre id=o>before</pre><button>keep live</button><script>
+            window.__order = [];
+            document.addEventListener('DOMContentLoaded', function () {
+              var s = document.createElement('script');
+              s.textContent = "window.__order.push('script'); document.getElementById('o').textContent=window.__order.join('|');";
+              document.body.appendChild(s);
+            });
+            window.addEventListener('load', function () {
+              window.__order.push('load');
+              document.getElementById('o').textContent = window.__order.join('|');
+            });
+            </script></body>"#,
+        );
+        let mut shell = false;
+        let mut ordered = false;
+        for _ in 0..8 {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{outcome:?}");
+                    shell |= html.contains(">before<");
+                    ordered |= html.contains(">script|load<");
+                    if ordered {
+                        break;
+                    }
+                }
+                Some(PageEvt::Static { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{outcome:?}");
+                    ordered |= html.contains(">script|load<");
+                    break;
+                }
+                Some(PageEvt::Settled) => {}
+                other => panic!("unexpected live-page event: {other:?}"),
+            }
+        }
+        drop(handle);
+        assert!(shell, "the live page still paints its shell first");
+        assert!(
+            ordered,
+            "window.load must follow the dynamically prepared script"
+        );
     }
 
     #[test]
