@@ -455,6 +455,11 @@ pub enum DisplayCommand {
     /// transform before a raster backend sees the list.
     BeginSticky(StickyConstraint),
     EndSticky,
+    /// Layout-owned scope for a viewport-fixed stacking context interleaved
+    /// with document paint. Scene composition cancels the document scroll
+    /// inside the scope before a raster backend sees the list.
+    BeginFixed,
+    EndFixed,
     /// A renderer may use a native blur/filter, or fall back to an expanded
     /// translucent shape. The geometry and CSS semantics remain TRust-owned.
     Shadow {
@@ -541,6 +546,9 @@ pub struct PagePaint {
     pub fixed_under_primitives: Vec<Primitive>,
     /// Viewport-fixed commands are composed after the scrolled document list.
     pub fixed_primitives: Vec<Primitive>,
+    /// Whether `primitives` already contains fixed scopes in CSS tree order.
+    /// Legacy protocol paints still use `fixed_primitives` as a separate layer.
+    pub fixed_interleaved: bool,
     /// Document top-layer entries, in the specification's ordered-set order.
     /// Absolute entries retain document scrolling; fixed entries are viewport-
     /// pinned. Every entry paints after the root stacking context.
@@ -753,6 +761,8 @@ fn command_changes_paint_state(command: &DisplayCommand) -> bool {
             | DisplayCommand::PopLayer
             | DisplayCommand::BeginSticky(_)
             | DisplayCommand::EndSticky
+            | DisplayCommand::BeginFixed
+            | DisplayCommand::EndFixed
     )
 }
 
@@ -859,7 +869,9 @@ fn leaf_command_bounds(command: &DisplayCommand) -> Option<CssRect> {
         | DisplayCommand::PushLayer(_)
         | DisplayCommand::PopLayer
         | DisplayCommand::BeginSticky(_)
-        | DisplayCommand::EndSticky => None,
+        | DisplayCommand::EndSticky
+        | DisplayCommand::BeginFixed
+        | DisplayCommand::EndFixed => None,
     }
 }
 
@@ -1252,7 +1264,7 @@ impl Scene {
 
         // Fixed-position descendants use the viewport as their containing
         // block: chrome offset applies, document scroll deliberately does not.
-        if !page.fixed_primitives.is_empty() {
+        if !page.fixed_interleaved && !page.fixed_primitives.is_empty() {
             self.primitives
                 .push(Primitive::PushTransform(Affine2d::translate(
                     self.content_viewport.x,
@@ -1312,6 +1324,14 @@ impl Scene {
                         .push(Primitive::PushTransform(Affine2d::translate(dx, dy)));
                 }
                 Primitive::EndSticky => self.primitives.push(Primitive::PopTransform),
+                Primitive::BeginFixed => {
+                    self.primitives
+                        .push(Primitive::PushTransform(Affine2d::translate(
+                            viewport_scroll.x,
+                            viewport_scroll.y,
+                        )))
+                }
+                Primitive::EndFixed => self.primitives.push(Primitive::PopTransform),
                 other => self.primitives.push(other.clone()),
             }
         }

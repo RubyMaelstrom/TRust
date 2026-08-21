@@ -25,10 +25,14 @@ use super::Units;
 use super::flow::{Clip, Frag, FragKind, TopFrag};
 use super::style::{Outline, OutlineStyle, outline_of};
 
-struct Builder<'a> {
+struct Builder<'a, 't> {
     dom: &'a Dom,
     base: &'a Url,
     images: &'a ImageSizes,
+    fixed: &'a [Frag<'t>],
+    viewport_w: f32,
+    viewport_h: f32,
+    fixed_depth: usize,
     /// Finite extent used when a CSS clip is unbounded on one axis. CSS
     /// Overflow L3 §3 defines that axis as unclipped; display-list paths,
     /// unlike CSS clip edges, cannot contain ±∞, so the extent must cover the
@@ -48,20 +52,26 @@ struct Builder<'a> {
     hard_clips: Vec<CssRect>,
 }
 
-impl<'a> Builder<'a> {
+impl<'a, 't> Builder<'a, 't> {
     fn new(
         dom: &'a Dom,
         base: &'a Url,
         images: &'a ImageSizes,
-        root: &Frag<'_>,
-        fixed: &[Frag<'_>],
-        top_layer: &[TopFrag<'_>],
+        root: &Frag<'t>,
+        fixed: &'a [Frag<'t>],
+        top_layer: &[TopFrag<'t>],
         flow_bottom: f32,
+        viewport_w: f32,
+        viewport_h: f32,
     ) -> Self {
         let mut this = Self {
             dom,
             base,
             images,
+            fixed,
+            viewport_w,
+            viewport_h,
+            fixed_depth: 0,
             clip_extent: paint_extent(root, fixed, top_layer, flow_bottom),
             commands: Vec::new(),
             lines: Vec::new(),
@@ -284,13 +294,13 @@ impl<'a> Builder<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn paint(
+pub(super) fn paint<'t>(
     dom: &Dom,
     base: &Url,
     images: &ImageSizes,
-    root: &Frag<'_>,
-    fixed: &[Frag<'_>],
-    top_layer: &[TopFrag<'_>],
+    root: &Frag<'t>,
+    fixed: &'_ [Frag<'t>],
+    top_layer: &[TopFrag<'t>],
     flow_bottom: f32,
     viewport_w: f32,
     viewport_h: f32,
@@ -299,7 +309,17 @@ pub(super) fn paint(
     Vec<super::GraphicalPatchBoundary>,
     Vec<super::GraphicalBoundary>,
 ) {
-    let mut builder = Builder::new(dom, base, images, root, fixed, top_layer, flow_bottom);
+    let mut builder = Builder::new(
+        dom,
+        base,
+        images,
+        root,
+        fixed,
+        top_layer,
+        flow_bottom,
+        viewport_w,
+        viewport_h,
+    );
     // CSS Backgrounds 3 §§2.11.1–2: the root background becomes the canvas
     // background. For HTML, when the root has its initial transparent/none
     // background, the first BODY child's computed background is propagated to
@@ -368,6 +388,7 @@ pub(super) fn paint(
         primitives,
         fixed_under_primitives,
         fixed_primitives,
+        fixed_interleaved: true,
         top_layer: top_layer_entries,
         image_requests: builder.image_requests,
         scroll_containers: builder.scroll_containers,
@@ -379,7 +400,7 @@ pub(super) fn paint(
 /// CSS 2.2 Appendix E order for one real stacking context. Opacity and
 /// transforms wrap the context atomically, as required by CSS Color and CSS
 /// Transforms; children never observe a renderer-specific layer object.
-fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
+fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     let boundary_start = builder.commands.len();
     let boundary_line_start = builder.lines.len();
     let boundary = graphical_boundary(fragment, builder);
@@ -415,24 +436,30 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
     let mut negative = Vec::new();
     let mut zero = Vec::new();
     let mut positive = Vec::new();
-    collect_positioned(fragment, &mut negative, &mut zero, &mut positive);
-    negative.sort_by_key(|child| child.paint.z.unwrap_or(0));
-    positive.sort_by_key(|child| child.paint.z.unwrap_or(0));
+    collect_positioned(
+        fragment,
+        builder.fixed,
+        &mut negative,
+        &mut zero,
+        &mut positive,
+    );
+    negative.sort_by_key(|child| positioned_z(child, builder.fixed));
+    positive.sort_by_key(|child| positioned_z(child, builder.fixed));
     for child in negative {
-        build_sc(child, builder);
+        build_positioned(child, builder, true);
     }
     inflow_backgrounds(fragment, builder);
     paint_floats(fragment, builder);
     inflow_content(fragment, builder);
     for (child, real_context) in zero {
-        if real_context {
-            build_sc(child, builder);
-        } else {
-            build_pseudo(child, builder);
+        match child {
+            PositionedChild::Fragment(child) if real_context => build_sc(child, builder),
+            PositionedChild::Fragment(child) => build_pseudo(child, builder),
+            PositionedChild::Fixed(index) => build_fixed(index, builder),
         }
     }
     for child in positive {
-        build_sc(child, builder);
+        build_positioned(child, builder, true);
     }
     if layered {
         builder.commands.push(DisplayCommand::PopLayer);
@@ -457,13 +484,65 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
     }
 }
 
+enum PositionedChild<'f, 't> {
+    Fragment(&'f Frag<'t>),
+    Fixed(usize),
+}
+
+fn positioned_z(child: &PositionedChild<'_, '_>, fixed: &[Frag<'_>]) -> i32 {
+    match child {
+        PositionedChild::Fragment(fragment) => fragment.paint.z.unwrap_or(0),
+        PositionedChild::Fixed(index) => fixed
+            .get(*index)
+            .and_then(|fragment| fragment.paint.z)
+            .unwrap_or(0),
+    }
+}
+
+fn build_positioned(
+    child: PositionedChild<'_, '_>,
+    builder: &mut Builder<'_, '_>,
+    _real_context: bool,
+) {
+    match child {
+        PositionedChild::Fragment(fragment) => build_sc(fragment, builder),
+        PositionedChild::Fixed(index) => build_fixed(index, builder),
+    }
+}
+
+fn build_fixed(index: usize, builder: &mut Builder<'_, '_>) {
+    let Some(fragment) = builder.fixed.get(index) else {
+        return;
+    };
+    // The full-viewport, auto-z backdrop remains in the dedicated underlay;
+    // its marker is intentionally silent in the document stream.
+    if super::flow::fixed_backdrop(
+        builder.dom,
+        fragment,
+        builder.viewport_w,
+        builder.viewport_h,
+    ) {
+        return;
+    }
+    let outer = builder.fixed_depth == 0;
+    if outer {
+        builder.commands.push(DisplayCommand::BeginFixed);
+    }
+    builder.fixed_depth += 1;
+    build_sc(fragment, builder);
+    builder.fixed_depth -= 1;
+    if outer {
+        builder.commands.push(DisplayCommand::EndFixed);
+    }
+}
+
 /// A graphical patch range must be atomic in CSS 2.2 Appendix-E order and its
 /// interior layout must not affect outside layout. A real stacking context is
 /// atomic for paint; an independent formatting context provides the layout
 /// boundary. Anything less stays on the full-layout fallback.
 fn graphical_boundary(
     fragment: &Frag<'_>,
-    builder: &Builder<'_>,
+    builder: &Builder<'_, '_>,
 ) -> Option<(usize, NodeId, CssRect)> {
     if fragment.node == NO_NODE
         || !fragment.paint.sc
@@ -491,14 +570,14 @@ fn graphical_boundary(
     ))
 }
 
-fn build_pseudo(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
+fn build_pseudo(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     paint_fragment(fragment, builder);
     inflow_backgrounds(fragment, builder);
     paint_floats(fragment, builder);
     inflow_content(fragment, builder);
 }
 
-fn inflow_backgrounds(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
+fn inflow_backgrounds(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     for child in &fragment.children {
         if child.paint.sc || child.paint.positioned || child.paint.float {
             continue;
@@ -510,7 +589,7 @@ fn inflow_backgrounds(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
     }
 }
 
-fn inflow_content(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
+fn inflow_content(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     for child in &fragment.children {
         if child.paint.sc || child.paint.positioned || child.paint.float {
             continue;
@@ -522,7 +601,7 @@ fn inflow_content(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
     }
 }
 
-fn paint_floats(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
+fn paint_floats(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     for child in &fragment.children {
         if child.paint.sc || child.paint.positioned {
             continue;
@@ -540,29 +619,42 @@ fn paint_floats(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
 
 fn collect_positioned<'a, 'tree>(
     fragment: &'a Frag<'tree>,
-    negative: &mut Vec<&'a Frag<'tree>>,
-    zero: &mut Vec<(&'a Frag<'tree>, bool)>,
-    positive: &mut Vec<&'a Frag<'tree>>,
+    fixed: &[Frag<'tree>],
+    negative: &mut Vec<PositionedChild<'a, 'tree>>,
+    zero: &mut Vec<(PositionedChild<'a, 'tree>, bool)>,
+    positive: &mut Vec<PositionedChild<'a, 'tree>>,
 ) {
     for child in &fragment.children {
+        if let FragKind::Fixed(index) = child.kind {
+            let z = fixed
+                .get(index)
+                .and_then(|fragment| fragment.paint.z)
+                .unwrap_or(0);
+            match z.cmp(&0) {
+                std::cmp::Ordering::Less => negative.push(PositionedChild::Fixed(index)),
+                std::cmp::Ordering::Equal => zero.push((PositionedChild::Fixed(index), true)),
+                std::cmp::Ordering::Greater => positive.push(PositionedChild::Fixed(index)),
+            }
+            continue;
+        }
         if child.paint.sc {
             match child.paint.z.unwrap_or(0) {
-                z if z < 0 => negative.push(child),
-                0 => zero.push((child, true)),
-                _ => positive.push(child),
+                z if z < 0 => negative.push(PositionedChild::Fragment(child)),
+                0 => zero.push((PositionedChild::Fragment(child), true)),
+                _ => positive.push(PositionedChild::Fragment(child)),
             }
             continue;
         }
         if child.paint.positioned {
-            zero.push((child, false));
-            collect_positioned(child, negative, zero, positive);
+            zero.push((PositionedChild::Fragment(child), false));
+            collect_positioned(child, fixed, negative, zero, positive);
             continue;
         }
-        collect_positioned(child, negative, zero, positive);
+        collect_positioned(child, fixed, negative, zero, positive);
     }
 }
 
-fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
+fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     if fragment.node != NO_NODE && builder.dom.visibility_hidden(fragment.node) {
         return;
     }
@@ -748,7 +840,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
 fn paint_native_control_surface(
     fragment: &Frag<'_>,
     radii: CornerRadii,
-    builder: &mut Builder<'_>,
+    builder: &mut Builder<'_, '_>,
 ) {
     let node = fragment.node;
     let is_control = matches!(builder.dom.tag_name(node), Some("button" | "textarea"))
@@ -835,7 +927,7 @@ fn paint_color_is_light(color: PaintColor) -> bool {
 /// outline's exact stacking is intentionally UA-defined; emitting it at the
 /// end of this fragment's paint keeps it visible over the fragment's own text
 /// while preserving the surrounding Appendix E traversal.
-fn paint_outline(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
+fn paint_outline(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     paint_outline_box(
         builder,
         fragment.node,
@@ -845,7 +937,7 @@ fn paint_outline(fragment: &Frag<'_>, builder: &mut Builder<'_>) {
 }
 
 fn paint_outline_box(
-    builder: &mut Builder<'_>,
+    builder: &mut Builder<'_, '_>,
     node: NodeId,
     border_box: CssRect,
     outline: Outline,
@@ -948,7 +1040,7 @@ fn interaction_actor(dom: &Dom, node: NodeId) -> Option<usize> {
     None
 }
 
-fn push_layer(fragment: &Frag<'_>, builder: &mut Builder<'_>) -> bool {
+fn push_layer(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) -> bool {
     if fragment.node == NO_NODE {
         return false;
     }
@@ -972,7 +1064,7 @@ fn push_layer(fragment: &Frag<'_>, builder: &mut Builder<'_>) -> bool {
     }
 }
 
-fn paint_transform(fragment: &Frag<'_>, builder: &Builder<'_>) -> Option<Affine2d> {
+fn paint_transform(fragment: &Frag<'_>, builder: &Builder<'_, '_>) -> Option<Affine2d> {
     if fragment.node == NO_NODE {
         return None;
     }
@@ -997,7 +1089,7 @@ fn paint_transform(fragment: &Frag<'_>, builder: &Builder<'_>) -> Option<Affine2
 fn paint_background_images(
     fragment: &Frag<'_>,
     shape: PaintShape,
-    builder: &mut Builder<'_>,
+    builder: &mut Builder<'_, '_>,
     canvas: Option<CssRect>,
 ) {
     paint_background_images_for_node(fragment, fragment.node, shape, builder, canvas);
@@ -1032,7 +1124,7 @@ fn paint_background_images_for_node(
     fragment: &Frag<'_>,
     style_node: NodeId,
     shape: PaintShape,
-    builder: &mut Builder<'_>,
+    builder: &mut Builder<'_, '_>,
     canvas: Option<CssRect>,
 ) {
     let Some(value) = builder
@@ -1361,7 +1453,7 @@ fn background_clip_shape(clip: CssRect, original: &PaintShape, border: CssRect) 
 
 #[allow(clippy::too_many_arguments)]
 fn paint_spaced_background(
-    builder: &mut Builder<'_>,
+    builder: &mut Builder<'_, '_>,
     clip: CssRect,
     node: NodeId,
     handle: ImageHandle,
@@ -1409,7 +1501,7 @@ fn paint_spaced_background(
 /// CSS Backgrounds and Borders §6: background first, then border. Uniform
 /// rounded borders use one true stroked rounded path; non-uniform sides retain
 /// each side's own color/style and CSS-pixel width.
-fn paint_borders(fragment: &Frag<'_>, radii: CornerRadii, builder: &mut Builder<'_>) {
+fn paint_borders(fragment: &Frag<'_>, radii: CornerRadii, builder: &mut Builder<'_, '_>) {
     let node = fragment.node;
     let [top, right, bottom, left] = fragment.border;
     if [top, right, bottom, left].iter().all(|v| *v <= 0.0) {
@@ -1480,7 +1572,7 @@ fn paint_borders(fragment: &Frag<'_>, radii: CornerRadii, builder: &mut Builder<
     }
 }
 
-fn paint_box_shadows(dom: &Dom, node: NodeId, shape: &PaintShape, builder: &mut Builder<'_>) {
+fn paint_box_shadows(dom: &Dom, node: NodeId, shape: &PaintShape, builder: &mut Builder<'_, '_>) {
     let Some(value) = dom.computed_value_resolved(node, "box-shadow") else {
         return;
     };

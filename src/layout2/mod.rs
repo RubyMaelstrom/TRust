@@ -358,6 +358,7 @@ pub fn lay_out_graphical(
                 primitives: Vec::new(),
                 fixed_under_primitives: Vec::new(),
                 fixed_primitives: Vec::new(),
+                fixed_interleaved: false,
                 top_layer: Vec::new(),
                 image_requests: Vec::new(),
                 scroll_containers: Vec::new(),
@@ -4110,6 +4111,40 @@ mod tests {
         assert!(
             out.fixed[0].under_document,
             "a non-interactive viewport backdrop remains pinned but cannot cover later content"
+        );
+    }
+
+    #[test]
+    fn fixed_zero_context_before_positioned_sibling_is_composited_under_document() {
+        // The fixed shell is still viewport-pinned, but its z:0 stacking
+        // context precedes the later z:0 dialog in Appendix E step 8. The
+        // terminal keeps the shell in a pinned buffer while compositing that
+        // buffer before the document rows, so the dialog remains visible and
+        // hit-testable.
+        let out = lay(
+            r#"<body style="margin:0">
+               <div style="position:fixed;inset:0;z-index:0;background:#111">
+                 <a href="/inside">page</a>
+               </div>
+               <div style="position:relative;z-index:0;width:160px;height:80px;background:#eee">
+                 <button>Allow</button>
+               </div></body>"#,
+            80,
+        );
+        assert_eq!(out.fixed.len(), 1);
+        assert!(
+            out.fixed[0].under_document,
+            "a fixed z:0 shell before a later z:0 sibling follows tree order"
+        );
+        let text = out
+            .rows
+            .iter()
+            .flat_map(|row| row.items.iter())
+            .map(|item| item.text.as_str())
+            .collect::<String>();
+        assert!(
+            text.contains("Allow"),
+            "later dialog remains in document rows"
         );
     }
 
