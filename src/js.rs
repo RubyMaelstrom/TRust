@@ -10302,6 +10302,15 @@ fn timer_wake(
 /// timer in the same turn (HTML §8.1.7.3).
 fn host_task_wake(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
     prepare_dispatch(page);
+    // A dynamically inserted external script is an HTML networking task. The
+    // script element's force-async path (HTML §4.12.1.1, "prepare the script
+    // element") fetches it without blocking the document's parser and runs it
+    // when its response becomes available. It is not a user interaction, so
+    // the one-second dispatch budget installed by `prepare_dispatch` must not
+    // cancel a legitimate slow bundle before its task can evaluate. Keep the
+    // same page-wide wall bound used for initial loading while the resource
+    // task is being serviced; the fetch count and SSRF gate remain in force.
+    page.budget.rearm(WALL_BUDGET);
     run_jobs_into(&mut page.ctx, &page.budget, &mut page.outcome);
     reconcile_custom_elements(&mut page.ctx);
     run_microtasks_into(&mut page.ctx, &mut page.outcome);
