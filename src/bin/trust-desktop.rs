@@ -1119,6 +1119,10 @@ struct DesktopApp {
     event_proxy: EventLoopProxy<DesktopEvent>,
     image_store: ImageStore,
     image_sizes: trust::layout2::ImageSizes,
+    /// Number of decoded intrinsic sizes successfully queued to the resident
+    /// page actor. `try_send` can legitimately find the command queue full;
+    /// retain the unsent map and retry from the native draw/event loop.
+    image_sizes_sent: usize,
     image_loads: ImageLoadScheduler,
     image_tasks: HashMap<ImageHandle, tokio::task::JoinHandle<()>>,
     image_flush_scheduled: bool,
@@ -1257,6 +1261,7 @@ impl DesktopApp {
             event_proxy,
             image_store,
             image_sizes: trust::layout2::ImageSizes::new(),
+            image_sizes_sent: 0,
             image_loads: ImageLoadScheduler::default(),
             image_tasks: HashMap::new(),
             image_flush_scheduled: false,
@@ -1347,6 +1352,7 @@ impl DesktopApp {
         // full decoded gallery would pin its high-water after navigation.
         self.image_store.clear();
         self.image_sizes.clear();
+        self.image_sizes_sent = 0;
         self.animation_sources.clear();
         self.active_animations.clear();
         self.image_schedule_key = None;
@@ -1755,6 +1761,7 @@ impl DesktopApp {
         self.retire_page_loading();
         self.image_store.clear();
         self.image_sizes.clear();
+        self.image_sizes_sent = 0;
         self.page_layout = None;
         self.protocol_page = None;
         self.terminal = Some(TerminalSession {
@@ -2210,6 +2217,18 @@ impl DesktopApp {
         } else {
             self.set_active_animations(HashSet::new());
             self.image_schedule_key = None;
+        }
+        // The actor owns the canonical layout, so decoded native pixels become
+        // paintable at the actor's next geometry pass. `BrowserController`
+        // deliberately uses a nonblocking send; retry a full command queue on
+        // the next redraw instead of silently leaving image boxes at their
+        // pending intrinsic size.
+        if self.browser.page_is_live() && self.image_sizes.len() > self.image_sizes_sent {
+            if self.browser.send_image_sizes(&self.image_sizes) {
+                self.image_sizes_sent = self.image_sizes.len();
+            } else {
+                self.request_redraw();
+            }
         }
         if let Some(terminal) = &mut self.terminal {
             let line_mode = !terminal.char_mode();
@@ -4573,7 +4592,17 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                     return;
                 }
                 self.decoded_images_pending_layout = false;
-                self.browser.send_image_sizes(&self.image_sizes);
+                if self.browser.page_is_live()
+                    && self.image_sizes.len() > self.image_sizes_sent
+                    && !self.browser.send_image_sizes(&self.image_sizes)
+                {
+                    // Keep the dirty bit set. The next redraw retries the
+                    // nonblocking handoff after the actor drains its queue.
+                    self.decoded_images_pending_layout = true;
+                    self.request_redraw();
+                    return;
+                }
+                self.image_sizes_sent = self.image_sizes.len();
                 self.relayout_cached_page();
                 self.image_schedule_key = None;
                 self.request_redraw();
