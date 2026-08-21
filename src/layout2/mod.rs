@@ -4396,6 +4396,33 @@ mod tests {
     }
 
     #[test]
+    fn overflow_hidden_keeps_text_in_an_intersected_terminal_cell() {
+        // CSS Overflow 3 §3.1 clips overflow:hidden content at the padding
+        // box, while §5.1 permits a character to be only partially rendered at
+        // a clip edge. A 59px box reaches 3px into the eighth 8px terminal
+        // cell; rounding that edge down made Steam's "Palworld" become
+        // "Palworl" in terminal TRust even though the graphical text fit.
+        let out = lay(
+            r#"<body style="margin:0"><div style="width:59px;overflow:hidden;white-space:nowrap">Palworld</div></body>"#,
+            20,
+        );
+        assert_eq!(row_text(&out.rows[0]), "Palworld");
+    }
+
+    #[test]
+    fn overflow_hidden_preserves_a_fitting_word_at_a_fractional_internal_edge() {
+        // The same case inside a page: the box starts one terminal cell in,
+        // and its 51px right edge quantizes to seven cells although the shaped
+        // word occupies eight terminal cells. The hidden line has no vertical
+        // reflow room, so the intersected edge cell must be retained.
+        let out = lay(
+            r#"<body style="margin:0"><div style="margin-left:8px;width:51px;font-size:12px;overflow:hidden;white-space:nowrap">Palworld</div></body>"#,
+            20,
+        );
+        assert!(row_text(&out.rows[0]).contains("Palworld"));
+    }
+
+    #[test]
     fn absolute_child_escapes_an_in_flow_overflow_hidden_ancestor() {
         // The abspos box's containing block is the positioned <body>, NOT the
         // in-flow overflow:hidden div between them — so that div does NOT clip

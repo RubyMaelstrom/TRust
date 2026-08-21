@@ -971,14 +971,19 @@ const FULL_CLIP: ClipCells = ClipCells {
 
 /// Quantize a fragment's px clip to cell bounds (edges snap, like every other
 /// px→cell conversion here). `ox`/`oy` shift for the box-relative pinned layer.
+/// A clipped terminal cell is atomic: when CSS leaves any part of a cell
+/// intersecting the clip, retain that cell so the adapter does not erase the
+/// final character merely because the CSS edge falls between columns. This
+/// represents CSS Overflow 3 §5.1's allowance for partially rendered
+/// characters at `text-overflow:clip` boundaries.
 fn clip_cells(clip: Option<Clip>, ox: f32, oy: f32, cw: f32, ch: f32) -> ClipCells {
     match clip {
         None => FULL_CLIP,
         Some(c) => ClipCells {
             r0: ((c.y0 - oy) / ch).round() as i64,
             r1: ((c.y1 - oy) / ch).round() as i64,
-            c0: ((c.x0 - ox) / cw).round() as i64,
-            c1: ((c.x1 - ox) / cw).round() as i64,
+            c0: ((c.x0 - ox) / cw).floor() as i64,
+            c1: ((c.x1 - ox) / cw).ceil() as i64,
         },
     }
 }
@@ -1097,6 +1102,10 @@ pub(crate) struct TerminalLinePlacement {
     /// block's right edge. `None` preserves genuine CSS overflow (for example
     /// an unbreakable word in an `overflow:visible` block).
     clip_right: Option<i64>,
+    /// A containing edge can clip a line without permitting a terminal-side
+    /// continuation row. A one-line `overflow:hidden` box has no vertical room
+    /// for an invented continuation; CSS Overflow clips it horizontally.
+    reflow_right: Option<i64>,
 }
 
 pub(crate) fn line_row_map(
@@ -1205,8 +1214,17 @@ pub(crate) fn line_row_map(
                 .then(|| ((right - ox) / cell_w).ceil() as i64)
         });
         let band = containing_right.map(|right| ((right - ox) / cell_w).ceil() as i64);
-        let reflow_right =
-            clip_right.filter(|right| *right > line_start && *right <= columns as i64);
+        // Terminal cell quantization may need an extra row when a proportional
+        // line's text is wider than its cell approximation. Do not invent that
+        // row inside a one-line clipped box, though: CSS Text's `nowrap` line
+        // remains one line and CSS Overflow clips it at the box edge. The
+        // horizontal compositor retains an intersected final cell instead.
+        let has_vertical_reflow_room = line
+            .clip
+            .is_none_or(|clip| clip.y1 > line.y + line.h + 0.01);
+        let reflow_right = clip_right.filter(|right| {
+            *right > line_start && *right <= columns as i64 && has_vertical_reflow_room
+        });
         let previous_flow = flow_states.get(&entry.parent).copied();
         let can_continue = previous_flow.is_some_and(|state| {
             let canonical_step = preferred - state.preferred_row;
@@ -1251,6 +1269,7 @@ pub(crate) fn line_row_map(
                     columns,
                     continuation_col: line_start,
                     clip_right,
+                    reflow_right: None,
                 },
             );
             continue;
@@ -1273,6 +1292,8 @@ pub(crate) fn line_row_map(
         let joins_previous = carry_row.is_some_and(|carry| carry == row);
         let (span, end_col) = if let Some(right) = reflow_right {
             terminal_line_extent(line, ox, cell_w, cell_h, right, line_start, start_col)
+        } else if clip_right.is_some() && !has_vertical_reflow_room {
+            (1, line_start)
         } else {
             (
                 terminal_line_span(line, ox, cell_w, cell_h, columns, line_start, clip_right),
@@ -1288,6 +1309,7 @@ pub(crate) fn line_row_map(
                 columns,
                 continuation_col: line_start,
                 clip_right,
+                reflow_right,
             },
         );
         previous_y = Some(line.y);
@@ -1805,6 +1827,7 @@ fn inflow_content(
                     columns: usize::MAX,
                     continuation_col: ((c.x - ox) / cw).round() as i64,
                     clip_right: None,
+                    reflow_right: None,
                 });
             let joins_soft_line_on_same_row = placement.joins_previous
                 && previous_line
@@ -1859,7 +1882,8 @@ fn inflow_content(
                 if item.image.is_none() && !item.text.is_empty() {
                     first_text_item = false;
                 }
-                let clip = if item.image.is_none() && !item.text.is_empty() && item.height <= 1 {
+                let mut clip = if item.image.is_none() && !item.text.is_empty() && item.height <= 1
+                {
                     text_item_clip_cells(c.clip, item_y, ox, oy, cw, ch)
                 } else {
                     clip_cells(c.clip, ox, oy, cw, ch)
@@ -1871,7 +1895,22 @@ fn inflow_content(
                 };
                 let mut row = placement.row + baseline_offset + (p.paint_y / ch).round() as i64;
                 let mut preferred_col = ((item_x - ox) / cw).round() as i64;
-                let reflow_right = placement.clip_right.filter(|right| {
+                if item.image.is_none()
+                    && !item.text.is_empty()
+                    && placement.reflow_right.is_none()
+                    && let Some(right) = placement.clip_right
+                    && item.width as i64 > right - preferred_col
+                {
+                    // The CSS line fits its hidden box, but the shaped text
+                    // can need one more terminal cell than the quantized box
+                    // edge. CSS Overflow 3 §5.1 permits a character to be
+                    // partially rendered at `text-overflow:clip`; a terminal
+                    // cell is atomic, so retain at most that one intersected
+                    // cell instead of dropping the final character.
+                    let retained_right = (preferred_col + i64::from(item.width)).min(right + 1);
+                    clip.c1 = clip.c1.max(retained_right);
+                }
+                let reflow_right = placement.reflow_right.filter(|right| {
                     *right > placement.continuation_col && *right <= placement.columns as i64
                 });
                 let text_reflow = reflow_right.is_some()
@@ -1948,7 +1987,9 @@ fn inflow_content(
                     let pen = row_pens.entry(row).or_insert(col);
                     *pen = col + i64::from(item.width);
                     let mut item_clip = clip;
-                    if let Some(right) = placement.clip_right {
+                    if placement.reflow_right.is_some()
+                        && let Some(right) = placement.clip_right
+                    {
                         item_clip.c1 = item_clip.c1.min(right);
                     }
                     ops.push(Op::Item {
