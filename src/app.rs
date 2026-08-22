@@ -3062,7 +3062,18 @@ impl App {
             (f.col, f.row).hash(&mut h);
             for row in &f.rows {
                 for it in &row.items {
-                    (it.col, &it.text).hash(&mut h);
+                    (it.col, it.height, &it.text, &it.image).hash(&mut h);
+                    // Fixed and top-layer images reveal asynchronously just
+                    // like document-flow images. If protocol readiness is not
+                    // part of the signature, the encoder can finish while the
+                    // redraw-economy gate still declares the frame unchanged,
+                    // leaving an icon-only modal close button permanently
+                    // blank on terminal TRust.
+                    if let Some(url) = &it.image {
+                        self.image_protocols
+                            .contains_key(&EncKey::for_item(url, it))
+                            .hash(&mut h);
+                    }
                 }
             }
         }
@@ -7757,6 +7768,62 @@ mod tests {
         assert_ne!(selected(&app), Some(0), "walk moved the selection");
         let after = app.browser_frame_sig().expect("still hashable");
         assert_ne!(before, after, "selection change must change the sig");
+    }
+
+    #[test]
+    fn frame_sig_tracks_fixed_image_protocol_readiness() {
+        use ratatui::layout::Size;
+
+        let url = url::Url::parse("https://example.com/").unwrap();
+        let image_url = String::from("https://example.com/close.png");
+        let mut images = crate::layout2::ImageSizes::new();
+        images.insert(image_url.clone(), (4, 4));
+        let doc = crate::http::parse(
+            &url,
+            "text/html",
+            br#"<body><div style="position:fixed;left:0;top:0"><img src="/close.png"></div></body>"#,
+            80,
+            24,
+            &images,
+        );
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.browser = Some(super::BrowserView {
+            doc,
+            selected: None,
+            sel_item: None,
+            sel_fixed: None,
+            scroll: 0,
+            history: vec![],
+            forward: vec![],
+        });
+        let item = app
+            .browser
+            .as_ref()
+            .unwrap()
+            .doc
+            .fixed
+            .iter()
+            .flat_map(|fixed| &fixed.rows)
+            .flat_map(|row| &row.items)
+            .find(|item| item.image.as_deref() == Some(image_url.as_str()))
+            .cloned()
+            .expect("fixed image item");
+        let key = super::EncKey::for_item(&image_url, &item);
+        let before = app.browser_frame_sig().expect("fixed page hashes");
+
+        let (decoded, _) = crate::img::decode(&crate::img::red_png()).unwrap();
+        let protocol = crate::img::encode_sliced(
+            &app.picker,
+            decoded,
+            Size::new(key.w, key.h),
+            key.crop,
+            key.pixelated,
+        )
+        .unwrap();
+        app.image_protocols.insert(key, protocol);
+        let after = app.browser_frame_sig().expect("fixed page still hashes");
+        assert_ne!(before, after, "fixed image reveal must request a redraw");
     }
 
     /// Navigating (push, back, or reload) drops a pinned-rail selection with
