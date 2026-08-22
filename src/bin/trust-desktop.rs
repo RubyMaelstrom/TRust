@@ -4061,14 +4061,20 @@ impl DesktopApp {
                         .as_ref()
                         .and_then(|scene| scene.page_hit_at(self.pointer))
                         .filter(|hit| hit.link.is_some() || hit.actor.is_some());
-                    if let (Some(pressed), Some(released)) = (self.pressed_hit.take(), released)
-                        && same_page_target(&pressed, &released)
-                    {
-                        if let Some((form, field)) = self.form_target_for_hit(&released) {
+                    let click_target =
+                        self.pressed_hit
+                            .take()
+                            .zip(released)
+                            .and_then(|(pressed, released)| {
+                                let parents = &self.page_layout.as_ref()?.document.parents;
+                                click_target_for_hits(&pressed, &released, parents)
+                            });
+                    if let Some(target) = click_target {
+                        if let Some((form, field)) = self.form_target_for_hit(&target) {
                             self.activate_form_control(form, field);
-                        } else if let Some(link) = released.link {
+                        } else if let Some(link) = target.link {
                             self.activate_link(link);
-                        } else if let Some(actor) = released.actor {
+                        } else if let Some(actor) = target.actor {
                             self.dispatch(UserAction::Activate(Link::JsClick {
                                 node: actor,
                                 href: String::new(),
@@ -5004,6 +5010,72 @@ fn same_page_target(left: &PageHit, right: &PageHit) -> bool {
     }
 }
 
+/// Pointer Events "click, auxclick, and contextmenu events" dispatch requires
+/// a click whose down/up targets differ to target their nearest common
+/// inclusive ancestor. SVG controls routinely paint the
+/// down and up coordinates as different graphical descendants (`line`,
+/// `polyline`, or the containing `svg`); exact-leaf equality incorrectly
+/// cancelled those clicks before DOM dispatch.
+fn click_target_for_hits(
+    pressed: &PageHit,
+    released: &PageHit,
+    parents: &HashMap<usize, usize>,
+) -> Option<PageHit> {
+    match (pressed.actor, released.actor) {
+        (Some(pressed_actor), Some(released_actor)) => {
+            let node = nearest_common_inclusive_ancestor(pressed_actor, released_actor, parents)?;
+            Some(PageHit {
+                rect: released.rect,
+                node,
+                actor: Some(node),
+                link: (pressed.link == released.link)
+                    .then(|| released.link.clone())
+                    .flatten(),
+            })
+        }
+        (None, None) if pressed.link == released.link => {
+            let node = nearest_common_inclusive_ancestor(pressed.node, released.node, parents)?;
+            Some(PageHit {
+                rect: released.rect,
+                node,
+                actor: None,
+                link: released.link.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn nearest_common_inclusive_ancestor(
+    left: usize,
+    right: usize,
+    parents: &HashMap<usize, usize>,
+) -> Option<usize> {
+    let mut right_ancestors = HashSet::new();
+    let mut node = right;
+    loop {
+        if !right_ancestors.insert(node) {
+            break;
+        }
+        let Some(parent) = parents.get(&node).copied() else {
+            break;
+        };
+        node = parent;
+    }
+
+    let mut seen = HashSet::new();
+    node = left;
+    loop {
+        if right_ancestors.contains(&node) {
+            return Some(node);
+        }
+        if !seen.insert(node) {
+            return None;
+        }
+        node = parents.get(&node).copied()?;
+    }
+}
+
 fn access_role(role: SemanticRole) -> AccessRole {
     match role {
         SemanticRole::Document => AccessRole::RootWebArea,
@@ -5345,6 +5417,28 @@ mod tests {
         let parents = HashMap::from([(42usize, 7usize), (7usize, 1usize)]);
         assert_eq!(form_target_for_node(42, &controls, &parents), Some((2, 3)));
         assert_eq!(form_target_for_node(99, &controls, &parents), None);
+    }
+
+    #[test]
+    fn click_uses_common_ancestor_of_svg_graphics() {
+        let parents = HashMap::from([
+            (101usize, 10usize),
+            (102usize, 10usize),
+            (10usize, 7usize),
+            (7usize, 1usize),
+        ]);
+        let hit = |node| PageHit {
+            rect: CssRect::new(1.0, 2.0, 3.0, 4.0),
+            node,
+            actor: Some(node),
+            link: None,
+        };
+        let target = click_target_for_hits(&hit(101), &hit(102), &parents).unwrap();
+        assert_eq!(target.node, 10);
+        assert_eq!(target.actor, Some(10));
+
+        let exact = click_target_for_hits(&hit(101), &hit(101), &parents).unwrap();
+        assert_eq!(exact.actor, Some(101));
     }
 
     #[test]

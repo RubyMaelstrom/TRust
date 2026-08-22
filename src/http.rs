@@ -4011,6 +4011,79 @@ mod tests {
     }
 
     #[test]
+    fn clickable_svg_survives_terminal_decode_transition() {
+        // SVG 2 §5.1 gives the outermost inline SVG a replaced-element box.
+        // Fetching and decoding that resource is asynchronous, so the
+        // terminal adapter must retain the same activation target before and
+        // after intrinsic dimensions become available.
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut dom = crate::dom::Dom::parse_document(
+            r##"<body><button id="close" aria-label="Close" style="width:34px;height:34px">
+                <svg id="icon" aria-label="Close" width="18" height="18" viewBox="0 0 18 18">
+                    <path fill="#fff" d="M2 3.4 3.4 2 9 7.6 14.6 2 16 3.4 10.4 9 16 14.6 14.6 16 9 10.4 3.4 16 2 14.6 7.6 9Z"/>
+                </svg>
+            </button></body>"##,
+        );
+        let close = dom.get_by_id("close").unwrap();
+        let icon = dom.get_by_id("icon").unwrap();
+        dom.set_render_clickables([close].into_iter().collect(), true);
+        let viewport = crate::layout2::Viewport::new(640.0, 480.0);
+        let terminal = crate::layout2::TerminalViewport::new(80, 24, 8.0, 16.0);
+
+        let pending = render_arena(&dom, &base, viewport, 1.0, None, &Default::default());
+        let source = pending
+            .image_urls
+            .iter()
+            .find(|source| source.starts_with("data:image/svg+xml"))
+            .cloned()
+            .expect("close SVG is discovered before decode");
+        let pending = adapt_rendered_terminal(
+            &base,
+            "text/html",
+            Vec::new(),
+            pending,
+            terminal,
+            &Default::default(),
+        );
+        let pending_item = pending
+            .rows
+            .iter()
+            .flat_map(|row| row.items.iter())
+            .find(|item| item.node == icon)
+            .expect("pending close SVG retains a terminal item");
+        assert_eq!(pending_item.kind, crate::layout2::ItemKind::Image);
+        assert_eq!(
+            pending_item.link,
+            Some(crate::doc::Link::JsClick {
+                node: close,
+                href: String::new(),
+            })
+        );
+
+        let bytes = crate::img::decode_data_url(&source).expect("valid close SVG data URL");
+        let info = crate::img::info(&bytes).expect("close SVG decodes");
+        let mut images = crate::layout2::ImageSizes::new();
+        images.insert(source.clone(), (info.width, info.height));
+        let decoded = render_arena(&dom, &base, viewport, 1.0, None, &images);
+        let decoded = adapt_rendered_terminal(
+            &base,
+            "text/html",
+            Vec::new(),
+            decoded,
+            terminal,
+            &Default::default(),
+        );
+        let decoded_item = decoded
+            .rows
+            .iter()
+            .flat_map(|row| row.items.iter())
+            .find(|item| item.node == icon)
+            .expect("decoded close SVG retains a terminal item");
+        assert_eq!(decoded_item.image.as_deref(), Some(source.as_str()));
+        assert_eq!(decoded_item.link, pending_item.link);
+    }
+
+    #[test]
     fn canonical_direct_render_preserves_legacy_presentation_semantics() {
         // Migration oracle: the removed serializer used to materialize shadow
         // content, resolved CSS variables, controls, backgrounds, and empty
