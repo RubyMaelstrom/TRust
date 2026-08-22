@@ -8551,15 +8551,16 @@ const OBSERVER_DELIVERY_PASSES: usize = 6;
 /// Settle ticks per AT-REST wake (the idle `timer_wake` loop). An at-rest wake
 /// fires ONE generation of due timers (one event-loop "task"), drains
 /// the microtask checkpoint, and returns to the sleep. A callback that re-arms a
-/// 0-delay timer (React's scheduler MessageChannel loop; an Apollo poll that never
-/// settles because its data is gated behind a bot wall) therefore advances at the
+/// 0-delay timer (an Apollo poll that never settles because its data is gated
+/// behind a bot wall) therefore advances at the
 /// `WAKE_FLOOR` cadence (~15fps) instead of running 50 generations crammed into a
 /// single virtual instant per wake — which pegged a CPU core on any page that
 /// never reaches a stable state. `setInterval`/`requestAnimationFrame` are
 /// future-dated, so they already fire one generation per wake and are unaffected;
 /// only a due-NOW re-arming chain is rate-limited, and one task per turn is the
-/// faithful event-loop model regardless. A finite deferred chain still completes,
-/// just one step per frame.
+/// faithful event-loop model regardless. Networking and port messages have
+/// their own runnable task sources and are selected separately below; they
+/// must not inherit this timer/animation cadence.
 const REST_TICKS: usize = 1;
 /// The page thread owns all parsing/execution: same wide stack as the
 /// one-shot path (Boa's parser recursion, see CLAUDE.md).
@@ -8583,6 +8584,7 @@ enum Wake {
     Hover(Option<PageHover>),
     Fetch(Option<(usize, FetchResult)>),
     Resource(Option<ResourceEvent>),
+    PlatformTask,
     Timer,
 }
 
@@ -9595,6 +9597,7 @@ fn page_actor(
         // rest. Only a truly inert page (no interaction AND no scheduled work)
         // takes the Static fast-exit and drops the engine (articles hold none).
         let has_timers = js_next_deadline(&mut page).is_some();
+        let has_platform_tasks = js_has_platform_tasks(&mut page);
         // Dynamically inserted module/style/resource work is queued as host
         // jobs. It must keep the resident actor alive even when the page has
         // no visible controls or author timers yet.
@@ -9620,6 +9623,7 @@ fn page_actor(
         if !has_clickables
             && !painted_live
             && !has_timers
+            && !has_platform_tasks
             && !has_pending_jobs
             && !has_scroll_work
             && !has_workers
@@ -9699,6 +9703,10 @@ fn page_actor(
     // fetch hide a due timer forever (or let a zero-delay timer chain hide the
     // module fetch).  This bit records that the last turn chose the timer.
     let mut prefer_host_turn = false;
+    // Networking/messages and timers are distinct HTML task sources. Alternate
+    // them when both are runnable, while still letting an otherwise sole
+    // platform queue advance without an artificial timer delay.
+    let mut previous_turn_was_platform = false;
     let mut last_timer_wake: Option<std::time::Instant> = None;
     loop {
         let elapsed = clock_wall.elapsed().as_millis() as f64;
@@ -9711,6 +9719,7 @@ fn page_actor(
         // unupgraded. The task itself parks on its network future, so this is a
         // single handoff, not an idle spin.
         let timer_due = js_next_deadline(&mut page).is_some_and(|at| at <= now_virt);
+        let platform_task_pending = js_has_platform_tasks(&mut page);
         let pending_host_jobs = page_has_pending_jobs(&page);
         let service_host_jobs = pending_host_jobs && (!timer_due || prefer_host_turn);
         // Hover/command traffic must not win the biased select forever when a
@@ -9720,6 +9729,9 @@ fn page_actor(
         let timer_floor_ready = last_timer_wake.is_none_or(|at| at.elapsed() >= WAKE_FLOOR);
         let service_due_timer =
             timer_due && timer_floor_ready && (!prefer_host_turn || !pending_host_jobs);
+        let service_platform_task = platform_task_pending
+            && (!service_due_timer || !previous_turn_was_platform)
+            && (!pending_host_jobs || !prefer_host_turn);
         let sleep_floor =
             last_timer_wake.map_or(WAKE_FLOOR, |at| WAKE_FLOOR.saturating_sub(at.elapsed()));
         let sleep_dur = if service_host_jobs {
@@ -9750,6 +9762,7 @@ fn page_actor(
                 done = fetch_rx.recv() => Wake::Fetch(done),
                 resource = resource_rx.recv() => Wake::Resource(resource),
                 () = std::future::ready(()), if service_host_jobs => Wake::Timer,
+                () = std::future::ready(()), if service_platform_task => Wake::PlatformTask,
                 () = std::future::ready(()), if service_due_timer => Wake::Timer,
                 () = sleep_or_pending(sleep_dur) => Wake::Timer,
             }
@@ -9794,6 +9807,14 @@ fn page_actor(
             // The keepalive sender keeps this channel open until the actor is
             // dropped, so a closed receiver is only a teardown race.
             Wake::Resource(None) => continue,
+            Wake::PlatformTask => {
+                if !platform_task_wake(&mut page, &evts) {
+                    break;
+                }
+                previous_turn_was_platform = true;
+                prefer_host_turn = true;
+                continue;
+            }
             Wake::Timer => {
                 // A dynamically inserted script/module is a later HTML host
                 // task.  The actor uses the same wake lane for that work as
@@ -9817,6 +9838,7 @@ fn page_actor(
                         }
                     }
                     prefer_host_turn = false;
+                    previous_turn_was_platform = false;
                     continue;
                 }
                 if !timer_wake(&mut page, &evts, real_now) {
@@ -9824,6 +9846,7 @@ fn page_actor(
                 }
                 last_timer_wake = Some(std::time::Instant::now());
                 prefer_host_turn = true;
+                previous_turn_was_platform = false;
                 continue;
             }
         };
@@ -10633,6 +10656,56 @@ fn timer_wake(
     true
 }
 
+/// Run one task from HTML's networking or messaging task sources. Network
+/// response processing, posted-message, and MessagePort tasks are runnable
+/// event-loop work, not timers: applying the terminal animation cadence to
+/// them delayed both XHR completion and React's cooperative scheduler.
+/// Keep the normal one-task → microtask-checkpoint → rendering boundary and
+/// return to task selection after every message so commands/networking retain
+/// priority and an author chain cannot become one uninterruptible dispatch.
+fn platform_task_wake(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
+    prepare_dispatch(page);
+    let ran = guarded_call_trust(
+        &mut page.ctx,
+        "runPlatformTask",
+        &[],
+        "platform task",
+        &mut page.outcome,
+    )
+    .is_some_and(|value| value.to_boolean());
+    if ran {
+        run_microtasks_into(&mut page.ctx, &mut page.outcome);
+    }
+    schedule_image_loads(&mut page.ctx, &mut page.outcome);
+    drain_js_side(&mut page.ctx, &mut page.outcome);
+    if page.outcome.panicked {
+        let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+        return false;
+    }
+    run_intersections(page);
+    if page.outcome.panicked {
+        let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+        return false;
+    }
+    if let Some((url, replace)) = take_script_navigation(page) {
+        return evts.blocking_send(navigation_event(url, replace)).is_ok();
+    }
+    let scrolls = page.dom.borrow_mut().take_scroll_changes();
+    let dirty = page.dom.borrow_mut().take_dirty();
+    if dirty && let Some(ok) = emit_dirty_render(page, evts) {
+        return ok;
+    }
+    if !send_scroll_events(&scrolls, evts) {
+        return false;
+    }
+    if !page.outcome.errors.is_empty() {
+        return evts
+            .blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)))
+            .is_ok();
+    }
+    true
+}
+
 /// Run one queued networking/module host task for a resident page.
 ///
 /// Dynamically inserted `<script>` elements are HTML tasks, not timer
@@ -10822,6 +10895,7 @@ fn dispatch_fetch_done(
     id: usize,
     result: FetchResult,
 ) -> bool {
+    let task_started = Instant::now();
     note_background_fetch_done(page);
     prepare_dispatch(page);
     let value = fetch_result_value(&mut page.ctx, result);
@@ -10832,6 +10906,17 @@ fn dispatch_fetch_done(
     // Draining those timers here let one YouTube guide response pull 50
     // framework scheduler turns into an uninterruptible ~17-second burst.
     run_microtasks_into(&mut page.ctx, &mut page.outcome);
+    if std::env::var_os("TRUST_NET_TRACE").is_some() {
+        phase(&format!(
+            "fetch task {id} microtasks done +{}ms",
+            task_started.elapsed().as_millis()
+        ));
+    }
+    // TRUST_JS_PROFILE samples the VM across resident networking callbacks as
+    // well as initial scripts. Reset at this task boundary so a slow promise
+    // reaction can be attributed to its actual hot leaf frames instead of
+    // disappearing after the load-lifecycle profile was already emitted.
+    dump_vm_profile("fetch task");
     // The promise reactions may mount images. Queue their resource-event tasks
     // without executing another task in this networking turn.
     schedule_image_loads(&mut page.ctx, &mut page.outcome);
@@ -10933,6 +11018,14 @@ fn js_next_deadline(page: &mut LoadedPage) -> Option<f64> {
         return None;
     }
     v.as_number()
+}
+
+/// Whether an HTML networking, posted-message, or enabled port-message task is
+/// runnable.
+fn js_has_platform_tasks(page: &mut LoadedPage) -> bool {
+    call_trust(&mut page.ctx, "hasPlatformTask", &[])
+        .ok()
+        .is_some_and(|value| value.to_boolean())
 }
 
 /// Whether the page actor has host work that is not represented by an author
@@ -12217,6 +12310,10 @@ fn dispatch_click_in(page: &mut LoadedPage, node: usize) -> Option<String> {
         &mut click_outcome,
     )
     .is_some_and(|v| v.to_boolean());
+    // Keep interaction work visible to TRUST_JS_PROFILE just like load and
+    // networking tasks. Consent/modal handlers are often where a framework
+    // performs its largest synchronous unmount and focus-restoration pass.
+    dump_vm_profile("click");
     page.outcome.errors.extend(click_outcome.errors);
     if click_outcome.panicked {
         page.outcome.panicked = true;
@@ -12518,6 +12615,116 @@ const PRELUDE: &str = r##"
     // `Document` class `get all()`. Per-page (fresh per realm), so its identity is
     // stable within a page but never shared across pages.
     let documentAllValue = null;
+    // HTML §6.6 focus model. `null` denotes the document viewport as the
+    // focused area; DocumentOrShadowRoot.activeElement maps that viewport's
+    // Document anchor to body, then documentElement, exactly as the specified
+    // getter does. Keep the focused DOM anchor itself when an element owns
+    // focus so modal/focus-restoration code never observes `undefined`.
+    let focusedArea = null;
+    function viewportFocusAnchor(doc) {
+        return (doc && (doc.body || doc.documentElement)) || null;
+    }
+    function activeElementFor(root) {
+        if (focusedArea) {
+            // Focus-fixup: once the focused element leaves its document, the
+            // viewport is the surviving focusable area. The activeElement
+            // getter must not return a detached stale wrapper.
+            if (!focusedArea.isConnected) focusedArea = null;
+        }
+        if (!focusedArea) return root.nodeType === 9 ? viewportFocusAnchor(root) : null;
+        // DocumentOrShadowRoot.activeElement retargets a focused shadow-tree
+        // descendant to each intervening host. `retarget` already implements
+        // DOM's normative retargeting algorithm for the event system.
+        const candidate = retarget(focusedArea, root);
+        return candidate && rootOfNode(candidate) === root ? candidate : null;
+    }
+    function focusEvent(target, type, related, bubbles) {
+        const ev = createTrustedEvent(FocusEvent, type, {
+            bubbles: !!bubbles, cancelable: false, composed: true,
+            view: g, detail: 0, relatedTarget: related || null,
+        });
+        dispatch(target, ev, false);
+    }
+    function parsedTabIndex(el) {
+        const raw = el.getAttribute("tabindex");
+        if (raw === null) return null;
+        // HTML's integer parser accepts leading ASCII whitespace and a sign,
+        // then the longest initial digit run. The IDL attribute is a Web IDL
+        // `long`, so values outside that range use the historical default.
+        const match = /^[\t\n\f\r ]*([+-]?\d+)/.exec(raw);
+        if (!match) return null;
+        const value = Number(match[1]);
+        return Number.isFinite(value) && value >= -2147483648 && value <= 2147483647
+            ? value : null;
+    }
+    function defaultTabIndex(el) {
+        const tag = el.localName;
+        if (tag === "summary") {
+            const parent = el.parentElement;
+            return parent && parent.localName === "details"
+                && parent.children.find((child) => child.localName === "summary") === el ? 0 : -1;
+        }
+        return tag === "a" || tag === "area" || tag === "button" || tag === "frame"
+            || tag === "iframe" || tag === "input" || tag === "object"
+            || tag === "select" || tag === "textarea" ? 0 : -1;
+    }
+    function isActuallyDisabled(el) {
+        const tag = el && el.localName;
+        const formControl = tag === "button" || tag === "fieldset" || tag === "input"
+            || tag === "select" || tag === "textarea";
+        if (!formControl) return false;
+        if (el.hasAttribute("disabled")) return true;
+        // HTML's "actually disabled" state propagates from every disabled
+        // fieldset to descendant form controls, except those inside that
+        // fieldset's first legend child. A meaningless disabled attribute on a
+        // generic tabindex element does not make it unfocusable.
+        for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+            if (parent.localName !== "fieldset" || !parent.hasAttribute("disabled")) continue;
+            const firstLegend = parent.children.find((child) => child.localName === "legend");
+            if (!firstLegend || !firstLegend.contains(el)) return true;
+        }
+        return false;
+    }
+    function elementCanFocus(el) {
+        if (!el || !el.isConnected || isActuallyDisabled(el)) return false;
+        for (let p = el; p && p.nodeType === 1; p = p.parentElement) {
+            if (p.hasAttribute("inert")) return false;
+        }
+        if (el === g.document.documentElement) return true;
+        if (parsedTabIndex(el) !== null) return true;
+        const tag = el.localName;
+        if (tag === "a" || tag === "area") return el.hasAttribute("href");
+        if (tag === "input") return String(el.type || "").toLowerCase() !== "hidden";
+        if (tag === "audio" || tag === "video") return el.hasAttribute("controls");
+        return tag === "button" || tag === "select" || tag === "textarea"
+            || tag === "iframe" || tag === "summary"
+            || el.hasAttribute("contenteditable");
+    }
+    function focusElement(el, options) {
+        if (!elementCanFocus(el) || focusedArea === el) return;
+        const old = focusedArea;
+        // HTML §6.6.4's focus update steps remove focus before firing blur;
+        // UI Events §3.3.2 orders blur, focusout, focus, then focusin. A handler
+        // reading activeElement during blur therefore sees the viewport
+        // fallback, not the future target.
+        focusedArea = null;
+        if (old && old.isConnected) {
+            focusEvent(old, "blur", el, false);
+            focusEvent(old, "focusout", el, true);
+        }
+        focusedArea = el;
+        focusEvent(el, "focus", old, false);
+        focusEvent(el, "focusin", old, true);
+        if (!(options && options.preventScroll)) {
+            try { el.scrollIntoView({ block: "center", inline: "center" }); } catch (e) {}
+        }
+    }
+    function blurElement(el) {
+        if (!el || focusedArea !== el) return;
+        focusedArea = null;
+        focusEvent(el, "blur", null, false);
+        focusEvent(el, "focusout", null, true);
+    }
     function baseHref() {
         if (baseHrefCache !== null) return baseHrefCache;
         const b = g.document.querySelector("base[href]");
@@ -13091,7 +13298,9 @@ const PRELUDE: &str = r##"
     // handlers attached during the current turn still observe it (same shape
     // as the synthetic image-load pass).
     function fireFrameLoad(frame) {
-        __queue_message_task(function () {
+        // HTML document lifecycle queues the iframe load event steps on the
+        // DOM manipulation task source, independently of messaging and timers.
+        __queue_dom_task(function () {
             // The nested document's Window also receives its load event. The
             // iframe element's load below is a separate parent-document event;
             // both are observable and child bootstraps commonly wait on the
@@ -13314,6 +13523,10 @@ const PRELUDE: &str = r##"
     function activateClick(t, record, trusted) {
         if (record) trust.lastClickSubmit = null;
         if (!t) return false;
+        // HTML §6.6.2: user activation of a click-focusable area runs the
+        // focusing steps. HTMLElement.click() is synthetic and deliberately
+        // does not focus; the actor's trusted terminal click does.
+        if (trusted && elementCanFocus(t)) focusElement(t, { preventScroll: true });
         const ev = syntheticClickEvent(!!trusted);
         dispatch(t, ev, false);
         if (ev.defaultPrevented) return true;
@@ -14088,22 +14301,47 @@ const PRELUDE: &str = r##"
     }
     const kebab = (s) => s.replace(/[A-Z]/g, (m) => "-" + m.toLowerCase());
     // el.style is backed by the REAL style attribute: writes are DOM
-    // mutations (dirty bit, serialized, visibility honored), reads
-    // parse the attribute. That's how show/hide actually works here.
+    // mutations (dirty bit, serialized, visibility honored). CSSOM §6.6.1's
+    // declaration-block creation/attribute-change steps keep ONE parsed block
+    // synchronized with its owner node; reparsing on every property GET is not
+    // part of those algorithms (and makes framework style reads quadratic).
+    // Keep the parsed block until the exact attribute text changes. All live
+    // attribute writes funnel through setAttribute/removeAttribute, and the
+    // raw-text comparison also covers writes made outside this proxy.
     function styleFor(el) {
+        let parsedRaw;
+        let parsedMap;
         const parse = () => {
-            const m = {};
             const raw = el.getAttribute("style") || "";
+            if (parsedMap !== undefined && raw === parsedRaw) return parsedMap;
+            const m = Object.create(null);
             for (const part of raw.split(";")) {
                 const i = part.indexOf(":");
                 if (i > 0) m[part.slice(0, i).trim().toLowerCase()] = part.slice(i + 1).trim();
             }
-            return m;
+            parsedRaw = raw;
+            parsedMap = m;
+            return parsedMap;
         };
+        // CSSStyleDeclaration mutation methods change THIS declaration list,
+        // then update the style attribute. Keep that list alive across a run of
+        // property writes; reparsing after every `style.foo = value` was the
+        // remaining hot path on React commits with large style objects.
         const write = (m) => {
             const keys = Object.keys(m);
-            if (keys.length) el.setAttribute("style", keys.map((k) => k + ": " + m[k]).join("; "));
-            else el.removeAttribute("style");
+            if (keys.length) {
+                const raw = keys.map((k) => k + ": " + m[k]).join("; ");
+                // Publish the complete declaration state before attribute
+                // reactions run. A reaction that directly replaces `style`
+                // produces different raw text, which parse() detects normally.
+                parsedRaw = raw;
+                parsedMap = m;
+                el.setAttribute("style", raw);
+            } else {
+                parsedRaw = "";
+                parsedMap = m;
+                el.removeAttribute("style");
+            }
         };
         return new Proxy({}, {
             get(_, p) {
@@ -14758,7 +14996,13 @@ const PRELUDE: &str = r##"
         // Was a no-op, so any programmatic click (consent "Accept" buttons,
         // framework-driven toggles, auto-clickers) silently did nothing.
         click() { try { activateClick(this, false, false); } catch (e) {} }
-        focus() {} blur() {}
+        focus(options) { focusElement(this, options || {}); }
+        blur() { blurElement(this); }
+        get tabIndex() {
+            const parsed = parsedTabIndex(this);
+            return parsed === null ? defaultTabIndex(this) : parsed;
+        }
+        set tabIndex(v) { this.setAttribute("tabindex", String(Number(v) | 0)); }
         // --- The Popover API (HTML §the popover attribute) ---------------
         // State truth lives in the ARENA (`__dom_popover` → the UA hide rule
         // + `:popover-open`); POPOVER_OPEN mirrors it for the API logic.
@@ -15702,6 +15946,10 @@ const PRELUDE: &str = r##"
         // shadow-root getSelection shim (`() => n.ownerDocument.getSelection()`)
         // into infinite recursion when it patched a missing `document.getSelection`.
         get ownerDocument() { return null; }
+        // HTML §6.6.6 DocumentOrShadowRoot.activeElement getter. The viewport
+        // focus fallback is body/documentElement, never JavaScript undefined.
+        get activeElement() { return activeElementFor(this); }
+        hasFocus() { return true; }
         // `document.getSelection()` is the Selection API alias for
         // `window.getSelection()`. Without it ProseMirror monkey-patches the
         // root's prototype to add one — see `ownerDocument` above.
@@ -16539,6 +16787,7 @@ const PRELUDE: &str = r##"
         get [Symbol.toStringTag]() { return "ShadowRoot"; }
         get host() { return this.__host || null; }
         get mode() { return this.__mode || "open"; }
+        get activeElement() { return activeElementFor(this); }
         get innerHTML() { return __dom_inner_html(this.__id); }
         set innerHTML(v) {
             __dom_set_inner_html(this.__id, String(v));
@@ -18852,11 +19101,29 @@ const PRELUDE: &str = r##"
                         frame: trust.__activeFrame || null });
         return id;
     };
-    // HTML §9.4.4 gives each MessagePort its own port-message task source.
-    // Capture TRust's native timer enqueue operation before page code can
-    // replace window.setTimeout: timer shims must not disable MessageChannel,
-    // which is how React and other schedulers deliver independent tasks.
-    const __queue_message_task = g.setTimeout;
+    // Fetch/XHR response processing and HTML web messaging use runnable task
+    // sources, not the timer task source. Keep networking and DOM manipulation
+    // separate from the immediately-enabled message FIFO so source selection
+    // remains explicit; MessagePort's initially-disabled per-port queue is
+    // handled beside its implementation.
+    const networkTasks = [];
+    const __queue_network_task = function (fn, frame) {
+        if (typeof fn === "function") {
+            networkTasks.push({ fn: fn, frame: frame === undefined ? (trust.__activeFrame || null) : frame });
+        }
+    };
+    const domTasks = [];
+    const __queue_dom_task = function (fn, frame) {
+        if (typeof fn === "function") {
+            domTasks.push({ fn: fn, frame: frame === undefined ? (trust.__activeFrame || null) : frame });
+        }
+    };
+    const messageTasks = [];
+    const __queue_message_task = function (fn) {
+        if (typeof fn === "function") {
+            messageTasks.push({ fn: fn, frame: trust.__activeFrame || null });
+        }
+    };
     g.setInterval = function (fn, d) {
         if (typeof fn !== "function") return 0;
         const id = timers.seq++;
@@ -18947,6 +19214,10 @@ const PRELUDE: &str = r##"
         // virtual time to it, draining the page to its eventual rendered state
         // (rAF-deferred content, delayed timeouts). Intervals are still skipped
         // (`every !== null`) so a snapshot doesn't show a jumped counter.
+        // One-shot snapshots also select runnable networking/messaging tasks.
+        // The live actor selects these sources independently (without timer
+        // throttling), but a transform has no resident event loop to do so later.
+        if (trust.runPlatformTask && trust.runPlatformTask()) return true;
         const observedNow = currentTime();
         const limit = trust.oneShot ? observedNow + 1000 : observedNow;
         let best = null;
@@ -20364,31 +20635,39 @@ const PRELUDE: &str = r##"
         abort(reason) { this.signal.__abort(reason); }
     };
 
-    // MessageChannel/MessagePort: schedulers (Polymer, React, async libs) use a
-    // channel's port to post a macrotask to themselves. We deliver across the
-    // pair on a virtual-time timer (a macrotask), which is exactly that role.
+    // HTML §9.4: MessagePort owns a port-message TASK SOURCE. It is deliberately
+    // separate from the timer queue: React's scheduler uses MessageChannel to
+    // yield between units of work, and treating each post as setTimeout(0)
+    // incorrectly applies timer cadence/clamping to runnable message tasks.
+    const portMessages = [];
     class MessagePort extends EventTarget {
         constructor() {
-            super(); this.onmessage = null; this.__other = null;
+            super(); this.__onmessage = null; this.__other = null;
             this.__frame = trust.__activeFrame || null;
+            this.__started = false; this.__closed = false;
+        }
+        get onmessage() { return this.__onmessage; }
+        set onmessage(handler) {
+            this.__onmessage = typeof handler === "function" ? handler : null;
+            // Setting onmessage enables the port message queue as if start()
+            // had been called (HTML §9.4.4).
+            if (this.__onmessage !== null) this.start();
         }
         postMessage(data) {
             const other = this.__other;
-            if (!other) return;
-            const senderFrame = this.__frame;
-            const targetFrame = other.__frame;
-            __queue_message_task(() => {
-                runInFrame(targetFrame || null, function () {
-                    const ev = new Event("message"); ev.data = data;
-                    if (typeof other.onmessage === "function") {
-                        try { other.onmessage.call(other, ev); }
-                        catch (e) { trust.errors.push("message port: " + ((e && e.message) || e)); }
-                    }
-                    other.dispatchEvent(ev);
-                });
-            }, 0);
+            if (!other || this.__closed || other.__closed) return;
+            portMessages.push({ target: other, data: data, frame: other.__frame || null });
         }
-        start() {} close() { this.__other = null; }
+        start() { if (!this.__closed) this.__started = true; }
+        close() {
+            this.__closed = true;
+            const other = this.__other;
+            this.__other = null;
+            if (other && other.__other === this) other.__other = null;
+            for (let i = portMessages.length - 1; i >= 0; i--) {
+                if (portMessages[i].target === this) portMessages.splice(i, 1);
+            }
+        }
     }
     class MessageChannel {
         constructor() {
@@ -20397,6 +20676,73 @@ const PRELUDE: &str = r##"
         }
     }
     g.MessagePort = MessagePort; g.MessageChannel = MessageChannel;
+    // WHATWG XHR §3.5.6 invokes response processing from Fetch's networking
+    // task. It is deliberately not an author timer: replacing/clearing
+    // setTimeout must not cancel readystatechange/load/loadend.
+    trust.hasMessageTask = function () {
+        if (messageTasks.length) return true;
+        for (const task of portMessages) {
+            if (task.target.__started && !task.target.__closed) return true;
+        }
+        return false;
+    };
+    trust.runMessageTask = function () {
+        if (messageTasks.length) {
+            const task = messageTasks.shift();
+            try { runInFrame(task.frame, task.fn); }
+            catch (e) { trust.errors.push("message task: " + ((e && e.message) || e)); }
+            return true;
+        }
+        let index = -1;
+        for (let i = 0; i < portMessages.length; i++) {
+            const target = portMessages[i].target;
+            if (target.__started && !target.__closed) { index = i; break; }
+        }
+        if (index < 0) return false;
+        const task = portMessages.splice(index, 1)[0];
+        const target = task.target;
+        try {
+            runInFrame(task.frame, function () {
+                const ev = new MessageEvent("message", { data: task.data, origin: "", source: null, ports: [] });
+                if (typeof target.onmessage === "function") {
+                    try { target.onmessage.call(target, ev); }
+                    catch (e) { trust.errors.push("message port: " + ((e && e.message) || e)); }
+                }
+                target.dispatchEvent(ev);
+            });
+        } catch (e) { trust.errors.push("message port: " + ((e && e.message) || e)); }
+        return true;
+    };
+    // HTML leaves selection among runnable task sources implementation-defined,
+    // while requiring the event loop to keep making progress. Rotate among the
+    // three represented sources so a self-replenishing source cannot starve
+    // another one. FIFO ordering remains intact within each source.
+    let platformSourceCursor = 0;
+    trust.hasPlatformTask = function () {
+        return networkTasks.length > 0 || domTasks.length > 0 || trust.hasMessageTask();
+    };
+    trust.runPlatformTask = function () {
+        for (let offset = 0; offset < 3; offset++) {
+            const source = (platformSourceCursor + offset) % 3;
+            let task = null;
+            let label = "";
+            if (source === 0 && networkTasks.length) {
+                task = networkTasks.shift(); label = "network task";
+            } else if (source === 1 && domTasks.length) {
+                task = domTasks.shift(); label = "DOM manipulation task";
+            } else if (source === 2 && trust.hasMessageTask()) {
+                platformSourceCursor = 0;
+                return trust.runMessageTask();
+            }
+            if (task) {
+                platformSourceCursor = (source + 1) % 3;
+                try { runInFrame(task.frame, task.fn); }
+                catch (e) { trust.errors.push(label + ": " + ((e && e.message) || e)); }
+                return true;
+            }
+        }
+        return false;
+    };
 
     // BroadcastChannel: same-origin cross-context messaging. A terminal
     // browser has one page (no other tabs/workers), so the only peers are
@@ -21035,6 +21381,7 @@ const PRELUDE: &str = r##"
         send(body) {
             this.__aborted = false;
             this.__inFlight = true;
+            this.__frame = trust.__activeFrame || null;
             // Async requests fire `loadstart` synchronously from send() (XHR
             // §the send() method; a SYNC request deliberately doesn't), and an
             // armed `timeout` runs the timeout request-error steps if the
@@ -21061,7 +21408,7 @@ const PRELUDE: &str = r##"
                 const arr = dp ? [200, dp.ctype || null, dp.text, dp.bytes] : null;
                 const xhr = this;
                 if (this.__sync) this.__finish(arr);
-                else g.setTimeout(function () { xhr.__finish(arr); }, 0);
+                else __queue_network_task(function () { xhr.__finish(arr); }, this.__frame);
                 return;
             }
             // A `blob:` URL resolves from the in-realm store, off the wire; a
@@ -21072,7 +21419,7 @@ const PRELUDE: &str = r##"
                 const arr = be ? [200, be.type || null, new g.TextDecoder().decode(__latin1ToBytes(be.bytes)), be.bytes] : null;
                 const xhr = this;
                 if (this.__sync) this.__finish(arr);
-                else g.setTimeout(function () { xhr.__finish(arr); }, 0);
+                else __queue_network_task(function () { xhr.__finish(arr); }, this.__frame);
                 return;
             }
             const isFD = body instanceof g.FormData && Array.isArray(body.__entries);
@@ -21083,13 +21430,19 @@ const PRELUDE: &str = r##"
             if (this.__sync) {
                 this.__finish(__http_fetch(this.__url, this.__method || "GET", b, ctype, hdrs));
             } else {
-                // The request runs concurrently, but its callbacks are
-                // macrotasks (not microtasks): defer __finish into the
-                // timer queue so promise reactions still run first, as on
-                // the real platform.
+                // XHR §3.5.6 supplies processResponse/processEndOfBody to
+                // Fetch; response state and readystatechange/load/loadend are
+                // processed by that networking task. __http_fetch_async's
+                // resident-page promise is settled by a host networking task.
+                // Its reaction queues response processing on TRust's explicit
+                // networking source. Re-queuing through author setTimeout
+                // misclassified completion, let pages replace/cancel it, and
+                // starved consent mutations behind the throttled timer source.
                 const xhr = this;
                 __http_fetch_async(this.__url, this.__method || "GET", b, ctype, hdrs)
-                    .then(function (r) { g.setTimeout(function () { xhr.__finish(r); }, 0); });
+                    .then(function (r) {
+                        __queue_network_task(function () { xhr.__finish(r); }, xhr.__frame);
+                    });
             }
         }
     }
@@ -24179,6 +24532,41 @@ mod tests {
     }
 
     #[test]
+    fn inline_style_declaration_cache_tracks_owner_attribute_changes() {
+        // CSSOM §6.6.1: HTMLElement.style is one identity-stable declaration
+        // block whose declarations are updated when the owner's style
+        // attribute changes. Exercise both mutation directions around repeated
+        // reads; the repeated reads are Instagram/React's performance-critical
+        // shape and must not create a fresh declaration object or stale block.
+        let html = r##"<body><div id=t style="color: red; width: 10px"></div><pre id=o></pre><script>
+            const el = document.getElementById('t');
+            const style = el.style;
+            const log = [
+                style === el.style,
+                style.color,
+                style.width,
+                style.color,
+                style.getPropertyValue('width')
+            ];
+            el.setAttribute('style', 'color: blue; height: 20px');
+            log.push(style.color, style.width === '', style.height);
+            style.width = '30px';
+            log.push(el.getAttribute('style').includes('width: 30px'), style.width);
+            style.removeProperty('color');
+            log.push(style.color === '', !el.getAttribute('style').includes('color'));
+            el.removeAttribute('style');
+            log.push(style.length, style.height === '');
+            document.getElementById('o').textContent = log.join('|');
+        </script></body>"##;
+        let (out, outcome) = page(html);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("true|red|10px|red|10px|blue|true|20px|true|30px|true|true|0|true"),
+            "style declaration cache did not track its owner attribute: {out}"
+        );
+    }
+
+    #[test]
     fn base_href_cache_invalidates_on_nav_and_base_changes() {
         // The cached base URL must refresh on (a) a location change, (b) a
         // runtime <base> insertion, and (c) a <base href> mutation. page()
@@ -24384,6 +24772,68 @@ mod tests {
                 .unwrap()
                 .to_std_string_escaped(),
             "scheduler turn"
+        );
+    }
+
+    #[test]
+    fn message_port_queue_waits_until_the_port_is_enabled() {
+        // HTML §9.4.4: a port message queue starts disabled. Assigning the
+        // onmessage handler enables it (as does start()), after which an older
+        // queued message becomes runnable on the port-message task source.
+        let dom = Rc::new(RefCell::new(Dom::parse_document(
+            r#"<html><head></head><body></body></html>"#,
+        )));
+        let mut ctx = page_context_with(None).0;
+        {
+            let mut host = ctx.realm().host_defined_mut();
+            host.insert(PageDom(dom));
+            host.insert(PageStore {
+                map: Default::default(),
+                origin: String::from("https://example.com"),
+            });
+        }
+        register_syscalls(&mut ctx).unwrap();
+        ctx.eval(Source::from_bytes(
+            br#"globalThis.__trust_cfg = { url: "https://example.com/", ua: "TRust/0.1", width: 800, height: 600 };"#,
+        ))
+        .unwrap();
+        ctx.eval(Source::from_bytes(PRELUDE.as_bytes())).unwrap();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "disabled-port.js",
+            br#"globalThis.out = "waiting";
+                globalThis.channel = new MessageChannel();
+                channel.port2.postMessage("queued");"#,
+            &budget,
+            &mut outcome,
+        );
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        assert_eq!(
+            ctx.eval(Source::from_bytes(b"out"))
+                .unwrap()
+                .to_string(&mut ctx)
+                .unwrap()
+                .to_std_string_escaped(),
+            "waiting"
+        );
+        run_script(
+            &mut ctx,
+            "enable-port.js",
+            br#"channel.port1.onmessage = event => { out = event.data; };"#,
+            &budget,
+            &mut outcome,
+        );
+        settle(&mut ctx, &budget, 4, &mut outcome);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(
+            ctx.eval(Source::from_bytes(b"out"))
+                .unwrap()
+                .to_string(&mut ctx)
+                .unwrap()
+                .to_std_string_escaped(),
+            "queued"
         );
     }
 
@@ -26942,6 +27392,75 @@ mod tests {
     }
 
     #[test]
+    fn focus_management_exposes_stable_active_elements_and_tab_indices() {
+        // HTML §6.6: the viewport's DOM anchor reads as body, focus() runs the
+        // focus update steps, activeElement retargets through shadow roots, and
+        // a detached focused area is fixed up to the viewport. React's modal
+        // teardown relies on every one of these properties.
+        let (out, outcome) = page(
+            r#"<body><button id=a>A</button><button id=b>B</button><div id=host></div><pre id=o></pre><script>
+                const a = document.getElementById('a');
+                const b = document.getElementById('b');
+                const log = [];
+                for (const type of ['focus', 'focusin', 'blur', 'focusout']) {
+                    a.addEventListener(type, () => log.push('a:' + type));
+                    b.addEventListener(type, () => log.push('b:' + type));
+                }
+                const initial = document.activeElement === document.body;
+                a.click();
+                const syntheticDidNotFocus = document.activeElement === document.body;
+                a.focus({preventScroll:true});
+                const aFocused = document.activeElement === a;
+                b.focus({preventScroll:true});
+                const bFocused = document.activeElement === b;
+                b.remove();
+                const detachedFixedUp = document.activeElement === document.body;
+
+                const host = document.getElementById('host');
+                const root = host.attachShadow({mode:'open'});
+                root.innerHTML = '<button id=inner>inner</button>';
+                const inner = root.getElementById('inner');
+                inner.focus({preventScroll:true});
+                const retargeted = document.activeElement === host && root.activeElement === inner;
+
+                const generic = document.createElement('div');
+                generic.setAttribute('disabled', '');
+                generic.tabIndex = 0;
+                document.body.appendChild(generic);
+                generic.focus({preventScroll:true});
+                const genericDisabledAttrIgnored = document.activeElement === generic;
+                const fieldset = document.createElement('fieldset');
+                fieldset.setAttribute('disabled', '');
+                fieldset.innerHTML = '<legend><button id=legendButton>L</button></legend><button id=blocked>blocked</button>';
+                document.body.appendChild(fieldset);
+                fieldset.querySelector('#blocked').focus({preventScroll:true});
+                const disabledFieldsetBlocked = document.activeElement === generic;
+                const legendButton = fieldset.querySelector('#legendButton');
+                legendButton.focus({preventScroll:true});
+                const firstLegendEscaped = document.activeElement === legendButton;
+
+                const detached = document.createElement('button');
+                const indexed = document.createElement('div');
+                indexed.setAttribute('tabindex', '  +12tail');
+                document.getElementById('o').textContent = [
+                    initial, syntheticDidNotFocus, aFocused, bFocused, detachedFixedUp,
+                    retargeted, genericDisabledAttrIgnored, disabledFieldsetBlocked,
+                    firstLegendEscaped, document.hasFocus(), detached.tabIndex,
+                    document.createElement('a').tabIndex, document.createElement('div').tabIndex,
+                    indexed.tabIndex, log.join(',')
+                ].join('|');
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains(
+                "true|true|true|true|true|true|true|true|true|true|0|0|-1|12|a:focus,a:focusin,a:blur,a:focusout,b:focus,b:focusin"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn dom_string_getters_cache_only_within_one_mutation_epoch() {
         // DOM/HTML serialization getters return the current tree state. A
         // repeated read may reuse an immutable value, but a text or attribute
@@ -28514,11 +29033,98 @@ mod tests {
     }
 
     #[test]
+    fn message_channel_scheduler_chain_is_not_timer_throttled() {
+        // MessagePort uses the port-message task source, not the timer task
+        // source (HTML §9.4.4). React's cooperative scheduler commonly needs
+        // hundreds of these turns before committing a mount. At 66ms per
+        // misclassified timer this took many seconds despite negligible JS.
+        let (handle, mut events) = live(
+            r#"<body><p id=o>shell</p><script>
+               const channel = new MessageChannel();
+               let turns = 0;
+               channel.port1.onmessage = function () {
+                   turns++;
+                   if (turns < 128) channel.port2.postMessage(turns);
+                   else document.getElementById('o').textContent = 'mounted-' + turns;
+               };
+               channel.port2.postMessage(0);
+               </script></body>"#,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let started = Instant::now();
+            let mut mounted = false;
+            while started.elapsed() < Duration::from_secs(3) {
+                let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                    .await
+                    .expect("port-message scheduler chain was timer-throttled")
+                    .expect("page actor exited with a runnable port task");
+                match event {
+                    PageEvt::Updated { html, outcome } => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        if html.contains("mounted-128") {
+                            mounted = true;
+                            break;
+                        }
+                    }
+                    PageEvt::Settled | PageEvt::Trouble(_) => continue,
+                    other => panic!("unexpected scheduler event: {other:?}"),
+                }
+            }
+            assert!(mounted, "128 runnable port tasks did not mount within 3s");
+            drop(handle);
+        });
+    }
+
+    #[test]
+    fn posted_message_scheduler_chain_is_not_timer_throttled() {
+        // HTML §9.3 queues window.postMessage on the posted-message task
+        // source. setImmediate polyfills use this exact loop; folding it into
+        // setTimeout made a lightweight framework bootstrap take many seconds.
+        let (handle, mut events) = live(
+            r#"<body><p id=o>shell</p><script>
+               let turns = 0;
+               window.addEventListener('message', function (event) {
+                   if (event.data !== 'trust-scheduler-turn') return;
+                   turns++;
+                   if (turns < 128) window.postMessage('trust-scheduler-turn', '*');
+                   else document.getElementById('o').textContent = 'mounted-' + turns;
+               });
+               window.postMessage('trust-scheduler-turn', '*');
+               </script></body>"#,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let started = Instant::now();
+            let mut mounted = false;
+            while started.elapsed() < Duration::from_secs(3) {
+                let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                    .await
+                    .expect("posted-message scheduler chain was timer-throttled")
+                    .expect("page actor exited with a runnable posted-message task");
+                match event {
+                    PageEvt::Updated { html, outcome } => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        if html.contains("mounted-128") {
+                            mounted = true;
+                            break;
+                        }
+                    }
+                    PageEvt::Settled | PageEvt::Trouble(_) => continue,
+                    other => panic!("unexpected scheduler event: {other:?}"),
+                }
+            }
+            assert!(mounted, "128 posted-message tasks did not mount within 3s");
+            drop(handle);
+        });
+    }
+
+    #[test]
     fn an_at_rest_timeout_chain_fires_one_generation_per_wake() {
-        // A perpetual `setTimeout(0)` re-arm chain — the shape React's scheduler
-        // takes (its MessageChannel posts route through our `setTimeout(0)`), and
-        // the shape a never-settling poll takes when its data is gated behind a
-        // bot wall (Twitch). The synchronous call paints COUNT=1; every queued
+        // A perpetual `setTimeout(0)` re-arm chain — the shape a never-settling
+        // poll takes when its data is gated behind a bot wall (Twitch). React's
+        // MessageChannel scheduler is a separate task source, covered above.
+        // The synchronous call paints COUNT=1; every queued
         // continuation must then run AT REST, one task per wake (`REST_TICKS`).
         // Draining the chain during live-page initialization made a framework's
         // first user-input opportunity wait behind hundreds of author tasks.
@@ -30789,6 +31395,51 @@ mod tests {
         let rest = &rest[attr_start..];
         let attr_end = rest.find('"').expect("attr end");
         rest[..attr_end].parse().expect("node id")
+    }
+
+    #[test]
+    fn trusted_click_focus_survives_modal_target_removal() {
+        // HTML §6.6.2 requires user activation of a click-focusable area to run
+        // the focusing steps. A modal may remove that area synchronously and
+        // then ask whether its old subtree contains document.activeElement;
+        // the answer must use the viewport/body fallback, never `undefined`.
+        let (handle, mut events) = live(
+            r#"<body><div id=modal><button id=accept>accept</button></div><p id=o>waiting</p><script>
+               const accept = document.getElementById('accept');
+               accept.addEventListener('click', function () {
+                   const focusedDuringClick = document.activeElement === accept;
+                   document.getElementById('modal').remove();
+                   const active = document.activeElement;
+                   document.getElementById('o').textContent = [
+                       focusedDuringClick,
+                       active === document.body,
+                       active && active.nodeType === 1,
+                       typeof active
+                   ].join('|');
+               });
+               </script></body>"#,
+        );
+        let initial = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, .. }) => break html,
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected initial modal render, got {other:?}"),
+            }
+        };
+        let accept = live_node_after(&initial, "id=\"accept\"");
+        handle.cmds.blocking_send(PageCmd::Click(accept)).unwrap();
+        let updated = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    break html;
+                }
+                Some(PageEvt::Settled | PageEvt::Trouble(_)) => continue,
+                other => panic!("expected post-consent render, got {other:?}"),
+            }
+        };
+        assert!(updated.contains("true|true|true|object"), "{updated}");
+        assert!(!updated.contains("id=\"modal\""), "{updated}");
     }
 
     #[test]
@@ -35815,6 +36466,26 @@ mod tests {
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("rejected+xhr-error"), "{out}");
         assert_eq!(outcome.fetches, 0);
+    }
+
+    #[test]
+    fn xhr_network_completion_does_not_use_the_author_timer_source() {
+        // XHR §3.5.6 processes a response and fires completion events from the
+        // fetch/networking operation. Author code replacing setTimeout cannot
+        // cancel that operation. Instagram replaces/schedules timer machinery
+        // heavily; routing its consent mutation's XHR load through setTimeout
+        // left React waiting forever after the response had already arrived.
+        let (out, outcome) = page(
+            "<body><div id=t>waiting</div><script>\
+             var x = new XMLHttpRequest();\
+             x.open('GET', '/api');\
+             x.onerror = function () { document.getElementById('t').textContent = 'network-complete'; };\
+             x.send();\
+             window.setTimeout = function () { return 0; };\
+             </script></body>",
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("network-complete"), "{out}");
     }
 
     #[test]
