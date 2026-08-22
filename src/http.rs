@@ -5469,8 +5469,24 @@ mod tests {
         });
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
-        let body = String::from_utf8_lossy(&response.body);
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        if !body.contains("sdk-ran loaded")
+            && let Some(live) = response.live.as_mut()
+        {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, .. }))
+                    | Ok(Some(crate::js::PageEvt::Static { html, .. })) => {
+                        body = html;
+                        if body.contains("sdk-ran loaded") {
+                            break;
+                        }
+                    }
+                    other => panic!("expected injected script render, got {other:?}"),
+                }
+            }
+        }
         assert!(body.contains("sdk-ran"), "injected script ran: {body}");
         assert!(body.contains("sdk-ran loaded"), "load event fired: {body}");
         assert!(
@@ -5674,8 +5690,24 @@ mod tests {
         });
         let url = parse_url(&format!("http://127.0.0.1:{port}/page")).unwrap();
         let response = fetch(&Request::get(url)).await.unwrap();
-        let response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
-        let body = String::from_utf8_lossy(&response.body);
+        let mut response = execute_js(response, (80, 24), (8, 16), Default::default()).await;
+        let mut body = String::from_utf8_lossy(&response.body).into_owned();
+        if !body.contains("ERRORED")
+            && let Some(live) = response.live.as_mut()
+        {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(5), live.events.recv()).await {
+                    Ok(Some(crate::js::PageEvt::Updated { html, .. }))
+                    | Ok(Some(crate::js::PageEvt::Static { html, .. })) => {
+                        body = html;
+                        if body.contains("ERRORED") {
+                            break;
+                        }
+                    }
+                    other => panic!("expected injected script error render, got {other:?}"),
+                }
+            }
+        }
         assert!(body.contains("ERRORED"), "error event fired: {body}");
         assert!(
             !body.contains("LOADED"),
