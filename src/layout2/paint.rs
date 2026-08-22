@@ -1191,6 +1191,11 @@ pub(crate) fn line_row_map(
     // following line down. The quantized containing edge is the retained
     // terminal identity of that band, while `None` represents the root flow.
     let mut next_row_by_band: HashMap<Option<i64>, i64> = HashMap::new();
+    // Positioned descendants paint out of flow and therefore must not reserve
+    // rows in the document allocator. Their own line boxes still need a
+    // private floor, however: a quantization-only continuation row from one
+    // positioned line must not be overwritten by the next canonical line.
+    let mut next_row_by_positioned_parent: HashMap<usize, i64> = HashMap::new();
     let mut last_band_parent: HashMap<Option<i64>, usize> = HashMap::new();
     let mut flow_states: HashMap<usize, FlowState> = HashMap::new();
     for entry in lines {
@@ -1245,6 +1250,10 @@ pub(crate) fn line_row_map(
             state.row + state.span - 1
         });
         let mut band_floor = next_row_by_band.get(&band).copied().unwrap_or(i64::MIN);
+        let positioned_floor = next_row_by_positioned_parent
+            .get(&entry.parent)
+            .copied()
+            .unwrap_or(i64::MIN);
         if can_continue
             && previous_flow.is_some_and(|state| {
                 state.row + state.span == band_floor
@@ -1259,7 +1268,7 @@ pub(crate) fn line_row_map(
         let vertically_clipped_away = line.clip.is_some_and(|clip| {
             ((clip.y0 - oy) / cell_h).round() as i64 >= ((clip.y1 - oy) / cell_h).round() as i64
         });
-        if positioned || vertically_clipped_away {
+        if vertically_clipped_away {
             map.insert(
                 std::ptr::from_ref(line) as usize,
                 TerminalLinePlacement {
@@ -1274,11 +1283,16 @@ pub(crate) fn line_row_map(
             );
             continue;
         }
-        let same_band = previous_y.is_some_and(|y| (line.y - y).abs() <= 0.01);
+        let same_band = !positioned && previous_y.is_some_and(|y| (line.y - y).abs() <= 0.01);
         let row = if same_band {
             previous_row
         } else if let Some(carry_row) = carry_row {
-            carry_row.max(band_floor)
+            carry_row
+        } else if positioned {
+            // An out-of-flow formatting context must not advance the shared
+            // document row allocator, but its own proportional lines still
+            // need the same terminal-cell adaptation as in-flow text.
+            preferred.max(positioned_floor)
         } else {
             preferred.max(band_floor)
         };
@@ -1314,9 +1328,16 @@ pub(crate) fn line_row_map(
         );
         previous_y = Some(line.y);
         previous_row = row;
-        let next_row = next_row_by_band.entry(band).or_insert(i64::MIN);
-        *next_row = (*next_row).max(row + span.max(1));
-        last_band_parent.insert(band, entry.parent);
+        if !positioned {
+            let next_row = next_row_by_band.entry(band).or_insert(i64::MIN);
+            *next_row = (*next_row).max(row + span.max(1));
+            last_band_parent.insert(band, entry.parent);
+        } else {
+            let next_row = next_row_by_positioned_parent
+                .entry(entry.parent)
+                .or_insert(i64::MIN);
+            *next_row = (*next_row).max(row + span.max(1));
+        }
         let forced = matches!(&line.kind, FragKind::Line(line) if line.forced);
         flow_states.insert(
             entry.parent,

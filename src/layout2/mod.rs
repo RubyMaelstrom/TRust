@@ -1343,6 +1343,38 @@ mod tests {
     }
 
     #[test]
+    fn positioned_text_reflows_without_reserving_document_rows() {
+        // CSS Text 3 §3 permits normal text to wrap at soft opportunities after
+        // the containing block has been sized. The graphical layout therefore
+        // keeps this proportional line in one positioned box, but its terminal
+        // cell equivalent needs a private continuation row. That row must not
+        // erase the next canonical line or move unrelated in-flow content.
+        let text = "systems. By using this legacy tool for fileless, low-visibility attacks, threat actors highlight the growing trend of weaponizing overlooked, living-off-the-land utilities.";
+        let html = format!(
+            r#"<body style="margin:0"><div style="position:absolute;left:0;top:0;width:624px;font-size:15px"><p style="margin:0">{text}</p></div><p style="margin:0;position:absolute;top:160px">after</p></body>"#
+        );
+        let out = lay(&html, 80);
+        let (after_row, after) = find(&out, "after");
+        let rendered = out
+            .rows
+            .iter()
+            .take(after_row)
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let compact = |value: &str| value.split_whitespace().collect::<String>();
+        assert_eq!(
+            compact(&rendered),
+            compact(text),
+            "positioned text lost content during terminal-cell reflow: {rendered:?}"
+        );
+        assert!(
+            after.col < 80,
+            "the following positioned content remains visible"
+        );
+    }
+
+    #[test]
     fn sidebar_viewport_clipping_does_not_add_main_flow_rows() {
         // The sidebar's containing block extends a little beyond the terminal
         // viewport. Its right-edge clipping must not be mistaken for a second
