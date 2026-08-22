@@ -399,6 +399,19 @@ impl BuiltInFunctionObject {
         generator: bool,
         context: &mut Context,
     ) -> JsResult<JsObject> {
+        // ECMA-262 §20.2.1.1.1 CreateDynamicFunction parses the supplied
+        // parameter and body strings into a new function source. That source
+        // is not retained
+        // by this engine's FunctionCompiler (`SpannedSourceText::new_empty()`),
+        // so TRust's lazy parser/compiler cannot safely defer nested functions:
+        // their first-call reparse would have no source span. Suppress both
+        // halves of TRust laziness for this operation. This preserves the
+        // standard's normal Function construction semantics and, importantly,
+        // prevents a later timer/host callback from turning an ordinary script
+        // error into an engine panic.
+        let _no_lazy_parse = boa_parser::lazy::suppress();
+        let _no_lazy_compile = crate::vm::lazy::suppress();
+
         // 1. If newTarget is undefined, set newTarget to constructor.
         let new_target = if new_target.is_undefined() {
             constructor.into()

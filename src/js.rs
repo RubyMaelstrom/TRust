@@ -2253,6 +2253,19 @@ thread_local! {
     /// the call site can re-throw the ORIGINAL value (js-api). Taken right after
     /// the call returns — no GC runs during the synchronous Rust unwind.
     static WASM_PENDING: RefCell<Option<boa_engine::JsError>> = const { RefCell::new(None) };
+    /// The Wasm state currently executing a core start function or exported
+    /// function. Host imports receive a `wasmi::Caller`, which is the only
+    /// valid way to touch the associated store while the outer state borrow is
+    /// suspended. The raw pointer is used only while that outer borrow is
+    /// dormant, to copy stable wasmi handles and register funcref handles read
+    /// by a nested JS call.
+    static WASM_ACTIVE_STATE: Cell<*mut WasmState> =
+        const { Cell::new(std::ptr::null_mut()) };
+    /// The active wasmi host-import caller. Its lifetime is limited to the
+    /// callback invocation; the erased raw pointer is restored by the guard
+    /// before the callback returns.
+    static WASM_CALLER: Cell<*mut wasmi::Caller<'static, ()>> =
+        const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// Sets `WASM_CTX` for the duration of a wasm call and restores the previous
@@ -2270,6 +2283,96 @@ impl Drop for WasmCtxGuard {
     fn drop(&mut self) {
         WASM_CTX.with(|c| c.set(self.0));
     }
+}
+
+/// Makes the currently executing state discoverable by WebAssembly JS-API
+/// syscalls invoked from a host import. This follows the WebAssembly JS
+/// Interface's associated-store rules: a host callback does not create a new
+/// store, and `Table.grow` must update the same store and return its old size.
+/// See WebAssembly JS Interface §§ 5.2 (instantiation) and 5.4 (Table objects).
+struct WasmStateGuard(*mut WasmState);
+impl WasmStateGuard {
+    fn set(state: &mut WasmState) -> Self {
+        let prev = WASM_ACTIVE_STATE.with(|s| s.replace(state as *mut WasmState));
+        Self(prev)
+    }
+}
+impl Drop for WasmStateGuard {
+    fn drop(&mut self) {
+        WASM_ACTIVE_STATE.with(|s| s.set(self.0));
+    }
+}
+
+/// Exposes wasmi's `Caller` to the JS syscall reached by the host import. The
+/// pointer is valid only until `make_import_func` returns; nested guards make
+/// the arrangement safe for nested JS callbacks on the same page actor.
+struct WasmCallerGuard(*mut wasmi::Caller<'static, ()>);
+impl WasmCallerGuard {
+    fn set(caller: &mut wasmi::Caller<'_, ()>) -> Self {
+        // The pointer never escapes this synchronous host-import callback;
+        // erase only the borrow lifetime so the thread-local guard can carry
+        // it to the JS syscall and restore it before returning.
+        let ptr = unsafe {
+            std::mem::transmute::<*mut wasmi::Caller<'_, ()>, *mut wasmi::Caller<'static, ()>>(
+                std::ptr::from_mut(caller),
+            )
+        };
+        let prev = WASM_CALLER.with(|c| c.replace(ptr));
+        Self(prev)
+    }
+}
+impl Drop for WasmCallerGuard {
+    fn drop(&mut self) {
+        WASM_CALLER.with(|c| c.set(self.0));
+    }
+}
+
+fn active_wasm_table(id: usize) -> Option<wasmi::Table> {
+    WASM_ACTIVE_STATE.with(|s| {
+        let ptr = s.get();
+        (!ptr.is_null())
+            .then(|| unsafe { (&*std::ptr::addr_of!((*ptr).tables)).get(id).copied() })?
+    })
+}
+
+fn active_wasm_func(id: usize) -> Option<wasmi::Func> {
+    WASM_ACTIVE_STATE.with(|s| {
+        let ptr = s.get();
+        (!ptr.is_null())
+            .then(|| unsafe { (&*std::ptr::addr_of!((*ptr).funcs)).get(id).copied() })?
+    })
+}
+
+/// Register a funcref read through an active host-import caller. The registry
+/// is not borrowed by wasmi while the callback is running; only the copied
+/// handle is used by the nested JS wrapper after this push.
+fn active_wasm_register_func(func: wasmi::Func) -> Option<usize> {
+    WASM_ACTIVE_STATE.with(|s| {
+        let ptr = s.get();
+        (!ptr.is_null()).then(|| unsafe {
+            let funcs = &mut (*ptr).funcs;
+            let id = funcs.len();
+            funcs.push(func);
+            id
+        })
+    })
+}
+
+fn with_active_wasm_caller<R>(f: impl FnOnce(&mut wasmi::Caller<'static, ()>) -> R) -> Option<R> {
+    WASM_CALLER.with(|c| {
+        let ptr = c.get();
+        (!ptr.is_null()).then(|| unsafe { f(&mut *ptr) })
+    })
+}
+
+fn active_wasm_table_element(id: usize) -> Option<wasmi::ValType> {
+    let table = active_wasm_table(id)?;
+    with_active_wasm_caller(|caller| table.ty(&*caller).element())
+}
+
+fn active_wasm_table_size(id: usize) -> Option<u64> {
+    let table = active_wasm_table(id)?;
+    with_active_wasm_caller(|caller| table.size(&*caller))
 }
 
 /// The wasmi error a host-import closure returns to unwind the call after it has
@@ -2345,7 +2448,7 @@ fn make_import_func(
     index: u32,
 ) -> wasmi::Func {
     let results: Vec<wasmi::ValType> = ft.results().to_vec();
-    wasmi::Func::new(store, ft, move |_caller, params, outs| {
+    wasmi::Func::new(store, ft, move |mut caller, params, outs| {
         let ctx_ptr = WASM_CTX.with(|c| c.get());
         if ctx_ptr.is_null() {
             return Err(wasmi::Error::new(
@@ -2366,6 +2469,9 @@ fn make_import_func(
                 }
             }
         }
+        // Keep the Caller alive through result conversion too: ToWebAssemblyValue
+        // can execute user JavaScript, which may use the same Table/Memory API.
+        let _caller_guard = WasmCallerGuard::set(&mut caller);
         match invoke_js_import(ctx, token, index, js_args)
             .and_then(|ret| write_import_results(ctx, &ret, &results, outs))
         {
@@ -4880,10 +4986,19 @@ fn sys_wasm_instantiate(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
         // The start function may call host imports back into JS — set the live
         // context and hold no `ctx`/`host_defined` borrow across the call.
         let _guard = WasmCtxGuard::set(ctx);
-        let mut slot = cell.borrow_mut();
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            return Ok(wasm_err(
+                "Runtime",
+                "re-entrant WebAssembly instantiation from a host import is not supported",
+                ctx,
+            ));
+        };
         let st = slot.get_or_insert_with(WasmState::new);
         match module_id.and_then(|id| st.modules.get(id)).cloned() {
-            Some(module) => build_and_instantiate(st, &module, token, &bindings),
+            Some(module) => {
+                let _state_guard = WasmStateGuard::set(st);
+                build_and_instantiate(st, &module, token, &bindings)
+            }
             None => Err((
                 "Link",
                 String::from("WebAssembly.instantiate: unknown module"),
@@ -5078,6 +5193,7 @@ fn sys_wasm_call_export(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
                         Some(f) => {
                             let mut outputs: Vec<wasmi::Val> =
                                 results.iter().map(|t| wasmi::Val::default(*t)).collect();
+                            let _state_guard = WasmStateGuard::set(st);
                             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 f.call(&mut st.store, &inputs, &mut outputs)
                             })) {
@@ -5536,14 +5652,40 @@ fn prepare_ref(ctx: &mut Context, value: &JsValue, elem: wasmi::ValType) -> JsRe
 
 /// Build the wasm `Val` for a prepared ref (inside the state borrow).
 fn build_ref(st: &mut WasmState, arg: RefArg) -> Result<wasmi::Val, ()> {
+    build_ref_with_context(&st.funcs, &mut st.store, arg)
+}
+
+/// Build a reference using an already active wasmi context. This is used by
+/// WebAssembly JS-API calls made from a host import: the normal `WasmState`
+/// `RefCell` is intentionally still borrowed by the outer call, so the
+/// host-import `Caller` is the associated store context available to us.
+fn build_ref_with_context<C: wasmi::AsContextMut<Data = ()>>(
+    funcs: &[wasmi::Func],
+    ctx: &mut C,
+    arg: RefArg,
+) -> Result<wasmi::Val, ()> {
     Ok(match arg {
         RefArg::Null(wasmi::ValType::FuncRef) => wasmi::Val::FuncRef(wasmi::Ref::Null),
         RefArg::Null(_) => wasmi::Val::ExternRef(wasmi::Ref::Null),
-        RefArg::Func(i) => {
-            wasmi::Val::FuncRef(wasmi::Ref::Val(st.funcs.get(i).copied().ok_or(())?))
-        }
+        RefArg::Func(i) => wasmi::Val::FuncRef(wasmi::Ref::Val(funcs.get(i).copied().ok_or(())?)),
         RefArg::Extern(id) => {
-            wasmi::Val::ExternRef(wasmi::Ref::Val(wasmi::ExternRef::new(&mut st.store, id)))
+            wasmi::Val::ExternRef(wasmi::Ref::Val(wasmi::ExternRef::new(&mut *ctx, id)))
+        }
+    })
+}
+
+/// The active-store variant of [`build_ref`]. Function handles are copied from
+/// the state registry before the caller mutably accesses the store.
+fn build_active_ref(
+    caller: &mut wasmi::Caller<'static, ()>,
+    arg: RefArg,
+) -> Result<wasmi::Val, ()> {
+    Ok(match arg {
+        RefArg::Null(wasmi::ValType::FuncRef) => wasmi::Val::FuncRef(wasmi::Ref::Null),
+        RefArg::Null(_) => wasmi::Val::ExternRef(wasmi::Ref::Null),
+        RefArg::Func(i) => wasmi::Val::FuncRef(wasmi::Ref::Val(active_wasm_func(i).ok_or(())?)),
+        RefArg::Extern(id) => {
+            wasmi::Val::ExternRef(wasmi::Ref::Val(wasmi::ExternRef::new(caller, id)))
         }
     })
 }
@@ -5650,15 +5792,16 @@ fn sys_wasm_table_length(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> Js
     let Some(cell) = page_wasm_cell(ctx) else {
         return Ok(JsValue::from(0.0));
     };
-    let slot = cell.borrow();
-    let len = slot
-        .as_ref()
-        .and_then(|st| {
-            arg_id(args, 0)
+    let table_id = arg_id(args, 0);
+    let len = match cell.try_borrow() {
+        Ok(slot) => slot.as_ref().and_then(|st| {
+            table_id
                 .and_then(|i| st.tables.get(i))
                 .map(|t| t.size(&st.store))
-        })
-        .unwrap_or(0);
+        }),
+        Err(_) => table_id.and_then(active_wasm_table_size),
+    }
+    .unwrap_or(0);
     Ok(JsValue::from(len as f64))
 }
 
@@ -5684,34 +5827,67 @@ fn sys_wasm_table_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
         Oob,
     }
     let tok = {
-        let mut slot = cell.borrow_mut();
-        match slot.as_mut().and_then(|st| {
-            arg_id(args, 0)
-                .and_then(|i| st.tables.get(i).copied())
-                .map(|t| (st, t))
-        }) {
-            Some((st, t)) => match t.get(&st.store, index) {
+        match cell.try_borrow_mut() {
+            Ok(mut slot) => match slot.as_mut().and_then(|st| {
+                arg_id(args, 0)
+                    .and_then(|i| st.tables.get(i).copied())
+                    .map(|t| (st, t))
+            }) {
+                Some((st, t)) => match t.get(&st.store, index) {
+                    None => Tok::Oob,
+                    Some(wasmi::Val::FuncRef(wasmi::Ref::Null))
+                    | Some(wasmi::Val::ExternRef(wasmi::Ref::Null)) => Tok::Null,
+                    Some(wasmi::Val::FuncRef(wasmi::Ref::Val(f))) => {
+                        // No `Func` equality in wasmi → a fresh wrapper (the
+                        // funcref read-back identity caveat); the VALUE is
+                        // correct/callable.
+                        let id = st.funcs.len();
+                        st.funcs.push(f);
+                        Tok::Func(id)
+                    }
+                    Some(wasmi::Val::ExternRef(wasmi::Ref::Val(er))) => {
+                        let id = er
+                            .data(&st.store)
+                            .downcast_ref::<usize>()
+                            .copied()
+                            .unwrap_or(0);
+                        Tok::Extern(id)
+                    }
+                    Some(other) => Tok::Other(other),
+                },
                 None => Tok::Oob,
-                Some(wasmi::Val::FuncRef(wasmi::Ref::Null))
-                | Some(wasmi::Val::ExternRef(wasmi::Ref::Null)) => Tok::Null,
-                Some(wasmi::Val::FuncRef(wasmi::Ref::Val(f))) => {
-                    // No `Func` equality in wasmi → a fresh wrapper (the funcref
-                    // read-back identity caveat); the VALUE is correct/callable.
-                    let id = st.funcs.len();
-                    st.funcs.push(f);
-                    Tok::Func(id)
-                }
-                Some(wasmi::Val::ExternRef(wasmi::Ref::Val(er))) => {
-                    let id = er
-                        .data(&st.store)
-                        .downcast_ref::<usize>()
-                        .copied()
-                        .unwrap_or(0);
-                    Tok::Extern(id)
-                }
-                Some(other) => Tok::Other(other),
             },
-            None => Tok::Oob,
+            Err(_) => {
+                let Some(table) = arg_id(args, 0).and_then(active_wasm_table) else {
+                    return Err(wasm_range_err(
+                        "WebAssembly.Table.get: unavailable re-entrant table",
+                    ));
+                };
+                let Some(result) =
+                    with_active_wasm_caller(|caller| match table.get(&*caller, index) {
+                        None => Tok::Oob,
+                        Some(wasmi::Val::FuncRef(wasmi::Ref::Null))
+                        | Some(wasmi::Val::ExternRef(wasmi::Ref::Null)) => Tok::Null,
+                        Some(wasmi::Val::FuncRef(wasmi::Ref::Val(f))) => {
+                            active_wasm_register_func(f).map_or(Tok::Oob, Tok::Func)
+                        }
+                        Some(wasmi::Val::ExternRef(wasmi::Ref::Val(er))) => {
+                            let id = er
+                                .data(&*caller)
+                                .downcast_ref::<usize>()
+                                .copied()
+                                .unwrap_or(0);
+                            Tok::Extern(id)
+                        }
+                        Some(other) => Tok::Other(other),
+                    })
+                else {
+                    return Err(wasm_range_err(
+                        "WebAssembly.Table.get: unavailable re-entrant store",
+                    ));
+                };
+                result
+            }
         }
     };
     match tok {
@@ -5738,30 +5914,51 @@ fn sys_wasm_table_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
         ));
     }
     let index = index as u64;
-    let elem = {
-        let slot = cell.borrow();
-        slot.as_ref().and_then(|st| {
-            arg_id(args, 0)
+    let table_id = arg_id(args, 0);
+    let elem = match cell.try_borrow() {
+        Ok(slot) => slot.as_ref().and_then(|st| {
+            table_id
                 .and_then(|i| st.tables.get(i))
                 .map(|t| t.ty(&st.store).element())
-        })
+        }),
+        Err(_) => table_id.and_then(active_wasm_table_element),
     };
     let Some(elem) = elem else {
         return Err(wasm_range_err("WebAssembly.Table.set: unknown table"));
     };
     let arg = prepare_ref(ctx, args.get(2).unwrap_or(&JsValue::undefined()), elem)?;
     let result: Result<(), String> = {
-        let mut slot = cell.borrow_mut();
-        if let Some(st) = slot.as_mut() {
-            match build_ref(st, arg) {
-                Err(()) => Err(String::from("invalid funcref")),
-                Ok(val) => match arg_id(args, 0).and_then(|i| st.tables.get(i).copied()) {
-                    Some(t) => t.set(&mut st.store, index, val).map_err(|e| format!("{e}")),
-                    None => Err(String::from("unknown table")),
-                },
+        match cell.try_borrow_mut() {
+            Ok(mut slot) => {
+                if let Some(st) = slot.as_mut() {
+                    match build_ref(st, arg) {
+                        Err(()) => Err(String::from("invalid funcref")),
+                        Ok(val) => match table_id.and_then(|i| st.tables.get(i).copied()) {
+                            Some(t) => t.set(&mut st.store, index, val).map_err(|e| format!("{e}")),
+                            None => Err(String::from("unknown table")),
+                        },
+                    }
+                } else {
+                    Err(String::from("unavailable"))
+                }
             }
-        } else {
-            Err(String::from("unavailable"))
+            Err(_) => {
+                let Some(table) = table_id.and_then(active_wasm_table) else {
+                    return Err(wasm_range_err(
+                        "WebAssembly.Table.set: unavailable re-entrant table",
+                    ));
+                };
+                let Some(result) = with_active_wasm_caller(|caller| {
+                    let val = build_active_ref(caller, arg)
+                        .map_err(|_| String::from("invalid funcref"))?;
+                    table.set(caller, index, val).map_err(|e| format!("{e}"))
+                }) else {
+                    return Err(wasm_range_err(
+                        "WebAssembly.Table.set: unavailable re-entrant store",
+                    ));
+                };
+                result
+            }
         }
     };
     match result {
@@ -5784,32 +5981,56 @@ fn sys_wasm_table_grow(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRe
         return Err(wasm_range_err("WebAssembly.Table.grow: invalid delta"));
     };
     let delta = delta as u64;
-    let elem = {
-        let slot = cell.borrow();
-        slot.as_ref().and_then(|st| {
-            arg_id(args, 0)
+    let table_id = arg_id(args, 0);
+    let elem = match cell.try_borrow() {
+        Ok(slot) => slot.as_ref().and_then(|st| {
+            table_id
                 .and_then(|i| st.tables.get(i))
                 .map(|t| t.ty(&st.store).element())
-        })
+        }),
+        // A host import is executing with the state cell mutably borrowed. In
+        // that case the active Caller is the associated store context required
+        // by the WebAssembly JS API; do not attempt a second RefCell borrow.
+        Err(_) => table_id.and_then(active_wasm_table_element),
     };
     let Some(elem) = elem else {
         return Err(wasm_range_err("WebAssembly.Table.grow: unknown table"));
     };
     let arg = prepare_ref(ctx, args.get(2).unwrap_or(&JsValue::undefined()), elem)?;
     let result: Result<u64, String> = {
-        let mut slot = cell.borrow_mut();
-        if let Some(st) = slot.as_mut() {
-            match build_ref(st, arg) {
-                Err(()) => Err(String::from("invalid funcref")),
-                Ok(val) => match arg_id(args, 0).and_then(|i| st.tables.get(i).copied()) {
-                    Some(t) => t
-                        .grow(&mut st.store, delta, val)
-                        .map_err(|e| format!("{e}")),
-                    None => Err(String::from("unknown table")),
-                },
+        match cell.try_borrow_mut() {
+            Ok(mut slot) => {
+                if let Some(st) = slot.as_mut() {
+                    match build_ref(st, arg) {
+                        Err(()) => Err(String::from("invalid funcref")),
+                        Ok(val) => match table_id.and_then(|i| st.tables.get(i).copied()) {
+                            Some(t) => t
+                                .grow(&mut st.store, delta, val)
+                                .map_err(|e| format!("{e}")),
+                            None => Err(String::from("unknown table")),
+                        },
+                    }
+                } else {
+                    Err(String::from("unavailable"))
+                }
             }
-        } else {
-            Err(String::from("unavailable"))
+            Err(_) => {
+                let Some(table) = table_id.and_then(active_wasm_table) else {
+                    return Err(wasm_range_err(
+                        "WebAssembly.Table.grow: unavailable re-entrant table",
+                    ));
+                };
+                let Some(result) = with_active_wasm_caller(|caller| {
+                    let val = build_active_ref(caller, arg)
+                        .map_err(|_| String::from("invalid funcref"))?;
+                    table.grow(caller, delta, val).map_err(|e| format!("{e}"))
+                }) else {
+                    return Err(wasm_range_err(
+                        "WebAssembly.Table.grow: unavailable re-entrant store",
+                    ));
+                };
+                result
+            }
         }
     };
     match result {
@@ -32877,6 +33098,31 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_function_nested_callbacks_do_not_use_missing_lazy_source() {
+        // ECMAScript CreateDynamicFunction builds source from strings rather
+        // than from the page script's retained source text. Nested functions
+        // therefore must not be lazy-parsed/compiled: their first-call reparse
+        // would otherwise have no source span and could panic the JS engine.
+        let padding = "x".repeat(180);
+        let body = format!("return function generated() {{ return 42; /* {padding} */ }};");
+        let html = format!(
+            "<body><pre id=o></pre><script>\
+             var factory = new Function({body:?});\
+             var generated = factory();\
+             document.getElementById('o').textContent = generated();\
+             </script></body>"
+        );
+        let (out, outcome) = page(&html);
+        assert!(
+            !outcome.panicked,
+            "dynamic function panicked: {:?}",
+            outcome.errors
+        );
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        assert!(out.contains("42"), "{out}");
+    }
+
+    #[test]
     fn bare_specifier_imports_reject_without_recursive_formatting() {
         let (out, outcome) = page(
             "<body><p>kept</p><script type=module>\
@@ -35770,6 +36016,43 @@ mod tests {
         let (out, outcome) = page(&html);
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("RUNTIMEERROR"), "{out}");
+    }
+
+    #[test]
+    fn wasm_start_import_can_use_the_javascript_table_api() {
+        // WebAssembly's start function runs imported host functions during
+        // instantiation. Those functions remain ordinary JavaScript and may
+        // use another WebAssembly object in the same agent; the JS API's
+        // Table.grow algorithm updates the agent's associated store and
+        // returns the previous length. Keep this regression next to the
+        // re-entrant exported-call guard because the two paths share the
+        // store boundary but have different observable semantics.
+        let bytes = wat_u8(
+            r#"(module
+                (import "env" "cb" (func $cb))
+                (func $start call $cb)
+                (start $start))"#,
+        );
+        let html = format!(
+            "<body><pre id=o></pre><script>\
+             var t = new WebAssembly.Table({{element:'externref', initial:1}});\
+             var old = 'unset';\
+             var seen = 'unset';\
+             var result = 'none';\
+             try {{ new WebAssembly.Instance(new WebAssembly.Module({bytes}), {{ env: {{ cb: function() {{ old = t.grow(1); t.set(0, 'x'); seen = t.length; }} }} }});\
+                 result = 'ok:' + old + ':' + seen + ':' + t.length; }}\
+             catch(e) {{ result = e.name + ':' + e.message; }}\
+             document.getElementById('o').textContent = result;\
+             </script></body>"
+        );
+        let (out, outcome) = page(&html);
+        assert!(
+            !outcome.panicked,
+            "host import must not panic: {:?}",
+            outcome.errors
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("ok:1:2:2"), "{out}");
     }
 
     // ---- WebAssembly: Stage 4 — Global ----
