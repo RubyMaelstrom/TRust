@@ -43,8 +43,9 @@ bytes = "1.11.1"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 # Default features = the pure-Rust `miniz_oxide` backend. NEVER enable the
 # `zlib`/`zlib-ng`/`cloudflare_zlib`/`miniz-sys` features — those pull a C
-# decompressor and betray the pure-Rust ethos. We only DECODE (gzip/deflate
-# responses a server forces on us unsolicited); we never advertise or compress.
+# compressor and betray the pure-Rust ethos. Used for HTTP content decoding and
+# the WHATWG Compression Streams API; the latter prevents sites from falling
+# back to large interpreted JavaScript codecs.
 flate2 = "1"
 futures = "0.3.32"
 html5ever = "0.39"
