@@ -9830,7 +9830,7 @@ fn page_actor(
     // (Console is left cumulative — it's a diagnostic channel, not a count.)
     if shell_sent {
         page.outcome.errors.clear();
-        // requestSubmit() may have run synchronously during parsing or
+        // A form submission may have run synchronously during parsing or
         // DOMContentLoaded. Emit it only after the first paint; its entry list
         // was captured from the complete resident DOM (including hidden forms).
         if let Some((form, submitter, submission)) = take_form_submit(&mut page) {
@@ -9862,7 +9862,7 @@ fn page_actor(
     }
     page.outcome.elapsed = page.started.elapsed();
     let changed = page.dom.borrow_mut().take_dirty();
-    // A DOMContentLoaded/load handler can reach requestSubmit(). Keep the intent
+    // A DOMContentLoaded/load handler can reach form.submit()/requestSubmit(). Keep the intent
     // until after the lifecycle DOM has been serialized.
     let pending_form_submit = take_form_submit(&mut page);
     if painted_live && !changed {
@@ -10923,13 +10923,17 @@ fn timer_wake(
             t0.elapsed().as_millis(),
         );
     }
-    if let Some(Some(ok)) = emit {
-        // The baked scroll position rides the Updated/Patched (see finish_dispatch).
-        return ok;
+    if let Some(Some(ok)) = emit
+        && !ok
+    {
+        return false;
     }
     // A rAF/effect that pinned a region (set `scrollTop`) without mutating the
     // DOM re-windows it cheaply via Scrolled — the chat auto-scroll at rest.
     if !send_scroll_events(&scrolls, evts) {
+        return false;
+    }
+    if !send_pending_form_submit(page, evts) {
         return false;
     }
     if !page.outcome.errors.is_empty() {
@@ -10976,10 +10980,16 @@ fn platform_task_wake(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<Pa
     }
     let scrolls = page.dom.borrow_mut().take_scroll_changes();
     let dirty = page.dom.borrow_mut().take_dirty();
-    if dirty && let Some(ok) = emit_dirty_render(page, evts) {
-        return ok;
+    if dirty
+        && let Some(ok) = emit_dirty_render(page, evts)
+        && !ok
+    {
+        return false;
     }
     if !send_scroll_events(&scrolls, evts) {
+        return false;
+    }
+    if !send_pending_form_submit(page, evts) {
         return false;
     }
     if !page.outcome.errors.is_empty() {
@@ -11046,7 +11056,7 @@ fn host_task_wake(
     if !finish_dispatch_render(page, evts, false) {
         return false;
     }
-    true
+    send_pending_form_submit(page, evts)
 }
 
 fn page_pending_fetches(page: &LoadedPage) -> usize {
@@ -11164,7 +11174,10 @@ fn dispatch_resource_done(
         let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
         return false;
     }
-    finish_dispatch_render(page, evts, false)
+    if !finish_dispatch_render(page, evts, false) {
+        return false;
+    }
+    send_pending_form_submit(page, evts)
 }
 
 /// A background fetch (a resident-page `fetch()` whose request ran OFF the
@@ -11225,8 +11238,12 @@ fn dispatch_fetch_done(
     }
     if page.dom.borrow_mut().take_dirty()
         && let Some(ok) = emit_dirty_render(page, evts)
+        && !ok
     {
-        return ok;
+        return false;
+    }
+    if !send_pending_form_submit(page, evts) {
+        return false;
     }
     if !page.outcome.errors.is_empty() {
         return evts
@@ -11452,9 +11469,9 @@ fn form_method_is_dialog(page: &LoadedPage, form: usize, submitter: usize) -> bo
     method.trim().eq_ignore_ascii_case("dialog")
 }
 
-/// A standards-driven `HTMLFormElement.requestSubmit()` that completed without
-/// cancellation. The optional second arena node is absent for requestSubmit()
-/// with no argument, so the app does not invent a successful submit button.
+/// Take a standards-driven `HTMLFormElement.submit()`/`requestSubmit()` intent.
+/// The optional second arena node is absent for no-argument requestSubmit() and
+/// submit(), so the app does not invent a successful submit button.
 fn take_form_submit(
     page: &mut LoadedPage,
 ) -> Option<(usize, Option<usize>, Option<FormSubmission>)> {
@@ -11467,6 +11484,24 @@ fn take_form_submit(
         .flatten();
     let submission = form_submission(page, form, submitter);
     Some((form, submitter, submission))
+}
+
+/// Forward a form submission queued by any HTML task source. `submit()` can
+/// run from an XHR callback, fetch reaction, timer, or dynamically loaded
+/// script; it is not limited to user activation or the initial lifecycle.
+fn send_pending_form_submit(
+    page: &mut LoadedPage,
+    evts: &tokio::sync::mpsc::Sender<PageEvt>,
+) -> bool {
+    let Some((form, submitter, submission)) = take_form_submit(page) else {
+        return true;
+    };
+    evts.blocking_send(PageEvt::SubmitForm {
+        form,
+        submitter,
+        submission,
+    })
+    .is_ok()
 }
 
 /// Construct successful controls and submitter overrides in the page realm,
@@ -12895,6 +12930,12 @@ const PRELUDE: &str = r##"
     // NOT tracked (self-heals on the next navigation, both vanishingly rare): a
     // `<base>` injected via innerHTML, or a case-variant setAttribute("HREF").
     let baseHrefCache = null;
+    // HTML §7.2.2: Window.frameElement is a readonly IDL attribute whose
+    // getter derives the value from the current browsing context. Keep that
+    // value outside the page-visible object: challenge scripts are allowed to
+    // define or freeze an own `frameElement` property, and frame bookkeeping
+    // must not try to overwrite page-owned descriptors while restoring state.
+    let frameElementState = null;
     // Lazily-minted, then cached `document.all` (`[[IsHTMLDDA]]`) — see the
     // `Document` class `get all()`. Per-page (fresh per realm), so its identity is
     // stable within a page but never shared across pages.
@@ -15876,6 +15917,13 @@ const PRELUDE: &str = r##"
             return true;
         }
         reportValidity() { return this.checkValidity(); }
+        submit() {
+            // HTML §4.10.22.3: submit() bypasses constraint validation and
+            // does not fire a submit event; it runs the form submission
+            // algorithm directly.
+            if (!this.isConnected || this.__trustFiringSubmit) return;
+            trust.queueFormSubmit(this.__id, null);
+        }
         requestSubmit(submitter) {
             const supplied = arguments.length > 0 && submitter !== undefined;
             if (supplied) {
@@ -16710,7 +16758,7 @@ const PRELUDE: &str = r##"
         return {
             document: g.document,
             location: Object.getOwnPropertyDescriptor(g, "location"),
-            parent: g.parent, top: g.top, frames: g.frames, frameElement: g.frameElement,
+            parent: g.parent, top: g.top, frames: g.frames, frameElement: frameElementState,
             name: g.name, cfgUrl: g.__trust_cfg && g.__trust_cfg.url,
             innerWidth: g.innerWidth, innerHeight: g.innerHeight,
             pageXOffset: g.pageXOffset, pageYOffset: g.pageYOffset,
@@ -16721,7 +16769,7 @@ const PRELUDE: &str = r##"
         g.document = state.document;
         if (state.location) Object.defineProperty(g, "location", state.location);
         g.parent = state.parent; g.top = state.top; g.frames = state.frames;
-        g.frameElement = state.frameElement; g.name = state.name;
+        frameElementState = state.frameElement; g.name = state.name;
         if (g.__trust_cfg) g.__trust_cfg.url = state.cfgUrl;
         g.innerWidth = state.innerWidth; g.innerHeight = state.innerHeight;
         g.pageXOffset = state.pageXOffset; g.pageYOffset = state.pageYOffset;
@@ -16759,7 +16807,7 @@ const PRELUDE: &str = r##"
         frame.__trustTopWindow = topWindow;
         frame.__trustParentWindow = parent;
         g.parent = parent; g.top = topWindow; g.frames = sameOrigin ? g : parent;
-        g.frameElement = frame; g.name = frame.getAttribute("name") || "";
+        frameElementState = frame; g.name = frame.getAttribute("name") || "";
         if (g.__trust_cfg) g.__trust_cfg.url = url;
         baseHrefCache = null;
         trust.__activeFrame = frame;
@@ -17515,6 +17563,14 @@ const PRELUDE: &str = r##"
     // `Window` interface (a ReferenceError without it — webcomponentsjs does
     // this) and checks `window instanceof Window`. Window IS an EventTarget.
     class Window extends EventTarget {}
+    // Web IDL attributes are accessor properties on the interface prototype;
+    // readonly attributes have a getter but no setter. This is the Window
+    // `frameElement` binding from HTML §7.2.2, not a writable expando used as
+    // scratch storage by the frame scheduler.
+    Object.defineProperty(Window.prototype, "frameElement", {
+        configurable: true, enumerable: false,
+        get() { return frameElementState; },
+    });
     class CDATASection extends Text {}
     class ProcessingInstruction extends CharacterData {}
     class DocumentType extends Node {}
@@ -31508,6 +31564,113 @@ mod tests {
     }
 
     #[test]
+    fn form_submit_bypasses_validation_and_submit_event() {
+        // HTMLFormElement.submit() must take the direct submission path: it
+        // ignores the required control and does not dispatch `submit`.
+        let (_handle, mut events) = live(
+            r##"<body><form action="/verify">
+            <input name=solution required>
+            <pre id=out>before</pre>
+            </form><script>
+            const form = document.forms[0];
+            form.addEventListener('submit', () => {
+                document.getElementById('out').textContent = 'event';
+            });
+            form.submit();
+            </script></body>"##,
+        );
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("form.submit() should leave the page actor live until native submission");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            html.contains(">before<"),
+            "submit event unexpectedly fired: {html}"
+        );
+        match events.blocking_recv() {
+            Some(PageEvt::SubmitForm { submission, .. }) => {
+                let submission = submission.expect("form submission entry list");
+                assert_eq!(submission.action, "https://example.com/verify");
+                assert_eq!(submission.body, "solution=");
+            }
+            other => panic!("form.submit() should ask the app to submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timer_form_submit_reaches_the_host_submission_task() {
+        // A form submission from an author timer is an HTML task result too;
+        // it must not be stranded in the page actor when no user click caused
+        // the submission.
+        let (_handle, mut events) = live(
+            r##"<body><form action="/verify">
+            <input name=solution required>
+            <pre id=out>before</pre>
+            </form><script>
+            const form = document.forms[0];
+            form.addEventListener('submit', () => {
+                document.getElementById('out').textContent = 'event';
+            });
+            setTimeout(() => form.submit(), 0);
+            </script></body>"##,
+        );
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("timer form page should stay live");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            html.contains(">before<"),
+            "submit event unexpectedly fired: {html}"
+        );
+        match events.blocking_recv() {
+            Some(PageEvt::SubmitForm { submission, .. }) => {
+                let submission = submission.expect("form submission entry list");
+                assert_eq!(submission.action, "https://example.com/verify");
+            }
+            other => panic!("timer form.submit() should reach the host, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xhr_form_submit_reaches_the_host_submission_task() {
+        // Cloudflare submits from an XHR readystatechange callback. That is a
+        // networking task, so exercise the exact task source rather than only
+        // the timer path above.
+        let (_handle, mut events) = live(
+            r##"<body><form action="/verify">
+            <input name=solution required>
+            <pre id=out>before</pre>
+            </form><script>
+            const form = document.forms[0];
+            form.addEventListener('submit', () => {
+                document.getElementById('out').textContent = 'event';
+            });
+            const xhr = new XMLHttpRequest();
+            xhr.onreadystatechange = () => {
+                if (xhr.readyState === 4) form.submit();
+            };
+            xhr.open('GET', 'data:text/plain,ok');
+            xhr.send();
+            </script></body>"##,
+        );
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("XHR form page should stay live");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            html.contains(">before<"),
+            "submit event unexpectedly fired: {html}"
+        );
+        match events.blocking_recv() {
+            Some(PageEvt::SubmitForm { submission, .. }) => {
+                let submission = submission.expect("form submission entry list");
+                assert_eq!(submission.action, "https://example.com/verify");
+            }
+            other => panic!("XHR form.submit() should reach the host, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn clicking_a_submit_button_fires_the_form_submit() {
         // A live <button type=submit> reaches the app as a JsClick (the live
         // serializer wraps every button). Clicking it must run the form-
@@ -34178,6 +34341,26 @@ mod tests {
         // a document facade, window.document is the SAME object, head exists,
         // and a plain <div> has no contentDocument.
         assert!(out.contains(">object|true|1|undefined<"), "{out}");
+    }
+
+    #[test]
+    fn frame_context_restore_does_not_write_a_page_owned_frame_element() {
+        // HTML exposes Window.frameElement as a readonly IDL getter. A
+        // challenge may install an own non-writable property while probing the
+        // environment; the browser's frame bookkeeping must not assign through
+        // that page-owned descriptor when a timer task returns to its frame.
+        let (out, outcome) = page(
+            r#"<body><pre id=o></pre><script>
+            'use strict';
+            Object.defineProperty(window, 'frameElement', { value: null });
+            setTimeout(function () {
+                document.getElementById('o').textContent = 'timer survived';
+            }, 0);
+            </script></body>"#,
+        );
+        assert!(!outcome.panicked, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        assert!(out.contains("timer survived"), "{out}");
     }
 
     #[test]
