@@ -7697,6 +7697,13 @@ fn settle_page(page: &mut LoadedPage) {
 /// time and gives app commands priority between turns.
 fn complete_live_lifecycle(page: &mut LoadedPage) {
     if !page.outcome.panicked {
+        // The initial lifecycle may finish after an interaction has already
+        // been accepted while a resource is still in the document's load-
+        // delay set. That interaction rearms the shared budget to the short
+        // dispatch window; HTML's browser-owned load task is a separate task
+        // and must not inherit that deadline. Restore the page-load wall
+        // window before draining blockers and firing `load`.
+        page.budget.rearm(WALL_BUDGET);
         // HTML §4.12.1.1: a dynamically prepared script keeps its preparation-
         // time document's load event delayed until its result is ready. Run
         // only that resource lane here; ordinary page fetches remain later
@@ -27754,15 +27761,26 @@ mod tests {
 
             handle.cmds.send(PageCmd::Click(node)).await.unwrap();
             let mut clicked = false;
+            let mut trouble = Vec::new();
             while !clicked {
                 let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
                     .await
                     .expect("click was blocked by the pending resource")
                     .expect("page actor closed after click");
-                if let PageEvt::Updated { html, .. } = event {
-                    clicked = html.contains(">clicked<");
+                match event {
+                    PageEvt::Updated { html, .. } => {
+                        clicked = html.contains(">clicked<");
+                    }
+                    PageEvt::Trouble(errors) => trouble.extend(errors),
+                    _ => {}
                 }
             }
+
+            // Let the short interaction deadline expire before the delayed
+            // resource completes. The browser-owned load task must still run
+            // after that interaction; it uses the page-load budget, not the
+            // one-second dispatch budget.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
 
             let response = crate::http::CachedResp {
                 status: 200,
@@ -27780,10 +27798,18 @@ mod tests {
                     .await
                     .expect("resource completion timed out")
                     .expect("page actor closed after resource completion");
-                if let PageEvt::Updated { html, .. } = event {
-                    loaded = html.contains(">loaded<");
+                match event {
+                    PageEvt::Updated { html, .. } => {
+                        loaded = html.contains(">loaded<");
+                    }
+                    PageEvt::Trouble(errors) => trouble.extend(errors),
+                    _ => {}
                 }
             }
+            assert!(
+                trouble.is_empty(),
+                "an interaction must not exhaust the later load task: {trouble:?}"
+            );
         });
     }
 
