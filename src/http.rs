@@ -6639,6 +6639,12 @@ mod tests {
                             outcome.errors, outcome.console
                         );
                         body = html;
+                        // The diagnostic's target exists now; do not spend a
+                        // full idle timeout draining unrelated background
+                        // events before dispatching the requested click.
+                        if !link_text.is_empty() && body.contains(&link_text) {
+                            break;
+                        }
                     }
                     Ok(Some(other)) => eprintln!("SETTLE EVT {other:?}"),
                     _ => {
@@ -6717,27 +6723,44 @@ mod tests {
                 .send(crate::js::PageCmd::Click(marker))
                 .await
                 .unwrap();
-            // Drain a few events so we see Updated/Navigate/Settled, not just the
-            // first. Time-bounded: after the dispatch settles no more events come,
-            // so don't block waiting for the actor to time out.
-            for _ in 0..4 {
-                let ev =
-                    match tokio::time::timeout(Duration::from_secs(8), live.events.recv()).await {
-                        Ok(ev) => ev,
-                        Err(_) => {
-                            eprintln!("EVT <no more within 8s>");
-                            break;
-                        }
-                    };
+            let click_wait = std::env::var("TRUST_CLICK_WAIT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(click_wait);
+            let mut probe_dismissed = probe.is_empty();
+            // Drain until the requested page predicate changes, not for an
+            // arbitrary event count. A framework can emit several scheduler or
+            // animation updates before a network mutation completes; dropping
+            // the actor after four such updates made a successful interaction
+            // look stuck. Keep both an overall deadline and a generous event
+            // cap so a noisy page cannot turn this diagnostic into an idle spin.
+            for _ in 0..128 {
+                let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now())
+                else {
+                    eprintln!("EVT <click deadline reached after {click_wait}s>");
+                    break;
+                };
+                let ev = match tokio::time::timeout(remaining, live.events.recv()).await {
+                    Ok(ev) => ev,
+                    Err(_) => {
+                        eprintln!("EVT <no more within {click_wait}s>");
+                        break;
+                    }
+                };
                 match ev {
                     Some(crate::js::PageEvt::Updated { html, outcome }) => {
-                        eprintln!("EVT Updated: errors={:?}", outcome.errors);
+                        eprintln!("EVT Updated ({}B): errors={:?}", html.len(), outcome.errors);
                         eprintln!("   console={:?}", outcome.console);
                         eprintln!(
                             "   probe {probe:?} present AFTER = {}",
                             html.contains(&probe)
                         );
+                        probe_dismissed = !probe.is_empty() && !html.contains(&probe);
                         last_html = Some(html);
+                        if probe_dismissed {
+                            break;
+                        }
                     }
                     Some(crate::js::PageEvt::Static { html, outcome }) => {
                         eprintln!("EVT Static: errors={:?}", outcome.errors);
@@ -6760,6 +6783,19 @@ mod tests {
                         break;
                     }
                 }
+            }
+            if !probe.is_empty() {
+                assert!(probe_dismissed, "probe remained after click: {probe:?}");
+            }
+            if let Ok(retain) = std::env::var("TRUST_CLICK_RETAIN")
+                && !retain.is_empty()
+            {
+                let html = last_html.as_deref().expect("post-click resident HTML");
+                assert!(
+                    html.contains(&retain),
+                    "post-click resident page lost retained marker {retain:?} ({}B)",
+                    html.len()
+                );
             }
         }
         // Optional SECOND click (TRUST_CLICK_FIND2=<substr in the target tag, e.g.
