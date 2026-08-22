@@ -2027,16 +2027,40 @@ impl Dom {
         if matches!(
             self.cascaded(id, "position").as_deref(),
             Some("absolute" | "fixed")
-        ) && (self
-            .cascaded(id, "left")
-            .as_deref()
-            .is_some_and(css_len_offscreen_neg)
-            || self
+        ) {
+            // CSS Position 3 §5.1 resolves an over-constrained axis using
+            // the inset equation. When both opposing insets are large and
+            // negative *and* the corresponding margins are auto, those auto
+            // margins absorb the free space and center the replaced box.
+            // Amazon's homepage uses this image-centering idiom:
+            // `left:-9999px; right:-9999px; margin:auto`. A single negative
+            // inset is still the usual screen-reader/off-screen pattern, but
+            // treating either side in isolation incorrectly drops the
+            // centered image from the render tree.
+            let centered_axis = |start: &str, end: &str, margin_start: &str, margin_end: &str| {
+                self.cascaded(id, start)
+                    .as_deref()
+                    .is_some_and(css_len_offscreen_neg)
+                    && self
+                        .cascaded(id, end)
+                        .as_deref()
+                        .is_some_and(css_len_offscreen_neg)
+                    && self.cascaded(id, margin_start).as_deref() == Some("auto")
+                    && self.cascaded(id, margin_end).as_deref() == Some("auto")
+            };
+            let offscreen_x = self
+                .cascaded(id, "left")
+                .as_deref()
+                .is_some_and(css_len_offscreen_neg)
+                && !centered_axis("left", "right", "margin-left", "margin-right");
+            let offscreen_y = self
                 .cascaded(id, "top")
                 .as_deref()
-                .is_some_and(css_len_offscreen_neg))
-        {
-            return true;
+                .is_some_and(css_len_offscreen_neg)
+                && !centered_axis("top", "bottom", "margin-top", "margin-bottom");
+            if offscreen_x || offscreen_y {
+                return true;
+            }
         }
         // A box collapsed to ZERO on an axis, with `overflow:hidden`/`clip` on
         // that axis, clips ALL its content to nothing — the standard "keep it
@@ -13049,6 +13073,30 @@ mod tests {
         );
         let d = dom2.get_by_id("d").unwrap();
         assert!(!dom2.is_hidden(d), "a real clipped box is not sr-only");
+    }
+
+    #[test]
+    fn opposing_negative_insets_with_auto_margins_keep_centered_images() {
+        // CSS Position 3 §5.1: opposing negative insets with auto margins
+        // resolve through the positioning constraint and center the box. This
+        // is the image-centering pattern used by Amazon's gateway cards; a
+        // one-sided negative inset remains an off-screen accessibility box.
+        let dom = Dom::parse_document(
+            "<body>\
+             <div id=card style=\"position:relative;width:320px;height:180px\">\
+               <img id=centered src=card.jpg style=\"position:absolute;left:-9999px;right:-9999px;margin:auto;height:100%\">\
+             </div>\
+             <span id=hidden style=\"position:absolute;left:-9999px\">screen reader only</span>\
+             </body>",
+        );
+        let centered = dom.get_by_id("centered").unwrap();
+        let hidden = dom.get_by_id("hidden").unwrap();
+        assert!(!dom.is_hidden(centered), "centered image was hidden");
+        assert!(dom.is_hidden(hidden), "one-sided off-screen text was kept");
+        assert!(
+            dom.serialize(DOCUMENT).contains("card.jpg"),
+            "centered image was dropped from the live tree"
+        );
     }
 
     #[test]
