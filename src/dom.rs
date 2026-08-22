@@ -1997,7 +1997,12 @@ impl Dom {
         // `visibility_hidden`/`Ctx.invisible`, so a `visibility:hidden` element
         // keeps its box (CSS2 §11.2) and a `visibility:visible` descendant of it
         // is still painted.
-        if self.cascaded(id, "display").as_deref() == Some("none") {
+        // CSS Variables L1 §3: `var()` is substituted at computed-value time,
+        // before the property's value is interpreted. A declaration such as
+        // Stack Exchange's `display:var(--_po-d)` therefore has to participate
+        // in the display:none check after substitution, not as the literal
+        // token stream returned by the cascade.
+        if self.computed_display(id).as_deref() == Some("none") {
             return true;
         }
         // Visually-hidden / "sr-only" accessibility text: the universal idiom
@@ -2148,8 +2153,7 @@ impl Dom {
         ) {
             return false;
         }
-        if self.attr(id, "hidden").is_some()
-            || self.cascaded(id, "display").as_deref() == Some("none")
+        if self.attr(id, "hidden").is_some() || self.computed_display(id).as_deref() == Some("none")
         {
             return true;
         }
@@ -2336,6 +2340,17 @@ impl Dom {
             return Some("none".to_string());
         }
         let v = self.cascaded(id, "display")?;
+        // CSS Variables L1 §3: custom properties are substituted at computed
+        // value time. Keep this resolution in the canonical display path so
+        // `display:var(--state)` has the same box-generation effect as its
+        // substituted keyword (and invalid substitutions do not leak a box).
+        let v = self.resolve_vars(id, &v);
+        if v.trim().is_empty() {
+            // An invalid-at-computed-value-time declaration uses display's
+            // initial value, inline, rather than silently becoming the UA
+            // default for the element's tag.
+            return Some("inline".to_string());
+        }
         match wide_keyword(&v) {
             // `display` doesn't inherit: `inherit` takes the parent's
             // computed display, `initial`/`unset` the initial value
@@ -12875,6 +12890,32 @@ mod tests {
             dom.serialize(c).contains("min-width:8rem"),
             ":root-defined --cell resolves"
         );
+    }
+
+    #[test]
+    fn custom_property_display_controls_box_generation() {
+        // CSS Variables L1 §3: `display:var(--state)` is substituted at
+        // computed-value time. This is the visibility pattern used by
+        // Stack Exchange's `.s-popover` (`--_po-d:none`, changed to `block`
+        // by `.is-visible`); a closed popover must not leak its tooltip box
+        // into the document while its visible counterpart still renders.
+        let dom = Dom::parse_document(
+            r#"<head><style>
+                .s-popover { --_state: none; display: var(--_state) }
+                .s-popover.is-visible { --_state: block }
+            </style></head>
+            <body><div id=closed class=s-popover>closed tooltip</div>
+            <div id=open class="s-popover is-visible">open popover</div></body>"#,
+        );
+        let closed = dom.get_by_id("closed").unwrap();
+        let open = dom.get_by_id("open").unwrap();
+        assert_eq!(dom.computed_display(closed).as_deref(), Some("none"));
+        assert!(
+            dom.is_hidden(closed),
+            "the substituted display:none omits the box"
+        );
+        assert_eq!(dom.computed_display(open).as_deref(), Some("block"));
+        assert!(!dom.is_hidden(open), "the class override restores the box");
     }
 
     #[test]

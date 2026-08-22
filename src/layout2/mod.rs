@@ -5524,6 +5524,31 @@ mod tests {
     }
 
     #[test]
+    fn variable_display_hides_closed_popover_from_layout() {
+        // CSS Variables L1 §3 + CSS Display: substitution must happen before
+        // display is interpreted, so a custom-property-backed tooltip remains
+        // out of the box tree until its visibility class changes.
+        let (dom, boxes) = measure(
+            r#"<head><style>
+                .s-popover { --_state: none; display: var(--_state) }
+                .s-popover.is-visible { --_state: block }
+            </style></head>
+            <body style="margin:0"><div id=closed class=s-popover>closed tooltip</div>
+            <div id=open class="s-popover is-visible">open popover</div></body>"#,
+            40,
+            24,
+        );
+        assert!(
+            !boxes.contains_key(&node_by_id(&dom, "closed")),
+            "display:none removes the closed tooltip box"
+        );
+        assert!(
+            boxes.contains_key(&node_by_id(&dom, "open")),
+            "the visible state still generates a box"
+        );
+    }
+
+    #[test]
     fn graphical_cssom_geometry_preserves_fractional_css_pixels() {
         let dom = Dom::parse_document(
             r#"<body style="margin:0"><div id="fractional" style="width:37.5px;height:22.25px;margin-left:3.75px"></div></body>"#,
