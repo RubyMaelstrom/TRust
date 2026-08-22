@@ -10657,7 +10657,14 @@ fn host_task_wake(
     if lifecycle_complete {
         run_jobs_into(&mut page.ctx, &page.budget, &mut page.outcome);
     } else {
-        run_parser_jobs_into(&mut page.ctx, &page.budget, &mut page.outcome);
+        // The actor has already returned from the parser task. A dynamically
+        // prepared module is a later networking task, but its entry/evaluation
+        // job is also in the document's load-delay set until it settles
+        // (HTML §4.12.1.1). The parser-only drain deliberately leaves that
+        // queue untouched, so using it here would select the same host task
+        // forever while `load` can never become runnable. Drain only the
+        // resource lane; ordinary author fetches remain in `async_jobs`.
+        run_load_blockers_into(&mut page.ctx, &page.budget, &mut page.outcome);
     }
     reconcile_custom_elements(&mut page.ctx);
     run_microtasks_into(&mut page.ctx, &mut page.outcome);
