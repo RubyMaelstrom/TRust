@@ -2686,6 +2686,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__storage_len", 1, sys_storage_len),
         ("__blob_mirror", 3, sys_blob_mirror),
         ("__crypto_sha256_digest", 1, sys_crypto_sha256_digest),
+        ("__compression_encode", 2, sys_compression_encode),
         ("__text_encode", 1, sys_text_encode),
         ("__dom_popover", 2, sys_dom_popover),
         ("__ws_open", 2, sys_ws_open),
@@ -4140,6 +4141,60 @@ fn sys_crypto_sha256_digest(_: &JsValue, args: &[JsValue], ctx: &mut Context) ->
     let block = boa_engine::object::builtins::AlignedVec::from_iter(0, digest.iter().copied());
     let output = boa_engine::object::builtins::JsArrayBuffer::from_byte_block(block, ctx)?;
     Ok(JsPromise::resolve(JsValue::from(output), ctx).into())
+}
+
+/// `__compression_encode(format, bufferSource)` — the Compression Streams
+/// Standard's compression core. The JS `CompressionStream` below owns the
+/// TransformStream lifecycle and buffers input until its flush algorithm; a
+/// codec is permitted to produce no bytes for ordinary chunks and all bytes
+/// for the finish operation. Keeping the actual DEFLATE implementation here
+/// avoids forcing pages into slow interpreted-code fallbacks.
+fn sys_compression_encode(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    use std::io::Write as _;
+
+    const MAX_STREAM_CODEC_BYTES: usize = 16 * 1024 * 1024;
+    let format = arg_str(args, 0, ctx);
+    let input = arg_buffer_source_bytes(args, 1, ctx).ok_or_else(|| {
+        boa_engine::JsNativeError::typ()
+            .with_message("CompressionStream input must be a BufferSource")
+    })?;
+    if input.len() > MAX_STREAM_CODEC_BYTES {
+        return Err(boa_engine::JsNativeError::range()
+            .with_message("CompressionStream input exceeds the 16 MiB page limit")
+            .into());
+    }
+
+    let output = match format.as_str() {
+        "deflate" => {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&input).and_then(|()| encoder.finish())
+        }
+        "deflate-raw" => {
+            let mut encoder =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&input).and_then(|()| encoder.finish())
+        }
+        "gzip" => {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&input).and_then(|()| encoder.finish())
+        }
+        _ => {
+            return Err(boa_engine::JsNativeError::typ()
+                .with_message("Unsupported compression format")
+                .into());
+        }
+    }
+    .map_err(|error| {
+        boa_engine::JsNativeError::typ().with_message(format!("CompressionStream failed: {error}"))
+    })?;
+    if output.len() > MAX_STREAM_CODEC_BYTES {
+        return Err(boa_engine::JsNativeError::range()
+            .with_message("CompressionStream output exceeds the 16 MiB page limit")
+            .into());
+    }
+    Ok(boa_engine::object::builtins::JsUint8Array::from_iter(output, ctx)?.into())
 }
 
 /// `__text_encode(string)` — the UTF-8 core used by both Window and Worker
@@ -8666,6 +8721,14 @@ fn worker_prelude() -> &'static str {
             .and_then(|(_, rest)| rest.split_once("/*__CRYPTO_END__*/"))
             .map(|(c, _)| format!("(function(g) {{\n{c}\n}})(globalThis);"))
             .unwrap_or_default();
+        // CompressionStream is [Exposed=*]. Reuse the exact Window Streams +
+        // Compression Streams implementation in DedicatedWorkerGlobalScope;
+        // the block is self-contained over `g` and registered native syscalls.
+        let streams = PRELUDE
+            .split_once("/*__STREAMS_BEGIN__*/")
+            .and_then(|(_, rest)| rest.split_once("/*__STREAMS_END__*/"))
+            .map(|(c, _)| format!("(function(g) {{\n{c}\n}})(globalThis);"))
+            .unwrap_or_default();
         // The WebAssembly block is self-contained (takes its own `g`), so the
         // worker reuses it verbatim — wasm runs inside a Worker too.
         let wasm = PRELUDE
@@ -8681,7 +8744,7 @@ fn worker_prelude() -> &'static str {
             .and_then(|(_, rest)| rest.split_once("/*__URLPATTERN_END__*/"))
             .map(|(c, _)| c)
             .unwrap_or("");
-        format!("{codec}\n{WORKER_SCOPE}\n{crypto}\n{urlpattern}\n{wasm}")
+        format!("{codec}\n{WORKER_SCOPE}\n{streams}\n{crypto}\n{urlpattern}\n{wasm}")
     })
     .as_str()
 }
@@ -19362,6 +19425,7 @@ const PRELUDE: &str = r##"
             return out;
         }
     };
+    /*__STREAMS_BEGIN__*/
     // --- WHATWG Streams (in-memory). Real constructors so streaming code
     // both LOADS and RUNS: Open WebUI's chat/SSE pipeline does
     // `class X extends TransformStream` at module-eval time and pipes
@@ -19371,7 +19435,7 @@ const PRELUDE: &str = r##"
     // faithful enough for producer→transform→reader pipelines. (A fetch
     // Response.body is still null — actual network streaming is a separate,
     // deeper feature — so the streams a page builds itself work, but reading a
-    // response AS a stream doesn't yet.) ---
+    // response as a stream follows the same buffered producer pipeline.) ---
     {
         const deferred = () => {
             let resolve, reject;
@@ -19591,7 +19655,43 @@ const PRELUDE: &str = r##"
         g.TransformStream = TransformStream;
         g.TextDecoderStream = TextDecoderStream;
         g.TextEncoderStream = TextEncoderStream;
+
+        // Compression Streams §§4 and 6. A compression context may buffer a
+        // chunk and return no output until the finish flag, so accumulating
+        // copied BufferSources here and invoking the native DEFLATE codec from
+        // flush preserves the standard TransformStream contract while keeping
+        // this expensive primitive out of interpreted page JavaScript.
+        class CompressionStream extends TransformStream {
+            constructor(format) {
+                format = String(format);
+                if (format !== "deflate" && format !== "deflate-raw" && format !== "gzip")
+                    throw new TypeError("Unsupported compression format: " + format);
+                const chunks = [];
+                let total = 0;
+                super({
+                    transform(chunk) {
+                        let view;
+                        if (chunk instanceof ArrayBuffer) view = new Uint8Array(chunk);
+                        else if (ArrayBuffer.isView(chunk)) view = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+                        else throw new TypeError("CompressionStream input must be a BufferSource");
+                        const copy = view.slice();
+                        chunks.push(copy);
+                        total += copy.byteLength;
+                        if (total > 16 * 1024 * 1024) throw new RangeError("CompressionStream input exceeds the 16 MiB page limit");
+                    },
+                    flush(controller) {
+                        const input = new Uint8Array(total);
+                        let offset = 0;
+                        for (const chunk of chunks) { input.set(chunk, offset); offset += chunk.byteLength; }
+                        const output = __compression_encode(format, input);
+                        if (output.byteLength) controller.enqueue(output);
+                    },
+                });
+            }
+        }
+        g.CompressionStream = CompressionStream;
     }
+    /*__STREAMS_END__*/
     // --- Web Animations API (Element.animate). A terminal has no real
     // animation, so an Animation settles to "finished" immediately — on a
     // MACROTASK, so a caller assigning `onfinish` AFTER animate() (Svelte 5's
@@ -20480,26 +20580,55 @@ const PRELUDE: &str = r##"
         if (typeof body.byteLength === "number") return null;
         return "text/plain;charset=UTF-8";
     };
-    // Body mixin shared by Request and Response: the consumption methods read
-    // the captured body once (lenient — we don't throw on re-read, unlike the
-    // spec, to avoid breaking defensive double-reads).
+    // Fetch §5.3 "consume body": fully read a ReadableStream BodyInit and join
+    // its BufferSource chunks into one byte sequence before converting it to
+    // the method-specific result. This is also the final consumer in the
+    // standard CompressionStream example (`new Response(stream).arrayBuffer`).
+    const __consumeBodyBytes = (owner) => {
+        if (owner.__body instanceof g.ReadableStream) {
+            if (owner.__bodyUsed || owner.__body.locked)
+                return Promise.reject(new TypeError("Body is unusable"));
+            owner.__bodyUsed = true;
+            const reader = owner.__body.getReader();
+            const chunks = [];
+            let total = 0;
+            const pump = () => reader.read().then((result) => {
+                if (result.done) {
+                    const all = new Uint8Array(total);
+                    let offset = 0;
+                    for (const chunk of chunks) { all.set(chunk, offset); offset += chunk.byteLength; }
+                    return all;
+                }
+                const value = result.value;
+                let view;
+                if (value instanceof ArrayBuffer) view = new Uint8Array(value);
+                else if (ArrayBuffer.isView(value)) view = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+                else throw new TypeError("ReadableStream body chunk must be a BufferSource");
+                const copy = view.slice();
+                total += copy.byteLength;
+                if (total > 16 * 1024 * 1024) throw new RangeError("Body exceeds the 16 MiB page limit");
+                chunks.push(copy);
+                return pump();
+            });
+            return pump();
+        }
+        owner.__bodyUsed = true;
+        const bin = owner.__bytes != null ? owner.__bytes : __bodyWire(owner.__body || "");
+        return Promise.resolve(__latin1ToBytes(bin || ""));
+    };
+    // Body mixin shared by Request and Response. Stream bodies follow Fetch's
+    // disturbed/locked rules; legacy buffered bodies remain repeat-readable
+    // for compatibility with defensive sites that probe a response twice.
     const __bodyMethods = {
-        text() { this.__bodyUsed = true; return Promise.resolve(__bodyText(this.__body) || ""); },
-        json() { this.__bodyUsed = true; try { return Promise.resolve(JSON.parse(__bodyText(this.__body) || "")); } catch (e) { return Promise.reject(e); } },
+        text() { return __consumeBodyBytes(this).then((bytes) => new g.TextDecoder().decode(bytes)); },
+        json() { return this.text().then((text) => JSON.parse(text)); },
         arrayBuffer() {
-            this.__bodyUsed = true;
-            // `__bytes` (set on fetched responses) is the byte-EXACT body; only a
-            // response built in JS from a text body falls back to UTF-8 bytes.
-            const bin = this.__bytes != null ? this.__bytes : utf8Binary(__bodyText(this.__body) || "");
-            const buf = new ArrayBuffer(bin.length); const view = new Uint8Array(buf);
-            for (let i = 0; i < bin.length; i++) view[i] = bin.charCodeAt(i) & 0xff;
-            return Promise.resolve(buf);
+            return __consumeBodyBytes(this).then((bytes) => bytes.buffer);
         },
+        bytes() { return __consumeBodyBytes(this); },
         blob() {
-            this.__bodyUsed = true;
             const t = (this.headers && this.headers.get && this.headers.get("content-type")) || "";
-            const body = this.__bytes != null ? this.__bytes : (__bodyText(this.__body) || "");
-            return Promise.resolve(new g.Blob([body], { type: t || "" }));
+            return __consumeBodyBytes(this).then((bytes) => new g.Blob([bytes], { type: t || "" }));
         },
         formData() { return Promise.reject(new TypeError("formData unsupported")); },
     };
@@ -20576,6 +20705,7 @@ const PRELUDE: &str = r##"
         get body() {
             if (this.__bodyStream !== undefined) return this.__bodyStream;
             if (this.__body === null || this.__body === undefined) { this.__bodyStream = null; return null; }
+            if (this.__body instanceof g.ReadableStream) { this.__bodyStream = this.__body; return this.__bodyStream; }
             // A fetched response streams its byte-EXACT body (`__bytes`, latin1)
             // — encoding the UTF-8-lossy text corrupted every binary payload
             // read through `.body` (the arrayBuffer()/`r[3]` bug, one path
@@ -29924,6 +30054,7 @@ mod tests {
                         setTimeout(function () {\
                           self.postMessage({ win: typeof window, doc: typeof document,\
                             sg: (self === globalThis), imp: typeof importScripts,\
+                            cs: typeof CompressionStream, ts: typeof TransformStream,\
                             hwc: navigator.hardwareConcurrency, lang: navigator.language,\
                             langs: navigator.languages.join(','), frozen: Object.isFrozen(navigator.languages), t: 'fired' });\
                         }, 30);\
@@ -29940,6 +30071,7 @@ mod tests {
              var w = new Worker('http://127.0.0.1:{port}/w.js');\
              w.onmessage = function (e) {{ var d = e.data; document.getElementById('o').textContent = \
                'SCOPE win=' + d.win + ' doc=' + d.doc + ' sg=' + d.sg + ' imp=' + d.imp + ' hwc=' + (typeof d.hwc) +\
+               ' cs=' + d.cs + ' ts=' + d.ts +\
                ' lang=' + d.lang + ' langs=' + d.langs + ' frozen=' + d.frozen + ' t=' + d.t; }};\
              w.postMessage('go');\
              </script></body>"
@@ -29967,7 +30099,7 @@ mod tests {
         drop(handle);
         assert!(
             got.contains(
-                "SCOPE win=undefined doc=undefined sg=true imp=function hwc=number lang=en-US langs=en-US,en frozen=true t=fired"
+                "SCOPE win=undefined doc=undefined sg=true imp=function hwc=number cs=function ts=function lang=en-US langs=en-US,en frozen=true t=fired"
             ),
             "worker scope/timer invariants: {got}"
         );
@@ -36707,6 +36839,80 @@ mod tests {
         );
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("dec=hi"), "decoder stream: {out}");
+    }
+
+    #[test]
+    fn compression_stream_and_response_consume_stream_bytes() {
+        // Compression Streams §§4/6 plus Fetch §5.3 consume body: this is the
+        // exact standards pipeline Instagram feature-detects before selecting
+        // its much slower interpreted compression fallback.
+        use std::io::Read as _;
+
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "compression-stream.js",
+            br##"
+            globalThis.out = { data: {}, errors: [] };
+            const source = new Uint8Array([84, 82, 117, 115, 116, 32, 115, 116, 114, 101, 97, 109]);
+            for (const format of ["deflate", "deflate-raw", "gzip"]) {
+                const readable = new Blob([source]).stream().pipeThrough(new CompressionStream(format));
+                const response = new Response(readable);
+                response.arrayBuffer().then((buffer) => {
+                    out.data[format] = Array.from(new Uint8Array(buffer)).join(",");
+                    out.data[format + "Used"] = response.bodyUsed;
+                }, (error) => { out.errors.push(format + ":" + error); });
+            }
+            try { new CompressionStream("brotli"); }
+            catch (error) { out.unsupported = error.name; }
+            const bad = new CompressionStream("deflate");
+            bad.writable.getWriter().write("not bytes").catch((error) => { out.badChunk = error.name; });
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 20, &mut outcome);
+
+        let string = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(string(&mut ctx, b"out.unsupported"), "TypeError");
+        assert_eq!(string(&mut ctx, b"out.badChunk"), "TypeError");
+        assert_eq!(string(&mut ctx, b"out.errors.join(',')"), "");
+
+        let expected = b"TRust stream";
+        for format in ["deflate", "deflate-raw", "gzip"] {
+            let expression = format!("out.data[{format:?}]");
+            let encoded = string(&mut ctx, expression.as_bytes());
+            assert_ne!(encoded, "undefined", "{format} pipeline did not settle");
+            let bytes: Vec<u8> = encoded
+                .split(',')
+                .map(|byte| byte.parse().unwrap())
+                .collect();
+            let mut decoded = Vec::new();
+            match format {
+                "deflate" => flate2::read::ZlibDecoder::new(bytes.as_slice())
+                    .read_to_end(&mut decoded)
+                    .unwrap(),
+                "deflate-raw" => flate2::read::DeflateDecoder::new(bytes.as_slice())
+                    .read_to_end(&mut decoded)
+                    .unwrap(),
+                "gzip" => flate2::read::GzDecoder::new(bytes.as_slice())
+                    .read_to_end(&mut decoded)
+                    .unwrap(),
+                _ => unreachable!(),
+            };
+            assert_eq!(decoded, expected, "{format} byte sequence");
+            let used = format!("String(out.data[{format:?} + 'Used'])");
+            assert_eq!(string(&mut ctx, used.as_bytes()), "true");
+        }
     }
 
     #[test]
