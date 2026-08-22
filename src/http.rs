@@ -565,6 +565,11 @@ impl PageCache {
         );
     }
 
+    #[cfg(test)]
+    pub fn seed_pending(&self, url: String, fetch: SharedFetch) {
+        self.map.lock().unwrap().insert(url, fetch);
+    }
+
     /// An existing entry (in-flight or done) for `url`, or None. The
     /// page's own `fetch()` uses this to join a known subresource request
     /// WITHOUT caching arbitrary API GETs — a miss falls through to a

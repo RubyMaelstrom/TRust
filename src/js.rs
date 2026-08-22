@@ -1816,6 +1816,30 @@ pub type WebStorage = std::sync::Arc<
 type FetchResult = Option<(u16, String, Vec<u8>, String)>;
 /// Channel a background fetch task posts its `(promise id, result)` back on.
 type FetchSender = tokio::sync::mpsc::Sender<(usize, FetchResult)>;
+
+/// A dynamically prepared resource completes on the networking task source,
+/// then its response is consumed by the resident page actor. Keeping the
+/// response data (rather than a JS closure or Boa value) on the channel keeps
+/// the JS realm single-threaded while allowing the wire to progress without
+/// blocking user-interaction tasks.
+type ResourceResult = Option<(u16, String, Vec<u8>, Vec<(String, String)>)>;
+
+#[derive(Clone, Copy)]
+enum ResourceKind {
+    ClassicScript,
+    ModuleScript,
+    Stylesheet,
+}
+
+struct ResourceEvent {
+    node_id: usize,
+    name: String,
+    kind: ResourceKind,
+    result: ResourceResult,
+    delays_load: bool,
+}
+
+type ResourceSender = tokio::sync::mpsc::Sender<ResourceEvent>;
 /// Host pieces needed to turn a resident-page fetch into a later networking
 /// task without retaining any GC-managed value across threads.
 type BackgroundFetchContext = (
@@ -1906,6 +1930,16 @@ struct PageNet {
     /// The initial actor classification keeps an otherwise inert document live
     /// while this is nonzero, so an async-only page can receive its result.
     pending_fetches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Dynamically prepared scripts/styles use a separate networking-task
+    /// lane. Their results are delivered to the actor without putting a
+    /// network future in Boa's JS-thread-owned job executor.
+    resource_events: Option<ResourceSender>,
+    pending_resources: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pending_load_resources: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Separate from `dispatch`: a user interaction can occur while the
+    /// initial load event is still delayed, and resources it prepares must
+    /// remain load blockers until the browser-owned load task runs.
+    load_complete: std::cell::Cell<bool>,
     /// The shared subresource cache, so the page's own `fetch()` can join
     /// an in-flight/done request for a chunk we already have.
     cache: std::sync::Arc<crate::http::PageCache>,
@@ -3728,6 +3762,74 @@ fn page_net_prepare(
     // default policy) unless the page set one itself.
     crate::http::set_referrer(&mut request, &net.page);
     Some((net.handle.clone(), request))
+}
+
+/// Move a dynamically prepared script/style fetch onto the page task scope.
+/// The returned response is later handled by the page actor, which remains
+/// the sole owner of the DOM and JS realm. `false` means this is a one-shot
+/// context (or a small test realm) without the resident resource channel and
+/// the caller should retain its synchronous-job fallback.
+fn enqueue_resident_resource(
+    ctx: &mut Context,
+    node_id: usize,
+    name: String,
+    kind: ResourceKind,
+    request: crate::http::Request,
+) -> bool {
+    let Some((tx, handle, cache, pending, pending_load, delays_load)) =
+        ctx.realm().host_defined().get::<PageNet>().and_then(|net| {
+            Some((
+                net.resource_events.clone()?,
+                net.handle.clone(),
+                net.cache.clone(),
+                net.pending_resources.clone(),
+                net.pending_load_resources.clone(),
+                !net.load_complete.get(),
+            ))
+        })
+    else {
+        return false;
+    };
+    pending.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if delays_load {
+        pending_load.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    phase(&format!("src: INJECT-ASYNC {}", request.url));
+    let shared = cache.peek(&request.url);
+    cache.spawn(&handle, async move {
+        let result = match shared {
+            Some(shared) => shared.await.ok().map(|response| {
+                (
+                    response.status,
+                    response.content_type.clone(),
+                    response.body.clone(),
+                    response.headers.clone(),
+                )
+            }),
+            None => crate::http::fetch(&request).await.ok().map(|response| {
+                (
+                    response.status,
+                    response.content_type,
+                    response.body,
+                    response.headers,
+                )
+            }),
+        };
+        let event = ResourceEvent {
+            node_id,
+            name,
+            kind,
+            result,
+            delays_load,
+        };
+        if tx.send(event).await.is_err() {
+            pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if delays_load {
+                pending_load.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+    true
 }
 
 /// Synchronous fetch — for the one caller that genuinely must block:
@@ -5732,49 +5834,49 @@ fn sys_run_injected_script(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> 
                 // Blocked/capped/cross-private: report a failed load like a browser.
                 None => fire_script_event(ctx, node_id, "error"),
                 Some((_handle, request)) => {
-                    phase(&format!("src: INJECT {}", request.url));
                     let name = request.url.to_string();
-                    let realm = ctx.realm().clone();
-                    let job = NativeAsyncJob::with_realm(
-                        async move |cell: &RefCell<&mut Context>| {
-                            // Await without borrowing the context (so injected
-                            // loads overlap like every other async fetch).
-                            let result = crate::http::fetch(&request).await;
-                            let mut guard = cell.borrow_mut();
-                            match result {
-                                // HTML "fetch a classic script" requires an OK
-                                // response. Fetch's `nosniff` check additionally
-                                // requires a JavaScript MIME type when requested
-                                // by the response. Fail the element load instead
-                                // of executing an error page or forbidden body.
-                                // (Running a 404's HTML body as JS produced a
-                                // spurious `SyntaxError: unexpected token '<'`; the
-                                // loader's own onerror — webpack's ChunkLoadError —
-                                // is the correct, faithful signal instead.)
-                                Ok(resp)
-                                    if crate::http::classic_script_response_allowed(
-                                        resp.status,
-                                        &resp.content_type,
-                                        &resp.headers,
-                                    ) =>
-                                {
-                                    let body =
-                                        crate::http::decode_body(&resp.content_type, &resp.body);
-                                    eval_injected_classic(
-                                        &mut guard,
-                                        node_id,
-                                        &name,
-                                        body.as_bytes(),
-                                    )?;
-                                    fire_script_event(&mut guard, node_id, "load");
+                    if !enqueue_resident_resource(
+                        ctx,
+                        node_id,
+                        name.clone(),
+                        ResourceKind::ClassicScript,
+                        request.clone(),
+                    ) {
+                        let realm = ctx.realm().clone();
+                        let job = NativeAsyncJob::with_realm(
+                            async move |cell: &RefCell<&mut Context>| {
+                                // The one-shot transform has no resident actor;
+                                // retain its historical in-line network path.
+                                let result = crate::http::fetch(&request).await;
+                                let mut guard = cell.borrow_mut();
+                                match result {
+                                    Ok(resp)
+                                        if crate::http::classic_script_response_allowed(
+                                            resp.status,
+                                            &resp.content_type,
+                                            &resp.headers,
+                                        ) =>
+                                    {
+                                        let body = crate::http::decode_body(
+                                            &resp.content_type,
+                                            &resp.body,
+                                        );
+                                        eval_injected_classic(
+                                            &mut guard,
+                                            node_id,
+                                            &name,
+                                            body.as_bytes(),
+                                        )?;
+                                        fire_script_event(&mut guard, node_id, "load");
+                                    }
+                                    _ => fire_script_event(&mut guard, node_id, "error"),
                                 }
-                                _ => fire_script_event(&mut guard, node_id, "error"),
-                            }
-                            Ok(JsValue::undefined())
-                        },
-                        realm,
-                    );
-                    enqueue_script_job(ctx, job);
+                                Ok(JsValue::undefined())
+                            },
+                            realm,
+                        );
+                        enqueue_script_job(ctx, job);
+                    }
                 }
             }
         }
@@ -5814,35 +5916,43 @@ fn enqueue_injected_module(ctx: &mut Context, node_id: usize, src: Option<String
         match page_net_prepare(ctx, &src, String::from("GET"), None, vec![]) {
             None => fire_script_event(ctx, node_id, "error"),
             Some((_handle, request)) => {
-                phase(&format!("src: INJECT-MODULE {}", request.url));
                 let name = request.url.to_string();
-                let realm = ctx.realm().clone();
-                let job = NativeAsyncJob::with_realm(
-                    async move |cell: &RefCell<&mut Context>| {
-                        let result = crate::http::fetch(&request).await;
-                        let mut guard = cell.borrow_mut();
-                        match result {
-                            Ok(resp)
-                                if crate::http::module_script_response_allowed(
-                                    resp.status,
-                                    &resp.content_type,
-                                ) =>
-                            {
-                                let body = crate::http::decode_body(&resp.content_type, &resp.body);
-                                queue_module_evaluation(
-                                    &mut guard,
-                                    node_id,
-                                    body.as_bytes(),
-                                    &name,
-                                );
+                if !enqueue_resident_resource(
+                    ctx,
+                    node_id,
+                    name.clone(),
+                    ResourceKind::ModuleScript,
+                    request.clone(),
+                ) {
+                    let realm = ctx.realm().clone();
+                    let job = NativeAsyncJob::with_realm(
+                        async move |cell: &RefCell<&mut Context>| {
+                            let result = crate::http::fetch(&request).await;
+                            let mut guard = cell.borrow_mut();
+                            match result {
+                                Ok(resp)
+                                    if crate::http::module_script_response_allowed(
+                                        resp.status,
+                                        &resp.content_type,
+                                    ) =>
+                                {
+                                    let body =
+                                        crate::http::decode_body(&resp.content_type, &resp.body);
+                                    queue_module_evaluation(
+                                        &mut guard,
+                                        node_id,
+                                        body.as_bytes(),
+                                        &name,
+                                    );
+                                }
+                                _ => fire_script_event(&mut guard, node_id, "error"),
                             }
-                            _ => fire_script_event(&mut guard, node_id, "error"),
-                        }
-                        Ok(JsValue::undefined())
-                    },
-                    realm,
-                );
-                enqueue_deferred_module_job(ctx, job);
+                            Ok(JsValue::undefined())
+                        },
+                        realm,
+                    );
+                    enqueue_deferred_module_job(ctx, job);
+                }
             }
         }
     } else if !text.trim().is_empty() {
@@ -6014,33 +6124,41 @@ fn sys_load_injected_stylesheet(
         // Blocked/capped/cross-private: a failed load, like a browser.
         None => fire_script_event(ctx, node_id, "error"),
         Some((_handle, request)) => {
-            phase(&format!("css: INJECT {}", request.url));
-            let realm = ctx.realm().clone();
-            let job = NativeAsyncJob::with_realm(
-                async move |cell: &RefCell<&mut Context>| {
-                    let result = crate::http::fetch(&request).await;
-                    let mut guard = cell.borrow_mut();
-                    match result {
-                        Ok(resp)
-                            if crate::http::stylesheet_response_allowed(
-                                resp.status,
-                                &resp.content_type,
-                                &resp.headers,
-                            ) =>
-                        {
-                            let css = crate::http::decode_body(&resp.content_type, &resp.body);
-                            page_dom(&mut guard)
-                                .borrow_mut()
-                                .attach_sheet_to_link(node_id, css);
-                            fire_script_event(&mut guard, node_id, "load");
+            let name = request.url.to_string();
+            if !enqueue_resident_resource(
+                ctx,
+                node_id,
+                name.clone(),
+                ResourceKind::Stylesheet,
+                request.clone(),
+            ) {
+                let realm = ctx.realm().clone();
+                let job = NativeAsyncJob::with_realm(
+                    async move |cell: &RefCell<&mut Context>| {
+                        let result = crate::http::fetch(&request).await;
+                        let mut guard = cell.borrow_mut();
+                        match result {
+                            Ok(resp)
+                                if crate::http::stylesheet_response_allowed(
+                                    resp.status,
+                                    &resp.content_type,
+                                    &resp.headers,
+                                ) =>
+                            {
+                                let css = crate::http::decode_body(&resp.content_type, &resp.body);
+                                page_dom(&mut guard)
+                                    .borrow_mut()
+                                    .attach_sheet_to_link(node_id, css);
+                                fire_script_event(&mut guard, node_id, "load");
+                            }
+                            _ => fire_script_event(&mut guard, node_id, "error"),
                         }
-                        _ => fire_script_event(&mut guard, node_id, "error"),
-                    }
-                    Ok(JsValue::undefined())
-                },
-                realm,
-            );
-            ctx.enqueue_job(job.into());
+                        Ok(JsValue::undefined())
+                    },
+                    realm,
+                );
+                ctx.enqueue_job(job.into());
+            }
         }
     }
     Ok(JsValue::undefined())
@@ -7007,6 +7125,7 @@ fn load_page(
     env: &PageEnv,
     ws_events: Option<tokio::sync::mpsc::Sender<(usize, crate::ws::WsIn)>>,
     fetch_events: Option<FetchSender>,
+    resource_events: Option<ResourceSender>,
     worker_events: Option<WorkerSender>,
 ) -> Result<LoadedPage, Outcome> {
     phase("load_page start (DOM parse)");
@@ -7119,6 +7238,10 @@ fn load_page(
                 fetch_events: fetch_events.clone(),
                 next_fetch_id: std::cell::Cell::new(1),
                 pending_fetches: Default::default(),
+                resource_events: resource_events.clone(),
+                pending_resources: Default::default(),
+                pending_load_resources: Default::default(),
+                load_complete: std::cell::Cell::new(false),
                 cache: env.cache.clone(),
             });
         }
@@ -7588,6 +7711,7 @@ fn complete_live_lifecycle(page: &mut LoadedPage) {
         // networking tasks rather than blocking this task to wire completion.
         if let Some(net) = page.ctx.realm().host_defined().get::<PageNet>() {
             net.dispatch.set(true);
+            net.load_complete.set(true);
         }
         phase("load task start");
         run_browser_task(
@@ -8099,7 +8223,7 @@ pub fn css_finish(mut dom: Dom, sheets: &[(String, String)]) -> String {
 }
 
 pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
-    match load_page(html, env, None, None, None) {
+    match load_page(html, env, None, None, None, None) {
         Err(outcome) => (html.to_string(), outcome),
         Ok(mut page) => {
             // One-shot snapshot: no resident actor will run deferred timers
@@ -8451,6 +8575,7 @@ enum Wake {
     Cmd(Option<PageCmd>),
     Hover(Option<PageHover>),
     Fetch(Option<(usize, FetchResult)>),
+    Resource(Option<ResourceEvent>),
     Timer,
 }
 
@@ -9013,6 +9138,10 @@ fn run_worker(
             fetch_events: None,
             next_fetch_id: std::cell::Cell::new(1),
             pending_fetches: Default::default(),
+            resource_events: None,
+            pending_resources: Default::default(),
+            pending_load_resources: Default::default(),
+            load_complete: std::cell::Cell::new(false),
             cache: std::sync::Arc::new(crate::http::PageCache::with_task_scope(tasks)),
         });
     }
@@ -9316,6 +9445,11 @@ fn page_actor(
     // and settles the promise + re-renders. Sized generously — a page can have
     // many in-flight requests (`Promise.all([...])`).
     let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::channel::<(usize, FetchResult)>(64);
+    // Dynamically inserted scripts and styles use a separate resource-task
+    // lane. Keep the response channel alive for the actor's lifetime so an
+    // empty queue parks rather than producing a ready `None` on every poll.
+    let (resource_tx, mut resource_rx) = tokio::sync::mpsc::channel::<ResourceEvent>(64);
+    let _resource_keepalive = resource_tx.clone();
     // Worker→page channel: a worker thread posts `(id, WorkerOut)` here when it
     // calls `self.postMessage` or errors; the forwarder (spawned after load)
     // relays each as `PageCmd::Worker`. Registered into the page context DURING
@@ -9333,6 +9467,7 @@ fn page_actor(
         &env,
         Some(ws_evt_tx),
         Some(fetch_tx),
+        Some(resource_tx),
         Some(worker_evt_tx),
     ) {
         Ok(page) => page,
@@ -9415,11 +9550,15 @@ fn page_actor(
         }
     }
 
-    // Complete DOMContentLoaded/load as their own event-loop tasks. Author
-    // timers and post-load networking remain queued for the resident loop,
-    // which processes one task per turn and prioritizes user input between
-    // turns (WHATWG HTML, event loops / processing model).
-    complete_live_lifecycle(&mut page);
+    // Complete DOMContentLoaded/load as their own event-loop tasks. When a
+    // dynamically prepared resource is still fetching, keep the load event
+    // delayed as required by HTML, but enter the resident loop immediately so
+    // user-interaction tasks remain serviceable while the networking task
+    // progresses.
+    let mut lifecycle_complete = !shell_has_load_blockers;
+    if lifecycle_complete {
+        complete_live_lifecycle(&mut page);
+    }
     // Location-object navigation is asynchronous with respect to the running
     // script, but it must not disappear when the document otherwise classifies
     // as inert. In particular, a parsing/DOMContentLoaded/load script can call
@@ -9584,16 +9723,27 @@ fn page_actor(
         };
         let wake = rt.block_on(async {
             tokio::select! {
-                // Pointer boundary state is a bounded latest-value lane. Give
-                // it priority over ordinary queued commands so an exit cannot
-                // remain stuck behind page bookkeeping or a busy animation.
+                // HTML §8.1.7.4 assigns click/key input to the user
+                // interaction task source. Give the command lane first choice
+                // whenever it and a later networking/module task are both
+                // runnable; otherwise an async resource queue can keep the
+                // actor inside host_task_wake and leave a consent click
+                // pending indefinitely. Background work still gets a turn
+                // immediately after a command sets prefer_host_turn below.
                 biased;
+                cmd = cmds.recv() => Wake::Cmd(cmd),
+                // Pointer boundary state is a bounded latest-value lane. Give
+                // it priority over ordinary background work so an exit cannot
+                // remain stuck behind page bookkeeping or a busy animation.
+                changed = hover.changed() => Wake::Hover(changed.ok().map(|()| *hover.borrow_and_update())),
+                // Completed networking tasks are already runnable. Deliver
+                // them before selecting another host-task drain, otherwise a
+                // continuously replenished promise queue can starve a
+                // resource completion (and its script load event) forever.
+                done = fetch_rx.recv() => Wake::Fetch(done),
+                resource = resource_rx.recv() => Wake::Resource(resource),
                 () = std::future::ready(()), if service_host_jobs => Wake::Timer,
                 () = std::future::ready(()), if service_due_timer => Wake::Timer,
-                changed = hover.changed() => Wake::Hover(changed.ok().map(|()| *hover.borrow_and_update())),
-                cmd = cmds.recv() => Wake::Cmd(cmd),
-                // A background fetch completed — settle its promise and re-render.
-                done = fetch_rx.recv() => Wake::Fetch(done),
                 () = sleep_or_pending(sleep_dur) => Wake::Timer,
             }
         });
@@ -9604,7 +9754,13 @@ fn page_actor(
                 y: hover.y,
             },
             Wake::Hover(None) => break, // app dropped the handle
-            Wake::Cmd(Some(cmd)) => cmd,
+            Wake::Cmd(Some(cmd)) => {
+                // User commands are the interaction task source. Let one
+                // background task run after this command, but never let a
+                // queued network/module task delay input indefinitely.
+                prefer_host_turn = true;
+                cmd
+            }
             Wake::Cmd(None) => break, // app dropped the handle
             Wake::Fetch(Some((id, result))) => {
                 if !dispatch_fetch_done(&mut page, &evts, id, result) {
@@ -9615,6 +9771,22 @@ fn page_actor(
             // `fetch_rx` only closes when the page (and its `PageNet` sender) is
             // gone; nothing more to do.
             Wake::Fetch(None) => continue,
+            Wake::Resource(Some(event)) => {
+                if !dispatch_resource_done(&mut page, &evts, event, lifecycle_complete) {
+                    break;
+                }
+                if !lifecycle_complete && !page_has_load_blockers(&page) {
+                    complete_live_lifecycle(&mut page);
+                    lifecycle_complete = true;
+                    if !finish_dispatch_render(&mut page, &evts, false) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            // The keepalive sender keeps this channel open until the actor is
+            // dropped, so a closed receiver is only a teardown race.
+            Wake::Resource(None) => continue,
             Wake::Timer => {
                 // A dynamically inserted script/module is a later HTML host
                 // task.  The actor uses the same wake lane for that work as
@@ -9627,8 +9799,15 @@ fn page_actor(
                 let real_now = clock_virt + clock_wall.elapsed().as_millis() as f64;
                 let timer_due = js_next_deadline(&mut page).is_some_and(|at| at <= real_now);
                 if page_has_pending_jobs(&page) && (!timer_due || prefer_host_turn) {
-                    if !host_task_wake(&mut page, &evts) {
+                    if !host_task_wake(&mut page, &evts, lifecycle_complete) {
                         break;
+                    }
+                    if !lifecycle_complete && !page_has_load_blockers(&page) {
+                        complete_live_lifecycle(&mut page);
+                        lifecycle_complete = true;
+                        if !finish_dispatch_render(&mut page, &evts, false) {
+                            break;
+                        }
                     }
                     prefer_host_turn = false;
                     continue;
@@ -10456,8 +10635,14 @@ fn timer_wake(
 /// explicit so a module graph can upgrade custom elements and trigger exactly
 /// one authoritative render without accidentally consuming an unrelated due
 /// timer in the same turn (HTML §8.1.7.3).
-fn host_task_wake(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
-    prepare_dispatch(page);
+fn host_task_wake(
+    page: &mut LoadedPage,
+    evts: &tokio::sync::mpsc::Sender<PageEvt>,
+    lifecycle_complete: bool,
+) -> bool {
+    if lifecycle_complete {
+        prepare_dispatch(page);
+    }
     // A dynamically inserted external script is an HTML networking task. The
     // script element's force-async path (HTML §4.12.1.1, "prepare the script
     // element") fetches it without blocking the document's parser and runs it
@@ -10466,8 +10651,14 @@ fn host_task_wake(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageEv
     // cancel a legitimate slow bundle before its task can evaluate. Keep the
     // same page-wide wall bound used for initial loading while the resource
     // task is being serviced; the fetch count and SSRF gate remain in force.
-    page.budget.rearm(WALL_BUDGET);
-    run_jobs_into(&mut page.ctx, &page.budget, &mut page.outcome);
+    if lifecycle_complete {
+        page.budget.rearm(WALL_BUDGET);
+    }
+    if lifecycle_complete {
+        run_jobs_into(&mut page.ctx, &page.budget, &mut page.outcome);
+    } else {
+        run_parser_jobs_into(&mut page.ctx, &page.budget, &mut page.outcome);
+    }
     reconcile_custom_elements(&mut page.ctx);
     run_microtasks_into(&mut page.ctx, &mut page.outcome);
     // Module factories commonly stamp image elements or style-bearing shadow
@@ -10506,6 +10697,103 @@ fn note_background_fetch_done(page: &LoadedPage) {
             |n| Some(n.saturating_sub(1)),
         );
     }
+}
+
+fn note_resource_done(page: &LoadedPage, delays_load: bool) {
+    if let Some(net) = page.ctx.realm().host_defined().get::<PageNet>() {
+        let _ = net.pending_resources.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |n| Some(n.saturating_sub(1)),
+        );
+        if delays_load {
+            let _ = net.pending_load_resources.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| Some(n.saturating_sub(1)),
+            );
+        }
+    }
+}
+
+/// Deliver a dynamically prepared resource as one networking task. Fetching
+/// happened outside the actor; only the standards-required response checks,
+/// script/style processing, event dispatch, microtask checkpoint, and render
+/// update happen here. `lifecycle_complete == false` keeps newly prepared
+/// resources in the document's load-delay set until the initial load task can
+/// legally run.
+fn dispatch_resource_done(
+    page: &mut LoadedPage,
+    evts: &tokio::sync::mpsc::Sender<PageEvt>,
+    event: ResourceEvent,
+    lifecycle_complete: bool,
+) -> bool {
+    note_resource_done(page, event.delays_load);
+    if lifecycle_complete {
+        prepare_dispatch(page);
+    }
+    match event.kind {
+        ResourceKind::ClassicScript => match event.result {
+            Some((status, content_type, body, headers))
+                if crate::http::classic_script_response_allowed(
+                    status,
+                    &content_type,
+                    &headers,
+                ) =>
+            {
+                let source = crate::http::decode_body(&content_type, &body);
+                if eval_injected_classic(
+                    &mut page.ctx,
+                    event.node_id,
+                    &event.name,
+                    source.as_bytes(),
+                )
+                .is_ok()
+                {
+                    fire_script_event(&mut page.ctx, event.node_id, "load");
+                } else {
+                    fire_script_event(&mut page.ctx, event.node_id, "error");
+                }
+            }
+            _ => fire_script_event(&mut page.ctx, event.node_id, "error"),
+        },
+        ResourceKind::ModuleScript => match event.result {
+            Some((status, content_type, body, _headers))
+                if crate::http::module_script_response_allowed(status, &content_type) =>
+            {
+                let source = crate::http::decode_body(&content_type, &body);
+                queue_module_evaluation(
+                    &mut page.ctx,
+                    event.node_id,
+                    source.as_bytes(),
+                    &event.name,
+                );
+            }
+            _ => fire_script_event(&mut page.ctx, event.node_id, "error"),
+        },
+        ResourceKind::Stylesheet => match event.result {
+            Some((status, content_type, body, headers))
+                if crate::http::stylesheet_response_allowed(status, &content_type, &headers) =>
+            {
+                let css = crate::http::decode_body(&content_type, &body);
+                page_dom(&mut page.ctx)
+                    .borrow_mut()
+                    .attach_sheet_to_link(event.node_id, css);
+                fire_script_event(&mut page.ctx, event.node_id, "load");
+            }
+            _ => fire_script_event(&mut page.ctx, event.node_id, "error"),
+        },
+    }
+    run_microtasks_into(&mut page.ctx, &mut page.outcome);
+    if !page.outcome.panicked {
+        schedule_image_loads(&mut page.ctx, &mut page.outcome);
+        drain_js_side(&mut page.ctx, &mut page.outcome);
+    }
+    if page.outcome.panicked {
+        let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+        return false;
+    }
+    finish_dispatch_render(page, evts, false)
 }
 
 /// A background fetch (a resident-page `fetch()` whose request ran OFF the
@@ -10638,15 +10926,43 @@ fn js_next_deadline(page: &mut LoadedPage) -> Option<f64> {
 /// and a module-evaluation promise; waking for those jobs follows the HTML
 /// event-loop task boundary instead of parking forever with no timer deadline.
 fn page_has_pending_jobs(page: &LoadedPage) -> bool {
-    page.ctx
+    let executor_pending = page
+        .ctx
         .downcast_job_executor::<PageJobExecutor>()
-        .is_some_and(|executor| executor.has_pending_jobs())
+        .is_some_and(|executor| executor.has_pending_jobs());
+    let resource_pending = page_pending_resources(page) > 0;
+    executor_pending || resource_pending
 }
 
 fn page_has_load_blockers(page: &LoadedPage) -> bool {
-    page.ctx
+    let executor_pending = page
+        .ctx
         .downcast_job_executor::<PageJobExecutor>()
-        .is_some_and(|executor| executor.has_load_blockers())
+        .is_some_and(|executor| executor.has_load_blockers());
+    let resource_pending = page_pending_load_resources(page) > 0;
+    executor_pending || resource_pending
+}
+
+fn page_pending_resources(page: &LoadedPage) -> usize {
+    page.ctx
+        .realm()
+        .host_defined()
+        .get::<PageNet>()
+        .map_or(0, |net| {
+            net.pending_resources
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+}
+
+fn page_pending_load_resources(page: &LoadedPage) -> usize {
+    page.ctx
+        .realm()
+        .host_defined()
+        .get::<PageNet>()
+        .map_or(0, |net| {
+            net.pending_load_resources
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
 }
 
 /// Does the page have scroll-driven work — an `IntersectionObserver` or a
@@ -12279,6 +12595,18 @@ const PRELUDE: &str = r##"
         if (l[i].capture) { captureCount--; l.capN--; }
         l.splice(i, 1); l.fns.splice(i, 1); l.caps.splice(i, 1);
     }
+    // DOM §2.2 initializes constructed events as untrusted. Events created by
+    // the user-agent activation algorithms use the separate "create an event"
+    // hook, which initializes `isTrusted` to true; `dispatchEvent()` resets it
+    // to false. Keep that bit in an unexposed WeakSet so page code cannot forge
+    // trusted input by passing a non-standard constructor option or assigning
+    // to the readonly `isTrusted` attribute.
+    const trustedEvents = new WeakSet();
+    function createTrustedEvent(C, type, opts) {
+        const ev = new C(type, opts);
+        trustedEvents.add(ev);
+        return ev;
+    }
     class Event {
         constructor(type, opts) {
             this.type = String(type);
@@ -12289,7 +12617,11 @@ const PRELUDE: &str = r##"
             this.target = null;
             this.currentTarget = null;
             this.eventPhase = 0; // NONE; dispatch sets 1/2/3 per phase
-            this.isTrusted = false;
+            Object.defineProperty(this, "isTrusted", {
+                configurable: false,
+                enumerable: true,
+                get() { return trustedEvents.has(this); },
+            });
             // CustomEvent.detail (and UIEvent.detail) default to null, not
             // undefined, when not supplied.
             this.detail = opts && "detail" in opts ? opts.detail : null;
@@ -12318,6 +12650,7 @@ const PRELUDE: &str = r##"
         // but still used by feature-detection (webcomponentsjs probes it) and a
         // lot of older code. initCustomEvent is the CustomEvent variant.
         initEvent(type, bubbles, cancelable) {
+            trustedEvents.delete(this);
             this.type = String(type);
             this.bubbles = !!bubbles;
             this.cancelable = !!cancelable;
@@ -12326,6 +12659,7 @@ const PRELUDE: &str = r##"
         initCustomEvent(type, bubbles, cancelable, detail) {
             // type is a mandatory WebIDL argument.
             if (arguments.length < 1) throw new TypeError("initCustomEvent requires a type");
+            trustedEvents.delete(this);
             this.type = String(type);
             this.bubbles = !!bubbles;
             this.cancelable = !!cancelable;
@@ -12953,17 +13287,20 @@ const PRELUDE: &str = r##"
     // PointerEvent; UI Events gives it bubbles + cancelable + COMPOSED (it
     // must escape shadow trees — a listener outside a component hears clicks
     // on its internals, retargeted to the host).
-    function syntheticClickEvent() {
-        return new PointerEvent("click", {
+    function syntheticClickEvent(trusted) {
+        const init = {
             bubbles: true, cancelable: true, composed: true, view: g,
             detail: 1, button: 0, buttons: 0,
             pointerId: 1, pointerType: "mouse", isPrimary: true,
-        });
+        };
+        return trusted
+            ? createTrustedEvent(PointerEvent, "click", init)
+            : new PointerEvent("click", init);
     }
-    function activateClick(t, record) {
+    function activateClick(t, record, trusted) {
         if (record) trust.lastClickSubmit = null;
         if (!t) return false;
-        const ev = syntheticClickEvent();
+        const ev = syntheticClickEvent(!!trusted);
         dispatch(t, ev, false);
         if (ev.defaultPrevented) return true;
         // HTML §4.11.2: the first <summary> child of a <details> element has
@@ -13024,7 +13361,9 @@ const PRELUDE: &str = r##"
         if (btn) {
             const form = formOwner(btn);
             if (form) {
-                const sev = new Event("submit", { bubbles: true, cancelable: true });
+                const sev = trusted
+                    ? createTrustedEvent(Event, "submit", { bubbles: true, cancelable: true })
+                    : new Event("submit", { bubbles: true, cancelable: true });
                 sev.submitter = btn;
                 dispatch(form, sev, false);
                 if (record || trust.keyDispatch) trust.lastClickSubmit = { form: form.__id, submitter: btn.__id, prevented: sev.defaultPrevented };
@@ -13035,7 +13374,7 @@ const PRELUDE: &str = r##"
         return false;
     }
     trust.click = function (id) {
-        return activateClick(wrap(id), true);
+        return activateClick(wrap(id), true, true);
     };
     // UI Events §3.5: a native keydown is a cancelable event dispatched at
     // the focused element before the user agent performs its default editing
@@ -13050,7 +13389,7 @@ const PRELUDE: &str = r##"
         trust.keyDispatch = true;
         let prevented = false;
         try {
-            const ev = new KeyboardEvent("keydown", {
+            const ev = createTrustedEvent(KeyboardEvent, "keydown", {
                 bubbles: true, cancelable: true, composed: true, view: g,
                 key: String(key || ""), code: String(code || ""),
                 repeat: !!repeat, isComposing: !!composing,
@@ -13495,7 +13834,12 @@ const PRELUDE: &str = r##"
             }
         }
         removeEventListener(type, fn, options) { removeL(this, type, fn, options); }
-        dispatchEvent(ev) { return dispatch(this, ev, false); }
+        dispatchEvent(ev) {
+            // DOM §2.7 dispatchEvent() always makes the event untrusted,
+            // including when a UA-created event is redispatched by script.
+            trustedEvents.delete(ev);
+            return dispatch(this, ev, false);
+        }
     }
     class Node extends EventTarget {
         constructor(id) {
@@ -14399,7 +14743,7 @@ const PRELUDE: &str = r##"
         // event (bubbles to React's delegated root listener) + run activation.
         // Was a no-op, so any programmatic click (consent "Accept" buttons,
         // framework-driven toggles, auto-clickers) silently did nothing.
-        click() { try { activateClick(this, false); } catch (e) {} }
+        click() { try { activateClick(this, false, false); } catch (e) {} }
         focus() {} blur() {}
         // --- The Popover API (HTML §the popover attribute) ---------------
         // State truth lives in the ARENA (`__dom_popover` → the UA hide rule
@@ -15658,7 +16002,10 @@ const PRELUDE: &str = r##"
         querySelectorAll(s) { return this.documentElement.querySelectorAll(s); }
         addEventListener(type, fn, options) { addL(this, type, fn, options); }
         removeEventListener(type, fn, options) { removeL(this, type, fn, options); }
-        dispatchEvent(ev) { return dispatch(this, ev, false); }
+        dispatchEvent(ev) {
+            trustedEvents.delete(ev);
+            return dispatch(this, ev, false);
+        }
         hasFocus() { return true; }
     }
 
@@ -27331,6 +27678,108 @@ mod tests {
         )
     }
 
+    #[test]
+    fn pending_dynamic_resource_does_not_block_user_interaction() {
+        use futures::FutureExt as _;
+
+        let script_url = String::from("https://example.com/slow.js");
+        let (resource_tx, resource_rx) =
+            tokio::sync::oneshot::channel::<crate::http::FetchOutcome>();
+        let pending = async move {
+            match resource_rx.await {
+                Ok(result) => result,
+                Err(_) => Err(()),
+            }
+        }
+        .boxed()
+        .shared();
+        let cache = std::sync::Arc::new(crate::http::PageCache::default());
+        cache.seed_pending(script_url, pending);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut env = PageEnv::bare("https://example.com/dir/page");
+        env.cache = cache;
+        env.net = Some(runtime.handle().clone());
+        let (handle, mut events) = spawn_page(
+            r##"<body>
+                <p id="status">pending</p>
+                <button id="accept">accept</button>
+                <script>
+                    document.addEventListener('DOMContentLoaded', function () {
+                        var s = document.createElement('script');
+                        s.src = '/slow.js';
+                        s.addEventListener('load', function () {
+                            document.getElementById('status').textContent = 'loaded';
+                        });
+                        document.body.appendChild(s);
+                    });
+                    document.getElementById('accept').addEventListener('click', function () {
+                        document.getElementById('status').textContent = 'clicked';
+                    });
+                </script>
+            </body>"##
+                .to_string(),
+            env,
+        );
+
+        runtime.block_on(async move {
+            let first = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .expect("initial shell timed out")
+                .expect("page actor closed before shell");
+            let shell = match first {
+                PageEvt::Updated { html, .. } => html,
+                other => panic!("expected live shell, got {other:?}"),
+            };
+            let button_at = shell.find("id=\"accept\"").expect("button in shell");
+            let tag_end = shell[button_at..]
+                .find('>')
+                .map(|offset| button_at + offset)
+                .expect("button end");
+            let tag = &shell[button_at..=tag_end];
+            let node_at = tag.find("data-trust-node=\"").expect("button node id");
+            let node_start = node_at + "data-trust-node=\"".len();
+            let node: usize = tag[node_start..]
+                .split('"')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+
+            handle.cmds.send(PageCmd::Click(node)).await.unwrap();
+            let mut clicked = false;
+            while !clicked {
+                let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                    .await
+                    .expect("click was blocked by the pending resource")
+                    .expect("page actor closed after click");
+                if let PageEvt::Updated { html, .. } = event {
+                    clicked = html.contains(">clicked<");
+                }
+            }
+
+            let response = crate::http::CachedResp {
+                status: 200,
+                content_type: String::from("text/javascript"),
+                headers: vec![(
+                    String::from("content-type"),
+                    String::from("text/javascript"),
+                )],
+                body: b"window.resourceLoaded = true;".to_vec(),
+            };
+            resource_tx.send(Ok(std::sync::Arc::new(response))).unwrap();
+            let mut loaded = false;
+            while !loaded {
+                let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .expect("resource completion timed out")
+                    .expect("page actor closed after resource completion");
+                if let PageEvt::Updated { html, .. } = event {
+                    loaded = html.contains(">loaded<");
+                }
+            }
+        });
+    }
+
     fn hover_actor_for_id(html: &str, id: &str) -> usize {
         let id_attr = format!("id=\"{id}\"");
         let id_at = html.find(&id_attr).expect("element id serialized");
@@ -30188,6 +30637,47 @@ mod tests {
                 panic!("unprevented submit-button click should ask app to submit, got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn user_activation_clicks_are_trusted_but_element_click_is_synthetic() {
+        // DOM §2.2 initializes constructed events as untrusted, while the
+        // user-agent "create an event" algorithm initializes an actual user
+        // interaction as trusted. HTML's HTMLElement.click() is the explicit
+        // legacy exception and must remain synthetic.
+        let (handle, mut events) = live(
+            "<body><button id=accept>Accept</button><p id=state></p><script>\
+             const b=document.getElementById('accept');\
+             const s=document.getElementById('state');\
+             b.addEventListener('click', e => { s.textContent += e.isTrusted ? '|trusted' : '|synthetic'; });\
+             b.click();\
+             </script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("trusted-click regression page should stay live");
+        };
+        assert!(
+            html.contains("|synthetic"),
+            "programmatic click was trusted: {html}"
+        );
+        let button = live_node_after(&html, "<button");
+        handle.cmds.blocking_send(PageCmd::Click(button)).unwrap();
+        let html = loop {
+            match events.blocking_recv() {
+                Some(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    if html.contains("|synthetic|trusted") {
+                        break html;
+                    }
+                }
+                Some(PageEvt::Settled) => continue,
+                other => panic!("expected trusted click update, got {other:?}"),
+            }
+        };
+        assert!(
+            html.contains("|synthetic|trusted"),
+            "user click was not trusted: {html}"
+        );
     }
 
     #[test]
