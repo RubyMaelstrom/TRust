@@ -362,8 +362,6 @@ fn browser_lines<'a>(g: &'a BrowserView, height: usize, find: Option<&FindState>
         .collect()
 }
 
-use crate::layout2::visible_col;
-
 /// The base cyberpunk colour for an item's `kind` (before emphasis, selection,
 /// carousel-disabled, and find highlighting are layered on). Shared by the
 /// scrolling document rows and the pinned fixed layer.
@@ -754,18 +752,25 @@ fn render_inline_images(
     let start = g.scroll.saturating_sub(crate::layout2::MAX_IMAGE_LOOKBACK);
     for (off, row) in g.doc.rows[start..end].iter().enumerate() {
         let doc_row = start + off;
-        for item in &row.items {
+        if !row.items.iter().any(|item| item.image.is_some()) {
+            continue;
+        }
+        // Use the exact placement that `browser_rows` used for this row. In
+        // particular, an atomic image whose proportional CSS box rounds onto
+        // the final cell of preceding text is appended after that text. The
+        // placeholder and the decoded pixels must occupy the same cells; using
+        // the raw item column here made a delayed dropdown-arrow decode erase
+        // the last letter that had rendered correctly in the first frame.
+        for (item_index, scol, _visible_width, _head_cut) in
+            crate::layout2::visual_columns(row, carousels, doc_row)
+        {
+            let item = &row.items[item_index];
             let Some(url) = &item.image else { continue };
             // Paint suppression (`opacity:0`): the image box is reserved (its
             // rows still spacer-pad the flow) but no pixels are drawn.
             if item.invisible {
                 continue;
             }
-            // Carousel offset/clip: a strip image scrolled out of its band
-            // doesn't draw — snapping keeps whole cards, so it's never cut.
-            let Some(scol) = visible_col(carousels, doc_row, item) else {
-                continue;
-            };
             let key = crate::app::EncKey::for_item(url, item);
             let Some(proto) = protocols.get(&key) else {
                 continue;
@@ -1262,6 +1267,7 @@ mod tests {
                 crop: false,
                 pixelated: false,
                 invisible: false,
+                terminal_band: None,
             }],
             hits: Vec::new(),
         }

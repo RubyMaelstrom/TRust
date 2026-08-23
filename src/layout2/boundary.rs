@@ -65,7 +65,7 @@ pub(super) fn collect(
 ) -> Vec<BoundaryBox> {
     let mut out = Vec::new();
     let columns = (root.w / cw).round().max(1.0) as usize;
-    let line_rows = super::terminal::line_row_map(root, 0.0, 0.0, cw, ch, columns);
+    let line_rows = super::terminal::line_row_map(dom, root, 0.0, 0.0, cw, ch, columns);
     walk(dom, root, cw, ch, &line_rows, &mut out);
     out
 }

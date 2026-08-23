@@ -7290,7 +7290,12 @@ mod tests {
         )
         .rows;
         for (y, row) in rows.iter().enumerate() {
-            for it in &row.items {
+            let visual: std::collections::HashMap<usize, u16> =
+                crate::layout2::visual_columns(row, &[], y)
+                    .into_iter()
+                    .map(|(item, col, _, _)| (item, col))
+                    .collect();
+            for (ii, it) in row.items.iter().enumerate() {
                 if let Some(src) = &it.image {
                     let tail: String = src
                         .rsplit('/')
@@ -7308,8 +7313,11 @@ mod tests {
                         .take(28)
                         .collect::<String>();
                     eprintln!(
-                        "row{y:>3} col{:>3} {:>3}x{:<3} css(w={cw},h={ch}) [{cls}] {tail}",
-                        it.col, it.width, it.height
+                        "row{y:>3} col{:>3}→{:>3} {:>3}x{:<3} css(w={cw},h={ch}) [{cls}] {tail}",
+                        it.col,
+                        visual.get(&ii).copied().unwrap_or(it.col),
+                        it.width,
+                        it.height,
                     );
                 }
             }
@@ -7670,7 +7678,12 @@ mod tests {
         let mut seen_nodes: std::collections::BTreeSet<usize> = Default::default();
         for (ri, row) in doc.rows.iter().enumerate() {
             let mut s = String::new();
-            for it in &row.items {
+            let visual: std::collections::HashMap<usize, u16> =
+                crate::layout2::visual_columns(row, &doc.carousels, ri)
+                    .into_iter()
+                    .map(|(item, col, _, _)| (item, col))
+                    .collect();
+            for (ii, it) in row.items.iter().enumerate() {
                 let t = it.text.replace('\n', "\\n");
                 let tag = match &it.kind {
                     crate::layout2::ItemKind::Image => "IMG",
@@ -7679,8 +7692,9 @@ mod tests {
                 };
                 seen_nodes.insert(it.node);
                 s.push_str(&format!(
-                    "[c{} w{} h{} {tag} n{} {:?}{}{}] ",
+                    "[c{}→{} w{} h{} {tag} n{} {:?}{}{}] ",
                     it.col,
+                    visual.get(&ii).copied().unwrap_or(it.col),
                     it.width,
                     it.height,
                     it.node,
