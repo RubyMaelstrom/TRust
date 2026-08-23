@@ -53,6 +53,10 @@ struct Builder<'a, 't> {
 }
 
 impl<'a, 't> Builder<'a, 't> {
+    // The paint adapter's inputs are distinct borrowed engine products. A
+    // parameter object would only move these references without simplifying
+    // ownership or call sites.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         dom: &'a Dom,
         base: &'a Url,

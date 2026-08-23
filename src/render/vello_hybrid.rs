@@ -595,7 +595,7 @@ impl VelloHybridRenderer {
         self.rgba
             .reserve(size.width as usize * size.height as usize * 4);
         for row in mapped.chunks_exact(target.bytes_per_row as usize) {
-            for pixel in row[..size.width as usize * 4].chunks_exact(4) {
+            for pixel in row[..size.width as usize * 4].as_chunks::<4>().0 {
                 let alpha = pixel[3];
                 let unpremultiply = |component: u8| {
                     if alpha == 0 {
@@ -1209,7 +1209,7 @@ impl RasterBackend for VelloHybridRenderer {
         self.presented.clear();
         self.presented.reserve(frame.pixels.len() / 4);
         self.presented
-            .extend(frame.pixels.chunks_exact(4).map(|pixel| {
+            .extend(frame.pixels.as_chunks::<4>().0.iter().map(|pixel| {
                 u32::from(pixel[0]) << 16 | u32::from(pixel[1]) << 8 | u32::from(pixel[2])
             }));
         Ok(RasterFrame {
@@ -1316,7 +1316,9 @@ fn hybrid_image_pixels(image: &ImageResource, limit: u32) -> Option<(u16, u16, V
 }
 
 fn premultiply_rgba(rgba: &[u8]) -> Vec<PremulRgba8> {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .map(|pixel| {
             let alpha = u16::from(pixel[3]);
             let premul = |component| ((u16::from(component) * alpha) / 255) as u8;

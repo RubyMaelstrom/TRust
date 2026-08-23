@@ -366,7 +366,7 @@ impl VelloCpuRenderer {
         for ((target, rgba), source) in self
             .presented
             .iter_mut()
-            .zip(self.rgba.chunks_exact_mut(4))
+            .zip(self.rgba.as_chunks_mut::<4>().0.iter_mut())
             .zip(self.pixmap.data())
         {
             *target = u32::from(source.r) << 16 | u32::from(source.g) << 8 | u32::from(source.b);
@@ -484,7 +484,9 @@ impl VelloCpuRenderer {
             }
             let pixels = image
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|pixel| {
                     let alpha = u16::from(pixel[3]);
                     let premul = |component| ((u16::from(component) * alpha) / 255) as u8;
