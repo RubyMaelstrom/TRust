@@ -12,14 +12,11 @@
 //!    FILLS: the terminal paints no color, but a declared background erases
 //!    what's beneath it in paint order (the modal/card-stack semantics).
 //!
-//! 2. **Compositor** (`Cells`): ops stamp per-row cell spans in list order —
-//!    the later op owns the cell (the painter's algorithm). At emission a
-//!    text run keeps only its surviving cells (split into segments); a
-//!    DECODED image is atomic — fully covered it drops, partially covered it
-//!    survives whole and its box stays opaque (text over a surviving image's
-//!    pixels is dropped: the renderer's image pass paints pixels over those
-//!    cells regardless; pixel-true compositing is the P8 polish).
-//!    Paint-suppressed (invisible) items are GHOSTS: they claim only
+//! 2. **Terminal composition**: shaped-run clipping is resolved before CSS
+//!    pixels become cells. Every operation stamps spans in paint order, but a
+//!    text spelling is sliced only when later paint genuinely overlaps its
+//!    canonical pixel bounds; adjacent boxes rounding onto the same cell cannot
+//!    delete characters. Paint-suppressed items are GHOSTS: they claim only
 //!    otherwise-free cells and never erase visible content.
 //!
 //! The single px→cell quantizer also lives here: EDGES snap to the cell grid
@@ -73,6 +70,15 @@ struct TerminalNodePaint {
     point_hit_subtree: bool,
     background_covers: bool,
     scrollbar_hidden: bool,
+    /// The element is an atomic inline formatting context or an item in a
+    /// flex/grid formatting context. Canonical layout keeps its contents in
+    /// that independently sized horizontal box; terminal adaptation expands
+    /// the row presentation instead of re-breaking the box's text.
+    horizontal_item: bool,
+    /// Establishes an independent horizontal adaptation band. Fixed-cell
+    /// expansion inside this box must not consume a neighboring flex/grid or
+    /// table cell. Floats are detected from fragment paint state.
+    independent_band: bool,
     inline_snap: bool,
     snap_align: Option<String>,
     live_node: Option<usize>,
@@ -135,6 +141,15 @@ impl TerminalPaintModel {
                 dom.attr(node, "data-trust-node")
                     .and_then(|value| value.parse().ok())
             };
+            let display = dom
+                .computed_value_resolved(node, "display")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let parent_display = dom
+                .parent_flat(node)
+                .and_then(|parent| dom.computed_value_resolved(parent, "display"))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
             nodes.push(TerminalNodePaint {
                 tag,
                 id: dom
@@ -154,6 +169,17 @@ impl TerminalPaintModel {
                     dom.computed_value_resolved(node, "scrollbar-width")
                         .as_deref(),
                     Some("none")
+                ),
+                horizontal_item: matches!(
+                    display.as_str(),
+                    "inline-block" | "inline-flex" | "inline-grid"
+                ) || matches!(
+                    parent_display.as_str(),
+                    "flex" | "inline-flex" | "grid" | "inline-grid"
+                ),
+                independent_band: matches!(
+                    display.as_str(),
+                    "inline-block" | "flex" | "inline-flex" | "grid" | "inline-grid" | "table-cell"
                 ),
                 inline_snap,
                 snap_align: dom
@@ -191,6 +217,22 @@ impl TerminalPaintModel {
             links,
             page_media: None,
         }
+    }
+
+    fn horizontal_item(&self, node: NodeId) -> bool {
+        node != NO_NODE
+            && self
+                .nodes
+                .get(node)
+                .is_some_and(|paint| paint.horizontal_item)
+    }
+
+    fn independent_band(&self, node: NodeId) -> bool {
+        node != NO_NODE
+            && self
+                .nodes
+                .get(node)
+                .is_some_and(|paint| paint.independent_band)
     }
 
     pub(crate) fn capture_page_media(
@@ -346,7 +388,7 @@ pub(crate) fn paint(
     // contributes only its reserved band height (not its scrolled-away content).
     let doc_h_px = root.max_bottom().max(flow_bottom).max(0.0);
     let mut ops = Vec::new();
-    let line_rows = line_row_map(root, 0.0, 0.0, cell_w, cell_h, cols);
+    let line_rows = line_row_map(dom, root, 0.0, 0.0, cell_w, cell_h, cols);
     build_sc(
         dom, root, &mut ops, cell_w, cell_h, 0.0, 0.0, links, &line_rows,
     );
@@ -426,7 +468,7 @@ pub(crate) fn paint(
             }
             let mut ops = Vec::new();
             let fixed_cols = cols.saturating_sub(col).max(1);
-            let line_rows = line_row_map(f, f.x, f.y, cell_w, cell_h, fixed_cols);
+            let line_rows = line_row_map(dom, f, f.x, f.y, cell_w, cell_h, fixed_cols);
             build_sc(
                 dom, f, &mut ops, cell_w, cell_h, f.x, f.y, links, &line_rows,
             );
@@ -455,7 +497,7 @@ pub(crate) fn paint(
         }
         let mut ops = Vec::new();
         let top_cols = cols.saturating_sub(col).max(1);
-        let line_rows = line_row_map(f, f.x, f.y, cell_w, cell_h, top_cols);
+        let line_rows = line_row_map(dom, f, f.x, f.y, cell_w, cell_h, top_cols);
         build_sc(
             dom, f, &mut ops, cell_w, cell_h, f.x, f.y, links, &line_rows,
         );
@@ -496,10 +538,10 @@ fn fixed_under_document(root: &Frag<'_>, fixed_len: usize) -> Vec<bool> {
     collect_positioned(root, &mut negative, &mut zero, &mut positive);
 
     for child in negative {
-        if let FragKind::Fixed(index) = child.kind {
-            if let Some(slot) = under.get_mut(index) {
-                *slot = true;
-            }
+        if let FragKind::Fixed(index) = child.kind
+            && let Some(slot) = under.get_mut(index)
+        {
+            *slot = true;
         }
     }
 
@@ -706,7 +748,7 @@ fn paint_carousel(
     // rows (the document, or the parent region's buffer).
     let strip_cols = ((content_right - ox) / cw).round().max(1.0) as usize;
     let mut ops = Vec::new();
-    let line_rows = line_row_map(f, ox, f.y, cw, ch, strip_cols);
+    let line_rows = line_row_map(dom, f, ox, f.y, cw, ch, strip_cols);
     build_sc(dom, f, &mut ops, cw, ch, ox, f.y, links, &line_rows);
     let strip = composite(ops, strip_cols, alpha, composites);
     f.children.clear();
@@ -870,7 +912,7 @@ fn paint_region(
     // top-left (the scroll origin), clipped to the scrollport WIDTH — the
     // scroll axis (height) is unbounded so the buffer holds the full content.
     let mut ops = Vec::new();
-    let line_rows = line_row_map(f, pad_x, pad_y, cw, ch, width);
+    let line_rows = line_row_map(dom, f, pad_x, pad_y, cw, ch, width);
     build_sc(dom, f, &mut ops, cw, ch, pad_x, pad_y, links, &line_rows);
     let mut buffer = composite(ops, width, alpha, composites);
     // Splice nested carousel strips over their (blank) bands in this buffer.
@@ -969,6 +1011,25 @@ const FULL_CLIP: ClipCells = ClipCells {
     c1: i64::MAX,
 };
 
+/// Intersect a paint rectangle with its canonical CSS-pixel clip before any
+/// edge becomes a terminal cell. Keeping this rectangle beside the quantized
+/// operation lets composition distinguish real paint overlap from two
+/// adjacent CSS boxes that merely round onto the same cell.
+fn clipped_paint_bounds(x0: f32, y0: f32, x1: f32, y1: f32, clip: Option<Clip>) -> Option<Clip> {
+    let mut bounds = Clip { x0, y0, x1, y1 };
+    if let Some(clip) = clip {
+        bounds.x0 = bounds.x0.max(clip.x0);
+        bounds.y0 = bounds.y0.max(clip.y0);
+        bounds.x1 = bounds.x1.min(clip.x1);
+        bounds.y1 = bounds.y1.min(clip.y1);
+    }
+    (bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0).then_some(bounds)
+}
+
+fn paint_bounds_overlap(left: Clip, right: Clip) -> bool {
+    left.x0 < right.x1 && right.x0 < left.x1 && left.y0 < right.y1 && right.y0 < left.y1
+}
+
 /// Quantize a fragment's px clip to cell bounds (edges snap, like every other
 /// px→cell conversion here). `ox`/`oy` shift for the box-relative pinned layer.
 /// A clipped terminal cell is atomic: when CSS leaves any part of a cell
@@ -1028,6 +1089,7 @@ enum Op {
         col0: i64,
         col1: i64,
         clip: ClipCells,
+        bounds: Clip,
     },
     /// One placed inline item at absolute (row, col).
     Item {
@@ -1035,6 +1097,13 @@ enum Op {
         col: i64,
         item: Item,
         clip: ClipCells,
+        /// Canonical CSS-pixel paint bounds after the fragment clip. This is
+        /// retained through quantization so cell collisions can be separated
+        /// from genuine CSS paint overlap.
+        bounds: Option<Clip>,
+        /// The run's own horizontal CSS clip was resolved from shaped glyphs;
+        /// only the terminal viewport may clip its fixed-cell spelling.
+        text_clip_resolved: bool,
     },
     /// A generated interactive border box. Unlike `Item`, this does not paint
     /// cells; it survives solely for standards hit testing when an anchor is
@@ -1099,16 +1168,20 @@ pub(crate) struct TerminalLinePlacement {
     continuation_col: i64,
     /// The canonical line fits inside its containing block, so terminal
     /// quantization must not let its display-cell approximation cross that
-    /// block's right edge. `None` preserves genuine CSS overflow (for example
-    /// an unbreakable word in an `overflow:visible` block).
+    /// block's right edge. `None` preserves genuine CSS overflow and
+    /// independently sized horizontal items.
     clip_right: Option<i64>,
-    /// A containing edge can clip a line without permitting a terminal-side
-    /// continuation row. A one-line `overflow:hidden` box has no vertical room
-    /// for an invented continuation; CSS Overflow clips it horizontally.
+    /// A containing edge can adapt an ordinary inline formatting context
+    /// without becoming a second layout boundary for flex/grid/atomic items.
     reflow_right: Option<i64>,
+    /// Stable outer independent horizontal formatting-context band. This is
+    /// retained on emitted items so the final terminal collision pass cannot
+    /// move content into a sibling table/flex/grid/float panel.
+    band: Option<(u16, u16)>,
 }
 
 pub(crate) fn line_row_map(
+    dom: &TerminalPaintModel,
     root: &Frag<'_>,
     ox: f32,
     oy: f32,
@@ -1121,6 +1194,20 @@ pub(crate) fn line_row_map(
         line: &'a Frag<'tree>,
         positioned: bool,
         containing_right: Option<f32>,
+        horizontal_item: bool,
+        /// Outermost independent box: fixed-cell collision recovery and
+        /// continuation rows remain local to this panel. Nested table cells
+        /// and inline-blocks share their outer panel's terminal cursor.
+        adapt_band: Option<(f32, f32)>,
+        parent: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct CollectState {
+        positioned: bool,
+        containing_right: Option<f32>,
+        horizontal_item: bool,
+        adapt_band: Option<(f32, f32)>,
         parent: usize,
     }
 
@@ -1137,31 +1224,44 @@ pub(crate) fn line_row_map(
     }
 
     fn collect<'a, 'tree>(
+        dom: &TerminalPaintModel,
         fragment: &'a Frag<'tree>,
-        positioned: bool,
-        containing_right: Option<f32>,
-        parent: usize,
+        state: CollectState,
         lines: &mut Vec<LineEntry<'a, 'tree>>,
     ) {
         if matches!(fragment.kind, FragKind::Line(_)) {
             lines.push(LineEntry {
                 line: fragment,
-                positioned,
-                containing_right,
-                parent,
+                positioned: state.positioned,
+                containing_right: state.containing_right,
+                horizontal_item: state.horizontal_item,
+                adapt_band: state.adapt_band,
+                parent: state.parent,
             });
         }
-        // The retained fragment contract exposes the border-box edge (not the
-        // resolved padding shorthand). It is the safe terminal boundary: it
-        // preserves text that still fits through a fractional border/padding
-        // quantization while preventing a line from entering the next box.
         let child_containing_right = Some(fragment.x + fragment.w);
         for child in &fragment.children {
+            let independent_band = if child.paint.float || dom.independent_band(child.node) {
+                Some((child.x, child.x + child.w))
+            } else {
+                None
+            };
+            // Nested table cells and inline-blocks refine canonical layout,
+            // but they do not start unrelated terminal documents. A sponsor
+            // table following a headlines table in one outer sidebar cell
+            // must see the rows added while adapting those headlines. The
+            // same stable outer cursor keeps a flex/inline sequence together.
+            let child_adapt_band = state.adapt_band.or(independent_band);
             collect(
+                dom,
                 child,
-                positioned || child.paint.positioned,
-                child_containing_right,
-                std::ptr::from_ref(fragment) as usize,
+                CollectState {
+                    positioned: state.positioned || child.paint.positioned,
+                    containing_right: child_containing_right,
+                    horizontal_item: state.horizontal_item || dom.horizontal_item(child.node),
+                    adapt_band: child_adapt_band,
+                    parent: std::ptr::from_ref(fragment) as usize,
+                },
                 lines,
             );
         }
@@ -1169,10 +1269,15 @@ pub(crate) fn line_row_map(
 
     let mut lines = Vec::new();
     collect(
+        dom,
         root,
-        false,
-        None,
-        std::ptr::from_ref(root) as usize,
+        CollectState {
+            positioned: false,
+            containing_right: None,
+            horizontal_item: dom.horizontal_item(root.node),
+            adapt_band: None,
+            parent: std::ptr::from_ref(root) as usize,
+        },
         &mut lines,
     );
     lines.sort_by(|left, right| {
@@ -1184,19 +1289,17 @@ pub(crate) fn line_row_map(
     let mut map = HashMap::with_capacity(lines.len());
     let mut previous_y: Option<f32> = None;
     let mut previous_row = i64::MIN;
-    // A terminal reflowed line reserves additional rows only in its own
-    // containing-cell band. Sibling table cells are independent inline
-    // formatting contexts; their line boxes may have slightly different CSS
-    // y coordinates, but a sidebar's extra row must not push the main cell's
-    // following line down. The quantized containing edge is the retained
-    // terminal identity of that band, while `None` represents the root flow.
-    let mut next_row_by_band: HashMap<Option<i64>, i64> = HashMap::new();
+    // A terminal-adapted line reserves additional rows only in its own
+    // quantized line-box band. Independent inline formatting contexts can
+    // have slightly different CSS y coordinates, but extra rows in a sidebar
+    // must not push the main flow down.
+    let mut next_row_by_band: HashMap<Option<(i64, i64)>, i64> = HashMap::new();
     // Positioned descendants paint out of flow and therefore must not reserve
     // rows in the document allocator. Their own line boxes still need a
     // private floor, however: a quantization-only continuation row from one
     // positioned line must not be overwritten by the next canonical line.
     let mut next_row_by_positioned_parent: HashMap<usize, i64> = HashMap::new();
-    let mut last_band_parent: HashMap<Option<i64>, usize> = HashMap::new();
+    let mut last_band_parent: HashMap<Option<(i64, i64)>, usize> = HashMap::new();
     let mut flow_states: HashMap<usize, FlowState> = HashMap::new();
     for entry in lines {
         let line = entry.line;
@@ -1204,21 +1307,25 @@ pub(crate) fn line_row_map(
         let containing_right = entry.containing_right;
         let preferred = ((line.y - oy) / cell_h).round() as i64;
         let line_start = ((line.x - ox) / cell_w).round().max(0.0) as i64;
-        // CSS line breaking has already proved that this line fits inside its
-        // containing block. Keep the containing edge as an adaptation hint:
-        // quantization overrun inside the viewport is terminal-side reflow,
-        // while an edge beyond the viewport is ordinary viewport clipping.
-        let clip_right = containing_right.and_then(|right| {
+        let mut clip_right = containing_right.and_then(|right| {
             let FragKind::Line(line_fragment) = &line.kind else {
                 return None;
             };
             (line.x + line_fragment.width <= right + 0.01)
-                // A partially intersected terminal cell remains part of the
-                // containing border box; ceil the right edge so fractional
-                // padding/border geometry does not delete the final glyph.
                 .then(|| ((right - ox) / cell_w).ceil() as i64)
         });
-        let band = containing_right.map(|right| ((right - ox) / cell_w).ceil() as i64);
+        let quantize_band = |(left, right): (f32, f32)| {
+            (
+                ((left - ox) / cell_w).floor() as i64,
+                ((right - ox) / cell_w).ceil() as i64,
+            )
+        };
+        let band = entry.adapt_band.map(quantize_band);
+        let item_band = band.and_then(|(left, right)| {
+            let left = left.clamp(0, columns as i64);
+            let right = right.clamp(left, columns as i64);
+            (left < right).then_some((left as u16, right as u16))
+        });
         // Terminal cell quantization may need an extra row when a proportional
         // line's text is wider than its cell approximation. Do not invent that
         // row inside a one-line clipped box, though: CSS Text's `nowrap` line
@@ -1227,6 +1334,13 @@ pub(crate) fn line_row_map(
         let has_vertical_reflow_room = line
             .clip
             .is_none_or(|clip| clip.y1 > line.y + line.h + 0.01);
+        let contains_atomic_inline = matches!(
+            &line.kind,
+            FragKind::Line(line_fragment) if line_fragment.contains_atomic_inline
+        );
+        if entry.horizontal_item || contains_atomic_inline {
+            clip_right = None;
+        }
         let reflow_right = clip_right.filter(|right| {
             *right > line_start && *right <= columns as i64 && has_vertical_reflow_room
         });
@@ -1279,6 +1393,7 @@ pub(crate) fn line_row_map(
                     continuation_col: line_start,
                     clip_right,
                     reflow_right: None,
+                    band: item_band,
                 },
             );
             continue;
@@ -1305,7 +1420,16 @@ pub(crate) fn line_row_map(
         };
         let joins_previous = carry_row.is_some_and(|carry| carry == row);
         let (span, end_col) = if let Some(right) = reflow_right {
-            terminal_line_extent(line, ox, cell_w, cell_h, right, line_start, start_col)
+            terminal_line_extent(
+                line,
+                ox,
+                cell_w,
+                cell_h,
+                right,
+                line_start,
+                start_col,
+                joins_previous,
+            )
         } else if clip_right.is_some() && !has_vertical_reflow_room {
             (1, line_start)
         } else {
@@ -1324,6 +1448,7 @@ pub(crate) fn line_row_map(
                 continuation_col: line_start,
                 clip_right,
                 reflow_right,
+                band: item_band,
             },
         );
         previous_y = Some(line.y);
@@ -1356,17 +1481,32 @@ pub(crate) fn line_row_map(
     map
 }
 
-fn terminal_piece_width(piece: &super::inline::Piece, cell_w: f32, cell_h: f32) -> usize {
+fn terminal_piece_width(piece: &super::inline::Piece, cell_w: f32, _cell_h: f32) -> usize {
     let text = terminal_piece_text(piece);
     if piece.item.image.is_some() || (piece.shaped.is_none() && text.is_empty()) {
         let x0 = (piece.paint_x / cell_w).round();
         let x1 = ((piece.paint_x + piece.paint_width) / cell_w).round();
-        let y0 = (piece.paint_y / cell_h).round();
-        let y1 = ((piece.paint_y + piece.paint_height) / cell_h).round();
-        let _height = (y1 - y0).max(1.0);
         (x1 - x0).max(1.0) as usize
     } else {
         display_width(&terminal_piece_text_with_space(piece))
+    }
+}
+
+/// Rows occupied below the canonical line-box origin by one terminal item.
+/// An atomic inline can be several cells tall even though it participates in
+/// one CSS line box. If an earlier proportional line has shifted that line
+/// downward, the terminal allocator must carry the atomic item's complete
+/// painted height forward before placing a following block.
+fn terminal_piece_row_extent(piece: &super::inline::Piece, cell_h: f32) -> i64 {
+    if piece.item.image.is_some()
+        || (piece.shaped.is_none() && terminal_piece_text(piece).is_empty())
+    {
+        let offset = (piece.paint_y / cell_h).round() as i64;
+        let bottom = ((piece.paint_y + piece.paint_height) / cell_h).round() as i64;
+        let height = (bottom - offset).max(1);
+        (offset + height).max(1)
+    } else {
+        1
     }
 }
 
@@ -1389,10 +1529,52 @@ fn terminal_piece_text_with_space(piece: &super::inline::Piece) -> String {
     text
 }
 
-/// Split a terminal text item at a display-cell boundary. Prefer the last
-/// whitespace in the fitting prefix so a quantization-only reflow does not
-/// cut an otherwise intact word; if there is no such boundary, make an
-/// emergency character split and let the compositor handle wide glyphs.
+/// Resolve horizontal CSS clipping while the canonical shaped geometry is
+/// still available. CSS Overflow 3 §5.1 clips glyph painting and permits a
+/// character to be partially visible. A terminal cannot paint part of a
+/// character cell, so every shaped cluster intersecting the clip contributes
+/// its complete character(s). The returned offset is still in CSS pixels and
+/// is quantized together with the run's origin by the caller.
+fn visible_terminal_piece_text(
+    piece: &super::inline::Piece,
+    origin_x: f32,
+    clip: Option<Clip>,
+) -> Option<(String, f32)> {
+    let text = terminal_piece_text(piece);
+    if piece.item.image.is_some() || text.is_empty() {
+        return Some((text.to_owned(), 0.0));
+    }
+    let Some(clip) = clip else {
+        return Some((text.to_owned(), 0.0));
+    };
+    let Some(shaped) = piece.shaped.as_ref().filter(|shaped| shaped.text == text) else {
+        let right = origin_x + piece.paint_width.max(0.0);
+        return (right > clip.x0 && origin_x < clip.x1).then(|| (text.to_owned(), 0.0));
+    };
+
+    let mut byte_start = usize::MAX;
+    let mut byte_end = 0usize;
+    let mut x_offset = f32::INFINITY;
+    for cluster in &shaped.clusters {
+        let left = origin_x + cluster.x.min(cluster.x + cluster.advance);
+        let right = origin_x + cluster.x.max(cluster.x + cluster.advance);
+        if right > clip.x0 && left < clip.x1 {
+            byte_start = byte_start.min(cluster.text_range.start);
+            byte_end = byte_end.max(cluster.text_range.end);
+            x_offset = x_offset.min(cluster.x.min(cluster.x + cluster.advance));
+        }
+    }
+    if byte_start >= byte_end {
+        return None;
+    }
+    let visible = text.get(byte_start..byte_end)?.to_owned();
+    Some((visible, x_offset.max(0.0)))
+}
+
+/// Split an ordinary terminal text flow at a display-cell boundary. Prefer
+/// whitespace, then use an emergency character split when proportional text
+/// cannot fit the containing cell band. Independently sized horizontal items
+/// never enter this reflow path.
 fn terminal_text_chunk(text: &str, max_cells: usize) -> (String, String) {
     if max_cells == 0 {
         return (String::new(), text.to_owned());
@@ -1445,6 +1627,7 @@ fn terminal_text_chunk(text: &str, max_cells: usize) -> (String, String) {
 /// `start_col` lets a soft-wrapped CSS line continue in the final terminal row
 /// of its predecessor. The returned end column is used to carry the next line
 /// without treating a proportional CSS line-box boundary as a forced break.
+#[allow(clippy::too_many_arguments)]
 fn terminal_line_extent(
     line: &Frag<'_>,
     ox: f32,
@@ -1453,12 +1636,15 @@ fn terminal_line_extent(
     right: i64,
     continuation_col: i64,
     start_col: i64,
+    joins_previous: bool,
 ) -> (i64, i64) {
     let FragKind::Line(line_fragment) = &line.kind else {
         return (1, start_col);
     };
     let mut rows = 1i64;
+    let mut span = 1i64;
     let mut pen = start_col;
+    let mut restore_soft_gap = joins_previous;
     for piece in &line_fragment.pieces {
         let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
         if piece.space_before
@@ -1467,9 +1653,21 @@ fn terminal_line_extent(
         {
             preferred -= 1;
         }
-        let mut remaining_text = (!piece.item.image.is_some()
-            && !terminal_piece_text(piece).is_empty())
-        .then(|| terminal_piece_text_with_space(piece));
+        let mut remaining_text =
+            (!piece.item.image.is_some() && !terminal_piece_text(piece).is_empty()).then(|| {
+                let mut text = terminal_piece_text_with_space(piece);
+                // CSS Text collapses the whitespace at a canonical soft line
+                // break. When the terminal adapter rejoins that line into the
+                // predecessor's final cell row, painting restores one gap. The
+                // extent simulation MUST make the identical transition or it will
+                // under-reserve rows and a following block can overwrite the
+                // unaccounted continuation.
+                if restore_soft_gap && !piece.space_before {
+                    text.insert(0, ' ');
+                }
+                restore_soft_gap = false;
+                text
+            });
         let mut remaining = remaining_text.as_deref().map_or_else(
             || terminal_piece_width(piece, cell_w, cell_h),
             display_width,
@@ -1514,8 +1712,9 @@ fn terminal_line_extent(
                 }
             }
         }
+        span = span.max(rows - 1 + terminal_piece_row_extent(piece, cell_h));
     }
-    (rows, pen)
+    (span.max(rows), pen)
 }
 
 fn terminal_line_span(
@@ -1543,6 +1742,7 @@ fn terminal_line_span(
             return 1;
         }
         let mut row_offset = 0i64;
+        let mut span = 1i64;
         let mut pen = continuation_col;
         for piece in &line_fragment.pieces {
             let width = terminal_piece_width(piece, cell_w, cell_h) as i64;
@@ -1560,11 +1760,13 @@ fn terminal_line_span(
             } else {
                 pen = col + width;
             }
+            span = span.max(row_offset + terminal_piece_row_extent(piece, cell_h));
         }
-        return row_offset + 1;
+        return span.max(row_offset + 1);
     };
 
     let mut row_offset = 0i64;
+    let mut span = 1i64;
     let mut pen = continuation_col;
     for piece in &line_fragment.pieces {
         let mut preferred = ((line.x + piece.x + piece.paint_x - ox) / cell_w).round() as i64;
@@ -1635,8 +1837,9 @@ fn terminal_line_span(
                 }
             }
         }
+        span = span.max(row_offset + terminal_piece_row_extent(piece, cell_h));
     }
-    row_offset + 1
+    span.max(row_offset + 1)
 }
 
 /// Paint one STACKING CONTEXT per Appendix E (the root element always forms
@@ -1849,6 +2052,7 @@ fn inflow_content(
                     continuation_col: ((c.x - ox) / cw).round() as i64,
                     clip_right: None,
                     reflow_right: None,
+                    band: None,
                 });
             let joins_soft_line_on_same_row = placement.joins_previous
                 && previous_line
@@ -1858,7 +2062,31 @@ fn inflow_content(
                 row_pens.clear();
             }
             for p in &line.pieces {
-                let mut item_x = c.x + p.x + p.paint_x;
+                let canonical_text_origin = c.x + p.x;
+                let text_clip_resolved = p.item.image.is_none()
+                    && p.item.terminal_text.is_none()
+                    && p.shaped
+                        .as_ref()
+                        .is_some_and(|shaped| shaped.text == p.item.text);
+                let (visible_text, text_x_offset) = if text_clip_resolved {
+                    let Some(visible) =
+                        visible_terminal_piece_text(p, canonical_text_origin, c.clip)
+                    else {
+                        continue;
+                    };
+                    visible
+                } else {
+                    (terminal_piece_text(p).to_owned(), 0.0)
+                };
+                let mut item_x = c.x + p.x + p.paint_x + text_x_offset;
+                let canonical_paint_right = c.x + p.x + p.paint_x + p.paint_width;
+                let bounds = clipped_paint_bounds(
+                    item_x,
+                    c.y + p.y + p.paint_y,
+                    canonical_paint_right,
+                    c.y + p.y + p.paint_y + p.paint_height,
+                    c.clip,
+                );
                 // A terminal row has no typographic baseline. Anchor adapted
                 // items to the canonical line-box top (plus object-fit inset),
                 // not to the glyph/image baseline offset: a short inline image
@@ -1869,7 +2097,7 @@ fn inflow_content(
                     col: 0,
                     width: 0,
                     height: 1,
-                    text: terminal_piece_text(p).to_string(),
+                    text: visible_text,
                     kind: p.item.kind,
                     image: p.item.image.clone(),
                     emph: p.item.emph,
@@ -1878,9 +2106,14 @@ fn inflow_content(
                     crop: p.item.crop,
                     pixelated: p.item.pixelated,
                     invisible: p.item.invisible,
+                    terminal_band: placement.band,
                 };
                 quantize_item(&mut item, p, cw, ch);
-                if p.space_before && item.image.is_none() && !item.text.is_empty() {
+                if p.space_before
+                    && text_x_offset <= 0.01
+                    && item.image.is_none()
+                    && !item.text.is_empty()
+                {
                     // The terminal compatibility model deliberately represents
                     // a collapsed proportional-space gap as one cell.
                     item.text.insert(0, ' ');
@@ -1922,13 +2155,11 @@ fn inflow_content(
                     && let Some(right) = placement.clip_right
                     && item.width as i64 > right - preferred_col
                 {
-                    // The CSS line fits its hidden box, but the shaped text
-                    // can need one more terminal cell than the quantized box
-                    // edge. CSS Overflow 3 §5.1 permits a character to be
-                    // partially rendered at `text-overflow:clip`; a terminal
-                    // cell is atomic, so retain at most that one intersected
-                    // cell instead of dropping the final character.
-                    let retained_right = (preferred_col + i64::from(item.width)).min(right + 1);
+                    // CSS Overflow 3 clips the canonical glyphs, not a second
+                    // fixed-cell spelling of the run. Horizontal text clipping
+                    // is resolved from the shaped clusters before this item is
+                    // emitted; retain the adapted spelling whole here.
+                    let retained_right = preferred_col + i64::from(item.width);
                     clip.c1 = clip.c1.max(retained_right);
                 }
                 let reflow_right = placement.reflow_right.filter(|right| {
@@ -1977,6 +2208,8 @@ fn inflow_content(
                                 col,
                                 item: chunk,
                                 clip: chunk_clip,
+                                bounds,
+                                text_clip_resolved,
                             });
                             if rest.is_empty() {
                                 break;
@@ -2018,6 +2251,8 @@ fn inflow_content(
                         col,
                         item,
                         clip: item_clip,
+                        bounds,
+                        text_clip_resolved,
                     });
                     if p.item.kind == ItemKind::Form && p.item.style_node != NO_NODE {
                         push_outline_cells(
@@ -2227,6 +2462,7 @@ fn fill_op(
         && dom.node(f.node).is_some_and(|node| node.background_covers)
         && row1 > row0
         && col1 > col0
+        && let Some(bounds) = clipped_paint_bounds(f.x, f.y, f.x + f.w, f.y + f.h, f.clip)
     {
         ops.push(Op::Fill {
             row0,
@@ -2234,6 +2470,7 @@ fn fill_op(
             col0,
             col1,
             clip,
+            bounds,
         });
     }
     if BORDERS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
@@ -2248,6 +2485,8 @@ fn fill_op(
                 col: col0,
                 item: border_item(f.node, horizontal.clone()),
                 clip,
+                bounds: None,
+                text_clip_resolved: false,
             });
         }
         if f.border[BOTTOM] > 0.0 {
@@ -2256,6 +2495,8 @@ fn fill_op(
                 col: col0,
                 item: border_item(f.node, horizontal),
                 clip,
+                bounds: None,
+                text_clip_resolved: false,
             });
         }
         for row in row0..row1 {
@@ -2265,6 +2506,8 @@ fn fill_op(
                     col: col0,
                     item: border_item(f.node, String::from("│")),
                     clip,
+                    bounds: None,
+                    text_clip_resolved: false,
                 });
             }
             if f.border[RIGHT] > 0.0 {
@@ -2273,6 +2516,8 @@ fn fill_op(
                     col: col1 - 1,
                     item: border_item(f.node, String::from("│")),
                     clip,
+                    bounds: None,
+                    text_clip_resolved: false,
                 });
             }
         }
@@ -2310,6 +2555,7 @@ fn border_item(node: NodeId, text: String) -> Item {
         crop: false,
         pixelated: false,
         invisible: false,
+        terminal_band: None,
     }
 }
 
@@ -2345,12 +2591,16 @@ fn push_outline_box(
         col: col0,
         item: border_item(node, horizontal.clone()),
         clip,
+        bounds: None,
+        text_clip_resolved: false,
     });
     ops.push(Op::Item {
         row: row1 - 1,
         col: col0,
         item: border_item(node, horizontal),
         clip,
+        bounds: None,
+        text_clip_resolved: false,
     });
     for row in row0..row1 {
         ops.push(Op::Item {
@@ -2358,12 +2608,16 @@ fn push_outline_box(
             col: col0,
             item: border_item(node, String::from("│")),
             clip,
+            bounds: None,
+            text_clip_resolved: false,
         });
         ops.push(Op::Item {
             row,
             col: col1 - 1,
             item: border_item(node, String::from("│")),
             clip,
+            bounds: None,
+            text_clip_resolved: false,
         });
     }
 }
@@ -2400,12 +2654,16 @@ fn push_outline_cells(
         col: col0,
         item: border_item(node, horizontal.clone()),
         clip,
+        bounds: None,
+        text_clip_resolved: false,
     });
     ops.push(Op::Item {
         row: row1 - 1,
         col: col0,
         item: border_item(node, horizontal),
         clip,
+        bounds: None,
+        text_clip_resolved: false,
     });
     for row in row0..row1 {
         ops.push(Op::Item {
@@ -2413,12 +2671,16 @@ fn push_outline_cells(
             col: col0,
             item: border_item(node, String::from("│")),
             clip,
+            bounds: None,
+            text_clip_resolved: false,
         });
         ops.push(Op::Item {
             row,
             col: col1 - 1,
             item: border_item(node, String::from("│")),
             clip,
+            bounds: None,
+            text_clip_resolved: false,
         });
     }
 }
@@ -2512,7 +2774,86 @@ impl RowSpans {
     }
 }
 
-/// Composite the display list into non-overlapping `Doc` rows. `alpha`
+fn is_terminal_text_run(item: &Item) -> bool {
+    item.image.is_none() && !item.text.is_empty() && item.kind != ItemKind::Border
+}
+
+fn op_paint_bounds(op: &Op) -> Option<Clip> {
+    match op {
+        Op::Fill { bounds, .. } => Some(*bounds),
+        Op::Item { item, bounds, .. } if !item.invisible => *bounds,
+        _ => None,
+    }
+}
+
+fn op_cell_bounds(op: &Op) -> Option<(i64, i64, i64, i64)> {
+    match op {
+        Op::Fill {
+            row0,
+            row1,
+            col0,
+            col1,
+            clip,
+            ..
+        } => Some((
+            (*row0).max(clip.r0),
+            (*row1).min(clip.r1),
+            (*col0).max(clip.c0),
+            (*col1).min(clip.c1),
+        )),
+        Op::Item {
+            row,
+            col,
+            item,
+            clip,
+            ..
+        } if !item.invisible => Some((
+            (*row).max(clip.r0),
+            (*row + i64::from(item.height.max(1))).min(clip.r1),
+            (*col).max(clip.c0),
+            (*col + i64::from(item.width)).min(clip.c1),
+        )),
+        _ => None,
+    }
+}
+
+fn cell_bounds_overlap(left: (i64, i64, i64, i64), right: (i64, i64, i64, i64)) -> bool {
+    left.0 < right.1 && right.0 < left.1 && left.2 < right.3 && right.2 < left.3
+}
+
+/// A terminal text spelling is emitted whole unless a LATER paint operation
+/// genuinely overlaps it in canonical CSS pixels. Adjacent proportional runs
+/// can round into the same terminal cell without overlapping in CSS; that is
+/// an adapter collision, not permission to delete either run. Operations that
+/// exist only in cell space (generated border chrome) use the cell fallback.
+fn preserve_text_op(ops: &[Op], index: usize) -> bool {
+    let Op::Item {
+        item,
+        bounds: Some(bounds),
+        ..
+    } = &ops[index]
+    else {
+        return false;
+    };
+    if !is_terminal_text_run(item) {
+        return false;
+    }
+    let cells = op_cell_bounds(&ops[index]);
+    !ops[index + 1..].iter().any(|later| {
+        if let Some(later_bounds) = op_paint_bounds(later) {
+            paint_bounds_overlap(*bounds, later_bounds)
+        } else {
+            cells
+                .zip(op_cell_bounds(later))
+                .is_some_and(|(left, right)| cell_bounds_overlap(left, right))
+        }
+    })
+}
+
+/// Composite the display list into `Doc` rows. Canonically non-overlapping
+/// text stays whole while every operation still stamps paint-order ownership;
+/// genuine later CSS paint therefore covers earlier text, but cell rounding
+/// alone cannot manufacture a substring. `alpha`
 /// (URL→`has_alpha`) and `composites` drive the P8 overlap grouping: image
 /// fragments that overlap and where an upper image is transparent are folded
 /// into ONE synthetic `x-trust-composite:` emission (registered in `composites`)
@@ -2524,6 +2865,9 @@ fn composite(
     composites: &mut Composites,
 ) -> Vec<Row> {
     let cols_u = cols as u32;
+    let preserve_text: Vec<bool> = (0..ops.len())
+        .map(|index| preserve_text_op(&ops, index))
+        .collect();
     let mut grid: Vec<RowSpans> = Vec::new();
     let ensure = |grid: &mut Vec<RowSpans>, row: usize| {
         while grid.len() <= row {
@@ -2543,6 +2887,7 @@ fn composite(
                 col0,
                 col1,
                 clip,
+                bounds: _,
             } => {
                 // Intersect the fill with its clip and the viewport.
                 let c0 = col0.max(clip.c0).clamp(0, cols_u as i64) as u32;
@@ -2562,13 +2907,21 @@ fn composite(
                 col,
                 mut item,
                 clip,
+                bounds: _,
+                text_clip_resolved,
             } => {
-                // Horizontal clip band = the op's clip ∩ the viewport
-                // [0, cols); vertical band = [max(0, clip.r0), clip.r1). For a
-                // FULL_CLIP op these collapse to the plain viewport bounds, so
-                // unclipped content is composited exactly as before.
-                let lo = clip.c0.clamp(0, cols_u as i64);
-                let hi = clip.c1.clamp(lo, cols_u as i64);
+                let text_run = is_terminal_text_run(&item);
+                let horizontal_clip_resolved = text_clip_resolved && text_run;
+                // Text's horizontal CSS clip has already been applied to its
+                // shaped clusters. Only the actual terminal viewport clips the
+                // resulting cell string. Atomic boxes continue to use their
+                // quantized CSS clip in both axes.
+                let (lo, hi) = if horizontal_clip_resolved {
+                    (0, cols_u as i64)
+                } else {
+                    let lo = clip.c0.clamp(0, cols_u as i64);
+                    (lo, clip.c1.clamp(lo, cols_u as i64))
+                };
                 let band0 = clip.r0.max(0);
                 let band1 = clip.r1;
                 let mut col = col;
@@ -2641,6 +2994,7 @@ fn composite(
                     row: top,
                     col: c0,
                     item,
+                    preserve_text: preserve_text[i],
                 }));
             }
             Op::Hit {
@@ -2688,9 +3042,9 @@ fn composite(
             rows.push(Row::default());
         }
     };
-    // Opaque pixel rects per row: text landing inside them is dropped (the
-    // image pass paints pixels over those cells regardless — a composite renders
-    // its whole box as one widget too, so text under it drops the same way).
+    // Opaque pixel rects per row: later sliceable text/atomic boxes do not
+    // claim image cells. Canonically non-overlapping text bypasses only the
+    // ownership-derived substring, not the paint-order stamping pass.
     let mut pixels: Vec<Vec<(u32, u32)>> = Vec::new();
     for (i, p) in placed.iter().enumerate() {
         let Some(p) = p else { continue };
@@ -2767,14 +3121,22 @@ fn composite(
             crop: false,
             pixelated: false,
             invisible: false,
+            terminal_band: base.item.terminal_band,
         });
         composites.insert(key, layers);
     }
-    // ---- emission pass 2: sliceable items (text, widgets, blank boxes) ----
+    // ---- emission pass 2: preserved text runs, then sliceable items ----
     for (i, p) in placed.iter().enumerate() {
         let Some(p) = p else { continue };
         if p.item.image.is_some() && !p.item.invisible {
             continue; // emitted above
+        }
+        if p.preserve_text && is_terminal_text_run(&p.item) {
+            let mut item = p.item.clone();
+            item.col = p.col.min(u32::from(u16::MAX)) as u16;
+            ensure_rows(&mut rows, p.row + usize::from(item.height.max(1)));
+            rows[p.row].items.push(item);
+            continue;
         }
         let Some(g) = grid.get(p.row) else { continue };
         let mut segs = g.owned(i);
@@ -2799,8 +3161,9 @@ fn composite(
             rows[p.row].items.push(item);
         }
     }
-    // Consumers walk a row's items left-to-right; compositing guarantees
-    // non-overlap, so column order is total. Stable for determinism.
+    // Consumers walk a row's items left-to-right. Text may share a preferred
+    // column after proportional-to-cell quantization; `visual_columns` extends
+    // the later run without mutating either item's content. Keep this stable.
     for row in &mut rows {
         row.items.sort_by_key(|it| it.col);
     }
@@ -2850,6 +3213,7 @@ fn composite(
             crop: false,
             pixelated: false,
             invisible: true,
+            terminal_band: None,
         });
         rows[hit.row].hits.push(HitBox {
             col: hit.col.min(u32::from(u16::MAX)) as u16,
@@ -2869,6 +3233,7 @@ struct Placed {
     row: usize,
     col: u32,
     item: Item,
+    preserve_text: bool,
 }
 
 struct PlacedHit {

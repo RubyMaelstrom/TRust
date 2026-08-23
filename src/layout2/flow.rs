@@ -121,6 +121,7 @@ pub(crate) enum FragKind<'t> {
 #[derive(Clone, Debug)]
 pub(crate) struct LineFrag {
     pub pieces: Vec<Piece>,
+    pub contains_atomic_inline: bool,
     pub width: f32,
     pub height: f32,
     pub baseline: f32,
@@ -1403,6 +1404,7 @@ impl Flow<'_> {
             let hpx = line.height;
             let line_frag = LineFrag {
                 pieces: line.pieces,
+                contains_atomic_inline: line.contains_atomic_inline,
                 width: line.width,
                 height: line.height,
                 baseline: line.baseline,
@@ -1548,6 +1550,7 @@ impl Flow<'_> {
             clip: None,
             kind: FragKind::Line(LineFrag {
                 pieces,
+                contains_atomic_inline: false,
                 width: w,
                 height: h,
                 baseline,
@@ -2887,6 +2890,7 @@ impl Flow<'_> {
                 pieces: vec![Piece::boxed(
                     item, r.box_w, r.box_h, r.off_x, r.off_y, r.paint_w, r.paint_h,
                 )],
+                contains_atomic_inline: false,
                 width: r.box_w,
                 height: r.box_h,
                 baseline: r.box_h,

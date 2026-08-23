@@ -5002,6 +5002,12 @@ impl App {
             for row in &mut new_rows {
                 for it in &mut row.items {
                     it.col += origin_col;
+                    it.terminal_band = it.terminal_band.map(|(left, right)| {
+                        (
+                            left.saturating_add(origin_col),
+                            right.saturating_add(origin_col),
+                        )
+                    });
                 }
             }
         }
@@ -12070,6 +12076,266 @@ mod tests {
                 term.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn steam_navigation_survives_ten_terminal_framebuffer_paints() {
+        use std::{
+            io::{self, Write},
+            sync::{Arc, Mutex},
+        };
+
+        use ratatui::{
+            Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect,
+        };
+
+        #[derive(Clone, Default)]
+        struct SharedBytes(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for SharedBytes {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        const HTML: &str = r#"<body style="margin:0;font:14px/20px Arial,sans-serif">
+          <div style="height:40px"></div>
+          <nav style="margin-left:42px;display:flex;gap:18px">
+            <a style="width:60px;overflow:hidden;white-space:nowrap">Browse</a>
+            <a style="width:130px;overflow:hidden;white-space:nowrap">Recommendations</a>
+            <a style="width:85px;overflow:hidden;white-space:nowrap">Categories</a>
+            <a style="width:75px;overflow:hidden;white-space:nowrap">Hardware</a>
+            <a style="width:110px;overflow:hidden;white-space:nowrap">Ways to Play</a>
+            <a style="width:150px;overflow:hidden;white-space:nowrap">Special Sections</a>
+          </nav>
+        </body>"#;
+
+        const ARROW: &str = "https://store.steampowered.com/dropdown-arrow.png";
+        let url = url::Url::parse("https://store.steampowered.com/").unwrap();
+        let parse = |columns| {
+            let mut doc = crate::http::parse_terminal(
+                &url,
+                "text/html; charset=utf-8",
+                HTML.as_bytes(),
+                columns,
+                18,
+                (10, 20),
+                &crate::layout2::ImageSizes::new(),
+            );
+            // Steam's delayed dropdown SVGs begin one raw cell before the end
+            // of their labels after proportional CSS geometry is quantized.
+            // `visual_columns` moves each atomic icon after the complete word;
+            // the decoded-image pass must use that same placement.
+            for label in ["Browse", "Recommendations", "Hardware"] {
+                let (row_index, col, terminal_band) = doc
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .find_map(|(row_index, row)| {
+                        row.items
+                            .iter()
+                            .find(|item| item.text == label)
+                            .map(|item| (row_index, item.col + item.width - 1, item.terminal_band))
+                    })
+                    .expect("fixture label");
+                doc.rows[row_index].items.push(crate::layout2::Item {
+                    col,
+                    width: 2,
+                    height: 1,
+                    text: String::new(),
+                    kind: crate::layout2::ItemKind::Image,
+                    image: Some(String::from(ARROW)),
+                    emph: crate::layout2::Emphasis::default(),
+                    node: crate::layout2::NO_NODE,
+                    link: None,
+                    crop: false,
+                    pixelated: false,
+                    invisible: false,
+                    terminal_band,
+                });
+                doc.rows[row_index].items.sort_by_key(|item| item.col);
+            }
+            doc
+        };
+        let mut app = super::App::new(None, 23);
+        app.mode = super::Mode::Session;
+        app.last_inner = (128, 18);
+        app.navigate_to(parse(128));
+
+        let output = SharedBytes::default();
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(output.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 130, 20)),
+            },
+        )
+        .unwrap();
+        let mut displayed = super::new_vt(20, 130);
+        let mut consumed = 0;
+        for frame in 0..10 {
+            if frame == 1 {
+                terminal.resize(Rect::new(0, 0, 131, 20)).unwrap();
+                displayed.screen_mut().set_size(20, 131);
+            }
+            if frame == 2 {
+                // Model the delayed live-page replacement which schedules the
+                // repaint in the reported failure: same DOM contents, freshly
+                // adapted terminal document at the resized viewport.
+                app.browser.as_mut().unwrap().doc = parse(129);
+            }
+            if frame == 3 {
+                // The first frames contain only the correctly placed reserved
+                // cells. The bug appeared precisely when decode completed and
+                // the image pass began painting those cells.
+                let arrow = app
+                    .browser
+                    .as_ref()
+                    .unwrap()
+                    .doc
+                    .rows
+                    .iter()
+                    .flat_map(|row| &row.items)
+                    .find(|item| item.image.as_deref() == Some(ARROW))
+                    .unwrap();
+                let key = super::EncKey::for_item(ARROW, arrow);
+                let (decoded, _) = crate::img::decode(&crate::img::red_png()).unwrap();
+                let protocol = crate::img::encode_sliced(
+                    &app.picker,
+                    decoded,
+                    ratatui::layout::Size::new(key.w, key.h),
+                    key.crop,
+                    key.pixelated,
+                )
+                .unwrap();
+                app.image_protocols.insert(key, protocol);
+            }
+            terminal
+                .draw(|framebuffer| crate::ui::draw(framebuffer, &mut app))
+                .unwrap();
+            let bytes = output.0.lock().unwrap();
+            displayed.process(&bytes[consumed..]);
+            consumed = bytes.len();
+            let screen = displayed.screen().contents();
+            for label in [
+                "Browse",
+                "Recommendations",
+                "Categories",
+                "Hardware",
+                "Ways to Play",
+                "Special Sections",
+            ] {
+                assert!(
+                    screen.contains(label),
+                    "frame {frame} framebuffer omitted {label:?}:\n{screen}"
+                );
+            }
+        }
+    }
+
+    /// Replays an actual `script(1)` capture of TRust's Crossterm output into
+    /// the same VT parser used by the application. This is intentionally a
+    /// manual diagnostic because its input is a live terminal session:
+    /// `TRUST_TTY_CAPTURE=/tmp/session.out TRUST_TTY_TIMING=/tmp/session.time`.
+    #[test]
+    #[ignore = "manual diagnostic, needs a script(1) output and timing log"]
+    fn replay_ten_real_terminal_frames() {
+        let capture = std::fs::read(std::env::var("TRUST_TTY_CAPTURE").unwrap()).unwrap();
+        let timing = std::fs::read_to_string(std::env::var("TRUST_TTY_TIMING").unwrap()).unwrap();
+        let (cols, rows) = std::env::var("TRUST_TTY_SIZE")
+            .unwrap_or_else(|_| String::from("130x20"))
+            .split_once('x')
+            .map(|(cols, rows)| (cols.parse::<u16>().unwrap(), rows.parse::<u16>().unwrap()))
+            .unwrap();
+        let start = capture
+            .windows(b"\x1b[?1049h".len())
+            .position(|window| window == b"\x1b[?1049h")
+            .expect("capture did not enter the alternate screen");
+        let mut offset = start;
+        let mut elapsed = 0.0f64;
+        let mut terminal = super::new_vt(rows, cols);
+        let mut frames = Vec::new();
+        let mut navigation_at = None;
+        let mut samples = Vec::new();
+        let sample_times = [1.0, 5.0, 10.0];
+        for line in timing.lines() {
+            let mut fields = line.split_whitespace();
+            if fields.next() != Some("O") {
+                continue;
+            }
+            elapsed += fields.next().unwrap().parse::<f64>().unwrap();
+            let count = fields.next().unwrap().parse::<usize>().unwrap();
+            let end = offset + count;
+            terminal.process(&capture[offset..end]);
+            offset = end;
+            let screen = terminal.screen().contents();
+            if screen.contains("Browse") || screen.contains("Recommendations") {
+                let navigation_at = *navigation_at.get_or_insert(elapsed);
+                frames.push((elapsed, screen));
+                if samples.len() < sample_times.len()
+                    && elapsed - navigation_at >= sample_times[samples.len()]
+                {
+                    samples.push((elapsed - navigation_at, terminal.screen().clone()));
+                }
+            }
+        }
+        for (elapsed, screen) in &samples {
+            eprintln!("SAMPLE +{elapsed:.3}s\n{}\n", screen.contents());
+            let contents = screen.contents();
+            for label in [
+                "Browse",
+                "Recommendations",
+                "Categories",
+                "Hardware",
+                "Ways to Play",
+                "Special Sections",
+            ] {
+                assert!(
+                    contents.contains(label),
+                    "live terminal sample +{elapsed:.3}s omitted {label:?}:\n{contents}"
+                );
+            }
+            for row in 0..rows {
+                let text = (0..cols)
+                    .filter_map(|col| screen.cell(row, col))
+                    .map(|cell| cell.contents())
+                    .collect::<String>();
+                if text.contains("Brows") || text.contains("Recommend") {
+                    eprint!("row {row} cells:");
+                    for col in 0..cols {
+                        let Some(cell) = screen.cell(row, col) else {
+                            continue;
+                        };
+                        if cell.has_contents() {
+                            eprint!(
+                                " {col}={:?}/fg={:?}/bg={:?}",
+                                cell.contents(),
+                                cell.fgcolor(),
+                                cell.bgcolor()
+                            );
+                        }
+                    }
+                    eprintln!();
+                }
+            }
+        }
+        assert!(
+            frames.len() >= 10,
+            "only captured {} candidate frames",
+            frames.len()
+        );
+        assert_eq!(
+            samples.len(),
+            sample_times.len(),
+            "capture ended before +10s"
+        );
     }
 
     /// The core of the `SlicedProtocol` switch: a box encodes ONCE and every

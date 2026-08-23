@@ -818,6 +818,12 @@ pub fn lay_subtree_fragment(
         for row in &mut out.rows {
             for item in &mut row.items {
                 item.col = item.col.saturating_sub(origin_col);
+                item.terminal_band = item.terminal_band.map(|(left, right)| {
+                    (
+                        left.saturating_sub(origin_col),
+                        right.saturating_sub(origin_col),
+                    )
+                });
             }
             for hit in &mut row.hits {
                 hit.col = hit.col.saturating_sub(origin_col);
@@ -912,6 +918,7 @@ fn page_media_fallback(model: &terminal::TerminalPaintModel, cols: usize, rows: 
                 crop: false,
                 pixelated: false,
                 invisible: false,
+                terminal_band: None,
             }
         }
         None => Item {
@@ -927,6 +934,7 @@ fn page_media_fallback(model: &terminal::TerminalPaintModel, cols: usize, rows: 
             crop: false,
             pixelated: false,
             invisible: false,
+            terminal_band: None,
         },
     };
     let extra = usize::from(item.height.max(1)) - 1;
@@ -1039,6 +1047,28 @@ mod tests {
 
     fn lay_images(html: &str, cols: usize, images: &ImageSizes) -> Output {
         lay_full(html, cols, images, &HashMap::new())
+    }
+
+    fn lay_with_cells(html: &str, cols: usize, cell_width: f32, cell_height: f32) -> Output {
+        let html = html.to_string();
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(move || {
+                let dom = Dom::parse_document(&html);
+                let base = Url::parse("http://e.com/").unwrap();
+                lay_out_document(
+                    &dom,
+                    &base,
+                    TerminalViewport::new(cols, 24, cell_width, cell_height),
+                    &[],
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &HashMap::new(),
+                )
+            })
+            .unwrap()
+            .join()
+            .unwrap()
     }
 
     /// Lay out with an explicit `has_alpha` map, to exercise the P8 overlap
@@ -1651,6 +1681,27 @@ mod tests {
             })
             .unwrap();
         assert!((run.advance - crate::text::shape("ab", &style).advance).abs() < 0.01);
+    }
+
+    #[test]
+    fn soft_wrap_before_punctuation_word_when_its_first_break_does_not_fit() {
+        // CSS Text 3 §5: the collapsible space is a valid soft-wrap
+        // opportunity. If the next word also contains a later opportunity
+        // (the hyphen), that later segment must not be forced into the
+        // remaining sliver and overflow an otherwise wrap-capable line.
+        let layout = lay_graphical(
+            r#"<body style="margin:0"><div style="width:100px;font:15px Arial">prefixword Ubuntu-based</div></body>"#,
+            300.0,
+            &HashMap::new(),
+        );
+        for primitive in &layout.paint.primitives {
+            if let crate::render::Primitive::GlyphRun { origin, shaped, .. } = primitive {
+                assert!(
+                    origin.x + shaped.advance <= 100.01,
+                    "a breakable line must fit its line box: origin={origin:?}, shaped={shaped:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3184,6 +3235,328 @@ mod tests {
     }
 
     #[test]
+    fn terminal_flex_nav_does_not_reflow_at_overflow_visible_item_edges() {
+        // CSS Overflow 3 §3.1: `overflow:visible` renders content outside a
+        // box instead of clipping it. The fixed-cell adapter must therefore
+        // not reinterpret every proportional flex-item edge as a new wrapping
+        // boundary. At a 10px terminal cell, these 14px sans-serif labels need
+        // more cells than their graphical advances, matching Steam's store nav.
+        let out = lay_with_cells(
+            r#"<body style="margin:0"><nav style="display:flex;width:730px;gap:32px;font-size:14px">
+                <a>Browse</a><a>Recommendations</a><a>Categories</a>
+                <a>Hardware</a><a>Ways to Play</a><a>Special Sections</a>
+               </nav></body>"#,
+            73,
+            10.0,
+            18.0,
+        );
+        let painted = out.rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        for label in [
+            "Browse",
+            "Recommendations",
+            "Categories",
+            "Hardware",
+            "Ways to Play",
+        ] {
+            assert!(
+                painted.contains(label),
+                "terminal adaptation must preserve {label:?} as one line: {painted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_reflows_inside_the_inline_formatting_context_band() {
+        // CSS Inline 3 §2.1: a block container's content edges form the
+        // containing block for its line boxes. The terminal adapter must use
+        // that retained band, not the viewport edge. This is the essential
+        // geometry of rubymaelstrom.com: a centered 65vw body with padding.
+        let text = "One proportional line can contain substantially more terminal cells than its shaped CSS width, but every adapted continuation must remain inside this centered content box instead of escaping across the right margin.";
+        let html = format!(
+            r#"<body style="box-sizing:border-box;margin:0 17.5vw;width:65vw;padding:20px;font-size:15px">
+                 <p style="margin:0">{text}</p>
+               </body>"#
+        );
+        let out = lay_with_cells(&html, 100, 10.0, 20.0);
+        let content_right = 81u16; // ceil((17.5vw + 65vw - 20px) / 10px)
+        for item in out.rows.iter().flat_map(|row| &row.items) {
+            assert!(
+                item.col.saturating_add(item.width) <= content_right,
+                "adapted text escaped the line-box band: {item:?}"
+            );
+        }
+        let painted_words = out
+            .rows
+            .iter()
+            .flat_map(|row| &row.items)
+            .flat_map(|item| item.text.split_whitespace())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            painted_words,
+            text.split_whitespace().collect::<Vec<_>>(),
+            "terminal reflow must preserve the canonical word sequence"
+        );
+    }
+
+    #[test]
+    fn terminal_reflow_preserves_soft_line_carries_before_the_next_block() {
+        // Exact structural reduction of rubymaelstrom.com/200226.html. Long
+        // proportional lines reflow into a centered fixed-cell band, including
+        // a styled inline in the following paragraph. No continuation may be
+        // overwritten by the next block or reordered at a canonical soft-line
+        // handoff.
+        let first = "I've always found it to be a lot of fun when there are books in video games. Finding books that I could actually read in the Elder Scrolls, books and newspapers on merchants in Everquest, or player-written books left in libraries private and public in Ultima Online, have always been things which brought me joy over the years. There's lots of more convenient ways to read a book than in a tiny window inside of a video game, but reading them in that context gives the world more life than it had before. It makes it feel like there's actually people occupying the environment, or at the very least that somebody cared enough about the setting to write something down about it for me to find.";
+        let second_before = "Second Life isn't";
+        let second_after = "a video game, but books in Second Life occupy a similar space in my head as books in games do. In Second Life, everything is intentional. If a book is there, somebody put it there for you to read. There have been people taking the time to either write or copy over writing into Second Life ever since it began in 2003, and of course there are plenty doing so to this very day. There are writers groups, libraries, bookstores, museums, exhibitions, etc. Heck, I found a Linden area from the mid-2000's the other day where someone had attempted to keep an in-world log of every single patch note for Second Life since the beginning. Is that a great work of literature? No. Is it neat to find and adds more of that \"flavor\" to the world like I was talking about before? Very much yes.";
+        let html = format!(
+            r#"<body style="box-sizing:border-box;margin:0 17.5vw;width:65vw;padding:20px;font-family:sans-serif;font-size:15px">
+                 <p>{first}</p>
+                 <p>{second_before} <i>exactly</i> {second_after}</p>
+               </body>"#
+        );
+        let out = lay_with_cells(&html, 98, 10.0, 20.0);
+        let painted_words = out
+            .rows
+            .iter()
+            .flat_map(|row| &row.items)
+            .flat_map(|item| item.text.split_whitespace())
+            .collect::<Vec<_>>();
+        let expected = format!("{first} {second_before} exactly {second_after}");
+        assert_eq!(
+            painted_words,
+            expected.split_whitespace().collect::<Vec<_>>(),
+            "terminal reflow must preserve every word across lines and blocks"
+        );
+    }
+
+    #[test]
+    fn terminal_clip_preserves_a_fitting_run_before_later_overflow() {
+        // CSS Overflow 3 §5.1 clips at the character/glyph level. A later
+        // run can make the line overflow without changing the fact that an
+        // earlier run is wholly inside the clip. With the box starting at a
+        // half-cell offset, deciding preservation for the whole line used to
+        // turn the fitting "Browse" into "Brows" after terminal quantization.
+        let out = lay_with_cells(
+            r#"<body style="margin:0;font:14px/20px Arial,sans-serif">
+                 <div style="margin-left:5px;width:54px;overflow:hidden;white-space:nowrap">
+                   <span>Browse</span><span> trailing overflow</span>
+                 </div>
+               </body>"#,
+            20,
+            10.0,
+            20.0,
+        );
+        let painted = out.rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            painted.contains("Browse"),
+            "a canonically fitting run must not inherit later line overflow: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_fixed_nav_preserves_every_label_character() {
+        let html = r#"<body style="margin:0;font:14px/20px Arial,sans-serif">
+                 <nav style="position:fixed;left:42px;top:40px;display:flex;gap:18px">
+                   <a style="width:60px;overflow:hidden;white-space:nowrap">Browse</a>
+                   <a style="width:130px;overflow:hidden;white-space:nowrap">Recommendations</a>
+                   <a style="width:85px;overflow:hidden;white-space:nowrap">Categories</a>
+                   <a style="width:75px;overflow:hidden;white-space:nowrap">Hardware</a>
+                 </nav>
+               </body>"#;
+        // A viewport rebuild follows the same path as the user's reliable
+        // resize reproduction. Repeat the original width after narrower and
+        // wider layouts so no later pass may turn an intact label into a
+        // character-count-clipped spelling.
+        for columns in [60, 114, 180, 114] {
+            let out = lay_with_cells(html, columns, 10.0, 20.0);
+            let painted = out
+                .fixed
+                .iter()
+                .flat_map(|fixed| fixed.rows.iter())
+                .map(row_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            for label in ["Browse", "Recommendations", "Categories", "Hardware"] {
+                assert!(
+                    painted.contains(label),
+                    "fixed-layer adaptation at {columns} columns omitted characters from {label:?}: {painted:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_collision_recovery_cannot_cross_independent_css_bands() {
+        fn item(col: u16, width: u16, text: &str, image: Option<&str>, band: (u16, u16)) -> Item {
+            Item {
+                col,
+                width,
+                height: 1,
+                text: text.to_owned(),
+                kind: if image.is_some() {
+                    ItemKind::Image
+                } else {
+                    ItemKind::Text
+                },
+                image: image.map(str::to_owned),
+                emph: Emphasis::default(),
+                node: NO_NODE,
+                link: None,
+                crop: false,
+                pixelated: false,
+                invisible: false,
+                terminal_band: Some(band),
+            }
+        }
+
+        // Reduction of DistroWatch's three table cells. Proportional layout
+        // put the sponsor at col 9, but an unrelated left-cell line that
+        // quantized onto the same row occupied through col 35. The old global
+        // cursor moved the 18-cell image to col 35, across the left cell's
+        // right edge at 44 and into the middle article. Center text could then
+        // similarly run directly into the right rankings cell.
+        let row = Row {
+            items: vec![
+                item(1, 34, "left headline expansion", None, (0, 44)),
+                item(9, 18, "", Some("https://e.test/3cx.png"), (0, 44)),
+                item(44, 55, "middle article", None, (44, 103)),
+                item(103, 20, "right rankings", None, (103, 130)),
+            ],
+            hits: Vec::new(),
+        };
+        let placed = crate::layout2::visual_columns(&row, &[], 0);
+        let at = |index| {
+            placed
+                .iter()
+                .find(|(item, ..)| *item == index)
+                .map(|(_, col, width, _)| (*col, *width))
+                .unwrap()
+        };
+        assert!(
+            placed.iter().all(|(item, ..)| *item != 1),
+            "an irreconcilable atomic overlap is omitted instead of overwriting text or crossing its panel"
+        );
+        assert_eq!(at(2), (44, 55), "the middle cell keeps its own origin");
+        assert_eq!(at(3), (103, 20), "the right cell keeps its own origin");
+        for (index, col, width, _) in placed {
+            if let Some((left, right)) = row.items[index].terminal_band {
+                assert!(col >= left && col + width <= right);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_table_cell_expansion_pushes_later_content_within_that_cell() {
+        let mut images = ImageSizes::new();
+        images.insert("http://e.com/sponsor.png".to_owned(), (160, 80));
+        let out = lay_images(
+            r#"<body style="margin:0;font:13px/16px Arial,sans-serif">
+               <table style="width:100%;table-layout:fixed"><tr>
+                 <td style="width:34%;vertical-align:top">
+                   <table style="width:88%"><tr><td>iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii iiii</td></tr></table>
+                   <table style="width:100%"><tr><td style="text-align:center"><img src="/sponsor.png"></td></tr></table>
+                   <table style="width:100%"><tr><td>First sponsor link must follow the full image box</td></tr></table>
+                 </td>
+                 <td style="width:46%;vertical-align:top">middle article text remains in the middle panel</td>
+                 <td style="width:20%;vertical-align:top">right rankings</td>
+               </tr></table></body>"#,
+            100,
+            &images,
+        );
+        let image_row = out
+            .rows
+            .iter()
+            .position(|row| row.items.iter().any(|item| item.image.is_some()))
+            .expect("decoded sponsor image");
+        let last_headline_row = out
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.items.iter().any(|item| item.text.contains("iiii")))
+            .map(|(row, _)| row)
+            .max()
+            .expect("headline text");
+        assert!(
+            image_row > last_headline_row,
+            "the later sponsor block must follow expanded left-cell text: headline row {last_headline_row}, image row {image_row}"
+        );
+        let image = out.rows[image_row]
+            .items
+            .iter()
+            .find(|item| item.image.is_some())
+            .unwrap();
+        let image_end = image_row + usize::from(image.height);
+        let first_link_row = out
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.items.iter().any(|item| item.text.contains("First")))
+            .map(|(row, _)| row)
+            .expect("following sponsor link");
+        assert!(
+            first_link_row >= image_end,
+            "the following table must start after every painted image row: image {image_row}..{image_end}, link row {first_link_row}"
+        );
+        let (left, right) = image.terminal_band.expect("table-cell band");
+        assert!(image.col >= left && image.col + image.width <= right);
+    }
+
+    #[test]
+    fn terminal_atomic_inline_and_following_text_keep_their_characters() {
+        // Steam's global action row combines an inline-block install button
+        // with following sign-in/language text. Their canonical boxes do not
+        // overlap, but independently-rounded terminal runs can share a cell.
+        let out = lay_with_cells(
+            r#"<body style="margin:0"><div style="width:241px;font:12px/24px Arial,sans-serif">
+                 <a style="display:inline-block;position:relative;z-index:0;width:116px"><span style="display:block;padding-left:35px">Install Steam</span></a><a>Sign in</a> | <a>language</a>
+               </div></body>"#,
+            40,
+            10.0,
+            18.0,
+        );
+        let rows = out.rows.iter().map(row_text).collect::<Vec<_>>();
+        let painted = rows.join("\n");
+        for label in ["Install Steam", "Sign in", "language"] {
+            assert!(
+                painted.contains(label),
+                "nested inline adaptation must preserve {label:?}: {painted:?}"
+            );
+        }
+        assert!(
+            rows.iter().any(|row| {
+                row.contains("Install Steam") && row.contains("Sign in") && row.contains("language")
+            }),
+            "an atomic paint context and its following CSS line must adapt together: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_preserves_a_canonically_fitting_run_across_a_real_clip() {
+        // A proportional run can fit its CSS overflow clip while its terminal
+        // spelling needs several fixed cells more. The clip must distinguish
+        // canonical overflow from adapter expansion; truncating to one extra
+        // cell produces the widespread `Security` -> `Securit` failure.
+        let out = lay_with_cells(
+            r#"<body style="margin:0;font:12px/20px monospace">
+                 <nav style="display:flex;gap:40px">
+                   <span style="display:block;width:60px;overflow:hidden;white-space:nowrap">Security</span>
+                   <span style="display:block;width:132px;overflow:hidden;white-space:nowrap">Apache-2.0 License</span>
+                 </nav>
+               </body>"#,
+            40,
+            10.0,
+            20.0,
+        );
+        let painted = out.rows.iter().map(row_text).collect::<Vec<_>>().join("\n");
+        for label in ["Security", "Apache-2.0 License"] {
+            assert!(
+                painted.contains(label),
+                "a run that fits canonically must survive terminal clipping: {label:?} in {painted:?}"
+            );
+        }
+    }
+
+    #[test]
     fn flex_grow_freezes_at_max_width_and_redistributes() {
         let out = lay(
             r#"<body style="margin:0"><div style="display:flex">
@@ -4417,14 +4790,15 @@ mod tests {
 
     #[test]
     fn overflow_hidden_truncates_a_wide_line() {
-        // Horizontal clip: an 8-col (64px) overflow:hidden box with nowrap
-        // content wider than it clips at the BOX's right edge, not the
-        // viewport's (viewport is 40 cols).
+        // Horizontal clipping is resolved from canonical shaped clusters,
+        // before the 64px box becomes eight terminal cells. In the default
+        // proportional face only seven complete/intersecting glyph clusters
+        // fit; fixed-cell character counting must not invent an eighth.
         let out = lay(
             r#"<body style="margin:0"><div style="width:64px;overflow:hidden;white-space:nowrap;margin:0">abcdefghijklmnop</div></body>"#,
             40,
         );
-        assert_eq!(row_text(&out.rows[0]), "abcdefgh");
+        assert_eq!(row_text(&out.rows[0]), "abcdefg");
     }
 
     #[test]

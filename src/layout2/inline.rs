@@ -219,6 +219,9 @@ pub(crate) struct AtomBoxPlace {
 #[derive(Debug)]
 pub(crate) struct LineOut {
     pub pieces: Vec<Piece>,
+    /// The line includes an atomic inline box whose independently laid
+    /// fragment must stay beside the remaining inline content.
+    pub contains_atomic_inline: bool,
     pub height: f32,
     pub baseline: f32,
     pub ascent: f32,
@@ -753,6 +756,23 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             };
             if cut > 0 && cut < rest.len() {
                 let (head, tail) = rest.split_at(cut);
+                // Parley returns the first legal in-word break even when that
+                // first segment cannot fit the REMAINDER of an occupied line
+                // (for example `Ubuntu-` after a nearly full prefix). CSS
+                // Text 3 §5 also supplies the preceding collapsed space as a
+                // soft-wrap opportunity. Take that earlier opportunity first;
+                // on the fresh line the whole word may fit, or Parley can
+                // choose its internal opportunity against the full line box.
+                let head_width = crate::text::shape(head, &ctx.text_style()).advance;
+                if may_wrap
+                    && ctx.ws.wraps()
+                    && self.pen > self.line_start
+                    && head_width > avail + 0.01
+                {
+                    self.soft_break();
+                    spaced = false;
+                    continue;
+                }
                 self.place(head, ctx, false, spaced);
                 self.soft_break();
                 rest = tail;
@@ -1360,8 +1380,10 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // The pen is the line's used extent. A contain-fitted replaced box
         // occupies its full object box even when its paint rectangle is less.
         let width = (self.pen - self.line_left).max(0.0);
+        let contains_atomic_inline = pieces.iter().any(|piece| piece.atom_box);
         let mut line = LineOut {
             pieces,
+            contains_atomic_inline,
             height,
             baseline,
             ascent,
@@ -1390,7 +1412,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         // drop their paint-nothing placeholders: the block flow splices the
         // box's real content fragment at each spot. Removal doesn't shift the
         // siblings — their x positions are already absolute on the line.
-        if line.pieces.iter().any(|p| p.atom_box) {
+        if line.contains_atomic_inline {
             let li = self.lines.len();
             for p in &line.pieces {
                 if p.atom_box {

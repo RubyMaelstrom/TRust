@@ -294,6 +294,12 @@ pub struct Item {
     /// React virtualized-list placeholders (`opacity:0` + cached height) report
     /// their real height instead of collapsing.
     pub invisible: bool,
+    /// Terminal-only collision scope inherited from the outermost independent
+    /// horizontal formatting context, expressed as `[left, right)`. Items in
+    /// one scope share a fixed-cell cursor without displacing sibling panels.
+    /// This is not an overflow clip; canonical CSS clipping remains decisive.
+    /// `None` is used by synthetic/non-layout items.
+    pub terminal_band: Option<(u16, u16)>,
 }
 
 /// Inline text emphasis, set by tags (`<b>`/`<i>`/`<u>`/`<s>`) and by CSS
@@ -754,11 +760,43 @@ pub fn visual_columns(
         .collect();
     placed.sort_by_key(|&(c, ..)| c);
     let mut out = Vec::with_capacity(placed.len());
-    let mut col = 0u16;
+    let mut unbanded_col = 0u16;
+    let mut band_cols: HashMap<(u16, u16), u16> = HashMap::new();
     for (scol, i, w, cut) in placed {
-        let start = scol.max(col);
-        out.push((i, start, w, cut));
-        col = start + w;
+        let item = &row.items[i];
+        let terminal_band = (!carousels
+            .iter()
+            .any(|carousel| carousel.contains_row(row_idx)))
+        .then_some(item.terminal_band)
+        .flatten()
+        .filter(|(left, right)| left < right);
+        if let Some((left, right)) = terminal_band {
+            let col = band_cols.entry((left, right)).or_insert(left);
+            let displaced = scol.max(*col).max(left);
+            // Atomic content cannot be partially represented or painted back
+            // over the text that displaced it. The vertical allocator keeps
+            // ordinary block successors on distinct rows; if an exceptional
+            // overlap still leaves no room, omit the atomic fallback for this
+            // cell frame instead of overwriting text or crossing the panel.
+            if (item.image.is_some() || item.text.is_empty())
+                && scol >= left
+                && scol.saturating_add(w) <= right
+                && displaced.saturating_add(w) > right
+            {
+                continue;
+            }
+            // A band scopes collision recovery; it is not itself an overflow
+            // clip. Canonical CSS clipping was already resolved from shaped
+            // clusters in paint, while `overflow:visible` and independently
+            // sized flex/atomic labels must retain their complete spelling.
+            let start = displaced;
+            out.push((i, start, w, cut));
+            *col = start.saturating_add(w);
+        } else {
+            let start = scol.max(unbanded_col);
+            out.push((i, start, w, cut));
+            unbanded_col = start + w;
+        }
     }
     out
 }
@@ -857,6 +895,13 @@ pub fn effective_row<'a>(
                 }
             }
             it.col += rg.left;
+            it.terminal_band = Some(
+                it.terminal_band
+                    .map(|(left, right)| {
+                        (left.saturating_add(rg.left), right.saturating_add(rg.left))
+                    })
+                    .unwrap_or((rg.left, rg.left.saturating_add(rg.width))),
+            );
             item_map.insert(bi, merged.items.len());
             merged.items.push(it);
         }
