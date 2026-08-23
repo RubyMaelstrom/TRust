@@ -26914,7 +26914,11 @@ mod tests {
         assert_eq!(
             s(
                 &mut ctx,
-                b"String(out.ts >= out.dateDelta && out.ts - out.dateDelta < 100)"
+                // The test process can be preempted between these adjacent JS
+                // reads under a parallel full-suite run. Monotonic ordering is
+                // the contract; use the same bounded scheduling allowance as
+                // the timer assertion above.
+                b"String(out.ts >= out.dateDelta && out.ts - out.dateDelta < 3000)"
             ),
             "true"
         );

@@ -209,8 +209,13 @@ mod tests {
 
         let frame = render_html(FIXTURE, &base, CssSize::new(240.0, 180.0)).unwrap();
         assert_eq!(frame.pixels.len(), 240 * 180 * 4);
-        let distinct: std::collections::HashSet<_> =
-            frame.pixels.chunks_exact(4).map(<[u8]>::to_vec).collect();
+        let distinct: std::collections::HashSet<_> = frame
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| pixel.to_vec())
+            .collect();
         assert!(
             distinct.len() > 8,
             "fixture should rasterize varied page paint"
@@ -228,7 +233,9 @@ mod tests {
         .unwrap();
         let non_background = frame
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|pixel| pixel[0] > 40 || pixel[1] > 40 || pixel[2] > 40)
             .count();
         assert!(
@@ -280,8 +287,9 @@ mod tests {
         assert!(
             frame
                 .pixels
-                .chunks_exact(4)
-                .any(|pixel| pixel == [90, 45, 114, 255]),
+                .as_chunks::<4>()
+                .0
+                .contains(&[90, 45, 114, 255]),
             "the visible child background was lost during rasterization"
         );
     }
@@ -306,8 +314,8 @@ mod tests {
         "#;
         let frame = render_html(html, &base, CssSize::new(180.0, 140.0)).unwrap();
         let mut red_pixels = 0;
-        for (index, pixel) in frame.pixels.chunks_exact(4).enumerate() {
-            if pixel != [255, 0, 0, 255] {
+        for (index, pixel) in frame.pixels.as_chunks::<4>().0.iter().enumerate() {
+            if *pixel != [255, 0, 0, 255] {
                 continue;
             }
             red_pixels += 1;
@@ -392,8 +400,9 @@ mod tests {
         assert!(
             frame
                 .pixels
-                .chunks_exact(4)
-                .any(|pixel| pixel == [255, 0, 128, 255])
+                .as_chunks::<4>()
+                .0
+                .contains(&[255, 0, 128, 255])
         );
     }
 

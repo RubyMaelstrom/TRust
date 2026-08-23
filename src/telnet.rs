@@ -219,7 +219,7 @@ fn linemode_reply(parser: &mut Parser, payload: &[u8]) -> (Option<TelnetEvents>,
 /// (all triples already acknowledged), which ends the handshake.
 fn slc_ack(parser: &mut Parser, triples: &[u8]) -> Option<TelnetEvents> {
     let mut out = vec![linemode::SLC];
-    for triple in triples.chunks_exact(3) {
+    for triple in triples.as_chunks::<3>().0 {
         let (func, flags, ch) = (triple[0], triple[1], triple[2]);
         if flags & linemode::SLC_ACK == 0 {
             out.extend_from_slice(&[func, flags | linemode::SLC_ACK, ch]);
