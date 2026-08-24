@@ -9,7 +9,7 @@
 
 use std::borrow::Cow;
 use std::io::Read as _;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use image::{AnimationDecoder as _, DynamicImage, ImageDecoder as _};
@@ -946,7 +946,8 @@ fn secure_svg_options() -> resvg::usvg::Options<'static> {
     options.default_size = resvg::usvg::Size::from_wh(300.0, 150.0).unwrap();
     options.font_size = 16.0;
     options.resources_dir = None;
-    options.fontdb = svg_fontdb().clone();
+    options.fontdb = crate::font_system::svg_fontdb();
+    options.font_resolver = crate::font_system::svg_font_resolver();
     options.image_href_resolver = resvg::usvg::ImageHrefResolver {
         resolve_data: Box::new(|mime, data, options| {
             if data.len() > MAX_SVG_BYTES {
@@ -970,15 +971,6 @@ fn secure_svg_options() -> resvg::usvg::Options<'static> {
         resolve_string: Box::new(|_, _| None),
     };
     options
-}
-
-fn svg_fontdb() -> &'static Arc<resvg::usvg::fontdb::Database> {
-    static FONTS: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
-    FONTS.get_or_init(|| {
-        let mut db = resvg::usvg::fontdb::Database::new();
-        db.load_system_fonts();
-        Arc::new(db)
-    })
 }
 
 fn bounded_svg_data(bytes: &[u8]) -> Result<Cow<'_, [u8]>, String> {
@@ -1634,6 +1626,19 @@ mod tests {
         assert_eq!(protocol_info, metadata);
         assert!(protocol.size().width <= cells.width);
         assert!(protocol.size().height <= cells.height);
+    }
+
+    #[test]
+    fn svg_text_uses_the_shared_caseless_font_catalog() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="90" height="30">
+            <text x="2" y="22" font-family="dEjAvU sAnS" font-size="20" fill="white">TRust</text>
+        </svg>"#;
+        let (image, mime) = decode(svg).unwrap();
+        assert_eq!(mime, SVG_MIME);
+        assert!(
+            image.to_rgba8().pixels().any(|pixel| pixel[3] != 0),
+            "font selection must leave visible SVG text outlines"
+        );
     }
 
     #[test]

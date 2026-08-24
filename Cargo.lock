@@ -16,6 +16,7 @@ dependencies = [
  "bytes",
  "crossterm",
  "flate2",
+ "fontdb",
  "futures",
  "glifo",
  "html5ever",
@@ -28,6 +29,7 @@ dependencies = [
  "ratatui-image",
  "rcgen",
  "resvg",
+ "roxmltree",
  "rustc-hash 2.1.2",
  "serde_json",
  "sha2 0.11.0",
@@ -37,7 +39,9 @@ dependencies = [
  "tiny-skia 0.12.0",
  "tokio",
  "tokio-rustls",
+ "ttf-parser",
  "tui-term",
+ "unicode-casefold",
  "unicode-segmentation",
  "unicode-width",
  "url",
@@ -1712,21 +1716,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "fontconfig-parser"
-version = "0.5.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbc773e24e02d4ddd8395fd30dc147524273a83e54e0f312d986ea30de5f5646"
-dependencies = [
- "roxmltree 0.20.0",
-]
-
-[[package]]
 name = "fontdb"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "457e789b3d1202543297a350643cf459f836cade38934e7a4cf6a39e7cde2905"
 dependencies = [
- "fontconfig-parser",
  "log",
  "slotmap",
  "tinyvec",
@@ -1736,8 +1730,6 @@ dependencies = [
 [[package]]
 name = "fontique"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e04c4750a17111ebd77c3e0aea00476ce33f59235bc4d9e7f0aded5033ad3fc"
 dependencies = [
  "hashbrown 0.17.1",
  "linebender_resource_handle",
@@ -1748,11 +1740,11 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parlance",
  "read-fonts 0.40.2",
- "roxmltree 0.21.1",
+ "roxmltree",
  "smallvec",
+ "unicode-casefold",
  "windows 0.62.2",
  "windows-core 0.62.2",
- "yeslogic-fontconfig-sys",
 ]
 
 [[package]]
@@ -4408,12 +4400,6 @@ dependencies = [
 
 [[package]]
 name = "roxmltree"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
-
-[[package]]
-name = "roxmltree"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
@@ -5563,6 +5549,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5dfa6e8c60bb66d49db113e0125ee8711b7647b5579dc7f5f19c42357ed039fe"
 
 [[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
+
+[[package]]
 name = "unicode-ccc"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5659,7 +5651,7 @@ dependencies = [
  "kurbo",
  "log",
  "pico-args",
- "roxmltree 0.21.1",
+ "roxmltree",
  "rustybuzz",
  "simplecss",
  "siphasher",
@@ -7061,17 +7053,6 @@ checksum = "b5f6765e852b9b4dc8e2a76843e4d64d1cea8e79bcde0b6901aea8e7c7f08282"
 dependencies = [
  "bit-vec 0.9.1",
  "time",
-]
-
-[[package]]
-name = "yeslogic-fontconfig-sys"
-version = "6.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d8b8abf912b9a29ff112e1671c97c33636903d13a69712037190e6805af4f76"
-dependencies = [
- "dlib",
- "once_cell",
- "pkg-config",
 ]
 
 [[package]]
