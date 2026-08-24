@@ -1160,13 +1160,13 @@ mod tests {
         // come out wide enough to hold the whole float bar on one shelf, not
         // shrink to the widest single item and wrap every float below.
         let out = lay(
-            r#"<body style="margin:0"><div style="position:absolute;left:200px">
-                <a style="display:block;float:left;padding:45px 7px 7px;position:relative">STORE</a>
-                <a style="display:block;float:left;padding:45px 7px 7px;position:relative">COMMUNITY</a>
-                <a style="display:block;float:left;padding:45px 7px 7px;position:relative">ABOUT</a>
-                <a style="display:block;float:left;padding:45px 7px 7px;position:relative">SUPPORT</a>
+            r#"<body style="margin:0"><div style="position:absolute;left:200px;font:18px Arial,sans-serif">
+                <a style="display:block;float:inline-start;padding:45px 7px 7px;position:relative">STORE</a>
+                <a style="display:block;float:inline-start;padding:45px 7px 7px;position:relative">COMMUNITY</a>
+                <a style="display:block;float:inline-start;padding:45px 7px 7px;position:relative">ABOUT</a>
+                <a style="display:block;float:inline-start;padding:45px 7px 7px;position:relative">SUPPORT</a>
                </div></body>"#,
-            240,
+            120,
         );
         let (rs, s) = find(&out, "STORE");
         let (rc, _) = find(&out, "COMMUNITY");
@@ -4075,6 +4075,37 @@ mod tests {
     }
 
     #[test]
+    fn flex_calc_basis_wraps_two_items_per_line() {
+        // Flexbox §§7.1/9.3: each `calc(50% - 5px)` basis plus the 10px
+        // gap fits exactly twice in a 220px line. This is Steam's 2x2 hero
+        // screenshot grid; losing the calc basis turns it into four tiny
+        // equally-grown items on one line.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><div style="display:flex;flex-wrap:wrap;gap:10px;width:220px">
+               <div id=a style="flex:1 1 calc(50% - 5px);height:20px"></div>
+               <div id=b style="flex:1 1 calc(50% - 5px);height:20px"></div>
+               <div id=c style="flex:1 1 calc(50% - 5px);height:20px"></div>
+               <div id=d style="flex:1 1 calc(50% - 5px);height:20px"></div>
+               </div></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(400.0, 300.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let box_of = |id| layout.boxes[&dom.get_by_id(id).unwrap()];
+        let (a, b, c, d) = (box_of("a"), box_of("b"), box_of("c"), box_of("d"));
+        assert!((a.width - 105.0).abs() < 0.1, "{a:?}");
+        assert!((b.left - 115.0).abs() < 0.1, "{b:?}");
+        assert!((c.top - 30.0).abs() < 0.1, "{c:?}");
+        assert!((d.left - 115.0).abs() < 0.1, "{d:?}");
+    }
+
+    #[test]
     fn column_with_definite_height_grows_items() {
         let out = lay(
             r#"<body style="margin:0"><div style="display:flex;flex-direction:column;height:320px">
@@ -6377,6 +6408,45 @@ mod tests {
         assert_eq!(retained.paint.lines, full.paint.lines);
         assert_eq!(retained.paint.image_requests, full.paint.image_requests);
         assert_eq!(retained.boundaries, full.boundaries);
+    }
+
+    #[test]
+    fn graphical_empty_positioned_pseudo_paints_border_and_transform() {
+        // CSS Pseudo 4 §4.1: content:"" still generates a fully styleable
+        // box. Steam draws its discounted-price slash as an absolutely
+        // positioned, skewed bottom border on precisely this kind of
+        // `::before`; generated fragments have no DOM node, but must retain
+        // the pseudo's own computed paint style.
+        let layout = lay_graphical(
+            r#"<head><style>
+               #price { position:relative;display:inline-block;font-size:20px }
+               #price::before { content:"";position:absolute;left:0;right:0;top:43%;
+                 border-bottom:1.5px solid rgb(115,136,149);transform:skewY(-8deg) }
+               </style></head><body style="margin:0"><span id=price>79.99€</span></body>"#,
+            400.0,
+            &HashMap::new(),
+        );
+        assert!(
+            layout.paint.primitives.iter().any(|command| matches!(
+                command,
+                crate::render::DisplayCommand::Stroke {
+                    shape: crate::render::PaintShape::Path(path),
+                    brush: crate::render::PaintBrush::Solid(
+                        crate::render::PaintColor::Rgba(115, 136, 149, 255)
+                    ),
+                    style,
+                } if path.len() == 2 && (style.width - 1.5).abs() < 0.01
+            )),
+            "the empty generated box must paint its authored bottom border"
+        );
+        assert!(
+            layout.paint.primitives.iter().any(|command| matches!(
+                command,
+                crate::render::DisplayCommand::PushTransform(matrix)
+                    if (matrix.0[1] - (-8.0f32).to_radians().tan()).abs() < 0.01
+            )),
+            "the generated border must retain its skew transform"
+        );
     }
 
     #[test]

@@ -8233,7 +8233,12 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
             _ => {
                 let mut nums = Vec::new();
                 let mut basis = None;
-                for t in v.split_whitespace() {
+                // CSS Syntax 3 §5.5.7-§5.5.10: a function (including
+                // `calc()`) is one component value even when its contents
+                // contain whitespace. Flexbox §7.1 consumes component
+                // values, so splitting `calc(50% - 5px)` at raw whitespace
+                // corrupts the basis into three unrelated tokens.
+                for t in split_top_level_ws(v) {
                     if t.parse::<f32>().is_ok() {
                         nums.push(t);
                     } else {
@@ -12014,6 +12019,26 @@ mod tests {
                 ("margin-left".to_string(), "calc(2px + 1em)".to_string()),
                 ("margin-right".to_string(), "auto".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn flex_shorthand_keeps_calc_basis_whole() {
+        // Flexbox §7.1 consumes the nested function as one <flex-basis>
+        // component value; CSS Syntax §5.5.7 makes its internal whitespace
+        // part of that function rather than shorthand separators.
+        let dom = Dom::parse_document(
+            r#"<body><div id=item style="flex:1 1 calc(50% - 5px)">x</div></body>"#,
+        );
+        let item = dom.get_by_id("item").unwrap();
+        assert_eq!(dom.computed_value(item, "flex-grow").as_deref(), Some("1"));
+        assert_eq!(
+            dom.computed_value(item, "flex-shrink").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            dom.computed_value(item, "flex-basis").as_deref(),
+            Some("calc(50% - 5px)")
         );
     }
 

@@ -214,7 +214,12 @@ impl FloatCtx {
             let l = cb_l.max(li);
             let r = cb_r.min(ri);
             best_y = y;
-            if r - l >= float.mw {
+            // CSS 2.2 §9.5.1 places a float on the highest shelf where its
+            // outer width fits. The containing block's shrink-to-fit width and
+            // the sum of its floats are mathematically identical but can take
+            // different f32 arithmetic paths; do not manufacture a wrap from
+            // sub-pixel representational noise at that exact boundary.
+            if super::css_px_fits(float.mw, r - l) {
                 let x = match float.side {
                     Side::Left => l,
                     Side::Right => r - float.mw,
