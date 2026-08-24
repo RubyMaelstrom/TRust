@@ -2634,6 +2634,21 @@ impl Flow<'_> {
         let bp_r = s.border[RIGHT] + self.pad(s, RIGHT, pct_basis);
         let bt = s.border[TOP] + self.pad(s, TOP, pct_basis);
         let bb = s.border[BOTTOM] + self.pad(s, BOTTOM, pct_basis);
+        // CSS Sizing 4 §§4.1–4.2: item layout is still ordinary box sizing.
+        // When the caller has imposed a definite content width but the block
+        // size is automatic, transfer that width through the preferred ratio.
+        // Flexbox §9.2 explicitly uses the definite cross size and ratio when
+        // determining a content-based main size; grid and positioned items use
+        // the same `item_frag` entry point and the same automatic-size rule.
+        let def_h = def_h.or_else(|| {
+            s.aspect_ratio.map(|ratio| {
+                if s.border_box {
+                    ((content_w + bp_l + bp_r) / ratio - bt - bb).max(0.0)
+                } else {
+                    content_w / ratio
+                }
+            })
+        });
         let mut cur = Cursor {
             y: bt,
             ..Default::default()

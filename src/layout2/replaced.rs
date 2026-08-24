@@ -104,23 +104,25 @@ pub(crate) fn size(
     // definite containing-block width, so under an intrinsic-size probe (`cb_w`
     // None) it does not apply: sizing falls back to the decoder's natural size
     // (the element's intrinsic contribution), unchanged from before.
-    let ratio_only = (spec_w.is_none() && spec_h.is_none() && cb_w.is_some())
-        .then(|| {
-            // A `data:` SVG's markup is in the src — read it synchronously.
-            // Otherwise the image loader records an external SVG's ratio-only
-            // ratio by URL as it decodes it.
-            // Responsive images size from the selected resource, never the
-            // `src` fallback that HTML suppresses when a width-descriptor
-            // source set is active.
-            url.and_then(crate::img::svg_url_ratio_only)
-                .or_else(|| url.and_then(crate::img::svg_ratio_only_get))
-        })
-        .flatten()
+    // SVG 2 intrinsic sizing: a root `viewBox` supplies an intrinsic ratio even
+    // when it supplies no intrinsic width or height. Read that ratio for every
+    // auto-axis combination, including width:auto + definite height (the
+    // absolute-replaced rule is width = height × ratio). The special
+    // containing-block-width rule below remains limited to auto/auto.
+    // Responsive images size from the selected resource, never the `src`
+    // fallback that HTML suppresses when a width-descriptor source set is
+    // active.
+    let svg_ratio = url
+        .and_then(crate::img::svg_url_ratio_only)
+        .or_else(|| url.and_then(crate::img::svg_ratio_only_get))
         .filter(|&r| r > 0.0);
+    let ratio_only = (spec_w.is_none() && spec_h.is_none() && cb_w.is_some())
+        .then_some(svg_ratio)
+        .flatten();
     // Prefer the exact viewBox ratio for a ratio-only image. A decoder may
     // supply a rasterized fallback size whose ratio differs slightly from the
     // vector's author-provided viewBox.
-    let ratio = ratio_only.or_else(|| ratio_of(dom, node, dimension_source, natural));
+    let ratio = svg_ratio.or_else(|| ratio_of(dom, node, dimension_source, natural));
 
     // §10.3.2/§10.6.2 auto resolution. The 300×150/2:1 caps are the spec's
     // own last resort for a ratio-less axis.

@@ -6487,6 +6487,66 @@ mod tests {
     }
 
     #[test]
+    fn non_replaced_aspect_ratio_transfers_into_flex_and_grid_items() {
+        // CSS Sizing 4 §§4.1–4.2 applies preferred-ratio automatic sizing in
+        // every formatting context. Flexbox §9.2 additionally calls out the
+        // definite cross-size transfer when finding an item's main size. Ars'
+        // responsive story cards use this exact column-flex ratio-box shape.
+        for display in [
+            "display:flex;flex-direction:column",
+            "display:grid;grid-template-columns:320px",
+        ] {
+            let html = format!(
+                r#"<body style="margin:0"><div style="{display};width:320px"><div id="frame" style="position:relative;width:100%;aspect-ratio:16/9;flex-shrink:0;overflow:hidden"><img id="photo" src="photo.jpg" style="position:absolute;width:100%;height:100%;object-fit:cover"></div><p id="after" style="margin:0">after</p></div></body>"#,
+            );
+            let dom = Dom::parse_document(&html);
+            let base = Url::parse("https://example.test/").unwrap();
+            let mut images = HashMap::new();
+            images.insert("https://example.test/photo.jpg".to_string(), (640, 360));
+            let layout = lay_out_graphical(
+                &dom,
+                &base,
+                Viewport::new(400.0, 600.0),
+                &[],
+                &HashMap::new(),
+                &images,
+            );
+            let frame = layout.boxes.get(&node_by_id(&dom, "frame")).unwrap();
+            let after = layout.boxes.get(&node_by_id(&dom, "after")).unwrap();
+            assert_eq!(
+                (frame.width, frame.height, after.top),
+                (320.0, 180.0, 180.0),
+                "ratio transfer failed for {display}"
+            );
+        }
+    }
+
+    #[test]
+    fn absolutely_positioned_inline_svg_does_not_occupy_normal_flow() {
+        // CSS Position 3 §2: absolute positioning removes every principal box
+        // from normal flow, including a replaced inline SVG. The SVG tail and
+        // the in-flow label therefore share the badge's top edge; the tail is
+        // positioned at the containing block's right edge.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><div id="badge" style="position:relative;width:118px;height:40px;color:rgb(4 204 116/1)"><svg id="tail" viewBox="0 0 19.2 40" style="display:block;width:auto;height:40px;position:absolute;top:0;right:1px"><path fill="currentColor" d="M0 40V0h5.6c7.5 0 13.7 6.2 13.7 13.7v2.6c0 4.2-1.9 8-5 10.5"/></svg><div id="label" style="display:flex;height:30px">Featured</div></div></body>"#,
+        );
+        let layout = lay_out_graphical(
+            &dom,
+            &Url::parse("https://example.test/").unwrap(),
+            Viewport::new(400.0, 200.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let tail = layout.boxes[&node_by_id(&dom, "tail")];
+        let label = layout.boxes[&node_by_id(&dom, "label")];
+        assert_eq!((tail.top, tail.height), (0.0, 40.0));
+        assert!((tail.width - 19.2).abs() < 0.01, "viewBox ratio: {tail:?}");
+        assert!((tail.left - 97.8).abs() < 0.01, "right:1px: {tail:?}");
+        assert_eq!(label.top, 0.0, "the SVG must not push the label down");
+    }
+
+    #[test]
     fn graphical_background_size_scales_source_into_used_tile() {
         // CSS Backgrounds 3 §2.9: the resolved background-size is the image's
         // rendered size. A high-resolution source must be scaled into that

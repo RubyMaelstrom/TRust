@@ -391,22 +391,24 @@ impl Builder<'_> {
         // Inline SVG is a replaced box whose pixels come from the shared image
         // pipeline. Keep the SVG node and its computed box intact; direct
         // layout no longer mutates a presentation clone into an `<img>`.
-        if tag == "svg" {
-            let Some((source, alt)) = self.dom.svg_image_data(id, Some(self.base)) else {
-                return Built::Skip;
-            };
-            return self.atom(
-                id,
-                disp,
-                AtomKind::Img {
+        //
+        // Classification as replaced does not exempt SVG from CSS Position 3
+        // §2: an absolutely positioned box is still out of flow. Feed SVG into
+        // the same position/float classification below as every other replaced
+        // element instead of returning an in-flow atom early.
+        let rep = if tag == "svg" {
+            match self.dom.svg_image_data(id, Some(self.base)) {
+                Some((source, alt)) => Replaced::Atom(AtomKind::Img {
                     url: Some(source),
                     density: 1.0,
                     dimension_source: id,
                     alt,
-                },
-            );
-        }
-        let rep = self.replaced(id, tag);
+                }),
+                None => Replaced::Skip,
+            }
+        } else {
+            self.replaced(id, tag)
+        };
         if matches!(rep, Replaced::Skip) {
             return Built::Skip;
         }
