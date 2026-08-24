@@ -5958,7 +5958,7 @@ impl Dom {
 
     /// The element's language: the nearest ancestor-or-self `lang` (or
     /// `xml:lang`) attribute.
-    fn inherited_lang(&self, id: NodeId) -> Option<&str> {
+    pub(crate) fn inherited_lang(&self, id: NodeId) -> Option<&str> {
         let mut cur = Some(id);
         while let Some(n) = cur {
             if let Some(l) = self.attr(n, "lang").or_else(|| self.attr(n, "xml:lang")) {

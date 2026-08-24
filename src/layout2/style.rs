@@ -874,6 +874,7 @@ pub(crate) struct InlineStyle {
     pub letter: f32,
     pub word: f32,
     pub font_family: String,
+    pub language: Option<String>,
     pub font_size: f32,
     pub font_weight: f32,
     pub font_italic: bool,
@@ -922,6 +923,7 @@ impl InlineStyle {
             letter: 0.0,
             word: 0.0,
             font_family: String::from("sans-serif"),
+            language: None,
             font_size: crate::dom::FONT_SIZE_INITIAL,
             font_weight: 400.0,
             font_italic: false,
@@ -993,6 +995,7 @@ impl InlineStyle {
         s.font_family = dom
             .computed_value_resolved(id, "font-family")
             .unwrap_or_else(|| s.font_family.clone());
+        s.language = dom.inherited_lang(id).map(str::to_string);
         s.font_size = dom.font_px(id);
         s.font_weight = dom
             .computed_value_resolved(id, "font-weight")
@@ -1107,6 +1110,7 @@ impl InlineStyle {
     pub fn text_style(&self) -> crate::text::TextStyle {
         crate::text::TextStyle {
             family: self.font_family.clone(),
+            language: self.language.clone(),
             size: self.font_size,
             weight: self.font_weight,
             italic: self.font_italic,

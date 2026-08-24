@@ -8,8 +8,8 @@
 //!
 //! CSS Fonts 4 §2.1/§5 requires ordered family matching followed by
 //! character/cluster fallback. CSS Inline 3 §3.2 defines ascent, descent, and
-//! leading as font metrics used by line layout. Parley's system `FontContext`
-//! and shaped runs implement those two pieces of machinery.
+//! leading as font metrics used by line layout. TRust's process-wide pure-Rust
+//! catalog and Parley's shaped runs implement those two pieces of machinery.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -18,7 +18,7 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 
 use parley::{
-    FontContext, FontFamily, FontStyle, FontWeight, Layout, LayoutContext, LineHeight,
+    FontContext, FontFamily, FontStyle, FontWeight, Language, Layout, LayoutContext, LineHeight,
     OverflowWrap, PositionedLayoutItem, StyleProperty, TextWrapMode, WordBreak,
     editing::PlainEditor,
 };
@@ -31,6 +31,9 @@ use crate::core::{ImeAction, Key, KeyInput, KeyState};
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextStyle {
     pub family: String,
+    /// Inherited BCP 47 language from HTML `lang`/`xml:lang`. Font fallback
+    /// uses this to distinguish locale-specific glyph conventions.
+    pub language: Option<String>,
     pub size: f32,
     pub weight: f32,
     pub italic: bool,
@@ -45,6 +48,7 @@ impl Default for TextStyle {
     fn default() -> Self {
         Self {
             family: String::from("sans-serif"),
+            language: None,
             size: 16.0,
             weight: 400.0,
             italic: false,
@@ -197,6 +201,7 @@ impl TextEditor {
         let styles = editor.edit_styles();
         let family = font_family_source(&style.family).into_owned();
         styles.insert(StyleProperty::FontFamily(FontFamily::Source(family.into())));
+        styles.insert(StyleProperty::Locale(text_language(style)));
         styles.insert(StyleProperty::FontSize(style.size.max(1.0)));
         styles.insert(StyleProperty::FontWeight(FontWeight::new(
             style.weight.clamp(1.0, 1000.0),
@@ -491,6 +496,7 @@ struct ShapeKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TextStyleKey {
     family: String,
+    language: Option<String>,
     size: u32,
     weight: u32,
     italic: bool,
@@ -510,6 +516,7 @@ impl From<&TextStyle> for TextStyleKey {
         };
         Self {
             family: style.family.clone(),
+            language: style.language.clone(),
             size: style.size.to_bits(),
             weight: style.weight.to_bits(),
             italic: style.italic,
@@ -530,36 +537,17 @@ struct CachedShape {
 /// CSS Fonts 4 §2.1 treats the value as a prioritized list and recommends a
 /// generic family as the final alternative when named faces are unavailable.
 fn font_family_source(family: &str) -> Cow<'_, str> {
-    if family.trim().is_empty() {
-        Cow::Borrowed("sans-serif")
-    } else if family.split(',').any(|candidate| {
-        matches!(
-            candidate.trim().to_ascii_lowercase().as_str(),
-            "serif"
-                | "sans-serif"
-                | "monospace"
-                | "cursive"
-                | "fantasy"
-                | "system-ui"
-                | "ui-serif"
-                | "ui-sans-serif"
-                | "ui-monospace"
-                | "ui-rounded"
-                | "math"
-                | "emoji"
-                | "fangsong"
-        )
-    }) {
-        Cow::Borrowed(family)
-    } else {
-        Cow::Owned(format!("{family}, sans-serif"))
-    }
+    crate::font_system::css_family_source(family)
+}
+
+fn text_language(style: &TextStyle) -> Option<Language> {
+    style.language.as_deref()?.parse().ok()
 }
 
 impl TextSystem {
     fn new() -> Self {
         Self {
-            fonts: FontContext::new(),
+            fonts: crate::font_system::font_context(),
             layouts: LayoutContext::new(),
             shape_cache: HashMap::new(),
             shape_order: VecDeque::new(),
@@ -613,6 +601,7 @@ impl TextSystem {
             .ranged_builder(&mut self.fonts, text, 1.0, true);
         let family = font_family_source(&style.family);
         builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family)));
+        builder.push_default(StyleProperty::Locale(text_language(style)));
         builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
         builder.push_default(StyleProperty::FontWeight(FontWeight::new(
             style.weight.clamp(1.0, 1000.0),
@@ -654,6 +643,7 @@ impl TextSystem {
             .ranged_builder(&mut self.fonts, text, 1.0, true);
         let family = font_family_source(&style.family);
         builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family)));
+        builder.push_default(StyleProperty::Locale(text_language(style)));
         builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
         builder.push_default(StyleProperty::FontWeight(FontWeight::new(
             style.weight.clamp(1.0, 1000.0),
@@ -708,6 +698,7 @@ impl TextSystem {
             .ranged_builder(&mut self.fonts, text, 1.0, true);
         let family = font_family_source(&style.family);
         builder.push_default(StyleProperty::FontFamily(FontFamily::Source(family)));
+        builder.push_default(StyleProperty::Locale(text_language(style)));
         builder.push_default(StyleProperty::FontSize(style.size.max(0.01)));
         builder.push_default(StyleProperty::FontWeight(FontWeight::new(
             style.weight.clamp(1.0, 1000.0),
@@ -739,6 +730,7 @@ fn shape_cost(key: &ShapeKey, shaped: &ShapedText) -> usize {
     key.text
         .len()
         .saturating_add(key.style.family.len())
+        .saturating_add(key.style.language.as_ref().map_or(0, String::len))
         .saturating_add(shaped.text.len())
         .saturating_add(
             shaped
@@ -913,6 +905,20 @@ mod tests {
     }
 
     #[test]
+    fn language_is_part_of_the_shape_cache_identity() {
+        let en = TextStyle {
+            language: Some("en".into()),
+            ..TextStyle::default()
+        };
+        let ja = TextStyle {
+            language: Some("ja".into()),
+            ..en.clone()
+        };
+        assert_ne!(TextStyleKey::from(&en), TextStyleKey::from(&ja));
+        assert_eq!(text_language(&ja), "ja".parse().ok());
+    }
+
+    #[test]
     fn mixed_script_and_bidi_keep_clusters_and_fallback_runs() {
         let shaped = shape("abc שלום 世界", &TextStyle::default());
         assert!(!shaped.runs.is_empty());
@@ -947,6 +953,7 @@ mod tests {
             "faustina,faustina-fallback, sans-serif"
         );
         assert_eq!(font_family_source("serif").as_ref(), "serif");
+        assert_eq!(font_family_source("SANS-SERIF").as_ref(), "sans-serif");
         assert_eq!(font_family_source("").as_ref(), "sans-serif");
     }
 

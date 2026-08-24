@@ -59,7 +59,18 @@ mimalloc = { version = "0.1", optional = true }
 # Keep the shaping/editor boundary current. Parley 0.11 requires ICU4X 2.1+;
 # TRust's customized Boa 0.21 fork follows upstream Boa's current ICU4X 2.2
 # pins so Cargo resolves one compiled-data provider across both engines.
-parley = "0.11.0"
+# Linux/FreeBSD discovery is owned by `font_system`, so do not activate
+# Fontique's native-system feature there. Other targets retain their native
+# platform catalog until their equivalent configuration policy is owned here.
+parley = { version = "0.11.0", default-features = false, features = ["std"] }
+# Pure-Rust, path-backed catalog used to give usvg the exact same installed
+# font set that is registered with Parley. The `fs` feature parses metadata
+# with ttf-parser and keeps font bytes lazy; `fontconfig` and `memmap` stay off.
+fontdb = { version = "0.23.0", default-features = false, features = ["fs"] }
+# Character-presence checks for SVG fallback use the same parser as fontdb.
+# Keeping the version aligned avoids parsing selected fonts through two table
+# implementations.
+ttf-parser = "0.25.1"
 # Vello CPU's retained glyph cache/backend API. Keeping this direct dependency
 # at the thin renderer adapter lets TRust forward variation coordinates and
 # synthetic faces without leaking Glifo into layout/browser contracts.
@@ -72,11 +83,13 @@ ratatui-image = { version = "11.0.6", default-features = false, features = ["cro
 rustc-hash = "2"
 serde_json = "1"
 # Static SVG image rendering. `resvg`/`usvg`/tiny-skia are pure Rust; text and
-# embedded data: raster images stay enabled for web compatibility. System-font
-# discovery reads font files through Rust and is initialized once in img.rs.
-# memmap-fonts is deliberately omitted: ordinary reads keep this path free of
-# the font database's mmap unsafe block.
-resvg = { version = "0.47.0", default-features = false, features = ["text", "system-fonts", "raster-images"] }
+# embedded data: raster images stay enabled for web compatibility. TRust
+# supplies usvg's font database from its shared pure-Rust catalog. Keep
+# `system-fonts` off: that feature independently interprets host Fontconfig
+# state and would make HTML and SVG resolve different catalogs. `memmap-fonts`
+# is deliberately omitted; selected SVG fonts are read safely on demand.
+resvg = { version = "0.47.0", default-features = false, features = ["text", "raster-images"] }
+roxmltree = "0.21.1"
 rcgen = "0.14.8"
 sha2 = "0.11.0"
 textwrap = "0.16.2"
@@ -89,6 +102,9 @@ unicode-width = "0.2"
 # Extended grapheme boundaries complete Parley's shaping-cluster data for
 # logical selection (notably emoji ZWJ sequences split by font fallback).
 unicode-segmentation = "1.13.3"
+# CSS Fonts 4 §5.1 requires Unicode Default Caseless Matching for every
+# localized family name. Lowercasing is not equivalent (for example, ß/SS).
+unicode-casefold = "0.2.0"
 url = "2.5.8"
 vello_cpu = { version = "0.2.0", default-features = false, features = ["std", "text", "u8_pipeline"] }
 # Accelerated implementation of the same renderer-neutral display list.  Keep
@@ -110,6 +126,9 @@ softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "
 wasmi = { version = "1", default-features = false, features = ["std", "simd"] }
 webpki-roots = "1.0.7"
 
+[target.'cfg(not(any(target_os = "linux", target_os = "freebsd")))'.dependencies]
+parley = { version = "0.11.0", default-features = false, features = ["system"] }
+
 [dev-dependencies]
 # Compiles readable `.wat` text into wasm bytes for the WebAssembly test
 # fixtures. Pure-Rust (wasmi ecosystem); NEVER a runtime dependency — the
@@ -124,6 +143,7 @@ boa_ast = "0.21"
 boa_interner = "0.21"
 
 [patch.crates-io]
+fontique = { path = "vendor/fontique-0.11.0" }
 crossterm = { path = "vendor/crossterm-0.29.0" }
 # Vello Hybrid 0.2 is the current release, but upstream still pins wgpu 29.
 # TRust carries this source-identical compatibility fork so the desktop uses
