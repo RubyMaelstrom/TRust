@@ -10210,20 +10210,14 @@ fn page_actor(
                                 if let Ok(event) = resource_rx.try_recv() {
                                     deferred_presentation_cmd = Some(cmd);
                                     presentation_task_cursor = 1;
-                                    if !dispatch_resource_done(
+                                    if !dispatch_resource_batch(
                                         &mut page,
                                         &evts,
                                         event,
-                                        lifecycle_complete,
+                                        &mut resource_rx,
+                                        &mut lifecycle_complete,
                                     ) {
                                         break 'event_loop;
-                                    }
-                                    if !lifecycle_complete && !page_has_load_blockers(&page) {
-                                        complete_live_lifecycle(&mut page);
-                                        lifecycle_complete = true;
-                                        if !finish_dispatch_render(&mut page, &evts, false) {
-                                            break 'event_loop;
-                                        }
                                     }
                                     previous_turn_was_platform = true;
                                     continue 'event_loop;
@@ -10296,15 +10290,14 @@ fn page_actor(
             // gone; nothing more to do.
             Wake::Fetch(None) => continue,
             Wake::Resource(Some(event)) => {
-                if !dispatch_resource_done(&mut page, &evts, event, lifecycle_complete) {
+                if !dispatch_resource_batch(
+                    &mut page,
+                    &evts,
+                    event,
+                    &mut resource_rx,
+                    &mut lifecycle_complete,
+                ) {
                     break;
-                }
-                if !lifecycle_complete && !page_has_load_blockers(&page) {
-                    complete_live_lifecycle(&mut page);
-                    lifecycle_complete = true;
-                    if !finish_dispatch_render(&mut page, &evts, false) {
-                        break;
-                    }
                 }
                 continue;
             }
@@ -11234,9 +11227,13 @@ fn host_task_wake(
     evts: &tokio::sync::mpsc::Sender<PageEvt>,
     lifecycle_complete: bool,
 ) -> bool {
-    if lifecycle_complete {
-        prepare_event_loop_task(page);
-    }
+    // HTML's event-loop processing model gives every selected task its own
+    // execution turn, whether or not that task is still delaying the
+    // document's load event. In particular, an asynchronously prepared script
+    // can complete after a user-interaction deadline has expired; its
+    // networking task, microtask checkpoint, and rendering update must not
+    // inherit that earlier task's interrupt deadline.
+    prepare_event_loop_task(page);
     // A dynamically inserted external script is an HTML networking task. The
     // script element's force-async path (HTML §4.12.1.1, "prepare the script
     // element") fetches it without blocking the document's parser and runs it
@@ -11245,9 +11242,6 @@ fn host_task_wake(
     // cancel a legitimate slow bundle before its task can evaluate. Keep the
     // same page-wide wall bound used for initial loading while the resource
     // task is being serviced; the fetch count and SSRF gate remain in force.
-    if lifecycle_complete {
-        page.budget.rearm(WALL_BUDGET);
-    }
     if lifecycle_complete {
         run_jobs_into(&mut page.ctx, &page.budget, &mut page.outcome);
     } else {
@@ -11317,22 +11311,26 @@ fn note_resource_done(page: &LoadedPage, delays_load: bool) {
     }
 }
 
-/// Deliver a dynamically prepared resource as one networking task. Fetching
+/// Maximum number of already-runnable resource tasks handled before returning
+/// to rendering and the browser command lanes. HTML leaves task-source
+/// selection implementation-defined, but an unbounded burst could delay user
+/// interaction. Sixteen is large enough to coalesce the repeated script-node
+/// removals in common split webpack graphs while returning promptly to input.
+const RESOURCE_TASK_BURST: usize = 16;
+
+/// Deliver one dynamically prepared resource as one networking task. Fetching
 /// happened outside the actor; only the standards-required response checks,
-/// script/style processing, event dispatch, microtask checkpoint, and render
-/// update happen here. `lifecycle_complete == false` keeps newly prepared
-/// resources in the document's load-delay set until the initial load task can
-/// legally run.
-fn dispatch_resource_done(
-    page: &mut LoadedPage,
-    evts: &tokio::sync::mpsc::Sender<PageEvt>,
-    event: ResourceEvent,
-    lifecycle_complete: bool,
-) -> bool {
+/// script/style processing, event dispatch, and microtask checkpoint happen
+/// here. Updating the rendering is selected separately by
+/// [`dispatch_resource_batch`].
+fn run_resource_task(page: &mut LoadedPage, event: ResourceEvent) -> bool {
     note_resource_done(page, event.delays_load);
-    if lifecycle_complete {
-        prepare_event_loop_task(page);
-    }
+    // Fetching a dynamically prepared script or stylesheet completes as a
+    // networking task even while that resource remains in the document's
+    // load-delay set (HTML Standard, event-loop processing model and script
+    // preparation). Give response processing a fresh task budget before its
+    // event dispatch and microtask checkpoint.
+    prepare_event_loop_task(page);
     match event.kind {
         ResourceKind::ClassicScript => match event.result {
             Some((status, content_type, body, headers))
@@ -11390,9 +11388,44 @@ fn dispatch_resource_done(
         schedule_image_loads(&mut page.ctx, &mut page.outcome);
         drain_js_side(&mut page.ctx, &mut page.outcome);
     }
-    if page.outcome.panicked {
-        let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
-        return false;
+    !page.outcome.panicked
+}
+
+/// Process an already-runnable burst from the networking task source, giving
+/// each resource its own task budget and microtask checkpoint, then paint once.
+///
+/// HTML §8.1.7.3 runs one selected task and its microtask checkpoint, but only
+/// updates rendering when the event loop reaches a rendering opportunity. A
+/// group of responses which are already queued can therefore complete before
+/// the next paint. This matters for chunk loaders: their `load` handlers often
+/// remove each `<script>`, making the DOM dirty without creating any useful
+/// intermediate frame. Painting every removal made a ready webpack graph take
+/// seconds on large pages and delayed the application that graph was loading.
+fn dispatch_resource_batch(
+    page: &mut LoadedPage,
+    evts: &tokio::sync::mpsc::Sender<PageEvt>,
+    first: ResourceEvent,
+    resource_rx: &mut tokio::sync::mpsc::Receiver<ResourceEvent>,
+    lifecycle_complete: &mut bool,
+) -> bool {
+    let mut next = first;
+    for index in 0..RESOURCE_TASK_BURST {
+        let event = next;
+        if !run_resource_task(page, event) {
+            let _ = evts.blocking_send(PageEvt::Trouble(std::mem::take(&mut page.outcome.errors)));
+            return false;
+        }
+        if !*lifecycle_complete && !page_has_load_blockers(page) {
+            complete_live_lifecycle(page);
+            *lifecycle_complete = true;
+        }
+        if index + 1 == RESOURCE_TASK_BURST {
+            break;
+        }
+        let Ok(event) = resource_rx.try_recv() else {
+            break;
+        };
+        next = event;
     }
     if !finish_dispatch_render(page, evts, false) {
         return false;
@@ -29325,6 +29358,74 @@ mod tests {
                 trouble.is_empty(),
                 "an interaction must not exhaust the later load task: {trouble:?}"
             );
+        });
+    }
+
+    #[test]
+    fn ready_dynamic_resource_tasks_share_a_rendering_opportunity() {
+        // HTML §8.1.7.3 performs a microtask checkpoint after each networking
+        // task, but updates rendering only at a rendering opportunity. A
+        // webpack-style Promise.all graph removes every loaded script before
+        // mounting; those already-ready tasks must not force one intermediate
+        // whole-document paint per removed script.
+        let cache = std::sync::Arc::new(crate::http::PageCache::default());
+        for index in 0..8 {
+            cache.seed(
+                format!("https://example.com/chunk-{index}.js"),
+                200,
+                String::from("text/javascript"),
+                format!("globalThis.chunk{index} = true;").into_bytes(),
+            );
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut env = PageEnv::bare("https://example.com/dir/page");
+        env.cache = cache;
+        env.net = Some(runtime.handle().clone());
+        let (handle, mut events) = spawn_page(
+            r##"<body><p id="status">pending</p><script>
+                document.addEventListener('DOMContentLoaded', function () {
+                    var chunks = [];
+                    for (let i = 0; i < 8; ++i) {
+                        chunks.push(new Promise(function (resolve, reject) {
+                            var script = document.createElement('script');
+                            script.src = '/chunk-' + i + '.js';
+                            script.onload = function () { script.remove(); resolve(); };
+                            script.onerror = reject;
+                            document.head.appendChild(script);
+                        }));
+                    }
+                    Promise.all(chunks).then(function () {
+                        document.getElementById('status').textContent = 'mounted';
+                    });
+                });
+            </script></body>"##
+                .to_string(),
+            env,
+        );
+
+        runtime.block_on(async move {
+            let mut updates = 0;
+            let mut mounted = false;
+            while !mounted {
+                let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                    .await
+                    .expect("ready resource graph did not settle")
+                    .expect("page actor closed before resource graph mounted");
+                match event {
+                    PageEvt::Updated { html, outcome } => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        updates += 1;
+                        mounted = html.contains(">mounted<");
+                    }
+                    PageEvt::Trouble(errors) => panic!("resource graph failed: {errors:?}"),
+                    _ => {}
+                }
+            }
+            assert!(
+                updates <= 3,
+                "ready resource tasks painted intermediate script removals {updates} times"
+            );
+            drop(handle);
         });
     }
 
