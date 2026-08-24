@@ -142,13 +142,31 @@ fn gc_permgen_on() -> bool {
 /// not the wire.
 pub struct Budget {
     deadline: std::cell::Cell<Instant>,
+    interrupt: std::sync::Arc<boa_engine::vm::RuntimeInterrupt>,
 }
 
 impl Budget {
     pub fn new(wall: Duration) -> Self {
+        Self::with_interrupt(
+            wall,
+            std::sync::Arc::new(boa_engine::vm::RuntimeInterrupt::default()),
+        )
+    }
+
+    fn with_interrupt(
+        wall: Duration,
+        interrupt: std::sync::Arc<boa_engine::vm::RuntimeInterrupt>,
+    ) -> Self {
+        let deadline = Instant::now() + wall;
+        interrupt.set_deadline(Some(deadline));
         Self {
-            deadline: std::cell::Cell::new(Instant::now() + wall),
+            deadline: std::cell::Cell::new(deadline),
+            interrupt,
         }
+    }
+
+    fn install(&self, ctx: &mut Context) {
+        ctx.set_runtime_interrupt(Some(self.interrupt.clone()));
     }
 
     pub fn exhausted(&self) -> bool {
@@ -165,7 +183,9 @@ impl Budget {
 
     /// A fresh window from now: per-dispatch budgets on a living page.
     pub fn rearm(&self, wall: Duration) {
-        self.deadline.set(Instant::now() + wall);
+        let deadline = Instant::now() + wall;
+        self.deadline.set(deadline);
+        self.interrupt.set_deadline(Some(deadline));
     }
 
     /// Push the deadline out to at least `now + dur`, never pulling it in. A
@@ -176,6 +196,7 @@ impl Budget {
         let target = Instant::now() + dur;
         if target > self.deadline.get() {
             self.deadline.set(target);
+            self.interrupt.set_deadline(Some(target));
         }
     }
 }
@@ -1036,6 +1057,7 @@ fn run_script_task(
             .push(format!("{name}: skipped, page JS budget exhausted"));
         return;
     }
+    budget.install(ctx);
     let started = Instant::now();
     // catch_unwind: a Boa VM bug must cost one script, not the page —
     // the DOM mutations made so far stay serializable. (RefCell guards
@@ -1996,6 +2018,17 @@ struct PageWorkers {
 /// thread. Dropping it closes the channel → the worker exits.
 struct WorkerHandle {
     ctl: tokio::sync::mpsc::Sender<WorkerCtl>,
+    runtime_interrupt: std::sync::Arc<boa_engine::vm::RuntimeInterrupt>,
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        // HTML §10.2.3 "terminate a worker" runs in parallel with the worker
+        // main loop and aborts the script currently running there. Closing the
+        // control channel only handles a parked worker; the VM interrupt also
+        // reaches one that is currently executing author code.
+        self.runtime_interrupt.cancel();
+    }
 }
 
 impl boa_engine::gc::Finalize for PageWorkers {}
@@ -4506,20 +4539,27 @@ fn sys_worker_spawn(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
         script_body,
         secure_context,
     };
+    let runtime_interrupt = std::sync::Arc::new(boa_engine::vm::RuntimeInterrupt::default());
+    let worker_interrupt = runtime_interrupt.clone();
     // The worker runs on its OWN 64MB-stack OS thread (Boa's parser recurses on
     // the native stack; same reason the page thread is wide). Named `trust-*` so
     // the panic hook swallows a Boa VM panic into a graceful per-worker degrade.
     let spawned = std::thread::Builder::new()
         .name(format!("trust-worker-{id}"))
         .stack_size(PAGE_STACK)
-        .spawn(move || run_worker(launch, handle, tasks, to_page, ctl_rx));
+        .spawn(move || {
+            run_worker(launch, handle, tasks, to_page, ctl_rx, worker_interrupt);
+        });
     if spawned.is_err() {
         return Ok(JsValue::new(-1));
     }
-    workers
-        .workers
-        .borrow_mut()
-        .insert(id, WorkerHandle { ctl: ctl_tx });
+    workers.workers.borrow_mut().insert(
+        id,
+        WorkerHandle {
+            ctl: ctl_tx,
+            runtime_interrupt,
+        },
+    );
     Ok(JsValue::new(id as i32))
 }
 
@@ -7403,6 +7443,7 @@ fn load_page(
     fetch_events: Option<FetchSender>,
     resource_events: Option<ResourceSender>,
     worker_events: Option<WorkerSender>,
+    runtime_interrupt: Option<std::sync::Arc<boa_engine::vm::RuntimeInterrupt>>,
 ) -> Result<LoadedPage, Outcome> {
     phase("load_page start (DOM parse)");
     phases_reset();
@@ -7484,7 +7525,12 @@ fn load_page(
         body: env.cache.clone(),
     });
     let (mut ctx, hooks) = page_context_with(Some(loader.clone()));
-    let budget = Rc::new(Budget::new(WALL_BUDGET));
+    let budget = Rc::new(Budget::with_interrupt(
+        WALL_BUDGET,
+        runtime_interrupt
+            .unwrap_or_else(|| std::sync::Arc::new(boa_engine::vm::RuntimeInterrupt::default())),
+    ));
+    budget.install(&mut ctx);
     {
         let mut host = ctx.realm().host_defined_mut();
         host.insert(PageDom(dom.clone()));
@@ -8506,7 +8552,7 @@ pub fn css_finish(mut dom: Dom, sheets: &[(String, String)]) -> String {
 }
 
 pub fn transform(html: &str, env: &PageEnv) -> (String, Outcome) {
-    match load_page(html, env, None, None, None, None) {
+    match load_page(html, env, None, None, None, None, None) {
         Err(outcome) => (html.to_string(), outcome),
         Ok(mut page) => {
             // One-shot snapshot: no resident actor will run deferred timers
@@ -8768,6 +8814,7 @@ pub struct PageHandle {
 struct PageHandleState {
     hover: Option<tokio::sync::watch::Sender<PageHover>>,
     cache: std::sync::Arc<crate::http::PageCache>,
+    runtime_interrupt: std::sync::Arc<boa_engine::vm::RuntimeInterrupt>,
 }
 
 impl PageHandle {
@@ -8786,7 +8833,11 @@ impl PageHandle {
 
     /// Freeze the document: cancel its fetch group before dropping the command
     /// sender lets the resident actor, workers, sockets and timers wind down.
+    /// HTML §8.1.4.5 explicitly permits killing a currently running script;
+    /// signaling the VM as well as closing its task lanes means navigation can
+    /// retire a document even when author code has not returned to the actor.
     pub fn retire(&self) {
+        self.state.runtime_interrupt.cancel();
         self.state.cache.cancel();
     }
 
@@ -8797,6 +8848,7 @@ impl PageHandle {
             state: Box::new(PageHandleState {
                 hover: None,
                 cache: Default::default(),
+                runtime_interrupt: Default::default(),
             }),
         }
     }
@@ -8881,6 +8933,7 @@ pub fn spawn_page(
     env: PageEnv,
 ) -> (PageHandle, tokio::sync::mpsc::Receiver<PageEvt>) {
     let cache = env.cache.clone();
+    let runtime_interrupt = std::sync::Arc::new(boa_engine::vm::RuntimeInterrupt::default());
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
     let (hover_tx, hover_rx) = tokio::sync::watch::channel(PageHover {
         node: None,
@@ -8891,11 +8944,20 @@ pub fn spawn_page(
     // The actor keeps a clone of its own command sender so a WebSocket task can
     // post inbound frames back as `PageCmd::Ws` (see `setup_page_ws`).
     let cmd_self = cmd_tx.clone();
+    let actor_interrupt = runtime_interrupt.clone();
     let spawned = std::thread::Builder::new()
         .name(String::from("trust-page"))
         .stack_size(PAGE_STACK)
         .spawn(move || {
-            page_actor(html, env, cmd_rx, hover_rx, evt_tx, cmd_self);
+            page_actor(
+                html,
+                env,
+                cmd_rx,
+                hover_rx,
+                evt_tx,
+                cmd_self,
+                actor_interrupt,
+            );
             // `page_actor` has returned, so the Context + DOM arena have dropped
             // and this thread's whole JS heap is freed back to its (about-to-be-
             // abandoned) mimalloc heap. Purge it to the OS NOW — on the owning
@@ -8918,6 +8980,7 @@ pub fn spawn_page(
             state: Box::new(PageHandleState {
                 hover: Some(hover_tx),
                 cache,
+                runtime_interrupt,
             }),
         },
         evt_rx,
@@ -9391,6 +9454,7 @@ fn run_worker(
     tasks: std::sync::Arc<crate::http::PageTaskScope>,
     to_page: WorkerSender,
     mut ctl_rx: tokio::sync::mpsc::Receiver<WorkerCtl>,
+    runtime_interrupt: std::sync::Arc<boa_engine::vm::RuntimeInterrupt>,
 ) {
     let WorkerLaunch {
         id,
@@ -9406,7 +9470,8 @@ fn run_worker(
         let _ = to_page.try_send((id, WorkerOut::Error(String::from("worker syscalls failed"))));
         return;
     }
-    let budget = Rc::new(Budget::new(WALL_BUDGET));
+    let budget = Rc::new(Budget::with_interrupt(WALL_BUDGET, runtime_interrupt));
+    budget.install(&mut ctx);
     {
         let mut host = ctx.realm().host_defined_mut();
         host.insert(WorkerSelf {
@@ -9725,6 +9790,7 @@ fn page_actor(
     mut hover: tokio::sync::watch::Receiver<PageHover>,
     evts: tokio::sync::mpsc::Sender<PageEvt>,
     cmd_self: tokio::sync::mpsc::Sender<PageCmd>,
+    runtime_interrupt: std::sync::Arc<boa_engine::vm::RuntimeInterrupt>,
 ) {
     // Create the WS inbound channel up front so `PageWs` can be registered
     // DURING `load_page` (before any script runs) — a socket.io app opens its
@@ -9762,6 +9828,7 @@ fn page_actor(
         Some(fetch_tx),
         Some(resource_tx),
         Some(worker_evt_tx),
+        Some(runtime_interrupt),
     ) {
         Ok(page) => page,
         Err(outcome) => {
@@ -27456,6 +27523,89 @@ mod tests {
     }
 
     #[test]
+    fn a_running_task_is_aborted_at_its_host_deadline() {
+        // HTML §8.1.4.5 "Killing scripts" allows a user agent to abort script
+        // which exceeds an execution-time resource limit. This must be a VM
+        // instruction interrupt, not only Boa's explicit-loop counter: a
+        // generated state machine (hCaptcha's fingerprint VM is the real
+        // example) can execute billions of ordinary bytecodes in one task.
+        let mut ctx = page_context();
+        ctx.runtime_limits_mut().disable_loop_iteration_limit();
+        let budget = Budget::new(WALL_BUDGET);
+        // Keep the outer Budget gate open so this specifically exercises an
+        // expiry observed while ScriptEvaluation is already running.
+        budget
+            .interrupt
+            .set_deadline(Some(Instant::now() + Duration::from_millis(20)));
+        let mut outcome = Outcome::default();
+        let started = Instant::now();
+        run_script(
+            &mut ctx,
+            "deadline.js",
+            b"let n=0; while (true) { n = Math.imul(n + 1, 2654435761); }",
+            &budget,
+            &mut outcome,
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|error| error.contains("execution deadline exceeded")),
+            "{:?}",
+            outcome.errors
+        );
+
+        // The host deadline aborts one task, not the whole realm. A fresh task
+        // after the host rearms its window must still execute normally.
+        budget.rearm(WALL_BUDGET);
+        let mut after = Outcome::default();
+        run_script(
+            &mut ctx,
+            "after-deadline.js",
+            b"globalThis.afterDeadline = 1;",
+            &budget,
+            &mut after,
+        );
+        assert!(after.errors.is_empty(), "{:?}", after.errors);
+    }
+
+    #[test]
+    fn a_running_task_observes_cross_thread_page_cancellation() {
+        // Navigation happens on the frontend thread while this realm executes
+        // on `trust-page`. HTML's script-killing model therefore needs a
+        // thread-safe interrupt rather than waiting for the actor to receive
+        // another command after the callback returns.
+        let mut ctx = page_context();
+        ctx.runtime_limits_mut().disable_loop_iteration_limit();
+        let budget = Budget::new(WALL_BUDGET);
+        let interrupt = budget.interrupt.clone();
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            interrupt.cancel();
+        });
+        let mut outcome = Outcome::default();
+        let started = Instant::now();
+        run_script(
+            &mut ctx,
+            "cancel.js",
+            b"let n=0; while (true) { n = Math.imul(n + 1, 2654435761); }",
+            &budget,
+            &mut outcome,
+        );
+        cancel.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            outcome
+                .errors
+                .iter()
+                .any(|error| error.contains("execution cancelled by the host")),
+            "{:?}",
+            outcome.errors
+        );
+    }
+
+    #[test]
     fn an_exhausted_budget_skips_remaining_scripts() {
         let mut ctx = page_context();
         let budget = Budget::new(Duration::ZERO);
@@ -32399,6 +32549,7 @@ mod tests {
             state: Box::new(PageHandleState {
                 hover: Some(hover_tx),
                 cache: Default::default(),
+                runtime_interrupt: Default::default(),
             }),
         };
 
@@ -33165,6 +33316,42 @@ mod tests {
         ));
         drop(handle);
         assert!(events.blocking_recv().is_none());
+    }
+
+    #[test]
+    fn dropping_the_handle_interrupts_a_running_actor_task() {
+        let (handle, mut events) = live(
+            "<body><button onclick=\"let n=0; while(true) { n = Math.imul(n + 1, 2654435761); }\">run</button><script>void 0;</script></body>",
+        );
+        let Some(PageEvt::Updated { html, .. }) = events.blocking_recv() else {
+            panic!("expected first Updated");
+        };
+        let id = html
+            .split("x-trust-js:")
+            .nth(1)
+            .and_then(|rest| rest.split(':').next())
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        handle.cmds.blocking_send(PageCmd::Click(id)).unwrap();
+        // Drop immediately: even if the click is already executing, retirement
+        // must abort it instead of waiting for its JavaScript to return.
+        drop(handle);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match events.try_recv() {
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "retired actor stayed alive in running JavaScript"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(_) => {}
+            }
+        }
     }
 
     #[test]
