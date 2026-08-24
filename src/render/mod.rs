@@ -1462,6 +1462,11 @@ pub const COMMAND_PANEL_HEIGHT: f32 = 122.0;
 pub const FIND_PANEL_HEIGHT: f32 = 64.0;
 const HEART_SIZE: f32 = 30.0;
 const HEART_HIT_SIZE: f32 = 34.0;
+// The thumb remains forgiving to grab, but an invisible full-height track
+// must not mask page controls placed at the viewport edge (carousel arrows are
+// a common example). Only the track's narrow visual interaction strip owns
+// pointer input outside the thumb.
+const HEART_RAIL_HIT_SIZE: f32 = 6.0;
 const HEART_EDGE_INSET: f32 = 17.0;
 const HEART_IDLE_SOURCE: &str = "trust:ui/heart/idle-v1";
 const HEART_ACTIVE_SOURCE: &str = "trust:ui/heart/active-v1";
@@ -1808,9 +1813,9 @@ fn paint_heart_scrollbars(scene: &mut Scene, heart: HeartVisual) {
             scene.controls.push(ControlRegion {
                 id: ControlId::VerticalRail,
                 rect: CssRect::new(
-                    center.x - HEART_HIT_SIZE / 2.0,
+                    center.x - HEART_RAIL_HIT_SIZE / 2.0,
                     start,
-                    HEART_HIT_SIZE,
+                    HEART_RAIL_HIT_SIZE,
                     (end - start).max(1.0),
                 ),
                 enabled: true,
@@ -1865,9 +1870,9 @@ fn paint_heart_scrollbars(scene: &mut Scene, heart: HeartVisual) {
             id: ControlId::HorizontalRail,
             rect: CssRect::new(
                 start,
-                center.y - HEART_HIT_SIZE / 2.0,
+                center.y - HEART_RAIL_HIT_SIZE / 2.0,
                 (end - start).max(1.0),
-                HEART_HIT_SIZE,
+                HEART_RAIL_HIT_SIZE,
             ),
             enabled: true,
         });
@@ -2386,8 +2391,13 @@ mod tests {
                     && (rect.height - 32.4).abs() < 0.01
         )));
         assert_eq!(
-            scene.control_at(CssPoint::new(788.0, 100.0)),
+            scene.control_at(CssPoint::new(783.0, 100.0)),
             Some(ControlId::VerticalRail)
+        );
+        assert_eq!(
+            scene.control_at(CssPoint::new(770.0, 100.0)),
+            None,
+            "the invisible rail must not mask edge-aligned page controls"
         );
         assert_eq!(
             scene.control_at(CssPoint::new(788.0, 300.0)),
@@ -2425,9 +2435,10 @@ mod tests {
         };
         paint_desktop_overlay(&mut scene, &snapshot(), &model);
         assert_eq!(
-            scene.control_at(CssPoint::new(100.0, 588.0)),
+            scene.control_at(CssPoint::new(100.0, 583.0)),
             Some(ControlId::HorizontalRail)
         );
+        assert_eq!(scene.control_at(CssPoint::new(100.0, 570.0)), None);
         assert!(
             scene
                 .controls

@@ -168,6 +168,9 @@ pub(super) fn retain_for_paint(fragment: &Frag<'_>) -> Option<Frag<'static>> {
 /// (§9.9/Appendix E, css-position-3 §2.2, css-transforms-1 §3).
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct PaintFlags {
+    /// Style source for a generated `::before`/`::after` fragment. Its
+    /// geometry node remains `NO_NODE`, but it is not paint-anonymous.
+    pub pseudo: Option<(NodeId, crate::dom::PseudoEl)>,
     /// A positioned box (§9.3.2) — Appendix E step 8 when no real stacking
     /// context is formed (the z:auto pseudo-stacking-context).
     pub positioned: bool,
@@ -198,6 +201,7 @@ pub(crate) struct PaintFlags {
 impl Default for PaintFlags {
     fn default() -> Self {
         Self {
+            pseudo: None,
             positioned: false,
             sc: false,
             z: None,
@@ -235,6 +239,7 @@ pub(super) fn fixed_backdrop(
 /// position:static — css-flexbox §4.3).
 pub(super) fn paint_flags(s: &BoxStyle, item: bool) -> PaintFlags {
     PaintFlags {
+        pseudo: s.pseudo,
         positioned: s.position.positioned(),
         sc: s.stacking_context(item),
         z: s.z_index,
