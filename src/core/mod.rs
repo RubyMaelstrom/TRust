@@ -780,7 +780,7 @@ impl BrowserController {
                     (self.interaction.scroll.x + delta.dx * multiplier).max(0.0);
                 self.interaction.scroll.y =
                     (self.interaction.scroll.y + delta.dy * multiplier).max(0.0);
-                self.send_live(crate::js::PageCmd::Scroll {
+                self.send_user(crate::js::PageCmd::Scroll {
                     x: f64::from(self.interaction.scroll.x),
                     y: f64::from(self.interaction.scroll.y),
                 });
@@ -788,7 +788,7 @@ impl BrowserController {
             }
             UserAction::SetViewportScroll(point) => {
                 self.interaction.scroll = CssPoint::new(point.x.max(0.0), point.y.max(0.0));
-                self.send_live(crate::js::PageCmd::Scroll {
+                self.send_user(crate::js::PageCmd::Scroll {
                     x: f64::from(self.interaction.scroll.x),
                     y: f64::from(self.interaction.scroll.y),
                 });
@@ -813,7 +813,7 @@ impl BrowserController {
                 checked,
             } => {
                 if let Some(node) = actor {
-                    self.send_live(crate::js::PageCmd::SetValue {
+                    self.send_user(crate::js::PageCmd::SetValue {
                         node,
                         value,
                         checked,
@@ -822,7 +822,7 @@ impl BrowserController {
                 true
             }
             UserAction::PageKey { node, input } => {
-                self.send_live(crate::js::PageCmd::Key { node, input });
+                self.send_user(crate::js::PageCmd::Key { node, input });
                 false
             }
             UserAction::SubmitForm { form, submitter } => {
@@ -834,7 +834,7 @@ impl BrowserController {
                     && self.live_page.is_some()
                 {
                     self.pending_live_submit = Some((form, submitter));
-                    self.send_live(crate::js::PageCmd::Submit {
+                    self.send_user(crate::js::PageCmd::Submit {
                         form: form_node,
                         submitter: submitter_node,
                     });
@@ -848,7 +848,7 @@ impl BrowserController {
                     self.interaction
                         .nested_scroll
                         .insert(actor, CssPoint::new(left.max(0.0), top.max(0.0)));
-                    self.send_live(crate::js::PageCmd::SetScroll {
+                    self.send_user(crate::js::PageCmd::SetScroll {
                         node: actor,
                         top: f64::from(top.max(0.0)),
                         left: f64::from(left.max(0.0)),
@@ -1115,6 +1115,18 @@ impl BrowserController {
             .is_some_and(|handle| handle.cmds.try_send(command).is_ok())
     }
 
+    fn send_user(&self, command: crate::js::PageCmd) -> bool {
+        self.live_page
+            .as_ref()
+            .is_some_and(|handle| handle.try_send_user(command).is_ok())
+    }
+
+    fn send_navigation_click(&self, node: usize) -> bool {
+        self.live_page
+            .as_ref()
+            .is_some_and(|handle| handle.try_send_navigation_click(node).is_ok())
+    }
+
     fn drop_live_page(&mut self) {
         if let Some(page) = self.live_page.take() {
             page.retire();
@@ -1142,8 +1154,12 @@ impl BrowserController {
 
     fn activate(&mut self, link: Link) -> bool {
         match link {
-            Link::JsClick { node, .. } => {
-                self.send_live(crate::js::PageCmd::Click(node));
+            Link::JsClick { node, href } => {
+                if href.is_empty() {
+                    self.send_user(crate::js::PageCmd::Click(node));
+                } else {
+                    self.send_navigation_click(node);
+                }
                 self.status = String::from("Page action …");
             }
             Link::Form { .. } => return false,

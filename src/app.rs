@@ -3710,11 +3710,8 @@ impl App {
         let Some(handle) = self.live_page.as_ref() else {
             return;
         };
-        // Clone the (Arc-backed) sender so the borrow of `self.live_page` ends
-        // before we record `last_scroll_sent`.
-        let sender = handle.cmds.clone();
-        if sender
-            .try_send(crate::js::PageCmd::Scroll { x: 0.0, y })
+        if handle
+            .try_send_user(crate::js::PageCmd::Scroll { x: 0.0, y })
             .is_ok()
         {
             self.last_scroll_sent = Some(row);
@@ -3997,11 +3994,7 @@ impl App {
             self.hover_want = None;
             return;
         };
-        let sender = handle.cmds.clone();
-        if sender
-            .try_send(crate::js::PageCmd::Hover { node: target, x, y })
-            .is_ok()
-        {
+        if handle.send_hover(target, x, y) {
             self.hover_sent = target;
             self.hover_want = None;
         }
@@ -4188,8 +4181,7 @@ impl App {
         let top = voffset as f64 * cell_h;
         if let Some(handle) = self.live_page.as_ref()
             && handle
-                .cmds
-                .try_send(crate::js::PageCmd::SetScroll {
+                .try_send_user(crate::js::PageCmd::SetScroll {
                     node,
                     top,
                     left: 0.0,
@@ -4285,7 +4277,7 @@ impl App {
     }
 
     /// Enter on a `Link::JsClick`: send the click to the living page.
-    fn dispatch_click(&mut self, node: usize) {
+    fn dispatch_click(&mut self, node: usize, may_navigate: bool) {
         let Some(handle) = &self.live_page else {
             // The page's engine is gone — it froze (navigated away) or died
             // during load (e.g. a runaway script tripped the iteration
@@ -4301,7 +4293,12 @@ impl App {
             }
             return;
         };
-        match handle.cmds.try_send(crate::js::PageCmd::Click(node)) {
+        let queued = if may_navigate {
+            handle.try_send_navigation_click(node)
+        } else {
+            handle.try_send_user(crate::js::PageCmd::Click(node))
+        };
+        match queued {
             Ok(()) => {
                 self.page_busy = true;
                 self.status = String::from("· click dispatched to page script");
@@ -4323,7 +4320,7 @@ impl App {
         let Some(handle) = &self.live_page else {
             return false;
         };
-        match handle.cmds.try_send(crate::js::PageCmd::SetValue {
+        match handle.try_send_user(crate::js::PageCmd::SetValue {
             node,
             value,
             checked,
@@ -4351,7 +4348,7 @@ impl App {
         let Some(handle) = &self.live_page else {
             return false;
         };
-        match handle.cmds.try_send(crate::js::PageCmd::Submit {
+        match handle.try_send_user(crate::js::PageCmd::Submit {
             form: form_node,
             submitter: submitter_node,
         }) {
@@ -6501,7 +6498,7 @@ impl App {
             // resolves). The terminal can't play it inline.
             Link::Media(url) => self.launch_mpv(url.to_string()),
             Link::Form { form, field } => self.form_interact(form, field),
-            Link::JsClick { node, .. } => self.dispatch_click(node),
+            Link::JsClick { node, href } => self.dispatch_click(node, !href.is_empty()),
             Link::External(target) => {
                 self.status = format!("external link: {target}");
             }
@@ -6704,12 +6701,12 @@ impl App {
             FieldKind::Submit => self.submit_form(form, field),
             FieldKind::Button => {
                 if let Some(node) = live_node {
-                    self.dispatch_click(node);
+                    self.dispatch_click(node, false);
                 }
             }
             FieldKind::Reset => {
                 if let Some(node) = live_node {
-                    self.dispatch_click(node);
+                    self.dispatch_click(node, false);
                     return;
                 }
                 if let Some(g) = &mut self.browser

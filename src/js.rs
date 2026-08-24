@@ -170,12 +170,15 @@ impl Budget {
     }
 
     pub fn exhausted(&self) -> bool {
-        Instant::now() >= self.deadline.get()
+        self.interrupt.user_navigation_requested() || Instant::now() >= self.deadline.get()
     }
 
     /// Time left until the deadline (zero if already past). Used to bound
     /// the async job loop so a hung server can't hold the page forever.
     pub fn remaining(&self) -> Duration {
+        if self.interrupt.user_navigation_requested() {
+            return Duration::ZERO;
+        }
         self.deadline
             .get()
             .saturating_duration_since(Instant::now())
@@ -186,6 +189,13 @@ impl Budget {
         let deadline = Instant::now() + wall;
         self.deadline.set(deadline);
         self.interrupt.set_deadline(Some(deadline));
+    }
+
+    /// Admit the next queued user-interaction task after a pending navigation
+    /// request has made background JavaScript unwind. The interaction receives
+    /// its own normal task deadline when its dispatch helper calls [`Self::rearm`].
+    fn begin_user_interaction(&self) {
+        self.interrupt.begin_user_interaction();
     }
 
     /// Push the deadline out to at least `now + dur`, never pulling it in. A
@@ -1085,7 +1095,7 @@ fn run_script_task(
     }));
     match result {
         Ok(Ok(_)) => {}
-        Ok(Err(err)) => outcome.errors.push(format!("{name}: {err}")),
+        Ok(Err(err)) => record_task_error(outcome, name, err),
         Err(_) => {
             outcome
                 .errors
@@ -1162,7 +1172,7 @@ fn run_rehydrated_image(
     }));
     match result {
         Ok(Ok(_)) => {}
-        Ok(Err(err)) => outcome.errors.push(format!("{name}: {err}")),
+        Ok(Err(err)) => record_task_error(outcome, name, err),
         Err(_) => {
             outcome
                 .errors
@@ -1231,7 +1241,7 @@ fn run_prelude(ctx: &mut Context, budget: &Budget, outcome: &mut Outcome) {
     }));
     match result {
         Ok(Ok(_)) => {}
-        Ok(Err(err)) => outcome.errors.push(format!("prelude: {err}")),
+        Ok(Err(err)) => record_task_error(outcome, "prelude", err),
         Err(_) => {
             outcome.errors.push(String::from(
                 "prelude: engine panic (Boa bug) — page JS halted",
@@ -1764,7 +1774,7 @@ fn run_external_classic(
     }));
     match result {
         Ok(Ok(_)) => {}
-        Ok(Err(err)) => outcome.errors.push(format!("{name}: {err}")),
+        Ok(Err(err)) => record_task_error(outcome, name, err),
         Err(_) => {
             outcome
                 .errors
@@ -7386,7 +7396,7 @@ fn run_module(
     }));
     match evaluated {
         Ok(None) => {}
-        Ok(Some(err)) => outcome.errors.push(format!("{name}: {err}")),
+        Ok(Some(err)) => record_task_error(outcome, name, err),
         Err(_) => {
             outcome
                 .errors
@@ -8152,6 +8162,19 @@ fn call_trust(ctx: &mut Context, name: &str, args: &[JsValue]) -> JsResult<JsVal
     f.call(&JsValue::undefined(), args, ctx)
 }
 
+const USER_NAVIGATION_YIELD: &str = "JavaScript execution yielded to user navigation";
+
+fn record_task_error(outcome: &mut Outcome, what: &str, error: impl std::fmt::Display) {
+    let error = error.to_string();
+    // HTML §8.1.4.5 permits the user agent to terminate script which exceeds a
+    // host resource limit. TRust also asks an overlong background task to
+    // yield when user navigation is queued. That host scheduling decision is
+    // not an author-script failure and must not surface as a page JS error.
+    if !error.contains(USER_NAVIGATION_YIELD) {
+        outcome.errors.push(format!("{what}: {error}"));
+    }
+}
+
 /// [`call_trust`] with the same panic containment as `run_script`/
 /// `run_jobs_into`, for the entry points that run PAGE CALLBACKS (timer ticks,
 /// observer delivery, hover/click/form dispatch, image-load scans). Bare
@@ -8172,7 +8195,7 @@ fn guarded_call_trust(
     match result {
         Ok(Ok(v)) => Some(v),
         Ok(Err(err)) => {
-            outcome.errors.push(format!("{what}: {err}"));
+            record_task_error(outcome, what, err);
             None
         }
         Err(_) => {
@@ -8332,7 +8355,7 @@ fn run_load_blockers_into(ctx: &mut Context, budget: &Budget, outcome: &mut Outc
     }));
     match drained {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => outcome.errors.push(format!("load-blocking task: {err}")),
+        Ok(Err(err)) => record_task_error(outcome, "load-blocking task", err),
         Err(_) => {
             outcome.errors.push(String::from(
                 "load-blocking task: engine panic (Boa bug) — page JS halted",
@@ -8350,7 +8373,7 @@ fn run_microtasks_into(ctx: &mut Context, outcome: &mut Outcome) {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| microtask_checkpoint(ctx)));
     match drained {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => outcome.errors.push(format!("microtask: {err}")),
+        Ok(Err(err)) => record_task_error(outcome, "microtask", err),
         Err(_) => {
             outcome.errors.push(String::from(
                 "microtask: engine panic (Boa bug) — page JS halted",
@@ -8450,7 +8473,7 @@ fn run_jobs_into_mode(
     }));
     match drained {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => outcome.errors.push(format!("async job: {err}")),
+        Ok(Err(err)) => record_task_error(outcome, "async job", err),
         Err(_) => {
             outcome.errors.push(String::from(
                 "async job: engine panic (Boa bug) — page JS halted",
@@ -8699,6 +8722,22 @@ pub enum PageCmd {
 }
 
 impl PageCmd {
+    /// Commands originating in native user input. HTML §8.1.7.4 assigns these
+    /// to the user-interaction task source, independently of networking,
+    /// timers, rendering, and page-owned messaging.
+    fn is_user_interaction(&self) -> bool {
+        matches!(
+            self,
+            Self::Click(_)
+                | Self::Key { .. }
+                | Self::SetValue { .. }
+                | Self::Submit { .. }
+                | Self::Scroll { .. }
+                | Self::Hover { .. }
+                | Self::SetScroll { .. }
+        )
+    }
+
     /// Frontend-to-engine presentation synchronization is bookkeeping, not a
     /// user-interaction task. HTML leaves selection among task sources to the
     /// user agent, but a perpetually ready bookkeeping lane must not prevent a
@@ -8850,12 +8889,79 @@ pub struct PageHandle {
 
 #[derive(Debug)]
 struct PageHandleState {
+    interactions: Option<tokio::sync::mpsc::Sender<PageCmd>>,
+    interaction_running: std::sync::Arc<std::sync::Mutex<bool>>,
     hover: Option<tokio::sync::watch::Sender<PageHover>>,
     cache: std::sync::Arc<crate::http::PageCache>,
     runtime_interrupt: std::sync::Arc<boa_engine::vm::RuntimeInterrupt>,
 }
 
 impl PageHandle {
+    /// Queue native input on HTML's user-interaction task source.
+    ///
+    /// Input uses a dedicated priority lane, but does not abort author script.
+    /// HTML §8.1.7.3 performs one task and its microtask checkpoint before
+    /// selecting another task; ordinary scrolling, typing, and controls must
+    /// therefore wait for that boundary without corrupting the running task.
+    pub fn try_send_user(
+        &self,
+        command: PageCmd,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<PageCmd>> {
+        self.try_send_user_with_navigation_preemption(command, false)
+    }
+
+    /// Queue activation of an anchor which has a navigation default action.
+    ///
+    /// HTML §8.1.4.5 permits a user agent to abort script for resource control.
+    /// TRust uses that escape hatch only for a user-requested navigation: it
+    /// yields page work already occupying the actor, then dispatches the
+    /// cancelable `click` and honors `preventDefault()` before navigating.
+    pub fn try_send_navigation_click(
+        &self,
+        node: usize,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<PageCmd>> {
+        self.try_send_user_with_navigation_preemption(PageCmd::Click(node), true)
+    }
+
+    fn try_send_user_with_navigation_preemption(
+        &self,
+        command: PageCmd,
+        preempt_for_navigation: bool,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<PageCmd>> {
+        debug_assert!(command.is_user_interaction());
+        let Some(sender) = &self.state.interactions else {
+            return self.cmds.try_send(command);
+        };
+        let permit = match sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+                return Err(tokio::sync::mpsc::error::TrySendError::Full(command));
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => {
+                return Err(tokio::sync::mpsc::error::TrySendError::Closed(command));
+            }
+        };
+        if preempt_for_navigation {
+            // Reserve first so the actor is never interrupted for a command
+            // which could not be queued. Holding the coordination lock through
+            // send also keeps a second navigation from aborting an interaction
+            // which has already started dispatching.
+            let running = self
+                .state
+                .interaction_running
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !*running {
+                self.state.runtime_interrupt.request_user_navigation();
+            }
+            permit.send(command);
+            drop(running);
+        } else {
+            permit.send(command);
+        }
+        Ok(())
+    }
+
     /// Publish the newest pointer hit without blocking the UI thread and
     /// without losing mouseout/mouseleave when the ordinary command queue is
     /// full. `watch` coalesces unsampled intermediate motion but always keeps
@@ -8863,10 +8969,10 @@ impl PageHandle {
     /// coalesce motion while preserving the effective pointer position.
     pub fn send_hover(&self, node: Option<usize>, x: f64, y: f64) -> bool {
         let hover = PageHover { node, x, y };
-        self.state.hover.as_ref().map_or_else(
-            || self.cmds.try_send(PageCmd::Hover { node, x, y }).is_ok(),
-            |sender| sender.send(hover).is_ok(),
-        )
+        let Some(sender) = self.state.hover.as_ref() else {
+            return self.try_send_user(PageCmd::Hover { node, x, y }).is_ok();
+        };
+        sender.send(hover).is_ok()
     }
 
     /// Freeze the document: cancel its fetch group before dropping the command
@@ -8884,6 +8990,8 @@ impl PageHandle {
         Self {
             cmds,
             state: Box::new(PageHandleState {
+                interactions: None,
+                interaction_running: Default::default(),
                 hover: None,
                 cache: Default::default(),
                 runtime_interrupt: Default::default(),
@@ -8955,12 +9063,50 @@ const WAKE_FLOOR: Duration = Duration::from_millis(66);
 /// channel closed, i.e. the page is going away), or the next-timer-deadline
 /// sleep elapsing.
 enum Wake {
+    Interaction(Option<PageCmd>),
     Cmd(Option<PageCmd>),
     Hover(Option<PageHover>),
     Fetch(Option<(usize, FetchResult)>),
     Resource(Option<ResourceEvent>),
     PlatformTask,
     Timer,
+}
+
+/// Marks the one HTML user-interaction task currently running in the page
+/// actor. Navigation producers consult the same lock before requesting a VM
+/// yield, so a later activation never aborts event dispatch already in progress.
+struct UserInteractionTurn {
+    running: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+struct PageActorIo {
+    cmds: tokio::sync::mpsc::Receiver<PageCmd>,
+    interactions: tokio::sync::mpsc::Receiver<PageCmd>,
+    hover: tokio::sync::watch::Receiver<PageHover>,
+    evts: tokio::sync::mpsc::Sender<PageEvt>,
+    cmd_self: tokio::sync::mpsc::Sender<PageCmd>,
+    interaction_running: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+impl UserInteractionTurn {
+    fn begin(budget: &Budget, running: &std::sync::Arc<std::sync::Mutex<bool>>) -> Self {
+        let mut active = running.lock().unwrap_or_else(|error| error.into_inner());
+        *active = true;
+        budget.begin_user_interaction();
+        drop(active);
+        Self {
+            running: running.clone(),
+        }
+    }
+}
+
+impl Drop for UserInteractionTurn {
+    fn drop(&mut self) {
+        *self
+            .running
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = false;
+    }
 }
 
 /// Sleep `d`, or never resolve when there's no pending timer — the loop then
@@ -8982,6 +9128,8 @@ pub fn spawn_page(
     let cache = env.cache.clone();
     let runtime_interrupt = std::sync::Arc::new(boa_engine::vm::RuntimeInterrupt::default());
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+    let (interaction_tx, interaction_rx) = tokio::sync::mpsc::channel(16);
+    let interaction_running = std::sync::Arc::new(std::sync::Mutex::new(false));
     let (hover_tx, hover_rx) = tokio::sync::watch::channel(PageHover {
         node: None,
         x: 0.0,
@@ -8992,6 +9140,7 @@ pub fn spawn_page(
     // post inbound frames back as `PageCmd::Ws` (see `setup_page_ws`).
     let cmd_self = cmd_tx.clone();
     let actor_interrupt = runtime_interrupt.clone();
+    let actor_interaction_running = interaction_running.clone();
     let spawned = std::thread::Builder::new()
         .name(String::from("trust-page"))
         .stack_size(PAGE_STACK)
@@ -8999,10 +9148,14 @@ pub fn spawn_page(
             page_actor(
                 html,
                 env,
-                cmd_rx,
-                hover_rx,
-                evt_tx,
-                cmd_self,
+                PageActorIo {
+                    cmds: cmd_rx,
+                    interactions: interaction_rx,
+                    hover: hover_rx,
+                    evts: evt_tx,
+                    cmd_self,
+                    interaction_running: actor_interaction_running,
+                },
                 actor_interrupt,
             );
             // `page_actor` has returned, so the Context + DOM arena have dropped
@@ -9025,6 +9178,8 @@ pub fn spawn_page(
         PageHandle {
             cmds: cmd_tx,
             state: Box::new(PageHandleState {
+                interactions: Some(interaction_tx),
+                interaction_running,
                 hover: Some(hover_tx),
                 cache,
                 runtime_interrupt,
@@ -9681,7 +9836,7 @@ fn drain_worker_jobs(ctx: &mut Context, outcome: &mut Outcome) {
     let drained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.run_jobs()));
     match drained {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => outcome.errors.push(format!("worker job: {err}")),
+        Ok(Err(err)) => record_task_error(outcome, "worker job", err),
         Err(_) => {
             outcome
                 .errors
@@ -9784,7 +9939,7 @@ fn dispatch_worker_in(page: &mut LoadedPage, id: usize, event: WorkerOut) {
         page.ctx.eval(Source::from_bytes(call.as_bytes()))
     })) {
         Ok(Ok(_)) => {}
-        Ok(Err(err)) => page.outcome.errors.push(format!("worker event: {err}")),
+        Ok(Err(err)) => record_task_error(&mut page.outcome, "worker event", err),
         Err(_) => {
             page.outcome.errors.push(String::from(
                 "worker event: engine panic (Boa bug) — page JS halted",
@@ -9833,12 +9988,17 @@ fn setup_page_ws(
 fn page_actor(
     html: String,
     env: PageEnv,
-    mut cmds: tokio::sync::mpsc::Receiver<PageCmd>,
-    mut hover: tokio::sync::watch::Receiver<PageHover>,
-    evts: tokio::sync::mpsc::Sender<PageEvt>,
-    cmd_self: tokio::sync::mpsc::Sender<PageCmd>,
+    io: PageActorIo,
     runtime_interrupt: std::sync::Arc<boa_engine::vm::RuntimeInterrupt>,
 ) {
+    let PageActorIo {
+        mut cmds,
+        mut interactions,
+        mut hover,
+        evts,
+        cmd_self,
+        interaction_running,
+    } = io;
     // Create the WS inbound channel up front so `PageWs` can be registered
     // DURING `load_page` (before any script runs) — a socket.io app opens its
     // WebSocket at load time and must find a live host immediately. The
@@ -10151,18 +10311,16 @@ fn page_actor(
             None => rt.block_on(async {
                 tokio::select! {
                 // HTML §8.1.7.4 assigns click/key input to the user
-                // interaction task source. Give the command lane first choice
-                // whenever it and a later networking/module task are both
-                // runnable; otherwise an async resource queue can keep the
-                // actor inside host_task_wake and leave a consent click
-                // pending indefinitely. Background work still gets a turn
-                // immediately after a command sets prefer_host_turn below.
+                // interaction task source. It has a dedicated queue so
+                // page-owned WebSocket/worker traffic and presentation sync
+                // already waiting in `cmds` cannot stand ahead of input.
                 biased;
-                cmd = cmds.recv() => Wake::Cmd(cmd),
+                interaction = interactions.recv() => Wake::Interaction(interaction),
                 // Pointer boundary state is a bounded latest-value lane. Give
                 // it priority over ordinary background work so an exit cannot
                 // remain stuck behind page bookkeeping or a busy animation.
                 changed = hover.changed() => Wake::Hover(changed.ok().map(|()| *hover.borrow_and_update())),
+                cmd = cmds.recv() => Wake::Cmd(cmd),
                 // Completed networking tasks are already runnable. Deliver
                 // them before selecting another host-task drain, otherwise a
                 // continuously replenished promise queue can starve a
@@ -10176,6 +10334,18 @@ fn page_actor(
                 }
             }),
         };
+        let _user_interaction_turn = match &wake {
+            Wake::Interaction(Some(_)) | Wake::Hover(Some(_)) => Some(UserInteractionTurn::begin(
+                &page.budget,
+                &interaction_running,
+            )),
+            // Compatibility for tests and transitional callers which still
+            // place an input command on the ordinary channel.
+            Wake::Cmd(Some(command)) if command.is_user_interaction() => Some(
+                UserInteractionTurn::begin(&page.budget, &interaction_running),
+            ),
+            _ => None,
+        };
         let cmd = match wake {
             Wake::Hover(Some(hover)) => PageCmd::Hover {
                 node: hover.node,
@@ -10183,6 +10353,15 @@ fn page_actor(
                 y: hover.y,
             },
             Wake::Hover(None) => break, // app dropped the handle
+            Wake::Interaction(Some(cmd)) => {
+                // Run this input before selecting another page-owned task.
+                // If navigation asked the previous task to yield, begin()
+                // above clears that request only now that an interaction owns
+                // the actor. Ordinary input reaches this lane without a yield.
+                prefer_host_turn = true;
+                cmd
+            }
+            Wake::Interaction(None) => break, // app dropped the handle
             Wake::Cmd(Some(cmd)) => {
                 // Native layout/image synchronization is not the HTML user
                 // interaction task source. Rotate one already-runnable page
@@ -10672,7 +10851,7 @@ fn page_actor(
                         page.ctx.eval(Source::from_bytes(call.as_bytes()))
                     })) {
                         Ok(Ok(_)) => {}
-                        Ok(Err(err)) => page.outcome.errors.push(format!("resize: {err}")),
+                        Ok(Err(err)) => record_task_error(&mut page.outcome, "resize", err),
                         Err(_) => {
                             page.outcome.errors.push(String::from(
                                 "resize: engine panic (Boa bug) — page JS halted",
@@ -10767,7 +10946,7 @@ fn dispatch_ws_in(page: &mut LoadedPage, id: usize, event: crate::ws::WsIn) {
         page.ctx.eval(Source::from_bytes(call.as_bytes()))
     })) {
         Ok(Ok(_)) => {}
-        Ok(Err(err)) => page.outcome.errors.push(format!("ws event: {err}")),
+        Ok(Err(err)) => record_task_error(&mut page.outcome, "ws event", err),
         Err(_) => {
             page.outcome.errors.push(String::from(
                 "ws event: engine panic (Boa bug) — page JS halted",
@@ -30236,6 +30415,178 @@ mod tests {
     }
 
     #[test]
+    fn queued_navigation_click_preempts_a_runaway_background_microtask_checkpoint() {
+        // HTML §8.1.7.4 places native input on the user-interaction task
+        // source, while §8.1.7.3 lets the UA prioritize its task queue. A
+        // platform callback can nevertheless already be inside its mandatory
+        // microtask checkpoint when input arrives. hCaptcha exposed this with
+        // a checkpoint which occupied the actor until the 60-second host
+        // deadline: the click was queued but could not even dispatch.
+        //
+        // This finite-body/self-replenishing microtask has the same scheduling
+        // shape without relying on Boa's explicit-loop limit. The input yield
+        // must abort only that background checkpoint, then dispatch the
+        // cancelable click and run the anchor's normal navigation default.
+        let (handle, mut events) = live(
+            r#"<body><a id=go href="/next">go</a><script>
+               const go = document.getElementById('go');
+               go.addEventListener('click', function () {});
+               window.addEventListener('message', function (event) {
+                   if (event.data !== 'block') return;
+                   queueMicrotask(function again() { queueMicrotask(again); });
+               });
+               window.postMessage('block', '*');
+               </script></body>"#,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let first = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                .await
+                .expect("live shell timed out")
+                .expect("page actor exited before its shell");
+            let shell = match first {
+                PageEvt::Updated { html, outcome } => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    html
+                }
+                other => panic!("expected live shell, got {other:?}"),
+            };
+            let marker = shell
+                .find("x-trust-js:")
+                .and_then(|at| {
+                    shell[at + "x-trust-js:".len()..]
+                        .split(':')
+                        .next()
+                        .and_then(|node| node.parse::<usize>().ok())
+                })
+                .expect("live anchor actor id");
+
+            // Let the posted-message task enter its non-terminating microtask
+            // checkpoint, then place ordinary commands ahead of the click in
+            // the background FIFO. The dedicated interaction queue must win.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            for node in 0..16 {
+                handle
+                    .cmds
+                    .try_send(PageCmd::LiveRegions(vec![node]))
+                    .expect("background command queue should be available");
+            }
+            handle
+                .try_send_navigation_click(marker)
+                .expect("priority click queue should be independent");
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .expect("click remained behind background page work");
+                let event = tokio::time::timeout(remaining, events.recv())
+                    .await
+                    .expect("click remained behind background page work")
+                    .expect("page actor exited before dispatching the click");
+                match event {
+                    PageEvt::Navigate(url) => {
+                        assert_eq!(url, "https://example.com/next");
+                        break;
+                    }
+                    PageEvt::Updated { outcome, .. } => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    }
+                    PageEvt::Settled => {}
+                    PageEvt::Trouble(errors) => {
+                        panic!("navigation preemption is not a page error: {errors:?}")
+                    }
+                    other => panic!("unexpected event before navigation: {other:?}"),
+                }
+            }
+            drop(handle);
+        });
+    }
+
+    #[test]
+    fn queued_scroll_does_not_abort_the_running_page_task() {
+        // HTML §8.1.7.3 runs the selected task and then performs its microtask
+        // checkpoint before selecting the next task. The user-interaction task
+        // source (§8.1.7.4) gives wheel input its own prompt queue, but does not
+        // make scroll permission to terminate the task currently executing.
+        //
+        // Keep a finite posted-message task in the VM while native scroll is
+        // queued. The background task must complete normally before the scroll
+        // event runs; treating every input as a VM interrupt used to truncate
+        // this task and left script-heavy pages partially initialized.
+        let (handle, mut events) = live(
+            r#"<body><p id=out>shell</p><div style="height:2000px"></div><script>
+               const out = document.getElementById('out');
+               window.addEventListener('message', function (event) {
+                   if (event.data !== 'work') return;
+                   let i = 0;
+                   while (i < 50000) i++;
+                   out.textContent = 'background-done';
+               });
+               window.addEventListener('scroll', function () {
+                   out.setAttribute('data-scroll', 'ran');
+               });
+               window.postMessage('work', '*');
+               </script></body>"#,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let first = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                .await
+                .expect("live shell timed out")
+                .expect("page actor exited before its shell");
+            match first {
+                PageEvt::Updated { html, outcome } => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    assert!(html.contains("shell"), "{html}");
+                }
+                other => panic!("expected live shell, got {other:?}"),
+            }
+
+            // Give the posted-message task time to enter its finite VM loop,
+            // then queue wheel-driven scroll on the priority input lane.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            handle
+                .try_send_user(PageCmd::Scroll { x: 0.0, y: 240.0 })
+                .expect("scroll input queue should be available");
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut background_done = false;
+            let mut scroll_ran = false;
+            while !(background_done && scroll_ran) {
+                let Some(remaining) =
+                    deadline.checked_duration_since(tokio::time::Instant::now())
+                else {
+                    panic!(
+                        "scroll did not preserve both tasks: background_done={background_done}, \
+                         scroll_ran={scroll_ran}"
+                    );
+                };
+                let event = tokio::time::timeout(remaining, events.recv())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "scroll did not preserve both tasks: background_done={background_done}, \
+                             scroll_ran={scroll_ran}"
+                        )
+                    })
+                    .expect("page actor exited while scroll was queued");
+                match event {
+                    PageEvt::Updated { html, outcome } => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        background_done |= html.contains("background-done");
+                        scroll_ran |= html.contains("data-scroll=\"ran\"");
+                    }
+                    PageEvt::Settled => {}
+                    PageEvt::Trouble(errors) => panic!("page task failed: {errors:?}"),
+                    other => panic!("unexpected event while waiting for scroll: {other:?}"),
+                }
+            }
+            drop(handle);
+        });
+    }
+
+    #[test]
     fn posted_message_scheduler_chain_is_not_timer_throttled() {
         // HTML §9.3 queues window.postMessage on the posted-message task
         // source. setImmediate polyfills use this exact loop; folding it into
@@ -33145,6 +33496,8 @@ mod tests {
         let handle = PageHandle {
             cmds,
             state: Box::new(PageHandleState {
+                interactions: None,
+                interaction_running: Default::default(),
                 hover: Some(hover_tx),
                 cache: Default::default(),
                 runtime_interrupt: Default::default(),
@@ -33715,7 +34068,7 @@ mod tests {
         let stay = id_for(">stay</a>").unwrap();
 
         // preventDefault: the page mutates instead of navigating.
-        handle.cmds.blocking_send(PageCmd::Click(stay)).unwrap();
+        handle.try_send_navigation_click(stay).unwrap();
         match events.blocking_recv() {
             Some(PageEvt::Updated { html, .. }) => {
                 assert!(html.contains("prevented!"), "{html}")
@@ -33724,7 +34077,7 @@ mod tests {
         }
 
         // No prevention: resolved against the page URL.
-        handle.cmds.blocking_send(PageCmd::Click(go)).unwrap();
+        handle.try_send_navigation_click(go).unwrap();
         match events.blocking_recv() {
             Some(PageEvt::Navigate(url)) => {
                 assert_eq!(url, "https://example.com/next");
