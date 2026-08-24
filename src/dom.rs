@@ -3218,7 +3218,13 @@ impl Dom {
         {
             return None;
         }
-        self.parse_content_value(id, &raw)
+        // CSS Variables 1 §3 substitutes var() at computed-value time for
+        // every ordinary property, including `content`. Font Awesome and many
+        // icon systems keep the glyph in a custom property on the originating
+        // element (`content:var(--icon)/""`). Parsing the specified token stream
+        // directly would discard that otherwise-valid generated content.
+        let resolved = self.resolve_vars(id, &raw);
+        self.parse_content_value(id, &resolved)
     }
 
     /// The cascade-winning value of `prop` on `id`'s `::before`/`::after`
@@ -3323,7 +3329,11 @@ impl Dom {
     /// whole. The old single-component reader mangled the common
     /// `content:"(" attr(data-n) ")"` decoration idiom.
     fn parse_content_value(&self, id: NodeId, raw: &str) -> Option<String> {
-        let v = raw.trim();
+        // CSS Content 3 §1.2 puts optional speech alternative text after a
+        // top-level slash. It is not part of the visual content list. Keep a
+        // slash inside url()/attr()/a quoted string intact.
+        let visual = split_top_level_slash(raw).map_or(raw, |(visual, _alt)| visual);
+        let v = visual.trim();
         if v.is_empty() || v == "none" || v == "normal" {
             return None;
         }
@@ -3973,6 +3983,30 @@ impl Dom {
             .find(|&c| self.tag_name(c) == Some("html"))?;
         self.child_iter(html)
             .find(|&c| self.tag_name(c) == Some("body"))
+    }
+
+    fn serialized_frame_wrapper_style(&self, id: NodeId) -> String {
+        let display = match self.effective_display(id).as_deref() {
+            Some("none") => "none",
+            Some("block" | "flow-root" | "flex" | "grid" | "table") => "block",
+            _ => "inline-block",
+        };
+        let dimension = |property: &str, attr: &str, fallback: &str| {
+            self.computed_value_resolved(id, property)
+                .filter(|value| value.trim() != "auto")
+                .or_else(|| {
+                    self.attr(id, attr)
+                        .and_then(|value| value.trim().parse::<f32>().ok())
+                        .filter(|value| value.is_finite() && *value >= 0.0)
+                        .map(|value| format!("{value}px"))
+                })
+                .unwrap_or_else(|| fallback.to_string())
+        };
+        format!(
+            "display:{display};width:{};height:{};overflow:hidden;",
+            dimension("width", "width", "300px"),
+            dimension("height", "height", "150px")
+        )
     }
 
     /// Load `html` as an iframe's nested document (the HTML "navigate an
@@ -4932,7 +4966,9 @@ impl Dom {
                     if let Some(body) = self.frame_body(id) {
                         let mut kids = self.child_iter(body).peekable();
                         if kids.peek().is_some() {
-                            out.push_str("<div data-trust-frame=\"\">");
+                            out.push_str("<div data-trust-frame=\"\" style=\"");
+                            out.push_str(&escape_attr(&self.serialized_frame_wrapper_style(id)));
+                            out.push_str("\">");
                             for c in kids {
                                 self.serialize_node_inner(c, host, keep_template, out);
                             }
@@ -5033,7 +5069,9 @@ impl Dom {
             if let Some(body) = self.frame_body(id) {
                 let mut kids = self.child_iter(body).peekable();
                 if kids.peek().is_some() {
-                    out.push_str("<div data-trust-frame=\"\">");
+                    out.push_str("<div data-trust-frame=\"\" style=\"");
+                    out.push_str(&escape_attr(&self.serialized_frame_wrapper_style(id)));
+                    out.push_str("\">");
                     for c in kids {
                         self.serialize_live_node(c, host, clickable, in_anchor, out);
                     }
@@ -8327,10 +8365,11 @@ fn expand_box_shorthand(prop: &str, value: &str) -> Vec<(String, String)> {
 
 const PENDING_BACKGROUND_SHORTHAND: &str = "\0trust-pending-background:";
 
-/// `background` shorthand → retained graphical longhands. This is deliberately
-/// conservative: image/color grammar is preserved exactly, while repeat,
-/// attachment and boxes are recognized from their closed keyword sets. An
-/// omitted component is reset to its initial value as the shorthand requires.
+/// `background` shorthand → retained graphical longhands (CSS Backgrounds 3
+/// §2.10). A declaration is expanded only after every layer parses: an invalid
+/// image or component invalidates the entire declaration, so an earlier valid
+/// fallback keeps winning in the cascade. For each valid layer omitted
+/// components are reset to their initial values before explicit values apply.
 fn expand_background(value: &str) -> Vec<(String, String)> {
     let v = value.trim();
     if v.is_empty() {
@@ -8378,44 +8417,260 @@ fn expand_background(value: &str) -> Vec<(String, String)> {
         }
         return out;
     }
-    let mut color: Option<&str> = None;
-    let mut images = Vec::new();
     let layers = split_top_level_commas(v);
+    if layers.iter().any(|layer| layer.trim().is_empty()) {
+        return Vec::new();
+    }
     let last = layers.len() - 1;
+    let mut color = None;
+    let mut images = Vec::with_capacity(layers.len());
+    let mut positions = Vec::with_capacity(layers.len());
+    let mut sizes = Vec::with_capacity(layers.len());
+    let mut repeats = Vec::with_capacity(layers.len());
+    let mut origins = Vec::with_capacity(layers.len());
+    let mut clips = Vec::with_capacity(layers.len());
+    let mut attachments = Vec::with_capacity(layers.len());
     for (i, layer) in layers.iter().enumerate() {
-        for tok in split_value_tokens(layer) {
-            let t = tok.to_ascii_lowercase();
-            if bg_image_token(&t) {
-                images.push(tok);
-            } else if i == last && color.is_none() && bg_color_token(&t) {
-                color = Some(tok);
-            }
+        let Some(parsed) = parse_background_layer(layer, i == last) else {
+            return Vec::new();
+        };
+        if let Some(layer_color) = parsed.color
+            && color.replace(layer_color).is_some()
+        {
+            return Vec::new();
         }
+        images.push(parsed.image.unwrap_or("none"));
+        positions.push(if parsed.position.is_empty() {
+            "0% 0%".to_string()
+        } else {
+            parsed.position.join(" ")
+        });
+        sizes.push(if parsed.size.is_empty() {
+            "auto auto".to_string()
+        } else {
+            parsed.size.join(" ")
+        });
+        repeats.push(if parsed.repeat.is_empty() {
+            "repeat".to_string()
+        } else {
+            parsed.repeat.join(" ")
+        });
+        attachments.push(parsed.attachment.unwrap_or("scroll"));
+        let (origin, clip) = match parsed.boxes.as_slice() {
+            [] => ("padding-box", "border-box"),
+            [one] => (*one, *one),
+            [origin, clip] => (*origin, *clip),
+            _ => return Vec::new(),
+        };
+        origins.push(origin);
+        clips.push(clip);
     }
     out.push((
         "background-color".to_string(),
         color.unwrap_or("transparent").to_string(),
     ));
-    out.push((
-        "background-image".to_string(),
-        if images.is_empty() {
-            "none".to_string()
-        } else {
-            images.join(", ")
-        },
-    ));
-    // Full layer position/size parsing is intentionally left to the retained
-    // paint snapshot. These initial values are nevertheless important: a
-    // shorthand resets an earlier longhand even when it omits the component.
+    out.push(("background-image".to_string(), images.join(", ")));
     out.extend([
-        ("background-repeat".to_string(), "repeat".to_string()),
-        ("background-position".to_string(), "0% 0%".to_string()),
-        ("background-size".to_string(), "auto auto".to_string()),
-        ("background-origin".to_string(), "padding-box".to_string()),
-        ("background-clip".to_string(), "border-box".to_string()),
-        ("background-attachment".to_string(), "scroll".to_string()),
+        ("background-repeat".to_string(), repeats.join(", ")),
+        ("background-position".to_string(), positions.join(", ")),
+        ("background-size".to_string(), sizes.join(", ")),
+        ("background-origin".to_string(), origins.join(", ")),
+        ("background-clip".to_string(), clips.join(", ")),
+        ("background-attachment".to_string(), attachments.join(", ")),
     ]);
     out
+}
+
+#[derive(Default)]
+struct BackgroundLayer<'a> {
+    color: Option<&'a str>,
+    image: Option<&'a str>,
+    position: Vec<&'a str>,
+    size: Vec<&'a str>,
+    repeat: Vec<&'a str>,
+    boxes: Vec<&'a str>,
+    attachment: Option<&'a str>,
+}
+
+fn parse_background_layer(layer: &str, final_layer: bool) -> Option<BackgroundLayer<'_>> {
+    let (before, size) = match split_top_level_slash(layer) {
+        Some((before, size)) => {
+            if split_top_level_slash(size).is_some() {
+                return None;
+            }
+            (before, Some(size))
+        }
+        None => (layer, None),
+    };
+    let mut parsed = BackgroundLayer::default();
+    for tok in split_top_level_ws(before) {
+        let lower = tok.to_ascii_lowercase();
+        if bg_image_token(&lower) {
+            if parsed.image.is_some() || !valid_background_image(tok) {
+                return None;
+            }
+            parsed.image = Some(tok);
+        } else if matches!(lower.as_str(), "repeat-x" | "repeat-y") {
+            if !parsed.repeat.is_empty() {
+                return None;
+            }
+            parsed.repeat.push(tok);
+        } else if matches!(lower.as_str(), "repeat" | "space" | "round" | "no-repeat") {
+            if parsed.repeat.len() == 2 {
+                return None;
+            }
+            parsed.repeat.push(tok);
+        } else if matches!(lower.as_str(), "scroll" | "fixed" | "local") {
+            if parsed.attachment.replace(tok).is_some() {
+                return None;
+            }
+        } else if matches!(
+            lower.as_str(),
+            "border-box" | "padding-box" | "content-box" | "text"
+        ) {
+            if parsed.boxes.len() == 2 {
+                return None;
+            }
+            parsed.boxes.push(tok);
+        } else if lower == "none" {
+            if parsed.image.replace(tok).is_some() {
+                return None;
+            }
+        } else if background_position_token(&lower) {
+            if parsed.position.len() == 4 {
+                return None;
+            }
+            parsed.position.push(tok);
+        } else if final_layer && parsed.color.is_none() && bg_color_token(&lower) {
+            parsed.color = Some(tok);
+        } else {
+            return None;
+        }
+    }
+    if let Some(size) = size {
+        // The slash belongs to `<position> / <bg-size>`; it cannot introduce
+        // a size when the position was omitted.
+        if parsed.position.is_empty() {
+            return None;
+        }
+        let tokens = split_top_level_ws(size);
+        let size_len = tokens
+            .iter()
+            .take(2)
+            .take_while(|token| background_size_token(&token.to_ascii_lowercase()))
+            .count();
+        parsed.size.extend_from_slice(&tokens[..size_len]);
+        if parsed.size.is_empty()
+            || (parsed.size.len() == 2
+                && parsed.size.iter().any(|token| {
+                    matches!(token.to_ascii_lowercase().as_str(), "cover" | "contain")
+                }))
+        {
+            return None;
+        }
+        // Components after the size remain unordered by `||` in the shorthand
+        // grammar. Position is the sole exception because the slash closes it.
+        for tok in &tokens[size_len..] {
+            let lower = tok.to_ascii_lowercase();
+            if bg_image_token(&lower) {
+                if parsed.image.is_some() || !valid_background_image(tok) {
+                    return None;
+                }
+                parsed.image = Some(tok);
+            } else if matches!(lower.as_str(), "repeat-x" | "repeat-y") {
+                if !parsed.repeat.is_empty() {
+                    return None;
+                }
+                parsed.repeat.push(tok);
+            } else if matches!(lower.as_str(), "repeat" | "space" | "round" | "no-repeat") {
+                if parsed.repeat.len() == 2 {
+                    return None;
+                }
+                parsed.repeat.push(tok);
+            } else if matches!(lower.as_str(), "scroll" | "fixed" | "local") {
+                if parsed.attachment.replace(tok).is_some() {
+                    return None;
+                }
+            } else if matches!(
+                lower.as_str(),
+                "border-box" | "padding-box" | "content-box" | "text"
+            ) {
+                if parsed.boxes.len() == 2 {
+                    return None;
+                }
+                parsed.boxes.push(tok);
+            } else if final_layer && parsed.color.is_none() && bg_color_token(&lower) {
+                parsed.color = Some(tok);
+            } else {
+                return None;
+            }
+        }
+    }
+    Some(parsed)
+}
+
+fn background_position_token(token: &str) -> bool {
+    matches!(token, "left" | "right" | "top" | "bottom" | "center")
+        || background_length_percentage(token)
+}
+
+fn background_size_token(token: &str) -> bool {
+    matches!(token, "auto" | "cover" | "contain") || background_length_percentage(token)
+}
+
+fn background_length_percentage(token: &str) -> bool {
+    token.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '+' | '-' | '.'))
+        || ["calc(", "min(", "max(", "clamp("]
+            .iter()
+            .any(|function| token.starts_with(function))
+}
+
+/// Recognize standard `<image>` functions and reject legacy proprietary
+/// gradient spellings. CSS Images 3 §3.1 requires keyword directions to use
+/// `to <side-or-corner>`; `linear-gradient(top,...)` is therefore an invalid
+/// declaration, not an image that clears a preceding solid-color fallback.
+fn valid_background_image(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    if lower.starts_with('-') || !lower.ends_with(')') {
+        return false;
+    }
+    for name in ["linear-gradient(", "repeating-linear-gradient("] {
+        if let Some(args) = lower.strip_prefix(name).and_then(|v| v.strip_suffix(')')) {
+            let first = split_top_level_commas(args)
+                .first()
+                .copied()
+                .unwrap_or("")
+                .trim();
+            if matches!(
+                first,
+                "top"
+                    | "right"
+                    | "bottom"
+                    | "left"
+                    | "top left"
+                    | "left top"
+                    | "top right"
+                    | "right top"
+                    | "bottom left"
+                    | "left bottom"
+                    | "bottom right"
+                    | "right bottom"
+            ) {
+                return false;
+            }
+            return true;
+        }
+    }
+    [
+        "url(",
+        "image(",
+        "image-set(",
+        "cross-fade(",
+        "radial-gradient(",
+        "repeating-radial-gradient(",
+    ]
+    .iter()
+    .any(|name| lower.starts_with(name))
 }
 
 /// Split a comma-separated list at paren-depth 0 (`linear-gradient(a, b)`
@@ -12949,6 +13204,70 @@ mod tests {
         let html = dom.serialize(host);
         assert!(html.contains("background-color:#222"), "{html}");
         assert!(!html.contains("background-color:transparent"), "{html}");
+    }
+
+    #[test]
+    fn invalid_legacy_gradient_keeps_valid_background_fallback() {
+        // CSS Images 3 §3.1 accepts `to bottom`, not the pre-standard
+        // unprefixed `top` direction. CSS Syntax/Cascade discard each invalid
+        // declaration as a unit, leaving the earlier solid fallback intact.
+        let dom = Dom::parse_document(
+            "<style>#x{background:#5e95a1;\
+             background:-moz-linear-gradient(top,#fff,#000);\
+             background:linear-gradient(top,#fff,#000)}</style>\
+             <div id=x></div>",
+        );
+        let x = dom.get_by_id("x").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(x, "background-color")
+                .as_deref(),
+            Some("#5e95a1")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(x, "background-image")
+                .as_deref(),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn background_shorthand_retains_position_repeat_and_size() {
+        // CSS Backgrounds 3 §2.10: explicit layer values replace their
+        // initial values while omitted longhands reset normally.
+        let dom = Dom::parse_document(
+            "<div id=x style='background:url(hero.png) 95% bottom / 734px auto no-repeat'></div>",
+        );
+        let x = dom.get_by_id("x").unwrap();
+        assert_eq!(
+            dom.computed_value_resolved(x, "background-position")
+                .as_deref(),
+            Some("95% bottom")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(x, "background-size").as_deref(),
+            Some("734px auto")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(x, "background-repeat")
+                .as_deref(),
+            Some("no-repeat")
+        );
+    }
+
+    #[test]
+    fn pseudo_content_resolves_custom_property_and_visual_alt_split() {
+        // CSS Variables 1 §3 + CSS Content 3 §1.2. Font icon libraries
+        // commonly keep the glyph in a custom property and mark it decorative
+        // with empty alternative text after `/`.
+        let dom = Dom::parse_document(
+            r#"<style>#x{--icon:"\f004"}#x::before{content:var(--icon)/""}</style>
+               <i id=x></i>"#,
+        );
+        let x = dom.get_by_id("x").unwrap();
+        assert_eq!(
+            dom.pseudo_content(x, PseudoEl::Before).as_deref(),
+            Some("\u{f004}")
+        );
     }
 
     #[test]
