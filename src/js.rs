@@ -7953,6 +7953,13 @@ fn load_page(
             &budget,
             &mut outcome,
         );
+        // WHATWG HTML §8.1.7.3: DOMContentLoaded is a task, so cleaning up
+        // after its callback performs a microtask checkpoint before the event
+        // loop selects a networking, timer, or rendering task. Async framework
+        // bootstraps commonly cross their first `await` here; postponing those
+        // reactions until an unrelated resource completed exposed a partially
+        // initialized DOM to the first paint and could strand a React root.
+        run_microtasks_into(&mut ctx, &mut outcome);
     }
 
     drain_js_side(&mut ctx, &mut outcome);
@@ -8691,6 +8698,25 @@ pub enum PageCmd {
     DevicePixelRatio(f32),
 }
 
+impl PageCmd {
+    /// Frontend-to-engine presentation synchronization is bookkeeping, not a
+    /// user-interaction task. HTML leaves selection among task sources to the
+    /// user agent, but a perpetually ready bookkeeping lane must not prevent a
+    /// runnable timer, networking, DOM-manipulation, posted-message, or port
+    /// task from making progress (HTML §8.1.7.3; Web Messaging §9.3–9.4).
+    fn is_presentation_sync(&self) -> bool {
+        matches!(
+            self,
+            Self::RegionGeom { .. }
+                | Self::LiveRegions(_)
+                | Self::LiveBoundaries(_)
+                | Self::ImageSizes(_)
+                | Self::Viewport(_)
+                | Self::DevicePixelRatio(_)
+        )
+    }
+}
+
 /// Latest native pointer hit delivered through the page actor's coalescing
 /// hover lane. Pointer boundary state is a latest-value signal rather than
 /// ordinary queued work: if the bounded command queue is saturated, dropping
@@ -8875,6 +8901,15 @@ impl Drop for PageHandle {
 /// Wall budget for a single user-event dispatch's COMPUTE (a fetch fired
 /// during it extends the deadline — see `DISPATCH_NET_GRACE`).
 const DISPATCH_BUDGET: Duration = Duration::from_secs(1);
+
+/// Safety ceiling for one ordinary HTML event-loop task. HTML §8.1.7.3 runs
+/// the selected task's steps to completion, performs its microtask checkpoint,
+/// and reports a long task; it does not interrupt networking, timer, message,
+/// or worker tasks at the much shorter user-interaction budget above. Keep the
+/// page-wide ceiling as a last-resort resource bound, alongside Boa's loop,
+/// recursion, and stack limits. Applying `DISPATCH_BUDGET` here interrupted
+/// finite framework renders after they had partially mutated the DOM.
+const EVENT_LOOP_TASK_BUDGET: Duration = WALL_BUDGET;
 
 /// How long a dispatch may wait on in-flight network before giving up. A
 /// page-initiated fetch during a dispatch pushes the deadline out to this, so a
@@ -9740,7 +9775,7 @@ fn setup_page_workers(
 /// `__trust.workerMessage`/`workerError` find the Worker by id, build the event,
 /// and fire it. Same dispatch shape as `dispatch_ws_in`.
 fn dispatch_worker_in(page: &mut LoadedPage, id: usize, event: WorkerOut) {
-    prepare_dispatch(page);
+    prepare_event_loop_task(page);
     let call = match event {
         WorkerOut::Message(s) => format!("__trust.workerMessage({id},{})", js_string(&s)),
         WorkerOut::Error(msg) => format!("__trust.workerError({id},{})", js_string(&msg)),
@@ -10071,7 +10106,13 @@ fn page_actor(
     // platform queue advance without an artificial timer delay.
     let mut previous_turn_was_platform = false;
     let mut last_timer_wake: Option<std::time::Instant> = None;
-    loop {
+    // A presentation-sync command selected while another HTML task source is
+    // runnable is held for exactly one turn. The following iteration services
+    // the held command before reading another one, giving bounded 1:1 progress
+    // to both lanes without delaying genuine user input.
+    let mut deferred_presentation_cmd: Option<PageCmd> = None;
+    let mut presentation_task_cursor = 0u8;
+    'event_loop: loop {
         let elapsed = clock_wall.elapsed().as_millis() as f64;
         let now_virt = (clock_virt + elapsed).max(js_now(&mut page));
         clock_virt = now_virt - elapsed;
@@ -10103,8 +10144,12 @@ fn page_actor(
             js_next_deadline(&mut page)
                 .map(|at| Duration::from_millis((at - now_virt).max(0.0) as u64).max(sleep_floor))
         };
-        let wake = rt.block_on(async {
-            tokio::select! {
+        let deferred = deferred_presentation_cmd.take();
+        let was_deferred_presentation = deferred.is_some();
+        let wake = match deferred {
+            Some(cmd) => Wake::Cmd(Some(cmd)),
+            None => rt.block_on(async {
+                tokio::select! {
                 // HTML §8.1.7.4 assigns click/key input to the user
                 // interaction task source. Give the command lane first choice
                 // whenever it and a later networking/module task are both
@@ -10128,8 +10173,9 @@ fn page_actor(
                 () = std::future::ready(()), if service_platform_task => Wake::PlatformTask,
                 () = std::future::ready(()), if service_due_timer => Wake::Timer,
                 () = sleep_or_pending(sleep_dur) => Wake::Timer,
-            }
-        });
+                }
+            }),
+        };
         let cmd = match wake {
             Wake::Hover(Some(hover)) => PageCmd::Hover {
                 node: hover.node,
@@ -10138,6 +10184,101 @@ fn page_actor(
             },
             Wake::Hover(None) => break, // app dropped the handle
             Wake::Cmd(Some(cmd)) => {
+                // Native layout/image synchronization is not the HTML user
+                // interaction task source. Rotate one already-runnable page
+                // task ahead of a newly received sync command, then service
+                // that exact command on the next iteration. This prevents a
+                // continuously replenished image/geometry stream from
+                // stranding React's MessagePort scheduler, author timers, or
+                // dynamically prepared script/style networking tasks.
+                if !was_deferred_presentation && cmd.is_presentation_sync() {
+                    for offset in 0..4 {
+                        let source = (presentation_task_cursor + offset) % 4;
+                        match source {
+                            // Fetch and dynamically prepared resource responses
+                            // are already-completed networking tasks.
+                            0 => {
+                                if let Ok((id, result)) = fetch_rx.try_recv() {
+                                    deferred_presentation_cmd = Some(cmd);
+                                    presentation_task_cursor = 1;
+                                    if !dispatch_fetch_done(&mut page, &evts, id, result) {
+                                        break 'event_loop;
+                                    }
+                                    previous_turn_was_platform = true;
+                                    continue 'event_loop;
+                                }
+                                if let Ok(event) = resource_rx.try_recv() {
+                                    deferred_presentation_cmd = Some(cmd);
+                                    presentation_task_cursor = 1;
+                                    if !dispatch_resource_done(
+                                        &mut page,
+                                        &evts,
+                                        event,
+                                        lifecycle_complete,
+                                    ) {
+                                        break 'event_loop;
+                                    }
+                                    if !lifecycle_complete && !page_has_load_blockers(&page) {
+                                        complete_live_lifecycle(&mut page);
+                                        lifecycle_complete = true;
+                                        if !finish_dispatch_render(&mut page, &evts, false) {
+                                            break 'event_loop;
+                                        }
+                                    }
+                                    previous_turn_was_platform = true;
+                                    continue 'event_loop;
+                                }
+                            }
+                            // XHR, DOM-manipulation, posted-message, and
+                            // enabled MessagePort task sources.
+                            1 if platform_task_pending => {
+                                deferred_presentation_cmd = Some(cmd);
+                                presentation_task_cursor = 2;
+                                if !platform_task_wake(&mut page, &evts) {
+                                    break 'event_loop;
+                                }
+                                previous_turn_was_platform = true;
+                                prefer_host_turn = true;
+                                continue 'event_loop;
+                            }
+                            // Module/resource executor work that is ready but
+                            // not represented by the JS platform queues.
+                            2 if service_host_jobs => {
+                                deferred_presentation_cmd = Some(cmd);
+                                presentation_task_cursor = 3;
+                                if !host_task_wake(&mut page, &evts, lifecycle_complete) {
+                                    break 'event_loop;
+                                }
+                                if !lifecycle_complete && !page_has_load_blockers(&page) {
+                                    complete_live_lifecycle(&mut page);
+                                    lifecycle_complete = true;
+                                    if !finish_dispatch_render(&mut page, &evts, false) {
+                                        break 'event_loop;
+                                    }
+                                }
+                                prefer_host_turn = false;
+                                previous_turn_was_platform = false;
+                                continue 'event_loop;
+                            }
+                            // Timers are their own HTML task source. Respect
+                            // the normal frame floor, but never let sync traffic
+                            // keep a due carousel/animation callback behind it.
+                            3 if timer_due && timer_floor_ready => {
+                                deferred_presentation_cmd = Some(cmd);
+                                presentation_task_cursor = 0;
+                                let real_now = clock_virt + clock_wall.elapsed().as_millis() as f64;
+                                if !timer_wake(&mut page, &evts, real_now) {
+                                    break 'event_loop;
+                                }
+                                last_timer_wake = Some(std::time::Instant::now());
+                                prefer_host_turn = true;
+                                previous_turn_was_platform = false;
+                                continue 'event_loop;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 // User commands are the interaction task source. Let one
                 // background task run after this command, but never let a
                 // queued network/module task delay input indefinitely.
@@ -10602,7 +10743,7 @@ fn page_actor(
 /// JS `WebSocket`), then perform its microtask checkpoint. A frame is one event
 /// loop task; a streamed token mutates the DOM and re-renders.
 fn dispatch_ws_in(page: &mut LoadedPage, id: usize, event: crate::ws::WsIn) {
-    prepare_dispatch(page);
+    prepare_event_loop_task(page);
     let call = match event {
         crate::ws::WsIn::Open => format!("__trust.wsEvent({id},'open')"),
         crate::ws::WsIn::Text(s) => {
@@ -10944,7 +11085,7 @@ fn timer_wake(
     let diag = frame_diag_on();
     let mark = || diag.then(std::time::Instant::now);
     let t_wake = mark();
-    prepare_dispatch(page);
+    prepare_event_loop_task(page);
     let t = mark();
     settle_to(
         &mut page.ctx,
@@ -11031,7 +11172,7 @@ fn timer_wake(
 /// return to task selection after every message so commands/networking retain
 /// priority and an author chain cannot become one uninterruptible dispatch.
 fn platform_task_wake(page: &mut LoadedPage, evts: &tokio::sync::mpsc::Sender<PageEvt>) -> bool {
-    prepare_dispatch(page);
+    prepare_event_loop_task(page);
     let ran = guarded_call_trust(
         &mut page.ctx,
         "runPlatformTask",
@@ -11094,7 +11235,7 @@ fn host_task_wake(
     lifecycle_complete: bool,
 ) -> bool {
     if lifecycle_complete {
-        prepare_dispatch(page);
+        prepare_event_loop_task(page);
     }
     // A dynamically inserted external script is an HTML networking task. The
     // script element's force-async path (HTML §4.12.1.1, "prepare the script
@@ -11190,7 +11331,7 @@ fn dispatch_resource_done(
 ) -> bool {
     note_resource_done(page, event.delays_load);
     if lifecycle_complete {
-        prepare_dispatch(page);
+        prepare_event_loop_task(page);
     }
     match event.kind {
         ResourceKind::ClassicScript => match event.result {
@@ -11273,7 +11414,7 @@ fn dispatch_fetch_done(
 ) -> bool {
     let task_started = Instant::now();
     note_background_fetch_done(page);
-    prepare_dispatch(page);
+    prepare_event_loop_task(page);
     let value = fetch_result_value(&mut page.ctx, result);
     settle_bg_fetch(&mut page.ctx, id, value);
     // Fetch response processing is one networking task followed by a
@@ -11608,8 +11749,8 @@ fn form_submission(
     })
 }
 
-fn prepare_dispatch(page: &mut LoadedPage) {
-    page.budget.rearm(DISPATCH_BUDGET);
+fn prepare_task(page: &mut LoadedPage, budget: Duration) {
+    page.budget.rearm(budget);
     if let Some(net) = page.ctx.realm().host_defined().get::<PageNet>() {
         net.fetched.set(0);
         // We're in interactive dispatch mode now: a fetch fired from here on
@@ -11622,6 +11763,14 @@ fn prepare_dispatch(page: &mut LoadedPage) {
     // when the member is missing, like the old `&&`-guarded eval.)
     let _ = call_trust(&mut page.ctx, "moResetGuard", &[]);
     let _ = page.dom.borrow_mut().take_dirty();
+}
+
+fn prepare_dispatch(page: &mut LoadedPage) {
+    prepare_task(page, DISPATCH_BUDGET);
+}
+
+fn prepare_event_loop_task(page: &mut LoadedPage) {
+    prepare_task(page, EVENT_LOOP_TASK_BUDGET);
 }
 
 fn js_string(s: &str) -> String {
@@ -18957,12 +19106,58 @@ const PRELUDE: &str = r##"
         disconnect() { this.__targets = []; const k = IO.indexOf(this); if (k >= 0) IO.splice(k, 1); }
         takeRecords() { return []; }
     };
-    // Feature-detected by older libraries: `'isIntersecting' in
-    // IntersectionObserverEntry.prototype` gates the isIntersecting code path.
-    // Entries are plain objects (like the records), this is just the brand.
-    g.IntersectionObserverEntry = function () {};
-    Object.defineProperty(g.IntersectionObserverEntry.prototype, "isIntersecting",
-        { get() { return false; }, configurable: true });
+    // W3C Intersection Observer §2.3 exposes every entry attribute on
+    // IntersectionObserverEntry.prototype. Libraries use those Web IDL members
+    // for feature detection; advertising only `isIntersecting` makes a complete
+    // native observer look partial and causes them to install polling polyfills.
+    // Keep the geometry values immutable, as DOMRectReadOnly values are.
+    function ioEntryRect(init) {
+        init = init || {};
+        const x = init.x === undefined ? 0 : Number(init.x);
+        const y = init.y === undefined ? 0 : Number(init.y);
+        const width = init.width === undefined ? 0 : Number(init.width);
+        const height = init.height === undefined ? 0 : Number(init.height);
+        return Object.freeze({
+            x, y, width, height,
+            top: Math.min(y, y + height),
+            right: Math.max(x, x + width),
+            bottom: Math.max(y, y + height),
+            left: Math.min(x, x + width),
+        });
+    }
+    g.IntersectionObserverEntry = class IntersectionObserverEntry {
+        constructor(init) {
+            if (init === null || init === undefined)
+                throw new TypeError("Failed to construct 'IntersectionObserverEntry': 1 argument required");
+            init = Object(init);
+            const required = ["time", "rootBounds", "boundingClientRect",
+                "intersectionRect", "isIntersecting", "intersectionRatio", "target"];
+            for (let i = 0; i < required.length; i++) {
+                if (!(required[i] in init))
+                    throw new TypeError("Failed to construct 'IntersectionObserverEntry': required member '" + required[i] + "' is undefined");
+            }
+            if (!init.target || typeof init.target.__id !== "number")
+                throw new TypeError("Failed to construct 'IntersectionObserverEntry': target is not an Element");
+            Object.defineProperty(this, "__entry", { value: Object.freeze({
+                time: Number(init.time),
+                rootBounds: init.rootBounds === null ? null : ioEntryRect(init.rootBounds),
+                boundingClientRect: ioEntryRect(init.boundingClientRect),
+                intersectionRect: ioEntryRect(init.intersectionRect),
+                isIntersecting: Boolean(init.isIntersecting),
+                intersectionRatio: Number(init.intersectionRatio),
+                target: init.target,
+            }) });
+        }
+    };
+    Object.defineProperties(g.IntersectionObserverEntry.prototype, {
+        time: { get() { return this.__entry.time; }, enumerable: true, configurable: true },
+        rootBounds: { get() { return this.__entry.rootBounds; }, enumerable: true, configurable: true },
+        boundingClientRect: { get() { return this.__entry.boundingClientRect; }, enumerable: true, configurable: true },
+        intersectionRect: { get() { return this.__entry.intersectionRect; }, enumerable: true, configurable: true },
+        isIntersecting: { get() { return this.__entry.isIntersecting; }, enumerable: true, configurable: true },
+        intersectionRatio: { get() { return this.__entry.intersectionRatio; }, enumerable: true, configurable: true },
+        target: { get() { return this.__entry.target; }, enumerable: true, configurable: true },
+    });
 
     // The spec's "update intersection observations" step: for each observer ×
     // target, intersect the target's DOCUMENT-space box with the viewport
@@ -19026,10 +19221,10 @@ const PRELUDE: &str = r##"
                 const ir = isIx
                     ? { x: iL - sx, y: iT - sy, left: iL - sx, top: iT - sy, right: iR - sx, bottom: iB - sy, width: iW, height: iH }
                     : { x: 0, y: 0, left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
-                entries.push({
+                entries.push(new g.IntersectionObserverEntry({
                     target: rec.el, isIntersecting: isIx, intersectionRatio: ratio,
                     boundingClientRect: bcr, intersectionRect: ir, rootBounds: rootBounds, time: g.performance.now(),
-                });
+                }));
             }
             if (entries.length) {
                 delivered += entries.length;
@@ -21252,20 +21447,13 @@ const PRELUDE: &str = r##"
     // WHATWG XHR §3.5.6 invokes response processing from Fetch's networking
     // task. It is deliberately not an author timer: replacing/clearing
     // setTimeout must not cancel readystatechange/load/loadend.
-    trust.hasMessageTask = function () {
-        if (messageTasks.length) return true;
+    trust.hasPortMessageTask = function () {
         for (const task of portMessages) {
             if (task.target.__started && !task.target.__closed) return true;
         }
         return false;
     };
-    trust.runMessageTask = function () {
-        if (messageTasks.length) {
-            const task = messageTasks.shift();
-            try { runInFrame(task.frame, task.fn); }
-            catch (e) { trust.errors.push("message task: " + ((e && e.message) || e)); }
-            return true;
-        }
+    trust.runPortMessageTask = function () {
         let index = -1;
         for (let i = 0; i < portMessages.length; i++) {
             const target = portMessages[i].target;
@@ -21286,29 +21474,64 @@ const PRELUDE: &str = r##"
         } catch (e) { trust.errors.push("message port: " + ((e && e.message) || e)); }
         return true;
     };
+    trust.hasPostedMessageTask = function () { return messageTasks.length > 0; };
+    trust.runPostedMessageTask = function () {
+        if (!messageTasks.length) return false;
+        const task = messageTasks.shift();
+        try { runInFrame(task.frame, task.fn); }
+        catch (e) { trust.errors.push("message task: " + ((e && e.message) || e)); }
+        return true;
+    };
+    trust.hasMessageTask = function () {
+        return trust.hasPostedMessageTask() || trust.hasPortMessageTask();
+    };
+    // Window.postMessage uses HTML's posted-message task source. Every enabled
+    // MessagePort instead contributes its queue through the unshipped port
+    // message task source (HTML §9.3.3 and §9.4.4). They are not one priority
+    // queue: a self-replenishing posted-message loop must not strand a port.
+    // Keep this compatibility helper fair too, although normal event-loop
+    // selection below treats the sources independently.
+    let messageSourceCursor = 0;
+    trust.runMessageTask = function () {
+        for (let offset = 0; offset < 2; ++offset) {
+            const source = (messageSourceCursor + offset) % 2;
+            if (source === 0 && trust.hasPostedMessageTask()) {
+                messageSourceCursor = 1;
+                return trust.runPostedMessageTask();
+            }
+            if (source === 1 && trust.hasPortMessageTask()) {
+                messageSourceCursor = 0;
+                return trust.runPortMessageTask();
+            }
+        }
+        return false;
+    };
     // HTML leaves selection among runnable task sources implementation-defined,
     // while requiring the event loop to keep making progress. Rotate among the
-    // three represented sources so a self-replenishing source cannot starve
+    // four represented sources so a self-replenishing source cannot starve
     // another one. FIFO ordering remains intact within each source.
     let platformSourceCursor = 0;
     trust.hasPlatformTask = function () {
         return networkTasks.length > 0 || domTasks.length > 0 || trust.hasMessageTask();
     };
     trust.runPlatformTask = function () {
-        for (let offset = 0; offset < 3; offset++) {
-            const source = (platformSourceCursor + offset) % 3;
+        for (let offset = 0; offset < 4; offset++) {
+            const source = (platformSourceCursor + offset) % 4;
             let task = null;
             let label = "";
             if (source === 0 && networkTasks.length) {
                 task = networkTasks.shift(); label = "network task";
             } else if (source === 1 && domTasks.length) {
                 task = domTasks.shift(); label = "DOM manipulation task";
-            } else if (source === 2 && trust.hasMessageTask()) {
+            } else if (source === 2 && trust.hasPostedMessageTask()) {
+                platformSourceCursor = 3;
+                return trust.runPostedMessageTask();
+            } else if (source === 3 && trust.hasPortMessageTask()) {
                 platformSourceCursor = 0;
-                return trust.runMessageTask();
+                return trust.runPortMessageTask();
             }
             if (task) {
-                platformSourceCursor = (source + 1) % 3;
+                platformSourceCursor = (source + 1) % 4;
                 try { runInFrame(task.frame, task.fn); }
                 catch (e) { trust.errors.push(label + ": " + ((e && e.message) || e)); }
                 return true;
@@ -21341,7 +21564,7 @@ const PRELUDE: &str = r##"
             const list = BC.get(this.name) || [];
             for (const ch of list.slice()) {
                 if (ch === this || ch.__closed) continue;
-                __queue_message_task(() => {
+                __queue_dom_task(() => {
                     if (ch.__closed) return;
                     const ev = new MessageEvent("message", {
                         data: message,
@@ -25411,6 +25634,50 @@ mod tests {
     }
 
     #[test]
+    fn posted_messages_cannot_starve_an_enabled_message_port_queue() {
+        // HTML §9.3.3 queues Window.postMessage on the posted-message task
+        // source, while §9.4.4 exposes enabled unshipped MessagePort queues as
+        // a different task source. A posted-message callback that queues its
+        // successor must therefore not prevent the port source from progress.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "message-source-fairness.js",
+            br##"
+            globalThis.out = { posted: 0, port: false };
+            window.addEventListener("message", function spin() {
+                out.posted++;
+                if (out.posted < 100) window.postMessage("again", "*");
+            });
+            window.postMessage("start", "*");
+            const channel = new MessageChannel();
+            channel.port1.onmessage = function () { out.port = true; };
+            channel.port2.postMessage("render");
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        settle(&mut ctx, &budget, 6, &mut outcome);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            ctx.eval(Source::from_bytes(b"out.port"))
+                .unwrap()
+                .to_boolean(),
+            "self-replenishing posted messages starved the port task source"
+        );
+        assert!(
+            ctx.eval(Source::from_bytes(b"out.posted"))
+                .unwrap()
+                .as_number()
+                .unwrap_or(100.0)
+                < 100.0,
+            "the regression must exercise source rotation before the posted-message loop ends"
+        );
+    }
+
+    #[test]
     fn file_reader_reads_blobs_asynchronously() {
         // FileReader is built by PRELUDE on the syscalls, so the test needs a
         // faithful page context (DOM + syscalls + config + PRELUDE), exactly
@@ -27368,6 +27635,66 @@ mod tests {
     }
 
     #[test]
+    fn injected_script_promise_all_resumes_after_load_handlers_remove_scripts() {
+        // HTML script processing fires one `load` event at a successfully
+        // executed external classic script. Webpack-style loaders install an
+        // `onload` IDL handler, remove the script in that handler, and await a
+        // Promise.all of several chunks before mounting the application.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "inject-promise-all.js",
+            br##"
+            globalThis.out = { events: [] };
+            const loads = [];
+            for (let i = 0; i < 7; ++i) {
+                loads.push(new Promise((resolve, reject) => {
+                    const sc = document.createElement("script");
+                    sc.onload = function (event) {
+                        out.events.push(event.type + i);
+                        sc.onerror = sc.onload = null;
+                        sc.remove();
+                        resolve(i);
+                    };
+                    sc.onerror = reject;
+                    sc.src = "data:text/javascript,globalThis.__chunk" + i + "=" + i;
+                    document.head.appendChild(sc);
+                }));
+            }
+            Promise.all(loads).then(values => {
+                out.mounted = values.join(",");
+            });
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        settle(&mut ctx, &budget, 16, &mut outcome);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let s = |ctx: &mut Context, expr: &[u8]| {
+            ctx.eval(Source::from_bytes(expr))
+                .unwrap()
+                .to_string(ctx)
+                .unwrap()
+                .to_std_string_escaped()
+        };
+        assert_eq!(
+            s(&mut ctx, b"out.events.join(',')"),
+            "load0,load1,load2,load3,load4,load5,load6"
+        );
+        assert_eq!(s(&mut ctx, b"out.mounted"), "0,1,2,3,4,5,6");
+        assert_eq!(
+            s(
+                &mut ctx,
+                b"String(document.head.querySelectorAll('script').length)"
+            ),
+            "0"
+        );
+    }
+
+    #[test]
     fn document_style_sheets_scripts_and_send_beacon_exist() {
         let mut ctx = platform_ctx();
         let budget = Budget::new(WALL_BUDGET);
@@ -27619,6 +27946,15 @@ mod tests {
         assert_eq!(outcome.errors.len(), 1, "{:?}", outcome.errors);
         // The limit must fire in seconds, not hang the suite.
         assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn ordinary_event_loop_tasks_do_not_inherit_the_interaction_deadline() {
+        // HTML §8.1.7.3 performs a selected timer/network/message task before
+        // its microtask checkpoint. The one-second interaction window is not a
+        // task boundary and used to interrupt finite framework renders midway.
+        assert_eq!(EVENT_LOOP_TASK_BUDGET, WALL_BUDGET);
+        assert!(EVENT_LOOP_TASK_BUDGET > DISPATCH_BUDGET);
     }
 
     #[test]
@@ -29732,6 +30068,68 @@ mod tests {
                 }
             }
             assert!(mounted, "128 runnable port tasks did not mount within 3s");
+            drop(handle);
+        });
+    }
+
+    #[test]
+    fn presentation_sync_cannot_starve_port_or_timer_task_sources() {
+        // HTML §8.1.7.3 selects a runnable task, runs it, then performs the
+        // microtask checkpoint. User-agent presentation bookkeeping is not the
+        // user-interaction task source and cannot remain the selected work
+        // forever while MessagePort (§9.4.4) and timer tasks are runnable.
+        // Desktop image/geometry feedback can continuously refill this exact
+        // command lane while a large page is mounting.
+        let (handle, mut events) = live(
+            r#"<body data-port="waiting" data-timer="waiting"><script>
+               const channel = new MessageChannel();
+               channel.port1.onmessage = function () {
+                   document.body.setAttribute('data-port', 'ran');
+               };
+               channel.port2.postMessage('render');
+               setTimeout(function () {
+                   document.body.setAttribute('data-timer', 'ran');
+               }, 0);
+               </script></body>"#,
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let flood_tx = handle.cmds.clone();
+            let flood = tokio::spawn(async move {
+                loop {
+                    if flood_tx
+                        .send(PageCmd::RegionGeom { items: vec![] })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let started = Instant::now();
+            let mut port_ran = false;
+            let mut timer_ran = false;
+            while started.elapsed() < Duration::from_secs(3) {
+                let event = tokio::time::timeout(Duration::from_secs(3), events.recv())
+                    .await
+                    .expect("presentation sync starved the page event loop")
+                    .expect("page actor exited with runnable tasks");
+                match event {
+                    PageEvt::Updated { html, outcome } => {
+                        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                        port_ran |= html.contains("data-port=\"ran\"");
+                        timer_ran |= html.contains("data-timer=\"ran\"");
+                        if port_ran && timer_ran {
+                            break;
+                        }
+                    }
+                    PageEvt::Settled | PageEvt::Trouble(_) => continue,
+                    other => panic!("unexpected presentation-fairness event: {other:?}"),
+                }
+            }
+            flood.abort();
+            assert!(port_ran, "presentation sync starved MessagePort tasks");
+            assert!(timer_ran, "presentation sync starved timer tasks");
             drop(handle);
         });
     }
@@ -34776,6 +35174,47 @@ mod tests {
     }
 
     #[test]
+    fn intersection_observer_entries_expose_the_standard_interface() {
+        // Intersection Observer §2.3 defines all seven readonly attributes on
+        // the IntersectionObserverEntry interface and requires callback records
+        // to be instances of that interface. This also covers the feature probe
+        // used by standards-aware libraries before deciding to install a
+        // synchronous geometry-polling polyfill.
+        let (out, outcome) = page(
+            r##"<body><div id=probe>probe</div><div id=out></div><script>
+            var probe = document.getElementById('probe');
+            var names = ['time', 'rootBounds', 'boundingClientRect',
+                'intersectionRect', 'isIntersecting', 'intersectionRatio', 'target'];
+            var manual = new IntersectionObserverEntry({
+                time: 5, rootBounds: null,
+                boundingClientRect: {x: 1, y: 2, width: 3, height: 4},
+                intersectionRect: {x: 1, y: 2, width: 1, height: 2},
+                isIntersecting: true, intersectionRatio: 0.5, target: probe
+            });
+            new IntersectionObserver(function (entries) {
+                var e = entries[0];
+                document.getElementById('out').textContent = [
+                    'interface=' + names.every(function (name) {
+                        return name in IntersectionObserverEntry.prototype;
+                    }),
+                    'callback=' + (e instanceof IntersectionObserverEntry),
+                    'target=' + (e.target === probe),
+                    'manual=' + (manual instanceof IntersectionObserverEntry),
+                    'root=' + (manual.rootBounds === null),
+                    'rect=' + manual.boundingClientRect.right + ',' +
+                        manual.boundingClientRect.bottom
+                ].join(' ');
+            }).observe(probe);
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("interface=true callback=true target=true manual=true root=true rect=4,6"),
+            "IntersectionObserverEntry must expose and carry its Web IDL members: {out}"
+        );
+    }
+
+    #[test]
     fn intersection_observer_sees_an_empty_generated_ratio_box() {
         // CSS Pseudo 4 §4.1 / CSS Content 3 §2: content:"" creates a
         // styleable box. CSS Box 4 §4: its vertical 56.25% padding resolves
@@ -37139,6 +37578,89 @@ mod tests {
         // sync first; the microtask drains before DOMContentLoaded; timers
         // run in virtual-time order (10 before 50, nested at 15); load last.
         assert!(out.contains("sync|micro|dcl|t10|nested|t50|load|"), "{out}");
+    }
+
+    #[test]
+    fn dom_content_loaded_microtasks_precede_the_live_shell() {
+        // HTML §8.1.7.3 performs the microtask checkpoint for the
+        // DOMContentLoaded task before updating the rendering or selecting a
+        // later timer task. The button keeps the shell live so this asserts the
+        // actual first-paint boundary rather than the one-shot final state.
+        let (handle, mut events) = live(
+            r#"<body><button>live</button><div id=out>sync</div><script>
+            document.addEventListener('DOMContentLoaded', function () {
+                Promise.resolve().then(function () {
+                    document.getElementById('out').textContent = 'microtask';
+                });
+                setTimeout(function () {
+                    document.getElementById('out').textContent = 'timer';
+                }, 100);
+            });
+            </script></body>"#,
+        );
+        match events.blocking_recv() {
+            Some(PageEvt::Updated { html, outcome }) => {
+                assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                assert!(
+                    html.contains("microtask"),
+                    "first shell missed DCL microtask: {html}"
+                );
+                assert!(
+                    !html.contains(">timer<"),
+                    "later timer leaked into DCL task: {html}"
+                );
+            }
+            other => panic!("expected live shell, got {other:?}"),
+        }
+        drop(handle);
+    }
+
+    #[test]
+    fn dom_content_loaded_message_port_task_runs_in_the_live_event_loop() {
+        // HTML §9.4 gives MessagePort messages their own task source. A
+        // DOMContentLoaded handler may post one before the live actor begins
+        // task selection; React 18 does this to schedule its initial root
+        // render. The task must remain runnable after the lifecycle shell.
+        let (handle, mut events) = live(
+            r#"<body><button>live</button><div id=out>waiting</div><script>
+            document.addEventListener('DOMContentLoaded', function () {
+                const channel = new MessageChannel();
+                channel.port1.onmessage = function () {
+                    document.getElementById('out').textContent = 'delivered';
+                };
+                channel.port2.postMessage('render');
+            });
+            </script></body>"#,
+        );
+        let first = events.blocking_recv().expect("live shell");
+        let PageEvt::Updated { html, outcome } = first else {
+            panic!("expected live shell, got {first:?}");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            html.contains("waiting"),
+            "message task ran inside DCL task: {html}"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let delivered = loop {
+            match events.try_recv() {
+                Ok(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    if html.contains("delivered") {
+                        break true;
+                    }
+                }
+                Ok(_) | Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break false,
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(handle);
+        assert!(delivered, "DOMContentLoaded MessagePort task was stranded");
     }
 
     #[test]
