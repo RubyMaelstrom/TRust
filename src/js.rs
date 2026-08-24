@@ -2776,7 +2776,7 @@ fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
         ("__dom_computed", 2, sys_computed_style),
         ("__image_current_src", 1, sys_image_current_src),
         ("__image_complete", 1, sys_image_complete),
-        ("__match_media", 1, sys_match_media),
+        ("__match_media", 3, sys_match_media),
         ("__dom_rect", 1, sys_rect),
         ("__dom_scroll_get", 2, sys_scroll_get),
         ("__dom_scroll_set", 3, sys_scroll_set),
@@ -3170,7 +3170,19 @@ fn sys_computed_style(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
 fn sys_match_media(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let query = arg_str(args, 0, ctx);
     let dom = page_dom(ctx);
-    let matches = dom.borrow().media_matches(&query);
+    let viewport = args
+        .get(1)
+        .and_then(JsValue::as_number)
+        .zip(args.get(2).and_then(JsValue::as_number))
+        .filter(|(width, height)| {
+            width.is_finite() && *width >= 0.0 && height.is_finite() && *height >= 0.0
+        });
+    let matches = match viewport {
+        Some((width, height)) => dom
+            .borrow()
+            .media_matches_at(&query, width as f32, height as f32),
+        None => dom.borrow().media_matches(&query),
+    };
     Ok(JsValue::from(matches))
 }
 
@@ -16218,6 +16230,86 @@ const PRELUDE: &str = r##"
     }
     installUrlParts(HTMLAnchorElement);
     installUrlParts(HTMLAreaElement);
+    // CSSOM View §4 requires Window.innerWidth/innerHeight to report THIS
+    // browsing context's viewport.  For a nested navigable that viewport is
+    // the iframe's content box, not the top-level viewport.  Prefer the layout
+    // engine's current border box; a newly inserted iframe can start running
+    // its fetched document before the next presentation pass, so retain the
+    // HTML replaced-element 300x150 defaults and resolve simple authored
+    // px/% sizes against its containing block for that interval.
+    function frameStyleValue(el, name) {
+        try { return String(g.getComputedStyle(el).getPropertyValue(name) || "").trim(); }
+        catch (e) { return ""; }
+    }
+    function frameEdgeSum(el, axis) {
+        const names = axis === "width"
+            ? ["padding-left", "padding-right", "border-left-width", "border-right-width"]
+            : ["padding-top", "padding-bottom", "border-top-width", "border-bottom-width"];
+        let sum = 0;
+        for (const name of names) {
+            const n = parseFloat(frameStyleValue(el, name));
+            if (Number.isFinite(n) && n > 0) sum += n;
+        }
+        return sum;
+    }
+    function frameMeasuredContentSize(el, axis) {
+        let r = null;
+        try { r = __dom_rect(el.__id); } catch (e) {}
+        if (!r) return 0;
+        const borderBox = +(axis === "width" ? r[2] : r[3]);
+        if (!(borderBox > 0)) return 0;
+        return Math.max(0, borderBox - frameEdgeSum(el, axis));
+    }
+    function frameContainingBlockSize(el, axis, depth) {
+        const parent = el && el.parentElement;
+        if (!parent || parent.localName === "html")
+            return axis === "width" ? +g.innerWidth : +g.innerHeight;
+        const measured = frameMeasuredContentSize(parent, axis);
+        if (measured > 0) return measured;
+        if (depth < 4) {
+            const specified = frameSpecifiedContentSize(parent, axis, depth + 1);
+            if (specified > 0) return specified;
+        }
+        return axis === "width" ? +g.innerWidth : +g.innerHeight;
+    }
+    function frameSpecifiedContentSize(el, axis, depth) {
+        const raw = frameStyleValue(el, axis);
+        let size = 0;
+        if (/^-?(?:\d+|\d*\.\d+)px$/i.test(raw)) size = parseFloat(raw);
+        else if (/^-?(?:\d+|\d*\.\d+)%$/.test(raw))
+            size = frameContainingBlockSize(el, axis, depth) * parseFloat(raw) / 100;
+        else if (raw === "0") size = 0;
+        if (!(size >= 0) || !Number.isFinite(size)) return 0;
+        if (frameStyleValue(el, "box-sizing").toLowerCase() === "border-box")
+            size = Math.max(0, size - frameEdgeSum(el, axis));
+        return size;
+    }
+    function frameViewportDimension(frame, axis) {
+        const measured = frameMeasuredContentSize(frame, axis);
+        if (measured > 0) return measured;
+        const specified = frameSpecifiedContentSize(frame, axis, 0);
+        if (specified > 0) return specified;
+        // HTML's width/height dimension attributes provide CSS-pixel hints for
+        // replaced elements. Invalid, negative and absent values use the
+        // iframe default dimensions from HTML's rendering rules.
+        const attr = frame.getAttribute(axis);
+        if (attr !== null && /^\s*\d+\s*$/.test(attr)) return +attr.trim();
+        return axis === "width" ? 300 : 150;
+    }
+    function mediaQueryListForViewport(query, viewport) {
+        const q = String(query);
+        return {
+            media: q,
+            get matches() {
+                const size = viewport();
+                return !!__match_media(q, size[0], size[1]);
+            },
+            onchange: null,
+            addListener() {}, removeListener() {},
+            addEventListener() {}, removeEventListener() {},
+            dispatchEvent() { return false; },
+        };
+    }
     // HTMLIFrameElement.contentDocument / .contentWindow — the nested browsing
     // context's document and WindowProxy. Backed by a real same-arena
     // FrameDocument: the near-universal idiom `iframe.contentDocument ||
@@ -16258,6 +16350,12 @@ const PRELUDE: &str = r##"
                                 transferPorts(targetOrigin, transfer), g.location.origin,
                                 frame.__trustParentWindow || g);
                         },
+                        matchMedia(query) {
+                            return mediaQueryListForViewport(query, function () {
+                                return [frameViewportDimension(frame, "width"),
+                                    frameViewportDimension(frame, "height")];
+                            });
+                        },
                         focus() {}, blur() {},
                         addEventListener() {}, removeEventListener() {},
                     };
@@ -16271,6 +16369,12 @@ const PRELUDE: &str = r##"
                     // getters below (document/location/self/window/parent…) still
                     // shadow the global's.
                     Object.setPrototypeOf(this.__contentWin, g);
+                    Object.defineProperties(this.__contentWin, {
+                        innerWidth: { configurable: true, enumerable: true,
+                            get() { return frameViewportDimension(frame, "width"); } },
+                        innerHeight: { configurable: true, enumerable: true,
+                            get() { return frameViewportDimension(frame, "height"); } },
+                    });
                     this.__contentWin.self = this.__contentWin;
                     this.__contentWin.window = this.__contentWin;
                 }
@@ -16860,6 +16964,8 @@ const PRELUDE: &str = r##"
         const url = frameURLFor(frame);
         const sameOrigin = frameSameOriginWithParent(frame, parentLocation);
         const frameLocation = makeFrameLocation(frame, parentLocation);
+        const frameWidth = frameViewportDimension(frame, "width");
+        const frameHeight = frameViewportDimension(frame, "height");
         Object.defineProperty(g, "location", {
             configurable: true, enumerable: true,
             get() { return frameLocation; },
@@ -16876,6 +16982,7 @@ const PRELUDE: &str = r##"
         g.parent = parent; g.top = topWindow; g.frames = sameOrigin ? g : parent;
         frameElementState = frame; g.name = frame.getAttribute("name") || "";
         if (g.__trust_cfg) g.__trust_cfg.url = url;
+        g.innerWidth = frameWidth; g.innerHeight = frameHeight;
         baseHrefCache = null;
         trust.__activeFrame = frame;
         return token;
@@ -18408,17 +18515,9 @@ const PRELUDE: &str = r##"
     // `.matches` is a live getter so a later read reflects the current viewport.
     // Listener plumbing stays inert — TRust re-evaluates media only on reload
     // (a breakpoint-crossing resize reloads), so there is no change event to fire.
-    g.matchMedia = (m) => {
-        const q = String(m);
-        return {
-            media: q,
-            get matches() { return !!__match_media(q); },
-            onchange: null,
-            addListener() {}, removeListener() {},
-            addEventListener() {}, removeEventListener() {},
-            dispatchEvent() { return false; },
-        };
-    };
+    g.matchMedia = (m) => mediaQueryListForViewport(m, function () {
+        return [g.innerWidth, g.innerHeight];
+    });
     // window.CSS — feature detection (used across the web, not just
     // css3test). `supports("selector(…)")` runs the real selector engine
     // (honest); the property/value form leans on the style declaration's
@@ -34626,6 +34725,27 @@ mod tests {
         assert!(
             out.contains("|got-up") && out.contains("|down") && out.contains("|reply"),
             "top document was not restored: {out}"
+        );
+    }
+
+    #[test]
+    fn iframe_window_uses_its_own_content_viewport() {
+        // CSSOM View §4: innerWidth/innerHeight expose the viewport of the
+        // relevant Window. A nested browsing context therefore uses the
+        // iframe content box, while leaving the parent Window dimensions
+        // unchanged. The percentage also covers a dynamically loaded frame
+        // whose script runs before the next presentation/layout pass.
+        let (out, outcome) = page(
+            r##"<body><div style="width:200px"><iframe id=f style="width:80%;height:74px" srcdoc="<p id=child></p><script>document.getElementById('child').textContent='child:'+window.innerWidth+'x'+window.innerHeight+' media:'+matchMedia('(max-width:160px)').matches+'/'+matchMedia('(min-width:161px)').matches</script>"></iframe></div><p id=report></p><script>var f=document.getElementById('f');document.getElementById('report').textContent='parent:'+window.innerWidth+'x'+window.innerHeight+' proxy:'+f.contentWindow.innerWidth+'x'+f.contentWindow.innerHeight+' media:'+matchMedia('(min-width:600px)').matches+'/'+f.contentWindow.matchMedia('(max-width:160px)').matches</script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("child:160x74 media:true/false"),
+            "child Window should use the iframe content viewport: {out}"
+        );
+        assert!(
+            out.contains("parent:640x384 proxy:160x74 media:true/true"),
+            "parent dimensions or child WindowProxy dimensions are wrong: {out}"
         );
     }
 

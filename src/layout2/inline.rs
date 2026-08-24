@@ -18,12 +18,14 @@ use url::Url;
 
 use crate::doc::{Form, Link};
 use crate::dom::{Dom, NodeId};
-use crate::layout2::{Emphasis, ImageSizes, ItemKind, NO_NODE, Units, is_collapsible_space};
+use crate::layout2::{Emphasis, ImageSizes, ItemKind, NO_NODE, is_collapsible_space};
 
 use super::float::{FloatBox, FloatCtx, FloatPlace};
-use super::style::{Align2, BoxStyle, InlineStyle, LEFT, RIGHT, TabSize, VerticalAlign};
+use super::style::{
+    Align2, BOTTOM, BoxStyle, InlineStyle, LEFT, RIGHT, TOP, TabSize, VerticalAlign,
+};
 use super::tree::{Atom, AtomKind, BoxNode, Inline};
-use super::value::{Len, Vp};
+use super::value::Vp;
 
 /// The float environment an IFC lays its line boxes against: the block
 /// formatting context's [`FloatCtx`] (queried per line and appended to when an
@@ -85,6 +87,10 @@ pub(crate) struct Piece {
     /// pre-laid fragment positioned at this piece's resolved spot (`flush_line`
     /// records it, the block flow splices it in). `item.node` is the box id.
     atom_box: bool,
+    /// Whether this form piece owns the replaced control's border-box paint.
+    /// Blockified controls already have an outer fragment and use their child
+    /// form piece only for the label.
+    pub(crate) paint_control_box: bool,
 }
 
 /// Frontend-neutral inline paint and interaction payload. Canonical fragments
@@ -153,6 +159,7 @@ impl Piece {
             stretch: false,
             space_before: false,
             atom_box: false,
+            paint_control_box: false,
         }
     }
 
@@ -178,6 +185,7 @@ impl Piece {
             stretch: false,
             space_before: false,
             atom_box: false,
+            paint_control_box: false,
         }
     }
 }
@@ -495,9 +503,29 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             // `margin-left:50%` hero video sits at mid-line, not col 0.
             Inline::Atom(a) if a.node != NO_NODE => {
                 let style = BoxStyle::of(self.dom, a.node, self.vp);
-                self.pending_gap_px += self.edge_px(&style, LEFT);
-                self.atom(a, ctx);
-                self.pending_gap_px += self.edge_px(&style, RIGHT);
+                // Replaced inline elements establish their own computed text
+                // style for intrinsic labels/alt text. In particular, form
+                // controls commonly reset the surrounding form's font size;
+                // measuring with the parent context makes an auto-width
+                // button substantially too wide.
+                let atom_context = self.form_context(a.node, ctx);
+                // Replaced form controls' AtomGeometry is their complete
+                // border box (the graphical painter needs that exact surface
+                // and hit target). Other atomic content retains the historical
+                // content-box geometry with border/padding carried as inline
+                // edges. Margins remain outside both representations.
+                let complete_border_box = matches!(&a.kind, AtomKind::Control { .. });
+                self.pending_gap_px += if complete_border_box {
+                    self.margin_px(&style, LEFT)
+                } else {
+                    self.edge_px(&style, LEFT)
+                };
+                self.atom(a, &atom_context);
+                self.pending_gap_px += if complete_border_box {
+                    self.margin_px(&style, RIGHT)
+                } else {
+                    self.edge_px(&style, RIGHT)
+                };
             }
             Inline::Atom(a) => self.atom(a, ctx),
             // A static-position mark, nothing more: the hypothetical box
@@ -548,6 +576,12 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             .resolve(Some(self.cb_w_px))
             .unwrap_or(0.0);
         m + style.border[side] + p
+    }
+
+    fn margin_px(&self, style: &BoxStyle, side: usize) -> f32 {
+        style.margin[side]
+            .resolve(Some(self.cb_w_px))
+            .unwrap_or(0.0)
     }
 
     /// Emit a text run under `ctx`.
@@ -633,6 +667,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             },
             None,
             false,
+            false,
             ctx.vertical_align,
             Self::space_advance(ctx),
         );
@@ -709,7 +744,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             if break_style.wrap
                 && emergency_wrap
                 && may_wrap
-                && full.advance > avail
+                && !super::css_px_fits(full.advance, avail)
                 && self.pen > self.line_start
             {
                 // CSS Text 3 §5/§5.4: overflow wrapping adds an
@@ -749,7 +784,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 ) && rest
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric() || character == '_'));
-            let cut = if full.advance <= avail || plainly_unbreakable {
+            let cut = if super::css_px_fits(full.advance, avail) || plainly_unbreakable {
                 rest.len()
             } else {
                 crate::text::first_line_end(rest, &ctx.text_style(), avail, break_style)
@@ -780,7 +815,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 continue;
             }
             if ctx.ws.wraps()
-                && full.advance > avail
+                && !super::css_px_fits(full.advance, avail)
                 && self.pen > self.line_start
                 && (may_wrap || cut == 0)
             {
@@ -820,7 +855,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
         let gap = self.take_gap();
         if may_wrap
             && ctx.ws.wraps()
-            && self.pen + space_width + gap + w > self.line_right
+            && !super::css_px_fits(self.pen + space_width + gap + w, self.line_right)
             && self.pen > self.line_start
             // `break-all` breaks mid-line inside the word instead of first
             // wrapping whole (CSS Text §5.2 — every character boundary is a
@@ -901,6 +936,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             stretch: ctx.ws.collapses_spaces(),
             space_before: space,
             atom_box: false,
+            paint_control_box: false,
         });
         self.pen = x + w;
         self.pending_space = false;
@@ -941,20 +977,22 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     ctx,
                     self.vp,
                 );
-                if labels.visual.is_empty() {
-                    return;
-                }
-                let shaped = crate::text::shape(&labels.visual, &ctx.text_style());
-                let w = shaped.advance;
-                self.place_atom(
-                    AtomGeometry {
-                        box_width: w,
-                        box_height: shaped.line_height,
-                        paint_x: 0.0,
-                        paint_y: 0.0,
-                        paint_width: w,
-                        paint_height: shaped.line_height,
+                let mut shaped = crate::text::shape(
+                    if labels.visual.is_empty() {
+                        " "
+                    } else {
+                        &labels.visual
                     },
+                    &ctx.text_style(),
+                );
+                if labels.visual.is_empty() {
+                    shaped.text.clear();
+                    shaped.advance = 0.0;
+                    shaped.runs.clear();
+                    shaped.clusters.clear();
+                }
+                self.place_atom(
+                    labels.geometry,
                     InlineItem {
                         text: labels.visual,
                         terminal_text: Some(labels.terminal),
@@ -974,11 +1012,92 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     },
                     Some(shaped),
                     false,
+                    true,
                     ctx.vertical_align,
                     Self::space_advance(ctx),
                 );
             }
         }
+    }
+
+    /// Paint the CONTENT of an atom whose blockified/flex-item border box is
+    /// already represented by its containing fragment. Re-running the normal
+    /// inline-control path here would add the control's padding and border a
+    /// second time, producing a smaller nested button surface. CSS Display 3
+    /// blockification changes the outer display type; it does not nest a
+    /// second replaced element inside the first one.
+    pub fn block_atom_content(&mut self, a: &Atom, ctx: &InlineStyle) {
+        let AtomKind::Control { form, field } = &a.kind else {
+            self.atom(a, ctx);
+            return;
+        };
+        let Some(f) = self
+            .forms
+            .get(*form)
+            .and_then(|form| form.fields.get(*field))
+        else {
+            return;
+        };
+        let labels = control_labels(
+            self.dom,
+            a.node,
+            f,
+            ControlWidthBasis::ContainingBlock(self.cb_w_px),
+            self.cap,
+            ctx,
+            self.vp,
+        );
+        let mut shaped = crate::text::shape(
+            if labels.visual.is_empty() {
+                " "
+            } else {
+                &labels.visual
+            },
+            &ctx.text_style(),
+        );
+        if labels.visual.is_empty() {
+            shaped.text.clear();
+            shaped.advance = 0.0;
+            shaped.runs.clear();
+            shaped.clusters.clear();
+        }
+        let width = shaped.advance.min(self.cap).max(0.0);
+        let height = self
+            .cb_h_px
+            .unwrap_or(shaped.line_height)
+            .max(shaped.line_height);
+        self.place_atom(
+            AtomGeometry {
+                box_width: width,
+                box_height: height,
+                paint_x: 0.0,
+                paint_y: ((height - shaped.line_height) / 2.0).max(0.0),
+                paint_width: width,
+                paint_height: shaped.line_height,
+            },
+            InlineItem {
+                text: labels.visual,
+                terminal_text: Some(labels.terminal),
+                kind: ItemKind::Form,
+                graphical_image: None,
+                image: None,
+                emph: Emphasis::default(),
+                style_node: a.node,
+                node: a.node,
+                link: Some(Link::Form {
+                    form: *form,
+                    field: *field,
+                }),
+                crop: false,
+                pixelated: false,
+                invisible: ctx.invisible,
+            },
+            Some(shaped),
+            false,
+            false,
+            ctx.vertical_align,
+            Self::space_advance(ctx),
+        );
     }
 
     /// An `<img>`: a decoded or dimension-declared image reserves its used
@@ -1063,6 +1182,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                     invisible: ctx.invisible,
                 },
                 None,
+                false,
                 false,
                 ctx.vertical_align,
                 Self::space_advance(ctx),
@@ -1187,6 +1307,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 },
                 None,
                 false,
+                false,
                 ctx.vertical_align,
                 Self::space_advance(ctx),
             );
@@ -1209,20 +1330,24 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
     /// painted `item` may be smaller than its box (`object-fit: contain`
     /// letterboxing), offset from the box's top-left;
     /// the pen and the line height always advance by the BOX.
+    #[allow(clippy::too_many_arguments)] // Keep each independent CSS box/paint input explicit.
     fn place_atom(
         &mut self,
         geometry: AtomGeometry,
         item: InlineItem,
         shaped: Option<crate::text::ShapedText>,
         atom_box: bool,
+        paint_control_box: bool,
         vertical_align: VerticalAlign,
         space_advance: f32,
     ) {
         let space = self.pending_space && self.pen > self.line_start;
         let space_width = if space { space_advance.max(0.0) } else { 0.0 };
         let gap = self.take_gap();
-        if self.pen + space_width + gap + geometry.box_width > self.line_right
-            && self.pen > self.line_start
+        if !super::css_px_fits(
+            self.pen + space_width + gap + geometry.box_width,
+            self.line_right,
+        ) && self.pen > self.line_start
         {
             self.soft_break();
             self.pending_gap_px = gap;
@@ -1231,6 +1356,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
                 item,
                 shaped,
                 atom_box,
+                paint_control_box,
                 vertical_align,
                 space_advance,
             );
@@ -1255,6 +1381,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             stretch: false,
             space_before: space,
             atom_box,
+            paint_control_box,
         });
         self.pen = x + geometry.box_width;
         self.pending_space = false;
@@ -1296,6 +1423,7 @@ impl<'a, 'f, 't> Ifc<'a, 'f, 't> {
             },
             None,
             true,
+            false,
             ctx.vertical_align,
             Self::space_advance(ctx),
         );
@@ -1676,6 +1804,7 @@ pub(crate) enum ControlWidthBasis {
     Intrinsic,
 }
 
+#[cfg(test)]
 pub(crate) fn control_label(
     dom: &Dom,
     node: NodeId,
@@ -1688,9 +1817,33 @@ pub(crate) fn control_label(
     control_labels(dom, node, f, width_basis, cap, inline_style, vp).visual
 }
 
+pub(crate) fn control_intrinsic_width(
+    dom: &Dom,
+    node: NodeId,
+    field: &crate::doc::Field,
+    inline_style: &InlineStyle,
+    vp: Vp,
+) -> f32 {
+    control_labels(
+        dom,
+        node,
+        field,
+        ControlWidthBasis::Intrinsic,
+        f32::INFINITY,
+        inline_style,
+        vp,
+    )
+    // BoxNode intrinsic contribution adds the element's border/padding once
+    // around this content size. Returning the complete AtomGeometry border
+    // box here double-counts those edges for floated/blockified controls.
+    .geometry
+    .paint_width
+}
+
 struct ControlLabels {
     visual: String,
     terminal: String,
+    geometry: AtomGeometry,
 }
 
 fn control_labels(
@@ -1702,25 +1855,25 @@ fn control_labels(
     inline_style: &InlineStyle,
     vp: Vp,
 ) -> ControlLabels {
-    let mut visual = f.visual_label();
+    let visual = f.visual_label();
     let mut terminal = f.row_label();
     use crate::doc::FieldKind;
-    if !matches!(
+    let text_field = matches!(
         f.kind,
         FieldKind::Text | FieldKind::Password | FieldKind::Textarea
-    ) {
-        return ControlLabels { visual, terminal };
-    }
-    let u = Units::of(dom, node);
-    let css_width = dom
-        .computed_value_resolved(node, "width")
-        .and_then(|v| Len::parse(&v, u, vp))
-        .and_then(|l| {
-            l.resolve(match width_basis {
-                ControlWidthBasis::ContainingBlock(width) => Some(width),
-                ControlWidthBasis::Intrinsic => None,
-            })
-        });
+    );
+    let basis = match width_basis {
+        ControlWidthBasis::ContainingBlock(width) => Some(width),
+        ControlWidthBasis::Intrinsic => None,
+    };
+    let box_style = BoxStyle::of(dom, node, vp);
+    let padding = box_style
+        .padding
+        .map(|length| length.resolve(basis).unwrap_or(0.0).max(0.0));
+    let horizontal_edges =
+        padding[LEFT] + padding[RIGHT] + box_style.border[LEFT] + box_style.border[RIGHT];
+    let vertical_edges =
+        padding[TOP] + padding[BOTTOM] + box_style.border[TOP] + box_style.border[BOTTOM];
     let attr_ch = |name: &str| {
         dom.attr(node, name)
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1734,21 +1887,97 @@ fn control_labels(
         "size"
     };
     let text_style = inline_style.text_style();
-    let target = css_width.unwrap_or_else(|| {
-        crate::text::zero_advance(&text_style) * (attr_ch(attr_name).unwrap_or(20) + 2) as f32
-    });
-    let target = target.min(cap).max(0.0);
-    let space = crate::text::shape(" ", &text_style).advance.max(0.01);
-    let visual_have = crate::text::shape(&visual, &text_style).advance;
-    if visual_have < target {
-        visual.push_str(&" ".repeat(((target - visual_have) / space).ceil() as usize));
+    let mut shaped = crate::text::shape(if visual.is_empty() { " " } else { &visual }, &text_style);
+    if visual.is_empty() {
+        shaped.text.clear();
+        shaped.advance = 0.0;
+        shaped.runs.clear();
+        shaped.clusters.clear();
     }
+    // WHATWG HTML Rendering §15.5.6: unless `field-sizing:content` is
+    // requested, a text field's preferred inline size comes from `size`
+    // (default 20), never from its value or placeholder. Buttons and other
+    // controls use their one-line label as their intrinsic content width.
+    let intrinsic_content = if text_field {
+        crate::text::zero_advance(&text_style) * attr_ch(attr_name).unwrap_or(20) as f32
+    } else {
+        shaped.advance
+    };
+    let specified_width = box_style.width.resolve(basis);
+    let mut box_width = specified_width.map_or(intrinsic_content + horizontal_edges, |width| {
+        if box_style.border_box {
+            width
+        } else {
+            width + horizontal_edges
+        }
+    });
+    if let Some(minimum) = box_style.min_width.resolve(basis) {
+        let minimum = if box_style.border_box {
+            minimum
+        } else {
+            minimum + horizontal_edges
+        };
+        box_width = box_width.max(minimum);
+    }
+    if let Some(maximum) = box_style.max_width.resolve(basis) {
+        let maximum = if box_style.border_box {
+            maximum
+        } else {
+            maximum + horizontal_edges
+        };
+        box_width = box_width.min(maximum);
+    }
+    box_width = box_width.min(cap).max(horizontal_edges);
+    let content_width = (box_width - horizontal_edges).max(0.0);
+    let specified_height = box_style.height.resolve(None);
+    let mut box_height = specified_height.map_or(shaped.line_height + vertical_edges, |height| {
+        if box_style.border_box {
+            height
+        } else {
+            height + vertical_edges
+        }
+    });
+    if let Some(minimum) = box_style.min_height.resolve(None) {
+        box_height = box_height.max(if box_style.border_box {
+            minimum
+        } else {
+            minimum + vertical_edges
+        });
+    }
+    if let Some(maximum) = box_style.max_height.resolve(None) {
+        box_height = box_height.min(if box_style.border_box {
+            maximum
+        } else {
+            maximum + vertical_edges
+        });
+    }
+    box_height = box_height.max(vertical_edges);
+    let content_height = (box_height - vertical_edges).max(0.0);
+    let paint_y = box_style.border[TOP]
+        + padding[TOP]
+        + ((content_height - shaped.line_height).max(0.0) / 2.0);
+    let geometry = AtomGeometry {
+        box_width,
+        box_height,
+        paint_x: box_style.border[LEFT] + padding[LEFT],
+        paint_y,
+        paint_width: content_width,
+        paint_height: content_height,
+    };
+    // The terminal adapter keeps its bracketed widget representation, padded
+    // to approximately the same used width. Graphical geometry no longer
+    // manufactures spaces or lets a long placeholder enlarge the CSS box.
+    let space = crate::text::shape(" ", &text_style).advance.max(0.01);
     let terminal_have = crate::text::shape(&terminal, &text_style).advance;
-    if terminal_have < target && terminal.ends_with(']') {
-        let pad = " ".repeat(((target - terminal_have) / space).ceil() as usize);
+    if terminal_have < box_width && terminal.ends_with(']') {
+        let pad = " ".repeat(((box_width - terminal_have) / space).ceil() as usize);
         terminal.truncate(terminal.len() - 1);
         terminal.push_str(&pad);
         terminal.push(']');
     }
-    ControlLabels { visual, terminal }
+    ControlLabels {
+        visual,
+        terminal,
+        geometry,
+    }
 }

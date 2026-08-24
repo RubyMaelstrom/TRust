@@ -19,9 +19,7 @@
 use crate::layout2::{NO_NODE, Units};
 
 use super::flow::Flow;
-use super::inline::{
-    AtomBoxSize, ControlWidthBasis, Ifc, control_label, media_label, media_source,
-};
+use super::inline::{AtomBoxSize, Ifc, media_label, media_source};
 use super::style::{Align2, InlineStyle};
 use super::tree::{AtomKind, BoxNode, Content};
 use super::value::Len;
@@ -270,16 +268,7 @@ impl Flow<'_> {
                 let Some(f) = self.forms.get(*form).and_then(|f| f.fields.get(*field)) else {
                     return 0.0;
                 };
-                let label = control_label(
-                    self.dom,
-                    atom.node,
-                    f,
-                    ControlWidthBasis::Intrinsic,
-                    f32::INFINITY,
-                    inl,
-                    self.vp,
-                );
-                text_intrinsic(&label, mode, inl)
+                super::inline::control_intrinsic_width(self.dom, atom.node, f, inl, self.vp)
             }
             AtomKind::Media { video } => {
                 // A decoded poster's box, else the external-player text
