@@ -723,9 +723,46 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
             } else {
                 0
             };
-            let clip = builder.effective_clip(node, fragment.clip);
+            let form_piece = matches!(piece.item.kind, super::ItemKind::Form);
+            let piece_rect = form_piece
+                .then(|| {
+                    CssRect::new(
+                        fragment.x + piece.x,
+                        fragment.y + piece.y,
+                        piece.box_width,
+                        piece.box_height,
+                    )
+                })
+                .filter(|_| style_node != NO_NODE);
+            let control_rect = piece.paint_control_box.then_some(piece_rect).flatten();
+            if let Some(rect) = control_rect {
+                paint_atomic_control_box(
+                    builder,
+                    fragment,
+                    style_node,
+                    rect,
+                    piece.item.link.clone(),
+                );
+            }
+            let mut clip = builder.effective_clip(node, fragment.clip);
+            if piece_rect.is_some() {
+                // A control's label is clipped to its content paint rectangle,
+                // not merely to the outer border box. This is the same box
+                // used to place the glyphs, so authored padding cannot become
+                // a second nested control surface or an overflow escape hatch.
+                let label_rect = CssRect::new(
+                    fragment.x + piece.x + piece.paint_x,
+                    fragment.y + piece.y + piece.paint_y,
+                    piece.paint_width,
+                    piece.paint_height,
+                );
+                clip = intersect_css_rects(clip, label_rect);
+            }
             if let Some(shaped) = &piece.shaped {
-                let origin = CssPoint::new(fragment.x + piece.x, fragment.y + piece.y);
+                let origin = CssPoint::new(
+                    fragment.x + piece.x + piece.paint_x,
+                    fragment.y + piece.y + piece.paint_y,
+                );
                 let color = text_color(builder.dom, style_node, piece.item.link.is_some());
                 let mut shaped = shaped.clone();
                 if style_node != NO_NODE {
@@ -810,19 +847,6 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                     }));
                 }
             }
-            if matches!(piece.item.kind, super::ItemKind::Form) && style_node != NO_NODE {
-                paint_outline_box(
-                    builder,
-                    style_node,
-                    CssRect::new(
-                        fragment.x + piece.x,
-                        fragment.y + piece.y,
-                        piece.box_width,
-                        piece.box_height,
-                    ),
-                    outline_of(builder.dom, style_node, Units::of(builder.dom, style_node)),
-                );
-            }
             builder.pop_scroll_ancestors(piece_scroll_depth);
         }
     }
@@ -833,6 +857,82 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
         builder.pop_hard_clip();
     }
     builder.pop_scroll_ancestors(scroll_depth);
+}
+
+fn intersect_css_rects(existing: Option<CssRect>, rect: CssRect) -> Option<CssRect> {
+    let Some(existing) = existing else {
+        return Some(rect);
+    };
+    let x0 = existing.x.max(rect.x);
+    let y0 = existing.y.max(rect.y);
+    let x1 = (existing.x + existing.width).min(rect.x + rect.width);
+    let y1 = (existing.y + existing.height).min(rect.y + rect.height);
+    (x1 > x0 && y1 > y0).then(|| CssRect::new(x0, y0, x1 - x0, y1 - y0))
+}
+
+/// Direct `<input>` controls are atomic pieces inside an anonymous line box,
+/// but CSS backgrounds, borders, shadows, outlines, and pointer hit testing
+/// apply to their complete replaced-element border box just as they do to a
+/// normal fragment (CSS UI 4 §7.2 / HTML Rendering §15.5). Reuse the
+/// canonical fragment decorators over a temporary geometry-only fragment.
+fn paint_atomic_control_box(
+    builder: &mut Builder<'_, '_>,
+    parent: &Frag<'_>,
+    node: NodeId,
+    rect: CssRect,
+    link: Option<crate::doc::Link>,
+) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let style = super::style::BoxStyle::of(
+        builder.dom,
+        node,
+        super::value::Vp {
+            w: builder.viewport_w,
+            h: builder.viewport_h,
+        },
+    );
+    let control = Frag {
+        node,
+        x: rect.x,
+        y: rect.y,
+        w: rect.width,
+        h: rect.height,
+        border: style.border,
+        paint: Default::default(),
+        clip: parent.clip,
+        kind: FragKind::Block,
+        children: Vec::new(),
+    };
+    let radii = border_radii(builder.dom, node, rect);
+    let shape = rounded_shape(rect, radii);
+    paint_box_shadows(builder.dom, node, &shape, builder);
+    paint_native_control_surface(&control, radii, builder);
+    if let Some(color) = background_color(builder.dom, node)
+        && !color.is_transparent()
+    {
+        builder.commands.push(DisplayCommand::Fill {
+            shape: shape.clone(),
+            brush: PaintBrush::Solid(color),
+        });
+    }
+    paint_background_images(&control, shape, builder, None);
+    paint_borders(&control, radii, builder);
+    if builder.dom.point_hit_testable(node) {
+        builder.commands.push(DisplayCommand::HitRegion(HitRegion {
+            rect,
+            node,
+            actor: interaction_actor(builder.dom, node),
+            link,
+        }));
+    }
+    paint_outline_box(
+        builder,
+        node,
+        rect,
+        outline_of(builder.dom, node, Units::of(builder.dom, node)),
+    );
 }
 
 /// HTML Rendering §15.5 permits a user agent to supply a native appearance for
@@ -1275,7 +1375,12 @@ fn paint_background_images_for_node(
                         rect: tile,
                         handle,
                         source_rect: None,
-                        fit: ImageFit::None,
+                        // `rect` is the used background image size after
+                        // CSS Backgrounds §2.9. Rendering at intrinsic pixels
+                        // here ignores an authored `background-size` (a 2x
+                        // source paints about twice as large); fill the already
+                        // aspect-correct tile rectangle exactly.
+                        fit: ImageFit::Fill,
                         sampling: ImageSampling::Smooth,
                         clip: None,
                         node: style_node,
@@ -1491,7 +1596,7 @@ fn paint_spaced_background(
                 rect: CssRect::new(x, y, tile_w, tile_h),
                 handle,
                 source_rect: None,
-                fit: ImageFit::None,
+                fit: ImageFit::Fill,
                 sampling: ImageSampling::Smooth,
                 clip: None,
                 node,

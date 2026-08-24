@@ -1081,12 +1081,12 @@ impl Flow<'_> {
                             self.vp,
                             h.content_w,
                             ifc_cb_h,
-                            super::style::Align2::Left,
+                            block_align(self.dom, style_node),
                             0.0,
                             None,
                             &[],
                         );
-                        ifc.atom(atom, &inl);
+                        ifc.block_atom_content(atom, &inl);
                         let (lines, _, _, _, _) = ifc.finish();
                         if !lines.is_empty() {
                             let yb = *y_border.get_or_insert_with(|| {
@@ -2680,12 +2680,12 @@ impl Flow<'_> {
                         self.vp,
                         content_w,
                         def_h,
-                        super::style::Align2::Left,
+                        block_align(self.dom, style_node),
                         0.0,
                         None,
                         &[],
                     );
-                    ifc.atom(atom, &inl);
+                    ifc.block_atom_content(atom, &inl);
                     let (lines, _, _, _, _) = ifc.finish();
                     if !lines.is_empty() {
                         self.emit_lines(lines, bp_l, &mut cur, &mut children);
@@ -2987,6 +2987,13 @@ impl Flow<'_> {
         if id == NO_NODE {
             return (false, false);
         }
+        // The nested document's viewport is the iframe's content box (HTML
+        // Rendering §15.2/§15.4.1). Its contents never paint through the
+        // replaced element's border box even when the iframe's own computed
+        // overflow is the initial `visible` value.
+        if matches!(self.dom.tag_name(id), Some("iframe" | "frame")) {
+            return (true, true);
+        }
         let clips =
             |v: Option<String>| matches!(v.as_deref().map(str::trim), Some("hidden" | "clip"));
         let (sx, sy) = match self.dom.computed_value_resolved(id, "overflow") {
@@ -3092,7 +3099,16 @@ impl Flow<'_> {
         // clipped by the padding box it establishes when it clips overflow.
         f.clip = own_clip;
         let content_clip = Clip::intersect(own_clip, self.clip_box(f));
-        let child_abs_clip = if f.paint.cb_abs {
+        // CSS Overflow 3 §3 clips an abspos descendant through its containing-
+        // block chain, not through intervening static ancestors. An iframe is
+        // different: its nested viewport establishes the initial containing
+        // block for the child navigable. `data-trust-frame` is the equivalent
+        // presentation wrapper used after serializing that navigable.
+        let frame_viewport = f.node != NO_NODE
+            && (matches!(self.dom.tag_name(f.node), Some("iframe" | "frame"))
+                || self.dom.attr(f.node, "data-trust-frame").is_some());
+        let establishes_abs_cb = f.paint.cb_abs || frame_viewport;
+        let child_abs_clip = if establishes_abs_cb {
             content_clip
         } else {
             abs_clip
@@ -3108,7 +3124,7 @@ impl Flow<'_> {
             w: (f.w - f.border[LEFT] - f.border[RIGHT]).max(0.0),
             h: (f.h - f.border[TOP] - f.border[BOTTOM]).max(0.0),
         };
-        let child_abs = if f.paint.cb_abs { pad } else { abs_cb };
+        let child_abs = if establishes_abs_cb { pad } else { abs_cb };
         let child_fixed = if f.paint.cb_fixed {
             Some(pad)
         } else {
@@ -3426,7 +3442,19 @@ impl Flow<'_> {
     fn shrink_to_fit(&self, b: &BoxNode, avail: f32, ctx: &InlineStyle) -> f32 {
         let minc = self.intrinsic_w(b, IMode::Min, ctx);
         let maxc = self.intrinsic_w(b, IMode::Max, ctx).max(minc);
-        avail.max(minc).min(maxc).max(0.0)
+        let bounded_avail = avail.max(minc);
+        // CSS 2.2 §10.3.5/§10.3.7 defines this comparison over real CSS
+        // lengths. Nested intrinsic contributions, borders, and padding are
+        // stored as f32, so a value assembled by addition can come back a few
+        // representable values smaller after the inverse subtraction. Treat
+        // only that floating-point noise as equality; otherwise a box sized
+        // to its max-content width can spuriously take a CSS Text soft wrap.
+        if super::css_px_fits(maxc, bounded_avail) {
+            maxc
+        } else {
+            bounded_avail
+        }
+        .max(0.0)
     }
 
     /// Whether `b` establishes a new block formatting context (§9.4.1) — so its

@@ -77,6 +77,22 @@ pub use terminal::set_borders_enabled;
 use flow::Flow;
 use value::{Len, Vp};
 
+/// Whether a computed CSS-pixel length fits within another after allowing for
+/// the bounded f32 noise introduced by equivalent layout arithmetic. This is
+/// deliberately relative and much smaller than any paintable subpixel; it
+/// does not forgive a substantive overflow.
+#[inline]
+pub(crate) fn css_px_fits(used: f32, available: f32) -> bool {
+    if used <= available {
+        return true;
+    }
+    if !used.is_finite() || !available.is_finite() {
+        return false;
+    }
+    let scale = used.abs().max(available.abs()).max(1.0);
+    used - available <= 8.0 * f32::EPSILON * scale
+}
+
 /// Resolve HTML's `<source-size-value>` through the same CSS Values parser as
 /// layout. Percentages are excluded by the HTML `sizes` grammar; `auto` and
 /// non-length sizing keywords likewise do not produce a source size here.
@@ -1170,6 +1186,70 @@ mod tests {
         let (ra, _) = find(&out, "AAAA");
         let (rb, _) = find(&out, "BB");
         assert!(rb > ra, "the cleared float takes its own shelf");
+    }
+
+    #[test]
+    fn nested_shrink_to_fit_float_keeps_spaced_label_on_one_line() {
+        // CSS 2.2 §10.3.5: an auto-width float uses the shrink-to-fit
+        // formula. Under its max-content constraint, the two inner floats and
+        // every soft-wrappable word in them must be formatted without taking
+        // soft line breaks. Repeated f32 addition/subtraction at the nested
+        // intrinsic boundaries must not manufacture an infinitesimal deficit.
+        let html = r#"<body id="body" style="margin:0;font-size:15px;font-family:-apple-system,system-ui,blinkmacsystemfont,'Segoe UI',roboto,oxygen,ubuntu,'Helvetica Neue',arial,sans-serif;font-weight:300;line-height:1.5">
+                <nav style="height:40px">
+                  <ul id="float-set" data-trust-clearfix style="float:right;margin:0;padding:0">
+                    <li id="label-item" style="float:left;margin:0">
+                      <a id="label" style="display:inline-block;padding:8px 12px;box-sizing:border-box">Sign In</a>
+                    </li>
+                    <li id="fixed-item" style="float:left;margin:0">
+                      <span style="display:inline-block;min-width:42px;padding:8px 12px;box-sizing:border-box"></span>
+                    </li>
+                  </ul>
+                </nav>
+               </body>"#;
+        let out = lay(html, 120);
+        let (sign_row, _) = find(&out, "Sign");
+        let (in_row, _) = find(&out, "In");
+        let dom = Dom::parse_document(html);
+        let base = Url::parse("http://e.com/").unwrap();
+        let graphical = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(960.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let label = graphical.boxes[&dom.get_by_id("label").unwrap()];
+        assert_eq!(in_row, sign_row, "the spaced label must not soft-wrap");
+        assert!(
+            (label.height - 38.5).abs() < 0.01,
+            "one 22.5px line plus 16px padding, got {label:?}"
+        );
+    }
+
+    #[test]
+    fn real_subpixel_inline_deficit_still_soft_wraps() {
+        // CSS Text 3 §5: numerical equality must not become a blanket overflow
+        // allowance. This definite content box is genuinely 0.15px narrower
+        // than the shaped label, so the space remains a soft-wrap opportunity.
+        let html = r#"<body style="margin:0;font-size:15px;font-family:-apple-system,system-ui,blinkmacsystemfont,'Segoe UI',roboto,oxygen,ubuntu,'Helvetica Neue',arial,sans-serif;font-weight:300;line-height:1.5">
+                 <div id="label" style="width:69px;padding:8px 12px;box-sizing:border-box">Sign In</div>
+               </body>"#;
+        let dom = Dom::parse_document(html);
+        let graphical = lay_out_graphical(
+            &dom,
+            &Url::parse("http://e.com/").unwrap(),
+            Viewport::new(960.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let label = graphical.boxes[&dom.get_by_id("label").unwrap()];
+        assert!(
+            (label.height - 61.0).abs() < 0.01,
+            "two 22.5px lines plus 16px padding, got {label:?}"
+        );
     }
 
     #[test]
@@ -2495,13 +2575,13 @@ mod tests {
     }
 
     #[test]
-    fn text_input_pads_to_size_attr_and_default() {
+    fn text_input_size_attr_sets_replaced_box_not_glyph_padding() {
         let layout = lay_graphical(
-            r#"<body style="margin:0"><form action="/s"><input name="q" placeholder="q" size="10"><input name="r" placeholder="r"></form></body>"#,
+            r#"<body style="margin:0"><form action="/s"><input id="q" name="q" placeholder="q" size="10"><input id="r" name="r" placeholder="r"></form></body>"#,
             640.0,
             &HashMap::new(),
         );
-        let q = layout
+        let q_glyph = layout
             .paint
             .primitives
             .iter()
@@ -2514,23 +2594,29 @@ mod tests {
                 _ => None,
             })
             .expect("q widget");
-        assert!(!q.text.ends_with(']'));
-        let style = crate::text::TextStyle::default();
-        assert!(q.advance >= crate::text::zero_advance(&style) * 12.0);
-        let r = layout
-            .paint
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                crate::render::Primitive::GlyphRun { shaped, .. }
-                    if shaped.text.starts_with('r') =>
-                {
-                    Some(shaped)
-                }
-                _ => None,
-            })
-            .expect("r widget");
-        assert!(r.advance > q.advance);
+        assert_eq!(q_glyph.text, "q");
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><form action="/s"><input id="q" name="q" placeholder="q" size="10"><input id="r" name="r" placeholder="r"></form></body>"#,
+        );
+        let q = dom.get_by_id("q").unwrap();
+        let r = dom.get_by_id("r").unwrap();
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(640.0, 300.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let q_box = layout.boxes.get(&q).expect("q control box");
+        let r_box = layout.boxes.get(&r).expect("r control box");
+        assert!(
+            q_box.width > f64::from(q_glyph.advance),
+            "{q_box:?} {q_glyph:?}"
+        );
+        assert!(r_box.width > q_box.width, "{q_box:?} {r_box:?}");
     }
 
     #[test]
@@ -2589,6 +2675,223 @@ mod tests {
             !terminal.contains("Submit"),
             "no synthetic submit: {terminal:?}"
         );
+    }
+
+    #[test]
+    fn graphical_text_control_uses_css_box_not_placeholder_and_hits_full_box() {
+        // HTML Rendering §15.5.6 + CSS UI 4 §7.2: a normal one-line field
+        // is a replaced inline-block. Its placeholder scrolls/clips inside the
+        // used CSS box; authored background/padding paint on that whole box,
+        // and activation is not limited to the glyph ink.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><form action="/s" style="width:280px">
+               <input id=q name=q placeholder="a placeholder much wider than the declared field and its containing form"
+                 style="box-sizing:border-box;width:100%;padding:7px 10px;background:#123456;border:0">
+               </form></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let q = dom.get_by_id("q").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(500.0, 300.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let geometry = layout.boxes.get(&q).expect("input geometry");
+        assert!((geometry.width - 280.0).abs() < 0.1, "{geometry:?}");
+        assert!(
+            geometry.height > 20.0,
+            "padding contributes to height: {geometry:?}"
+        );
+
+        let shape_rect = |shape: &crate::render::PaintShape| match shape {
+            crate::render::PaintShape::Rect(rect)
+            | crate::render::PaintShape::RoundedRect { rect, .. } => Some(*rect),
+            crate::render::PaintShape::Path(_) => None,
+        };
+        let painted = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                crate::render::DisplayCommand::Fill {
+                    shape,
+                    brush:
+                        crate::render::PaintBrush::Solid(crate::render::PaintColor::Rgba(
+                            0x12,
+                            0x34,
+                            0x56,
+                            0xff,
+                        )),
+                } => shape_rect(shape),
+                _ => None,
+            });
+        let painted = painted.expect("authored input background fill");
+        assert!((painted.width - 280.0).abs() < 0.1, "{painted:?}");
+        let hit = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                crate::render::DisplayCommand::HitRegion(region)
+                    if region.node == q
+                        && matches!(region.link, Some(crate::doc::Link::Form { .. })) =>
+                {
+                    Some(region.rect)
+                }
+                _ => None,
+            });
+        let hit = hit.expect("full form activation region");
+        assert!((hit.width - 280.0).abs() < 0.1, "{hit:?}");
+    }
+
+    #[test]
+    fn auto_width_control_uses_its_own_computed_font() {
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><form style="font-size:40px">
+               <input id=s type=submit value="Go"
+                 style="font-size:10px;padding:0;border:0">
+               </form></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let submit = dom.get_by_id("s").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(500.0, 300.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let geometry = layout.boxes.get(&submit).expect("submit geometry");
+        assert!(
+            geometry.width < 30.0,
+            "control must not inherit the surrounding 40px label metrics: {geometry:?}"
+        );
+    }
+
+    #[test]
+    fn floated_control_intrinsic_width_does_not_double_count_edges() {
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><form>
+               <input id=s type=submit value="Go"
+                 style="float:right;font-size:10px;padding:5px;text-align:center;background:#e93250;border:1px solid">
+               </form></body>"#,
+        );
+        let base = Url::parse("http://e.com/").unwrap();
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let submit = dom.get_by_id("s").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(500.0, 300.0),
+            &forms,
+            &controls,
+            &HashMap::new(),
+        );
+        let geometry = layout.boxes.get(&submit).expect("submit geometry");
+        let expected = f64::from(
+            crate::text::shape(
+                "Go",
+                &crate::text::TextStyle {
+                    size: 10.0,
+                    ..crate::text::TextStyle::default()
+                },
+            )
+            .advance,
+        ) + 12.0;
+        assert!((geometry.width - expected).abs() < 0.1, "{geometry:?}");
+
+        let shape_rect = |shape: &crate::render::PaintShape| match shape {
+            crate::render::PaintShape::Rect(rect)
+            | crate::render::PaintShape::RoundedRect { rect, .. } => Some(*rect),
+            crate::render::PaintShape::Path(_) => None,
+        };
+        let authored_surfaces: Vec<_> = layout
+            .paint
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                crate::render::DisplayCommand::Fill {
+                    shape,
+                    brush:
+                        crate::render::PaintBrush::Solid(crate::render::PaintColor::Rgba(
+                            0xe9,
+                            0x32,
+                            0x50,
+                            0xff,
+                        )),
+                } => shape_rect(shape),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            authored_surfaces.len(),
+            1,
+            "blockification must not paint a nested control surface: {authored_surfaces:?}"
+        );
+        assert!(
+            (authored_surfaces[0].width - geometry.width as f32).abs() < 0.1,
+            "authored background and used border box diverged: {authored_surfaces:?} {geometry:?}"
+        );
+        let full_hit = layout.paint.primitives.iter().any(|primitive| {
+            matches!(primitive,
+                crate::render::DisplayCommand::HitRegion(region)
+                    if region.node == submit
+                        && (region.rect.width - geometry.width as f32).abs() < 0.1)
+        });
+        assert!(full_hit, "the complete floated control must be activatable");
+    }
+
+    #[test]
+    fn iframe_keeps_replaced_viewport_size_and_clips_nested_document() {
+        // HTML Rendering §15.2/§15.4.1: a child navigable is sized to the
+        // iframe content box and the iframe remains a replaced element. Its
+        // document must not become an unconstrained parent-document sibling.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><div style="width:400px">
+               <iframe id=f style="width:50%;height:74px;border:0"></iframe><span>after</span>
+               </div></body>"#,
+        );
+        let frame = dom.get_by_id("f").unwrap();
+        dom.install_frame_document(
+            frame,
+            r#"<body style="margin:0"><div style="position:relative;width:300px;height:74px">
+               <span id=inside style="position:absolute;right:0;bottom:0">nested viewport content</span>
+               </div></body>"#,
+            "https://frame.test/widget",
+        )
+        .unwrap();
+        let inside = dom.get_by_id("inside").unwrap();
+        let base = Url::parse("https://page.test/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(400.0, 300.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let geometry = layout.boxes.get(&frame).expect("iframe geometry");
+        assert!((geometry.width - 200.0).abs() < 0.1, "{geometry:?}");
+        assert!((geometry.height - 74.0).abs() < 0.1, "{geometry:?}");
+        let clip = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|primitive| match primitive {
+                crate::render::DisplayCommand::GlyphRun {
+                    node, shaped, clip, ..
+                } if *node == inside && shaped.text.contains("nested") => *clip,
+                _ => None,
+            });
+        let clip = clip.expect("nested document viewport clip");
+        assert!((clip.width - 200.0).abs() < 0.1, "{clip:?}");
+        assert!((clip.height - 74.0).abs() < 0.1, "{clip:?}");
     }
 
     #[test]
@@ -6104,6 +6407,42 @@ mod tests {
                 (rect.width - 16.0).abs() < 0.01 && (rect.height - 12.0).abs() < 0.01
             })
         );
+    }
+
+    #[test]
+    fn graphical_background_size_scales_source_into_used_tile() {
+        // CSS Backgrounds 3 §2.9: the resolved background-size is the image's
+        // rendered size. A high-resolution source must be scaled into that
+        // rectangle rather than painted at its larger intrinsic pixel size.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><section style="width:800px;height:214px;background:url('/hero.png') 95% bottom no-repeat;background-size:734px"></section></body>"#,
+        );
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut images = HashMap::new();
+        images.insert("https://example.test/hero.png".to_string(), (1248, 361));
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(800.0, 300.0),
+            &[],
+            &HashMap::new(),
+            &images,
+        );
+        let (rect, fit) = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::Image { rect, fit, .. } => Some((*rect, *fit)),
+                _ => None,
+            })
+            .expect("hero background image");
+        assert!((rect.width - 734.0).abs() < 0.01, "{rect:?}");
+        assert!(
+            (rect.height - 734.0 * 361.0 / 1248.0).abs() < 0.01,
+            "{rect:?}"
+        );
+        assert_eq!(fit, crate::render::ImageFit::Fill);
     }
 
     #[test]

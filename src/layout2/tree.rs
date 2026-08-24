@@ -348,15 +348,6 @@ impl Builder<'_> {
         let Some(tag) = self.dom.tag_name(id) else {
             return Built::Skip;
         };
-        // A realized same-origin nested document is already part of the
-        // canonical arena. Project its body into the CSS box tree directly;
-        // the historical serializer wrapped these children in a synthetic div
-        // solely to survive HTML's iframe RAWTEXT reparse rules.
-        if matches!(tag, "iframe" | "frame") {
-            return self.dom.frame_body(id).map_or(Built::Skip, |body| {
-                Built::Block(Box::new(self.container(body, Disp::Block)))
-            });
-        }
         if SKIP.contains(&tag) {
             return Built::Skip;
         }
@@ -367,6 +358,16 @@ impl Builder<'_> {
         if disp == Disp::Contents {
             let kids = self.children(id);
             return Built::Hoist(kids);
+        }
+        // HTML Rendering §15.4.1: iframe/frame are replaced elements. A
+        // realized nested document still needs its own viewport border box;
+        // projecting its body as an unconstrained sibling loses the frame's
+        // CSS width/height, containing block, and clipping (notably hCaptcha).
+        // Keep the body as the contents of one independently laid atomic box,
+        // with the standard 300×150 default object size when neither CSS nor
+        // dimension attributes supplies a size.
+        if matches!(tag, "iframe" | "frame") {
+            return self.frame(id, disp);
         }
         // A `<slot>` in a shadow tree is TRANSPARENT (HTML §4.8.2): it renders
         // the host's assigned light nodes in its place, or its own fallback
@@ -556,6 +557,48 @@ impl Builder<'_> {
                 }
             }
             Disp::None | Disp::Contents => unreachable!("handled above"),
+        }
+    }
+
+    fn frame(&mut self, id: NodeId, disp: Disp) -> Built {
+        let body = self.dom.frame_body(id);
+        let mut style = BoxStyle::of(self.dom, id, self.vp);
+        let dimension = |name: &str, fallback: f32| {
+            self.dom
+                .attr(id, name)
+                .and_then(|value| value.trim().parse::<f32>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .unwrap_or(fallback)
+        };
+        if matches!(style.width, super::value::Len::Auto) {
+            style.width = super::value::Len::px(dimension("width", 300.0));
+        }
+        if matches!(style.height, super::value::Len::Auto) {
+            style.height = super::value::Len::px(dimension("height", 150.0));
+        }
+        let frame = BoxNode {
+            node: id,
+            style,
+            content: Content::Blocks(
+                body.map(|body| vec![self.container(body, Disp::Block)])
+                    .unwrap_or_default(),
+            ),
+            marker: None,
+            marker_image: None,
+            marker_inside: false,
+            oof: Vec::new(),
+        };
+        if Pos::of(self.dom, id).out_of_flow() {
+            return Built::Inline(Inline::OutOfFlow(Box::new(frame)));
+        }
+        if super::float::float_side(self.dom, id).is_some() {
+            return Built::Inline(Inline::Float(Box::new(frame)));
+        }
+        match disp {
+            Disp::Block | Disp::ListItem | Disp::Flex | Disp::Grid | Disp::Table => {
+                Built::Block(Box::new(frame))
+            }
+            _ => Built::Inline(Inline::AtomBox(Box::new(frame))),
         }
     }
 
