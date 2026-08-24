@@ -4535,7 +4535,7 @@ impl Dom {
                 .computed_value_resolved(node, "color")
                 .filter(|value| !value.trim().eq_ignore_ascii_case("currentcolor"))
             {
-                return value;
+                return svg_resource_color(&value);
             }
             current = self.nodes[node].parent;
         }
@@ -6129,6 +6129,24 @@ fn replace_css_current_color(input: &str, replacement: &str) -> String {
     }
     out.push_str(&input[cursor..]);
     out
+}
+
+/// Serialize a computed CSS color into the conservative sRGB syntax accepted
+/// by the standalone SVG decoder. CSS Color 4 modern functional notation such
+/// as `rgb(4 204 116 / 1)` is valid on the embedding HTML element, but the SVG
+/// resource parser has no access to that HTML CSS implementation. Materialize
+/// the used `currentColor` value as an equivalent legacy-compatible color.
+fn svg_resource_color(value: &str) -> String {
+    match crate::render::PaintColor::parse_css(value) {
+        Some(crate::render::PaintColor::Rgba(r, g, b, 255)) => {
+            format!("#{r:02x}{g:02x}{b:02x}")
+        }
+        Some(crate::render::PaintColor::Rgba(r, g, b, a)) => {
+            let alpha = f32::from(a) / 255.0;
+            format!("rgba({r},{g},{b},{alpha:.6})")
+        }
+        _ => value.to_string(),
+    }
 }
 
 // ---- Selector subset ------------------------------------------------
@@ -11217,7 +11235,7 @@ mod tests {
         // `color`; the desktop rasterizer has no DOM/CSS context once it gets
         // the image bytes, so the resource must carry that resolved value.
         let dom = Dom::parse_document(
-            r#"<body style="color:#f5f5f5"><svg id="send" viewBox="0 0 10 10">
+            r#"<body style="color:rgb(4 204 116/1)"><svg id="send" viewBox="0 0 10 10">
                 <path fill="currentColor" d="M0 0h10v10H0z"/>
                 <g style="color:#e22"><path fill="currentColor" d="M0 0h5v10H0z"/></g>
             </svg></body>"#,
@@ -11228,18 +11246,20 @@ mod tests {
             .expect("inline SVG is a graphical image");
         let markup = String::from_utf8(crate::img::decode_data_url(&source).unwrap()).unwrap();
         assert!(
-            markup.contains("fill=\"#f5f5f5\""),
+            markup.contains("fill=\"#04cc74\""),
             "resolved color missing: {markup}"
         );
         assert!(
-            markup.contains("fill=\"#e22\""),
+            markup.contains("fill=\"#ee2222\""),
             "descendant color missing: {markup}"
         );
         let (image, _) = crate::img::decode(&crate::img::decode_data_url(&source).unwrap())
             .expect("materialized SVG rasterizes");
-        assert!(image.to_rgba8().pixels().any(|pixel| {
-            pixel[0] >= 240 && pixel[1] >= 240 && pixel[2] >= 240 && pixel[3] > 0
-        }));
+        assert!(
+            image.to_rgba8().pixels().any(|pixel| {
+                pixel[0] < 40 && pixel[1] >= 190 && pixel[2] >= 90 && pixel[3] > 0
+            })
+        );
         assert!(
             image
                 .to_rgba8()
