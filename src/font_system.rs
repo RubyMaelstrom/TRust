@@ -19,13 +19,16 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use fontdb::{Database, Family, ID, Query, Source};
 use parley::FontContext;
 use parley::fontique::{
-    Blob, Collection, CollectionOptions, FallbackKey, FamilyId, GenericFamily, Language, Script,
-    ScriptExt as _, SourceCache,
+    Blob, Collection, CollectionOptions, FallbackKey, FamilyId, FontInfoOverride, GenericFamily,
+    Language, Script, ScriptExt as _, SourceCache,
 };
 use roxmltree::{Document, Node, ParsingOptions};
 use unicode_casefold::UnicodeCaseFold as _;
@@ -58,16 +61,44 @@ impl AsRef<[u8]> for EmbeddedFont {
 
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
 static SVG_CATALOG: OnceLock<SvgCatalog> = OnceLock::new();
+static PAGE_FONT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 struct Catalog {
     alias_candidates: HashMap<String, Vec<String>>,
     paths: Vec<PathBuf>,
     embedded_fallback: bool,
+    base_text_collection: Collection,
     text_collection: Mutex<Collection>,
     /// Default-caseless font name to the exact spelling stored by Fontique.
     installed_names: HashMap<String, String>,
     generic_names: HashMap<GenericFamily, Vec<String>>,
     family_expansions: Mutex<ExpansionCache>,
+}
+
+/// One already-fetched `@font-face` resource. The CSS descriptor's family
+/// name intentionally overrides the font file's internal name (CSS Fonts 4
+/// §4.1 permits authors to assign an arbitrary family to a face).
+pub(crate) struct PageFont {
+    pub family: String,
+    pub bytes: Vec<u8>,
+}
+
+impl PageFont {
+    /// Decode a fetched CSS font resource into the SFNT container expected by
+    /// Fontique. WOFF 1.0 and WOFF2 are transport containers, not formats that
+    /// OpenType consumers are required to parse directly.
+    pub(crate) fn from_web_resource(family: String, bytes: Vec<u8>) -> Option<Self> {
+        let bytes = match bytes.get(..4)? {
+            b"wOFF" => wuff::decompress_woff1(&bytes).ok()?,
+            b"wOF2" => wuff::decompress_woff2(&bytes).ok()?,
+            // TrueType, CFF OpenType, Apple TrueType, and collections are
+            // already SFNT containers. Reject legacy EOT and arbitrary data
+            // so CSS Fonts can continue with the next `src` item.
+            [0, 1, 0, 0] | b"OTTO" | b"true" | b"ttcf" => bytes,
+            _ => return None,
+        };
+        Some(Self { family, bytes })
+    }
 }
 
 struct SvgCatalog {
@@ -130,6 +161,43 @@ pub(crate) fn font_context() -> FontContext {
     {
         FontContext::new()
     }
+}
+
+/// Replace the downloadable-font set for the foreground document. CSS Fonts 4
+/// §4.1 scopes downloaded faces to documents; TRust has exactly one live
+/// foreground page, so rebuilding from the immutable installed-font catalog on
+/// navigation both enforces that scope and bounds retained font bytes.
+pub(crate) fn install_page_fonts(fonts: Vec<PageFont>) {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        let catalog = catalog();
+        let mut collection = catalog.base_text_collection.clone();
+        for font in fonts {
+            if font.family.trim().is_empty() || font.bytes.is_empty() {
+                continue;
+            }
+            collection.register_fonts(
+                Blob::new(Arc::new(font.bytes)),
+                Some(FontInfoOverride {
+                    family_name: Some(font.family.trim()),
+                    ..FontInfoOverride::default()
+                }),
+            );
+        }
+        *catalog
+            .text_collection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = collection;
+        PAGE_FONT_EPOCH.fetch_add(1, Ordering::Release);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+    {
+        let _ = fonts;
+    }
+}
+
+pub(crate) fn page_font_epoch() -> u64 {
+    PAGE_FONT_EPOCH.load(Ordering::Acquire)
 }
 
 /// Applies installed aliases to a CSS family list without changing its
@@ -265,6 +333,7 @@ impl Catalog {
             alias_candidates,
             paths,
             embedded_fallback,
+            base_text_collection: collection.clone(),
             text_collection: Mutex::new(collection),
             installed_names,
             generic_names,
@@ -1587,6 +1656,15 @@ fn default_font_directories() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_font_resource_rejects_unsupported_container_and_keeps_sfnt() {
+        assert!(PageFont::from_web_resource("Legacy".into(), b"LP\0\0EOT".to_vec()).is_none());
+        let sfnt = [b"OTTO".as_slice(), b"payload"].concat();
+        let font = PageFont::from_web_resource("Site".into(), sfnt.clone()).unwrap();
+        assert_eq!(font.family, "Site");
+        assert_eq!(font.bytes, sfnt);
+    }
 
     #[test]
     fn css_family_split_preserves_commas_inside_strings() {

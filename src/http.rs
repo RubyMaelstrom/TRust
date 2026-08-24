@@ -1946,10 +1946,21 @@ pub async fn execute_js_for_device(
             Kind::Sheet => {
                 // A failed sheet is simply absent: fail-open, nothing
                 // gets hidden.
-                if let Some(r) = resp
-                    .filter(|r| stylesheet_response_allowed(r.status, &r.content_type, &r.headers))
-                {
-                    sheets.push((raw, decode_body(&r.content_type, &r.body)));
+                if let (Some(url), Some(r)) = (
+                    resolved,
+                    resp.filter(|r| {
+                        stylesheet_response_allowed(r.status, &r.content_type, &r.headers)
+                    }),
+                ) {
+                    let css = expand_stylesheet_imports(
+                        decode_body(&r.content_type, &r.body),
+                        url,
+                        response.url.clone(),
+                        Vec::new(),
+                        0,
+                    )
+                    .await;
+                    sheets.push((raw, css));
                 }
             }
             Kind::Preload => {
@@ -1978,6 +1989,7 @@ pub async fn execute_js_for_device(
             }
         }
     }
+    install_stylesheet_fonts(&sheets, &response.url).await;
     // Created HERE so it outlives the engine: the app hangs it on the Doc
     // and decodes blob: image srcs from it even after the page froze.
     let blobs = crate::js::BlobMap::default();
@@ -2102,7 +2114,7 @@ async fn fetch_page_sheets(html: &str, base: &Url) -> Vec<(String, String)> {
         .into_iter()
         .take(MAX_PAGE_SHEETS)
         .collect();
-    futures::stream::iter(jobs.into_iter().map(|raw| {
+    let fetched = futures::stream::iter(jobs.into_iter().map(|raw| {
         let base = base.clone();
         async move {
             let resolved = base
@@ -2114,15 +2126,449 @@ async fn fetch_page_sheets(html: &str, base: &Url) -> Vec<(String, String)> {
                 Some(u) => fetch(&Request::get(u.clone())).await.ok(),
                 None => None,
             };
-            (raw, resp)
+            (raw, resolved, resp)
         }
     }))
     .buffered(PREFETCH_CONCURRENCY)
     .collect::<Vec<_>>()
     .await
     .into_iter()
-    .filter_map(|(raw, resp)| resp.map(|r| (raw, decode_body(&r.content_type, &r.body))))
+    .filter_map(|(raw, resolved, resp)| {
+        let url = resolved?;
+        let response = resp?.filter_stylesheet()?;
+        Some((
+            raw,
+            url,
+            decode_body(&response.content_type, &response.body),
+        ))
+    })
+    .collect::<Vec<_>>();
+    let page_url = base.clone();
+    futures::stream::iter(fetched.into_iter().map(|(raw, url, css)| {
+        let page_url = page_url.clone();
+        async move {
+            let expanded = expand_stylesheet_imports(css, url, page_url, Vec::new(), 0).await;
+            (raw, expanded)
+        }
+    }))
+    .buffered(PREFETCH_CONCURRENCY)
     .collect()
+    .await
+}
+
+trait StylesheetResponseExt {
+    fn filter_stylesheet(self) -> Option<Self>
+    where
+        Self: Sized;
+}
+
+impl StylesheetResponseExt for Response {
+    fn filter_stylesheet(self) -> Option<Self> {
+        stylesheet_response_allowed(self.status, &self.content_type, &self.headers).then_some(self)
+    }
+}
+
+const MAX_STYLESHEET_IMPORT_DEPTH: usize = 16;
+const MAX_PAGE_WEB_FONTS: usize = 32;
+
+#[derive(Clone, Debug)]
+struct CssImport {
+    start: usize,
+    end: usize,
+    url: String,
+    condition: String,
+}
+
+/// CSS Cascade 5 §2.2: replace each applicable `@import` in source order by
+/// the imported rules. Imports are recursively bounded and cycle-checked; a
+/// failed resource contributes no rules. URL tokens are then made absolute
+/// against the stylesheet that contained them, as CSSOM URL resolution
+/// requires, rather than against the HTML document.
+fn expand_stylesheet_imports(
+    css: String,
+    sheet_url: Url,
+    page_url: Url,
+    mut ancestry: Vec<String>,
+    depth: usize,
+) -> futures::future::BoxFuture<'static, String> {
+    use futures::FutureExt as _;
+    async move {
+        if depth >= MAX_STYLESHEET_IMPORT_DEPTH
+            || ancestry.iter().any(|seen| seen == sheet_url.as_str())
+        {
+            return String::new();
+        }
+        ancestry.push(sheet_url.to_string());
+        let imports = stylesheet_imports(&css);
+        if imports.is_empty() {
+            return absolutize_css_urls(&css, &sheet_url);
+        }
+        let mut out = String::with_capacity(css.len());
+        let mut cursor = 0usize;
+        for import in imports {
+            out.push_str(&css[cursor..import.start]);
+            cursor = import.end;
+            let Some(url) = sheet_url
+                .join(&import.url)
+                .ok()
+                .filter(|url| matches!(url.scheme(), "http" | "https"))
+                .filter(|url| subresource_allowed(&page_url, url))
+            else {
+                continue;
+            };
+            if ancestry.iter().any(|seen| seen == url.as_str()) {
+                continue;
+            }
+            let Some(response) = fetch(&Request::get(url.clone()))
+                .await
+                .ok()
+                .and_then(StylesheetResponseExt::filter_stylesheet)
+            else {
+                continue;
+            };
+            let child = expand_stylesheet_imports(
+                decode_body(&response.content_type, &response.body),
+                url,
+                page_url.clone(),
+                ancestry.clone(),
+                depth + 1,
+            )
+            .await;
+            out.push_str(&wrap_import_condition(child, &import.condition));
+        }
+        out.push_str(&css[cursor..]);
+        absolutize_css_urls(&out, &sheet_url)
+    }
+    .boxed()
+}
+
+fn wrap_import_condition(css: String, condition: &str) -> String {
+    let condition = condition.trim();
+    if condition.is_empty() {
+        return css;
+    }
+    // CSS Cascade 5 §2.1 defines layer/supports/media modifiers in that
+    // order. Preserve the common media-only form exactly; the parser already
+    // understands nested @media blocks. Layer/supports modifiers remain on a
+    // generated grouping rule so their cascade/condition semantics survive.
+    if let Some(layer) = condition.strip_prefix("layer(")
+        && let Some((name, rest)) = layer.split_once(')')
+    {
+        return wrap_import_condition(format!("@layer {name}{{{css}}}"), rest);
+    }
+    if let Some(rest) = condition.strip_prefix("layer") {
+        return wrap_import_condition(format!("@layer{{{css}}}"), rest);
+    }
+    if let Some(supports) = condition.strip_prefix("supports(")
+        && let Some((query, rest)) = supports.rsplit_once(')')
+    {
+        return wrap_import_condition(format!("@supports ({query}){{{css}}}"), rest);
+    }
+    format!("@media {condition}{{{css}}}")
+}
+
+fn stylesheet_imports(css: &str) -> Vec<CssImport> {
+    let bytes = css.as_bytes();
+    let mut imports = Vec::new();
+    let mut i = 0usize;
+    let mut brace_depth = 0usize;
+    let mut quote = None;
+    let mut comment = false;
+    while i < bytes.len() {
+        if comment {
+            if bytes.get(i..i + 2) == Some(b"*/") {
+                comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            if bytes[i] == b'\\' {
+                i = (i + 2).min(bytes.len());
+            } else {
+                if bytes[i] == q {
+                    quote = None;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if bytes.get(i..i + 2) == Some(b"/*") {
+            comment = true;
+            i += 2;
+            continue;
+        }
+        if matches!(bytes[i], b'\'' | b'"') {
+            quote = Some(bytes[i]);
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'@' if brace_depth == 0
+                && css[i..]
+                    .get(..7)
+                    .is_some_and(|word| word.eq_ignore_ascii_case("@import")) =>
+            {
+                let start = i;
+                let Some(end) = css_statement_end(css, i + 7) else {
+                    break;
+                };
+                if let Some((url, condition)) = parse_import_prelude(&css[i + 7..end - 1]) {
+                    imports.push(CssImport {
+                        start,
+                        end,
+                        url,
+                        condition,
+                    });
+                }
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    imports
+}
+
+fn css_statement_end(css: &str, mut i: usize) -> Option<usize> {
+    let bytes = css.as_bytes();
+    let mut parens = 0usize;
+    let mut quote = None;
+    while i < bytes.len() {
+        if let Some(q) = quote {
+            if bytes[i] == b'\\' {
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            if bytes[i] == q {
+                quote = None;
+            }
+        } else {
+            match bytes[i] {
+                b'\'' | b'"' => quote = Some(bytes[i]),
+                b'(' => parens += 1,
+                b')' => parens = parens.saturating_sub(1),
+                b';' if parens == 0 => return Some(i + 1),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_import_prelude(prelude: &str) -> Option<(String, String)> {
+    let prelude = prelude.trim();
+    if prelude
+        .get(..4)
+        .is_some_and(|word| word.eq_ignore_ascii_case("url("))
+    {
+        let end = prelude.find(')')?;
+        let url = unquote_css_url(&prelude[4..end]);
+        return Some((url, prelude[end + 1..].trim().to_string()));
+    }
+    let quote = prelude.as_bytes().first().copied()?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+    let end = quoted_css_end(prelude, 1, quote)?;
+    Some((
+        prelude[1..end].to_string(),
+        prelude[end + 1..].trim().to_string(),
+    ))
+}
+
+fn quoted_css_end(value: &str, mut i: usize, quote: u8) -> Option<usize> {
+    let bytes = value.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+        } else if bytes[i] == quote {
+            return Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn unquote_css_url(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2
+        && matches!(value.as_bytes()[0], b'\'' | b'"')
+        && value.as_bytes()[value.len() - 1] == value.as_bytes()[0]
+    {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn absolutize_css_urls(css: &str, base: &Url) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut cursor = 0usize;
+    let lower = css.to_ascii_lowercase();
+    while let Some(relative) = lower[cursor..].find("url(") {
+        let start = cursor + relative;
+        out.push_str(&css[cursor..start]);
+        let args = start + 4;
+        let Some(close_relative) = css[args..].find(')') else {
+            out.push_str(&css[start..]);
+            return out;
+        };
+        let end = args + close_relative;
+        let raw = unquote_css_url(&css[args..end]);
+        let resolved =
+            if raw.starts_with('#') || raw.starts_with("data:") || raw.starts_with("blob:") {
+                None
+            } else {
+                base.join(&raw).ok()
+            };
+        if let Some(url) = resolved {
+            out.push_str("url(\"");
+            out.push_str(url.as_str());
+            out.push_str("\")");
+        } else {
+            out.push_str(&css[start..=end]);
+        }
+        cursor = end + 1;
+    }
+    out.push_str(&css[cursor..]);
+    out
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CssFontFace {
+    family: String,
+    sources: Vec<String>,
+}
+
+fn stylesheet_font_faces(css: &str) -> Vec<CssFontFace> {
+    let lower = css.to_ascii_lowercase();
+    let mut faces = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = lower[cursor..].find("@font-face") {
+        let rule = cursor + relative;
+        let Some(open_relative) = css[rule..].find('{') else {
+            break;
+        };
+        let open = rule + open_relative;
+        let Some(close) = css_block_end(css, open) else {
+            break;
+        };
+        let block = &css[open + 1..close];
+        let mut family = None;
+        let mut sources = Vec::new();
+        for declaration in block.split(';') {
+            let Some((name, value)) = declaration.split_once(':') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case("font-family") {
+                family = Some(unquote_css_url(value));
+            } else if name.trim().eq_ignore_ascii_case("src") {
+                let value_lower = value.to_ascii_lowercase();
+                let mut source_cursor = 0usize;
+                while let Some(relative) = value_lower[source_cursor..].find("url(") {
+                    let args = source_cursor + relative + 4;
+                    let Some(end) = value[args..].find(')') else {
+                        break;
+                    };
+                    sources.push(unquote_css_url(&value[args..args + end]));
+                    source_cursor = args + end + 1;
+                }
+            }
+        }
+        if let Some(family) = family
+            && !family.trim().is_empty()
+            && !sources.is_empty()
+        {
+            sources.retain(|url| !url.trim().is_empty());
+            if !sources.is_empty() {
+                faces.push(CssFontFace { family, sources });
+            }
+        }
+        cursor = close + 1;
+    }
+    faces
+}
+
+fn css_block_end(css: &str, open: usize) -> Option<usize> {
+    let bytes = css.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut i = open;
+    while i < bytes.len() {
+        if let Some(q) = quote {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                quote = None;
+            }
+        } else {
+            match bytes[i] {
+                b'\'' | b'"' => quote = Some(bytes[i]),
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+async fn install_stylesheet_fonts(sheets: &[(String, String)], page_url: &Url) {
+    let mut faces = sheets
+        .iter()
+        .flat_map(|(_, css)| stylesheet_font_faces(css))
+        .filter_map(|face| {
+            let sources = face
+                .sources
+                .into_iter()
+                .filter_map(|source| page_url.join(&source).ok())
+                .filter(|url| {
+                    matches!(url.scheme(), "http" | "https") && subresource_allowed(page_url, url)
+                })
+                .collect::<Vec<_>>();
+            (!sources.is_empty()).then_some((face.family, sources))
+        })
+        .collect::<Vec<_>>();
+    faces.truncate(MAX_PAGE_WEB_FONTS);
+    let fonts = futures::stream::iter(faces.into_iter().map(|(family, sources)| async move {
+        // CSS Fonts 4 §4.3.3: try external references in specified order and
+        // proceed to the next item when loading or format decoding fails.
+        for url in sources {
+            let Ok(response) = fetch(&Request::get(url)).await else {
+                continue;
+            };
+            if !(200..300).contains(&response.status) {
+                continue;
+            }
+            if let Some(font) =
+                crate::font_system::PageFont::from_web_resource(family.clone(), response.body)
+            {
+                return Some(font);
+            }
+        }
+        None
+    }))
+    .buffered(PREFETCH_CONCURRENCY)
+    .filter_map(|font| async move { font })
+    .collect()
+    .await;
+    crate::font_system::install_page_fonts(fonts);
 }
 
 /// Render an HTML page with ONLY its CSS cascade applied (no JS): fetch its
@@ -2167,6 +2613,7 @@ async fn css_only_with_sheets(
     sheets: Vec<(String, String)>,
 ) -> Response {
     let html = decode_body(&response.content_type, &response.body);
+    install_stylesheet_fonts(&sheets, &response.url).await;
     let base = base_with_doc_base(&html, &response.url);
     fetch_svg_sprite_sheets(&html, &base, &response.url).await;
     // The frame documents are fetched up front into a url→content map (Dom is
@@ -3593,6 +4040,54 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn css_imports_are_found_in_order_and_urls_use_sheet_base() {
+        let imports = stylesheet_imports(
+            "/* lead */ @import url('../fonts/fonts.css');\
+             @import \"theme.css\" screen and (min-width: 30em);p{color:red}",
+        );
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].url, "../fonts/fonts.css");
+        assert_eq!(imports[1].url, "theme.css");
+        assert_eq!(imports[1].condition, "screen and (min-width: 30em)");
+
+        let base = Url::parse("https://example.test/css/components/main.css").unwrap();
+        assert_eq!(
+            absolutize_css_urls(
+                ".hero{background:url(../../img/hero.png)}\
+                 @font-face{src:url('../fonts/site.woff2') format('woff2')}",
+                &base,
+            ),
+            ".hero{background:url(\"https://example.test/img/hero.png\")}\
+             @font-face{src:url(\"https://example.test/css/fonts/site.woff2\") format('woff2')}"
+        );
+    }
+
+    #[test]
+    fn font_face_parser_uses_css_family_descriptor_and_ordered_url_sources() {
+        let faces = stylesheet_font_faces(
+            "@font-face{font-family:'Site Icons';\
+             src:local('Site Icons'),url(\"https://cdn.test/icons.woff2\") format('woff2')}\
+             @font-face{src:url(no-family.woff2)}",
+        );
+        assert_eq!(
+            faces,
+            vec![CssFontFace {
+                family: "Site Icons".into(),
+                sources: vec!["https://cdn.test/icons.woff2".into()],
+            }]
+        );
+
+        let faces = stylesheet_font_faces(
+            "@font-face{font-family:Site;src:url(site.eot?#iefix) format('embedded-opentype'),\
+             url(site.woff2) format('woff2'),url(site.ttf) format('truetype')}",
+        );
+        assert_eq!(
+            faces[0].sources,
+            vec!["site.eot?#iefix", "site.woff2", "site.ttf"]
+        );
+    }
 
     #[test]
     fn discovers_css_background_image_urls_for_eager_fetch() {
@@ -9603,7 +10098,11 @@ customElements.define('lit-counter', LitCounter);
         // inline widgets may carry a trailing separator space).
         assert!(has_item(&doc, "[Everywhere ▾]"));
         assert!(has_item(&doc, "[x] safe"));
-        assert!(has_item(&doc, "[ Search ]"));
+        assert!(
+            has_item(&doc, "Search"),
+            "terminal submit label was lost: {:?}",
+            doc.rows
+        );
     }
 
     #[test]
