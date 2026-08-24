@@ -3965,6 +3965,45 @@ mod tests {
     }
 
     #[test]
+    fn row_flex_hypothetical_cross_size_honors_item_max_height() {
+        // Flexbox §9.4 obtains the hypothetical cross size through ordinary
+        // block layout, including CSS Sizing 3's max-height constraint.
+        let layout = lay_graphical(
+            r#"<body style="margin:0"><div id="row" style="display:flex;width:200px"><div id="item" style="max-height:100px;overflow:hidden"><div style="height:300px"></div></div></div><div id="after" style="height:10px"></div></body>"#,
+            320.0,
+            &HashMap::new(),
+        );
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><div id="row" style="display:flex;width:200px"><div id="item" style="max-height:100px;overflow:hidden"><div style="height:300px"></div></div></div><div id="after" style="height:10px"></div></body>"#,
+        );
+        assert_eq!(layout.boxes[&node_by_id(&dom, "item")].height, 100.0);
+        assert_eq!(layout.boxes[&node_by_id(&dom, "row")].height, 100.0);
+        assert_eq!(layout.boxes[&node_by_id(&dom, "after")].top, 100.0);
+    }
+
+    #[test]
+    fn auto_height_column_uses_max_clamped_item_contributions() {
+        // Flexbox §§9.2 and 9.4: a max-height on an item constrains both that
+        // item and the intrinsic automatic main size of its column container.
+        let html = r#"<body style="margin:0"><div id="col" style="display:flex;flex-direction:column"><div id="bounded" style="max-height:100px;overflow:auto"><div style="height:300px"></div></div><div style="height:20px"></div></div><div id="after" style="height:10px"></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 320.0, &HashMap::new());
+        assert_eq!(layout.boxes[&node_by_id(&dom, "bounded")].height, 100.0);
+        assert_eq!(layout.boxes[&node_by_id(&dom, "col")].height, 120.0);
+        assert_eq!(layout.boxes[&node_by_id(&dom, "after")].top, 120.0);
+    }
+
+    #[test]
+    fn overflowing_flex_item_center_alignment_remains_unsafe_by_default() {
+        // CSS Box Alignment 3 §4.4.1.3: unspecified overflow alignment on a
+        // flex item is unsafe, so negative free space remains equally split.
+        let html = r#"<body style="margin:0"><div id="row" style="display:flex;align-items:center;width:100px;height:100px"><div id="item" style="width:20px;height:200px"></div></div></body>"#;
+        let dom = Dom::parse_document(html);
+        let layout = lay_graphical(html, 320.0, &HashMap::new());
+        assert_eq!(layout.boxes[&node_by_id(&dom, "item")].top, -50.0);
+    }
+
+    #[test]
     fn flex_baseline_alignment_uses_typographic_baselines() {
         let layout = lay_graphical(
             r#"<body style="margin:0"><div style="display:flex;align-items:baseline"><div style="font-size:12px">small</div><div style="font-size:28px;font-style:italic">BIG</div></div></body>"#,
@@ -6407,6 +6446,44 @@ mod tests {
                 (rect.width - 16.0).abs() < 0.01 && (rect.height - 12.0).abs() < 0.01
             })
         );
+    }
+
+    #[test]
+    fn non_replaced_aspect_ratio_sizes_an_overflow_clip_for_absolute_image() {
+        // CSS Sizing 4 §§4.1–4.2: an automatic height is transferred from the
+        // definite used width through the preferred ratio. The resulting box
+        // is also the scrollport/clip for its absolutely positioned image.
+        let dom = Dom::parse_document(
+            r#"<body style="margin:0"><div id="frame" style="position:relative;width:320px;aspect-ratio:16/9;overflow:hidden"><img id="photo" src="photo.jpg" style="position:absolute;width:100%;height:100%;object-fit:cover"></div><p id="after" style="margin:0">after</p></body>"#,
+        );
+        let base = Url::parse("https://example.test/").unwrap();
+        let mut images = HashMap::new();
+        images.insert("https://example.test/photo.jpg".to_string(), (640, 360));
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(400.0, 600.0),
+            &[],
+            &HashMap::new(),
+            &images,
+        );
+        let frame = layout.boxes.get(&node_by_id(&dom, "frame")).unwrap();
+        let after = layout.boxes.get(&node_by_id(&dom, "after")).unwrap();
+        assert_eq!((frame.width, frame.height), (320.0, 180.0));
+        assert_eq!(after.top, 180.0);
+        let (image, clip) = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::Image {
+                    node, rect, clip, ..
+                } if *node == node_by_id(&dom, "photo") => Some((*rect, *clip)),
+                _ => None,
+            })
+            .expect("photo paint command");
+        assert_eq!((image.width, image.height), (320.0, 180.0));
+        assert_eq!(clip.map(|rect| rect.height), Some(180.0));
     }
 
     #[test]

@@ -768,7 +768,24 @@ impl Flow<'_> {
 
         // Definite heights (content-box px). A percentage against an
         // indefinite CB height is auto (§10.5).
-        let spec_h = self.height_px(&s.height, s, bt, bb, cb_h);
+        let authored_h = self.height_px(&s.height, s, bt, bb, cb_h);
+        // CSS Sizing 4 §§4.1–4.2: with an automatic block size and a
+        // preferred aspect ratio, transfer the definite used inline size
+        // through the ratio. A specified ratio uses the box selected by
+        // `box-sizing`; layout stores content dimensions, so convert a
+        // border-box result back to the content box before height layout.
+        let ratio_h = (authored_h.is_none() && s.height.is_auto())
+            .then(|| {
+                s.aspect_ratio.map(|ratio| {
+                    if s.border_box {
+                        ((h.content_w + h.bp_l + h.bp_r) / ratio - bt - bb).max(0.0)
+                    } else {
+                        h.content_w / ratio
+                    }
+                })
+            })
+            .flatten();
+        let spec_h = authored_h.or(ratio_h);
         let min_h = self
             .height_px(&s.min_height, s, bt, bb, cb_h)
             .unwrap_or(0.0);
@@ -1740,11 +1757,15 @@ fn collect_lines(outer: &[f32], wrap: bool, avail: f32, gap: f32) -> Vec<std::op
 /// §9.6's per-item cross placement: the margin-box shift within the line
 /// for the given auto-margin flags and alignment.
 pub(super) fn cross_shift(extra: f32, auto_start: bool, auto_end: bool, align: AlignItem) -> f32 {
-    let extra = extra.max(0.0);
     match (auto_start, auto_end) {
-        (true, true) => extra / 2.0,
-        (true, false) => extra,
+        // Flexbox §8.1: auto margins are treated as zero when the item
+        // overflows, so negative free space never pulls it past cross-start.
+        (true, true) => extra.max(0.0) / 2.0,
+        (true, false) => extra.max(0.0),
         (false, true) => 0.0,
+        // CSS Box Alignment 3 §4.4.1.3: the default overflow alignment for a
+        // flex item's self-alignment is unsafe. Preserve negative free space
+        // for center/end instead of silently changing them to flex-start.
         (false, false) => match align {
             AlignItem::Start | AlignItem::Stretch | AlignItem::Baseline => 0.0,
             AlignItem::Center => extra / 2.0,
@@ -2001,7 +2022,38 @@ impl Flow<'_> {
             let mut cross = 0.0f32;
             for i in r.clone() {
                 let used = calcs[i].target.max(0.0);
-                let (frag, anc) = self.item_frag(fi[i].b, used, content_w, fi[i].def_h, inl);
+                let (mut frag, mut anc) =
+                    self.item_frag(fi[i].b, used, content_w, fi[i].def_h, inl);
+                // Flexbox §9.4's hypothetical cross size comes from ordinary
+                // block layout, which includes the item's own min/max-height
+                // constraints (CSS Sizing 3 §3.1). `item_frag` receives an
+                // imposed height from its caller, so an auto-height item needs
+                // this explicit clamp and a second layout when the clamp
+                // changes the definite basis seen by its descendants.
+                if fi[i].def_h.is_none() {
+                    let s = &fi[i].b.style;
+                    let to_content = |value: f32| {
+                        if s.border_box {
+                            (value - fi[i].bp_cross).max(0.0)
+                        } else {
+                            value.max(0.0)
+                        }
+                    };
+                    let min_cross = s.min_height.resolve(def_ch).map(to_content).unwrap_or(0.0);
+                    let max_cross = match &s.max_height {
+                        Len::None => f32::INFINITY,
+                        value => value
+                            .resolve(def_ch)
+                            .map(to_content)
+                            .unwrap_or(f32::INFINITY),
+                    }
+                    .max(min_cross);
+                    let natural = (frag.h - fi[i].bp_cross).max(0.0);
+                    let clamped = natural.clamp(min_cross, max_cross);
+                    if (clamped - natural).abs() > 0.01 {
+                        (frag, anc) = self.item_frag(fi[i].b, used, content_w, Some(clamped), inl);
+                    }
+                }
                 cross = cross.max(frag.h + fi[i].m[TOP] + fi[i].m[BOTTOM]);
                 fi[i].frag = Some(frag);
                 fi[i].anchors = anc;
@@ -2358,7 +2410,14 @@ impl Flow<'_> {
                         .as_ref()
                         .map(|frag| (frag.h - fi[i].bp_main).max(0.0))
                         .unwrap_or(0.0);
-                    natural + calcs[i].mbp
+                    // Flexbox §§9.2 and 9.4: intrinsic auto-height sizing uses
+                    // the item's content contribution, but its hypothetical
+                    // main size remains clamped by its used min/max sizes.
+                    // Keeping the natural contribution (rather than a zero
+                    // flex-basis) preserves scroll-content sizing while the
+                    // clamp prevents a max-height child from inflating its
+                    // auto-height column container.
+                    natural.clamp(calcs[i].min, calcs[i].max) + calcs[i].mbp
                 })
                 .sum();
             let avail = def_ch

@@ -314,7 +314,7 @@ fn constrain_ratio(w: f32, h: f32, min_w: f32, max_w: f32, min_h: f32, max_h: f3
 /// Parse a CSS `aspect-ratio`: `R`, `W / H`, `auto W / H` (`auto` with a
 /// ratio uses the ratio for boxes without a natural one — our caller only
 /// consults this when no natural ratio exists, which is that exact rule).
-fn parse_ratio(value: &str) -> Option<f32> {
+pub(crate) fn parse_ratio(value: &str) -> Option<f32> {
     let v = value.trim().trim_start_matches("auto").trim();
     if v.is_empty() || v == "auto" {
         return None;
