@@ -383,6 +383,7 @@ impl TextEditor {
 
     pub fn geometry(&mut self) -> (Vec<EditorRect>, Option<EditorRect>, EditorRect) {
         TEXT.with_borrow_mut(|system| {
+            system.refresh_page_fonts();
             let mut driver = self.editor.driver(&mut system.fonts, &mut system.layouts);
             driver.refresh_layout();
             let selection = driver
@@ -450,6 +451,7 @@ impl TextEditor {
 
     fn drive(&mut self, operation: impl FnOnce(&mut parley::editing::PlainEditorDriver<'_, ()>)) {
         TEXT.with_borrow_mut(|system| {
+            system.refresh_page_fonts();
             let mut driver = self.editor.driver(&mut system.fonts, &mut system.layouts);
             operation(&mut driver);
         });
@@ -468,6 +470,7 @@ fn editor_rect(rect: parley::BoundingBox) -> EditorRect {
 struct TextSystem {
     fonts: FontContext,
     layouts: LayoutContext<()>,
+    page_font_epoch: u64,
     /// Shaping is pure for a fixed system-font collection and CSS text style.
     /// Inline layout asks for the same spaces, words, labels, and intrinsic
     /// probes many times; retaining those results avoids repeating font
@@ -549,6 +552,7 @@ impl TextSystem {
         Self {
             fonts: crate::font_system::font_context(),
             layouts: LayoutContext::new(),
+            page_font_epoch: crate::font_system::page_font_epoch(),
             shape_cache: HashMap::new(),
             shape_order: VecDeque::new(),
             shape_cache_bytes: 0,
@@ -556,6 +560,7 @@ impl TextSystem {
     }
 
     fn shape(&mut self, text: &str, style: &TextStyle) -> ShapedText {
+        self.refresh_page_fonts();
         let key = ShapeKey {
             text: text.to_string(),
             style: style.into(),
@@ -635,6 +640,7 @@ impl TextSystem {
         width: f32,
         breaks: TextBreakStyle,
     ) -> usize {
+        self.refresh_page_fonts();
         if text.is_empty() || width <= 0.0 || style.size <= 0.0 {
             return 0;
         }
@@ -690,6 +696,7 @@ impl TextSystem {
         style: &TextStyle,
         breaks: TextBreakStyle,
     ) -> (f32, f32) {
+        self.refresh_page_fonts();
         if text.is_empty() || style.size <= 0.0 {
             return (0.0, 0.0);
         }
@@ -723,6 +730,19 @@ impl TextSystem {
         let layout: Layout<()> = builder.build(text);
         let widths = layout.calculate_content_widths();
         (widths.min, widths.max)
+    }
+
+    fn refresh_page_fonts(&mut self) {
+        let epoch = crate::font_system::page_font_epoch();
+        if self.page_font_epoch == epoch {
+            return;
+        }
+        self.fonts = crate::font_system::font_context();
+        self.layouts = LayoutContext::new();
+        self.shape_cache.clear();
+        self.shape_order.clear();
+        self.shape_cache_bytes = 0;
+        self.page_font_epoch = epoch;
     }
 }
 
