@@ -8,7 +8,9 @@ Image support? We got it. Live JS rendering? Yup. Full CSS? Yeah.
 Browse the web, connect to MUDs, check out your favorite gopher holes and
 gemini capsules, all in one place. Do you like YouTube or any other
 audio/video content? If you have mpv installed, it will automatically
-open the target in mpv for your viewing and listening pleasure.
+open the target in mpv for your viewing and listening pleasure. Direct YouTube
+playback URLs, including `youtu.be` shares, are delegated to mpv while YouTube
+search, channel, and other browsing pages remain in TRust.
 
 ## Installation
 

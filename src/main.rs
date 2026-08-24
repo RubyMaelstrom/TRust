@@ -33,6 +33,19 @@ async fn main() -> ExitCode {
         None => None,
     };
 
+    // An OS URL handler may invoke TRust without an interactive terminal.
+    // Delegate concrete YouTube playback URLs before Ratatui touches the TTY;
+    // normal YouTube browsing URLs continue through the browser below.
+    if let Some(url) = host.as_deref().and_then(trust::media::youtube_video_url) {
+        return match trust::media::launch_mpv(url.as_str(), None) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("trust: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let terminal = ratatui::init();
     // This thread (the `#[tokio::main]` `block_on` driver) owns the live
     // terminal, and the run loop never migrates off it (verified). Claim it

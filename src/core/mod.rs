@@ -390,10 +390,19 @@ enum CoreEvent {
         generation: u64,
         result: Result<FetchedDocument, String>,
     },
+    ExternalMedia {
+        generation: u64,
+        url: url::Url,
+    },
     Page {
         generation: u64,
         event: crate::js::PageEvt,
     },
+}
+
+enum InteractiveFetch {
+    Document(FetchedDocument),
+    ExternalMedia(url::Url),
 }
 
 /// Read-only state used by graphical chrome.
@@ -450,6 +459,7 @@ pub struct BrowserController {
     /// page. Native frontends consume these after the actor runs `keydown`.
     page_key_defaults: VecDeque<bool>,
     pending_fragment: Option<String>,
+    external_media: VecDeque<(url::Url, Option<url::Url>)>,
     storage: crate::js::WebStorage,
     external_address: Option<String>,
     generation: u64,
@@ -482,6 +492,7 @@ impl BrowserController {
             pending_live_submit: None,
             page_key_defaults: VecDeque::new(),
             pending_fragment: None,
+            external_media: VecDeque::new(),
             storage: Default::default(),
             external_address: None,
             generation: 0,
@@ -516,6 +527,13 @@ impl BrowserController {
 
     pub fn current_page(&self) -> Option<&BrowserPage> {
         self.current.as_ref()
+    }
+
+    /// Take a playback URL delegated by navigation. External-process spawning
+    /// remains a frontend responsibility, while classification is centralized
+    /// with navigation so typed, clicked, redirected, and scripted URLs agree.
+    pub fn take_external_media(&mut self) -> Option<(url::Url, Option<url::Url>)> {
+        self.external_media.pop_front()
     }
 
     pub fn page_is_live(&self) -> bool {
@@ -856,6 +874,9 @@ impl BrowserController {
                 CoreEvent::FetchFinished { generation, result } => {
                     changed |= self.finish_fetch(generation, result);
                 }
+                CoreEvent::ExternalMedia { generation, url } => {
+                    changed |= self.finish_external_media(generation, url);
+                }
                 CoreEvent::Page { generation, event } => {
                     if generation == self.generation {
                         changed |= self.handle_page_event(event);
@@ -870,6 +891,13 @@ impl BrowserController {
     }
 
     fn begin_address(&mut self, address: &str, intent: NavigationIntent) -> bool {
+        // Classify the address-bar form before generic bare-host handling adds
+        // a trailing slash. For `youtube.com/watch?v=id`, appending that slash
+        // would alter the query value and hide an otherwise valid video URL.
+        if let Some(url) = crate::media::youtube_video_url(address) {
+            self.delegate_external_media(url);
+            return true;
+        }
         match parse_navigation_target(address) {
             Ok((target, fallback_http)) => {
                 self.begin_fetch(target, fallback_http, intent);
@@ -920,6 +948,12 @@ impl BrowserController {
     }
 
     fn begin_fetch(&mut self, target: Link, fallback_http: bool, intent: NavigationIntent) {
+        if let Link::Http(url) = &target
+            && crate::media::is_youtube_video_url(url)
+        {
+            self.delegate_external_media(url.clone());
+            return;
+        }
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -950,13 +984,44 @@ impl BrowserController {
                 None,
             )
             .await;
-            if tx
-                .send(CoreEvent::FetchFinished { generation, result })
-                .is_ok()
-            {
+            let event = interactive_fetch_event(generation, result);
+            if tx.send(event).is_ok() {
                 invalidation.request_redraw();
             }
         }));
+    }
+
+    fn queue_external_media(&mut self, url: url::Url) {
+        let referrer = self.current.as_ref().and_then(|page| match &page.target {
+            Link::Http(url) => Some(url.clone()),
+            _ => None,
+        });
+        self.status = format!("Opening in mpv: {url}");
+        self.external_media.push_back((url, referrer));
+        self.invalidation.request_redraw();
+    }
+
+    fn delegate_external_media(&mut self, url: url::Url) {
+        if self.pending.take().is_some() {
+            if let Some(task) = self.task.take() {
+                task.abort();
+            }
+            // Ignore a completion already queued by the superseded fetch.
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.queue_external_media(url);
+    }
+
+    fn finish_external_media(&mut self, generation: u64, url: url::Url) -> bool {
+        let Some(_pending) = self
+            .pending
+            .take_if(|pending| pending.generation == generation)
+        else {
+            return false;
+        };
+        self.task = None;
+        self.queue_external_media(url);
+        true
     }
 
     fn finish_fetch(&mut self, generation: u64, result: Result<FetchedDocument, String>) -> bool {
@@ -1247,6 +1312,10 @@ impl BrowserController {
     }
 
     fn begin_post(&mut self, url: url::Url, body: String) {
+        if crate::media::is_youtube_video_url(&url) {
+            self.delegate_external_media(url);
+            return;
+        }
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -1277,10 +1346,8 @@ impl BrowserController {
                 Some(body),
             )
             .await;
-            if tx
-                .send(CoreEvent::FetchFinished { generation, result })
-                .is_ok()
-            {
+            let event = interactive_fetch_event(generation, result);
+            if tx.send(event).is_ok() {
                 invalidation.request_redraw();
             }
         }));
@@ -1330,7 +1397,7 @@ async fn fetch_protocol_interactive(
     device_pixel_ratio: f32,
     storage: crate::js::WebStorage,
     post_body: Option<String>,
-) -> Result<FetchedDocument, String> {
+) -> Result<InteractiveFetch, String> {
     if let Link::Http(url) = target {
         let mut response = if let Some(body) = post_body {
             let mut request = http::Request {
@@ -1358,6 +1425,9 @@ async fn fetch_protocol_interactive(
             http::set_navigation_metadata(&mut request, referrer);
             http::fetch(&request).await?
         };
+        if crate::media::is_youtube_video_url(&response.url) {
+            return Ok(InteractiveFetch::ExternalMedia(response.url));
+        }
         // The legacy API accepts a terminal viewport and cell size. A one-pixel
         // cell is the explicit desktop adapter, so the actor's CSSOM viewport
         // is exactly the desktop's CSS-pixel viewport and never device pixels.
@@ -1373,9 +1443,27 @@ async fn fetch_protocol_interactive(
             storage,
         )
         .await;
-        Ok(FetchedDocument::Http(Box::new(response)))
+        Ok(InteractiveFetch::Document(FetchedDocument::Http(Box::new(
+            response,
+        ))))
     } else {
-        fetch_protocol(target, fallback_http, referrer).await
+        fetch_protocol(target, fallback_http, referrer)
+            .await
+            .map(InteractiveFetch::Document)
+    }
+}
+
+fn interactive_fetch_event(generation: u64, result: Result<InteractiveFetch, String>) -> CoreEvent {
+    match result {
+        Ok(InteractiveFetch::Document(document)) => CoreEvent::FetchFinished {
+            generation,
+            result: Ok(document),
+        },
+        Ok(InteractiveFetch::ExternalMedia(url)) => CoreEvent::ExternalMedia { generation, url },
+        Err(error) => CoreEvent::FetchFinished {
+            generation,
+            result: Err(error),
+        },
     }
 }
 
@@ -1707,6 +1795,85 @@ mod tests {
         assert!(!fallback);
 
         assert!(parse_navigation_target("telnet://example.com").is_err());
+    }
+
+    #[test]
+    fn typed_clicked_and_scripted_youtube_players_delegate_without_fetching() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+
+        browser.handle_action(UserAction::Navigate(String::from(
+            "https://127.0.0.1:9/superseded",
+        )));
+        assert!(browser.snapshot().loading);
+
+        let outcome = browser.handle_action(UserAction::Navigate(String::from(
+            "youtube.com/watch?v=typed123",
+        )));
+        assert!(outcome.invalidated);
+        assert!(outcome.loading_retired);
+        assert!(!browser.snapshot().loading);
+        let (url, referrer) = browser.take_external_media().unwrap();
+        assert_eq!(url.as_str(), "https://youtube.com/watch?v=typed123");
+        assert!(referrer.is_none());
+
+        browser.handle_action(UserAction::Activate(Link::Http(
+            url::Url::parse("https://youtu.be/clicked123?si=share").unwrap(),
+        )));
+        let (url, _) = browser.take_external_media().unwrap();
+        assert_eq!(url.host_str(), Some("youtu.be"));
+
+        assert!(
+            browser.handle_page_event(crate::js::PageEvt::Replace(String::from(
+                "https://www.youtube.com/shorts/scripted123",
+            )))
+        );
+        let (url, _) = browser.take_external_media().unwrap();
+        assert_eq!(url.path(), "/shorts/scripted123");
+        assert!(browser.current_page().is_none());
+
+        browser.begin_post(
+            url::Url::parse("https://www.youtube.com/watch?v=posted123").unwrap(),
+            String::from("ignored=body"),
+        );
+        let (url, _) = browser.take_external_media().unwrap();
+        assert_eq!(url.query(), Some("v=posted123"));
+
+        browser.handle_action(UserAction::Navigate(String::from(
+            "https://www.youtube.com/results?search_query=rust",
+        )));
+        assert!(browser.snapshot().loading);
+        assert!(browser.take_external_media().is_none());
+    }
+
+    #[test]
+    fn redirected_youtube_result_is_delegated_before_document_commit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut browser =
+            BrowserController::new(runtime.handle().clone(), || {}, CssSize::new(640.0, 480.0));
+        browser.handle_action(UserAction::Navigate(String::from(
+            "https://127.0.0.1:9/redirect-source",
+        )));
+        let generation = browser.generation;
+        browser.task.take().unwrap().abort();
+
+        let url = url::Url::parse("https://www.youtube.com/watch?v=redirect123").unwrap();
+        let event =
+            interactive_fetch_event(generation, Ok(InteractiveFetch::ExternalMedia(url.clone())));
+        browser.tx.send(event).unwrap();
+        let outcome = browser.process_async_events();
+
+        assert!(outcome.invalidated);
+        assert!(!browser.snapshot().loading);
+        assert!(browser.current_page().is_none());
+        assert_eq!(browser.take_external_media().unwrap().0, url);
     }
 
     #[test]
