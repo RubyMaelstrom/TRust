@@ -11,6 +11,7 @@ use std::time::Instant;
 #[derive(Debug, Default)]
 pub struct RuntimeInterrupt {
     cancelled: AtomicBool,
+    user_navigation_requested: AtomicBool,
     deadline: Mutex<Option<Instant>>,
 }
 
@@ -18,6 +19,29 @@ impl RuntimeInterrupt {
     /// Request that the current execution stop at the next VM interrupt poll.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Request that author JavaScript yield so the embedder can service a
+    /// queued user navigation. Unlike [`Self::cancel`], this is a reusable
+    /// per-document signal: the embedder clears it at the next user-interaction
+    /// task boundary and rearms that task's ordinary deadline.
+    pub fn request_user_navigation(&self) {
+        self.user_navigation_requested
+            .store(true, Ordering::Release);
+    }
+
+    /// Clear a pending user-navigation yield at the boundary where the
+    /// embedder begins running the next user-interaction task.
+    pub fn begin_user_interaction(&self) {
+        self.user_navigation_requested
+            .store(false, Ordering::Release);
+    }
+
+    /// Whether a user navigation is waiting for the currently running page
+    /// task to yield. Async host-job drivers use this alongside VM polling so
+    /// a task parked outside the bytecode loop also returns promptly.
+    pub fn user_navigation_requested(&self) -> bool {
+        self.user_navigation_requested.load(Ordering::Acquire)
     }
 
     /// Set or clear the wall-clock deadline for JavaScript execution.
@@ -28,6 +52,9 @@ impl RuntimeInterrupt {
     pub(crate) fn reason(&self) -> Option<&'static str> {
         if self.cancelled.load(Ordering::Acquire) {
             return Some("JavaScript execution cancelled by the host");
+        }
+        if self.user_navigation_requested.load(Ordering::Acquire) {
+            return Some("JavaScript execution yielded to user navigation");
         }
         self.deadline
             .lock()

@@ -7483,11 +7483,7 @@ mod tests {
                 .expect("marker");
             eprintln!("clicking node {marker} (\"{link_text}\")");
             let live = response.live.as_mut().expect("page is live");
-            live.handle
-                .cmds
-                .send(crate::js::PageCmd::Click(marker))
-                .await
-                .unwrap();
+            live.handle.try_send_navigation_click(marker).unwrap();
             let click_wait = std::env::var("TRUST_CLICK_WAIT")
                 .ok()
                 .and_then(|s| s.parse().ok())
