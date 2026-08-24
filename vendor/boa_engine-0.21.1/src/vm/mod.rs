@@ -14,7 +14,7 @@ use crate::{
 };
 use boa_gc::{Finalize, Gc, Trace, custom_trace};
 use shadow_stack::ShadowStack;
-use std::{future::Future, ops::ControlFlow, pin::Pin, task};
+use std::{future::Future, ops::ControlFlow, pin::Pin, sync::Arc, task};
 
 #[cfg(feature = "trace")]
 use crate::sys::time::Instant;
@@ -34,7 +34,7 @@ pub(crate) use {
     inline_cache::InlineCache,
 };
 
-pub use runtime_limits::RuntimeLimits;
+pub use runtime_limits::{RuntimeInterrupt, RuntimeLimits};
 pub use {
     call_frame::{CallFrame, GeneratorResumeKind},
     code_block::CodeBlock,
@@ -353,6 +353,11 @@ pub struct Vm {
     pub(crate) pending_exception: Option<JsError>,
     pub(crate) environments: EnvironmentStack,
     pub(crate) runtime_limits: RuntimeLimits,
+
+    /// Host-owned cancellation/deadline state for the currently executing
+    /// realm. Checked periodically by both synchronous and async VM loops.
+    pub(crate) runtime_interrupt: Option<Arc<RuntimeInterrupt>>,
+    pub(crate) interrupt_poll_countdown: u16,
 
     /// This is used to assign a native (rust) function as the active function,
     /// because we don't push a frame for them.
@@ -692,6 +697,8 @@ impl Vm {
             environments: EnvironmentStack::new(realm.environment().clone()),
             pending_exception: None,
             runtime_limits: RuntimeLimits::default(),
+            runtime_interrupt: None,
+            interrupt_poll_countdown: 0,
             native_active_function: None,
             realm,
             shadow_stack: ShadowStack::default(),
@@ -937,6 +944,27 @@ impl Context {
     where
         F: FnOnce(&mut Context, Opcode) -> ControlFlow<CompletionRecord>,
     {
+        // HTML §8.1.4.5 permits a user agent to abort a running script when it
+        // exceeds a resource limit. Poll every few thousand bytecodes rather
+        // than only at explicit loop opcodes: generated state machines and
+        // repeated native callbacks can otherwise execute indefinitely without
+        // touching `IncrementLoopIteration`. Runtime-limit errors are
+        // uncatchable, so `handle_error` empties the execution-context stack.
+        if self.vm.interrupt_poll_countdown == 0 {
+            self.vm.interrupt_poll_countdown = 4096;
+            let reason = self
+                .vm
+                .runtime_interrupt
+                .as_ref()
+                .and_then(|interrupt| interrupt.reason());
+            if let Some(reason) = reason {
+                return self.handle_error(JsError::from_native(
+                    JsNativeError::runtime_limit().with_message(reason),
+                ));
+            }
+        }
+        self.vm.interrupt_poll_countdown -= 1;
+
         #[cfg(feature = "fuzz")]
         {
             if self.instructions_remaining == 0 {

@@ -1,6 +1,6 @@
 //! The ECMAScript context.
 
-use std::{cell::Cell, path::Path, rc::Rc};
+use std::{cell::Cell, path::Path, rc::Rc, sync::Arc};
 
 use boa_ast::StatementList;
 use boa_interner::Interner;
@@ -16,7 +16,7 @@ use timezone_provider::tzif::CompiledTzdbProvider;
 
 use crate::job::Job;
 use crate::module::DynModuleLoader;
-use crate::vm::RuntimeLimits;
+use crate::vm::{RuntimeInterrupt, RuntimeLimits};
 use crate::{
     HostDefined, JsNativeError, JsResult, JsString, JsValue, NativeObject, Source, builtins,
     class::{Class, ClassBuilder},
@@ -590,6 +590,15 @@ impl Context {
     #[inline]
     pub fn runtime_limits_mut(&mut self) -> &mut RuntimeLimits {
         &mut self.vm.runtime_limits
+    }
+
+    /// Install host-owned cancellation and deadline state for running script.
+    ///
+    /// The VM polls this state from its instruction loop, allowing another
+    /// thread to abort an execution which has not returned to the embedder.
+    pub fn set_runtime_interrupt(&mut self, interrupt: Option<Arc<RuntimeInterrupt>>) {
+        self.vm.runtime_interrupt = interrupt;
+        self.vm.interrupt_poll_countdown = 0;
     }
 
     /// Returns `true` if this context can be suspended by an `Atomics.wait` call.

@@ -1,3 +1,42 @@
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+/// A thread-safe request to abort JavaScript which is already executing.
+///
+/// Embedders use this for host resource deadlines and lifecycle cancellation.
+/// Polling is performed by the VM instruction loop, so an interrupt can unwind
+/// a script even when it never reaches an explicit ECMAScript loop opcode or
+/// returns to the embedder between callbacks.
+#[derive(Debug, Default)]
+pub struct RuntimeInterrupt {
+    cancelled: AtomicBool,
+    deadline: Mutex<Option<Instant>>,
+}
+
+impl RuntimeInterrupt {
+    /// Request that the current execution stop at the next VM interrupt poll.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Set or clear the wall-clock deadline for JavaScript execution.
+    pub fn set_deadline(&self, deadline: Option<Instant>) {
+        *self.deadline.lock().unwrap_or_else(|e| e.into_inner()) = deadline;
+    }
+
+    pub(crate) fn reason(&self) -> Option<&'static str> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Some("JavaScript execution cancelled by the host");
+        }
+        self.deadline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            .then_some("JavaScript execution deadline exceeded")
+    }
+}
+
 /// Represents the limits of different runtime operations.
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeLimits {
