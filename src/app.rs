@@ -305,11 +305,35 @@ enum Payload {
     Gopher(Vec<u8>),
     Gemini(gemini::Response),
     Http(Box<http::Response>),
+    /// A fetch redirected to a YouTube playback page. The redirect response is
+    /// classified before page JavaScript/layout and delegated on the UI thread.
+    Media(url::Url),
     OneShot(Vec<u8>),
     /// An internal `about:` page's gemtext source, generated locally (no
     /// network). Rides the fetch pipe so history deep-travel refetches of
     /// `about:` entries flow through the same completion path as the rest.
     About(String),
+}
+
+async fn prepare_http_payload(
+    response: http::Response,
+    viewport: (u16, u16),
+    cell_px: (u16, u16),
+    storage: crate::js::WebStorage,
+    js_on: bool,
+) -> Payload {
+    // Classify the final URL after HTTP redirects, but before either the JS
+    // actor or the CSS/layout pipeline sees the playback document.
+    if crate::media::is_youtube_video_url(&response.url) {
+        return Payload::Media(response.url);
+    }
+    // JS on: full transform. JS off: still bake the page's CSS so it lays out
+    // per its own stylesheets.
+    Payload::Http(Box::new(if js_on {
+        http::execute_js(response, viewport, cell_px, storage).await
+    } else {
+        http::css_only(response, viewport, cell_px).await
+    }))
 }
 
 /// Result of a background fetch.
@@ -2551,7 +2575,11 @@ impl App {
     /// HTTP GET). `port` is the explicitly-supplied port, if any; a `host:port`
     /// in the target wins over it.
     fn dispatch_open(&mut self, target: &str, port: Option<u16>) {
-        if let Some(url) = GopherUrl::parse(target) {
+        // Do this before bare-host dispatch, whose compatibility path appends
+        // `/` and would otherwise change a schemeless `watch?v=id` query.
+        if let Some(url) = crate::media::youtube_video_url(target) {
+            self.start_fetch(Link::Http(url));
+        } else if let Some(url) = GopherUrl::parse(target) {
             self.start_fetch(Link::Gopher(url));
         } else if let Some(url) = GeminiUrl::parse(target) {
             self.start_fetch(Link::Gemini(url));
@@ -2675,6 +2703,20 @@ impl App {
         // A new fetch intent supersedes a pending deep-travel completion
         // (the deep-travel path itself re-sets the flag after this call).
         self.pending_travel = None;
+        if let Link::Http(url) = &target
+            && crate::media::is_youtube_video_url(url)
+        {
+            // This is still a navigation intent even though no document will
+            // be committed. Prevent an older response from arriving after mpv
+            // opens and unexpectedly replacing the page the user kept.
+            if let Some(task) = self.fetch_task.take() {
+                task.abort();
+            }
+            self.fetch_rx = None;
+            self.replace_nav = false;
+            self.launch_mpv_with_referrer(url.to_string(), referrer.as_ref());
+            return;
+        }
         // Internal pages regenerate locally; the body is built HERE (it
         // needs App state) and echoed through the task so the completion
         // path — including the deep-travel trail shuffle — stays one road.
@@ -2702,15 +2744,10 @@ impl App {
                         Ok(Payload::Gemini(response))
                     }
                     Ok(crate::core::FetchedDocument::OneShot(raw)) => Ok(Payload::OneShot(raw)),
-                    Ok(crate::core::FetchedDocument::Http(response)) => {
-                        // JS on: full transform. JS off: still bake the page's
-                        // CSS so it lays out per its own stylesheets.
-                        Ok(Payload::Http(Box::new(if js_on {
-                            http::execute_js(*response, viewport, cell_px, storage).await
-                        } else {
-                            http::css_only(*response, viewport, cell_px).await
-                        })))
-                    }
+                    Ok(crate::core::FetchedDocument::Http(response)) => Ok(prepare_http_payload(
+                        *response, viewport, cell_px, storage, js_on,
+                    )
+                    .await),
                     Ok(crate::core::FetchedDocument::Internal(_)) => Err(String::from(
                         "internal document cannot come from the network",
                     )),
@@ -2725,6 +2762,10 @@ impl App {
     /// POST a form-encoded body to a web URL (her use case; the UX can
     /// grow content-type options once the target application is known).
     fn start_post(&mut self, url: url::Url, body: String, referrer: Option<url::Url>) {
+        if crate::media::is_youtube_video_url(&url) {
+            self.start_fetch_opts(Link::Http(url), false, referrer);
+            return;
+        }
         self.pending_travel = None;
         let (tx, rx) = mpsc::channel(1);
         self.fetch_rx = Some(rx);
@@ -2750,11 +2791,9 @@ impl App {
             }
             http::set_navigation_metadata(&mut request, referrer.as_ref());
             let result = match http::fetch(&request).await {
-                Ok(response) => Ok(Payload::Http(Box::new(if js_on {
-                    http::execute_js(response, viewport, cell_px, storage).await
-                } else {
-                    http::css_only(response, viewport, cell_px).await
-                }))),
+                Ok(response) => {
+                    Ok(prepare_http_payload(response, viewport, cell_px, storage, js_on).await)
+                }
                 Err(err) => Err(err),
             };
             let _ = tx
@@ -3364,6 +3403,12 @@ impl App {
             }
             (Ok(Payload::Gemini(response)), _) => self.on_gemini_response(response, width),
             (Ok(Payload::Http(response)), _) => self.on_http_response(*response, width),
+            (Ok(Payload::Media(url)), _) => {
+                // No document consumed these one-shot navigation flags.
+                self.replace_nav = false;
+                self.nav_from_post = false;
+                self.launch_mpv(url.to_string());
+            }
             (Ok(Payload::About(body)), Link::External(url)) => {
                 self.status = url.clone();
                 let doc = Self::about_doc(url, body, width);
@@ -6409,7 +6454,7 @@ impl App {
         // Manual `v` covers any other web link. One resolve serves both
         // checks (`selected_web_url` walks the doc and allocates).
         if let Some(url) = self.selected_web_url()
-            && (is_youtube_video_url(&url) || is_playable_media_url(&url))
+            && (crate::media::youtube_video_url(&url).is_some() || is_playable_media_url(&url))
         {
             self.launch_mpv(url);
             return;
@@ -6480,30 +6525,20 @@ impl App {
     /// Spawn mpv on a URL, detached. Shared by the `v` key, the automatic
     /// YouTube routing, and the `<video>`/`<audio>` → mpv path.
     fn launch_mpv(&mut self, url: String) {
-        // notice so the confirmation/error shows over the selected-link
-        // hint until the next keypress.
-        self.notice = true;
-        let mut cmd = std::process::Command::new("mpv");
         // Many media hosts hotlink-protect their files with a Referer check —
         // erome's mp4s 403 without one. Hand mpv the current page as referrer
         // so a direct media URL plays (harmless for yt-dlp-handled links).
-        if let Some(Link::Http(page)) = self.browser.as_ref().map(|g| &g.doc.url) {
-            cmd.arg(format!("--referrer={page}"));
-        }
-        match cmd
-            .arg(&url)
-            // Detach from our tty so mpv can't fight ratatui for the screen;
-            // it opens its own window. We don't wait on it.
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(_) => self.status = format!("▶ mpv {url}"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.status = String::from("mpv not found on PATH (can't play video).");
-            }
-            Err(e) => self.status = format!("mpv failed to launch: {e}"),
+        let referrer = self.http_referrer();
+        self.launch_mpv_with_referrer(url, referrer.as_ref());
+    }
+
+    fn launch_mpv_with_referrer(&mut self, url: String, referrer: Option<&url::Url>) {
+        // Keep confirmation/errors above selected-link hints until the next
+        // keypress, including for typed and startup playback URLs.
+        self.notice = true;
+        match crate::media::launch_mpv(&url, referrer) {
+            Ok(()) => self.status = format!("▶ mpv {url}"),
+            Err(error) => self.status = error,
         }
     }
 
@@ -7300,36 +7335,6 @@ fn ring_terminal_bell() {
     let mut out = std::io::stdout();
     let _ = out.write_all(b"\x07");
     let _ = out.flush();
-}
-
-/// Recognize a YouTube video URL across its formats, for auto-routing to
-/// mpv (yt-dlp resolves all of these). Covers `youtu.be/<id>`,
-/// `youtube.com/watch`, and the `/shorts/ /embed/ /live/ /v/` paths, on
-/// the bare, `www.`, `m.`, `music.`, and `-nocookie` hosts.
-fn is_youtube_video_url(url: &str) -> bool {
-    let Ok(u) = url::Url::parse(url) else {
-        return false;
-    };
-    if !matches!(u.scheme(), "http" | "https") {
-        return false;
-    }
-    let Some(host) = u.host_str() else {
-        return false;
-    };
-    let host = host.to_ascii_lowercase();
-    let host = host.strip_prefix("www.").unwrap_or(&host);
-    let path = u.path();
-    match host {
-        "youtu.be" => path.len() > 1,
-        "youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtube-nocookie.com" => {
-            path == "/watch"
-                || path.starts_with("/shorts/")
-                || path.starts_with("/embed/")
-                || path.starts_with("/live/")
-                || path.starts_with("/v/")
-        }
-        _ => false,
-    }
 }
 
 /// Whether a URL points at media mpv routinely plays directly — a video or
@@ -11044,28 +11049,6 @@ mod tests {
             }
         }
         panic!("no item matched the predicate");
-    }
-
-    #[test]
-    fn youtube_url_recognizer_covers_the_formats() {
-        use super::is_youtube_video_url as yt;
-        // Auto-route these:
-        assert!(yt("https://youtu.be/dQw4w9WgXcQ"));
-        assert!(yt("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
-        assert!(yt("https://youtube.com/watch?v=x&t=10s"));
-        assert!(yt("https://m.youtube.com/watch?v=x"));
-        assert!(yt("https://music.youtube.com/watch?v=x"));
-        assert!(yt("https://www.youtube.com/shorts/abc123"));
-        assert!(yt("https://www.youtube-nocookie.com/embed/abc"));
-        assert!(yt("http://youtube.com/live/abc"));
-        // Leave these to normal navigation:
-        assert!(!yt("https://www.youtube.com/")); // channel/home, not a video
-        assert!(!yt("https://www.youtube.com/feed/subscriptions"));
-        assert!(!yt("https://youtu.be/")); // no id
-        assert!(!yt("https://example.com/watch?v=x"));
-        assert!(!yt("https://notyoutube.com/watch"));
-        assert!(!yt("mailto:x@y.z"));
-        assert!(!yt("not a url"));
     }
 
     #[test]

@@ -1612,11 +1612,21 @@ impl DesktopApp {
             self.pending_page_keys.clear();
         }
         let outcome = self.browser.handle_action(action);
+        self.launch_external_media_requests();
         if outcome.loading_retired {
             self.retire_page_loading();
         }
         if outcome.invalidated {
             self.request_redraw();
+        }
+    }
+
+    fn launch_external_media_requests(&mut self) {
+        while let Some((url, referrer)) = self.browser.take_external_media() {
+            match trust::media::launch_mpv(url.as_str(), referrer.as_ref()) {
+                Ok(()) => self.browser.set_status(format!("▶ mpv {url}")),
+                Err(error) => self.browser.set_status(error),
+            }
         }
     }
 
@@ -1712,6 +1722,7 @@ impl DesktopApp {
     /// queue along with the old page.
     fn process_browser_events(&mut self) -> trust::core::ActionOutcome {
         let outcome = self.browser.process_async_events();
+        self.launch_external_media_requests();
         if outcome.loading_retired {
             let had_pending_key = !self.pending_page_keys.is_empty();
             self.pending_page_keys.clear();
@@ -5381,6 +5392,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     if options.help {
         println!("Usage: trust-desktop [--renderer=auto|cpu|hybrid] [URL]");
+        return Ok(());
+    }
+    // External URL handlers should not create a browser window for a concrete
+    // YouTube player. Navigation/search/channel pages still open normally.
+    if let Some(url) = options
+        .address
+        .as_deref()
+        .and_then(trust::media::youtube_video_url)
+    {
+        trust::media::launch_mpv(url.as_str(), None).map_err(std::io::Error::other)?;
         return Ok(());
     }
     let event_loop = EventLoop::<DesktopEvent>::with_user_event().build()?;
