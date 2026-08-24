@@ -2412,33 +2412,195 @@ fn unquote_css_url(value: &str) -> String {
 fn absolutize_css_urls(css: &str, base: &Url) -> String {
     let mut out = String::with_capacity(css.len());
     let mut cursor = 0usize;
-    let lower = css.to_ascii_lowercase();
-    while let Some(relative) = lower[cursor..].find("url(") {
-        let start = cursor + relative;
-        out.push_str(&css[cursor..start]);
-        let args = start + 4;
-        let Some(close_relative) = css[args..].find(')') else {
-            out.push_str(&css[start..]);
-            return out;
-        };
-        let end = args + close_relative;
-        let raw = unquote_css_url(&css[args..end]);
-        let resolved =
-            if raw.starts_with('#') || raw.starts_with("data:") || raw.starts_with("blob:") {
+    let mut i = 0usize;
+    while i < css.len() {
+        if css[i..].starts_with("/*") {
+            i = css[i + 2..]
+                .find("*/")
+                .map_or(css.len(), |end| i + 2 + end + 2);
+            continue;
+        }
+        let ch = css[i..].chars().next().unwrap();
+        if matches!(ch, '\'' | '"') {
+            i = css_string_end(css, i, ch);
+            continue;
+        }
+        if css_url_function_starts(css, i)
+            && let Some(span) = css_url_span(css, i)
+        {
+            let raw = css_unescape_url(&css[span.value_start..span.value_end]);
+            let lower = raw.to_ascii_lowercase();
+            let resolved = if raw.is_empty()
+                || raw.starts_with('#')
+                || lower.starts_with("data:")
+                || lower.starts_with("blob:")
+            {
                 None
             } else {
                 base.join(&raw).ok()
             };
-        if let Some(url) = resolved {
-            out.push_str("url(\"");
-            out.push_str(url.as_str());
-            out.push_str("\")");
-        } else {
-            out.push_str(&css[start..=end]);
+            if let Some(url) = resolved {
+                out.push_str(&css[cursor..span.value_start]);
+                out.push_str(url.as_str());
+                cursor = span.value_end;
+            }
+            i = span.function_end;
+            continue;
         }
-        cursor = end + 1;
+        i += ch.len_utf8();
     }
     out.push_str(&css[cursor..]);
+    out
+}
+
+#[derive(Clone, Copy)]
+struct CssUrlSpan {
+    value_start: usize,
+    value_end: usize,
+    function_end: usize,
+}
+
+fn css_url_function_starts(css: &str, start: usize) -> bool {
+    let Some(candidate) = css.get(start..start + 4) else {
+        return false;
+    };
+    if !candidate.eq_ignore_ascii_case("url(") {
+        return false;
+    }
+    css[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !css_ident_continue(ch))
+}
+
+fn css_ident_continue(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || !ch.is_ascii()
+}
+
+/// Return the URL value and complete function boundaries for one real CSS
+/// `url()` token/function. CSS Syntax 3 §§4.3.4–4.3.6 distinguish this from
+/// the characters `url(` occurring inside a string or comment; quoted values
+/// may themselves contain `)` and arbitrary text such as an SVG `url(#id)`.
+fn css_url_span(css: &str, start: usize) -> Option<CssUrlSpan> {
+    let mut i = start + 4;
+    while css[i..].chars().next().is_some_and(char::is_whitespace) {
+        i += css[i..].chars().next().unwrap().len_utf8();
+    }
+    let first = css[i..].chars().next()?;
+    if matches!(first, '\'' | '"') {
+        let value_start = i + first.len_utf8();
+        let quote_end = css_string_end(css, i, first);
+        if quote_end <= value_start || !css[..quote_end].ends_with(first) {
+            return None;
+        }
+        let value_end = quote_end - first.len_utf8();
+        let function_end = css_function_end(css, quote_end)?;
+        return Some(CssUrlSpan {
+            value_start,
+            value_end,
+            function_end,
+        });
+    }
+
+    let value_start = i;
+    let mut escaped = false;
+    while i < css.len() {
+        let ch = css[i..].chars().next().unwrap();
+        if escaped {
+            escaped = false;
+            i += ch.len_utf8();
+            continue;
+        }
+        match ch {
+            '\\' => {
+                escaped = true;
+                i += 1;
+            }
+            ')' => {
+                let value_end = css[value_start..i].trim_end().len() + value_start;
+                return Some(CssUrlSpan {
+                    value_start,
+                    value_end,
+                    function_end: i + 1,
+                });
+            }
+            '\'' | '"' | '(' => return None,
+            _ => i += ch.len_utf8(),
+        }
+    }
+    None
+}
+
+fn css_string_end(css: &str, start: usize, quote: char) -> usize {
+    let mut i = start + quote.len_utf8();
+    let mut escaped = false;
+    while i < css.len() {
+        let ch = css[i..].chars().next().unwrap();
+        i += ch.len_utf8();
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return i;
+        }
+    }
+    css.len()
+}
+
+fn css_function_end(css: &str, mut i: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    while i < css.len() {
+        if css[i..].starts_with("/*") {
+            i = css[i + 2..]
+                .find("*/")
+                .map_or(css.len(), |end| i + 2 + end + 2);
+            continue;
+        }
+        let ch = css[i..].chars().next().unwrap();
+        if matches!(ch, '\'' | '"') {
+            i = css_string_end(css, i, ch);
+            continue;
+        }
+        i += ch.len_utf8();
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn css_unescape_url(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let mut hex = String::new();
+        while hex.len() < 6 && chars.peek().is_some_and(char::is_ascii_hexdigit) {
+            hex.push(chars.next().unwrap());
+        }
+        if !hex.is_empty() {
+            if chars.peek().is_some_and(|ch| ch.is_whitespace()) {
+                chars.next();
+            }
+            let value = u32::from_str_radix(&hex, 16).unwrap_or(0xFFFD);
+            out.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
+        } else if let Some(escaped) = chars.next()
+            && !matches!(escaped, '\n' | '\r' | '\u{c}')
+        {
+            out.push(escaped);
+        }
+    }
     out
 }
 
@@ -4059,8 +4221,43 @@ mod tests {
                  @font-face{src:url('../fonts/site.woff2') format('woff2')}",
                 &base,
             ),
-            ".hero{background:url(\"https://example.test/img/hero.png\")}\
-             @font-face{src:url(\"https://example.test/css/fonts/site.woff2\") format('woff2')}"
+            ".hero{background:url(https://example.test/img/hero.png)}\
+             @font-face{src:url('https://example.test/css/fonts/site.woff2') format('woff2')}"
+        );
+    }
+
+    #[test]
+    fn stylesheet_url_resolution_obeys_css_token_boundaries() {
+        let base = Url::parse("https://cdn.example.test/css/app.css").unwrap();
+        let data = "data:image/svg+xml,%3Cg clip-path='url(%23a)'%3E";
+        let css = format!(
+            ".icon{{background-image:url(\"{data}\")}}\
+             /* url(ignored.png) */\
+             .label::before{{content:\"url(also-ignored.png)\"}}\
+             .asset{{background:url(../img/panel.png)}}\
+             .h-5{{height:1.25rem}}.w-5{{width:1.25rem}}"
+        );
+        let resolved = absolutize_css_urls(&css, &base);
+        assert!(resolved.contains(&format!("url(\"{data}\")")));
+        assert!(resolved.contains("/* url(ignored.png) */"));
+        assert!(resolved.contains("content:\"url(also-ignored.png)\""));
+        assert!(resolved.contains("url(https://cdn.example.test/img/panel.png)"));
+
+        // A nested `url(#id)` inside the quoted SVG data must not terminate or
+        // corrupt the outer token and swallow all following style rules.
+        let mut dom = crate::dom::Dom::parse_document(
+            "<head><link rel=stylesheet href=app.css></head>\
+             <body><svg id=icon class='icon h-5 w-5' viewBox='0 0 40 40'></svg></body>",
+        );
+        dom.attach_external_sheets(&[("app.css".into(), resolved)]);
+        let icon = dom.get_by_id("icon").unwrap();
+        assert_eq!(
+            dom.computed_style(icon, "width").as_deref(),
+            Some("1.25rem")
+        );
+        assert_eq!(
+            dom.computed_style(icon, "height").as_deref(),
+            Some("1.25rem")
         );
     }
 

@@ -177,6 +177,10 @@ pub(crate) struct BoxStyle {
     pub height: Len,
     pub min_height: Len,
     pub max_height: Len,
+    /// CSS Sizing 4 §4.1 preferred width/height ratio. `None` is `auto` on a
+    /// non-replaced box; replaced elements combine this with natural data in
+    /// `replaced` rather than consuming this snapshot directly.
+    pub aspect_ratio: Option<f32>,
     /// `box-sizing: border-box` — declared width/height include border+padding.
     pub border_box: bool,
     pub position: Pos,
@@ -225,6 +229,7 @@ impl BoxStyle {
             height: Len::Auto,
             min_height: Len::Auto,
             max_height: Len::None,
+            aspect_ratio: None,
             border_box: false,
             position: Pos::Static,
             inset: [Len::Auto, Len::Auto, Len::Auto, Len::Auto],
@@ -279,6 +284,9 @@ impl BoxStyle {
             height: Len::parse_or(cv("height").as_deref(), u, vp, Len::Auto),
             min_height: Len::parse_or(cv("min-height").as_deref(), u, vp, Len::Auto),
             max_height: Len::parse_or(cv("max-height").as_deref(), u, vp, Len::None),
+            aspect_ratio: cv("aspect-ratio")
+                .as_deref()
+                .and_then(super::replaced::parse_ratio),
             border_box: matches!(cv("box-sizing").as_deref(), Some("border-box")),
             position: Pos::of(dom, id),
             inset: [
@@ -411,6 +419,9 @@ impl BoxStyle {
             height: len("height", Len::Auto),
             min_height: len("min-height", Len::Auto),
             max_height: len("max-height", Len::None),
+            aspect_ratio: cv("aspect-ratio")
+                .as_deref()
+                .and_then(super::replaced::parse_ratio),
             border_box: matches!(cv("box-sizing").as_deref(), Some("border-box")),
             position,
             inset: [
