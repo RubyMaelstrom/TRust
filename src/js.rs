@@ -6582,8 +6582,8 @@ fn eval_injected_classic(
     checkpoint
 }
 
-/// Fire a `load`/`error` event on an injected script element (and call its
-/// `on<type>` handler), for loaders that wait on `script.onload`.
+/// Fire one `load`/`error` event on an injected resource. Its GlobalEventHandlers
+/// `on<type>` listener runs through ordinary event dispatch.
 fn fire_script_event(ctx: &mut Context, node_id: usize, ty: &str) {
     let t = Instant::now();
     let _ = ctx.eval(Source::from_bytes(
@@ -14481,15 +14481,15 @@ pub(crate) const PRELUDE: &str = r##"
         }
         return prevented;
     };
-    // Fire a load/error event on an injected <script> (and its on<type>
-    // handler), for loaders that wait on `script.onload` instead of polling.
+    // Fire a load/error event on an injected resource. GlobalEventHandlers
+    // backs `onload`/`onerror` with the same listener registry, so dispatch
+    // invokes it exactly once; calling the property again here would violate
+    // DOM dispatch and double-settle script/style loaders.
     trust.scriptEvent = function (id, type) {
         const t = wrap(id);
         if (!t) return;
         const ev = new Event(type);
         dispatch(t, ev, false);
-        const on = t["on" + type];
-        if (typeof on === "function") { try { on.call(t, ev); } catch (e) { trust.errors.push("script on" + type + ": " + ((e && e.message) || e)); } }
     };
     trust.clickables = function () {
         const out = [];
