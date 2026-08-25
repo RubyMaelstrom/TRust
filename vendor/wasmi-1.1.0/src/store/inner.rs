@@ -35,7 +35,7 @@ use core::{
 /// # Note
 ///
 /// Used to protect against invalid entity indices.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct StoreIdx(u32);
 
 impl ArenaIndex for StoreIdx {

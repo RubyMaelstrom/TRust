@@ -80,6 +80,7 @@ struct ModuleHeaderInner {
     globals: Box<[GlobalType]>,
     globals_init: Box<[ConstExpr]>,
     exports: Map<Box<str>, ExternIdx>,
+    export_order: Box<[Box<str>]>,
     start: Option<FuncIdx>,
     engine_funcs: EngineFuncSpan,
     element_segments: Box<[ElementSegment]>,

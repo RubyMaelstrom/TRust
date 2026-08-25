@@ -1,6 +1,7 @@
 use super::GlobalIdx;
-use crate::{collections::map::Iter as MapIter, Error, ExternType, Module};
+use crate::{Error, ExternType, Module};
 use alloc::boxed::Box;
+use core::slice::Iter as SliceIter;
 
 /// The index of a function declaration within a [`Module`].
 ///
@@ -106,7 +107,7 @@ impl ExternIdx {
 /// [`Module`]: [`super::Module`]
 #[derive(Debug)]
 pub struct ModuleExportsIter<'module> {
-    exports: MapIter<'module, Box<str>, ExternIdx>,
+    names: SliceIter<'module, Box<str>>,
     module: &'module Module,
 }
 
@@ -136,7 +137,7 @@ impl<'module> ModuleExportsIter<'module> {
     /// Creates a new [`ModuleExportsIter`] from the given [`Module`].
     pub(super) fn new(module: &'module Module) -> Self {
         Self {
-            exports: module.module_header().exports.iter(),
+            names: module.module_header().export_order.iter(),
             module,
         }
     }
@@ -146,8 +147,9 @@ impl<'module> Iterator for ModuleExportsIter<'module> {
     type Item = ExportType<'module>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.exports.next().map(|(name, idx)| {
-            let ty = self.module.get_extern_type(*idx);
+        self.names.next().map(|name| {
+            let idx = self.module.module_header().exports[name];
+            let ty = self.module.get_extern_type(idx);
             ExportType { name, ty }
         })
     }

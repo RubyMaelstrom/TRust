@@ -28,7 +28,7 @@ use alloc::{boxed::Box, sync::Arc};
 use core::{fmt, fmt::Debug, num::NonZeroU32};
 
 /// A raw index to a function entity.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FuncIdx(NonZeroU32);
 
 impl ArenaIndex for FuncIdx {
@@ -311,7 +311,7 @@ impl<T> Clone for TrampolineEntity<T> {
 }
 
 /// A Wasm or host function reference.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Func(Stored<FuncIdx>);
 

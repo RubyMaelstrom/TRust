@@ -43,6 +43,7 @@ pub struct ModuleBuilder {
     pub globals: Vec<GlobalType>,
     pub globals_init: Vec<ConstExpr>,
     pub exports: Map<Box<str>, ExternIdx>,
+    pub export_order: Vec<Box<str>>,
     pub start: Option<FuncIdx>,
     pub engine_funcs: EngineFuncSpan,
     pub element_segments: Box<[ElementSegment]>,
@@ -64,6 +65,7 @@ impl ModuleBuilder {
             globals: Vec::new(),
             globals_init: Vec::new(),
             exports: Map::new(),
+            export_order: Vec::new(),
             start: None,
             engine_funcs: EngineFuncSpan::default(),
             element_segments: Box::from([]),
@@ -102,6 +104,7 @@ impl ModuleBuilder {
                 globals: take(&mut self.globals).into(),
                 globals_init: take(&mut self.globals_init).into(),
                 exports: take(&mut self.exports),
+                export_order: take(&mut self.export_order).into(),
                 start: self.start,
                 engine_funcs: self.engine_funcs,
                 element_segments: take(&mut self.element_segments),
@@ -123,6 +126,7 @@ impl ModuleBuilder {
 /// The import names of the [`Module`] imports.
 #[derive(Debug, Default)]
 pub struct ModuleImportsBuilder {
+    pub items: Vec<Imported>,
     pub funcs: Vec<ImportName>,
     pub tables: Vec<ImportName>,
     pub memories: Vec<ImportName>,
@@ -136,15 +140,7 @@ impl ModuleImportsBuilder {
         let len_globals = self.globals.len();
         let len_memories = self.memories.len();
         let len_tables = self.tables.len();
-        let funcs = self.funcs.into_iter().map(Imported::Func);
-        let tables = self.tables.into_iter().map(Imported::Table);
-        let memories = self.memories.into_iter().map(Imported::Memory);
-        let globals = self.globals.into_iter().map(Imported::Global);
-        let items = funcs
-            .chain(tables)
-            .chain(memories)
-            .chain(globals)
-            .collect::<Box<[_]>>();
+        let items = self.items.into_boxed_slice();
         ModuleImports {
             items,
             len_funcs,
@@ -205,19 +201,23 @@ impl ModuleBuilder {
             let (name, kind) = import.into_name_and_type();
             match kind {
                 ExternTypeIdx::Func(func_type_idx) => {
+                    self.imports.items.push(Imported::Func(name.clone()));
                     self.imports.funcs.push(name);
                     let func_type = self.func_types[func_type_idx.into_u32() as usize];
                     self.funcs.push(func_type);
                 }
                 ExternTypeIdx::Table(table_type) => {
+                    self.imports.items.push(Imported::Table(name.clone()));
                     self.imports.tables.push(name);
                     self.tables.push(table_type);
                 }
                 ExternTypeIdx::Memory(memory_type) => {
+                    self.imports.items.push(Imported::Memory(name.clone()));
                     self.imports.memories.push(name);
                     self.memories.push(memory_type);
                 }
                 ExternTypeIdx::Global(global_type) => {
+                    self.imports.items.push(Imported::Global(name.clone()));
                     self.imports.globals.push(name);
                     self.globals.push(global_type);
                 }
@@ -371,7 +371,11 @@ impl ModuleBuilder {
             self.exports.is_empty(),
             "tried to initialize module export declarations twice"
         );
-        self.exports = exports.into_iter().collect::<Result<Map<_, _>, _>>()?;
+        for export in exports {
+            let (name, index) = export?;
+            self.export_order.push(name.clone());
+            self.exports.insert(name, index);
+        }
         Ok(())
     }
 
