@@ -54,6 +54,10 @@ enum LumenHostTask {
         result: LumenResourceResult,
         external: bool,
     },
+    WebSocket {
+        id: usize,
+        event: crate::ws::WsIn,
+    },
 }
 
 struct LumenNetwork {
@@ -62,6 +66,15 @@ struct LumenNetwork {
     fetched: Arc<std::sync::atomic::AtomicUsize>,
     next_fetch_id: usize,
     pending_fetches: HashMap<usize, Value>,
+}
+
+struct LumenWebSockets {
+    handle: tokio::runtime::Handle,
+    page: url::Url,
+    tasks: Arc<crate::http::PageTaskScope>,
+    events: tokio::sync::mpsc::Sender<(usize, crate::ws::WsIn)>,
+    sockets: HashMap<usize, tokio::sync::mpsc::Sender<crate::ws::WsOut>>,
+    next_id: usize,
 }
 
 struct HostState {
@@ -77,6 +90,7 @@ struct HostState {
     task_events: Option<tokio::sync::mpsc::UnboundedSender<LumenHostTask>>,
     pending_resources: usize,
     network: Option<LumenNetwork>,
+    websockets: Option<LumenWebSockets>,
 }
 
 impl HostState {
@@ -104,6 +118,7 @@ impl HostState {
             task_events: None,
             pending_resources: 0,
             network: None,
+            websockets: None,
         }
     }
 
@@ -115,8 +130,28 @@ impl HostState {
         cache: Arc<crate::http::PageCache>,
         events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
     ) {
+        let (ws_events, mut ws_rx) = tokio::sync::mpsc::channel(64);
+        let host_events = events.clone();
+        cache.spawn(&handle, async move {
+            while let Some((id, event)) = ws_rx.recv().await {
+                if host_events
+                    .send(LumenHostTask::WebSocket { id, event })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         self.base = page;
         self.task_events = Some(events);
+        self.websockets = Some(LumenWebSockets {
+            handle: handle.clone(),
+            page: self.base.clone(),
+            tasks: cache.task_scope(),
+            events: ws_events,
+            sockets: HashMap::new(),
+            next_id: 1,
+        });
         self.network = Some(LumenNetwork {
             handle,
             cache,
@@ -354,6 +389,9 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
         1,
         host_load_injected_stylesheet,
     ),
+    ("__ws_open", 2, host_ws_open),
+    ("__ws_send", 3, host_ws_send),
+    ("__ws_close", 3, host_ws_close),
     ("__dom_computed", 2, host_computed_style),
     ("__image_current_src", 1, host_image_current_src),
     ("__image_complete", 1, host_image_complete),
@@ -960,6 +998,102 @@ fn host_load_injected_stylesheet(
     Ok(Value::Undefined)
 }
 
+/// WebSockets §3.1 constructor boundary: the prelude performs Web IDL/URL/subprotocol
+/// validation synchronously; this host applies the page's private-network policy and starts the
+/// RFC 6455 connection in parallel. Protocol feedback returns as WebSocket-task-source work.
+fn host_ws_open(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let target = host_arg_string(ctx, args, 0);
+    let protocols = host_arg_string(ctx, args, 1);
+    let Some(protocols) = crate::ws::parse_protocols(&protocols) else {
+        return Ok(Value::Num(-1.0));
+    };
+    let connection = ctx.host_mut::<HostState>().and_then(|state| {
+        let sockets = state.websockets.as_mut()?;
+        let resolved = sockets.page.join(&target).ok()?;
+        if !matches!(resolved.scheme(), "ws" | "wss") || resolved.fragment().is_some() {
+            return None;
+        }
+        let mut http_equivalent = resolved.clone();
+        http_equivalent
+            .set_scheme(if resolved.scheme() == "wss" {
+                "https"
+            } else {
+                "http"
+            })
+            .ok()?;
+        if !crate::http::subresource_allowed(&sockets.page, &http_equivalent) {
+            return None;
+        }
+        let id = sockets.next_id;
+        sockets.next_id += 1;
+        let origin = sockets.page.origin().ascii_serialization();
+        let cookie = crate::http::cookies_for_request(&http_equivalent);
+        let (sender, task) = crate::ws::connect(
+            resolved,
+            protocols,
+            origin,
+            (!cookie.is_empty()).then_some(cookie),
+            &sockets.handle,
+            id,
+            sockets.events.clone(),
+        );
+        sockets.tasks.track(task);
+        sockets.sockets.insert(id, sender);
+        Some(id)
+    });
+    Ok(connection.map_or(Value::Num(-1.0), |id| Value::Num(id as f64)))
+}
+
+/// WebSockets §3.1 `send()`: queue one complete text or binary message without blocking the
+/// page thread. `bufferedAmount` is maintained in the prelude and decremented only by the later
+/// [`crate::ws::WsIn::Sent`] task after the transport accepts these application bytes.
+fn host_ws_send(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let id = args
+        .first()
+        .and_then(Value::as_num_opt)
+        .and_then(|id| (id.is_finite() && id >= 0.0 && id.fract() == 0.0).then_some(id as usize));
+    let data = host_arg_string(ctx, args, 1);
+    let binary = matches!(args.get(2), Some(Value::Bool(true)));
+    let sent = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.websockets.as_mut())
+        .and_then(|sockets| id.and_then(|id| sockets.sockets.get(&id)))
+        .is_some_and(|sender| {
+            sender
+                .try_send(if binary {
+                    crate::ws::WsOut::Binary(data.chars().map(|ch| ch as u32 as u8).collect())
+                } else {
+                    crate::ws::WsOut::Text(data)
+                })
+                .is_ok()
+        });
+    Ok(Value::Bool(sent))
+}
+
+/// WebSockets §3.1 `close()`: code zero is the boundary sentinel for an omitted status code,
+/// whose RFC 6455 Close frame has an empty body. Validation and the synchronous CLOSING state
+/// transition happen in the shared prelude before this non-blocking transport command.
+fn host_ws_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let id = args
+        .first()
+        .and_then(Value::as_num_opt)
+        .and_then(|id| (id.is_finite() && id >= 0.0 && id.fract() == 0.0).then_some(id as usize));
+    let code = args
+        .get(1)
+        .and_then(Value::as_num_opt)
+        .filter(|code| code.is_finite() && *code >= 0.0 && *code <= f64::from(u16::MAX))
+        .unwrap_or_default() as u16;
+    let reason = host_arg_string(ctx, args, 2);
+    if let Some(sender) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.websockets.as_mut())
+        .and_then(|sockets| id.and_then(|id| sockets.sockets.get(&id)))
+    {
+        let _ = sender.try_send(crate::ws::WsOut::Close(code, reason));
+    }
+    Ok(Value::Undefined)
+}
+
 fn module_dependency_loader(
     page: &url::Url,
     handle: &tokio::runtime::Handle,
@@ -1195,6 +1329,71 @@ fn run_resource_task(
     Ok(())
 }
 
+fn dispatch_websocket_task(
+    engine: &mut lumen::Engine,
+    id: usize,
+    event: crate::ws::WsIn,
+) -> Result<(), String> {
+    let mut args = vec![
+        Value::Num(id as f64),
+        Value::Undefined,
+        Value::from_string(String::new()),
+        Value::Bool(false),
+        Value::Num(0.0),
+        Value::from_string(String::new()),
+        Value::Bool(false),
+        Value::Bool(false),
+        Value::from_string(String::new()),
+    ];
+    match event {
+        crate::ws::WsIn::Open { protocol } => {
+            args[1] = Value::from_string(String::from("open"));
+            args[8] = Value::from_string(protocol);
+        }
+        crate::ws::WsIn::Text(message) => {
+            args[1] = Value::from_string(String::from("message"));
+            args[2] = Value::from_string(message);
+        }
+        crate::ws::WsIn::Binary(bytes) => {
+            args[1] = Value::from_string(String::from("message"));
+            args[2] = Value::from_string(bytes.into_iter().map(char::from).collect());
+            args[3] = Value::Bool(true);
+        }
+        crate::ws::WsIn::Sent(bytes) => {
+            args[1] = Value::from_string(String::from("drain"));
+            args[4] = Value::Num(bytes as f64);
+        }
+        crate::ws::WsIn::Closed {
+            code,
+            reason,
+            was_clean,
+            failed,
+        } => {
+            if let Some(sockets) = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .and_then(|state| state.websockets.as_mut())
+            {
+                sockets.sockets.remove(&id);
+            }
+            args[1] = Value::from_string(String::from("close"));
+            args[4] = Value::Num(f64::from(code));
+            args[5] = Value::from_string(reason);
+            args[6] = Value::Bool(was_clean);
+            args[7] = Value::Bool(failed);
+        }
+    }
+    host_call_trust(engine.ctx(), "wsEvent", &args)
+        .map(|_| ())
+        .map_err(|error| {
+            engine
+                .ctx()
+                .coerce_string(&error)
+                .map(|message| format!("WebSocket task: {message}"))
+                .unwrap_or_else(|_| String::from("WebSocket task failed"))
+        })
+}
+
 /// Run the engine-owned portion of one selected host task. The caller performs the HTML event
 /// loop's microtask checkpoint after this returns, before selecting another task.
 #[allow(dead_code)] // The networked test realm uses this before the resident actor is switched.
@@ -1225,6 +1424,9 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
                 state.pending_resources = state.pending_resources.saturating_sub(1);
             }
             run_resource_task(engine, node_id, name, kind, result, external)?;
+        }
+        LumenHostTask::WebSocket { id, event } => {
+            dispatch_websocket_task(engine, id, event)?;
         }
     }
     Ok(())
@@ -2414,6 +2616,56 @@ mod tests {
         value_string(engine, &value)
     }
 
+    async fn read_test_client_frame(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut head = [0u8; 2];
+        stream.read_exact(&mut head).await.unwrap();
+        assert_ne!(head[1] & 0x80, 0, "RFC 6455 client frames are masked");
+        let mut length = u64::from(head[1] & 0x7f);
+        if length == 126 {
+            let mut extended = [0u8; 2];
+            stream.read_exact(&mut extended).await.unwrap();
+            length = u64::from(u16::from_be_bytes(extended));
+        } else if length == 127 {
+            let mut extended = [0u8; 8];
+            stream.read_exact(&mut extended).await.unwrap();
+            length = u64::from_be_bytes(extended);
+        }
+        let mut mask = [0u8; 4];
+        stream.read_exact(&mut mask).await.unwrap();
+        let mut payload = vec![0; usize::try_from(length).unwrap()];
+        stream.read_exact(&mut payload).await.unwrap();
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index & 3];
+        }
+        (head[0] & 0x0f, payload)
+    }
+
+    async fn write_test_server_frame(
+        stream: &mut tokio::net::TcpStream,
+        opcode: u8,
+        payload: &[u8],
+    ) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let mut frame = vec![0x80 | opcode];
+        match payload.len() {
+            length @ 0..=125 => frame.push(length as u8),
+            length @ 126..=65535 => {
+                frame.push(126);
+                frame.extend_from_slice(&(length as u16).to_be_bytes());
+            }
+            length => {
+                frame.push(127);
+                frame.extend_from_slice(&(length as u64).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(payload);
+        stream.write_all(&frame).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
     #[test]
     fn tier_names_are_explicit() {
         assert_eq!(parse_tier("interp").unwrap(), Tier::Interp);
@@ -2452,7 +2704,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 73);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 76);
 
         let mut engine = platform_engine();
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
@@ -2659,6 +2911,163 @@ mod tests {
             "{headers}"
         );
         assert_eq!(&request[header_end..], &[0, 0x80, 0xff]);
+    }
+
+    #[test]
+    fn websocket_boundary_negotiates_and_delivers_ordered_protocol_tasks() {
+        // WebSockets §2.2/§4 and RFC 6455 §4.1: the opening response proves receipt of
+        // the nonce, selects one offered subprotocol, and every open/message/send-complete/close
+        // notification returns to the page as an ordered WebSocket-task-source task.
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = runtime.spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "client closed during opening handshake");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(
+                request.contains("Sec-WebSocket-Protocol: chat, superchat\r\n"),
+                "{request}"
+            );
+            let key = request
+                .lines()
+                .find_map(|line| line.strip_prefix("Sec-WebSocket-Key:").map(str::trim))
+                .unwrap();
+            let accept = crate::ws::websocket_accept(key);
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\n\
+                         Upgrade: websocket\r\n\
+                         Connection: keep-alive, Upgrade\r\n\
+                         Sec-WebSocket-Accept: {accept}\r\n\
+                         Sec-WebSocket-Protocol: chat\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            let text = read_test_client_frame(&mut stream).await;
+            let binary = read_test_client_frame(&mut stream).await;
+            assert_eq!(text, (0x1, "hé".as_bytes().to_vec()));
+            assert_eq!(binary, (0x2, vec![0, 0x80, 0xff]));
+            write_test_server_frame(&mut stream, 0x1, b"reply").await;
+            write_test_server_frame(&mut stream, 0x2, &[0, 0x80, 0xff]).await;
+
+            let close = read_test_client_frame(&mut stream).await;
+            assert_eq!(close.0, 0x8);
+            assert_eq!(&close.1[..2], &1000u16.to_be_bytes());
+            assert_eq!(&close.1[2..], b"bye");
+            write_test_server_frame(&mut stream, 0x8, &close.1).await;
+        });
+
+        let page = url::Url::parse(&format!("http://127.0.0.1:{port}/page")).unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
+        state.enable_network(page.clone(), runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, page.as_str());
+        eval(
+            &mut engine,
+            &format!(
+                r#"
+                globalThis.wsLog = [];
+                globalThis.wsErrors = 0;
+                globalThis.wsEventsTrusted = true;
+                try {{ new WebSocket('ftp://example.test/'); }} catch (error) {{ wsLog.push('bad-url:' + error.name); }}
+                try {{ new WebSocket('/duplicate', ['chat', 'chat']); }} catch (error) {{ wsLog.push('bad-protocol:' + error.name); }}
+                globalThis.socket = new WebSocket('http://127.0.0.1:{port}/echo', ['chat', 'superchat']);
+                socket.binaryType = 'arraybuffer';
+                try {{ socket.binaryType = 'invalid'; }} catch (error) {{ wsLog.push('bad-binary:' + error.name); }}
+                try {{ socket.send('too-soon'); }} catch (error) {{ wsLog.push('connecting-send:' + error.name); }}
+                try {{ socket.close(2000); }} catch (error) {{ wsLog.push('bad-close:' + error.name); }}
+                try {{ socket.close(1000, 'é'.repeat(62)); }} catch (error) {{ wsLog.push('long-reason:' + error.name); }}
+                globalThis.openListenerCount = 0;
+                socket.addEventListener('open', function (event) {{ openListenerCount++; wsLog.push('open-listener'); wsEventsTrusted = wsEventsTrusted && event.isTrusted; }});
+                socket.onopen = function (event) {{
+                    wsEventsTrusted = wsEventsTrusted && event.isTrusted;
+                    wsLog.push('open:' + socket.protocol);
+                    socket.send('hé');
+                    socket.send(new Uint8Array([0, 128, 255]));
+                    globalThis.bufferedDuringOpen = socket.bufferedAmount;
+                }};
+                globalThis.messageCount = 0;
+                socket.onmessage = function (event) {{
+                    wsEventsTrusted = wsEventsTrusted && event.isTrusted;
+                    messageCount++;
+                    if (typeof event.data === 'string') wsLog.push('text:' + event.data + ':' + event.origin);
+                    else wsLog.push('binary:' + Array.from(new Uint8Array(event.data)).join(','));
+                    if (messageCount === 2) socket.close(1000, 'bye');
+                }};
+                socket.onerror = function () {{ wsErrors++; }};
+                socket.onclose = function (event) {{
+                    wsEventsTrusted = wsEventsTrusted && event.isTrusted;
+                    wsLog.push('close:' + event.code + ':' + event.reason + ':' + event.wasClean);
+                    socket.send('z');
+                    globalThis.bufferedAfterClose = socket.bufferedAmount;
+                    globalThis.wsClosed = true;
+                }};
+                "#
+            ),
+            "WebSocket setup",
+        )
+        .unwrap();
+
+        for _ in 0..12 {
+            if string_value(&mut engine, "String(globalThis.wsClosed === true)") == "true" {
+                break;
+            }
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), task_rx.recv()).await
+                })
+                .expect("WebSocket task completes")
+                .expect("WebSocket task channel remains open");
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        runtime.block_on(server).unwrap();
+
+        let log = string_value(&mut engine, "wsLog.join('|')");
+        assert!(log.contains("bad-url:SyntaxError"), "{log}");
+        assert!(log.contains("bad-protocol:SyntaxError"), "{log}");
+        assert!(log.contains("bad-binary:TypeError"), "{log}");
+        assert!(log.contains("connecting-send:InvalidStateError"), "{log}");
+        assert!(log.contains("bad-close:InvalidAccessError"), "{log}");
+        assert!(log.contains("long-reason:SyntaxError"), "{log}");
+        assert!(log.contains("open-listener|open:chat"), "{log}");
+        assert_eq!(log.matches("open:chat").count(), 1, "{log}");
+        assert!(
+            log.contains(&format!("text:reply:ws://127.0.0.1:{port}")),
+            "{log}"
+        );
+        assert!(log.contains("binary:0,128,255"), "{log}");
+        assert!(log.contains("close:1000:bye:true"), "{log}");
+        assert_eq!(string_value(&mut engine, "String(openListenerCount)"), "1");
+        assert_eq!(string_value(&mut engine, "String(wsErrors)"), "0");
+        assert_eq!(string_value(&mut engine, "String(wsEventsTrusted)"), "true");
+        assert_eq!(string_value(&mut engine, "String(bufferedDuringOpen)"), "6");
+        assert_eq!(string_value(&mut engine, "String(bufferedAfterClose)"), "1");
+        assert_eq!(
+            string_value(&mut engine, "socket.url"),
+            format!("ws://127.0.0.1:{port}/echo")
+        );
     }
 
     #[test]

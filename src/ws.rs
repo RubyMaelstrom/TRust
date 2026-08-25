@@ -10,9 +10,10 @@
 //! hyper" ethos (and the hand-rolled telnet parser): the `Upgrade` handshake
 //! reuses `http`'s dial (TCP + WebPKI TLS for `wss`), then this module does the
 //! RFC 6455 framing itself — client masking, fragmentation reassembly, and the
-//! ping/pong/close control frames. `Sec-WebSocket-Accept` is not strictly
-//! verified (we require the `101` + `Upgrade: websocket`); the key/mask use a
-//! cheap PRNG since their randomness guards proxy-cache poisoning, not secrecy.
+//! ping/pong/close control frames. The opening response is validated against
+//! RFC 6455 §4.1, including `Connection`, `Sec-WebSocket-Accept`, and negotiated
+//! subprotocol. The key/mask use a cheap PRNG since their randomness guards
+//! proxy-cache poisoning, not secrecy.
 //!
 //! The connection runs as one tokio task. It forwards inbound events to the
 //! page actor over an mpsc channel (mapped to `PageCmd::Ws`, dispatched like a
@@ -32,14 +33,20 @@ pub enum WsOut {
 /// An inbound event delivered to the page actor (becomes `PageCmd::Ws`).
 #[derive(Debug)]
 pub enum WsIn {
-    Open,
+    Open {
+        protocol: String,
+    },
     Text(String),
     Binary(Vec<u8>),
+    /// Application bytes from a successful send which reached the transport.
+    Sent(usize),
     /// The connection ended (clean close with code/reason, or a transport drop
     /// reported as 1006). Always the final event for a socket.
     Closed {
         code: u16,
         reason: String,
+        was_clean: bool,
+        failed: bool,
     },
 }
 
@@ -75,6 +82,44 @@ const OP_CLOSE: u8 = 0x8;
 const OP_PING: u8 = 0x9;
 const OP_PONG: u8 = 0xA;
 
+/// Parse the host boundary's comma-separated subprotocol list. WebSockets §3.1 requires
+/// every value to be a distinct RFC 6455 `token`; commas cannot occur inside a token.
+pub(crate) fn parse_protocols(value: &str) -> Option<Vec<String>> {
+    if value.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut protocols = Vec::new();
+    for protocol in value.split(',') {
+        if protocol.is_empty()
+            || !protocol.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+            || protocols.iter().any(|existing| existing == protocol)
+        {
+            return None;
+        }
+        protocols.push(protocol.to_string());
+    }
+    Some(protocols)
+}
+
 /// A control/data frame's payload is capped so a hostile server can't make us
 /// buffer unboundedly (mirrors http's `MAX_BODY` spirit; a single chat token
 /// frame is tiny).
@@ -85,6 +130,7 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// messages to write. Dropping the returned sender closes the socket.
 pub fn connect(
     url: url::Url,
+    protocols: Vec<String>,
     origin: String,
     cookie: Option<String>,
     handle: &tokio::runtime::Handle,
@@ -93,21 +139,22 @@ pub fn connect(
 ) -> (mpsc::Sender<WsOut>, tokio::task::JoinHandle<()>) {
     let (out_tx, out_rx) = mpsc::channel::<WsOut>(64);
     let task = handle.spawn(async move {
-        run_session(url, origin, cookie, id, events, out_rx).await;
+        run_session(url, protocols, origin, cookie, id, events, out_rx).await;
     });
     (out_tx, task)
 }
 
 async fn run_session(
     url: url::Url,
+    protocols: Vec<String>,
     origin: String,
     cookie: Option<String>,
     id: usize,
     events: mpsc::Sender<(usize, WsIn)>,
     mut out_rx: mpsc::Receiver<WsOut>,
 ) {
-    let io = match handshake(&url, &origin, cookie.as_deref()).await {
-        Ok(io) => io,
+    let (io, protocol) = match handshake(&url, &protocols, &origin, cookie.as_deref()).await {
+        Ok(result) => result,
         Err(e) => {
             wsdiag(&format!("WS handshake FAILED for {url}: {e}"));
             // Transport failure: report an abnormal closure and stop.
@@ -117,6 +164,8 @@ async fn run_session(
                     WsIn::Closed {
                         code: 1006,
                         reason: String::new(),
+                        was_clean: false,
+                        failed: true,
                     },
                 ))
                 .await;
@@ -124,7 +173,7 @@ async fn run_session(
         }
     };
     wsdiag(&format!("WS open ok for {url}"));
-    if events.send((id, WsIn::Open)).await.is_err() {
+    if events.send((id, WsIn::Open { protocol })).await.is_err() {
         return; // actor gone
     }
     // Split so the read future borrows the read half while a control/outbound
@@ -132,6 +181,8 @@ async fn run_session(
     let (mut rd, mut wr) = tokio::io::split(io);
     let mut frag: Vec<u8> = Vec::new();
     let mut frag_op: u8 = 0;
+    let mut closing = false;
+    let mut closed_reported = false;
     loop {
         tokio::select! {
             frame = read_frame(&mut rd) => {
@@ -139,7 +190,13 @@ async fn run_session(
                     Ok(f) => f,
                     Err(e) => {
                         wsdiag(&format!("WS read error: {e}"));
-                        let _ = events.send((id, WsIn::Closed { code: 1006, reason: String::new() })).await;
+                        let _ = events.send((id, WsIn::Closed {
+                            code: 1006,
+                            reason: String::new(),
+                            was_clean: false,
+                            failed: true,
+                        })).await;
+                        closed_reported = true;
                         break;
                     }
                 };
@@ -155,13 +212,29 @@ async fn run_session(
                     }
                     OP_PONG => {}
                     OP_CLOSE => {
-                        let (code, reason) = parse_close(&payload);
-                        // Echo a close, then report and stop.
-                        let _ = write_frame(&mut wr, OP_CLOSE, &payload).await;
-                        let _ = events.send((id, WsIn::Closed { code, reason })).await;
+                        let Ok((code, reason)) = parse_close(&payload) else {
+                            break;
+                        };
+                        // RFC 6455 §7.1.2: answer a peer-initiated Close, then report a
+                        // clean closure only after both directions of the handshake exist.
+                        if !closing
+                            && write_frame(&mut wr, OP_CLOSE, &payload).await.is_err()
+                        {
+                            break;
+                        }
+                        let _ = events.send((id, WsIn::Closed {
+                            code,
+                            reason,
+                            was_clean: true,
+                            failed: false,
+                        })).await;
+                        closed_reported = true;
                         break;
                     }
                     OP_TEXT | OP_BINARY => {
+                        if frag_op != 0 {
+                            break;
+                        }
                         if fin {
                             if deliver(&events, id, opcode, payload).await.is_err() { break; }
                         } else {
@@ -170,39 +243,70 @@ async fn run_session(
                         }
                     }
                     OP_CONT => {
+                        if frag_op == 0 {
+                            break;
+                        }
                         if frag.len() + payload.len() > MAX_FRAME { break; }
                         frag.extend_from_slice(&payload);
                         if fin {
                             let msg = std::mem::take(&mut frag);
                             let op = frag_op;
+                            frag_op = 0;
                             if deliver(&events, id, op, msg).await.is_err() { break; }
                         }
                     }
                     _ => {} // reserved opcode: ignore
                 }
             }
-            out = out_rx.recv() => {
+            out = out_rx.recv(), if !closing => {
                 match out {
                     Some(WsOut::Text(s)) => {
+                        let len = s.len();
                         if write_frame(&mut wr, OP_TEXT, s.as_bytes()).await.is_err() { break; }
+                        if events.send((id, WsIn::Sent(len))).await.is_err() { break; }
                     }
                     Some(WsOut::Binary(b)) => {
+                        let len = b.len();
                         if write_frame(&mut wr, OP_BINARY, &b).await.is_err() { break; }
+                        if events.send((id, WsIn::Sent(len))).await.is_err() { break; }
                     }
                     Some(WsOut::Close(code, reason)) => {
-                        let _ = write_frame(&mut wr, OP_CLOSE, &close_payload(code, &reason)).await;
-                        let _ = events.send((id, WsIn::Closed { code, reason })).await;
-                        break;
+                        if write_frame(&mut wr, OP_CLOSE, &close_payload(code, &reason)).await.is_err() {
+                            let _ = events.send((id, WsIn::Closed {
+                                code: 1006,
+                                reason: String::new(),
+                                was_clean: false,
+                                failed: true,
+                            })).await;
+                            closed_reported = true;
+                            break;
+                        }
+                        closing = true;
                     }
                     None => {
-                        // JS dropped the WebSocket: send a normal close and stop.
-                        let _ = write_frame(&mut wr, OP_CLOSE, &close_payload(1000, "")).await;
-                        let _ = events.send((id, WsIn::Closed { code: 1000, reason: String::new() })).await;
-                        break;
+                        // WebSockets §7: a collected live socket starts a 1001 closing
+                        // handshake. Navigation cancellation owns the task if the peer stalls.
+                        if write_frame(&mut wr, OP_CLOSE, &close_payload(1001, "")).await.is_err() {
+                            break;
+                        }
+                        closing = true;
                     }
                 }
             }
         }
+    }
+    if !closed_reported {
+        let _ = events
+            .send((
+                id,
+                WsIn::Closed {
+                    code: 1006,
+                    reason: String::new(),
+                    was_clean: false,
+                    failed: true,
+                },
+            ))
+            .await;
     }
 }
 
@@ -213,7 +317,7 @@ async fn deliver(
     payload: Vec<u8>,
 ) -> Result<(), ()> {
     let ev = if opcode == OP_TEXT {
-        WsIn::Text(String::from_utf8_lossy(&payload).into_owned())
+        WsIn::Text(String::from_utf8(payload).map_err(|_| ())?)
     } else {
         WsIn::Binary(payload)
     };
@@ -224,9 +328,10 @@ async fn deliver(
 /// positioned right after the `\r\n\r\n` of the `101` response.
 async fn handshake(
     url: &url::Url,
+    protocols: &[String],
     origin: &str,
     cookie: Option<&str>,
-) -> Result<crate::http::WsTransport, String> {
+) -> Result<(crate::http::WsTransport, String), String> {
     let host = url.host_str().ok_or("no host")?.to_string();
     let secure = url.scheme() == "wss";
     let port = url.port().unwrap_or(if secure { 443 } else { 80 });
@@ -270,6 +375,12 @@ async fn handshake(
     if let Some(c) = cookie.filter(|c| !c.is_empty()) {
         req.push_str(&format!("Cookie: {c}\r\n"));
     }
+    if !protocols.is_empty() {
+        req.push_str(&format!(
+            "Sec-WebSocket-Protocol: {}\r\n",
+            protocols.join(", ")
+        ));
+    }
     req.push_str("\r\n");
     io.write_all(req.as_bytes())
         .await
@@ -283,14 +394,42 @@ async fn handshake(
         "WS handshake -> {path}\n--- response head ---\n{head}---"
     ));
     let status_line = head.lines().next().unwrap_or("");
-    if !status_line.contains(" 101") {
+    if status_line.split_ascii_whitespace().nth(1) != Some("101") {
         return Err(format!("not a websocket upgrade: {status_line}"));
     }
-    let lower = head.to_ascii_lowercase();
-    if !lower.contains("upgrade: websocket") {
+    let headers = parse_response_headers(&head);
+    if !header_has_token(&headers, "upgrade", "websocket") {
         return Err(String::from("missing Upgrade: websocket"));
     }
-    Ok(io)
+    if !header_has_token(&headers, "connection", "upgrade") {
+        return Err(String::from("missing Connection: Upgrade"));
+    }
+    let expected_accept = websocket_accept(&key);
+    if header_value(&headers, "sec-websocket-accept") != Some(expected_accept.as_str()) {
+        return Err(String::from("invalid Sec-WebSocket-Accept"));
+    }
+    if headers
+        .iter()
+        .any(|(name, _)| name == "sec-websocket-extensions")
+    {
+        return Err(String::from(
+            "server selected an unrequested WebSocket extension",
+        ));
+    }
+    let protocol_headers = headers
+        .iter()
+        .filter(|(name, _)| name == "sec-websocket-protocol")
+        .collect::<Vec<_>>();
+    let protocol = match (protocols.is_empty(), protocol_headers.as_slice()) {
+        (true, []) => String::new(),
+        (false, [(_, selected)])
+            if !selected.is_empty() && protocols.iter().any(|offered| offered == selected) =>
+        {
+            selected.clone()
+        }
+        _ => return Err(String::from("invalid Sec-WebSocket-Protocol")),
+    };
+    Ok((io, protocol))
 }
 
 /// Read the response head (through `\r\n\r\n`) one byte at a time so we never
@@ -314,46 +453,153 @@ async fn read_until_headers_end(io: &mut crate::http::WsTransport) -> Result<Str
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Read one frame: `(fin, opcode, unmasked_payload)`. Server→client frames are
-/// never masked (RFC 6455 §5.1); we tolerate a mask bit anyway.
+fn parse_response_headers(head: &str) -> Vec<(String, String)> {
+    head.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    let mut values = headers
+        .iter()
+        .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str());
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn header_has_token(headers: &[(String, String)], name: &str, token: &str) -> bool {
+    headers
+        .iter()
+        .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .flat_map(|(_, value)| value.split(','))
+        .any(|candidate| candidate.trim().eq_ignore_ascii_case(token))
+}
+
+/// RFC 6455 §4.1's server proof: base64(SHA-1(key || WebSocket GUID)). SHA-1 is used
+/// here solely as a fixed protocol transform; no collision-resistance property is relied on.
+pub(crate) fn websocket_accept(key: &str) -> String {
+    let mut challenge = Vec::with_capacity(key.len() + 36);
+    challenge.extend_from_slice(key.as_bytes());
+    challenge.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64(&sha1(&challenge))
+}
+
+fn sha1(input: &[u8]) -> [u8; 20] {
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity((input.len() + 72) & !63);
+    padded.extend_from_slice(input);
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut state = [
+        0x6745_2301u32,
+        0xefcd_ab89,
+        0x98ba_dcfe,
+        0x1032_5476,
+        0xc3d2_e1f0,
+    ];
+    for block in padded.as_chunks::<64>().0 {
+        let mut words = [0u32; 80];
+        for (word, bytes) in words[..16].iter_mut().zip(block.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
+        }
+        for index in 16..80 {
+            words[index] =
+                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
+                    .rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = state;
+        for (index, word) in words.into_iter().enumerate() {
+            let (function, constant) = match index {
+                0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999),
+                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
+                _ => (b ^ c ^ d, 0xca62_c1d6),
+            };
+            let next = a
+                .rotate_left(5)
+                .wrapping_add(function)
+                .wrapping_add(e)
+                .wrapping_add(constant)
+                .wrapping_add(word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = next;
+        }
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+    let mut digest = [0u8; 20];
+    for (bytes, value) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+        bytes.copy_from_slice(&value.to_be_bytes());
+    }
+    digest
+}
+
+/// Read one server frame as `(fin, opcode, payload)`, rejecting protocol-invalid RSV bits,
+/// masking, reserved opcodes, fragmented controls, and oversized/non-minimal length forms.
 async fn read_frame(
     io: &mut tokio::io::ReadHalf<crate::http::WsTransport>,
 ) -> Result<(bool, u8, Vec<u8>), String> {
     let mut hdr = [0u8; 2];
     io.read_exact(&mut hdr).await.map_err(|e| e.to_string())?;
+    if hdr[0] & 0x70 != 0 {
+        return Err(String::from("unnegotiated WebSocket extension bits"));
+    }
     let fin = hdr[0] & 0x80 != 0;
     let opcode = hdr[0] & 0x0F;
-    let masked = hdr[1] & 0x80 != 0;
-    let mut len = (hdr[1] & 0x7F) as usize;
-    if len == 126 {
+    if !matches!(
+        opcode,
+        OP_CONT | OP_TEXT | OP_BINARY | OP_CLOSE | OP_PING | OP_PONG
+    ) {
+        return Err(String::from("reserved WebSocket opcode"));
+    }
+    if hdr[1] & 0x80 != 0 {
+        return Err(String::from("masked server WebSocket frame"));
+    }
+    let length_code = hdr[1] & 0x7F;
+    if opcode >= OP_CLOSE && (!fin || length_code > 125) {
+        return Err(String::from("invalid WebSocket control frame"));
+    }
+    let mut len = usize::from(length_code);
+    if length_code == 126 {
         let mut ext = [0u8; 2];
         io.read_exact(&mut ext).await.map_err(|e| e.to_string())?;
         len = u16::from_be_bytes(ext) as usize;
-    } else if len == 127 {
+        if len < 126 {
+            return Err(String::from("non-minimal WebSocket frame length"));
+        }
+    } else if length_code == 127 {
         let mut ext = [0u8; 8];
         io.read_exact(&mut ext).await.map_err(|e| e.to_string())?;
-        len = u64::from_be_bytes(ext) as usize;
+        if ext[0] & 0x80 != 0 {
+            return Err(String::from("invalid 63-bit WebSocket frame length"));
+        }
+        let extended = u64::from_be_bytes(ext);
+        if extended <= u64::from(u16::MAX) {
+            return Err(String::from("non-minimal WebSocket frame length"));
+        }
+        len = usize::try_from(extended).map_err(|_| String::from("frame too large"))?;
     }
     if len > MAX_FRAME {
         return Err(String::from("frame too large"));
     }
-    let mask = if masked {
-        let mut m = [0u8; 4];
-        io.read_exact(&mut m).await.map_err(|e| e.to_string())?;
-        Some(m)
-    } else {
-        None
-    };
     let mut payload = vec![0u8; len];
     if len > 0 {
         io.read_exact(&mut payload)
             .await
             .map_err(|e| e.to_string())?;
-    }
-    if let Some(m) = mask {
-        for (i, byte) in payload.iter_mut().enumerate() {
-            *byte ^= m[i & 3];
-        }
     }
     Ok((fin, opcode, payload))
 }
@@ -403,14 +649,21 @@ fn close_payload(code: u16, reason: &str) -> Vec<u8> {
     p
 }
 
-fn parse_close(payload: &[u8]) -> (u16, String) {
-    if payload.len() >= 2 {
-        let code = u16::from_be_bytes([payload[0], payload[1]]);
-        let reason = String::from_utf8_lossy(&payload[2..]).into_owned();
-        (code, reason)
-    } else {
-        (1005, String::new()) // "no status received"
+fn parse_close(payload: &[u8]) -> Result<(u16, String), String> {
+    if payload.is_empty() {
+        return Ok((1005, String::new()));
     }
+    if payload.len() == 1 {
+        return Err(String::from("one-byte WebSocket Close payload"));
+    }
+    let code = u16::from_be_bytes([payload[0], payload[1]]);
+    if !(1000..=4999).contains(&code) || matches!(code, 1004..=1006 | 1015) {
+        return Err(String::from("invalid WebSocket Close status code"));
+    }
+    let reason = std::str::from_utf8(&payload[2..])
+        .map_err(|_| String::from("invalid UTF-8 WebSocket Close reason"))?
+        .to_string();
+    Ok((code, reason))
 }
 
 /// A fresh 16-byte `Sec-WebSocket-Key`, base64'd. Uniqueness (not secrecy) is
@@ -496,12 +749,35 @@ mod tests {
     }
 
     #[test]
+    fn websocket_accept_matches_rfc_6455_example() {
+        assert_eq!(
+            websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn subprotocols_are_distinct_rfc_tokens() {
+        assert_eq!(
+            parse_protocols("chat,graphql-ws"),
+            Some(vec![String::from("chat"), String::from("graphql-ws")])
+        );
+        assert_eq!(parse_protocols(""), Some(Vec::new()));
+        assert_eq!(parse_protocols("chat,chat"), None);
+        assert_eq!(parse_protocols("chat, bad"), None);
+        assert_eq!(parse_protocols("chat\r\ninjected"), None);
+    }
+
+    #[test]
     fn close_payload_roundtrips() {
         let p = close_payload(1000, "bye");
-        let (code, reason) = parse_close(&p);
+        let (code, reason) = parse_close(&p).unwrap();
         assert_eq!(code, 1000);
         assert_eq!(reason, "bye");
-        assert_eq!(parse_close(&[]).0, 1005);
+        assert_eq!(parse_close(&[]).unwrap().0, 1005);
+        assert!(parse_close(&[0]).is_err());
+        assert!(parse_close(&1006u16.to_be_bytes()).is_err());
+        assert!(parse_close(&[0x03, 0xe8, 0xff]).is_err());
     }
 
     #[tokio::test]
@@ -522,19 +798,33 @@ mod tests {
                 }
                 request.extend_from_slice(&buf[..read]);
             }
-            let _ = head_tx.send(String::from_utf8_lossy(&request).into_owned());
+            let head = String::from_utf8_lossy(&request).into_owned();
+            let key = head
+                .lines()
+                .find_map(|line| line.strip_prefix("Sec-WebSocket-Key:").map(str::trim))
+                .unwrap();
+            let accept = websocket_accept(key);
+            let _ = head_tx.send(head);
             socket
                 .write_all(
-                    b"HTTP/1.1 101 Switching Protocols\r\n\
-                      Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\n\
+                         Upgrade: websocket\r\n\
+                         Connection: Upgrade\r\n\
+                         Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                    )
+                    .as_bytes(),
                 )
                 .await
                 .unwrap();
         });
 
         let url = url::Url::parse(&format!("ws://127.0.0.1:{port}/socket")).unwrap();
-        let transport = handshake(&url, "http://example.test", None).await.unwrap();
+        let (transport, protocol) = handshake(&url, &[], "http://example.test", None)
+            .await
+            .unwrap();
         drop(transport);
+        assert!(protocol.is_empty());
         let head = head_rx.await.unwrap();
         assert!(
             head.contains("Accept-Language: en-US,en;q=0.9\r\n"),
