@@ -14,6 +14,17 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const DEFAULT_URL: &str = "https://example.com/";
+const DEFAULT_VIEWPORT: crate::layout2::Viewport = crate::layout2::Viewport {
+    width: 640.0,
+    height: 384.0,
+};
+
+type LumenGeomCache = (
+    u64,
+    std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
+    std::collections::HashMap<crate::dom::NodeId, (Vec<f32>, Vec<f32>)>,
+    std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
+);
 
 struct HostState {
     dom: Rc<RefCell<Dom>>,
@@ -21,16 +32,34 @@ struct HostState {
     base: url::Url,
     storage: crate::js::WebStorage,
     blobs: crate::js::BlobMap,
+    viewport: Cell<crate::layout2::Viewport>,
+    device_pixel_ratio: Cell<f32>,
+    geom_cache: Rc<RefCell<LumenGeomCache>>,
+    images: Rc<RefCell<crate::layout2::ImageSizes>>,
 }
 
 impl HostState {
     fn new(dom: Rc<RefCell<Dom>>, clock: Rc<RealmClock>) -> Self {
+        {
+            let mut dom = dom.borrow_mut();
+            dom.set_viewport_px(DEFAULT_VIEWPORT.width, DEFAULT_VIEWPORT.height);
+            dom.set_device_pixel_ratio(1.0);
+        }
         Self {
             dom,
             clock,
             base: url::Url::parse(DEFAULT_URL).expect("static default URL parses"),
             storage: Default::default(),
             blobs: Default::default(),
+            viewport: Cell::new(DEFAULT_VIEWPORT),
+            device_pixel_ratio: Cell::new(1.0),
+            geom_cache: Rc::new(RefCell::new((
+                u64::MAX,
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            ))),
+            images: Default::default(),
         }
     }
 }
@@ -232,6 +261,7 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_ce_candidates", 1, host_ce_candidates),
     ("__dom_clone", 2, host_clone),
     ("__dom_doc_element", 0, host_doc_element),
+    ("__html_dda", 0, host_html_dda),
     ("__url_parse", 2, host_url_parse),
     ("__url_set", 3, host_url_set),
     ("__dom_attach_shadow", 1, host_attach_shadow),
@@ -240,6 +270,14 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__css_parse", 1, host_css_parse),
     ("__css_supports_selector", 1, host_css_supports_selector),
     ("__dom_template_content", 1, host_template_content),
+    ("__dom_computed", 2, host_computed_style),
+    ("__image_current_src", 1, host_image_current_src),
+    ("__image_complete", 1, host_image_complete),
+    ("__match_media", 3, host_match_media),
+    ("__dom_rect", 1, host_rect),
+    ("__dom_scroll_get", 2, host_scroll_get),
+    ("__dom_scroll_set", 3, host_scroll_set),
+    ("__dom_load_frame", 3, host_load_frame),
     ("__cookie_get", 0, host_cookie_get),
     ("__cookie_set", 1, host_cookie_set),
     ("__clock_set", 1, host_clock_set),
@@ -780,6 +818,13 @@ fn host_doc_element(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Valu
     ))
 }
 
+/// ECMA-262 Annex B.3.6 requires the host-defined `document.all` exotic to participate in
+/// language-level `typeof`, truthiness, and loose-equality exceptions. Lumen owns those semantics;
+/// the browser adapter only requests the realm-local exotic.
+fn host_html_dda(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    Ok(ctx.make_html_dda())
+}
+
 fn host_attach_shadow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let dom = host_dom(ctx);
     let mut dom = dom.borrow_mut();
@@ -938,6 +983,223 @@ fn lumen_host_without_port(host: &str) -> &str {
         Some(index) => &host[..index],
         None => host,
     }
+}
+
+fn host_layout_environment(ctx: &mut Ctx) -> (url::Url, crate::layout2::Viewport, f32) {
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("HostState installed before any Lumen host call");
+    (
+        state.base.clone(),
+        state.viewport.get(),
+        state.device_pixel_ratio.get(),
+    )
+}
+
+/// Keep the geometry used by CSSOM View reads on the same epoch-keyed layout pass as TRust's Boa
+/// adapter. The resulting rectangles remain floating-point CSS pixels; terminal quantization is
+/// still confined to `layout2::paint`.
+fn ensure_host_geom_cache(ctx: &mut Ctx) -> Rc<RefCell<LumenGeomCache>> {
+    let (dom, base, viewport, cache, images) = {
+        let state = ctx
+            .host_mut::<HostState>()
+            .expect("HostState installed before any Lumen host call");
+        (
+            state.dom.clone(),
+            state.base.clone(),
+            state.viewport.get(),
+            state.geom_cache.clone(),
+            state.images.clone(),
+        )
+    };
+    let dom = dom.borrow();
+    let epoch = dom.epoch();
+    let mut cached = cache.borrow_mut();
+    if cached.0 != epoch {
+        let (forms, controls) = crate::http::extract_forms_arena(&dom, &base, None);
+        let (boxes, tracks, scrolling_areas) = crate::layout2::measure_boxes_css(
+            &dom,
+            &base,
+            viewport,
+            &forms,
+            &controls,
+            &images.borrow(),
+        );
+        cached.1 = boxes;
+        cached.2 = tracks;
+        cached.3 = scrolling_areas;
+        cached.0 = epoch;
+    }
+    drop(cached);
+    cache
+}
+
+fn host_resolved_grid_tracks(ctx: &mut Ctx, args: &[Value], columns: bool) -> Option<String> {
+    let cache = ensure_host_geom_cache(ctx);
+    let id = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        host_arg_node(&dom, args, 0)?
+    };
+    let cached = cache.borrow();
+    let (column_tracks, row_tracks) = cached.2.get(&id)?;
+    let tracks = if columns { column_tracks } else { row_tracks };
+    if tracks.is_empty() {
+        return None;
+    }
+    Some(
+        tracks
+            .iter()
+            .map(|width| format!("{}px", width.round().max(0.0) as i64))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// CSSOM §7.2/§9 resolved-value backing. Grid track lists are used values captured by the same
+/// layout pass; all other properties come from the canonical DOM cascade.
+fn host_computed_style(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let name = host_arg_string(ctx, args, 1);
+    if (name == "grid-template-columns" || name == "grid-template-rows")
+        && let Some(value) = host_resolved_grid_tracks(ctx, args, name == "grid-template-columns")
+    {
+        return Ok(Value::from_string(value));
+    }
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    Ok(
+        match host_arg_node(&dom, args, 0).and_then(|id| dom.cssom_resolved_value(id, &name)) {
+            Some(value) => Value::from_string(value),
+            None => Value::Null,
+        },
+    )
+}
+
+/// CSSOM View §4.1: parse and evaluate the media query list against the document environment.
+fn host_match_media(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let query = host_arg_string(ctx, args, 0);
+    let viewport = args
+        .get(1)
+        .and_then(Value::as_num_opt)
+        .zip(args.get(2).and_then(Value::as_num_opt))
+        .filter(|(width, height)| {
+            width.is_finite() && *width >= 0.0 && height.is_finite() && *height >= 0.0
+        });
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let matches = match viewport {
+        Some((width, height)) => dom.media_matches_at(&query, width as f32, height as f32),
+        None => dom.media_matches(&query),
+    };
+    Ok(Value::Bool(matches))
+}
+
+/// HTML §4.8.4 exposes the absolute URL of the selected current image request.
+fn host_image_current_src(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let (base, viewport, density) = host_layout_environment(ctx);
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let Some(id) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::from_string(String::new()));
+    };
+    Ok(
+        crate::responsive_image::select(&dom, id, &base, viewport, density).map_or_else(
+            || Value::from_string(String::new()),
+            |selected| Value::from_string(selected.source),
+        ),
+    )
+}
+
+/// HTML §4.8.4 `complete`: omitted/empty sources are complete. Until the frontend's resource
+/// availability state is injected into this spike, synchronously available data URLs are the
+/// selected requests that can be proven completely available.
+fn host_image_complete(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let (base, viewport, density) = host_layout_environment(ctx);
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let Some(id) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Bool(false));
+    };
+    let src = dom.attr(id, "src").unwrap_or("").trim();
+    let srcset = dom.attr(id, "srcset").unwrap_or("").trim();
+    if src.is_empty() && srcset.is_empty() {
+        return Ok(Value::Bool(true));
+    }
+    let complete = crate::responsive_image::select(&dom, id, &base, viewport, density)
+        .is_some_and(|selected| selected.source.starts_with("data:"));
+    Ok(Value::Bool(complete))
+}
+
+/// CSSOM View §6 bounding-box backing, sourced directly from canonical layout fragments.
+fn host_rect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let cache = ensure_host_geom_cache(ctx);
+    let id = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        host_arg_node(&dom, args, 0)
+    };
+    let rect = id.and_then(|id| cache.borrow().1.get(&id).copied());
+    Ok(match rect {
+        Some(rect) => ctx.make_array(vec![
+            Value::Num(rect.left),
+            Value::Num(rect.top),
+            Value::Num(rect.width),
+            Value::Num(rect.height),
+        ]),
+        None => Value::Null,
+    })
+}
+
+/// CSSOM View §6 scroll metrics. Scrolling-area dimensions come from the layout fragment pass;
+/// mutable offsets and client dimensions remain canonical DOM state.
+fn host_scroll_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let which = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u8;
+    let scrolling_area = if matches!(which, 2 | 3) {
+        let cache = ensure_host_geom_cache(ctx);
+        let id = {
+            let dom = host_dom(ctx);
+            let dom = dom.borrow();
+            host_arg_node(&dom, args, 0)
+        };
+        id.and_then(|id| cache.borrow().3.get(&id).copied())
+    } else {
+        None
+    };
+    let dom = host_dom(ctx);
+    let dom = dom.borrow();
+    let Some(id) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Null);
+    };
+    Ok(match dom.scroll_metric(id, which) {
+        Some(value) => Value::Num(value),
+        None if which == 2 => scrolling_area.map_or(Value::Null, |rect| Value::Num(rect.height)),
+        None if which == 3 => scrolling_area.map_or(Value::Null, |rect| Value::Num(rect.width)),
+        None => Value::Null,
+    })
+}
+
+fn host_scroll_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let top = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0);
+    let left = args.get(2).and_then(Value::as_num_opt).unwrap_or(0.0);
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    let Some(id) = host_arg_node(&dom, args, 0) else {
+        return Ok(Value::Bool(false));
+    };
+    Ok(Value::Bool(dom.set_scroll_pos(id, top, left, true)))
+}
+
+/// HTML's iframe processing installs a parsed nested document and resolves its URLs at the frame
+/// boundary. `Dom::install_frame_document` is shared by both engine adapters.
+fn host_load_frame(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let html = host_arg_string(ctx, args, 1);
+    let base = host_arg_string(ctx, args, 2);
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    if let Some(frame) = host_arg_node(&dom, args, 0) {
+        dom.install_frame_document(frame, &html, &base);
+    }
+    Ok(Value::Undefined)
 }
 
 fn host_cookie_get(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
@@ -1218,7 +1480,7 @@ mod tests {
         install_host_boundary(&mut engine);
         eval(
             &mut engine,
-            "globalThis.__trust_cfg = { url: 'https://example.com/' };",
+            "globalThis.__trust_cfg = { url: 'https://example.com/', width: 640, height: 384 };",
             "configuration",
         )
         .unwrap();
@@ -1277,7 +1539,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 60);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 69);
 
         let mut engine = platform_engine();
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
@@ -1365,6 +1627,32 @@ mod tests {
     }
 
     #[test]
+    fn document_all_uses_lumens_real_html_dda_exotic() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r#"
+            globalThis.htmlDdaResult = [
+                typeof document.all,
+                Boolean(document.all),
+                document.all == null,
+                document.all == undefined,
+                document.all === null,
+                document.all === undefined,
+                document.all === document.all,
+                String(document.all())
+            ].join("|");
+            "#,
+            "document.all Annex B semantics",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "htmlDdaResult"),
+            "undefined|false|true|true|false|false|true|null"
+        );
+    }
+
+    #[test]
     fn selectors_serialization_shadow_templates_css_and_url_share_the_live_arena() {
         // DOM scope-match/clone algorithms, HTML fragment parsing and serialization, Shadow DOM
         // host/root relationships, CSS selector parsing, and WHATWG URL component setters.
@@ -1417,6 +1705,70 @@ mod tests {
         assert_eq!(
             string_value(&mut engine, "extendedDomResult"),
             "true|true|1|v|tail|b|true|shade|true|2|true|https://example.com/c%20d?q=1#h"
+        );
+    }
+
+    #[test]
+    fn geometry_media_images_and_frames_use_canonical_platform_state() {
+        // CSSOM §7.2/§9, CSSOM View §§4/6, and HTML §§4.8.4/4.8.5. The assertions enter through
+        // the shared prelude so wrapper behavior and the Lumen host calls are covered together.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const html = document.createElement("html");
+            const body = document.createElement("body");
+            document.appendChild(html);
+            html.appendChild(body);
+            body.innerHTML = `
+                <div id="grid" style="display:grid;width:240px;height:80px;grid-template-columns:100px 140px">
+                    <span>a</span><span>b</span>
+                </div>
+                <div id="scroller" style="width:120px;height:40px;overflow:auto">
+                    <div style="width:300px;height:100px">large</div>
+                </div>
+                <img id="responsive" src="fallback.png"
+                     srcset="small.png 320w, large.png 640w" sizes="100vw">
+                <img id="blank"><img id="inline" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==">
+                <iframe id="frame" srcdoc="<a id='inside' href='child'>child</a>"></iframe>`;
+
+            const grid = document.getElementById("grid");
+            const gridStyle = getComputedStyle(grid);
+            const rect = grid.getBoundingClientRect();
+            const scroller = document.getElementById("scroller");
+            const overflow = scroller.scrollWidth > scroller.clientWidth
+                && scroller.scrollHeight > scroller.clientHeight;
+            scroller.scrollLeft = 30;
+            scroller.scrollTop = 25;
+
+            const responsive = document.getElementById("responsive");
+            const frame = document.getElementById("frame");
+            const inside = frame.contentDocument.querySelector("#inside");
+            globalThis.geometryResult = [
+                matchMedia("screen and (min-width: 600px)").matches,
+                matchMedia("(max-width: 639px)").matches,
+                gridStyle.display,
+                gridStyle.gridTemplateColumns,
+                rect.width,
+                rect.height,
+                overflow,
+                scroller.scrollLeft,
+                scroller.scrollTop,
+                responsive.currentSrc,
+                responsive.complete,
+                document.getElementById("blank").complete,
+                document.getElementById("inline").complete,
+                inside.textContent,
+                inside.getAttribute("href")
+            ].join("|");
+            "##,
+            "geometry and environment boundary",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "geometryResult"),
+            "true|false|grid|100px 140px|240|80|true|30|25|https://example.com/large.png|false|true|true|child|https://example.com/child"
         );
     }
 
