@@ -13291,7 +13291,7 @@ fn esc_js(s: &str) -> String {
 /// ResizeObserver, custom elements + shadow DOM, CSSOM, URL/URLSearchParams,
 /// Blob/File/FileReader + blob: URLs, structured clone, Streams, storage,
 /// crypto.digest, and the Intl shim. Everything RAM-only, session-lifetime.
-const PRELUDE: &str = r##"
+pub(crate) const PRELUDE: &str = r##"
 (function () {
     "use strict";
     const g = globalThis;

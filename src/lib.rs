@@ -43,6 +43,8 @@ pub mod img;
 pub mod js;
 pub mod layout2;
 mod locale;
+#[cfg(feature = "lumen-spike")]
+pub mod lumen_spike;
 pub mod media;
 pub mod oneshot;
 pub mod telnet;
