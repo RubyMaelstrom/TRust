@@ -2756,122 +2756,134 @@ fn dump_vm_profile(tag: &str) {
     }
 }
 
-/// Register every `__dom_*` / `__url_parse` syscall. Each is a plain fn
-/// pointer fetching the arena from host-defined state.
+type BoaHostFn = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
+
+/// The canonical TRust JavaScript host boundary. Backends must expose every entry with the same
+/// name and function length; the individual implementations remain engine-specific adapters over
+/// the shared Rust DOM, protocol, layout, and resource state.
+const HOST_FUNCTIONS: &[(&str, usize, BoaHostFn)] = &[
+    ("__dom_create_element", 1, sys_create_element),
+    ("__dom_create_text", 1, sys_create_text),
+    ("__dom_create_fragment", 0, sys_create_fragment),
+    ("__dom_parse_document", 1, sys_parse_document),
+    ("__dom_create_comment", 0, sys_create_comment),
+    ("__dom_append", 2, sys_append),
+    ("__dom_insert_before", 3, sys_insert_before),
+    ("__dom_detach", 1, sys_detach),
+    ("__dom_owner_document", 1, sys_owner_document),
+    ("__dom_adopt", 2, sys_adopt),
+    ("__dom_parent", 1, sys_parent),
+    ("__dom_is_connected", 1, sys_is_connected),
+    ("__dom_contains", 2, sys_contains),
+    ("__dom_set_hover", 1, sys_set_hover),
+    ("__dom_children", 1, sys_children),
+    ("__dom_slot_assigned", 1, sys_slot_assigned),
+    ("__dom_next", 1, sys_next),
+    ("__dom_prev", 1, sys_prev),
+    ("__dom_node_type", 1, sys_node_type),
+    ("__dom_tag", 1, sys_tag),
+    ("__dom_namespace", 1, sys_namespace),
+    ("__dom_get_attr", 2, sys_get_attr),
+    ("__dom_computed", 2, sys_computed_style),
+    ("__image_current_src", 1, sys_image_current_src),
+    ("__image_complete", 1, sys_image_complete),
+    ("__match_media", 3, sys_match_media),
+    ("__dom_rect", 1, sys_rect),
+    ("__dom_scroll_get", 2, sys_scroll_get),
+    ("__dom_scroll_set", 3, sys_scroll_set),
+    ("__dom_set_attr", 3, sys_set_attr),
+    ("__dom_remove_attr", 2, sys_remove_attr),
+    ("__dom_attr_names", 1, sys_attr_names),
+    ("__dom_text", 1, sys_text),
+    ("__dom_set_text", 2, sys_set_text),
+    ("__dom_inner_html", 1, sys_inner_html),
+    ("__dom_set_inner_html", 2, sys_set_inner_html),
+    ("__dom_load_frame", 3, sys_load_frame),
+    ("__dom_outer_html", 1, sys_outer_html),
+    ("__dom_insert_adjacent", 3, sys_insert_adjacent),
+    ("__dom_query", 3, sys_query),
+    ("__dom_matches", 2, sys_matches),
+    ("__dom_get_by_id", 1, sys_get_by_id),
+    ("__dom_upgrade_candidates", 2, sys_upgrade_candidates),
+    ("__dom_ce_candidates", 1, sys_ce_candidates),
+    ("__dom_clone", 2, sys_clone),
+    ("__dom_doc_element", 0, sys_doc_element),
+    ("__html_dda", 0, sys_html_dda),
+    ("__url_parse", 2, sys_url_parse),
+    ("__url_set", 3, sys_url_set),
+    ("__dom_attach_shadow", 1, sys_attach_shadow),
+    ("__dom_shadow_root", 1, sys_shadow_root),
+    ("__dom_adopt_styles", 2, sys_adopt_styles),
+    ("__css_parse", 1, sys_css_parse),
+    ("__css_supports_selector", 1, sys_css_supports_selector),
+    ("__dom_template_content", 1, sys_template_content),
+    ("__http_fetch", 5, sys_http_fetch),
+    ("__http_fetch_async", 5, sys_http_fetch_async),
+    ("__dom_run_injected_script", 1, sys_run_injected_script),
+    (
+        "__dom_load_injected_stylesheet",
+        1,
+        sys_load_injected_stylesheet,
+    ),
+    ("__cookie_get", 0, sys_cookie_get),
+    ("__cookie_set", 1, sys_cookie_set),
+    ("__clock_set", 1, sys_clock_set),
+    ("__storage_get", 2, sys_storage_get),
+    ("__storage_set", 3, sys_storage_set),
+    ("__storage_remove", 2, sys_storage_remove),
+    ("__storage_clear", 1, sys_storage_clear),
+    ("__storage_key", 2, sys_storage_key),
+    ("__storage_len", 1, sys_storage_len),
+    ("__blob_mirror", 3, sys_blob_mirror),
+    ("__crypto_sha256_digest", 1, sys_crypto_sha256_digest),
+    ("__compression_encode", 2, sys_compression_encode),
+    ("__text_encode", 1, sys_text_encode),
+    ("__dom_popover", 2, sys_dom_popover),
+    ("__ws_open", 2, sys_ws_open),
+    ("__ws_send", 3, sys_ws_send),
+    ("__ws_close", 3, sys_ws_close),
+    ("__worker_spawn", 4, sys_worker_spawn),
+    ("__worker_post", 2, sys_worker_post),
+    ("__worker_terminate", 1, sys_worker_terminate),
+    ("__worker_self_post", 1, sys_worker_self_post),
+    ("__worker_self_close", 0, sys_worker_self_close),
+    ("__wasm_validate", 1, sys_wasm_validate),
+    ("__wasm_compile", 1, sys_wasm_compile),
+    ("__wasm_module_imports", 1, sys_wasm_module_imports),
+    ("__wasm_module_exports", 1, sys_wasm_module_exports),
+    (
+        "__wasm_module_custom_sections",
+        2,
+        sys_wasm_module_custom_sections,
+    ),
+    ("__wasm_instantiate", 3, sys_wasm_instantiate),
+    ("__wasm_instance_exports", 2, sys_wasm_instance_exports),
+    ("__wasm_call_export", 2, sys_wasm_call_export),
+    ("__wasm_global_new", 3, sys_wasm_global_new),
+    ("__wasm_global_get", 1, sys_wasm_global_get),
+    ("__wasm_global_set", 2, sys_wasm_global_set),
+    ("__wasm_memory_new", 2, sys_wasm_memory_new),
+    ("__wasm_memory_size", 1, sys_wasm_memory_size),
+    ("__wasm_memory_grow", 2, sys_wasm_memory_grow),
+    ("__wasm_memory_buffer", 1, sys_wasm_memory_buffer),
+    ("__wasm_table_new", 4, sys_wasm_table_new),
+    ("__wasm_table_length", 1, sys_wasm_table_length),
+    ("__wasm_table_get", 2, sys_wasm_table_get),
+    ("__wasm_table_set", 3, sys_wasm_table_set),
+    ("__wasm_table_grow", 3, sys_wasm_table_grow),
+];
+
+/// Engine-neutral view of [`HOST_FUNCTIONS`], used by alternate backends to prove that their
+/// registry has neither silently omitted nor invented host operations.
+#[cfg(feature = "lumen-spike")]
+pub(crate) fn host_boundary_signatures() -> impl Iterator<Item = (&'static str, usize)> {
+    HOST_FUNCTIONS.iter().map(|(name, len, _)| (*name, *len))
+}
+
+/// Register every host operation in the Boa realm. Each is a plain function pointer fetching the
+/// page-owned state from the realm.
 fn register_syscalls(ctx: &mut Context) -> JsResult<()> {
-    type Sys = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
-    let table: &[(&str, usize, Sys)] = &[
-        ("__dom_create_element", 1, sys_create_element),
-        ("__dom_create_text", 1, sys_create_text),
-        ("__dom_create_fragment", 0, sys_create_fragment),
-        ("__dom_parse_document", 1, sys_parse_document),
-        ("__dom_create_comment", 0, sys_create_comment),
-        ("__dom_append", 2, sys_append),
-        ("__dom_insert_before", 3, sys_insert_before),
-        ("__dom_detach", 1, sys_detach),
-        ("__dom_owner_document", 1, sys_owner_document),
-        ("__dom_adopt", 2, sys_adopt),
-        ("__dom_parent", 1, sys_parent),
-        ("__dom_is_connected", 1, sys_is_connected),
-        ("__dom_contains", 2, sys_contains),
-        ("__dom_set_hover", 1, sys_set_hover),
-        ("__dom_children", 1, sys_children),
-        ("__dom_slot_assigned", 1, sys_slot_assigned),
-        ("__dom_next", 1, sys_next),
-        ("__dom_prev", 1, sys_prev),
-        ("__dom_node_type", 1, sys_node_type),
-        ("__dom_tag", 1, sys_tag),
-        ("__dom_namespace", 1, sys_namespace),
-        ("__dom_get_attr", 2, sys_get_attr),
-        ("__dom_computed", 2, sys_computed_style),
-        ("__image_current_src", 1, sys_image_current_src),
-        ("__image_complete", 1, sys_image_complete),
-        ("__match_media", 3, sys_match_media),
-        ("__dom_rect", 1, sys_rect),
-        ("__dom_scroll_get", 2, sys_scroll_get),
-        ("__dom_scroll_set", 3, sys_scroll_set),
-        ("__dom_set_attr", 3, sys_set_attr),
-        ("__dom_remove_attr", 2, sys_remove_attr),
-        ("__dom_attr_names", 1, sys_attr_names),
-        ("__dom_text", 1, sys_text),
-        ("__dom_set_text", 2, sys_set_text),
-        ("__dom_inner_html", 1, sys_inner_html),
-        ("__dom_set_inner_html", 2, sys_set_inner_html),
-        ("__dom_load_frame", 3, sys_load_frame),
-        ("__dom_outer_html", 1, sys_outer_html),
-        ("__dom_insert_adjacent", 3, sys_insert_adjacent),
-        ("__dom_query", 3, sys_query),
-        ("__dom_matches", 2, sys_matches),
-        ("__dom_get_by_id", 1, sys_get_by_id),
-        ("__dom_upgrade_candidates", 2, sys_upgrade_candidates),
-        ("__dom_ce_candidates", 1, sys_ce_candidates),
-        ("__dom_clone", 2, sys_clone),
-        ("__dom_doc_element", 0, sys_doc_element),
-        ("__html_dda", 0, sys_html_dda),
-        ("__url_parse", 2, sys_url_parse),
-        ("__url_set", 3, sys_url_set),
-        ("__dom_attach_shadow", 1, sys_attach_shadow),
-        ("__dom_shadow_root", 1, sys_shadow_root),
-        ("__dom_adopt_styles", 2, sys_adopt_styles),
-        ("__css_parse", 1, sys_css_parse),
-        ("__css_supports_selector", 1, sys_css_supports_selector),
-        ("__dom_template_content", 1, sys_template_content),
-        ("__http_fetch", 5, sys_http_fetch),
-        ("__http_fetch_async", 5, sys_http_fetch_async),
-        ("__dom_run_injected_script", 1, sys_run_injected_script),
-        (
-            "__dom_load_injected_stylesheet",
-            1,
-            sys_load_injected_stylesheet,
-        ),
-        ("__cookie_get", 0, sys_cookie_get),
-        ("__cookie_set", 1, sys_cookie_set),
-        ("__clock_set", 1, sys_clock_set),
-        ("__storage_get", 2, sys_storage_get),
-        ("__storage_set", 3, sys_storage_set),
-        ("__storage_remove", 2, sys_storage_remove),
-        ("__storage_clear", 1, sys_storage_clear),
-        ("__storage_key", 2, sys_storage_key),
-        ("__storage_len", 1, sys_storage_len),
-        ("__blob_mirror", 3, sys_blob_mirror),
-        ("__crypto_sha256_digest", 1, sys_crypto_sha256_digest),
-        ("__compression_encode", 2, sys_compression_encode),
-        ("__text_encode", 1, sys_text_encode),
-        ("__dom_popover", 2, sys_dom_popover),
-        ("__ws_open", 2, sys_ws_open),
-        ("__ws_send", 3, sys_ws_send),
-        ("__ws_close", 3, sys_ws_close),
-        ("__worker_spawn", 4, sys_worker_spawn),
-        ("__worker_post", 2, sys_worker_post),
-        ("__worker_terminate", 1, sys_worker_terminate),
-        ("__worker_self_post", 1, sys_worker_self_post),
-        ("__worker_self_close", 0, sys_worker_self_close),
-        ("__wasm_validate", 1, sys_wasm_validate),
-        ("__wasm_compile", 1, sys_wasm_compile),
-        ("__wasm_module_imports", 1, sys_wasm_module_imports),
-        ("__wasm_module_exports", 1, sys_wasm_module_exports),
-        (
-            "__wasm_module_custom_sections",
-            2,
-            sys_wasm_module_custom_sections,
-        ),
-        ("__wasm_instantiate", 3, sys_wasm_instantiate),
-        ("__wasm_instance_exports", 2, sys_wasm_instance_exports),
-        ("__wasm_call_export", 2, sys_wasm_call_export),
-        ("__wasm_global_new", 3, sys_wasm_global_new),
-        ("__wasm_global_get", 1, sys_wasm_global_get),
-        ("__wasm_global_set", 2, sys_wasm_global_set),
-        ("__wasm_memory_new", 2, sys_wasm_memory_new),
-        ("__wasm_memory_size", 1, sys_wasm_memory_size),
-        ("__wasm_memory_grow", 2, sys_wasm_memory_grow),
-        ("__wasm_memory_buffer", 1, sys_wasm_memory_buffer),
-        ("__wasm_table_new", 4, sys_wasm_table_new),
-        ("__wasm_table_length", 1, sys_wasm_table_length),
-        ("__wasm_table_get", 2, sys_wasm_table_get),
-        ("__wasm_table_set", 3, sys_wasm_table_set),
-        ("__wasm_table_grow", 3, sys_wasm_table_grow),
-    ];
-    for (name, len, f) in table {
+    for (name, len, f) in HOST_FUNCTIONS {
         ctx.register_global_callable(JsString::from(*name), *len, NativeFunction::from_fn_ptr(*f))?;
     }
     Ok(())
@@ -2933,8 +2945,9 @@ fn sys_append(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
     Ok(JsValue::from(true))
 }
 
-/// `__dom_insert_before(parent, child, ref)` → did it mutate? Same pre-insertion
-/// validity gate as `sys_append` (returns `false`, unmutated, on a cycle).
+/// `__dom_insert_before(parent, child, ref)` → mutation status. Same pre-insertion validity gate as
+/// `sys_append` (returns `false`, unmutated, on a cycle), plus `-1` for DOM §4.2.3's
+/// `NotFoundError` case where `ref` is not a child of `parent`.
 fn sys_insert_before(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let dom = page_dom(ctx);
     let mut d = dom.borrow_mut();
@@ -2943,6 +2956,9 @@ fn sys_insert_before(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
             return Ok(JsValue::from(false));
         }
         let r = arg_node(&d, args, 2);
+        if r.is_some_and(|reference| d.node(reference).parent != Some(p)) {
+            return Ok(JsValue::from(-1));
+        }
         d.insert_before(p, c, r);
     }
     Ok(JsValue::from(true))
@@ -15012,7 +15028,9 @@ pub(crate) const PRELUDE: &str = r##"
         }
         insertBefore(c, ref) {
             if (c && c.nodeType === 11 && !c.__host) { for (const k of c.childNodes) this.insertBefore(k, ref); return c; }
-            if (!__dom_insert_before(this.__id, c.__id, ref ? ref.__id : null)) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            const insertion = __dom_insert_before(this.__id, c.__id, ref ? ref.__id : null);
+            if (insertion === -1) throw new DOMException("The reference node is not a child of this node.", "NotFoundError");
+            if (!insertion) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
             slotQueueCheck(this);
             if (MO.length) moChildInsert(this, c);
             if (CE.defs.size) ceScan(c);
@@ -15022,12 +15040,24 @@ pub(crate) const PRELUDE: &str = r##"
             else if (c.__trustLN === "iframe" || c.__trustLN === "frame") maybeProcessInsertedFrame(c, this);
             return c;
         }
-        removeChild(c) { if (c.__trustLN === "base") baseHrefCache = null; if (MO.length) moChildRemove(this, c); if (CE.defs.size) ceDisconnect(c); __dom_detach(c.__id); slotQueueCheck(this); return c; }
+        removeChild(c) {
+            // DOM §4.2.3 pre-remove: validate before mutation-observer or custom-element side
+            // effects. A node belonging to some other parent is not silently detached.
+            if (!c || c.parentNode !== this) throw new DOMException("The node to be removed is not a child of this node.", "NotFoundError");
+            if (c.__trustLN === "base") baseHrefCache = null;
+            if (MO.length) moChildRemove(this, c);
+            if (CE.defs.size) ceDisconnect(c);
+            __dom_detach(c.__id);
+            slotQueueCheck(this);
+            return c;
+        }
         replaceChild(n, old) {
             const prev = old.previousSibling, next = old.nextSibling;
             // Validity (WHATWG DOM §4.2.3) before any side effect: the insert
             // syscall refuses (unmutated) when `n` is an inclusive ancestor.
-            if (!__dom_insert_before(this.__id, n.__id, old.__id)) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
+            const insertion = __dom_insert_before(this.__id, n.__id, old.__id);
+            if (insertion === -1) throw new DOMException("The node to be replaced is not a child of this node.", "NotFoundError");
+            if (!insertion) throw new DOMException("The new child element contains the parent.", "HierarchyRequestError");
             if (CE.defs.size) ceDisconnect(old);
             __dom_detach(old.__id);
             slotQueueCheck(this);
@@ -29442,6 +29472,38 @@ mod tests {
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(
             out.contains("true|true|NotSupportedError|HierarchyRequestError"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn node_mutations_reject_foreign_children_before_side_effects() {
+        // WHATWG DOM §4.2.3: ensure pre-insert validity rejects a reference whose parent is not
+        // the insertion parent, and pre-remove rejects a node whose parent is not the receiver.
+        // Both checks precede mutation-observer/custom-element side effects.
+        let (out, outcome) = page(
+            r##"<body><pre id="out"></pre><script>
+                const left = document.createElement('section');
+                const right = document.createElement('aside');
+                const foreign = document.createElement('b');
+                const candidate = document.createElement('i');
+                right.appendChild(foreign);
+                let insertError = '', removeError = '';
+                try { left.insertBefore(candidate, foreign); }
+                catch (error) { insertError = error.name; }
+                try { left.removeChild(foreign); }
+                catch (error) { removeError = error.name; }
+                document.getElementById('out').textContent = [
+                    insertError,
+                    candidate.parentNode === null,
+                    removeError,
+                    foreign.parentNode === right
+                ].join('|');
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("NotFoundError|true|NotFoundError|true"),
             "{out}"
         );
     }
