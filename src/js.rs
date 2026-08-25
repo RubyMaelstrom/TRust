@@ -9287,7 +9287,7 @@ pub fn spawn_page(
 /// The full worker-scope JS: the shared structured-clone codec (extracted from
 /// PRELUDE so it's a single source of truth) followed by the DOM-less worker
 /// global scope. Built once per process.
-fn worker_prelude() -> &'static str {
+pub(crate) fn worker_prelude() -> &'static str {
     static WP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     WP.get_or_init(|| {
         let codec = PRELUDE
@@ -9338,7 +9338,7 @@ fn worker_prelude() -> &'static str {
 const WORKER_SCOPE: &str = r##"
 (function () {
     var g = globalThis;
-    var cfg = g.__worker_cfg || { id: 0, name: "", url: "about:blank", language: "en-US", languages: ["en-US", "en"], hwc: 8 };
+    var cfg = g.__worker_cfg || { id: 0, name: "", type: "classic", url: "about:blank", language: "en-US", languages: ["en-US", "en"], hwc: 8 };
     function errStr(where, e) { return where + ": " + ((e && e.message) || e) + (e && e.stack ? "\n" + e.stack : ""); }
 
     // --- the real-time event-loop core (driven by the Rust worker thread) ---
@@ -9352,20 +9352,25 @@ const WORKER_SCOPE: &str = r##"
         },
         tick: function (realNow) {
             this.nowMs = realNow;
-            var due = [];
-            for (var i = 0; i < this.timers.length; i++) if (this.timers[i].at <= this.nowMs) due.push(this.timers[i]);
-            due.sort(function (a, b) { return a.at - b.at; });
-            for (var j = 0; j < due.length; j++) {
-                var t = due[j];
-                if (t.interval) t.at = this.nowMs + t.delay; else removeTimer(t.id);
-                try { t.fn.apply(g, t.args); } catch (e) { this.errors.push(errStr("Uncaught", e)); }
+            // HTML's event loop runs one timer task and then performs a
+            // microtask checkpoint before selecting the next task. Returning
+            // after the oldest due timer lets the Rust loop preserve that
+            // boundary instead of batching every due timer into one task.
+            var due = null;
+            for (var i = 0; i < this.timers.length; i++) {
+                var candidate = this.timers[i];
+                if (candidate.at <= this.nowMs && (!due || candidate.at < due.at)) due = candidate;
             }
+            if (!due) return false;
+            if (due.interval) due.at = this.nowMs + due.delay; else removeTimer(due.id);
+            try { due.fn.apply(g, due.args); } catch (e) { this.errors.push(errStr("Uncaught", e)); }
+            return true;
         },
         message: function (s) {
             var data;
             try { data = g.__sc_deserialize(s); }
-            catch (e) { fireScope("messageerror", new MessageEvent("messageerror", {})); return; }
-            fireScope("message", new MessageEvent("message", { data: data, origin: "" }));
+            catch (e) { fireScope("messageerror", trustedScopeEvent(MessageEvent, "messageerror", {})); return; }
+            fireScope("message", trustedScopeEvent(MessageEvent, "message", { data: data, origin: "" }));
         },
         takeErrors: function () { var e = this.errors; this.errors = []; return e.join("\u001e"); }
     };
@@ -9423,7 +9428,9 @@ const WORKER_SCOPE: &str = r##"
         l[i].removed = true;
         l.splice(i, 1); l.fns.splice(i, 1); l.caps.splice(i, 1);
     };
-    g.dispatchEvent = function (ev) {
+    var trustedScopeEvents = new WeakSet();
+    function dispatchScopeEvent(ev, preserveTrusted) {
+        if (!preserveTrusted) trustedScopeEvents.delete(ev);
         ev.target = g; ev.currentTarget = g;
         var l = lsFor(ev.type), snap = l.slice();
         for (var i = 0; i < snap.length; i++) {
@@ -9436,15 +9443,22 @@ const WORKER_SCOPE: &str = r##"
             catch (e) { WK.errors.push(errStr(ev.type + " handler", e)); }
         }
         return !ev.defaultPrevented;
-    };
+    }
+    g.dispatchEvent = function (ev) { return dispatchScopeEvent(ev, false); };
     function fireScope(type, ev) {
-        var h = g["on" + type];
-        if (typeof h === "function") { try { h.call(g, ev); } catch (e) { WK.errors.push(errStr("on" + type, e)); } }
-        g.dispatchEvent(ev);
+        dispatchScopeEvent(ev, true);
     }
 
     // --- Event / MessageEvent / ErrorEvent ---
-    function Event(type, init) { init = init || {}; this.type = String(type); this.bubbles = !!init.bubbles; this.cancelable = !!init.cancelable; this.defaultPrevented = false; this.target = null; this.currentTarget = null; this.timeStamp = Date.now(); }
+    function Event(type, init) {
+        init = init || {}; this.type = String(type); this.bubbles = !!init.bubbles;
+        this.cancelable = !!init.cancelable; this.defaultPrevented = false;
+        this.target = null; this.currentTarget = null; this.timeStamp = Date.now();
+        Object.defineProperty(this, "isTrusted", {
+            configurable: false, enumerable: true,
+            get: function () { return trustedScopeEvents.has(this); }
+        });
+    }
     Event.prototype.preventDefault = function () { if (this.cancelable) this.defaultPrevented = true; };
     Event.prototype.stopPropagation = function () {}; Event.prototype.stopImmediatePropagation = function () {};
     function MessageEvent(type, init) { Event.call(this, type, init); init = init || {}; this.data = init.data; this.origin = init.origin || ""; this.lastEventId = init.lastEventId || ""; this.source = init.source || null; this.ports = init.ports || []; }
@@ -9455,12 +9469,36 @@ const WORKER_SCOPE: &str = r##"
     g.CustomEvent = function CustomEvent(type, init) { MessageEvent.call(this, type, init); this.detail = (init && init.detail !== undefined) ? init.detail : null; };
     g.CustomEvent.prototype = Object.create(MessageEvent.prototype);
 
+    function trustedScopeEvent(C, type, init) {
+        var ev = new C(type, init);
+        trustedScopeEvents.add(ev);
+        return ev;
+    }
+
+    // Event-handler IDL attributes participate in the same listener list, at
+    // the point where a non-null callback is assigned. This preserves the DOM
+    // event listener registration order relative to addEventListener().
+    ["message", "messageerror", "error"].forEach(function (type) {
+        var callback = null, wrapper = null;
+        Object.defineProperty(g, "on" + type, {
+            configurable: true, enumerable: true,
+            get: function () { return callback; },
+            set: function (value) {
+                if (wrapper) g.removeEventListener(type, wrapper);
+                callback = (typeof value === "function" || (value && typeof value.handleEvent === "function")) ? value : null;
+                wrapper = callback && function (event) {
+                    return typeof callback === "function" ? callback.call(g, event) : callback.handleEvent(event);
+                };
+                if (wrapper) g.addEventListener(type, wrapper);
+            }
+        });
+    });
+
     if (!g.DOMException) { g.DOMException = function (message, name) { var e = new Error(message || ""); e.name = name || "Error"; return e; }; }
 
     // --- self / postMessage / close / on* (DedicatedWorkerGlobalScope) ---
     g.self = g;
     g.name = cfg.name || "";
-    g.onmessage = null; g.onmessageerror = null; g.onerror = null;
     g.postMessage = function (message, transfer) { __worker_self_post(g.__sc_serialize(message)); };
     g.close = function () { __worker_self_close(); };
 
@@ -9695,6 +9733,9 @@ const WORKER_SCOPE: &str = r##"
 
     // --- importScripts (classic, synchronous fetch + global eval) ---
     g.importScripts = function () {
+        // HTML §10.2.1.1 exposes the method in both worker kinds, but the
+        // imported-classic-script algorithm throws in a module worker.
+        if (cfg.type === "module") throw new TypeError("importScripts() is unavailable in a module worker");
         for (var i = 0; i < arguments.length; i++) {
             var u = String(arguments[i]);
             if (u.slice(0, 5) === "blob:") {
@@ -22316,11 +22357,15 @@ pub(crate) const PRELUDE: &str = r##"
         constructor(url, options) {
             super();
             options = options || {};
-            const type = options.type === "module" ? "module" : "classic";
+            const type = options.type === undefined ? "classic" : String(options.type);
+            if (type !== "classic" && type !== "module") throw new TypeError("Invalid Worker type");
+            if (options.credentials !== undefined && !["omit", "same-origin", "include"].includes(String(options.credentials))) {
+                throw new TypeError("Invalid Worker credentials mode");
+            }
             const name = options.name != null ? String(options.name) : "";
-            this.onmessage = null; this.onmessageerror = null; this.onerror = null;
-            let href = String(url);
-            try { href = new g.URL(href, g.location.href).href; } catch (e) {}
+            let href;
+            try { href = new g.URL(String(url), g.location.href).href; }
+            catch (e) { throw new DOMException("Invalid worker script URL", "SyntaxError"); }
             // HTML's Worker constructor fetches Blob URLs from the File API
             // Blob URL Store. The store is authoritative in this realm; pass
             // an active entry's byte string to the Rust worker launcher rather
@@ -22347,25 +22392,21 @@ pub(crate) const PRELUDE: &str = r##"
                 this.__id = -1;
             }
         }
-        __fire(type, ev) {
-            const h = this["on" + type];
-            if (typeof h === "function") { try { h.call(this, ev); } catch (e) { trust.errors.push("worker on" + type + ": " + ((e && e.message) || e)); } }
-            this.dispatchEvent(ev);
-        }
+        __fire(type, ev) { dispatch(this, ev, false); }
     }
+    installHandlerProps(Worker.prototype, ["message", "messageerror", "error"]);
     g.Worker = Worker;
-    const __origin = () => (g.location && g.location.origin) || "";
     trust.workerMessage = function (id, s) {
         const w = trust.workers[id];
         if (!w) return;
         let data;
         try { data = g.__sc_deserialize(s); }
-        catch (e) { w.__fire("messageerror", new MessageEvent("messageerror", { origin: __origin() })); return; }
-        w.__fire("message", new MessageEvent("message", { data: data, origin: __origin() }));
+        catch (e) { w.__fire("messageerror", createTrustedEvent(MessageEvent, "messageerror", { origin: "" })); return; }
+        w.__fire("message", createTrustedEvent(MessageEvent, "message", { data: data, origin: "" }));
     };
     trust.workerError = function (id, msg) {
         const w = trust.workers[id];
-        if (w) w.__fire("error", new ErrorEvent("error", { message: String(msg) }));
+        if (w) w.__fire("error", createTrustedEvent(ErrorEvent, "error", { message: String(msg), cancelable: true }));
     };
 
     // Flatten a header map ({lowercased-name: value}) into the `k\nv\nk\nv`
