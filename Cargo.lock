@@ -23,6 +23,7 @@ dependencies = [
  "image",
  "libmimalloc-sys",
  "libmudtelnet",
+ "lumen",
  "mimalloc",
  "parley",
  "ratatui",
@@ -2812,6 +2813,10 @@ checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
 dependencies = [
  "hashbrown 0.17.1",
 ]
+
+[[package]]
+name = "lumen"
+version = "0.1.3"
 
 [[package]]
 name = "mac_address"

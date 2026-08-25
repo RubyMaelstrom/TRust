@@ -17,6 +17,11 @@ path = "src/main.rs"
 name = "trust-desktop"
 path = "src/bin/trust-desktop.rs"
 
+[[bin]]
+name = "trust-lumen-spike"
+path = "src/bin/trust-lumen-spike.rs"
+required-features = ["lumen-spike"]
+
 [features]
 # `mimalloc` (default on) installs the mimalloc global allocator. Parse and
 # bytecode-compile of large JS bundles are dominated by millions of small
@@ -30,6 +35,9 @@ default = ["mimalloc"]
 # exposes `mi_collect`, which we call at navigation boundaries to return a heavy
 # page's freed high-water to the OS (see `release_allocator_memory`).
 mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+# Experimental sibling-engine integration. Boa remains the production engine;
+# this only builds the isolated TRust-prelude/benchmark probe.
+lumen-spike = ["dep:lumen"]
 
 [dependencies]
 accesskit = "0.24.1"
@@ -52,6 +60,7 @@ html5ever = "0.39"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico"] }
 libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 libmudtelnet = "2.0.2"
+lumen = { path = "../Lumen/crates/lumen", features = ["embed"], optional = true }
 mimalloc = { version = "0.1", optional = true }
 # Unicode shaping, font discovery/fallback, bidi, cluster mapping, and line
 # metrics for the canonical CSS-pixel inline formatting context. TRust owns the
