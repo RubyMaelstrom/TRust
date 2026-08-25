@@ -5939,16 +5939,27 @@ mod tests {
                 }
                 let text = String::from_utf8_lossy(&req).into_owned();
                 if text.contains("Upgrade: websocket") {
-                    // Complete the RFC 6455 handshake (our client doesn't verify
-                    // the accept key — it requires 101 + Upgrade), then push one
-                    // unmasked text frame "hi" and hold the socket open.
-                    let _ = sock
-                        .write_all(
-                            b"HTTP/1.1 101 Switching Protocols\r\n\
-                              Upgrade: websocket\r\nConnection: Upgrade\r\n\
-                              Sec-WebSocket-Accept: x\r\n\r\n\x81\x02hi",
-                        )
-                        .await;
+                    // RFC 6455 §4.2.2: the server proves it received the client
+                    // handshake by deriving Sec-WebSocket-Accept from the nonce.
+                    let key = text
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("Sec-WebSocket-Key")
+                                .then(|| value.trim())
+                        })
+                        .expect("client sends Sec-WebSocket-Key");
+                    let accept = crate::ws::websocket_accept(key);
+                    // Complete the handshake, push one unmasked text frame "hi",
+                    // and hold the socket open.
+                    let mut reply = format!(
+                        "HTTP/1.1 101 Switching Protocols\r\n\
+                             Upgrade: websocket\r\nConnection: Upgrade\r\n\
+                             Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                    )
+                    .into_bytes();
+                    reply.extend_from_slice(&[0x81, 0x02, b'h', b'i']);
+                    let _ = sock.write_all(&reply).await;
                     // Keep the connection alive so the client doesn't see a drop.
                     let mut sink = [0u8; 256];
                     let _ = sock.read(&mut sink).await;
