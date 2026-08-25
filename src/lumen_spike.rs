@@ -29,20 +29,37 @@ type LumenGeomCache = (
 );
 
 type LumenFetchResult = Option<(u16, String, Vec<u8>, String)>;
+type LumenResourceResult = Option<(u16, String, Vec<u8>, Vec<(String, String)>)>;
+
+#[derive(Clone, Copy)]
+enum LumenResourceKind {
+    ClassicScript,
+    ModuleScript,
+    Stylesheet,
+}
 
 /// Send-only work returned by background platform operations. Engine values never enter this
 /// channel: the page thread retains Promise resolvers in [`LumenNetwork`] and settles them after
 /// selecting the corresponding HTML task.
 #[allow(dead_code)] // Read by the resident Lumen actor once the backend cutover reaches src/js.rs.
 enum LumenHostTask {
-    FetchDone { id: usize, result: LumenFetchResult },
+    FetchDone {
+        id: usize,
+        result: LumenFetchResult,
+    },
+    ResourceDone {
+        node_id: usize,
+        name: String,
+        kind: LumenResourceKind,
+        result: LumenResourceResult,
+        external: bool,
+    },
 }
 
 struct LumenNetwork {
     handle: tokio::runtime::Handle,
     cache: Arc<crate::http::PageCache>,
-    events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
-    fetched: usize,
+    fetched: Arc<std::sync::atomic::AtomicUsize>,
     next_fetch_id: usize,
     pending_fetches: HashMap<usize, Value>,
 }
@@ -57,6 +74,8 @@ struct HostState {
     device_pixel_ratio: Cell<f32>,
     geom_cache: Rc<RefCell<LumenGeomCache>>,
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
+    task_events: Option<tokio::sync::mpsc::UnboundedSender<LumenHostTask>>,
+    pending_resources: usize,
     network: Option<LumenNetwork>,
 }
 
@@ -82,6 +101,8 @@ impl HostState {
                 Default::default(),
             ))),
             images: Default::default(),
+            task_events: None,
+            pending_resources: 0,
             network: None,
         }
     }
@@ -95,13 +116,27 @@ impl HostState {
         events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
     ) {
         self.base = page;
+        self.task_events = Some(events);
         self.network = Some(LumenNetwork {
             handle,
             cache,
-            events,
-            fetched: 0,
+            fetched: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             next_fetch_id: 0,
             pending_fetches: HashMap::new(),
+        });
+    }
+
+    fn configure_module_loading(&self, engine: &mut lumen::Engine) {
+        engine.set_import_base(self.base.as_str());
+        let Some(network) = self.network.as_ref() else {
+            return;
+        };
+        let page = self.base.clone();
+        let handle = network.handle.clone();
+        let cache = network.cache.clone();
+        let fetched = network.fetched.clone();
+        engine.set_module_loader(move |specifier, referrer| {
+            module_dependency_loader(&page, &handle, &cache, &fetched, specifier, referrer)
         });
     }
 }
@@ -169,10 +204,9 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     let clock = Rc::new(RealmClock::new());
     let engine_clock = clock.clone();
     engine.set_wall_clock(move || engine_clock.now_ms());
-    engine
-        .ctx()
-        .op_state()
-        .put(HostState::new(Rc::new(RefCell::new(Dom::new())), clock));
+    let state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
+    state.configure_module_loading(&mut engine);
+    engine.ctx().op_state().put(state);
     install_host_boundary(&mut engine);
 
     eval(
@@ -314,6 +348,12 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__dom_template_content", 1, host_template_content),
     ("__http_fetch", 5, host_http_fetch),
     ("__http_fetch_async", 5, host_http_fetch_async),
+    ("__dom_run_injected_script", 1, host_run_injected_script),
+    (
+        "__dom_load_injected_stylesheet",
+        1,
+        host_load_injected_stylesheet,
+    ),
     ("__dom_computed", 2, host_computed_style),
     ("__image_current_src", 1, host_image_current_src),
     ("__image_complete", 1, host_image_complete),
@@ -383,13 +423,6 @@ fn host_ids_array(ctx: &Ctx, ids: Vec<usize>) -> Value {
     ctx.make_array(ids.into_iter().map(|id| Value::Num(id as f64)).collect())
 }
 
-fn host_arg_latin1_bytes(ctx: &mut Ctx, args: &[Value], index: usize) -> Vec<u8> {
-    args.get(index)
-        .and_then(|value| ctx.coerce_string(value).ok())
-        .map(|value| value.chars().map(|ch| ch as u32 as u8).collect())
-        .unwrap_or_default()
-}
-
 /// Fetch Standard §2.2.1 method normalization plus the byte-string request-body and header
 /// transport contract shared with the platform prelude.
 #[allow(clippy::type_complexity)]
@@ -419,7 +452,7 @@ fn host_fetch_args(
     let body = args
         .get(2)
         .filter(|value| !matches!(value, Value::Null | Value::Undefined))
-        .map(|_| host_arg_latin1_bytes(ctx, args, 2));
+        .map(|_| host_latin1_bytes(ctx, args, 2));
     let content_type = args
         .get(3)
         .filter(|value| !matches!(value, Value::Null | Value::Undefined))
@@ -454,11 +487,17 @@ fn prepare_host_request(
     let network = state.network.as_mut()?;
     if !matches!(resolved.scheme(), "http" | "https")
         || !crate::http::subresource_allowed(&page, &resolved)
-        || network.fetched >= crate::js::MAX_PAGE_FETCHES
+        || network
+            .fetched
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |count| (count < crate::js::MAX_PAGE_FETCHES).then_some(count + 1),
+            )
+            .is_err()
     {
         return None;
     }
-    network.fetched += 1;
     let mut request = crate::http::Request {
         method,
         url: resolved,
@@ -559,8 +598,9 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
             None => prepare_host_request(state, &target, method, body, headers)
                 .map(|(_, _, request)| AsyncFetchSource::Request(Box::new(request))),
         };
-        match (state.network.as_mut(), source) {
-            (Some(network), Some(source)) => {
+        let events = state.task_events.clone();
+        match (state.network.as_mut(), source, events) {
+            (Some(network), Some(source), Some(events)) => {
                 let id = network.next_fetch_id;
                 network.next_fetch_id += 1;
                 network.pending_fetches.insert(id, resolve.clone());
@@ -568,7 +608,7 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
                     id,
                     network.handle.clone(),
                     network.cache.clone(),
-                    network.events.clone(),
+                    events,
                     source,
                 ))
             }
@@ -596,6 +636,565 @@ fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
     Ok(promise)
 }
 
+fn host_trust(ctx: &mut Ctx) -> Result<Value, Value> {
+    let global = ctx.global_this();
+    ctx.member_get(&global, "__trust")
+}
+
+fn host_call_trust(ctx: &mut Ctx, name: &str, args: &[Value]) -> Result<Value, Value> {
+    let trust = host_trust(ctx)?;
+    let function = ctx.member_get(&trust, name)?;
+    ctx.invoke(function, trust, args)
+}
+
+fn host_resource_url(ctx: &mut Ctx, node_id: usize, fallback: Option<String>) -> Option<String> {
+    host_call_trust(ctx, "resourceURL", &[Value::Num(node_id as f64)])
+        .ok()
+        .and_then(|value| ctx.coerce_string(&value).ok())
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| fallback.filter(|value| !value.trim().is_empty()))
+}
+
+fn host_push_injected_error(ctx: &mut Ctx, message: impl Into<String>) {
+    let Ok(trust) = host_trust(ctx) else {
+        return;
+    };
+    let Ok(errors) = ctx.member_get(&trust, "errors") else {
+        return;
+    };
+    let Ok(push) = ctx.member_get(&errors, "push") else {
+        return;
+    };
+    let _ = ctx.invoke(push, errors, &[Value::from_string(message.into())]);
+}
+
+fn host_fire_script_event(ctx: &mut Ctx, node_id: usize, event_type: &str) {
+    let _ = host_call_trust(ctx, "bindFrameForNode", &[Value::Num(node_id as f64)]);
+    let _ = host_call_trust(
+        ctx,
+        "scriptEvent",
+        &[
+            Value::Num(node_id as f64),
+            Value::from_string(event_type.to_string()),
+        ],
+    );
+    let _ = host_call_trust(ctx, "restoreFrame", &[]);
+}
+
+/// The media type metadata of a `data:` URL. Fetch's data-URL processor defaults an omitted type
+/// to `text/plain;charset=US-ASCII`; module-script fetching subsequently rejects that default
+/// because it is not a JavaScript MIME type.
+fn data_url_content_type(url: &str) -> String {
+    let mut metadata = url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(',').map(|(metadata, _)| metadata))
+        .unwrap_or_default()
+        .trim();
+    if metadata
+        .get(metadata.len().saturating_sub(";base64".len())..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(";base64"))
+    {
+        metadata = &metadata[..metadata.len() - ";base64".len()];
+    }
+    if metadata.is_empty() {
+        String::from("text/plain;charset=US-ASCII")
+    } else if metadata.starts_with(';') {
+        format!("text/plain{metadata}")
+    } else {
+        metadata.to_string()
+    }
+}
+
+fn data_resource_result(url: &str) -> LumenResourceResult {
+    crate::img::decode_data_url(url.trim())
+        .map(|body| (200, data_url_content_type(url), body, Vec::new()))
+}
+
+fn send_resource_completion(
+    ctx: &mut Ctx,
+    node_id: usize,
+    name: String,
+    kind: LumenResourceKind,
+    result: LumenResourceResult,
+    external: bool,
+) -> bool {
+    let Some((events, pending)) = ctx.host_mut::<HostState>().and_then(|state| {
+        let events = state.task_events.clone()?;
+        state.pending_resources += 1;
+        Some((events, state.pending_resources))
+    }) else {
+        return false;
+    };
+    if events
+        .send(LumenHostTask::ResourceDone {
+            node_id,
+            name,
+            kind,
+            result,
+            external,
+        })
+        .is_err()
+    {
+        if let Some(state) = ctx.host_mut::<HostState>() {
+            state.pending_resources = pending.saturating_sub(1);
+        }
+        return false;
+    }
+    true
+}
+
+fn spawn_resource_fetch(
+    ctx: &mut Ctx,
+    node_id: usize,
+    kind: LumenResourceKind,
+    request: crate::http::Request,
+) -> bool {
+    let name = request.url.to_string();
+    let Some((handle, cache, events)) = ctx.host_mut::<HostState>().and_then(|state| {
+        let events = state.task_events.clone()?;
+        let network = state.network.as_ref()?;
+        state.pending_resources += 1;
+        Some((network.handle.clone(), network.cache.clone(), events))
+    }) else {
+        return false;
+    };
+    let shared = cache.peek(&request.url);
+    cache.spawn(&handle, async move {
+        let result = match shared {
+            Some(shared) => shared.await.ok().map(|response| {
+                (
+                    response.status,
+                    response.content_type.clone(),
+                    response.body.clone(),
+                    response.headers.clone(),
+                )
+            }),
+            None => crate::http::fetch(&request).await.ok().map(|response| {
+                (
+                    response.status,
+                    response.content_type,
+                    response.body,
+                    response.headers,
+                )
+            }),
+        };
+        let _ = events.send(LumenHostTask::ResourceDone {
+            node_id,
+            name,
+            kind,
+            result,
+            external: true,
+        });
+    });
+    true
+}
+
+fn queue_resource_error(ctx: &mut Ctx, node_id: usize, kind: LumenResourceKind, name: String) {
+    if !send_resource_completion(ctx, node_id, name, kind, None, true) {
+        host_fire_script_event(ctx, node_id, "error");
+    }
+}
+
+fn host_eval_inline_classic(ctx: &mut Ctx, node_id: usize, source: String) {
+    let _ = host_call_trust(ctx, "bindFrameForNode", &[Value::Num(node_id as f64)]);
+    let trust = host_trust(ctx).ok();
+    let old_current = trust
+        .as_ref()
+        .and_then(|trust| ctx.member_get(trust, "currentScript").ok());
+    if let Some(trust) = trust.as_ref() {
+        let _ = ctx.member_set(trust, "currentScript", Value::Num(node_id as f64));
+    }
+    let result = (|| {
+        let global = ctx.global_this();
+        let indirect_eval = ctx.member_get(&global, "eval")?;
+        ctx.invoke(
+            indirect_eval,
+            Value::Undefined,
+            &[Value::from_string(source)],
+        )
+    })();
+    if let Err(error) = result {
+        let message = ctx
+            .coerce_string(&error)
+            .map(|message| message.to_string())
+            .unwrap_or_else(|_| String::from("injected inline script failed"));
+        host_push_injected_error(ctx, format!("injected-inline: {message}"));
+    }
+    if let (Some(trust), Some(old_current)) = (trust.as_ref(), old_current) {
+        let _ = ctx.member_set(trust, "currentScript", old_current);
+    }
+    let _ = host_call_trust(ctx, "restoreFrame", &[]);
+}
+
+/// HTML §4.12.1.1 post-connection and prepare-the-script-element steps for scripts inserted
+/// through the live DOM. The prelude owns the already-started/type/connected gates; this host owns
+/// source acquisition and execution.
+fn host_run_injected_script(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let (node_id, src, text, module) = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        let Some(node_id) = host_arg_node(&dom, args, 0) else {
+            return Ok(Value::Undefined);
+        };
+        (
+            node_id,
+            dom.attr(node_id, "src").map(str::to_string),
+            dom.text_content(node_id),
+            dom.attr(node_id, "type")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("module")),
+        )
+    };
+    let src = host_resource_url(ctx, node_id, src);
+
+    if let Some(src) = src {
+        if src.trim_start().starts_with("data:") {
+            let result = data_resource_result(src.trim());
+            if !send_resource_completion(
+                ctx,
+                node_id,
+                src,
+                if module {
+                    LumenResourceKind::ModuleScript
+                } else {
+                    LumenResourceKind::ClassicScript
+                },
+                result,
+                true,
+            ) {
+                host_fire_script_event(ctx, node_id, "error");
+            }
+            return Ok(Value::Undefined);
+        }
+        let request = ctx.host_mut::<HostState>().and_then(|state| {
+            prepare_host_request(state, &src, String::from("GET"), None, Vec::new())
+                .map(|(_, _, request)| request)
+        });
+        let kind = if module {
+            LumenResourceKind::ModuleScript
+        } else {
+            LumenResourceKind::ClassicScript
+        };
+        match request {
+            Some(request) => {
+                if !spawn_resource_fetch(ctx, node_id, kind, request) {
+                    queue_resource_error(ctx, node_id, kind, src);
+                }
+            }
+            None => queue_resource_error(ctx, node_id, kind, src),
+        }
+    } else if module {
+        let base = state_base(ctx);
+        if !send_resource_completion(
+            ctx,
+            node_id,
+            base,
+            LumenResourceKind::ModuleScript,
+            Some((
+                200,
+                String::from("text/javascript"),
+                text.into_bytes(),
+                Vec::new(),
+            )),
+            false,
+        ) {
+            host_push_injected_error(ctx, "inline module could not enter the host task queue");
+        }
+    } else if !text.is_empty() {
+        // A non-parser-inserted inline classic script executes immediately in the element's
+        // post-connection steps. Its exception is reported, not rethrown from appendChild().
+        host_eval_inline_classic(ctx, node_id, text);
+    }
+    Ok(Value::Undefined)
+}
+
+fn state_base(ctx: &mut Ctx) -> String {
+    ctx.host_mut::<HostState>()
+        .map(|state| state.base.to_string())
+        .unwrap_or_else(|| String::from("about:blank"))
+}
+
+/// HTML stylesheet-link processing: fetching is parallel, while attaching the CSSStyleSheet and
+/// firing `load`/`error` occur in the later resource task.
+fn host_load_injected_stylesheet(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
+    let (node_id, href) = {
+        let dom = host_dom(ctx);
+        let dom = dom.borrow();
+        let Some(node_id) = host_arg_node(&dom, args, 0) else {
+            return Ok(Value::Undefined);
+        };
+        (node_id, dom.attr(node_id, "href").map(str::to_string))
+    };
+    let Some(href) = host_resource_url(ctx, node_id, href) else {
+        return Ok(Value::Undefined);
+    };
+    if href.trim_start().starts_with("data:") {
+        if !send_resource_completion(
+            ctx,
+            node_id,
+            href.clone(),
+            LumenResourceKind::Stylesheet,
+            data_resource_result(href.trim()),
+            true,
+        ) {
+            host_fire_script_event(ctx, node_id, "error");
+        }
+        return Ok(Value::Undefined);
+    }
+    let request = ctx.host_mut::<HostState>().and_then(|state| {
+        prepare_host_request(state, &href, String::from("GET"), None, Vec::new())
+            .map(|(_, _, request)| request)
+    });
+    match request {
+        Some(request) => {
+            if !spawn_resource_fetch(ctx, node_id, LumenResourceKind::Stylesheet, request) {
+                queue_resource_error(ctx, node_id, LumenResourceKind::Stylesheet, href);
+            }
+        }
+        None => queue_resource_error(ctx, node_id, LumenResourceKind::Stylesheet, href),
+    }
+    Ok(Value::Undefined)
+}
+
+fn module_dependency_loader(
+    page: &url::Url,
+    handle: &tokio::runtime::Handle,
+    cache: &Arc<crate::http::PageCache>,
+    fetched: &std::sync::atomic::AtomicUsize,
+    specifier: &str,
+    referrer: &str,
+) -> Option<(String, String)> {
+    let base = url::Url::parse(referrer).unwrap_or_else(|_| page.clone());
+    let resolved = base.join(specifier).ok()?;
+    if resolved.scheme() == "data" {
+        let content_type = data_url_content_type(resolved.as_str());
+        if !crate::http::module_script_response_allowed(200, &content_type) {
+            return None;
+        }
+        let body = crate::img::decode_data_url(resolved.as_str())?;
+        return Some((
+            resolved.to_string(),
+            crate::http::decode_body(&content_type, &body),
+        ));
+    }
+    if !matches!(resolved.scheme(), "http" | "https")
+        || !crate::http::subresource_allowed(page, &resolved)
+    {
+        return None;
+    }
+    let response = if let Some(shared) = cache.peek(&resolved) {
+        crate::http::PageCache::block_on_fetch(Some(handle), shared)?
+    } else {
+        if fetched
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |count| (count < crate::js::MAX_PAGE_FETCHES).then_some(count + 1),
+            )
+            .is_err()
+        {
+            return None;
+        }
+        let shared = cache.fetch(handle, resolved.clone());
+        crate::http::PageCache::block_on_fetch(Some(handle), shared)?
+    };
+    crate::http::module_script_response_allowed(response.status, &response.content_type).then(
+        || {
+            (
+                resolved.to_string(),
+                crate::http::decode_body(&response.content_type, &response.body),
+            )
+        },
+    )
+}
+
+fn push_engine_error(engine: &mut lumen::Engine, message: String) {
+    host_push_injected_error(engine.ctx(), message);
+}
+
+fn fire_engine_script_event(engine: &mut lumen::Engine, node_id: usize, event_type: &str) {
+    host_fire_script_event(engine.ctx(), node_id, event_type);
+}
+
+fn run_injected_classic_task(
+    engine: &mut lumen::Engine,
+    node_id: usize,
+    name: &str,
+    source: &str,
+) -> Result<(), String> {
+    let trust = host_trust(engine.ctx()).map_err(|_| "read __trust".to_string())?;
+    let document_base = state_base(engine.ctx());
+    engine.set_import_base(name);
+    let old_current = engine
+        .ctx()
+        .member_get(&trust, "currentScript")
+        .unwrap_or(Value::Null);
+    let _ = host_call_trust(
+        engine.ctx(),
+        "bindFrameForNode",
+        &[Value::Num(node_id as f64)],
+    );
+    let _ = engine
+        .ctx()
+        .member_set(&trust, "currentScript", Value::Num(node_id as f64));
+    let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine.eval_value_interruptible(source)
+    }));
+    match evaluated {
+        Ok(Ok(Ok(_))) => {}
+        Ok(Ok(Err(error))) => {
+            let message = describe_eval_error(engine, error, name);
+            push_engine_error(engine, message);
+        }
+        Ok(Err(error)) => push_engine_error(
+            engine,
+            format!(
+                "{name} parse error at line {}: {}",
+                error.line, error.message
+            ),
+        ),
+        Err(_) => push_engine_error(engine, format!("{name}: Lumen engine panic")),
+    }
+    // HTML clean-up after running script performs a checkpoint once the script stack is empty.
+    let checkpoint = engine
+        .run_microtasks_interruptible()
+        .map_err(|reason| format!("{name} microtasks interrupted: {}", reason.message()));
+    let _ = engine
+        .ctx()
+        .member_set(&trust, "currentScript", old_current);
+    let _ = host_call_trust(engine.ctx(), "restoreFrame", &[]);
+    engine.set_import_base(&document_base);
+    checkpoint
+}
+
+fn run_injected_module_task(
+    engine: &mut lumen::Engine,
+    node_id: usize,
+    name: &str,
+    source: &str,
+) -> Result<(), String> {
+    let snapshot = engine.ctx().host_mut::<HostState>().and_then(|state| {
+        let network = state.network.as_ref()?;
+        Some((
+            state.base.clone(),
+            network.handle.clone(),
+            network.cache.clone(),
+            network.fetched.clone(),
+        ))
+    });
+    let evaluated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some((page, handle, cache, fetched)) = snapshot {
+            let loader_page = page.clone();
+            engine.eval_module_attrs_interruptible(
+                source,
+                name,
+                move |specifier, referrer, _attributes| {
+                    module_dependency_loader(
+                        &loader_page,
+                        &handle,
+                        &cache,
+                        &fetched,
+                        specifier,
+                        referrer,
+                    )
+                },
+            )
+        } else {
+            engine.eval_module_attrs_interruptible(
+                source,
+                name,
+                |_specifier, _referrer, _attributes| None,
+            )
+        }
+    }));
+    match evaluated {
+        Ok(Ok(lumen::ExecutionOutcome::Value(_))) => {
+            // HTML fires load after successful evaluation for both external and inline modules.
+            fire_engine_script_event(engine, node_id, "load");
+        }
+        Ok(Ok(lumen::ExecutionOutcome::Throw { name: ty, message })) => {
+            push_engine_error(engine, format!("module {name}: {ty}: {message}"));
+            fire_engine_script_event(engine, node_id, "error");
+        }
+        Ok(Ok(lumen::ExecutionOutcome::Interrupted { reason })) => {
+            return Err(format!("module {name} interrupted: {}", reason.message()));
+        }
+        Ok(Err(error)) => {
+            push_engine_error(
+                engine,
+                format!(
+                    "module {name} parse error at line {}: {}",
+                    error.line, error.message
+                ),
+            );
+            fire_engine_script_event(engine, node_id, "error");
+        }
+        Err(_) => {
+            push_engine_error(engine, format!("module {name}: Lumen engine panic"));
+            fire_engine_script_event(engine, node_id, "error");
+        }
+    }
+    Ok(())
+}
+
+fn run_resource_task(
+    engine: &mut lumen::Engine,
+    node_id: usize,
+    name: String,
+    kind: LumenResourceKind,
+    result: LumenResourceResult,
+    external: bool,
+) -> Result<(), String> {
+    match kind {
+        LumenResourceKind::ClassicScript => match result {
+            Some((status, content_type, body, headers))
+                if crate::http::classic_script_response_allowed(
+                    status,
+                    &content_type,
+                    &headers,
+                ) =>
+            {
+                let source = crate::http::decode_body(&content_type, &body);
+                run_injected_classic_task(engine, node_id, &name, &source)?;
+                if external {
+                    fire_engine_script_event(engine, node_id, "load");
+                }
+            }
+            _ => fire_engine_script_event(engine, node_id, "error"),
+        },
+        LumenResourceKind::ModuleScript => match result {
+            Some((status, content_type, body, _headers))
+                if crate::http::module_script_response_allowed(status, &content_type) =>
+            {
+                let source = crate::http::decode_body(&content_type, &body);
+                run_injected_module_task(engine, node_id, &name, &source)?;
+            }
+            _ => fire_engine_script_event(engine, node_id, "error"),
+        },
+        LumenResourceKind::Stylesheet => match result {
+            Some((status, content_type, body, headers))
+                if crate::http::stylesheet_response_allowed(status, &content_type, &headers) =>
+            {
+                let css = crate::http::decode_body(&content_type, &body);
+                let dom = engine
+                    .ctx()
+                    .host_mut::<HostState>()
+                    .expect("HostState installed before resource dispatch")
+                    .dom
+                    .clone();
+                dom.borrow_mut().attach_sheet_to_link(node_id, css);
+                fire_engine_script_event(engine, node_id, "load");
+            }
+            _ => fire_engine_script_event(engine, node_id, "error"),
+        },
+    }
+    Ok(())
+}
+
 /// Run the engine-owned portion of one selected host task. The caller performs the HTML event
 /// loop's microtask checkpoint after this returns, before selecting another task.
 #[allow(dead_code)] // The networked test realm uses this before the resident actor is switched.
@@ -614,6 +1213,18 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
             engine
                 .call_function_interruptible(&resolve, Value::Undefined, &[value])
                 .map_err(|error| describe_eval_error(engine, error, "fetch networking task"))?;
+        }
+        LumenHostTask::ResourceDone {
+            node_id,
+            name,
+            kind,
+            result,
+            external,
+        } => {
+            if let Some(state) = engine.ctx().host_mut::<HostState>() {
+                state.pending_resources = state.pending_resources.saturating_sub(1);
+            }
+            run_resource_task(engine, node_id, name, kind, result, external)?;
         }
     }
     Ok(())
@@ -1761,6 +2372,7 @@ mod tests {
         let clock = state.clock.clone();
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
+        state.configure_module_loading(&mut engine);
         engine.ctx().op_state().put(state);
         install_host_boundary(&mut engine);
         eval(
@@ -1811,6 +2423,22 @@ mod tests {
     }
 
     #[test]
+    fn data_url_media_types_follow_the_fetch_processor() {
+        assert_eq!(
+            data_url_content_type("data:,plain"),
+            "text/plain;charset=US-ASCII"
+        );
+        assert_eq!(
+            data_url_content_type("data:;charset=utf-8,plain"),
+            "text/plain;charset=utf-8"
+        );
+        assert_eq!(
+            data_url_content_type("data:text/javascript;charset=utf-8;BaSe64,ZXhwb3J0IHt9"),
+            "text/javascript;charset=utf-8"
+        );
+    }
+
+    #[test]
     fn lumen_registry_is_a_unique_arity_checked_subset_of_the_host_boundary() {
         let canonical: Vec<_> = crate::js::host_boundary_signatures().collect();
         assert_eq!(canonical.len(), 101, "canonical host boundary changed");
@@ -1824,7 +2452,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 71);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 73);
 
         let mut engine = platform_engine();
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
@@ -2031,6 +2659,177 @@ mod tests {
             "{headers}"
         );
         assert_eq!(&request[header_end..], &[0, 0x80, 0xff]);
+    }
+
+    #[test]
+    fn injected_scripts_modules_and_stylesheets_complete_as_resource_tasks() {
+        // HTML §4.12.1.1: a connected inline classic executes during post-connection, while
+        // external classic/module scripts execute when their fetched result is ready. HTML
+        // §4.2.4.3 attaches a successfully obtained CSS sheet before firing the link's load event.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = url::Url::parse(DEFAULT_URL).unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        let seed = |path: &str, content_type: &str, body: &[u8]| {
+            let url = page.join(path).unwrap();
+            cache.seed_with_headers(
+                url.to_string(),
+                200,
+                content_type.to_string(),
+                vec![(String::from("content-type"), content_type.to_string())],
+                body.to_vec(),
+            );
+        };
+        seed(
+            "chunk.js",
+            "text/javascript",
+            br#"
+                resourceOrder.push('classic-exec');
+                globalThis.classicCurrent = document.currentScript === document.getElementById('classic');
+                import('./classic-dep.js').then(function (dependency) {
+                    globalThis.classicImport = dependency.answer;
+                    resourceOrder.push('classic-import:' + dependency.answer);
+                });
+                Promise.resolve().then(function () {
+                    globalThis.classicMicroCurrent = document.currentScript === document.getElementById('classic');
+                    resourceOrder.push('classic-micro');
+                });
+            "#,
+        );
+        seed(
+            "classic-dep.js",
+            "text/javascript",
+            b"export const answer = 17;",
+        );
+        seed(
+            "module.js",
+            "text/javascript",
+            br#"
+                import { answer } from 'data:text/javascript,export%20const%20answer%20%3D%2042%3B';
+                globalThis.moduleAnswer = answer;
+                resourceOrder.push('module-exec');
+            "#,
+        );
+        seed(
+            "chunk.css",
+            "text/css",
+            b"#resource-target { display: grid; grid-template-columns: 90px 110px; }",
+        );
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
+        state.enable_network(page, runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, DEFAULT_URL);
+
+        eval(
+            &mut engine,
+            r#"
+                globalThis.resourceOrder = [];
+                const html = document.createElement('html');
+                const head = document.createElement('head');
+                const body = document.createElement('body');
+                document.appendChild(html); html.appendChild(head); html.appendChild(body);
+                const target = document.createElement('div');
+                target.id = 'resource-target';
+                document.body.appendChild(target);
+
+                const inline = document.createElement('script');
+                globalThis.inlineElement = inline;
+                inline.textContent = "globalThis.inlineCurrent = document.currentScript === globalThis.inlineElement; resourceOrder.push('inline-exec'); Promise.resolve().then(function () { resourceOrder.push('inline-micro'); })";
+                document.body.appendChild(inline);
+                resourceOrder.push('after-inline');
+
+                const emptyModule = document.createElement('script');
+                emptyModule.type = 'module';
+                emptyModule.onload = function () { resourceOrder.push('inline-module-load'); };
+                emptyModule.onerror = function () { resourceOrder.push('inline-module-error'); };
+                document.body.appendChild(emptyModule);
+
+                const link = document.createElement('link');
+                link.rel = 'stylesheet'; link.href = '/chunk.css';
+                link.onload = function () { resourceOrder.push('style-load:' + getComputedStyle(target).display); };
+                link.onerror = function () { resourceOrder.push('style-error'); };
+                document.head.appendChild(link);
+
+                const classic = document.createElement('script');
+                classic.id = 'classic'; classic.src = '/chunk.js';
+                classic.onload = function () { resourceOrder.push('classic-load'); };
+                classic.onerror = function () { resourceOrder.push('classic-error'); };
+                document.body.appendChild(classic);
+
+                const module = document.createElement('script');
+                module.type = 'module'; module.src = '/module.js';
+                module.onload = function () { resourceOrder.push('module-load:' + moduleAnswer); };
+                module.onerror = function () { resourceOrder.push('module-error'); };
+                document.body.appendChild(module);
+                resourceOrder.push('after-external-insert');
+            "#,
+            "insert dynamic resources",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "resourceOrder.slice(0, 4).join('|')"),
+            "inline-exec|after-inline|after-external-insert|inline-micro"
+        );
+        assert_eq!(string_value(&mut engine, "String(inlineCurrent)"), "true");
+        assert_eq!(
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .map(|state| state.pending_resources),
+            Some(4)
+        );
+
+        for _ in 0..4 {
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), task_rx.recv()).await
+                })
+                .expect("resource task completes")
+                .expect("resource task channel remains open");
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+        let order = string_value(&mut engine, "resourceOrder.join('|')");
+        assert!(order.contains("style-load:grid"), "{order}");
+        assert!(order.contains("classic-exec"), "{order}");
+        assert!(order.contains("classic-micro"), "{order}");
+        assert!(order.contains("classic-import:17"), "{order}");
+        assert!(order.contains("classic-load"), "{order}");
+        assert!(order.contains("inline-module-load"), "{order}");
+        assert!(order.contains("module-exec"), "{order}");
+        assert!(order.contains("module-load:42"), "{order}");
+        assert!(!order.contains("-error"), "{order}");
+        assert_eq!(order.matches("style-load:grid").count(), 1, "{order}");
+        assert_eq!(order.matches("classic-load").count(), 1, "{order}");
+        assert_eq!(order.matches("inline-module-load").count(), 1, "{order}");
+        assert_eq!(order.matches("module-load:42").count(), 1, "{order}");
+        assert!(
+            order.find("classic-exec") < order.find("classic-micro")
+                && order.find("classic-micro") < order.find("classic-load"),
+            "classic script cleanup/load ordering: {order}"
+        );
+        assert!(
+            order.find("classic-import:17") < order.find("classic-load"),
+            "classic-script dynamic import must settle during cleanup: {order}"
+        );
+        assert_eq!(string_value(&mut engine, "String(classicCurrent)"), "true");
+        assert_eq!(string_value(&mut engine, "String(classicImport)"), "17");
+        assert_eq!(
+            string_value(&mut engine, "String(classicMicroCurrent)"),
+            "true"
+        );
+        assert_eq!(
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .map(|state| state.pending_resources),
+            Some(0)
+        );
     }
 
     #[test]
