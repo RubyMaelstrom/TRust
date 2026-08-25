@@ -806,8 +806,12 @@ impl VelloHybridRenderer {
                 DisplayCommand::PopLayer => target.pop_layer(),
                 DisplayCommand::BeginSticky(_)
                 | DisplayCommand::EndSticky
+                | DisplayCommand::BeginScroll(_)
+                | DisplayCommand::EndScroll
                 | DisplayCommand::BeginFixed
-                | DisplayCommand::EndFixed => {}
+                | DisplayCommand::EndFixed
+                | DisplayCommand::BeginCssAnimation(_)
+                | DisplayCommand::EndCssAnimation => {}
                 DisplayCommand::Shadow {
                     shape,
                     color,

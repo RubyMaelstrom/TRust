@@ -232,6 +232,22 @@ impl ImageHandle {
     }
 }
 
+impl PagePaint {
+    /// Whether scene composition must advance the CSS Animations document
+    /// timeline even when no DOM/layout mutation occurred.
+    pub fn has_css_animations(&self) -> bool {
+        let has = |commands: &[Primitive]| {
+            commands
+                .iter()
+                .any(|command| matches!(command, Primitive::BeginCssAnimation(_)))
+        };
+        has(&self.primitives)
+            || has(&self.fixed_under_primitives)
+            || has(&self.fixed_primitives)
+            || self.top_layer.iter().any(|entry| has(&entry.primitives))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageRequest {
     pub handle: ImageHandle,
@@ -407,6 +423,10 @@ pub struct HitRegion {
     /// node ids are deliberately not sent to JavaScript.
     pub actor: Option<usize>,
     pub link: Option<Link>,
+    /// Computed CSS `cursor` value for this pointer target. Relative URL
+    /// resolution and image fallback remain frontend-neutral until the native
+    /// cursor backend selects the first decoded source.
+    pub cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -455,11 +475,21 @@ pub enum DisplayCommand {
     /// transform before a raster backend sees the list.
     BeginSticky(StickyConstraint),
     EndSticky,
+    /// Layout-owned scrolling-box scope. Scene composition resolves the
+    /// current retained offset by node id, so a user scroll updates pixels
+    /// immediately without rebuilding layout or waiting for a DOM render.
+    BeginScroll(usize),
+    EndScroll,
     /// Layout-owned scope for a viewport-fixed stacking context interleaved
     /// with document paint. Scene composition cancels the document scroll
     /// inside the scope before a raster backend sees the list.
     BeginFixed,
     EndFixed,
+    /// CSS Animations sampling scope. Layout resolves supported keyframe
+    /// values into CSS-pixel translations; scene composition samples the
+    /// document clock and emits an ordinary transform before rasterization.
+    BeginCssAnimation(CssAnimationScope),
+    EndCssAnimation,
     /// A renderer may use a native blur/filter, or fall back to an expanded
     /// translucent shape. The geometry and CSS semantics remain TRust-owned.
     Shadow {
@@ -507,6 +537,34 @@ pub enum DisplayCommand {
 /// Compatibility name used by the Phase-1 chrome and older tests. It aliases
 /// the permanent display command rather than creating a second paint model.
 pub type Primitive = DisplayCommand;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CssAnimationScope {
+    pub animations: Vec<CssPaintAnimation>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CssPaintAnimation {
+    pub name: String,
+    pub duration_seconds: f32,
+    pub delay_seconds: f32,
+    /// `None` is the CSS `infinite` keyword.
+    pub iteration_count: Option<f32>,
+    pub direction: String,
+    pub fill_mode: String,
+    pub timing_function: String,
+    pub running: bool,
+    /// Translation contributed by an animated inset such as `top`.
+    pub position: Vec<CssAnimationPoint>,
+    /// Translation contributed by a supported `transform` keyframe.
+    pub transform: Vec<CssAnimationPoint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CssAnimationPoint {
+    pub offset: f32,
+    pub value: CssPoint,
+}
 
 /// One entry in the document's ordered top layer. Entries cannot be flattened
 /// into separate absolute/fixed lists: CSS Positioned Layout paints the
@@ -761,8 +819,12 @@ fn command_changes_paint_state(command: &DisplayCommand) -> bool {
             | DisplayCommand::PopLayer
             | DisplayCommand::BeginSticky(_)
             | DisplayCommand::EndSticky
+            | DisplayCommand::BeginScroll(_)
+            | DisplayCommand::EndScroll
             | DisplayCommand::BeginFixed
             | DisplayCommand::EndFixed
+            | DisplayCommand::BeginCssAnimation(_)
+            | DisplayCommand::EndCssAnimation
     )
 }
 
@@ -870,8 +932,12 @@ fn leaf_command_bounds(command: &DisplayCommand) -> Option<CssRect> {
         | DisplayCommand::PopLayer
         | DisplayCommand::BeginSticky(_)
         | DisplayCommand::EndSticky
+        | DisplayCommand::BeginScroll(_)
+        | DisplayCommand::EndScroll
         | DisplayCommand::BeginFixed
-        | DisplayCommand::EndFixed => None,
+        | DisplayCommand::EndFixed
+        | DisplayCommand::BeginCssAnimation(_)
+        | DisplayCommand::EndCssAnimation => None,
     }
 }
 
@@ -954,6 +1020,7 @@ pub struct PageHit {
     pub node: usize,
     pub actor: Option<usize>,
     pub link: Option<Link>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1007,7 +1074,7 @@ impl Scene {
                 // topmost decorative/anonymous region to the first semantic
                 // target beneath it; filtering only after this method returns
                 // made text/pseudo/SVG paint over a button swallow its click.
-                if region.link.is_none() && region.actor.is_none() {
+                if region.link.is_none() && region.actor.is_none() && region.cursor.is_none() {
                     return None;
                 }
                 let state = states.get(index)?.as_ref()?;
@@ -1021,6 +1088,7 @@ impl Scene {
                         node: region.node,
                         actor: region.actor,
                         link: region.link.clone(),
+                        cursor: region.cursor.clone(),
                     })
             })
     }
@@ -1043,6 +1111,7 @@ impl Scene {
                     node: region.node,
                     actor: region.actor,
                     link: region.link.clone(),
+                    cursor: region.cursor.clone(),
                 })
             })
             .collect()
@@ -1220,6 +1289,13 @@ impl Scene {
 
     /// Overlay canonical page paint into the chrome's content viewport.
     pub fn append_page(&mut self, page: &PagePaint, scroll: CssPoint) {
+        self.append_page_at(page, scroll, 0.0);
+    }
+
+    /// Overlay page paint while sampling CSS Animations at `elapsed_seconds`
+    /// on the document timeline. Keeping the time parameter in scene
+    /// composition preserves a stable layout/display list between frames.
+    pub fn append_page_at(&mut self, page: &PagePaint, scroll: CssPoint, elapsed_seconds: f32) {
         self.page_size = CssSize::new(page.width, page.height);
         self.page_scroll_containers = page
             .scroll_containers
@@ -1251,7 +1327,12 @@ impl Scene {
                     self.content_viewport.x,
                     self.content_viewport.y,
                 )));
-            self.append_sticky_commands(&page.fixed_under_primitives, page, CssPoint::default());
+            self.append_sticky_commands(
+                &page.fixed_under_primitives,
+                page,
+                CssPoint::default(),
+                elapsed_seconds,
+            );
             self.primitives.push(Primitive::PopTransform);
         }
         self.primitives
@@ -1259,7 +1340,7 @@ impl Scene {
                 self.content_viewport.x - scroll.x,
                 self.content_viewport.y - scroll.y,
             )));
-        self.append_sticky_commands(&page.primitives, page, scroll);
+        self.append_sticky_commands(&page.primitives, page, scroll, elapsed_seconds);
         self.primitives.push(Primitive::PopTransform);
 
         // Fixed-position descendants use the viewport as their containing
@@ -1270,7 +1351,12 @@ impl Scene {
                     self.content_viewport.x,
                     self.content_viewport.y,
                 )));
-            self.append_sticky_commands(&page.fixed_primitives, page, CssPoint::default());
+            self.append_sticky_commands(
+                &page.fixed_primitives,
+                page,
+                CssPoint::default(),
+                elapsed_seconds,
+            );
             self.primitives.push(Primitive::PopTransform);
         }
         // Top-layer boxes are painted after the document's root stacking
@@ -1287,7 +1373,7 @@ impl Scene {
                     self.content_viewport.x - entry_scroll.x,
                     self.content_viewport.y - entry_scroll.y,
                 )));
-            self.append_sticky_commands(&entry.primitives, page, entry_scroll);
+            self.append_sticky_commands(&entry.primitives, page, entry_scroll, elapsed_seconds);
             self.primitives.push(Primitive::PopTransform);
         }
         self.primitives.push(Primitive::PopClip);
@@ -1298,6 +1384,7 @@ impl Scene {
         commands: &[Primitive],
         page: &PagePaint,
         viewport_scroll: CssPoint,
+        elapsed_seconds: f32,
     ) {
         for command in commands {
             match command {
@@ -1324,6 +1411,19 @@ impl Scene {
                         .push(Primitive::PushTransform(Affine2d::translate(dx, dy)));
                 }
                 Primitive::EndSticky => self.primitives.push(Primitive::PopTransform),
+                Primitive::BeginScroll(node) => {
+                    let offset = page
+                        .scroll_containers
+                        .iter()
+                        .find(|container| container.node == *node)
+                        .map(|container| container.offset)
+                        .unwrap_or_default();
+                    self.primitives
+                        .push(Primitive::PushTransform(Affine2d::translate(
+                            -offset.x, -offset.y,
+                        )));
+                }
+                Primitive::EndScroll => self.primitives.push(Primitive::PopTransform),
                 Primitive::BeginFixed => {
                     self.primitives
                         .push(Primitive::PushTransform(Affine2d::translate(
@@ -1332,10 +1432,182 @@ impl Scene {
                         )))
                 }
                 Primitive::EndFixed => self.primitives.push(Primitive::PopTransform),
+                Primitive::BeginCssAnimation(scope) => {
+                    let translation = sample_css_animation_scope(scope, elapsed_seconds);
+                    self.primitives
+                        .push(Primitive::PushTransform(Affine2d::translate(
+                            translation.x,
+                            translation.y,
+                        )));
+                }
+                Primitive::EndCssAnimation => self.primitives.push(Primitive::PopTransform),
                 other => self.primitives.push(other.clone()),
             }
         }
     }
+}
+
+fn sample_css_animation_scope(scope: &CssAnimationScope, elapsed_seconds: f32) -> CssPoint {
+    // CSS Animations 1 §4.2: later animations override earlier animations
+    // that affect the same property. `top` and `transform` remain independent
+    // tracks and their translations compose for paint.
+    let mut position = None;
+    let mut transform = None;
+    for animation in &scope.animations {
+        let Some(progress) = css_animation_progress(animation, elapsed_seconds) else {
+            continue;
+        };
+        if !animation.position.is_empty() {
+            position = Some(sample_css_animation_track(
+                &animation.position,
+                progress,
+                &animation.timing_function,
+            ));
+        }
+        if !animation.transform.is_empty() {
+            transform = Some(sample_css_animation_track(
+                &animation.transform,
+                progress,
+                &animation.timing_function,
+            ));
+        }
+    }
+    let position = position.unwrap_or_default();
+    let transform = transform.unwrap_or_default();
+    CssPoint::new(position.x + transform.x, position.y + transform.y)
+}
+
+fn css_animation_progress(animation: &CssPaintAnimation, elapsed_seconds: f32) -> Option<f32> {
+    if animation.duration_seconds <= 0.0 {
+        return None;
+    }
+    // A declaratively paused animation starts with a hold time of zero. Full
+    // script-driven playback state can later replace this clock without
+    // changing the retained paint contract.
+    let elapsed = if animation.running {
+        elapsed_seconds
+    } else {
+        0.0
+    };
+    let local = elapsed - animation.delay_seconds;
+    let fills_backwards = matches!(animation.fill_mode.as_str(), "backwards" | "both");
+    let fills_forwards = matches!(animation.fill_mode.as_str(), "forwards" | "both");
+    let (iteration, mut progress) = if local < 0.0 {
+        if !fills_backwards {
+            return None;
+        }
+        (0u64, 0.0)
+    } else if let Some(count) = animation.iteration_count {
+        if count <= 0.0 {
+            return None;
+        }
+        let total = animation.duration_seconds * count;
+        if local >= total {
+            if !fills_forwards {
+                return None;
+            }
+            let whole = count.floor();
+            let fraction = count - whole;
+            if fraction > 0.0 {
+                (whole as u64, fraction)
+            } else {
+                (whole.max(1.0) as u64 - 1, 1.0)
+            }
+        } else {
+            let overall = local / animation.duration_seconds;
+            (overall.floor() as u64, overall.fract())
+        }
+    } else {
+        let overall = local / animation.duration_seconds;
+        (overall.floor() as u64, overall.fract())
+    };
+    let reverse = match animation.direction.as_str() {
+        "reverse" => true,
+        "alternate" => iteration % 2 == 1,
+        "alternate-reverse" => iteration % 2 == 0,
+        _ => false,
+    };
+    if reverse {
+        progress = 1.0 - progress;
+    }
+    Some(progress.clamp(0.0, 1.0))
+}
+
+fn sample_css_animation_track(
+    track: &[CssAnimationPoint],
+    progress: f32,
+    timing_function: &str,
+) -> CssPoint {
+    let Some(first) = track.first() else {
+        return CssPoint::default();
+    };
+    if progress <= first.offset {
+        return first.value;
+    }
+    let Some(last) = track.last() else {
+        return first.value;
+    };
+    if progress >= last.offset {
+        return last.value;
+    }
+    let Some(window) = track
+        .windows(2)
+        .find(|window| progress >= window[0].offset && progress <= window[1].offset)
+    else {
+        return last.value;
+    };
+    let span = (window[1].offset - window[0].offset).max(f32::EPSILON);
+    let t = css_timing_progress(timing_function, (progress - window[0].offset) / span);
+    CssPoint::new(
+        window[0].value.x + (window[1].value.x - window[0].value.x) * t,
+        window[0].value.y + (window[1].value.y - window[0].value.y) * t,
+    )
+}
+
+fn css_timing_progress(value: &str, x: f32) -> f32 {
+    let value = value.trim().to_ascii_lowercase();
+    if value == "linear" {
+        return x;
+    }
+    let control = match value.as_str() {
+        "ease" => Some((0.25, 0.1, 0.25, 1.0)),
+        "ease-in" => Some((0.42, 0.0, 1.0, 1.0)),
+        "ease-out" => Some((0.0, 0.0, 0.58, 1.0)),
+        "ease-in-out" => Some((0.42, 0.0, 0.58, 1.0)),
+        _ => value
+            .strip_prefix("cubic-bezier(")
+            .and_then(|body| body.strip_suffix(')'))
+            .and_then(|body| {
+                let values = body
+                    .split(',')
+                    .map(|part| part.trim().parse::<f32>().ok())
+                    .collect::<Option<Vec<_>>>()?;
+                (values.len() == 4
+                    && (0.0..=1.0).contains(&values[0])
+                    && (0.0..=1.0).contains(&values[2]))
+                .then_some((values[0], values[1], values[2], values[3]))
+            }),
+    };
+    let Some((x1, y1, x2, y2)) = control else {
+        return x;
+    };
+    // Invert the x component of the cubic Bézier monotonically. CSS Easing 1
+    // restricts x1/x2 to [0,1], so bounded bisection is deterministic.
+    let bezier = |t: f32, a: f32, b: f32| {
+        let mt = 1.0 - t;
+        3.0 * mt * mt * t * a + 3.0 * mt * t * t * b + t * t * t
+    };
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..16 {
+        let mid = (low + high) * 0.5;
+        if bezier(mid, x1, x2) < x {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    bezier((low + high) * 0.5, y1, y2).clamp(0.0, 1.0)
 }
 
 fn ordered_selection(selection: TextSelection) -> (TextPosition, TextPosition) {
@@ -2272,6 +2544,112 @@ mod tests {
     }
 
     #[test]
+    fn css_animation_tracks_sample_timing_direction_and_composition() {
+        let scope = CssAnimationScope {
+            animations: vec![
+                CssPaintAnimation {
+                    name: "fall".into(),
+                    duration_seconds: 10.0,
+                    delay_seconds: 0.0,
+                    iteration_count: None,
+                    direction: "normal".into(),
+                    fill_mode: "none".into(),
+                    timing_function: "linear".into(),
+                    running: true,
+                    position: vec![
+                        CssAnimationPoint {
+                            offset: 0.0,
+                            value: CssPoint::new(0.0, 0.0),
+                        },
+                        CssAnimationPoint {
+                            offset: 1.0,
+                            value: CssPoint::new(0.0, 660.0),
+                        },
+                    ],
+                    transform: Vec::new(),
+                },
+                CssPaintAnimation {
+                    name: "shake".into(),
+                    duration_seconds: 4.0,
+                    delay_seconds: 0.0,
+                    iteration_count: None,
+                    direction: "alternate".into(),
+                    fill_mode: "none".into(),
+                    timing_function: "linear".into(),
+                    running: true,
+                    position: Vec::new(),
+                    transform: vec![
+                        CssAnimationPoint {
+                            offset: 0.0,
+                            value: CssPoint::new(0.0, 0.0),
+                        },
+                        CssAnimationPoint {
+                            offset: 1.0,
+                            value: CssPoint::new(80.0, 0.0),
+                        },
+                    ],
+                },
+            ],
+        };
+        assert_eq!(
+            sample_css_animation_scope(&scope, 2.0),
+            CssPoint::new(40.0, 132.0)
+        );
+        // Second alternate iteration runs backwards: 5s is 75% directed
+        // progress, while the independent fall track is halfway through.
+        assert_eq!(
+            sample_css_animation_scope(&scope, 5.0),
+            CssPoint::new(60.0, 330.0)
+        );
+    }
+
+    #[test]
+    fn scene_samples_the_current_nested_scroll_offset_without_relayout() {
+        let viewport =
+            ViewportMetrics::from_physical(PhysicalSize::new(200, 120), ScaleFactor::default());
+        let mut page = PagePaint {
+            width: 200.0,
+            height: 300.0,
+            primitives: vec![
+                DisplayCommand::BeginScroll(7),
+                DisplayCommand::FillRect {
+                    rect: CssRect::new(0.0, 40.0, 20.0, 20.0),
+                    color: PaintColor::Accent,
+                },
+                DisplayCommand::EndScroll,
+            ],
+            scroll_containers: vec![ScrollContainer {
+                node: 7,
+                actor: Some(77),
+                viewport: CssRect::new(0.0, 0.0, 100.0, 50.0),
+                content: CssSize::new(100.0, 300.0),
+                offset: CssPoint::new(0.0, 24.0),
+                horizontal: false,
+                vertical: true,
+            }],
+            ..PagePaint::default()
+        };
+        let mut first = desktop_shell(viewport, &snapshot());
+        first.append_page(&page, CssPoint::default());
+        assert!(first.primitives.iter().any(|command| matches!(
+            command,
+            DisplayCommand::PushTransform(matrix) if matrix.0[5] == -24.0
+        )));
+
+        page.scroll_containers[0].offset.y = 80.0;
+        let mut second = desktop_shell(viewport, &snapshot());
+        second.append_page(&page, CssPoint::default());
+        assert!(second.primitives.iter().any(|command| matches!(
+            command,
+            DisplayCommand::PushTransform(matrix) if matrix.0[5] == -80.0
+        )));
+        assert!(!second.primitives.iter().any(|command| matches!(
+            command,
+            DisplayCommand::BeginScroll(_) | DisplayCommand::EndScroll
+        )));
+    }
+
+    #[test]
     fn raster_damage_quantizes_outward_at_device_scale() {
         let viewport =
             ViewportMetrics::from_physical(PhysicalSize::new(400, 240), ScaleFactor::new(2.0));
@@ -2470,6 +2848,7 @@ mod tests {
             node: 7,
             actor: Some(42),
             link: None,
+            cursor: None,
         }));
         page.primitives.push(DisplayCommand::PopTransform);
         page.primitives.push(DisplayCommand::PopClip);
@@ -2499,6 +2878,7 @@ mod tests {
             node: 7,
             actor: Some(42),
             link: None,
+            cursor: None,
         }));
         // A later-painted anonymous glyph/SVG box has geometry but no semantic
         // identity. The button remains the pointer target through that paint.
@@ -2507,6 +2887,7 @@ mod tests {
             node: crate::layout2::NO_NODE,
             actor: None,
             link: None,
+            cursor: None,
         }));
         scene.append_page(&page, CssPoint::default());
 

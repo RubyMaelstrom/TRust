@@ -13,10 +13,11 @@ use url::Url;
 use crate::core::{CssPoint, CssSize};
 use crate::dom::{Dom, NodeId, PseudoEl};
 use crate::render::{
-    Affine2d, BlendMode, CompositingLayer, CornerRadii, CssRect, DecorationStyle, DisplayCommand,
-    GradientStop, HitRegion, ImageFit, ImageHandle, ImageRequest, ImageSampling, LineCap,
-    PagePaint, PaintBrush, PaintColor, PaintLine, PaintShape, PathElement, ScrollContainer,
-    StickyConstraint, StrokeStyle, TextDecorationPaint, TopLayerEntry,
+    Affine2d, BlendMode, CompositingLayer, CornerRadii, CssAnimationPoint, CssAnimationScope,
+    CssPaintAnimation, CssRect, DecorationStyle, DisplayCommand, GradientStop, HitRegion, ImageFit,
+    ImageHandle, ImageRequest, ImageSampling, LineCap, PagePaint, PaintBrush, PaintColor,
+    PaintLine, PaintShape, PathElement, ScrollContainer, StickyConstraint, StrokeStyle,
+    TextDecorationPaint, TopLayerEntry,
 };
 
 use super::ImageSizes;
@@ -24,6 +25,7 @@ use super::NO_NODE;
 use super::Units;
 use super::flow::{Clip, Frag, FragKind, TopFrag};
 use super::style::{Outline, OutlineStyle, outline_of};
+use super::value::{Len, Vp};
 
 /// Computed-style source used by graphical box decoration. Generated boxes
 /// retain the originating element plus pseudo identity because they have no
@@ -122,8 +124,19 @@ impl<'a, 't> Builder<'a, 't> {
         this.collect_scroll_containers(root);
         this.collect_patch_boundaries(root);
         this.collect_sticky(root);
+        // Fixed-positioned fragments are retained outside the normal-flow
+        // fragment tree for compositing. CSS Position 3 changes their
+        // containing block and viewport attachment, but descendants still
+        // establish ordinary CSS Overflow scroll containers and interaction
+        // boundaries.
+        for fixed in fixed {
+            this.collect_scroll_containers(fixed);
+            this.collect_patch_boundaries(fixed);
+            this.collect_sticky(fixed);
+        }
         for top in top_layer {
             this.collect_scroll_containers(&top.fragment);
+            this.collect_patch_boundaries(&top.fragment);
             this.collect_sticky(&top.fragment);
         }
         this
@@ -218,17 +231,14 @@ impl<'a, 't> Builder<'a, 't> {
                     container.viewport,
                 )));
             self.commands
-                .push(DisplayCommand::PushTransform(Affine2d::translate(
-                    -container.offset.x,
-                    -container.offset.y,
-                )));
+                .push(DisplayCommand::BeginScroll(container.node));
         }
         chain.len()
     }
 
     fn pop_scroll_ancestors(&mut self, count: usize) {
         for _ in 0..count {
-            self.commands.push(DisplayCommand::PopTransform);
+            self.commands.push(DisplayCommand::EndScroll);
             self.commands.push(DisplayCommand::PopClip);
         }
     }
@@ -376,6 +386,7 @@ pub(super) fn paint<'t>(
             PaintShape::Rect(canvas),
             &mut builder,
             Some(canvas),
+            None,
         );
         background_color(dom, style_node).filter(|color| !color.is_transparent())
     } else {
@@ -450,6 +461,12 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
             .commands
             .push(DisplayCommand::BeginSticky(constraint.clone()));
     }
+    let animation = paint_animation_scope(fragment, builder);
+    if let Some(animation) = &animation {
+        builder
+            .commands
+            .push(DisplayCommand::BeginCssAnimation(animation.clone()));
+    }
     let transform = paint_transform(fragment, builder);
     // CSS Overflow 3 §3.1 requires hidden overflow to clip descendants,
     // while CSS Transforms 1 §2 paints a transformed element's layer in its
@@ -506,6 +523,9 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
     if context_clip {
         builder.pop_hard_clip();
     }
+    if animation.is_some() {
+        builder.commands.push(DisplayCommand::EndCssAnimation);
+    }
     if sticky.is_some() {
         builder.commands.push(DisplayCommand::EndSticky);
     }
@@ -518,6 +538,144 @@ fn build_sc(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
             lines: boundary_line_start..builder.lines.len(),
         });
     }
+}
+
+/// Resolve the CSS Animations keyframe values supported by the graphical
+/// display list into translation tracks. CSS Animations 1 §3 samples the
+/// animated value without relaying out the document; the stable fragment
+/// geometry therefore remains the underlying value and each point stores only
+/// its delta from that value. Percentages on `top` use the fixed-position
+/// containing block (CSS Positioned Layout 3 §3.5), while transform
+/// percentages use the element's own border box (CSS Transforms 1 §9).
+fn paint_animation_scope(
+    fragment: &Frag<'_>,
+    builder: &Builder<'_, '_>,
+) -> Option<CssAnimationScope> {
+    if fragment.node == NO_NODE || fragment.paint.pseudo.is_some() {
+        return None;
+    }
+    let definitions = builder.dom.css_animation_definitions(fragment.node);
+    if definitions.is_empty() {
+        return None;
+    }
+    let units = Units::of(builder.dom, fragment.node);
+    let viewport = Vp {
+        w: builder.viewport_w,
+        h: builder.viewport_h,
+    };
+    let underlying_top = builder
+        .dom
+        .computed_value_resolved(fragment.node, "top")
+        .as_deref()
+        .and_then(|value| Len::parse(value, units, viewport))
+        .and_then(|value| value.resolve(Some(builder.viewport_h)))
+        .unwrap_or(0.0);
+    let mut animations = Vec::new();
+    for definition in definitions {
+        let mut position = definition
+            .keyframes
+            .iter()
+            .filter_map(|frame| {
+                let value = frame
+                    .top
+                    .as_deref()
+                    .and_then(|value| Len::parse(value, units, viewport))
+                    .and_then(|value| value.resolve(Some(builder.viewport_h)))?;
+                Some(CssAnimationPoint {
+                    offset: frame.offset,
+                    value: CssPoint::new(0.0, value - underlying_top),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut transform = definition
+            .keyframes
+            .iter()
+            .filter_map(|frame| {
+                let value = animation_transform_translation(
+                    frame.transform.as_deref()?,
+                    fragment.w,
+                    fragment.h,
+                )?;
+                Some(CssAnimationPoint {
+                    offset: frame.offset,
+                    value,
+                })
+            })
+            .collect::<Vec<_>>();
+        complete_animation_track(&mut position);
+        complete_animation_track(&mut transform);
+        if position.is_empty() && transform.is_empty() {
+            continue;
+        }
+        animations.push(CssPaintAnimation {
+            name: definition.name,
+            duration_seconds: definition.duration_seconds,
+            delay_seconds: definition.delay_seconds,
+            iteration_count: definition.iteration_count,
+            direction: definition.direction,
+            fill_mode: definition.fill_mode,
+            timing_function: definition.timing_function,
+            running: definition.running,
+            position,
+            transform,
+        });
+    }
+    (!animations.is_empty()).then_some(CssAnimationScope { animations })
+}
+
+/// CSS Animations 1 §3.3 synthesizes missing 0%/100% values from the
+/// underlying style. The graphical subset represents that style as a zero
+/// delta, so adding endpoints here also makes interpolation well-defined.
+fn complete_animation_track(track: &mut Vec<CssAnimationPoint>) {
+    if track.is_empty() {
+        return;
+    }
+    track.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+    if track.first().is_some_and(|point| point.offset > 0.0) {
+        track.insert(
+            0,
+            CssAnimationPoint {
+                offset: 0.0,
+                value: CssPoint::default(),
+            },
+        );
+    }
+    if track.last().is_some_and(|point| point.offset < 1.0) {
+        track.push(CssAnimationPoint {
+            offset: 1.0,
+            value: CssPoint::default(),
+        });
+    }
+}
+
+fn animation_transform_translation(value: &str, width: f32, height: f32) -> Option<CssPoint> {
+    if value.trim().eq_ignore_ascii_case("none") {
+        return Some(CssPoint::default());
+    }
+    let mut result = CssPoint::default();
+    for (name, args) in transform_functions(value)? {
+        match name.as_str() {
+            "translate" => {
+                result.x += transform_length(args.first()?, width)?;
+                result.y += transform_length(args.get(1).map_or("0", String::as_str), height)?;
+            }
+            "translatex" => result.x += transform_length(args.first()?, width)?,
+            "translatey" => result.y += transform_length(args.first()?, height)?,
+            "translate3d" => {
+                result.x += transform_length(args.first()?, width)?;
+                result.y += transform_length(args.get(1)?, height)?;
+            }
+            "matrix" if args.len() == 6 => {
+                result.x += args.get(4)?.parse::<f32>().ok()?;
+                result.y += args.get(5)?.parse::<f32>().ok()?;
+            }
+            // A transform animation whose matrix component cannot yet be
+            // represented by a translation is left to the static underlying
+            // transform rather than being approximated incorrectly.
+            _ => return None,
+        }
+    }
+    Some(result)
 }
 
 enum PositionedChild<'f, 't> {
@@ -713,7 +871,8 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
         let is_canvas_body = builder
             .dom
             .document_element()
-            .is_some_and(|root| canvas_background_node(builder.dom, root) == fragment.node);
+            .is_some_and(|root| canvas_background_node(builder.dom, root) == fragment.node)
+            || nested_canvas_background_source(builder.dom, fragment.node) == Some(fragment.node);
         if !is_root && !is_canvas_body {
             if fragment.node != NO_NODE {
                 paint_native_control_surface(fragment, radii, builder);
@@ -728,6 +887,22 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
             }
             paint_background_images(fragment, shape.clone(), builder, None);
         }
+        // Each iframe owns a child navigable with its own document canvas.
+        // Paint that canvas below the child document, inside the iframe's
+        // scrollport, rather than on the nested BODY's finite CSS box. CSS
+        // Backgrounds 3 §2.11 makes the propagated root/body background cover
+        // the entire canvas; a `height:100%` body can therefore remain only
+        // one viewport tall while overflowing descendants extend the canvas.
+        // Keeping this underlay in the frame's scroll scope preserves ordinary
+        // `background-attachment: scroll` positioning as the viewport moves.
+        if fragment.node != NO_NODE
+            && matches!(
+                builder.dom.tag_name(fragment.node),
+                Some("iframe" | "frame")
+            )
+        {
+            paint_nested_document_canvas(fragment, builder);
+        }
         paint_borders(fragment, radii, builder);
         // Generated boxes participate in originating-element hit testing via
         // their painted descendants/ancestor region; NO_NODE is never a DOM
@@ -738,6 +913,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                 node: fragment.node,
                 actor: interaction_actor(builder.dom, fragment.node),
                 link: None,
+                cursor: cursor_value(builder.dom, fragment.node),
             }));
         }
     }
@@ -833,6 +1009,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                         node,
                         actor: interaction_actor(builder.dom, node),
                         link: piece.item.link.clone(),
+                        cursor: cursor_value(builder.dom, style_node),
                     }));
                 }
             } else if let Some(source) = piece
@@ -888,6 +1065,7 @@ fn paint_fragment(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
                         node,
                         actor: interaction_actor(builder.dom, node),
                         link: piece.item.link.clone(),
+                        cursor: cursor_value(builder.dom, style_node),
                     }));
                 }
             }
@@ -969,6 +1147,7 @@ fn paint_atomic_control_box(
             node,
             actor: interaction_actor(builder.dom, node),
             link,
+            cursor: cursor_value(builder.dom, node),
         }));
     }
     paint_outline_box(
@@ -1246,8 +1425,91 @@ fn paint_background_images(
     canvas: Option<CssRect>,
 ) {
     if let Some(style) = PaintStyle::of(fragment) {
-        paint_background_images_for_style(fragment, style, shape, builder, canvas);
+        paint_background_images_for_style(fragment, style, shape, builder, canvas, None);
     }
+}
+
+/// Return the root and propagated background source of a realized iframe
+/// document. The child document is retained below its iframe owner in TRust's
+/// arena, but it remains a distinct document/canvas for CSS painting.
+fn frame_canvas_background(dom: &Dom, frame: NodeId) -> Option<(NodeId, NodeId)> {
+    if !matches!(dom.tag_name(frame), Some("iframe" | "frame")) {
+        return None;
+    }
+    let root = dom
+        .children(frame)
+        .into_iter()
+        .find(|&child| dom.tag_name(child) == Some("html"))?;
+    Some((root, canvas_background_node(dom, root)))
+}
+
+/// If `node` is the BODY supplying a nested document's canvas background,
+/// return that source node. This suppresses the ordinary BODY-box paint after
+/// the same values have been propagated to the iframe canvas.
+fn nested_canvas_background_source(dom: &Dom, node: NodeId) -> Option<NodeId> {
+    if node == NO_NODE || dom.tag_name(node) != Some("body") {
+        return None;
+    }
+    let root = dom.parent_flat(node)?;
+    if dom.tag_name(root) != Some("html") {
+        return None;
+    }
+    let frame = dom.parent_flat(root)?;
+    let (document_root, source) = frame_canvas_background(dom, frame)?;
+    (document_root == root).then_some(source)
+}
+
+fn paint_nested_document_canvas(fragment: &Frag<'_>, builder: &mut Builder<'_, '_>) {
+    let Some((_root, style_node)) = frame_canvas_background(builder.dom, fragment.node) else {
+        return;
+    };
+    let Some(container) = builder
+        .scroll_containers
+        .iter()
+        .find(|container| container.node == fragment.node)
+        .cloned()
+    else {
+        return;
+    };
+
+    // The infinite CSS canvas only needs a finite retained representation out
+    // to this viewport's scrolling-area edges. At every legal scroll offset,
+    // that rectangle still completely covers the iframe scrollport.
+    let canvas = CssRect::new(
+        container.viewport.x,
+        container.viewport.y,
+        container.content.width.max(container.viewport.width),
+        container.content.height.max(container.viewport.height),
+    );
+    builder
+        .commands
+        .push(DisplayCommand::PushClip(PaintShape::Rect(
+            container.viewport,
+        )));
+    builder
+        .commands
+        .push(DisplayCommand::BeginScroll(container.node));
+    if let Some(color) = background_color(builder.dom, style_node)
+        && !color.is_transparent()
+    {
+        builder.commands.push(DisplayCommand::Fill {
+            shape: PaintShape::Rect(canvas),
+            brush: PaintBrush::Solid(color),
+        });
+    }
+    paint_background_images_for_style(
+        fragment,
+        PaintStyle::Element(style_node),
+        PaintShape::Rect(canvas),
+        builder,
+        Some(canvas),
+        // The nested root's box starts at its viewport origin and extends over
+        // the scrollable document. It is not the embedding iframe's border or
+        // padding box, whose geometry `fragment` otherwise describes.
+        Some(canvas),
+    );
+    builder.commands.push(DisplayCommand::EndScroll);
+    builder.commands.push(DisplayCommand::PopClip);
 }
 
 /// Return the element whose computed background is propagated to the canvas.
@@ -1281,6 +1543,7 @@ fn paint_background_images_for_style(
     shape: PaintShape,
     builder: &mut Builder<'_, '_>,
     canvas: Option<CssRect>,
+    positioning_override: Option<CssRect>,
 ) {
     let Some(value) = style.value(builder.dom, "background-image") else {
         return;
@@ -1325,7 +1588,8 @@ fn paint_background_images_for_style(
             let source = resolve_image_source(builder.base, &url);
             let handle = builder.image(source.clone());
             let origin = layer_value(&origin_layers, index, "padding-box");
-            let positioning = background_box(origin, border_box, padding_box, content_box);
+            let positioning = positioning_override
+                .unwrap_or_else(|| background_box(origin, border_box, padding_box, content_box));
             let clip = canvas.unwrap_or_else(|| {
                 background_box(
                     layer_value(&clip_layers, index, "border-box"),
@@ -2107,6 +2371,13 @@ fn resolve_image_source(base: &Url, source: &str) -> String {
 
 fn background_color(dom: &Dom, node: NodeId) -> Option<PaintColor> {
     background_color_for_style(dom, PaintStyle::Element(node))
+}
+
+fn cursor_value(dom: &Dom, node: NodeId) -> Option<String> {
+    (node != NO_NODE)
+        .then(|| dom.computed_value_resolved(node, "cursor"))
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn background_color_for_style(dom: &Dom, style: PaintStyle) -> Option<PaintColor> {

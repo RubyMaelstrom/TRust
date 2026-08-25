@@ -398,6 +398,10 @@ enum CoreEvent {
         generation: u64,
         event: crate::js::PageEvt,
     },
+    DeclarativeRefresh {
+        generation: u64,
+        url: url::Url,
+    },
 }
 
 enum InteractiveFetch {
@@ -452,6 +456,7 @@ pub struct BrowserController {
     forward: Vec<HistoryEntry>,
     pending: Option<PendingNavigation>,
     task: Option<JoinHandle<()>>,
+    declarative_refresh_task: Option<JoinHandle<()>>,
     live_task: Option<JoinHandle<()>>,
     live_page: Option<crate::js::PageHandle>,
     pending_live_submit: Option<(crate::doc::Form, Option<usize>)>,
@@ -487,6 +492,7 @@ impl BrowserController {
             forward: Vec::new(),
             pending: None,
             task: None,
+            declarative_refresh_task: None,
             live_task: None,
             live_page: None,
             pending_live_submit: None,
@@ -646,6 +652,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        self.abort_declarative_refresh();
         self.drop_live_page();
         self.external_address = None;
         self.generation = self.generation.wrapping_add(1);
@@ -670,6 +677,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        self.abort_declarative_refresh();
         self.drop_live_page();
         self.pending = None;
         if let Some(old) = self.current.take() {
@@ -882,6 +890,13 @@ impl BrowserController {
                         changed |= self.handle_page_event(event);
                     }
                 }
+                CoreEvent::DeclarativeRefresh { generation, url } => {
+                    if generation == self.document_generation {
+                        self.declarative_refresh_task = None;
+                        self.begin_fetch(Link::Http(url), false, NavigationIntent::Replace);
+                        changed = true;
+                    }
+                }
             }
         }
         ActionOutcome {
@@ -957,6 +972,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        self.abort_declarative_refresh();
         self.drop_live_page();
         self.external_address = None;
         self.generation = self.generation.wrapping_add(1);
@@ -1002,6 +1018,7 @@ impl BrowserController {
     }
 
     fn delegate_external_media(&mut self, url: url::Url) {
+        self.abort_declarative_refresh();
         if self.pending.take().is_some() {
             if let Some(task) = self.task.take() {
                 task.abort();
@@ -1031,9 +1048,11 @@ impl BrowserController {
         self.task = None;
         match result {
             Ok(mut document) => {
-                let live = match &mut document {
-                    FetchedDocument::Http(response) => response.live.take(),
-                    _ => None,
+                let (live, declarative_refresh) = match &mut document {
+                    FetchedDocument::Http(response) => {
+                        (response.live.take(), response.declarative_refresh.take())
+                    }
+                    _ => (None, None),
                 };
                 let initial_rendered = match &document {
                     FetchedDocument::Http(response) => response.rendered.as_deref().cloned(),
@@ -1083,6 +1102,9 @@ impl BrowserController {
                         self.device_pixel_ratio,
                     ));
                 }
+                if let Some(refresh) = declarative_refresh {
+                    self.schedule_declarative_refresh(generation, refresh);
+                }
             }
             Err(error) => {
                 self.status = format!("{} — {error}", pending.target);
@@ -1094,19 +1116,48 @@ impl BrowserController {
     fn stop(&mut self) -> bool {
         let pending = self.pending.take();
         let had_live_page = self.live_page.is_some() || self.live_task.is_some();
-        if pending.is_none() && !had_live_page {
+        let had_refresh = self.declarative_refresh_task.is_some();
+        if pending.is_none() && !had_live_page && !had_refresh {
             return false;
         }
         if let Some(task) = self.task.take() {
             task.abort();
         }
         self.drop_live_page();
+        self.abort_declarative_refresh();
         self.generation = self.generation.wrapping_add(1);
         self.status = pending.map_or_else(
             || String::from("Stopped — page scripts killed."),
             |pending| format!("Stopped loading {} — page scripts killed.", pending.target),
         );
         true
+    }
+
+    fn abort_declarative_refresh(&mut self) {
+        if let Some(task) = self.declarative_refresh_task.take() {
+            task.abort();
+        }
+    }
+
+    /// HTML Living Standard, declarative refresh: after the document commits,
+    /// wait for the parsed directive and navigate its navigable with history
+    /// replacement. The generation rejects a retired document's timer.
+    fn schedule_declarative_refresh(&mut self, generation: u64, refresh: http::DeclarativeRefresh) {
+        self.abort_declarative_refresh();
+        let tx = self.tx.clone();
+        let invalidation = self.invalidation.clone();
+        self.declarative_refresh_task = Some(self.runtime.spawn(async move {
+            tokio::time::sleep(refresh.delay).await;
+            if tx
+                .send(CoreEvent::DeclarativeRefresh {
+                    generation,
+                    url: refresh.url,
+                })
+                .is_ok()
+            {
+                invalidation.request_redraw();
+            }
+        }));
     }
 
     fn send_live(&self, command: crate::js::PageCmd) -> bool {
@@ -1335,6 +1386,7 @@ impl BrowserController {
         if let Some(task) = self.task.take() {
             task.abort();
         }
+        self.abort_declarative_refresh();
         self.drop_live_page();
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
@@ -1689,6 +1741,57 @@ mod tests {
         assert!(!browser.handle_page_event(crate::js::PageEvt::Settled));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn declarative_refresh_replaces_the_committed_history_entry() {
+        let mut browser = BrowserController::new(
+            tokio::runtime::Handle::current(),
+            || {},
+            CssSize::new(640.0, 480.0),
+        );
+        let source = url::Url::parse("https://source.example/").unwrap();
+        let destination = url::Url::parse("https://destination.example/").unwrap();
+        browser.generation = 1;
+        browser.pending = Some(PendingNavigation {
+            generation: 1,
+            target: Link::Http(source.clone()),
+            fallback_http: false,
+            intent: NavigationIntent::New,
+        });
+        assert!(browser.finish_fetch(
+            1,
+            Ok(FetchedDocument::Http(Box::new(crate::http::Response {
+                url: source,
+                status: 200,
+                content_type: String::from("text/html"),
+                headers: Vec::new(),
+                body: b"<p>redirecting</p>".to_vec(),
+                rendered: None,
+                js: None,
+                blobs: None,
+                live: None,
+                declarative_refresh: Some(crate::http::DeclarativeRefresh {
+                    delay: std::time::Duration::ZERO,
+                    url: destination.clone(),
+                }),
+                challenge: None,
+                from_post: false,
+            })))
+        ));
+
+        browser
+            .declarative_refresh_task
+            .take()
+            .expect("refresh timer installed")
+            .await
+            .unwrap();
+        assert!(browser.process_async_events().invalidated);
+        let pending = browser.pending.as_ref().expect("refresh starts navigation");
+        assert_eq!(pending.target, Link::Http(destination));
+        assert_eq!(pending.intent, NavigationIntent::Replace);
+        assert!(browser.back.is_empty(), "the source is not added twice");
+        browser.task.take().unwrap().abort();
+    }
+
     #[test]
     fn image_size_delivery_reports_a_full_page_queue_for_retry() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1735,6 +1838,7 @@ mod tests {
                 js: None,
                 blobs: None,
                 live: None,
+                declarative_refresh: None,
                 challenge: None,
                 from_post: false,
             })),

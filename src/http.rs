@@ -120,6 +120,10 @@ pub struct Response {
     /// The living page behind this response, when its JS left
     /// something to interact with.
     pub live: Option<LivePage>,
+    /// The first successfully processed HTTP/HTML declarative refresh.
+    /// Frontends arm this only after committing the completely loaded
+    /// document, then navigate with replacement history handling.
+    pub declarative_refresh: Option<DeclarativeRefresh>,
     /// Set when response headers identify a bot-mitigation challenge (AWS WAF,
     /// Cloudflare, …), with a short human-readable label such as
     /// `"AWS WAF (challenge)"`. This is metadata for the status line only: the
@@ -132,6 +136,14 @@ pub struct Response {
     /// can't be refetched honestly (a re-POST double-submits), so its doc
     /// is never evicted from the trail.
     pub from_post: bool,
+}
+
+/// A parsed HTML/HTTP declarative refresh. WHATWG HTML's shared declarative
+/// refresh steps use whole seconds and replacement history handling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclarativeRefresh {
+    pub delay: Duration,
+    pub url: Url,
 }
 #[derive(Debug)]
 pub struct RenderedPage {
@@ -1180,6 +1192,7 @@ fn finish_response(
             js: None,
             blobs: None,
             live: None,
+            declarative_refresh: None,
             challenge: None,
             from_post: false,
         });
@@ -1204,6 +1217,7 @@ fn finish_response(
         js: None,
         blobs: None,
         live: None,
+        declarative_refresh: None,
         challenge: detect_challenge(&headers),
         from_post: false,
     })
@@ -1802,6 +1816,9 @@ pub async fn execute_js_for_device(
         return response;
     }
     let html = decode_body(&response.content_type, &response.body);
+    if response.declarative_refresh.is_none() {
+        response.declarative_refresh = detect_declarative_refresh(&response, &html);
+    }
     // Keep the cheap CSS-only path for inert documents, but do not classify a
     // script-less document that uses `:hover` as inert. Selectors 4 §9.1
     // requires that user-action pseudo-class to track the pointing device even
@@ -2743,7 +2760,7 @@ pub async fn css_only(response: Response, viewport: (u16, u16), cell_px: (u16, u
 }
 
 async fn css_only_for_device(
-    response: Response,
+    mut response: Response,
     viewport: (u16, u16),
     cell_px: (u16, u16),
     device_pixel_ratio: f32,
@@ -2759,6 +2776,9 @@ async fn css_only_for_device(
         return response;
     }
     let html = decode_body(&response.content_type, &response.body);
+    if response.declarative_refresh.is_none() {
+        response.declarative_refresh = detect_declarative_refresh(&response, &html);
+    }
     let sheets = fetch_page_sheets(&html, &response.url).await;
     css_only_with_sheets(response, viewport, cell_px, device_pixel_ratio, sheets).await
 }
@@ -2824,6 +2844,151 @@ const MAX_FRAME_LOADS: usize = 32;
 
 fn strip_fragment(u: &str) -> &str {
     u.split('#').next().unwrap_or(u)
+}
+
+/// Parse WHATWG HTML's shared declarative-refresh `input` grammar. The URL is
+/// left unresolved because an HTTP `Refresh` header uses the response URL as
+/// its base, while a `<meta http-equiv=refresh>` uses the document base URL.
+fn parse_declarative_refresh_input(input: &str) -> Option<(Duration, Option<String>)> {
+    let bytes = input.as_bytes();
+    let mut position = 0usize;
+    while bytes.get(position).is_some_and(u8::is_ascii_whitespace) {
+        position += 1;
+    }
+
+    let digits_start = position;
+    let mut seconds = 0u64;
+    while let Some(digit) = bytes.get(position).filter(|byte| byte.is_ascii_digit()) {
+        seconds = seconds
+            .saturating_mul(10)
+            .saturating_add(u64::from(*digit - b'0'));
+        position += 1;
+    }
+    if position == digits_start && bytes.get(position) != Some(&b'.') {
+        return None;
+    }
+    while bytes
+        .get(position)
+        .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'.')
+    {
+        position += 1;
+    }
+
+    if position == bytes.len() {
+        return Some((Duration::from_secs(seconds), None));
+    }
+    if !bytes
+        .get(position)
+        .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(*byte, b';' | b','))
+    {
+        return None;
+    }
+    while bytes.get(position).is_some_and(u8::is_ascii_whitespace) {
+        position += 1;
+    }
+    if bytes
+        .get(position)
+        .is_some_and(|byte| matches!(*byte, b';' | b','))
+    {
+        position += 1;
+    }
+    while bytes.get(position).is_some_and(u8::is_ascii_whitespace) {
+        position += 1;
+    }
+    if position == bytes.len() {
+        return Some((Duration::from_secs(seconds), None));
+    }
+
+    // `URL` is stripped only when the complete ASCII-case-insensitive token,
+    // optional whitespace, and `=` are present. A partial token is parsed as
+    // part of the URL, matching the specification's labeled jumps.
+    let original = position;
+    let mut after_url = position;
+    let has_url_token = bytes
+        .get(after_url..after_url.saturating_add(3))
+        .is_some_and(|token| token.eq_ignore_ascii_case(b"url"));
+    if has_url_token {
+        after_url += 3;
+        while bytes.get(after_url).is_some_and(u8::is_ascii_whitespace) {
+            after_url += 1;
+        }
+        if bytes.get(after_url) == Some(&b'=') {
+            position = after_url + 1;
+            while bytes.get(position).is_some_and(u8::is_ascii_whitespace) {
+                position += 1;
+            }
+        } else {
+            position = original;
+        }
+    }
+
+    let quote = bytes
+        .get(position)
+        .copied()
+        .filter(|byte| matches!(*byte, b'\'' | b'"'));
+    if quote.is_some() {
+        position += 1;
+    }
+    let end = quote
+        .and_then(|quote| {
+            bytes[position..]
+                .iter()
+                .position(|byte| *byte == quote)
+                .map(|offset| position + offset)
+        })
+        .unwrap_or(bytes.len());
+    Some((
+        Duration::from_secs(seconds),
+        Some(input[position..end].to_string()),
+    ))
+}
+
+/// Process the first successful `Refresh` header or `<meta http-equiv>`
+/// directive using WHATWG HTML §4.2.5's shared declarative refresh steps.
+/// Header processing precedes parser-inserted metadata; once one succeeds the
+/// document's `will declaratively refresh` flag prevents later directives.
+fn detect_declarative_refresh(response: &Response, html: &str) -> Option<DeclarativeRefresh> {
+    let resolve = |delay: Duration, target: Option<String>, base: &Url| {
+        let url = match target {
+            Some(target) => base.join(&target).ok()?,
+            None => response.url.clone(),
+        };
+        (url.scheme() != "javascript").then_some(DeclarativeRefresh { delay, url })
+    };
+
+    for (name, value) in &response.headers {
+        if name.eq_ignore_ascii_case("refresh")
+            && let Some((delay, target)) = parse_declarative_refresh_input(value)
+            && let Some(refresh) = resolve(delay, target, &response.url)
+        {
+            return Some(refresh);
+        }
+    }
+
+    let lower = html.to_ascii_lowercase();
+    if !lower.contains("http-equiv") || !lower.contains("refresh") {
+        return None;
+    }
+    let dom = crate::dom::Dom::parse_document(html);
+    let base = base_with_doc_base(html, &response.url);
+    for node in dom.descendants(crate::dom::DOCUMENT) {
+        if dom.tag_name(node) != Some("meta")
+            || !dom
+                .attr(node, "http-equiv")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("refresh"))
+        {
+            continue;
+        }
+        let Some(content) = dom.attr(node, "content").filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        if let Some((delay, target)) = parse_declarative_refresh_input(content)
+            && let Some(refresh) = resolve(delay, target, &base)
+        {
+            return Some(refresh);
+        }
+    }
+    None
 }
 
 /// The base URL for resolving a document's `src`/`href`: the document URL,
@@ -3725,7 +3890,7 @@ pub(crate) fn collect_image_urls(
     // before the first paint rather than waiting for a later display-list
     // rebuild (CSS Backgrounds 3 §§2.1, 2.3).
     for id in dom.flat_descendants(crate::dom::DOCUMENT) {
-        for property in ["background-image", "list-style-image"] {
+        for property in ["background-image", "list-style-image", "cursor"] {
             let Some(value) = dom.computed_value_resolved(id, property) else {
                 continue;
             };
@@ -4202,6 +4367,116 @@ fn field_from_arena(dom: &crate::dom::Dom, id: usize, tag: &str) -> Option<Field
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refresh_response(url: &str, html: &str) -> Response {
+        Response {
+            url: Url::parse(url).unwrap(),
+            status: 200,
+            content_type: String::from("text/html"),
+            headers: Vec::new(),
+            body: html.as_bytes().to_vec(),
+            rendered: None,
+            js: None,
+            blobs: None,
+            live: None,
+            declarative_refresh: None,
+            challenge: None,
+            from_post: false,
+        }
+    }
+
+    #[test]
+    fn declarative_refresh_parser_follows_the_html_algorithm() {
+        assert_eq!(
+            parse_declarative_refresh_input(" 12.75 ; URL = '/next?q=1' trailing"),
+            Some((Duration::from_secs(12), Some(String::from("/next?q=1"))))
+        );
+        assert_eq!(
+            parse_declarative_refresh_input(".5,relative.html"),
+            Some((Duration::ZERO, Some(String::from("relative.html"))))
+        );
+        assert_eq!(
+            parse_declarative_refresh_input("3"),
+            Some((Duration::from_secs(3), None))
+        );
+        assert!(parse_declarative_refresh_input("soon; url=/no").is_none());
+        assert!(parse_declarative_refresh_input("1x; url=/no").is_none());
+    }
+
+    #[test]
+    fn callies_zero_second_meta_refresh_becomes_replacement_navigation() {
+        let response = refresh_response(
+            "https://callieswebgarden.neocities.org/",
+            r#"<head><base href="/garden/"><meta http-equiv="refresh"
+                 content="0; url=http://callie.garden"></head><body></body>"#,
+        );
+        assert_eq!(
+            detect_declarative_refresh(
+                &response,
+                &String::from_utf8_lossy(response.body.as_slice())
+            ),
+            Some(DeclarativeRefresh {
+                delay: Duration::ZERO,
+                url: Url::parse("http://callie.garden/").unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn first_successful_refresh_wins_and_relative_meta_uses_document_base() {
+        let response = refresh_response(
+            "https://example.test/root/index.html",
+            r#"<head><base href="/section/">
+                <meta http-equiv=refresh content="invalid">
+                <meta http-equiv=REFRESH content="5; URL=next.html">
+                <meta http-equiv=refresh content="0; URL=/too-late">
+               </head>"#,
+        );
+        assert_eq!(
+            detect_declarative_refresh(
+                &response,
+                &String::from_utf8_lossy(response.body.as_slice())
+            ),
+            Some(DeclarativeRefresh {
+                delay: Duration::from_secs(5),
+                url: Url::parse("https://example.test/section/next.html").unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn refresh_header_precedes_meta_and_javascript_targets_are_rejected() {
+        let mut response = refresh_response(
+            "https://example.test/index.html",
+            r#"<meta http-equiv=refresh content="1; URL=/meta">"#,
+        );
+        response
+            .headers
+            .push((String::from("refresh"), String::from("7; /header")));
+        assert_eq!(
+            detect_declarative_refresh(
+                &response,
+                &String::from_utf8_lossy(response.body.as_slice())
+            ),
+            Some(DeclarativeRefresh {
+                delay: Duration::from_secs(7),
+                url: Url::parse("https://example.test/header").unwrap(),
+            })
+        );
+
+        response.headers[0].1 = String::from("0; URL=javascript:alert(1)");
+        assert_eq!(
+            detect_declarative_refresh(
+                &response,
+                &String::from_utf8_lossy(response.body.as_slice())
+            ),
+            Some(DeclarativeRefresh {
+                delay: Duration::from_secs(1),
+                url: Url::parse("https://example.test/meta").unwrap(),
+            }),
+            "an invalid header does not set will-declaratively-refresh"
+        );
+    }
 
     #[test]
     fn css_imports_are_found_in_order_and_urls_use_sheet_base() {
@@ -5439,6 +5714,7 @@ mod tests {
             js: None,
             blobs: None,
             live: None,
+            declarative_refresh: None,
             challenge: None,
             from_post: false,
         };

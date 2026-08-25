@@ -101,6 +101,9 @@ impl GraphicalAnimation {
 pub struct DecodedGraphicalImage {
     pub image: crate::render::ImageResource,
     pub animation: Option<GraphicalAnimation>,
+    /// Natural hotspot carried by a Windows CUR directory entry. CSS UI 4
+    /// uses it when `cursor: url(...)` omits explicit hotspot coordinates.
+    pub cursor_hotspot: Option<(u16, u16)>,
 }
 
 pub struct GraphicalAnimationFrame {
@@ -329,6 +332,9 @@ pub fn info(bytes: &[u8]) -> Result<ImageInfo, String> {
 /// Viewer and inline-image callers should prefer encode_bytes so SVG is
 /// rasterized at the actual terminal box instead of this intrinsic fallback.
 pub fn decode(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
+    if cur_hotspot(bytes).is_some() {
+        return decode_cur(bytes);
+    }
     if image::guess_format(bytes).is_ok() {
         return decode_raster(bytes);
     }
@@ -388,6 +394,7 @@ pub fn decode_graphical_image_for_source(
     bytes: Vec<u8>,
 ) -> Result<DecodedGraphicalImage, String> {
     let bytes: Arc<[u8]> = Arc::from(bytes);
+    let cursor_hotspot = cur_hotspot(&bytes);
     let animated_format = image::guess_format(&bytes)
         .ok()
         .and_then(animated_raster_format);
@@ -422,6 +429,7 @@ pub fn decode_graphical_image_for_source(
             return Ok(DecodedGraphicalImage {
                 image: first.image,
                 animation,
+                cursor_hotspot,
             });
         }
     }
@@ -430,6 +438,7 @@ pub fn decode_graphical_image_for_source(
     Ok(DecodedGraphicalImage {
         image,
         animation: None,
+        cursor_hotspot,
     })
 }
 
@@ -637,7 +646,7 @@ fn animation_decoder(
             })
         }
         AnimatedRasterFormat::WebP => {
-            let decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes))
+            let mut decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes))
                 .map_err(|error| format!("WebP animation header: {error}"))?;
             let (width, height) = decoder.dimensions();
             if width > MAX_DIMENSION || height > MAX_DIMENSION {
@@ -645,6 +654,16 @@ fn animation_decoder(
                     "image dimensions {width}x{height} exceed {MAX_DIMENSION}px cap"
                 ));
             }
+            // WebP Container Specification, “Canvas Assembly from Frames”:
+            // each loop begins with the ANIM background *or an
+            // application-defined color*, and a disposal method of 1 fills
+            // the previous frame rectangle with that same color. HTML image
+            // resources use a transparent canvas, so make transparent black
+            // explicit; leaving the decoder's optional background unset turns
+            // disposal into a no-op and accumulates subframes as ghost trails.
+            decoder
+                .set_background_color(image::Rgba([0, 0, 0, 0]))
+                .map_err(|error| format!("WebP animation background: {error}"))?;
             let loop_count = animation_loop_count(decoder.loop_count());
             Ok(GraphicalAnimationDecoder {
                 frames: decoder.into_frames(),
@@ -652,6 +671,33 @@ fn animation_decoder(
             })
         }
     }
+}
+
+fn cur_hotspot(bytes: &[u8]) -> Option<(u16, u16)> {
+    (bytes.len() >= 14 && bytes[..4] == [0, 0, 2, 0] && bytes[4..6] != [0, 0]).then(|| {
+        (
+            u16::from_le_bytes([bytes[10], bytes[11]]),
+            u16::from_le_bytes([bytes[12], bytes[13]]),
+        )
+    })
+}
+
+fn decode_cur(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
+    // ICO and CUR share the same directory/image representation; CUR replaces
+    // the planes/bit-depth fields with hotspot coordinates. `image`'s bounded
+    // ICO decoder intentionally accepts both directory variants but its magic
+    // sniffer only recognizes ICO, so select it explicitly here.
+    let decoder = image::codecs::ico::IcoDecoder::new(std::io::Cursor::new(bytes))
+        .map_err(|error| format!("cursor header: {error}"))?;
+    let (width, height) = decoder.dimensions();
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(format!(
+            "image dimensions {width}x{height} exceed {MAX_DIMENSION}px cap"
+        ));
+    }
+    DynamicImage::from_decoder(decoder)
+        .map(|image| (image, "image/x-icon"))
+        .map_err(|error| format!("cursor decode: {error}"))
 }
 
 fn decode_raster(bytes: &[u8]) -> Result<(DynamicImage, &'static str), String> {
@@ -1828,6 +1874,32 @@ mod tests {
         assert_eq!(&first.image.rgba[..4], &[255, 0, 0, 255]);
         assert!(second.image.rgba[2] > 250 && second.image.rgba[0] < 5);
         assert!(frames.next_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn cur_cursor_decodes_pixels_and_retains_directory_hotspot() {
+        let png = {
+            let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([20, 40, 60, 255]));
+            let mut bytes = Vec::new();
+            DynamicImage::ImageRgba8(image)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .unwrap();
+            bytes
+        };
+        let mut cur = vec![0, 0, 2, 0, 1, 0, 2, 2, 0, 0];
+        cur.extend_from_slice(&1u16.to_le_bytes());
+        cur.extend_from_slice(&1u16.to_le_bytes());
+        cur.extend_from_slice(&(png.len() as u32).to_le_bytes());
+        cur.extend_from_slice(&22u32.to_le_bytes());
+        cur.extend_from_slice(&png);
+
+        let decoded = decode_graphical_image_for_source("https://e.test/cursor.cur", cur).unwrap();
+        assert_eq!((decoded.image.width, decoded.image.height), (2, 2));
+        assert_eq!(decoded.cursor_hotspot, Some((1, 1)));
+        assert_eq!(&decoded.image.rgba[..4], &[20, 40, 60, 255]);
     }
 
     #[test]

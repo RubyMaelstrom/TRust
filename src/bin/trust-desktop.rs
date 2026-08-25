@@ -40,7 +40,7 @@ use winit::event_loop::{
     ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy, OwnedDisplayHandle,
 };
 use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
-use winit::window::{CursorIcon, Window, WindowId};
+use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 const PAGE_ACCESS_BASE: u64 = 10_000;
 const ACCESS_ROOT: AccessNodeId = AccessNodeId(0);
@@ -54,11 +54,17 @@ const MAX_ANIMATION_SOURCES: usize = 512;
 const MAX_ANIMATION_SOURCE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_ACTIVE_ANIMATIONS: usize = 128;
 const MAX_ACTIVE_ANIMATION_WORKING_BYTES: usize = 256 * 1024 * 1024;
+/// Explicit image-animation presentation ceiling. GIF89a permits zero-delay
+/// frames and delegates timing policy to the decoder; a 100 fps ceiling keeps
+/// hostile streams bounded while preserving all ordinarily authored motion.
+const MAX_IMAGE_ANIMATION_FPS: u32 = 100;
 /// GIF permits a zero delay, APNG allows viewers to impose a reasonable lower
 /// bound, and WebP explicitly makes zero/very-short duration handling an
 /// implementation choice. Ten milliseconds preserves 100 fps content while
 /// preventing a malformed zero-delay stream from becoming an idle spin.
-const MIN_ANIMATION_FRAME_DELAY: Duration = Duration::from_millis(10);
+const MIN_ANIMATION_FRAME_DELAY: Duration =
+    Duration::from_millis(1_000 / MAX_IMAGE_ANIMATION_FPS as u64);
+const CSS_ANIMATION_FRAME_DELAY: Duration = Duration::from_nanos(16_666_667);
 /// Preserve absolute frame deadlines (PNG 3 §11.3.6.2) but cap one overdue
 /// catch-up burst so an expensive/corrupt animation cannot monopolize the one
 /// shared worker and starve other visible images.
@@ -1102,6 +1108,10 @@ struct DesktopApp {
     pointer: CssPoint,
     pointer_inside: bool,
     cursor_icon: CursorIcon,
+    cursor_custom: Option<(ImageHandle, u16, u16)>,
+    cursor_visible: bool,
+    custom_cursors: HashMap<(ImageHandle, u16, u16), CustomCursor>,
+    cursor_hotspots: HashMap<ImageHandle, (u16, u16)>,
     modifiers: ModifiersState,
     focus: FocusTarget,
     /// The command-line URL starts only after the native window reports its
@@ -1134,6 +1144,8 @@ struct DesktopApp {
     window_focused: bool,
     hovered_actor: Option<usize>,
     hover_document_generation: u64,
+    css_animation_generation: u64,
+    css_animation_started: Instant,
     link_preview: String,
     selection: Option<TextSelection>,
     selecting: bool,
@@ -1217,6 +1229,187 @@ fn viewport_scroll_key_target(
     Some(target)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CssCursorFallback {
+    Automatic,
+    Hidden,
+    Icon(CursorIcon),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CssCursorImage {
+    source: String,
+    hotspot: Option<(u16, u16)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CssCursorSpec {
+    images: Vec<CssCursorImage>,
+    fallback: CssCursorFallback,
+}
+
+fn parse_css_cursor(value: &str) -> Option<CssCursorSpec> {
+    let parts = split_css_cursor_list(value);
+    let fallback = css_cursor_fallback(parts.last()?.trim())?;
+    let images = parts[..parts.len().saturating_sub(1)]
+        .iter()
+        .map(|part| parse_css_cursor_image(part))
+        .collect::<Option<Vec<_>>>()?;
+    Some(CssCursorSpec { images, fallback })
+}
+
+fn split_css_cursor_list(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut start = 0usize;
+    for (index, ch) in value.char_indices() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            ',' if depth == 0 => {
+                parts.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+fn parse_css_cursor_image(value: &str) -> Option<CssCursorImage> {
+    let value = value.trim();
+    let open = value.find('(')?;
+    if !value[..open].trim().eq_ignore_ascii_case("url") {
+        return None;
+    }
+    let close = value.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let source = value[open + 1..close]
+        .trim()
+        .trim_matches(['\'', '"'])
+        .to_string();
+    if source.is_empty() {
+        return None;
+    }
+    let coordinate_tokens = value[close + 1..].split_whitespace().collect::<Vec<_>>();
+    let hotspot = match coordinate_tokens.as_slice() {
+        [] => None,
+        [x, y] => {
+            let x = x.parse::<f32>().ok()?.round().clamp(0.0, u16::MAX as f32) as u16;
+            let y = y.parse::<f32>().ok()?.round().clamp(0.0, u16::MAX as f32) as u16;
+            Some((x, y))
+        }
+        _ => return None,
+    };
+    Some(CssCursorImage { source, hotspot })
+}
+
+fn css_cursor_fallback(value: &str) -> Option<CssCursorFallback> {
+    let icon = match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => return Some(CssCursorFallback::Automatic),
+        "none" => return Some(CssCursorFallback::Hidden),
+        "default" => CursorIcon::Default,
+        "context-menu" => CursorIcon::ContextMenu,
+        "help" => CursorIcon::Help,
+        "pointer" => CursorIcon::Pointer,
+        "progress" => CursorIcon::Progress,
+        "wait" => CursorIcon::Wait,
+        "cell" => CursorIcon::Cell,
+        "crosshair" => CursorIcon::Crosshair,
+        "text" => CursorIcon::Text,
+        "vertical-text" => CursorIcon::VerticalText,
+        "alias" => CursorIcon::Alias,
+        "copy" => CursorIcon::Copy,
+        "move" => CursorIcon::Move,
+        "no-drop" => CursorIcon::NoDrop,
+        "not-allowed" => CursorIcon::NotAllowed,
+        "grab" => CursorIcon::Grab,
+        "grabbing" => CursorIcon::Grabbing,
+        "e-resize" => CursorIcon::EResize,
+        "n-resize" => CursorIcon::NResize,
+        "ne-resize" => CursorIcon::NeResize,
+        "nw-resize" => CursorIcon::NwResize,
+        "s-resize" => CursorIcon::SResize,
+        "se-resize" => CursorIcon::SeResize,
+        "sw-resize" => CursorIcon::SwResize,
+        "w-resize" => CursorIcon::WResize,
+        "ew-resize" => CursorIcon::EwResize,
+        "ns-resize" => CursorIcon::NsResize,
+        "nesw-resize" => CursorIcon::NeswResize,
+        "nwse-resize" => CursorIcon::NwseResize,
+        "col-resize" => CursorIcon::ColResize,
+        "row-resize" => CursorIcon::RowResize,
+        "all-scroll" => CursorIcon::AllScroll,
+        "zoom-in" => CursorIcon::ZoomIn,
+        "zoom-out" => CursorIcon::ZoomOut,
+        _ => return None,
+    };
+    Some(CssCursorFallback::Icon(icon))
+}
+
+fn resolve_cursor_source(base: &url::Url, source: &str) -> Option<String> {
+    if source.starts_with("data:") || source.starts_with("blob:") {
+        Some(source.to_string())
+    } else {
+        base.join(source).ok().map(|url| url.to_string())
+    }
+}
+
+fn native_cursor_pixels(
+    image: &trust::render::ImageResource,
+    hotspot: (u16, u16),
+) -> Option<(Vec<u8>, u16, u16, u16, u16)> {
+    let (width, height) = (image.width, image.height);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let max = u32::from(winit::window::MAX_CURSOR_SIZE);
+    let scale = (max as f64 / width as f64)
+        .min(max as f64 / height as f64)
+        .min(1.0);
+    let out_width = ((width as f64 * scale).round() as u32).max(1);
+    let out_height = ((height as f64 * scale).round() as u32).max(1);
+    let rgba = if out_width == width && out_height == height {
+        image.rgba.to_vec()
+    } else {
+        let source = image::RgbaImage::from_raw(width, height, image.rgba.to_vec())?;
+        image::imageops::resize(
+            &source,
+            out_width,
+            out_height,
+            image::imageops::FilterType::Lanczos3,
+        )
+        .into_raw()
+    };
+    let hotspot_x = ((u32::from(hotspot.0).min(width - 1) as f64 * scale).round() as u32)
+        .min(out_width - 1) as u16;
+    let hotspot_y = ((u32::from(hotspot.1).min(height - 1) as f64 * scale).round() as u32)
+        .min(out_height - 1) as u16;
+    Some((
+        rgba,
+        out_width as u16,
+        out_height as u16,
+        hotspot_x,
+        hotspot_y,
+    ))
+}
+
 impl DesktopApp {
     fn new(
         browser: BrowserController,
@@ -1247,6 +1440,10 @@ impl DesktopApp {
             pointer: CssPoint::default(),
             pointer_inside: false,
             cursor_icon: CursorIcon::Default,
+            cursor_custom: None,
+            cursor_visible: true,
+            custom_cursors: HashMap::new(),
+            cursor_hotspots: HashMap::new(),
             modifiers: ModifiersState::empty(),
             focus: FocusTarget::default(),
             initial_navigation,
@@ -1273,6 +1470,8 @@ impl DesktopApp {
             window_focused: true,
             hovered_actor: None,
             hover_document_generation: 0,
+            css_animation_generation: 0,
+            css_animation_started: Instant::now(),
             link_preview: String::new(),
             selection: None,
             selecting: false,
@@ -1352,6 +1551,8 @@ impl DesktopApp {
         // full decoded gallery would pin its high-water after navigation.
         self.image_store.clear();
         self.image_sizes.clear();
+        self.custom_cursors.clear();
+        self.cursor_hotspots.clear();
         self.image_sizes_sent = 0;
         self.animation_sources.clear();
         self.active_animations.clear();
@@ -1489,21 +1690,41 @@ impl DesktopApp {
             || self.image_flush_scheduled
     }
 
-    fn schedule_chrome_tick(&mut self, glide: bool) {
+    fn schedule_chrome_tick(&mut self, fast: bool) {
         if self.chrome_tick_scheduled {
             return;
         }
         self.chrome_tick_scheduled = true;
         let proxy = self.event_proxy.clone();
         self.runtime.spawn(async move {
-            tokio::time::sleep(if glide {
-                Duration::from_millis(32)
+            tokio::time::sleep(if fast {
+                CSS_ANIMATION_FRAME_DELAY
             } else {
                 Duration::from_millis(120)
             })
             .await;
             let _ = proxy.send_event(DesktopEvent::ChromeTick);
         });
+    }
+
+    fn css_animations_active(&self) -> bool {
+        self.window_focused
+            && self
+                .page_layout
+                .as_ref()
+                .is_some_and(|page| page.layout.paint.has_css_animations())
+    }
+
+    fn css_animation_elapsed(&mut self) -> f32 {
+        if !self.css_animations_active() {
+            return 0.0;
+        }
+        let generation = self.browser.document_generation();
+        if self.css_animation_generation != generation {
+            self.css_animation_generation = generation;
+            self.css_animation_started = Instant::now();
+        }
+        self.css_animation_started.elapsed().as_secs_f32()
     }
 
     fn cancel_heart_glide(&mut self) {
@@ -2241,6 +2462,7 @@ impl DesktopApp {
                 self.request_redraw();
             }
         }
+        let css_animation_elapsed = self.css_animation_elapsed();
         if let Some(terminal) = &mut self.terminal {
             let line_mode = !terminal.char_mode();
             let terminal_viewport = CssSize::new(
@@ -2286,7 +2508,11 @@ impl DesktopApp {
                 });
             }
         } else if let Some(page) = &self.page_layout {
-            scene.append_page(&page.layout.paint, self.browser.interaction().scroll);
+            scene.append_page_at(
+                &page.layout.paint,
+                self.browser.interaction().scroll,
+                css_animation_elapsed,
+            );
         } else if let Some(page) = &self.protocol_page {
             scene.append_page(&page.layout.paint, self.browser.interaction().scroll);
         }
@@ -2364,8 +2590,9 @@ impl DesktopApp {
             };
             window.set_title(&title);
         }
-        if self.chrome_loading(&snapshot) || self.heart_glide.is_some() {
-            self.schedule_chrome_tick(self.heart_glide.is_some());
+        let css_animations_active = self.css_animations_active();
+        if self.chrome_loading(&snapshot) || self.heart_glide.is_some() || css_animations_active {
+            self.schedule_chrome_tick(self.heart_glide.is_some() || css_animations_active);
         }
         self.scene = Some(scene);
         // UI Events `mouseout`/`mouseover` target the element currently under
@@ -2380,7 +2607,7 @@ impl DesktopApp {
                 self.hover_document_generation = generation;
                 self.hovered_actor = None;
             }
-            self.pointer_moved(self.pointer);
+            self.pointer_moved(None, self.pointer);
         }
         self.update_accessibility(false);
         if trace {
@@ -2994,14 +3221,7 @@ impl DesktopApp {
                 }
                 (FocusTarget::Page, Key::Enter) if self.terminal.is_none() => {
                     if let Some(target) = self.keyboard_target.clone() {
-                        if let Some(link) = target.link {
-                            self.activate_link(link);
-                        } else if let Some(actor) = target.actor {
-                            self.dispatch(UserAction::Activate(Link::JsClick {
-                                node: actor,
-                                href: String::new(),
-                            }));
-                        }
+                        self.activate_page_hit(target);
                         return;
                     }
                 }
@@ -3824,6 +4044,16 @@ impl DesktopApp {
         }
     }
 
+    fn activate_page_hit(&mut self, target: PageHit) {
+        if let Some((form, field)) = self.form_target_for_hit(&target) {
+            self.activate_form_control(form, field);
+            return;
+        }
+        if let Some(activation) = page_hit_activation(&target, self.browser.page_is_live()) {
+            self.activate_link(activation);
+        }
+    }
+
     fn same_document_fragment(&self, target: &url::Url) -> bool {
         let Some(current) = self
             .browser
@@ -3863,7 +4093,94 @@ impl DesktopApp {
         }
     }
 
-    fn pointer_moved(&mut self, point: CssPoint) {
+    fn apply_cursor_icon(&mut self, icon: CursorIcon) {
+        let changed =
+            !self.cursor_visible || self.cursor_custom.is_some() || self.cursor_icon != icon;
+        self.cursor_visible = true;
+        self.cursor_custom = None;
+        self.cursor_icon = icon;
+        if changed && let Some(window) = &self.window {
+            window.set_cursor_visible(true);
+            window.set_cursor(icon);
+        }
+    }
+
+    fn apply_hidden_cursor(&mut self) {
+        if self.cursor_visible {
+            self.cursor_visible = false;
+            self.cursor_custom = None;
+            if let Some(window) = &self.window {
+                window.set_cursor_visible(false);
+            }
+        }
+    }
+
+    fn apply_pointer_cursor(
+        &mut self,
+        event_loop: Option<&ActiveEventLoop>,
+        authored: Option<&str>,
+        automatic: CursorIcon,
+    ) {
+        let Some(spec) = authored.and_then(parse_css_cursor) else {
+            self.apply_cursor_icon(automatic);
+            return;
+        };
+        let base = self
+            .page_layout
+            .as_ref()
+            .map(|page| page.document.base.clone());
+        if let Some(base) = base {
+            for candidate in &spec.images {
+                let Some(source) = resolve_cursor_source(&base, &candidate.source) else {
+                    continue;
+                };
+                let handle = ImageHandle::for_source(&source);
+                let Some(image) = self.image_store.get(handle) else {
+                    continue;
+                };
+                let hotspot = candidate.hotspot.unwrap_or_else(|| {
+                    self.cursor_hotspots.get(&handle).copied().unwrap_or((0, 0))
+                });
+                let Some((rgba, width, height, hotspot_x, hotspot_y)) =
+                    native_cursor_pixels(&image, hotspot)
+                else {
+                    continue;
+                };
+                let key = (handle, hotspot_x, hotspot_y);
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    self.custom_cursors.entry(key)
+                {
+                    let Some(event_loop) = event_loop else {
+                        continue;
+                    };
+                    let Ok(source) = winit::window::CustomCursor::from_rgba(
+                        rgba, width, height, hotspot_x, hotspot_y,
+                    ) else {
+                        continue;
+                    };
+                    entry.insert(event_loop.create_custom_cursor(source));
+                }
+                let changed = !self.cursor_visible || self.cursor_custom != Some(key);
+                self.cursor_visible = true;
+                self.cursor_custom = Some(key);
+                if changed
+                    && let (Some(window), Some(cursor)) =
+                        (&self.window, self.custom_cursors.get(&key))
+                {
+                    window.set_cursor_visible(true);
+                    window.set_cursor(cursor.clone());
+                }
+                return;
+            }
+        }
+        match spec.fallback {
+            CssCursorFallback::Automatic => self.apply_cursor_icon(automatic),
+            CssCursorFallback::Hidden => self.apply_hidden_cursor(),
+            CssCursorFallback::Icon(icon) => self.apply_cursor_icon(icon),
+        }
+    }
+
+    fn pointer_moved(&mut self, event_loop: Option<&ActiveEventLoop>, point: CssPoint) {
         self.pointer = point;
         let chrome_owned = self.heart_drag.is_some()
             || self
@@ -3877,12 +4194,7 @@ impl DesktopApp {
         let mut visual_changed = false;
         if self.heart_drag.is_some() {
             self.seek_heart_drag(point);
-            if self.cursor_icon != CursorIcon::Grabbing {
-                self.cursor_icon = CursorIcon::Grabbing;
-                if let Some(window) = &self.window {
-                    window.set_cursor(CursorIcon::Grabbing);
-                }
-            }
+            self.apply_cursor_icon(CursorIcon::Grabbing);
             return;
         }
         let heart_hover = self.scene.as_ref().and_then(|scene| {
@@ -3951,9 +4263,17 @@ impl DesktopApp {
                 _ => None,
             })
         });
-        if actor != self.hovered_actor {
+        let actor_changed = actor != self.hovered_actor;
+        if actor_changed {
             self.hovered_actor = actor;
             visual_changed = true;
+        }
+        // A native motion sample remains observable as pointermove/mousemove
+        // even when hit testing stays on the same element. Scene-commit
+        // re-hit-tests pass no ActiveEventLoop and only synthesize boundary
+        // transitions, so DOM movement under a stationary pointer does not
+        // manufacture a movement event.
+        if actor_changed || event_loop.is_some() {
             let viewport = self.scene.as_ref().map_or(point, |scene| {
                 CssPoint::new(
                     point.x - scene.content_viewport.x,
@@ -4012,12 +4332,11 @@ impl DesktopApp {
                 _ => CursorIcon::Default,
             }
         };
-        if cursor != self.cursor_icon {
-            self.cursor_icon = cursor;
-            if let Some(window) = &self.window {
-                window.set_cursor(cursor);
-            }
-        }
+        self.apply_pointer_cursor(
+            event_loop,
+            hit.as_ref().and_then(|hit| hit.cursor.as_deref()),
+            cursor,
+        );
         // Plain motion over the same semantic target only updates the core's
         // pointer coordinates and platform cursor. JS/DOM mutations wake us
         // through BrowserWake; there is no reason to rebuild and rasterize an
@@ -4081,16 +4400,7 @@ impl DesktopApp {
                                 click_target_for_hits(&pressed, &released, parents)
                             });
                     if let Some(target) = click_target {
-                        if let Some((form, field)) = self.form_target_for_hit(&target) {
-                            self.activate_form_control(form, field);
-                        } else if let Some(link) = target.link {
-                            self.activate_link(link);
-                        } else if let Some(actor) = target.actor {
-                            self.dispatch(UserAction::Activate(Link::JsClick {
-                                node: actor,
-                                href: String::new(),
-                            }));
-                        }
+                        self.activate_page_hit(target);
                     }
                 }
                 _ => {}
@@ -4163,10 +4473,7 @@ impl DesktopApp {
                 // natural extension of the same CSSOM View scroll operation.
                 self.seek_heart_drag(self.pointer);
             }
-            self.cursor_icon = CursorIcon::Grabbing;
-            if let Some(window) = &self.window {
-                window.set_cursor(CursorIcon::Grabbing);
-            }
+            self.apply_cursor_icon(CursorIcon::Grabbing);
             self.request_redraw();
             return;
         }
@@ -4391,14 +4698,7 @@ impl DesktopApp {
                     });
                     if let Some(target) = target {
                         if request.action == AccessAction::Click {
-                            if let Some(link) = target.link {
-                                self.activate_link(link);
-                            } else if let Some(actor) = target.actor {
-                                self.dispatch(UserAction::Activate(Link::JsClick {
-                                    node: actor,
-                                    href: String::new(),
-                                }));
-                            }
+                            self.activate_page_hit(target);
                         } else if matches!(
                             request.action,
                             AccessAction::Focus | AccessAction::ScrollIntoView
@@ -4519,7 +4819,10 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             DesktopEvent::ChromeTick => {
                 self.chrome_tick_scheduled = false;
                 let snapshot = self.browser.snapshot();
-                if self.chrome_loading(&snapshot) || self.heart_glide.is_some() {
+                if self.chrome_loading(&snapshot)
+                    || self.heart_glide.is_some()
+                    || self.css_animations_active()
+                {
                     self.request_redraw();
                 }
             }
@@ -4542,7 +4845,14 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 self.image_tasks.remove(&handle);
                 match result {
                     Ok(decoded) => {
-                        let trust::img::DecodedGraphicalImage { image, animation } = decoded;
+                        let trust::img::DecodedGraphicalImage {
+                            image,
+                            animation,
+                            cursor_hotspot,
+                        } = decoded;
+                        if let Some(hotspot) = cursor_hotspot {
+                            self.cursor_hotspots.insert(handle, hotspot);
+                        }
                         self.image_sizes.insert(source, (image.width, image.height));
                         let evicted = self.image_store.insert(handle, image);
                         self.handle_decoded_image_evictions(evicted);
@@ -4807,11 +5117,14 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
             WindowEvent::Ime(event) => self.handle_ime(event),
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer_inside = true;
-                self.pointer_moved(self.metrics.physical_to_css(position.x, position.y));
+                self.pointer_moved(
+                    Some(event_loop),
+                    self.metrics.physical_to_css(position.x, position.y),
+                );
             }
             WindowEvent::CursorEntered { .. } => {
                 self.pointer_inside = true;
-                self.pointer_moved(self.pointer);
+                self.pointer_moved(Some(event_loop), self.pointer);
             }
             WindowEvent::CursorLeft { .. } => {
                 self.pointer_inside = false;
@@ -4832,7 +5145,7 @@ impl ApplicationHandler<DesktopEvent> for DesktopApp {
                 let point = self
                     .metrics
                     .physical_to_css(touch.location.x, touch.location.y);
-                self.pointer_moved(point);
+                self.pointer_moved(Some(event_loop), point);
                 match touch.phase {
                     TouchPhase::Started => {
                         self.handle_pointer_button(ElementState::Pressed, MouseButton::Left)
@@ -5021,6 +5334,28 @@ fn same_page_target(left: &PageHit, right: &PageHit) -> bool {
     }
 }
 
+/// Choose the activation sent across the renderer/controller boundary.
+/// HTML links in a live document must first dispatch `click` in that document;
+/// only its uncancelled default action may choose a named navigable. The URL is
+/// retained solely as the dead-actor fallback used by the controller's
+/// navigation-priority lane.
+fn page_hit_activation(hit: &PageHit, page_live: bool) -> Option<Link> {
+    if page_live && let Some(node) = hit.actor {
+        let href = match hit.link.as_ref() {
+            Some(Link::JsClick { href, .. }) => href.clone(),
+            Some(Link::Form { .. }) | None => String::new(),
+            Some(link) => link.to_string(),
+        };
+        return Some(Link::JsClick { node, href });
+    }
+    hit.link.clone().or_else(|| {
+        hit.actor.map(|node| Link::JsClick {
+            node,
+            href: String::new(),
+        })
+    })
+}
+
 /// Pointer Events "click, auxclick, and contextmenu events" dispatch requires
 /// a click whose down/up targets differ to target their nearest common
 /// inclusive ancestor. SVG controls routinely paint the
@@ -5042,6 +5377,7 @@ fn click_target_for_hits(
                 link: (pressed.link == released.link)
                     .then(|| released.link.clone())
                     .flatten(),
+                cursor: released.cursor.clone(),
             })
         }
         (None, None) if pressed.link == released.link => {
@@ -5051,6 +5387,7 @@ fn click_target_for_hits(
                 node,
                 actor: None,
                 link: released.link.clone(),
+                cursor: released.cursor.clone(),
             })
         }
         _ => None,
@@ -5441,6 +5778,54 @@ mod tests {
     }
 
     #[test]
+    fn css_cursor_parser_keeps_order_hotspots_and_mandatory_fallback() {
+        let parsed =
+            parse_css_cursor("url('first.cur') 2 3, url(data:image/png;base64,AAAA), pointer")
+                .unwrap();
+        assert_eq!(
+            parsed.images,
+            vec![
+                CssCursorImage {
+                    source: "first.cur".into(),
+                    hotspot: Some((2, 3)),
+                },
+                CssCursorImage {
+                    source: "data:image/png;base64,AAAA".into(),
+                    hotspot: None,
+                },
+            ]
+        );
+        assert_eq!(
+            parsed.fallback,
+            CssCursorFallback::Icon(CursorIcon::Pointer)
+        );
+        assert!(parse_css_cursor("url(first.cur)").is_none());
+    }
+
+    #[test]
+    fn native_cursor_clamps_hotspot_to_the_decoded_bitmap() {
+        let image = ImageResource {
+            width: 2,
+            height: 2,
+            rgba: Arc::from(vec![255; 16]),
+            has_alpha: false,
+        };
+        let (rgba, width, height, x, y) = native_cursor_pixels(&image, (99, 80)).unwrap();
+        assert_eq!((width, height), (2, 2));
+        assert_eq!((x, y), (1, 1));
+        assert_eq!(rgba.len(), 16);
+    }
+
+    #[test]
+    fn image_animation_frame_rate_has_an_explicit_ceiling() {
+        assert_eq!(MAX_IMAGE_ANIMATION_FPS, 100);
+        assert_eq!(
+            animation_frame_delay(Duration::from_nanos(1)),
+            Duration::from_millis(10)
+        );
+    }
+
+    #[test]
     fn click_uses_common_ancestor_of_svg_graphics() {
         let parents = HashMap::from([
             (101usize, 10usize),
@@ -5453,6 +5838,7 @@ mod tests {
             node,
             actor: Some(node),
             link: None,
+            cursor: None,
         };
         let target = click_target_for_hits(&hit(101), &hit(102), &parents).unwrap();
         assert_eq!(target.node, 10);
@@ -5460,6 +5846,27 @@ mod tests {
 
         let exact = click_target_for_hits(&hit(101), &hit(101), &parents).unwrap();
         assert_eq!(exact.actor, Some(101));
+    }
+
+    #[test]
+    fn live_link_hit_dispatches_dom_activation_before_static_url_fallback() {
+        let target = PageHit {
+            rect: CssRect::new(0.0, 0.0, 20.0, 20.0),
+            node: 9,
+            actor: Some(42),
+            link: Some(Link::Http(
+                url::Url::parse("https://example.test/inside").unwrap(),
+            )),
+            cursor: None,
+        };
+        assert_eq!(
+            page_hit_activation(&target, true),
+            Some(Link::JsClick {
+                node: 42,
+                href: "https://example.test/inside".into(),
+            })
+        );
+        assert_eq!(page_hit_activation(&target, false), target.link);
     }
 
     #[test]

@@ -172,6 +172,7 @@ pub fn paint_doc_selected(
                 node: line_index + 1,
                 actor: None,
                 link: line.link.clone(),
+                cursor: None,
             }));
             line_width = line_width.max(rect.width);
             far_right = far_right.max(rect.x + rect.width + left);
