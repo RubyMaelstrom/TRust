@@ -2666,7 +2666,7 @@ fn arg_id(args: &[JsValue], i: usize) -> Option<usize> {
 /// modules — under 96 the graph never linked). Still a hard envelope
 /// against runaway pages; `subresource_allowed` separately blocks
 /// private-address pivots regardless of count. PROVISIONAL — her call.
-const MAX_PAGE_FETCHES: usize = 256;
+pub(crate) const MAX_PAGE_FETCHES: usize = 256;
 
 /// Most import specifiers we'll speculatively prefetch from one module's
 /// source. Bounds the wasted bandwidth of a false-positive scan; the
@@ -6683,7 +6683,7 @@ fn fetch_args(
 
 /// Parse a `name\nvalue\nname\nvalue` header blob into pairs (empty names
 /// dropped). The prelude joins headers this way; values hold no newlines.
-fn parse_header_blob(blob: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_header_blob(blob: &str) -> Vec<(String, String)> {
     if blob.is_empty() {
         return Vec::new();
     }
@@ -6735,7 +6735,7 @@ fn body_array_buffer(body: &[u8], ctx: &mut Context) -> JsValue {
 /// the compatibility path because dynamically loaded scripts and ordinary API
 /// responses still consume the array's text slot directly; the binary path
 /// uses the byte-exact ArrayBuffer and its lazy decoder instead.
-fn response_body_is_binary(content_type: &str) -> bool {
+pub(crate) fn response_body_is_binary(content_type: &str) -> bool {
     let essence = content_type
         .split(';')
         .next()
@@ -6781,7 +6781,7 @@ fn response_body_text(content_type: &str, body: &[u8]) -> JsValue {
 /// (`parse_header_blob` is its inverse); the prelude splits it back into the
 /// fetch `Response.headers` / XHR `getResponseHeader` map. Values never hold
 /// newlines (read_line strips them), but strip defensively anyway.
-fn headers_to_blob(headers: &[(String, String)]) -> String {
+pub(crate) fn headers_to_blob(headers: &[(String, String)]) -> String {
     let mut s = String::new();
     for (k, v) in headers {
         if k.is_empty() {

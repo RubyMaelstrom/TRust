@@ -9,8 +9,10 @@ use crate::dom::{AdoptError, DOCUMENT, Dom, NodeData, SelectorList};
 use lumen::bytecode::Tier;
 use lumen::embed::{Ctx, EvalError, NativeFn, Value};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DEFAULT_URL: &str = "https://example.com/";
@@ -26,6 +28,25 @@ type LumenGeomCache = (
     std::collections::HashMap<crate::dom::NodeId, crate::layout2::PxRect>,
 );
 
+type LumenFetchResult = Option<(u16, String, Vec<u8>, String)>;
+
+/// Send-only work returned by background platform operations. Engine values never enter this
+/// channel: the page thread retains Promise resolvers in [`LumenNetwork`] and settles them after
+/// selecting the corresponding HTML task.
+#[allow(dead_code)] // Read by the resident Lumen actor once the backend cutover reaches src/js.rs.
+enum LumenHostTask {
+    FetchDone { id: usize, result: LumenFetchResult },
+}
+
+struct LumenNetwork {
+    handle: tokio::runtime::Handle,
+    cache: Arc<crate::http::PageCache>,
+    events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    fetched: usize,
+    next_fetch_id: usize,
+    pending_fetches: HashMap<usize, Value>,
+}
+
 struct HostState {
     dom: Rc<RefCell<Dom>>,
     clock: Rc<RealmClock>,
@@ -36,6 +57,7 @@ struct HostState {
     device_pixel_ratio: Cell<f32>,
     geom_cache: Rc<RefCell<LumenGeomCache>>,
     images: Rc<RefCell<crate::layout2::ImageSizes>>,
+    network: Option<LumenNetwork>,
 }
 
 impl HostState {
@@ -60,7 +82,27 @@ impl HostState {
                 Default::default(),
             ))),
             images: Default::default(),
+            network: None,
         }
+    }
+
+    #[allow(dead_code)] // The networked test realm uses this before the resident actor is switched.
+    fn enable_network(
+        &mut self,
+        page: url::Url,
+        handle: tokio::runtime::Handle,
+        cache: Arc<crate::http::PageCache>,
+        events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    ) {
+        self.base = page;
+        self.network = Some(LumenNetwork {
+            handle,
+            cache,
+            events,
+            fetched: 0,
+            next_fetch_id: 0,
+            pending_fetches: HashMap::new(),
+        });
     }
 }
 
@@ -270,6 +312,8 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__css_parse", 1, host_css_parse),
     ("__css_supports_selector", 1, host_css_supports_selector),
     ("__dom_template_content", 1, host_template_content),
+    ("__http_fetch", 5, host_http_fetch),
+    ("__http_fetch_async", 5, host_http_fetch_async),
     ("__dom_computed", 2, host_computed_style),
     ("__image_current_src", 1, host_image_current_src),
     ("__image_complete", 1, host_image_complete),
@@ -337,6 +381,242 @@ fn host_id_value(id: Option<usize>) -> Value {
 
 fn host_ids_array(ctx: &Ctx, ids: Vec<usize>) -> Value {
     ctx.make_array(ids.into_iter().map(|id| Value::Num(id as f64)).collect())
+}
+
+fn host_arg_latin1_bytes(ctx: &mut Ctx, args: &[Value], index: usize) -> Vec<u8> {
+    args.get(index)
+        .and_then(|value| ctx.coerce_string(value).ok())
+        .map(|value| value.chars().map(|ch| ch as u32 as u8).collect())
+        .unwrap_or_default()
+}
+
+/// Fetch Standard §2.2.1 method normalization plus the byte-string request-body and header
+/// transport contract shared with the platform prelude.
+#[allow(clippy::type_complexity)]
+fn host_fetch_args(
+    ctx: &mut Ctx,
+    args: &[Value],
+) -> (
+    String,
+    String,
+    Option<(String, Vec<u8>)>,
+    Vec<(String, String)>,
+) {
+    let target = host_arg_string(ctx, args, 0);
+    let mut method: String = host_arg_string(ctx, args, 1)
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(*ch))
+        .collect();
+    if ["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"]
+        .iter()
+        .any(|known| method.eq_ignore_ascii_case(known))
+    {
+        method.make_ascii_uppercase();
+    }
+    if method.is_empty() {
+        method = String::from("GET");
+    }
+    let body = args
+        .get(2)
+        .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+        .map(|_| host_arg_latin1_bytes(ctx, args, 2));
+    let content_type = args
+        .get(3)
+        .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+        .map(|_| host_arg_string(ctx, args, 3));
+    let body = body.map(|bytes| {
+        (
+            content_type.unwrap_or_else(|| String::from("text/plain;charset=UTF-8")),
+            bytes,
+        )
+    });
+    let headers = args
+        .get(4)
+        .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+        .map(|_| crate::js::parse_header_blob(&host_arg_string(ctx, args, 4)))
+        .unwrap_or_default();
+    (target, method, body, headers)
+}
+
+fn prepare_host_request(
+    state: &mut HostState,
+    target: &str,
+    method: String,
+    body: Option<(String, Vec<u8>)>,
+    headers: Vec<(String, String)>,
+) -> Option<(
+    tokio::runtime::Handle,
+    Arc<crate::http::PageCache>,
+    crate::http::Request,
+)> {
+    let page = state.base.clone();
+    let resolved = page.join(target).ok()?;
+    let network = state.network.as_mut()?;
+    if !matches!(resolved.scheme(), "http" | "https")
+        || !crate::http::subresource_allowed(&page, &resolved)
+        || network.fetched >= crate::js::MAX_PAGE_FETCHES
+    {
+        return None;
+    }
+    network.fetched += 1;
+    let mut request = crate::http::Request {
+        method,
+        url: resolved,
+        body,
+        headers,
+        fetch_metadata: None,
+    };
+    crate::http::set_referrer(&mut request, &page);
+    Some((network.handle.clone(), network.cache.clone(), request))
+}
+
+fn lumen_fetch_result(response: crate::http::Response) -> LumenFetchResult {
+    Some((
+        response.status,
+        response.content_type,
+        response.body,
+        crate::js::headers_to_blob(&response.headers),
+    ))
+}
+
+fn lumen_cached_result(response: &crate::http::CachedResp) -> LumenFetchResult {
+    Some((
+        response.status,
+        response.content_type.clone(),
+        response.body.clone(),
+        crate::js::headers_to_blob(&response.headers),
+    ))
+}
+
+fn host_fetch_result_value(ctx: &mut Ctx, result: LumenFetchResult) -> Value {
+    let Some((status, content_type, body, headers)) = result else {
+        return Value::Null;
+    };
+    let text = if crate::js::response_body_is_binary(&content_type) {
+        Value::Undefined
+    } else {
+        Value::from_string(String::from_utf8_lossy(&body).into_owned())
+    };
+    // Fetch Body is a byte sequence. Uint8Array is accepted by the prelude's BufferSource path;
+    // retain the legacy one-code-point-per-byte string only as an allocation-failure fallback.
+    let bytes = ctx
+        .make_uint8array(&body)
+        .unwrap_or_else(|_| Value::from_string(body.iter().copied().map(char::from).collect()));
+    ctx.make_array(vec![
+        Value::Num(f64::from(status)),
+        Value::from_string(content_type),
+        text,
+        bytes,
+        Value::from_string(headers),
+    ])
+}
+
+/// XMLHttpRequest's synchronous flag uses HTML's pause semantics. The network future runs on the
+/// application runtime while only this page thread waits, avoiding a nested Tokio `block_on`.
+fn host_http_fetch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let (target, method, body, headers) = host_fetch_args(ctx, args);
+    let work = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| prepare_host_request(state, &target, method, body, headers));
+    let result = match work {
+        Some((handle, cache, request)) => {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            cache.spawn(&handle, async move {
+                let _ = sender.send(crate::http::fetch(&request).await.ok());
+            });
+            receiver.recv().ok().flatten().and_then(lumen_fetch_result)
+        }
+        None => None,
+    };
+    Ok(host_fetch_result_value(ctx, result))
+}
+
+enum AsyncFetchSource {
+    Cached(crate::http::SharedFetch),
+    Request(Box<crate::http::Request>),
+}
+
+/// Fetch API §5.6 creates and returns a Promise before Fetch runs in parallel. Only Send response
+/// data crosses the runtime channel; the resolving function remains rooted in the page realm and
+/// is invoked later when the browser selects the networking task.
+fn host_http_fetch_async(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let (target, method, body, headers) = host_fetch_args(ctx, args);
+    let (promise, resolve, _reject) = ctx.new_promise_with_resolvers();
+
+    let dispatch = {
+        let Some(state) = ctx.host_mut::<HostState>() else {
+            let _ = ctx.invoke(resolve, Value::Undefined, &[Value::Null]);
+            return Ok(promise);
+        };
+        let cached = state.network.as_ref().and_then(|network| {
+            (method == "GET" && body.is_none())
+                .then(|| state.base.join(&target).ok())
+                .flatten()
+                .and_then(|url| network.cache.peek(&url))
+        });
+        let source = match cached {
+            Some(shared) => Some(AsyncFetchSource::Cached(shared)),
+            None => prepare_host_request(state, &target, method, body, headers)
+                .map(|(_, _, request)| AsyncFetchSource::Request(Box::new(request))),
+        };
+        match (state.network.as_mut(), source) {
+            (Some(network), Some(source)) => {
+                let id = network.next_fetch_id;
+                network.next_fetch_id += 1;
+                network.pending_fetches.insert(id, resolve.clone());
+                Some((
+                    id,
+                    network.handle.clone(),
+                    network.cache.clone(),
+                    network.events.clone(),
+                    source,
+                ))
+            }
+            _ => None,
+        }
+    };
+
+    let Some((id, handle, cache, events, source)) = dispatch else {
+        let _ = ctx.invoke(resolve, Value::Undefined, &[Value::Null]);
+        return Ok(promise);
+    };
+    cache.spawn(&handle, async move {
+        let result = match source {
+            AsyncFetchSource::Cached(shared) => shared
+                .await
+                .ok()
+                .and_then(|response| lumen_cached_result(&response)),
+            AsyncFetchSource::Request(request) => crate::http::fetch(&request)
+                .await
+                .ok()
+                .and_then(lumen_fetch_result),
+        };
+        let _ = events.send(LumenHostTask::FetchDone { id, result });
+    });
+    Ok(promise)
+}
+
+/// Run the engine-owned portion of one selected host task. The caller performs the HTML event
+/// loop's microtask checkpoint after this returns, before selecting another task.
+#[allow(dead_code)] // The networked test realm uses this before the resident actor is switched.
+fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result<(), String> {
+    match task {
+        LumenHostTask::FetchDone { id, result } => {
+            let resolve = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .and_then(|state| state.network.as_mut())
+                .and_then(|network| network.pending_fetches.remove(&id));
+            let Some(resolve) = resolve else {
+                return Ok(());
+            };
+            let value = host_fetch_result_value(engine.ctx(), result);
+            engine
+                .call_function_interruptible(&resolve, Value::Undefined, &[value])
+                .map_err(|error| describe_eval_error(engine, error, "fetch networking task"))?;
+        }
+    }
+    Ok(())
 }
 
 fn host_create_element(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
@@ -1468,19 +1748,24 @@ mod tests {
     use super::*;
 
     fn platform_engine() -> lumen::Engine {
+        let clock = Rc::new(RealmClock::new());
+        configured_engine(
+            HostState::new(Rc::new(RefCell::new(Dom::new())), clock),
+            DEFAULT_URL,
+        )
+    }
+
+    fn configured_engine(state: HostState, url: &str) -> lumen::Engine {
         let mut engine = lumen::Engine::new();
         engine.set_tier(Tier::Interp);
-        let clock = Rc::new(RealmClock::new());
+        let clock = state.clock.clone();
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
-        engine
-            .ctx()
-            .op_state()
-            .put(HostState::new(Rc::new(RefCell::new(Dom::new())), clock));
+        engine.ctx().op_state().put(state);
         install_host_boundary(&mut engine);
         eval(
             &mut engine,
-            "globalThis.__trust_cfg = { url: 'https://example.com/', width: 640, height: 384 };",
+            &format!("globalThis.__trust_cfg = {{ url: {url:?}, width: 640, height: 384 }};"),
             "configuration",
         )
         .unwrap();
@@ -1539,13 +1824,213 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 69);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 71);
 
         let mut engine = platform_engine();
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
             let actual = eval_value(&mut engine, &format!("{name}.length"), name).unwrap();
             assert_eq!(actual.as_num_opt(), Some(length as f64), "{name}.length");
         }
+    }
+
+    #[test]
+    fn fetch_completion_is_a_networking_task_with_byte_exact_body() {
+        // Fetch §5.6 creates the promise before fetching in parallel; Fetch §2 queues response
+        // processing on the networking task source; HTML §8.1.7.3 then performs one microtask
+        // checkpoint. The fourth host-array item remains a BufferSource so binary bytes survive.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = url::Url::parse(DEFAULT_URL).unwrap();
+        let response_url = page.join("api").unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        cache.seed_with_headers(
+            response_url.to_string(),
+            206,
+            String::from("application/octet-stream"),
+            vec![
+                (
+                    String::from("content-type"),
+                    String::from("application/octet-stream"),
+                ),
+                (String::from("x-result"), String::from("exact")),
+            ],
+            vec![0, 0x80, 0xff, 65],
+        );
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
+        state.enable_network(page, runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, DEFAULT_URL);
+
+        eval(
+            &mut engine,
+            r#"
+                globalThis.fetchOrder = [];
+                fetch('/api').then(function (response) {
+                    fetchOrder.push('response:' + response.status + ':' + response.headers.get('x-result'));
+                    return response.arrayBuffer();
+                }).then(function (buffer) {
+                    fetchOrder.push('bytes:' + Array.from(new Uint8Array(buffer)).join(','));
+                }, function (error) {
+                    fetchOrder.push('error:' + error);
+                });
+                fetchOrder.push('script');
+            "#,
+            "start fetch",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(string_value(&mut engine, "fetchOrder.join('|')"), "script");
+        assert_eq!(
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .and_then(|state| state.network.as_ref())
+                .map(|network| network.pending_fetches.len()),
+            Some(1)
+        );
+
+        let task = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), task_rx.recv()).await })
+            .expect("network task completes")
+            .expect("network task channel remains open");
+        dispatch_host_task(&mut engine, task).unwrap();
+        assert_eq!(
+            string_value(&mut engine, "fetchOrder.join('|')"),
+            "script",
+            "settling the promise does not inline its reactions into the networking task"
+        );
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "fetchOrder.join('|')"),
+            "script|response:206:exact|bytes:0,128,255,65"
+        );
+        assert_eq!(
+            engine
+                .ctx()
+                .host_mut::<HostState>()
+                .and_then(|state| state.network.as_ref())
+                .map(|network| network.pending_fetches.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn fetch_without_a_network_grant_rejects_at_the_microtask_checkpoint() {
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            "globalThis.fetchOrder = ['script']; fetch('/blocked').catch(() => fetchOrder.push('rejected'));",
+            "blocked fetch",
+        )
+        .unwrap();
+        assert_eq!(string_value(&mut engine, "fetchOrder.join('|')"), "script");
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "fetchOrder.join('|')"),
+            "script|rejected"
+        );
+    }
+
+    #[test]
+    fn synchronous_xhr_boundary_blocks_only_the_page_thread_and_preserves_bytes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // XHR §3.5.6 permits the synchronous flag to pause its Window task. The actual I/O must
+        // remain on TRust's runtime, both to keep the browser responsive and to avoid nested
+        // runtime entry when a synchronous request originates in a JS callback.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener =
+            runtime.block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap() });
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 2048];
+            let header_end = loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0, "request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(index) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("Content-Length: ")
+                        .or_else(|| line.strip_prefix("content-length: "))
+                })
+                .and_then(|length| length.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0, "request ended before its body");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            request_tx.send(request).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Type: application/octet-stream\r\nX-Answer: exact\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\0\x80\xffA",
+                )
+                .await
+                .unwrap();
+        });
+
+        let page_url = format!("http://{address}/page");
+        let page = url::Url::parse(&page_url).unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        let (task_tx, _task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
+        state.enable_network(page, runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, &page_url);
+        eval(
+            &mut engine,
+            r#"
+                const syncResponse = __http_fetch(
+                    '/sync', 'POST', String.fromCharCode(0, 128, 255),
+                    'application/octet-stream', 'x-custom\nyes'
+                );
+                globalThis.syncFetchResult = [
+                    syncResponse[0], syncResponse[1],
+                    syncResponse[4].indexOf('x-answer\nexact') >= 0,
+                    Array.from(syncResponse[3]).join(',')
+                ].join('|');
+            "#,
+            "synchronous fetch",
+        )
+        .unwrap();
+        assert_eq!(
+            string_value(&mut engine, "syncFetchResult"),
+            "201|application/octet-stream|true|0,128,255,65"
+        );
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server observed request");
+        let header_end = request
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .unwrap();
+        let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+        assert!(headers.starts_with("post /sync http/1.1\r\n"), "{headers}");
+        assert!(headers.contains("x-custom: yes\r\n"), "{headers}");
+        assert!(
+            headers.contains(&format!("referer: {page_url}\r\n")),
+            "{headers}"
+        );
+        assert_eq!(&request[header_end..], &[0, 0x80, 0xff]);
     }
 
     #[test]
