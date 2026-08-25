@@ -18,6 +18,21 @@ const DEFAULT_URL: &str = "https://example.com/";
 struct HostState {
     dom: Rc<RefCell<Dom>>,
     clock: Rc<RealmClock>,
+    base: url::Url,
+    storage: crate::js::WebStorage,
+    blobs: crate::js::BlobMap,
+}
+
+impl HostState {
+    fn new(dom: Rc<RefCell<Dom>>, clock: Rc<RealmClock>) -> Self {
+        Self {
+            dom,
+            clock,
+            base: url::Url::parse(DEFAULT_URL).expect("static default URL parses"),
+            storage: Default::default(),
+            blobs: Default::default(),
+        }
+    }
 }
 
 struct RealmClock {
@@ -83,10 +98,10 @@ pub fn run_benchmark(path: &Path, tier: Tier, threshold: u32) -> Result<SpikeRep
     let clock = Rc::new(RealmClock::new());
     let engine_clock = clock.clone();
     engine.set_wall_clock(move || engine_clock.now_ms());
-    engine.ctx().op_state().put(HostState {
-        dom: Rc::new(RefCell::new(Dom::new())),
-        clock,
-    });
+    engine
+        .ctx()
+        .op_state()
+        .put(HostState::new(Rc::new(RefCell::new(Dom::new())), clock));
     install_host_boundary(&mut engine);
 
     eval(
@@ -225,7 +240,20 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__css_parse", 1, host_css_parse),
     ("__css_supports_selector", 1, host_css_supports_selector),
     ("__dom_template_content", 1, host_template_content),
+    ("__cookie_get", 0, host_cookie_get),
+    ("__cookie_set", 1, host_cookie_set),
     ("__clock_set", 1, host_clock_set),
+    ("__storage_get", 2, host_storage_get),
+    ("__storage_set", 3, host_storage_set),
+    ("__storage_remove", 2, host_storage_remove),
+    ("__storage_clear", 1, host_storage_clear),
+    ("__storage_key", 2, host_storage_key),
+    ("__storage_len", 1, host_storage_len),
+    ("__blob_mirror", 3, host_blob_mirror),
+    ("__crypto_sha256_digest", 1, host_crypto_sha256_digest),
+    ("__compression_encode", 2, host_compression_encode),
+    ("__text_encode", 1, host_text_encode),
+    ("__dom_popover", 2, host_dom_popover),
 ];
 
 fn install_host_boundary(engine: &mut lumen::Engine) {
@@ -912,6 +940,217 @@ fn lumen_host_without_port(host: &str) -> &str {
     }
 }
 
+fn host_cookie_get(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    let page = ctx
+        .host_mut::<HostState>()
+        .expect("HostState installed before any Lumen host call")
+        .base
+        .clone();
+    Ok(Value::from_string(crate::http::cookies_for_js(&page)))
+}
+
+fn host_cookie_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let line = host_arg_string(ctx, args, 0);
+    let page = ctx
+        .host_mut::<HostState>()
+        .expect("HostState installed before any Lumen host call")
+        .base
+        .clone();
+    crate::http::set_cookie_from_js(&page, &line);
+    Ok(Value::Undefined)
+}
+
+fn host_storage_bucket(ctx: &mut Ctx, args: &[Value]) -> (crate::js::WebStorage, String) {
+    let kind = host_arg_string(ctx, args, 0);
+    let state = ctx
+        .host_mut::<HostState>()
+        .expect("HostState installed before any Lumen host call");
+    (
+        state.storage.clone(),
+        format!("{kind}:{}", state.base.origin().ascii_serialization()),
+    )
+}
+
+fn host_storage_get(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let key = host_arg_string(ctx, args, 1);
+    let (storage, bucket) = host_storage_bucket(ctx, args);
+    let storage = storage.lock().unwrap();
+    Ok(
+        match storage.get(&bucket).and_then(|bucket| bucket.get(&key)) {
+            Some(value) => Value::from_string(value.clone()),
+            None => Value::Null,
+        },
+    )
+}
+
+fn host_storage_set(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let key = host_arg_string(ctx, args, 1);
+    let value = host_arg_string(ctx, args, 2);
+    let (storage, bucket) = host_storage_bucket(ctx, args);
+    storage
+        .lock()
+        .unwrap()
+        .entry(bucket)
+        .or_default()
+        .insert(key, value);
+    Ok(Value::Undefined)
+}
+
+fn host_storage_remove(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let key = host_arg_string(ctx, args, 1);
+    let (storage, bucket) = host_storage_bucket(ctx, args);
+    if let Some(bucket) = storage.lock().unwrap().get_mut(&bucket) {
+        bucket.remove(&key);
+    }
+    Ok(Value::Undefined)
+}
+
+fn host_storage_clear(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let (storage, bucket) = host_storage_bucket(ctx, args);
+    storage.lock().unwrap().remove(&bucket);
+    Ok(Value::Undefined)
+}
+
+fn host_storage_key(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let index = args.get(1).and_then(Value::as_num_opt).unwrap_or(-1.0);
+    let (storage, bucket) = host_storage_bucket(ctx, args);
+    let storage = storage.lock().unwrap();
+    let key = (index >= 0.0)
+        .then(|| {
+            storage
+                .get(&bucket)
+                .and_then(|bucket| bucket.keys().nth(index as usize).cloned())
+        })
+        .flatten();
+    Ok(key.map_or(Value::Null, Value::from_string))
+}
+
+fn host_storage_len(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let (storage, bucket) = host_storage_bucket(ctx, args);
+    let len = storage
+        .lock()
+        .unwrap()
+        .get(&bucket)
+        .map_or(0, std::collections::HashMap::len);
+    Ok(Value::Num(len as f64))
+}
+
+fn host_latin1_bytes(ctx: &mut Ctx, args: &[Value], index: usize) -> Vec<u8> {
+    args.get(index)
+        .and_then(|value| ctx.coerce_string(value).ok())
+        .map(|string| {
+            string
+                .chars()
+                .map(|character| character as u32 as u8)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn host_blob_mirror(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let url = host_arg_string(ctx, args, 0);
+    let bytes = host_latin1_bytes(ctx, args, 1);
+    let mime = host_arg_string(ctx, args, 2);
+    if !url.is_empty() {
+        let blobs = ctx
+            .host_mut::<HostState>()
+            .expect("HostState installed before any Lumen host call")
+            .blobs
+            .clone();
+        blobs.lock().unwrap().insert(url, (bytes, mime));
+    }
+    Ok(Value::Undefined)
+}
+
+fn host_resolved_promise(ctx: &mut Ctx, value: Value) -> Result<Value, Value> {
+    let global = ctx.global_this();
+    let promise = ctx.member_get(&global, "Promise")?;
+    let resolve = ctx.member_get(&promise, "resolve")?;
+    ctx.invoke(resolve, promise.clone(), &[value])
+}
+
+/// Web Crypto §14.3.5 copies the `BufferSource` bytes before digesting and resolves the returned
+/// promise with a realm-local `ArrayBuffer` containing the digest.
+fn host_crypto_sha256_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    use sha2::Digest as _;
+
+    let input = args
+        .first()
+        .and_then(|value| ctx.buffer_source_bytes(value, false))
+        .unwrap_or_default();
+    let digest = sha2::Sha256::digest(input);
+    let view = ctx.make_uint8array(&digest)?;
+    let buffer = ctx.member_get(&view, "buffer")?;
+    host_resolved_promise(ctx, buffer)
+}
+
+/// Compression Streams §4's compression operation. The JavaScript TransformStream owns chunking
+/// and invokes this once with the copied, bounded aggregate at flush time.
+fn host_compression_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    use std::io::Write as _;
+
+    const MAX_STREAM_CODEC_BYTES: usize = 16 * 1024 * 1024;
+    let format = host_arg_string(ctx, args, 0);
+    let input = args
+        .get(1)
+        .and_then(|value| ctx.buffer_source_bytes(value, false))
+        .ok_or_else(|| {
+            ctx.make_error(
+                "TypeError",
+                "CompressionStream input must be a BufferSource",
+            )
+        })?;
+    if input.len() > MAX_STREAM_CODEC_BYTES {
+        return Err(ctx.make_error(
+            "RangeError",
+            "CompressionStream input exceeds the 16 MiB page limit",
+        ));
+    }
+    let output = match format.as_str() {
+        "deflate" => {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&input).and_then(|()| encoder.finish())
+        }
+        "deflate-raw" => {
+            let mut encoder =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&input).and_then(|()| encoder.finish())
+        }
+        "gzip" => {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&input).and_then(|()| encoder.finish())
+        }
+        _ => return Err(ctx.make_error("TypeError", "Unsupported compression format")),
+    }
+    .map_err(|error| ctx.make_error("TypeError", format!("CompressionStream failed: {error}")))?;
+    if output.len() > MAX_STREAM_CODEC_BYTES {
+        return Err(ctx.make_error(
+            "RangeError",
+            "CompressionStream output exceeds the 16 MiB page limit",
+        ));
+    }
+    ctx.make_uint8array(&output)
+}
+
+/// Encoding §7.4 UTF-8 encode: the Web IDL `USVString` conversion has already replaced lone
+/// surrogates before the host call, and the result is a fresh realm-local `Uint8Array`.
+fn host_text_encode(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let text = host_arg_string(ctx, args, 0);
+    ctx.make_uint8array(text.as_bytes())
+}
+
+fn host_dom_popover(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let open = matches!(args.get(1), Some(Value::Bool(true)));
+    let dom = host_dom(ctx);
+    let mut dom = dom.borrow_mut();
+    if let Some(id) = host_arg_node(&dom, args, 0) {
+        dom.set_popover_open(id, open);
+    }
+    Ok(Value::Undefined)
+}
+
 fn eval(engine: &mut lumen::Engine, source: &str, label: &str) -> Result<(), String> {
     eval_value(engine, source, label).map(|_| ())
 }
@@ -972,10 +1211,10 @@ mod tests {
         let clock = Rc::new(RealmClock::new());
         let engine_clock = clock.clone();
         engine.set_wall_clock(move || engine_clock.now_ms());
-        engine.ctx().op_state().put(HostState {
-            dom: Rc::new(RefCell::new(Dom::new())),
-            clock,
-        });
+        engine
+            .ctx()
+            .op_state()
+            .put(HostState::new(Rc::new(RefCell::new(Dom::new())), clock));
         install_host_boundary(&mut engine);
         eval(
             &mut engine,
@@ -1038,7 +1277,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 47);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 60);
 
         let mut engine = platform_engine();
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
@@ -1182,6 +1421,87 @@ mod tests {
     }
 
     #[test]
+    fn binary_storage_cookie_blob_and_popover_hosts_follow_the_platform_prelude() {
+        // Encoding §7.4, Web Crypto §14.3.5, Compression Streams §4, Web Storage, cookies, File
+        // API blob URLs, and HTML popover state all enter through the shared browser surface.
+        let mut engine = platform_engine();
+        eval(
+            &mut engine,
+            r##"
+            const hex = value => Array.from(new Uint8Array(value))
+                .map(byte => byte.toString(16).padStart(2, "0")).join("");
+            const encoded = new TextEncoder().encode("Aé🙂");
+            globalThis.binaryResult = [Array.from(encoded).join(",")];
+
+            const source = new Uint8Array([0, 97, 98, 99, 0]);
+            crypto.subtle.digest("SHA-256", source.subarray(1, 4))
+                .then(value => binaryResult.push(hex(value)));
+            crypto.subtle.digest("SHA-256", new DataView(source.buffer, 1, 3))
+                .then(value => binaryResult.push(hex(value)));
+
+            const compression = new CompressionStream("gzip");
+            const writer = compression.writable.getWriter();
+            const reader = compression.readable.getReader();
+            writer.write(new TextEncoder().encode("hello"));
+            writer.close();
+            reader.read().then(result => binaryResult.push(
+                result.value[0] + "," + result.value[1] + "," + (result.value.byteLength > 10)
+            ));
+
+            localStorage.clear();
+            localStorage.setItem("alpha", "one");
+            localStorage.setItem("beta", "two");
+            const stored = [localStorage.length, localStorage.getItem("alpha")].join(":");
+            localStorage.removeItem("beta");
+            document.cookie = "lumen_port_cookie=ready; Path=/";
+
+            const blobUrl = URL.createObjectURL(new Blob([
+                new Uint8Array([0, 128, 255])
+            ], { type: "application/x-lumen-port" }));
+            globalThis.blobPortUrl = blobUrl;
+
+            const popover = document.createElement("div");
+            popover.setAttribute("popover", "auto");
+            document.appendChild(popover);
+            popover.showPopover();
+            const open = popover.matches(":popover-open");
+            popover.hidePopover();
+            globalThis.hostStateResult = [
+                stored,
+                localStorage.length,
+                document.cookie.includes("lumen_port_cookie=ready"),
+                open,
+                popover.matches(":popover-open")
+            ].join("|");
+            "##,
+            "binary and stateful host boundary",
+        )
+        .unwrap();
+        run_microtask_checkpoint(&mut engine);
+
+        assert_eq!(
+            string_value(&mut engine, "binaryResult.join('|')"),
+            "65,195,169,240,159,153,130|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|31,139,true"
+        );
+        assert_eq!(
+            string_value(&mut engine, "hostStateResult"),
+            "2:one|1|true|true|false"
+        );
+
+        let blob_url = string_value(&mut engine, "blobPortUrl");
+        let blobs = engine
+            .ctx()
+            .host_mut::<HostState>()
+            .expect("host state")
+            .blobs
+            .clone();
+        assert_eq!(
+            blobs.lock().unwrap().get(&blob_url).cloned(),
+            Some((vec![0, 128, 255], "application/x-lumen-port".to_owned()))
+        );
+    }
+
+    #[test]
     fn minimal_boundary_boots_the_real_prelude() {
         let mut engine = platform_engine();
         let node_type = eval_value(&mut engine, "document.nodeType", "node type").unwrap();
@@ -1256,18 +1576,16 @@ mod tests {
         .unwrap();
         eval(&mut engine, "counter += 1", "second host entry").unwrap();
 
-        for expected in ["v42,micro-42"] {
-            let now = eval_value(&mut engine, "__trust.now() + 100", "timer deadline").unwrap();
-            assert_eq!(
-                call_trust_method(&mut engine, "tickTo", &[now]).as_num_opt(),
-                Some(1.0)
-            );
-            run_microtask_checkpoint(&mut engine);
-            assert_eq!(
-                string_value(&mut engine, "intervalOrder.join(',')"),
-                expected
-            );
-        }
+        let now = eval_value(&mut engine, "__trust.now() + 100", "timer deadline").unwrap();
+        assert_eq!(
+            call_trust_method(&mut engine, "tickTo", &[now]).as_num_opt(),
+            Some(1.0)
+        );
+        run_microtask_checkpoint(&mut engine);
+        assert_eq!(
+            string_value(&mut engine, "intervalOrder.join(',')"),
+            "v42,micro-42"
+        );
         let now = eval_value(&mut engine, "__trust.now() + 100", "timer deadline").unwrap();
         assert_eq!(
             call_trust_method(&mut engine, "tickTo", &[now]).as_num_opt(),
