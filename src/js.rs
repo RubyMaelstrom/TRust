@@ -20315,7 +20315,15 @@ pub(crate) const PRELUDE: &str = r##"
         }
         if (!best) return false;
         timers.q.splice(timers.q.indexOf(best), 1);
-        timers.now = Math.max(timers.now, trust.oneShot ? best.at : observedNow);
+        // Advancing a one-shot snapshot to `best.at` must never move the
+        // realm's monotonic clock behind the instant at which this turn
+        // selected its task. In particular, sibling zero-delay timers have
+        // already completed their wait by `observedNow`; a zero-delay timer
+        // created by the first callback must not acquire an earlier deadline
+        // merely because `__clockSync()` re-anchored Date to an older value.
+        // HTML Timers' "run steps after a timeout" orders earlier invocations
+        // before later ones once the corresponding waits complete.
+        timers.now = Math.max(timers.now, observedNow, best.at);
         __clockSync();
         try {
             runInFrame(best.frame, () => best.fn.apply(undefined, best.args || []));
