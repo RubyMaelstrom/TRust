@@ -58,6 +58,13 @@ enum LumenHostTask {
         id: usize,
         event: crate::ws::WsIn,
     },
+    Worker {
+        id: usize,
+        event: crate::js::WorkerOut,
+    },
+    WorkerExited {
+        id: usize,
+    },
 }
 
 struct LumenNetwork {
@@ -77,6 +84,55 @@ struct LumenWebSockets {
     next_id: usize,
 }
 
+enum LumenWorkerCtl {
+    Message(String),
+    Terminate,
+}
+
+struct LumenWorkerHandle {
+    ctl: std::sync::mpsc::SyncSender<LumenWorkerCtl>,
+    interrupt: Arc<lumen::RuntimeInterrupt>,
+}
+
+impl Drop for LumenWorkerHandle {
+    fn drop(&mut self) {
+        // HTML §10.2.4 "terminate a worker": cancellation is host control
+        // flow, so author catch/finally cannot observe or suppress it.
+        self.interrupt.cancel();
+    }
+}
+
+struct LumenPageWorkers {
+    handle: tokio::runtime::Handle,
+    page: url::Url,
+    tasks: Arc<crate::http::PageTaskScope>,
+    events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    workers: HashMap<usize, LumenWorkerHandle>,
+    next_id: usize,
+}
+
+struct LumenWorkerSelf {
+    id: usize,
+    events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    closed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LumenWorkerKind {
+    Classic,
+    Module,
+}
+
+struct LumenWorkerLaunch {
+    id: usize,
+    owner_page: url::Url,
+    script_url: url::Url,
+    kind: LumenWorkerKind,
+    name: String,
+    script_body: Option<Vec<u8>>,
+    secure_context: bool,
+}
+
 struct HostState {
     dom: Rc<RefCell<Dom>>,
     clock: Rc<RealmClock>,
@@ -91,6 +147,8 @@ struct HostState {
     pending_resources: usize,
     network: Option<LumenNetwork>,
     websockets: Option<LumenWebSockets>,
+    workers: Option<LumenPageWorkers>,
+    worker_self: Option<LumenWorkerSelf>,
 }
 
 impl HostState {
@@ -119,6 +177,8 @@ impl HostState {
             pending_resources: 0,
             network: None,
             websockets: None,
+            workers: None,
+            worker_self: None,
         }
     }
 
@@ -143,13 +203,21 @@ impl HostState {
             }
         });
         self.base = page;
-        self.task_events = Some(events);
+        self.task_events = Some(events.clone());
         self.websockets = Some(LumenWebSockets {
             handle: handle.clone(),
             page: self.base.clone(),
             tasks: cache.task_scope(),
             events: ws_events,
             sockets: HashMap::new(),
+            next_id: 1,
+        });
+        self.workers = Some(LumenPageWorkers {
+            handle: handle.clone(),
+            page: self.base.clone(),
+            tasks: cache.task_scope(),
+            events: events.clone(),
+            workers: HashMap::new(),
             next_id: 1,
         });
         self.network = Some(LumenNetwork {
@@ -392,6 +460,11 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__ws_open", 2, host_ws_open),
     ("__ws_send", 3, host_ws_send),
     ("__ws_close", 3, host_ws_close),
+    ("__worker_spawn", 4, host_worker_spawn),
+    ("__worker_post", 2, host_worker_post),
+    ("__worker_terminate", 1, host_worker_terminate),
+    ("__worker_self_post", 1, host_worker_self_post),
+    ("__worker_self_close", 0, host_worker_self_close),
     ("__dom_computed", 2, host_computed_style),
     ("__image_current_src", 1, host_image_current_src),
     ("__image_complete", 1, host_image_complete),
@@ -1094,6 +1167,602 @@ fn host_ws_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, V
     Ok(Value::Undefined)
 }
 
+fn lumen_potentially_trustworthy(url: &url::Url) -> bool {
+    match url.scheme() {
+        "https" | "wss" | "file" => true,
+        "http" => url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .strip_suffix(".localhost")
+                    .is_some_and(|prefix| !prefix.is_empty())
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        }),
+        _ => false,
+    }
+}
+
+/// HTML §10.2.6 `Worker()` construction: URL parsing is synchronous in the shared prelude; the
+/// worker realm, script fetch, and evaluation start in parallel on a dedicated agent thread.
+fn host_worker_spawn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    const MAX_LUMEN_WORKERS: usize = 16;
+    const LUMEN_WORKER_STACK: usize = 64 * 1024 * 1024;
+
+    let target = host_arg_string(ctx, args, 0);
+    let kind = if host_arg_string(ctx, args, 1) == "module" {
+        LumenWorkerKind::Module
+    } else {
+        LumenWorkerKind::Classic
+    };
+    let name = host_arg_string(ctx, args, 2);
+    let script_body = args
+        .get(3)
+        .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+        .map(|_| host_latin1_bytes(ctx, args, 3));
+
+    let Some((id, launch, handle, tasks, events)) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.workers.as_mut())
+        .and_then(|workers| {
+            if workers.workers.len() >= MAX_LUMEN_WORKERS {
+                return None;
+            }
+            let script_url = workers.page.join(&target).ok()?;
+            let secure_context = lumen_potentially_trustworthy(&workers.page)
+                && (script_url.scheme() == "blob" || lumen_potentially_trustworthy(&script_url));
+            let id = workers.next_id;
+            workers.next_id += 1;
+            Some((
+                id,
+                LumenWorkerLaunch {
+                    id,
+                    owner_page: workers.page.clone(),
+                    script_url,
+                    kind,
+                    name,
+                    script_body,
+                    secure_context,
+                },
+                workers.handle.clone(),
+                workers.tasks.clone(),
+                workers.events.clone(),
+            ))
+        })
+    else {
+        return Ok(Value::Num(-1.0));
+    };
+
+    let (ctl, ctl_rx) = std::sync::mpsc::sync_channel(64);
+    let interrupt = Arc::new(lumen::RuntimeInterrupt::default());
+    let worker_interrupt = interrupt.clone();
+    let panic_events = events.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("trust-lumen-worker-{id}"))
+        .stack_size(LUMEN_WORKER_STACK)
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_lumen_worker(launch, handle, tasks, events, ctl_rx, worker_interrupt);
+            }));
+            if result.is_err() {
+                let _ = panic_events.send(LumenHostTask::Worker {
+                    id,
+                    event: crate::js::WorkerOut::Error(String::from("Lumen worker engine panic")),
+                });
+            }
+            let _ = panic_events.send(LumenHostTask::WorkerExited { id });
+        });
+    if spawned.is_err() {
+        return Ok(Value::Num(-1.0));
+    }
+    if let Some(workers) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.workers.as_mut())
+    {
+        workers
+            .workers
+            .insert(id, LumenWorkerHandle { ctl, interrupt });
+    }
+    Ok(Value::Num(id as f64))
+}
+
+/// MessagePort post-message steps serialize in the sender's realm before this call; the wire
+/// snapshot is queued FIFO and deserialized only when the worker selects its message task.
+fn host_worker_post(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let id = args
+        .first()
+        .and_then(Value::as_num_opt)
+        .and_then(|id| (id.is_finite() && id >= 0.0 && id.fract() == 0.0).then_some(id as usize));
+    let message = host_arg_string(ctx, args, 1);
+    let sent = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.workers.as_mut())
+        .and_then(|workers| id.and_then(|id| workers.workers.get(&id)))
+        .is_some_and(|worker| {
+            worker
+                .ctl
+                .try_send(LumenWorkerCtl::Message(message))
+                .is_ok()
+        });
+    Ok(Value::Bool(sent))
+}
+
+/// HTML §10.2.4 terminate-a-worker: discard queued messages and interrupt author code even when
+/// the worker is currently executing instead of parked on its inbox.
+fn host_worker_terminate(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let id = args
+        .first()
+        .and_then(Value::as_num_opt)
+        .and_then(|id| (id.is_finite() && id >= 0.0 && id.fract() == 0.0).then_some(id as usize));
+    if let Some(worker) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.workers.as_mut())
+        .and_then(|workers| id.and_then(|id| workers.workers.remove(&id)))
+    {
+        worker.interrupt.cancel();
+        let _ = worker.ctl.try_send(LumenWorkerCtl::Terminate);
+    }
+    Ok(Value::Undefined)
+}
+
+fn host_worker_self_post(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+    let message = host_arg_string(ctx, args, 0);
+    if let Some(worker) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.worker_self.as_ref())
+    {
+        let _ = worker.events.send(LumenHostTask::Worker {
+            id: worker.id,
+            event: crate::js::WorkerOut::Message(message),
+        });
+    }
+    Ok(Value::Undefined)
+}
+
+fn host_worker_self_close(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    if let Some(worker) = ctx
+        .host_mut::<HostState>()
+        .and_then(|state| state.worker_self.as_mut())
+    {
+        worker.closed = true;
+    }
+    Ok(Value::Undefined)
+}
+
+fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
+    // DedicatedWorkerGlobalScope is DOM-less. Install only the operations the
+    // shared worker prelude can reach; WebAssembly joins this list in the next
+    // boundary slice rather than being silently routed through Boa.
+    for &(name, len, function) in &[
+        ("__url_parse", 2, host_url_parse as NativeFn),
+        ("__url_set", 3, host_url_set as NativeFn),
+        ("__http_fetch", 5, host_http_fetch as NativeFn),
+        ("__worker_self_post", 1, host_worker_self_post as NativeFn),
+        ("__worker_self_close", 0, host_worker_self_close as NativeFn),
+        ("__blob_mirror", 3, host_blob_mirror as NativeFn),
+        (
+            "__crypto_sha256_digest",
+            1,
+            host_crypto_sha256_digest as NativeFn,
+        ),
+        (
+            "__compression_encode",
+            2,
+            host_compression_encode as NativeFn,
+        ),
+        ("__text_encode", 1, host_text_encode as NativeFn),
+    ] {
+        engine.define_global(name, len, function);
+    }
+}
+
+fn lumen_same_origin(left: &url::Url, right: &url::Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+struct LumenWorkerScript {
+    url: url::Url,
+    source: String,
+}
+
+struct LumenWorkerModuleFetch {
+    page: url::Url,
+    handle: tokio::runtime::Handle,
+    cache: Arc<crate::http::PageCache>,
+    fetched: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// HTML §8.1.4.2 classic/module worker fetch. Top-level HTTP(S) worker requests are same-origin;
+/// classic HTTP(S) responses and all module responses require a JavaScript MIME type. `data:` and
+/// active same-partition `blob:` entries are fetched without applying the HTTP MIME gate.
+fn fetch_lumen_worker_script(
+    launch: &LumenWorkerLaunch,
+    handle: &tokio::runtime::Handle,
+    cache: &Arc<crate::http::PageCache>,
+) -> Option<LumenWorkerScript> {
+    if let Some(body) = launch.script_body.as_ref() {
+        return (launch.script_url.scheme() == "blob").then(|| LumenWorkerScript {
+            url: launch.script_url.clone(),
+            source: String::from_utf8_lossy(body).into_owned(),
+        });
+    }
+    if launch.script_url.scheme() == "data" {
+        let content_type = data_url_content_type(launch.script_url.as_str());
+        if launch.kind == LumenWorkerKind::Module
+            && !crate::http::module_script_response_allowed(200, &content_type)
+        {
+            return None;
+        }
+        let body = crate::img::decode_data_url(launch.script_url.as_str())?;
+        return Some(LumenWorkerScript {
+            url: launch.script_url.clone(),
+            source: String::from_utf8_lossy(&body).into_owned(),
+        });
+    }
+    if !matches!(launch.script_url.scheme(), "http" | "https")
+        || !lumen_same_origin(&launch.owner_page, &launch.script_url)
+        || !crate::http::subresource_allowed(&launch.owner_page, &launch.script_url)
+    {
+        return None;
+    }
+
+    let request = crate::http::Request::get(launch.script_url.clone());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    cache.spawn(handle, async move {
+        let result = crate::http::fetch(&request).await.ok().map(|response| {
+            (
+                response.url,
+                response.status,
+                response.content_type,
+                response.body,
+            )
+        });
+        let _ = sender.send(result);
+    });
+    let (response_url, status, content_type, body) = receiver.recv().ok().flatten()?;
+    if !lumen_same_origin(&launch.owner_page, &response_url)
+        || !crate::http::module_script_response_allowed(status, &content_type)
+    {
+        return None;
+    }
+    Some(LumenWorkerScript {
+        url: response_url,
+        source: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
+fn send_lumen_worker_error(
+    events: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    id: usize,
+    message: impl Into<String>,
+) {
+    let _ = events.send(LumenHostTask::Worker {
+        id,
+        event: crate::js::WorkerOut::Error(message.into()),
+    });
+}
+
+/// Trusted bootstrap runs before author code but still observes a cancellation which raced with
+/// realm construction. `Ok(false)` is the silent HTML termination path; parse/throw failures are
+/// genuine platform bootstrap defects and are reported to the owner.
+fn eval_lumen_worker_setup(
+    engine: &mut lumen::Engine,
+    source: &str,
+    label: &str,
+) -> Result<bool, String> {
+    match engine.eval_value_interruptible(source) {
+        Err(error) => Err(format!(
+            "{label} parse error at line {}: {}",
+            error.line, error.message
+        )),
+        Ok(Err(EvalError::Throw(error))) => Err(describe_throw(engine, error, label)),
+        Ok(Err(EvalError::Interrupted(_))) => Ok(false),
+        Ok(Ok(_)) => Ok(true),
+    }
+}
+
+fn eval_lumen_worker_classic(
+    engine: &mut lumen::Engine,
+    source: &str,
+    label: &str,
+    events: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    id: usize,
+) -> bool {
+    match engine.eval_value_interruptible(source) {
+        Err(error) => {
+            send_lumen_worker_error(
+                events,
+                id,
+                format!(
+                    "{label} parse error at line {}: {}",
+                    error.line, error.message
+                ),
+            );
+        }
+        Ok(Err(EvalError::Throw(error))) => {
+            send_lumen_worker_error(events, id, describe_throw(engine, error, label));
+        }
+        Ok(Err(EvalError::Interrupted(_))) => return false,
+        Ok(Ok(_)) => {}
+    }
+    if engine.run_microtasks_interruptible().is_err() {
+        return false;
+    }
+    true
+}
+
+fn eval_lumen_worker_module(
+    engine: &mut lumen::Engine,
+    script: &LumenWorkerScript,
+    fetch: LumenWorkerModuleFetch,
+    events: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    id: usize,
+) -> bool {
+    let loader_page = fetch.page;
+    let loader_handle = fetch.handle;
+    let loader_cache = fetch.cache;
+    let loader_fetched = fetch.fetched;
+    match engine.eval_module_attrs_interruptible(
+        &script.source,
+        script.url.as_str(),
+        move |specifier, referrer, _attributes| {
+            module_dependency_loader(
+                &loader_page,
+                &loader_handle,
+                &loader_cache,
+                &loader_fetched,
+                specifier,
+                referrer,
+            )
+        },
+    ) {
+        Err(error) => send_lumen_worker_error(
+            events,
+            id,
+            format!(
+                "{} parse error at line {}: {}",
+                script.url, error.line, error.message
+            ),
+        ),
+        Ok(lumen::ExecutionOutcome::Throw { name, message }) => send_lumen_worker_error(
+            events,
+            id,
+            format!("{} threw {name}: {message}", script.url),
+        ),
+        Ok(lumen::ExecutionOutcome::Interrupted { .. }) => return false,
+        Ok(lumen::ExecutionOutcome::Value(_)) => {}
+    }
+    true
+}
+
+fn lumen_worker_internal_call(
+    engine: &mut lumen::Engine,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, EvalError> {
+    let global = engine.global_this();
+    let worker = engine
+        .ctx()
+        .member_get(&global, "__wkr")
+        .map_err(EvalError::Throw)?;
+    let function = engine
+        .ctx()
+        .member_get(&worker, name)
+        .map_err(EvalError::Throw)?;
+    engine.call_function_interruptible(&function, worker, args)
+}
+
+fn lumen_worker_report_buffered_errors(
+    engine: &mut lumen::Engine,
+    events: &tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    id: usize,
+) -> bool {
+    match lumen_worker_internal_call(engine, "takeErrors", &[]) {
+        Ok(value) => {
+            let errors = value_string(engine, &value);
+            for error in errors.split('\u{1e}').filter(|error| !error.is_empty()) {
+                send_lumen_worker_error(events, id, error.to_string());
+            }
+            true
+        }
+        Err(EvalError::Interrupted(_)) => false,
+        Err(EvalError::Throw(error)) => {
+            send_lumen_worker_error(
+                events,
+                id,
+                describe_throw(engine, error, "worker error reporting"),
+            );
+            true
+        }
+    }
+}
+
+fn lumen_worker_closed(engine: &mut lumen::Engine) -> bool {
+    engine
+        .ctx()
+        .host_mut::<HostState>()
+        .and_then(|state| state.worker_self.as_ref())
+        .is_some_and(|worker| worker.closed)
+}
+
+fn lumen_worker_deadline(engine: &mut lumen::Engine) -> Option<f64> {
+    match lumen_worker_internal_call(engine, "nextDeadline", &[]) {
+        Ok(Value::Num(deadline)) if deadline.is_finite() => Some(deadline),
+        _ => None,
+    }
+}
+
+fn lumen_worker_now(engine: &mut lumen::Engine) -> f64 {
+    match lumen_worker_internal_call(engine, "now", &[]) {
+        Ok(Value::Num(now)) if now.is_finite() => now,
+        _ => 0.0,
+    }
+}
+
+/// One Lumen realm per dedicated worker agent. No engine value crosses the thread boundary;
+/// messages are structured-clone wire strings, and every selected message/timer task is followed
+/// by its own microtask checkpoint before the loop parks or selects another task.
+fn run_lumen_worker(
+    launch: LumenWorkerLaunch,
+    handle: tokio::runtime::Handle,
+    tasks: Arc<crate::http::PageTaskScope>,
+    events: tokio::sync::mpsc::UnboundedSender<LumenHostTask>,
+    ctl_rx: std::sync::mpsc::Receiver<LumenWorkerCtl>,
+    interrupt: Arc<lumen::RuntimeInterrupt>,
+) {
+    let cache = Arc::new(crate::http::PageCache::with_task_scope(tasks));
+    let clock = Rc::new(RealmClock::new());
+    let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock.clone());
+    state.base = launch.script_url.clone();
+    state.network = Some(LumenNetwork {
+        handle: handle.clone(),
+        cache: cache.clone(),
+        fetched: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        next_fetch_id: 0,
+        pending_fetches: HashMap::new(),
+    });
+    state.worker_self = Some(LumenWorkerSelf {
+        id: launch.id,
+        events: events.clone(),
+        closed: false,
+    });
+
+    let mut engine = lumen::Engine::new_with_interrupt(interrupt);
+    let engine_clock = clock.clone();
+    engine.set_wall_clock(move || engine_clock.now_ms());
+    state.configure_module_loading(&mut engine);
+    engine.ctx().op_state().put(state);
+    install_lumen_worker_boundary(&mut engine);
+
+    let worker_type = if launch.kind == LumenWorkerKind::Module {
+        "module"
+    } else {
+        "classic"
+    };
+    let config = format!(
+        "globalThis.__worker_cfg = {{ id: {}, name: {}, type: {}, url: {}, language: {}, languages: [{}, {}], hwc: {}, globalPrivacyControl: {}, secureContext: {} }};",
+        launch.id,
+        serde_json::to_string(&launch.name).unwrap_or_else(|_| String::from("\"\"")),
+        serde_json::to_string(worker_type).expect("static worker type serializes"),
+        serde_json::to_string(launch.script_url.as_str()).expect("URL serializes"),
+        serde_json::to_string(crate::locale::LANGUAGE).expect("locale serializes"),
+        serde_json::to_string(crate::locale::LANGUAGES[0]).expect("locale serializes"),
+        serde_json::to_string(crate::locale::LANGUAGES[1]).expect("locale serializes"),
+        std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(8),
+        crate::http::GLOBAL_PRIVACY_CONTROL,
+        launch.secure_context,
+    );
+    for (source, label) in [
+        (config.as_str(), "worker configuration"),
+        (crate::js::worker_prelude(), "worker platform prelude"),
+    ] {
+        match eval_lumen_worker_setup(&mut engine, source, label) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                send_lumen_worker_error(&events, launch.id, error);
+                return;
+            }
+        }
+    }
+
+    let Some(script) = fetch_lumen_worker_script(&launch, &handle, &cache) else {
+        send_lumen_worker_error(
+            &events,
+            launch.id,
+            format!("worker script failed to load: {}", launch.script_url),
+        );
+        return;
+    };
+    engine.set_import_base(script.url.as_str());
+    let continued = match launch.kind {
+        LumenWorkerKind::Classic => eval_lumen_worker_classic(
+            &mut engine,
+            &script.source,
+            script.url.as_str(),
+            &events,
+            launch.id,
+        ),
+        LumenWorkerKind::Module => {
+            let fetched = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .and_then(|state| state.network.as_ref())
+                .map(|network| network.fetched.clone())
+                .unwrap_or_default();
+            eval_lumen_worker_module(
+                &mut engine,
+                &script,
+                LumenWorkerModuleFetch {
+                    page: launch.owner_page.clone(),
+                    handle: handle.clone(),
+                    cache: cache.clone(),
+                    fetched,
+                },
+                &events,
+                launch.id,
+            )
+        }
+    };
+    if !continued
+        || !lumen_worker_report_buffered_errors(&mut engine, &events, launch.id)
+        || lumen_worker_closed(&mut engine)
+    {
+        return;
+    }
+    loop {
+        let base_ms = lumen_worker_now(&mut engine);
+        let wall = Instant::now();
+        let deadline = lumen_worker_deadline(&mut engine);
+        let command = match deadline {
+            Some(deadline) => {
+                let wait = Duration::from_secs_f64(((deadline - base_ms).max(0.0)) / 1000.0);
+                match ctl_rx.recv_timeout(wait) {
+                    Ok(command) => Some(command),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            None => match ctl_rx.recv() {
+                Ok(command) => Some(command),
+                Err(_) => break,
+            },
+        };
+
+        let task_result = match command {
+            Some(LumenWorkerCtl::Terminate) => break,
+            Some(LumenWorkerCtl::Message(message)) => {
+                lumen_worker_internal_call(&mut engine, "message", &[Value::from_string(message)])
+            }
+            None => lumen_worker_internal_call(
+                &mut engine,
+                "tick",
+                &[Value::Num(base_ms + wall.elapsed().as_secs_f64() * 1000.0)],
+            ),
+        };
+        match task_result {
+            Ok(_) => {}
+            Err(EvalError::Interrupted(_)) => break,
+            Err(EvalError::Throw(error)) => send_lumen_worker_error(
+                &events,
+                launch.id,
+                describe_throw(&mut engine, error, "worker task"),
+            ),
+        }
+        if engine.run_microtasks_interruptible().is_err()
+            || !lumen_worker_report_buffered_errors(&mut engine, &events, launch.id)
+            || lumen_worker_closed(&mut engine)
+        {
+            break;
+        }
+        engine.collect_garbage_at_idle();
+    }
+}
+
 fn module_dependency_loader(
     page: &url::Url,
     handle: &tokio::runtime::Handle,
@@ -1427,6 +2096,33 @@ fn dispatch_host_task(engine: &mut lumen::Engine, task: LumenHostTask) -> Result
         }
         LumenHostTask::WebSocket { id, event } => {
             dispatch_websocket_task(engine, id, event)?;
+        }
+        LumenHostTask::Worker { id, event } => {
+            let (name, payload) = match event {
+                crate::js::WorkerOut::Message(message) => ("workerMessage", message),
+                crate::js::WorkerOut::Error(message) => ("workerError", message),
+            };
+            host_call_trust(
+                engine.ctx(),
+                name,
+                &[Value::Num(id as f64), Value::from_string(payload)],
+            )
+            .map_err(|error| {
+                engine
+                    .ctx()
+                    .coerce_string(&error)
+                    .map(|message| format!("Worker task: {message}"))
+                    .unwrap_or_else(|_| String::from("Worker task failed"))
+            })?;
+        }
+        LumenHostTask::WorkerExited { id } => {
+            if let Some(workers) = engine
+                .ctx()
+                .host_mut::<HostState>()
+                .and_then(|state| state.workers.as_mut())
+            {
+                workers.workers.remove(&id);
+            }
         }
     }
     Ok(())
@@ -2704,7 +3400,7 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 76);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 81);
 
         let mut engine = platform_engine();
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
@@ -2911,6 +3607,151 @@ mod tests {
             "{headers}"
         );
         assert_eq!(&request[header_end..], &[0, 0x80, 0xff]);
+    }
+
+    #[test]
+    fn workers_use_lumen_realms_and_preserve_task_microtask_order() {
+        // HTML §10.2.4/§10.2.6 and §8.1.7: each Worker gets a distinct dedicated agent;
+        // incoming port messages and timers are tasks with a microtask checkpoint between them.
+        // MessagePort post-message steps clone immediately and dispatch trusted MessageEvents with
+        // an empty origin. Module workers run as modules and importScripts() rejects there.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let page = url::Url::parse(DEFAULT_URL).unwrap();
+        let cache = Arc::new(crate::http::PageCache::default());
+        let (task_tx, mut task_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock = Rc::new(RealmClock::new());
+        let mut state = HostState::new(Rc::new(RefCell::new(Dom::new())), clock);
+        state.enable_network(page.clone(), runtime.handle().clone(), cache, task_tx);
+        let mut engine = configured_engine(state, page.as_str());
+
+        let classic_source = r#"
+            var workerOrder = [];
+            addEventListener('message', function (event) { workerOrder.push('listener'); });
+            onmessage = function (event) {
+                workerOrder.push('handler');
+                setTimeout(function () {
+                    postMessage({ kind: 'timer1', cycle: event.data === event.data.self,
+                        workerOrder: workerOrder.join(','), trusted: event.isTrusted,
+                        origin: event.origin, workerName: self.name });
+                    Promise.resolve().then(function () { postMessage({ kind: 'micro' }); });
+                }, 0);
+                setTimeout(function () { postMessage({ kind: 'timer2' }); }, 0);
+            };
+        "#;
+        let module_source = r#"
+            export const answer = 42;
+            var importError = '';
+            try { importScripts('data:text/javascript,'); }
+            catch (error) { importError = error.name; }
+            postMessage({ kind: 'module', answer: answer, importError: importError });
+        "#;
+        let data_url = |source: &str| {
+            // A data URL is not form-urlencoded: `+` is a literal plus, not a
+            // space. Percent-encode every source byte so the Fetch data-URL
+            // processor reconstructs the script exactly.
+            let encoded = source
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("%{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join("");
+            format!("data:text/javascript,{}", encoded)
+        };
+        let classic_url = serde_json::to_string(&data_url(classic_source)).unwrap();
+        let module_url = serde_json::to_string(&data_url(module_source)).unwrap();
+        let spinner_url = serde_json::to_string(&data_url("while (true) {}")).unwrap();
+        eval(
+            &mut engine,
+            &format!(
+                r#"
+                globalThis.workerLog = [];
+                globalThis.workerTrusted = true;
+                globalThis.workerOrigins = [];
+                globalThis.workerErrors = 0;
+                try {{ new Worker('http://['); }} catch (error) {{ workerLog.push('bad-url:' + error.name); }}
+                try {{ new Worker('data:text/javascript,', {{ type: 'invalid' }}); }} catch (error) {{ workerLog.push('bad-type:' + error.name); }}
+
+                globalThis.classicWorker = new Worker({classic_url}, {{ name: 'echo' }});
+                classicWorker.addEventListener('message', function (event) {{
+                    workerLog.push('listener:' + event.data.kind);
+                    workerTrusted = workerTrusted && event.isTrusted;
+                    workerOrigins.push(event.origin);
+                }});
+                classicWorker.onmessage = function (event) {{
+                    workerLog.push('handler:' + event.data.kind);
+                    if (event.data.kind === 'timer1') globalThis.timer1 = event.data;
+                }};
+                classicWorker.onerror = function () {{ workerErrors++; }};
+                var cyclic = {{ value: 41 }}; cyclic.self = cyclic;
+                classicWorker.postMessage(cyclic);
+
+                globalThis.moduleWorker = new Worker({module_url}, {{ type: 'module' }});
+                moduleWorker.onmessage = function (event) {{
+                    workerLog.push('module:' + event.data.answer + ':' + event.data.importError);
+                    workerTrusted = workerTrusted && event.isTrusted;
+                    workerOrigins.push(event.origin);
+                }};
+                moduleWorker.onerror = function () {{ workerErrors++; }};
+
+                globalThis.spinnerWorker = new Worker({spinner_url});
+                spinnerWorker.onerror = function () {{ workerErrors++; }};
+                spinnerWorker.terminate();
+                "#
+            ),
+            "Worker setup",
+        )
+        .unwrap();
+
+        for _ in 0..12 {
+            let log = string_value(&mut engine, "workerLog.join('|')");
+            if log.contains("handler:timer2") && log.contains("module:42:TypeError") {
+                break;
+            }
+            let task = runtime
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(15), task_rx.recv()).await
+                })
+                .expect("Worker task completes")
+                .expect("Worker task channel remains open");
+            dispatch_host_task(&mut engine, task).unwrap();
+            run_microtask_checkpoint(&mut engine);
+        }
+
+        let log = string_value(&mut engine, "workerLog.join('|')");
+        assert!(
+            log.starts_with("bad-url:SyntaxError|bad-type:TypeError"),
+            "{log}"
+        );
+        assert!(log.contains("module:42:TypeError"), "{log}");
+        let timer1 = log.find("listener:timer1|handler:timer1").unwrap();
+        let microtask = log.find("listener:micro|handler:micro").unwrap();
+        let timer2 = log.find("listener:timer2|handler:timer2").unwrap();
+        assert!(
+            timer1 < microtask && microtask < timer2,
+            "one timer task and its microtasks must precede the next timer task: {log}"
+        );
+        assert_eq!(string_value(&mut engine, "String(timer1.cycle)"), "true");
+        assert_eq!(
+            string_value(&mut engine, "timer1.workerOrder"),
+            "listener,handler"
+        );
+        assert_eq!(string_value(&mut engine, "String(timer1.trusted)"), "true");
+        assert_eq!(string_value(&mut engine, "timer1.origin"), "");
+        assert_eq!(string_value(&mut engine, "timer1.workerName"), "echo");
+        assert_eq!(string_value(&mut engine, "String(workerTrusted)"), "true");
+        assert_eq!(string_value(&mut engine, "workerOrigins.join(',')"), ",,,");
+        assert_eq!(string_value(&mut engine, "String(workerErrors)"), "0");
+
+        eval(
+            &mut engine,
+            "classicWorker.terminate(); moduleWorker.terminate();",
+            "Worker cleanup",
+        )
+        .unwrap();
     }
 
     #[test]
