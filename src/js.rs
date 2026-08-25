@@ -2204,6 +2204,53 @@ impl WasmState {
             tables: Vec::new(),
         }
     }
+
+    fn register_func(&mut self, value: wasmi::Func) -> usize {
+        if let Some(index) = self.funcs.iter().position(|candidate| *candidate == value) {
+            return index;
+        }
+        let index = self.funcs.len();
+        self.funcs.push(value);
+        index
+    }
+
+    fn register_global(&mut self, value: wasmi::Global) -> usize {
+        if let Some(index) = self
+            .globals
+            .iter()
+            .position(|candidate| *candidate == value)
+        {
+            return index;
+        }
+        let index = self.globals.len();
+        self.globals.push(value);
+        index
+    }
+
+    fn register_memory(&mut self, value: wasmi::Memory) -> usize {
+        if let Some(index) = self
+            .memories
+            .iter()
+            .position(|candidate| candidate.mem == value)
+        {
+            return index;
+        }
+        let index = self.memories.len();
+        self.memories.push(MemorySlot {
+            mem: value,
+            last_pages: value.size(&self.store),
+        });
+        index
+    }
+
+    fn register_table(&mut self, value: wasmi::Table) -> usize {
+        if let Some(index) = self.tables.iter().position(|candidate| *candidate == value) {
+            return index;
+        }
+        let index = self.tables.len();
+        self.tables.push(value);
+        index
+    }
 }
 
 /// The wasm state is held behind an `Rc` so a syscall that EXECUTES wasm
@@ -2392,12 +2439,7 @@ fn active_wasm_func(id: usize) -> Option<wasmi::Func> {
 fn active_wasm_register_func(func: wasmi::Func) -> Option<usize> {
     WASM_ACTIVE_STATE.with(|s| {
         let ptr = s.get();
-        (!ptr.is_null()).then(|| unsafe {
-            let funcs = &mut (*ptr).funcs;
-            let id = funcs.len();
-            funcs.push(func);
-            id
-        })
+        (!ptr.is_null()).then(|| unsafe { (*ptr).register_func(func) })
     })
 }
 
@@ -4826,6 +4868,9 @@ enum ImportBinding {
     /// A JS function import: the index into the instantiation's import-function
     /// array (`__wasm_invoke_import` looks it up by `(token, index)`).
     Func(u32),
+    /// An existing Exported Function imported directly, preserving its core
+    /// function address and wrapper-cache identity (js-api "read the imports").
+    FuncRef(u32),
     /// A `WebAssembly.Global` passed as an import: its global registry id.
     GlobalRef(u32),
     /// A bare Number/BigInt imported into a global: pre-coerced to the import's
@@ -4870,6 +4915,9 @@ fn parse_import_descriptor(
             .unwrap_or_else(|_| JsValue::undefined());
         match tag.as_str() {
             "f" => out.push(ImportBinding::Func(
+                payload.as_number().unwrap_or(0.0) as u32
+            )),
+            "fr" => out.push(ImportBinding::FuncRef(
                 payload.as_number().unwrap_or(0.0) as u32
             )),
             "g" => out.push(ImportBinding::GlobalRef(
@@ -4918,17 +4966,33 @@ fn build_and_instantiate(
         let binding = bindings.get(i);
         match imp.ty() {
             wasmi::ExternType::Func(ft) => {
-                let Some(ImportBinding::Func(j)) = binding else {
-                    return Err((
-                        "Link",
-                        format!(
-                            "import {}.{}: expected a function",
-                            imp.module(),
-                            imp.name()
-                        ),
-                    ));
+                let func = match binding {
+                    Some(ImportBinding::Func(j)) => {
+                        make_import_func(&mut st.store, ft.clone(), token, *j)
+                    }
+                    Some(ImportBinding::FuncRef(id)) => {
+                        st.funcs.get(*id as usize).copied().ok_or_else(|| {
+                            (
+                                "Link",
+                                format!(
+                                    "import {}.{}: unknown exported function",
+                                    imp.module(),
+                                    imp.name()
+                                ),
+                            )
+                        })?
+                    }
+                    _ => {
+                        return Err((
+                            "Link",
+                            format!(
+                                "import {}.{}: expected a function",
+                                imp.module(),
+                                imp.name()
+                            ),
+                        ));
+                    }
                 };
-                let func = make_import_func(&mut st.store, ft.clone(), token, *j);
                 linker
                     .define(imp.module(), imp.name(), func)
                     .map_err(|e| ("Link", format!("{e}")))?;
@@ -5106,7 +5170,9 @@ fn sys_wasm_instantiate(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
 }
 
 /// `__wasm_instance_exports(instanceId, moduleId)` → flat array
-/// `[name, kind, subId, …]`; the prelude builds the (frozen) exports object.
+/// `[name, kind, subId, auxiliaryType, …]`; the prelude builds the (frozen)
+/// exports object. `auxiliaryType` carries a table's element type and is empty
+/// for other extern kinds.
 /// wasmi has no per-instance export listing, so names/kinds come from the
 /// module and each export is fetched by name. Stage 2 wraps FUNCTION exports
 /// (each registered into `funcs`, its index returned as `subId`); memory/table/
@@ -5139,39 +5205,42 @@ fn sys_wasm_instance_exports(
                         match kind {
                             "function" => {
                                 if let Some(f) = inst.get_func(&st.store, &name) {
-                                    let sub = st.funcs.len();
-                                    st.funcs.push(f);
+                                    let sub = st.register_func(f);
                                     v.push(str_value(&name));
                                     v.push(str_value("function"));
                                     v.push(JsValue::from(sub as f64));
+                                    v.push(str_value(""));
                                 }
                             }
                             "global" => {
                                 if let Some(g) = inst.get_global(&st.store, &name) {
-                                    let sub = st.globals.len();
-                                    st.globals.push(g);
+                                    let sub = st.register_global(g);
                                     v.push(str_value(&name));
                                     v.push(str_value("global"));
                                     v.push(JsValue::from(sub as f64));
+                                    v.push(str_value(""));
                                 }
                             }
                             "memory" => {
                                 if let Some(m) = inst.get_memory(&st.store, &name) {
-                                    let last_pages = m.size(&st.store);
-                                    let sub = st.memories.len();
-                                    st.memories.push(MemorySlot { mem: m, last_pages });
+                                    let sub = st.register_memory(m);
                                     v.push(str_value(&name));
                                     v.push(str_value("memory"));
                                     v.push(JsValue::from(sub as f64));
+                                    v.push(str_value(""));
                                 }
                             }
                             "table" => {
                                 if let Some(t) = inst.get_table(&st.store, &name) {
-                                    let sub = st.tables.len();
-                                    st.tables.push(t);
+                                    let sub = st.register_table(t);
                                     v.push(str_value(&name));
                                     v.push(str_value("table"));
                                     v.push(JsValue::from(sub as f64));
+                                    v.push(str_value(match t.ty(&st.store).element() {
+                                        wasmi::ValType::FuncRef => "anyfunc",
+                                        wasmi::ValType::ExternRef => "externref",
+                                        _ => "",
+                                    }));
                                 }
                             }
                             _ => {}
@@ -5338,8 +5407,8 @@ fn sys_wasm_call_export(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsR
 /// `__wasm_global_new(typeStr, mutable, value)` → a global id (Number) on
 /// success, or throws a `TypeError` (js-api `Global` constructor): bad type,
 /// v128 (not constructible from JS), or a value that won't coerce. A missing
-/// value uses the type's default. Stage 4 supports numeric globals; reference-
-/// typed globals (externref/funcref) coerce in Stage 6.
+/// value uses the type's default. Numeric and reference-typed globals both use
+/// the JavaScript API's `ToWebAssemblyValue` conversion.
 fn sys_wasm_global_new(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let type_str = arg_str(args, 0, ctx);
     let mutable = args.get(1).map(|v| v.to_boolean()).unwrap_or(false);
@@ -5353,11 +5422,9 @@ fn sys_wasm_global_new(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRe
             .with_message("WebAssembly.Global: a v128 global cannot be constructed from JS")
             .into());
     }
-    // Coerce the initial value (or the type default) BEFORE the wasm borrow.
-    let init = match args.get(2) {
-        Some(v) if !v.is_undefined() => js_to_wasm(ctx, v, ty)?,
-        _ => wasmi::Val::default(ty),
-    };
+    // Coerce/intern the initial value before borrowing the store. In particular,
+    // `undefined` is an ordinary externref value, not a missing initializer.
+    let init = prepare_arg(ctx, args.get(2).unwrap_or(&JsValue::undefined()), ty)?;
     let mutability = if mutable {
         wasmi::Mutability::Var
     } else {
@@ -5370,9 +5437,10 @@ fn sys_wasm_global_new(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRe
     };
     let mut slot = cell.borrow_mut();
     let st = slot.get_or_insert_with(WasmState::new);
+    let init = build_arg(st, init)
+        .map_err(|()| wasm_type_err("WebAssembly.Global: invalid reference value"))?;
     let g = wasmi::Global::new(&mut st.store, init, mutability);
-    let id = st.globals.len();
-    st.globals.push(g);
+    let id = st.register_global(g);
     Ok(JsValue::from(id as f64))
 }
 
@@ -5382,16 +5450,22 @@ fn sys_wasm_global_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRe
     let Some(cell) = page_wasm_cell(ctx) else {
         return Ok(JsValue::undefined());
     };
-    let val = {
-        let slot = cell.borrow();
-        slot.as_ref().and_then(|st| {
+    let token = {
+        let mut slot = cell.borrow_mut();
+        slot.as_mut().and_then(|st| {
             arg_id(args, 0)
                 .and_then(|i| st.globals.get(i))
-                .map(|g| g.get(&st.store))
+                .copied()
+                .map(|g| {
+                    let value = g.get(&st.store);
+                    extract_out_token(st, &value)
+                })
         })
     };
-    match val {
-        Some(v) => wasm_to_js(&v),
+    match token {
+        Some(OutTok::Js(value)) => Ok(value),
+        Some(OutTok::Func(id)) => wasm_make_func(ctx, id),
+        Some(OutTok::Extern(id)) => wasm_extern_get(ctx, id),
         None => Ok(JsValue::undefined()),
     }
 }
@@ -5422,14 +5496,16 @@ fn sys_wasm_global_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRe
             .with_message("WebAssembly.Global: cannot set the value of an immutable global")
             .into());
     }
-    let val = js_to_wasm(ctx, args.get(1).unwrap_or(&JsValue::undefined()), content)?;
+    let val = prepare_arg(ctx, args.get(1).unwrap_or(&JsValue::undefined()), content)?;
     let mut slot = cell.borrow_mut();
-    if let Some(st) = slot.as_mut()
-        && let Some(g) = arg_id(args, 0).and_then(|i| st.globals.get(i)).copied()
-    {
-        g.set(&mut st.store, val).map_err(|e| {
-            boa_engine::JsNativeError::typ().with_message(format!("WebAssembly.Global: {e}"))
-        })?;
+    if let Some(st) = slot.as_mut() {
+        let val = build_arg(st, val)
+            .map_err(|()| wasm_type_err("WebAssembly.Global: invalid reference value"))?;
+        if let Some(g) = arg_id(args, 0).and_then(|i| st.globals.get(i)).copied() {
+            g.set(&mut st.store, val).map_err(|e| {
+                boa_engine::JsNativeError::typ().with_message(format!("WebAssembly.Global: {e}"))
+            })?;
+        }
     }
     Ok(JsValue::undefined())
 }
@@ -5713,10 +5789,11 @@ enum RefArg {
 }
 
 /// `ToWebAssemblyValue` for a reference-typed slot, with `ctx` but no state
-/// borrow (it may intern an externref via the prelude). null/undefined → the
-/// null reference; a funcref value must be an Exported Function (js-api).
+/// borrow (it may intern an externref via the prelude). `null` is the null
+/// reference; `undefined` is an ordinary externref value and is invalid for
+/// funcref. A funcref value must be an Exported Function (js-api).
 fn prepare_ref(ctx: &mut Context, value: &JsValue, elem: wasmi::ValType) -> JsResult<RefArg> {
-    if value.is_null() || value.is_undefined() {
+    if value.is_null() {
         return Ok(RefArg::Null(elem));
     }
     match elem {
@@ -5814,11 +5891,7 @@ fn extract_out_token(st: &mut WasmState, v: &wasmi::Val) -> OutTok {
         wasmi::Val::FuncRef(wasmi::Ref::Null) | wasmi::Val::ExternRef(wasmi::Ref::Null) => {
             OutTok::Js(JsValue::null())
         }
-        wasmi::Val::FuncRef(wasmi::Ref::Val(f)) => {
-            let id = st.funcs.len();
-            st.funcs.push(*f);
-            OutTok::Func(id)
-        }
+        wasmi::Val::FuncRef(wasmi::Ref::Val(f)) => OutTok::Func(st.register_func(*f)),
         wasmi::Val::ExternRef(wasmi::Ref::Val(er)) => {
             let id = er
                 .data(&st.store)
@@ -5925,14 +5998,7 @@ fn sys_wasm_table_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
                     None => Tok::Oob,
                     Some(wasmi::Val::FuncRef(wasmi::Ref::Null))
                     | Some(wasmi::Val::ExternRef(wasmi::Ref::Null)) => Tok::Null,
-                    Some(wasmi::Val::FuncRef(wasmi::Ref::Val(f))) => {
-                        // No `Func` equality in wasmi → a fresh wrapper (the
-                        // funcref read-back identity caveat); the VALUE is
-                        // correct/callable.
-                        let id = st.funcs.len();
-                        st.funcs.push(f);
-                        Tok::Func(id)
-                    }
+                    Some(wasmi::Val::FuncRef(wasmi::Ref::Val(f))) => Tok::Func(st.register_func(f)),
                     Some(wasmi::Val::ExternRef(wasmi::Ref::Val(er))) => {
                         let id = er
                             .data(&st.store)
@@ -22904,6 +22970,28 @@ pub(crate) const PRELUDE: &str = r##"
         return externRefs[id];
     };
 
+    // WebAssembly JS API §5.6 AddressValueToU64 for the currently-supported
+    // i32 address type. This is Web IDL [EnforceRange] unsigned long: NaN
+    // becomes +0, finite values truncate, and negative/out-of-range values
+    // throw instead of wrapping modulo 2^32.
+    function addressU32(value) {
+        let number = Number(value);
+        if (Number.isNaN(number)) number = 0;
+        number = Math.trunc(number);
+        if (!Number.isFinite(number) || number < 0 || number > 0xffffffff) {
+            throw new TypeError("WebAssembly address value is out of range");
+        }
+        return number;
+    }
+
+    function defaultWasmValue(type) {
+        if (type === "i64") return 0n;
+        if (type === "f32" || type === "f64" || type === "i32") return 0;
+        if (type === "externref") return undefined;
+        if (type === "anyfunc") return null;
+        return undefined;
+    }
+
     // WebAssembly.Global. The value lives in the wasm store; the JS object is a
     // thin handle carrying its registry id. `makeGlobal` wraps an EXISTING global
     // (an export or an import round-tripped back) without re-creating it, and is
@@ -22922,7 +23010,9 @@ pub(crate) const PRELUDE: &str = r##"
             if (typeof descriptor !== "object" || descriptor === null) {
                 throw new TypeError("WebAssembly.Global: descriptor must be an object");
             }
-            const id = __wasm_global_new(String(descriptor.value), !!descriptor.mutable, v);
+            const type = String(descriptor.value);
+            const value = arguments.length < 2 ? defaultWasmValue(type) : v;
+            const id = __wasm_global_new(type, !!descriptor.mutable, value);
             Object.defineProperty(this, "__globalId", { value: id });
             globalWrappers.set(id, this);
         }
@@ -22938,8 +23028,9 @@ pub(crate) const PRELUDE: &str = r##"
     }
 
     // WebAssembly.Memory. The bytes live in the wasm store; `.buffer` is a
-    // zero-copy live ArrayBuffer window onto them (rebuilt + the old one detached
-    // whenever the memory grows). The JS object carries only the memory id.
+    // live ArrayBuffer identified with them (rebuilt + the old one detached
+    // whenever the memory grows). Each engine adapter preserves the same
+    // observable data-block semantics; the JS object carries only the memory id.
     const memoryWrappers = new Map();
     function makeMemory(memId) {
         let m = memoryWrappers.get(memId);
@@ -22954,11 +23045,18 @@ pub(crate) const PRELUDE: &str = r##"
             if (typeof descriptor !== "object" || descriptor === null) {
                 throw new TypeError("WebAssembly.Memory: descriptor must be an object");
             }
-            const initial = descriptor.initial >>> 0;
+            if (descriptor.initial === undefined) {
+                throw new TypeError("WebAssembly.Memory: initial is required");
+            }
+            if (descriptor.address !== undefined && descriptor.address !== "i32") {
+                throw new TypeError("WebAssembly.Memory: unsupported address type");
+            }
+            if (descriptor.shared === true) {
+                throw new TypeError("WebAssembly.Memory: shared memory is not supported");
+            }
+            const initial = addressU32(descriptor.initial);
             const maximum =
-                descriptor.maximum === undefined ? -1 : descriptor.maximum >>> 0;
-            // (A `shared` memory request is treated as non-shared — the threads
-            // proposal / SharedArrayBuffer is out of scope.)
+                descriptor.maximum === undefined ? -1 : addressU32(descriptor.maximum);
             const id = __wasm_memory_new(initial, maximum);
             Object.defineProperty(this, "__memId", { value: id });
             memoryWrappers.set(id, this);
@@ -22967,20 +23065,27 @@ pub(crate) const PRELUDE: &str = r##"
             return __wasm_memory_buffer(this.__memId);
         }
         grow(delta) {
-            return __wasm_memory_grow(this.__memId, delta >>> 0);
+            return __wasm_memory_grow(this.__memId, addressU32(delta));
+        }
+        toFixedLengthBuffer() {
+            return this.buffer;
+        }
+        toResizableBuffer() {
+            throw new TypeError("WebAssembly.Memory: resizable buffers are not supported");
         }
     }
 
     // WebAssembly.Table — a growable array of funcref/externref values living in
     // the wasm store. The JS object carries only the table id. get/set convert
     // funcref ↔ Exported Function and externref ↔ any JS value (identity-
-    // preserving for externref; funcref read-back is a fresh wrapper).
+    // preserving for both externref values and exported-function addresses).
     const tableWrappers = new Map();
-    function makeTable(tableId) {
+    function makeTable(tableId, element) {
         let t = tableWrappers.get(tableId);
         if (t) return t;
         t = Object.create(Table.prototype);
         Object.defineProperty(t, "__tableId", { value: tableId });
+        Object.defineProperty(t, "__element", { value: element });
         tableWrappers.set(tableId, t);
         return t;
     }
@@ -22989,24 +23094,35 @@ pub(crate) const PRELUDE: &str = r##"
             if (typeof descriptor !== "object" || descriptor === null) {
                 throw new TypeError("WebAssembly.Table: descriptor must be an object");
             }
-            const initial = descriptor.initial >>> 0;
+            if (descriptor.initial === undefined) {
+                throw new TypeError("WebAssembly.Table: initial is required");
+            }
+            if (descriptor.address !== undefined && descriptor.address !== "i32") {
+                throw new TypeError("WebAssembly.Table: unsupported address type");
+            }
+            const element = String(descriptor.element);
+            const initial = addressU32(descriptor.initial);
             const maximum =
-                descriptor.maximum === undefined ? -1 : descriptor.maximum >>> 0;
-            const id = __wasm_table_new(String(descriptor.element), initial, maximum, value);
+                descriptor.maximum === undefined ? -1 : addressU32(descriptor.maximum);
+            if (arguments.length < 2) value = defaultWasmValue(element);
+            const id = __wasm_table_new(element, initial, maximum, value);
             Object.defineProperty(this, "__tableId", { value: id });
+            Object.defineProperty(this, "__element", { value: element });
             tableWrappers.set(id, this);
         }
         get length() {
             return __wasm_table_length(this.__tableId);
         }
         get(index) {
-            return __wasm_table_get(this.__tableId, index >>> 0);
+            return __wasm_table_get(this.__tableId, addressU32(index));
         }
         set(index, value) {
-            return __wasm_table_set(this.__tableId, index >>> 0, value);
+            if (arguments.length < 2) value = defaultWasmValue(this.__element);
+            return __wasm_table_set(this.__tableId, addressU32(index), value);
         }
         grow(delta, value) {
-            return __wasm_table_grow(this.__tableId, delta >>> 0, value);
+            if (arguments.length < 2) value = defaultWasmValue(this.__element);
+            return __wasm_table_grow(this.__tableId, addressU32(delta), value);
         }
     }
 
@@ -23015,14 +23131,15 @@ pub(crate) const PRELUDE: &str = r##"
     function buildExports(instanceId, moduleId) {
         const flat = __wasm_instance_exports(instanceId, moduleId);
         const exports = Object.create(null);
-        for (let i = 0; i + 2 < flat.length; i += 3) {
+        for (let i = 0; i + 3 < flat.length; i += 4) {
             const name = flat[i],
                 kind = flat[i + 1],
-                sub = flat[i + 2];
+                sub = flat[i + 2],
+                auxiliaryType = flat[i + 3];
             if (kind === "function") exports[name] = exportedFunction(sub);
             else if (kind === "global") exports[name] = makeGlobal(sub);
             else if (kind === "memory") exports[name] = makeMemory(sub);
-            else if (kind === "table") exports[name] = makeTable(sub);
+            else if (kind === "table") exports[name] = makeTable(sub, auxiliaryType);
         }
         return Object.freeze(exports);
     }
@@ -23039,8 +23156,8 @@ pub(crate) const PRELUDE: &str = r##"
 
     // js-api "read the imports": for each module import, resolve
     // importObject[module][name], validate its kind, and collect the binding.
-    // Stage 3 supports FUNCTION imports; global/memory/table imports arrive in
-    // their stages. `descriptor[i]` is the import-function index for import `i`.
+    // Existing Exported Functions retain their core address; ordinary JS
+    // functions receive a host-function address keyed by the import token.
     function readImports(module, importObject) {
         const imps = Module.imports(module);
         if (imps.length > 0 && (typeof importObject !== "object" || importObject === null)) {
@@ -23064,8 +23181,12 @@ pub(crate) const PRELUDE: &str = r##"
                             "import '" + imp.module + "." + imp.name + "' is not a function"
                         );
                     }
-                    descriptor.push(["f", funcs.length]);
-                    funcs.push(value);
+                    if (typeof value.__wasmFunc === "number") {
+                        descriptor.push(["fr", value.__wasmFunc]);
+                    } else {
+                        descriptor.push(["f", funcs.length]);
+                        funcs.push(value);
+                    }
                     break;
                 case "global":
                     if (value instanceof Global) {
@@ -37827,6 +37948,38 @@ mod tests {
     }
 
     #[test]
+    fn wasm_module_metadata_preserves_declaration_order() {
+        // WebAssembly JS API §4.2 walks the module's import and export sections in
+        // declaration order. The underlying wasmi registries must not regroup by
+        // external kind or expose hash-map iteration order.
+        let bytes = wat_u8(
+            r#"(module
+                (import "env" "f" (func $f))
+                (import "env" "g" (global $g i32))
+                (import "env" "m" (memory $m 1))
+                (import "env" "t" (table $t 1 externref))
+                (export "m" (memory $m))
+                (export "t" (table $t))
+                (export "g" (global $g))
+                (export "f" (func $f)))"#,
+        );
+        let html = format!(
+            "<body><pre id=o></pre><script>\
+             var m = new WebAssembly.Module({bytes});\
+             var imports = WebAssembly.Module.imports(m).map(function(v){{return v.kind}}).join(',');\
+             var exports = WebAssembly.Module.exports(m).map(function(v){{return v.kind}}).join(',');\
+             document.getElementById('o').textContent = imports + '|' + exports;\
+             </script></body>"
+        );
+        let (out, outcome) = page(&html);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("function,global,memory,table|memory,table,global,function"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn wasm_compile_throws_compileerror_on_bad_bytes() {
         let html = "<body><pre id=o></pre><script>\
              var r='none';\
@@ -37892,6 +38045,33 @@ mod tests {
         let (out, outcome) = page(&html);
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert!(out.contains("r=42"), "{out}");
+    }
+
+    #[test]
+    fn wasm_reexported_function_preserves_wrapper_identity() {
+        // WebAssembly JS API exported-function caching is by core function
+        // address, including an imported function re-exported by another module.
+        let source = wat_u8(
+            r#"(module
+                (func (export "f") (param i32) (result i32) local.get 0))"#,
+        );
+        let forwarding = wat_u8(
+            r#"(module
+                (import "env" "f" (func $f (param i32) (result i32)))
+                (export "f" (func $f)))"#,
+        );
+        let html = format!(
+            "<body><pre id=o></pre><script>\
+             var first = new WebAssembly.Instance(new WebAssembly.Module({source}));\
+             var second = new WebAssembly.Instance(new WebAssembly.Module({forwarding}),\
+                 {{env:{{f:first.exports.f}}}});\
+             document.getElementById('o').textContent =\
+                 (first.exports.f === second.exports.f) + '|' + second.exports.f(9);\
+             </script></body>"
+        );
+        let (out, outcome) = page(&html);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("true|9"), "{out}");
     }
 
     #[test]
@@ -38350,12 +38530,48 @@ mod tests {
              var len = t.length;\
              var oldLen = t.grow(1);\
              document.getElementById('o').textContent = \
-                 same + ',' + len + ',' + oldLen + ',' + t.length + ',' + (t.get(2) === null);\
+                 same + ',' + len + ',' + oldLen + ',' + t.length + ',' + (t.get(2) === undefined);\
              </script></body>";
         let (out, outcome) = page(html);
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
-        // identity preserved, length 2, grow returns old length 2, now 3, new slot null
+        // WebAssembly JS API §4.6: omitted externref initializers use undefined.
+        // Identity is preserved, grow returns the old length, and the new slot
+        // receives that default value.
         assert!(out.contains("true,2,2,3,true"), "{out}");
+    }
+
+    #[test]
+    fn wasm_descriptors_and_addresses_follow_web_idl_conversions() {
+        // WebAssembly JS API §§4.3–4.6: omitted reference initializers use
+        // type-specific defaults, while i32 address values use Web IDL's
+        // [EnforceRange] unsigned-long conversion instead of modulo wrapping.
+        let html = "<body><pre id=o></pre><script>\
+             var ext = new WebAssembly.Table({element:'externref', initial:1});\
+             ext.set(0);\
+             var fun = new WebAssembly.Table({element:'anyfunc', initial:1});\
+             fun.set(0);\
+             var checks = [ext.get(0) === undefined, fun.get(0) === null,\
+                 new WebAssembly.Global({value:'externref'}).value === undefined,\
+                 new WebAssembly.Memory({initial:NaN}).buffer.byteLength === 0];\
+             for (var action of [\
+                 function(){new WebAssembly.Memory({});},\
+                 function(){new WebAssembly.Memory({initial:-1});},\
+                 function(){new WebAssembly.Memory({initial:4294967296});},\
+                 function(){new WebAssembly.Table({element:'externref'});},\
+                 function(){ext.get(-1);},\
+                 function(){fun.set(0, undefined);}\
+             ]) {\
+                 try { action(); checks.push(false); }\
+                 catch (error) { checks.push(error instanceof TypeError); }\
+             }\
+             document.getElementById('o').textContent = checks.join(',');\
+             </script></body>";
+        let (out, outcome) = page(html);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("true,true,true,true,true,true,true,true,true,true"),
+            "{out}"
+        );
     }
 
     #[test]
