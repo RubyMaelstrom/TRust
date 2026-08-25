@@ -49,7 +49,7 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 flate2 = "1"
 futures = "0.3.32"
 html5ever = "0.39"
-image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico"] }
 libmimalloc-sys = { version = "0.1", features = ["extended"], optional = true }
 libmudtelnet = "2.0.2"
 mimalloc = { version = "0.1", optional = true }
@@ -149,6 +149,10 @@ boa_interner = "0.21"
 [patch.crates-io]
 fontique = { path = "vendor/fontique-0.11.0" }
 crossterm = { path = "vendor/crossterm-0.29.0" }
+# image-webp 0.2.4 indexes an always-RGBA animation canvas with a three-byte
+# stride when disposal is followed by an opaque subframe. Carry upstream
+# image-rs/image-webp#178 until its fix ships in a crates.io release.
+image-webp = { path = "vendor/image-webp-0.2.4" }
 # Vello Hybrid 0.2 is the current release, but upstream still pins wgpu 29.
 # TRust carries this source-identical compatibility fork so the desktop uses
 # wgpu 30's panic-safe SurfaceTexture teardown (gfx-rs/wgpu#9678). Keep the

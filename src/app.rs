@@ -705,6 +705,9 @@ pub struct App {
     /// The next fetched document replaces the current one instead of
     /// pushing history (`reload`).
     replace_nav: bool,
+    /// Due HTML declarative refresh for the committed document. The URL is
+    /// followed using replacement-history semantics when its deadline passes.
+    declarative_refresh: Option<(tokio::time::Instant, Url)>,
     /// A deep back/forward is refetching an evicted trail entry: the next
     /// fetched document completes the travel (pop the entry, park the
     /// current doc on the opposite stack) instead of pushing history.
@@ -964,6 +967,7 @@ impl App {
             pending_live_submit: None,
             page_js_errors: std::collections::HashSet::new(),
             replace_nav: false,
+            declarative_refresh: None,
             pending_travel: None,
             current_from_post: false,
             nav_from_post: false,
@@ -1228,6 +1232,10 @@ impl App {
             // shrink-clamped) display scroll — that's what the tail-sync below
             // skips, so a placeholder frame can't destroy the reader's place.
             let mut from_page = false;
+            let declarative_refresh_deadline = self
+                .declarative_refresh
+                .as_ref()
+                .map(|(deadline, _)| *deadline);
             tokio::select! {
                 event = input_rx.recv() => match event {
                     Some(event) => self.on_terminal_event(event).await,
@@ -1274,6 +1282,13 @@ impl App {
                     pending_hover_target = None;
                     hover_sleep = None;
                     self.commit_page_hover();
+                },
+                _ = async {
+                    if let Some(deadline) = declarative_refresh_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    }
+                }, if declarative_refresh_deadline.is_some() => {
+                    self.follow_declarative_refresh();
                 },
                 _ = tick.tick(), if self.loading() => {
                     self.spinner = self.spinner.wrapping_add(1);
@@ -2703,6 +2718,7 @@ impl App {
         // A new fetch intent supersedes a pending deep-travel completion
         // (the deep-travel path itself re-sets the flag after this call).
         self.pending_travel = None;
+        self.declarative_refresh = None;
         if let Link::Http(url) = &target
             && crate::media::is_youtube_video_url(url)
         {
@@ -3499,6 +3515,7 @@ impl App {
     /// server sent a usable body (error pages are content); the status
     /// code always lands in the status bar.
     fn on_http_response(&mut self, mut response: http::Response, width: usize) {
+        let declarative_refresh = response.declarative_refresh.take();
         let live = response.live.take();
         // A challenge response is still a normal HTML navigation. Its body
         // may contain the provider's browser challenge, an interactive
@@ -3634,6 +3651,22 @@ impl App {
         }
         // Kick off the parallel image pipeline; decoded images re-flow in.
         self.start_image_loads(page, image_urls);
+        if let Some(refresh) = declarative_refresh
+            && let Some(deadline) = tokio::time::Instant::now().checked_add(refresh.delay)
+        {
+            self.declarative_refresh = Some((deadline, refresh.url));
+        }
+    }
+
+    /// Follow a due HTML declarative refresh with replacement navigation.
+    /// Any competing navigation clears the pending deadline first, preventing
+    /// a retired document from navigating the new page later.
+    fn follow_declarative_refresh(&mut self) {
+        let Some((_, url)) = self.declarative_refresh.take() else {
+            return;
+        };
+        self.replace_nav = true;
+        self.navigate_from_page(url.as_str());
     }
 
     fn drop_live_page(&mut self) {
@@ -4267,6 +4300,7 @@ impl App {
             task.abort();
         }
         self.fetch_rx = None;
+        self.declarative_refresh = None;
         self.pending_travel = None;
         self.abort_image_loads();
         self.drop_live_page();
@@ -11436,6 +11470,7 @@ mod tests {
             rendered: None,
             js: None,
             live: None,
+            declarative_refresh: None,
             challenge: Some(String::from("AWS WAF (challenge)")),
             from_post: false,
         };
@@ -11467,6 +11502,7 @@ mod tests {
             rendered: None,
             js: None,
             live: None,
+            declarative_refresh: None,
             challenge: None,
             from_post: false,
         };
@@ -12589,6 +12625,7 @@ mod tests {
                 rendered: None,
                 js: None,
                 live: None,
+                declarative_refresh: None,
                 challenge: None,
                 from_post: false,
             },

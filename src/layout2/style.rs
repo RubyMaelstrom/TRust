@@ -255,7 +255,17 @@ impl BoxStyle {
         let u = Units::of(dom, id);
         let tag = dom.tag_name(id).unwrap_or("");
         let (ua_margin, ua_padding) = ua_box(dom, id, tag, u.fs);
-        let (has_transform, tx, ty) = transform_translation(dom, id, u, vp);
+        let (mut has_transform, tx, ty) = transform_translation(dom, id, u, vp);
+        // CSS Animations 1 §4 gives a transform animation the same stacking-
+        // context behavior as a non-none computed transform even when the
+        // underlying value is `none`. This also keeps the animated element's
+        // subtree atomic in the retained display list.
+        has_transform |= dom.css_animation_definitions(id).iter().any(|animation| {
+            animation
+                .keyframes
+                .iter()
+                .any(|frame| frame.transform.is_some())
+        });
         // CSS Custom Properties §3: substitute var() references at computed-
         // value time, before the typed layout snapshot parses lengths. Feeding
         // raw `var(--x)` into Len made a valid declaration silently fall back

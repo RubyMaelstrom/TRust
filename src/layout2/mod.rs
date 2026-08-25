@@ -1011,6 +1011,38 @@ mod tests {
     }
 
     #[test]
+    fn fixed_keyframe_animation_is_retained_for_scene_sampling() {
+        let layout = lay_graphical(
+            "<style>
+               @keyframes fall { from { top:-10% } to { top:100% } }
+               @keyframes shake { 0%,100% { transform:translateX(0) }
+                                  50% { transform:translateX(80px) } }
+               #snow { position:fixed; top:-10%; z-index:9;
+                       animation-name:fall,shake;
+                       animation-duration:10s,3s;
+                       animation-timing-function:linear,ease-in-out;
+                       animation-iteration-count:infinite,infinite }
+             </style><div id=snow>snow</div>",
+            800.0,
+            &ImageSizes::new(),
+        );
+        let scope = layout
+            .paint
+            .primitives
+            .iter()
+            .find_map(|command| match command {
+                crate::render::DisplayCommand::BeginCssAnimation(scope) => Some(scope),
+                _ => None,
+            })
+            .expect("animated fixed element has a scene-sampled scope");
+        assert_eq!(scope.animations.len(), 2);
+        assert_eq!(scope.animations[0].position[0].value.y, 0.0);
+        assert_eq!(scope.animations[0].position[1].value.y, 660.0);
+        assert_eq!(scope.animations[1].transform[1].value.x, 80.0);
+        assert!(layout.paint.has_css_animations());
+    }
+
+    #[test]
     fn hscroll_strip_escapes_an_overflow_hidden_ancestor_clip() {
         // A `<pre overflow-x:auto>` code line nested inside an `overflow:hidden`
         // ancestor (a locked model-card / app-shell column — HuggingFace) must
@@ -2892,6 +2924,186 @@ mod tests {
         let clip = clip.expect("nested document viewport clip");
         assert!((clip.width - 200.0).abs() < 0.1, "{clip:?}");
         assert!((clip.height - 74.0).abs() < 0.1, "{clip:?}");
+    }
+
+    #[test]
+    fn iframe_content_navigable_is_an_independent_scrollport() {
+        // HTML iframe content is a child navigable with its own viewport. CSS
+        // Overflow 3 §2.3 makes overflowing content independently scrollable
+        // within that viewport instead of extending the parent document.
+        let mut dom = Dom::parse_document(
+            r#"<style>iframe{width:200px;height:100px;overflow:scroll}</style>
+               <body style="margin:0"><iframe id=f></iframe></body>"#,
+        );
+        let frame = dom.get_by_id("f").unwrap();
+        dom.install_frame_document(
+            frame,
+            r#"<body style="margin:0"><div style="height:400px">child</div></body>"#,
+            "https://frame.test/",
+        )
+        .unwrap();
+        let base = Url::parse("https://page.test/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(400.0, 300.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let scroll = layout
+            .paint
+            .scroll_containers
+            .iter()
+            .find(|scroll| scroll.node == frame)
+            .expect("iframe viewport is a scroll container");
+        assert_eq!(scroll.viewport.width, 200.0);
+        assert_eq!(scroll.viewport.height, 100.0);
+        assert!(scroll.content.height >= 400.0, "{scroll:?}");
+        assert!(scroll.vertical);
+    }
+
+    #[test]
+    fn iframe_canvas_background_covers_the_complete_scrolling_area() {
+        // CSS Backgrounds 3 §§2.11.1–2: the nested document's BODY
+        // background is propagated to its canvas and the painting area covers
+        // the complete canvas. It must not end after the BODY's 100%-of-
+        // viewport box when descendants extend the child viewport's scrolling
+        // area (the midosuji.neocities.org iframe regression).
+        let mut dom = Dom::parse_document(
+            r#"<style>iframe{width:120px;height:60px;overflow:scroll}</style>
+               <body style="margin:0;background:#ff00ff"><iframe id=f></iframe></body>"#,
+        );
+        let frame = dom.get_by_id("f").unwrap();
+        dom.install_frame_document(
+            frame,
+            r#"<html style="height:100%;background:transparent"><body style="height:100%;margin:0;background:#123456"><div id=tail style="height:240px">tail</div></body></html>"#,
+            "https://frame.test/",
+        )
+        .unwrap();
+        let base = Url::parse("https://page.test/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(320.0, 200.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let scroll = layout
+            .paint
+            .scroll_containers
+            .iter()
+            .find(|scroll| scroll.node == frame)
+            .expect("iframe viewport scroll metadata");
+        assert!(scroll.content.height >= 240.0, "{scroll:?}");
+
+        let mut frame_scroll_depth = 0usize;
+        let mut canvas = None;
+        let mut nested_color_fills = 0usize;
+        for command in &layout.paint.primitives {
+            match command {
+                crate::render::DisplayCommand::BeginScroll(node) if *node == frame => {
+                    frame_scroll_depth += 1;
+                }
+                crate::render::DisplayCommand::EndScroll if frame_scroll_depth > 0 => {
+                    frame_scroll_depth -= 1;
+                }
+                crate::render::DisplayCommand::Fill {
+                    shape: crate::render::PaintShape::Rect(rect),
+                    brush:
+                        crate::render::PaintBrush::Solid(crate::render::PaintColor::Rgba(
+                            18,
+                            52,
+                            86,
+                            255,
+                        )),
+                } => {
+                    nested_color_fills += 1;
+                    if frame_scroll_depth > 0 {
+                        canvas = Some(*rect);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let canvas = canvas.expect("nested canvas fill inside iframe scroll scope");
+        assert_eq!(
+            nested_color_fills, 1,
+            "the propagated BODY background must not repaint on its finite box"
+        );
+        assert!((canvas.x - scroll.viewport.x).abs() < 0.01, "{canvas:?}");
+        assert!((canvas.y - scroll.viewport.y).abs() < 0.01, "{canvas:?}");
+        assert!(
+            canvas.height >= scroll.content.height,
+            "canvas must cover the full scrolling area: {canvas:?} {scroll:?}"
+        );
+        let max_scroll = (scroll.content.height - scroll.viewport.height).max(0.0);
+        assert!(
+            canvas.y + canvas.height - max_scroll >= scroll.viewport.y + scroll.viewport.height,
+            "canvas must still cover the scrollport at its maximum offset"
+        );
+    }
+
+    #[test]
+    fn indefinite_percentage_iframe_height_uses_replaced_fallback() {
+        // CSS Sizing 3 §§3.2.1 and 5.1: the percentage cannot resolve against
+        // this content-sized containing block, so it behaves as auto; an
+        // iframe has no natural dimensions and uses the 300x150 fallback.
+        let mut dom = Dom::parse_document(
+            r#"<body style="margin:0"><div style="width:200px">
+               <iframe id=f style="width:100%;height:100%;overflow:scroll"></iframe>
+               </div></body>"#,
+        );
+        let frame = dom.get_by_id("f").unwrap();
+        dom.install_frame_document(
+            frame,
+            r#"<body style="margin:0"><div style="height:400px">child</div></body>"#,
+            "https://frame.test/",
+        )
+        .unwrap();
+        let base = Url::parse("https://page.test/").unwrap();
+        let layout = lay_out_graphical(
+            &dom,
+            &base,
+            Viewport::new(400.0, 300.0),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let geometry = layout.boxes.get(&frame).expect("iframe geometry");
+        assert!((geometry.height - 150.0).abs() < 0.1, "{geometry:?}");
+        let scroll = layout
+            .paint
+            .scroll_containers
+            .iter()
+            .find(|scroll| scroll.node == frame)
+            .expect("iframe viewport is independently scrollable");
+        assert!((scroll.viewport.height - 150.0).abs() < 0.1, "{scroll:?}");
+        assert!(scroll.content.height >= 400.0, "{scroll:?}");
+    }
+
+    #[test]
+    fn fixed_subtree_retains_nested_scroll_container_metadata() {
+        // CSS Position 3 §2 changes the fixed box's placement, not the CSS
+        // Overflow 3 scroll-container status of its descendants. Graphical
+        // fixed fragments are retained separately from normal flow, so their
+        // scrollports must be collected explicitly for wheel hit testing.
+        let layout = lay_graphical(
+            r#"<body style="margin:0"><div style="position:fixed;inset:0">
+               <div id=scroller style="width:200px;height:100px;overflow:auto">
+               <div style="height:400px">child</div></div></div></body>"#,
+            400.0,
+            &HashMap::new(),
+        );
+        let scroller = layout
+            .paint
+            .scroll_containers
+            .iter()
+            .find(|scroll| scroll.viewport.width == 200.0 && scroll.viewport.height == 100.0)
+            .expect("scrollport inside a fixed layer remains interactive");
+        assert!(scroller.content.height >= 400.0, "{scroller:?}");
+        assert!(scroller.vertical);
     }
 
     #[test]
@@ -6967,8 +7179,8 @@ mod tests {
                 .iter()
                 .any(|command| matches!(
                     command,
-                    crate::render::DisplayCommand::PushTransform(matrix)
-                        if (matrix.0[5] + 24.0).abs() < 0.01
+                    crate::render::DisplayCommand::BeginScroll(node)
+                        if *node == container.node
                 ))
         );
         assert!(

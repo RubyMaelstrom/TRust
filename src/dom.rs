@@ -2282,7 +2282,12 @@ impl Dom {
         }
         for (name, fill) in self.animations_of(id) {
             if matches!(fill.as_deref(), Some("forwards" | "both"))
-                && let Some(&end) = self.style_index().keyframes.get(&name)
+                && let Some(end) = self
+                    .style_index()
+                    .keyframes
+                    .get(&name)
+                    .and_then(|rule| rule.end_value("opacity"))
+                    .and_then(parse_alpha)
             {
                 return end;
             }
@@ -2326,6 +2331,127 @@ impl Dom {
                     fills[i % fills.len()].clone()
                 };
                 Some((n, fill))
+            })
+            .collect()
+    }
+
+    /// Resolve CSS Animations 1's comma-matched animation lists and attach
+    /// the retained keyframe values used by graphical paint. Shorter
+    /// longhand lists repeat to the `animation-name` list length (§3.2).
+    pub(crate) fn css_animation_definitions(&self, id: NodeId) -> Vec<CssAnimationDefinition> {
+        let shorthand = self
+            .cascaded(id, "animation")
+            .map(|value| {
+                split_top_level(&value, ',')
+                    .into_iter()
+                    .map(parse_full_animation_segment)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let list = |property: &str| {
+            self.cascaded(id, property)
+                .map(|value| {
+                    split_top_level(&value, ',')
+                        .into_iter()
+                        .map(|item| item.trim().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let names = {
+            let values = list("animation-name");
+            if values.is_empty() {
+                shorthand
+                    .iter()
+                    .map(|animation| animation.name.clone().unwrap_or_else(|| "none".into()))
+                    .collect::<Vec<_>>()
+            } else {
+                values
+            }
+        };
+        let durations = list("animation-duration");
+        let timings = list("animation-timing-function");
+        let iterations = list("animation-iteration-count");
+        let directions = list("animation-direction");
+        let fills = list("animation-fill-mode");
+        let delays = list("animation-delay");
+        let play_states = list("animation-play-state");
+        let style_index = self.style_index();
+
+        names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, raw_name)| {
+                let name = raw_name.trim().trim_matches(['\'', '"']).to_string();
+                if name.is_empty() || name.eq_ignore_ascii_case("none") {
+                    return None;
+                }
+                let shorthand = shorthand.get(index % shorthand.len().max(1));
+                let duration_seconds = animation_list_value(&durations, index)
+                    .and_then(parse_animation_time)
+                    .or_else(|| shorthand.map(|animation| animation.duration_seconds))
+                    .unwrap_or(0.0);
+                if duration_seconds <= 0.0 {
+                    return None;
+                }
+                let delay_seconds = animation_list_value(&delays, index)
+                    .and_then(parse_animation_time)
+                    .or_else(|| shorthand.map(|animation| animation.delay_seconds))
+                    .unwrap_or(0.0);
+                let iteration_count = animation_list_value(&iterations, index)
+                    .and_then(parse_iteration_count)
+                    .or_else(|| shorthand.and_then(|animation| animation.iteration_count))
+                    .unwrap_or(Some(1.0));
+                let direction = animation_list_value(&directions, index)
+                    .map(str::to_ascii_lowercase)
+                    .or_else(|| shorthand.map(|animation| animation.direction.clone()))
+                    .unwrap_or_else(|| "normal".into());
+                let fill_mode = animation_list_value(&fills, index)
+                    .map(str::to_ascii_lowercase)
+                    .or_else(|| shorthand.map(|animation| animation.fill_mode.clone()))
+                    .unwrap_or_else(|| "none".into());
+                let timing_function = animation_list_value(&timings, index)
+                    .map(str::to_ascii_lowercase)
+                    .or_else(|| shorthand.map(|animation| animation.timing_function.clone()))
+                    .unwrap_or_else(|| "ease".into());
+                let running = animation_list_value(&play_states, index)
+                    .map(|value| !value.eq_ignore_ascii_case("paused"))
+                    .or_else(|| shorthand.map(|animation| animation.running))
+                    .unwrap_or(true);
+                let rule = style_index.keyframes.get(&name)?;
+                let tops = rule.properties.get("top");
+                let transforms = rule.properties.get("transform");
+                let mut offsets = tops
+                    .into_iter()
+                    .flatten()
+                    .chain(transforms.into_iter().flatten())
+                    .map(|frame| frame.offset)
+                    .collect::<Vec<_>>();
+                offsets.sort_by(f32::total_cmp);
+                offsets.dedup();
+                let keyframes = offsets
+                    .into_iter()
+                    .map(|offset| CssAnimationKeyframe {
+                        offset,
+                        top: tops
+                            .and_then(|values| values.iter().find(|frame| frame.offset == offset))
+                            .map(|frame| frame.value.clone()),
+                        transform: transforms
+                            .and_then(|values| values.iter().find(|frame| frame.offset == offset))
+                            .map(|frame| frame.value.clone()),
+                    })
+                    .collect::<Vec<_>>();
+                (!keyframes.is_empty()).then_some(CssAnimationDefinition {
+                    name,
+                    duration_seconds,
+                    delay_seconds,
+                    iteration_count,
+                    direction,
+                    fill_mode,
+                    timing_function,
+                    running,
+                    keyframes,
+                })
             })
             .collect()
     }
@@ -2630,8 +2756,7 @@ impl Dom {
             return hit;
         }
         let parent_computed = || {
-            self.nodes[id]
-                .parent
+            self.style_parent(id)
                 .and_then(|p| self.computed_value(p, name))
         };
         let author = self
@@ -2706,6 +2831,16 @@ impl Dom {
             .map_or(FONT_SIZE_INITIAL, |r| self.font_px(r))
     }
 
+    fn style_scope_root_element(&self, id: NodeId) -> Option<NodeId> {
+        let scope = self.tree_scope(id);
+        if matches!(self.tag_name(scope), Some("iframe" | "frame")) {
+            self.child_iter(scope)
+                .find(|&child| self.tag_name(child) == Some("html"))
+        } else {
+            self.document_element()
+        }
+    }
+
     /// The element's COMPUTED `font-size` in CSS px (CSS Fonts §6.1) — the
     /// `em` basis, and (on the root) the `rem` basis. Numeric composition,
     /// not string inheritance: the own declaration resolves against the
@@ -2719,16 +2854,17 @@ impl Dom {
         if let Some(&v) = self.font_cache.borrow().get(id, self.epoch) {
             return v;
         }
-        let parent_px = match self.nodes[id].parent {
+        let parent_px = match self.style_parent(id) {
             Some(p) if p != DOCUMENT => self.font_px(p),
             _ => FONT_SIZE_INITIAL,
         };
         // `rem` on the root element itself resolves against the initial
         // value (a self-reference otherwise, per CSS Values §6.2.1).
-        let root_px = if Some(id) == self.document_element() {
+        let scope_root = self.style_scope_root_element(id);
+        let root_px = if Some(id) == scope_root {
             FONT_SIZE_INITIAL
         } else {
-            self.root_font_px()
+            scope_root.map_or(FONT_SIZE_INITIAL, |root| self.font_px(root))
         };
         let v = self
             .cascaded(id, "font-size")
@@ -3065,7 +3201,7 @@ impl Dom {
         if let Some(v) = self.cascaded(id, name) {
             return Some(v);
         }
-        self.parent_composed(id)
+        self.style_parent(id)
             .and_then(|p| self.custom_prop(p, name))
     }
 
@@ -3369,9 +3505,31 @@ impl Dom {
     fn tree_scope(&self, id: NodeId) -> NodeId {
         let mut cur = id;
         while let Some(p) = self.nodes[cur].parent {
+            // A nested navigable's active document is a distinct tree scope.
+            // TRust retains it below the iframe owner in one arena, so use the
+            // owner as the scope key without making the owner itself part of
+            // the child document's author cascade.
+            if matches!(self.tag_name(p), Some("iframe" | "frame")) && self.frame_body(p).is_some()
+            {
+                return p;
+            }
             cur = p;
         }
         cur
+    }
+
+    /// CSS parent without crossing from a child document element to its
+    /// embedding iframe. Shadow-tree inheritance still uses `parent_flat()`
+    /// and crosses to its host; separate Document trees do not inherit.
+    fn style_parent(&self, id: NodeId) -> Option<NodeId> {
+        let parent = self.parent_flat(id)?;
+        if matches!(self.tag_name(parent), Some("iframe" | "frame"))
+            && self.frame_body(parent).is_some()
+        {
+            None
+        } else {
+            Some(parent)
+        }
     }
 
     /// The parsed style index, built on first use after a STYLE-epoch
@@ -5223,6 +5381,14 @@ impl Dom {
             // alter flex/grid item identity.
             out.push_str(&format!(" data-trust-click=\"x-trust-js:{id}:\""));
         }
+        // Every hyperlink on a live page must run DOM click dispatch before
+        // its HTML activation behavior. This is required even without an
+        // authored listener: `target`, `<base target>`, `preventDefault()` on
+        // an ancestor, and named child navigables are resolved by the resident
+        // document, not by the presentation adapter's plain URL fallback.
+        if is_anchor && !is_click && self.attr(id, "href").is_some() {
+            out.push_str(&format!(" data-trust-click=\"x-trust-js:{id}:\""));
+        }
         // The app re-parses this serialized HTML into a fresh layout DOM, so
         // form controls AND vertical scroll containers need an explicit pointer
         // back to the resident page actor's original node ids (form values /
@@ -5565,16 +5731,16 @@ impl Dom {
             return true;
         }
         match comb {
-            Combinator::Child => self.nodes[id]
-                .parent
+            Combinator::Child => self
+                .style_parent(id)
                 .is_some_and(|p| self.matches_complex(p, rest, scope)),
             Combinator::Descendant | Combinator::None => {
-                let mut up = self.nodes[id].parent;
+                let mut up = self.style_parent(id);
                 while let Some(a) = up {
                     if self.matches_complex(a, rest, scope) {
                         return true;
                     }
-                    up = self.nodes[a].parent;
+                    up = self.style_parent(a);
                 }
                 false
             }
@@ -5989,7 +6155,7 @@ impl Dom {
             if let Some(ce) = self.attr(n, "contenteditable") {
                 return !ce.eq_ignore_ascii_case("false");
             }
-            cur = self.nodes[n].parent;
+            cur = self.style_parent(n);
         }
         false
     }
@@ -6002,7 +6168,7 @@ impl Dom {
             if let Some(l) = self.attr(n, "lang").or_else(|| self.attr(n, "xml:lang")) {
                 return Some(l);
             }
-            cur = self.nodes[n].parent;
+            cur = self.style_parent(n);
         }
         None
     }
@@ -6018,12 +6184,12 @@ impl Dom {
                     "rtl" => true,
                     "ltr" | "auto" => false,
                     _ => {
-                        cur = self.nodes[n].parent;
+                        cur = self.style_parent(n);
                         continue;
                     }
                 };
             }
-            cur = self.nodes[n].parent;
+            cur = self.style_parent(n);
         }
         false
     }
@@ -7409,6 +7575,7 @@ const INHERITED_LAYOUT_PROPS: &[&str] = &[
     "text-decoration-color",
     "text-decoration-style",
     "visibility",
+    "cursor",
     "pointer-events",
     "interactivity",
     "image-rendering",
@@ -7433,7 +7600,13 @@ const PROPS: &[PropDef] = &[
     prop("interactivity", true, true),
     prop("opacity", false, false),
     prop("animation-name", false, false),
+    prop("animation-duration", false, false),
+    prop("animation-timing-function", false, false),
+    prop("animation-iteration-count", false, false),
+    prop("animation-direction", false, false),
     prop("animation-fill-mode", false, false),
+    prop("animation-delay", false, false),
+    prop("animation-play-state", false, false),
     prop("animation", false, false),
     prop("margin-top", false, true),
     prop("margin-bottom", false, true),
@@ -7518,7 +7691,10 @@ const PROPS: &[PropDef] = &[
     // `scroll-snap-align` (on the items) is the snap-position alignment.
     prop("scroll-snap-type", false, true),
     prop("scroll-snap-align", false, true),
-    prop("cursor", false, false),
+    // CSS UI 4 §5.1.1: cursor applies to all elements and is inherited. Bake
+    // it into live presentation snapshots because graphical hit testing, not
+    // box sizing, chooses the cursor for the topmost pointer target.
+    prop("cursor", true, true),
     // CSS Backgrounds 3: the layout paints no color, but a declared background
     // is an OPAQUE FILL in the cell compositor (layout2 P4 — Appendix E paint
     // order: a modal's background erases the page cells under its rect).
@@ -9029,10 +9205,11 @@ struct StyleIndex {
     /// rules are consulted while cascading a light-DOM element assigned to a
     /// slot in the corresponding shadow tree.
     slotted_rules: Vec<(NodeId, u32)>,
-    /// `@keyframes <name>` → the animation's END opacity (the `to`/`100%`
-    /// keyframe), for honoring an `animation-fill-mode:forwards` reveal/hide.
-    /// Only opacity is extracted (the one keyframe property visibility needs).
-    keyframes: FxHashMap<String, f32>,
+    /// The last `@keyframes` rule for each case-sensitive name. Animation
+    /// declarations do not participate in the ordinary cascade; values are
+    /// retained by property and sorted offset so paint can sample supported
+    /// tracks without reparsing the stylesheet every frame.
+    keyframes: FxHashMap<String, KeyframesRule>,
     /// Whether any rule sets `opacity` at all — lets `paint_suppressed` skip
     /// the opacity cascade entirely on the overwhelming majority of pages.
     has_opacity: bool,
@@ -9053,6 +9230,46 @@ struct StyleIndex {
     /// boxless-content suppression whenever the active sheet set contains
     /// either dependency.
     boxless_content_may_escape: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct KeyframesRule {
+    properties: FxHashMap<String, Vec<KeyframeValue>>,
+}
+
+#[derive(Clone, Debug)]
+struct KeyframeValue {
+    offset: f32,
+    value: String,
+}
+
+impl KeyframesRule {
+    fn end_value(&self, property: &str) -> Option<&str> {
+        self.properties
+            .get(property)?
+            .last()
+            .map(|keyframe| keyframe.value.as_str())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CssAnimationDefinition {
+    pub name: String,
+    pub duration_seconds: f32,
+    pub delay_seconds: f32,
+    pub iteration_count: Option<f32>,
+    pub direction: String,
+    pub fill_mode: String,
+    pub timing_function: String,
+    pub running: bool,
+    pub keyframes: Vec<CssAnimationKeyframe>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CssAnimationKeyframe {
+    pub offset: f32,
+    pub top: Option<String>,
+    pub transform: Option<String>,
 }
 
 /// A cheap could-match test for the compound that carries a `:hover` — the
@@ -9514,7 +9731,7 @@ fn parse_sheet(
     css: &str,
     order: &mut usize,
     out: &mut Vec<StyleRule>,
-    keyframes: &mut FxHashMap<String, f32>,
+    keyframes: &mut FxHashMap<String, KeyframesRule>,
     media: MediaEnvironment,
     layers: &mut LayerRegistry,
     layer: &str,
@@ -9535,9 +9752,9 @@ fn parse_sheet(
             return;
         }
         if let Some(after) = rest.strip_prefix('@') {
-            // `@keyframes <name> { ... }` (and the -webkit- prefix): we read
-            // only the END opacity, to honor an animation that reveals/hides
-            // an element via `animation-fill-mode:forwards` (slideshow fades).
+            // CSS Animations 1 §3: keyframe names are case-sensitive and the
+            // last rule of a given name wins. Store supported property tracks
+            // in sorted offset order; duplicate offsets cascade in rule order.
             let lower = after.trim_start().to_ascii_lowercase();
             if let Some(rest_name) = lower
                 .strip_prefix("keyframes")
@@ -9548,9 +9765,7 @@ fn parse_sheet(
                     .trim()
                     .to_string();
                 let (block, tail) = take_block(&after[brace_off..]);
-                if let Some(end) = keyframes_end_opacity(block) {
-                    keyframes.insert(name, end);
-                }
+                keyframes.insert(name, parse_keyframes_rule(block));
                 rest = tail;
                 continue;
             }
@@ -10352,48 +10567,60 @@ fn media_px(value: &str) -> Option<f32> {
     Some(px.max(0.0))
 }
 
-/// The opacity at an `@keyframes` animation's END — the value at the highest
-/// keyframe offset (`to`/`100%`). `None` if no keyframe sets opacity. Only
-/// the END matters: with `animation-fill-mode:forwards` that's the resting
-/// state, so a fade-in resolves to its `to{opacity:1}` (visible) and a
-/// fade-out to `to{opacity:0}` (hidden).
-fn keyframes_end_opacity(block: &str) -> Option<f32> {
-    let mut best: Option<(f32, f32)> = None; // (offset, opacity)
+/// Parse the supported declarations of an `@keyframes` rule. CSS Animations
+/// 1 §3 conceptually builds an independent sorted keyframe set per property;
+/// repeated selectors cascade in source order and `!important` is invalid.
+fn parse_keyframes_rule(block: &str) -> KeyframesRule {
+    let mut rule = KeyframesRule::default();
     let mut rest = block;
     while let Some(brace) = rest.find('{') {
         let sel = &rest[..brace];
         let (decls, tail) = take_block(&rest[brace..]);
         rest = tail;
-        let offset = sel
+        let offsets = sel
             .split(',')
             .filter_map(keyframe_offset)
-            .fold(f32::MIN, f32::max);
-        if offset == f32::MIN {
+            .collect::<Vec<_>>();
+        if offsets.is_empty() {
             continue;
         }
         for decl in decls.split(';') {
-            if let Some((k, v, _)) = parse_decl(decl)
-                && k == "opacity"
-                && let Some(o) = parse_alpha(&v)
-                && best.is_none_or(|(bo, _)| offset >= bo)
-            {
-                best = Some((offset, o));
+            let Some((property, value, important)) = parse_decl(decl) else {
+                continue;
+            };
+            if important || !matches!(property.as_str(), "opacity" | "top" | "transform") {
+                continue;
+            }
+            for &offset in &offsets {
+                let values = rule.properties.entry(property.clone()).or_default();
+                if let Some(existing) = values.iter_mut().find(|frame| frame.offset == offset) {
+                    existing.value = value.clone();
+                } else {
+                    values.push(KeyframeValue {
+                        offset,
+                        value: value.clone(),
+                    });
+                }
             }
         }
     }
-    best.map(|(_, o)| o)
+    for values in rule.properties.values_mut() {
+        values.sort_by(|left, right| left.offset.total_cmp(&right.offset));
+    }
+    rule
 }
 
 /// A keyframe selector offset as a 0..1 fraction (`from`=0, `to`=1, `N%`).
 fn keyframe_offset(sel: &str) -> Option<f32> {
-    match sel.trim() {
+    let offset = match sel.trim() {
         "from" => Some(0.0),
         "to" => Some(1.0),
         s => s
             .strip_suffix('%')
             .and_then(|p| p.trim().parse::<f32>().ok())
             .map(|p| p / 100.0),
-    }
+    }?;
+    (offset.is_finite() && (0.0..=1.0).contains(&offset)).then_some(offset)
 }
 
 /// One comma-separated `animation` shorthand segment → its `(name,
@@ -10401,54 +10628,110 @@ fn keyframe_offset(sel: &str) -> Option<f32> {
 /// time/keyword are picked out; everything else (durations, easings,
 /// iteration counts) is skipped.
 fn parse_animation_segment(seg: &str) -> (Option<String>, Option<String>) {
-    let mut name = None;
-    let mut fill = None;
-    for tok in seg.split_whitespace() {
-        match tok {
-            "forwards" | "backwards" | "both" => {
-                fill.get_or_insert_with(|| tok.to_string());
+    let parsed = parse_full_animation_segment(seg);
+    (
+        parsed.name,
+        (parsed.fill_mode != "none").then_some(parsed.fill_mode),
+    )
+}
+
+#[derive(Clone, Debug)]
+struct ParsedAnimationSegment {
+    name: Option<String>,
+    duration_seconds: f32,
+    delay_seconds: f32,
+    iteration_count: Option<Option<f32>>,
+    direction: String,
+    fill_mode: String,
+    timing_function: String,
+    running: bool,
+}
+
+fn parse_full_animation_segment(segment: &str) -> ParsedAnimationSegment {
+    let mut parsed = ParsedAnimationSegment {
+        name: None,
+        duration_seconds: 0.0,
+        delay_seconds: 0.0,
+        iteration_count: None,
+        direction: "normal".into(),
+        fill_mode: "none".into(),
+        timing_function: "ease".into(),
+        running: true,
+    };
+    let mut times = 0;
+    for token in segment.split_whitespace() {
+        let lower = token.to_ascii_lowercase();
+        if let Some(time) = parse_animation_time(&lower) {
+            if times == 0 {
+                parsed.duration_seconds = time;
+            } else if times == 1 {
+                parsed.delay_seconds = time;
             }
-            _ if is_anim_keyword_or_time(tok) => {}
+            times += 1;
+            continue;
+        }
+        match lower.as_str() {
+            "infinite" => parsed.iteration_count = Some(None),
+            "normal" | "reverse" | "alternate" | "alternate-reverse" => parsed.direction = lower,
+            "none" | "forwards" | "backwards" | "both" => {
+                if lower == "none" && parsed.name.is_none() {
+                    parsed.name = Some(lower);
+                } else {
+                    parsed.fill_mode = lower;
+                }
+            }
+            "running" => parsed.running = true,
+            "paused" => parsed.running = false,
+            "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out" | "step-start"
+            | "step-end" => parsed.timing_function = lower,
+            _ if lower.starts_with("cubic-bezier(") || lower.starts_with("steps(") => {
+                parsed.timing_function = lower
+            }
+            _ if parsed.iteration_count.is_none() => {
+                if let Ok(count) = lower.parse::<f32>()
+                    && count.is_finite()
+                    && count >= 0.0
+                {
+                    parsed.iteration_count = Some(Some(count));
+                    continue;
+                }
+                parsed.name.get_or_insert_with(|| token.to_string());
+            }
             _ => {
-                name.get_or_insert_with(|| tok.to_string());
+                parsed.name.get_or_insert_with(|| token.to_string());
             }
         }
     }
-    (name, fill)
+    parsed
 }
 
-/// Whether an `animation` shorthand token is a non-name part (a time, a
-/// timing function, an iteration count, a direction/fill/play keyword) — so
-/// the remaining token can be taken as the `animation-name`.
-fn is_anim_keyword_or_time(tok: &str) -> bool {
-    const KW: &[&str] = &[
-        "none",
-        "normal",
-        "reverse",
-        "alternate",
-        "alternate-reverse",
-        "infinite",
-        "running",
-        "paused",
-        "linear",
-        "ease",
-        "ease-in",
-        "ease-out",
-        "ease-in-out",
-        "step-start",
-        "step-end",
-    ];
-    if KW.contains(&tok) {
-        return true;
+fn parse_animation_time(value: &str) -> Option<f32> {
+    let value = value.trim().to_ascii_lowercase();
+    let seconds = if let Some(milliseconds) = value.strip_suffix("ms") {
+        milliseconds.trim().parse::<f32>().ok()? / 1000.0
+    } else if let Some(seconds) = value.strip_suffix('s') {
+        seconds.trim().parse::<f32>().ok()?
+    } else if value == "0" {
+        0.0
+    } else {
+        return None;
+    };
+    seconds.is_finite().then_some(seconds)
+}
+
+fn parse_iteration_count(value: &str) -> Option<Option<f32>> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("infinite") {
+        return Some(None);
     }
-    let num = tok
-        .strip_suffix("ms")
-        .or_else(|| tok.strip_suffix('s'))
-        .unwrap_or(tok);
-    num.parse::<f32>().is_ok()
-        || tok.parse::<f32>().is_ok()
-        || tok.starts_with("cubic-bezier")
-        || tok.starts_with("steps")
+    let count = value.parse::<f32>().ok()?;
+    (count.is_finite() && count >= 0.0).then_some(Some(count))
+}
+
+fn animation_list_value(values: &[String], index: usize) -> Option<&str> {
+    (!values.is_empty())
+        .then(|| &values[index % values.len()])
+        .map(String::as_str)
 }
 
 /// `input` starts at '{'; return (inner text, after-the-matching-'}').
@@ -12647,6 +12930,51 @@ mod tests {
     }
 
     #[test]
+    fn iframe_document_has_an_independent_author_style_scope() {
+        let mut dom = Dom::parse_document(
+            "<style>p{color:red} iframe{overflow:scroll;color:green}</style>\
+             <body><p id=parent>parent</p><iframe id=frame></iframe></body>",
+        );
+        let frame = dom.get_by_id("frame").unwrap();
+        dom.install_frame_document(
+            frame,
+            "<html><head><style>p{color:blue} iframe{overflow:hidden}</style></head>\
+             <body><p id=child>child</p></body></html>",
+            "https://child.test/",
+        )
+        .unwrap();
+        let parent = dom.get_by_id("parent").unwrap();
+        let child = dom.get_by_id("child").unwrap();
+        let child_html = dom
+            .child_iter(frame)
+            .find(|&node| dom.tag_name(node) == Some("html"))
+            .unwrap();
+
+        assert_eq!(
+            dom.computed_value_resolved(parent, "color").as_deref(),
+            Some("red")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(child, "color").as_deref(),
+            Some("blue")
+        );
+        assert_eq!(
+            dom.computed_value_resolved(frame, "overflow").as_deref(),
+            Some("scroll"),
+            "a child sheet cannot restyle its embedding iframe"
+        );
+        assert_ne!(
+            dom.computed_value_resolved(child_html, "color").as_deref(),
+            Some("green"),
+            "inherited values do not cross the Document boundary"
+        );
+        assert!(
+            !dom.matches(child, &SelectorList::parse("iframe p").unwrap()),
+            "selector ancestry stops at the child document element"
+        );
+    }
+
+    #[test]
     fn selectors_match_the_workhorse_grammar() {
         let dom = Dom::parse_document(
             "<body><div class='a b'><p id=p1 class=x>1</p><span data-k='v'>2</span></div>\
@@ -13116,6 +13444,17 @@ mod tests {
             .filter(|&d| reparsed.tag_name(d) == Some("a"))
             .count();
         assert_eq!(anchors, 1, "anchor survives re-parse un-split: {html}");
+    }
+
+    #[test]
+    fn ordinary_live_anchor_retains_actor_for_html_default_activation() {
+        let dom = Dom::parse_document(
+            r#"<iframe name="content"></iframe><a href="inside.html" target="content">open</a>"#,
+        );
+        let html = dom.serialize_live(DOCUMENT, &std::collections::HashSet::new());
+        assert!(html.contains("href=\"inside.html\""), "{html}");
+        assert!(html.contains("target=\"content\""), "{html}");
+        assert!(html.contains("data-trust-click=\"x-trust-js:"), "{html}");
     }
 
     #[test]
@@ -14146,6 +14485,52 @@ mod tests {
         assert!(
             !dom.paint_suppressed(dom.get_by_id("l2").unwrap()),
             "longhand comma lists pair by index"
+        );
+    }
+
+    #[test]
+    fn animation_longhand_lists_retain_independent_keyframe_tracks() {
+        let dom = Dom::parse_document(
+            "<style>
+               @keyframes fall { from { top:-10% } to { top:100% } }
+               @keyframes shake { 0%,100% { transform:translateX(0) }
+                                  50% { transform:translateX(80px) } }
+               #snow { animation-name:fall,shake;
+                       animation-duration:10s,3s;
+                       animation-timing-function:linear,ease-in-out;
+                       animation-iteration-count:infinite,infinite;
+                       animation-delay:6s,.5s }
+             </style><div id=snow>x</div>",
+        );
+        let animations = dom.css_animation_definitions(dom.get_by_id("snow").unwrap());
+        assert_eq!(animations.len(), 2);
+        assert_eq!(animations[0].name, "fall");
+        assert_eq!(animations[0].duration_seconds, 10.0);
+        assert_eq!(animations[0].delay_seconds, 6.0);
+        assert_eq!(animations[0].iteration_count, None);
+        assert_eq!(animations[0].timing_function, "linear");
+        assert_eq!(animations[0].keyframes.len(), 2);
+        assert_eq!(animations[0].keyframes[1].top.as_deref(), Some("100%"));
+        assert_eq!(animations[1].name, "shake");
+        assert_eq!(animations[1].duration_seconds, 3.0);
+        assert_eq!(animations[1].delay_seconds, 0.5);
+        assert_eq!(animations[1].keyframes.len(), 3);
+        assert_eq!(
+            animations[1].keyframes[1].transform.as_deref(),
+            Some("translatex(80px)")
+        );
+    }
+
+    #[test]
+    fn cursor_is_inherited_as_required_by_css_ui() {
+        let dom = Dom::parse_document(
+            "<style>#parent{cursor:url(pointer.cur) 2 3, pointer}</style>\
+             <div id=parent><span id=child>child</span></div>",
+        );
+        assert_eq!(
+            dom.computed_value_resolved(dom.get_by_id("child").unwrap(), "cursor")
+                .as_deref(),
+            Some("url(pointer.cur) 2 3, pointer")
         );
     }
 

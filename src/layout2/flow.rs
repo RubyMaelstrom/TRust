@@ -773,7 +773,9 @@ impl Flow<'_> {
 
         // Definite heights (content-box px). A percentage against an
         // indefinite CB height is auto (§10.5).
-        let authored_h = self.height_px(&s.height, s, bt, bb, cb_h);
+        let authored_h = self
+            .height_px(&s.height, s, bt, bb, cb_h)
+            .or_else(|| self.iframe_auto_height(b, s, bt, bb));
         // CSS Sizing 4 §§4.1–4.2: with an automatic block size and a
         // preferred aspect ratio, transfer the definite used inline size
         // through the ratio. A specified ratio uses the box selected by
@@ -1689,6 +1691,17 @@ impl Flow<'_> {
         } else {
             v.max(0.0)
         })
+    }
+
+    /// CSS Sizing 3 §§3.2.1 and 5.1: a percentage block size against an
+    /// indefinite containing block behaves as `auto`; an iframe is a replaced
+    /// element without natural dimensions, so its missing block dimension uses
+    /// the 150px max-content fallback. (`tree::frame` has already supplied the
+    /// same default when the computed value itself is `auto`.)
+    fn iframe_auto_height(&self, b: &BoxNode, s: &BoxStyle, bt: f32, bb: f32) -> Option<f32> {
+        (b.node != NO_NODE && matches!(self.dom.tag_name(b.node), Some("iframe" | "frame")))
+            .then(|| self.height_px(&Len::px(150.0), s, bt, bb, Some(150.0)))
+            .flatten()
     }
 
     /// `text-indent` in px for a box's IFC (inherited; percentages against
@@ -2645,15 +2658,17 @@ impl Flow<'_> {
         // Flexbox §9.2 explicitly uses the definite cross size and ratio when
         // determining a content-based main size; grid and positioned items use
         // the same `item_frag` entry point and the same automatic-size rule.
-        let def_h = def_h.or_else(|| {
-            s.aspect_ratio.map(|ratio| {
-                if s.border_box {
-                    ((content_w + bp_l + bp_r) / ratio - bt - bb).max(0.0)
-                } else {
-                    content_w / ratio
-                }
-            })
-        });
+        let def_h = def_h
+            .or_else(|| self.iframe_auto_height(b, s, bt, bb))
+            .or_else(|| {
+                s.aspect_ratio.map(|ratio| {
+                    if s.border_box {
+                        ((content_w + bp_l + bp_r) / ratio - bt - bb).max(0.0)
+                    } else {
+                        content_w / ratio
+                    }
+                })
+            });
         let mut cur = Cursor {
             y: bt,
             ..Default::default()

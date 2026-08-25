@@ -9274,8 +9274,18 @@ const WORKER_SCOPE: &str = r##"
         },
         takeErrors: function () { var e = this.errors; this.errors = []; return e.join("\u001e"); }
     };
+    // HTML Timers "timer initialization steps" apply to both Window and
+    // WorkerGlobalScope: TimerHandler accepts a Function or a DOMString. Convert
+    // string handlers when scheduled, then compile their classic script in the
+    // worker realm when the timer task runs. Web IDL ToString rejects Symbols.
+    function prepareTimerHandler(handler) {
+        if (typeof handler === "function") return handler;
+        if (typeof handler === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
+        var source = String(handler);
+        return function () { return (0, eval)(source); };
+    }
     function addTimer(fn, delay, args, interval) {
-        if (typeof fn !== "function") return 0;
+        fn = prepareTimerHandler(fn);
         delay = +delay; if (!(delay >= 0)) delay = 0;
         var id = WK.nextId++;
         WK.timers.push({ id: id, at: WK.nowMs + delay, delay: delay, fn: fn, args: args || [], interval: !!interval });
@@ -13072,6 +13082,21 @@ fn dispatch_click_in(page: &mut LoadedPage, node: usize) -> Option<String> {
     // Keep interaction work visible to TRUST_JS_PROFILE just like load and
     // networking tasks. Consent/modal handlers are often where a framework
     // performs its largest synchronous unmount and focus-restoration pass.
+    let navigation = if prevented {
+        None
+    } else {
+        guarded_call_trust(
+            &mut page.ctx,
+            "followAnchorDefault",
+            &[JsValue::from(node as f64)],
+            "hyperlink navigation",
+            &mut click_outcome,
+        )
+        .filter(|value| !value.is_null_or_undefined())
+        .and_then(|value| value.to_string(&mut page.ctx).ok())
+        .map(|value| value.to_std_string_lossy())
+        .filter(|value| !value.trim().is_empty())
+    };
     dump_vm_profile("click");
     page.outcome.errors.extend(click_outcome.errors);
     if click_outcome.panicked {
@@ -13079,34 +13104,7 @@ fn dispatch_click_in(page: &mut LoadedPage, node: usize) -> Option<String> {
         return None;
     }
     checkpoint_live_task(page);
-
-    if prevented {
-        return None;
-    }
-    let href = {
-        let d = page.dom.borrow();
-        let mut cur = Some(node);
-        let mut found = None;
-        while let Some(c) = cur {
-            if d.tag_name(c) == Some("a")
-                && let Some(h) = d.attr(c, "href")
-            {
-                found = Some(h.to_string());
-                break;
-            }
-            cur = d.parent_composed(c);
-        }
-        found
-    }?;
-    let href = href.trim();
-    // Fragments and javascript: pseudo-links never navigate.
-    if href.is_empty() || href.starts_with('#') || href.starts_with("javascript:") {
-        return None;
-    }
-    page.page_url
-        .as_ref()
-        .and_then(|base| base.join(href).ok())
-        .map(|u| u.to_string())
+    navigation
 }
 
 /// Collect external script srcs (raw attribute values, document order)
@@ -14471,9 +14469,13 @@ const PRELUDE: &str = r##"
             if (t) {
                 fireHoverPair("over", t, old, true, x, y);
                 for (let i = ni; i >= 0; i--) fireHoverPair("enter", newPath[i], old, false, x, y);
-                fireHoverPair("move", t, null, true, x, y);
             }
         }
+        // UI Events §3.4.5.8 and Pointer Events require motion events when the
+        // pointing device moves even if hit testing retains the same target.
+        // The native lane may coalesce samples, but a target transition is not
+        // the condition for `pointermove`/`mousemove` dispatch.
+        if (t) fireHoverPair("move", t, null, true, x, y);
         // The CSS half: the cascade's :hover chain follows the same committed
         // target (Phase B syscall; guarded so the JS half stands alone).
         if (typeof __dom_set_hover === "function") __dom_set_hover(t ? t.__id : -1);
@@ -17176,6 +17178,65 @@ const PRELUDE: &str = r##"
         return p ? p[0] : raw;
     }
     trust.resourceURL = function (nodeId) { return frameResourceURL(wrap(nodeId)); };
+
+    // HTML §7.4.4/§7.4.5: an un-cancelled hyperlink navigates the chosen
+    // navigable. The subject node's Document supplies the URL base, and an
+    // existing child navigable named by `target` is navigated in place. TRust
+    // represents every same-page navigable in one arena, so update the iframe
+    // owner and re-run its attribute-processing steps; only a top-level choice
+    // is returned to the frontend as a page navigation.
+    trust.followAnchorDefault = function (nodeId) {
+        let anchor = wrap(nodeId);
+        while (anchor && anchor.nodeType === 1 && anchor.localName !== "a")
+            anchor = anchor.parentNode;
+        if (!anchor || anchor.localName !== "a") return null;
+        const raw = anchor.getAttribute("href");
+        if (raw === null || !String(raw).trim()) return null;
+        const subject = frameOwnerForNode(anchor);
+        const base = subject ? frameBaseURL(subject) : baseHref();
+        const parsed = __url_parse(String(raw), base);
+        if (!parsed) return null;
+        const url = String(parsed[0] || "");
+        if (!url || /^javascript:/i.test(url)) return null;
+
+        const rawTarget = String(anchor.getAttribute("target") || "");
+        const keyword = rawTarget.toLowerCase();
+        let destination;
+        if (!rawTarget || keyword === "_self") {
+            destination = subject;
+        } else if (keyword === "_parent") {
+            destination = subject ? frameOwnerForNode(subject) : null;
+        } else if (keyword === "_top") {
+            destination = null;
+        } else if (keyword === "_blank") {
+            // TRust currently presents one top-level traversable. Opening a
+            // fresh auxiliary context therefore degrades to that traversable.
+            destination = null;
+        } else {
+            destination = undefined;
+            let frames = [];
+            try { frames = document.querySelectorAll("iframe, frame"); } catch (e) {}
+            for (let i = 0; i < frames.length; i++) {
+                if (frames[i].getAttribute("name") === rawTarget) {
+                    destination = frames[i];
+                    break;
+                }
+            }
+            // A non-keyword name with no existing familiar navigable requests
+            // a new top-level traversable. Use the single available one.
+            if (destination === undefined) destination = null;
+        }
+        if (!destination) return url;
+        try {
+            destination.removeAttribute("srcdoc");
+            destination.setAttribute("src", url);
+            processIframeAttributes(destination);
+            return null;
+        } catch (e) {
+            trust.errors.push("hyperlink navigation: " + ((e && e.message) || e));
+            return null;
+        }
+    };
 
     function makeFrameLocation(frame, parentLocation) {
         const raw = frameURLFor(frame);
@@ -20003,11 +20064,23 @@ const PRELUDE: &str = r##"
     // (`timers` itself is declared at the top of the prelude — the Event
     // class stamps `timeStamp` from it — with the `__clockSync` anchor that
     // mirrors every `timers.now` advance into the Rust-side Date clock.)
-    // HTML §8.6: `setTimeout(handler, delay, ...args)` invokes `handler` with
-    // the trailing arguments. Capture them so e.g. `setTimeout(resolve, ms, v)`
-    // and libraries that pass state through the timer work (they got dropped).
+    // HTML Timers "timer initialization steps": TimerHandler is the Web IDL
+    // union `(DOMString or Function)`. A non-callable value is converted to a
+    // string when the API is invoked, then compiled as a classic script when
+    // the timer task runs (equivalent to an indirect/global eval). This legacy
+    // form remains normative and powers old-web cursor trails such as
+    // `setTimeout("tick()", 40)`. Preserve ToString's Symbol exception rather
+    // than using String(Symbol), whose special constructor behavior differs.
+    function prepareTimerHandler(handler) {
+        if (typeof handler === "function") return handler;
+        if (typeof handler === "symbol") throw new TypeError("Cannot convert a Symbol value to a string");
+        const source = String(handler);
+        return function () { return (0, eval)(source); };
+    }
+    // Function handlers receive the trailing arguments. String handlers ignore
+    // them when their prepared classic script runs, as the standard requires.
     g.setTimeout = function (fn, d) {
-        if (typeof fn !== "function") return 0;
+        fn = prepareTimerHandler(fn);
         const id = timers.seq++;
         const args = Array.prototype.slice.call(arguments, 2);
         timers.q.push({ id, at: currentTime() + Math.max(0, Number(d) || 0), fn, every: null, args,
@@ -20038,7 +20111,7 @@ const PRELUDE: &str = r##"
         }
     };
     g.setInterval = function (fn, d) {
-        if (typeof fn !== "function") return 0;
+        fn = prepareTimerHandler(fn);
         const id = timers.seq++;
         const every = Math.max(4, Number(d) || 4);
         const args = Array.prototype.slice.call(arguments, 2);
@@ -30836,6 +30909,34 @@ mod tests {
     }
 
     #[test]
+    fn string_timer_handler_converts_when_scheduled_and_runs_as_classic_script() {
+        // HTML Timers' TimerHandler union converts a non-Function to a string
+        // during timer initialization, but compiles/runs that string later in
+        // the global realm. Symbol cannot be converted to Web IDL DOMString.
+        let (out, outcome) = page(
+            r##"<body><output id="out">waiting</output><script>
+            var conversions = 0;
+            var handler = {
+                toString: function () {
+                    conversions++;
+                    return "document.getElementById('out').textContent = 'converted=' + conversions + ' ran=true symbol=' + window.symbolResult";
+                }
+            };
+            setTimeout(handler, 30);
+            window.symbolResult = 'none';
+            try { setTimeout(Symbol('invalid'), 0); }
+            catch (error) { window.symbolResult = error.name; }
+            document.getElementById('out').textContent = 'converted=' + conversions + ' ran=false symbol=' + window.symbolResult;
+            </script></body>"##,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            out.contains("converted=1 ran=true symbol=TypeError"),
+            "TimerHandler conversion/execution semantics: {out}"
+        );
+    }
+
+    #[test]
     fn request_animation_frame_runs_at_rest() {
         // A rAF chain (each frame schedules the next) is a one-shot setTimeout
         // driven by the same wake loop; it must keep firing at rest with a
@@ -31430,14 +31531,15 @@ mod tests {
                 }
                 let reply: Vec<u8> = if String::from_utf8_lossy(&req).starts_with("GET /w.js ") {
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\n\
-                      self.onmessage = function () {\
-                        setTimeout(function () {\
+                      function replyFromStringTimer() {\
                           self.postMessage({ win: typeof window, doc: typeof document,\
                             sg: (self === globalThis), imp: typeof importScripts,\
                             cs: typeof CompressionStream, ts: typeof TransformStream,\
                             hwc: navigator.hardwareConcurrency, lang: navigator.language,\
                             langs: navigator.languages.join(','), frozen: Object.isFrozen(navigator.languages), t: 'fired' });\
-                        }, 30);\
+                      }\
+                      self.onmessage = function () {\
+                        setTimeout('replyFromStringTimer()', 30);\
                       };"
                     .to_vec()
                 } else {
@@ -33441,6 +33543,95 @@ mod tests {
             out.contains(&expected),
             "hover sequence mismatch:\n want …{expected}…\n got {out}"
         );
+    }
+
+    #[test]
+    fn mousemove_repeats_without_a_target_transition() {
+        let (out, outcome) = page(
+            r#"<body><div id=surface>surface</div><output id=out></output><script>
+            var points = [];
+            document.onmousemove = function (event) {
+                points.push(event.clientX + ":" + event.clientY);
+            };
+            var surface = document.getElementById("surface");
+            __trust.hover(surface.__id, 10, 20);
+            __trust.hover(surface.__id, 11, 22);
+            document.getElementById("out").textContent = points.join(",");
+            </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("10:20,11:22"), "{out}");
+    }
+
+    #[test]
+    fn mousemove_timer_cursor_trail_becomes_visible_and_repositions() {
+        // A compact version of midosuji.neocities.org's cursor trail. HTML's
+        // onmousemove event handler attribute must receive every native motion
+        // sample, and the timer task it arms must publish the absolutely
+        // positioned DOM mutation without needing a hover-target transition.
+        let (handle, mut events) = live(
+            r#"<body><div id=surface style="width:300px;height:200px">surface</div><script>
+            var x = 400, y = 300, ox = 400, oy = 300, heart;
+            window.onload = function () {
+                heart = document.createElement('div');
+                heart.id = 'trail-heart';
+                heart.style.position = 'absolute';
+                heart.style.width = 'auto';
+                heart.style.height = 'auto';
+                heart.style.overflow = 'hidden';
+                heart.style.visibility = 'hidden';
+                heart.style.pointerEvents = 'none';
+                heart.style.color = '#ff0066';
+                heart.appendChild(document.createTextNode('\u2665'));
+                document.body.appendChild(heart);
+                tick();
+            };
+            document.onmousemove = function (event) { x = event.pageX; y = event.pageY; };
+            function tick() {
+                if (Math.abs(x - ox) > 1 || Math.abs(y - oy) > 1) {
+                    ox = x; oy = y;
+                    heart.style.left = (x - 5) + 'px';
+                    heart.style.top = (y - 11) + 'px';
+                    heart.style.fontSize = '11px';
+                    heart.style.visibility = 'visible';
+                }
+                setTimeout('tick()', 40);
+            }
+            </script></body>"#,
+        );
+        let Some(PageEvt::Updated { html, outcome }) = events.blocking_recv() else {
+            panic!("cursor-trail page must remain live");
+        };
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let surface = hover_actor_for_id(&html, "surface");
+        assert!(handle.send_hover(Some(surface), 90.0, 70.0));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match events.try_recv() {
+                Ok(PageEvt::Updated { html, outcome }) => {
+                    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+                    if html.contains("id=\"trail-heart\"")
+                        && html.contains("visibility:visible")
+                        && html.contains("left:85px")
+                        && html.contains("top:59px")
+                    {
+                        break;
+                    }
+                }
+                Ok(PageEvt::Trouble(errors)) => panic!("cursor trail failed: {errors:?}"),
+                Ok(_) | Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "cursor trail never became visible"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("cursor-trail actor exited")
+                }
+            }
+        }
     }
 
     #[test]
@@ -35599,6 +35790,70 @@ mod tests {
             out.contains("parent:640x384 proxy:160x74 media:true/true"),
             "parent dimensions or child WindowProxy dimensions are wrong: {out}"
         );
+    }
+
+    #[test]
+    fn hyperlink_target_navigates_named_iframe_not_top_page() {
+        // HTML §7.4.4 chooses the existing child navigable whose name matches
+        // target. The URL is resolved using the subject node's Document; only
+        // a top-level destination is handed back to the frontend.
+        let (out, outcome) = page(
+            r#"<body><iframe id=frame name=content srcdoc="<p>old</p>"></iframe>
+               <a id=inside href="data:text/html,new" target=content>inside</a>
+               <a id=top href="../next" target=_top>top</a><script>
+               var frame = document.getElementById('frame');
+               var local = __trust.followAnchorDefault(document.getElementById('inside').__id);
+               var top = __trust.followAnchorDefault(document.getElementById('top').__id);
+               document.body.setAttribute('data-local', String(local));
+               document.body.setAttribute('data-frame-src', frame.getAttribute('src'));
+               document.body.setAttribute('data-srcdoc', String(frame.hasAttribute('srcdoc')));
+               document.body.setAttribute('data-top', String(top));
+               </script></body>"#,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(out.contains("data-local=\"null\""), "{out}");
+        assert!(
+            out.contains("data-frame-src=\"data:text/html,new\""),
+            "{out}"
+        );
+        assert!(out.contains("data-srcdoc=\"false\""), "{out}");
+        assert!(
+            out.contains("data-top=\"https://example.com/next\""),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn trusted_click_uses_named_iframe_default_instead_of_top_navigation() {
+        // Exercise the same trusted-click dispatcher as the resident actor,
+        // directly. Keeping this as a task-local conformance test avoids making
+        // its result depend on wall-clock actor scheduling while ~1,300 tests
+        // run concurrently.
+        let html = r#"<body><iframe name=content srcdoc='<p>old</p>'></iframe>
+            <a href='about:blank?inside' target=content>inside</a>
+            <script>document.querySelector('a').addEventListener('click', function () {})</script></body>"#;
+        let env = PageEnv::bare("https://example.com/dir/page");
+        let mut page = load_page(html, &env, None, None, None, None, None).unwrap();
+        let node = page
+            .ctx
+            .eval(Source::from_bytes(b"document.querySelector('a').__id"))
+            .unwrap()
+            .as_number()
+            .unwrap() as usize;
+
+        let top_navigation = dispatch_click_in(&mut page, node);
+        assert_eq!(top_navigation, None);
+        assert!(page.outcome.errors.is_empty(), "{:?}", page.outcome.errors);
+        let frame_state = page
+            .ctx
+            .eval(Source::from_bytes(
+                b"var f=document.querySelector('iframe'); f.getAttribute('src')+'|'+f.hasAttribute('srcdoc')",
+            ))
+            .unwrap()
+            .to_string(&mut page.ctx)
+            .unwrap()
+            .to_std_string_lossy();
+        assert_eq!(frame_state, "about:blank?inside|false");
     }
 
     #[test]
