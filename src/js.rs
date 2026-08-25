@@ -23063,6 +23063,40 @@ const PRELUDE: &str = r##"
 mod tests {
     use super::*;
 
+    fn benchmark_score_from_console(logs: &[String]) -> Option<f64> {
+        logs.iter().rev().find_map(|line| {
+            line.strip_prefix("log: Score: ")
+                .and_then(|score| score.trim().parse().ok())
+        })
+    }
+
+    fn drain_console_logs(ctx: &mut Context) -> Vec<String> {
+        let Ok(value) = ctx.eval(Source::from_bytes(
+            b"__trust.logs.splice(0).join(\"\\u0000\")",
+        )) else {
+            return Vec::new();
+        };
+        let Ok(string) = value.to_string(ctx) else {
+            return Vec::new();
+        };
+        string
+            .to_std_string_lossy()
+            .split('\0')
+            .filter(|line| !line.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn benchmark_score_capture_accepts_upstream_log() {
+        let logs = vec![
+            String::from("log: Score: 24368"),
+            String::from("log: unrelated later message"),
+        ];
+        assert_eq!(benchmark_score_from_console(&logs), Some(24368.0));
+        assert_eq!(benchmark_score_from_console(&[]), None);
+    }
+
     /// Measure PRELUDE's per-page cost in isolation, and the parse/exec
     /// split (to judge whether a compile cache would even help — note Boa's
     /// `Script` binds to the realm it parsed in, so cross-page reuse isn't
@@ -23374,6 +23408,11 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5)
             .max(1);
+        let settle_secs: u64 = std::env::var("TRUST_JS_BENCH_SETTLE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300)
+            .max(1);
         let no_opt = std::env::var_os("TRUST_NO_OPT").is_some();
 
         // --- reproducibility metadata header ---
@@ -23403,6 +23442,7 @@ mod tests {
             if no_opt { "OFF" } else { "on" },
         );
         eprintln!("runs     : {runs} (first discarded as cold)");
+        eprintln!("settle   : {settle_secs}s benchmark completion budget");
 
         // One independent measurement: fresh context + clean heap, then time
         // parse / compile / execute of the bench source (NOT the prelude setup).
@@ -23417,6 +23457,7 @@ mod tests {
             (usize, Duration, usize),
             &'static str,
             boa_engine::vm::fn_census::FnCensus,
+            Option<f64>,
         ) {
             let html = r#"<html><head></head><body><div id="content"></div></body></html>"#;
             let dom = Rc::new(RefCell::new(Dom::parse_document(html)));
@@ -23473,6 +23514,27 @@ mod tests {
                 script.evaluate(&mut ctx)
             }));
             let execute = t.elapsed();
+            // BenchmarkSuite yields between suites with 25ms timers. The
+            // normal live loop advances those at rest, while this standalone
+            // profiler has no resident actor; use the one-shot settle mode to
+            // drive the queued completion callbacks before reading the score.
+            ctx.eval(Source::from_bytes(b"__trust.oneShot = true"))
+                .unwrap();
+            let mut settle_outcome = Outcome::default();
+            settle(
+                &mut ctx,
+                &Budget::new(Duration::from_secs(settle_secs)),
+                MAX_TICKS,
+                &mut settle_outcome,
+            );
+            // The benchmark's own `print("Score: …")` is routed through the
+            // page console in this harness. Drain it after timing so score
+            // capture does not contribute to the execute measurement.
+            let logs = drain_console_logs(&mut ctx);
+            let score = benchmark_score_from_console(&logs);
+            if score.is_none() {
+                eprintln!("benchmark console (no score): {logs:?}");
+            }
             let census = boa_engine::vm::fn_census::snapshot();
             if do_census {
                 boa_engine::vm::fn_census::disarm();
@@ -23494,6 +23556,7 @@ mod tests {
                 (gc1.0 - gc0.0, gc1.1 - gc0.1, gc1.2),
                 outcome,
                 census,
+                score,
             )
         };
 
@@ -23507,21 +23570,26 @@ mod tests {
         let mut parses = Vec::new();
         let mut compiles = Vec::new();
         let mut executes = Vec::new();
+        let mut scores = Vec::new();
         let mut last_gc = (0usize, Duration::ZERO, 0usize);
         let mut last_outcome = "n/a";
         for i in 0..runs {
-            let (p, c, e, gc, outcome, _) = run_once(false);
+            let (p, c, e, gc, outcome, _, score) = run_once(false);
             last_gc = gc;
             last_outcome = outcome;
             eprintln!(
-                "run {i:>2}{}: parse {p:>9.3?}  compile {c:>9.3?}  execute {e:>9.3?}  [{outcome}]",
-                if i == 0 && runs > 1 { " (cold)" } else { "" }
+                "run {i:>2}{}: parse {p:>9.3?}  compile {c:>9.3?}  execute {e:>9.3?}  score {}  [{outcome}]",
+                if i == 0 && runs > 1 { " (cold)" } else { "" },
+                score.map_or_else(|| String::from("<missing>"), |value| format!("{value:.0}")),
             );
             // Discard the cold run only when we have warm runs to keep.
             if i > 0 || runs == 1 {
                 parses.push(p);
                 compiles.push(c);
                 executes.push(e);
+                if let Some(score) = score {
+                    scores.push(score);
+                }
             }
         }
 
@@ -23536,6 +23604,17 @@ mod tests {
         eprintln!("compile  : {cm:>9.3?}   ({clo:.3?} … {chi:.3?})");
         eprintln!("execute  : {em:>9.3?}   ({elo:.3?} … {ehi:.3?})");
         eprintln!("TOTAL    : {:>9.3?}   (medians summed)", pm + cm + em);
+        assert!(!scores.is_empty(), "benchmark emitted no Score line");
+        let (score_median, score_min, score_max) = {
+            let mut values = scores.clone();
+            values.sort_by(f64::total_cmp);
+            (
+                values[values.len() / 2],
+                values[0],
+                values[values.len() - 1],
+            )
+        };
+        eprintln!("score    : {score_median:.0}   ({score_min:.0} … {score_max:.0})");
         eprintln!("--- last run GC / footprint ---");
         eprintln!("result   : {last_outcome}");
         eprintln!(
@@ -23569,7 +23648,7 @@ mod tests {
         // A separate, un-timed pass so the census hooks don't perturb the
         // medians above. Counts how many of the bundle's compiled blocks ever
         // begin executing; the never-called share is the lazy-parse prize.
-        let (.., census) = run_once(true);
+        let (.., census, _) = run_once(true);
         let never_n = census.compiled_n.saturating_sub(census.executed_n);
         let never_bytes = census.compiled_bytes.saturating_sub(census.executed_bytes);
         let pct = |num: u64, den: u64| -> f64 {
