@@ -9,7 +9,7 @@ use super::{AsContext, AsContextMut, StoreContext, StoreContextMut, Stored};
 use crate::{collections::arena::ArenaIndex, core::CoreMemory, errors::MemoryError, Error};
 
 /// A raw index to a linear memory entity.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemoryIdx(u32);
 
 impl ArenaIndex for MemoryIdx {
@@ -26,7 +26,7 @@ impl ArenaIndex for MemoryIdx {
 }
 
 /// A Wasm linear memory reference.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Memory(Stored<MemoryIdx>);
 

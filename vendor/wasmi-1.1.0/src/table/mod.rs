@@ -9,7 +9,7 @@ mod element;
 mod ty;
 
 /// A raw index to a table entity.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TableIdx(u32);
 
 impl ArenaIndex for TableIdx {
@@ -26,7 +26,7 @@ impl ArenaIndex for TableIdx {
 }
 
 /// A Wasm table reference.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Table(Stored<TableIdx>);
 

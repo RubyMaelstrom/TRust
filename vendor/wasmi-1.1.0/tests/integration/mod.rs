@@ -7,5 +7,6 @@ mod host_call_compilation;
 mod host_call_instantiation;
 mod host_calls_wasm;
 mod instantitation;
+mod module_metadata;
 mod resource_limiter;
 mod resumable_call;

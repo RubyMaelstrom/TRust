@@ -9,7 +9,7 @@ use crate::{
 };
 
 /// A raw index to a global variable entity.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GlobalIdx(u32);
 
 impl ArenaIndex for GlobalIdx {
@@ -26,7 +26,7 @@ impl ArenaIndex for GlobalIdx {
 }
 
 /// A Wasm global variable reference.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Global(Stored<GlobalIdx>);
 
