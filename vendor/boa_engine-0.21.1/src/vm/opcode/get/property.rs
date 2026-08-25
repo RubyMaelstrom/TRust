@@ -1,5 +1,8 @@
 use crate::{
     Context, JsResult, JsString,
+    builtins::typed_array::{
+        TypedArray, typed_array_get_integer_element,
+    },
     object::{internal_methods::InternalMethodPropertyContext, shape::slot::SlotAttributes},
     property::PropertyKey,
     vm::opcode::{Operation, VaryingOperand},
@@ -143,6 +146,19 @@ impl GetPropertyByValue {
             }
         }
 
+        // ECMAScript §10.4.5.5/§10.4.5.17: a canonical integer index on a
+        // TypedArray is resolved by TypedArrayGetElement. Keep the complete
+        // checked operation, but avoid rebuilding an internal-method context
+        // and dispatching through the generic exotic-object path for the hot
+        // `bytes[cursor++]` pattern used by binary decoders.
+        if let PropertyKey::Index(index) = &key
+            && object.is::<TypedArray>()
+        {
+            let value = typed_array_get_integer_element(&object, index.get()).unwrap_or_default();
+            context.vm.set_register(dst.into(), value);
+            return Ok(());
+        }
+
         let receiver = context.vm.get_register(receiver.into());
 
         // Slow path:
@@ -196,6 +212,18 @@ impl GetPropertyByValuePush {
                 context.vm.set_register(dst.into(), element);
                 return Ok(());
             }
+        }
+
+        // Same TypedArrayGetElement fast path as GetPropertyByValue. This
+        // opcode is emitted when the computed property expression also has to
+        // preserve the key on the operand stack.
+        if let PropertyKey::Index(index) = &key_value
+            && object.is::<TypedArray>()
+        {
+            let value = typed_array_get_integer_element(&object, index.get()).unwrap_or_default();
+            context.vm.set_register(key.into(), key_value.into());
+            context.vm.set_register(dst.into(), value);
+            return Ok(());
         }
 
         let receiver = context.vm.get_register(receiver.into());

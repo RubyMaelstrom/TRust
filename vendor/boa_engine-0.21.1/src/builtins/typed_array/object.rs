@@ -255,6 +255,21 @@ impl TypedArray {
         // 9. Return true.
         Some(index as u64)
     }
+
+    /// The integer form of `IsValidIntegerIndex` used after the VM has already
+    /// canonicalized a property key to `PropertyKey::Index`.
+    #[inline(always)]
+    pub(crate) fn validate_integer_index(&self, index: u32, buf_len: usize) -> Option<u64> {
+        // A `PropertyKey::Index` is non-negative and integral by construction.
+        if self.is_out_of_bounds(buf_len) {
+            return None;
+        }
+        let length = self.array_length(buf_len);
+        if u64::from(index) >= length {
+            return None;
+        }
+        Some(u64::from(index))
+    }
 }
 
 /// `CanonicalNumericIndexString ( argument )`
@@ -609,7 +624,14 @@ pub(crate) fn typed_array_exotic_own_property_keys(
 ///  - [ECMAScript reference][spec]
 ///
 /// [spec]: https://tc39.es/ecma262/sec-typedarraygetelement
-fn typed_array_get_element(obj: &JsObject, index: f64) -> Option<JsValue> {
+/// Read an integer-indexed element for the VM's numeric property fast path.
+///
+/// This remains the complete `TypedArrayGetElement` operation: detached and
+/// out-of-bounds views still produce the same result as the ordinary exotic
+/// `[[Get]]` path. The VM only uses this entry point after it has already
+/// canonicalized the property key to `PropertyKey::Index`.
+#[inline(always)]
+pub(crate) fn typed_array_get_element(obj: &JsObject, index: f64) -> Option<JsValue> {
     let inner = obj
         .downcast_ref::<TypedArray>()
         .expect("Must be an TypedArray object");
@@ -642,6 +664,30 @@ fn typed_array_get_element(obj: &JsObject, index: f64) -> Option<JsValue> {
             .get_value(elem_type, Ordering::Relaxed)
     };
 
+    Some(value.into())
+}
+
+/// Integer-indexed `TypedArrayGetElement` for the VM's hot numeric property
+/// path. The key has already passed `ToPropertyKey`, so avoid converting the
+/// same exact integer to a floating-point value and validating its fraction.
+#[inline(always)]
+pub(crate) fn typed_array_get_integer_element(obj: &JsObject, index: u32) -> Option<JsValue> {
+    let inner = obj
+        .downcast_ref::<TypedArray>()
+        .expect("Must be an TypedArray object");
+    let buffer = inner.viewed_array_buffer().as_buffer();
+    let buffer = buffer.bytes(Ordering::Relaxed)?;
+    let index = inner.validate_integer_index(index, buffer.len())?;
+    let byte_index = ((index * inner.kind.element_size()) + inner.byte_offset()) as usize;
+
+    // SAFETY: the validity check above proves that the complete element is
+    // within the viewed buffer and the TypedArray allocation guarantees the
+    // alignment required by `get_value`.
+    let value = unsafe {
+        buffer
+            .subslice(byte_index..)
+            .get_value(inner.kind(), Ordering::Relaxed)
+    };
     Some(value.into())
 }
 

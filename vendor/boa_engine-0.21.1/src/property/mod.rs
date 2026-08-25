@@ -816,7 +816,12 @@ impl From<f64> for PropertyKey {
     fn from(value: f64) -> Self {
         use num_traits::cast::FromPrimitive;
 
-        u32::from_f64(value)
+        // `FromPrimitive::from_f64` is allowed to truncate. Property-key
+        // conversion cannot: only integral Numbers become canonical integer
+        // index keys; 1.5 must remain the string key "1.5".
+        (value.is_finite() && value.fract() == 0.0)
+            .then(|| value)
+            .and_then(u32::from_f64)
             .and_then(NonMaxU32::new)
             .map_or_else(|| Self::String(value.into()), Self::Index)
     }

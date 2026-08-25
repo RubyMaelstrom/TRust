@@ -36,6 +36,7 @@ pub(crate) use builtin::{BuiltinTypedArray, is_valid_integer_index};
 pub(crate) use element::Float16;
 pub(crate) use element::{Atomic, ClampedU8, Element};
 pub use object::TypedArray;
+pub(crate) use object::typed_array_get_integer_element;
 
 pub(crate) trait TypedArrayMarker {
     type Element: Element;
@@ -654,20 +655,24 @@ impl From<f64> for TypedArrayElement {
 impl From<TypedArrayElement> for JsValue {
     fn from(value: TypedArrayElement) -> Self {
         match value {
-            TypedArrayElement::Int8(value) => Numeric::from(value),
-            TypedArrayElement::Uint8(value) => Numeric::from(value),
-            TypedArrayElement::Uint8Clamped(value) => Numeric::from(value),
-            TypedArrayElement::Int16(value) => Numeric::from(value),
-            TypedArrayElement::Uint16(value) => Numeric::from(value),
-            TypedArrayElement::Int32(value) => Numeric::from(value),
-            TypedArrayElement::Uint32(value) => Numeric::from(value),
-            TypedArrayElement::BigInt64(value) => Numeric::from(value),
-            TypedArrayElement::BigUint64(value) => Numeric::from(value),
+            // These element types are ECMAScript Number values. Keeping
+            // exact small integers in Boa's existing Integer32 representation
+            // is observable-equivalent to a Float64 Number, but avoids
+            // needlessly sending every byte read through floating-point
+            // arithmetic in binary decoders.
+            TypedArrayElement::Int8(value) => JsValue::from(value),
+            TypedArrayElement::Uint8(value) => JsValue::from(value),
+            TypedArrayElement::Uint8Clamped(value) => JsValue::from(value.0),
+            TypedArrayElement::Int16(value) => JsValue::from(value),
+            TypedArrayElement::Uint16(value) => JsValue::from(value),
+            TypedArrayElement::Int32(value) => JsValue::from(value),
+            TypedArrayElement::Uint32(value) => JsValue::from(value),
+            TypedArrayElement::BigInt64(value) => JsValue::from(value),
+            TypedArrayElement::BigUint64(value) => JsValue::from(value),
             #[cfg(feature = "float16")]
-            TypedArrayElement::Float16(value) => Numeric::from(value),
-            TypedArrayElement::Float32(value) => Numeric::from(value),
-            TypedArrayElement::Float64(value) => Numeric::from(value),
+            TypedArrayElement::Float16(value) => JsValue::from(Numeric::from(value)),
+            TypedArrayElement::Float32(value) => JsValue::from(value),
+            TypedArrayElement::Float64(value) => JsValue::from(value),
         }
-        .into()
     }
 }

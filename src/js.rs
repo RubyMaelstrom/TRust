@@ -6694,6 +6694,73 @@ fn body_latin1(body: &[u8]) -> JsValue {
     JsValue::from(JsString::from(boa_engine::string::JsStr::latin1(body)))
 }
 
+/// Expose a network response's bytes as the native JS buffer type. Fetch's
+/// Body mixin and XHR's `responseType = "arraybuffer"` both operate on a byte
+/// sequence; passing that sequence as a latin1 string forces the page to run
+/// an interpreted one-byte-at-a-time conversion before it can decode a binary
+/// response. The only copy here is the Rust slice into Boa's ArrayBuffer.
+///
+/// Fetch Standard §5.3 and XMLHttpRequest §the response attribute require the
+/// observable bytes to be preserved. Keep the latin1 value as an allocation
+/// failure fallback so a resource error cannot turn into a silently truncated
+/// response.
+fn body_array_buffer(body: &[u8], ctx: &mut Context) -> JsValue {
+    let block = boa_engine::object::builtins::AlignedVec::from_iter(0, body.iter().copied());
+    match boa_engine::object::builtins::JsArrayBuffer::from_byte_block(block, ctx) {
+        Ok(buffer) => JsValue::from(buffer),
+        Err(_) => body_latin1(body),
+    }
+}
+
+/// Whether a fetched body should avoid an eager JS text allocation. Fetch's
+/// body mixin decodes the byte sequence when `text()`/`json()` is actually
+/// consumed, so constructing a second 430KB string for a protobuf response is
+/// both unnecessary and expensive. Keep text-like `application/*` formats on
+/// the compatibility path because dynamically loaded scripts and ordinary API
+/// responses still consume the array's text slot directly; the binary path
+/// uses the byte-exact ArrayBuffer and its lazy decoder instead.
+fn response_body_is_binary(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if essence.is_empty() || essence.starts_with("text/") {
+        return false;
+    }
+    if essence.starts_with("image/")
+        || essence.starts_with("audio/")
+        || essence.starts_with("video/")
+        || essence.starts_with("font/")
+    {
+        return true;
+    }
+    if essence.starts_with("application/") {
+        return !(essence == "application/json"
+            || essence.ends_with("+json")
+            || essence == "application/xml"
+            || essence.ends_with("+xml")
+            || essence == "application/javascript"
+            || essence == "application/ecmascript"
+            || essence == "application/x-www-form-urlencoded"
+            || essence == "application/graphql")
+            && !matches!(
+                essence.as_str(),
+                "application/xhtml+xml" | "application/sql" | "application/rtf"
+            );
+    }
+    false
+}
+
+fn response_body_text(content_type: &str, body: &[u8]) -> JsValue {
+    if response_body_is_binary(content_type) {
+        JsValue::undefined()
+    } else {
+        str_value(&String::from_utf8_lossy(body))
+    }
+}
+
 /// Response headers as the same `name\nvalue\n…` blob the request side uses
 /// (`parse_header_blob` is its inverse); the prelude splits it back into the
 /// fetch `Response.headers` / XHR `getResponseHeader` map. Values never hold
@@ -6722,8 +6789,8 @@ fn response_to_array(resp: &crate::http::Response, ctx: &mut Context) -> JsValue
     let vals = vec![
         JsValue::from(f64::from(resp.status)),
         str_value(&resp.content_type),
-        str_value(&String::from_utf8_lossy(&resp.body)),
-        body_latin1(&resp.body),
+        response_body_text(&resp.content_type, &resp.body),
+        body_array_buffer(&resp.body, ctx),
         str_value(&headers_to_blob(&resp.headers)),
     ];
     JsArray::from_iter(vals, ctx).into()
@@ -6735,8 +6802,8 @@ fn cached_to_array(c: &crate::http::CachedResp, ctx: &mut Context) -> JsValue {
     let vals = vec![
         JsValue::from(f64::from(c.status)),
         str_value(&c.content_type),
-        str_value(&String::from_utf8_lossy(&c.body)),
-        body_latin1(&c.body),
+        response_body_text(&c.content_type, &c.body),
+        body_array_buffer(&c.body, ctx),
         str_value(&headers_to_blob(&c.headers)),
     ];
     JsArray::from_iter(vals, ctx).into()
@@ -11708,8 +11775,8 @@ fn fetch_result_value(ctx: &mut Context, result: FetchResult) -> JsValue {
             let vals = vec![
                 JsValue::from(f64::from(status)),
                 str_value(&content_type),
-                str_value(&String::from_utf8_lossy(&body)),
-                body_latin1(&body),
+                response_body_text(&content_type, &body),
+                body_array_buffer(&body, ctx),
                 str_value(&header_blob),
             ];
             JsArray::from_iter(vals, ctx).into()
@@ -21135,6 +21202,14 @@ const PRELUDE: &str = r##"
         return out;
     }
     function __latin1ToBytes(s) { const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i) & 0xff; return u; }
+    // Network responses arrive from Rust as a native ArrayBuffer. Keep the
+    // latin1 loop only for in-realm data/blob URLs and old callers that still
+    // provide the compatibility string representation.
+    function __bodyBytes(value) {
+        if (value instanceof ArrayBuffer) return new Uint8Array(value);
+        if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        return __latin1ToBytes(value || "");
+    }
     // Resolve a `blob:` URL to { bytes (latin1), type } or null (no entry → a
     // network error at the call site). Keyed without a fragment, per spec.
     function __resolveBlobURL(u) {
@@ -21537,7 +21612,7 @@ const PRELUDE: &str = r##"
         }
         owner.__bodyUsed = true;
         const bin = owner.__bytes != null ? owner.__bytes : __bodyWire(owner.__body || "");
-        return Promise.resolve(__latin1ToBytes(bin || ""));
+        return Promise.resolve(__bodyBytes(bin));
     };
     // Body mixin shared by Request and Response. Stream bodies follow Fetch's
     // disturbed/locked rules; legacy buffered bodies remain repeat-readable
@@ -21627,15 +21702,13 @@ const PRELUDE: &str = r##"
         // closes; an SSE parser splits it identically. null only for empty bodies.
         get body() {
             if (this.__bodyStream !== undefined) return this.__bodyStream;
-            if (this.__body === null || this.__body === undefined) { this.__bodyStream = null; return null; }
+            if ((this.__body === null || this.__body === undefined) && this.__bytes == null) { this.__bodyStream = null; return null; }
             if (this.__body instanceof g.ReadableStream) { this.__bodyStream = this.__body; return this.__bodyStream; }
-            // A fetched response streams its byte-EXACT body (`__bytes`, latin1)
-            // — encoding the UTF-8-lossy text corrupted every binary payload
-            // read through `.body` (the arrayBuffer()/`r[3]` bug, one path
-            // over). Only a Response constructed in JS from a text body falls
-            // back to UTF-8 bytes of that text.
+            // A fetched response streams its byte-exact native ArrayBuffer;
+            // only a Response constructed in JS from a text body falls back
+            // to UTF-8 bytes of that text.
             const bytes = this.__bytes != null
-                ? __latin1ToBytes(this.__bytes)
+                ? __bodyBytes(this.__bytes)
                 : new g.TextEncoder().encode(__bodyText(this.__body) || "");
             this.__bodyStream = new g.ReadableStream({
                 start(c) { if (bytes.length) c.enqueue(bytes); c.close(); },
@@ -21644,7 +21717,7 @@ const PRELUDE: &str = r##"
         }
         clone() {
             const r = new Response(this.__body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url });
-            r.type = this.type; r.redirected = this.redirected; return r;
+            r.type = this.type; r.redirected = this.redirected; r.__bytes = this.__bytes; return r;
         }
         static error() { const r = new Response(null, { status: 0 }); r.type = "error"; return r; }
         static redirect(url, status) { const r = new Response(null, { status: status || 302 }); r.headers.set("location", String(url)); return r; }
@@ -22291,7 +22364,7 @@ const PRELUDE: &str = r##"
                 if (respCType && hdrs["content-type"] === undefined) hdrs["content-type"] = respCType;
                 const resp = new Response(text, { status: status, statusText: "", headers: hdrs, url: url });
                 resp.type = "basic";
-                resp.__bytes = r[3]; // byte-exact body (latin1) for arrayBuffer()
+                resp.__bytes = r[3]; // native byte-exact body for arrayBuffer()
                 return resp;
             }));
         } catch (e) { return Promise.reject(e); }
@@ -22340,24 +22413,23 @@ const PRELUDE: &str = r##"
         // text corrupts binary payloads (Steam's protobuf WebAPI responses).
         get responseText() {
             if (this.__respType !== "" && this.__respType !== "text") throw new DOMException("responseText is only available for '' or 'text' responseType", "InvalidStateError");
-            return this.__text;
+            return this.__ensureText();
         }
         get response() {
             const rt = this.__respType;
-            if (rt === "" || rt === "text") return this.__text;
+            if (rt === "" || rt === "text") return this.__ensureText();
             if (this.readyState !== 4) return null;
             if (this.__respObj !== undefined) return this.__respObj;
             let out = null;
             if (rt === "arraybuffer" || rt === "blob") {
-                const bin = this.__bytes != null ? this.__bytes : utf8Binary(this.__text);
-                const buf = new ArrayBuffer(bin.length), view = new Uint8Array(buf);
-                for (let i = 0; i < bin.length; i++) view[i] = bin.charCodeAt(i) & 0xff;
+                const bytes = __bodyBytes(this.__bytes != null ? this.__bytes : utf8Binary(this.__text));
+                const buf = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
                 out = rt === "blob" ? new g.Blob([buf], { type: this.__ctype || "" }) : buf;
             } else if (rt === "json") {
-                try { out = JSON.parse(this.__text); } catch (e) { out = null; }
+                try { out = JSON.parse(this.__ensureText()); } catch (e) { out = null; }
             } else if (rt === "document") {
                 const xml = /xml/i.test(this.__ctype || "") && !/html/i.test(this.__ctype || "");
-                try { out = new g.DOMParser().parseFromString(this.__text, xml ? "text/xml" : "text/html"); } catch (e) { out = null; }
+                try { out = new g.DOMParser().parseFromString(this.__ensureText(), xml ? "text/xml" : "text/html"); } catch (e) { out = null; }
             }
             this.__respObj = out;
             return out;
@@ -22378,7 +22450,7 @@ const PRELUDE: &str = r##"
             const isHtml = /html/.test(ct);
             let out = null;
             if (isXml || (isHtml && this.__respType === "document")) {
-                try { out = new g.DOMParser().parseFromString(this.__text, isXml ? "text/xml" : "text/html"); } catch (e) { out = null; }
+                try { out = new g.DOMParser().parseFromString(this.__ensureText(), isXml ? "text/xml" : "text/html"); } catch (e) { out = null; }
             }
             this.__respXML = out;
             return out;
@@ -22410,6 +22482,12 @@ const PRELUDE: &str = r##"
                 return s;
             }
             return this.__ctype ? "content-type: " + this.__ctype + "\r\n" : "";
+        }
+        __ensureText() {
+            if ((this.__text === null || this.__text === undefined || this.__text === "") && this.__bytes != null) {
+                this.__text = new g.TextDecoder().decode(__bodyBytes(this.__bytes));
+            }
+            return this.__text || "";
         }
         overrideMimeType() {}
         // XHR §the abort() method: an in-flight request runs the "request error
@@ -22451,7 +22529,7 @@ const PRELUDE: &str = r##"
                 return;
             }
             this.status = r[0]; this.__ctype = r[1];
-            this.__text = r[2]; this.__bytes = r[3] != null ? r[3] : null;
+            this.__text = r[2] == null ? "" : r[2]; this.__bytes = r[3] != null ? r[3] : null;
             this.__hdrs = r.length > 4 ? __parseHdrBlob(r[4]) : null;
             if (this.__hdrs && this.__ctype && this.__hdrs["content-type"] === undefined) this.__hdrs["content-type"] = this.__ctype;
             this.__respObj = undefined; this.__respXML = undefined;
@@ -27092,6 +27170,75 @@ mod tests {
                 .to_std_string_escaped()
         };
         assert_eq!(s(&mut ctx, b"out.bytes"), "255,0,65");
+    }
+
+    #[test]
+    fn network_response_body_is_exposed_as_native_array_buffer() {
+        // The Rust/JS response seam must hand binary bodies to Boa as an
+        // ArrayBuffer. This prevents every binary response from entering the
+        // interpreted latin1-to-Uint8Array loop in the page prelude.
+        let mut ctx = platform_ctx();
+        let expected = [0, 1, 127, 128, 254, 255];
+        let value = body_array_buffer(&expected, &mut ctx);
+        let object = value
+            .as_object()
+            .expect("response body is an object")
+            .clone();
+        let buffer = boa_engine::object::builtins::JsArrayBuffer::from_object(object)
+            .expect("response body is an ArrayBuffer");
+        assert_eq!(buffer.byte_length(), expected.len());
+        assert_eq!(
+            buffer.detach(&JsValue::undefined()).unwrap().as_slice(),
+            expected
+        );
+    }
+
+    #[test]
+    fn binary_response_text_is_deferred_until_consumed() {
+        // Fetch §5.3 exposes one byte sequence through text/json/arrayBuffer;
+        // it does not require an eager text copy while the response is being
+        // created. Binary media such as Steam's protobuf result should retain
+        // the native byte path, while JSON and scripts keep their compatibility
+        // text slot for classic resource consumers.
+        assert!(response_body_is_binary("application/x-protobuf"));
+        assert!(response_body_is_binary(
+            "application/octet-stream; charset=binary"
+        ));
+        assert!(!response_body_is_binary("application/json; charset=utf-8"));
+        assert!(!response_body_is_binary("text/javascript"));
+        assert!(response_body_text("application/x-protobuf", &[0xff]).is_undefined());
+        assert_eq!(
+            response_body_text("application/json", br#"{"x":1}"#)
+                .as_string()
+                .expect("JSON keeps a text slot")
+                .to_std_string_escaped(),
+            r#"{"x":1}"#
+        );
+    }
+
+    #[test]
+    fn typed_array_integer_index_access_keeps_spec_edges() {
+        // ECMAScript §10.4.5.5/§10.4.5.17: canonical integer indexes use
+        // TypedArrayGetElement, while negative, fractional, non-canonical,
+        // and out-of-bounds keys are ordinary absent properties. This also
+        // exercises the VM's numeric-index fast path rather than only the
+        // generic exotic-object dispatch.
+        let mut ctx = platform_ctx();
+        let value = ctx
+            .eval(Source::from_bytes(
+                br#"(() => {
+                    const a = new Uint8Array([3, 7]);
+                    return JSON.stringify([
+                        a[0], a["1"], a[2], a[-1], a[1.5], a["01"],
+                        a[4294967295], a.length, a.byteOffset
+                    ]);
+                })()"#,
+            ))
+            .unwrap()
+            .to_string(&mut ctx)
+            .unwrap()
+            .to_std_string_escaped();
+        assert_eq!(value, "[3,7,null,null,null,null,null,2,0]");
     }
 
     #[test]

@@ -626,6 +626,12 @@ impl JsValue {
             JsVariant::String(string) => string.clone().into(),
             JsVariant::Symbol(symbol) => symbol.clone().into(),
             JsVariant::Integer32(integer) => integer.into(),
+            // `PropertyKey::from(f64)` performs the same canonical numeric
+            // index conversion as ToString(number) followed by the
+            // property's index-key parser, without allocating the temporary
+            // decimal string. In particular, -0 becomes the "0" index and
+            // non-integral/out-of-range values remain string keys.
+            JsVariant::Float64(number) => number.into(),
             // Slow path:
             JsVariant::Object(_) => {
                 let primitive = self.to_primitive(context, PreferredType::String)?;
