@@ -15,6 +15,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[path = "lumen_wasm.rs"]
+mod lumen_wasm;
+
 const DEFAULT_URL: &str = "https://example.com/";
 const DEFAULT_VIEWPORT: crate::layout2::Viewport = crate::layout2::Viewport {
     width: 640.0,
@@ -149,6 +152,7 @@ struct HostState {
     websockets: Option<LumenWebSockets>,
     workers: Option<LumenPageWorkers>,
     worker_self: Option<LumenWorkerSelf>,
+    wasm: lumen_wasm::PageWasm,
 }
 
 impl HostState {
@@ -179,6 +183,7 @@ impl HostState {
             websockets: None,
             workers: None,
             worker_self: None,
+            wasm: lumen_wasm::PageWasm::new(),
         }
     }
 
@@ -487,6 +492,34 @@ const LUMEN_HOST_FUNCTIONS: &[(&str, usize, NativeFn)] = &[
     ("__compression_encode", 2, host_compression_encode),
     ("__text_encode", 1, host_text_encode),
     ("__dom_popover", 2, host_dom_popover),
+    ("__wasm_validate", 1, lumen_wasm::host_validate),
+    ("__wasm_compile", 1, lumen_wasm::host_compile),
+    ("__wasm_module_imports", 1, lumen_wasm::host_module_imports),
+    ("__wasm_module_exports", 1, lumen_wasm::host_module_exports),
+    (
+        "__wasm_module_custom_sections",
+        2,
+        lumen_wasm::host_module_custom_sections,
+    ),
+    ("__wasm_instantiate", 3, lumen_wasm::host_instantiate),
+    (
+        "__wasm_instance_exports",
+        2,
+        lumen_wasm::host_instance_exports,
+    ),
+    ("__wasm_call_export", 2, lumen_wasm::host_call_export),
+    ("__wasm_global_new", 3, lumen_wasm::host_global_new),
+    ("__wasm_global_get", 1, lumen_wasm::host_global_get),
+    ("__wasm_global_set", 2, lumen_wasm::host_global_set),
+    ("__wasm_memory_new", 2, lumen_wasm::host_memory_new),
+    ("__wasm_memory_size", 1, lumen_wasm::host_memory_size),
+    ("__wasm_memory_grow", 2, lumen_wasm::host_memory_grow),
+    ("__wasm_memory_buffer", 1, lumen_wasm::host_memory_buffer),
+    ("__wasm_table_new", 4, lumen_wasm::host_table_new),
+    ("__wasm_table_length", 1, lumen_wasm::host_table_length),
+    ("__wasm_table_get", 2, lumen_wasm::host_table_get),
+    ("__wasm_table_set", 3, lumen_wasm::host_table_set),
+    ("__wasm_table_grow", 3, lumen_wasm::host_table_grow),
 ];
 
 fn install_host_boundary(engine: &mut lumen::Engine) {
@@ -1331,8 +1364,8 @@ fn host_worker_self_close(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Resul
 
 fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
     // DedicatedWorkerGlobalScope is DOM-less. Install only the operations the
-    // shared worker prelude can reach; WebAssembly joins this list in the next
-    // boundary slice rather than being silently routed through Boa.
+    // shared worker prelude can reach, including its independent per-agent
+    // WebAssembly store.
     for &(name, len, function) in &[
         ("__url_parse", 2, host_url_parse as NativeFn),
         ("__url_set", 3, host_url_set as NativeFn),
@@ -1351,6 +1384,98 @@ fn install_lumen_worker_boundary(engine: &mut lumen::Engine) {
             host_compression_encode as NativeFn,
         ),
         ("__text_encode", 1, host_text_encode as NativeFn),
+        ("__wasm_validate", 1, lumen_wasm::host_validate as NativeFn),
+        ("__wasm_compile", 1, lumen_wasm::host_compile as NativeFn),
+        (
+            "__wasm_module_imports",
+            1,
+            lumen_wasm::host_module_imports as NativeFn,
+        ),
+        (
+            "__wasm_module_exports",
+            1,
+            lumen_wasm::host_module_exports as NativeFn,
+        ),
+        (
+            "__wasm_module_custom_sections",
+            2,
+            lumen_wasm::host_module_custom_sections as NativeFn,
+        ),
+        (
+            "__wasm_instantiate",
+            3,
+            lumen_wasm::host_instantiate as NativeFn,
+        ),
+        (
+            "__wasm_instance_exports",
+            2,
+            lumen_wasm::host_instance_exports as NativeFn,
+        ),
+        (
+            "__wasm_call_export",
+            2,
+            lumen_wasm::host_call_export as NativeFn,
+        ),
+        (
+            "__wasm_global_new",
+            3,
+            lumen_wasm::host_global_new as NativeFn,
+        ),
+        (
+            "__wasm_global_get",
+            1,
+            lumen_wasm::host_global_get as NativeFn,
+        ),
+        (
+            "__wasm_global_set",
+            2,
+            lumen_wasm::host_global_set as NativeFn,
+        ),
+        (
+            "__wasm_memory_new",
+            2,
+            lumen_wasm::host_memory_new as NativeFn,
+        ),
+        (
+            "__wasm_memory_size",
+            1,
+            lumen_wasm::host_memory_size as NativeFn,
+        ),
+        (
+            "__wasm_memory_grow",
+            2,
+            lumen_wasm::host_memory_grow as NativeFn,
+        ),
+        (
+            "__wasm_memory_buffer",
+            1,
+            lumen_wasm::host_memory_buffer as NativeFn,
+        ),
+        (
+            "__wasm_table_new",
+            4,
+            lumen_wasm::host_table_new as NativeFn,
+        ),
+        (
+            "__wasm_table_length",
+            1,
+            lumen_wasm::host_table_length as NativeFn,
+        ),
+        (
+            "__wasm_table_get",
+            2,
+            lumen_wasm::host_table_get as NativeFn,
+        ),
+        (
+            "__wasm_table_set",
+            3,
+            lumen_wasm::host_table_set as NativeFn,
+        ),
+        (
+            "__wasm_table_grow",
+            3,
+            lumen_wasm::host_table_grow as NativeFn,
+        ),
     ] {
         engine.define_global(name, len, function);
     }
@@ -3400,13 +3525,229 @@ mod tests {
             "canonical host boundary contains a duplicate name"
         );
         assert!(lumen_registry_matches_canonical_boundary());
-        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 81);
+        assert_eq!(LUMEN_HOST_FUNCTIONS.len(), 101);
 
         let mut engine = platform_engine();
         for &(name, length, _) in LUMEN_HOST_FUNCTIONS {
             let actual = eval_value(&mut engine, &format!("{name}.length"), name).unwrap();
             assert_eq!(actual.as_num_opt(), Some(length as f64), "{name}.length");
         }
+    }
+
+    #[test]
+    fn webassembly_boundary_preserves_store_identity_memory_and_reentry() {
+        // WebAssembly JS Interface §§4.1–4.2 and 5.1–5.6: one store per agent, one wrapper per
+        // address, imported host calls see the current memory Data Block, memory growth detaches
+        // the previous fixed buffer, and i64 crosses the JS boundary as BigInt.
+        let mut engine = platform_engine();
+        let mut module = wat::parse_str(
+            r#"
+            (module
+              (import "env" "observe" (func $observe (result i32)))
+              (import "env" "boom" (func $boom))
+              (import "env" "g" (global $g (mut i32)))
+              (import "env" "memory" (memory $memory 1 3))
+              (import "env" "table" (table $table 1 3 externref))
+              (export "memory" (memory $memory))
+              (export "table" (table $table))
+              (export "g" (global $g))
+              (func (export "addGlobal") (param i32) (result i32)
+                local.get 0 global.get $g i32.add)
+              (func (export "read2") (result i32)
+                i32.const 2 i32.load8_u)
+              (func (export "write0") (param i32)
+                i32.const 0 local.get 0 i32.store8)
+              (func (export "bridge") (result i32)
+                i32.const 0 i32.const 37 i32.store8
+                call $observe
+                i32.const 1 i32.load8_u
+                i32.add)
+              (func (export "growInside") (result i32)
+                i32.const 1 memory.grow)
+              (func (export "callBoom") call $boom)
+              (global (export "big") (mut i64) (i64.const -2)))
+            "#,
+        )
+        .unwrap();
+        // A custom section named "note" with payload [1, 2, 3].
+        module.extend_from_slice(&[0, 8, 4, b'n', b'o', b't', b'e', 1, 2, 3]);
+        let forwarding = wat::parse_str(
+            r#"
+            (module
+              (import "x" "f" (func $f (param i32) (result i32)))
+              (export "f" (func $f)))
+            "#,
+        )
+        .unwrap();
+        let reentrant = wat::parse_str(
+            r#"
+            (module
+              (import "env" "instantiate" (func $instantiate (result i32)))
+              (func (export "run") (result i32) call $instantiate))
+            "#,
+        )
+        .unwrap();
+        let nested = wat::parse_str(
+            r#"
+            (module
+              (import "env" "started" (func $started))
+              (func $start call $started)
+              (start $start)
+              (func (export "answer") (result i32) i32.const 23))
+            "#,
+        )
+        .unwrap();
+        let module_value = engine
+            .ctx()
+            .make_uint8array(&module)
+            .unwrap_or_else(|_| panic!("make wasm fixture"));
+        let forwarding_value = engine
+            .ctx()
+            .make_uint8array(&forwarding)
+            .unwrap_or_else(|_| panic!("make forwarding fixture"));
+        let reentrant_value = engine
+            .ctx()
+            .make_uint8array(&reentrant)
+            .unwrap_or_else(|_| panic!("make reentrant fixture"));
+        let nested_value = engine
+            .ctx()
+            .make_uint8array(&nested)
+            .unwrap_or_else(|_| panic!("make nested fixture"));
+        let global = engine.global_this();
+        engine
+            .ctx()
+            .member_set(&global, "wasmFixture", module_value)
+            .unwrap_or_else(|_| panic!("install wasm fixture"));
+        engine
+            .ctx()
+            .member_set(&global, "wasmForwardingFixture", forwarding_value)
+            .unwrap_or_else(|_| panic!("install forwarding fixture"));
+        engine
+            .ctx()
+            .member_set(&global, "wasmReentrantFixture", reentrant_value)
+            .unwrap_or_else(|_| panic!("install reentrant fixture"));
+        engine
+            .ctx()
+            .member_set(&global, "wasmNestedFixture", nested_value)
+            .unwrap_or_else(|_| panic!("install nested fixture"));
+
+        eval(
+            &mut engine,
+            r#"
+            const wasmModule = new WebAssembly.Module(wasmFixture);
+            const importGlobal = new WebAssembly.Global({ value: "i32", mutable: true }, 4);
+            const importMemory = new WebAssembly.Memory({ initial: 1, maximum: 3 });
+            const importTable = new WebAssembly.Table({ element: "externref", initial: 1, maximum: 3 });
+            let observed = -1;
+            let wasmInstance;
+            const sentinel = { sentinel: true };
+            const imports = { env: {
+                g: importGlobal,
+                memory: importMemory,
+                table: importTable,
+                observe() {
+                    const bytes = new Uint8Array(importMemory.buffer);
+                    observed = bytes[0];
+                    bytes[1] = 5;
+                    return wasmInstance.exports.addGlobal(observed);
+                },
+                boom() { throw sentinel; }
+            }};
+            wasmInstance = new WebAssembly.Instance(wasmModule, imports);
+            const firstBuffer = importMemory.buffer;
+            const sameBuffer = firstBuffer === importMemory.buffer;
+            new Uint8Array(firstBuffer)[2] = 8;
+            const readFromJs = wasmInstance.exports.read2();
+            wasmInstance.exports.write0(11);
+            const writtenFromWasm = new Uint8Array(firstBuffer)[0];
+            const bridge = wasmInstance.exports.bridge();
+            const internalOldPages = wasmInstance.exports.growInside();
+            const detachedAfterInternalGrow = firstBuffer.byteLength;
+            const secondBuffer = importMemory.buffer;
+            const explicitOldPages = importMemory.grow(1);
+            const detachedAfterExplicitGrow = secondBuffer.byteLength;
+
+            const marker = { marker: 1 };
+            importTable.set(0, marker);
+            const tableIdentity = importTable.get(0) === marker;
+            const oldTableLength = importTable.grow(1);
+            const tableDefault = importTable.get(1) === undefined;
+            const anyfunc = new WebAssembly.Table({ element: "anyfunc", initial: 1 });
+            const anyfuncDefault = anyfunc.get(0) === null;
+            let explicitUndefinedRejected = false;
+            try { anyfunc.set(0, undefined); } catch (error) {
+                explicitUndefinedRejected = error instanceof TypeError;
+            }
+
+            const forwardingModule = new WebAssembly.Module(wasmForwardingFixture);
+            const forwardingInstance = new WebAssembly.Instance(forwardingModule, {
+                x: { f: wasmInstance.exports.addGlobal }
+            });
+            const functionIdentity = forwardingInstance.exports.f === wasmInstance.exports.addGlobal;
+            let nestedStarts = 0;
+            let nestedBoundary = false;
+            const reentrantInstance = new WebAssembly.Instance(
+                new WebAssembly.Module(wasmReentrantFixture),
+                { env: { instantiate() {
+                    const nestedModule = new WebAssembly.Module(wasmNestedFixture);
+                    const nestedGlobal = new WebAssembly.Global({ value: "i32" }, 7);
+                    const nestedMemory = new WebAssembly.Memory({ initial: 1 });
+                    const nestedTable = new WebAssembly.Table({ element: "externref", initial: 1 });
+                    nestedBoundary = WebAssembly.validate(wasmNestedFixture) &&
+                        WebAssembly.Module.imports(nestedModule)[0].name === "started" &&
+                        WebAssembly.Module.exports(nestedModule)[0].name === "answer" &&
+                        WebAssembly.Module.customSections(nestedModule, "missing").length === 0 &&
+                        nestedGlobal.value === 7 && nestedMemory.buffer.byteLength === 65536 &&
+                        nestedTable.get(0) === undefined;
+                    const inner = new WebAssembly.Instance(nestedModule, {
+                        env: { started() { nestedStarts++; } }
+                    });
+                    return inner.exports.answer();
+                } } }
+            );
+            const nestedInstantiation = reentrantInstance.exports.run() === 23 &&
+                nestedStarts === 1 && nestedBoundary;
+            let throwIdentity = false;
+            try { wasmInstance.exports.callBoom(); }
+            catch (error) { throwIdentity = error === sentinel; }
+            const custom = WebAssembly.Module.customSections(wasmModule, "note")[0];
+            const descriptors = [
+                WebAssembly.Module.imports(wasmModule).map(v => v.kind).join(','),
+                WebAssembly.Module.exports(wasmModule).map(v => v.kind).join(','),
+                Array.from(new Uint8Array(custom)).join(',')
+            ].join(';');
+            const identity = wasmInstance.exports.memory === importMemory &&
+                wasmInstance.exports.table === importTable && wasmInstance.exports.g === importGlobal;
+            const big = wasmInstance.exports.big.value;
+            wasmInstance.exports.big.value = 9n;
+            const globalDefaults = new WebAssembly.Global({ value: "f64" }).value === 0 &&
+                new WebAssembly.Global({ value: "externref" }).value === undefined;
+            let badMemory = false, badTable = false, keyedTransfer = false;
+            try { new WebAssembly.Memory({ initial: 4294967296 }); }
+            catch (error) { badMemory = error instanceof TypeError; }
+            try { new WebAssembly.Table({ element: "externref" }); }
+            catch (error) { badTable = error instanceof TypeError; }
+            try { importMemory.buffer.transfer(); }
+            catch (error) { keyedTransfer = error instanceof TypeError; }
+
+            globalThis.wasmResult = [
+                WebAssembly.validate(wasmFixture), sameBuffer, readFromJs, writtenFromWasm,
+                observed, bridge, internalOldPages, detachedAfterInternalGrow,
+                explicitOldPages, detachedAfterExplicitGrow, tableIdentity, oldTableLength,
+                tableDefault, anyfuncDefault, explicitUndefinedRejected, functionIdentity,
+                nestedInstantiation, throwIdentity, identity, String(big),
+                String(wasmInstance.exports.big.value), globalDefaults,
+                badMemory, badTable, keyedTransfer, descriptors
+            ].join('|');
+            "#,
+            "WebAssembly Lumen boundary",
+        )
+        .unwrap();
+
+        assert_eq!(
+            string_value(&mut engine, "wasmResult"),
+            "true|true|8|11|37|46|1|0|2|0|true|1|true|true|true|true|true|true|true|-2|9|true|true|true|true|function,function,global,memory,table;memory,table,global,function,function,function,function,function,function,global;1,2,3"
+        );
     }
 
     #[test]
@@ -3630,13 +3971,17 @@ mod tests {
 
         let classic_source = r#"
             var workerOrder = [];
+            var workerWasm = new WebAssembly.Instance(new WebAssembly.Module(new Uint8Array([
+                0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,2,1,0,7,10,1,6,
+                97,110,115,119,101,114,0,0,10,6,1,4,0,65,42,11
+            ]))).exports.answer();
             addEventListener('message', function (event) { workerOrder.push('listener'); });
             onmessage = function (event) {
                 workerOrder.push('handler');
                 setTimeout(function () {
                     postMessage({ kind: 'timer1', cycle: event.data === event.data.self,
                         workerOrder: workerOrder.join(','), trusted: event.isTrusted,
-                        origin: event.origin, workerName: self.name });
+                        origin: event.origin, workerName: self.name, wasm: workerWasm });
                     Promise.resolve().then(function () { postMessage({ kind: 'micro' }); });
                 }, 0);
                 setTimeout(function () { postMessage({ kind: 'timer2' }); }, 0);
@@ -3742,6 +4087,7 @@ mod tests {
         assert_eq!(string_value(&mut engine, "String(timer1.trusted)"), "true");
         assert_eq!(string_value(&mut engine, "timer1.origin"), "");
         assert_eq!(string_value(&mut engine, "timer1.workerName"), "echo");
+        assert_eq!(string_value(&mut engine, "String(timer1.wasm)"), "42");
         assert_eq!(string_value(&mut engine, "String(workerTrusted)"), "true");
         assert_eq!(string_value(&mut engine, "workerOrigins.join(',')"), ",,,");
         assert_eq!(string_value(&mut engine, "String(workerErrors)"), "0");
