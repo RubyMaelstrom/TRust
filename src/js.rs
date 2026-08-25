@@ -4398,6 +4398,15 @@ fn sys_ws_open(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
         Some(v) => v.to_string(ctx)?.to_std_string_lossy(),
         None => return Ok(JsValue::new(-1)),
     };
+    let protocol_arg = args
+        .get(1)
+        .map(|value| value.to_string(ctx))
+        .transpose()?
+        .map(|value| value.to_std_string_lossy())
+        .unwrap_or_default();
+    let Some(protocols) = crate::ws::parse_protocols(&protocol_arg) else {
+        return Ok(JsValue::new(-1));
+    };
     let host = ctx.realm().host_defined();
     let Some(wsh) = host.get::<PageWs>() else {
         return Ok(JsValue::new(-1)); // no-net page / one-shot transform
@@ -4427,6 +4436,7 @@ fn sys_ws_open(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
     };
     let (out_tx, task) = crate::ws::connect(
         resolved,
+        protocols,
         origin,
         cookie,
         &wsh.handle,
@@ -10746,6 +10756,7 @@ fn page_actor(
                 }
             }
             PageCmd::Ws { id, event } => {
+                let can_mutate_page = !matches!(&event, crate::ws::WsIn::Sent(_));
                 dispatch_ws_in(&mut page, id, event);
                 drain_js_side(&mut page.ctx, &mut page.outcome);
                 if page.outcome.panicked {
@@ -10757,6 +10768,9 @@ fn page_actor(
                     if evts.blocking_send(navigation_event(url, replace)).is_err() {
                         return;
                     }
+                    continue;
+                }
+                if !can_mutate_page {
                     continue;
                 }
                 // A socket frame that mutated the DOM (a streamed chat token)
@@ -11012,7 +11026,12 @@ fn page_actor(
 fn dispatch_ws_in(page: &mut LoadedPage, id: usize, event: crate::ws::WsIn) {
     prepare_event_loop_task(page);
     let call = match event {
-        crate::ws::WsIn::Open => format!("__trust.wsEvent({id},'open')"),
+        crate::ws::WsIn::Open { protocol } => {
+            format!(
+                "__trust.wsEvent({id},'open','',false,0,'',false,false,{})",
+                js_string(&protocol)
+            )
+        }
         crate::ws::WsIn::Text(s) => {
             format!("__trust.wsEvent({id},'message',{},false)", js_string(&s))
         }
@@ -11025,15 +11044,23 @@ fn dispatch_ws_in(page: &mut LoadedPage, id: usize, event: crate::ws::WsIn) {
                 js_string(&latin1)
             )
         }
-        crate::ws::WsIn::Closed { code, reason } => {
+        crate::ws::WsIn::Sent(bytes) => {
+            format!("__trust.wsEvent({id},'drain','',false,{bytes})")
+        }
+        crate::ws::WsIn::Closed {
+            code,
+            reason,
+            was_clean,
+            failed,
+        } => {
             // The socket is done: drop it from the registry so a `close`
             // handler can't resurrect a send, then fire the close event.
             if let Some(wsh) = page.ctx.realm().host_defined().get::<PageWs>() {
                 wsh.sockets.borrow_mut().remove(&id);
             }
             format!(
-                "__trust.wsEvent({id},'close','',false,{code},{})",
-                js_string(&reason)
+                "__trust.wsEvent({id},'close','',false,{code},{},{was_clean},{failed})",
+                js_string(&reason),
             )
         }
     };
@@ -21994,17 +22021,36 @@ pub(crate) const PRELUDE: &str = r##"
     class WebSocket extends EventTarget {
         constructor(url, protocols) {
             super();
-            this.url = String(url);
+            let parsed;
+            try {
+                parsed = new g.URL(String(url), (g.document && g.document.baseURI) || (g.location && g.location.href) || "about:blank");
+            } catch (_) {
+                throw new DOMException("Invalid WebSocket URL", "SyntaxError");
+            }
+            if (parsed.protocol === "http:") parsed.protocol = "ws:";
+            else if (parsed.protocol === "https:") parsed.protocol = "wss:";
+            if ((parsed.protocol !== "ws:" && parsed.protocol !== "wss:") || parsed.hash) {
+                throw new DOMException("Invalid WebSocket URL", "SyntaxError");
+            }
+            let protocolList;
+            if (protocols === undefined) protocolList = [];
+            else if (typeof protocols === "string") protocolList = [protocols];
+            else if (protocols !== null && protocols[Symbol.iterator] !== undefined) protocolList = Array.from(protocols, (value) => String(value));
+            else protocolList = [String(protocols)];
+            const protocolToken = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+            for (let i = 0; i < protocolList.length; i++) {
+                const protocol = protocolList[i];
+                if (!protocolToken.test(protocol) || protocolList.indexOf(protocol) !== i) {
+                    throw new DOMException("Invalid WebSocket subprotocol", "SyntaxError");
+                }
+            }
+            this.url = parsed.href;
             this.readyState = 0; // CONNECTING
             this.bufferedAmount = 0;
             this.extensions = "";
             this.protocol = "";
-            this.binaryType = "blob";
-            this.onopen = null; this.onmessage = null; this.onclose = null; this.onerror = null;
-            let proto = "";
-            if (Array.isArray(protocols)) proto = protocols.join(",");
-            else if (protocols !== undefined && protocols !== null) proto = String(protocols);
-            this.__id = __ws_open(this.url, proto);
+            this.__binaryType = "blob";
+            this.__id = __ws_open(this.url, protocolList.join(","));
             if (this.__id < 0) {
                 // Synchronous open failure (bad URL / blocked / no net grant):
                 // a browser still reports it asynchronously as error + close.
@@ -22020,43 +22066,69 @@ pub(crate) const PRELUDE: &str = r##"
         }
         get CONNECTING() { return 0; } get OPEN() { return 1; }
         get CLOSING() { return 2; } get CLOSED() { return 3; }
+        get binaryType() { return this.__binaryType; }
+        set binaryType(value) {
+            value = String(value);
+            if (value !== "blob" && value !== "arraybuffer") throw new TypeError("Invalid WebSocket binaryType");
+            this.__binaryType = value;
+        }
         send(data) {
             if (this.readyState === 0) throw new DOMException("WebSocket is still CONNECTING", "InvalidStateError");
-            if (this.readyState !== 1) return;
-            if (typeof data === "string") { __ws_send(this.__id, data, false); return; }
-            let bytes = null;
-            if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
-            else if (data && data.buffer instanceof ArrayBuffer) bytes = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
-            if (bytes) {
-                let s = ""; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-                __ws_send(this.__id, s, true);
+            let wire, binary = false, byteLength;
+            if (typeof data === "string") {
+                wire = data;
+                byteLength = new g.TextEncoder().encode(data).byteLength;
+            } else if (data instanceof g.Blob) {
+                wire = __blobBytes(data); binary = true; byteLength = wire.length;
             } else {
-                __ws_send(this.__id, String(data), false); // Blob/other: best-effort
+                let bytes = null;
+                if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+                else if (data && data.buffer instanceof ArrayBuffer) bytes = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength);
+                if (bytes) {
+                    wire = ""; for (let i = 0; i < bytes.length; i++) wire += String.fromCharCode(bytes[i]);
+                    binary = true; byteLength = bytes.length;
+                } else {
+                    wire = String(data);
+                    byteLength = new g.TextEncoder().encode(wire).byteLength;
+                }
             }
+            this.bufferedAmount += byteLength;
+            if (this.readyState === 1) __ws_send(this.__id, wire, binary);
         }
         close(code, reason) {
+            if (code !== undefined) {
+                code = Number(code);
+                code = !Number.isFinite(code) ? 0 : Math.max(0, Math.min(65535, Math.round(code)));
+                if (code !== 1000 && (code < 3000 || code > 4999)) {
+                    throw new DOMException("Invalid WebSocket close code", "InvalidAccessError");
+                }
+            }
+            reason = reason === undefined ? "" : String(reason);
+            if (new g.TextEncoder().encode(reason).byteLength > 123) {
+                throw new DOMException("WebSocket close reason exceeds 123 UTF-8 bytes", "SyntaxError");
+            }
             if (this.readyState >= 2) return;
             this.readyState = 2; // CLOSING
-            __ws_close(this.__id, (code === undefined || code === null) ? 1000 : (code | 0), reason ? String(reason) : "");
+            __ws_close(this.__id, code === undefined ? 0 : code, reason);
         }
         __fire(type, init) {
             let ev;
-            if (type === "message") ev = new MessageEvent("message", init);
-            else if (type === "close") ev = new CloseEvent("close", init);
-            else ev = new Event(type);
-            const h = this["on" + type];
-            if (typeof h === "function") { try { h.call(this, ev); } catch (e) { trust.errors.push("ws on" + type + ": " + ((e && e.message) || e)); } }
-            this.dispatchEvent(ev);
+            if (type === "message") ev = createTrustedEvent(MessageEvent, "message", init);
+            else if (type === "close") ev = createTrustedEvent(CloseEvent, "close", init);
+            else ev = createTrustedEvent(Event, type, init);
+            dispatch(this, ev, false);
         }
     }
+    installHandlerProps(WebSocket.prototype, ["open", "message", "error", "close"]);
     WebSocket.CONNECTING = 0; WebSocket.OPEN = 1; WebSocket.CLOSING = 2; WebSocket.CLOSED = 3;
     g.WebSocket = WebSocket;
     // The actor calls this for every inbound WebSocket event (open/message/close).
-    trust.wsEvent = function (id, kind, data, isBinary, code, reason) {
+    trust.wsEvent = function (id, kind, data, isBinary, code, reason, wasClean, failed, protocol) {
         const ws = WS_REGISTRY[id];
         if (!ws) return;
         if (kind === "open") {
             ws.readyState = 1; // OPEN
+            ws.protocol = protocol || "";
             ws.__fire("open", {});
         } else if (kind === "message") {
             let payload = data;
@@ -22065,11 +22137,16 @@ pub(crate) const PRELUDE: &str = r##"
                 for (let i = 0; i < len; i++) view[i] = data.charCodeAt(i) & 0xFF;
                 payload = (ws.binaryType === "arraybuffer") ? buf : new g.Blob([buf]);
             }
-            ws.__fire("message", { data: payload, origin: ws.url });
+            let origin = "";
+            try { origin = new g.URL(ws.url).origin; } catch (_) {}
+            ws.__fire("message", { data: payload, origin: origin });
+        } else if (kind === "drain") {
+            ws.bufferedAmount = Math.max(0, ws.bufferedAmount - (Number(code) || 0));
         } else if (kind === "close") {
             ws.readyState = 3; // CLOSED
             delete WS_REGISTRY[id];
-            ws.__fire("close", { code: code, reason: reason || "", wasClean: code === 1000 });
+            if (failed) ws.__fire("error", {});
+            ws.__fire("close", { code: code, reason: reason || "", wasClean: !!wasClean });
         }
     };
 
@@ -28187,6 +28264,51 @@ mod tests {
         assert_eq!(s(&mut ctx, b"String(globalThis.__injectedMicro)"), "true");
         assert_eq!(s(&mut ctx, b"out.events.join(',')"), "load");
         assert_eq!(s(&mut ctx, b"String(out.currentAtLoad)"), "null");
+    }
+
+    #[test]
+    fn websocket_constructor_and_close_validation_are_synchronous() {
+        // WebSockets §3.1 constructor/close steps run before any parallel connection work:
+        // URL/subprotocol failures throw SyntaxError, send while CONNECTING throws
+        // InvalidStateError, and close validates its status and UTF-8 reason length first.
+        let mut ctx = platform_ctx();
+        let budget = Budget::new(WALL_BUDGET);
+        let mut outcome = Outcome::default();
+        run_script(
+            &mut ctx,
+            "websocket-validation.js",
+            br##"
+            globalThis.wsChecks = [];
+            try { new WebSocket("ftp://example.test/socket"); }
+            catch (error) { wsChecks.push("url:" + error.name); }
+            try { new WebSocket("/socket", ["chat", "chat"]); }
+            catch (error) { wsChecks.push("protocol:" + error.name); }
+            const socket = new WebSocket("https://example.test/socket", ["chat"]);
+            wsChecks.push("serialized:" + socket.url);
+            try { socket.binaryType = "bytes"; }
+            catch (error) { wsChecks.push("binary:" + error.name); }
+            try { socket.send("early"); }
+            catch (error) { wsChecks.push("send:" + error.name); }
+            try { socket.close(2000); }
+            catch (error) { wsChecks.push("code:" + error.name); }
+            try { socket.close(1000, "\u00e9".repeat(62)); }
+            catch (error) { wsChecks.push("reason:" + error.name); }
+            "##,
+            &budget,
+            &mut outcome,
+        );
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        let checks = ctx
+            .eval(Source::from_bytes(b"wsChecks.join('|')"))
+            .unwrap()
+            .to_string(&mut ctx)
+            .unwrap()
+            .to_std_string_escaped();
+        assert_eq!(
+            checks,
+            "url:SyntaxError|protocol:SyntaxError|serialized:wss://example.test/socket|\
+             binary:TypeError|send:InvalidStateError|code:InvalidAccessError|reason:SyntaxError"
+        );
     }
 
     #[test]
