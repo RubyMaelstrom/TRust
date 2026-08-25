@@ -3,7 +3,7 @@
 //! Persistent connections (a RAM-only keep-alive pool — measured
 //! 2026-06-12: serial fresh-TLS-per-request was 85% of a page load),
 //! responses delimited precisely (Content-Length / chunked / EOF), no
-//! compression (`Accept-Encoding: identity`), redirects followed here.
+//! compression (`Accept-Encoding: gzip, deflate`), redirects followed here.
 //! HTTPS uses standard WebPKI validation (`tls::webpki_connector`),
 //! not TOFU. HTML renders through our own arena DOM (`dom.rs`) laid out
 //! into positioned rows (`layout.rs`); forms are extracted from that
@@ -1284,7 +1284,7 @@ async fn exchange(
          User-Agent: {}\r\n\
          Accept: {}\r\n\
          Accept-Language: {}\r\n\
-         Accept-Encoding: identity\r\n\
+         Accept-Encoding: gzip, deflate\r\n\
          Connection: keep-alive\r\n",
         request.method,
         path,
@@ -1585,10 +1585,10 @@ async fn read_to_eof<R: AsyncRead + Unpin>(io: &mut BufReader<R>) -> Result<Vec<
     }
 }
 
-/// Undo `Content-Encoding` on a fully-read body. We never advertise an
-/// encoding (`Accept-Encoding: identity`), but some servers compress anyway
-/// (archive.org sends `Content-Encoding: gzip` unsolicited); a browser
-/// decodes it regardless, so we do too. Layering: this runs AFTER framing
+/// Undo `Content-Encoding` on a fully-read body. We advertise the codings we
+/// can decode (`Accept-Encoding: gzip, deflate`) and tolerate servers that
+/// compress regardless; a browser decodes it, so we do too. Layering: this
+/// runs AFTER framing
 /// (Content-Length / dechunking) — `Content-Encoding` is the payload, not
 /// the message framing, so it never affects connection reuse.
 ///
@@ -4384,7 +4384,6 @@ mod tests {
             from_post: false,
         }
     }
-
     #[test]
     fn declarative_refresh_parser_follows_the_html_algorithm() {
         assert_eq!(
@@ -4583,6 +4582,7 @@ mod tests {
                 .contains(&"https://example.test/images/HeartDot.png".to_string())
         );
     }
+
     #[test]
     fn graphical_image_discovery_is_document_ordered_resolved_and_deduplicated() {
         let base = Url::parse("https://www.example.test/gallery/index.html").unwrap();
@@ -9979,6 +9979,10 @@ customElements.define('lit-counter', LitCounter);
             "no duplicate Accept-Language header: {head}"
         );
         assert!(
+            head.contains("Accept-Encoding: gzip, deflate"),
+            "supported response compression is advertised: {head}"
+        );
+        assert!(
             head.contains("Sec-GPC: 1\r\n"),
             "the user-agent GPC preference reaches the wire: {head}"
         );
@@ -10241,8 +10245,8 @@ customElements.define('lit-counter', LitCounter);
     async fn decompresses_an_unsolicited_gzip_body() {
         use flate2::{Compression, write::GzEncoder};
         use std::io::Write as _;
-        // A server forces gzip even though we asked for `identity` — decode
-        // it like a browser would, end to end through read_response.
+        // A server's gzip response exercises the same path as the advertised
+        // `Accept-Encoding: gzip, deflate` request.
         let mut e = GzEncoder::new(Vec::new(), Compression::default());
         e.write_all(b"<html>hello compressed</html>").unwrap();
         let gz = e.finish().unwrap();
