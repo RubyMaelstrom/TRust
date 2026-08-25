@@ -9103,7 +9103,7 @@ const OBSERVER_DELIVERY_PASSES: usize = 6;
 /// the microtask checkpoint, and returns to the sleep. A callback that re-arms a
 /// 0-delay timer (an Apollo poll that never settles because its data is gated
 /// behind a bot wall) therefore advances at the
-/// `WAKE_FLOOR` cadence (~15fps) instead of running 50 generations crammed into a
+/// `WAKE_FLOOR` cadence (~60fps) instead of running 50 generations crammed into a
 /// single virtual instant per wake — which pegged a CPU core on any page that
 /// never reaches a stable state. `setInterval`/`requestAnimationFrame` are
 /// future-dated, so they already fire one generation per wake and are unaffected;
@@ -9116,14 +9116,16 @@ const REST_TICKS: usize = 1;
 /// one-shot path (Boa's parser recursion, see CLAUDE.md).
 const PAGE_STACK: usize = 64 * 1024 * 1024;
 
-/// At rest the actor never wakes more often than this, even if a page arms a
-/// 0/16ms timer (a `requestAnimationFrame` chain) — so an animation settles to
-/// ~15fps instead of pegging a core. Sub-floor delays are coalesced to the
-/// frame; a one-shot `setTimeout` with a longer delay still fires near its real
-/// time (the floor only raises sub-frame waits). Her call: 15fps render cadence
-/// (see CLAUDE.md). A page with no pending timers arms NO sleep and parks on
-/// the command channel — zero idle CPU, exactly like the old blocking park.
-const WAKE_FLOOR: Duration = Duration::from_millis(66);
+/// At rest the actor yields at most once per display-sized frame for a due
+/// timer. HTML's timer algorithm permits an implementation-defined power pad,
+/// but it does not require a 66ms/15Hz clamp; that clamp made foreground
+/// requestAnimationFrame and zero-delay scheduler chains visibly lag behind a
+/// normal browser. Sixteen milliseconds keeps the actor bounded at roughly
+/// 60Hz while limiting the work to one timer task per wake. A one-shot
+/// `setTimeout` with a longer delay still fires near its real time (the floor
+/// only raises sub-frame waits). See HTML §8.7, especially the 4ms nested
+/// minimum and the optional, implementation-defined additional wait.
+const WAKE_FLOOR: Duration = Duration::from_millis(16);
 
 /// What unblocked the at-rest event loop: an app command (`None` = the app
 /// dropped the page handle), a background fetch completing (`None` = the
@@ -10301,7 +10303,7 @@ fn page_actor(
     // WITHOUT busy-waiting. An empty timer queue means no sleep arm, so we park
     // purely on the command channel (zero idle CPU), exactly like the old
     // `blocking_recv`. Only a page that schedules ongoing work wakes, and no
-    // more often than `WAKE_FLOOR` (~15fps), so an animation can't peg a core.
+    // more often than `WAKE_FLOOR` (~60fps), so an animation can't busy-loop.
     // Time tracks the REAL monotonic clock here (unlike the load/dispatch
     // settle, which fast-forwards virtual time): a 1s interval fires once per
     // real second. A WebSocket frame still arrives as `PageCmd::Ws` and just
@@ -11343,6 +11345,10 @@ fn timer_wake(
         &mut page.outcome,
         real_now,
     );
+    // Resident timer turns are outside the initial-load profile. Keep their
+    // samples separate so a long timer wake can be attributed to author JS
+    // rather than guessed from the surrounding render timing.
+    dump_vm_profile("timer");
     let d_settle = t.map(|t| t.elapsed().as_millis());
     // A timer may swap in a fresh <img> (a JS slideshow advancing) whose reveal
     // waits on a `load` event a headless DOM never fires. Queue those resource
@@ -30532,7 +30538,7 @@ mod tests {
     fn message_channel_scheduler_chain_is_not_timer_throttled() {
         // MessagePort uses the port-message task source, not the timer task
         // source (HTML §9.4.4). React's cooperative scheduler commonly needs
-        // hundreds of these turns before committing a mount. At 66ms per
+        // hundreds of these turns before committing a mount. At a 16ms frame
         // misclassified timer this took many seconds despite negligible JS.
         let (handle, mut events) = live(
             r#"<body><p id=o>shell</p><script>
